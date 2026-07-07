@@ -1581,15 +1581,34 @@ bool android_get_vfs_authorized_locations(
 void android_show_saf_tree_picker(void)
 {
    JNIEnv *env;
-
    if (!g_android || !g_android->have_saf)
       return;
-
    env = jni_thread_getenv();
    if (!env)
       return;
-
    CALL_VOID_METHOD(env, g_android->activity->clazz, g_android->requestOpenDocumentTree);
+}
+#endif
+#ifdef HAVE_ADRENOTOOLS
+void android_show_vulkan_driver_picker(void)
+{
+   JNIEnv *env;
+   if (!g_android)
+      return;
+   env = jni_thread_getenv();
+   if (!env)
+      return;
+   CALL_VOID_METHOD(env, g_android->activity->clazz, g_android->requestVulkanDriverPicker);
+}
+void android_reset_vulkan_driver(void)
+{
+   JNIEnv *env;
+   if (!g_android)
+      return;
+   env = jni_thread_getenv();
+   if (!env)
+      return;
+   CALL_VOID_METHOD(env, g_android->activity->clazz, g_android->resetVulkanDriverToSystem);
 }
 #endif
 
@@ -3436,7 +3455,7 @@ static void frontend_unix_init(void *data)
    GET_METHOD_ID(env, android_app->doVibrateUSB, class,
          "doVibrateUSB", "(III)Z");
    GET_METHOD_ID(env, android_app->doHapticFeedback, class,
-         "doHapticFeedback", "(I)V");
+         "doHapticFeedback", "(II)V");
    GET_METHOD_ID(env, android_app->getUserLanguageString, class,
          "getUserLanguageString", "()Ljava/lang/String;");
    GET_METHOD_ID(env, android_app->isPlayStoreBuild, class,
@@ -3480,6 +3499,13 @@ static void frontend_unix_init(void *data)
 
    if (android_app->have_saf)
       android_vfs_authorized_locations_refresh();
+#endif
+
+#ifdef HAVE_ADRENOTOOLS
+   GET_METHOD_ID(env, android_app->requestVulkanDriverPicker, class,
+         "requestVulkanDriverPicker", "()V");
+   GET_METHOD_ID(env, android_app->resetVulkanDriverToSystem, class,
+         "resetVulkanDriverToSystem", "()V");
 #endif
 
    GET_OBJECT_CLASS(env, class, obj);

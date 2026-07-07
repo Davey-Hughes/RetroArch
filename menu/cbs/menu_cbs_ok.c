@@ -7101,6 +7101,22 @@ static int action_ok_open_picker(const char *path,
    return ret;
 #endif
 }
+static int action_ok_vulkan_driver_picker(const char *path,
+   const char *label, unsigned type, size_t idx, size_t entry_idx)
+{
+#if defined(ANDROID) && defined(HAVE_ADRENOTOOLS)
+   android_show_vulkan_driver_picker();
+#endif
+   return 0;
+}
+static int action_ok_vulkan_driver_reset(const char *path,
+   const char *label, unsigned type, size_t idx, size_t entry_idx)
+{
+#if defined(ANDROID) && defined(HAVE_ADRENOTOOLS)
+   android_reset_vulkan_driver();
+#endif
+   return 0;
+}
 
 #ifdef HAVE_NETWORKING
 #ifdef HAVE_WIFI
@@ -9720,6 +9736,8 @@ static int menu_cbs_init_bind_ok_compare_label(menu_file_list_cbs_t *cbs,
 #endif
          {MENU_ENUM_LABEL_FILE_BROWSER_OPEN_UWP_PERMISSIONS,   action_ok_open_uwp_permission_settings},
          {MENU_ENUM_LABEL_FILE_BROWSER_OPEN_PICKER,            action_ok_open_picker},
+         {MENU_ENUM_LABEL_VULKAN_DRIVER_PICKER,                action_ok_vulkan_driver_picker},
+         {MENU_ENUM_LABEL_VULKAN_DRIVER_RESET,                 action_ok_vulkan_driver_reset},
 #ifdef HAVE_BLUETOOTH
          {MENU_ENUM_LABEL_BLUETOOTH_SETTINGS,                  action_ok_bluetooth_list},
 #endif

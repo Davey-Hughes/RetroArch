@@ -272,6 +272,10 @@ struct android_app
    jmethodID getPersistedSafTrees;
    bool have_saf;
 #endif
+#ifdef HAVE_ADRENOTOOLS
+   jmethodID requestVulkanDriverPicker;
+   jmethodID resetVulkanDriverToSystem;
+#endif
 };
 
 enum
@@ -526,7 +530,6 @@ void android_run_lifecycle_hook(struct android_app *android_app,
 #endif
 
 extern struct android_app *g_android;
-
 void frontend_android_get_name(char *s, size_t len);
 
 void frontend_android_get_manufacturer_model(char *s, size_t len);
@@ -534,7 +537,10 @@ void frontend_android_get_manufacturer_model(char *s, size_t len);
 void frontend_android_get_version(int32_t *major, int32_t *minor, int32_t *rel);
 
 void frontend_android_get_version_sdk(int32_t *sdk);
-
+#ifdef HAVE_ADRENOTOOLS
+extern char android_vulkan_driver_display_name[256];
+extern bool android_vulkan_driver_enabled;
+#endif
 bool is_screen_reader_enabled(void);
 
 /* Pushes the live values of the window-affecting settings to the
@@ -549,7 +555,9 @@ void android_show_saf_tree_picker(void);
 bool android_get_vfs_authorized_locations(
       struct retro_vfs_authorized_locations *locations);
 #endif
-
+#ifdef HAVE_ADRENOTOOLS
+void android_show_vulkan_driver_picker(void);
+void android_reset_vulkan_driver(void);
 #endif
-
+#endif /* ANDROID */
 #endif
