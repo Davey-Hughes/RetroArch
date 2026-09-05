@@ -4441,7 +4441,9 @@ static void ui_application_qt_quit(void)
       app_handler->exit();
 }
 
-#ifdef HAVE_MAIN
+/* The Cocoa UI driver supplies main() on macOS, and both drivers define
+ * HAVE_MAIN, so building this one too gives the link two of them. */
+#if defined(HAVE_MAIN) && !defined(HAVE_COCOA)
 #if defined(__cplusplus) && !defined(CXX_BUILD)
 extern "C"
 #endif
