@@ -139,7 +139,12 @@ static void rarch_draw_observer(CFRunLoopObserverRef observer,
    if (ret == -1)
    {
 #ifdef HAVE_QT
-      application->quit();
+      uico_driver_state_t *uico_st        = uico_state_get_ptr();
+      const ui_application_t *application = uico_st->drv
+         ? uico_st->drv->application
+         : NULL;
+      if (application)
+         application->quit();
 #endif
       main_exit(NULL);
       exit(0);
