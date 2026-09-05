@@ -31,3 +31,22 @@ jobs:
         name: RetroArch-${{ steps.slug.outputs.sha8 }}
         path: |
           build/Build/Products/Release
+
+  # The Xcode workspace above never defines HAVE_QT, so the Cocoa + Qt
+  # combination is only reachable through configure. Build it here so a
+  # break in code behind #ifdef HAVE_QT does not ship unnoticed.
+  configure-qt:
+    name: configure + Qt build
+    runs-on: macos-latest
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Install dependencies
+      run: brew install qt pkg-config
+
+    - name: Configure
+      run: ./configure --enable-qt
+
+    - name: Compile RA
+      run: make -j$(sysctl -n hw.ncpu)
