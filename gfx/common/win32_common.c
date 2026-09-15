@@ -551,16 +551,23 @@ static void win32_save_position(void)
     * end up with fullscreen size and position. */
    if (!(settings->flags & SETTINGS_FLG_SKIP_WINDOW_POSITIONS))
    {
-      if (GetWindowPlacement(main_window.hwnd, &placement))
+      /* A fullscreen window's rect is the monitor's. Saved positions
+       * are reloaded for the next windowed window, so capturing it
+       * could only reach the save below as the windowed size. */
+      if (!(     window_save_positions
+            && (g_win32_flags & WIN32_CMN_FLAG_FULLSCREEN)))
       {
-         g_win32->pos_x      = placement.rcNormalPosition.left;
-         g_win32->pos_y      = placement.rcNormalPosition.top;
-      }
+         if (GetWindowPlacement(main_window.hwnd, &placement))
+         {
+            g_win32->pos_x      = placement.rcNormalPosition.left;
+            g_win32->pos_y      = placement.rcNormalPosition.top;
+         }
 
-      if (GetWindowRect(main_window.hwnd, &rect))
-      {
-         g_win32->pos_width  = rect.right  - rect.left;
-         g_win32->pos_height = rect.bottom - rect.top;
+         if (GetWindowRect(main_window.hwnd, &rect))
+         {
+            g_win32->pos_width  = rect.right  - rect.left;
+            g_win32->pos_height = rect.bottom - rect.top;
+         }
       }
    }
    else
@@ -1791,6 +1798,12 @@ static bool win32_window_create(void *data, unsigned style,
       user_width                 = g_win32->pos_width;
       user_height                = g_win32->pos_height;
    }
+
+   /* Before creation: CreateWindowEx already sends WM_MOVE. */
+   if (fullscreen)
+      g_win32_flags             |=  WIN32_CMN_FLAG_FULLSCREEN;
+   else
+      g_win32_flags             &= ~WIN32_CMN_FLAG_FULLSCREEN;
 #ifdef LEGACY_WIN32
    main_window.hwnd              = CreateWindowEx(0,
          "RetroArch", title_local,

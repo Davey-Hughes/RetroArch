@@ -70,7 +70,8 @@ enum win32_common_flags
    WIN32_CMN_FLAG_TASKBAR_CREATED = (1 << 2),
    WIN32_CMN_FLAG_RESTORE_DESKTOP = (1 << 3),
    WIN32_CMN_FLAG_INITED          = (1 << 4),
-   WIN32_CMN_FLAG_SWAP_MOUSE_BTNS = (1 << 5)
+   WIN32_CMN_FLAG_SWAP_MOUSE_BTNS = (1 << 5),
+   WIN32_CMN_FLAG_FULLSCREEN      = (1 << 6)
 };
 
 extern uint8_t g_win32_flags;
