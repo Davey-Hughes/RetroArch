@@ -2359,8 +2359,8 @@ static int menu_cbs_init_bind_get_string_representation_compare_type(
            break;
        case MENU_SETTING_ACTION:
            if (cbs->setting
-               && cbs->setting->get_string_representation
-               && cbs->setting->get_string_representation != &setting_get_string_representation_default)
+               && cbs->setting->actions->repr
+               && cbs->setting->actions->repr != &setting_get_string_representation_default)
                BIND_ACTION_GET_VALUE(cbs, menu_action_setting_disp_set_label);
            else
                BIND_ACTION_GET_VALUE(cbs,

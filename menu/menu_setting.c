@@ -14601,8 +14601,7 @@ static void settings_build_video(
                   &group_info,
                   &subgroup_info,
                   parent_group);
-            (*list)[list_info->index - 1].get_string_representation =
-               &setting_get_string_representation_vulkan_driver_name;
+            SETTINGS_ACTION_SET(repr, &(*list)[list_info->index - 1], &setting_get_string_representation_vulkan_driver_name);
             CONFIG_ACTION(
                   list, list_info,
                   MENU_ENUM_LABEL_VULKAN_DRIVER_RESET,
