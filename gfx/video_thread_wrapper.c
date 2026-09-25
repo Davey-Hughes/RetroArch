@@ -886,6 +886,13 @@ static bool video_thread_handle_packet(
          video_thread_reply(thr, &pkt);
          break;
 
+      case CMD_POKE_SET_VIEW_COUNT:
+         if (thr->driver_data && thr->poke && thr->poke->set_view_count)
+            thr->poke->set_view_count(thr->driver_data,
+                  (unsigned)pkt.data.i);
+         video_thread_reply(thr, &pkt);
+         break;
+
       case CMD_FONT_INIT:
          if (pkt.data.font_init.method)
             pkt.data.font_init.return_value = pkt.data.font_init.method(
@@ -3431,6 +3438,22 @@ static void thread_set_aspect_ratio(void *data, unsigned aspect_ratio_idx)
    }
 }
 
+static void thread_set_view_count(void *data, unsigned count)
+{
+   thread_video_t *thr = (thread_video_t*)data;
+
+   if (thr)
+   {
+      thread_packet_t pkt;
+      pkt.type   = CMD_POKE_SET_VIEW_COUNT;
+      pkt.data.i = (int)count;
+
+      /* Waits: the driver parses its shader preset here, which reads
+       * settings the main thread must not be writing meanwhile. */
+      video_thread_send_and_wait_user_to_thread(thr, &pkt);
+   }
+}
+
 static void thread_set_texture_frame(void *data, const void *frame,
       bool rgb32, unsigned dims, float alpha)
 {
@@ -3782,7 +3805,9 @@ static const video_poke_interface_t thread_poke = {
    NULL, /* hw_ring_context_new */
    NULL, /* hw_ring_context_free */
    NULL, /* hw_ring_framebuffer */
-   thread_update_texture
+   thread_update_texture,
+   NULL, /* get_swap_interval_cap */
+   thread_set_view_count
 };
 
 static void video_thread_get_poke_interface(void *data,

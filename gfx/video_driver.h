@@ -42,6 +42,7 @@
 #include "../input/input_types.h"
 
 #include "video_defines.h"
+#include "video_views.h"
 
 #ifdef HAVE_MODELINE
 #include "video_crt_switch.h"
@@ -657,6 +658,10 @@ typedef struct video_frame_info
    bool threaded_present_repeat;
    bool threaded_display_pacing;
    bool present_timing_from_display;
+   /* This frame's views and where each is drawn. views.num_views is 0
+    * when the frame is drawn whole. */
+   video_views_map_t views;
+   video_views_layout_t views_layout;
 } video_frame_info_t;
 
 typedef void (*update_window_title_cb)(void*);
@@ -987,6 +992,11 @@ typedef struct video_poke_interface
     * while the audio rate was scaled for the full multiple. Drivers
     * that hold a frame for as long as they are asked leave it NULL. */
    unsigned (*get_swap_interval_cap)(void *data);
+
+   /* Hold filter chains for count views; 0 frees them. The main thread
+    * calls it, or waits while the video thread runs it, so a driver may
+    * parse its shader preset here. */
+   void (*set_view_count)(void *data, unsigned count);
 } video_poke_interface_t;
 
 /* dims is the frame's size, VIDEO_SCALE_PACK'd; msg is for showing a
@@ -1415,6 +1425,19 @@ typedef struct
     * out of order cannot strand or steal it. */
    struct font_data *osd_font;
    void             *osd_font_owner;
+
+   /* The core's view map, and what the last frame presented with views
+    * used: the core's map and frame size (touch maps back into those),
+    * the map scaled to the frame the driver got, and the layout. Main
+    * thread only. */
+   video_views_map_t views;
+   video_views_map_t views_core;
+   video_views_map_t views_frame;
+   video_views_layout_t views_layout;
+   unsigned views_frame_dims;
+   /* The view count the driver instance was last told. */
+   unsigned views_driver_count;
+   bool views_presented;
 } video_driver_state_t;
 
 typedef struct video_frame_delay_auto
@@ -1719,6 +1742,17 @@ const char *video_driver_get_ident(void);
 unsigned video_driver_get_output_dims(void);
 
 void video_driver_set_output_dims(unsigned dims);
+
+bool video_driver_set_views(const struct retro_video_views *views);
+void video_driver_clear_views(void);
+/* RETRO_VIDEO_VIEWS_STATUS_ flags for the current driver and settings. */
+unsigned video_driver_views_status(void);
+/* The size the menu and widgets lay out at: the output size, or one
+ * eye's UI size when views are drawn side by side or top-bottom. */
+unsigned video_driver_get_ui_dims(void);
+/* Main thread: the layout the last frame presented a core's views
+ * with, or NULL when it was drawn whole. */
+const video_views_layout_t *video_driver_get_views_layout(void);
 
 #ifdef HAVE_OVERLAY
 struct overlay;
