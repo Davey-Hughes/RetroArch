@@ -169,6 +169,13 @@ void gl3_filter_chain_build_viewport_pass(
       const struct gl3_viewport *vp,
       const float *mvp);
 
+/* The final pass again, into another viewport in the same frame, for a
+ * view shown in both eyes: the feedback buffers swap once per frame. */
+void gl3_filter_chain_build_viewport_pass_again(
+      gl3_filter_chain_t *chain,
+      const struct gl3_viewport *vp,
+      const float *mvp);
+
 gl3_filter_chain_t *gl3_filter_chain_create_default(
       enum glslang_filter_chain_filter filter);
 
