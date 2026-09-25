@@ -11813,7 +11813,7 @@ unsigned menu_displaylist_build_list(
                {MENU_ENUM_LABEL_VIDEO_PRESENT_TIMING_FROM_DISPLAY, PARSE_ONLY_BOOL, false},
                {MENU_ENUM_LABEL_VIDEO_MAX_FRAME_LATENCY,    PARSE_ONLY_INT,  false},
                {MENU_ENUM_LABEL_VIDEO_MAX_SWAPCHAIN_IMAGES, PARSE_ONLY_UINT, false},
-#ifdef HAVE_D3DKMT
+#if defined(HAVE_D3DKMT) || defined(HAVE_KMS)
                {MENU_ENUM_LABEL_VIDEO_SCANLINE_SYNC,        PARSE_ONLY_BOOL, true},
 #endif
                {MENU_ENUM_LABEL_VIDEO_FRAME_DELAY_AUTO,     PARSE_ONLY_BOOL, true},
@@ -11875,6 +11875,11 @@ unsigned menu_displaylist_build_list(
                      break;
                   case MENU_ENUM_LABEL_VIDEO_MAX_SWAPCHAIN_IMAGES:
                      build_list[i].checked = swapchain_images;
+                     break;
+                  case MENU_ENUM_LABEL_VIDEO_SCANLINE_SYNC:
+                     /* Kept while on, so it can be turned off */
+                     build_list[i].checked = video_display_server_has_scanline()
+                        || settings->bools.video_scanline_sync;
                      break;
                   default:
                      break;
@@ -12484,10 +12489,12 @@ unsigned menu_displaylist_build_list(
                count++;
             }
 
-#ifdef HAVE_D3DKMT
-            if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
-                  MENU_ENUM_LABEL_VIDEO_SCANLINE_SYNC,
-                  PARSE_ONLY_BOOL, false) == 0)
+#if defined(HAVE_D3DKMT) || defined(HAVE_KMS)
+            if (     (video_display_server_has_scanline()
+                     || settings->bools.video_scanline_sync)
+                  && MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                        MENU_ENUM_LABEL_VIDEO_SCANLINE_SYNC,
+                        PARSE_ONLY_BOOL, false) == 0)
                count++;
 #endif
 #ifdef HAVE_RUNAHEAD
