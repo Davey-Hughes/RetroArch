@@ -8166,6 +8166,14 @@ static uint16_t video_driver_scanline_get_total(
    uint16_t scanline_total = video_height * ((double)1125 / (double)1080);
    uint8_t res_lut_size    = ARRAY_SIZE(resolution_lut);
    uint8_t i               = 0;
+   float display_total     = 0.0f;
+
+   /* The display's own count, where the server knows the mode */
+   if (     video_display_server_get_metrics(
+               DISPLAY_METRIC_TOTAL_LINES, &display_total)
+         && display_total >= video_height
+         && display_total < 65536.0f)
+      return (uint16_t)display_total;
 
    for (i = 0; i < res_lut_size; i++)
    {
@@ -8276,10 +8284,9 @@ VIDEO_NOINLINE static void video_driver_scanline_after_frame(video_driver_state_
       uint16_t core_run_time)
 {
    uint16_t scanline_next  = video_st->scanline[SCANLINE_NEXT];
-   uint16_t scanline_total = video_st->scanline[SCANLINE_TOTAL];
    uint16_t video_height   = video_st->scanline[SCANLINE_ACTIVE];
-   int16_t scanline_count  = 0;
    int16_t scanline        = 0;
+   retro_time_t wait_until = 0;
    bool wait               = (scanline_next) ? true : false;
 
    /* Invalid target skips wait */
@@ -8301,13 +8308,17 @@ VIDEO_NOINLINE static void video_driver_scanline_after_frame(video_driver_state_
       retro_sleep(sleep);
    }
 
+   /* Two frame targets bound the wait, however cheap a beam read is:
+    * the target can be half a refresh (Windows Vulkan's mailbox
+    * emulation) or the refresh rate setting can be above the mode's */
+   wait_until = cpu_features_get_time_usec() + 2 * frame_time_target;
+
    while (wait)
    {
       scanline = video_driver_scanline_get();
 
-      /* Disable if unsupported and prevent lockup if loop exceeds total lines */
-      scanline_count++;
-      if (scanline < 0 || scanline_count > scanline_total)
+      /* Disable if unsupported and prevent lockup */
+      if (scanline < 0 || cpu_features_get_time_usec() > wait_until)
       {
          scanline = 0;
          break;
