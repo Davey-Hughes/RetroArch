@@ -1273,6 +1273,18 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
    }
 #endif
 
+#ifdef HAVE_OPENXR
+   if (vk->context.xr && !vulkan_openxr_start(vk->context.xr,
+            vk->context.instance, vk->context.gpu, vk->context.device,
+            vk->context.graphics_queue_index, vk->context.queue_lock))
+   {
+      /* The device was made for the runtime: rebuild video without it. */
+      vulkan_openxr_drop_and_reinit(vk->context.xr);
+      vk->context.xr = NULL;
+      video_driver_modify_disp_flags(VIDEO_FLAG_DRIVER_REINIT, 0);
+   }
+#endif
+
    return true;
 }
 
@@ -3727,6 +3739,10 @@ void vulkan_context_destroy(gfx_ctx_vulkan_data_t *vk,
 {
    video_driver_state_t *video_st = video_state_get_ptr();
    uint32_t video_st_flags        = 0;
+#ifdef HAVE_OPENXR
+   /* Its thread uses the queue, which is drained below. */
+   vulkan_openxr_stop(vk->context.xr);
+#endif
    if (!vk->context.instance)
    {
 #ifdef HAVE_OPENXR

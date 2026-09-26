@@ -51,6 +51,9 @@
 
 #include "../common/vulkan_common.h"
 #include "../common/rgba16_pack.h"
+#ifdef HAVE_OPENXR
+#include "../common/vulkan_openxr.h"
+#endif
 
 #include "../../configuration.h"
 #ifdef HAVE_REWIND
@@ -10671,6 +10674,11 @@ static uint32_t vulkan_get_flags(void *data)
       BIT32_SET(flags, GFX_CTX_FLAGS_VIDEO_VIEWS);
    if (vk && retro_atomic_load_acquire_int(&vk->views.fallback))
       BIT32_SET(flags, GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK);
+#ifdef HAVE_OPENXR
+   if (     vk && vk->context && vk->context->xr
+         && vulkan_openxr_alive(vk->context->xr))
+      BIT32_SET(flags, GFX_CTX_FLAGS_VIDEO_VIEWS_HEADSET);
+#endif
 
    return flags;
 }

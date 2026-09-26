@@ -20,6 +20,7 @@
 
 #include <boolean.h>
 #include <retro_common_api.h>
+#include <rthreads/rthreads.h>
 
 #include "../include/vulkan/vulkan.h"
 
@@ -76,6 +77,60 @@ VkResult vulkan_openxr_create_device(vulkan_openxr_t *xr,
 
 /* The GPU the headset is attached to, or VK_NULL_HANDLE. */
 VkPhysicalDevice vulkan_openxr_gpu(vulkan_openxr_t *xr, VkInstance instance);
+
+/* What the headset input needs from a session, valid between the hooks'
+ * session_created and session_destroying. */
+typedef struct vulkan_openxr_handles
+{
+   vulkan_openxr_t *xr;
+   XrInstance instance;
+   XrSystemId system;
+   XrSession session;
+   XrSpace local_space;
+   XrSpace view_space;
+   PFN_xrGetInstanceProcAddr get_proc;
+} vulkan_openxr_handles_t;
+
+#define VULKAN_OPENXR_MAX_EXTRA_LAYERS 4
+
+typedef struct vulkan_openxr_hooks
+{
+   /* The session and its spaces exist and its frame loop has not
+    * started: suggest bindings and attach action sets here. */
+   void (*session_created)(void *user, const vulkan_openxr_handles_t *handles);
+   /* The frame loop has stopped; the session is destroyed next. */
+   void (*session_destroying)(void *user, vulkan_openxr_t *xr);
+   /* The XR thread, each headset frame: up to cap layers drawn over
+    * RetroArch's. Returns how many were written. */
+   unsigned (*frame_layers)(void *user, XrTime display_time,
+         const XrCompositionLayerBaseHeader **layers, unsigned cap);
+   void *user;
+} vulkan_openxr_hooks_t;
+
+/* Main thread, while no session exists. NULL clears. */
+void vulkan_openxr_set_hooks(const vulkan_openxr_hooks_t *hooks);
+
+/* Makes the session on the first call, then (again after a stop)
+ * starts the XR thread. Every OpenXR call that may use the queue holds
+ * queue_lock. False when the session could not be made. */
+bool vulkan_openxr_start(vulkan_openxr_t *xr, VkInstance instance,
+      VkPhysicalDevice gpu, VkDevice device, uint32_t queue_family,
+      slock_t *queue_lock);
+
+/* Stops the XR thread; the session stays. NULL is fine. */
+void vulkan_openxr_stop(vulkan_openxr_t *xr);
+
+/* The session failed on a device made for it: frees, tells the user,
+ * and has the next video init skip the runtime. */
+void vulkan_openxr_drop_and_reinit(vulkan_openxr_t *xr);
+
+/* Until the runtime ends the session: the headset shows both eyes. */
+bool vulkan_openxr_alive(vulkan_openxr_t *xr);
+
+/* The session's focus as the XR thread last saw it, and its latest
+ * predicted display time. */
+bool vulkan_openxr_focused(vulkan_openxr_t *xr);
+XrTime vulkan_openxr_predicted_time(vulkan_openxr_t *xr);
 
 RETRO_END_DECLS
 

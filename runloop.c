@@ -8408,6 +8408,16 @@ int runloop_iterate(void)
          & VIDEO_FLAG_GPU_DEVICE_LOST)
       runloop_gpu_device_lost(runloop_st);
 
+   if ((uint32_t)retro_atomic_load_relaxed_int(&video_st->flags)
+         & VIDEO_FLAG_DRIVER_REINIT)
+   {
+      int reinit_flags = DRIVER_VIDEO_MASK | DRIVER_INPUT_MASK
+         | DRIVER_MENU_MASK;
+      video_driver_modify_disp_flags(0, VIDEO_FLAG_DRIVER_REINIT);
+      RARCH_LOG("[Video] Reinitialising the video driver at its request.\n");
+      command_event(CMD_EVENT_REINIT, &reinit_flags);
+   }
+
 #ifdef HAVE_DISCORD
    if (runloop_st->frame_work & RUNLOOP_WORK_DISCORD)
       discord_poll(current_time);

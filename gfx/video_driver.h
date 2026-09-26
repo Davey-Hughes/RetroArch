@@ -163,7 +163,10 @@ enum video_driver_state_flags
     * callbacks) while the main thread read-modify-writes this word for
     * unrelated bits, and a bit in a shared word cannot be read from
     * another thread without the lock the write side takes. */
-   VIDEO_FLAG_THREAD_WRAPPER_ACTIVE_UNUSED        = (1 << 22)
+   VIDEO_FLAG_THREAD_WRAPPER_ACTIVE_UNUSED        = (1 << 22),
+   /* A driver that failed to finish something it built its device for
+    * asks the main thread to rebuild video. */
+   VIDEO_FLAG_DRIVER_REINIT                       = (1 << 23)
 };
 
 enum video_driver_scanline

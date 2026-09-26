@@ -2878,7 +2878,9 @@ unsigned video_driver_views_status(void)
    settings_t *settings = config_get_ptr();
    if (!video_driver_test_all_flags(GFX_CTX_FLAGS_VIDEO_VIEWS))
       return 0;
-   if (settings->uints.video_stereo_mode == VIDEO_STEREO_MODE_2D)
+   /* A headset shows both eyes whatever the window's mode. */
+   if (     settings->uints.video_stereo_mode == VIDEO_STEREO_MODE_2D
+         && !video_driver_test_all_flags(GFX_CTX_FLAGS_VIDEO_VIEWS_HEADSET))
       return RETRO_VIDEO_VIEWS_STATUS_PRESENTS;
    return RETRO_VIDEO_VIEWS_STATUS_PRESENTS | RETRO_VIDEO_VIEWS_STATUS_STEREO;
 }
