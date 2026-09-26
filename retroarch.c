@@ -6178,6 +6178,9 @@ bool command_event(enum event_command cmd, void *data)
                   MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
          }
          break;
+      case CMD_EVENT_HEADSET_RECENTER:
+         video_driver_headset_recenter();
+         break;
       case CMD_EVENT_NONE:
          return false;
 

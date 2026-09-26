@@ -8949,6 +8949,10 @@ unsigned menu_displaylist_build_list(
                /* Hidden items */
                else if (key == RARCH_OVERLAY_NEXT)
                   continue;
+#ifndef HAVE_OPENXR
+               else if (key == RARCH_HEADSET_RECENTER)
+                  continue;
+#endif
                /* Show combo entries before normal binds */
                else if (key == RARCH_MENU_TOGGLE)
                {

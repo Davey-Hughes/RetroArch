@@ -8142,6 +8142,9 @@ static enum runloop_state_enum runloop_check_state(
    /* Check VRR runloop hotkey */
    HOTKEY_CHECK(RARCH_VRR_RUNLOOP_TOGGLE, CMD_EVENT_VRR_RUNLOOP_TOGGLE, true, NULL);
 
+   /* Check headset recenter hotkey */
+   HOTKEY_CHECK(RARCH_HEADSET_RECENTER, CMD_EVENT_HEADSET_RECENTER, true, NULL);
+
    /* Check bsv movie hotkeys */
    HOTKEY_CHECK(RARCH_PLAY_REPLAY_KEY, CMD_EVENT_PLAY_REPLAY, true, NULL);
    HOTKEY_CHECK(RARCH_RECORD_REPLAY_KEY, CMD_EVENT_RECORD_REPLAY, true, NULL);

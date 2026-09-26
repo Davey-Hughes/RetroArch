@@ -664,6 +664,16 @@ typedef struct video_frame_info
     * when the frame is drawn whole. */
    video_views_map_t views;
    video_views_layout_t views_layout;
+   /* Headset output: the screens' distance and width in metres, and a
+    * count of recenter requests the driver compares with the last it
+    * saw. */
+   float headset_distance;
+   float headset_width;
+   unsigned headset_recenter;
+   unsigned screen_layout;
+   bool stereo_swap_eyes;
+   /* The last frame sent again (paused, menu), not a new core frame. */
+   bool frame_repeat;
 } video_frame_info_t;
 
 typedef void (*update_window_title_cb)(void*);
@@ -1447,6 +1457,10 @@ typedef struct
     * (GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK), so touch, overlays and the
     * UI follow the packed frame. */
    bool views_fallback;
+   /* Recenter requests for a headset, counted. */
+   unsigned headset_recenter;
+   /* Set while video_driver_cached_frame() sends the last frame again. */
+   bool frame_repeat;
 } video_driver_state_t;
 
 typedef struct video_frame_delay_auto
@@ -1764,6 +1778,9 @@ unsigned video_driver_get_ui_dims(void);
 /* Main thread: the layout the last frame presented a core's views
  * with, or NULL when it was drawn whole. */
 const video_views_layout_t *video_driver_get_views_layout(void);
+/* Main thread: ask a headset to place its screens in front of where it
+ * looks now. */
+void video_driver_headset_recenter(void);
 
 #ifdef HAVE_OVERLAY
 struct overlay;

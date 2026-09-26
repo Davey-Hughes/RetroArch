@@ -2906,6 +2906,12 @@ const video_views_layout_t *video_driver_get_views_layout(void)
       ? &video_st->views_layout : NULL;
 }
 
+void video_driver_headset_recenter(void)
+{
+   video_driver_st.headset_recenter++;
+   RARCH_LOG("[Video] Headset recenter requested.\n");
+}
+
 static void video_driver_views_layout(settings_t *settings,
       const video_views_map_t *map, unsigned dims,
       video_views_layout_t *out)
@@ -4514,9 +4520,11 @@ void video_driver_cached_frame(void)
        * the tuple read here. */
       frame_cache_snapshot(&data, &dims, &pitch);
 
+      video_driver_st.frame_repeat = true;
       cbs->frame_cb(
             (data != RETRO_HW_FRAME_BUFFER_VALID) ? data : NULL,
             VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims), pitch);
+      video_driver_st.frame_repeat = false;
    }
 
    recording_st->data             = recording;
@@ -5150,6 +5158,12 @@ void video_driver_build_info(video_frame_info_t *video_info)
    video_info->black_frame_insertion       = settings->uints.video_black_frame_insertion;
    video_info->bfi_dark_frames             = settings->uints.video_bfi_dark_frames;
    video_info->shader_subframes            = settings->uints.video_shader_subframes;
+   video_info->headset_distance            = settings->floats.video_openxr_distance;
+   video_info->headset_width               = settings->floats.video_openxr_width;
+   video_info->headset_recenter            = video_st->headset_recenter;
+   video_info->screen_layout               = settings->uints.video_screen_layout;
+   video_info->stereo_swap_eyes            = settings->bools.video_stereo_swap_eyes;
+   video_info->frame_repeat                = video_st->frame_repeat;
    video_info->current_subframe            = 0;
 #ifdef HAVE_THREADS
    /* The video thread owns and stamps this under the wrapper. */

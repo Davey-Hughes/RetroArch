@@ -12174,6 +12174,14 @@ MSG_HASH(
    "Switches software 'Video Filter' on/off."
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_META_HEADSET_RECENTER,
+   "Recenter Headset Screens"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_META_HEADSET_RECENTER,
+   "Places the headset's screens in front of where you are looking now."
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_META_FPS_TOGGLE,
    "Show FPS (Toggle)"
    )
