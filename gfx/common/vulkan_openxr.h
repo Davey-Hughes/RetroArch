@@ -32,6 +32,7 @@
 #endif
 #include "../include/openxr/openxr.h"
 #include "../include/openxr/openxr_platform.h"
+#include "../video_xr.h"
 
 RETRO_BEGIN_DECLS
 
@@ -131,6 +132,45 @@ bool vulkan_openxr_alive(vulkan_openxr_t *xr);
  * predicted display time. */
 bool vulkan_openxr_focused(vulkan_openxr_t *xr);
 XrTime vulkan_openxr_predicted_time(vulkan_openxr_t *xr);
+
+#define VULKAN_OPENXR_MAX_IMAGES 8
+
+/* Video thread: whether to draw for the headset now. */
+bool vulkan_openxr_should_draw(vulkan_openxr_t *xr);
+
+/* Headset pixels per radian; 0 until the first headset frame. */
+float vulkan_openxr_pixels_per_radian(vulkan_openxr_t *xr);
+
+/* The largest swapchain side the headset takes. */
+unsigned vulkan_openxr_max_dim(const vulkan_openxr_t *xr);
+
+bool vulkan_openxr_supports_format(const vulkan_openxr_t *xr,
+      VkFormat format);
+
+/* Video thread. A slot's swapchain, replacing any it had; they take the
+ * queue lock themselves. */
+bool vulkan_openxr_slot_create(vulkan_openxr_t *xr, unsigned slot,
+      VkFormat format, bool mutable_format, unsigned dims, unsigned layers,
+      VkImage *images, unsigned *num_images);
+void vulkan_openxr_slot_destroy(vulkan_openxr_t *xr, unsigned slot);
+
+/* Video thread, holding the queue lock. Acquire keeps an image until it
+ * can be written, never waiting on the compositor: false means try next
+ * frame. Release after the frame that drew it is submitted. */
+bool vulkan_openxr_slot_acquire(vulkan_openxr_t *xr, unsigned slot,
+      unsigned *index);
+void vulkan_openxr_slot_release(vulkan_openxr_t *xr, unsigned slot);
+
+/* The quads the XR thread submits from now on; a quad whose slot has
+ * not released an image yet is left out. */
+void vulkan_openxr_publish(vulkan_openxr_t *xr,
+      const video_xr_quad_set_t *set);
+
+/* Where screen 0 is centred in front of. */
+void vulkan_openxr_get_anchor(vulkan_openxr_t *xr, video_xr_pose_t *anchor);
+
+/* Any thread: the quads the XR thread submits. */
+bool vulkan_openxr_get_quads(vulkan_openxr_t *xr, video_xr_quad_set_t *out);
 
 RETRO_END_DECLS
 
