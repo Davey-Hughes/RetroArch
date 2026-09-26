@@ -30,6 +30,10 @@
  *   head off                the runtime's own pose again
  *   fail session            xrCreateSession fails
  *   state <n>               the next xrPollEvent reports session state n
+ *
+ * A changed script is applied line by line without resetting anything:
+ * head and fail stay in effect until a later head or fail line replaces
+ * them (head off, fail off). state fires once per change of the file.
  */
 
 #include <math.h>
