@@ -531,6 +531,8 @@ typedef struct settings
       float video_hdr_menu_nits;
       float video_hdr_paper_white_nits;
       float video_hdr_max_nits;
+      float video_openxr_distance;
+      float video_openxr_width;
 
       float menu_scale_factor;
       float menu_widget_scale_factor;
@@ -613,6 +615,7 @@ typedef struct settings
       bool video_vfilter;
       bool video_smooth;
       bool video_stereo_swap_eyes;
+      bool video_openxr_enable;
       bool video_ctx_scaling;
       bool video_force_aspect;
       bool video_frame_delay_auto;

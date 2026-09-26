@@ -689,6 +689,10 @@ enum msg_hash_enums
    MSG_VIDEO_REFRESH_RATE_CHANGED,
    MSG_VIDEO_FILTER_ENABLE_ON,
    MSG_VIDEO_FILTER_ENABLE_OFF,
+   MSG_OPENXR_UNAVAILABLE,
+   MSG_OPENXR_FAILED,
+   MSG_OPENXR_SESSION_ENDED,
+   MSG_OPENXR_NEEDS_RELOAD,
 
    MSG_IOS_TOUCH_MOUSE_ENABLED,
    MSG_IOS_TOUCH_MOUSE_DISABLED,
@@ -8986,7 +8990,7 @@ enum msg_hash_enums
    MENU_ENUM_LABEL_VALUE_VIDEO_HDR_EXPAND_GAMUT_EXPANDED,
    MENU_ENUM_LABEL_VALUE_VIDEO_HDR_EXPAND_GAMUT_WIDE,
    MENU_ENUM_LABEL_VALUE_VIDEO_HDR_EXPAND_GAMUT_SUPER,
-   /* GENERATED REGION: HDR toggle group and stereo 3D & screens group enum rows (see settings/settings_def_video_hdr_toggles.h and settings/settings_def_video_stereo.h). */
+   /* GENERATED REGION: HDR toggle group, stereo 3D & screens group and headset group enum rows (see settings/settings_def_video_hdr_toggles.h, settings/settings_def_video_stereo.h and settings/settings_def_video_headset.h). */
 #define SETTINGS_DEF_ENUM_PASS
 #define SETTINGS_DEF_STRINGS_PASS
 #define S_BOOL(f, T, n, d, sd, df, c, us, sub) MENU_LABEL(T),
@@ -9051,6 +9055,7 @@ enum msg_hash_enums
 #define S_ACTION_EX_NS_H(T, n, sd, ok, rp, c, us) MENU_LBL_H(T),
 #include "settings/settings_def_video_hdr_toggles.h"
 #include "settings/settings_def_video_stereo.h"
+#include "settings/settings_def_video_headset.h"
 #undef S_BOOL
 #undef S_BOOL_NS
 #undef S_UINT

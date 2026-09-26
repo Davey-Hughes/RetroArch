@@ -7420,7 +7420,7 @@ MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_HDR_EXPAND_GAMUT_SUPER,
    "Super"
    )
-/* GENERATED REGION: HDR toggle group and stereo 3D & screens group (see settings_def_video_hdr_toggles.h and settings_def_video_stereo.h). */
+/* GENERATED REGION: HDR toggle group, stereo 3D & screens group and headset group (see settings_def_video_hdr_toggles.h, settings_def_video_stereo.h and settings_def_video_headset.h). */
 #define SETTINGS_DEF_STRINGS_PASS
 #define S_BOOL(f, T, n, d, sd, df, c, us, sub) \
 MSG_HASH(MENU_ENUM_LABEL_VALUE_##T, us) \
@@ -7499,6 +7499,7 @@ MSG_HASH(MENU_ENUM_SUBLABEL_##T, sub)
 MSG_HASH(MENU_ENUM_LABEL_VALUE_##T, us)
 #include "../settings/settings_def_video_hdr_toggles.h"
 #include "../settings/settings_def_video_stereo.h"
+#include "../settings/settings_def_video_headset.h"
 #undef S_BOOL
 #undef S_BOOL_NS
 #undef S_BOOL_H
@@ -33570,6 +33571,22 @@ MSG_HASH(
 MSG_HASH(
    MSG_VIDEO_FILTER_ENABLE_OFF,
    "Video-Filter: Disable"
+   )
+MSG_HASH(
+   MSG_OPENXR_UNAVAILABLE,
+   "Headset output is off: no OpenXR runtime or headset was found."
+   )
+MSG_HASH(
+   MSG_OPENXR_FAILED,
+   "Headset output could not start. The window shows the output."
+   )
+MSG_HASH(
+   MSG_OPENXR_SESSION_ENDED,
+   "The headset session ended. Turn Headset Output off and on to try again."
+   )
+MSG_HASH(
+   MSG_OPENXR_NEEDS_RELOAD,
+   "Headset output starts when the content is loaded again."
    )
 
 

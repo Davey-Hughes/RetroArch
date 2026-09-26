@@ -11894,6 +11894,24 @@ unsigned menu_displaylist_build_list(
                   MENU_ENUM_LABEL_VIDEO_SCREEN_LAYOUT,
                   PARSE_ONLY_UINT, false) == 0)
             count++;
+#ifdef HAVE_OPENXR
+         /* Headset output is the Vulkan driver's. */
+         if (string_is_equal(settings->arrays.video_driver, "vulkan"))
+         {
+            if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                     MENU_ENUM_LABEL_VIDEO_OPENXR_ENABLE,
+                     PARSE_ONLY_BOOL, false) == 0)
+               count++;
+            if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                     MENU_ENUM_LABEL_VIDEO_OPENXR_DISTANCE,
+                     PARSE_ONLY_FLOAT, false) == 0)
+               count++;
+            if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                     MENU_ENUM_LABEL_VIDEO_OPENXR_WIDTH,
+                     PARSE_ONLY_FLOAT, false) == 0)
+               count++;
+         }
+#endif
          break;
       case DISPLAYLIST_VIDEO_SCALING_SETTINGS_LIST:
          {

@@ -12179,6 +12179,11 @@ static const setting_desc_t stereo_desc[] = {
 #include "../settings/settings_def_video_stereo.h"
 };
 
+static const setting_desc_t headset_desc[] = {
+/* GENERATED: rows come from settings_def_video_headset.h in order. */
+#include "../settings/settings_def_video_headset.h"
+};
+
 static const setting_desc_t vid_desc_20[] = {
 /* GENERATED: rows come from settings_def_screen_brightness.h in order. */
 #include "../settings/settings_def_screen_brightness.h"
@@ -15089,6 +15094,12 @@ static void settings_build_video(
          START_SUB_GROUP(list, list_info, "Stereo 3D & Screens", &group_info, &subgroup_info, parent_group);
 
          ADD_DESC(stereo_desc);
+
+         END_SUB_GROUP(list, list_info, parent_group);
+
+         START_SUB_GROUP(list, list_info, "Headset", &group_info, &subgroup_info, parent_group);
+
+         ADD_DESC(headset_desc);
 
          END_SUB_GROUP(list, list_info, parent_group);
 
