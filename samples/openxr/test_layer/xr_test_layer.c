@@ -319,6 +319,7 @@ static void capture(struct chain *c, uint32_t index)
    void *map;
    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
    VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+   VkBufferMemoryBarrier bb = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
    VkBufferImageCopy region;
    VkDeviceSize size = (VkDeviceSize)c->width * c->height * 4 * c->layers;
@@ -352,6 +353,15 @@ static void capture(struct chain *c, uint32_t index)
    region.imageExtent.depth           = 1;
    vkCmdCopyImageToBuffer(L.cmd, c->images[index],
          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c->buffer, 1, &region);
+   /* The fence wait alone does not make the copy visible to the host. */
+   bb.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
+   bb.dstAccessMask       = VK_ACCESS_HOST_READ_BIT;
+   bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+   bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+   bb.buffer              = c->buffer;
+   bb.size                = VK_WHOLE_SIZE;
+   vkCmdPipelineBarrier(L.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+         VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 1, &bb, 0, NULL);
    b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
    b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
    b.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -516,6 +526,15 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_DestroySession(XrSession session)
       L.cmd    = VK_NULL_HANDLE;
       L.device = VK_NULL_HANDLE;
    }
+   /* Its spaces and swapchains go with it, and the runtime may hand their
+    * handles out again. */
+   for (i = 0; i < MAX_CHAINS; i++)
+   {
+      free(L.chains[i].pixels);
+      memset(&L.chains[i], 0, sizeof(L.chains[i]));
+   }
+   L.num_spaces = 0;
+   L.session    = XR_NULL_HANDLE;
    pthread_mutex_unlock(&L.lock);
    return L.DestroySession(session);
 }
