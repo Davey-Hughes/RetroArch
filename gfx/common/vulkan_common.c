@@ -1278,10 +1278,16 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
             vk->context.instance, vk->context.gpu, vk->context.device,
             vk->context.graphics_queue_index, vk->context.queue_lock))
    {
-      /* The device was made for the runtime: rebuild video without it. */
-      vulkan_openxr_drop_and_reinit(vk->context.xr);
+      /* The device was made for the runtime: rebuild video without it,
+       * unless the core keeps its context, which a reinit would reuse. */
+      if (video_st->hw_render.cache_context)
+         vulkan_openxr_drop(vk->context.xr);
+      else
+      {
+         vulkan_openxr_drop_and_reinit(vk->context.xr);
+         video_driver_modify_disp_flags(VIDEO_FLAG_DRIVER_REINIT, 0);
+      }
       vk->context.xr = NULL;
-      video_driver_modify_disp_flags(VIDEO_FLAG_DRIVER_REINIT, 0);
    }
 #endif
 

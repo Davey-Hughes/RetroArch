@@ -609,12 +609,16 @@ static void vulkan_openxr_session_state(vulkan_openxr_t *xr,
 
 static void vulkan_openxr_poll(vulkan_openxr_t *xr)
 {
+   XrResult res;
    XrEventDataBuffer ev;
    for (;;)
    {
       memset(&ev, 0, sizeof(ev));
       ev.type = XR_TYPE_EVENT_DATA_BUFFER;
-      if (xr->PollEvent(xr->instance, &ev) != XR_SUCCESS)
+      res     = xr->PollEvent(xr->instance, &ev);
+      if (res == XR_ERROR_INSTANCE_LOST)
+         vulkan_openxr_ended(xr);
+      if (res != XR_SUCCESS)
          break;
       if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED)
          vulkan_openxr_session_state(xr,
@@ -659,10 +663,14 @@ static void vulkan_openxr_measure(vulkan_openxr_t *xr, XrTime time)
 static void vulkan_openxr_frame_error(vulkan_openxr_t *xr,
       const char *fn, XrResult res)
 {
-   if (xr->frame_failed)
-      return;
-   xr->frame_failed = true;
-   RARCH_ERR("[OpenXR] %s failed (%d).\n", fn, (int)res);
+   if (!xr->frame_failed)
+   {
+      xr->frame_failed = true;
+      RARCH_ERR("[OpenXR] %s failed (%d).\n", fn, (int)res);
+   }
+   /* A runtime may report the loss here without an event. */
+   if (res == XR_ERROR_SESSION_LOST || res == XR_ERROR_INSTANCE_LOST)
+      vulkan_openxr_ended(xr);
 }
 
 /* One headset frame. xrWaitFrame paces this thread at the headset's
@@ -670,6 +678,7 @@ static void vulkan_openxr_frame_error(vulkan_openxr_t *xr,
 static void vulkan_openxr_frame(vulkan_openxr_t *xr)
 {
    XrResult res;
+   const char *fn = NULL;
    XrFrameWaitInfo wait_info;
    XrFrameState state;
    XrFrameBeginInfo begin_info;
@@ -699,12 +708,15 @@ static void vulkan_openxr_frame(vulkan_openxr_t *xr)
    end_info.environmentBlendMode = xr->blend_mode;
 
    slock_lock(xr->queue_lock);
-   res = xr->BeginFrame(xr->session, &begin_info);
-   if (XR_SUCCEEDED(res))
-      res = xr->EndFrame(xr->session, &end_info);
+   if (XR_FAILED(res = xr->BeginFrame(xr->session, &begin_info)))
+      fn = "xrBeginFrame";
+   else if (XR_FAILED(res = xr->EndFrame(xr->session, &end_info)))
+      fn = "xrEndFrame";
    slock_unlock(xr->queue_lock);
-   if (XR_FAILED(res))
-      vulkan_openxr_frame_error(xr, "xrEndFrame", res);
+   if (fn)
+      vulkan_openxr_frame_error(xr, fn, res);
+   else
+      xr->frame_failed = false;
 }
 
 static void vulkan_openxr_thread(void *data)
@@ -775,7 +787,7 @@ static bool vulkan_openxr_create_session(vulkan_openxr_t *xr,
    {
       RARCH_ERR("[OpenXR] No LOCAL space (%d).\n", (int)res);
       xr->local_space = XR_NULL_HANDLE;
-      return false;
+      goto error;
    }
    rci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
    if (XR_FAILED(res = xr->CreateReferenceSpace(xr->session, &rci,
@@ -783,7 +795,7 @@ static bool vulkan_openxr_create_session(vulkan_openxr_t *xr,
    {
       RARCH_ERR("[OpenXR] No VIEW space (%d).\n", (int)res);
       xr->view_space = XR_NULL_HANDLE;
-      return false;
+      goto error;
    }
    if (XR_FAILED(xr->EnumerateSwapchainFormats(xr->session,
                VULKAN_OPENXR_MAX_FORMATS, &count, xr->formats)))
@@ -804,6 +816,15 @@ static bool vulkan_openxr_create_session(vulkan_openxr_t *xr,
       vulkan_openxr_hooks.session_created(vulkan_openxr_hooks.user, &h);
    }
    return true;
+
+error:
+   /* Freed here, so session_destroying only follows session_created. */
+   if (xr->local_space)
+      xr->DestroySpace(xr->local_space);
+   xr->local_space = XR_NULL_HANDLE;
+   xr->DestroySession(xr->session);
+   xr->session     = XR_NULL_HANDLE;
+   return false;
 }
 
 bool vulkan_openxr_start(vulkan_openxr_t *xr, VkInstance instance,

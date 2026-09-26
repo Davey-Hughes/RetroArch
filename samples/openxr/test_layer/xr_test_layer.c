@@ -29,6 +29,7 @@
  *   head <x> <y> <z> <yaw>  the VIEW space's pose in LOCAL, yaw in degrees
  *   head off                the runtime's own pose again
  *   fail session            xrCreateSession fails
+ *   fail waitframe          xrWaitFrame reports XR_ERROR_SESSION_LOST
  *   state <n>               the next xrPollEvent reports session state n
  *
  * A changed script is applied line by line without resetting anything:
@@ -84,6 +85,7 @@ static struct
    struct timespec script_mtime;
    bool head_set;
    bool fail_session;
+   bool fail_waitframe;
    int inject_state;
    XrSession session;
    XrPosef head;
@@ -185,7 +187,8 @@ static void script_head(const char *args)
 
 static void script_fail(const char *args)
 {
-   L.fail_session = !strncmp(args, "session", 7);
+   L.fail_session   = !strncmp(args, "session", 7);
+   L.fail_waitframe = !strncmp(args, "waitframe", 9);
 }
 
 static void script_state(const char *args)
@@ -730,7 +733,21 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_ReleaseSwapchainImage(XrSwapchain sc
 static XRAPI_ATTR XrResult XRAPI_CALL layer_WaitFrame(XrSession session,
       const XrFrameWaitInfo *info, XrFrameState *state)
 {
-   XrResult res = L.WaitFrame(session, info, state);
+   bool fail;
+   XrResult res;
+   pthread_mutex_lock(&L.lock);
+   script_poll();
+   fail = L.fail_waitframe;
+   if (fail && L.out)
+   {
+      fprintf(L.out, "{\"ev\":\"fail\",\"fn\":\"xrWaitFrame\",\"t_us\":%lld}\n",
+            now_us());
+      fflush(L.out);
+   }
+   pthread_mutex_unlock(&L.lock);
+   if (fail)
+      return XR_ERROR_SESSION_LOST;
+   res = L.WaitFrame(session, info, state);
    if (XR_SUCCEEDED(res))
    {
       pthread_mutex_lock(&L.lock);
