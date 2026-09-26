@@ -102,41 +102,52 @@ static bool vulkan_openxr_has_extension(
    return found;
 }
 
-/* Splits a space-separated list in buf into names. */
-static unsigned vulkan_openxr_split(char *buf, const char **names,
-      unsigned cap)
+/* Splits a space-separated list in buf into names; false when there
+ * are more than VULKAN_OPENXR_MAX_EXTS. */
+static bool vulkan_openxr_split(char *buf, const char **names,
+      unsigned *count)
 {
    unsigned n = 0;
    char *p    = buf;
-   while (*p && n < cap)
+   for (;;)
    {
       while (*p == ' ')
          *p++ = '\0';
       if (!*p)
          break;
+      if (n == VULKAN_OPENXR_MAX_EXTS)
+         return false;
       names[n++] = p;
       while (*p && *p != ' ')
          p++;
    }
-   return n;
+   *count = n;
+   return true;
 }
 
-static unsigned vulkan_openxr_list(vulkan_openxr_t *xr,
+/* False rather than a list cut short, which would leave the runtime
+ * without extensions it needs. */
+static bool vulkan_openxr_list(vulkan_openxr_t *xr,
       PFN_xrGetVulkanInstanceExtensionsKHR get, char *buf,
-      const char **names)
+      const char **names, unsigned *count)
 {
    uint32_t len = 0;
+   *count       = 0;
    if (     XR_FAILED(get(xr->instance, xr->system, 0, &len, NULL))
-         || !len || len > VULKAN_OPENXR_EXT_BUF
-         || XR_FAILED(get(xr->instance, xr->system, len, &len, buf)))
-      return 0;
+         || len > VULKAN_OPENXR_EXT_BUF)
+      return false;
+   if (!len)
+      return true;
+   if (XR_FAILED(get(xr->instance, xr->system, len, &len, buf)))
+      return false;
    buf[VULKAN_OPENXR_EXT_BUF - 1] = '\0';
-   return vulkan_openxr_split(buf, names, VULKAN_OPENXR_MAX_EXTS);
+   return vulkan_openxr_split(buf, names, count);
 }
 
-vulkan_openxr_t *vulkan_openxr_new(bool enable1)
+vulkan_openxr_t *vulkan_openxr_new(bool enable1, uint32_t api_version)
 {
    XrResult res;
+   XrVersion api;
    uint32_t count = 0;
    XrInstanceCreateInfo ici;
    XrSystemGetInfo sgi;
@@ -167,13 +178,19 @@ vulkan_openxr_t *vulkan_openxr_new(bool enable1)
    xr->GetInstanceProcAddr = (PFN_xrGetInstanceProcAddr)
       dylib_proc(xr->lib, "xrGetInstanceProcAddr");
    if (!xr->GetInstanceProcAddr)
+   {
+      RARCH_WARN("[OpenXR] No runtime (the loader lacks xrGetInstanceProcAddr).\n");
       goto unavailable;
+   }
    enum_exts       = (PFN_xrEnumerateInstanceExtensionProperties)
       vulkan_openxr_proc(xr, "xrEnumerateInstanceExtensionProperties");
    create_instance = (PFN_xrCreateInstance)
       vulkan_openxr_proc(xr, "xrCreateInstance");
    if (!enum_exts || !create_instance)
+   {
+      RARCH_WARN("[OpenXR] No runtime (the loader lacks xrCreateInstance or xrEnumerateInstanceExtensionProperties).\n");
       goto unavailable;
+   }
 
    if (XR_FAILED(res = enum_exts(NULL, 0, &count, NULL)))
    {
@@ -214,20 +231,20 @@ vulkan_openxr_t *vulkan_openxr_new(bool enable1)
    if (     !VULKAN_OPENXR_FN(xr, DestroyInstance)
          || !get_system || !get_system_properties
          || !enum_views || !enum_modes)
-      goto failed;
+      goto missing;
    if (enable1)
    {
       if (     !VULKAN_OPENXR_FN(xr, GetVulkanGraphicsRequirementsKHR)
             || !VULKAN_OPENXR_FN(xr, GetVulkanGraphicsDeviceKHR)
             || !VULKAN_OPENXR_FN(xr, GetVulkanInstanceExtensionsKHR)
             || !VULKAN_OPENXR_FN(xr, GetVulkanDeviceExtensionsKHR))
-         goto failed;
+         goto missing;
    }
    else if (!VULKAN_OPENXR_FN(xr, GetVulkanGraphicsRequirements2KHR)
          || !VULKAN_OPENXR_FN(xr, CreateVulkanInstanceKHR)
          || !VULKAN_OPENXR_FN(xr, CreateVulkanDeviceKHR)
          || !VULKAN_OPENXR_FN(xr, GetVulkanGraphicsDevice2KHR))
-      goto failed;
+      goto missing;
 
    memset(&sgi, 0, sizeof(sgi));
    sgi.type       = XR_TYPE_SYSTEM_GET_INFO;
@@ -290,14 +307,30 @@ vulkan_openxr_t *vulkan_openxr_new(bool enable1)
          (unsigned)XR_VERSION_MAJOR(reqs.maxApiVersionSupported),
          (unsigned)XR_VERSION_MINOR(reqs.maxApiVersionSupported));
 
-   if (enable1)
+   /* Major and minor only. The maximum is what the runtime was tested
+    * with, so only a newer major is refused. */
+   api = XR_MAKE_VERSION(VK_VERSION_MAJOR(api_version),
+         VK_VERSION_MINOR(api_version), 0);
+   if (     api < XR_MAKE_VERSION(
+               XR_VERSION_MAJOR(reqs.minApiVersionSupported),
+               XR_VERSION_MINOR(reqs.minApiVersionSupported), 0)
+         || VK_VERSION_MAJOR(api_version)
+            > XR_VERSION_MAJOR(reqs.maxApiVersionSupported))
    {
-      xr->num_inst_exts = vulkan_openxr_list(xr,
-            xr->GetVulkanInstanceExtensionsKHR, xr->inst_ext_buf,
-            xr->inst_exts);
-      xr->num_dev_exts  = vulkan_openxr_list(xr,
-            xr->GetVulkanDeviceExtensionsKHR, xr->dev_ext_buf,
-            xr->dev_exts);
+      RARCH_WARN("[OpenXR] The runtime does not take Vulkan %u.%u.\n",
+            (unsigned)VK_VERSION_MAJOR(api_version),
+            (unsigned)VK_VERSION_MINOR(api_version));
+      goto failed;
+   }
+
+   if (     enable1
+         && (  !vulkan_openxr_list(xr, xr->GetVulkanInstanceExtensionsKHR,
+                  xr->inst_ext_buf, xr->inst_exts, &xr->num_inst_exts)
+            || !vulkan_openxr_list(xr, xr->GetVulkanDeviceExtensionsKHR,
+                  xr->dev_ext_buf, xr->dev_exts, &xr->num_dev_exts)))
+   {
+      RARCH_ERR("[OpenXR] The runtime's Vulkan extension lists could not be read.\n");
+      goto failed;
    }
    return xr;
 
@@ -305,8 +338,9 @@ unavailable:
    vulkan_openxr_notify(MSG_OPENXR_UNAVAILABLE);
    vulkan_openxr_free(xr);
    return NULL;
-failed:
+missing:
    RARCH_ERR("[OpenXR] The runtime lacks functions headset output needs.\n");
+failed:
    vulkan_openxr_notify(MSG_OPENXR_FAILED);
    vulkan_openxr_free(xr);
    return NULL;
@@ -425,7 +459,7 @@ VkPhysicalDevice vulkan_openxr_gpu(vulkan_openxr_t *xr, VkInstance instance)
    else
       res = xr->GetVulkanGraphicsDeviceKHR(xr->instance, xr->system,
             instance, &gpu);
-   if (XR_FAILED(res))
+   if (XR_FAILED(res) || gpu == VK_NULL_HANDLE)
    {
       RARCH_WARN("[OpenXR] The runtime named no GPU (%d).\n", (int)res);
       return VK_NULL_HANDLE;

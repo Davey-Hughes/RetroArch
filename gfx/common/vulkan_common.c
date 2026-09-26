@@ -77,6 +77,7 @@
 static dylib_t                       vulkan_library;
 static VkInstance                    cached_instance_vk;
 static VkDevice                      cached_device_vk;
+static VkPhysicalDevice              cached_gpu_vk;
 static retro_vulkan_destroy_device_t cached_destroy_device_vk;
 #ifdef HAVE_OPENXR
 /* Kept with a cached device: the runtime made it. */
@@ -680,6 +681,8 @@ static bool vulkan_context_openxr_gpu(gfx_ctx_vulkan_data_t *vk,
       vk->context.gpu = gpu;
       return true;
    }
+   if (gpu != VK_NULL_HANDLE)
+      RARCH_WARN("[OpenXR] The runtime's GPU is not one Vulkan lists.\n");
    vulkan_openxr_drop(vk->context.xr);
    vk->context.xr = NULL;
    return false;
@@ -741,6 +744,14 @@ static bool vulkan_context_init_gpu(gfx_ctx_vulkan_data_t *vk)
    }
 
    video_driver_set_gpu_api_devices(GFX_CTX_VULKAN_API, vk->gpu_list);
+
+   /* A cached device is reused as is, so it keeps the GPU it was made on. */
+   if (cached_device_vk && cached_gpu_vk)
+   {
+      vk->context.gpu = cached_gpu_vk;
+      free(gpus);
+      return true;
+   }
 
 #ifdef HAVE_OPENXR
    if (vk->context.xr && vulkan_context_openxr_gpu(vk, gpus, gpu_count))
@@ -1195,6 +1206,7 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
       {
          vk->context.device = cached_device_vk;
          cached_device_vk   = NULL;
+         cached_gpu_vk      = VK_NULL_HANDLE;
 
          if (cached_destroy_device_vk)
          {
@@ -3461,7 +3473,8 @@ static bool vulkan_context_openxr_instance_exts_ok(vulkan_openxr_t *xr)
  * gets XR_KHR_vulkan_enable's lists; everything else goes through
  * XR_KHR_vulkan_enable2. */
 static void vulkan_context_openxr_init(gfx_ctx_vulkan_data_t *vk,
-      const struct retro_hw_render_context_negotiation_interface_vulkan *iface)
+      const struct retro_hw_render_context_negotiation_interface_vulkan *iface,
+      uint32_t api_version)
 {
    settings_t *settings = config_get_ptr();
    bool enable          = settings->bools.video_openxr_enable;
@@ -3487,7 +3500,7 @@ static void vulkan_context_openxr_init(gfx_ctx_vulkan_data_t *vk,
    }
    if (!enable)
       return;
-   vk->context.xr = vulkan_openxr_new(enable1);
+   vk->context.xr = vulkan_openxr_new(enable1, api_version);
    if (     vk->context.xr && enable1
          && !vulkan_context_openxr_instance_exts_ok(vk->context.xr))
    {
@@ -3635,7 +3648,7 @@ bool vulkan_context_init(gfx_ctx_vulkan_data_t *vk,
    }
 
 #ifdef HAVE_OPENXR
-   vulkan_context_openxr_init(vk, iface);
+   vulkan_context_openxr_init(vk, iface, app.apiVersion);
 #endif
 
    if (cached_instance_vk)
@@ -3754,6 +3767,7 @@ void vulkan_context_destroy(gfx_ctx_vulkan_data_t *vk,
    if (video_st_flags & VIDEO_FLAG_CACHE_CONTEXT)
    {
       cached_device_vk         = vk->context.device;
+      cached_gpu_vk            = vk->context.gpu;
       cached_instance_vk       = vk->context.instance;
       cached_destroy_device_vk = vk->context.destroy_device;
 #ifdef HAVE_OPENXR

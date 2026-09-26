@@ -44,8 +44,8 @@ typedef struct vulkan_openxr vulkan_openxr_t;
 /* The runtime's instance and headset, or NULL after a notification.
  * enable1 is for a core that makes its own device with create_device
  * (v1): the runtime then only lists what the instance and device
- * need. */
-vulkan_openxr_t *vulkan_openxr_new(bool enable1);
+ * need. api_version is the Vulkan version the instance will ask for. */
+vulkan_openxr_t *vulkan_openxr_new(bool enable1, uint32_t api_version);
 
 /* Before the Vulkan device is destroyed. NULL is fine. */
 void vulkan_openxr_free(vulkan_openxr_t *xr);
