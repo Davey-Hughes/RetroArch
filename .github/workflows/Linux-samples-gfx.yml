@@ -1097,7 +1097,10 @@ jobs:
           # compositor on libwayland-server: what is offered, which
           # connector an index picks, an index past the offer, a
           # refusal, a revoke arriving while the client is idle, and
-          # no Wayland session at all. The leased descriptor and the
+          # no Wayland session at all. Then the server's beam estimate
+          # from presentation feedback and a stubbed DRM mode: refused
+          # without DRM timing, on another output, under VRR, or while
+          # presents wait for vblank. The leased descriptor and the
           # device's non-master fd are the ones a mistake leaks, so
           # the lane runs under ASan. Both protocol halves are
           # generated here from deps/wayland-protocols, which needs

@@ -61,6 +61,9 @@
 #include <errno.h>
 #include <signal.h>
 #include <pthread.h>
+#include <time.h>
+#include <fcntl.h>
+#include <dirent.h>
 
 #include <boolean.h>
 #include <compat/strl.h>
@@ -71,6 +74,9 @@
 
 #include "../../../gfx/video_display_server.h"
 #include "../../../gfx/common/wayland_drm_lease.h"
+#include "../../../gfx/common/wayland_beam.h"
+#include "../../../gfx/common/wayland/presentation-time.h"
+#include "../../../gfx/common/drm_scanout.h"
 
 /* ---- the log, captured ---- */
 
@@ -108,6 +114,58 @@ LOG_FN(RARCH_LOG)
 LOG_FN(RARCH_WARN)
 LOG_FN(RARCH_ERR)
 LOG_FN(RARCH_DBG)
+
+/* The output's DRM timing, as the beam tests set it. Each open hands
+ * out a real descriptor, so one dispserv_wl fails to close shows in
+ * open_fds(). */
+static drm_scanout_t s_scanout;
+static bool          s_scanout_ok;
+static unsigned      s_scanout_opens, s_scanout_updates;
+
+int drm_scanout_open(const char *sysfs_root, const char *dev_root,
+      const char *name, drm_scanout_t *out)
+{
+   (void)sysfs_root; (void)dev_root; (void)name;
+   s_scanout_opens++;
+   if (!s_scanout_ok)
+      return -1;
+   *out = s_scanout;
+   return open("/dev/null", O_RDONLY | O_CLOEXEC);
+}
+
+bool drm_scanout_update(int fd, drm_scanout_t *s)
+{
+   (void)fd;
+   s_scanout_updates++;
+   if (!s_scanout_ok)
+      return false;
+   *s = s_scanout;
+   return true;
+}
+
+static int open_fds(void)
+{
+   int n    = 0;
+   DIR *dir = opendir("/proc/self/fd");
+   if (!dir)
+      return -1;
+   while (readdir(dir))
+      n++;
+   closedir(dir);
+   return n;
+}
+
+static int log_times(const char *needle)
+{
+   int i;
+   int n = 0;
+   pthread_mutex_lock(&log_lock);
+   for (i = 0; i < log_count; i++)
+      if (strstr(log_lines[i], needle))
+         n++;
+   pthread_mutex_unlock(&log_lock);
+   return n;
+}
 
 static bool log_saw(const char *needle)
 {
@@ -188,6 +246,8 @@ static int revoke_timer_fired(void *data)
 {
    if (comp.lease_res)
       wp_drm_lease_v1_send_finished(comp.lease_res);
+   wl_event_source_remove(comp.revoke_timer);
+   comp.revoke_timer = NULL;
    return 0;
 }
 
@@ -490,6 +550,12 @@ static void lease_comp_stop(void)
    wayland_drm_lease_release();
    comp_stop();
    pthread_join(comp_tid, NULL);
+   /* A revoke test that failed before the timer fired would leak it */
+   if (comp.revoke_timer)
+   {
+      wl_event_source_remove(comp.revoke_timer);
+      comp.revoke_timer = NULL;
+   }
    wl_display_destroy(comp.dpy);
    if (comp.fd_write >= 0)
       close(comp.fd_write);
@@ -628,6 +694,201 @@ static void test_lease_without_a_session(void)
       setenv("WAYLAND_DISPLAY", saved, 1);
 }
 
+static uint64_t mono_ns(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (uint64_t)ts.tv_sec * 1000000000 + (uint64_t)ts.tv_nsec;
+}
+
+static void publish_on(const char *output, uint64_t line0_ns,
+      uint64_t refresh_ns, uint32_t flags)
+{
+   wl_beam_t t;
+   memset(&t, 0, sizeof(t));
+   t.line0_ns   = line0_ns;
+   t.refresh_ns = refresh_ns;
+   t.flags      = flags;
+   t.clock_id   = CLOCK_MONOTONIC;
+   strlcpy(t.output, output, sizeof(t.output));
+   wl_beam_publish(&t);
+}
+
+static void publish(uint64_t line0_ns, uint64_t refresh_ns, uint32_t flags)
+{
+   publish_on("DP-9", line0_ns, refresh_ns, flags);
+}
+
+/* n presents held for vblank, each a new frame polled once; how many
+ * polls said -1 */
+static int vsync_frames(void *serv, int n, uint64_t frame, uint32_t hw)
+{
+   static uint64_t line0;
+   int i;
+   int refused = 0;
+   if (!line0)
+      line0 = mono_ns();
+   for (i = 0; i < n; i++)
+   {
+      line0 += frame;
+      publish(line0, frame, hw | WP_PRESENTATION_FEEDBACK_KIND_VSYNC);
+      if (dispserv_wl.get_scanline(serv) == -1)
+         refused++;
+   }
+   return refused;
+}
+
+/* The beam from presentation feedback, timed by the output's DRM
+ * mode, which get_metrics reads and get_scanline only uses */
+static void test_scanline_from_feedback(void)
+{
+   void *serv;
+   int line;
+   int i;
+   int again;
+   int fds0;
+   int fds;
+   float v;
+   const uint64_t frame = 16674276; /* 3440x1440 at 59.97 Hz */
+   const uint32_t hw    = WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK
+                        | WP_PRESENTATION_FEEDBACK_KIND_HW_COMPLETION;
+   struct timespec past_recheck = { 0, 600000000 };
+
+   printf("\n-- the beam from presentation feedback --\n");
+   fds0 = open_fds();
+   serv = start(1, true);
+   fds  = open_fds();
+
+   memset(&s_scanout, 0, sizeof(s_scanout));
+   s_scanout.frame_ns = frame;
+   s_scanout.vtotal   = 1481;
+   s_scanout.vdisplay = 1440;
+   s_scanout.crtc_id  = 80;
+   s_scanout_ok       = false;
+   s_scanout_opens    = 0;
+   s_scanout_updates  = 0;
+
+   check("get_scanline is offered", dispserv_wl.get_scanline != NULL);
+   if (!dispserv_wl.get_scanline)
+   {
+      finish(serv);
+      return;
+   }
+
+   wl_beam_reset();
+   check("no feedback yet: -1", dispserv_wl.get_scanline(serv) == -1);
+   check("no line count without feedback",
+         !dispserv_wl.get_metrics(serv, DISPLAY_METRIC_TOTAL_LINES, &v));
+   check("  and no DRM lookup either", s_scanout_opens == 0);
+
+   publish(mono_ns() - 5000000, frame, hw);
+   check("feedback, but no DRM timing asked for yet: -1",
+         dispserv_wl.get_scanline(serv) == -1);
+   check("  get_scanline never looks the output up itself",
+         s_scanout_opens == 0);
+
+   check("no DRM connector: no line count",
+         !dispserv_wl.get_metrics(serv, DISPLAY_METRIC_TOTAL_LINES, &v));
+   check("  and get_scanline stays -1", dispserv_wl.get_scanline(serv) == -1);
+   check("  which is said once",
+         log_times("to time the beam by") == 1);
+
+   /* A new name is looked up at once; the same name twice a second */
+   s_scanout_ok = true;
+   publish_on("DP-8", mono_ns() - 5000000, frame, hw);
+   check("DP-8's total lines are its mode's",
+         dispserv_wl.get_metrics(serv, DISPLAY_METRIC_TOTAL_LINES, &v)
+         && v == 1481.0f);
+   check("  and its visible lines",
+         dispserv_wl.get_metrics(serv, DISPLAY_METRIC_ACTIVE_LINES, &v)
+         && v == 1440.0f);
+   line = dispserv_wl.get_scanline(serv);
+   check("5 ms after line 0 is about line 444", line >= 440 && line <= 480);
+
+   publish(mono_ns() - 5000000, frame, hw);
+   check("a frame on another output (DP-9): -1 until it is looked up",
+         dispserv_wl.get_scanline(serv) == -1);
+   dispserv_wl.get_metrics(serv, DISPLAY_METRIC_TOTAL_LINES, &v);
+   check("  then a line", dispserv_wl.get_scanline(serv) >= 0);
+   check("  DP-8's descriptor was given back for DP-9's",
+         open_fds() == fds + 1);
+
+   publish(mono_ns() - 2000000000, frame, hw);
+   check("a hidden window's old feedback: -1",
+         dispserv_wl.get_scanline(serv) == -1);
+
+   publish(mono_ns() + 300000, frame, hw);
+   line = dispserv_wl.get_scanline(serv);
+   check("line 0 still ahead maps to the last lines",
+         line >= 1450 && line < 1481);
+
+   publish(mono_ns() + 2 * frame, frame, hw);
+   check("a line 0 two frames ahead: -1", dispserv_wl.get_scanline(serv) == -1);
+
+   /* KWin holds a window's first presents for vblank until it treats
+    * it as the fullscreen one, so the hint waits for 120 in a row */
+   check("119 presents held for vblank: -1 each",
+         vsync_frames(serv, 119, frame, hw) == 119);
+   again = 0;
+   for (i = 0; i < 5; i++)
+      if (dispserv_wl.get_scanline(serv) == -1)
+         again++;
+   check("  the last polled again: -1 each", again == 5);
+   check("  and not tearing is not said yet", !log_saw("not tearing"));
+   check("the 120th: -1", vsync_frames(serv, 1, frame, hw) == 1);
+   check("  and that the compositor is not tearing is said",
+         log_times("not tearing") == 1);
+   vsync_frames(serv, 30, frame, hw);
+   check("  once, not again", log_times("not tearing") == 1);
+
+   publish(mono_ns() - 5000000, frame, hw);
+   check("a tearing frame gives a line again",
+         dispserv_wl.get_scanline(serv) >= 0);
+   check("120 more held for vblank: -1 each",
+         vsync_frames(serv, 120, frame, hw) == 120);
+   check("  and it is said again", log_times("not tearing") == 2);
+
+   publish(mono_ns() - 5000000, frame,
+         WP_PRESENTATION_FEEDBACK_KIND_HW_COMPLETION);
+   check("a software stamp: -1", dispserv_wl.get_scanline(serv) == -1);
+
+   publish(mono_ns() - 5000000, 0, hw);
+   check("no refresh: -1", dispserv_wl.get_scanline(serv) == -1);
+
+   publish(mono_ns() - 2000000000, frame, hw);
+   check("feedback 2 s old: -1", dispserv_wl.get_scanline(serv) == -1);
+
+   /* VRR, seen when the same output is read again */
+   s_scanout.vrr = true;
+   nanosleep(&past_recheck, NULL);
+   publish(mono_ns() - 5000000, frame, hw);
+   dispserv_wl.get_metrics(serv, DISPLAY_METRIC_TOTAL_LINES, &v);
+   check("the recheck reads the CRTC again", s_scanout_updates == 1);
+   check("VRR on: -1", dispserv_wl.get_scanline(serv) == -1);
+   check("  and VRR is said once", dispserv_wl.get_scanline(serv) == -1
+         && log_times("Variable refresh is on") == 1);
+
+   /* A recheck that fails gives the descriptor back */
+   s_scanout_ok = false;
+   nanosleep(&past_recheck, NULL);
+   publish(mono_ns() - 5000000, frame, hw);
+   check("a failed recheck: no line count",
+         !dispserv_wl.get_metrics(serv, DISPLAY_METRIC_TOTAL_LINES, &v));
+   check("  and -1", dispserv_wl.get_scanline(serv) == -1);
+   check("  and nothing left open", open_fds() == fds);
+
+   s_scanout_ok = true;
+   s_scanout.vrr = false;
+   publish_on("DP-7", mono_ns() - 5000000, frame, hw);
+   dispserv_wl.get_metrics(serv, DISPLAY_METRIC_TOTAL_LINES, &v);
+   check("a found output again gives a line",
+         dispserv_wl.get_scanline(serv) >= 0);
+
+   wl_beam_reset();
+   finish(serv);
+   check("teardown closes the descriptor", open_fds() == fds0);
+}
+
 int main(int argc, char **argv)
 {
    int i;
@@ -654,6 +915,7 @@ int main(int argc, char **argv)
    test_lease_refused();
    test_lease_revoked();
    test_lease_without_a_session();
+   test_scanline_from_feedback();
 
    printf("\n%s\n", fails ? "FAILED" : "all checks passed");
    return fails ? 1 : 0;
