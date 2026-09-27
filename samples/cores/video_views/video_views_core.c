@@ -28,7 +28,10 @@
  * In the Vulkan modes context_destroy first waits on the device without
  * the queue lock, as a core draining its work may, and logs when:
  * samples/openxr/e2e/run.py checks nothing of the frontend's used the
- * queue meanwhile. vulkan_keep keeps its context over video reinits. */
+ * queue meanwhile. vulkan_keep keeps its context over video reinits.
+ *
+ * It also logs its pads, analog values and light gun when they change,
+ * and rumbles a port while it holds Start, for the headset input tests. */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -173,6 +176,12 @@ static int last_status        = -1;
 static int last_accepted      = -1;
 static int last_pressed       = -1;
 static int16_t last_px, last_py;
+static struct retro_rumble_interface rumble;
+static int last_pad[2][7];      /* buttons, lx, ly, rx, ry, l2, r2 */
+static bool pad_logged[2];
+static int last_gun[4];         /* x, y, offscreen, trigger */
+static bool gun_logged;
+static unsigned last_rumble[2];
 
 static void fallback_log(enum retro_log_level level, const char *fmt, ...)
 {
@@ -749,6 +758,84 @@ void retro_set_controller_port_device(unsigned port, unsigned device)
 
 void retro_reset(void) { }
 
+static void log_pads(void)
+{
+   unsigned p;
+   for (p = 0; p < 2; p++)
+   {
+      int s[7];
+      s[0] = (int)(uint16_t)input_state_cb(p, RETRO_DEVICE_JOYPAD, 0,
+            RETRO_DEVICE_ID_JOYPAD_MASK);
+      s[1] = input_state_cb(p, RETRO_DEVICE_ANALOG,
+            RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X);
+      s[2] = input_state_cb(p, RETRO_DEVICE_ANALOG,
+            RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y);
+      s[3] = input_state_cb(p, RETRO_DEVICE_ANALOG,
+            RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X);
+      s[4] = input_state_cb(p, RETRO_DEVICE_ANALOG,
+            RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y);
+      s[5] = input_state_cb(p, RETRO_DEVICE_ANALOG,
+            RETRO_DEVICE_INDEX_ANALOG_BUTTON, RETRO_DEVICE_ID_JOYPAD_L2);
+      s[6] = input_state_cb(p, RETRO_DEVICE_ANALOG,
+            RETRO_DEVICE_INDEX_ANALOG_BUTTON, RETRO_DEVICE_ID_JOYPAD_R2);
+      if (pad_logged[p] && !memcmp(s, last_pad[p], sizeof(s)))
+         continue;
+      log_cb(RETRO_LOG_INFO,
+            "[video_views] pad port=%u buttons=0x%04x lx=%d ly=%d rx=%d ry=%d l2=%d r2=%d\n",
+            p, (unsigned)s[0], s[1], s[2], s[3], s[4], s[5], s[6]);
+      memcpy(last_pad[p], s, sizeof(s));
+      pad_logged[p] = true;
+   }
+}
+
+static void log_lightgun(unsigned fw, unsigned fh)
+{
+   int s[4];
+   int cx = -1;
+   int cy = -1;
+   s[0] = input_state_cb(0, RETRO_DEVICE_LIGHTGUN, 0,
+         RETRO_DEVICE_ID_LIGHTGUN_SCREEN_X);
+   s[1] = input_state_cb(0, RETRO_DEVICE_LIGHTGUN, 0,
+         RETRO_DEVICE_ID_LIGHTGUN_SCREEN_Y);
+   s[2] = input_state_cb(0, RETRO_DEVICE_LIGHTGUN, 0,
+         RETRO_DEVICE_ID_LIGHTGUN_IS_OFFSCREEN) ? 1 : 0;
+   s[3] = input_state_cb(0, RETRO_DEVICE_LIGHTGUN, 0,
+         RETRO_DEVICE_ID_LIGHTGUN_TRIGGER) ? 1 : 0;
+   if (gun_logged && !memcmp(s, last_gun, sizeof(s)))
+      return;
+   if (!s[2])
+   {
+      cx = (int)(((long)s[0] + 0x7fff) * (long)(fw - 1) / 0xfffe);
+      cy = (int)(((long)s[1] + 0x7fff) * (long)(fh - 1) / 0xfffe);
+   }
+   log_cb(RETRO_LOG_INFO,
+         "[video_views] lightgun x=%d y=%d offscreen=%d trigger=%d packed=(%d,%d)\n",
+         s[0], s[1], s[2], s[3], cx, cy);
+   memcpy(last_gun, s, sizeof(s));
+   gun_logged = true;
+}
+
+/* A port rumbles while it holds Start; each port at its own strength. */
+static void update_rumble(void)
+{
+   static const uint16_t strong[2] = { 0xC000, 0x8000 };
+   static const uint16_t weak[2]   = { 0x4000, 0x2000 };
+   unsigned p;
+   if (!rumble.set_rumble_state)
+      return;
+   for (p = 0; p < 2; p++)
+   {
+      unsigned on = ((unsigned)last_pad[p][0] >> RETRO_DEVICE_ID_JOYPAD_START) & 1;
+      if (on == last_rumble[p])
+         continue;
+      rumble.set_rumble_state(p, RETRO_RUMBLE_STRONG, on ? strong[p] : 0);
+      rumble.set_rumble_state(p, RETRO_RUMBLE_WEAK,   on ? weak[p]   : 0);
+      log_cb(RETRO_LOG_INFO, "[video_views] rumble port=%u strong=%u weak=%u\n",
+            p, on ? (unsigned)strong[p] : 0u, on ? (unsigned)weak[p] : 0u);
+      last_rumble[p] = on;
+   }
+}
+
 void retro_run(void)
 {
    struct retro_video_view v[RETRO_VIDEO_VIEWS_MAX];
@@ -827,6 +914,10 @@ void retro_run(void)
    last_py      = py;
    last_pressed = pressed;
 
+   log_pads();
+   log_lightgun(fw, fh);
+   update_rumble();
+
    if (hw_kind >= HW_VULKAN)
    {
       if (vk_send(fw, fh))
@@ -861,6 +952,8 @@ bool retro_load_game(const struct retro_game_info *game)
    if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt))
       return false;
    read_options();
+   if (!environ_cb(RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE, &rumble))
+      memset(&rumble, 0, sizeof(rumble));
    if (hw_kind >= HW_VULKAN)
    {
       memset(&hw_render, 0, sizeof(hw_render));
