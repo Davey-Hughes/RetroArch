@@ -641,6 +641,32 @@ def check_recenter(res):
     return errors
 
 
+def check_runtime_recenter(res):
+    """The runtime's own recenter moves LOCAL: the screens go back
+    straight ahead after a hotkey recenter. A STAGE change leaves them."""
+    stage = res.marks.get('stage', 0) * 1e6
+    local = res.marks.get('local', 0) * 1e6
+    held = [x for f in res.frames if stage + 1e6 < f['t_us'] < local
+            for x in quads(f) if x['eye'] == 'left']
+    shown = [f for f in res.frames if quads(f)]
+    if not held or not shown:
+        return no_quads(res)
+    errors = []
+    moved = [x['pose'][:3] for x in held if not at(x, (-1.3, 0.2, 0.3))]
+    if moved:
+        errors.append('screen 0 left the hotkey\'s place before the LOCAL '
+                      'change: %s' % moved[0])
+    last = [x for x in quads(shown[-1]) if x['eye'] == 'left']
+    if (     not last or not at(last[0], (0.0, 0.0, -1.8))
+            or not facing(last[0], (0.0, 0.0, 0.0, 1.0))):
+        errors.append('screen 0 ends at %s, want straight ahead'
+                      % (last[0]['pose'] if last else None))
+    n = res.log.count('[OpenXR] Recentered by the runtime.')
+    if n != 1:
+        errors.append('%d runtime recenters logged, want 1' % n)
+    return errors
+
+
 def check_pacing(res):
     """The headset's frames keep its own rate while the core is paused,
     and no new images are drawn for it."""
@@ -831,6 +857,13 @@ CASES = [
      'steps': [('wait', 6), ('script', 'head 0.5 0.2 0.3 90'), ('wait', 1),
                ('send', 'HEADSET_RECENTER'), ('wait', 3)],
      'check': check_recenter},
+    # The runtime's recenter after the hotkey's (space 2 is LOCAL).
+    {'name': 'runtime-recenter', 'map': '3ds',
+     'steps': [('wait', 6), ('script', 'head 0.5 0.2 0.3 90'), ('wait', 1),
+               ('send', 'HEADSET_RECENTER'), ('wait', 2), ('mark', 'stage'),
+               ('script', 'space 3'), ('wait', 2), ('mark', 'local'),
+               ('script', 'space 2'), ('wait', 2)],
+     'check': check_runtime_recenter},
     {'name': 'pacing', 'map': '3ds',
      'steps': [('wait', 6), ('send', 'PAUSE_TOGGLE'), ('mark', 'paused'),
                ('wait', 3), ('mark', 'resumed'), ('send', 'PAUSE_TOGGLE'),

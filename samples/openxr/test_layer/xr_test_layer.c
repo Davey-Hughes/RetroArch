@@ -33,10 +33,13 @@
  *   fail instance           xrPollEvent reports XR_ERROR_INSTANCE_LOST
  *                           while a session exists
  *   state <n>               the next xrPollEvent reports session state n
+ *   space <n>               the next xrPollEvent reports reference space
+ *                           type n changing (2, LOCAL: a runtime recenter)
  *
  * A changed script is applied line by line without resetting anything:
  * head and fail stay in effect until a later head or fail line replaces
- * them (head off, fail off). state fires once per change of the file.
+ * them (head off, fail off). state and space fire once per change of the
+ * file.
  */
 
 #include <math.h>
@@ -90,6 +93,7 @@ static struct
    bool fail_waitframe;
    bool fail_instance;
    int inject_state;
+   int inject_space;
    XrSession session;
    XrPosef head;
    uint64_t frames;
@@ -200,6 +204,11 @@ static void script_state(const char *args)
    L.inject_state = atoi(args);
 }
 
+static void script_space(const char *args)
+{
+   L.inject_space = atoi(args);
+}
+
 static const struct
 {
    const char *name;
@@ -208,6 +217,7 @@ static const struct
    { "head", script_head },
    { "fail", script_fail },
    { "state", script_state },
+   { "space", script_space },
 };
 
 /* Caller holds L.lock. */
@@ -546,6 +556,34 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_DestroySession(XrSession session)
    return L.DestroySession(session);
 }
 
+/* A scripted reference space change into ev, once, while a session
+ * exists. */
+static bool take_space_change(XrEventDataBuffer *ev)
+{
+   int type;
+   XrEventDataReferenceSpaceChangePending *c =
+      (XrEventDataReferenceSpaceChangePending*)ev;
+   pthread_mutex_lock(&L.lock);
+   type           = L.session ? L.inject_space : 0;
+   L.inject_space = 0;
+   if (type)
+   {
+      memset(ev, 0, sizeof(*ev));
+      c->type               = XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING;
+      c->session            = L.session;
+      c->referenceSpaceType = (XrReferenceSpaceType)type;
+      c->poseInPreviousSpace.orientation.w = 1.0f;
+      if (L.out)
+      {
+         fprintf(L.out, "{\"ev\":\"space\",\"space\":%d,\"t_us\":%lld}\n",
+               type, now_us());
+         fflush(L.out);
+      }
+   }
+   pthread_mutex_unlock(&L.lock);
+   return type != 0;
+}
+
 static XRAPI_ATTR XrResult XRAPI_CALL layer_PollEvent(XrInstance instance,
       XrEventDataBuffer *ev)
 {
@@ -569,6 +607,8 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_PollEvent(XrInstance instance,
       s->state   = (XrSessionState)inject;
       res        = XR_SUCCESS;
    }
+   else if (take_space_change(ev))
+      res = XR_SUCCESS;
    else
       res = L.PollEvent(instance, ev);
    if (res == XR_SUCCESS && ev->type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED)

@@ -642,6 +642,21 @@ static void vulkan_openxr_session_state(vulkan_openxr_t *xr,
    }
 }
 
+/* The runtime's own recenter moves LOCAL, which the anchor is in: the
+ * screens go back straight ahead, and a hotkey request with them. */
+static void vulkan_openxr_space_changed(vulkan_openxr_t *xr,
+      const XrEventDataReferenceSpaceChangePending *ev)
+{
+   if (     ev->session != xr->session
+         || ev->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_LOCAL)
+      return;
+   retro_atomic_store_release_int(&xr->recenter, 0);
+   slock_lock(xr->lock);
+   video_xr_pose_identity(&xr->anchor);
+   slock_unlock(xr->lock);
+   RARCH_LOG("[OpenXR] Recentered by the runtime.\n");
+}
+
 static void vulkan_openxr_poll(vulkan_openxr_t *xr)
 {
    XrResult res;
@@ -655,6 +670,9 @@ static void vulkan_openxr_poll(vulkan_openxr_t *xr)
          vulkan_openxr_ended(xr, true);
       if (res != XR_SUCCESS)
          break;
+      if (ev.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING)
+         vulkan_openxr_space_changed(xr,
+               (const XrEventDataReferenceSpaceChangePending*)&ev);
       if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED)
       {
          const XrEventDataSessionStateChanged *sc =
@@ -930,6 +948,7 @@ static bool vulkan_openxr_create_session(vulkan_openxr_t *xr,
    }
    xr->device = device;
    video_xr_pose_identity(&xr->anchor);
+   retro_atomic_store_release_int(&xr->recenter, 0);
 
    memset(&rci, 0, sizeof(rci));
    rci.type                               = XR_TYPE_REFERENCE_SPACE_CREATE_INFO;
