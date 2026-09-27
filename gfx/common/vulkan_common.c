@@ -664,8 +664,35 @@ static void vulkan_append_ext(const char **list, uint32_t *count,
       list[(*count)++] = name;
 }
 
-/* The headset's GPU, which must be one the loader lists; otherwise the
- * runtime refused this system and the headset is dropped. */
+/* Whether a queue family init_device() can use presents to the window. */
+static bool vulkan_context_gpu_presents(gfx_ctx_vulkan_data_t *vk,
+      VkPhysicalDevice gpu)
+{
+   uint32_t i;
+   uint32_t count                 = 0;
+   bool found                     = false;
+   VkQueueFamilyProperties *props = NULL;
+   vkGetPhysicalDeviceQueueFamilyProperties(gpu, &count, NULL);
+   if (!count || !(props = (VkQueueFamilyProperties*)
+            malloc(count * sizeof(*props))))
+      return false;
+   vkGetPhysicalDeviceQueueFamilyProperties(gpu, &count, props);
+   for (i = 0; i < count && !found; i++)
+   {
+      VkQueueFlags required = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT;
+      VkBool32 supported    = VK_FALSE;
+      if ((props[i].queueFlags & required) != required)
+         continue;
+      vkGetPhysicalDeviceSurfaceSupportKHR(gpu, i, vk->vk_surface,
+            &supported);
+      found = (supported == VK_TRUE);
+   }
+   free(props);
+   return found;
+}
+
+/* The headset's GPU, which must be one the loader lists and able to
+ * present to the window; otherwise the headset is dropped. */
 static bool vulkan_context_openxr_gpu(gfx_ctx_vulkan_data_t *vk,
       const VkPhysicalDevice *gpus, uint32_t gpu_count)
 {
@@ -676,12 +703,18 @@ static bool vulkan_context_openxr_gpu(gfx_ctx_vulkan_data_t *vk,
    {
       if (gpus[i] != gpu)
          continue;
+      if (!vulkan_context_gpu_presents(vk, gpu))
+      {
+         RARCH_WARN("[OpenXR] The runtime's GPU #%u cannot present to the window.\n",
+               (unsigned)i);
+         break;
+      }
       RARCH_LOG("[Vulkan] Using the headset's GPU #%u: \"%s\".\n",
             (unsigned)i, vk->gpu_list->elems[i].data);
       vk->context.gpu = gpu;
       return true;
    }
-   if (gpu != VK_NULL_HANDLE)
+   if (gpu != VK_NULL_HANDLE && i == gpu_count)
       RARCH_WARN("[OpenXR] The runtime's GPU is not one Vulkan lists.\n");
    vulkan_openxr_drop(vk->context.xr);
    vk->context.xr = NULL;
