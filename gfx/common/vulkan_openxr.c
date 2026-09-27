@@ -74,7 +74,9 @@ struct vulkan_openxr
    retro_atomic_int_t recenter;
    bool running;                   /* XR thread */
    bool ended;                     /* XR thread, or while it is stopped */
-   bool lost;                      /* ended with the instance; as ended */
+   /* The instance was lost too, so a kept device cannot get a new
+    * session. Written like ended. */
+   bool lost;
    bool frame_failed;              /* XR thread */
    int64_t formats[VULKAN_OPENXR_MAX_FORMATS];
    uint32_t num_formats;

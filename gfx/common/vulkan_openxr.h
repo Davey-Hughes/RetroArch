@@ -97,7 +97,9 @@ typedef struct vulkan_openxr_handles
 typedef struct vulkan_openxr_hooks
 {
    /* The session and its spaces exist and its frame loop has not
-    * started: suggest bindings and attach action sets here. */
+    * started: attach action sets here. A kept device's instance gets
+    * a new session after the runtime ends one, so suggest bindings
+    * once per instance. */
    void (*session_created)(void *user, const vulkan_openxr_handles_t *handles);
    /* The frame loop has stopped; the session is destroyed next. */
    void (*session_destroying)(void *user, vulkan_openxr_t *xr);

@@ -110,7 +110,8 @@ def unexpected(log, baseline):
         text = '\n'.join(b)
         m = VUID.search(text)
         vuid = m.group(1) if m else b[0].strip()
-        if any(vuid == v and t in text for v, t in baseline):
+        if any(vuid == v and (t(text) if callable(t) else t in text)
+               for v, t in baseline):
             known += 1
         else:
             extra.add(vuid)
@@ -802,12 +803,21 @@ def check_kept_lost(res):
     return errors
 
 
+def kept_leak(text):
+    """What a kept context's reinit leaks, headset or not, on master too:
+    two unnamed buffers and two unnamed memory objects."""
+    m = re.search(r'has 4 leaked objects that have not been destroyed\.\n'
+                  r'(.*)', text)
+    objects = m.group(1).rstrip('. ').split(', ') if m else []
+    kinds = sorted(re.sub(r' 0x[0-9a-f]+$', '', o) for o in objects)
+    return kinds == ['VkBuffer', 'VkBuffer', 'VkDeviceMemory', 'VkDeviceMemory']
+
+
 SETTLE = [('wait', 8)]
 VULKAN = {'video_views_test_hw': 'vulkan'}
 TEARDOWN = [('wait', 6), ('send', 'FULLSCREEN_TOGGLE'), ('wait', 4),
             ('send', 'CLOSE_CONTENT'), ('wait', 4)]
-# A kept context's reinit leaks these, headset or not, on master too.
-KEPT_LEAK = [('VUID-vkDestroyDevice-device-05137', 'has 4 leaked objects')]
+KEPT_LEAK = [('VUID-vkDestroyDevice-device-05137', kept_leak)]
 SIZED = {'video_shader_enable': 'true'}
 SHOT = [('wait', 8), ('shot', None)]
 
