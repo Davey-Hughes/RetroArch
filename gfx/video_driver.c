@@ -5000,6 +5000,11 @@ bool video_driver_has_focus(void)
    return VIDEO_HAS_FOCUS(video_st);
 }
 
+bool video_driver_headset_focused(void)
+{
+   return video_driver_test_all_flags(GFX_CTX_FLAGS_HEADSET_FOCUSED);
+}
+
 /* The window title crosses from the main thread, which builds it, to
  * the video thread, which applies it. Where the atomics have pointer
  * ops it crosses as an immutable heap copy through a one-slot atomic

@@ -1520,6 +1520,10 @@ bool video_thread_hw_allowed(void);
 
 bool video_driver_has_focus(void);
 
+/* The player is in the headset: focused for pausing and controllers,
+ * never for the keyboard and mouse. */
+bool video_driver_headset_focused(void);
+
 void video_driver_set_stub_frame(void);
 
 void video_driver_unset_stub_frame(void);

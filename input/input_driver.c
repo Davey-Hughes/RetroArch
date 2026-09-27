@@ -554,7 +554,8 @@ static void input_driver_update_joypad_focus(
       input_driver_state_t *input_st, const settings_t *settings)
 {
    if (     !settings->bools.input_joypad_background
-         && !video_driver_has_focus())
+         && !video_driver_has_focus()
+         && !video_driver_headset_focused())
       input_st->flags |=  INP_FLAG_JOYPAD_UNFOCUSED;
    else
       input_st->flags &= ~INP_FLAG_JOYPAD_UNFOCUSED;

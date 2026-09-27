@@ -6991,7 +6991,7 @@ static enum runloop_state_enum runloop_check_state(
 #endif
       {
          if (pause_nonactive)
-            focused = is_focused;
+            focused = is_focused || video_driver_headset_focused();
          else
             focused = true;
       }
@@ -7636,7 +7636,8 @@ static enum runloop_state_enum runloop_check_state(
    if (netplay_allow_pause)
 #endif
    if (pause_nonactive)
-      focused                = is_focused;
+      focused                = is_focused
+                            || video_driver_headset_focused();
 
    /* Check pause hotkey */
    {

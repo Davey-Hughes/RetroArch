@@ -11414,6 +11414,9 @@ static uint32_t vulkan_get_flags(void *data)
    if (     vk && vk->context && vk->context->xr
          && vulkan_openxr_alive(vk->context->xr))
       BIT32_SET(flags, GFX_CTX_FLAGS_VIDEO_VIEWS_HEADSET);
+   if (     vk && vk->context && vk->context->xr
+         && vulkan_openxr_focused(vk->context->xr))
+      BIT32_SET(flags, GFX_CTX_FLAGS_HEADSET_FOCUSED);
 #endif
 
    return flags;
@@ -12848,12 +12851,6 @@ static bool vulkan_has_windowed(void *data)
 static bool vulkan_focus(void *data)
 {
    vk_t *vk        = (vk_t*)data;
-#ifdef HAVE_OPENXR
-   /* The player is in the headset. */
-   if (     vk && vk->context && vk->context->xr
-         && vulkan_openxr_focused(vk->context->xr))
-      return true;
-#endif
    if (vk && vk->ctx_driver && vk->ctx_driver->has_focus)
       return vk->ctx_driver->has_focus(vk->ctx_data);
    return true;
