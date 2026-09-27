@@ -2952,28 +2952,29 @@ enum retro_mod
  * being emulated, racing the display's scanout, or ignore them. Cores
  * that never make this call are unaffected.
  *
- * The core sets \c interface_version to
- * \c RETRO_RASTER_POLL_INTERFACE_VERSION before the call. The frontend
- * fills in \c raster_poll and returns \c true, or returns \c false and
- * leaves the struct untouched for a \c NULL \c data or a version it
- * does not know.
+ * Make this call once, in \c retro_load_game(). The core sets
+ * \c interface_version to \c RETRO_RASTER_POLL_INTERFACE_VERSION
+ * first. The frontend fills in \c raster_poll and returns \c true, or
+ * returns \c false and leaves the struct untouched when the call's
+ * \c data is \c NULL or the version is one it does not know.
  *
  * Contract:
  *  - Call \c raster_poll only inside \c retro_run(), on its thread.
- *  - \c row is the last finished row of the output frame, counted
- *    after any crop: rows 0 to \c row of \c data are final. Within a
- *    frame it strictly increases. Call once a row or once a batch of
- *    rows; calls may be skipped.
- *  - \c data is the software frame being built, in the
- *    \c RETRO_ENVIRONMENT_SET_PIXEL_FORMAT format; never \c NULL or
- *    \c RETRO_HW_FRAME_BUFFER_VALID. The frontend reads rows up to
- *    \c row, and only during the call.
+ *  - \c data, \c width, \c height and \c pitch describe the frame as
+ *    \c retro_video_refresh_t will receive it, counted after any crop.
+ *    \c data is in the \c RETRO_ENVIRONMENT_SET_PIXEL_FORMAT format,
+ *    never \c NULL or \c RETRO_HW_FRAME_BUFFER_VALID.
+ *  - \c row is the last finished row, less than \c height: rows 0 to
+ *    \c row are final. Within a frame it strictly increases. Call once
+ *    a row or once a batch of rows; calls may be skipped.
+ *  - The frontend reads rows up to \c row, and only during the call.
  *  - The frame still ends with \c retro_video_refresh_t at the same
- *    width and height, and the rows reported final are unchanged
- *    there. That call's \c data may be another buffer.
+ *    width and height, not with a dupe, and the rows reported final
+ *    are unchanged there. That call's \c data may be another buffer.
  *  - The call may block for up to about a frame.
- *  - Call it on every frame; the frontend ignores frames it does not
- *    show (run-ahead, rewind, netplay).
+ *  - The core need not know which frames are shown; the frontend
+ *    ignores the rows of frames it hides or replays (run-ahead,
+ *    netplay).
  *  - The callback stays valid until \c retro_deinit().
  *
  * @param[in,out] data <tt>struct retro_raster_poll_interface *</tt>.
