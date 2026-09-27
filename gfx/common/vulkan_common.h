@@ -348,6 +348,9 @@ typedef struct gfx_ctx_vulkan_data
    PFN_vkVoidFunction display_timing_query;
    uint32_t present_id;
    bool display_timing_supported;
+   /* The display and mode a display surface was made for */
+   VkDisplayKHR display_khr;
+   VkDisplayModeParametersKHR display_mode_params;
 #ifdef VULKAN_HDR_SWAPCHAIN
    /* Loaded from VK_EXT_hdr_metadata when that optional device extension is
     * present; NULL otherwise. Used to signal SMPTE-2086 mastering-display
@@ -439,6 +442,18 @@ bool vulkan_surface_create(gfx_ctx_vulkan_data_t *vk,
       enum vulkan_wsi_type type,
       void *display, void *surface,
       unsigned dims, int8_t swap_interval);
+
+#ifdef HAVE_KMS
+/* The DRM primary node major:minor of the GPU; false without
+ * VK_EXT_physical_device_drm or below a 1.1 GPU */
+bool vulkan_display_drm_node(gfx_ctx_vulkan_data_t *vk,
+      unsigned *major, unsigned *minor);
+
+/* The VkDisplayKHR of connector_id on the card fd is open on;
+ * VK_NULL_HANDLE without VK_EXT_acquire_drm_display */
+VkDisplayKHR vulkan_display_from_drm_connector(gfx_ctx_vulkan_data_t *vk,
+      int fd, uint32_t connector_id);
+#endif
 
 bool vulkan_surface_destroy(gfx_ctx_vulkan_data_t *vk);
 

@@ -63,6 +63,29 @@
 #endif
 #endif
 
+#ifdef HAVE_KMS
+/* Newer than the bundled headers */
+#ifndef VK_EXT_physical_device_drm
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT ((VkStructureType)1000353000)
+typedef struct VkPhysicalDeviceDrmPropertiesEXT
+{
+   VkStructureType sType;
+   void           *pNext;
+   VkBool32        hasPrimary;
+   VkBool32        hasRender;
+   int64_t         primaryMajor;
+   int64_t         primaryMinor;
+   int64_t         renderMajor;
+   int64_t         renderMinor;
+} VkPhysicalDeviceDrmPropertiesEXT;
+#endif
+#ifndef VK_EXT_acquire_drm_display
+typedef VkResult (VKAPI_PTR *PFN_vkGetDrmDisplayEXT)(
+      VkPhysicalDevice physicalDevice, int32_t drmFd,
+      uint32_t connectorId, VkDisplayKHR *display);
+#endif
+#endif
+
 #if defined(_WIN32) || defined(__APPLE__) || (defined(__linux__) && !defined(ANDROID))
 #define VULKAN_EMULATE_MAILBOX
 #endif
@@ -1161,6 +1184,17 @@ static const char *vulkan_optional_instance_extensions[] = {
 #endif
 };
 
+#ifdef HAVE_KMS
+/* The DRM connector behind a display surface, for dispserv_kms */
+static const char *vulkan_display_drm_instance_extensions[] = {
+   "VK_EXT_direct_mode_display",
+   "VK_EXT_acquire_drm_display"
+};
+#define VULKAN_DISPLAY_DRM_EXTENSIONS ARRAY_SIZE(vulkan_display_drm_instance_extensions)
+#else
+#define VULKAN_DISPLAY_DRM_EXTENSIONS 0
+#endif
+
 static VkInstance vulkan_context_create_instance_wrapper(void *opaque, const VkInstanceCreateInfo *create_info)
 {
    VkResult res;
@@ -1173,7 +1207,8 @@ static VkInstance vulkan_context_create_instance_wrapper(void *opaque, const VkI
    uint32_t required_extension_count = 0;
    const char **instance_extensions = (const char**)malloc((info.enabledExtensionCount
                                                           + ARRAY_SIZE(required_extensions)
-                                                          + ARRAY_SIZE(vulkan_optional_instance_extensions)) * sizeof(const char *));
+                                                          + ARRAY_SIZE(vulkan_optional_instance_extensions)
+                                                          + VULKAN_DISPLAY_DRM_EXTENSIONS) * sizeof(const char *));
    const char **instance_layers     = (const char**)malloc((info.enabledLayerCount     + 1)                * sizeof(const char *));
 
    /* Both mallocs must have succeeded before the memcpy / field
@@ -1267,6 +1302,16 @@ static VkInstance vulkan_context_create_instance_wrapper(void *opaque, const VkI
       RARCH_ERR("[Vulkan] Instance does not support required extensions.\n");
       goto end;
    }
+
+#ifdef HAVE_KMS
+   /* Optional: they only find Scanline Sync's connector */
+   if (vk->wsi_type == VULKAN_WSI_DISPLAY)
+      vulkan_find_instance_extensions(
+            instance_extensions, &info.enabledExtensionCount,
+            vulkan_display_drm_instance_extensions, 0,
+            vulkan_display_drm_instance_extensions,
+            VULKAN_DISPLAY_DRM_EXTENSIONS);
+#endif
 
 #ifdef VULKAN_HDR_SWAPCHAIN
    /* Check if HDR colorspace extension was enabled */
@@ -1373,6 +1418,8 @@ static bool vulkan_create_display_surface(gfx_ctx_vulkan_data_t *vk,
    uint32_t best_plane                       = UINT32_MAX;
    VkDisplayPlaneAlphaFlagBitsKHR alpha_mode = VK_DISPLAY_PLANE_ALPHA_OPAQUE_BIT_KHR;
    VkDisplayModeKHR best_mode                = VK_NULL_HANDLE;
+   VkDisplayKHR best_display                 = VK_NULL_HANDLE;
+   VkDisplayModeParametersKHR best_params;
    /* Monitor index starts on 1, 0 is auto. */
    unsigned monitor_index                    = info->monitor_index;
    unsigned saved_dims                       = *dims;
@@ -1391,6 +1438,8 @@ static bool vulkan_create_display_surface(gfx_ctx_vulkan_data_t *vk,
          vkGetDisplayPlaneCapabilitiesKHR);
    VULKAN_SYMBOL_WRAPPER_LOAD_INSTANCE_EXTENSION_SYMBOL(vk->context.instance,
          vkCreateDisplayPlaneSurfaceKHR);
+
+   memset(&best_params, 0, sizeof(best_params));
 
 #define GOTO_FAIL() do { \
    ret = false; \
@@ -1443,7 +1492,11 @@ retry:
       {
          const VkDisplayModePropertiesKHR *mode = &modes[i];
          if (vulkan_update_display_mode(dims, mode, info))
-            best_mode = modes[i].displayMode;
+         {
+            best_mode    = modes[i].displayMode;
+            best_display = display;
+            best_params  = modes[i].parameters;
+         }
       }
 
       free(modes);
@@ -1538,12 +1591,78 @@ out:
             &create_info, NULL, &vk->vk_surface) != VK_SUCCESS)
       GOTO_FAIL();
 
+   vk->display_khr         = best_display;
+   vk->display_mode_params = best_params;
+
 end:
    free(displays);
    free(planes);
    free(modes);
    return ret;
 }
+
+#ifdef HAVE_KMS
+bool vulkan_display_drm_node(gfx_ctx_vulkan_data_t *vk,
+      unsigned *major, unsigned *minor)
+{
+   uint32_t i;
+   uint32_t count                         = 0;
+   bool supported                         = false;
+   VkExtensionProperties *exts            = NULL;
+   PFN_vkGetPhysicalDeviceProperties2 get = NULL;
+   VkPhysicalDeviceDrmPropertiesEXT drm;
+   VkPhysicalDeviceProperties2 props;
+
+   /* The core entry point: RetroArch asks for a 1.1 instance */
+   if (     vk->context.gpu == VK_NULL_HANDLE
+         || vk->context.gpu_properties.apiVersion < VK_API_VERSION_1_1
+         || !(get = (PFN_vkGetPhysicalDeviceProperties2)
+            vulkan_symbol_wrapper_instance_proc_addr()(
+               vk->context.instance, "vkGetPhysicalDeviceProperties2")))
+      return false;
+
+   if (     vkEnumerateDeviceExtensionProperties(vk->context.gpu, NULL,
+               &count, NULL) != VK_SUCCESS
+         || !count
+         || !(exts = (VkExtensionProperties*)calloc(count, sizeof(*exts))))
+      return false;
+   if (vkEnumerateDeviceExtensionProperties(vk->context.gpu, NULL,
+            &count, exts) == VK_SUCCESS)
+      for (i = 0; i < count && !supported; i++)
+         supported = string_is_equal(exts[i].extensionName,
+               "VK_EXT_physical_device_drm");
+   free(exts);
+   if (!supported)
+      return false;
+
+   memset(&drm, 0, sizeof(drm));
+   memset(&props, 0, sizeof(props));
+   drm.sType   = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT;
+   props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+   props.pNext = &drm;
+   get(vk->context.gpu, &props);
+   if (!drm.hasPrimary || drm.primaryMajor < 0 || drm.primaryMinor < 0)
+      return false;
+   *major = (unsigned)drm.primaryMajor;
+   *minor = (unsigned)drm.primaryMinor;
+   return true;
+}
+
+VkDisplayKHR vulkan_display_from_drm_connector(gfx_ctx_vulkan_data_t *vk,
+      int fd, uint32_t connector_id)
+{
+   VkDisplayKHR display       = VK_NULL_HANDLE;
+   /* The loader answers NULL unless the instance enabled the extension */
+   PFN_vkGetDrmDisplayEXT get = (PFN_vkGetDrmDisplayEXT)
+      vulkan_symbol_wrapper_instance_proc_addr()(
+            vk->context.instance, "vkGetDrmDisplayEXT");
+
+   if (     !get
+         || get(vk->context.gpu, fd, connector_id, &display) != VK_SUCCESS)
+      return VK_NULL_HANDLE;
+   return display;
+}
+#endif
 
 /* Waits, by fence, for every frame this context submitted - the only
  * work that references the swapchain images from this side. This is
