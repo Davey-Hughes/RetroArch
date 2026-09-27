@@ -27,10 +27,15 @@
 #include "input_openxr.h"
 
 #include "../input_defines.h"
+#include "../input_driver.h"
 #include "../../configuration.h"
 #include "../../gfx/video_views.h"
 #include "../../gfx/common/vulkan_openxr.h"
 #include "../../verbosity.h"
+
+#ifdef HAVE_MENU
+#include "../../menu/menu_driver.h"
+#endif
 
 #define INPUT_OPENXR_HANDS     2
 #define INPUT_OPENXR_MAX_BINDS 48
@@ -291,6 +296,7 @@ typedef struct input_openxr
    /* Main thread. */
    input_openxr_pad_t pads[INPUT_OPENXR_PADS];
    input_openxr_trigger_t trig[INPUT_OPENXR_HANDS];
+   XrResult sync_result; /* the last xrSyncActions */
    int mode;             /* the controllers mode last logged, or -1 */
    bool focused;
    bool menu_toggle;
@@ -340,9 +346,13 @@ static void input_openxr_suggest(input_openxr_t *st,
    XrActionSuggestedBinding binds[INPUT_OPENXR_MAX_BINDS];
    XrInteractionProfileSuggestedBinding sb;
 
-   if (     p->count > INPUT_OPENXR_MAX_BINDS
-         || XR_FAILED(st->StringToPath(st->instance, p->path, &profile)))
+   if (p->count > INPUT_OPENXR_MAX_BINDS)
       return;
+   if (XR_FAILED(res = st->StringToPath(st->instance, p->path, &profile)))
+   {
+      RARCH_WARN("[OpenXR] No path %s (%d).\n", p->path, (int)res);
+      return;
+   }
    for (i = 0; i < p->count; i++)
    {
       binds[i].action = st->actions[p->binds[i].action];
@@ -619,8 +629,37 @@ static void input_openxr_triggers(input_openxr_t *st, float threshold)
    }
 }
 
+/* Analog to Digital as a gamepad on the port gets it: the D-pad (or
+ * Twin Stick's face buttons) from the sticks the mode takes, which then
+ * read as centred. The menu reads the sticks itself, as it does a
+ * gamepad's. */
+static void input_openxr_dpad(input_openxr_t *st, const settings_t *settings)
+{
+   unsigned p;
+#ifdef HAVE_MENU
+   if (menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE)
+      return;
+#endif
+   for (p = 0; p < INPUT_OPENXR_PADS; p++)
+   {
+      input_openxr_pad_t *pad = &st->pads[p];
+      unsigned mode           = input_driver_analog_dpad_mode(settings, p);
+      pad->buttons |= input_driver_analog_dpad_buttons(mode, pad->analog,
+            settings->floats.input_axis_threshold);
+      if (     mode == ANALOG_DPAD_LSTICK
+            || mode == ANALOG_DPAD_LRSTICK
+            || mode == ANALOG_DPAD_TWINSTICK)
+         pad->analog[0] = pad->analog[1] = 0;
+      if (     mode == ANALOG_DPAD_RSTICK
+            || mode == ANALOG_DPAD_LRSTICK
+            || mode == ANALOG_DPAD_TWINSTICK)
+         pad->analog[2] = pad->analog[3] = 0;
+   }
+}
+
 void input_openxr_poll(void)
 {
+   XrResult res;
    XrActionsSyncInfo si;
    XrActiveActionSet active[2];
    input_openxr_t *st   = &input_openxr_st;
@@ -639,6 +678,8 @@ void input_openxr_poll(void)
       if (st->focused)
          RARCH_LOG("[OpenXR] Controllers released: the headset is not focused.\n");
       st->focused = false;
+      /* So their return is logged too. */
+      st->mode    = -1;
       return;
    }
    st->focused = true;
@@ -652,8 +693,15 @@ void input_openxr_poll(void)
    si.countActiveActionSets = 2;
    si.activeActionSets      = active;
    /* XR_SESSION_NOT_FOCUSED succeeds too, with nothing active. */
-   if (st->SyncActions(st->session, &si) != XR_SUCCESS)
+   if ((res = st->SyncActions(st->session, &si)) != XR_SUCCESS)
+   {
+      if (res != st->sync_result)
+         RARCH_WARN("[OpenXR] Controllers not read: xrSyncActions %d.\n",
+               (int)res);
+      st->sync_result = res;
       return;
+   }
+   st->sync_result = XR_SUCCESS;
    if (st->mode != (int)separate)
    {
       RARCH_LOG("[OpenXR] Controllers: %s.\n",
@@ -665,6 +713,7 @@ void input_openxr_poll(void)
    else
       input_openxr_read_combined(st);
    input_openxr_triggers(st, settings->floats.input_axis_threshold);
+   input_openxr_dpad(st, settings);
 }
 
 bool input_openxr_button(unsigned port, unsigned id)
@@ -705,7 +754,6 @@ int16_t input_openxr_analog(unsigned port, unsigned idx, unsigned id,
    return res;
 }
 
-/* Last in the file: later tasks add a hook defined above it. */
 void input_openxr_register(void)
 {
    vulkan_openxr_hooks_t hooks;

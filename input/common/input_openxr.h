@@ -37,7 +37,7 @@ void input_openxr_register(void);
 void input_openxr_poll(void);
 
 /* A RetroPad button held on user port's pad, or RARCH_MENU_TOGGLE or
- * RARCH_HEADSET_RECENTER on either. */
+ * RARCH_HEADSET_RECENTER, which answer for any port. */
 bool input_openxr_button(unsigned port, unsigned id);
 
 /* A stick axis (idx LEFT/RIGHT, id X/Y) or analog L2/R2 (idx

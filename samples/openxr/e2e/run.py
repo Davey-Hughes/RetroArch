@@ -889,6 +889,14 @@ def moved(f):
     return any(f[k] for k in ('buttons', 'lx', 'ly', 'rx', 'ry', 'l2', 'r2'))
 
 
+def controllers(res):
+    """RetroArch's controller lines in order, one thread's: 'live' when
+    they are read again, 'released' when focus is lost."""
+    return ['released' if 'released' in line else 'live'
+            for line in res.log.splitlines()
+            if '[OpenXR] Controllers' in line]
+
+
 def bindings_errors(res):
     got = dict((e['profile'], e['result']) for e in events(res, 'bindings'))
     return ['bindings for %s: %s (see Monado\'s warning in run.log)'
@@ -928,6 +936,9 @@ SEPARATE = script('action separate/b@left 1',
                   'action separate/r2@right 0.6',
                   'action combined/x 1')
 HELD = script('action combined/b 1', 'action combined/left_stick 1 0')
+RETURNED = script('action combined/a 1', 'action combined/left_stick -1 0')
+DPAD = script('action combined/left_stick 0.8 0.8',
+              'action combined/right_stick 0.5 0')
 
 
 def check_combined(res):
@@ -998,14 +1009,41 @@ def check_input_focus(res):
 def check_input_unfocused(res):
     """The window unfocused, with Pause Content When Not Active and no
     background joypads: check_focus()'s pause rule, and the headset's
-    controllers still reach player 1 while its session is focused."""
+    controllers still reach player 1 while its session is focused. The
+    content is paused while the session is only visible, so the core
+    never reads the release: RetroArch's log shows it."""
     errors = check_focus(res)
-    if find(pads(res, 0), 0, lambda f: f['buttons'] == RP['B']
-            and f['lx'] == 32767) < 0:
+    p0 = pads(res, 0)
+    i = find(p0, 0, lambda f: f['buttons'] == RP['B'] and f['lx'] == 32767)
+    # RETURNED is only scripted once the session is focused again.
+    j = (find(p0, i + 1, lambda f: f['buttons'] == RP['A']
+              and f['lx'] == -32767) if i >= 0 else -1)
+    if i < 0:
         errors.append('B and the stick never reached player 1 with the '
                       'window unfocused')
-    if 'Controllers released: the headset is not focused' not in res.log:
-        errors.append('no "Controllers released" in the log')
+    elif j < 0:
+        errors.append('A and the stick never reached player 1 once the '
+                      'headset had focus back: %s' % p0[i:i + 3])
+    seq = controllers(res)
+    if seq[:3] != ['live', 'released', 'live']:
+        errors.append('controllers went %s, want live, released while '
+                      'visible, live again' % seq)
+    return errors
+
+
+def check_input_dpad(res):
+    """Forced Left Analog on player 1: the left stick is the D-pad and
+    reads centred, the right stays analog."""
+    p0 = pads(res, 0)
+    i = find(p0, 0, lambda f: f['buttons'] == RP['UP'] | RP['RIGHT']
+             and (f['lx'], f['ly']) == (0, 0)
+             and close((f['rx'], f['ry']), (16383, 0)))
+    errors = []
+    if i < 0:
+        errors.append('player 1 never had Up and Right from the left stick, '
+                      'centred, with the right stick at 0.5: %s' % p0[-3:])
+    elif find(p0, i + 1, lambda f: not moved(f)) < 0:
+        errors.append('player 1 was not released')
     return errors
 
 
@@ -1055,6 +1093,12 @@ def check_kept_retry(res):
                       'per session)' % ready)
     if '[OpenXR] Headset controllers unavailable' in res.log:
         errors.append('headset controllers unavailable in a session')
+    # The core logs no pads with a kept Vulkan context: RetroArch's log
+    # shows the release when the session ends, and the new session's.
+    seq = controllers(res)
+    if seq != ['live', 'released', 'live']:
+        errors.append('controllers went %s, want live, released when the '
+                      'session ended, live in the new one' % seq)
     # The laser's dot is VULKAN_OPENXR_CURSOR_DIM square; each start makes
     # one, and each start here made a session.
     dots = [e for e in events(res, 'swapchain')
@@ -1225,9 +1269,15 @@ CASES = [
      'steps': [('wait', 6), ('unfocus', None), ('mark', 'unfocused'),
                ('script', HELD), ('wait', 3), ('mark', 'visible'),
                ('script', script(HELD, 'state 4')), ('wait', 3),
-               ('mark', 'refocused'), ('script', script(HELD, 'state 5')),
+               ('mark', 'refocused'), ('script', script(RETURNED, 'state 5')),
                ('wait', 3), ('mark', 'end'), ('script', ''), ('wait', 1)],
      'check': check_input_unfocused},
+    # Forced, so the core's analog reads leave it on.
+    {'name': 'input-dpad', 'map': '3ds',
+     'settings': {'input_player1_analog_dpad_mode': '3'},
+     'steps': [('wait', 6), ('script', DPAD), ('wait', 2), ('script', ''),
+               ('wait', 2)],
+     'check': check_input_dpad},
 ]
 
 
