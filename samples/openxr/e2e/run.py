@@ -502,6 +502,40 @@ def check_frame(res):
     return errors
 
 
+def check_menu(res):
+    fr = last_snap(res)
+    if not fr:
+        return no_quads(res)
+    q = quads(fr)
+    menus = [x for x in q if x['flags'] & BLEND]
+    if len(menus) != 1:
+        return ['want one blended menu quad, got %d' % len(menus)]
+    m = menus[0]
+    errors = []
+    if len(q) != 4:
+        errors.append('want the three screen quads behind the menu, got %d'
+                      % (len(q) - 1))
+    if q[-1] is not m:
+        errors.append('the menu is not drawn last')
+    if not at(m, (0.0, 0.0, -1.7)) or not sized(m, (1.6, 0.96)):
+        errors.append('menu at %s size %s' % (m['pose'][:3], m['size']))
+    _, alpha = colour(image(res, fr, m), 0.5, 0.5)
+    if alpha == 0:
+        errors.append('the menu is transparent at its centre')
+    return errors
+
+
+def check_menu_closed(res):
+    last = [f for f in res.frames if quads(f)]
+    if not last:
+        return no_quads(res)
+    if any(x['flags'] & BLEND for x in quads(last[-1])):
+        return ['the menu quad stayed after the menu closed']
+    if not any(x['flags'] & BLEND for f in last for x in quads(f)):
+        return ['the menu quad never appeared']
+    return []
+
+
 SETTLE = [('wait', 8)]
 SIZED = {'video_shader_enable': 'true'}
 SHOT = [('wait', 8), ('shot', None)]
@@ -526,6 +560,13 @@ CASES = [
     {'name': 'no-map-output-size', 'map': 'none', 'settings': SIZED,
      'args': ['--set-shader=' + PRESET], 'steps': SHOT,
      'check': check_sized_frame},
+    {'name': 'menu', 'map': '3ds', 'settings': {'menu_driver': 'ozone'},
+     'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 4)],
+     'check': check_menu},
+    {'name': 'menu-closes', 'map': '3ds', 'settings': {'menu_driver': 'ozone'},
+     'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),
+               ('send', 'MENU_TOGGLE'), ('wait', 3)],
+     'check': check_menu_closed},
 ]
 
 
