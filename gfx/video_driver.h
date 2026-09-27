@@ -172,6 +172,8 @@ enum video_driver_scanline
    SCANLINE_ACTIVE,
    SCANLINE_TOTAL,
    SCANLINE_HOLD,
+   /* Frames until the display is asked for its counts again */
+   SCANLINE_RETRY,
    SCANLINE_LAST
 };
 
