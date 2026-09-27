@@ -154,6 +154,7 @@ static bool drm_scanout_crtc(int fd, uint32_t crtc_id, drm_scanout_t *out)
       out->frame_ns = (uint64_t)m->htotal * m->vtotal
             * 1000000 / m->clock;
       out->crtc_id  = crtc_id;
+      out->hdisplay = m->hdisplay;
       out->vtotal   = m->vtotal;
       out->vdisplay = m->vdisplay;
       out->vrr      = drm_scanout_vrr(fd, crtc_id);
@@ -161,6 +162,54 @@ static bool drm_scanout_crtc(int fd, uint32_t crtc_id, drm_scanout_t *out)
    }
    drmModeFreeCrtc(crtc);
    return timed;
+}
+
+/* Opened while no one held the card, this descriptor became its
+ * master, and kept open it would lock the holder out. AUTH_MAGIC
+ * needs master: drmIsMaster(), which older libdrm lacks. */
+static int drm_scanout_open_path(const char *path)
+{
+   int fd;
+
+   if ((fd = open(path, O_RDONLY | O_CLOEXEC)) < 0)
+      return -1;
+   if (drmAuthMagic(fd, 0) != -EACCES)
+   {
+      close(fd);
+      return -1;
+   }
+   return fd;
+}
+
+void drm_scanout_connector_name(uint32_t type, uint32_t type_id,
+      char *s, size_t len)
+{
+   snprintf(s, len, "%s-%u", drm_scanout_type_name(type), type_id);
+}
+
+bool drm_scanout_read_connector(int fd, uint32_t connector_id,
+      drm_scanout_t *out)
+{
+   bool found             = false;
+   drmModeConnector *conn = drmModeGetConnectorCurrent(fd, connector_id);
+
+   if (!conn)
+      return false;
+   if (conn->encoder_id)
+   {
+      drmModeEncoder *enc = drmModeGetEncoder(fd, conn->encoder_id);
+      if (enc)
+      {
+         if (enc->crtc_id && drm_scanout_crtc(fd, enc->crtc_id, out))
+         {
+            out->connector_id = conn->connector_id;
+            found             = true;
+         }
+         drmModeFreeEncoder(enc);
+      }
+   }
+   drmModeFreeConnector(conn);
+   return found;
 }
 
 int drm_scanout_open(const char *sysfs_root, const char *dev_root,
@@ -178,46 +227,27 @@ int drm_scanout_open(const char *sysfs_root, const char *dev_root,
       return -1;
 
    snprintf(path, sizeof(path), "%s/card%d", dev_root, card);
-   if ((fd = open(path, O_RDONLY | O_CLOEXEC)) < 0)
+   if ((fd = drm_scanout_open_path(path)) < 0)
       return -1;
-
-   /* Opened while no compositor held the card, this descriptor became
-    * its master, and kept open it would lock the compositor out.
-    * AUTH_MAGIC needs master: drmIsMaster(), which older libdrm lacks. */
-   if (drmAuthMagic(fd, 0) != -EACCES)
-   {
-      close(fd);
-      return -1;
-   }
 
    if ((res = drmModeGetResources(fd)))
    {
       for (i = 0; i < res->count_connectors && !found; i++)
       {
          char conn_name[32];
-         drmModeEncoder *enc;
          drmModeConnector *conn = drmModeGetConnectorCurrent(fd,
                res->connectors[i]);
 
          if (!conn)
             continue;
-         snprintf(conn_name, sizeof(conn_name), "%s-%u",
-               drm_scanout_type_name(conn->connector_type),
-               conn->connector_type_id);
-         if (     strcmp(conn_name, name)
-               || !conn->encoder_id
-               || !(enc = drmModeGetEncoder(fd, conn->encoder_id)))
+         drm_scanout_connector_name(conn->connector_type,
+               conn->connector_type_id, conn_name, sizeof(conn_name));
+         if (     !strcmp(conn_name, name)
+               && drm_scanout_read_connector(fd, conn->connector_id, out))
          {
-            drmModeFreeConnector(conn);
-            continue;
+            out->card = card;
+            found     = true;
          }
-         if (enc->crtc_id && drm_scanout_crtc(fd, enc->crtc_id, out))
-         {
-            out->connector_id = conn->connector_id;
-            out->card         = card;
-            found             = true;
-         }
-         drmModeFreeEncoder(enc);
          drmModeFreeConnector(conn);
       }
       drmModeFreeResources(res);
@@ -228,6 +258,36 @@ int drm_scanout_open(const char *sysfs_root, const char *dev_root,
       return -1;
    }
    return fd;
+}
+
+int drm_scanout_open_card(const char *dev_char_root, const char *dev_root,
+      unsigned major, unsigned minor)
+{
+   char link[256];
+   char target[256];
+   char path[256];
+   const char *base;
+   char *end;
+   ssize_t len;
+   long n;
+
+   snprintf(link, sizeof(link), "%s/%u:%u", dev_char_root, major, minor);
+   len = readlink(link, target, sizeof(target) - 1);
+   /* A truncated target could still parse as a valid, wrong card */
+   if (len <= 0 || len >= (ssize_t)sizeof(target) - 1)
+      return -1;
+   target[len] = '\0';
+   base        = strrchr(target, '/');
+   base        = base ? base + 1 : target;
+   /* A render node has no connectors */
+   if (strncmp(base, "card", 4))
+      return -1;
+   n = strtol(base + 4, &end, 10);
+   if (end == base + 4 || *end || n < 0 || n > 255)
+      return -1;
+
+   snprintf(path, sizeof(path), "%s/card%ld", dev_root, n);
+   return drm_scanout_open_path(path);
 }
 
 bool drm_scanout_update(int fd, drm_scanout_t *s)

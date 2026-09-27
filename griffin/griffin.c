@@ -355,6 +355,7 @@ VIDEO CONTEXT
 #include "../gfx/drivers_context/drm_ctx.c"
 #include "../gfx/display_servers/dispserv_kms.c"
 #include "../gfx/common/drm_hdr.c"
+#include "../gfx/common/drm_scanout.c"
 #endif
 
 #if defined(HAVE_VIDEOCORE)
