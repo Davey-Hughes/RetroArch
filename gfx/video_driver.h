@@ -2107,9 +2107,6 @@ bool video_driver_init_internal(bool *video_is_threaded, bool verbosity_enabled)
 void video_driver_frame(const void *data, unsigned width,
       unsigned height, size_t pitch);
 
-void video_driver_raster_poll(const void *data, unsigned width,
-      unsigned height, size_t pitch, unsigned row);
-
 void video_driver_update_title(void *data);
 
 bool video_coord_array_append(video_coord_array_t *ca,

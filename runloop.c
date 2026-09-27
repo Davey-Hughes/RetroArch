@@ -1490,6 +1490,23 @@ static void core_performance_counter_stop(struct retro_perf_counter *perf)
       perf->total += cpu_features_get_perf_counter() - perf->start;
 }
 
+/* The core's retro_raster_poll_t. A frame whose video is thrown away
+ * (hidden by run-ahead, replayed by netplay) never reaches the raster;
+ * the test is RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE's. */
+static void runloop_raster_poll(const void *data, unsigned width,
+      unsigned height, size_t pitch, unsigned row)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+
+   if (!(video_st->main_flags & VIDEO_FLAG_ACTIVE))
+      return;
+#ifdef HAVE_NETWORKING
+   if (netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_REPLAYING, NULL))
+      return;
+#endif
+
+   video_raster_poll(&video_st->raster, data, width, height, row);
+}
 
 bool runloop_environment_cb(unsigned cmd, void *data)
 {
@@ -3920,7 +3937,7 @@ bool runloop_environment_cb(unsigned cmd, void *data)
          }
 
          video_raster_reset(&video_state_get_ptr()->raster);
-         raster->raster_poll = video_driver_raster_poll;
+         raster->raster_poll = runloop_raster_poll;
          break;
       }
 
