@@ -19,6 +19,7 @@
 #include <boolean.h>
 #include <compat/strl.h>
 #include <retro_miscellaneous.h>
+#include <retro_atomic.h>
 
 #ifdef HAVE_CONFIG_H
 #include "../../config.h"
@@ -31,6 +32,7 @@
 #include "../../configuration.h"
 #include "../../gfx/video_views.h"
 #include "../../gfx/common/vulkan_openxr.h"
+#include "../../gfx/video_driver.h"
 #include "../../verbosity.h"
 
 #ifdef HAVE_MENU
@@ -301,9 +303,32 @@ typedef struct input_openxr
    bool focused;
    bool menu_toggle;
    bool recenter;
+   /* The laser, from this poll. */
+   video_xr_quad_set_t quads;
+   int hit[INPUT_OPENXR_HANDS];         /* a live quad, or -1 */
+   float hit_u[INPUT_OPENXR_HANDS];
+   float hit_v[INPUT_OPENXR_HANDS];
+   bool trig_down[INPUT_OPENXR_HANDS];
+   int pointer;                         /* the hand that points, or -1 */
+   bool ptr_owned;
+   bool ptr_on;
+   bool ptr_pressed;
+   int16_t ptr_x;
+   int16_t ptr_y;
+   bool menu_on;
+   bool menu_pressed;
+   float menu_u;
+   float menu_v;
+
+   /* XR thread. */
+   XrCompositionLayerQuad cursors[INPUT_OPENXR_HANDS];
 } input_openxr_t;
 
 static input_openxr_t input_openxr_st;
+
+/* The main thread's laser mode and menu, for the XR thread's dots. */
+static retro_atomic_int_t input_openxr_laser;
+static retro_atomic_int_t input_openxr_menu_open;
 
 #define INPUT_OPENXR_PROC(st, get, inst, name) \
    (XR_SUCCEEDED((get)((inst), "xr" #name, \
@@ -312,7 +337,10 @@ static input_openxr_t input_openxr_st;
 static void input_openxr_clear(input_openxr_t *st)
 {
    memset(st, 0, sizeof(*st));
-   st->mode = -1;
+   st->mode    = -1;
+   st->hit[0]  = -1;
+   st->hit[1]  = -1;
+   st->pointer = -1;
 }
 
 static bool input_openxr_load(input_openxr_t *st,
@@ -612,7 +640,8 @@ static void input_openxr_read_separate(input_openxr_t *st)
 }
 
 /* Each hand's trigger into its L2 or R2: the value, and the button
- * past the threshold. */
+ * past the threshold. A hand pointing at a live quad keeps its trigger
+ * for the laser. */
 static void input_openxr_triggers(input_openxr_t *st, float threshold)
 {
    unsigned h;
@@ -620,7 +649,7 @@ static void input_openxr_triggers(input_openxr_t *st, float threshold)
    {
       input_openxr_pad_t *pad = &st->pads[st->trig[h].pad];
       float v                 = st->trig[h].value;
-      if (v <= 0.0f)
+      if (v <= 0.0f || st->hit[h] >= 0)
          continue;
       pad->trigger[st->trig[h].slot] = input_openxr_axis(v);
       if (v > threshold)
@@ -657,6 +686,164 @@ static void input_openxr_dpad(input_openxr_t *st, const settings_t *settings)
    }
 }
 
+/* A hand's aim ray in LOCAL space at time, when it is tracked. Either
+ * thread: it only reads what the session hooks wrote. */
+static bool input_openxr_ray(const input_openxr_t *st, unsigned h,
+      XrTime time, video_xr_vec3_t *o, video_xr_vec3_t *d)
+{
+   XrSpaceLocation loc;
+   video_xr_quat_t q;
+   video_xr_vec3_t fwd;
+   XrSpaceLocationFlags valid = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT
+      | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+
+   memset(&loc, 0, sizeof(loc));
+   loc.type = XR_TYPE_SPACE_LOCATION;
+   if (     !st->aim[h] || !time
+         || XR_FAILED(st->LocateSpace(st->aim[h], st->local_space, time,
+               &loc))
+         || (loc.locationFlags & valid) != valid)
+      return false;
+   q.x   = loc.pose.orientation.x;
+   q.y   = loc.pose.orientation.y;
+   q.z   = loc.pose.orientation.z;
+   q.w   = loc.pose.orientation.w;
+   o->x  = loc.pose.position.x;
+   o->y  = loc.pose.position.y;
+   o->z  = loc.pose.position.z;
+   /* An aim pose's ray is its -Z. */
+   fwd.x = 0.0f;
+   fwd.y = 0.0f;
+   fwd.z = -1.0f;
+   video_xr_rotate(&q, &fwd, d);
+   return true;
+}
+
+/* A point on a screen's quad as the core's pointer coordinates: into
+ * the core's view map when it has one, over the whole frame when not. */
+static bool input_openxr_frame_point(const video_xr_quad_t *q, float u,
+      float v, int16_t *x, int16_t *y)
+{
+   unsigned dims                  = 0;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   if (video_st->views_presented)
+      return video_xr_quad_to_frame(q, u, v, &video_st->views_core,
+            video_st->views_frame_dims, x, y);
+   if (!video_driver_cached_frame_info(&dims, NULL, NULL))
+      return false;
+   return video_xr_quad_to_frame(q, u, v, NULL, dims, x, y);
+}
+
+/* Where each hand points, which hand is the pointer, and what it points
+ * at: a point in the core's frame, or on the menu. */
+static void input_openxr_laser_poll(input_openxr_t *st, unsigned laser,
+      bool menu_open, float threshold)
+{
+   unsigned h;
+   int p;
+   XrTime time;
+
+   if (laser == VIDEO_OPENXR_LASER_OFF)
+      return;
+   st->ptr_owned = true;
+   time          = vulkan_openxr_predicted_time(st->xr);
+   if (!time || !vulkan_openxr_get_quads(st->xr, &st->quads))
+      return;
+   for (h = 0; h < INPUT_OPENXR_HANDS; h++)
+   {
+      float t;
+      video_xr_vec3_t o, d;
+      bool down = st->trig[h].value > threshold;
+      if (input_openxr_ray(st, h, time, &o, &d))
+         st->hit[h] = video_xr_pick(&st->quads, laser, menu_open, &o, &d,
+               &st->hit_u[h], &st->hit_v[h], &t);
+      /* With both hands on the screens, the last trigger down points. */
+      if (st->hit[h] >= 0 && down && !st->trig_down[h])
+         st->pointer = (int)h;
+      st->trig_down[h] = down;
+   }
+   if (st->hit[0] < 0 && st->hit[1] < 0)
+      st->pointer = -1;
+   else if (st->pointer < 0 || st->hit[st->pointer] < 0)
+      st->pointer = (st->hit[1] >= 0) ? 1 : 0;
+   if ((p = st->pointer) < 0)
+      return;
+
+   {
+      const video_xr_quad_t *q = &st->quads.quads[st->hit[p]];
+      bool pressed             = st->trig[p].value > threshold;
+      if (q->kind == VIDEO_XR_QUAD_MENU)
+      {
+         st->menu_on      = true;
+         st->menu_u       = st->hit_u[p];
+         st->menu_v       = st->hit_v[p];
+         st->menu_pressed = pressed;
+      }
+      else if (input_openxr_frame_point(q, st->hit_u[p], st->hit_v[p],
+               &st->ptr_x, &st->ptr_y))
+      {
+         st->ptr_on      = true;
+         st->ptr_pressed = pressed;
+      }
+   }
+}
+
+/* The XR thread, each headset frame: a dot where each hand points at a
+ * live quad, from its own locate at the frame's display time. */
+static unsigned input_openxr_frame_layers(void *user, XrTime time,
+      const XrCompositionLayerBaseHeader **layers, unsigned cap)
+{
+   unsigned h;
+   XrSwapchain cursor;
+   video_xr_quad_set_t set;
+   unsigned n         = 0;
+   input_openxr_t *st = &input_openxr_st;
+   int laser          = retro_atomic_load_acquire_int(&input_openxr_laser);
+   bool menu_open     = retro_atomic_load_acquire_int(
+         &input_openxr_menu_open) != 0;
+   (void)user;
+
+   if (     !st->xr || laser == VIDEO_OPENXR_LASER_OFF
+         || !vulkan_openxr_focused(st->xr)
+         || !(cursor = vulkan_openxr_cursor(st->xr))
+         || !vulkan_openxr_get_quads(st->xr, &set))
+      return 0;
+   for (h = 0; h < INPUT_OPENXR_HANDS && n < cap; h++)
+   {
+      int q;
+      float u, v, t, size;
+      video_xr_pose_t pose;
+      video_xr_vec3_t o, d;
+      XrCompositionLayerQuad *l = &st->cursors[h];
+      if (     !input_openxr_ray(st, h, time, &o, &d)
+            || (q = video_xr_pick(&set, (unsigned)laser, menu_open,
+                  &o, &d, &u, &v, &t)) < 0)
+         continue;
+      size = video_xr_cursor(&set.quads[q], u, v, t, &pose);
+      memset(l, 0, sizeof(*l));
+      l->type                             = XR_TYPE_COMPOSITION_LAYER_QUAD;
+      l->layerFlags                       =
+         XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+      l->space                            = st->local_space;
+      l->eyeVisibility                    = XR_EYE_VISIBILITY_BOTH;
+      l->subImage.swapchain               = cursor;
+      l->subImage.imageRect.extent.width  = VULKAN_OPENXR_CURSOR_DIM;
+      l->subImage.imageRect.extent.height = VULKAN_OPENXR_CURSOR_DIM;
+      l->pose.orientation.x               = pose.orientation.x;
+      l->pose.orientation.y               = pose.orientation.y;
+      l->pose.orientation.z               = pose.orientation.z;
+      l->pose.orientation.w               = pose.orientation.w;
+      l->pose.position.x                  = pose.position.x;
+      l->pose.position.y                  = pose.position.y;
+      l->pose.position.z                  = pose.position.z;
+      l->size.width                       = size;
+      l->size.height                      = size;
+      layers[n++]                         =
+         (const XrCompositionLayerBaseHeader*)l;
+   }
+   return n;
+}
+
 void input_openxr_poll(void)
 {
    XrResult res;
@@ -666,11 +853,31 @@ void input_openxr_poll(void)
    settings_t *settings = config_get_ptr();
    bool separate        = settings->uints.video_openxr_controllers
       == VIDEO_OPENXR_CONTROLLERS_SEPARATE;
+   unsigned laser       = settings->uints.video_openxr_laser;
+   float threshold      = settings->floats.input_axis_threshold;
+#ifdef HAVE_MENU
+   bool menu_open       = (menu_state_get_ptr()->flags
+         & MENU_ST_FLAG_ALIVE) ? true : false;
+#else
+   bool menu_open       = false;
+#endif
+
+   /* The XR thread places the dots by these. */
+   retro_atomic_store_release_int(&input_openxr_laser, (int)laser);
+   retro_atomic_store_release_int(&input_openxr_menu_open,
+         menu_open ? 1 : 0);
 
    memset(st->pads, 0, sizeof(st->pads));
    memset(st->trig, 0, sizeof(st->trig));
-   st->menu_toggle = false;
-   st->recenter    = false;
+   st->menu_toggle  = false;
+   st->recenter     = false;
+   st->hit[0]       = -1;
+   st->hit[1]       = -1;
+   st->ptr_owned    = false;
+   st->ptr_on       = false;
+   st->ptr_pressed  = false;
+   st->menu_on      = false;
+   st->menu_pressed = false;
    if (!st->xr)
       return;
    if (!vulkan_openxr_focused(st->xr))
@@ -712,7 +919,8 @@ void input_openxr_poll(void)
       input_openxr_read_separate(st);
    else
       input_openxr_read_combined(st);
-   input_openxr_triggers(st, settings->floats.input_axis_threshold);
+   input_openxr_laser_poll(st, laser, menu_open, threshold);
+   input_openxr_triggers(st, threshold);
    input_openxr_dpad(st, settings);
 }
 
@@ -754,12 +962,66 @@ int16_t input_openxr_analog(unsigned port, unsigned idx, unsigned id,
    return res;
 }
 
+bool input_openxr_pointer(unsigned port, unsigned device, unsigned idx,
+      unsigned id, int16_t *res)
+{
+   const input_openxr_t *st = &input_openxr_st;
+   bool on                  = st->ptr_on && idx == 0;
+   if (port != 0 || !st->ptr_owned)
+      return false;
+   if (device == RETRO_DEVICE_POINTER)
+   {
+      switch (id)
+      {
+         case RETRO_DEVICE_ID_POINTER_X:
+            *res = on ? st->ptr_x : -0x8000;
+            break;
+         case RETRO_DEVICE_ID_POINTER_Y:
+            *res = on ? st->ptr_y : -0x8000;
+            break;
+         case RETRO_DEVICE_ID_POINTER_PRESSED:
+         case RETRO_DEVICE_ID_POINTER_COUNT:
+            *res = (on && st->ptr_pressed) ? 1 : 0;
+            break;
+         case RETRO_DEVICE_ID_POINTER_IS_OFFSCREEN:
+            *res = on ? 0 : 1;
+            break;
+         default:
+            *res = 0;
+            break;
+      }
+      return true;
+   }
+   if (device == RETRO_DEVICE_LIGHTGUN)
+   {
+      switch (id)
+      {
+         case RETRO_DEVICE_ID_LIGHTGUN_SCREEN_X:
+            *res = st->ptr_on ? st->ptr_x : -0x8000;
+            return true;
+         case RETRO_DEVICE_ID_LIGHTGUN_SCREEN_Y:
+            *res = st->ptr_on ? st->ptr_y : -0x8000;
+            return true;
+         case RETRO_DEVICE_ID_LIGHTGUN_IS_OFFSCREEN:
+            *res = st->ptr_on ? 0 : 1;
+            return true;
+         case RETRO_DEVICE_ID_LIGHTGUN_TRIGGER:
+            *res = (st->ptr_on && st->ptr_pressed) ? 1 : 0;
+            return true;
+         default:
+            break;
+      }
+   }
+   /* The gun's other buttons and the mouse stay the input driver's. */
+   return false;
+}
+
 void input_openxr_register(void)
 {
    vulkan_openxr_hooks_t hooks;
    hooks.session_created    = input_openxr_session_created;
    hooks.session_destroying = input_openxr_session_destroying;
-   hooks.frame_layers       = NULL;
+   hooks.frame_layers       = input_openxr_frame_layers;
    hooks.user               = NULL;
    vulkan_openxr_set_hooks(&hooks);
 }

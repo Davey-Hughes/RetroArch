@@ -2513,6 +2513,12 @@ static int16_t input_state_device(
       case RETRO_DEVICE_LIGHTGUN:
       case RETRO_DEVICE_POINTER:
 
+#ifdef HAVE_OPENXR
+         /* The headset's laser, ahead of the overlay and the mouse. */
+         if (input_openxr_pointer(port, device, idx, id, &res))
+            break;
+#endif
+
 #ifdef HAVE_OVERLAY
          if (     (input_st->overlay_ptr)
                && (input_st->overlay_ptr->flags & INPUT_OVERLAY_ENABLE)

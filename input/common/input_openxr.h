@@ -46,6 +46,12 @@ bool input_openxr_button(unsigned port, unsigned id);
 int16_t input_openxr_analog(unsigned port, unsigned idx, unsigned id,
       int16_t res);
 
+/* The laser as RETRO_DEVICE_POINTER or RETRO_DEVICE_LIGHTGUN on port 0,
+ * while it can point (the headset focused, the laser not Off): true,
+ * with *res set. A miss reads as offscreen. */
+bool input_openxr_pointer(unsigned port, unsigned device, unsigned idx,
+      unsigned id, int16_t *res);
+
 RETRO_END_DECLS
 
 #endif
