@@ -255,7 +255,10 @@ static void gfx_ctx_wl_swap_buffers(void *data)
    gfx_ctx_wayland_data_t *wl = (gfx_ctx_wayland_data_t*)data;
 
    if (wl->present.clock)
+   {
       wl_present_dispatch(&wl->present, wl->input.dpy);
+      gfx_ctx_wl_publish_presented(wl);
+   }
 
    /* While the compositor reports the surface suspended (occluded,
     * minimized, screen locked), skip presentation-time pacing,

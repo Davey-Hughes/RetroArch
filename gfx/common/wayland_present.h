@@ -39,6 +39,8 @@ typedef struct wl_present
 {
    uint64_t                last_ust;
    uint64_t                refresh_interval;
+   /* The last presented frame's wp_presentation_feedback_kind bits */
+   uint32_t                flags;
    struct wp_presentation *presentation;
    struct wl_event_queue  *queue;
    struct wl_list          feedbacks;

@@ -153,7 +153,9 @@ static void s_surface_commit(struct wl_client *c, struct wl_resource *r)
                (uint32_t)((ust / 1000000000ULL) >> 32),
                (uint32_t)(ust / 1000000000ULL),
                (uint32_t)(ust % 1000000000ULL),
-               refresh, 0, 1, 0);
+               refresh, 0, 1,
+               WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK
+               | WP_PRESENTATION_FEEDBACK_KIND_HW_COMPLETION);
       else
          wp_presentation_feedback_send_discarded(fb->res);
       wl_resource_destroy(fb->res);
@@ -377,6 +379,9 @@ int main(void)
    CHECK(present.presented, "presented not dispatched");
    CHECK(present.last_ust == ust, "wrong presentation time");
    CHECK(present.refresh_interval == 16666667u, "wrong refresh");
+   CHECK(present.flags == (WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK
+            | WP_PRESENTATION_FEEDBACK_KIND_HW_COMPLETION),
+         "wrong feedback flags");
    CHECK(wl_list_empty(&present.feedbacks), "presented feedback kept");
    printf("ok:   feedback events wait for the presenting thread\n");
 

@@ -200,6 +200,8 @@ typedef struct output_info
    unsigned scale;
    char *make;
    char *model;
+   /* wl_output v4 name: the DRM connector ("DP-1"), "" without it */
+   char name[32];
 } output_info_t;
 
 typedef struct display_output
@@ -355,6 +357,10 @@ typedef struct gfx_ctx_wayland_data
    struct wp_content_type_v1 *content_type;
    struct wp_single_pixel_buffer_manager_v1 *single_pixel_manager;
    output_info_t *current_output;
+   /* current_output's connector name, kept apart for the thread that
+    * presents frames: it must not follow a pointer the thread
+    * dispatching outputs can free */
+   char current_output_name[32];
 #ifdef HAVE_VULKAN
    gfx_ctx_vulkan_data_t vk;
 #endif

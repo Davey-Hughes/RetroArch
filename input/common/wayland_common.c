@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 #include <string/stdstring.h>
+#include <compat/strl.h>
 
 #ifdef HAVE_LIBDECOR_H
 #include <libdecor.h>
@@ -769,6 +770,8 @@ static bool wl_update_scale(gfx_ctx_wayland_data_t *wl)
    if (new_output && wl->current_output != new_output)
    {
       wl->current_output       = new_output;
+      strlcpy(wl->current_output_name, new_output->name,
+            sizeof(wl->current_output_name));
       /* The compositor's own choice wins once it has made one. */
       wl->pending_buffer_scale = wl->preferred_buffer_scale
             ? wl->preferred_buffer_scale : new_output->scale;
@@ -923,7 +926,11 @@ static void wl_output_handle_done(void *data, struct wl_output *output) { }
 
 #ifdef WL_OUTPUT_NAME_SINCE_VERSION
 static void wl_output_handle_name(void *data,
-      struct wl_output *output, const char *name) { }
+      struct wl_output *output, const char *name)
+{
+   output_info_t *oi = (output_info_t*)data;
+   strlcpy(oi->name, name ? name : "", sizeof(oi->name));
+}
 
 static void wl_output_handle_description(void *data,
       struct wl_output *output, const char *description) { }
@@ -1105,7 +1112,10 @@ static void wl_registry_handle_global_remove(void *data,
           * output -- it would be left dangling for the next scale
           * query to read. */
          if (wl->current_output == od->output)
-            wl->current_output = NULL;
+         {
+            wl->current_output         = NULL;
+            wl->current_output_name[0] = '\0';
+         }
 
          wl_list_remove(&od->link);
          /* The wl_output proxy is ours from wl_registry_bind() and has
