@@ -1318,9 +1318,9 @@ def check_menu_rgui(res):
 # error).
 AIM_MENU_SHAKE = 'aim right 0.2 -0.4 -0.3 0.1615 0.192 -1.7'
 AIM_MENU_BACK = 'aim right 0.2 -0.4 -0.3 0.1625 0.192 -1.7'
-# The menu's header, where a press selects nothing. Not at its top edge:
-# a menu cursor drawn across it wraps the Vulkan viewport (master's
-# gfx_display_vk_draw()).
+# The menu's header: Ozone takes a tap or short press there as Back, a
+# long press as nothing. Not at its top edge: a menu cursor drawn across
+# it wraps the Vulkan viewport (master's gfx_display_vk_draw()).
 AIM_MENU_TOP = 'aim right 0.2 -0.4 -0.3 0.16 0.4224 -1.7'         # 0.6 0.06
 AIM_LEFT_MENU_TOP = 'aim left -0.2 -0.4 -0.3 -0.16 0.4224 -1.7'   # 0.4 0.06
 STICK_DOWN = 'action combined/left_stick 0 -1'
@@ -1389,6 +1389,74 @@ def check_menu_hands(res):
     if not any(len(cursors(f)) == 2 for f in res.frames):
         errors.append('no frame with a dot for each hand')
     return errors
+
+
+# RGUI's 320x240 rows are 11 px from y 26; its Quick Menu has Reset at 1
+# and Take Screenshot at 6.
+AIM_RGUI_RESET = 'aim right 0.2 -0.4 -0.3 0.16 0.3101 -1.7'        # 0.6 0.177
+AIM_RGUI_SHOT = 'aim right 0.2 -0.4 -0.3 0.16 0.09 -1.7'           # 0.6 0.406
+# Shorter than a tap (200 ms).
+CLICK = 0.1
+
+
+def menu_cursor_errors(res, uv):
+    """The laser's dot is its cursor: no menu snapshot may show the
+    menu's own mouse cursor, a bright mark, around the laser's point."""
+    for fr in res.frames:
+        for q in (menus(fr) if fr['snap'] else []):
+            path = image(res, fr, q)
+            if not os.path.exists(path):
+                continue
+            w, h, bpp, rows = read_png(path)
+            for y in range(max(0, int((uv[1] - 0.05) * h)),
+                           min(h, int((uv[1] + 0.05) * h) + 1)):
+                for x in range(max(0, int((uv[0] - 0.03) * w)),
+                               min(w, int((uv[0] + 0.03) * w) + 1)):
+                    if min(rows[y][x * bpp:x * bpp + 3]) > 200:
+                        return ['snapshot %d shows the menu\'s own cursor '
+                                'at %s' % (fr['n'], uv)]
+    return []
+
+
+def click_errors(res, before, uv):
+    """One quick click with `before` selected: the pointed entry, Restart,
+    acts once (the core resets once), and at the release, not the press."""
+    evs = []
+    for line in res.log.splitlines():
+        m = MENU_RE.search(line)
+        if m:
+            evs.append(int(m.group(3)))
+        elif '[Core] Reset.' in line:
+            evs.append('reset')
+    press = find(evs, 0, lambda e: e == 1)
+    if press < 0:
+        return ['the trigger did not press on the menu']
+    lines = kinds(core_events(res), 'menu')
+    at_press = [f for f in lines if f['pressed']][0]['selection']
+    release = find(evs, press + 1, lambda e: e == 0)
+    resets = [i for i, e in enumerate(evs) if e == 'reset']
+    errors = []
+    if at_press != before:
+        errors.append('selection %d at the press, want %d'
+                      % (at_press, before))
+    if len(resets) != 1:
+        errors.append('the click restarted %d times, want once'
+                      % len(resets))
+    elif release < 0 or resets[0] < release:
+        errors.append('the click acted on the press, before the release')
+    return errors + menu_cursor_errors(res, uv)
+
+
+def check_menu_click(res):
+    """Ozone: the laser's hover selects Restart, and a quick click on
+    it restarts once."""
+    return click_errors(res, 1, (0.6, 0.3))
+
+
+def check_menu_click_rgui(res):
+    """RGUI, with Core Options selected: a quick click on Reset restarts
+    once; the press does nothing to Core Options."""
+    return click_errors(res, 4, (0.6, 0.177))
 
 
 def check_hw_teardown(res):
@@ -1690,12 +1758,14 @@ CASES = [
                ('script', script(AIM_MENU_LOW, R2)), ('wait', 1),
                ('script', AIM_MENU_LOW), ('wait', 2)],
      'check': check_menu_laser},
+    # Take Screenshot writes into the case's directory; a short press, well
+    # inside a second, which would make it a long one.
     {'name': 'input-menu-rgui', 'map': '3ds',
      'settings': {'menu_driver': 'rgui', 'frontend_log_level': '0'},
      'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),
-               ('script', AIM_MENU_LOW), ('wait', 2),
-               ('script', script(AIM_MENU_LOW, R2)), ('wait', 1),
-               ('script', AIM_MENU_LOW), ('wait', 2)],
+               ('script', AIM_RGUI_SHOT), ('wait', 2),
+               ('script', script(AIM_RGUI_SHOT, R2)), ('wait', 0.5),
+               ('script', AIM_RGUI_SHOT), ('wait', 2)],
      'check': check_menu_rgui},
     {'name': 'input-menu-stick', 'map': '3ds',
      'settings': {'menu_driver': 'ozone', 'frontend_log_level': '0'},
@@ -1712,7 +1782,7 @@ CASES = [
                ('script', script(AIM_LEFT_MENU_TOP, AIM_MENU_TOP)),
                ('wait', 1),
                ('script', script(AIM_LEFT_MENU_TOP, AIM_MENU_TOP, L2)),
-               ('wait', 1),
+               ('wait', 1.5),
                ('script', script(AIM_LEFT_MENU_TOP, AIM_MENU_TOP, L2, R2)),
                ('wait', 1),
                ('script', script(AIM_LEFT_MENU_TOP, AIM_MENU_TOP, R2)),
@@ -1720,6 +1790,23 @@ CASES = [
                ('script', script(AIM_LEFT_MENU_TOP, AIM_MENU_TOP)),
                ('wait', 1)],
      'check': check_menu_hands},
+    {'name': 'input-menu-click', 'map': '3ds',
+     'settings': {'menu_driver': 'ozone', 'frontend_log_level': '0',
+                  'confirm_reset': 'false'},
+     'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),
+               ('script', AIM_MENU_HIGH), ('wait', 2),
+               ('script', script(AIM_MENU_HIGH, R2)), ('wait', CLICK),
+               ('script', AIM_MENU_HIGH), ('wait', 2)],
+     'check': check_menu_click},
+    {'name': 'input-menu-click-rgui', 'map': '3ds',
+     'settings': {'menu_driver': 'rgui', 'frontend_log_level': '0',
+                  'confirm_reset': 'false'},
+     'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3)]
+     + [('send', 'MENU_DOWN'), ('wait', 0.2)] * 4
+     + [('script', AIM_RGUI_RESET), ('wait', 2),
+        ('script', script(AIM_RGUI_RESET, R2)), ('wait', CLICK),
+        ('script', AIM_RGUI_RESET), ('wait', 2)],
+     'check': check_menu_click_rgui},
 ]
 
 

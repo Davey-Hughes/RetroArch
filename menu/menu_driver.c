@@ -2470,6 +2470,10 @@ MENU_NOINLINE static void menu_input_get_touchscreen_hw_state(
 }
 
 #ifdef HAVE_OPENXR
+/* The laser drives the menu's pointer: since it last read on the menu
+ * quad, no mouse or touch has moved. */
+static bool menu_input_headset_drives = false;
+
 /* The headset's laser on the menu quad, read as a mouse. The quad shows
  * the whole window, where a framebuffer menu (RGUI) fills the viewport.
  * A press that leaves the quad is released where it left. True while
@@ -2480,7 +2484,7 @@ MENU_NOINLINE static bool menu_input_get_headset_hw_state(
       menu_input_pointer_hw_state_t *hw_state)
 {
    float u, v;
-   bool pressed;
+   bool pressed, changed;
    static int16_t last_x        = -1;
    static int16_t last_y        = -1;
    static bool last_pressed     = false;
@@ -2526,15 +2530,21 @@ MENU_NOINLINE static bool menu_input_get_headset_hw_state(
    {
       hw_state->x = (int16_t)(u * (float)fb_width);
       hw_state->y = (int16_t)(v * (float)fb_height);
+      if (fb_width && hw_state->x >= (int)fb_width)
+         hw_state->x = (int16_t)(fb_width - 1);
+      if (fb_height && hw_state->y >= (int)fb_height)
+         hw_state->y = (int16_t)(fb_height - 1);
    }
 
+   changed = hw_state->x != last_x || hw_state->y != last_y
+      || pressed != last_pressed;
    if (pressed)
       hw_state->flags |= MENU_INP_PTR_FLG_PRESS_SELECT;
-   if (     hw_state->x != last_x || hw_state->y != last_y
-         || pressed != last_pressed)
+   /* Active while pressed too, as the mouse is: menu_event() then
+    * flushes, so a click acts once, at pointer-up. */
+   if (changed || pressed)
       hw_state->flags |= MENU_INP_PTR_FLG_ACTIVE;
-   if (     (hw_state->flags & MENU_INP_PTR_FLG_ACTIVE)
-         || menu_st->selection_ptr != last_selection)
+   if (changed || menu_st->selection_ptr != last_selection)
       RARCH_DBG("[Menu] Headset pointer x=%d y=%d pressed=%d selection=%u.\n",
             hw_state->x, hw_state->y, pressed ? 1 : 0,
             (unsigned)menu_st->selection_ptr);
@@ -4019,6 +4029,24 @@ MENU_NOINLINE static void menu_input_set_pointer_visibility(
    static bool cursor_hidden         = false;
    static retro_time_t end_time      = 0;
    struct menu_state       *menu_st  = &menu_driver_state;
+
+#ifdef HAVE_OPENXR
+   /* The laser's dot is its cursor. */
+   if (menu_input_headset_drives)
+   {
+      if (!cursor_hidden)
+      {
+         if (menu_st->driver_ctx->environ_cb)
+            menu_st->driver_ctx->environ_cb(MENU_ENVIRON_DISABLE_MOUSE_CURSOR,
+                  NULL, menu_st->userdata);
+         cursor_shown  = false;
+         cursor_hidden = true;
+      }
+      /* So a mouse taking over shows it at once. */
+      end_time = 0;
+      return;
+   }
+#endif
 
    /* Ensure that mouse cursor is hidden when not in use */
    if (     (menu_input->pointer.type == MENU_POINTER_MOUSE)
@@ -5635,9 +5663,10 @@ unsigned menu_event(
       menu_input_pointer_hw_state_t mouse_hw_state       = {0};
       menu_input_pointer_hw_state_t touchscreen_hw_state = {0};
 #ifdef HAVE_OPENXR
-      static bool headset_last                           = false;
       menu_input_pointer_hw_state_t headset_hw_state     = {0};
       bool headset_on                                    = false;
+      bool was_pressed                                   =
+         (pointer_hw_state->flags & MENU_INP_PTR_FLG_PRESS_SELECT) ? true : false;
 #endif
 
       /* Read mouse */
@@ -5692,10 +5721,10 @@ unsigned menu_event(
        * does: the idle mouse's point would read as a move. */
       if (     (mouse_hw_state.flags       & MENU_INP_PTR_FLG_ACTIVE)
             || (touchscreen_hw_state.flags & MENU_INP_PTR_FLG_ACTIVE))
-         headset_last = false;
+         menu_input_headset_drives = false;
       else if (headset_on)
-         headset_last = true;
-      if (headset_last)
+         menu_input_headset_drives = true;
+      if (menu_input_headset_drives)
       {
          menu_input->pointer.type = MENU_POINTER_MOUSE;
          if (headset_on)
@@ -5716,9 +5745,13 @@ unsigned menu_event(
          menu_st->input_last_time_us = menu_st->current_time_us;
          /* Prevent double trigger when OK/Cancel has mouse binds */
 #ifdef HAVE_OPENXR
-         /* Not for the laser: its trigger is no pad button there, and
-          * a held hand is never still, so pad input would never pass. */
-         if (!headset_last)
+         /* The flush also keeps a press from firing OK here as well as
+          * at pointer-up. The laser skips it only while it merely
+          * points: a held hand is never still, and pad input would
+          * never pass. */
+         if (     !menu_input_headset_drives
+               || was_pressed
+               || (pointer_hw_state->flags & MENU_INP_PTR_FLG_PRESS_SELECT))
 #endif
          menu_st->input_driver_flushing_input = 1;
       }
