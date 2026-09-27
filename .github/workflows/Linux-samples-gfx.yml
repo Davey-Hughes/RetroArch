@@ -1031,6 +1031,19 @@ jobs:
              timeout 60 ./drm_hdr_test
           echo "[pass] drm_hdr_test"
 
+      - name: Build and run drm_scanout_test (ASan + UBSan)
+        shell: bash
+        working-directory: samples/gfx/drm_scanout
+        run: |
+          set -eu
+          # gfx/common/drm_scanout.c: a connector's scanout timing and
+          # VRR state by name, against a fake sysfs tree and stubbed
+          # libdrm: one card, a name on two, idle, interlaced, missing.
+          make clean all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./drm_scanout_test
+          echo "[pass] drm_scanout_test"
+
       - name: Build and run wayland_wlr_output_test (ASan + UBSan)
         shell: bash
         working-directory: samples/gfx/wayland_wlr_output
