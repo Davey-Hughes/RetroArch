@@ -47,7 +47,7 @@ $(CORE): raster_poll_core.c
 	$(CC) -Wall $(INCDIRS) $(C89) -O2 -fPIC -shared -o $@ $<
 
 $(CONFORM): raster_poll_conform.o video_raster.o
-	$(CC) -o $@ raster_poll_conform.o video_raster.o $(LDFLAGS) -ldl
+	$(CC) -o $@ raster_poll_conform.o video_raster.o $(LDFLAGS) -ldl -pthread
 
 raster_poll_conform.o: raster_poll_conform.c
 	$(CC) $(CFLAGS) $(C89) -c -o $@ $<

@@ -40,6 +40,7 @@
  * Exits 0 on PASS, 1 on FAIL, 2 when it cannot run. */
 
 #include <dlfcn.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -78,27 +79,30 @@ struct rc_option
 {
    char key[128];
    char value[256];
+   bool declared;
 };
 
 struct rc_core
 {
-   void   (*set_environment)(retro_environment_t);
-   void   (*set_video_refresh)(retro_video_refresh_t);
-   void   (*set_audio_sample)(retro_audio_sample_t);
-   void   (*set_audio_sample_batch)(retro_audio_sample_batch_t);
-   void   (*set_input_poll)(retro_input_poll_t);
-   void   (*set_input_state)(retro_input_state_t);
-   void   (*init)(void);
-   void   (*deinit)(void);
-   void   (*get_system_info)(struct retro_system_info*);
-   void   (*set_controller_port_device)(unsigned, unsigned);
-   void   (*reset)(void);
-   void   (*run)(void);
-   size_t (*serialize_size)(void);
-   bool   (*serialize)(void*, size_t);
-   bool   (*unserialize)(const void*, size_t);
-   bool   (*load_game)(const struct retro_game_info*);
-   void   (*unload_game)(void);
+   unsigned (*api_version)(void);
+   void     (*set_environment)(retro_environment_t);
+   void     (*set_video_refresh)(retro_video_refresh_t);
+   void     (*set_audio_sample)(retro_audio_sample_t);
+   void     (*set_audio_sample_batch)(retro_audio_sample_batch_t);
+   void     (*set_input_poll)(retro_input_poll_t);
+   void     (*set_input_state)(retro_input_state_t);
+   void     (*init)(void);
+   void     (*deinit)(void);
+   void     (*get_system_info)(struct retro_system_info*);
+   void     (*get_system_av_info)(struct retro_system_av_info*);
+   void     (*set_controller_port_device)(unsigned, unsigned);
+   void     (*reset)(void);
+   void     (*run)(void);
+   size_t   (*serialize_size)(void);
+   bool     (*serialize)(void*, size_t);
+   bool     (*unserialize)(const void*, size_t);
+   bool     (*load_game)(const struct retro_game_info*);
+   void     (*unload_game)(void);
 };
 
 typedef void (*rc_func_t)(void);
@@ -137,6 +141,8 @@ static unsigned                rc_bpp = 2;
 static unsigned                rc_joypad;
 static unsigned                rc_frame;
 static FILE                   *rc_hash_file;
+static bool                    rc_in_run;
+static pthread_t               rc_run_thread;
 
 /* The frame being built */
 static video_raster_t          rc_raster;
@@ -146,7 +152,11 @@ static unsigned                rc_shadow_width;
 static unsigned                rc_shadow_height;
 static unsigned                rc_shadow_rows;
 static unsigned                rc_frame_polls;
+static bool                    rc_frame_presented;
 static bool                    rc_bad_pitch_seen;
+static bool                    rc_bad_refresh_pitch_seen;
+static bool                    rc_poll_outside_run_seen;
+static bool                    rc_poll_other_thread_seen;
 
 static unsigned                rc_presented;
 static unsigned                rc_polled_frames;
@@ -191,7 +201,7 @@ static struct rc_option *rc_option_find(const char *key)
 }
 
 /* KEY=VALUE */
-static bool rc_option_set(const char *pair)
+static struct rc_option *rc_option_set(const char *pair)
 {
    const char       *eq = strchr(pair, '=');
    size_t            key_len;
@@ -202,19 +212,19 @@ static bool rc_option_set(const char *pair)
          || eq == pair
          || (size_t)(eq - pair) >= sizeof(key)
          || strlen(eq + 1) >= sizeof(rc_options[0].value))
-      return false;
+      return NULL;
    key_len = (size_t)(eq - pair);
    memcpy(key, pair, key_len);
    key[key_len] = '\0';
    if (!(opt = rc_option_find(key)))
    {
       if (rc_option_count == RC_MAX_OPTIONS)
-         return false;
+         return NULL;
       opt = &rc_options[rc_option_count++];
       strcpy(opt->key, key);
    }
    strcpy(opt->value, eq + 1);
-   return true;
+   return opt;
 }
 
 /* "Description; default|other|..." unless the option is already set */
@@ -255,6 +265,21 @@ static void RETRO_CALLCONV rc_raster_poll(const void *data,
 {
    unsigned y;
    size_t   row_bytes = (size_t)width * rc_bpp;
+
+   if (!rc_in_run)
+   {
+      if (!rc_poll_outside_run_seen)
+         fprintf(stderr, "frame %u: raster poll outside retro_run\n", rc_frame);
+      rc_poll_outside_run_seen = true;
+      rc_violations++;
+   }
+   else if (!pthread_equal(pthread_self(), rc_run_thread))
+   {
+      if (!rc_poll_other_thread_seen)
+         fprintf(stderr, "frame %u: raster poll on another thread\n", rc_frame);
+      rc_poll_other_thread_seen = true;
+      rc_violations++;
+   }
 
    rc_polls++;
    rc_frame_polls++;
@@ -366,10 +391,22 @@ static void RETRO_CALLCONV rc_video_refresh(const void *data,
          && pitch >= row_bytes;
 
    rc_presented++;
+   rc_frame_presented = true;
    if (     !rc_null_poll
          && video_raster_frame_end(&rc_raster, data, width, height)
             != VIDEO_RASTER_OK)
       rc_violations++;
+
+   if (     data
+         && data != RETRO_HW_FRAME_BUFFER_VALID
+         && pitch < row_bytes)
+   {
+      if (!rc_bad_refresh_pitch_seen)
+         fprintf(stderr, "frame %u: final pitch %lu is under %u pixels\n",
+               rc_frame, (unsigned long)pitch, width);
+      rc_bad_refresh_pitch_seen = true;
+      rc_violations++;
+   }
 
    if (     software
          && width  == rc_shadow_width
@@ -451,8 +488,13 @@ static bool RETRO_CALLCONV rc_environment(unsigned cmd, void *data)
       {
          const struct retro_variable *var =
                (const struct retro_variable*)data;
+         struct rc_option            *opt;
          for (; var && var->key; var++)
+         {
             rc_option_default(var);
+            if ((opt = rc_option_find(var->key)))
+               opt->declared = true;
+         }
          return true;
       }
       case RETRO_ENVIRONMENT_GET_VARIABLE:
@@ -465,6 +507,11 @@ static bool RETRO_CALLCONV rc_environment(unsigned cmd, void *data)
       case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE:
          *(bool*)data       = rc_options_updated;
          rc_options_updated = false;
+         return true;
+      case RETRO_ENVIRONMENT_GET_CAN_DUPE:
+         *(bool*)data = true;
+         return true;
+      case RETRO_ENVIRONMENT_GET_INPUT_BITMASKS:
          return true;
       case RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY:
       case RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY:
@@ -492,10 +539,13 @@ static int16_t RETRO_CALLCONV rc_input_state(unsigned port,
       unsigned device, unsigned index, unsigned id)
 {
    (void)index;
-   if (     port == 0
-         && (device & RETRO_DEVICE_MASK) == RETRO_DEVICE_JOYPAD
-         && id < 16)
-      return (int16_t)((rc_joypad >> id) & 1);
+   if (port == 0 && (device & RETRO_DEVICE_MASK) == RETRO_DEVICE_JOYPAD)
+   {
+      if (id == RETRO_DEVICE_ID_JOYPAD_MASK)
+         return (int16_t)rc_joypad;
+      if (id < 16)
+         return (int16_t)((rc_joypad >> id) & 1);
+   }
    return 0;
 }
 
@@ -530,6 +580,8 @@ static void rc_core_open(const char *path)
    void *lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
    if (!lib)
       rc_cannot_run("cannot load the core", dlerror());
+   rc_core.api_version = (unsigned (*)(void))
+         rc_sym(lib, "retro_api_version");
    rc_core.set_environment = (void (*)(retro_environment_t))
          rc_sym(lib, "retro_set_environment");
    rc_core.set_video_refresh = (void (*)(retro_video_refresh_t))
@@ -546,6 +598,8 @@ static void rc_core_open(const char *path)
    rc_core.deinit = (void (*)(void))rc_sym(lib, "retro_deinit");
    rc_core.get_system_info = (void (*)(struct retro_system_info*))
          rc_sym(lib, "retro_get_system_info");
+   rc_core.get_system_av_info = (void (*)(struct retro_system_av_info*))
+         rc_sym(lib, "retro_get_system_av_info");
    rc_core.set_controller_port_device = (void (*)(unsigned, unsigned))
          rc_sym(lib, "retro_set_controller_port_device");
    rc_core.reset = (void (*)(void))rc_sym(lib, "retro_reset");
@@ -662,23 +716,24 @@ static void rc_parse_event(const char *opt, const char *value)
 
 int main(int argc, char **argv)
 {
-   int                      i;
-   unsigned                 e;
-   unsigned                 frames          = 600;
-   const char              *core_path       = NULL;
-   const char              *content_path    = NULL;
-   bool                     expect_polls    = false;
-   bool                     expect_no_polls = false;
-   bool                     ok              = true;
-   unsigned                 port_device[RC_MAX_PORTS];
-   bool                     port_set[RC_MAX_PORTS];
-   void                    *content         = NULL;
-   void                    *state           = NULL;
-   size_t                   state_size      = 0;
-   clock_t                  start;
-   double                   seconds;
-   struct retro_system_info sys;
-   struct retro_game_info   game;
+   int                         i;
+   unsigned                    e;
+   unsigned                    frames          = 600;
+   const char                 *core_path       = NULL;
+   const char                 *content_path    = NULL;
+   bool                        expect_polls    = false;
+   bool                        expect_no_polls = false;
+   bool                        ok              = true;
+   unsigned                    port_device[RC_MAX_PORTS];
+   bool                        port_set[RC_MAX_PORTS];
+   void                       *content         = NULL;
+   void                       *state           = NULL;
+   size_t                      state_size      = 0;
+   clock_t                     start;
+   double                      seconds;
+   struct retro_system_info    sys;
+   struct retro_system_av_info av;
+   struct retro_game_info      game;
 
    memset(port_set, 0, sizeof(port_set));
 
@@ -742,6 +797,8 @@ int main(int argc, char **argv)
    rc_core.set_audio_sample_batch(rc_audio_sample_batch);
    rc_core.set_input_poll(rc_input_poll);
    rc_core.set_input_state(rc_input_state);
+   if (rc_core.api_version() != RETRO_API_VERSION)
+      rc_cannot_run("the core's API version does not match ours", NULL);
    rc_core.init();
 
    memset(&sys, 0, sizeof(sys));
@@ -755,9 +812,18 @@ int main(int argc, char **argv)
    }
    if (!rc_core.load_game(content_path ? &game : NULL))
       rc_cannot_run("the core did not load", content_path);
+   memset(&av, 0, sizeof(av));
+   rc_core.get_system_av_info(&av);
    for (e = 0; e < RC_MAX_PORTS; e++)
       if (port_set[e])
          rc_core.set_controller_port_device(e, port_device[e]);
+      else if (e < 2)
+         rc_core.set_controller_port_device(e, RETRO_DEVICE_JOYPAD);
+   for (e = 0; e < rc_option_count; e++)
+      if (!rc_options[e].declared)
+         fprintf(stderr,
+               "raster_poll_conform: warning: option %s is not declared by the core\n",
+               rc_options[e].key);
 
    start = clock();
    for (rc_frame = 0; rc_frame < frames; rc_frame++)
@@ -780,8 +846,12 @@ int main(int argc, char **argv)
             case RC_EVENT_OPTION:
                if (rc_frame == ev->frame)
                {
-                  rc_option_set(ev->arg);
+                  struct rc_option *opt = rc_option_set(ev->arg);
                   rc_options_updated = true;
+                  if (opt && !opt->declared)
+                     fprintf(stderr,
+                           "raster_poll_conform: warning: option %s is not "
+                           "declared by the core\n", opt->key);
                }
                break;
             case RC_EVENT_STATE:
@@ -813,12 +883,22 @@ int main(int argc, char **argv)
                break;
          }
       }
-      rc_frame_polls = 0;
+      rc_frame_polls     = 0;
+      rc_frame_presented = false;
+      rc_in_run          = true;
+      rc_run_thread      = pthread_self();
       rc_core.run();
+      rc_in_run = false;
       if (rc_frame_polls)
          rc_polled_frames++;
    }
    seconds = (double)(clock() - start) / CLOCKS_PER_SEC;
+
+   if (frames && rc_frame_polls && !rc_frame_presented)
+   {
+      fprintf(stderr, "frame %u: raster poll never presented\n", frames - 1);
+      rc_violations++;
+   }
 
    rc_core.unload_game();
    rc_core.deinit();

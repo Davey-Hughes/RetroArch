@@ -186,16 +186,16 @@ jobs:
           # interface, and a row changed after it was reported caught.
           conform() {
              for rows in 1 8 240; do
-                ./raster_poll_conform --frames 120 --expect-polls \
+                timeout 60 ./raster_poll_conform --frames 120 --expect-polls \
                    --set raster_poll_rows_per_call=$rows \
                    ./raster_poll_libretro.so
              done
-             ./raster_poll_conform --frames 120 \
+             timeout 60 ./raster_poll_conform --frames 120 \
                 --hash-out "$RUNNER_TEMP/poll.hash" ./raster_poll_libretro.so
-             ./raster_poll_conform --frames 120 --no-interface \
+             timeout 60 ./raster_poll_conform --frames 120 --no-interface \
                 --hash-out "$RUNNER_TEMP/plain.hash" ./raster_poll_libretro.so
              cmp "$RUNNER_TEMP/poll.hash" "$RUNNER_TEMP/plain.hash"
-             if out=$(./raster_poll_conform --frames 10 \
+             if out=$(timeout 60 ./raster_poll_conform --frames 10 \
                    --set raster_poll_mutate=enabled ./raster_poll_libretro.so); then
                 echo "$out"
                 echo "raster_poll_conform missed a row changed after it was reported"
