@@ -745,6 +745,7 @@ static void input_openxr_laser_poll(input_openxr_t *st, unsigned laser,
    bool pressed;
    XrTime time;
    bool can[INPUT_OPENXR_HANDS];
+   bool active = false;
    int prev    = st->pointer;
 
    st->pointer = -1;
@@ -753,14 +754,20 @@ static void input_openxr_laser_poll(input_openxr_t *st, unsigned laser,
    time        = vulkan_openxr_predicted_time(st->xr);
    if (!time || !vulkan_openxr_get_quads(st->xr, &st->quads))
       return;
-   /* With nothing to point at, the mouse and the overlay keep it. */
    for (i = 0; i < st->quads.num_quads; i++)
-      if (video_xr_quad_live(&st->quads.quads[i], laser, menu_open))
-         break;
-   if (i == st->quads.num_quads)
+   {
+      const video_xr_quad_t *q = &st->quads.quads[i];
+      if (!video_xr_quad_live(q, laser, menu_open))
+         continue;
+      active = true;
+      /* Without a live screen, the mouse and the overlay keep the
+       * core's pointer and gun. */
+      if (q->kind != VIDEO_XR_QUAD_MENU)
+         st->ptr_owned = true;
+   }
+   if (!active)
       return;
-   st->ptr_owned = true;
-   st->pointer   = prev;
+   st->pointer = prev;
    for (h = 0; h < INPUT_OPENXR_HANDS; h++)
    {
       float t;
@@ -779,6 +786,9 @@ static void input_openxr_laser_poll(input_openxr_t *st, unsigned laser,
          st->pointer = (int)h;
       st->trig_down[h] = down;
    }
+   /* Always: the gun stays with its hand through a tracking loss. */
+   if (laser == VIDEO_OPENXR_LASER_ALWAYS && prev >= 0)
+      can[prev] = true;
    if (!can[0] && !can[1])
       st->pointer = -1;
    else if (st->pointer < 0 || !can[st->pointer])

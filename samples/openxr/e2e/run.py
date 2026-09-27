@@ -1211,11 +1211,11 @@ def check_frame_always(res):
 
 
 def check_single_auto(res):
-    """A core without views in Auto: nothing is live, so the laser leaves
-    the core's pointer and light gun to the mouse, and the trigger stays
-    R2. The laser's miss reads -32768; the x driver's gun follows the
-    mouse, which headless gamescope leaves at the window's corner
-    (-32767)."""
+    """A core without views in Auto: no screen is live, so the laser
+    leaves the core's pointer and light gun to the mouse, and the trigger
+    stays R2; with the menu open, the laser points at the menu alone. The
+    laser's miss reads -32768; the x driver's gun follows the mouse,
+    which headless gamescope leaves at the window's corner (-32767)."""
     evs = core_events(res)
     errors = []
     if find(pads(res, 0), 0, lambda f: f['buttons'] & RP['R2']
@@ -1227,8 +1227,36 @@ def check_single_auto(res):
         errors.append('the laser answered the light gun: %s' % laser[:2])
     if any(f['pressed'] for f in kinds(evs, 'pointer')):
         errors.append('the only screen was touched in Auto')
-    if any(cursors(f) for f in res.frames):
-        errors.append('a dot showed in Auto with nothing live')
+    shown = [f for f in res.frames if cursors(f)]
+    if not shown or not all(menus(f) for f in shown):
+        errors.append('the dot was not on the open menu alone')
+    return errors
+
+
+def check_gun_tracking(res):
+    """Always: the right hand takes the gun on screen 0, then loses
+    tracking. It keeps the gun: its trigger still shoots off the screens,
+    the left trigger stays L2, and tracked again the right still aims."""
+    guns = kinds(core_events(res), 'gun')
+    p0 = pads(res, 0)
+    errors = []
+    hit = find(guns, 0, lambda g: g['trigger'] and packed_at(g, (100, 60)))
+    shot = (find(guns, hit + 1, lambda g: g['offscreen'] and g['trigger'])
+            if hit >= 0 else -1)
+    back = (find(guns, shot + 1, lambda g: not g['trigger']
+                 and packed_at(g, (100, 60))) if shot >= 0 else -1)
+    if hit < 0:
+        errors.append('the right hand never shot screen 0: %s' % guns[-3:])
+    elif shot < 0:
+        errors.append('the untracked right hand\'s trigger did not shoot '
+                      'off the screens: %s' % guns[hit:hit + 4])
+    elif back < 0:
+        errors.append('tracked again, the right hand did not aim the gun: %s'
+                      % guns[shot:shot + 3])
+    if not any(f['buttons'] & RP['L2'] and f['l2'] for f in p0):
+        errors.append('the left trigger was not L2')
+    if any(f['buttons'] & RP['R2'] or f['r2'] for f in p0):
+        errors.append('the right trigger pressed R2')
     return errors
 
 
@@ -1504,10 +1532,25 @@ CASES = [
      'steps': [('wait', 6), ('script', script(AIM_GUN, R2)), ('wait', 2),
                ('script', ''), ('wait', 2)],
      'check': check_frame_always},
+    # The core runs behind the menu, though RetroArch blocks its input
+    # there, and AIM_GUN meets the menu quad in front of the frame.
     {'name': 'input-single-auto', 'map': 'none',
+     'settings': {'menu_driver': 'ozone', 'menu_pause_libretro': 'false'},
      'steps': [('wait', 6), ('script', script(AIM_GUN, R2)), ('wait', 2),
-               ('script', ''), ('wait', 1)],
+               ('script', ''), ('wait', 1), ('send', 'MENU_TOGGLE'),
+               ('wait', 2), ('script', AIM_GUN), ('wait', 2),
+               ('script', ''), ('send', 'MENU_TOGGLE'), ('wait', 2)],
      'check': check_single_auto},
+    {'name': 'input-gun-tracking', 'map': '3ds',
+     'settings': {'video_openxr_laser': '1'},
+     'steps': [('wait', 6), ('script', script(AIM_GUN, R2)), ('wait', 2),
+               ('script', script('aim right off', AIM_LEFT_MISS, L2)),
+               ('wait', 2),
+               ('script', script('aim right off', AIM_LEFT_MISS, R2)),
+               ('wait', 2),
+               ('script', script(AIM_GUN, AIM_LEFT_MISS)), ('wait', 2),
+               ('script', ''), ('wait', 1)],
+     'check': check_gun_tracking},
 ]
 
 
