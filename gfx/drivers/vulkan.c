@@ -9109,6 +9109,12 @@ static bool vulkan_xr_ready(vk_t *vk)
       if (!vk->xr.hdr_warned)
          RARCH_WARN("[OpenXR] The headset shows nothing while HDR output is on.\n");
       vk->xr.hdr_warned = true;
+      /* Nothing, rather than its last frame. */
+      if (vk->xr.set.num_quads)
+      {
+         memset(&vk->xr.set, 0, sizeof(vk->xr.set));
+         vulkan_openxr_publish(xr, &vk->xr.set);
+      }
       return false;
    }
    return vulkan_xr_pick_format(vk);
@@ -9559,6 +9565,20 @@ static bool vulkan_frame(void *data, const void *frame,
                      .view_images[i].image))
             views = false;
    }
+#ifdef HAVE_OPENXR
+   /* Nor may the headset: a view only it shows waits for a real frame,
+    * rather than one eye drawing from nothing. */
+   if (views && xr_map && !frame)
+   {
+      unsigned i;
+      for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+         if (     xr_chains[i]
+               && (!(vk->views.copied & (1u << i))
+                  || !vk->swapchain[vk->views.last_index]
+                     .view_images[i].image))
+            xr_draw = false;
+   }
+#endif
    /* A later repeat must not draw view images this frame outdates. */
    if (frame && !views)
       vk->views.copied = 0;
