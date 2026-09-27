@@ -1492,7 +1492,8 @@ static void core_performance_counter_stop(struct retro_perf_counter *perf)
 
 /* The core's retro_raster_poll_t. A frame whose video is thrown away
  * (hidden by run-ahead, replayed by netplay) never reaches the raster;
- * the test is RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE's. */
+ * the test is RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE's, less its
+ * null-driver check. */
 static void runloop_raster_poll(const void *data, unsigned width,
       unsigned height, size_t pitch, unsigned row)
 {

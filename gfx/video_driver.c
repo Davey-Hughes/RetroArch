@@ -4284,9 +4284,12 @@ void video_driver_cached_frame(void)
    recording_state_t *recording_st= recording_state_get_ptr();
    void             *recording    = recording_st->data;
    struct retro_callbacks *cbs    = &runloop_st->retro_ctx;
+   video_driver_state_t *video_st = &video_driver_st;
 
    /* Cannot allow recording when pushing duped frames. */
    recording_st->data             = NULL;
+   /* Nor may it end the frame the core is still polling */
+   video_st->raster.flags        |= VIDEO_RASTER_FLAG_REPLAY;
 
    if (runloop_st->current_core.flags & RETRO_CORE_FLAG_INITED)
    {
@@ -4307,6 +4310,7 @@ void video_driver_cached_frame(void)
             VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims), pitch);
    }
 
+   video_st->raster.flags        &= ~VIDEO_RASTER_FLAG_REPLAY;
    recording_st->data             = recording;
 }
 
