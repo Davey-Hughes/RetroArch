@@ -173,19 +173,43 @@ jobs:
              timeout 300 ./ffmpeg_audio_pipe_test
           echo "[pass] ffmpeg_audio_pipe_test (TSan)"
 
-      - name: Build and run raster_poll_test (plain, ASan + UBSan)
+      - name: Build and run raster_poll_test and raster_poll_conform (plain, ASan + UBSan)
         shell: bash
         working-directory: samples/cores/raster_poll
         run: |
           set -eu
           # The raster poll contract checker against synthetic call
           # sequences, then the test core driven through it at 1, 8
-          # and 240 rows per call, and its state round trip.
+          # and 240 rows per call, and its state round trip. Then the
+          # conformance runner loading the test core: clean at each
+          # rows-per-call value, the same frames with and without the
+          # interface, and a row changed after it was reported caught.
+          conform() {
+             for rows in 1 8 240; do
+                ./raster_poll_conform --frames 120 --expect-polls \
+                   --set raster_poll_rows_per_call=$rows \
+                   ./raster_poll_libretro.so
+             done
+             ./raster_poll_conform --frames 120 \
+                --hash-out "$RUNNER_TEMP/poll.hash" ./raster_poll_libretro.so
+             ./raster_poll_conform --frames 120 --no-interface \
+                --hash-out "$RUNNER_TEMP/plain.hash" ./raster_poll_libretro.so
+             cmp "$RUNNER_TEMP/poll.hash" "$RUNNER_TEMP/plain.hash"
+             if out=$(./raster_poll_conform --frames 10 \
+                   --set raster_poll_mutate=enabled ./raster_poll_libretro.so); then
+                echo "$out"
+                echo "raster_poll_conform missed a row changed after it was reported"
+                exit 1
+             fi
+             echo "$out" | grep -q ', 10 mismatched rows,'
+          }
           make clean all
           ./raster_poll_test
-          echo "[pass] raster_poll_test"
+          conform
+          echo "[pass] raster_poll_test, raster_poll_conform"
           make clean all SANITIZER=address,undefined
-          ASAN_OPTIONS=detect_stack_use_after_return=1 \
-             UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
-             timeout 120 ./raster_poll_test
-          echo "[pass] raster_poll_test (ASan + UBSan)"
+          export ASAN_OPTIONS=detect_stack_use_after_return=1
+          export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+          timeout 120 ./raster_poll_test
+          conform
+          echo "[pass] raster_poll_test, raster_poll_conform (ASan + UBSan)"

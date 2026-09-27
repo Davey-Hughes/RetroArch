@@ -31,6 +31,7 @@ static uint32_t rp_frame[RP_WIDTH * RP_HEIGHT];
 static unsigned rp_bar_x;
 static uint32_t rp_frame_count;
 static unsigned rp_rows_per_call = 1;
+static bool     rp_mutate;
 
 static retro_environment_t   rp_environ_cb;
 static retro_video_refresh_t rp_video_cb;
@@ -41,6 +42,7 @@ void retro_set_environment(retro_environment_t cb)
 {
    static const struct retro_variable vars[] = {
       { "raster_poll_rows_per_call", "Rows per raster poll; 1|8|240" },
+      { "raster_poll_mutate", "Change a row after reporting it; disabled|enabled" },
       { NULL, NULL }
    };
    bool no_game = true;
@@ -107,6 +109,12 @@ static void rp_read_variables(void)
       else if (!strcmp(var.value, "240"))
          rp_rows_per_call = 240;
    }
+
+   var.key   = "raster_poll_mutate";
+   var.value = NULL;
+   rp_mutate = false;
+   if (rp_environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      rp_mutate = !strcmp(var.value, "enabled");
 }
 
 static void rp_draw_row(unsigned y)
@@ -139,6 +147,10 @@ void retro_run(void)
          rp_raster_poll_cb(rp_frame, RP_WIDTH, RP_HEIGHT,
                sizeof(rp_frame[0]) * RP_WIDTH, y);
    }
+
+   /* A conformance runner's negative control */
+   if (rp_mutate)
+      rp_frame[(RP_HEIGHT / 2) * RP_WIDTH] ^= 0x00FFFFFF;
 
    rp_video_cb(rp_frame, RP_WIDTH, RP_HEIGHT,
          sizeof(rp_frame[0]) * RP_WIDTH);
