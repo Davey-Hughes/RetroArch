@@ -69,12 +69,19 @@
 #include <string.h>
 #include <time.h>
 
+#include <dirent.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <retro_miscellaneous.h>
+
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
 #include "../../../gfx/video_display_server.h"
 #include "../../../gfx/video_driver.h"
 #include "../../../command.h"
+#include "../../../gfx/common/drm_scanout.h"
 
 extern const video_display_server_t dispserv_kms;
 
@@ -105,6 +112,43 @@ void RARCH_DBG(const char *fmt, ...) { (void)fmt; }
 int g_drm_fd = -1;
 uint32_t g_crtc_id = 0;
 
+/* drm_scanout.c, faked: device 226:1, whose connector 50 drives a CRTC
+ * that reads as s_khr_crtc while s_khr_routed */
+static drm_scanout_t s_khr_crtc;
+static int           s_khr_routed;
+static unsigned      s_khr_opens;
+
+int drm_scanout_open_card(const char *dev_char_root, const char *dev_root,
+      unsigned major, unsigned minor)
+{
+   (void)dev_char_root;
+   (void)dev_root;
+   if (major != 226 || minor != 1)
+      return -1;
+   s_khr_opens++;
+   return open("/dev/null", O_RDONLY);
+}
+
+bool drm_scanout_read_connector(int fd, uint32_t connector_id,
+      drm_scanout_t *out)
+{
+   if (fd < 0 || connector_id != 50 || !s_khr_routed)
+      return false;
+   *out              = s_khr_crtc;
+   out->connector_id = 50;
+   return true;
+}
+
+bool drm_scanout_update(int fd, drm_scanout_t *s)
+{
+   if (     fd < 0 || !s_khr_routed
+         || s->crtc_id != s_khr_crtc.crtc_id)
+      return false;
+   *s              = s_khr_crtc;
+   s->connector_id = 50;
+   return true;
+}
+
 /* Line 0 of the current frame s_seq_offset_ns before the real clock,
  * so get_scanline's own clock read lands microseconds later - well
  * inside one of seq_mode()'s 10 ms lines. get_scanline issues
@@ -119,7 +163,9 @@ int drmIoctl(int fd, unsigned long request, void *arg)
    struct drm_crtc_get_sequence *get_seq = (struct drm_crtc_get_sequence*)arg;
    (void)fd;
    if (     request != DRM_IOCTL_CRTC_GET_SEQUENCE
-         || s_seq_fail || get_seq->crtc_id != g_crtc_id)
+         || s_seq_fail || !get_seq->crtc_id
+         || (     get_seq->crtc_id != g_crtc_id
+               && get_seq->crtc_id != s_khr_crtc.crtc_id))
    {
       errno = EINVAL;
       return -1;
@@ -1088,6 +1134,190 @@ static int test_total_lines_metric(void)
    return 0;
 }
 
+static int open_fds(void)
+{
+   int n = 0;
+   struct dirent *e;
+   DIR *d = opendir("/proc/self/fd");
+   if (!d)
+      return -1;
+   while ((e = readdir(d)))
+      if (e->d_name[0] != '.')
+         n++;
+   closedir(d);
+   return n;
+}
+
+static kms_khr_display_t khr_pub(uint32_t connector_id,
+      unsigned refresh_mhz)
+{
+   kms_khr_display_t d;
+   memset(&d, 0, sizeof(d));
+   d.connector_id = connector_id;
+   d.major        = 226;
+   d.minor        = 1;
+   d.width        = 800;
+   d.height       = 90;
+   d.refresh_mhz  = refresh_mhz;
+   return d;
+}
+
+/* seq_mode()'s timing: 1 s frames of 100 lines, 1 Hz */
+static void khr_crtc(uint32_t crtc_id, unsigned hdisplay, int vrr)
+{
+   memset(&s_khr_crtc, 0, sizeof(s_khr_crtc));
+   s_khr_crtc.frame_ns = 10 * (uint64_t)SEQ_FRAME_NS;
+   s_khr_crtc.crtc_id  = crtc_id;
+   s_khr_crtc.hdisplay = hdisplay;
+   s_khr_crtc.vdisplay = 90;
+   s_khr_crtc.vtotal   = SEQ_LINES;
+   s_khr_crtc.vrr      = vrr ? true : false;
+}
+
+static int khr_line(void *data, int64_t offset_ns)
+{
+   s_seq_offset_ns = offset_ns;
+   return dispserv_kms.get_scanline(data);
+}
+
+static int khr_total(void *data)
+{
+   float v = 0.0f;
+   if (!dispserv_kms.get_metrics(data, DISPLAY_METRIC_TOTAL_LINES, &v))
+      return -1;
+   return (int)v;
+}
+
+static int khr_active(void *data)
+{
+   float v = 0.0f;
+   if (!dispserv_kms.get_metrics(data, DISPLAY_METRIC_ACTIVE_LINES, &v))
+      return -1;
+   return (int)v;
+}
+
+static int has_modeline(void)
+{
+   uint32_t flags = dispserv_kms.get_flags(NULL);
+   return BIT32_GET(flags, DISPSERV_CTX_MODELINE) ? 1 : 0;
+}
+
+static int has_no_resolution_list(void)
+{
+   uint32_t flags = dispserv_kms.get_flags(NULL);
+   return BIT32_GET(flags, DISPSERV_CTX_NO_RESOLUTION_LIST) ? 1 : 0;
+}
+
+/* A Vulkan display surface's connector, published by khr_display: no
+ * beam until its CRTC runs the published mode without VRR, a
+ * republish seen at once, drm_ctx's globals not asked meanwhile, and
+ * no modelines while khr_display owns the display */
+static int test_khr_display(void)
+{
+   kms_khr_display_t d;
+   drmModeModeInfo other = seq_mode(0);
+   void *data;
+   unsigned opens;
+   int fails = 0;
+   int fds   = open_fds();
+
+   fails += expect_line("MODELINE while nothing is published", has_modeline(), 1);
+   fails += expect_line("  and a resolution list", has_no_resolution_list(), 0);
+
+   data = dispserv_kms.init();
+   d    = khr_pub(0, 1000);
+   kms_display_server_set_khr_display(&d);
+   fails += expect_line("no MODELINE once khr_display owns the display", has_modeline(), 0);
+   fails += expect_line("  and no resolution list", has_no_resolution_list(), 1);
+   opens = s_khr_opens;
+   fails += expect_line("owned but unmapped: no beam", khr_line(data, 505000000), -1);
+   fails += expect_line("  no line count", khr_total(data), -1);
+   fails += expect_line("  and no card opened", (int)(s_khr_opens - opens), 0);
+
+   /* Before Mesa's first modeset: fbcon's 1024-wide mode */
+   khr_crtc(60, 1024, 0);
+   s_khr_routed = 1;
+   d            = khr_pub(50, 1000);
+   kms_display_server_set_khr_display(&d);
+   fails += expect_line("fbcon's mode: no beam", khr_line(data, 505000000), -1);
+   fails += expect_line("  no line count", khr_total(data), -1);
+
+   /* Mesa's modeset, on another CRTC */
+   khr_crtc(61, 800, 0);
+   fails += expect_line("  none before the recheck", khr_total(data), -1);
+   usleep(600000);
+   fails += expect_line("the modeset is seen half a second on", khr_total(data), SEQ_LINES);
+   fails += expect_line("  and its active lines", khr_active(data), 90);
+   fails += expect_line("  the beam mid-frame", khr_line(data, 505000000), 50);
+   fails += expect_line("  in blanking", khr_line(data, 955000000), 95);
+
+   /* drm_ctx's globals are not asked while khr_display owns the display */
+   other.vtotal = 200;
+   g_drm_mode   = &other;
+   g_crtc_id    = 7;
+   fails += expect_line("drm_ctx's mode is not asked", khr_total(data), SEQ_LINES);
+   fails += expect_line("  and its active lines", khr_active(data), 90);
+   g_drm_mode   = NULL;
+   g_crtc_id    = 0;
+
+   d = khr_pub(50, 1010);
+   kms_display_server_set_khr_display(&d);
+   fails += expect_line("10 mHz off is the same mode", khr_total(data), SEQ_LINES);
+   fails += expect_line("  and its active lines", khr_active(data), 90);
+   d = khr_pub(50, 1020);
+   kms_display_server_set_khr_display(&d);
+   fails += expect_line("20 mHz off is another", khr_total(data), -1);
+
+   d = khr_pub(51, 1000);
+   kms_display_server_set_khr_display(&d);
+   fails += expect_line("another connector is seen at once", khr_total(data), -1);
+
+   d = khr_pub(50, 1000);
+   d.height = 91;
+   kms_display_server_set_khr_display(&d);
+   fails += expect_line("height mismatch: no beam", khr_line(data, 505000000), -1);
+   fails += expect_line("  no line count", khr_total(data), -1);
+
+   d = khr_pub(50, 1000);
+   kms_display_server_set_khr_display(&d);
+   fails += expect_line("the matching mode again", khr_total(data), SEQ_LINES);
+
+   khr_crtc(61, 800, 1);
+   d = khr_pub(50, 1000);
+   kms_display_server_set_khr_display(&d);
+   fails += expect_line("VRR: no beam", khr_line(data, 505000000), -1);
+   fails += expect_line("  no line count", khr_total(data), -1);
+
+   khr_crtc(61, 800, 0);
+   d = khr_pub(50, 1000);
+   kms_display_server_set_khr_display(&d);
+   fails += expect_line("a republish: no beam until the lines are asked for",
+         khr_line(data, 505000000), -1);
+   fails += expect_line("  then the lines", khr_total(data), SEQ_LINES);
+   s_seq_fail = 1;
+   fails += expect_line("a failed vblank query", khr_line(data, 505000000), -1);
+   s_seq_fail = 0;
+   fails += expect_line("no server data", khr_line(NULL, 505000000), -1);
+   fails += expect_line("  the beam again", khr_line(data, 505000000), 50);
+
+   /* The monitor sleeps: the connector leaves its CRTC */
+   s_khr_routed = 0;
+   usleep(600000);
+   fails += expect_line("a connector gone idle", khr_total(data), -1);
+
+   kms_display_server_set_khr_display(NULL);
+   fails += expect_line("MODELINE again once khr_display lets go", has_modeline(), 1);
+   fails += expect_line("  and a resolution list again", has_no_resolution_list(), 0);
+   dispserv_kms.destroy(data);
+   fails += expect_line("every descriptor closed", open_fds(), fds);
+
+   memset(&s_khr_crtc, 0, sizeof(s_khr_crtc));
+   if (fails)
+      return 1;
+   puts("[pass] a published Vulkan display gives the beam once its CRTC runs the published mode without VRR, and no modelines");
+   return 0;
+}
+
 int main(void)
 {
    if (test_scanline_from_time())
@@ -1095,6 +1325,8 @@ int main(void)
    if (test_get_scanline())
       return 1;
    if (test_total_lines_metric())
+      return 1;
+   if (test_khr_display())
       return 1;
    if (test_get_edid())
       return 1;
