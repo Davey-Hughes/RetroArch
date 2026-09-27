@@ -280,6 +280,20 @@ extern const video_display_server_t dispserv_wl;
  * the log is on to show it. */
 void wl_display_server_report_lease(void *data);
 extern const video_display_server_t dispserv_kms;
+/* The connector a Vulkan display surface drives, for dispserv_kms to
+ * read the beam of beside Mesa; connector_id 0 until it is known */
+typedef struct kms_khr_display
+{
+   uint32_t connector_id;
+   unsigned major;       /* the card's primary node */
+   unsigned minor;
+   unsigned width;       /* the mode the surface asked for */
+   unsigned height;
+   unsigned refresh_mhz;
+} kms_khr_display_t;
+/* khr_display owns the display from any publish until NULL. One
+ * writer: the thread the context runs on. */
+void kms_display_server_set_khr_display(const kms_khr_display_t *d);
 extern const video_display_server_t dispserv_videocore;
 extern const video_display_server_t dispserv_android;
 extern const video_display_server_t dispserv_apple;

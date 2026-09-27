@@ -20,6 +20,7 @@
 #include <time.h>
 
 #include <compat/strl.h>
+#include <retro_atomic.h>
 
 #include <sys/types.h>
 #include <unistd.h>
@@ -36,6 +37,7 @@
 #include "../../command.h"
 #include "../video_crt_switch.h" /* Needed to set aspect for low resolution in Linux */
 #include "../common/drm_common.h"
+#include "../common/drm_scanout.h"
 #include "../../verbosity.h"
 #include "edid_sysfs.h"
 
@@ -49,6 +51,15 @@ typedef struct
    char new_mode[256];
    char old_mode[256];
    char orig_output[256];
+   /* The published Vulkan display's CRTC, through a descriptor of our
+    * own: the publish it was read for and when */
+   drm_scanout_t khr_scanout;
+   uint64_t khr_checked_ns;
+   int      khr_seq;
+   int      khr_fd;
+   bool     khr_valid;
+   bool     khr_logged_beam;
+   bool     khr_logged_vrr;
 } dispserv_kms_t;
 
 static bool kms_display_server_set_resolution(void *data,
@@ -209,16 +220,22 @@ static void* kms_display_server_init(void)
 {
    dispserv_kms_t *dispserv = (dispserv_kms_t*)calloc(1, sizeof(*dispserv));
 
-   if (dispserv)
-      return dispserv;
-   return NULL;
+   if (!dispserv)
+      return NULL;
+   dispserv->khr_fd  = -1;
+   dispserv->khr_seq = -1;
+   return dispserv;
 }
 
 static void kms_display_server_destroy(void *data)
 {
    dispserv_kms_t *dispserv       = (dispserv_kms_t*)data;
    if (dispserv)
+   {
+      if (dispserv->khr_fd >= 0)
+         close(dispserv->khr_fd);
       free(dispserv);
+   }
 }
 
 static bool kms_display_server_set_window_opacity(void *data, unsigned opacity)
@@ -226,10 +243,74 @@ static bool kms_display_server_set_window_opacity(void *data, unsigned opacity)
    return true;
 }
 
+/* kms_khr_display_t as int-sized atomics behind a seqlock, from the
+ * context's thread to the frame path. Every publish moves the sequence
+ * on, which tells a reader its descriptor may be another display's. */
+#define KMS_KHR_OWNED     0
+#define KMS_KHR_CONNECTOR 1
+#define KMS_KHR_MAJOR     2
+#define KMS_KHR_MINOR     3
+#define KMS_KHR_WIDTH     4
+#define KMS_KHR_HEIGHT    5
+#define KMS_KHR_REFRESH   6
+#define KMS_KHR_WORDS     7
+
+static retro_atomic_int_t kms_khr_seq;
+static retro_atomic_int_t kms_khr[KMS_KHR_WORDS];
+
+void kms_display_server_set_khr_display(const kms_khr_display_t *d)
+{
+   int u[KMS_KHR_WORDS];
+   int i;
+   int seq = retro_atomic_load_relaxed_int(&kms_khr_seq);
+
+   memset(u, 0, sizeof(u));
+   if (d)
+   {
+      u[KMS_KHR_OWNED]     = 1;
+      u[KMS_KHR_CONNECTOR] = (int)d->connector_id;
+      u[KMS_KHR_MAJOR]     = (int)d->major;
+      u[KMS_KHR_MINOR]     = (int)d->minor;
+      u[KMS_KHR_WIDTH]     = (int)d->width;
+      u[KMS_KHR_HEIGHT]    = (int)d->height;
+      u[KMS_KHR_REFRESH]   = (int)d->refresh_mhz;
+   }
+   retro_atomic_store_relaxed_int(&kms_khr_seq, seq + 1);
+   retro_atomic_thread_fence_release();
+   for (i = 0; i < KMS_KHR_WORDS; i++)
+      retro_atomic_store_relaxed_int(&kms_khr[i], u[i]);
+   retro_atomic_store_release_int(&kms_khr_seq, seq + 2);
+}
+
+/* The published words; returns the sequence they were read at */
+static int kms_khr_get(int *u)
+{
+   int i;
+
+   for (;;)
+   {
+      int s1 = retro_atomic_load_acquire_int(&kms_khr_seq);
+      if (s1 & 1)
+         continue;
+      for (i = 0; i < KMS_KHR_WORDS; i++)
+         u[i] = retro_atomic_load_relaxed_int(&kms_khr[i]);
+      retro_atomic_thread_fence_acquire();
+      if (retro_atomic_load_relaxed_int(&kms_khr_seq) == s1)
+         return s1;
+   }
+}
+
 static uint32_t kms_display_server_get_flags(void *data)
 {
    uint32_t             flags   = 0;
-   BIT32_SET(flags, DISPSERV_CTX_MODELINE);
+   int u[KMS_KHR_WORDS];
+
+   kms_khr_get(u);
+   /* Modelines and the mode list are drm_ctx's, which Mesa never reads */
+   if (!u[KMS_KHR_OWNED])
+      BIT32_SET(flags, DISPSERV_CTX_MODELINE);
+   else
+      BIT32_SET(flags, DISPSERV_CTX_NO_RESOLUTION_LIST);
 
    return flags;
 }
@@ -434,6 +515,92 @@ static bool kms_display_server_mode_timed(void)
             & (DRM_MODE_FLAG_INTERLACE | DRM_MODE_FLAG_DBLSCAN));
 }
 
+#define KMS_KHR_RECHECK_NS 500000000
+
+/* Reads the published display's CRTC again after a publish or half a
+ * second, as Scanline Sync asks every 60 frames: khr_valid while the
+ * CRTC runs the published mode without VRR. Until Mesa's first
+ * modeset the connector can still show fbcon's mode. The descriptor
+ * stays open while it keeps its CRTC, as an open costs a GPU address
+ * space on amdgpu. */
+static void kms_display_server_khr_update(dispserv_kms_t *dispserv,
+      const int *u, int seq)
+{
+   struct timespec now;
+   uint64_t now_ns;
+   uint64_t refresh_mhz;
+   int64_t off_mhz;
+   const drm_scanout_t *s = &dispserv->khr_scanout;
+   bool renewed           = seq != dispserv->khr_seq;
+
+   if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+      return;
+   now_ns = (uint64_t)now.tv_sec * 1000000000 + (uint64_t)now.tv_nsec;
+   if (     !renewed
+         && now_ns - dispserv->khr_checked_ns < KMS_KHR_RECHECK_NS)
+      return;
+
+   if (renewed)
+   {
+      dispserv->khr_logged_beam = false;
+      dispserv->khr_logged_vrr  = false;
+   }
+   dispserv->khr_seq        = seq;
+   dispserv->khr_checked_ns = now_ns;
+   dispserv->khr_valid      = false;
+
+   if (     dispserv->khr_fd >= 0
+         && (renewed
+            || !drm_scanout_update(dispserv->khr_fd, &dispserv->khr_scanout)))
+   {
+      close(dispserv->khr_fd);
+      dispserv->khr_fd = -1;
+   }
+   if (dispserv->khr_fd < 0)
+   {
+      if (!u[KMS_KHR_CONNECTOR])
+         return;
+      if ((dispserv->khr_fd = drm_scanout_open_card("/sys/dev/char",
+            "/dev/dri", (unsigned)u[KMS_KHR_MAJOR],
+            (unsigned)u[KMS_KHR_MINOR])) < 0)
+         return;
+      if (!drm_scanout_read_connector(dispserv->khr_fd,
+            (uint32_t)u[KMS_KHR_CONNECTOR], &dispserv->khr_scanout))
+      {
+         close(dispserv->khr_fd);
+         dispserv->khr_fd = -1;
+         return;
+      }
+   }
+
+   /* Within 10 mHz, as Mesa matches its own modes */
+   if (!s->frame_ns)
+      return;
+   refresh_mhz = (uint64_t)1000000000 * 1000 / s->frame_ns;
+   off_mhz     = (int64_t)refresh_mhz - (int64_t)u[KMS_KHR_REFRESH];
+   if (     s->hdisplay != (unsigned)u[KMS_KHR_WIDTH]
+         || s->vdisplay != (unsigned)u[KMS_KHR_HEIGHT]
+         || off_mhz > 10 || off_mhz < -10)
+      return;
+   if (s->vrr)
+   {
+      if (!dispserv->khr_logged_vrr)
+      {
+         dispserv->khr_logged_vrr = true;
+         RARCH_LOG("[KMS] Variable refresh is on for the Vulkan display, so Scanline Sync stays off.\n");
+      }
+      return;
+   }
+   dispserv->khr_valid = true;
+   if (!dispserv->khr_logged_beam)
+   {
+      dispserv->khr_logged_beam = true;
+      RARCH_LOG("[KMS] Scanline Sync reads the Vulkan display on CRTC %u: %ux%u, %u lines in all, %.3f Hz.\n",
+            s->crtc_id, s->hdisplay, s->vdisplay, s->vtotal,
+            (double)refresh_mhz / 1000.0);
+   }
+}
+
 /* The ioctl behind drmCrtcGetSequence(), which needs libdrm 2.4.89 */
 static bool kms_display_server_line0_ns(int fd, uint32_t crtc_id,
       uint64_t *line0_ns)
@@ -483,7 +650,28 @@ static bool kms_display_server_crtc_vrr(int fd, uint32_t crtc_id)
 static bool kms_display_server_get_metrics(void *data,
       enum display_metric_types type, float *value)
 {
+   int u[KMS_KHR_WORDS];
+   int seq;
    bool vrr;
+
+   if (     type != DISPLAY_METRIC_TOTAL_LINES
+         && type != DISPLAY_METRIC_ACTIVE_LINES)
+      return false;
+
+   seq = kms_khr_get(u);
+   if (u[KMS_KHR_OWNED])
+   {
+      dispserv_kms_t *dispserv = (dispserv_kms_t*)data;
+      if (!dispserv)
+         return false;
+      kms_display_server_khr_update(dispserv, u, seq);
+      if (!dispserv->khr_valid)
+         return false;
+      *value = (float)(type == DISPLAY_METRIC_TOTAL_LINES
+            ? dispserv->khr_scanout.vtotal
+            : dispserv->khr_scanout.vdisplay);
+      return true;
+   }
 
    if (!kms_display_server_mode_timed())
       return false;
@@ -492,8 +680,6 @@ static bool kms_display_server_get_metrics(void *data,
       *value = (float)g_drm_mode->vdisplay;
       return true;
    }
-   if (type != DISPLAY_METRIC_TOTAL_LINES)
-      return false;
    /* Read with the line count, outside Scanline Sync's wait */
    vrr = g_crtc_id && kms_display_server_crtc_vrr(g_drm_fd, g_crtc_id);
    if (vrr && !kms_vrr)
@@ -514,19 +700,45 @@ static int kms_display_server_get_scanline(void *data)
    uint64_t line0_ns;
    uint64_t now_ns;
    uint64_t frame_ns;
+   unsigned vtotal;
+   uint32_t crtc_id;
+   int fd;
+   int u[KMS_KHR_WORDS];
+   int seq = kms_khr_get(u);
 
-   if (!g_crtc_id || !kms_display_server_mode_timed() || kms_vrr)
-      return -1;
-   if (!kms_display_server_line0_ns(g_drm_fd, g_crtc_id, &line0_ns))
+   if (u[KMS_KHR_OWNED])
+   {
+      dispserv_kms_t *dispserv = (dispserv_kms_t*)data;
+      /* The CRTC as get_metrics last read it, outside Scanline Sync's
+       * wait; a republish waits for that */
+      if (     !dispserv
+            || !dispserv->khr_valid
+            || seq != dispserv->khr_seq)
+         return -1;
+      fd       = dispserv->khr_fd;
+      crtc_id  = dispserv->khr_scanout.crtc_id;
+      frame_ns = dispserv->khr_scanout.frame_ns;
+      vtotal   = dispserv->khr_scanout.vtotal;
+   }
+   else
+   {
+      if (!g_crtc_id || !kms_display_server_mode_timed() || kms_vrr)
+         return -1;
+      fd       = g_drm_fd;
+      crtc_id  = g_crtc_id;
+      frame_ns = (uint64_t)g_drm_mode->htotal * g_drm_mode->vtotal
+            * 1000000 / g_drm_mode->clock;
+      vtotal   = g_drm_mode->vtotal;
+   }
+
+   if (!kms_display_server_line0_ns(fd, crtc_id, &line0_ns))
       return -1;
    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
       return -1;
 
-   now_ns   = (uint64_t)now.tv_sec * 1000000000 + (uint64_t)now.tv_nsec;
-   frame_ns = (uint64_t)g_drm_mode->htotal * g_drm_mode->vtotal
-         * 1000000 / g_drm_mode->clock;
+   now_ns = (uint64_t)now.tv_sec * 1000000000 + (uint64_t)now.tv_nsec;
    return video_display_server_scanline_from_time(
-         (int64_t)(now_ns - line0_ns), frame_ns, g_drm_mode->vtotal);
+         (int64_t)(now_ns - line0_ns), frame_ns, vtotal);
 }
 
 const video_display_server_t dispserv_kms = {
