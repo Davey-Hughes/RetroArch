@@ -1055,6 +1055,7 @@ AIM_BOTTOM = 'aim right 0.2 -0.4 -0.3 -0.32 -1.232 -1.8'   # screen 1, 0.25 0.75
 AIM_TOP = 'aim right 0.2 -0.4 -0.3 0.4 0.24 -1.8'          # screen 0, 0.75 0.25
 AIM_GUN = 'aim right 0.2 -0.4 -0.3 -0.4 0.24 -1.8'         # screen 0, 0.25 0.25
 AIM_MISS = 'aim right 0.2 -0.4 -0.3 3.0 0.0 -1.8'          # beside every quad
+AIM_LEFT_MISS = 'aim left -0.2 -0.4 -0.3 -3.0 0.0 -1.8'    # beside every quad
 AIM_LEFT_BOTTOM = 'aim left -0.2 -0.4 -0.3 -0.32 -0.752 -1.8'   # screen 1, 0.25 0.25
 AIM_RIGHT_BOTTOM = 'aim right 0.2 -0.4 -0.3 0.32 -1.232 -1.8'   # screen 1, 0.75 0.75
 L2 = 'action combined/l2 1'
@@ -1122,6 +1123,9 @@ def check_top_auto(res):
 
 
 def check_lightgun(res):
+    """Always: the trigger fires the gun on screen 0, then off every
+    screen (an off-screen shot) with no R2; the other hand, off the
+    screens too, keeps L2."""
     evs = core_events(res)
     errors = []
     hit = find(evs, 0, lambda kf: kf[0] == 'gun'
@@ -1140,34 +1144,92 @@ def check_lightgun(res):
         errors.append('the gun did not read offscreen on a miss')
     else:
         m = evs[miss][1]
-        if (m['x'], m['y'], m['trigger']) != (-32768, -32768, 0):
-            errors.append('offscreen reads %s' % m)
-        # The core logs a frame's pads before its gun: the pad state at a
-        # gun line is the last pad line before it.
-        at_miss = [i for i in p0 if i < miss][-1:]
+        if (m['x'], m['y'], m['trigger']) != (-32768, -32768, 1):
+            errors.append('the shot off the screens reads %s' % m)
+        # The core logs a frame's pads just before its gun: the pad lines
+        # directly before the miss are the miss's frame.
+        k = miss
+        while k > 0 and evs[k - 1][0] == 'pad':
+            k -= 1
         pointing = ([i for i in p0 if i < hit][-1:]
-                    + [i for i in p0 if hit < i < miss][:-1])
+                    + [i for i in p0 if hit < i < k])
+        off = [i for i in p0 if i >= k]
         if any(evs[i][1]['buttons'] & RP['R2'] for i in pointing):
             errors.append('R2 while the gun pointed at the screen')
-        if not at_miss or not evs[at_miss[0]][1]['buttons'] & RP['R2']:
-            errors.append('the trigger off the screens was not R2')
+        if any(evs[i][1]['buttons'] & RP['R2'] for i in off):
+            errors.append('R2 while the gun shot off the screens')
+        if not any(evs[i][1]['buttons'] & RP['L2'] for i in off):
+            errors.append('the other hand off the screens did not press L2')
     return errors + cursor_errors(res, (-0.4, 0.24, -1.8))
 
 
+def packed_at(f, want):
+    return 'cx' in f and close((f['cx'], f['cy']), want, 3)
+
+
 def check_two_hands(res):
-    presses = [f for f in kinds(core_events(res), 'pointer') if f['pressed']]
+    evs = core_events(res)
+    touches = kinds(evs, 'pointer')
     errors = []
-    i = find(presses, 0, lambda f: close((f['cx'], f['cy']), (320, 300), 3))
-    j = (find(presses, i + 1, lambda f: close((f['cx'], f['cy']), (480, 420), 3))
+    left, right = (320, 300), (480, 420)
+    # Before any trigger, both on screen 1: the right hand points.
+    aimed = [f for f in kinds(evs, 'gun')
+             if packed_at(f, left) or packed_at(f, right)]
+    if not aimed or not packed_at(aimed[0], right):
+        errors.append('the right hand did not point first: %s' % aimed[:2])
+    i = find(touches, 0, lambda f: f['pressed'] and packed_at(f, left))
+    j = (find(touches, i + 1, lambda f: f['pressed'] and packed_at(f, right))
          if i >= 0 else -1)
     if i < 0:
-        errors.append('the left hand did not touch first: %s' % presses[:3])
+        errors.append('the left hand did not touch first: %s' % touches[:3])
     elif j < 0:
         errors.append('the right hand did not take over when its trigger '
-                      'went down: %s' % presses[i:i + 3])
+                      'went down: %s' % touches[i:i + 3])
+    elif not any(not f['pressed'] for f in touches[i + 1:j]):
+        errors.append('the touch dragged from hand to hand without a lift')
     if not any(len(cursors(f)) == 2 for f in res.frames):
         errors.append('no frame with a dot for each hand')
     return errors + trigger_errors(res)
+
+
+def check_frame_always(res):
+    """A core without views in Always: the whole frame is a light gun
+    target, mapped over the frame the core last sent."""
+    evs = core_events(res)
+    shots = [f for f in kinds(evs, 'gun')
+             if not f['offscreen'] and f['trigger']]
+    errors = []
+    # (0.25, 0.25) of the 800x480 frame.
+    if not shots:
+        errors.append('the light gun never fired on the frame: %s'
+                      % kinds(evs, 'gun')[-3:])
+    elif not close((shots[0]['cx'], shots[0]['cy']), (200, 120), 3):
+        errors.append('the gun aimed at %d,%d, want 200,120'
+                      % (shots[0]['cx'], shots[0]['cy']))
+    return (errors + trigger_errors(res)
+            + cursor_errors(res, (-0.4, 0.24, -1.8)))
+
+
+def check_single_auto(res):
+    """A core without views in Auto: nothing is live, so the laser leaves
+    the core's pointer and light gun to the mouse, and the trigger stays
+    R2. The laser's miss reads -32768; the x driver's gun follows the
+    mouse, which headless gamescope leaves at the window's corner
+    (-32767)."""
+    evs = core_events(res)
+    errors = []
+    if find(pads(res, 0), 0, lambda f: f['buttons'] & RP['R2']
+            and f['r2'] == 32767) < 0:
+        errors.append('the trigger on the only screen was not R2')
+    laser = [f for f in kinds(evs, 'gun')
+             if (f['x'], f['y']) == (-32768, -32768) or f['trigger']]
+    if laser:
+        errors.append('the laser answered the light gun: %s' % laser[:2])
+    if any(f['pressed'] for f in kinds(evs, 'pointer')):
+        errors.append('the only screen was touched in Auto')
+    if any(cursors(f) for f in res.frames):
+        errors.append('a dot showed in Auto with nothing live')
+    return errors
 
 
 def check_hw_teardown(res):
@@ -1422,10 +1484,13 @@ CASES = [
      'settings': {'video_openxr_laser': '1'},
      'steps': [('wait', 6), ('script', script(AIM_GUN, R2)), ('wait', 2),
                ('script', script(AIM_MISS, R2)), ('wait', 2),
-               ('script', ''), ('wait', 2)],
+               ('script', script(AIM_MISS, R2, AIM_LEFT_MISS, L2)),
+               ('wait', 2), ('script', ''), ('wait', 2)],
      'check': check_lightgun},
     {'name': 'input-two-hands', 'map': '3ds',
      'steps': [('wait', 6),
+               ('script', script(AIM_LEFT_BOTTOM, AIM_RIGHT_BOTTOM)),
+               ('wait', 1),
                ('script', script(AIM_LEFT_BOTTOM, AIM_RIGHT_BOTTOM, L2)),
                ('wait', 2),
                ('script', script(AIM_LEFT_BOTTOM, AIM_RIGHT_BOTTOM, L2, R2)),
@@ -1433,6 +1498,16 @@ CASES = [
                ('script', script(AIM_LEFT_BOTTOM, AIM_RIGHT_BOTTOM, R2)),
                ('wait', 1), ('script', ''), ('wait', 1)],
      'check': check_two_hands},
+    # No views: one quad of the whole frame, where screen 0 would be.
+    {'name': 'input-frame-always', 'map': 'none',
+     'settings': {'video_openxr_laser': '1'},
+     'steps': [('wait', 6), ('script', script(AIM_GUN, R2)), ('wait', 2),
+               ('script', ''), ('wait', 2)],
+     'check': check_frame_always},
+    {'name': 'input-single-auto', 'map': 'none',
+     'steps': [('wait', 6), ('script', script(AIM_GUN, R2)), ('wait', 2),
+               ('script', ''), ('wait', 1)],
+     'check': check_single_auto},
 ]
 
 
