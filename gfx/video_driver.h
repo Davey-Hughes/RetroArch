@@ -1013,10 +1013,11 @@ typedef struct video_poke_interface
     * parse its shader preset here. */
    void (*set_view_count)(void *data, unsigned count);
 
-   /* The core's context_destroy is next, and may wait on the device
-    * without the queue lock: stop the driver's own threads that submit
-    * to the core's queue. The driver instance is freed after it. The
-    * main thread calls it, or waits while the video thread runs it. */
+   /* The core's hardware context goes next: from its context_destroy
+    * to its unload the core may wait on the device without the queue
+    * lock, so stop the driver's own threads that submit to the core's
+    * queue. The driver instance is freed after it. The main thread
+    * calls it, or waits while the video thread runs it. */
    void (*hw_context_destroying)(void *data);
 } video_poke_interface_t;
 

@@ -2546,13 +2546,19 @@ void video_driver_free_hw_context(void)
     * a core may present once more on its way out (one that runs ahead
     * of the frontend drains the frame it had queued). */
    video_driver_invalidate_hw_render_cache();
-   if (video_st->hw_render.context_destroy)
+   /* From here to its unload the core may wait on the device without
+    * the queue lock: no frame of ours may be in flight meanwhile. */
+   if (video_st->hw_render.context_type != RETRO_HW_CONTEXT_NONE)
    {
+#ifdef HAVE_THREADS
+      video_thread_wait_idle();
+#endif
       if (     video_st->data && video_st->poke
             && video_st->poke->hw_context_destroying)
          video_st->poke->hw_context_destroying(video_st->data);
-      video_st->hw_render.context_destroy();
    }
+   if (video_st->hw_render.context_destroy)
+      video_st->hw_render.context_destroy();
    video_driver_invalidate_hw_render_cache();
 
    memset(&video_st->hw_render, 0, sizeof(video_st->hw_render));
