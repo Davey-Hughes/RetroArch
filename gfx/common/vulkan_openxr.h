@@ -190,6 +190,13 @@ bool vulkan_openxr_get_quads(vulkan_openxr_t *xr, video_xr_quad_set_t *out);
  * its next frame. */
 void vulkan_openxr_request_recenter(vulkan_openxr_t *xr);
 
+#define VULKAN_OPENXR_CURSOR_DIM 32
+
+/* The laser's round dot: one image, made at each start and freed at
+ * each stop, for layers the hooks add. XR_NULL_HANDLE if it could not
+ * be made. The XR thread may use it. */
+XrSwapchain vulkan_openxr_cursor(const vulkan_openxr_t *xr);
+
 RETRO_END_DECLS
 
 #endif

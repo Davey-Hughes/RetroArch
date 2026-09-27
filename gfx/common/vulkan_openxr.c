@@ -14,6 +14,7 @@
  */
 
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 
 #include <boolean.h>
@@ -27,6 +28,7 @@
 #include "../../config.h"
 #endif
 
+#include "vksym.h"
 #include "vulkan_openxr.h"
 #include "../video_defines.h"
 
@@ -83,6 +85,7 @@ struct vulkan_openxr
    struct vulkan_openxr_slot slots[VIDEO_XR_MAX_SLOTS];
    video_xr_quad_set_t quads;      /* lock */
    video_xr_pose_t anchor;         /* lock */
+   XrSwapchain cursor;             /* start to stop; the XR thread reads it */
 
    /* XR_KHR_vulkan_enable's lists, split in place. */
    char inst_ext_buf[VULKAN_OPENXR_EXT_BUF];
@@ -1001,6 +1004,265 @@ error:
    return false;
 }
 
+/* A white dot with a dark rim and a one-pixel soft edge, alpha
+ * premultiplied. Grey, so RGBA and BGRA hold the same bytes. */
+static void vulkan_openxr_cursor_pixels(uint8_t *px)
+{
+   unsigned x, y;
+   const float c = (VULKAN_OPENXR_CURSOR_DIM - 1) * 0.5f;
+   const float r = VULKAN_OPENXR_CURSOR_DIM * 0.5f;
+   for (y = 0; y < VULKAN_OPENXR_CURSOR_DIM; y++)
+   {
+      for (x = 0; x < VULKAN_OPENXR_CURSOR_DIM; x++)
+      {
+         float dx   = (float)x - c;
+         float dy   = (float)y - c;
+         float d    = (float)sqrt(dx * dx + dy * dy) / r;
+         float a    = (d < 1.0f - 1.0f / r) ? 1.0f
+            : ((d < 1.0f) ? (1.0f - d) * r : 0.0f);
+         float l    = (d < 0.6f) ? 1.0f : 0.15f;
+         uint8_t *p = px + ((size_t)y * VULKAN_OPENXR_CURSOR_DIM + x) * 4;
+         p[0]       = (uint8_t)(l * a * 255.0f + 0.5f);
+         p[1]       = p[0];
+         p[2]       = p[0];
+         p[3]       = (uint8_t)(a * 255.0f + 0.5f);
+      }
+   }
+}
+
+/* The dot's swapchain, filled once from a staging buffer on the
+ * session's queue. A failure leaves no dot and changes nothing else. */
+static void vulkan_openxr_cursor_create(vulkan_openxr_t *xr,
+      VkPhysicalDevice gpu, VkDevice device, uint32_t queue_family)
+{
+   static const VkFormat formats[4] = {
+      VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_B8G8R8A8_SRGB,
+      VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM };
+   unsigned i;
+   uint32_t n                 = 0;
+   uint32_t index             = 0;
+   XrResult res               = XR_SUCCESS;
+   VkResult vk_res            = VK_SUCCESS;
+   const char *step           = NULL;
+   VkFormat format            = VK_FORMAT_UNDEFINED;
+   XrSwapchain sc             = XR_NULL_HANDLE;
+   VkQueue queue              = VK_NULL_HANDLE;
+   VkBuffer buffer            = VK_NULL_HANDLE;
+   VkDeviceMemory memory      = VK_NULL_HANDLE;
+   VkCommandPool pool         = VK_NULL_HANDLE;
+   VkCommandBuffer cmd        = VK_NULL_HANDLE;
+   VkFence fence              = VK_NULL_HANDLE;
+   void *map                  = NULL;
+   VkDeviceSize size          = VULKAN_OPENXR_CURSOR_DIM
+      * VULKAN_OPENXR_CURSOR_DIM * 4;
+   VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+      | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+   XrSwapchainCreateInfo ci;
+   XrSwapchainImageVulkanKHR imgs[VULKAN_OPENXR_MAX_IMAGES];
+   XrSwapchainImageAcquireInfo ai;
+   XrSwapchainImageWaitInfo wi;
+   XrSwapchainImageReleaseInfo ri;
+   VkBufferCreateInfo bi;
+   VkMemoryRequirements req;
+   VkPhysicalDeviceMemoryProperties props;
+   VkMemoryAllocateInfo mi;
+   VkCommandPoolCreateInfo pi;
+   VkCommandBufferAllocateInfo cai;
+   VkCommandBufferBeginInfo cbi;
+   VkFenceCreateInfo fi;
+   VkImageMemoryBarrier b;
+   VkBufferImageCopy region;
+   VkSubmitInfo si;
+
+   for (i = 0; i < 4 && format == VK_FORMAT_UNDEFINED; i++)
+      if (vulkan_openxr_supports_format(xr, formats[i]))
+         format = formats[i];
+   if (format == VK_FORMAT_UNDEFINED)
+   {
+      step = "no 8-bit RGBA format";
+      goto end;
+   }
+
+   memset(&ci, 0, sizeof(ci));
+   ci.type        = XR_TYPE_SWAPCHAIN_CREATE_INFO;
+   ci.usageFlags  = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT
+      | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+   ci.format      = (int64_t)format;
+   ci.sampleCount = 1;
+   ci.width       = VULKAN_OPENXR_CURSOR_DIM;
+   ci.height      = VULKAN_OPENXR_CURSOR_DIM;
+   ci.faceCount   = 1;
+   ci.arraySize   = 1;
+   ci.mipCount    = 1;
+   memset(imgs, 0, sizeof(imgs));
+   for (i = 0; i < VULKAN_OPENXR_MAX_IMAGES; i++)
+      imgs[i].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
+   memset(&ai, 0, sizeof(ai));
+   ai.type        = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
+   memset(&wi, 0, sizeof(wi));
+   wi.type        = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO;
+   wi.timeout     = 100000000; /* 100 ms: a fresh swapchain is free */
+
+   slock_lock(xr->queue_lock);
+   res = xr->CreateSwapchain(xr->session, &ci, &sc);
+   if (XR_SUCCEEDED(res))
+      res = xr->EnumerateSwapchainImages(sc, 0, &n, NULL);
+   if (XR_SUCCEEDED(res) && (!n || n > VULKAN_OPENXR_MAX_IMAGES))
+      res = XR_ERROR_SIZE_INSUFFICIENT;
+   if (XR_SUCCEEDED(res))
+      res = xr->EnumerateSwapchainImages(sc, n, &n,
+            (XrSwapchainImageBaseHeader*)imgs);
+   if (XR_SUCCEEDED(res))
+      res = xr->AcquireSwapchainImage(sc, &ai, &index);
+   if (XR_SUCCEEDED(res))
+      res = xr->WaitSwapchainImage(sc, &wi);
+   slock_unlock(xr->queue_lock);
+   /* XR_TIMEOUT_EXPIRED succeeds too, but leaves no image. */
+   if (res != XR_SUCCESS)
+   {
+      step = "swapchain";
+      goto end;
+   }
+
+   vkGetDeviceQueue(device, queue_family, 0, &queue);
+   memset(&bi, 0, sizeof(bi));
+   bi.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+   bi.size        = size;
+   bi.usage       = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+   bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+   if (vkCreateBuffer(device, &bi, NULL, &buffer) != VK_SUCCESS)
+   {
+      step = "vkCreateBuffer";
+      goto end;
+   }
+   vkGetBufferMemoryRequirements(device, buffer, &req);
+   vkGetPhysicalDeviceMemoryProperties(gpu, &props);
+   for (i = 0; i < props.memoryTypeCount; i++)
+      if (     (req.memoryTypeBits & (1u << i))
+            && (props.memoryTypes[i].propertyFlags & host) == host)
+         break;
+   memset(&mi, 0, sizeof(mi));
+   mi.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+   mi.allocationSize  = req.size;
+   mi.memoryTypeIndex = i;
+   if (     i == props.memoryTypeCount
+         || vkAllocateMemory(device, &mi, NULL, &memory) != VK_SUCCESS
+         || vkBindBufferMemory(device, buffer, memory, 0) != VK_SUCCESS
+         || vkMapMemory(device, memory, 0, size, 0, &map) != VK_SUCCESS)
+   {
+      step = "staging memory";
+      goto end;
+   }
+   vulkan_openxr_cursor_pixels((uint8_t*)map);
+   vkUnmapMemory(device, memory);
+
+   memset(&pi, 0, sizeof(pi));
+   pi.sType              = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+   pi.queueFamilyIndex   = queue_family;
+   memset(&cai, 0, sizeof(cai));
+   cai.sType             = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+   cai.level             = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+   cai.commandBufferCount = 1;
+   memset(&fi, 0, sizeof(fi));
+   fi.sType              = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+   if (vkCreateCommandPool(device, &pi, NULL, &pool) != VK_SUCCESS)
+   {
+      step = "command pool";
+      goto end;
+   }
+   cai.commandPool = pool;
+   if (     vkAllocateCommandBuffers(device, &cai, &cmd) != VK_SUCCESS
+         || vkCreateFence(device, &fi, NULL, &fence) != VK_SUCCESS)
+   {
+      step = "command buffer";
+      goto end;
+   }
+
+   memset(&cbi, 0, sizeof(cbi));
+   cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+   cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+   vkBeginCommandBuffer(cmd, &cbi);
+   memset(&b, 0, sizeof(b));
+   b.sType                       = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+   b.srcAccessMask               = 0;
+   b.dstAccessMask               = VK_ACCESS_TRANSFER_WRITE_BIT;
+   b.oldLayout                   = VK_IMAGE_LAYOUT_UNDEFINED;
+   b.newLayout                   = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+   b.srcQueueFamilyIndex         = VK_QUEUE_FAMILY_IGNORED;
+   b.dstQueueFamilyIndex         = VK_QUEUE_FAMILY_IGNORED;
+   b.image                       = imgs[index].image;
+   b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+   b.subresourceRange.levelCount = 1;
+   b.subresourceRange.layerCount = 1;
+   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+   memset(&region, 0, sizeof(region));
+   region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+   region.imageSubresource.layerCount = 1;
+   region.imageExtent.width           = VULKAN_OPENXR_CURSOR_DIM;
+   region.imageExtent.height          = VULKAN_OPENXR_CURSOR_DIM;
+   region.imageExtent.depth           = 1;
+   vkCmdCopyBufferToImage(cmd, buffer, imgs[index].image,
+         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+   /* The layout the runtime takes it back in. */
+   b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+   b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+   b.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+   b.newLayout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL,
+         1, &b);
+   vkEndCommandBuffer(cmd);
+
+   memset(&si, 0, sizeof(si));
+   si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+   si.commandBufferCount = 1;
+   si.pCommandBuffers    = &cmd;
+   slock_lock(xr->queue_lock);
+   vk_res = vkQueueSubmit(queue, 1, &si, fence);
+   slock_unlock(xr->queue_lock);
+   if (     vk_res != VK_SUCCESS
+         || vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX)
+         != VK_SUCCESS)
+   {
+      step = "submit";
+      goto end;
+   }
+
+   memset(&ri, 0, sizeof(ri));
+   ri.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
+   slock_lock(xr->queue_lock);
+   res = xr->ReleaseSwapchainImage(sc, &ri);
+   slock_unlock(xr->queue_lock);
+   if (XR_FAILED(res))
+   {
+      step = "xrReleaseSwapchainImage";
+      goto end;
+   }
+   xr->cursor = sc;
+   sc         = XR_NULL_HANDLE;
+   RARCH_LOG("[OpenXR] Laser cursor ready.\n");
+
+end:
+   if (fence)
+      vkDestroyFence(device, fence, NULL);
+   if (pool)
+      vkDestroyCommandPool(device, pool, NULL);
+   if (memory)
+      vkFreeMemory(device, memory, NULL);
+   if (buffer)
+      vkDestroyBuffer(device, buffer, NULL);
+   if (sc)
+   {
+      slock_lock(xr->queue_lock);
+      xr->DestroySwapchain(sc);
+      slock_unlock(xr->queue_lock);
+   }
+   if (step)
+      RARCH_WARN("[OpenXR] No laser cursor (%s, %d).\n", step,
+            (res != XR_SUCCESS) ? (int)res : (int)vk_res);
+}
+
 bool vulkan_openxr_start(vulkan_openxr_t *xr, VkInstance instance,
       VkPhysicalDevice gpu, VkDevice device, uint32_t queue_family,
       slock_t *queue_lock)
@@ -1025,6 +1287,8 @@ bool vulkan_openxr_start(vulkan_openxr_t *xr, VkInstance instance,
       return false;
    }
    xr->queue_lock = queue_lock;
+   if (!xr->cursor)
+      vulkan_openxr_cursor_create(xr, gpu, device, queue_family);
    retro_atomic_store_release_int(&xr->quit, 0);
    retro_atomic_store_release_int(&xr->alive, xr->ended ? 0 : 1);
    if (!(xr->thread = sthread_create(vulkan_openxr_thread, xr)))
@@ -1053,6 +1317,13 @@ void vulkan_openxr_stop(vulkan_openxr_t *xr)
    /* A kept session outlives the driver's views of its images. */
    for (s = 0; s < VIDEO_XR_MAX_SLOTS; s++)
       vulkan_openxr_slot_destroy(xr, s);
+   if (xr->cursor)
+   {
+      slock_lock(xr->queue_lock);
+      xr->DestroySwapchain(xr->cursor);
+      slock_unlock(xr->queue_lock);
+      xr->cursor = XR_NULL_HANDLE;
+   }
    if (xr->lock)
    {
       slock_lock(xr->lock);
@@ -1297,4 +1568,9 @@ bool vulkan_openxr_get_quads(vulkan_openxr_t *xr, video_xr_quad_set_t *out)
 void vulkan_openxr_request_recenter(vulkan_openxr_t *xr)
 {
    retro_atomic_store_release_int(&xr->recenter, 1);
+}
+
+XrSwapchain vulkan_openxr_cursor(const vulkan_openxr_t *xr)
+{
+   return xr->cursor;
 }
