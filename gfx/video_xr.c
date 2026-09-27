@@ -369,3 +369,71 @@ bool video_xr_quad_to_frame(const video_xr_quad_t *q, float u, float v,
    *res_y = video_xr_norm(y0 + video_xr_pixel(v, h), VIDEO_SCALE_H(frame_dims));
    return true;
 }
+
+bool video_xr_quad_live(const video_xr_quad_t *q, unsigned laser,
+      bool menu_open)
+{
+   if (laser == VIDEO_OPENXR_LASER_OFF)
+      return false;
+   switch (q->kind)
+   {
+      case VIDEO_XR_QUAD_MENU:
+         return menu_open;
+      case VIDEO_XR_QUAD_SCREEN:
+         if (q->screen >= 1)
+            return true;
+         break;
+      default:
+         break;
+   }
+   return laser == VIDEO_OPENXR_LASER_ALWAYS;
+}
+
+int video_xr_pick(const video_xr_quad_set_t *set, unsigned laser,
+      bool menu_open, const video_xr_vec3_t *origin,
+      const video_xr_vec3_t *dir, float *u, float *v, float *t)
+{
+   unsigned i;
+   int best  = -1;
+   float bu  = 0.0f;
+   float bv  = 0.0f;
+   float bt  = 0.0f;
+   for (i = 0; i < set->num_quads; i++)
+   {
+      float qu, qv, qt;
+      if (     !video_xr_quad_live(&set->quads[i], laser, menu_open)
+            || !video_xr_ray_hit(&set->quads[i], origin, dir,
+               &qu, &qv, &qt))
+         continue;
+      if (best < 0 || qt < bt)
+      {
+         best = (int)i;
+         bu   = qu;
+         bv   = qv;
+         bt   = qt;
+      }
+   }
+   if (best >= 0)
+   {
+      *u = bu;
+      *v = bv;
+      *t = bt;
+   }
+   return best;
+}
+
+float video_xr_cursor(const video_xr_quad_t *q, float u, float v,
+      float dist, video_xr_pose_t *pose)
+{
+   video_xr_vec3_t local, world;
+   float size          = dist * VIDEO_XR_CURSOR_SCALE;
+   local.x             = (u - 0.5f) * q->width;
+   local.y             = (0.5f - v) * q->height;
+   local.z             = VIDEO_XR_CURSOR_LIFT;
+   video_xr_rotate(&q->pose.orientation, &local, &world);
+   pose->orientation   = q->pose.orientation;
+   pose->position.x    = q->pose.position.x + world.x;
+   pose->position.y    = q->pose.position.y + world.y;
+   pose->position.z    = q->pose.position.z + world.z;
+   return (size < VIDEO_XR_CURSOR_MIN) ? VIDEO_XR_CURSOR_MIN : size;
+}

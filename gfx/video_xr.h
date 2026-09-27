@@ -159,6 +159,30 @@ bool video_xr_quad_to_frame(const video_xr_quad_t *q, float u, float v,
       const video_views_map_t *map, unsigned frame_dims,
       int16_t *res_x, int16_t *res_y);
 
+/* The laser's dot: this wide per metre along the ray, never narrower
+ * than VIDEO_XR_CURSOR_MIN, just in front of the quad it is on. */
+#define VIDEO_XR_CURSOR_SCALE 0.012f
+#define VIDEO_XR_CURSOR_MIN   0.005f
+#define VIDEO_XR_CURSOR_LIFT  0.002f
+
+/* Whether a laser (enum video_openxr_laser) can point at q. Auto: the
+ * menu while it is open, and screens 1 and up. Always: every screen
+ * and a whole frame too. Off: nothing. */
+bool video_xr_quad_live(const video_xr_quad_t *q, unsigned laser,
+      bool menu_open);
+
+/* The nearest live quad the ray meets, as an index into set->quads, or
+ * -1; of a stereo screen's two quads, the first. t is in units of
+ * dir's length. */
+int video_xr_pick(const video_xr_quad_set_t *set, unsigned laser,
+      bool menu_open, const video_xr_vec3_t *origin,
+      const video_xr_vec3_t *dir, float *u, float *v, float *t);
+
+/* The dot where a ray dist metres long meets q at (u, v): its pose,
+ * facing as q does. Returns its width in metres. */
+float video_xr_cursor(const video_xr_quad_t *q, float u, float v,
+      float dist, video_xr_pose_t *pose);
+
 RETRO_END_DECLS
 
 #endif

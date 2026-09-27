@@ -42,6 +42,22 @@ enum video_screen_layout
    VIDEO_SCREEN_LAYOUT_LAST
 };
 
+/* Headset input settings (video_openxr_controllers, video_openxr_laser). */
+enum video_openxr_controllers
+{
+   VIDEO_OPENXR_CONTROLLERS_COMBINED = 0,
+   VIDEO_OPENXR_CONTROLLERS_SEPARATE,
+   VIDEO_OPENXR_CONTROLLERS_LAST
+};
+
+enum video_openxr_laser
+{
+   VIDEO_OPENXR_LASER_AUTO = 0,
+   VIDEO_OPENXR_LASER_ALWAYS,
+   VIDEO_OPENXR_LASER_OFF,
+   VIDEO_OPENXR_LASER_LAST
+};
+
 /* An origin in VIDEO_POS_PACK's layout and a size in
  * VIDEO_SCALE_PACK's, as video_viewport_t keeps them. */
 typedef struct video_views_rect

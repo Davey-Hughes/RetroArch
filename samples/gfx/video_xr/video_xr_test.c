@@ -386,6 +386,121 @@ static void test_quad_to_frame(void)
    CHECK(x == -16364 && y == 16485);
 }
 
+static void test_live(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+
+   map_3ds(&map);
+   params_init(&p, &map);
+   p.ui_dims = VIDEO_SCALE_PACK(1600, 960);
+   video_xr_place(&p, &set);
+   /* 0 and 1 are screen 0's eyes, 2 is screen 1, 3 the menu. */
+   CHECK(!video_xr_quad_live(&set.quads[0], VIDEO_OPENXR_LASER_AUTO, true));
+   CHECK( video_xr_quad_live(&set.quads[0], VIDEO_OPENXR_LASER_ALWAYS, false));
+   CHECK(!video_xr_quad_live(&set.quads[0], VIDEO_OPENXR_LASER_OFF, false));
+   CHECK( video_xr_quad_live(&set.quads[2], VIDEO_OPENXR_LASER_AUTO, false));
+   CHECK( video_xr_quad_live(&set.quads[2], VIDEO_OPENXR_LASER_ALWAYS, false));
+   CHECK(!video_xr_quad_live(&set.quads[2], VIDEO_OPENXR_LASER_OFF, false));
+   CHECK( video_xr_quad_live(&set.quads[3], VIDEO_OPENXR_LASER_AUTO, true));
+   CHECK(!video_xr_quad_live(&set.quads[3], VIDEO_OPENXR_LASER_AUTO, false));
+   CHECK( video_xr_quad_live(&set.quads[3], VIDEO_OPENXR_LASER_ALWAYS, true));
+   CHECK(!video_xr_quad_live(&set.quads[3], VIDEO_OPENXR_LASER_ALWAYS, false));
+   CHECK(!video_xr_quad_live(&set.quads[3], VIDEO_OPENXR_LASER_OFF, true));
+
+   /* A whole frame is screen 0. */
+   params_init(&p, NULL);
+   p.frame_dims = VIDEO_SCALE_PACK(800, 480);
+   video_xr_place(&p, &set);
+   CHECK(!video_xr_quad_live(&set.quads[0], VIDEO_OPENXR_LASER_AUTO, false));
+   CHECK( video_xr_quad_live(&set.quads[0], VIDEO_OPENXR_LASER_ALWAYS, false));
+}
+
+static void test_pick(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   video_xr_vec3_t o, d;
+   float u, v, t;
+
+   map_3ds(&map);
+   params_init(&p, &map);
+   p.ui_dims = VIDEO_SCALE_PACK(1600, 960);
+   video_xr_place(&p, &set);
+   o.x = 0.0f; o.y = 0.0f; o.z = 0.0f;
+
+   /* Screen 0 in Auto, the menu closed though its quad is up: nothing. */
+   d.x = 0.0f; d.y = 0.0f; d.z = -1.0f;
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_AUTO, false,
+            &o, &d, &u, &v, &t) == -1);
+   /* The bottom screen. */
+   d.x = -0.32f; d.y = -1.232f; d.z = -1.8f;
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_AUTO, false,
+            &o, &d, &u, &v, &t) == 2);
+   CHECK(NEAR(u, 0.25) && NEAR(v, 0.75) && NEAR(t, 1.0));
+   /* The open menu, in front of screen 0. */
+   d.x = 0.4f; d.y = 0.24f; d.z = -1.7f;
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_AUTO, true,
+            &o, &d, &u, &v, &t) == 3);
+   CHECK(NEAR(u, 0.75) && NEAR(v, 0.25) && NEAR(t, 1.0));
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_ALWAYS, true,
+            &o, &d, &u, &v, &t) == 3);
+   /* Closed, the ray goes through it to screen 0's left eye. */
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_ALWAYS, false,
+            &o, &d, &u, &v, &t) == 0);
+   CHECK(NEAR(u, 0.76471) && NEAR(v, 0.23529) && NEAR(t, 1.05882));
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_OFF, true,
+            &o, &d, &u, &v, &t) == -1);
+   /* Beside every screen. */
+   d.x = 3.0f; d.y = 0.0f; d.z = -1.8f;
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_ALWAYS, true,
+            &o, &d, &u, &v, &t) == -1);
+
+   /* A whole frame: only Always points at it. */
+   params_init(&p, NULL);
+   p.frame_dims = VIDEO_SCALE_PACK(800, 480);
+   video_xr_place(&p, &set);
+   d.x = 0.0f; d.y = 0.0f; d.z = -1.0f;
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_AUTO, false,
+            &o, &d, &u, &v, &t) == -1);
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_ALWAYS, false,
+            &o, &d, &u, &v, &t) == 0);
+   CHECK(NEAR(u, 0.5) && NEAR(v, 0.5) && NEAR(t, 1.8));
+}
+
+static void test_cursor(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   video_xr_pose_t pose;
+   float w;
+
+   map_3ds(&map);
+   params_init(&p, &map);
+   video_xr_place(&p, &set);
+   /* On the bottom screen, 1.2% of the ray's length wide. */
+   w = video_xr_cursor(&set.quads[2], 0.25f, 0.75f, 2.2f, &pose);
+   CHECK(NEAR(w, 0.0264));
+   CHECK(NEAR(pose.position.x, -0.32) && NEAR(pose.position.y, -1.232)
+         && NEAR(pose.position.z, -1.798));
+   CHECK(NEAR(pose.orientation.w, 1.0));
+   /* Never smaller than 5 mm. */
+   CHECK(NEAR(video_xr_cursor(&set.quads[2], 0.5f, 0.5f, 0.1f, &pose), 0.005));
+
+   /* A quad turned to face +X: u 0.75 is towards -Z, lifted along +X. */
+   video_xr_pose_identity(&p.anchor);
+   p.anchor.orientation.y = 0.70711f;
+   p.anchor.orientation.w = 0.70711f;
+   video_xr_place(&p, &set);
+   video_xr_cursor(&set.quads[0], 0.75f, 0.5f, 1.8f, &pose);
+   CHECK(NEAR(pose.position.x, -1.798) && NEAR(pose.position.y, 0.0)
+         && NEAR(pose.position.z, -0.4));
+   CHECK(NEAR(pose.orientation.y, 0.70711));
+}
+
 int main(void)
 {
    test_image_dims();
@@ -397,6 +512,9 @@ int main(void)
    test_anchor();
    test_ray_hit();
    test_quad_to_frame();
+   test_live();
+   test_pick();
+   test_cursor();
 
    if (failures)
    {
