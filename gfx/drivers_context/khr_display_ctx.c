@@ -13,6 +13,7 @@
  *  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <string.h>
 #include <compat/strl.h>
 #include <string/stdstring.h>
 #include <retro_timers.h>
@@ -25,6 +26,13 @@
 #include "../common/vulkan_common.h"
 #include "../../verbosity.h"
 #include "../../configuration.h"
+#ifdef HAVE_KMS
+#include <unistd.h>
+#include <xf86drmMode.h>
+#include "../../gfx/video_driver.h"
+#include "../common/drm_scanout.h"
+#include "../video_display_server.h"
+#endif
 
 typedef struct
 {
@@ -40,6 +48,9 @@ static void gfx_ctx_khr_display_destroy(void *data)
    if (!khr)
       return;
 
+#ifdef HAVE_KMS
+   kms_display_server_set_khr_display(NULL);
+#endif
    vulkan_context_destroy(&khr->vk, true);
 #ifdef HAVE_THREADS
    if (khr->vk.context.queue_lock)
@@ -67,6 +78,71 @@ static float gfx_ctx_khr_display_get_refresh_rate(void *data)
 }
 
 
+#ifdef HAVE_KMS
+/* dispserv_kms reads the beam of the connector the surface drives,
+ * found beside Mesa, which holds the card as master */
+static void gfx_ctx_khr_display_publish(khr_display_ctx_data_t *khr)
+{
+   kms_khr_display_t d;
+   char name[32];
+   unsigned major  = 0;
+   unsigned minor  = 0;
+   int fd          = -1;
+   drmModeRes *res = NULL;
+   const char *why = NULL;
+
+   memset(&d, 0, sizeof(d));
+   name[0] = '\0';
+
+   if (khr->vk.display_khr == VK_NULL_HANDLE)
+      why = "no display surface";
+   else if (!vulkan_display_drm_node(&khr->vk, &major, &minor))
+      why = "the GPU names no DRM device (VK_EXT_physical_device_drm)";
+   else if ((fd = drm_scanout_open_card("/sys/dev/char", "/dev/dri",
+         major, minor)) < 0)
+      why = "its card cannot be opened beside the driver";
+   else if (!(res = drmModeGetResources(fd)))
+      why = "its card lists no connectors";
+   else
+   {
+      int i;
+      for (i = 0; i < res->count_connectors && !d.connector_id; i++)
+         if (vulkan_display_from_drm_connector(&khr->vk, fd,
+               res->connectors[i]) == khr->vk.display_khr)
+            d.connector_id = res->connectors[i];
+      if (!d.connector_id)
+         why = "no connector is the display (VK_EXT_acquire_drm_display)";
+   }
+
+   if (d.connector_id)
+   {
+      drmModeConnector *conn = drmModeGetConnectorCurrent(fd,
+            d.connector_id);
+      if (conn)
+      {
+         drm_scanout_connector_name(conn->connector_type,
+               conn->connector_type_id, name, sizeof(name));
+         drmModeFreeConnector(conn);
+      }
+      d.major       = major;
+      d.minor       = minor;
+      d.width       = khr->vk.display_mode_params.visibleRegion.width;
+      d.height      = khr->vk.display_mode_params.visibleRegion.height;
+      d.refresh_mhz = khr->vk.display_mode_params.refreshRate;
+      RARCH_LOG("[Vulkan] The display is DRM connector %s (id %u, device %u:%u).\n",
+            *name ? name : "?", d.connector_id, major, minor);
+   }
+   else
+      RARCH_LOG("[Vulkan] No DRM connector for Scanline Sync: %s.\n", why);
+
+   if (res)
+      drmModeFreeResources(res);
+   if (fd >= 0)
+      close(fd);
+   kms_display_server_set_khr_display(&d);
+}
+#endif
+
 static void *gfx_ctx_khr_display_init(void *video_driver)
 {
    khr_display_ctx_data_t *khr = (khr_display_ctx_data_t*)
@@ -79,6 +155,16 @@ static void *gfx_ctx_khr_display_init(void *video_driver)
       RARCH_ERR("[Vulkan] Failed to create Vulkan context.\n");
       goto error;
    }
+
+#ifdef HAVE_KMS
+   {
+      /* Owned from here, so the menu never offers modelines */
+      kms_khr_display_t d;
+      memset(&d, 0, sizeof(d));
+      video_driver_display_type_set(RARCH_DISPLAY_KMS);
+      kms_display_server_set_khr_display(&d);
+   }
+#endif
 
    frontend_driver_install_signal_handler();
 
@@ -151,6 +237,10 @@ static bool gfx_ctx_khr_display_set_video_mode(void *data,
 
    khr->dims                      = khr->vk.context.swapchain_dims;
    khr->refresh_rate_x1000        = info.refresh_rate_x1000;
+
+#ifdef HAVE_KMS
+   gfx_ctx_khr_display_publish(khr);
+#endif
 
    return true;
 }
