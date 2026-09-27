@@ -545,6 +545,8 @@ uint	keyboard_gamepad_mapping_type	1	1
 uint	video_hdr_subpixel_layout	1	0
 uint	video_stereo_mode	1	0
 uint	video_screen_layout	1	0
+uint	video_openxr_controllers	1	0
+uint	video_openxr_laser	1	0
 uint	rewind_granularity	1	1
 uint	playlist_show_history_icons	1	PLAYLIST_SHOW_HISTORY_ICONS_CONTENT
 uint	rgui_internal_upscale_level	1	RGUI_UPSCALE_NONE
@@ -1217,6 +1219,8 @@ uint	keyboard_gamepad_mapping_type	1	1
 uint	video_hdr_subpixel_layout	1	0
 uint	video_stereo_mode	1	0
 uint	video_screen_layout	1	0
+uint	video_openxr_controllers	1	0
+uint	video_openxr_laser	1	0
 uint	rewind_granularity	1	1
 uint	playlist_show_history_icons	1	PLAYLIST_SHOW_HISTORY_ICONS_CONTENT
 uint	rgui_internal_upscale_level	1	RGUI_UPSCALE_NONE
@@ -1912,6 +1916,8 @@ uint	keyboard_gamepad_mapping_type	1	1
 uint	video_hdr_subpixel_layout	1	0
 uint	video_stereo_mode	1	0
 uint	video_screen_layout	1	0
+uint	video_openxr_controllers	1	0
+uint	video_openxr_laser	1	0
 uint	rewind_granularity	1	1
 uint	playlist_show_history_icons	1	PLAYLIST_SHOW_HISTORY_ICONS_CONTENT
 uint	rgui_internal_upscale_level	1	RGUI_UPSCALE_NONE

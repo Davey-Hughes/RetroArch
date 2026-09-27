@@ -19,3 +19,13 @@ S_FLOAT(video_openxr_width, VIDEO_OPENXR_WIDTH,
       1.6f, "%.1f m", SD_FLAG_ALLOW_INPUT, SDESC_RANGE_MINMAX, CMD_EVENT_NONE, 0.3, 10.0, 0.1, NULL, NULL,
       "Screen Width",
       "The width of the main screen in the headset. Other screens are sized to match it.")
+S_UINT_EX(video_openxr_controllers, VIDEO_OPENXR_CONTROLLERS,
+      "video_openxr_controllers",
+      0, SD_FLAG_NONE, SDESC_RANGE_MINMAX, 0, 0, 1, 1, 0, setting_action_ok_uint, setting_get_string_representation_video_openxr_controllers, NULL, NULL, NULL, NULL, ST_UI_TYPE_UINT_COMBOBOX,
+      "Headset Controllers",
+      "How the headset's controllers play. Combined makes both one gamepad for player 1. Separate makes the left controller player 1 and the right player 2.")
+S_UINT_EX(video_openxr_laser, VIDEO_OPENXR_LASER,
+      "video_openxr_laser",
+      0, SD_FLAG_NONE, SDESC_RANGE_MINMAX, 0, 0, 2, 1, 0, setting_action_ok_uint, setting_get_string_representation_video_openxr_laser, NULL, NULL, NULL, NULL, ST_UI_TYPE_UINT_COMBOBOX,
+      "Laser Pointer",
+      "Where a controller's trigger points and touches instead of pressing L2 or R2. Auto: the menu while it is open, and second screens such as a touch screen. Always: every screen, for light guns. Off: nowhere.")

@@ -268,6 +268,8 @@ typedef struct settings
       unsigned video_rotation;
       unsigned video_stereo_mode;
       unsigned video_screen_layout;
+      unsigned video_openxr_controllers;
+      unsigned video_openxr_laser;
       unsigned video_fse_negotiation;
       unsigned screen_orientation;
       unsigned video_msg_bgcolor_red;
