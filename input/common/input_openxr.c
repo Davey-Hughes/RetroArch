@@ -1051,6 +1051,17 @@ bool input_openxr_pointer(unsigned port, unsigned device, unsigned idx,
    return false;
 }
 
+bool input_openxr_menu_pointer(float *u, float *v, bool *pressed)
+{
+   const input_openxr_t *st = &input_openxr_st;
+   if (!st->menu_on)
+      return false;
+   *u       = st->menu_u;
+   *v       = st->menu_v;
+   *pressed = st->menu_pressed;
+   return true;
+}
+
 void input_openxr_register(void)
 {
    vulkan_openxr_hooks_t hooks;

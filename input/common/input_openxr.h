@@ -52,6 +52,10 @@ int16_t input_openxr_analog(unsigned port, unsigned idx, unsigned id,
 bool input_openxr_pointer(unsigned port, unsigned device, unsigned idx,
       unsigned id, int16_t *res);
 
+/* The laser on the menu quad: where, from 0 to 1 across and down, and
+ * whether its trigger is held. */
+bool input_openxr_menu_pointer(float *u, float *v, bool *pressed);
+
 RETRO_END_DECLS
 
 #endif

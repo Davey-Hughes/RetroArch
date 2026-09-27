@@ -1260,6 +1260,137 @@ def check_gun_tracking(res):
     return errors
 
 
+AIM_MENU_HIGH = 'aim right 0.2 -0.4 -0.3 0.16 0.192 -1.7'   # the menu, 0.6 0.3
+AIM_MENU_LOW = 'aim right 0.2 -0.4 -0.3 0.16 -0.048 -1.7'   # the menu, 0.6 0.55
+
+
+def check_menu_laser(res):
+    """Ozone at 1600x960: pointing lower moves the selection down, and the
+    trigger clicks."""
+    lines = kinds(core_events(res), 'menu')
+    high = [i for i, f in enumerate(lines)
+            if close((f['x'], f['y']), (960, 288), 4)]
+    low = [i for i, f in enumerate(lines)
+           if close((f['x'], f['y']), (960, 528), 4)]
+    if not high or not low:
+        return ['the laser did not reach the menu at both points: %s'
+                % lines[:6]]
+    errors = []
+    before = lines[high[-1]]['selection']
+    hover = [lines[i]['selection'] for i in low if not lines[i]['pressed']]
+    if not any(s > before for s in hover):
+        errors.append('pointing lower did not move the selection down '
+                      '(%d, then %s)' % (before, hover))
+    press = [i for i in low if lines[i]['pressed']]
+    if not press:
+        errors.append('the trigger did not press on the menu')
+    elif find(lines, press[0] + 1, lambda f: not f['pressed']) < 0:
+        errors.append('the press on the menu was not released')
+    shown = [f for f in res.frames if cursors(f)]
+    if not shown or not any(at(c, (0.16, -0.048, -1.7))
+                            for c in cursors(shown[-1])):
+        errors.append('no dot on the menu where the laser points')
+    return errors
+
+
+def check_menu_rgui(res):
+    """RGUI: the point is in its own small framebuffer, and a click
+    selects the entry under it."""
+    lines = kinds(core_events(res), 'menu')
+    if not lines:
+        return ['the laser never reached the menu']
+    errors = []
+    if max(f['y'] for f in lines) >= 480:
+        errors.append('menu pointer y %d is window pixels, not RGUI\'s'
+                      % max(f['y'] for f in lines))
+    press = find(lines, 0, lambda f: f['pressed'])
+    if press < 0:
+        return errors + ['the trigger did not press on the menu']
+    first = lines[0]['selection']
+    if not any(f['selection'] > first for f in lines[press:]):
+        errors.append('clicking lower did not move RGUI\'s selection (%d)'
+                      % first)
+    return errors
+
+
+# A held hand is never still: a pixel, then two, right of AIM_MENU_HIGH
+# (half a pixel in, so x truncates to 961 and 962 either side of float
+# error).
+AIM_MENU_SHAKE = 'aim right 0.2 -0.4 -0.3 0.1615 0.192 -1.7'
+AIM_MENU_BACK = 'aim right 0.2 -0.4 -0.3 0.1625 0.192 -1.7'
+# The menu's header, where a press selects nothing. Not at its top edge:
+# a menu cursor drawn across it wraps the Vulkan viewport (master's
+# gfx_display_vk_draw()).
+AIM_MENU_TOP = 'aim right 0.2 -0.4 -0.3 0.16 0.4224 -1.7'         # 0.6 0.06
+AIM_LEFT_MENU_TOP = 'aim left -0.2 -0.4 -0.3 -0.16 0.4224 -1.7'   # 0.4 0.06
+STICK_DOWN = 'action combined/left_stick 0 -1'
+# Stick taps shorter than the menu's repeat delay move one entry each,
+# so Ozone's list never scrolls (scrolling wraps the viewport too). Each
+# starts with the laser moving.
+SHAKE = [('script', AIM_MENU_SHAKE), ('wait', 0.05)] + [
+    step for _ in range(2) for step in (
+        ('script', script(AIM_MENU_HIGH, STICK_DOWN)), ('wait', 0.05),
+        ('script', script(AIM_MENU_SHAKE, STICK_DOWN)), ('wait', 0.05),
+        ('script', AIM_MENU_HIGH), ('wait', 0.05),
+        ('script', AIM_MENU_SHAKE), ('wait', 0.05))]
+
+
+def changes(seq):
+    return sum(1 for a, b in zip(seq, seq[1:]) if a != b)
+
+
+def check_menu_stick(res):
+    """Ozone: the headset's stick moves the selection under a still laser
+    and under one that shakes by a pixel; the laser leaving the menu and
+    coming back a pixel from where it left keeps the stick's selection."""
+    lines = kinds(core_events(res), 'menu')
+    shake = [i for i, f in enumerate(lines) if f['x'] == 961]
+    back = find(lines, 0, lambda f: f['x'] == 962)
+    if not shake or back < 1:
+        return ['the laser did not shake on the menu and come back: %s'
+                % lines[:6]]
+    sel = [f['selection'] for f in lines]
+    errors = []
+    # A still laser selects once, where it first lands; the rest is the
+    # stick's.
+    if changes(sel[:shake[0]]) < 2:
+        errors.append('the stick did not move the selection under a still '
+                      'laser: %s' % sel[:shake[0]])
+    if not changes(sel[shake[0]:shake[-1] + 1]):
+        errors.append('the stick did not move the selection under a shaking '
+                      'laser (%d)' % sel[shake[0]])
+    if len(set(sel[back - 1:])) != 1:
+        errors.append('the laser leaving the menu and coming back moved the '
+                      'selection: %s' % sel[back - 1:])
+    return errors
+
+
+def check_menu_hands(res):
+    """Both hands on the menu: the right points first, the left's trigger
+    takes the press, and the right's, pulled while the left's is held,
+    takes it back with a lift between."""
+    lines = kinds(core_events(res), 'menu')
+    left, right = (640, 57), (960, 57)
+    errors = []
+    if not lines or not close((lines[0]['x'], lines[0]['y']), right, 4):
+        errors.append('the right hand did not point first: %s' % lines[:2])
+    i = find(lines, 0, lambda f: f['pressed']
+             and close((f['x'], f['y']), left, 4))
+    j = (find(lines, i + 1, lambda f: f['pressed']
+              and close((f['x'], f['y']), right, 4)) if i >= 0 else -1)
+    if i < 0:
+        errors.append('the left hand did not press on the menu: %s'
+                      % lines[:4])
+    elif j < 0:
+        errors.append('the right hand did not take the press over: %s'
+                      % lines[i:i + 3])
+    elif not any(not f['pressed'] for f in lines[i + 1:j]):
+        errors.append('the press dragged from hand to hand without a lift')
+    if not any(len(cursors(f)) == 2 for f in res.frames):
+        errors.append('no frame with a dot for each hand')
+    return errors
+
+
 def check_hw_teardown(res):
     """The core's context_destroy waits on the device without the queue
     lock, at a video reinit and at unload: the headset's frames stop
@@ -1551,6 +1682,44 @@ CASES = [
                ('script', script(AIM_GUN, AIM_LEFT_MISS)), ('wait', 2),
                ('script', ''), ('wait', 1)],
      'check': check_gun_tracking},
+    {'name': 'input-menu', 'map': '3ds',
+     'settings': {'menu_driver': 'ozone', 'frontend_log_level': '0'},
+     'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),
+               ('script', AIM_MENU_HIGH), ('wait', 2),
+               ('script', AIM_MENU_LOW), ('wait', 2),
+               ('script', script(AIM_MENU_LOW, R2)), ('wait', 1),
+               ('script', AIM_MENU_LOW), ('wait', 2)],
+     'check': check_menu_laser},
+    {'name': 'input-menu-rgui', 'map': '3ds',
+     'settings': {'menu_driver': 'rgui', 'frontend_log_level': '0'},
+     'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),
+               ('script', AIM_MENU_LOW), ('wait', 2),
+               ('script', script(AIM_MENU_LOW, R2)), ('wait', 1),
+               ('script', AIM_MENU_LOW), ('wait', 2)],
+     'check': check_menu_rgui},
+    {'name': 'input-menu-stick', 'map': '3ds',
+     'settings': {'menu_driver': 'ozone', 'frontend_log_level': '0'},
+     'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),
+               ('script', AIM_MENU_HIGH), ('wait', 2),
+               ('script', script(AIM_MENU_HIGH, STICK_DOWN)), ('wait', 0.1),
+               ('script', AIM_MENU_HIGH), ('wait', 1)] + SHAKE
+     + [('wait', 1), ('script', AIM_MISS), ('wait', 1),
+        ('script', AIM_MENU_BACK), ('wait', 1)],
+     'check': check_menu_stick},
+    {'name': 'input-menu-hands', 'map': '3ds',
+     'settings': {'menu_driver': 'ozone', 'frontend_log_level': '0'},
+     'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),
+               ('script', script(AIM_LEFT_MENU_TOP, AIM_MENU_TOP)),
+               ('wait', 1),
+               ('script', script(AIM_LEFT_MENU_TOP, AIM_MENU_TOP, L2)),
+               ('wait', 1),
+               ('script', script(AIM_LEFT_MENU_TOP, AIM_MENU_TOP, L2, R2)),
+               ('wait', 1),
+               ('script', script(AIM_LEFT_MENU_TOP, AIM_MENU_TOP, R2)),
+               ('wait', 0.5),
+               ('script', script(AIM_LEFT_MENU_TOP, AIM_MENU_TOP)),
+               ('wait', 1)],
+     'check': check_menu_hands},
 ]
 
 
