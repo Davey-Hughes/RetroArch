@@ -36,7 +36,8 @@ import zlib
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, '..', '..', '..'))
 sys.path.insert(0, os.path.join(ROOT, 'samples', 'cores', 'video_views', 'e2e'))
-from run import CORE, read_png, send, write_cfg  # noqa: E402
+from run import (CORE, free_port, isolated_env, read_png, send,  # noqa: E402
+                 write_cfg)
 
 PRESET = os.path.join(HERE, 'output_size.slangp')
 LAYER_DIR = os.path.join(ROOT, 'samples', 'openxr', 'test_layer')
@@ -215,8 +216,9 @@ def run_case(retroarch, root, monado, case, validate):
     if case.get('overlay'):
         settings.update(write_overlay(d))
     settings.update(case.get('settings', {}))
+    port = free_port()
     cfg = os.path.join(d, 'retroarch.cfg')
-    write_cfg(cfg, d, 'vulkan', settings)
+    write_cfg(cfg, d, 'vulkan', settings, port)
     options = {'video_views_test_map': case.get('map', '3ds'),
                'video_views_test_hw': 'off'}
     options.update(case.get('options', {}))
@@ -255,7 +257,8 @@ def run_case(retroarch, root, monado, case, validate):
                        for k, v in sorted(child.items()))
     # Never reach the desktop: refuse the real display; what the runtime
     # and RetroArch open lives in this case's directory. The gamescope
-    # WSI layer still needs gamescope's own socket, by an absolute path.
+    # WSI layer still needs gamescope's own socket, by an absolute path in
+    # gamescope's private runtime dir.
     guard = ('case "$DISPLAY" in ""|:0) echo "refusing DISPLAY=$DISPLAY" >&2;'
              ' exit 99;; esac; cd ' + shlex.quote(d) + ' || exit 98;'
              ' case "${GAMESCOPE_WAYLAND_DISPLAY:-}" in ""|/*) ;;'
@@ -263,17 +266,19 @@ def run_case(retroarch, root, monado, case, validate):
              '$GAMESCOPE_WAYLAND_DISPLAY"; export GAMESCOPE_WAYLAND_DISPLAY;;'
              ' esac; export ' + exports + '; exec "$0" "$@"')
 
+    # gamescope and the service get none of the desktop's display, bus or
+    # runtime dir.
+    env = isolated_env()
     svc = svc_log = None
     if monado.get('MODE') == 'service':
-        env = dict(os.environ)
-        env.pop('DISPLAY', None)
-        env['WAYLAND_DISPLAY'] = 'openxr-e2e-no-socket'
-        env['XDG_RUNTIME_DIR'] = RUNTIME_DIR
+        svc_env = dict(env)
+        svc_env['WAYLAND_DISPLAY'] = 'openxr-e2e-no-socket'
+        svc_env['XDG_RUNTIME_DIR'] = RUNTIME_DIR
         # Monado's and libsurvive's config stay out of ~/.config.
-        env['XDG_CONFIG_HOME'] = os.path.join(d, 'config')
-        env.update(pairs(monado.get('SERVICE_ENV', '')))
+        svc_env['XDG_CONFIG_HOME'] = os.path.join(d, 'config')
+        svc_env.update(pairs(monado.get('SERVICE_ENV', '')))
         svc_log = open(os.path.join(d, 'service.log'), 'w')
-        svc = subprocess.Popen(['monado-service'], cwd=d, env=env,
+        svc = subprocess.Popen(['monado-service'], cwd=d, env=svc_env,
                                stdout=svc_log, stderr=subprocess.STDOUT,
                                stdin=subprocess.DEVNULL,
                                start_new_session=True)
@@ -293,14 +298,14 @@ def run_case(retroarch, root, monado, case, validate):
         cmd.append(case['content'])
     log = open(os.path.join(d, 'run.log'), 'w')
     p = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
-                         start_new_session=True)
+                         env=env, start_new_session=True)
     res = Result(d)
     try:
         for kind, arg in case['steps']:
             if kind == 'wait':
                 time.sleep(arg)
             elif kind == 'send':
-                send(arg)
+                send(arg, port)
             elif kind == 'mark':
                 res.marks[arg] = time.monotonic()
             elif kind == 'script':
@@ -309,9 +314,9 @@ def run_case(retroarch, root, monado, case, validate):
                     f.write(arg + '\n')
                 os.replace(tmp, script)
             elif kind == 'shot':
-                send('SCREENSHOT')
+                send('SCREENSHOT', port)
                 res.shot = wait_shot(d)
-        send('QUIT')
+        send('QUIT', port)
         try:
             p.wait(10)
         except subprocess.TimeoutExpired:
@@ -322,6 +327,9 @@ def run_case(retroarch, root, monado, case, validate):
         log.close()
         if svc_log:
             svc_log.close()
+        runtime_dir = env['XDG_RUNTIME_DIR']
+        if os.path.basename(runtime_dir).startswith('ra-e2e-'):
+            shutil.rmtree(runtime_dir, ignore_errors=True)
     load(res)
     return res
 
