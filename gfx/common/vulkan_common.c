@@ -3499,15 +3499,18 @@ static void vulkan_context_openxr_init(gfx_ctx_vulkan_data_t *vk,
    bool enable1         = iface && iface->create_device
       && !(iface->interface_version >= 2 && iface->create_device2);
 
-   /* A kept device keeps the runtime it was made for. */
+   /* A kept device keeps the runtime it was made for, while the runtime
+    * keeps the instance. */
    if (cached_instance_vk)
    {
-      if (cached_xr && enable)
+      if (cached_xr && enable && !vulkan_openxr_lost(cached_xr))
          vk->context.xr = cached_xr;
-      else if (cached_xr)
+      else
+      {
          vulkan_openxr_free(cached_xr);
-      else if (enable)
-         vulkan_openxr_needs_reload();
+         if (enable)
+            vulkan_openxr_needs_reload();
+      }
       cached_xr = NULL;
       return;
    }

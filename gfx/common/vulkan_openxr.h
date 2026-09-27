@@ -111,9 +111,10 @@ typedef struct vulkan_openxr_hooks
 /* Main thread, while no session exists. NULL clears. */
 void vulkan_openxr_set_hooks(const vulkan_openxr_hooks_t *hooks);
 
-/* Makes the session on the first call, then (again after a stop)
- * starts the XR thread. Every OpenXR call that may use the queue holds
- * queue_lock. False when the session could not be made. */
+/* Makes the session on the first call, and again when the runtime ended
+ * the last one, then (again after a stop) starts the XR thread. Every
+ * OpenXR call that may use the queue holds queue_lock. False when the
+ * session could not be made. */
 bool vulkan_openxr_start(vulkan_openxr_t *xr, VkInstance instance,
       VkPhysicalDevice gpu, VkDevice device, uint32_t queue_family,
       slock_t *queue_lock);
@@ -131,6 +132,10 @@ void vulkan_openxr_drop_and_reinit(vulkan_openxr_t *xr);
 
 /* Until the runtime ends the session: the headset shows both eyes. */
 bool vulkan_openxr_alive(vulkan_openxr_t *xr);
+
+/* While stopped: the runtime lost the instance, so no session can be
+ * made on its device again. */
+bool vulkan_openxr_lost(const vulkan_openxr_t *xr);
 
 /* The session's focus as the XR thread last saw it, and its latest
  * predicted display time. */

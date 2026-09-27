@@ -30,6 +30,8 @@
  *   head off                the runtime's own pose again
  *   fail session            xrCreateSession fails
  *   fail waitframe          xrWaitFrame reports XR_ERROR_SESSION_LOST
+ *   fail instance           xrPollEvent reports XR_ERROR_INSTANCE_LOST
+ *                           while a session exists
  *   state <n>               the next xrPollEvent reports session state n
  *
  * A changed script is applied line by line without resetting anything:
@@ -86,6 +88,7 @@ static struct
    bool head_set;
    bool fail_session;
    bool fail_waitframe;
+   bool fail_instance;
    int inject_state;
    XrSession session;
    XrPosef head;
@@ -189,6 +192,7 @@ static void script_fail(const char *args)
 {
    L.fail_session   = !strncmp(args, "session", 7);
    L.fail_waitframe = !strncmp(args, "waitframe", 9);
+   L.fail_instance  = !strncmp(args, "instance", 8);
 }
 
 static void script_state(const char *args)
@@ -546,12 +550,16 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_PollEvent(XrInstance instance,
       XrEventDataBuffer *ev)
 {
    int inject;
+   bool lost;
    XrResult res;
    pthread_mutex_lock(&L.lock);
    script_poll();
+   lost           = L.session && L.fail_instance;
    inject         = L.session ? L.inject_state : 0;
    L.inject_state = 0;
    pthread_mutex_unlock(&L.lock);
+   if (lost)
+      return XR_ERROR_INSTANCE_LOST;
    if (inject)
    {
       XrEventDataSessionStateChanged *s = (XrEventDataSessionStateChanged*)ev;

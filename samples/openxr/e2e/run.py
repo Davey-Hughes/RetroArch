@@ -735,10 +735,53 @@ def check_hw_teardown(res):
     return errors
 
 
+def check_kept_retry(res):
+    """A kept context's session that the runtime ended starts again at
+    the next video reinit, on the same device."""
+    errors = []
+    for line in ('[OpenXR] The headset session ended',
+                 '[Vulkan] Using cached Vulkan context.'):
+        if line not in res.log:
+            errors.append('missing "%s"' % line)
+    made = res.log.count('[OpenXR] Session created.')
+    if made != 2:
+        errors.append('%d sessions created, want 2' % made)
+    t = res.marks.get('reinit', 0) * 1e6
+    after = [f for f in res.frames if f['t_us'] > t + 1e6]
+    if len(after) < 40:
+        errors.append('%d headset frames after the reinit' % len(after))
+    stereo = re.findall(r'\[video_views\] presents=\d stereo=(\d)', res.log)
+    if '0' not in stereo or stereo[-1:] != ['1']:
+        errors.append('the core saw stereo %s, want it off and on again'
+                      % ' '.join(stereo))
+    return errors
+
+
+def check_kept_lost(res):
+    """A kept context whose runtime lost the instance needs the content
+    loaded again: the reinit says so and makes no session."""
+    errors = []
+    for line in ('[OpenXR] The headset session ended',
+                 '[Vulkan] Using cached Vulkan context.',
+                 'headset output starts when it is loaded again'):
+        if line not in res.log:
+            errors.append('missing "%s"' % line)
+    made = res.log.count('[OpenXR] Session created.')
+    if made != 1:
+        errors.append('%d sessions created, want 1' % made)
+    t = res.marks.get('reinit', 0) * 1e6
+    after = [f for f in res.frames if f['t_us'] > t]
+    if after:
+        errors.append('%d headset frames after the reinit' % len(after))
+    return errors
+
+
 SETTLE = [('wait', 8)]
 VULKAN = {'video_views_test_hw': 'vulkan'}
 TEARDOWN = [('wait', 6), ('send', 'FULLSCREEN_TOGGLE'), ('wait', 4),
             ('send', 'CLOSE_CONTENT'), ('wait', 4)]
+# A kept context's reinit leaks these, headset or not, on master too.
+KEPT_LEAK = [('VUID-vkDestroyDevice-device-05137', 'has 4 leaked objects')]
 SIZED = {'video_shader_enable': 'true'}
 SHOT = [('wait', 8), ('shot', None)]
 
@@ -809,6 +852,18 @@ CASES = [
     {'name': 'hw-teardown-threaded', 'map': 'none', 'options': VULKAN,
      'settings': {'video_threaded': 'true'}, 'steps': TEARDOWN,
      'check': threaded(check_hw_teardown)},
+    {'name': 'kept-retry', 'map': 'none',
+     'options': {'video_views_test_hw': 'vulkan_keep'},
+     'steps': [('wait', 6), ('script', 'state 8'), ('wait', 2),
+               ('mark', 'reinit'), ('send', 'FULLSCREEN_TOGGLE'),
+               ('wait', 5)],
+     'baseline': KEPT_LEAK, 'check': check_kept_retry},
+    {'name': 'kept-lost', 'map': 'none',
+     'options': {'video_views_test_hw': 'vulkan_keep'},
+     'steps': [('wait', 6), ('script', 'fail instance'), ('wait', 2),
+               ('mark', 'reinit'), ('send', 'FULLSCREEN_TOGGLE'),
+               ('wait', 4)],
+     'baseline': KEPT_LEAK, 'check': check_kept_lost},
 ]
 
 
@@ -835,7 +890,8 @@ def main():
         if 'hung' in res.marks:
             errors.append('RetroArch did not quit')
         if validate:
-            extra, known = unexpected(res.log, baseline)
+            extra, known = unexpected(res.log,
+                                      baseline + case.get('baseline', []))
             if extra:
                 errors.append('validation: ' + ', '.join(extra))
             if not known:

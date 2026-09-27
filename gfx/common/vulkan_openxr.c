@@ -74,6 +74,7 @@ struct vulkan_openxr
    retro_atomic_int_t recenter;
    bool running;                   /* XR thread */
    bool ended;                     /* XR thread, or while it is stopped */
+   bool lost;                      /* ended with the instance; as ended */
    bool frame_failed;              /* XR thread */
    int64_t formats[VULKAN_OPENXR_MAX_FORMATS];
    uint32_t num_formats;
@@ -414,11 +415,9 @@ failed:
    return NULL;
 }
 
-void vulkan_openxr_free(vulkan_openxr_t *xr)
+/* After vulkan_openxr_stop(). */
+static void vulkan_openxr_destroy_session(vulkan_openxr_t *xr)
 {
-   if (!xr)
-      return;
-   vulkan_openxr_stop(xr);
    if (xr->session && vulkan_openxr_hooks.session_destroying)
       vulkan_openxr_hooks.session_destroying(vulkan_openxr_hooks.user, xr);
    if (xr->view_space)
@@ -427,6 +426,17 @@ void vulkan_openxr_free(vulkan_openxr_t *xr)
       xr->DestroySpace(xr->local_space);
    if (xr->session)
       xr->DestroySession(xr->session);
+   xr->view_space  = XR_NULL_HANDLE;
+   xr->local_space = XR_NULL_HANDLE;
+   xr->session     = XR_NULL_HANDLE;
+}
+
+void vulkan_openxr_free(vulkan_openxr_t *xr)
+{
+   if (!xr)
+      return;
+   vulkan_openxr_stop(xr);
+   vulkan_openxr_destroy_session(xr);
    if (xr->instance && xr->DestroyInstance)
       xr->DestroyInstance(xr->instance);
    if (xr->lock)
@@ -580,9 +590,11 @@ static const char *vulkan_openxr_state_name(XrSessionState state)
    return "unknown";
 }
 
-static void vulkan_openxr_ended(vulkan_openxr_t *xr)
+static void vulkan_openxr_ended(vulkan_openxr_t *xr, bool instance_lost)
 {
    xr->running = false;
+   if (instance_lost)
+      xr->lost = true;
    if (xr->ended)
       return;
    xr->ended = true;
@@ -623,7 +635,7 @@ static void vulkan_openxr_session_state(vulkan_openxr_t *xr,
          break;
       case XR_SESSION_STATE_EXITING:
       case XR_SESSION_STATE_LOSS_PENDING:
-         vulkan_openxr_ended(xr);
+         vulkan_openxr_ended(xr, false);
          break;
       default:
          break;
@@ -640,14 +652,19 @@ static void vulkan_openxr_poll(vulkan_openxr_t *xr)
       ev.type = XR_TYPE_EVENT_DATA_BUFFER;
       res     = xr->PollEvent(xr->instance, &ev);
       if (res == XR_ERROR_INSTANCE_LOST)
-         vulkan_openxr_ended(xr);
+         vulkan_openxr_ended(xr, true);
       if (res != XR_SUCCESS)
          break;
       if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED)
-         vulkan_openxr_session_state(xr,
-               ((const XrEventDataSessionStateChanged*)&ev)->state);
+      {
+         const XrEventDataSessionStateChanged *sc =
+            (const XrEventDataSessionStateChanged*)&ev;
+         /* A session destroyed for a new one may have some queued. */
+         if (sc->session == xr->session)
+            vulkan_openxr_session_state(xr, sc->state);
+      }
       else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING)
-         vulkan_openxr_ended(xr);
+         vulkan_openxr_ended(xr, true);
    }
 }
 
@@ -693,7 +710,7 @@ static void vulkan_openxr_frame_error(vulkan_openxr_t *xr,
    }
    /* A runtime may report the loss here without an event. */
    if (res == XR_ERROR_SESSION_LOST || res == XR_ERROR_INSTANCE_LOST)
-      vulkan_openxr_ended(xr);
+      vulkan_openxr_ended(xr, res == XR_ERROR_INSTANCE_LOST);
 }
 
 /* The published quads whose slot has released an image. The caller
@@ -969,6 +986,14 @@ bool vulkan_openxr_start(vulkan_openxr_t *xr, VkInstance instance,
 {
    if (!xr->lock && !(xr->lock = slock_new()))
       return false;
+   /* A kept device outlives a session the runtime ended: a new one. */
+   if (xr->ended)
+   {
+      vulkan_openxr_destroy_session(xr);
+      xr->ended        = false;
+      xr->frame_failed = false;
+      retro_atomic_store_release_int(&xr->state, XR_SESSION_STATE_UNKNOWN);
+   }
    if (     !xr->session
          && !vulkan_openxr_create_session(xr, instance, gpu, device,
             queue_family))
@@ -1021,6 +1046,11 @@ void vulkan_openxr_drop_and_reinit(vulkan_openxr_t *xr)
    vulkan_openxr_notify(MSG_OPENXR_FAILED);
    vulkan_openxr_free(xr);
    vulkan_openxr_skip_once = true;
+}
+
+bool vulkan_openxr_lost(const vulkan_openxr_t *xr)
+{
+   return xr->lost;
 }
 
 bool vulkan_openxr_alive(vulkan_openxr_t *xr)
