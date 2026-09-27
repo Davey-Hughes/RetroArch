@@ -1,10 +1,13 @@
 # The raster poll interface: RetroArch's contract checker
-# (gfx/video_raster.c) against synthetic call sequences.
+# (gfx/video_raster.c) against synthetic call sequences and against a
+# software core that polls the raster, and that core as a libretro core
+# RetroArch can load (raster_poll_libretro.so).
 
 CORE_DIR          := ../../..
 LIBRETRO_COMM_DIR := $(CORE_DIR)/libretro-common
 
 TARGET := raster_poll_test
+CORE   := raster_poll_libretro.so
 
 INCDIRS := -I$(LIBRETRO_COMM_DIR)/include
 # RetroArch's linux-c89 lane
@@ -20,9 +23,9 @@ else
 CFLAGS  += -g -O1
 endif
 
-OBJS := raster_poll_test.o video_raster.o
+OBJS := raster_poll_test.o video_raster.o raster_poll_core.o
 
-all: $(TARGET)
+all: $(TARGET) $(CORE)
 
 $(TARGET): $(OBJS)
 	$(CC) -o $@ $(OBJS) $(LDFLAGS)
@@ -34,7 +37,14 @@ raster_poll_test.o: raster_poll_test.c
 video_raster.o: $(CORE_DIR)/gfx/video_raster.c
 	$(CC) $(CFLAGS) $(C89) -c -o $@ $<
 
+raster_poll_core.o: raster_poll_core.c
+	$(CC) $(CFLAGS) $(C89) -c -o $@ $<
+
+# Loaded by RetroArch, so never sanitized
+$(CORE): raster_poll_core.c
+	$(CC) -Wall $(INCDIRS) $(C89) -O2 -fPIC -shared -o $@ $<
+
 clean:
-	rm -f $(TARGET) $(OBJS)
+	rm -f $(TARGET) $(CORE) $(OBJS)
 
 .PHONY: all clean
