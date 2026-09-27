@@ -335,6 +335,8 @@ typedef struct vk
       VkFormat format;
       bool mutable_format;
       bool hdr_warned;
+      bool recenter_seen;
+      unsigned recenter;   /* the request count last seen */
    } xr;
 #endif
    vulkan_context_t *context;
@@ -9208,6 +9210,18 @@ static void vulkan_xr_release(vk_t *vk)
    }
 }
 
+/* A recenter request since the last frame goes to the XR thread. */
+static void vulkan_xr_recenter(vk_t *vk, const video_frame_info_t *video_info)
+{
+   if (!vk->context->xr)
+      return;
+   if (     vk->xr.recenter_seen
+         && vk->xr.recenter != video_info->headset_recenter)
+      vulkan_openxr_request_recenter(vk->context->xr);
+   vk->xr.recenter      = video_info->headset_recenter;
+   vk->xr.recenter_seen = true;
+}
+
 /* Whether the headset shows this frame: a session it can see, its
  * pixel density measured, no HDR output, and a format to draw in. */
 static bool vulkan_xr_ready(vk_t *vk)
@@ -9390,6 +9404,7 @@ static bool vulkan_frame(void *data, const void *frame,
    vk->chain                                     = chain;
    vk->backbuffer                                = backbuffer;
 #ifdef HAVE_OPENXR
+   vulkan_xr_recenter(vk, video_info);
    xr_draw                                       = vulkan_xr_ready(vk);
 #endif
 

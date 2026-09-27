@@ -175,6 +175,10 @@ void vulkan_openxr_get_anchor(vulkan_openxr_t *xr, video_xr_pose_t *anchor);
 /* Any thread: the quads the XR thread submits. */
 bool vulkan_openxr_get_quads(vulkan_openxr_t *xr, video_xr_quad_set_t *out);
 
+/* Any thread: place the screens in front of where the headset looks, at
+ * its next frame. */
+void vulkan_openxr_request_recenter(vulkan_openxr_t *xr);
+
 RETRO_END_DECLS
 
 #endif

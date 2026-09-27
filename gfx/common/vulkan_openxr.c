@@ -71,6 +71,7 @@ struct vulkan_openxr
    retro_atomic_int_t quit;
    retro_atomic_int_t state;       /* XrSessionState */
    retro_atomic_int_t alive;
+   retro_atomic_int_t recenter;
    bool running;                   /* XR thread */
    bool ended;                     /* XR thread, or while it is stopped */
    bool frame_failed;              /* XR thread */
@@ -98,6 +99,7 @@ struct vulkan_openxr
    PFN_xrCreateReferenceSpace CreateReferenceSpace;
    PFN_xrDestroySpace DestroySpace;
    PFN_xrLocateViews LocateViews;
+   PFN_xrLocateSpace LocateSpace;
    PFN_xrWaitFrame WaitFrame;
    PFN_xrBeginFrame BeginFrame;
    PFN_xrEndFrame EndFrame;
@@ -740,6 +742,39 @@ static unsigned vulkan_openxr_layers(vulkan_openxr_t *xr,
    return n;
 }
 
+/* The head's position and heading at time become the anchor. */
+static void vulkan_openxr_recenter(vulkan_openxr_t *xr, XrTime time)
+{
+   XrSpaceLocation loc;
+   video_xr_pose_t head, anchor;
+   XrSpaceLocationFlags valid = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT
+      | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+
+   memset(&loc, 0, sizeof(loc));
+   loc.type = XR_TYPE_SPACE_LOCATION;
+   if (     XR_FAILED(xr->LocateSpace(xr->view_space, xr->local_space,
+               time, &loc))
+         || (loc.locationFlags & valid) != valid)
+   {
+      RARCH_WARN("[OpenXR] Recenter: the headset is not tracked.\n");
+      return;
+   }
+   head.orientation.x = loc.pose.orientation.x;
+   head.orientation.y = loc.pose.orientation.y;
+   head.orientation.z = loc.pose.orientation.z;
+   head.orientation.w = loc.pose.orientation.w;
+   head.position.x    = loc.pose.position.x;
+   head.position.y    = loc.pose.position.y;
+   head.position.z    = loc.pose.position.z;
+   if (!video_xr_anchor_from_head(&head, &anchor))
+      return;
+   slock_lock(xr->lock);
+   xr->anchor = anchor;
+   slock_unlock(xr->lock);
+   RARCH_LOG("[OpenXR] Recentered at %.2f, %.2f, %.2f.\n",
+         anchor.position.x, anchor.position.y, anchor.position.z);
+}
+
 /* One headset frame. xrWaitFrame paces this thread at the headset's
  * rate; the core never waits on it. */
 static void vulkan_openxr_frame(vulkan_openxr_t *xr)
@@ -770,6 +805,11 @@ static void vulkan_openxr_frame(vulkan_openxr_t *xr)
    slock_unlock(xr->lock);
    if (xr->px_per_rad <= 0.0f)
       vulkan_openxr_measure(xr, state.predictedDisplayTime);
+   if (retro_atomic_load_acquire_int(&xr->recenter))
+   {
+      retro_atomic_store_release_int(&xr->recenter, 0);
+      vulkan_openxr_recenter(xr, state.predictedDisplayTime);
+   }
 
    memset(&begin_info, 0, sizeof(begin_info));
    begin_info.type               = XR_TYPE_FRAME_BEGIN_INFO;
@@ -838,6 +878,7 @@ static bool vulkan_openxr_create_session(vulkan_openxr_t *xr,
          || !VULKAN_OPENXR_FN(xr, CreateReferenceSpace)
          || !VULKAN_OPENXR_FN(xr, DestroySpace)
          || !VULKAN_OPENXR_FN(xr, LocateViews)
+         || !VULKAN_OPENXR_FN(xr, LocateSpace)
          || !VULKAN_OPENXR_FN(xr, WaitFrame)
          || !VULKAN_OPENXR_FN(xr, BeginFrame)
          || !VULKAN_OPENXR_FN(xr, EndFrame)
@@ -1194,4 +1235,9 @@ bool vulkan_openxr_get_quads(vulkan_openxr_t *xr, video_xr_quad_set_t *out)
    *out = xr->quads;
    slock_unlock(xr->lock);
    return true;
+}
+
+void vulkan_openxr_request_recenter(vulkan_openxr_t *xr)
+{
+   retro_atomic_store_release_int(&xr->recenter, 1);
 }

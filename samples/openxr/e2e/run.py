@@ -616,6 +616,102 @@ def check_menu_closed(res):
     return []
 
 
+def check_recenter(res):
+    shown = [f for f in res.frames if quads(f)]
+    if not shown:
+        return no_quads(res)
+    errors = []
+    first = [x for x in quads(shown[0]) if x['eye'] == 'left']
+    last = [x for x in quads(shown[-1]) if x['eye'] == 'left']
+    if not first or not last:
+        return ['no left-eye quad']
+    if not at(first[0], (0.0, 0.0, -1.8)):
+        errors.append('screen 0 started at %s' % first[0]['pose'][:3])
+    # The scripted head: 0.5, 0.2, 0.3, turned 90 degrees left.
+    if not at(last[0], (-1.3, 0.2, 0.3)):
+        errors.append('screen 0 at %s after recentering, want (-1.3, 0.2, 0.3)'
+                      % last[0]['pose'][:3])
+    if not facing(last[0], (0.0, 0.70711, 0.0, 0.70711)):
+        errors.append('screen 0 turned %s, want a quarter turn left'
+                      % last[0]['pose'][3:])
+    if 'Headset recenter requested' not in res.log:
+        errors.append('the network command did not reach the hotkey')
+    return errors
+
+
+def check_pacing(res):
+    """The headset's frames keep its own rate while the core is paused,
+    and no new images are drawn for it."""
+    if 'paused' not in res.marks or 'resumed' not in res.marks:
+        return ['the run did not pause']
+    t0 = (res.marks['paused'] + 0.5) * 1e6
+    t1 = res.marks['resumed'] * 1e6
+    periods = sorted(f['period_ns'] for f in res.frames if f['period_ns'] > 0)
+    if not periods:
+        return ['no frame period recorded']
+    period = periods[len(periods) // 2]
+    frames = [f for f in res.frames if t0 <= f['t_us'] <= t1]
+    released = [r for r in res.releases if t0 <= r['t_us'] <= t1]
+    before = [r for r in res.releases if r['t_us'] < t0 - 1e6]
+    want = (t1 - t0) * 1e3 / period
+    errors = []
+    if abs(len(frames) - want) > 0.15 * want:
+        errors.append('%d headset frames while paused, want about %.0f'
+                      % (len(frames), want))
+    if len(released) > 2:
+        errors.append('%d images released while paused, want none'
+                      % len(released))
+    if not before:
+        errors.append('no images were released before the pause')
+    return errors
+
+
+def window_is(res, want, what):
+    if not res.shot:
+        return ['no screenshot']
+    w, h, bpp, rows = read_png(res.shot)
+    got = tuple(rows[240][800 * bpp:800 * bpp + 3])
+    if not near(got, want):
+        return ['the window shows %s at the top screen, want %s (%s)'
+                % (got, want, what)]
+    return []
+
+
+def check_no_runtime(res):
+    errors = []
+    # The loader may fail listing extensions or creating the instance.
+    if (     '[OpenXR] No runtime' not in res.log
+            and '[OpenXR] The runtime lacks' not in res.log):
+        errors.append('no "[OpenXR] No runtime" in the log')
+    if any(quads(f) for f in res.frames):
+        errors.append('quads were submitted without a runtime')
+    return errors + window_is(res, GREEN, 'the 2D map')
+
+
+def check_session_fails(res):
+    errors = []
+    for line in ('[OpenXR] Rebuilding video without headset output.',
+                 '[Video] Reinitialising the video driver at its request.',
+                 '[OpenXR] Starting once without headset output after a failure.'):
+        if line not in res.log:
+            errors.append('missing "%s"' % line)
+    if any(quads(f) for f in res.frames):
+        errors.append('quads were submitted after the session failed')
+    return errors + window_is(res, GREEN, 'the 2D map')
+
+
+def check_session_lost(res):
+    errors = []
+    if '[OpenXR] The headset session ended' not in res.log:
+        errors.append('no "[OpenXR] The headset session ended" in the log')
+    lost = res.marks.get('lost', 0) * 1e6
+    late = [f for f in res.frames if f['t_us'] > lost + 500000 and quads(f)]
+    if late:
+        errors.append('%d frames with quads after the session was lost'
+                      % len(late))
+    return errors + window_is(res, GREEN, 'the 2D map again')
+
+
 SETTLE = [('wait', 8)]
 SIZED = {'video_shader_enable': 'true'}
 SHOT = [('wait', 8), ('shot', None)]
@@ -662,6 +758,25 @@ CASES = [
      'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),
                ('send', 'MENU_TOGGLE'), ('wait', 3)],
      'check': check_menu_closed},
+    {'name': 'recenter', 'map': '3ds',
+     'steps': [('wait', 6), ('script', 'head 0.5 0.2 0.3 90'), ('wait', 1),
+               ('send', 'HEADSET_RECENTER'), ('wait', 3)],
+     'check': check_recenter},
+    {'name': 'pacing', 'map': '3ds',
+     'steps': [('wait', 6), ('send', 'PAUSE_TOGGLE'), ('mark', 'paused'),
+               ('wait', 3), ('mark', 'resumed'), ('send', 'PAUSE_TOGGLE'),
+               ('wait', 2)],
+     'check': check_pacing},
+    {'name': 'no-runtime', 'map': '3ds', 'no_runtime': True,
+     'steps': [('wait', 6), ('shot', None)],
+     'check': check_no_runtime},
+    {'name': 'session-fails', 'map': '3ds', 'script': 'fail session\n',
+     'steps': [('wait', 8), ('shot', None)],
+     'check': check_session_fails},
+    {'name': 'session-lost', 'map': '3ds',
+     'steps': [('wait', 6), ('script', 'state 7'), ('mark', 'lost'),
+               ('wait', 3), ('shot', None)],
+     'check': check_session_lost},
 ]
 
 
