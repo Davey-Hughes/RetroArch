@@ -18,8 +18,9 @@
  * Records every xrEndFrame's layers as JSON lines, copies each swapchain
  * image as the application releases it, and writes the images a frame
  * shows to PNG every Nth frame. A script file overrides answers the
- * runtime gives: today the head pose. The headset input tests add
- * action states, aim poses and focus changes as more script commands.
+ * runtime gives: the head pose, session state events, the controllers'
+ * actions and hand poses. Haptics, suggested bindings and synced
+ * action sets are recorded.
  *
  *   RA_XR_LAYER_OUT         directory for frames.jsonl and snap_*.png
  *   RA_XR_LAYER_SNAP_EVERY  write images every Nth frame; 0 never
@@ -32,14 +33,23 @@
  *   fail waitframe          xrWaitFrame reports XR_ERROR_SESSION_LOST
  *   fail instance           xrPollEvent reports XR_ERROR_INSTANCE_LOST
  *                           while a session exists
- *   state <n>               the next xrPollEvent reports session state n
+ *   state <n>               queue session state n: while a session
+ *                           exists, each xrPollEvent reports the oldest
  *   space <n>               the next xrPollEvent reports reference space
  *                           type n changing (2, LOCAL: a runtime recenter)
+ *   action <set>/<name>[@left|@right] <x> [<y>]
+ *                           an action's state while its set is synced:
+ *                           boolean x != 0, float x, vector2f x y
+ *   aim <left|right> <px> <py> <pz> <tx> <ty> <tz>
+ *                           that hand's pose spaces at p, -Z towards t
+ *   aim <left|right> off    that hand untracked
  *
- * A changed script is applied line by line without resetting anything:
- * head and fail stay in effect until a later head or fail line replaces
- * them (head off, fail off). state and space fire once per change of the
- * file.
+ * A changed script (a new mtime, inode or size) is applied line by
+ * line. head and fail stay in effect until a later head or fail line
+ * replaces them (head off, fail off). state and space fire once per
+ * change of the file. Every read starts from no actions and no aims: a
+ * script is the whole controller state. Action states and hand poses
+ * never come from the runtime.
  */
 
 #include <math.h>
@@ -62,6 +72,27 @@
 #define MAX_CHAINS 32
 #define MAX_IMAGES 8
 #define MAX_SPACES 64
+
+#define MAX_SETS        16
+#define MAX_ACTIONS     128
+#define MAX_SCRIPTED    64
+#define MAX_HAND_SPACES 32
+#define ACTION_NAME     (XR_MAX_ACTION_SET_NAME_SIZE + XR_MAX_ACTION_NAME_SIZE)
+
+struct action_rec
+{
+   XrAction handle;
+   XrActionSet set;
+   XrActionType type;
+   char name[ACTION_NAME];   /* "set/action" */
+};
+
+struct scripted
+{
+   char name[ACTION_NAME];
+   int hand;                 /* 0 any, 1 left, 2 right */
+   float v[2];
+};
 
 struct chain
 {
@@ -88,11 +119,14 @@ static struct
    unsigned snap_every;
    char script[1024];
    struct timespec script_mtime;
+   ino_t script_ino;
+   off_t script_size;
    bool head_set;
    bool fail_session;
    bool fail_waitframe;
    bool fail_instance;
-   int inject_state;
+   int inject_states[8];     /* oldest first */
+   unsigned num_inject_states;
    int inject_space;
    XrSession session;
    XrPosef head;
@@ -126,6 +160,45 @@ static struct
    PFN_xrReleaseSwapchainImage ReleaseSwapchainImage;
    PFN_xrWaitFrame WaitFrame;
    PFN_xrEndFrame EndFrame;
+
+   XrInstance instance;
+   struct
+   {
+      XrActionSet handle;
+      char name[XR_MAX_ACTION_SET_NAME_SIZE];
+   } sets[MAX_SETS];
+   unsigned num_sets;
+   struct action_rec actions[MAX_ACTIONS];
+   unsigned num_actions;
+   struct
+   {
+      XrSpace space;
+      int hand;
+   } hand_spaces[MAX_HAND_SPACES];
+   unsigned num_hand_spaces;
+   XrActionSet synced[MAX_SETS];
+   unsigned num_synced;
+   char synced_names[512];
+   struct scripted scripted[MAX_SCRIPTED];
+   unsigned num_scripted;
+   bool aim_set[3];
+   XrPosef aim[3];
+   int hand_logged[3];       /* 0 never, 1 untracked, 2 tracked */
+
+   PFN_xrPathToString PathToString;
+   PFN_xrCreateActionSet CreateActionSet;
+   PFN_xrDestroyActionSet DestroyActionSet;
+   PFN_xrCreateAction CreateAction;
+   PFN_xrCreateActionSpace CreateActionSpace;
+   PFN_xrDestroySpace DestroySpace;
+   PFN_xrSyncActions SyncActions;
+   PFN_xrGetActionStateBoolean GetActionStateBoolean;
+   PFN_xrGetActionStateFloat GetActionStateFloat;
+   PFN_xrGetActionStateVector2f GetActionStateVector2f;
+   PFN_xrGetActionStatePose GetActionStatePose;
+   PFN_xrApplyHapticFeedback ApplyHapticFeedback;
+   PFN_xrStopHapticFeedback StopHapticFeedback;
+   PFN_xrSuggestInteractionProfileBindings SuggestInteractionProfileBindings;
 } L = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
 static long long now_us(void)
@@ -170,6 +243,82 @@ static int space_type(XrSpace s)
    return -1;
 }
 
+/* ---- Actions and hands ---- */
+
+/* 1 left, 2 right, 0 anything else. Caller holds L.lock. */
+static int hand_of(XrPath path)
+{
+   char s[XR_MAX_PATH_LENGTH];
+   uint32_t n = 0;
+   if (     path == XR_NULL_PATH || !L.PathToString
+         || XR_FAILED(L.PathToString(L.instance, path, sizeof(s), &n, s)))
+      return 0;
+   if (!strcmp(s, "/user/hand/left"))
+      return 1;
+   if (!strcmp(s, "/user/hand/right"))
+      return 2;
+   return 0;
+}
+
+static const char *hand_name(int hand)
+{
+   return hand == 1 ? "left" : (hand == 2 ? "right" : "any");
+}
+
+static const char *set_name(XrActionSet s)
+{
+   unsigned i;
+   for (i = 0; i < L.num_sets; i++)
+      if (L.sets[i].handle == s)
+         return L.sets[i].name;
+   return "?";
+}
+
+static const struct action_rec *find_action(XrAction a)
+{
+   unsigned i;
+   for (i = 0; i < L.num_actions; i++)
+      if (L.actions[i].handle == a)
+         return &L.actions[i];
+   return NULL;
+}
+
+static bool set_synced(XrActionSet s)
+{
+   unsigned i;
+   for (i = 0; i < L.num_synced; i++)
+      if (L.synced[i] == s)
+         return true;
+   return false;
+}
+
+/* The script's value for an action asked for a hand, while its set is
+ * synced; NULL reads inactive. Caller holds L.lock. */
+static const struct scripted *scripted_value(XrAction action, XrPath sub)
+{
+   unsigned i;
+   int hand;
+   const struct action_rec *a = find_action(action);
+   if (!a || !set_synced(a->set))
+      return NULL;
+   hand = hand_of(sub);
+   for (i = 0; i < L.num_scripted; i++)
+      if (     !strcmp(L.scripted[i].name, a->name)
+            && (!hand || !L.scripted[i].hand || L.scripted[i].hand == hand))
+         return &L.scripted[i];
+   return NULL;
+}
+
+/* 1 or 2 for a hand's pose action space, 0 for any other space. */
+static int hand_space(XrSpace s)
+{
+   unsigned i;
+   for (i = 0; i < L.num_hand_spaces; i++)
+      if (L.hand_spaces[i].space == s)
+         return L.hand_spaces[i].hand;
+   return 0;
+}
+
 /* ---- Script ---- */
 
 static void script_head(const char *args)
@@ -199,14 +348,88 @@ static void script_fail(const char *args)
    L.fail_instance  = !strncmp(args, "instance", 8);
 }
 
+/* Queued until a session exists, so a script may lead with states. */
 static void script_state(const char *args)
 {
-   L.inject_state = atoi(args);
+   if (L.num_inject_states
+         < sizeof(L.inject_states) / sizeof(L.inject_states[0]))
+      L.inject_states[L.num_inject_states++] = atoi(args);
 }
 
 static void script_space(const char *args)
 {
    L.inject_space = atoi(args);
+}
+
+static void script_reset(void)
+{
+   L.num_scripted = 0;
+   L.aim_set[1]   = false;
+   L.aim_set[2]   = false;
+}
+
+static int parse_hand(const char *s)
+{
+   if (!strncmp(s, "left", 4))
+      return 1;
+   if (!strncmp(s, "right", 5))
+      return 2;
+   return 0;
+}
+
+static void script_action(const char *args)
+{
+   char name[ACTION_NAME];
+   float x = 0.0f, y = 0.0f;
+   char *at;
+   struct scripted *s;
+   if (     L.num_scripted >= MAX_SCRIPTED
+         || sscanf(args, "%127s %f %f", name, &x, &y) < 2)
+      return;
+   s = &L.scripted[L.num_scripted++];
+   memset(s, 0, sizeof(*s));
+   if ((at = strchr(name, '@')))
+   {
+      *at     = '\0';
+      s->hand = parse_hand(at + 1);
+   }
+   snprintf(s->name, sizeof(s->name), "%s", name);
+   s->v[0] = x;
+   s->v[1] = y;
+}
+
+static void script_aim(const char *args)
+{
+   char side[16];
+   float p[3], t[3], fx, fy, fz, len, yaw, pitch;
+   int hand;
+   if (sscanf(args, "%15s", side) != 1 || !(hand = parse_hand(side)))
+      return;
+   if (strstr(args, "off"))
+   {
+      L.aim_set[hand] = false;
+      return;
+   }
+   if (sscanf(args, "%15s %f %f %f %f %f %f", side, &p[0], &p[1], &p[2],
+            &t[0], &t[1], &t[2]) != 7)
+      return;
+   fx  = t[0] - p[0];
+   fy  = t[1] - p[1];
+   fz  = t[2] - p[2];
+   len = sqrtf(fx * fx + fy * fy + fz * fz);
+   if (len < 1e-6f)
+      return;
+   yaw   = atan2f(-fx / len, -fz / len);
+   pitch = asinf(fy / len);
+   /* Pitch about +X, then yaw about +Y: -Z points along (f). */
+   L.aim[hand].orientation.x = cosf(yaw / 2.0f) * sinf(pitch / 2.0f);
+   L.aim[hand].orientation.y = sinf(yaw / 2.0f) * cosf(pitch / 2.0f);
+   L.aim[hand].orientation.z = -sinf(yaw / 2.0f) * sinf(pitch / 2.0f);
+   L.aim[hand].orientation.w = cosf(yaw / 2.0f) * cosf(pitch / 2.0f);
+   L.aim[hand].position.x    = p[0];
+   L.aim[hand].position.y    = p[1];
+   L.aim[hand].position.z    = p[2];
+   L.aim_set[hand]           = true;
 }
 
 static const struct
@@ -217,6 +440,8 @@ static const struct
    { "head", script_head },
    { "fail", script_fail },
    { "state", script_state },
+   { "action", script_action },
+   { "aim", script_aim },
    { "space", script_space },
 };
 
@@ -229,12 +454,19 @@ static void script_poll(void)
    FILE *f;
    if (!L.script[0] || stat(L.script, &st) != 0)
       return;
+   /* A quick rewrite can keep the mtime; run.py replaces the file, so
+    * the inode changes too. */
    if (     st.st_mtim.tv_sec  == L.script_mtime.tv_sec
-         && st.st_mtim.tv_nsec == L.script_mtime.tv_nsec)
+         && st.st_mtim.tv_nsec == L.script_mtime.tv_nsec
+         && st.st_ino          == L.script_ino
+         && st.st_size         == L.script_size)
       return;
    L.script_mtime = st.st_mtim;
+   L.script_ino   = st.st_ino;
+   L.script_size  = st.st_size;
    if (!(f = fopen(L.script, "r")))
       return;
+   script_reset();
    while (fgets(line, sizeof(line), f))
       for (i = 0; i < sizeof(script_cmds) / sizeof(script_cmds[0]); i++)
       {
@@ -550,8 +782,9 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_DestroySession(XrSession session)
       free(L.chains[i].pixels);
       memset(&L.chains[i], 0, sizeof(L.chains[i]));
    }
-   L.num_spaces = 0;
-   L.session    = XR_NULL_HANDLE;
+   L.num_spaces      = 0;
+   L.num_hand_spaces = 0;
+   L.session         = XR_NULL_HANDLE;
    pthread_mutex_unlock(&L.lock);
    return L.DestroySession(session);
 }
@@ -593,8 +826,14 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_PollEvent(XrInstance instance,
    pthread_mutex_lock(&L.lock);
    script_poll();
    lost           = L.session && L.fail_instance;
-   inject         = L.session ? L.inject_state : 0;
-   L.inject_state = 0;
+   inject         = 0;
+   if (L.session && L.num_inject_states)
+   {
+      inject = L.inject_states[0];
+      L.num_inject_states--;
+      memmove(L.inject_states, L.inject_states + 1,
+            L.num_inject_states * sizeof(L.inject_states[0]));
+   }
    pthread_mutex_unlock(&L.lock);
    if (lost)
       return XR_ERROR_INSTANCE_LOST;
@@ -648,9 +887,11 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_CreateReferenceSpace(XrSession sessi
 static XRAPI_ATTR XrResult XRAPI_CALL layer_LocateSpace(XrSpace space,
       XrSpace base, XrTime time, XrSpaceLocation *loc)
 {
+   int hand;
    XrResult res = L.LocateSpace(space, base, time, loc);
    pthread_mutex_lock(&L.lock);
    script_poll();
+   hand = hand_space(space);
    if (     XR_SUCCEEDED(res) && L.head_set
          && space_type(space) == XR_REFERENCE_SPACE_TYPE_VIEW
          && space_type(base)  == XR_REFERENCE_SPACE_TYPE_LOCAL)
@@ -660,6 +901,33 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_LocateSpace(XrSpace space,
          | XR_SPACE_LOCATION_POSITION_VALID_BIT
          | XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT
          | XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
+   }
+   else if (XR_SUCCEEDED(res) && hand)
+   {
+      /* Hands are only where the script puts them. */
+      bool tracked = L.aim_set[hand]
+         && space_type(base) == XR_REFERENCE_SPACE_TYPE_LOCAL;
+      if (tracked)
+      {
+         loc->pose          = L.aim[hand];
+         loc->locationFlags = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT
+            | XR_SPACE_LOCATION_POSITION_VALID_BIT
+            | XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT
+            | XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
+      }
+      else
+         loc->locationFlags = 0;
+      if (L.hand_logged[hand] != (tracked ? 2 : 1))
+      {
+         L.hand_logged[hand] = tracked ? 2 : 1;
+         if (L.out)
+         {
+            fprintf(L.out, "{\"ev\":\"hand\",\"hand\":\"%s\",\"tracked\":%s,"
+                  "\"t_us\":%lld}\n", hand_name(hand),
+                  tracked ? "true" : "false", now_us());
+            fflush(L.out);
+         }
+      }
    }
    pthread_mutex_unlock(&L.lock);
    return res;
@@ -891,6 +1159,265 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_EndFrame(XrSession session,
    return L.EndFrame(session, info);
 }
 
+static XRAPI_ATTR XrResult XRAPI_CALL layer_CreateActionSet(XrInstance instance,
+      const XrActionSetCreateInfo *info, XrActionSet *set)
+{
+   XrResult res = L.CreateActionSet(instance, info, set);
+   if (XR_SUCCEEDED(res))
+   {
+      pthread_mutex_lock(&L.lock);
+      if (L.num_sets < MAX_SETS)
+      {
+         L.sets[L.num_sets].handle = *set;
+         snprintf(L.sets[L.num_sets].name, sizeof(L.sets[0].name), "%s",
+               info->actionSetName);
+         L.num_sets++;
+      }
+      pthread_mutex_unlock(&L.lock);
+   }
+   return res;
+}
+
+static XRAPI_ATTR XrResult XRAPI_CALL layer_CreateAction(XrActionSet set,
+      const XrActionCreateInfo *info, XrAction *action)
+{
+   XrResult res = L.CreateAction(set, info, action);
+   if (XR_SUCCEEDED(res))
+   {
+      pthread_mutex_lock(&L.lock);
+      if (L.num_actions < MAX_ACTIONS)
+      {
+         struct action_rec *a = &L.actions[L.num_actions++];
+         a->handle = *action;
+         a->set    = set;
+         a->type   = info->actionType;
+         snprintf(a->name, sizeof(a->name), "%s/%s", set_name(set),
+               info->actionName);
+      }
+      pthread_mutex_unlock(&L.lock);
+   }
+   return res;
+}
+
+/* Its actions go with it. The layer outlives the instance (nodelete)
+ * and the runtime may hand the handles out again, so no record may
+ * keep an old handle's meaning. */
+static XRAPI_ATTR XrResult XRAPI_CALL layer_DestroyActionSet(XrActionSet set)
+{
+   unsigned i;
+   pthread_mutex_lock(&L.lock);
+   for (i = 0; i < L.num_actions; )
+   {
+      if (L.actions[i].set == set)
+         L.actions[i] = L.actions[--L.num_actions];
+      else
+         i++;
+   }
+   for (i = 0; i < L.num_sets; i++)
+      if (L.sets[i].handle == set)
+      {
+         L.sets[i] = L.sets[--L.num_sets];
+         break;
+      }
+   for (i = 0; i < L.num_synced; i++)
+      if (L.synced[i] == set)
+      {
+         L.synced[i] = L.synced[--L.num_synced];
+         break;
+      }
+   pthread_mutex_unlock(&L.lock);
+   return L.DestroyActionSet(set);
+}
+
+static XRAPI_ATTR XrResult XRAPI_CALL layer_CreateActionSpace(XrSession session,
+      const XrActionSpaceCreateInfo *info, XrSpace *space)
+{
+   XrResult res = L.CreateActionSpace(session, info, space);
+   if (XR_SUCCEEDED(res))
+   {
+      pthread_mutex_lock(&L.lock);
+      if (L.num_hand_spaces < MAX_HAND_SPACES)
+      {
+         L.hand_spaces[L.num_hand_spaces].space = *space;
+         L.hand_spaces[L.num_hand_spaces].hand  = hand_of(info->subactionPath);
+         L.num_hand_spaces++;
+      }
+      pthread_mutex_unlock(&L.lock);
+   }
+   return res;
+}
+
+/* A handle the runtime reuses must not keep an old space's meaning. */
+static XRAPI_ATTR XrResult XRAPI_CALL layer_DestroySpace(XrSpace space)
+{
+   unsigned i;
+   pthread_mutex_lock(&L.lock);
+   for (i = 0; i < L.num_hand_spaces; i++)
+      if (L.hand_spaces[i].space == space)
+      {
+         L.hand_spaces[i] = L.hand_spaces[--L.num_hand_spaces];
+         break;
+      }
+   for (i = 0; i < L.num_spaces; i++)
+      if (L.spaces[i] == space)
+      {
+         L.num_spaces--;
+         L.spaces[i]      = L.spaces[L.num_spaces];
+         L.space_types[i] = L.space_types[L.num_spaces];
+         break;
+      }
+   pthread_mutex_unlock(&L.lock);
+   return L.DestroySpace(space);
+}
+
+static XRAPI_ATTR XrResult XRAPI_CALL layer_SyncActions(XrSession session,
+      const XrActionsSyncInfo *info)
+{
+   uint32_t i;
+   size_t len = 0;
+   char names[512];
+   XrResult res = L.SyncActions(session, info);
+   pthread_mutex_lock(&L.lock);
+   script_poll();
+   names[0]     = '\0';
+   L.num_synced = 0;
+   /* An unfocused or failed sync makes nothing active. */
+   if (res == XR_SUCCESS)
+      for (i = 0; i < info->countActiveActionSets && L.num_synced < MAX_SETS; i++)
+      {
+         XrActionSet s = info->activeActionSets[i].actionSet;
+         L.synced[L.num_synced++] = s;
+         if (len < sizeof(names))
+            len += (size_t)snprintf(names + len, sizeof(names) - len,
+                  "%s\"%s\"", i ? "," : "", set_name(s));
+      }
+   if (strcmp(names, L.synced_names) && L.out)
+   {
+      fprintf(L.out, "{\"ev\":\"sync\",\"sets\":[%s],\"result\":%d,"
+            "\"t_us\":%lld}\n", names, (int)res, now_us());
+      fflush(L.out);
+   }
+   snprintf(L.synced_names, sizeof(L.synced_names), "%s", names);
+   pthread_mutex_unlock(&L.lock);
+   return res;
+}
+
+static XRAPI_ATTR XrResult XRAPI_CALL layer_GetActionStateBoolean(XrSession session,
+      const XrActionStateGetInfo *gi, XrActionStateBoolean *state)
+{
+   const struct scripted *s;
+   (void)session;
+   pthread_mutex_lock(&L.lock);
+   script_poll();
+   s = scripted_value(gi->action, gi->subactionPath);
+   state->currentState         = (s && s->v[0] != 0.0f) ? XR_TRUE : XR_FALSE;
+   state->changedSinceLastSync = XR_FALSE;
+   state->lastChangeTime       = 0;
+   state->isActive             = s ? XR_TRUE : XR_FALSE;
+   pthread_mutex_unlock(&L.lock);
+   return XR_SUCCESS;
+}
+
+static XRAPI_ATTR XrResult XRAPI_CALL layer_GetActionStateFloat(XrSession session,
+      const XrActionStateGetInfo *gi, XrActionStateFloat *state)
+{
+   const struct scripted *s;
+   (void)session;
+   pthread_mutex_lock(&L.lock);
+   script_poll();
+   s = scripted_value(gi->action, gi->subactionPath);
+   state->currentState         = s ? s->v[0] : 0.0f;
+   state->changedSinceLastSync = XR_FALSE;
+   state->lastChangeTime       = 0;
+   state->isActive             = s ? XR_TRUE : XR_FALSE;
+   pthread_mutex_unlock(&L.lock);
+   return XR_SUCCESS;
+}
+
+static XRAPI_ATTR XrResult XRAPI_CALL layer_GetActionStateVector2f(XrSession session,
+      const XrActionStateGetInfo *gi, XrActionStateVector2f *state)
+{
+   const struct scripted *s;
+   (void)session;
+   pthread_mutex_lock(&L.lock);
+   script_poll();
+   s = scripted_value(gi->action, gi->subactionPath);
+   state->currentState.x       = s ? s->v[0] : 0.0f;
+   state->currentState.y       = s ? s->v[1] : 0.0f;
+   state->changedSinceLastSync = XR_FALSE;
+   state->lastChangeTime       = 0;
+   state->isActive             = s ? XR_TRUE : XR_FALSE;
+   pthread_mutex_unlock(&L.lock);
+   return XR_SUCCESS;
+}
+
+static XRAPI_ATTR XrResult XRAPI_CALL layer_GetActionStatePose(XrSession session,
+      const XrActionStateGetInfo *gi, XrActionStatePose *state)
+{
+   int hand;
+   (void)session;
+   pthread_mutex_lock(&L.lock);
+   script_poll();
+   hand            = hand_of(gi->subactionPath);
+   state->isActive = (hand ? L.aim_set[hand]
+         : (L.aim_set[1] || L.aim_set[2])) ? XR_TRUE : XR_FALSE;
+   pthread_mutex_unlock(&L.lock);
+   return XR_SUCCESS;
+}
+
+static XRAPI_ATTR XrResult XRAPI_CALL layer_ApplyHapticFeedback(XrSession session,
+      const XrHapticActionInfo *info, const XrHapticBaseHeader *fb)
+{
+   pthread_mutex_lock(&L.lock);
+   if (L.out && fb->type == XR_TYPE_HAPTIC_VIBRATION)
+   {
+      const XrHapticVibration *v = (const XrHapticVibration*)fb;
+      fprintf(L.out, "{\"ev\":\"haptic\",\"hand\":\"%s\",\"amplitude\":%.4f,"
+            "\"duration_ns\":%lld,\"t_us\":%lld}\n",
+            hand_name(hand_of(info->subactionPath)), v->amplitude,
+            (long long)v->duration, now_us());
+      fflush(L.out);
+   }
+   pthread_mutex_unlock(&L.lock);
+   return L.ApplyHapticFeedback(session, info, fb);
+}
+
+static XRAPI_ATTR XrResult XRAPI_CALL layer_StopHapticFeedback(XrSession session,
+      const XrHapticActionInfo *info)
+{
+   pthread_mutex_lock(&L.lock);
+   if (L.out)
+   {
+      fprintf(L.out, "{\"ev\":\"haptic_stop\",\"hand\":\"%s\",\"t_us\":%lld}\n",
+            hand_name(hand_of(info->subactionPath)), now_us());
+      fflush(L.out);
+   }
+   pthread_mutex_unlock(&L.lock);
+   return L.StopHapticFeedback(session, info);
+}
+
+static XRAPI_ATTR XrResult XRAPI_CALL layer_SuggestInteractionProfileBindings(
+      XrInstance instance, const XrInteractionProfileSuggestedBinding *sb)
+{
+   char profile[XR_MAX_PATH_LENGTH];
+   uint32_t n   = 0;
+   XrResult res = L.SuggestInteractionProfileBindings(instance, sb);
+   pthread_mutex_lock(&L.lock);
+   if (     !L.PathToString
+         || XR_FAILED(L.PathToString(instance, sb->interactionProfile,
+               sizeof(profile), &n, profile)))
+      snprintf(profile, sizeof(profile), "?");
+   if (L.out)
+   {
+      fprintf(L.out, "{\"ev\":\"bindings\",\"profile\":\"%s\",\"count\":%u,"
+            "\"result\":%d,\"t_us\":%lld}\n", profile,
+            (unsigned)sb->countSuggestedBindings, (int)res, now_us());
+      fflush(L.out);
+   }
+   pthread_mutex_unlock(&L.lock);
+   return res;
+}
+
 /* ---- Loader interface ---- */
 
 static XRAPI_ATTR XrResult XRAPI_CALL layer_GetInstanceProcAddr(XrInstance instance,
@@ -915,6 +1442,19 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_GetInstanceProcAddr(XrInstance insta
    HOOK(ReleaseSwapchainImage)
    HOOK(WaitFrame)
    HOOK(EndFrame)
+   HOOK(CreateActionSet)
+   HOOK(DestroyActionSet)
+   HOOK(CreateAction)
+   HOOK(CreateActionSpace)
+   HOOK(DestroySpace)
+   HOOK(SyncActions)
+   HOOK(GetActionStateBoolean)
+   HOOK(GetActionStateFloat)
+   HOOK(GetActionStateVector2f)
+   HOOK(GetActionStatePose)
+   HOOK(ApplyHapticFeedback)
+   HOOK(StopHapticFeedback)
+   HOOK(SuggestInteractionProfileBindings)
    if (!L.gipa)
       return XR_ERROR_FUNCTION_UNSUPPORTED;
    return L.gipa(instance, name, fn);
@@ -949,7 +1489,22 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_CreateApiLayerInstance(
    NEXT(ReleaseSwapchainImage);
    NEXT(WaitFrame);
    NEXT(EndFrame);
+   NEXT(PathToString);
+   NEXT(CreateActionSet);
+   NEXT(DestroyActionSet);
+   NEXT(CreateAction);
+   NEXT(CreateActionSpace);
+   NEXT(DestroySpace);
+   NEXT(SyncActions);
+   NEXT(GetActionStateBoolean);
+   NEXT(GetActionStateFloat);
+   NEXT(GetActionStateVector2f);
+   NEXT(GetActionStatePose);
+   NEXT(ApplyHapticFeedback);
+   NEXT(StopHapticFeedback);
+   NEXT(SuggestInteractionProfileBindings);
 #undef NEXT
+   L.instance = *instance;
    pthread_mutex_lock(&L.lock);
    layer_open();
    pthread_mutex_unlock(&L.lock);
