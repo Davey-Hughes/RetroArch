@@ -3901,6 +3901,29 @@ bool runloop_environment_cb(unsigned cmd, void *data)
          break;
       }
 
+      case RETRO_ENVIRONMENT_GET_RASTER_POLL_INTERFACE:
+      {
+         struct retro_raster_poll_interface *raster =
+               (struct retro_raster_poll_interface*)data;
+
+         RARCH_LOG("[Environ] GET_RASTER_POLL_INTERFACE.\n");
+
+         if (!raster)
+            return false;
+
+         if (raster->interface_version != RETRO_RASTER_POLL_INTERFACE_VERSION)
+         {
+            RARCH_ERR("[Environ] Core requested unexpected raster poll interface version %u, only %u is available.\n",
+                  raster->interface_version,
+                  RETRO_RASTER_POLL_INTERFACE_VERSION);
+            return false;
+         }
+
+         video_raster_reset(&video_state_get_ptr()->raster);
+         raster->raster_poll = video_driver_raster_poll;
+         break;
+      }
+
       case RETRO_ENVIRONMENT_GET_JIT_CAPABLE:
          {
 #if TARGET_OS_IPHONE

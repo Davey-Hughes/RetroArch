@@ -49,6 +49,7 @@
 
 #include "video_shader_parse.h"
 #include "video_filter.h"
+#include "video_raster.h"
 
 #define RARCH_SCALE_BASE 256
 
@@ -1387,6 +1388,9 @@ typedef struct
    char title_buf[64];
    char cached_driver_id[32];
 
+   /* The core's raster polls for the frame being built */
+   video_raster_t raster;
+
    uint16_t scanline[SCANLINE_LAST];
 
    uint16_t frame_drop_count;
@@ -2102,6 +2106,9 @@ bool video_driver_init_internal(bool *video_is_threaded, bool verbosity_enabled)
  **/
 void video_driver_frame(const void *data, unsigned width,
       unsigned height, size_t pitch);
+
+void video_driver_raster_poll(const void *data, unsigned width,
+      unsigned height, size_t pitch, unsigned row);
 
 void video_driver_update_title(void *data);
 

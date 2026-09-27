@@ -6630,6 +6630,20 @@ VIDEO_NOINLINE static void video_driver_frame_statistics(
    }
 }
 
+/* The core's retro_raster_poll_t. Frames hidden by run-ahead and
+ * preemptive frames are dropped here and in video_driver_frame alike,
+ * so they never reach the raster. */
+void video_driver_raster_poll(const void *data, unsigned width,
+      unsigned height, size_t pitch, unsigned row)
+{
+   video_driver_state_t *video_st = &video_driver_st;
+
+   if (!(video_st->main_flags & VIDEO_FLAG_ACTIVE))
+      return;
+
+   video_raster_poll(&video_st->raster, data, width, height, row);
+}
+
 void video_driver_frame(const void *data, unsigned width,
       unsigned height, size_t pitch)
 {
@@ -6691,6 +6705,8 @@ void video_driver_frame(const void *data, unsigned width,
 
    if (!video_driver_active)
       return;
+
+   video_raster_frame_end(&video_st->raster, data, width, height);
 
    new_time                      = cpu_features_get_time_usec();
    runloop_st->core_run_time     = new_time - runloop_st->core_run_time;
