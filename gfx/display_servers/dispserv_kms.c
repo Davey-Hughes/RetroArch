@@ -485,8 +485,14 @@ static bool kms_display_server_get_metrics(void *data,
 {
    bool vrr;
 
-   if (     type != DISPLAY_METRIC_TOTAL_LINES
-         || !kms_display_server_mode_timed())
+   if (!kms_display_server_mode_timed())
+      return false;
+   if (type == DISPLAY_METRIC_ACTIVE_LINES)
+   {
+      *value = (float)g_drm_mode->vdisplay;
+      return true;
+   }
+   if (type != DISPLAY_METRIC_TOTAL_LINES)
       return false;
    /* Read with the line count, outside Scanline Sync's wait */
    vrr = g_crtc_id && kms_display_server_crtc_vrr(g_drm_fd, g_crtc_id);

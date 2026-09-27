@@ -8158,6 +8158,28 @@ static const common_resolution_lut_t resolution_lut[] = {
    { 7680, 4320, 4400 },
 };
 
+/* The display's own visible and total lines, where the server knows
+ * the mode; Wayland only knows them once frames are presented. Both
+ * come from one mode, as the output size can be another monitor's. */
+static bool video_driver_scanline_display_lines(uint16_t *active,
+      uint16_t *total)
+{
+   float display_active = 0.0f;
+   float display_total  = 0.0f;
+
+   if (     !video_display_server_get_metrics(
+               DISPLAY_METRIC_ACTIVE_LINES, &display_active)
+         || !video_display_server_get_metrics(
+               DISPLAY_METRIC_TOTAL_LINES, &display_total)
+         || display_active <= 0.0f
+         || display_active > display_total
+         || display_total >= 65536.0f)
+      return false;
+   *active = (uint16_t)display_active;
+   *total  = (uint16_t)display_total;
+   return true;
+}
+
 static uint16_t video_driver_scanline_get_total(
       uint16_t video_width,
       uint16_t video_height)
@@ -8166,14 +8188,6 @@ static uint16_t video_driver_scanline_get_total(
    uint16_t scanline_total = video_height * ((double)1125 / (double)1080);
    uint8_t res_lut_size    = ARRAY_SIZE(resolution_lut);
    uint8_t i               = 0;
-   float display_total     = 0.0f;
-
-   /* The display's own count, where the server knows the mode */
-   if (     video_display_server_get_metrics(
-               DISPLAY_METRIC_TOTAL_LINES, &display_total)
-         && display_total >= video_height
-         && display_total < 65536.0f)
-      return (uint16_t)display_total;
 
    for (i = 0; i < res_lut_size; i++)
    {
@@ -8192,12 +8206,23 @@ void video_driver_scanline_init(void)
 {
    video_driver_state_t *video_st      = video_state_get_ptr();
    unsigned dims                       = 0;
+   uint16_t active                     = 0;
+   uint16_t total                      = 0;
 
-   video_driver_get_video_output_size(&dims, NULL, 0);
+   if (video_driver_scanline_display_lines(&active, &total))
+   {
+      video_st->scanline[SCANLINE_ACTIVE] = active;
+      video_st->scanline[SCANLINE_TOTAL]  = total;
+   }
+   else
+   {
+      video_driver_get_video_output_size(&dims, NULL, 0);
 
-   video_st->scanline[SCANLINE_ACTIVE] = VIDEO_SCALE_H(dims);
-   video_st->scanline[SCANLINE_TOTAL]  = video_driver_scanline_get_total(
-         VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims));
+      video_st->scanline[SCANLINE_ACTIVE] = VIDEO_SCALE_H(dims);
+      video_st->scanline[SCANLINE_TOTAL]  = video_driver_scanline_get_total(
+            VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims));
+   }
+   video_st->scanline[SCANLINE_RETRY]  = 0;
    video_st->scanline[SCANLINE_NEXT]   = 0;
    video_st->scanline[SCANLINE_PREV]   = 0;
    video_st->scanline[SCANLINE_HOLD]   = 0;
@@ -8283,11 +8308,37 @@ VIDEO_NOINLINE static void video_driver_scanline_after_frame(video_driver_state_
       uint16_t frame_time_target,
       uint16_t core_run_time)
 {
-   uint16_t scanline_next  = video_st->scanline[SCANLINE_NEXT];
-   uint16_t video_height   = video_st->scanline[SCANLINE_ACTIVE];
+   uint16_t scanline_next;
+   uint16_t video_height;
    int16_t scanline        = 0;
    retro_time_t wait_until = 0;
-   bool wait               = (scanline_next) ? true : false;
+   bool wait;
+
+   /* The display's counts replace a table guess once it has them and
+    * follow the window to another output, asked for every 60 frames:
+    * Wayland learns them only from presented frames. Asked after the
+    * present, where the wait below absorbs what the answer costs;
+    * before it, that would delay the flip. */
+   if (video_st->scanline[SCANLINE_ACTIVE])
+   {
+      if (video_st->scanline[SCANLINE_RETRY])
+         video_st->scanline[SCANLINE_RETRY]--;
+      else
+      {
+         uint16_t active = 0;
+         uint16_t total  = 0;
+         video_st->scanline[SCANLINE_RETRY] = 60;
+         if (video_driver_scanline_display_lines(&active, &total))
+         {
+            video_st->scanline[SCANLINE_ACTIVE] = active;
+            video_st->scanline[SCANLINE_TOTAL]  = total;
+         }
+      }
+   }
+
+   scanline_next = video_st->scanline[SCANLINE_NEXT];
+   video_height  = video_st->scanline[SCANLINE_ACTIVE];
+   wait          = (scanline_next) ? true : false;
 
    /* Invalid target skips wait */
    if (     !scanline_next

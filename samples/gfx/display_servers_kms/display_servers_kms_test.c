@@ -1048,6 +1048,12 @@ static int test_total_lines_metric(void)
       fprintf(stderr, "FAIL: total lines %.0f, want %d\n", value, SEQ_LINES);
       fails++;
    }
+   if (     !dispserv_kms.get_metrics(NULL, DISPLAY_METRIC_ACTIVE_LINES, &value)
+         || value != (float)mode.vdisplay)
+   {
+      fprintf(stderr, "FAIL: active lines %.0f, want %d\n", value, mode.vdisplay);
+      fails++;
+   }
    if (dispserv_kms.get_metrics(NULL, DISPLAY_METRIC_DPI, &value))
    {
       fputs("FAIL: get_metrics answered DPI\n", stderr);
@@ -1059,16 +1065,26 @@ static int test_total_lines_metric(void)
       fputs("FAIL: total lines answered for an interlaced mode\n", stderr);
       fails++;
    }
+   if (dispserv_kms.get_metrics(NULL, DISPLAY_METRIC_ACTIVE_LINES, &value))
+   {
+      fputs("FAIL: active lines answered for an interlaced mode\n", stderr);
+      fails++;
+   }
    g_drm_mode = NULL;
    if (dispserv_kms.get_metrics(NULL, DISPLAY_METRIC_TOTAL_LINES, &value))
    {
       fputs("FAIL: total lines answered without a mode\n", stderr);
       fails++;
    }
+   if (dispserv_kms.get_metrics(NULL, DISPLAY_METRIC_ACTIVE_LINES, &value))
+   {
+      fputs("FAIL: active lines answered without a mode\n", stderr);
+      fails++;
+   }
 
    if (fails)
       return 1;
-   puts("[pass] DISPLAY_METRIC_TOTAL_LINES is the mode's vtotal, and nothing else is answered");
+   puts("[pass] DISPLAY_METRIC_TOTAL_LINES and _ACTIVE_LINES are the mode's vtotal and vdisplay, and nothing else is answered");
    return 0;
 }
 
