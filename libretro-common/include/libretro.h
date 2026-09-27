@@ -2954,8 +2954,9 @@ enum retro_mod
  *
  * The core sets \c interface_version to
  * \c RETRO_RASTER_POLL_INTERFACE_VERSION before the call. The frontend
- * fills in \c raster_poll and returns \c true, or returns \c false for
- * a version it does not know.
+ * fills in \c raster_poll and returns \c true, or returns \c false and
+ * leaves the struct untouched for a \c NULL \c data or a version it
+ * does not know.
  *
  * Contract:
  *  - Call \c raster_poll only inside \c retro_run(), on its thread.
