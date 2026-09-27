@@ -9,15 +9,25 @@ Monado, and a RetroArch built with HAVE_OPENXR.
 
 Usage: run.py <retroarch> <out dir> <monado.env> [--validate] [case ...]
 
+Build the test core and layer first (make -C samples/cores/video_views,
+make -C samples/openxr/test_layer). monado.env.example here runs
+Monado's null compositor and simulated headset; RetroArch reaches Monado
+through XR_RUNTIME_JSON, so the system's active runtime is not used.
+gamescope and Monado get none of the desktop's display, session bus or
+runtime dir.
+
 monado.env holds KEY=VALUE lines (values may be double-quoted): MODE
-(inprocess or service), RUNTIME_JSON, CLIENT_ENV and SERVICE_ENV
-(space-separated KEY=VALUE pairs), SERVICE_SOCKET, DISPLAY_PERIOD_NS and
-VALIDATION_BASELINE: the messages raised without RetroArch's headset
-code, one per line, a VUID and then text the message must contain (an
-object's name), so a VUID alone does not hide RetroArch's own.
---validate runs RetroArch under the Vulkan validation layer and fails a
-case on any other message, or when none of the baseline's appear: the
-window's own come every run, so without them the layer did not load.
+(inprocess or service), RUNTIME_JSON (Monado's manifest), CLIENT_ENV and
+SERVICE_ENV (space-separated KEY=VALUE pairs), SERVICE_SOCKET and
+VALIDATION_BASELINE, relative to monado.env, by default
+validation-baseline.txt here: the messages raised without RetroArch's
+headset code, one per line, a VUID and then text the message must
+contain (an object's name), so a VUID alone does not hide RetroArch's
+own.
+--validate runs RetroArch under the Vulkan validation layer, which must
+be installed, and fails a case on any other message, or when none of the
+baseline's appear: the window's own come every run, so without them the
+layer did not load.
 """
 
 import ctypes
@@ -1014,8 +1024,11 @@ def main():
     monado = read_env(args[2])
     names = args[3:]
     baseline = []
-    if validate and monado.get('VALIDATION_BASELINE'):
-        baseline = read_baseline(monado['VALIDATION_BASELINE'])
+    if validate:
+        baseline = read_baseline(os.path.join(
+            os.path.dirname(os.path.abspath(args[2])),
+            monado.get('VALIDATION_BASELINE', os.path.join(
+                HERE, 'validation-baseline.txt'))))
     os.makedirs(root, exist_ok=True)
     failed = 0
     for case in CASES:
