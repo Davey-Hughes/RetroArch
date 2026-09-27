@@ -271,6 +271,7 @@ int drmAuthMagic(int fd, drm_magic_t magic)
 /* ./fixture: the sysfs names the lookup scans and two device nodes */
 static const char *const fixture_dirs[] = {
    "fixture",
+   "fixture/char",
    "fixture/sys",
    "fixture/dev",
    "fixture/sys/card0",
@@ -286,6 +287,19 @@ static const char *const fixture_dirs[] = {
    "fixture/sys/renderD128",
 };
 #define FIXTURE_DIRS (sizeof(fixture_dirs) / sizeof(fixture_dirs[0]))
+
+/* ./fixture/char: the /sys/dev/char links a device number is found by */
+static const struct
+{
+   const char *link;
+   const char *target;
+} fixture_links[] = {
+   { "fixture/char/226:0",   "../sys/card0" },
+   { "fixture/char/226:1",   "../../devices/pci0000:00/0000:03:00.0/drm/card1" },
+   { "fixture/char/226:5",   "../../devices/pci0000:00/0000:05:00.0/drm/card5" },
+   { "fixture/char/226:128", "../../devices/pci0000:00/0000:03:00.0/drm/renderD128" },
+};
+#define FIXTURE_LINKS (sizeof(fixture_links) / sizeof(fixture_links[0]))
 
 static int fixture_node(const char *path, char card)
 {
@@ -305,6 +319,9 @@ static int make_fixture(void)
    if (     fixture_node("fixture/dev/card0", '0') != 0
          || fixture_node("fixture/dev/card1", '1') != 0)
       return -1;
+   for (i = 0; i < FIXTURE_LINKS; i++)
+      if (symlink(fixture_links[i].target, fixture_links[i].link) != 0)
+         return -1;
    return 0;
 }
 
@@ -313,6 +330,8 @@ static void remove_fixture(void)
    size_t i;
    unlink("fixture/dev/card0");
    unlink("fixture/dev/card1");
+   for (i = 0; i < FIXTURE_LINKS; i++)
+      unlink(fixture_links[i].link);
    for (i = FIXTURE_DIRS; i > 0; i--)
       rmdir(fixture_dirs[i - 1]);
 }
@@ -352,6 +371,7 @@ static int same(const drm_scanout_t *a, const drm_scanout_t *b)
    return a->frame_ns     == b->frame_ns
        && a->connector_id == b->connector_id
        && a->crtc_id      == b->crtc_id
+       && a->hdisplay     == b->hdisplay
        && a->vtotal       == b->vtotal
        && a->vdisplay     == b->vdisplay
        && a->card         == b->card
@@ -407,6 +427,57 @@ static void test_update(void)
    close(fd);
 }
 
+static int open_card(unsigned major, unsigned minor)
+{
+   return drm_scanout_open_card("fixture/char", "fixture/dev", major, minor);
+}
+
+/* The card Vulkan names by device number, and a connector on it by id */
+static void test_by_number(void)
+{
+   drm_scanout_t s;
+   int fd = open_card(226, 1);
+
+   check("card1 is opened by its device number", fd >= 0);
+   if (fd >= 0)
+   {
+      memset(&s, 0, sizeof(s));
+      check("  a connector on it is read by id",
+            drm_scanout_read_connector(fd, 12, &s)
+            && s.connector_id == 12 && s.crtc_id == 32
+            && s.hdisplay == 3840 && s.vdisplay == 2160
+            && s.vtotal == 2250 && s.vrr);
+      memset(&s, 0, sizeof(s));
+      check("  an idle connector is refused, leaving out as it was",
+            !drm_scanout_read_connector(fd, 15, &s) && s.vtotal == 0);
+      check("  another card's connector is refused",
+            !drm_scanout_read_connector(fd, 10, &s));
+      check("  an unknown connector is refused",
+            !drm_scanout_read_connector(fd, 99, &s));
+      close(fd);
+   }
+
+   fd = open_card(226, 0);
+   check("card0 is opened through a relative link", fd >= 0);
+   if (fd >= 0)
+   {
+      check("  its interlaced connector is refused",
+            !drm_scanout_read_connector(fd, 14, &s));
+      close(fd);
+   }
+
+   check("a render node is refused", open_card(226, 128) < 0);
+   check("a card without a device node is refused", open_card(226, 5) < 0);
+   check("a number with no link is refused", open_card(226, 9) < 0);
+
+   s_master = 1;
+   fd = open_card(226, 1);
+   check("a card no one holds is refused, not kept as master", fd < 0);
+   if (fd >= 0)
+      close(fd);
+   s_master = 0;
+}
+
 int main(void)
 {
    drm_scanout_t s;
@@ -427,6 +498,7 @@ int main(void)
    check("  its connector, CRTC and card",
          s.connector_id == 10 && s.crtc_id == 30 && s.card == 0);
    check("  VRR off", !s.vrr);
+   check("  its width", s.hdisplay == 3440);
    check("HDMI-A-1 is found with VRR on",
          get("HDMI-A-1", &s) && s.vrr && s.vtotal == 2250 && s.card == 1);
    check("eDP-1 is found by the kernel's mixed-case name",
@@ -441,6 +513,13 @@ int main(void)
    check("a card no compositor holds is refused, not kept as master",
          !get("DP-1", &s));
    s_master = 0;
+   {
+      char name[32];
+      drm_scanout_connector_name(DRM_MODE_CONNECTOR_HDMIA, 1,
+            name, sizeof(name));
+      check("connector names are the kernel's", !strcmp(name, "HDMI-A-1"));
+   }
+   test_by_number();
    test_update();
    check("everything taken was freed", allocs == 0);
    check("every descriptor opened was closed", fds > 0 && open_fds() == fds);

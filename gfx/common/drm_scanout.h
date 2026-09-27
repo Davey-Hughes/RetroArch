@@ -16,6 +16,7 @@
 #ifndef __DRM_SCANOUT_H
 #define __DRM_SCANOUT_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include <boolean.h>
@@ -28,6 +29,7 @@ typedef struct drm_scanout
    uint64_t frame_ns; /* htotal * vtotal * 1000000 / clock */
    uint32_t connector_id;
    uint32_t crtc_id;
+   unsigned hdisplay;
    unsigned vtotal;
    unsigned vdisplay;
    int      card;
@@ -44,11 +46,29 @@ typedef struct drm_scanout
 int drm_scanout_open(const char *sysfs_root, const char *dev_root,
       const char *name, drm_scanout_t *out);
 
+/* The card whose primary node is major:minor, found through the
+ * dev_char_root ("/sys/dev/char") link and opened under dev_root
+ * beside whoever holds it. The descriptor, which the caller closes,
+ * or -1 with nothing left open when the number is no card's, the open
+ * fails, or no one else holds the card. */
+int drm_scanout_open_card(const char *dev_char_root, const char *dev_root,
+      unsigned major, unsigned minor);
+
+/* Fills out from connector_id's CRTC through fd, all but out->card.
+ * False, leaving out as it was, when the connector is idle or its mode
+ * is off, untimed, interlaced or doublescan. */
+bool drm_scanout_read_connector(int fd, uint32_t connector_id,
+      drm_scanout_t *out);
+
 /* Reads s->crtc_id's mode and VRR state again through fd, the
  * descriptor drm_scanout_open() returned. False, leaving s as it was,
  * when the connector no longer drives that CRTC, or the CRTC is off
  * or its mode is untimed, interlaced or doublescan. */
 bool drm_scanout_update(int fd, drm_scanout_t *s);
+
+/* The kernel's name for a connector, "DP-2" */
+void drm_scanout_connector_name(uint32_t type, uint32_t type_id,
+      char *s, size_t len);
 
 RETRO_END_DECLS
 
