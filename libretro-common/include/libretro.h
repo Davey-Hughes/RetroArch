@@ -2945,6 +2945,44 @@ enum retro_mod
 #define RETRO_AUDIO_LAYOUT_7_1    (RETRO_AUDIO_LAYOUT_5_1 | RETRO_AUDIO_SPEAKER_SIDE_LEFT | RETRO_AUDIO_SPEAKER_SIDE_RIGHT)
 
 /**
+ * Gets a callback the core calls as rows of a software frame are
+ * finished, before the frame reaches \c retro_video_refresh_t.
+ *
+ * A frontend may use the rows to show the frame while it is still
+ * being emulated, racing the display's scanout, or ignore them. Cores
+ * that never make this call are unaffected.
+ *
+ * The core sets \c interface_version to
+ * \c RETRO_RASTER_POLL_INTERFACE_VERSION before the call. The frontend
+ * fills in \c raster_poll and returns \c true, or returns \c false for
+ * a version it does not know.
+ *
+ * Contract:
+ *  - Call \c raster_poll only inside \c retro_run(), on its thread.
+ *  - \c row is the last finished row of the output frame, counted
+ *    after any crop: rows 0 to \c row of \c data are final. Within a
+ *    frame it strictly increases. Call once a row or once a batch of
+ *    rows; calls may be skipped.
+ *  - \c data is the software frame being built, in the
+ *    \c RETRO_ENVIRONMENT_SET_PIXEL_FORMAT format; never \c NULL or
+ *    \c RETRO_HW_FRAME_BUFFER_VALID. The frontend reads rows up to
+ *    \c row, and only during the call.
+ *  - The frame still ends with \c retro_video_refresh_t at the same
+ *    width and height, and the rows reported final are unchanged
+ *    there. That call's \c data may be another buffer.
+ *  - The call may block for up to about a frame.
+ *  - Call it on every frame; the frontend ignores frames it does not
+ *    show (run-ahead, rewind, netplay).
+ *  - The callback stays valid until \c retro_deinit().
+ *
+ * @param[in,out] data <tt>struct retro_raster_poll_interface *</tt>.
+ * @return \c true if the callback was filled in.
+ * @see retro_raster_poll_interface
+ * @see retro_raster_poll_t
+ */
+#define RETRO_ENVIRONMENT_GET_RASTER_POLL_INTERFACE (95 | RETRO_ENVIRONMENT_EXPERIMENTAL)
+
+/**
  * Result of \c RETRO_ENVIRONMENT_GET_MEMORY_STATUS.
  *
  * Sizes are in bytes; a field the frontend cannot determine is left at 0.
@@ -8248,6 +8286,35 @@ typedef bool (RETRO_CALLCONV *retro_environment_t)(unsigned cmd, void *data);
  */
 typedef void (RETRO_CALLCONV *retro_video_refresh_t)(const void *data, unsigned width,
       unsigned height, size_t pitch);
+
+/**
+ * Reports rows of the frame being built as final.
+ *
+ * @param data The frame being built, as for \c retro_video_refresh_t.
+ * @param width The frame's width, in pixels.
+ * @param height The frame's height, in pixels.
+ * @param pitch The distance between rows of \c data, in bytes.
+ * @param row The last finished row: rows 0 to \c row are final.
+ * @see RETRO_ENVIRONMENT_GET_RASTER_POLL_INTERFACE
+ */
+typedef void (RETRO_CALLCONV *retro_raster_poll_t)(const void *data,
+      unsigned width, unsigned height, size_t pitch, unsigned row);
+
+/**
+ * The current version of \c retro_raster_poll_interface.
+ */
+#define RETRO_RASTER_POLL_INTERFACE_VERSION 1
+
+/**
+ * @see RETRO_ENVIRONMENT_GET_RASTER_POLL_INTERFACE
+ */
+struct retro_raster_poll_interface
+{
+   /* Set by the core to the version it asks for. */
+   unsigned interface_version;
+   /* Set by the frontend. */
+   retro_raster_poll_t raster_poll;
+};
 
 /**
  * Renders a single audio frame. Should only be used if implementation generates a single sample at a time.
