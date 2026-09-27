@@ -90,6 +90,7 @@ static void wl_present_feedback_presented(void *data,
 
    present->last_ust         = sec * 1000000000ULL + (uint64_t)tv_nsec;
    present->refresh_interval = (uint64_t)refresh;
+   present->flags            = flags;
    present->presented        = true;
 }
 

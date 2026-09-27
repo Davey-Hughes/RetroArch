@@ -24,8 +24,10 @@
 #include <poll.h>
 #include <time.h>
 #include <unistd.h>
+#include <compat/strl.h>
 
 #include "wayland_common.h"
+#include "wayland_beam.h"
 #include "../gfx/video_driver.h"
 #include "../../frontend/frontend_driver.h"
 #include "../../verbosity.h"
@@ -400,6 +402,21 @@ static const struct xdg_toplevel_listener wl_xdg_toplevel_listener = {
    xdg_toplevel_handle_wm_capabilities,
 };
 
+void gfx_ctx_wl_publish_presented(gfx_ctx_wayland_data_t *wl)
+{
+   wl_beam_t t;
+
+   if (!wl->present.last_ust)
+      return;
+
+   t.line0_ns   = wl->present.last_ust;
+   t.refresh_ns = wl->present.refresh_interval;
+   t.flags      = wl->present.flags;
+   t.clock_id   = (int)wl->present.clock_id;
+   strlcpy(t.output, wl->current_output_name, sizeof(t.output));
+   wl_beam_publish(&t);
+}
+
 void gfx_ctx_wl_get_video_size_common(void *data, unsigned *dims)
 {
    gfx_ctx_wayland_data_t *wl   = (gfx_ctx_wayland_data_t*)data;
@@ -563,6 +580,7 @@ void gfx_ctx_wl_destroy_resources_common(gfx_ctx_wayland_data_t *wl)
       wp_viewporter_destroy(wl->viewporter);
    if (wl->fractional_scale_manager)
       wp_fractional_scale_manager_v1_destroy(wl->fractional_scale_manager);
+   wl_beam_reset();
    wl_present_destroy(&wl->present);
    wl_frame_destroy(&wl->frame);
    if (wl->compositor)

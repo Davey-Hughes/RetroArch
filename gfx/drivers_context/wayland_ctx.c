@@ -642,7 +642,10 @@ static void gfx_ctx_wl_swap_buffers(void *data)
       wl_frame_request(&wl->frame, wl->input.dpy, wl->surface);
 
    if (wl->present.clock)
+   {
       wl_present_dispatch(&wl->present, wl->input.dpy);
+      gfx_ctx_wl_publish_presented(wl);
+   }
 
    /* Skip presentation-time pacing and feedback while the surface is
     * suspended: the compositor is not scanning out the surface, so

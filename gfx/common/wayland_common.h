@@ -28,6 +28,10 @@ typedef struct shm_buffer
 
 void gfx_ctx_wl_get_video_size_common(void *data, unsigned *dims);
 
+/* Hands the last presented frame's timing to the display server's
+ * beam estimate; from the presenting thread, after wl_present_dispatch */
+void gfx_ctx_wl_publish_presented(gfx_ctx_wayland_data_t *wl);
+
 void gfx_ctx_wl_destroy_resources_common(gfx_ctx_wayland_data_t *wl);
 #ifdef WEBOS
 void gfx_ctx_wl_destroy_resources_webos(gfx_ctx_wayland_data_t *wl);
