@@ -160,6 +160,9 @@ void vulkan_openxr_slot_destroy(vulkan_openxr_t *xr, unsigned slot);
 bool vulkan_openxr_slot_acquire(vulkan_openxr_t *xr, unsigned slot,
       unsigned *index);
 void vulkan_openxr_slot_release(vulkan_openxr_t *xr, unsigned slot);
+/* Video thread. The slot's quads are left out again until it releases
+ * another image. */
+void vulkan_openxr_slot_forget(vulkan_openxr_t *xr, unsigned slot);
 
 /* The quads the XR thread submits from now on; a quad whose slot has
  * not released an image yet is left out. */

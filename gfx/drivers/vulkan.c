@@ -9041,12 +9041,73 @@ static void vulkan_xr_draw_screen(vk_t *vk, unsigned s,
       if (chain)
          vulkan_filter_chain_end_frame(chain, vk->cmd);
    }
+
+   /* The chains bound descriptor sets of their own. */
+   vk->tracker.view    = VK_NULL_HANDLE;
+   vk->tracker.sampler = VK_NULL_HANDLE;
+   memset(vk->tracker.mvp.data, 0, sizeof(vk->tracker.mvp.data));
 }
 
-/* The UI layer this frame drew, into the menu slot's image. */
-static void vulkan_xr_copy_ui(vk_t *vk, VkImage dst, unsigned dims)
+/* The UI layer this frame drew, into slot s's image: copied at its own
+ * size, else drawn scaled through the slot's view in the layer's own
+ * format, so the encoded values stay as they are. */
+static void vulkan_xr_copy_ui(vk_t *vk, unsigned s, unsigned ui_dims)
 {
    VkImageCopy region;
+   unsigned index = vk->xr.slots[s].index;
+   unsigned dims  = vk->xr.set.slots[s].dims;
+   VkImage dst    = vk->xr.slots[s].images[index];
+
+   if (dims != ui_dims)
+   {
+      VkClearValue clear;
+      VkRenderPassBeginInfo rp;
+      struct vk_texture tex;
+      struct vk_draw_quad quad;
+      struct video_viewport vp;
+
+      VULKAN_IMAGE_LAYOUT_TRANSITION(vk->cmd, dst,
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+      memset(&clear, 0, sizeof(clear));
+      rp.sType                    = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+      rp.pNext                    = NULL;
+      rp.renderPass               = vk->views.render_pass;
+      rp.framebuffer              = vk->xr.slots[s].framebuffers[index][0];
+      rp.renderArea.offset.x      = 0;
+      rp.renderArea.offset.y      = 0;
+      rp.renderArea.extent.width  = VIDEO_SCALE_W(dims);
+      rp.renderArea.extent.height = VIDEO_SCALE_H(dims);
+      rp.clearValueCount          = 1;
+      rp.pClearValues             = &clear;
+      vkCmdBeginRenderPass(vk->cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+      vk->tracker.pipeline = VK_NULL_HANDLE;
+
+      /* The scissor follows vk->vp. */
+      vp                   = vk->vp;
+      vk->vp.pos           = VIDEO_POS_PACK(0, 0);
+      vk->vp.dims          = dims;
+      vk->vk_vp.x          = 0.0f;
+      vk->vk_vp.y          = 0.0f;
+      vk->vk_vp.width      = (float)VIDEO_SCALE_W(dims);
+      vk->vk_vp.height     = (float)VIDEO_SCALE_H(dims);
+      vk->vk_vp.minDepth   = 0.0f;
+      vk->vk_vp.maxDepth   = 1.0f;
+      vk->tracker.dirty   |= VULKAN_DIRTY_DYNAMIC_BIT;
+      vulkan_views_texture(vk, &vk->views.ui, ui_dims, &tex);
+      quad.texture  = &tex;
+      quad.mvp      = &vk->mvp_no_rot;
+      quad.pipeline = vk->pipelines.alpha_premult;
+      quad.sampler  = vk->samplers.linear;
+      quad.color    = RGBA16_WHITE;
+      vulkan_draw_quad(vk, &quad);
+      vkCmdEndRenderPass(vk->cmd);
+      vk->vp = vp;
+      return;
+   }
 
    VULKAN_IMAGE_LAYOUT_TRANSITION(vk->cmd, vk->views.ui.image,
          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -9101,6 +9162,13 @@ static void vulkan_xr_draw(vk_t *vk, const video_frame_info_t *video_info,
       bool ok;
       unsigned index = 0;
       vk->xr.slots[s].drawn = false;
+      /* A menu that comes back must not show the last one's image. */
+      if (     s == VIDEO_XR_MENU_SLOT && !vk->xr.set.slots[s].dims
+            && vk->xr.slots[s].released)
+      {
+         vulkan_openxr_slot_forget(xr, s);
+         vk->xr.slots[s].released = false;
+      }
       if (!vk->xr.set.slots[s].dims || !vulkan_xr_slot_ensure(vk, s))
          continue;
       if (     s != VIDEO_XR_MENU_SLOT && !new_frame
@@ -9118,8 +9186,7 @@ static void vulkan_xr_draw(vk_t *vk, const video_frame_info_t *video_info,
       vk->xr.slots[s].index = index;
       /* The menu slot has no view: -1 would draw the whole frame. */
       if (s == VIDEO_XR_MENU_SLOT)
-         vulkan_xr_copy_ui(vk, vk->xr.slots[s].images[index],
-               vk->xr.set.slots[s].dims);
+         vulkan_xr_copy_ui(vk, s, ui_dims);
       else
          vulkan_xr_draw_screen(vk, s, xr_chains, xr_frame);
       vk->xr.slots[s].drawn = true;
@@ -9954,7 +10021,8 @@ static bool vulkan_frame(void *data, const void *frame,
       ui_layer_dims = video_info->dims;
 #endif
    /* The UI layer is drawn and composited only when there is UI, by
-    * the same test the HDR composite makes; overlays are hidden. */
+    * the same test the HDR composite makes. Overlays are hidden per
+    * eye, and drawn around the layer when it is for a headset. */
    views_ui = ui_layer_dims
       && (     (vk->flags & VK_FLAG_MENU_ENABLE)
             || (msg && *msg)

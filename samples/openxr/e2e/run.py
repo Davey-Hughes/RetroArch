@@ -27,9 +27,11 @@ import re
 import shlex
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import time
+import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, '..', '..', '..'))
@@ -53,6 +55,7 @@ RUNTIME_DIR = 'run'
 
 RED, BLUE, GREEN = (255, 0, 0), (0, 0, 255), (0, 255, 0)
 YELLOW, WHITE, GREY = (255, 255, 0), (255, 255, 255), (32, 32, 32)
+MAGENTA = (255, 0, 255)
 
 
 def read_env(path):
@@ -169,6 +172,31 @@ def wait_shot(d):
     return None
 
 
+def write_overlay(d):
+    """An overlay whose top-left sixteenth is opaque magenta, and the
+    settings that show it over the menu."""
+    rows = b''
+    for y in range(16):
+        rows += b'\0' + b''.join(bytes(MAGENTA + (255,)) if x < 4 and y < 4
+                                  else bytes(4) for x in range(16))
+
+    def chunk(kind, data):
+        return (struct.pack('>I', len(data)) + kind + data
+                + struct.pack('>I', zlib.crc32(kind + data) & 0xffffffff))
+    with open(os.path.join(d, 'corner.png'), 'wb') as f:
+        f.write(b'\x89PNG\r\n\x1a\n'
+                + chunk(b'IHDR', struct.pack('>IIBBBBB', 16, 16, 8, 6, 0, 0, 0))
+                + chunk(b'IDAT', zlib.compress(rows)) + chunk(b'IEND', b''))
+    cfg = os.path.join(d, 'corner.cfg')
+    with open(cfg, 'w') as f:
+        f.write('overlays = 1\noverlay0_overlay = "corner.png"\n'
+                'overlay0_full_screen = true\noverlay0_normalized = true\n'
+                'overlay0_descs = 0\n')
+    return {'input_overlay_enable': 'true', 'input_overlay': cfg,
+            'input_overlay_hide_in_menu': 'false',
+            'input_overlay_opacity': '1.0'}
+
+
 def run_case(retroarch, root, monado, case, validate):
     d = os.path.realpath(os.path.join(root, case['name']))
     if os.path.commonpath([root, d]) != root or d == root:
@@ -181,6 +209,8 @@ def run_case(retroarch, root, monado, case, validate):
     settings = {'video_openxr_enable': 'true',
                 'video_openxr_distance': '1.8',
                 'video_openxr_width': '1.6'}
+    if case.get('overlay'):
+        settings.update(write_overlay(d))
     settings.update(case.get('settings', {}))
     cfg = os.path.join(d, 'retroarch.cfg')
     write_cfg(cfg, d, 'vulkan', settings)
@@ -250,8 +280,9 @@ def run_case(retroarch, root, monado, case, validate):
         while time.time() < deadline and not os.path.exists(sock):
             time.sleep(0.1)
 
+    w, h = case.get('screen', (W, H))
     cmd = ['gamescope', '--backend', 'headless',
-           '-w', str(W), '-h', str(H), '-W', str(W), '-H', str(H),
+           '-w', str(w), '-h', str(h), '-W', str(w), '-H', str(h),
            '-r', '60', '--', 'sh', '-c', guard,
            retroarch, '--config', cfg, '-L', case.get('core', CORE),
            '--verbose'] + case.get('args', [])
@@ -502,26 +533,75 @@ def check_frame(res):
     return errors
 
 
-def check_menu(res):
-    fr = last_snap(res)
-    if not fr:
-        return no_quads(res)
-    q = quads(fr)
-    menus = [x for x in q if x['flags'] & BLEND]
-    if len(menus) != 1:
-        return ['want one blended menu quad, got %d' % len(menus)]
-    m = menus[0]
+def menu_size(res, q, ui, distance=1.7):
+    """Errors unless the menu quad's swapchain has the UI's size, at
+    most twice the headset's pixels across the quad, in its shape."""
+    m = DENSITY.search(res.log)
+    sc = res.chains.get(q['sc'])
+    if not m or not sc:
+        return ['no headset density or swapchain for the menu']
+    px_per_rad = int(m.group(1)) / math.radians(int(m.group(2)))
+    most = 4.0 * math.atan(q['size'][0] / (2.0 * distance)) * px_per_rad
+    if ui[0] <= most * 0.98 - 1:
+        w, h, slack = ui[0], ui[1], 0
+    else:
+        w = min(ui[0], math.ceil(most))
+        h = w * q['size'][1] / q['size'][0]
+        slack = 2 + int(most * 0.01)
     errors = []
-    if len(q) != 4:
-        errors.append('want the three screen quads behind the menu, got %d'
-                      % (len(q) - 1))
-    if q[-1] is not m:
-        errors.append('the menu is not drawn last')
-    if not at(m, (0.0, 0.0, -1.7)) or not sized(m, (1.6, 0.96)):
-        errors.append('menu at %s size %s' % (m['pose'][:3], m['size']))
-    _, alpha = colour(image(res, fr, m), 0.5, 0.5)
-    if alpha == 0:
-        errors.append('the menu is transparent at its centre')
+    if abs(sc['w'] - w) > slack or abs(sc['h'] - h) > slack + 1:
+        errors.append('menu sc%d is %dx%d, want about %dx%d (%.1f px/rad)'
+                      % (q['sc'], sc['w'], sc['h'], w, round(h), px_per_rad))
+    if q['rect'] != [0, 0, sc['w'], sc['h']]:
+        errors.append('menu sc%d shows %s, want all of it'
+                      % (q['sc'], q['rect']))
+    return errors
+
+
+def check_menu(ui=(W, H)):
+    def check(res):
+        fr = last_snap(res)
+        if not fr:
+            return no_quads(res)
+        q = quads(fr)
+        menus = [x for x in q if x['flags'] & BLEND]
+        if len(menus) != 1:
+            return ['want one blended menu quad, got %d' % len(menus)]
+        m = menus[0]
+        errors = []
+        if len(q) != 4:
+            errors.append('want the three screen quads behind the menu, '
+                          'got %d' % (len(q) - 1))
+        if q[-1] is not m:
+            errors.append('the menu is not drawn last')
+        if not at(m, (0.0, 0.0, -1.7)) or not sized(m, (1.6, 0.96)):
+            errors.append('menu at %s size %s' % (m['pose'][:3], m['size']))
+        errors += menu_size(res, m, ui)
+        # The UI over running content is translucent; a core's frame
+        # there would be opaque.
+        _, alpha = colour(image(res, fr, m), 0.5, 0.5)
+        if not 0 < alpha < 255:
+            errors.append('the menu\'s centre has alpha %d' % alpha)
+        return errors
+    return check
+
+
+def check_menu_overlay(res):
+    """The overlay shows in the window, never in the headset's menu."""
+    errors = check_menu()(res)
+    fr = last_snap(res)
+    menus = [x for x in quads(fr) if x['flags'] & BLEND] if fr else []
+    if menus:
+        c, _ = colour(image(res, fr, menus[0]), 0.05, 0.05)
+        if near(c, MAGENTA, 40):
+            errors.append('the overlay is in the headset\'s menu quad')
+    if not res.shot:
+        errors.append('no window screenshot')
+    else:
+        c, _ = colour(res.shot, 0.05, 0.05)
+        if not near(c, MAGENTA):
+            errors.append('the window shows %s at the overlay, want %s'
+                          % (c, MAGENTA))
     return errors
 
 
@@ -562,7 +642,22 @@ CASES = [
      'check': check_sized_frame},
     {'name': 'menu', 'map': '3ds', 'settings': {'menu_driver': 'ozone'},
      'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 4)],
-     'check': check_menu},
+     'check': check_menu()},
+    # The screens drawn in the same frames as the menu.
+    {'name': 'menu-running', 'map': '3ds',
+     'settings': {'menu_driver': 'ozone', 'menu_pause_libretro': 'false'},
+     'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 4)],
+     'check': check_menu()},
+    # A UI no bigger than the headset's density allows: copied, not drawn.
+    {'name': 'menu-small', 'map': '3ds', 'settings': {'menu_driver': 'ozone'},
+     'screen': (320, 192),
+     'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 4)],
+     'check': check_menu((320, 192))},
+    {'name': 'menu-overlay', 'map': '3ds', 'overlay': True,
+     'settings': {'menu_driver': 'ozone'},
+     'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),
+               ('shot', None), ('wait', 3)],
+     'check': check_menu_overlay},
     {'name': 'menu-closes', 'map': '3ds', 'settings': {'menu_driver': 'ozone'},
      'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),
                ('send', 'MENU_TOGGLE'), ('wait', 3)],

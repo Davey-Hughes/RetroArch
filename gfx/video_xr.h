@@ -39,6 +39,10 @@ RETRO_BEGIN_DECLS
 #define VIDEO_XR_GAP       0.02f
 /* How far the UI floats in front of screen 0, in metres. */
 #define VIDEO_XR_MENU_LIFT 0.10f
+/* The UI's quad fits in screen 0's width by this much of it. */
+#define VIDEO_XR_MENU_MAX_H 0.75f
+/* At most this many UI pixels per headset pixel across its quad. */
+#define VIDEO_XR_MENU_DENSITY 2.0f
 
 enum video_xr_eye
 {

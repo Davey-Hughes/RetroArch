@@ -205,6 +205,28 @@ static void video_xr_place_screens(const video_xr_params_t *p,
    }
 }
 
+/* The UI's image: its own size, but no more than VIDEO_XR_MENU_DENSITY
+ * times the headset's pixels across the quad, and at most max_dim a
+ * side, in its shape. */
+static unsigned video_xr_menu_dims(const video_xr_params_t *p,
+      float width, float height, float distance)
+{
+   unsigned w = VIDEO_SCALE_W(p->ui_dims);
+   unsigned h = VIDEO_SCALE_H(p->ui_dims);
+   if (p->px_per_rad > 0.0f)
+   {
+      double most = ceil(VIDEO_XR_MENU_DENSITY * 2.0
+            * atan((double)width / (2.0 * distance)) * p->px_per_rad);
+      if (most < (double)w)
+         w = (unsigned)most;
+   }
+   if (     w == VIDEO_SCALE_W(p->ui_dims)
+         && (!p->max_dim || (w <= p->max_dim && h <= p->max_dim)))
+      return p->ui_dims;
+   return video_xr_image_dims(width, height, distance, 0.0f,
+         VIDEO_SCALE_PACK(w, h), p->max_dim);
+}
+
 void video_xr_place(const video_xr_params_t *p, video_xr_quad_set_t *out)
 {
    unsigned s;
@@ -241,13 +263,21 @@ void video_xr_place(const video_xr_params_t *p, video_xr_quad_set_t *out)
 
    if (VIDEO_SCALE_W(p->ui_dims) && VIDEO_SCALE_H(p->ui_dims))
    {
-      float h = p->width * (float)VIDEO_SCALE_H(p->ui_dims)
-         / (float)VIDEO_SCALE_W(p->ui_dims);
-      video_xr_put(p, 0.0, 0.0, -p->distance + VIDEO_XR_MENU_LIFT, &pose);
-      out->slots[VIDEO_XR_MENU_SLOT].dims   = p->ui_dims;
+      float aspect = (float)VIDEO_SCALE_W(p->ui_dims)
+         / (float)VIDEO_SCALE_H(p->ui_dims);
+      float d      = p->distance - VIDEO_XR_MENU_LIFT;
+      float w      = p->width;
+      float h      = w / aspect;
+      if (h > p->width * VIDEO_XR_MENU_MAX_H)
+      {
+         h = p->width * VIDEO_XR_MENU_MAX_H;
+         w = h * aspect;
+      }
+      video_xr_put(p, 0.0, 0.0, -d, &pose);
+      out->slots[VIDEO_XR_MENU_SLOT].dims   = video_xr_menu_dims(p, w, h, d);
       out->slots[VIDEO_XR_MENU_SLOT].layers = 1;
       video_xr_add(out, VIDEO_XR_QUAD_MENU, VIDEO_XR_EYE_BOTH, 0,
-            VIDEO_XR_MENU_SLOT, 0, &pose, p->width, h);
+            VIDEO_XR_MENU_SLOT, 0, &pose, w, h);
    }
 }
 

@@ -220,6 +220,45 @@ static void test_place_frame_menu(void)
    CHECK(set.num_quads == 0);
 }
 
+static void test_place_menu_size(void)
+{
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+
+   params_init(&p, NULL);
+   p.frame_dims = VIDEO_SCALE_PACK(800, 480);
+
+   /* At 200 px/rad the headset shows 176 px across the menu: its image
+    * gets twice that, in the UI's shape. */
+   p.px_per_rad = 200.0f;
+   p.ui_dims    = VIDEO_SCALE_PACK(1600, 960);
+   video_xr_place(&p, &set);
+   CHECK(set.quads[1].kind == VIDEO_XR_QUAD_MENU);
+   CHECK(NEAR(set.quads[1].width, 1.6) && NEAR(set.quads[1].height, 0.96));
+   CHECK(dims_is(set.slots[VIDEO_XR_MENU_SLOT].dims, 352, 211));
+
+   /* Wider than a swapchain may be: capped, keeping the shape, with or
+    * without a density; a lower density caps it first. */
+   p.ui_dims    = VIDEO_SCALE_PACK(5120, 2880);
+   p.px_per_rad = 0.0f;
+   video_xr_place(&p, &set);
+   CHECK(dims_is(set.slots[VIDEO_XR_MENU_SLOT].dims, 4096, 2304));
+   p.px_per_rad = 3000.0f;
+   video_xr_place(&p, &set);
+   CHECK(dims_is(set.slots[VIDEO_XR_MENU_SLOT].dims, 4096, 2304));
+   p.px_per_rad = 1000.0f;
+   video_xr_place(&p, &set);
+   CHECK(dims_is(set.slots[VIDEO_XR_MENU_SLOT].dims, 1760, 990));
+
+   /* Taller than 3:4, as one eye of a side-by-side window: as tall as
+    * 3/4 of the screen width allows, narrower, at the UI's own size. */
+   p.ui_dims = VIDEO_SCALE_PACK(800, 960);
+   video_xr_place(&p, &set);
+   CHECK(pos_is(&set.quads[1], 0.0, 0.0, -1.7));
+   CHECK(NEAR(set.quads[1].width, 1.0) && NEAR(set.quads[1].height, 1.2));
+   CHECK(set.slots[VIDEO_XR_MENU_SLOT].dims == VIDEO_SCALE_PACK(800, 960));
+}
+
 static void test_anchor(void)
 {
    video_views_map_t map;
@@ -354,6 +393,7 @@ int main(void)
    test_place_swap_horizontal();
    test_place_ds_rotation();
    test_place_frame_menu();
+   test_place_menu_size();
    test_anchor();
    test_ray_hit();
    test_quad_to_frame();

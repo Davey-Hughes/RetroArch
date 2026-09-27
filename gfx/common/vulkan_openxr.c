@@ -1166,6 +1166,11 @@ void vulkan_openxr_slot_release(vulkan_openxr_t *xr, unsigned slot)
    s->waited   = false;
 }
 
+void vulkan_openxr_slot_forget(vulkan_openxr_t *xr, unsigned slot)
+{
+   retro_atomic_store_release_int(&xr->slots[slot].content, 0);
+}
+
 void vulkan_openxr_publish(vulkan_openxr_t *xr,
       const video_xr_quad_set_t *set)
 {
