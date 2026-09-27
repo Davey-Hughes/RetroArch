@@ -88,15 +88,16 @@ enum video_raster_violation video_raster_frame_end(video_raster_t *raster,
 {
    enum video_raster_violation violation = VIDEO_RASTER_OK;
 
-   /* A dupe (NULL) ends the frame without judging it */
-   if (     raster->calls
-         && data
-         && !(raster->flags & VIDEO_RASTER_FLAG_BROKEN))
+   if (raster->flags & VIDEO_RASTER_FLAG_REPLAY)
+      return VIDEO_RASTER_OK;
+
+   if (raster->calls && !(raster->flags & VIDEO_RASTER_FLAG_BROKEN))
    {
-      if (data == RETRO_HW_FRAME_BUFFER_VALID)
+      if (!data || data == RETRO_HW_FRAME_BUFFER_VALID)
       {
          if (!(raster->flags & VIDEO_RASTER_FLAG_WARNED_DATA))
-            RARCH_WARN("[Video] Raster poll without a software frame.\n");
+            RARCH_WARN("[Video] Raster polls for %ux%u, frame presented as a dupe or hardware frame.\n",
+                  raster->width, raster->height);
          raster->flags |= VIDEO_RASTER_FLAG_WARNED_DATA;
          violation      = VIDEO_RASTER_BAD_DATA;
       }

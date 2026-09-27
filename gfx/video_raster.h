@@ -41,7 +41,9 @@ enum video_raster_flags
    VIDEO_RASTER_FLAG_WARNED_ORDER = (1 << 3),
    VIDEO_RASTER_FLAG_WARNED_SIZE  = (1 << 4),
    /* The frame broke the contract; its later polls are ignored */
-   VIDEO_RASTER_FLAG_BROKEN       = (1 << 5)
+   VIDEO_RASTER_FLAG_BROKEN       = (1 << 5),
+   /* A frontend replay of the cached frame, not the core's frame */
+   VIDEO_RASTER_FLAG_REPLAY       = (1 << 6)
 };
 
 typedef struct video_raster
@@ -60,7 +62,7 @@ void video_raster_reset(video_raster_t *raster);
 enum video_raster_violation video_raster_poll(video_raster_t *raster,
       const void *data, unsigned width, unsigned height, unsigned row);
 
-/* The frame's video_refresh; NULL data is a dupe */
+/* The frame's video_refresh; a replay passes through untouched */
 enum video_raster_violation video_raster_frame_end(video_raster_t *raster,
       const void *data, unsigned width, unsigned height);
 

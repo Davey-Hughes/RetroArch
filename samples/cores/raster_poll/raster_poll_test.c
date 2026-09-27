@@ -197,20 +197,23 @@ static void test_dupe_and_empty(void)
    video_raster_reset(&r);
    counts_reset();
 
-   /* A duped frame ends the frame without judging it... */
+   /* A dupe after polls is a contract break */
    poll_frame(&r, 1);
-   CHECK(video_raster_frame_end(&r, NULL, 256, 240) == VIDEO_RASTER_OK);
+   CHECK(video_raster_frame_end(&r, NULL, 256, 240) == VIDEO_RASTER_BAD_DATA);
    CHECK(r.calls == 0);
-   CHECK(log_count == 0 && warn_count == 0);
+   CHECK(warn_count == 1 && log_count == 0);
+   CHECK(strstr(last_msg, "256x240, frame presented as a dupe or hardware frame.") != NULL);
 
-   /* ...so the next frame starts over at row 0 */
+   /* The next frame starts over at row 0 */
    poll_frame(&r, 1);
    CHECK(video_raster_frame_end(&r, frame, 256, 240) == VIDEO_RASTER_OK);
-   CHECK(log_count == 1 && warn_count == 0);
+   CHECK(log_count == 1 && warn_count == 1);
 
    /* A frame without polls says nothing */
    counts_reset();
    CHECK(video_raster_frame_end(&r, frame, 256, 240) == VIDEO_RASTER_OK);
+   CHECK(log_count == 0 && warn_count == 0);
+   CHECK(video_raster_frame_end(&r, NULL, 256, 240) == VIDEO_RASTER_OK);
    CHECK(log_count == 0 && warn_count == 0);
 }
 
@@ -233,6 +236,31 @@ static void test_reset(void)
    poll_frame(&r, 1);
    video_raster_frame_end(&r, frame, 256, 240);
    CHECK(warn_count == 2 && log_count == 2);
+}
+
+static void test_replay(void)
+{
+   unsigned y;
+   video_raster_t r;
+   video_raster_reset(&r);
+   counts_reset();
+
+   for (y = 0; y < 100; y++)
+      CHECK(video_raster_poll(&r, frame, 256, 240, y) == VIDEO_RASTER_OK);
+
+   /* A replay of another frame mid-frame passes through untouched */
+   r.flags |= VIDEO_RASTER_FLAG_REPLAY;
+   CHECK(video_raster_frame_end(&r, frame, 256, 224) == VIDEO_RASTER_OK);
+   CHECK(video_raster_frame_end(&r, NULL, 256, 240) == VIDEO_RASTER_OK);
+   r.flags &= ~VIDEO_RASTER_FLAG_REPLAY;
+   CHECK(r.calls == 100 && r.last_row == 99);
+   CHECK(warn_count == 0 && log_count == 0);
+
+   for (y = 100; y < 240; y++)
+      CHECK(video_raster_poll(&r, frame, 256, 240, y) == VIDEO_RASTER_OK);
+   CHECK(video_raster_frame_end(&r, frame, 256, 240) == VIDEO_RASTER_OK);
+   CHECK(log_count == 1 && warn_count == 0);
+   CHECK(strstr(last_msg, "240 calls for 256x240, rows 0-239.") != NULL);
 }
 
 /* The test core, driven as a frontend would, through the checker */
@@ -405,6 +433,7 @@ int main(void)
    test_data();
    test_dupe_and_empty();
    test_reset();
+   test_replay();
 
    test_core("1",   true,  240);
    test_core("8",   true,  30);
