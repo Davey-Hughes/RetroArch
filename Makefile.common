@@ -1727,7 +1727,8 @@ ifeq ($(HAVE_VULKAN), 1)
    endif
    ifeq ($(HAVE_OPENXR), 1)
       OBJ += gfx/common/vulkan_openxr.o \
-             gfx/video_xr.o
+             gfx/video_xr.o \
+             input/common/input_openxr.o
    endif
    NEED_CXX_LINKER = 1
    DEFINES += -DHAVE_VULKAN

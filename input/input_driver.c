@@ -89,6 +89,9 @@
 #include "../tasks/tasks_internal.h"
 #include "../verbosity.h"
 #include "../gfx/video_driver.h"
+#ifdef HAVE_OPENXR
+#include "common/input_openxr.h"
+#endif
 
 #ifdef ANDROID
 #include "../frontend/drivers/platform_unix.h"
@@ -2083,6 +2086,23 @@ static int16_t input_state_device(
                      res |= 1;
                }
 #endif
+#ifdef HAVE_OPENXR
+               /* The headset's controllers, as the overlay's buttons: a
+                * remapped button was mapped in input_driver_poll(). */
+               if (input_openxr_button(port, id))
+               {
+#ifdef HAVE_MENU
+                  bool menu_alive = (menu_state_get_ptr()->flags
+                        & MENU_ST_FLAG_ALIVE) ? true : false;
+#else
+                  bool menu_alive = false;
+#endif
+                  if (     menu_alive
+                        || !settings->bools.input_remap_binds_enable
+                        || (id == remap_button))
+                     res |= 1;
+               }
+#endif
             }
 
             if (id <= RETRO_DEVICE_ID_JOYPAD_R3)
@@ -2375,6 +2395,9 @@ static int16_t input_state_device(
                               }
                            }
                         }
+#endif
+#ifdef HAVE_OPENXR
+                        res = input_openxr_analog(port, idx, id, res);
 #endif
                      }
                   }
@@ -7211,6 +7234,7 @@ void input_pad_connect(unsigned port, input_device_driver_t *driver)
 
 static bool input_keys_pressed_other_sources(
       input_driver_state_t *input_st,
+      unsigned port,
       unsigned i,
       input_bits_t *p_new_state)
 {
@@ -7233,6 +7257,11 @@ static bool input_keys_pressed_other_sources(
    if (i < RARCH_CUSTOM_BIND_LIST_END
          && input_st->remote
          && INPUT_REMOTE_KEY_PRESSED(input_st, i, 0))
+      return true;
+#endif
+
+#ifdef HAVE_OPENXR
+   if (input_openxr_button(port, i))
       return true;
 #endif
 
@@ -7363,7 +7392,7 @@ static void input_keys_pressed(
    for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
    {
       if (     (ret & (UINT64_C(1) << i))
-            || input_keys_pressed_other_sources(input_st, i, p_new_state))
+            || input_keys_pressed_other_sources(input_st, port, i, p_new_state))
       {
          any_pressed = true;
          held_now   |= (uint16_t)(1u << i);
@@ -7423,7 +7452,7 @@ static void input_keys_pressed(
 
          if (     bit_pressed
                || BIT64_GET(lifecycle_state, i)
-               || input_keys_pressed_other_sources(input_st, i, p_new_state))
+               || input_keys_pressed_other_sources(input_st, port, i, p_new_state))
          {
             if (!(input_st->flags & INP_FLAG_MENU_PRESS_PENDING))
                input_st->flags &= ~INP_FLAG_MENU_PRESS_CANCEL;
@@ -7599,7 +7628,7 @@ static void input_keys_pressed(
 
    for (i = RARCH_FIRST_META_KEY; i < RARCH_BIND_LIST_END; i++)
    {
-      bool other_pressed = input_keys_pressed_other_sources(input_st, i, p_new_state);
+      bool other_pressed = input_keys_pressed_other_sources(input_st, port, i, p_new_state);
       bool bit_pressed   = RETRO_KEYBIND_VALID(&binds[port][i])
             && input_state_wrap(
                   input_st->current_driver,
@@ -7746,6 +7775,9 @@ void input_driver_poll(void)
       sec_joypad->poll();
    if (input && input->poll)
       input->poll(input_st->current_data);
+#ifdef HAVE_OPENXR
+   input_openxr_poll();
+#endif
 
    /* The real drivers are polled regardless, so their state stays
     * current and nothing is replayed on refocus; everything read
@@ -8152,6 +8184,10 @@ void input_driver_poll(void)
                         current_button_value |= BIT256_GET(ol_state->buttons, j);
                   }
 #endif
+#ifdef HAVE_OPENXR
+                  if (input_openxr_button((unsigned)i, (unsigned)j))
+                     current_button_value = 1;
+#endif
                   /* Press */
                   if ((current_button_value == 1)
                         && !MAPPER_GET_KEY(handle, remap_key))
@@ -8209,6 +8245,10 @@ void input_driver_poll(void)
                      if (ol_state)
                         current_button_value |= BIT256_GET(ol_state->buttons, j);
                   }
+#endif
+#ifdef HAVE_OPENXR
+                  if (input_openxr_button((unsigned)i, (unsigned)j))
+                     current_button_value = 1;
 #endif
                   remap_valid                   =
                         (current_button_value == 1)

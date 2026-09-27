@@ -164,6 +164,9 @@
 #endif
 
 #include "input/input_remapping.h"
+#ifdef HAVE_OPENXR
+#include "input/common/input_openxr.h"
+#endif
 
 #ifdef HAVE_CHEEVOS
 #include "cheevos/cheevos.h"
@@ -1657,6 +1660,10 @@ void drivers_init(
 
       video_st->frame_time_count = 0;
 
+#ifdef HAVE_OPENXR
+      /* Before video makes a headset session. */
+      input_openxr_register();
+#endif
       video_driver_lock_new();
 #ifdef HAVE_VIDEO_FILTER
       video_driver_filter_free();

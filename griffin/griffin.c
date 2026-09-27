@@ -370,6 +370,7 @@ VIDEO CONTEXT
 #ifdef HAVE_OPENXR
 #include "../gfx/video_xr.c"
 #include "../gfx/common/vulkan_openxr.c"
+#include "../input/common/input_openxr.c"
 #endif
 #ifdef HAVE_VULKAN_DISPLAY
 #include "../gfx/drivers_context/khr_display_ctx.c"

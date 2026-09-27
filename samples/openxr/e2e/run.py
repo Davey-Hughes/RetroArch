@@ -139,6 +139,7 @@ class Result(object):
         self.chains = {}
         self.marks = {}
         self.shot = None
+        self.events = []
 
 
 def load(res):
@@ -150,6 +151,7 @@ def load(res):
                     e = json.loads(line)
                 except ValueError:
                     continue  # a line cut short at exit
+                res.events.append(e)
                 if e['ev'] == 'frame':
                     res.frames.append(e)
                 elif e['ev'] == 'release':
@@ -790,6 +792,223 @@ def check_session_lost(res):
     return errors + window_is(res, GREEN, 'the 2D map again')
 
 
+# ---- Headset input ----
+
+PAD_RE = re.compile(r'\[video_views\] pad port=(\d) buttons=0x([0-9a-f]+) '
+                    r'lx=(-?\d+) ly=(-?\d+) rx=(-?\d+) ry=(-?\d+) '
+                    r'l2=(-?\d+) r2=(-?\d+)')
+POINTER_RE = re.compile(r'\[video_views\] pointer (?:x=(-?\d+) y=(-?\d+) '
+                        r'pressed=1 packed=\((\d+),(\d+)\)|pressed=0)')
+GUN_RE = re.compile(r'\[video_views\] lightgun x=(-?\d+) y=(-?\d+) '
+                    r'offscreen=(\d) trigger=(\d) '
+                    r'packed=\((-?\d+),(-?\d+)\)')
+RUMBLE_RE = re.compile(r'\[video_views\] rumble port=(\d) strong=(\d+) '
+                       r'weak=(\d+)')
+MENU_RE = re.compile(r'\[Menu\] Headset pointer x=(-?\d+) y=(-?\d+) '
+                     r'pressed=(\d) selection=(\d+)')
+RP = dict((n, 1 << i) for i, n in enumerate(
+    ('B', 'Y', 'SELECT', 'START', 'UP', 'DOWN', 'LEFT', 'RIGHT',
+     'A', 'X', 'L', 'R', 'L2', 'R2', 'L3', 'R3')))
+PROFILES = ('/interaction_profiles/valve/index_controller',
+            '/interaction_profiles/oculus/touch_controller',
+            '/interaction_profiles/htc/vive_controller',
+            '/interaction_profiles/khr/simple_controller')
+
+
+def script(*lines):
+    return '\n'.join(lines)
+
+
+def core_events(res):
+    """The core's and the menu's input lines, in log order, as
+    (kind, fields): pad, pointer, gun, rumble, menu."""
+    out = []
+    for line in res.log.splitlines():
+        m = PAD_RE.search(line)
+        if m:
+            v = [int(g) for g in m.groups()[2:]]
+            out.append(('pad', {'port': int(m.group(1)),
+                                'buttons': int(m.group(2), 16),
+                                'lx': v[0], 'ly': v[1], 'rx': v[2],
+                                'ry': v[3], 'l2': v[4], 'r2': v[5]}))
+            continue
+        m = POINTER_RE.search(line)
+        if m:
+            if m.group(1) is None:
+                out.append(('pointer', {'pressed': 0}))
+            else:
+                out.append(('pointer', {'pressed': 1,
+                                        'cx': int(m.group(3)),
+                                        'cy': int(m.group(4))}))
+            continue
+        m = GUN_RE.search(line)
+        if m:
+            v = [int(g) for g in m.groups()]
+            out.append(('gun', {'x': v[0], 'y': v[1], 'offscreen': v[2],
+                                'trigger': v[3], 'cx': v[4], 'cy': v[5]}))
+            continue
+        m = RUMBLE_RE.search(line)
+        if m:
+            v = [int(g) for g in m.groups()]
+            out.append(('rumble', {'port': v[0], 'strong': v[1],
+                                   'weak': v[2]}))
+            continue
+        m = MENU_RE.search(line)
+        if m:
+            v = [int(g) for g in m.groups()]
+            out.append(('menu', {'x': v[0], 'y': v[1], 'pressed': v[2],
+                                 'selection': v[3]}))
+    return out
+
+
+def kinds(evs, kind):
+    return [f for k, f in evs if k == kind]
+
+
+def pads(res, port):
+    return [f for f in kinds(core_events(res), 'pad') if f['port'] == port]
+
+
+def events(res, name):
+    return [e for e in res.events if e['ev'] == name]
+
+
+def close(got, want, tol=2):
+    return all(abs(a - b) <= tol for a, b in zip(got, want))
+
+
+def find(seq, start, pred):
+    """The index of the first item from start on that matches, or -1."""
+    for i in range(max(start, 0), len(seq)):
+        if pred(seq[i]):
+            return i
+    return -1
+
+
+def moved(f):
+    return any(f[k] for k in ('buttons', 'lx', 'ly', 'rx', 'ry', 'l2', 'r2'))
+
+
+def bindings_errors(res):
+    got = dict((e['profile'], e['result']) for e in events(res, 'bindings'))
+    return ['bindings for %s: %s (see Monado\'s warning in run.log)'
+            % (p, got.get(p, 'not suggested'))
+            for p in PROFILES if got.get(p) != 0]
+
+
+def sync_errors(res, want):
+    seen = set(tuple(sorted(e['sets'])) for e in events(res, 'sync'))
+    seen.discard(())
+    if not seen:
+        return ['xrSyncActions never made a set active']
+    return ['synced %s, want only %s' % (list(s), sorted(want))
+            for s in sorted(seen) if s != tuple(sorted(want))]
+
+
+def cursors(frame):
+    """The laser's dots: small blended quads."""
+    return [q for q in quads(frame)
+            if q['flags'] & BLEND and q['size'][0] < 0.1]
+
+
+def menus(frame):
+    return [q for q in quads(frame)
+            if q['flags'] & BLEND and q['size'][0] >= 0.1]
+
+
+ALL_BUTTONS = script(*['action combined/%s 1' % n for n in (
+    'b', 'y', 'select', 'start', 'dpad_up', 'dpad_down', 'dpad_left',
+    'dpad_right', 'a', 'x', 'l', 'r', 'l2', 'r2', 'l3', 'r3')])
+STICKS = script('action combined/left_stick 0.5 0.5',
+                'action combined/right_stick -1 -0.25',
+                'action combined/l2 0.25', 'action combined/r2 0.75')
+SEPARATE = script('action separate/b@left 1',
+                  'action separate/stick@left 0.5 0.5',
+                  'action separate/a@right 1',
+                  'action separate/r2@right 0.6',
+                  'action combined/x 1')
+HELD = script('action combined/b 1', 'action combined/left_stick 1 0')
+
+
+def check_combined(res):
+    errors = bindings_errors(res) + sync_errors(res, ('combined', 'pointer'))
+    p0 = pads(res, 0)
+    i = find(p0, 0, lambda f: f['buttons'] == 0xffff
+             and (f['l2'], f['r2']) == (32767, 32767))
+    # Sticks up are negative Y; analog L2/R2 with only R2 past halfway.
+    j = find(p0, i + 1, lambda f: f['buttons'] == RP['R2'] and close(
+        (f['lx'], f['ly'], f['rx'], f['ry'], f['l2'], f['r2']),
+        (16383, -16383, -32767, 8191, 8191, 24575)))
+    k = find(p0, j + 1, lambda f: not moved(f))
+    if i < 0:
+        errors.append('player 1 never had every button and both triggers: %s'
+                      % p0[-3:])
+    elif j < 0:
+        errors.append('player 1 never had the sticks and half triggers: %s'
+                      % p0[i:i + 3])
+    elif k < 0:
+        errors.append('player 1 was not released')
+    if any(moved(f) for f in pads(res, 1)):
+        errors.append('player 2 moved in Combined')
+    if '[OpenXR] Controllers: combined.' not in res.log:
+        errors.append('no "[OpenXR] Controllers: combined." in the log')
+    if 'Headset recenter requested' not in res.log:
+        errors.append('Recenter did not reach the hotkey')
+    if not any(menus(f) for f in res.frames):
+        errors.append('RetroArch Menu did not open the menu')
+    return errors
+
+
+def check_separate(res):
+    errors = bindings_errors(res) + sync_errors(res, ('separate', 'pointer'))
+    p0, p1 = pads(res, 0), pads(res, 1)
+    if find(p0, 0, lambda f: f['buttons'] == RP['B']
+            and close((f['lx'], f['ly']), (16383, -16383))) < 0:
+        errors.append('player 1 never had B and the left stick: %s' % p0[-3:])
+    if find(p1, 0, lambda f: f['buttons'] == RP['A'] | RP['R2']
+            and close((f['r2'],), (19660,))) < 0:
+        errors.append('player 2 never had A and R2: %s' % p1[-3:])
+    if any(f['buttons'] & RP['X'] for f in p0 + p1):
+        errors.append('an action of the unsynced Combined set reached a pad')
+    if not p0 or moved(p0[-1]) or not p1 or moved(p1[-1]):
+        errors.append('the pads were not released at the end')
+    if '[OpenXR] Controllers: separate.' not in res.log:
+        errors.append('no "[OpenXR] Controllers: separate." in the log')
+    return errors
+
+
+def check_input_focus(res):
+    p0 = pads(res, 0)
+    i = find(p0, 0, lambda f: f['buttons'] == RP['B'] and f['lx'] == 32767)
+    j = find(p0, i + 1, lambda f: not moved(f)) if i >= 0 else -1
+    k = (find(p0, j + 1, lambda f: f['buttons'] == RP['B']
+              and f['lx'] == 32767) if j >= 0 else -1)
+    errors = []
+    if i < 0:
+        errors.append('B and the stick never reached player 1')
+    elif j < 0:
+        errors.append('still held after the headset lost focus')
+    elif k < 0:
+        errors.append('not held again once the headset had focus back')
+    if 'Controllers released: the headset is not focused' not in res.log:
+        errors.append('no "Controllers released" in the log')
+    return errors
+
+
+def check_input_unfocused(res):
+    """The window unfocused, with Pause Content When Not Active and no
+    background joypads: check_focus()'s pause rule, and the headset's
+    controllers still reach player 1 while its session is focused."""
+    errors = check_focus(res)
+    if find(pads(res, 0), 0, lambda f: f['buttons'] == RP['B']
+            and f['lx'] == 32767) < 0:
+        errors.append('B and the stick never reached player 1 with the '
+                      'window unfocused')
+    if 'Controllers released: the headset is not focused' not in res.log:
+        errors.append('no "Controllers released" in the log')
+    return errors
+
+
 def check_hw_teardown(res):
     """The core's context_destroy waits on the device without the queue
     lock, at a video reinit and at unload: the headset's frames stop
@@ -830,6 +1049,19 @@ def check_kept_retry(res):
     if '0' not in stereo or stereo[-1:] != ['1']:
         errors.append('the core saw stereo %s, want it off and on again'
                       % ' '.join(stereo))
+    ready = res.log.count('[OpenXR] Headset controllers ready.')
+    if ready != 2:
+        errors.append('headset controllers ready %d times, want 2 (one '
+                      'per session)' % ready)
+    if '[OpenXR] Headset controllers unavailable' in res.log:
+        errors.append('headset controllers unavailable in a session')
+    # The laser's dot is VULKAN_OPENXR_CURSOR_DIM square; each start makes
+    # one, and each start here made a session.
+    dots = [e for e in events(res, 'swapchain')
+            if (e['w'], e['h']) == (32, 32)]
+    if len(dots) != 2:
+        errors.append('%d laser dot swapchains, want 2 (one per start)'
+                      % len(dots))
     return errors
 
 
@@ -965,6 +1197,37 @@ CASES = [
                ('mark', 'reinit'), ('send', 'FULLSCREEN_TOGGLE'),
                ('wait', 4)],
      'baseline': KEPT_LEAK, 'check': check_kept_lost},
+    {'name': 'input-combined', 'map': '3ds',
+     'steps': [('wait', 6), ('script', ALL_BUTTONS), ('wait', 2),
+               ('script', STICKS), ('wait', 2), ('script', ''), ('wait', 2),
+               ('script', 'action combined/recenter 1'), ('wait', 1),
+               ('script', ''), ('wait', 1),
+               ('script', 'action combined/menu 1'), ('wait', 1),
+               ('script', ''), ('wait', 3)],
+     'check': check_combined},
+    {'name': 'input-separate', 'map': '3ds',
+     'settings': {'video_openxr_controllers': '1'},
+     'steps': [('wait', 6), ('script', SEPARATE), ('wait', 2),
+               ('script', ''), ('wait', 2)],
+     'check': check_separate},
+    {'name': 'input-focus', 'map': '3ds',
+     'steps': [('wait', 6), ('script', HELD), ('wait', 2),
+               ('script', script(HELD, 'state 4')), ('wait', 2),
+               ('script', script(HELD, 'state 5')), ('wait', 2),
+               ('script', ''), ('wait', 1)],
+     'check': check_input_focus},
+    # Output spec section 3, Focus: the headset's focus keeps its
+    # controllers and the content going while the window is unfocused;
+    # only visible (4), they release and the content pauses.
+    {'name': 'input-unfocused', 'map': '3ds', 'unfocus': True,
+     'settings': {'pause_nonactive': 'true',
+                  'input_joypad_background': 'false'},
+     'steps': [('wait', 6), ('unfocus', None), ('mark', 'unfocused'),
+               ('script', HELD), ('wait', 3), ('mark', 'visible'),
+               ('script', script(HELD, 'state 4')), ('wait', 3),
+               ('mark', 'refocused'), ('script', script(HELD, 'state 5')),
+               ('wait', 3), ('mark', 'end'), ('script', ''), ('wait', 1)],
+     'check': check_input_unfocused},
 ]
 
 
