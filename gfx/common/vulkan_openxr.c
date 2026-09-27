@@ -1059,6 +1059,8 @@ void vulkan_openxr_stop(vulkan_openxr_t *xr)
       xr->quads.num_quads = 0;
       slock_unlock(xr->lock);
    }
+   /* The context frees it next; a kept session outlives it. */
+   xr->queue_lock = NULL;
 }
 
 void vulkan_openxr_drop_and_reinit(vulkan_openxr_t *xr)
