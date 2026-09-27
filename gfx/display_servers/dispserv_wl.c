@@ -16,6 +16,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <boolean.h>
 #include <compat/strl.h>
 #include <retro_miscellaneous.h>
@@ -30,6 +31,12 @@
 #include "../video_display_server.h"
 #include "edid_sysfs.h"
 #include "../common/wayland_drm_lease.h"
+#include "../common/wayland_beam.h"
+#include "../common/wayland/presentation-time.h"
+#ifdef HAVE_KMS
+#include <unistd.h>
+#include "../common/drm_scanout.h"
+#endif
 
 #include "../../verbosity.h"
 
@@ -58,6 +65,25 @@ typedef struct
    kwin_outputs_t kwin;
    /* wlroots compositors' heads and modes (sway, Hyprland, river) */
    wlr_outputs_t  wlr;
+   /* The beam estimate's DRM facts for the connector named in
+    * scanout_output, read again at most twice a second */
+   char     scanout_output[32];
+   uint64_t scanout_checked_ns;
+   uint64_t scanout_frame_ns;
+   unsigned scanout_vtotal;
+   unsigned scanout_vdisplay;
+   bool     scanout_valid;
+   bool     scanout_vrr;
+#ifdef HAVE_KMS
+   /* The connector's card, open while the output keeps its name */
+   int      scanout_fd;
+   drm_scanout_t scanout;
+#endif
+   /* Presented frames held for vblank in a row, the last one's line 0 */
+   uint64_t vsync_line0_ns;
+   unsigned vsync_frames;
+   bool     logged_vrr;
+   bool     logged_no_drm;
 } dispserv_wl_t;
 
 /* wl_output listener callbacks */
@@ -215,6 +241,9 @@ static void *wl_display_server_init(void)
    dispserv_wl_t *serv = (dispserv_wl_t*)calloc(1, sizeof(*serv));
    if (!serv)
       return NULL;
+#ifdef HAVE_KMS
+   serv->scanout_fd = -1;
+#endif
 
    serv->dpy = wl_display_connect(NULL);
    if (!serv->dpy)
@@ -241,6 +270,10 @@ static void wl_display_server_destroy(void *data)
    dispserv_wl_t *serv = (dispserv_wl_t*)data;
    if (!serv)
       return;
+#ifdef HAVE_KMS
+   if (serv->scanout_fd >= 0)
+      close(serv->scanout_fd);
+#endif
    kwin_outputs_destroy(&serv->kwin);
    wlr_outputs_destroy(&serv->wlr);
    if (serv->output)
@@ -378,6 +411,137 @@ static void wl_display_server_get_video_output_size(void *data,
       *dims = VIDEO_SCALE_PACK(serv->width, serv->height);
 }
 
+#define WL_BEAM_STALE_NS      1000000000
+#define WL_SCANOUT_RECHECK_NS 500000000
+/* About 2 s at 60 Hz: KWin holds a window's first presents for vblank
+ * until it treats it as the fullscreen one */
+#define WL_NO_TEARING_FRAMES  120
+
+static uint64_t wl_display_server_now_ns(int clock_id)
+{
+   struct timespec ts;
+   if (clock_gettime((clockid_t)clock_id, &ts) != 0)
+      return 0;
+   return (uint64_t)ts.tv_sec * 1000000000 + (uint64_t)ts.tv_nsec;
+}
+
+/* The card stays open while the output keeps its name, as an open
+ * costs a GPU address space on amdgpu, and is re-read at most twice a
+ * second, as KWin can switch VRR on when a game goes fullscreen.
+ * Scanline Sync asks every 60 frames, so a tighter bound would let
+ * every other ask at 60 Hz go unread. */
+static void wl_display_server_scanout(dispserv_wl_t *serv,
+      const char *name, uint64_t now_ns)
+{
+   bool renamed = !serv->scanout_checked_ns
+         || strcmp(serv->scanout_output, name);
+
+   if (     !renamed
+         && now_ns - serv->scanout_checked_ns < WL_SCANOUT_RECHECK_NS)
+      return;
+
+   strlcpy(serv->scanout_output, name, sizeof(serv->scanout_output));
+   serv->scanout_checked_ns = now_ns;
+   serv->scanout_valid      = false;
+#ifdef HAVE_KMS
+   /* A CRTC that went off or changed hands is looked up afresh */
+   if (     serv->scanout_fd >= 0
+         && (renamed
+            || !drm_scanout_update(serv->scanout_fd, &serv->scanout)))
+   {
+      close(serv->scanout_fd);
+      serv->scanout_fd = -1;
+   }
+   if (serv->scanout_fd < 0 && *name)
+      serv->scanout_fd = drm_scanout_open("/sys/class/drm", "/dev/dri",
+            name, &serv->scanout);
+   if (serv->scanout_fd >= 0)
+   {
+      serv->scanout_valid    = true;
+      serv->scanout_frame_ns = serv->scanout.frame_ns;
+      serv->scanout_vtotal   = serv->scanout.vtotal;
+      serv->scanout_vdisplay = serv->scanout.vdisplay;
+      serv->scanout_vrr      = serv->scanout.vrr;
+   }
+#endif
+   if (!serv->scanout_valid && !serv->logged_no_drm)
+   {
+      serv->logged_no_drm = true;
+      if (!*name)
+         RARCH_LOG("[Wayland] The output has no connector name (wl_output v4), so Scanline Sync has no DRM timing and stays off.\n");
+#ifdef HAVE_KMS
+      else
+         RARCH_LOG("[Wayland] No active progressive DRM connector \"%s\" to time the beam by, so Scanline Sync stays off.\n",
+               name);
+#else
+      else
+         RARCH_LOG("[Wayland] Built without KMS, so Scanline Sync has no DRM timing and stays off.\n");
+#endif
+   }
+}
+
+/* The compositor reports when line 0 of each presented frame started,
+ * and keeps doing so while the presents tear */
+static int wl_display_server_get_scanline(void *data)
+{
+   dispserv_wl_t *serv = (dispserv_wl_t*)data;
+   wl_beam_t t;
+   uint64_t now_ns;
+   int64_t elapsed_ns;
+
+   if (!serv || !wl_beam_get(&t))
+      return -1;
+   /* A software stamp says nothing about the scanout */
+   if (!(t.flags & WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK))
+      return -1;
+   /* 0: the compositor cannot predict the next refresh (VRR) */
+   if (!t.refresh_ns)
+      return -1;
+   /* Presents held for vblank cannot be aimed at a line, and aiming
+    * them late misses the compositor's deadline */
+   if (t.flags & WP_PRESENTATION_FEEDBACK_KIND_VSYNC)
+   {
+      if (     t.line0_ns != serv->vsync_line0_ns
+            && serv->vsync_frames < WL_NO_TEARING_FRAMES)
+      {
+         serv->vsync_line0_ns = t.line0_ns;
+         if (++serv->vsync_frames == WL_NO_TEARING_FRAMES)
+            RARCH_LOG("[Wayland] The compositor is not tearing, so Scanline Sync stays off (KWin: \"Allow tearing in full screen\").\n");
+      }
+      return -1;
+   }
+   serv->vsync_frames = 0;
+
+   /* The output's DRM timing, which get_metrics reads again when
+    * Scanline Sync asks for the line counts, outside its wait. Without
+    * it VRR cannot be ruled out, and KWin reports the nominal refresh
+    * under VRR. */
+   if (     !serv->scanout_valid
+         || strcmp(serv->scanout_output, t.output))
+      return -1;
+   if (serv->scanout_vrr)
+   {
+      if (!serv->logged_vrr)
+      {
+         serv->logged_vrr = true;
+         RARCH_LOG("[Wayland] Variable refresh is on for \"%s\", so Scanline Sync stays off (KWin: Adaptive Sync).\n",
+               t.output);
+      }
+      return -1;
+   }
+
+   /* A hidden window's last feedback is refused */
+   if (!(now_ns = wl_display_server_now_ns(t.clock_id)))
+      return -1;
+   elapsed_ns = (int64_t)(now_ns - t.line0_ns);
+   if (     elapsed_ns > WL_BEAM_STALE_NS
+         || elapsed_ns < -(int64_t)serv->scanout_frame_ns)
+      return -1;
+
+   return video_display_server_scanline_from_time(elapsed_ns,
+         serv->scanout_frame_ns, serv->scanout_vtotal);
+}
+
 static bool wl_display_server_get_metrics(void *data,
       enum display_metric_types type, float *value)
 {
@@ -415,6 +579,20 @@ static bool wl_display_server_get_metrics(void *data,
          if (!serv->have_mode)
             return false;
          *value = (float)serv->height;
+         break;
+      case DISPLAY_METRIC_TOTAL_LINES:
+      case DISPLAY_METRIC_ACTIVE_LINES:
+         {
+            wl_beam_t t;
+            if (!wl_beam_get(&t))
+               return false;
+            wl_display_server_scanout(serv, t.output,
+                  wl_display_server_now_ns(t.clock_id));
+            if (!serv->scanout_valid)
+               return false;
+            *value = (float)(type == DISPLAY_METRIC_TOTAL_LINES
+                  ? serv->scanout_vtotal : serv->scanout_vdisplay);
+         }
          break;
       case DISPLAY_METRIC_NONE:
       default:
@@ -466,7 +644,7 @@ const video_display_server_t dispserv_wl = {
    NULL, /* get_video_output_next */
    wl_display_server_get_metrics,
    wl_display_server_get_flags,
-   NULL, /* get_scanline */
+   wl_display_server_get_scanline,
    NULL, /* wait_vblank */
    NULL, /* modeline_list_outputs */
    NULL, /* modeline_open */

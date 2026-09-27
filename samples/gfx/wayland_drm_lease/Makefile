@@ -28,10 +28,16 @@ KDE_CODE := kde-output-device-v2-protocol.c kde-output-management-v2-protocol.c
 WLR_XML  := $(REPO_ROOT)/deps/wayland-protocols/wlr
 WLR_HDRS := $(REPO_ROOT)/gfx/common/wayland/wlr-output-management-unstable-v1.h
 WLR_CODE := wlr-output-management-unstable-v1-protocol.c
+# presentation-time's feedback flags and clock id, which the beam
+# estimate reads directly; nothing here binds the global, so only
+# the client header is needed
+PRES_XML  := $(REPO_ROOT)/deps/wayland-protocols/stable/presentation-time/presentation-time.xml
+PRES_HDRS := $(REPO_ROOT)/gfx/common/wayland/presentation-time.h
 SOURCES := wayland_drm_lease_test.c \
            drm-lease-v1-protocol.c \
            $(REPO_ROOT)/gfx/display_servers/dispserv_wl.c \
            $(REPO_ROOT)/gfx/common/wayland_drm_lease.c \
+           $(REPO_ROOT)/gfx/common/wayland_beam.c \
            $(REPO_ROOT)/gfx/common/wayland_kwin_output.c \
            $(REPO_ROOT)/gfx/common/video_mode_select.c \
            kde-output-device-v2-protocol.c \
@@ -41,8 +47,10 @@ SOURCES := wayland_drm_lease_test.c \
            $(LRC)/rthreads/rthreads.c \
            $(LRC)/compat/compat_strl.c
 
+# HAVE_KMS compiles dispserv_wl's DRM timing for the beam; the test
+# stands in for gfx/common/drm_scanout.c, so no card is needed.
 CFLAGS  += -Wall -std=gnu99 -g -O0 \
-           -DRARCH_INTERNAL -DHAVE_WAYLAND -DHAVE_THREADS -D_GNU_SOURCE \
+           -DRARCH_INTERNAL -DHAVE_WAYLAND -DHAVE_KMS -DHAVE_THREADS -D_GNU_SOURCE \
            -I. \
            -I$(REPO_ROOT) \
            -I$(LRC)/include \
@@ -88,7 +96,9 @@ $(REPO_ROOT)/gfx/common/wayland/wlr-%.h: $(WLR_XML)/wlr-%.xml
 	wayland-scanner client-header $< $@
 wlr-%-protocol.c: $(WLR_XML)/wlr-%.xml
 	wayland-scanner private-code $< $@
-$(OBJS): $(KDE_HDRS) $(WLR_HDRS)
+$(PRES_HDRS): $(PRES_XML)
+	$(WAYLAND_SCANNER) client-header $< $@
+$(OBJS): $(KDE_HDRS) $(WLR_HDRS) $(PRES_HDRS)
 
 $(TARGET): $(OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)

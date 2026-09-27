@@ -109,8 +109,8 @@ typedef struct video_display_server
     * caller asks for that first.
     *
     * win32 implements both through D3DKMT; KMS implements get_scanline
-    * from DRM's vblank timestamps. X11's glXWaitForMscOML and Wayland's
-    * presentation-time are not wired up. */
+    * from DRM's vblank timestamps, and Wayland from presentation-time
+    * feedback. X11's glXWaitForMscOML is not wired up. */
    int  (*get_scanline)(void *data);
    bool (*wait_vblank)(void *data);
 
