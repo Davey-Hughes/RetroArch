@@ -282,28 +282,6 @@ def run_case(retroarch, root, monado, case, validate):
              '$GAMESCOPE_WAYLAND_DISPLAY"; export GAMESCOPE_WAYLAND_DISPLAY;;'
              ' esac; export ' + exports + '; exec "$0" "$@"')
 
-    # gamescope and the service get none of the desktop's display, bus or
-    # runtime dir.
-    env = isolated_env()
-    svc = svc_log = None
-    if monado.get('MODE') == 'service':
-        svc_env = dict(env)
-        svc_env['WAYLAND_DISPLAY'] = 'openxr-e2e-no-socket'
-        svc_env['XDG_RUNTIME_DIR'] = RUNTIME_DIR
-        # Monado's and libsurvive's config stay out of ~/.config.
-        svc_env['XDG_CONFIG_HOME'] = os.path.join(d, 'config')
-        svc_env.update(pairs(monado.get('SERVICE_ENV', '')))
-        svc_log = open(os.path.join(d, 'service.log'), 'w')
-        svc = subprocess.Popen(['monado-service'], cwd=d, env=svc_env,
-                               stdout=svc_log, stderr=subprocess.STDOUT,
-                               stdin=subprocess.DEVNULL,
-                               start_new_session=True)
-        sock = os.path.join(d, RUNTIME_DIR,
-                            monado.get('SERVICE_SOCKET', 'monado_comp_ipc'))
-        deadline = time.time() + 10
-        while time.time() < deadline and not os.path.exists(sock):
-            time.sleep(0.1)
-
     w, h = case.get('screen', (W, H))
     cmd = ['gamescope', '--backend', 'headless',
            '-w', str(w), '-h', str(h), '-W', str(w), '-H', str(h),
@@ -312,11 +290,34 @@ def run_case(retroarch, root, monado, case, validate):
            '--verbose'] + case.get('args', [])
     if case.get('content'):
         cmd.append(case['content'])
-    log = open(os.path.join(d, 'run.log'), 'w')
-    p = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
-                         env=env, start_new_session=True)
+
+    # gamescope and the service get none of the desktop's display, bus or
+    # runtime dir.
+    env = isolated_env()
+    svc = svc_log = log = p = None
     res = Result(d)
     try:
+        if monado.get('MODE') == 'service':
+            svc_env = dict(env)
+            svc_env['WAYLAND_DISPLAY'] = 'openxr-e2e-no-socket'
+            svc_env['XDG_RUNTIME_DIR'] = RUNTIME_DIR
+            # Monado's and libsurvive's config stay out of ~/.config.
+            svc_env['XDG_CONFIG_HOME'] = os.path.join(d, 'config')
+            svc_env.update(pairs(monado.get('SERVICE_ENV', '')))
+            svc_log = open(os.path.join(d, 'service.log'), 'w')
+            svc = subprocess.Popen(['monado-service'], cwd=d, env=svc_env,
+                                   stdout=svc_log, stderr=subprocess.STDOUT,
+                                   stdin=subprocess.DEVNULL,
+                                   start_new_session=True)
+            sock = os.path.join(d, RUNTIME_DIR, monado.get(
+                'SERVICE_SOCKET', 'monado_comp_ipc'))
+            deadline = time.time() + 10
+            while time.time() < deadline and not os.path.exists(sock):
+                time.sleep(0.1)
+
+        log = open(os.path.join(d, 'run.log'), 'w')
+        p = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
+                             env=env, start_new_session=True)
         for kind, arg in case['steps']:
             if kind == 'wait':
                 time.sleep(arg)
@@ -342,7 +343,8 @@ def run_case(retroarch, root, monado, case, validate):
     finally:
         stop(p)
         stop(svc)
-        log.close()
+        if log:
+            log.close()
         if svc_log:
             svc_log.close()
         runtime_dir = env['XDG_RUNTIME_DIR']
