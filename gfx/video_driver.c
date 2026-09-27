@@ -2547,7 +2547,12 @@ void video_driver_free_hw_context(void)
     * of the frontend drains the frame it had queued). */
    video_driver_invalidate_hw_render_cache();
    if (video_st->hw_render.context_destroy)
+   {
+      if (     video_st->data && video_st->poke
+            && video_st->poke->hw_context_destroying)
+         video_st->poke->hw_context_destroying(video_st->data);
       video_st->hw_render.context_destroy();
+   }
    video_driver_invalidate_hw_render_cache();
 
    memset(&video_st->hw_render, 0, sizeof(video_st->hw_render));

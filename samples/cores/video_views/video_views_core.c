@@ -23,11 +23,17 @@
  * option through a GL core context, with either origin, or into
  * Vulkan images of its own handed over with set_image. With
  * video_views_test_max it declares a far larger maximum than it draws.
- * e2e/run.py checks the colours on screen and the status in the log. */
+ * e2e/run.py checks the colours on screen and the status in the log.
+ *
+ * In the Vulkan modes context_destroy first waits on the device without
+ * the queue lock, as a core draining its work may, and logs when:
+ * samples/openxr/e2e/run.py checks nothing of the frontend's used the
+ * queue meanwhile. vulkan_keep keeps its context over video reinits. */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <time.h>
 
 #include <libretro.h>
 #include <libretro_vulkan.h>
@@ -65,7 +71,8 @@ enum hw_kind
    HW_OFF = 0,
    HW_GL,         /* bottom-left origin */
    HW_GL_TOPLEFT,
-   HW_VULKAN
+   HW_VULKAN,
+   HW_VULKAN_KEEP
 };
 
 /* The GL the hardware mode uses, loaded through the frontend's
@@ -86,7 +93,7 @@ typedef void (APIENTRY *gl_scissor_t)(int, int, int, int);
 typedef void (APIENTRY *gl_clear_color_t)(float, float, float, float);
 typedef void (APIENTRY *gl_clear_t)(unsigned);
 
-/* The Vulkan mode's device functions, from the frontend's
+/* The Vulkan modes' device functions, from the frontend's
  * get_device_proc_addr: the core links no Vulkan loader either. */
 struct vk_funcs
 {
@@ -111,7 +118,7 @@ struct vk_funcs
    PFN_vkCmdPipelineBarrier          vkCmdPipelineBarrier;
    PFN_vkCmdCopyBufferToImage        vkCmdCopyBufferToImage;
    PFN_vkQueueSubmit                 vkQueueSubmit;
-   PFN_vkQueueWaitIdle               vkQueueWaitIdle;
+   PFN_vkDeviceWaitIdle              vkDeviceWaitIdle;
    PFN_vkCreateFence                 vkCreateFence;
    PFN_vkDestroyFence                vkDestroyFence;
    PFN_vkWaitForFences               vkWaitForFences;
@@ -239,6 +246,13 @@ static void context_reset(void)
 static void context_destroy(void)
 {
    gl_ready = false;
+}
+
+static long long now_us(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (long long)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
 static bool vk_alloc(const VkMemoryRequirements *req,
@@ -401,7 +415,7 @@ static void vk_context_reset(void)
    VK_LOAD(vkCmdPipelineBarrier);
    VK_LOAD(vkCmdCopyBufferToImage);
    VK_LOAD(vkQueueSubmit);
-   VK_LOAD(vkQueueWaitIdle);
+   VK_LOAD(vkDeviceWaitIdle);
    VK_LOAD(vkCreateFence);
    VK_LOAD(vkDestroyFence);
    VK_LOAD(vkWaitForFences);
@@ -429,15 +443,22 @@ static void vk_context_reset(void)
    log_cb(RETRO_LOG_INFO, "[video_views] Vulkan context reset\n");
 }
 
+/* Half a second of waits, so a submission beside them is caught. */
 static void vk_context_destroy(void)
 {
    unsigned i;
+   long long t0 = now_us();
+   long long t1 = t0;
    if (!vk_ready)
       return;
-   /* The frontend's reads of the images come before this on the queue. */
-   vk->lock_queue(vk->handle);
-   vkf.vkQueueWaitIdle(vk->queue);
-   vk->unlock_queue(vk->handle);
+   while (t1 - t0 < 500000)
+   {
+      vkf.vkDeviceWaitIdle(vk->device);
+      t1 = now_us();
+   }
+   log_cb(RETRO_LOG_INFO,
+         "[video_views] context_destroy waited on the device from %lld to %lld us\n",
+         t0, t1);
    for (i = 0; i < VK_SLOTS; i++)
       vk_slot_free(&vk_slots[i]);
    vkf.vkDestroyCommandPool(vk->device, vk_pool, NULL);
@@ -529,6 +550,18 @@ static bool vk_send(unsigned fw, unsigned fh)
    return true;
 }
 
+static void log_status(unsigned status, int accepted, unsigned n)
+{
+   if ((int)status == last_status && accepted == last_accepted)
+      return;
+   log_cb(RETRO_LOG_INFO,
+         "[video_views] presents=%d stereo=%d accepted=%d views=%u\n",
+         (status & RETRO_VIDEO_VIEWS_STATUS_PRESENTS) ? 1 : 0,
+         (status & RETRO_VIDEO_VIEWS_STATUS_STEREO) ? 1 : 0, accepted, n);
+   last_status   = (int)status;
+   last_accepted = accepted;
+}
+
 static void frame_size(unsigned *fw, unsigned *fh)
 {
    switch (map_kind)
@@ -608,6 +641,8 @@ static void read_options(void)
          hw_kind = HW_GL_TOPLEFT;
       else if (!strcmp(var.value, "vulkan"))
          hw_kind = HW_VULKAN;
+      else if (!strcmp(var.value, "vulkan_keep"))
+         hw_kind = HW_VULKAN_KEEP;
    }
 
    var.key   = "video_views_test_max";
@@ -652,7 +687,7 @@ void retro_set_environment(retro_environment_t cb)
       { "video_views_test_map",
         "View map; 3ds|3ds_force|ds|vb|invalid|none|crop" },
       { "video_views_test_hw",
-        "Hardware rendering; off|gl|gl_topleft|vulkan" },
+        "Hardware rendering; off|gl|gl_topleft|vulkan|vulkan_keep" },
       { "video_views_test_max",
         "Declared maximum size; normal|large" },
       { NULL, NULL }
@@ -766,15 +801,7 @@ void retro_run(void)
       accepted        = environ_cb(RETRO_ENVIRONMENT_SET_VIDEO_VIEWS,
             &views) ? 1 : 0;
    }
-   if ((int)status != last_status || accepted != last_accepted)
-   {
-      log_cb(RETRO_LOG_INFO,
-            "[video_views] presents=%d stereo=%d accepted=%d views=%u\n",
-            (status & RETRO_VIDEO_VIEWS_STATUS_PRESENTS) ? 1 : 0,
-            stereo ? 1 : 0, accepted, n);
-      last_status   = (int)status;
-      last_accepted = accepted;
-   }
+   log_status(status, accepted, n);
 
    px      = input_state_cb(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X);
    py      = input_state_cb(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_Y);
@@ -839,6 +866,7 @@ bool retro_load_game(const struct retro_game_info *game)
       memset(&hw_render, 0, sizeof(hw_render));
       hw_render.context_type    = RETRO_HW_CONTEXT_VULKAN;
       hw_render.version_major   = VK_API_VERSION_1_1;
+      hw_render.cache_context   = (hw_kind == HW_VULKAN_KEEP);
       hw_render.context_reset   = vk_context_reset;
       hw_render.context_destroy = vk_context_destroy;
       if (!environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw_render))

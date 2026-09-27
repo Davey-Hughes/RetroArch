@@ -11724,6 +11724,17 @@ static void vulkan_set_view_count(void *data, unsigned count)
    vulkan_views_build_chains(vk);
 }
 
+#ifdef HAVE_OPENXR
+/* The XR thread submits to the queue the core may then wait on
+ * without its lock. */
+static void vulkan_hw_context_destroying(void *data)
+{
+   vk_t *vk = (vk_t*)data;
+   if (vk && vk->context)
+      vulkan_openxr_stop_thread(vk->context->xr);
+}
+#endif
+
 static const video_poke_interface_t vulkan_poke_interface = {
    vulkan_get_flags,
    vulkan_load_texture,
@@ -11775,7 +11786,12 @@ static const video_poke_interface_t vulkan_poke_interface = {
    NULL, /* hw_ring_framebuffer */
    vulkan_update_texture,
    NULL, /* get_swap_interval_cap */
-   vulkan_set_view_count
+   vulkan_set_view_count,
+#ifdef HAVE_OPENXR
+   vulkan_hw_context_destroying
+#else
+   NULL  /* hw_context_destroying */
+#endif
 };
 
 static void vulkan_get_poke_interface(void *data,

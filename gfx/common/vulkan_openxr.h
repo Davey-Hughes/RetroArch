@@ -121,6 +121,10 @@ bool vulkan_openxr_start(vulkan_openxr_t *xr, VkInstance instance,
 /* Stops the XR thread; the session stays. NULL is fine. */
 void vulkan_openxr_stop(vulkan_openxr_t *xr);
 
+/* Stops the XR thread alone, before a core's context_destroy: the core
+ * may wait on the device there without the queue lock. NULL is fine. */
+void vulkan_openxr_stop_thread(vulkan_openxr_t *xr);
+
 /* The session failed on a device made for it: frees, tells the user,
  * and has the next video init skip the runtime. */
 void vulkan_openxr_drop_and_reinit(vulkan_openxr_t *xr);

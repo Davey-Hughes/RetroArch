@@ -49,6 +49,8 @@ BLEND = 2  # XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
 VUID = re.compile(r'(VUID-[A-Za-z0-9_-]+|UNASSIGNED-[A-Za-z0-9_.-]+)')
 MESSAGE = re.compile(r'Validation (Error|Warning|Performance Warning):')
 DENSITY = re.compile(r'\[OpenXR\] (\d+) pixels across (\d+) degrees per eye')
+DESTROY = re.compile(r'\[video_views\] context_destroy waited on the device '
+                     r'from (\d+) to (\d+) us')
 # The Monado client's sockets live under a relative XDG_RUNTIME_DIR in
 # the case's directory: an absolute scratch path overflows sun_path.
 RUNTIME_DIR = 'run'
@@ -712,7 +714,31 @@ def check_session_lost(res):
     return errors + window_is(res, GREEN, 'the 2D map again')
 
 
+def check_hw_teardown(res):
+    """The core's context_destroy waits on the device without the queue
+    lock, at a video reinit and at unload: the headset's frames stop
+    before it and start again after."""
+    waits = [(int(a), int(b)) for a, b in DESTROY.findall(res.log)]
+    if len(waits) != 2:
+        return ['%d context_destroy waits, want 2 (reinit, unload)'
+                % len(waits)]
+    errors = []
+    for i, (t0, t1) in enumerate(waits):
+        inside = [f for f in res.frames if t0 <= f['t_us'] <= t1]
+        if inside:
+            errors.append('%d headset frames while the core waited on the '
+                          'device (%s)' % (len(inside), ('reinit', 'unload')[i]))
+        end = waits[i + 1][0] if i + 1 < len(waits) else float('inf')
+        if not [f for f in res.frames if t1 < f['t_us'] < end]:
+            errors.append('no headset frames after the %s'
+                          % ('reinit', 'unload')[i])
+    return errors
+
+
 SETTLE = [('wait', 8)]
+VULKAN = {'video_views_test_hw': 'vulkan'}
+TEARDOWN = [('wait', 6), ('send', 'FULLSCREEN_TOGGLE'), ('wait', 4),
+            ('send', 'CLOSE_CONTENT'), ('wait', 4)]
 SIZED = {'video_shader_enable': 'true'}
 SHOT = [('wait', 8), ('shot', None)]
 
@@ -777,6 +803,12 @@ CASES = [
      'steps': [('wait', 6), ('script', 'state 7'), ('mark', 'lost'),
                ('wait', 3), ('shot', None)],
      'check': check_session_lost},
+    # A Vulkan core: reinit and unload while the headset runs.
+    {'name': 'hw-teardown', 'map': 'none', 'options': VULKAN,
+     'steps': TEARDOWN, 'check': check_hw_teardown},
+    {'name': 'hw-teardown-threaded', 'map': 'none', 'options': VULKAN,
+     'settings': {'video_threaded': 'true'}, 'steps': TEARDOWN,
+     'check': threaded(check_hw_teardown)},
 ]
 
 

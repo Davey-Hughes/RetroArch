@@ -989,17 +989,21 @@ bool vulkan_openxr_start(vulkan_openxr_t *xr, VkInstance instance,
    return true;
 }
 
+void vulkan_openxr_stop_thread(vulkan_openxr_t *xr)
+{
+   if (!xr || !xr->thread)
+      return;
+   retro_atomic_store_release_int(&xr->quit, 1);
+   sthread_join(xr->thread);
+   xr->thread = NULL;
+}
+
 void vulkan_openxr_stop(vulkan_openxr_t *xr)
 {
    unsigned s;
    if (!xr)
       return;
-   if (xr->thread)
-   {
-      retro_atomic_store_release_int(&xr->quit, 1);
-      sthread_join(xr->thread);
-      xr->thread = NULL;
-   }
+   vulkan_openxr_stop_thread(xr);
    /* A kept session outlives the driver's views of its images. */
    for (s = 0; s < VIDEO_XR_MAX_SLOTS; s++)
       vulkan_openxr_slot_destroy(xr, s);
