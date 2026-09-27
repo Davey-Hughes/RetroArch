@@ -31,7 +31,9 @@
  *   --dump FRAME:FILE            write that frame as a PPM
  *   --hash-out FILE              a line per presented frame: number,
  *                                size and a hash of its rows
- *   --hash-in FILE               fail on a presented frame that differs from FILE, the --hash-out of a --no-interface run with the same inputs
+ *   --hash-in FILE               fail on a presented frame that differs
+ *                                from FILE, the --hash-out of a
+ *                                --no-interface run with the same inputs
  *   --no-interface               refuse GET_RASTER_POLL_INTERFACE
  *   --null-poll                  a callback that does nothing
  *   --expect-polls               fail unless some frame polls
