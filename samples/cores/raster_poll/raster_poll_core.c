@@ -32,6 +32,7 @@ static unsigned rp_bar_x;
 static uint32_t rp_frame_count;
 static unsigned rp_rows_per_call = 1;
 static bool     rp_mutate;
+static bool     rp_overlay;
 
 static retro_environment_t   rp_environ_cb;
 static retro_video_refresh_t rp_video_cb;
@@ -43,6 +44,7 @@ void retro_set_environment(retro_environment_t cb)
    static const struct retro_variable vars[] = {
       { "raster_poll_rows_per_call", "Rows per raster poll; 1|8|240" },
       { "raster_poll_mutate", "Change a row after reporting it; disabled|enabled" },
+      { "raster_poll_overlay", "Draw an overlay only on frames that do not poll; disabled|enabled" },
       { NULL, NULL }
    };
    bool no_game = true;
@@ -115,6 +117,12 @@ static void rp_read_variables(void)
    rp_mutate = false;
    if (rp_environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
       rp_mutate = !strcmp(var.value, "enabled");
+
+   var.key    = "raster_poll_overlay";
+   var.value  = NULL;
+   rp_overlay = false;
+   if (rp_environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      rp_overlay = !strcmp(var.value, "enabled");
 }
 
 static void rp_draw_row(unsigned y)
@@ -151,6 +159,16 @@ void retro_run(void)
    /* A conformance runner's negative control */
    if (rp_mutate)
       rp_frame[(RP_HEIGHT / 2) * RP_WIDTH] ^= 0x00FFFFFF;
+
+   /* A frame-end draw a polling core would lose, like FCEUmm's zapper
+    * crosshair once did */
+   if (rp_overlay && !rp_raster_poll_cb)
+   {
+      unsigned ox, oy;
+      for (oy = RP_HEIGHT / 2 - 4; oy < RP_HEIGHT / 2 + 4; oy++)
+         for (ox = RP_WIDTH / 2 - 4; ox < RP_WIDTH / 2 + 4; ox++)
+            rp_frame[oy * RP_WIDTH + ox] = 0x00FF00FF;
+   }
 
    rp_video_cb(rp_frame, RP_WIDTH, RP_HEIGHT,
          sizeof(rp_frame[0]) * RP_WIDTH);

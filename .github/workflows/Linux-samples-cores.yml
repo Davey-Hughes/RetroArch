@@ -183,18 +183,18 @@ jobs:
           # and 240 rows per call, and its state round trip. Then the
           # conformance runner loading the test core: clean at each
           # rows-per-call value, the same frames with and without the
-          # interface, and a row changed after it was reported caught.
+          # interface, a row changed after it was reported caught, and
+          # a frame-end draw lost to polling caught by --hash-in.
           conform() {
              for rows in 1 8 240; do
                 timeout 60 ./raster_poll_conform --frames 120 --expect-polls \
                    --set raster_poll_rows_per_call=$rows \
                    ./raster_poll_libretro.so
              done
-             timeout 60 ./raster_poll_conform --frames 120 \
-                --hash-out "$RUNNER_TEMP/poll.hash" ./raster_poll_libretro.so
              timeout 60 ./raster_poll_conform --frames 120 --no-interface \
                 --hash-out "$RUNNER_TEMP/plain.hash" ./raster_poll_libretro.so
-             cmp "$RUNNER_TEMP/poll.hash" "$RUNNER_TEMP/plain.hash"
+             timeout 60 ./raster_poll_conform --frames 120 --expect-polls \
+                --hash-in "$RUNNER_TEMP/plain.hash" ./raster_poll_libretro.so
              if out=$(timeout 60 ./raster_poll_conform --frames 10 \
                    --set raster_poll_mutate=enabled ./raster_poll_libretro.so); then
                 echo "$out"
@@ -202,6 +202,18 @@ jobs:
                 exit 1
              fi
              echo "$out" | grep -q ', 10 mismatched rows,'
+             timeout 60 ./raster_poll_conform --frames 120 --no-interface \
+                --hash-out "$RUNNER_TEMP/overlay.hash" \
+                --set raster_poll_overlay=enabled ./raster_poll_libretro.so
+             if out=$(timeout 60 ./raster_poll_conform --frames 120 \
+                   --hash-in "$RUNNER_TEMP/overlay.hash" \
+                   --set raster_poll_overlay=enabled ./raster_poll_libretro.so); then
+                echo "$out"
+                echo "raster_poll_conform missed a frame-end draw lost to polling"
+                exit 1
+             fi
+             echo "$out" | grep -q 'hash-in: 120 of 120 presented frames differ'
+             echo "$out" | grep -q ', 0 mismatched rows,'
           }
           make clean all
           ./raster_poll_test

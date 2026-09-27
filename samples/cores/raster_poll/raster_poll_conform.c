@@ -31,6 +31,7 @@
  *   --dump FRAME:FILE            write that frame as a PPM
  *   --hash-out FILE              a line per presented frame: number,
  *                                size and a hash of its rows
+ *   --hash-in FILE               fail on a presented frame that differs from FILE, the --hash-out of a --no-interface run with the same inputs
  *   --no-interface               refuse GET_RASTER_POLL_INTERFACE
  *   --null-poll                  a callback that does nothing
  *   --expect-polls               fail unless some frame polls
@@ -52,10 +53,11 @@
 
 #include "../../../gfx/video_raster.h"
 
-#define RC_MAX_OPTIONS  512
-#define RC_MAX_EVENTS   64
-#define RC_MAX_PORTS    8
-#define RC_STATE_FRAMES 60
+#define RC_MAX_OPTIONS   512
+#define RC_MAX_EVENTS    64
+#define RC_MAX_PORTS     8
+#define RC_STATE_FRAMES  60
+#define RC_HASH_LINE_MAX 128
 
 enum rc_event_type
 {
@@ -141,6 +143,11 @@ static unsigned                rc_bpp = 2;
 static unsigned                rc_joypad;
 static unsigned                rc_frame;
 static FILE                   *rc_hash_file;
+static FILE                   *rc_hash_in_file;
+static unsigned                rc_hash_in_diffs;
+static unsigned                rc_hash_in_first_frame;
+static char                    rc_hash_in_first_expected[RC_HASH_LINE_MAX];
+static char                    rc_hash_in_first_presented[RC_HASH_LINE_MAX];
 static bool                    rc_in_run;
 static pthread_t               rc_run_thread;
 
@@ -333,6 +340,62 @@ static uint32_t rc_hash(uint32_t hash, const uint8_t *bytes, size_t len)
    return hash;
 }
 
+/* "<frame> <w>x<h> <hash>" or "<frame> dupe": what --hash-out writes
+ * and --hash-in compares against */
+static void rc_hash_line(char *buf, unsigned frame, const void *data,
+      unsigned width, unsigned height, size_t pitch, bool software)
+{
+   if (software)
+   {
+      unsigned y;
+      size_t   row_bytes = (size_t)width * rc_bpp;
+      uint32_t hash      = 2166136261u;
+      for (y = 0; y < height; y++)
+         hash = rc_hash(hash, (const uint8_t*)data + y * pitch, row_bytes);
+      sprintf(buf, "%u %ux%u %08lx", frame, width, height,
+            (unsigned long)hash);
+   }
+   else
+      sprintf(buf, "%u dupe", frame);
+}
+
+/* Reads FILE's next line, or "" past its end */
+static void rc_hash_in_next(char *buf)
+{
+   if (!fgets(buf, RC_HASH_LINE_MAX, rc_hash_in_file))
+   {
+      buf[0] = '\0';
+      return;
+   }
+   buf[strcspn(buf, "\n")] = '\0';
+}
+
+static void rc_hash_in_check(const char *line)
+{
+   char expected[RC_HASH_LINE_MAX];
+   rc_hash_in_next(expected);
+   if (strcmp(expected, line))
+   {
+      if (!rc_hash_in_diffs)
+      {
+         rc_hash_in_first_frame = rc_frame;
+         strcpy(rc_hash_in_first_expected, expected);
+         strcpy(rc_hash_in_first_presented, line);
+      }
+      rc_hash_in_diffs++;
+   }
+}
+
+/* Lines FILE still has once the run is done comparing */
+static unsigned rc_hash_in_leftover(void)
+{
+   char     line[RC_HASH_LINE_MAX];
+   unsigned count = 0;
+   while (fgets(line, sizeof(line), rc_hash_in_file))
+      count++;
+   return count;
+}
+
 static void rc_dump(const char *path, const uint8_t *data,
       unsigned width, unsigned height, size_t pitch)
 {
@@ -429,19 +492,14 @@ static void RETRO_CALLCONV rc_video_refresh(const void *data,
    }
    rc_shadow_rows = 0;
 
-   if (rc_hash_file)
+   if (rc_hash_file || rc_hash_in_file)
    {
-      if (software)
-      {
-         uint32_t hash = 2166136261u;
-         for (y = 0; y < height; y++)
-            hash = rc_hash(hash, (const uint8_t*)data + y * pitch,
-                  row_bytes);
-         fprintf(rc_hash_file, "%u %ux%u %08lx\n", rc_frame, width,
-               height, (unsigned long)hash);
-      }
-      else
-         fprintf(rc_hash_file, "%u dupe\n", rc_frame);
+      char line[RC_HASH_LINE_MAX];
+      rc_hash_line(line, rc_frame, data, width, height, pitch, software);
+      if (rc_hash_file)
+         fprintf(rc_hash_file, "%s\n", line);
+      if (rc_hash_in_file)
+         rc_hash_in_check(line);
    }
 
    for (e = 0; e < rc_event_count; e++)
@@ -765,6 +823,11 @@ int main(int argc, char **argv)
          if (!(rc_hash_file = fopen(rc_next_arg(argc, argv, &i), "w")))
             rc_cannot_run("cannot write", argv[i]);
       }
+      else if (!strcmp(a, "--hash-in"))
+      {
+         if (!(rc_hash_in_file = fopen(rc_next_arg(argc, argv, &i), "r")))
+            rc_cannot_run("cannot read", argv[i]);
+      }
       else if (!strcmp(a, "--no-interface"))
          rc_offer_interface = false;
       else if (!strcmp(a, "--null-poll"))
@@ -931,6 +994,25 @@ int main(int argc, char **argv)
    {
       printf("expected no polls, saw %u polled frames\n", rc_polled_frames);
       ok = false;
+   }
+   if (rc_hash_in_file)
+   {
+      unsigned leftover = rc_hash_in_leftover();
+      printf("hash-in: %u of %u presented frames differ\n",
+            rc_hash_in_diffs, rc_presented);
+      if (rc_hash_in_diffs)
+      {
+         printf("first difference: frame %u: expected \"%s\", presented \"%s\"\n",
+               rc_hash_in_first_frame, rc_hash_in_first_expected,
+               rc_hash_in_first_presented);
+         ok = false;
+      }
+      if (leftover)
+      {
+         printf("hash-in: %u lines left over\n", leftover);
+         ok = false;
+      }
+      fclose(rc_hash_in_file);
    }
    printf("%s\n", ok ? "PASS" : "FAIL");
    return ok ? 0 : 1;
