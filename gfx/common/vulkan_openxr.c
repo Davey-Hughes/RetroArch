@@ -1141,9 +1141,9 @@ bool vulkan_openxr_slot_acquire(vulkan_openxr_t *xr, unsigned slot,
       XrSwapchainImageWaitInfo wi;
       memset(&wi, 0, sizeof(wi));
       wi.type    = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO;
-      /* Never stall the core: an image the compositor still reads is
-       * tried again next frame. */
-      wi.timeout = 1000000;
+      /* Never stall the core, nor the XR thread behind the queue lock:
+       * an image the compositor still reads is tried again next frame. */
+      wi.timeout = 0;
       if (xr->WaitSwapchainImage(s->swapchain, &wi) != XR_SUCCESS)
          return false;
       s->waited = true;

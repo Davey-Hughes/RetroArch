@@ -274,8 +274,7 @@ typedef struct vk
     * shader, and the preset they were made from. canvas holds both
     * eyes for a blend, ui the UI drawn once for both eyes. count is
     * what set_view_count last asked for; copied has a bit per view
-    * whose image in frame last_index holds a copy. drawn has a bit per
-    * view whose chain ran its final pass this frame. */
+    * whose image in frame last_index holds a copy. */
    struct
    {
       vulkan_filter_chain_t *chains[RETRO_VIDEO_VIEWS_MAX];
@@ -293,7 +292,6 @@ typedef struct vk
       unsigned count;
       unsigned last_index;
       unsigned copied;
-      unsigned drawn;
       /* Whether views may be drawn, for get_flags on the main thread.
        * Written only on the video thread, where HDR output and the
        * source format are settled. */
@@ -308,9 +306,16 @@ typedef struct vk
    } views;
 #ifdef HAVE_OPENXR
    /* Headset output: each slot's swapchain images, with a view and a
-    * framebuffer per image and layer, and this frame's quads. */
+    * framebuffer per image and layer, and this frame's quads. Each view
+    * and the whole frame have chains of their own, as views.chains and
+    * views.stock are the window's, so every headset image is its chain's
+    * first draw at the image's size. */
    struct
    {
+      vulkan_filter_chain_t *chains[RETRO_VIDEO_VIEWS_MAX];
+      vulkan_filter_chain_t *stock[RETRO_VIDEO_VIEWS_MAX];
+      vulkan_filter_chain_t *frame_chain;
+      vulkan_filter_chain_t *frame_stock;
       struct
       {
          VkImage images[VULKAN_OPENXR_MAX_IMAGES];
@@ -5265,9 +5270,9 @@ if ((vk->context->flags & VK_CTX_FLAG_HDR_SUPPORT) || vk->views.ui_sdr)
 }
 
 #ifdef HAVE_OPENXR
-/* A headset slot's views, framebuffers and swapchain. The caller has
- * waited for this driver's submissions. */
-static void vulkan_xr_slot_free(vk_t *vk, unsigned s)
+/* A headset slot's views and framebuffers; its swapchain stays. The
+ * caller has waited for this driver's submissions. */
+static void vulkan_xr_slot_free_views(vk_t *vk, unsigned s)
 {
    unsigned i, l;
    for (i = 0; i < vk->xr.slots[s].num_images; i++)
@@ -5279,7 +5284,16 @@ static void vulkan_xr_slot_free(vk_t *vk, unsigned s)
          if (vk->xr.slots[s].views[i][l])
             vkDestroyImageView(vk->context->device,
                   vk->xr.slots[s].views[i][l], NULL);
+         vk->xr.slots[s].framebuffers[i][l] = VK_NULL_HANDLE;
+         vk->xr.slots[s].views[i][l]        = VK_NULL_HANDLE;
       }
+}
+
+/* A headset slot's views, framebuffers and swapchain. The caller has
+ * waited for this driver's submissions. */
+static void vulkan_xr_slot_free(vk_t *vk, unsigned s)
+{
+   vulkan_xr_slot_free_views(vk, s);
    memset(&vk->xr.slots[s], 0, sizeof(vk->xr.slots[s]));
    if (vk->context->xr)
       vulkan_openxr_slot_destroy(vk->context->xr, s);
@@ -5300,8 +5314,11 @@ static void vulkan_deinit_framebuffers(vk_t *vk)
 {
    int i;
 #ifdef HAVE_OPENXR
-   /* Made with views.render_pass, which goes below. */
-   vulkan_xr_free(vk);
+   unsigned s;
+   /* Made with views.render_pass, which goes below. The swapchains stay,
+    * so the headset keeps its images through a new window swapchain. */
+   for (s = 0; s < VIDEO_XR_MAX_SLOTS; s++)
+      vulkan_xr_slot_free_views(vk, s);
 #endif
    for (i = 0; i < (int) vk->num_swapchain_images; i++)
    {
@@ -5548,7 +5565,8 @@ static bool vulkan_init_default_filter_chain(vk_t *vk)
    return true;
 }
 
-/* Frees the view chains from index first on. */
+/* Frees the view chains from index first on, the headset's too, and
+ * with first 0 the headset's whole-frame chains. */
 static void vulkan_views_free_chains(vk_t *vk, unsigned first)
 {
    unsigned i;
@@ -5560,7 +5578,26 @@ static void vulkan_views_free_chains(vk_t *vk, unsigned first)
          vulkan_filter_chain_free(vk->views.stock[i]);
       vk->views.chains[i] = NULL;
       vk->views.stock[i]  = NULL;
+#ifdef HAVE_OPENXR
+      if (vk->xr.chains[i])
+         vulkan_filter_chain_free(vk->xr.chains[i]);
+      if (vk->xr.stock[i])
+         vulkan_filter_chain_free(vk->xr.stock[i]);
+      vk->xr.chains[i] = NULL;
+      vk->xr.stock[i]  = NULL;
+#endif
    }
+#ifdef HAVE_OPENXR
+   if (!first)
+   {
+      if (vk->xr.frame_chain)
+         vulkan_filter_chain_free(vk->xr.frame_chain);
+      if (vk->xr.frame_stock)
+         vulkan_filter_chain_free(vk->xr.frame_stock);
+      vk->xr.frame_chain = NULL;
+      vk->xr.frame_stock = NULL;
+   }
+#endif
    vk->views.stock_failed = false;
 }
 
@@ -5612,6 +5649,25 @@ static void vulkan_views_build_chains(vk_t *vk)
          RARCH_ERR("[Vulkan] Failed to create view %u's preset: \"%s\".\n",
                i, vk->views.preset);
    }
+#ifdef HAVE_OPENXR
+   /* With a headset, its own: one per view and one for the whole frame. */
+   if (!vk->context->xr)
+      return;
+   for (i = 0; i <= vk->views.count; i++)
+   {
+      vulkan_filter_chain_t **chain = (i < vk->views.count)
+         ? &vk->xr.chains[i] : &vk->xr.frame_chain;
+      if (*chain)
+         continue;
+      *chain = vulkan_filter_chain_create_from_preset(&info,
+            vk->views.preset, vk->video.smooth
+            ? GLSLANG_FILTER_CHAIN_LINEAR
+            : GLSLANG_FILTER_CHAIN_NEAREST);
+      if (!*chain)
+         RARCH_ERR("[OpenXR] Failed to create the headset's preset: \"%s\".\n",
+               vk->views.preset);
+   }
+#endif
 }
 
 /* The view chains follow the main chain's preset; NULL or empty for
@@ -6077,6 +6133,9 @@ static void vulkan_free(void *data)
       vulkan_deinit_descriptor_pool(vk);
       vulkan_deinit_pipelines(vk);
       vulkan_deinit_framebuffers(vk);
+#ifdef HAVE_OPENXR
+      vulkan_xr_free(vk);
+#endif
       vulkan_deinit_textures(vk);
       vulkan_deinit_buffers(vk);
 
@@ -6855,7 +6914,23 @@ static void vulkan_check_swapchain(vk_t *vk)
       if (vk->views.stock[v])
          vulkan_filter_chain_update_swapchain_info(vk->views.stock[v],
                &filter_info);
+#ifdef HAVE_OPENXR
+      if (vk->xr.chains[v])
+         vulkan_filter_chain_update_swapchain_info(vk->xr.chains[v],
+               &filter_info);
+      if (vk->xr.stock[v])
+         vulkan_filter_chain_update_swapchain_info(vk->xr.stock[v],
+               &filter_info);
+#endif
    }
+#ifdef HAVE_OPENXR
+   if (vk->xr.frame_chain)
+      vulkan_filter_chain_update_swapchain_info(vk->xr.frame_chain,
+            &filter_info);
+   if (vk->xr.frame_stock)
+      vulkan_filter_chain_update_swapchain_info(vk->xr.frame_stock,
+            &filter_info);
+#endif
 
    /* A new swapchain can turn HDR output on or off. */
    vulkan_views_publish(vk);
@@ -8287,12 +8362,9 @@ static void vulkan_run_hdr_pipeline(VkPipeline pipeline, VkRenderPass render_pas
  * the left eye's area only), its chain and the rectangle its first draw
  * uses, which its offscreen passes are sized for; a NULL chain for a
  * view not drawn. False when views can't be drawn this frame. Preset
- * chains come from vulkan_views_build_chains() only. extra_dims, when
- * not NULL, gives a view drawn only outside this target the size its
- * passes are built for. */
+ * chains come from vulkan_views_build_chains() only. */
 static bool vulkan_views_prepare(vk_t *vk,
       const video_frame_info_t *video_info, bool all_areas, unsigned dims,
-      const unsigned *extra_dims,
       vulkan_filter_chain_t **chains, video_views_rect_t *rects)
 {
    unsigned i, j;
@@ -8315,13 +8387,7 @@ static bool vulkan_views_prepare(vk_t *vk,
    {
       struct video_shader *preset;
       if (!video_views_first_drawn(layout, i, all_areas, dims, &rects[i]))
-      {
-         /* Drawn only elsewhere (a headset), at that size. */
-         if (!extra_dims || !extra_dims[i])
-            continue;
-         rects[i].pos  = 0;
-         rects[i].dims = extra_dims[i];
-      }
+         continue;
       /* A threaded frame queued before the count shrank: the driver
        * keeps no chain past the count. */
       if (i >= vk->views.count)
@@ -8487,12 +8553,14 @@ static void vulkan_views_offscreen(vk_t *vk,
 
 /* Draws the placements into the current render pass, a target of size
  * dims, with the same all_areas and dims that vulkan_views_prepare()
- * was given. A chain that already ran its final pass this frame runs it
- * again, without a second feedback swap. */
+ * was given. A view placed twice runs its final pass again, without a
+ * second feedback swap. */
 static void vulkan_views_draw(vk_t *vk, const video_views_layout_t *layout,
       vulkan_filter_chain_t **chains, bool all_areas, unsigned dims)
 {
    unsigned i;
+   bool drawn[RETRO_VIDEO_VIEWS_MAX];
+   memset(drawn, 0, sizeof(drawn));
    for (i = 0; i < layout->num_placements; i++)
    {
       VkViewport vp;
@@ -8503,13 +8571,13 @@ static void vulkan_views_draw(vk_t *vk, const video_views_layout_t *layout,
             || !video_views_clip(&p->dst, dims, &r))
          continue;
       vulkan_views_vp(&r, &vp);
-      if (vk->views.drawn & (1u << p->view))
+      if (drawn[p->view])
          vulkan_filter_chain_build_viewport_pass_again(chains[p->view],
                vk->cmd, &vp, vk->mvp.data);
       else
          vulkan_filter_chain_build_viewport_pass(chains[p->view],
                vk->cmd, &vp, vk->mvp.data);
-      vk->views.drawn |= 1u << p->view;
+      drawn[p->view] = true;
    }
 }
 
@@ -8745,11 +8813,14 @@ static void vulkan_views_ui_end(vk_t *vk, video_frame_info_t *video_info,
 #ifdef HAVE_OPENXR
 /* The runtime's format for the window's, which the chains' final passes
  * render in: its sRGB twin through a UNORM view where there is one, so
- * the runtime reads the encoded values as sRGB. */
+ * the runtime reads the encoded values as sRGB. Swapchains made in
+ * another format go. */
 static bool vulkan_xr_pick_format(vk_t *vk)
 {
    vulkan_openxr_t *xr = vk->context->xr;
    VkFormat window     = vk->context->swapchain_format;
+   VkFormat old        = vk->xr.format;
+   bool old_mutable    = vk->xr.mutable_format;
    VkFormat srgb       = VK_FORMAT_UNDEFINED;
 
    if (vk->xr.window_format == window)
@@ -8769,45 +8840,52 @@ static bool vulkan_xr_pick_format(vk_t *vk)
    else if (vulkan_openxr_supports_format(xr, window))
       vk->xr.format = window;
    else
-   {
       RARCH_ERR("[OpenXR] The runtime takes no format the window's (%d) can be drawn as.\n",
             (int)window);
-      return false;
+   if (     old != VK_FORMAT_UNDEFINED
+         && (old != vk->xr.format || old_mutable != vk->xr.mutable_format))
+   {
+      vulkan_wait_own_submissions(vk);
+      vulkan_xr_free(vk);
    }
-   return true;
+   return vk->xr.format != VK_FORMAT_UNDEFINED;
 }
 
 /* Makes slot s the planned size and layers, with a view and a
- * framebuffer per image and layer. A size the runtime refused is not
- * tried again until the plan changes. */
+ * framebuffer per image and layer; a new window swapchain takes the
+ * views, not the swapchain. A size the runtime refused is not tried
+ * again until the plan changes. */
 static bool vulkan_xr_slot_ensure(vk_t *vk, unsigned s)
 {
    unsigned i, l;
    const video_xr_slot_t *plan = &vk->xr.set.slots[s];
    VkDevice device             = vk->context->device;
 
-   if (     vk->xr.slots[s].num_images
-         && vk->xr.slots[s].dims   == plan->dims
-         && vk->xr.slots[s].layers == plan->layers)
+   if (     !vk->xr.slots[s].num_images
+         || vk->xr.slots[s].dims   != plan->dims
+         || vk->xr.slots[s].layers != plan->layers)
+   {
+      if (vk->xr.slots[s].failed_dims == plan->dims)
+         return false;
+      if (vk->xr.slots[s].num_images)
+      {
+         /* This driver's earlier frames may still draw into it. */
+         vulkan_wait_own_submissions(vk);
+         vulkan_xr_slot_free(vk, s);
+      }
+      if (!vulkan_openxr_slot_create(vk->context->xr, s, vk->xr.format,
+               vk->xr.mutable_format, plan->dims, plan->layers,
+               vk->xr.slots[s].images, &vk->xr.slots[s].num_images))
+      {
+         vk->xr.slots[s].num_images  = 0;
+         vk->xr.slots[s].failed_dims = plan->dims;
+         return false;
+      }
+      vk->xr.slots[s].dims   = plan->dims;
+      vk->xr.slots[s].layers = plan->layers;
+   }
+   if (vk->xr.slots[s].framebuffers[0][0])
       return true;
-   if (vk->xr.slots[s].failed_dims == plan->dims)
-      return false;
-   if (vk->xr.slots[s].num_images)
-   {
-      /* This driver's earlier frames may still draw into it. */
-      vulkan_wait_own_submissions(vk);
-      vulkan_xr_slot_free(vk, s);
-   }
-   if (!vulkan_openxr_slot_create(vk->context->xr, s, vk->xr.format,
-            vk->xr.mutable_format, plan->dims, plan->layers,
-            vk->xr.slots[s].images, &vk->xr.slots[s].num_images))
-   {
-      vk->xr.slots[s].num_images  = 0;
-      vk->xr.slots[s].failed_dims = plan->dims;
-      return false;
-   }
-   vk->xr.slots[s].dims   = plan->dims;
-   vk->xr.slots[s].layers = plan->layers;
 
    for (i = 0; i < vk->xr.slots[s].num_images; i++)
    {
@@ -8874,11 +8952,46 @@ static void vulkan_xr_plan(vk_t *vk, const video_frame_info_t *video_info,
    video_xr_place(&p, &vk->xr.set);
 }
 
-/* Each layer of slot s's acquired image: its view's final pass, or the
- * whole frame's, over the whole image. */
+/* The headset's chain for a view, or for the whole frame when view is
+ * negative, from the set the window uses this frame; NULL if none. */
+static vulkan_filter_chain_t *vulkan_xr_chain(vk_t *vk,
+      const video_frame_info_t *video_info, int view)
+{
+   unsigned j;
+   struct video_shader *live;
+   struct video_shader *preset;
+   vulkan_filter_chain_t **chain;
+   bool stock = !video_info->shader_active
+      || !vk->filter_chain
+      || vk->filter_chain == vk->filter_chain_default;
+
+   /* A threaded frame queued before the count shrank. */
+   if (view >= (int)vk->views.count)
+      return NULL;
+   if (view >= 0)
+      chain = stock ? &vk->xr.stock[view] : &vk->xr.chains[view];
+   else
+      chain = stock ? &vk->xr.frame_stock : &vk->xr.frame_chain;
+   if (!*chain && stock && !vk->views.stock_failed)
+   {
+      *chain                 = vulkan_views_create_stock(vk);
+      vk->views.stock_failed = !*chain;
+   }
+   if (!*chain || stock)
+      return *chain;
+   /* Parameter edits land in the main chain's preset. */
+   live   = vulkan_filter_chain_get_preset(vk->filter_chain);
+   preset = vulkan_filter_chain_get_preset(*chain);
+   if (live && preset && preset->num_parameters == live->num_parameters)
+      for (j = 0; j < live->num_parameters; j++)
+         preset->parameters[j].current = live->parameters[j].current;
+   return *chain;
+}
+
+/* Each layer of slot s's acquired image, drawn whole by its view's
+ * headset chain or the whole frame's: its passes at the image's size. */
 static void vulkan_xr_draw_screen(vk_t *vk, unsigned s,
-      vulkan_filter_chain_t **view_chains,
-      vulkan_filter_chain_t *filter_chain, bool main_drawn)
+      vulkan_filter_chain_t **xr_chains, vulkan_filter_chain_t *xr_frame)
 {
    unsigned l;
    VkViewport vp;
@@ -8887,11 +9000,12 @@ static void vulkan_xr_draw_screen(vk_t *vk, unsigned s,
    const video_xr_slot_t *plan = &vk->xr.set.slots[s];
    unsigned index              = vk->xr.slots[s].index;
 
-   /* Every layer is drawn again, so what the image held goes. */
+   /* Every layer is drawn again, so what the image held goes. The
+    * runtime's acquire barrier ends at colour output, as a WSI one. */
    VULKAN_IMAGE_LAYOUT_TRANSITION(vk->cmd, vk->xr.slots[s].images[index],
          VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
          0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 
    vp.x        = 0.0f;
@@ -8904,12 +9018,11 @@ static void vulkan_xr_draw_screen(vk_t *vk, unsigned s,
 
    for (l = 0; l < plan->layers; l++)
    {
-      int view                     = plan->view[l];
-      vulkan_filter_chain_t *chain = (view >= 0)
-         ? view_chains[view] : filter_chain;
-      bool again                   = (view >= 0)
-         ? ((vk->views.drawn & (1u << view)) != 0) : main_drawn;
+      vulkan_filter_chain_t *chain = (plan->view[l] >= 0)
+         ? xr_chains[plan->view[l]] : xr_frame;
 
+      if (chain)
+         vulkan_filter_chain_build_offscreen_passes(chain, vk->cmd, &vp);
       rp.sType                    = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
       rp.pNext                    = NULL;
       rp.renderPass               = vk->views.render_pass;
@@ -8924,31 +9037,25 @@ static void vulkan_xr_draw_screen(vk_t *vk, unsigned s,
       vk->tracker.dirty   |= VULKAN_DIRTY_DYNAMIC_BIT;
       vk->tracker.pipeline = VK_NULL_HANDLE;
       if (chain)
-      {
-         if (again)
-            vulkan_filter_chain_build_viewport_pass_again(chain, vk->cmd,
-                  &vp, vk->xr.mvp.data);
-         else
-            vulkan_filter_chain_build_viewport_pass(chain, vk->cmd,
-                  &vp, vk->xr.mvp.data);
-         if (view >= 0)
-            vk->views.drawn |= 1u << view;
-      }
+         vulkan_filter_chain_build_viewport_pass(chain, vk->cmd,
+               &vp, vk->xr.mvp.data);
       vkCmdEndRenderPass(vk->cmd);
+      if (chain)
+         vulkan_filter_chain_end_frame(chain, vk->cmd);
    }
 }
 
 /* Draws this frame into the headset's slots, outside any render pass.
  * A repeated frame leaves the headset on the images it has. */
 static void vulkan_xr_draw(vk_t *vk, const video_frame_info_t *video_info,
-      bool new_frame, bool views, vulkan_filter_chain_t **view_chains,
-      vulkan_filter_chain_t *filter_chain, bool main_drawn,
-      unsigned frame_dims, unsigned src_dims)
+      bool new_frame, bool map, vulkan_filter_chain_t **xr_chains,
+      vulkan_filter_chain_t *xr_frame, unsigned frame_dims,
+      unsigned src_dims)
 {
    unsigned s;
    vulkan_openxr_t *xr = vk->context->xr;
 
-   vulkan_xr_plan(vk, video_info, views, frame_dims, src_dims, 0);
+   vulkan_xr_plan(vk, video_info, map, frame_dims, src_dims, 0);
    for (s = 0; s < VIDEO_XR_MAX_SLOTS; s++)
    {
       bool ok;
@@ -8968,7 +9075,7 @@ static void vulkan_xr_draw(vk_t *vk, const video_frame_info_t *video_info,
       if (!ok)
          continue;
       vk->xr.slots[s].index = index;
-      vulkan_xr_draw_screen(vk, s, view_chains, filter_chain, main_drawn);
+      vulkan_xr_draw_screen(vk, s, xr_chains, xr_frame);
       vk->xr.slots[s].drawn = true;
    }
 }
@@ -9061,19 +9168,25 @@ static bool vulkan_frame(void *data, const void *frame,
    struct vk_buffer_chain *buff_chain_ubo;
    vulkan_filter_chain_t *view_chains[RETRO_VIDEO_VIEWS_MAX];
    video_views_rect_t view_rects[RETRO_VIDEO_VIEWS_MAX];
-   vulkan_filter_chain_t **setup_chains;
-   unsigned num_setup_chains, c;
+   /* The window's chains, then the headset's; the view each draws, or
+    * -1 for the whole frame. */
+   vulkan_filter_chain_t *setup_chains[RETRO_VIDEO_VIEWS_MAX * 2 + 1];
+   int setup_views[RETRO_VIDEO_VIEWS_MAX * 2 + 1];
+   unsigned num_setup_chains, num_setup, c;
+   /* The views copied out of the frame. */
+   vulkan_filter_chain_t **copy_chains           = view_chains;
    bool views                                    = false;
    bool views_blend                              = false;
    bool views_per_eye                            = false;
    bool views_ui                                 = false;
-   const unsigned *views_extra                   = NULL;
 #ifdef HAVE_OPENXR
-   unsigned xr_view_dims[RETRO_VIDEO_VIEWS_MAX];
+   vulkan_filter_chain_t *xr_chains[RETRO_VIDEO_VIEWS_MAX];
+   vulkan_filter_chain_t *xr_copy[RETRO_VIDEO_VIEWS_MAX];
+   vulkan_filter_chain_t *xr_frame               = NULL;
    unsigned xr_frame_dims                        = 0;
    unsigned xr_src_dims                          = 0;
    bool xr_draw                                  = false;
-   bool xr_main_drawn                            = false;
+   bool xr_map                                   = false;
 #endif
 #ifdef VULKAN_HDR_SWAPCHAIN
    bool use_offscreen_buffer                     = false;
@@ -9155,7 +9268,6 @@ static bool vulkan_frame(void *data, const void *frame,
 
    vk->chain                                     = chain;
    vk->backbuffer                                = backbuffer;
-   vk->views.drawn                               = 0;
 #ifdef HAVE_OPENXR
    xr_draw                                       = vulkan_xr_ready(vk);
 #endif
@@ -9379,19 +9491,20 @@ static bool vulkan_frame(void *data, const void *frame,
    }
 
 #ifdef HAVE_OPENXR
-   /* Views the headset shows need a chain, a copy and passes sized for
-    * their image there, whether or not the window draws them. */
+   /* Each view the headset shows has a chain of its own there. */
    if (xr_draw && video_info->views.num_views)
    {
       unsigned s, l;
-      memset(xr_view_dims, 0, sizeof(xr_view_dims));
+      memset(xr_chains, 0, sizeof(xr_chains));
+      xr_map = true;
       vulkan_xr_plan(vk, video_info, true, 0, 0, 0);
       for (s = 0; s < VIDEO_XR_MAX_SLOTS; s++)
          for (l = 0; l < vk->xr.set.slots[s].layers; l++)
-            if (vk->xr.set.slots[s].view[l] >= 0)
-               xr_view_dims[vk->xr.set.slots[s].view[l]] =
-                  vk->xr.set.slots[s].dims;
-      views_extra = xr_view_dims;
+         {
+            int v = vk->xr.set.slots[s].view[l];
+            if (v >= 0 && !(xr_chains[v] = vulkan_xr_chain(vk, video_info, v)))
+               xr_map = false;
+         }
    }
 #endif
 
@@ -9408,7 +9521,7 @@ static bool vulkan_frame(void *data, const void *frame,
             views_blend || !video_info->views_layout.offscreen,
             views_blend ? video_info->views_layout.canvas_dims
                         : vk->context->swapchain_dims,
-            views_extra, view_chains, view_rects);
+            view_chains, view_rects);
    /* A hardware frame needs the core's image, in a format a view image
     * can copy: vulkan_create_texture() widens R5G6B5. */
    if (     views && (vk->flags & VK_FLAG_HW_ENABLE)
@@ -9420,9 +9533,19 @@ static bool vulkan_frame(void *data, const void *frame,
     * crop it. */
    if (views && frame && !video_views_fit_frame(&video_info->views, dims))
       views = false;
+#ifdef HAVE_OPENXR
+   /* The headset's views come from the same copies. */
+   if (views && xr_map)
+   {
+      unsigned i;
+      for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+         xr_copy[i] = view_chains[i] ? view_chains[i] : xr_chains[i];
+      copy_chains = xr_copy;
+   }
+#endif
    /* A view image that can't be made draws this frame whole. */
    if (     views && frame
-         && !vulkan_views_images(vk, chain, video_info, view_chains,
+         && !vulkan_views_images(vk, chain, video_info, copy_chains,
                vulkan_views_src_format(vk)))
       views = false;
    /* A repeat needs every view it draws copied by an earlier frame. */
@@ -9443,10 +9566,48 @@ static bool vulkan_frame(void *data, const void *frame,
    vk->views.active = views;
    retro_atomic_store_release_int(&vk->views.fallback,
          (video_info->views.num_views && !views) ? 1 : 0);
-   setup_chains     = views ? view_chains : &filter_chain;
-   num_setup_chains = views ? video_info->views.num_views : 1;
+#ifdef HAVE_OPENXR
+   /* Without the window's views the headset shows the whole frame. */
+   xr_map = xr_map && views;
+   if (xr_draw && !xr_map)
+   {
+      memset(xr_chains, 0, sizeof(xr_chains));
+      if (!(xr_frame = vulkan_xr_chain(vk, video_info, -1)))
+         xr_draw = false;
+   }
+#endif
 
-   for (c = 0; c < num_setup_chains; c++)
+   num_setup_chains = 0;
+   if (views)
+      for (c = 0; c < video_info->views.num_views; c++)
+      {
+         setup_chains[num_setup_chains]  = view_chains[c];
+         setup_views[num_setup_chains++] = (int)c;
+      }
+   else
+   {
+      setup_chains[num_setup_chains]  = filter_chain;
+      setup_views[num_setup_chains++] = -1;
+   }
+   num_setup = num_setup_chains;
+#ifdef HAVE_OPENXR
+   if (xr_draw)
+   {
+      for (c = 0; c < RETRO_VIDEO_VIEWS_MAX; c++)
+         if (xr_chains[c])
+         {
+            setup_chains[num_setup]  = xr_chains[c];
+            setup_views[num_setup++] = (int)c;
+         }
+      if (xr_frame)
+      {
+         setup_chains[num_setup]  = xr_frame;
+         setup_views[num_setup++] = -1;
+      }
+   }
+#endif
+
+   for (c = 0; c < num_setup; c++)
    {
       vulkan_filter_chain_t *fc = setup_chains[c];
       if (!fc)
@@ -9461,10 +9622,12 @@ static bool vulkan_frame(void *data, const void *frame,
             video_info->swap_count);
 
       /* Sub-frame info for multiframe shaders (per real content frame).
-         Should always be 1 for non-use of subframes*/
+         Should always be 1 for non-use of subframes. The headset's
+         chains draw once a frame. */
       if (!(vk->context->flags & VK_CTX_FLAG_SWAP_INTERVAL_EMULATION_LOCK))
       {
-        if (     black_frame_insertion
+        if (     c >= num_setup_chains
+              || black_frame_insertion
               || input_driver_nonblock_state
               || runloop_is_slowmotion
               || runloop_is_paused
@@ -9481,7 +9644,8 @@ static bool vulkan_frame(void *data, const void *frame,
       }
 
 #ifdef VULKAN_ROLLING_SCANLINE_SIMULATION
-      if (      (video_info->shader_subframes > 1)
+      if (      (c < num_setup_chains)
+            &&  (video_info->shader_subframes > 1)
             &&  (video_info->scan_subframes)
             &&  (backbuffer->image != VK_NULL_HANDLE)
             &&  !black_frame_insertion
@@ -9515,8 +9679,9 @@ static bool vulkan_frame(void *data, const void *frame,
       {
          uint32_t rot          = vk->rotation_raw;
          /* A view's chain sees that view's display aspect. */
-         float core_aspect     = views
-            ? (float)video_views_aspect(&video_info->views.views[c])
+         float core_aspect     = (setup_views[c] >= 0)
+            ? (float)video_views_aspect(
+                  &video_info->views.views[setup_views[c]])
             : video_driver_get_core_aspect();
          float core_aspect_rot = core_aspect;
 
@@ -9601,6 +9766,8 @@ static bool vulkan_frame(void *data, const void *frame,
 
 #ifdef HAVE_OPENXR
       xr_src_dims = input.dims;
+      if (xr_frame)
+         vulkan_filter_chain_set_input_texture(xr_frame, &input);
 #endif
       if (views)
       {
@@ -9609,7 +9776,7 @@ static bool vulkan_frame(void *data, const void *frame,
          if (frame)
          {
             vk->views.copied     = vulkan_views_copy(vk, chain, video_info,
-                  view_chains, input.image, input.layout);
+                  copy_chains, input.image, input.layout);
             vk->views.last_index = frame_index;
          }
          vf = &vk->swapchain[vk->views.last_index];
@@ -9617,7 +9784,7 @@ static bool vulkan_frame(void *data, const void *frame,
          {
             struct vulkan_filter_chain_texture vin;
             struct vk_texture *img = &vf->view_images[i];
-            if (!view_chains[i])
+            if (!copy_chains[i])
                continue;
             if (!img->image || !(vk->views.copied & (1u << i)))
                img = &vk->default_texture;
@@ -9629,7 +9796,12 @@ static bool vulkan_frame(void *data, const void *frame,
              * configured, a hardware frame says its own. */
             vin.format = (vk->flags & VK_FLAG_HW_ENABLE)
                ? img->format : VK_FORMAT_UNDEFINED;
-            vulkan_filter_chain_set_input_texture(view_chains[i], &vin);
+            if (view_chains[i])
+               vulkan_filter_chain_set_input_texture(view_chains[i], &vin);
+#ifdef HAVE_OPENXR
+            if (xr_map && xr_chains[i])
+               vulkan_filter_chain_set_input_texture(xr_chains[i], &vin);
+#endif
          }
       }
       else
@@ -9772,14 +9944,9 @@ static bool vulkan_frame(void *data, const void *frame,
                !video_info->views_layout.offscreen,
                vk->context->swapchain_dims);
       else
-      {
          vulkan_filter_chain_build_viewport_pass(
                (vulkan_filter_chain_t*)filter_chain, vk->cmd,
                &vk->video_vp, vk->mvp.data);
-#ifdef HAVE_OPENXR
-         xr_main_drawn = true;
-#endif
-      }
 
 #ifdef VULKAN_HDR_SWAPCHAIN
       end_pass      = true;
@@ -10015,8 +10182,7 @@ static bool vulkan_frame(void *data, const void *frame,
 #ifdef HAVE_OPENXR
    if (xr_draw)
       vulkan_xr_draw(vk, video_info, frame && !video_info->frame_repeat,
-            views, view_chains, filter_chain, xr_main_drawn,
-            xr_frame_dims, xr_src_dims);
+            xr_map, xr_chains, xr_frame, xr_frame_dims, xr_src_dims);
 #endif
 
    /* End the filter chain frame.
@@ -10241,15 +10407,15 @@ static bool vulkan_frame(void *data, const void *frame,
          &submit_info, vk->context->swapchain_fences[frame_index]));
    vk->context->swapchain_fences_signalled[frame_index] = true;
 #ifdef HAVE_OPENXR
+   /* The quads with their images, before the XR thread's next frame. */
    if (xr_draw)
+   {
       vulkan_xr_release(vk);
+      vulkan_openxr_publish(vk->context->xr, &vk->xr.set);
+   }
 #endif
 #ifdef HAVE_THREADS
    slock_unlock(vk->context->queue_lock);
-#endif
-#ifdef HAVE_OPENXR
-   if (xr_draw)
-      vulkan_openxr_publish(vk->context->xr, &vk->xr.set);
 #endif
 
    vulkan_await_frame_before_present(vk, frame_index);

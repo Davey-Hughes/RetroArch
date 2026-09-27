@@ -16,7 +16,8 @@ VALIDATION_BASELINE: the messages raised without RetroArch's headset
 code, one per line, a VUID and then text the message must contain (an
 object's name), so a VUID alone does not hide RetroArch's own.
 --validate runs RetroArch under the Vulkan validation layer and fails a
-case on any other message.
+case on any other message, or when none of the baseline's appear: the
+window's own come every run, so without them the layer did not load.
 """
 
 import json
@@ -35,6 +36,7 @@ ROOT = os.path.normpath(os.path.join(HERE, '..', '..', '..'))
 sys.path.insert(0, os.path.join(ROOT, 'samples', 'cores', 'video_views', 'e2e'))
 from run import CORE, read_png, send, write_cfg  # noqa: E402
 
+PRESET = os.path.join(HERE, 'output_size.slangp')
 LAYER_DIR = os.path.join(ROOT, 'samples', 'openxr', 'test_layer')
 LAYER = 'XR_APILAYER_RETROARCH_test_recorder'
 SYSTEM_LAYERS = '/usr/share/openxr/1/api_layers/explicit.d'
@@ -80,8 +82,9 @@ def read_baseline(path):
 
 
 def unexpected(log, baseline):
-    """The VUIDs of validation messages the baseline does not cover. A
-    message runs from its first line to a blank line or the next one."""
+    """The VUIDs of validation messages the baseline does not cover, and
+    how many it does. A message runs from its first line to a blank line
+    or the next one."""
     blocks, cur = [], None
     for line in log.splitlines():
         if MESSAGE.search(line):
@@ -97,13 +100,16 @@ def unexpected(log, baseline):
     if cur:
         blocks.append(cur)
     extra = set()
+    known = 0
     for b in blocks:
         text = '\n'.join(b)
         m = VUID.search(text)
         vuid = m.group(1) if m else b[0].strip()
-        if not any(vuid == v and t in text for v, t in baseline):
+        if any(vuid == v and t in text for v, t in baseline):
+            known += 1
+        else:
             extra.add(vuid)
-    return sorted(extra)
+    return sorted(extra), known
 
 
 class Result(object):
@@ -248,7 +254,7 @@ def run_case(retroarch, root, monado, case, validate):
            '-w', str(W), '-h', str(H), '-W', str(W), '-H', str(H),
            '-r', '60', '--', 'sh', '-c', guard,
            retroarch, '--config', cfg, '-L', case.get('core', CORE),
-           '--verbose']
+           '--verbose'] + case.get('args', [])
     if case.get('content'):
         cmd.append(case['content'])
     log = open(os.path.join(d, 'run.log'), 'w')
@@ -393,11 +399,88 @@ def check_screens(swap=False, horizontal=False):
             if not near(c, want):
                 errors.append('%s shows %s, want %s' % (what, c, want))
         # Each view's white marker is at its top-left: not flipped.
-        c, _ = colour(image(res, fr, lq), 0.01, 0.015)
-        if not near(c, WHITE):
-            errors.append('left eye top-left is %s, want white' % (c,))
+        for x, what in ((lq, 'left eye'), (rq, 'right eye'),
+                        (bq, 'bottom screen')):
+            c, _ = colour(image(res, fr, x), 0.01, 0.015)
+            if not near(c, WHITE):
+                errors.append('%s top-left is %s, want white' % (what, c))
         return errors
     return check
+
+
+def threaded(check):
+    def run(res):
+        errors = check(res)
+        if 'Starting threaded video driver' not in res.log:
+            errors.append('threaded video did not start')
+        return errors
+    return run
+
+
+def size_colour(w, h):
+    """What output_size.slangp draws into a w x h target: the final
+    pass's size, and in blue its first pass's, at half the viewport."""
+    return tuple(int(round(v / 2048.0 * 255.0)) for v in (w, h, w / 2.0))
+
+
+def sized_like(res, fr, q, what, tol=2):
+    """Errors unless q's image shows the colour for its own size."""
+    sc = res.chains.get(q['sc'])
+    if not sc:
+        return ['no swapchain for %s' % what]
+    want = size_colour(sc['w'], sc['h'])
+    c, _ = colour(image(res, fr, q), 0.5, 0.5)
+    if not near(c, want, tol):
+        return ['%s (%dx%d) shows %s, want %s' % (what, sc['w'], sc['h'],
+                                                  c, want)]
+    return []
+
+
+def window_like(res, points, tol=2):
+    """Errors unless the window screenshot shows, at each (fx, fy), the
+    colour for a (w, h) target."""
+    if not res.shot:
+        return ['no window screenshot']
+    errors = []
+    for fx, fy, w, h, what in points:
+        c, _ = colour(res.shot, fx, fy)
+        if not near(c, size_colour(w, h), tol):
+            errors.append('window %s (%dx%d) shows %s, want %s'
+                          % (what, w, h, c, size_colour(w, h)))
+    return errors
+
+
+def check_sized_screens(res):
+    """Every headset image drawn as a first draw at its own size, and
+    the window at its rectangles: 2D, the top screen over the bottom."""
+    fr = last_snap(res)
+    if not fr:
+        return no_quads(res)
+    q = [x for x in quads(fr) if not x['flags'] & BLEND]
+    eyes = dict((x['eye'], x) for x in q)
+    if sorted(eyes) != ['both', 'left', 'right']:
+        return ['want a left, a right and a both-eye quad, got %s'
+                % [x['eye'] for x in q]]
+    errors = []
+    for eye, what in (('left', 'left eye'), ('right', 'right eye'),
+                      ('both', 'bottom screen')):
+        errors += sized_like(res, fr, eyes[eye], what)
+    k = min(W / 400.0, H / 480.0)
+    return errors + window_like(res, (
+        (0.5, 0.25, 400 * k, 240 * k, 'top screen'),
+        (0.5, 0.75, 320 * k, 240 * k, 'bottom screen')))
+
+
+def check_sized_frame(res):
+    fr = last_snap(res)
+    if not fr:
+        return no_quads(res)
+    q = [x for x in quads(fr) if not x['flags'] & BLEND]
+    if len(q) != 1 or q[0]['eye'] != 'both':
+        return ['want one quad for both eyes, got %s' % [x['eye'] for x in q]]
+    # The core's frame has the window's shape, so it fills the window.
+    return (sized_like(res, fr, q[0], 'frame')
+            + window_like(res, ((0.5, 0.5, W, H, 'frame'),)))
 
 
 def check_frame(res):
@@ -420,6 +503,8 @@ def check_frame(res):
 
 
 SETTLE = [('wait', 8)]
+SIZED = {'video_shader_enable': 'true'}
+SHOT = [('wait', 8), ('shot', None)]
 
 CASES = [
     {'name': '3ds-stereo', 'map': '3ds', 'steps': SETTLE,
@@ -434,7 +519,13 @@ CASES = [
      'check': check_frame},
     {'name': '3ds-stereo-threaded', 'map': '3ds',
      'settings': {'video_threaded': 'true'}, 'steps': SETTLE,
-     'check': check_screens()},
+     'check': threaded(check_screens())},
+    {'name': '3ds-output-size', 'map': '3ds', 'settings': SIZED,
+     'args': ['--set-shader=' + PRESET], 'steps': SHOT,
+     'check': check_sized_screens},
+    {'name': 'no-map-output-size', 'map': 'none', 'settings': SIZED,
+     'args': ['--set-shader=' + PRESET], 'steps': SHOT,
+     'check': check_sized_frame},
 ]
 
 
@@ -461,9 +552,12 @@ def main():
         if 'hung' in res.marks:
             errors.append('RetroArch did not quit')
         if validate:
-            extra = unexpected(res.log, baseline)
+            extra, known = unexpected(res.log, baseline)
             if extra:
                 errors.append('validation: ' + ', '.join(extra))
+            if not known:
+                errors.append('validation: no message at all; did the '
+                              'layer load?')
         print('%s %s' % ('FAIL' if errors else 'pass', case['name']))
         for e in errors:
             print('    ' + e)
