@@ -703,7 +703,10 @@ static bool vulkan_context_openxr_gpu(gfx_ctx_vulkan_data_t *vk,
    {
       if (gpus[i] != gpu)
          continue;
-      if (!vulkan_context_gpu_presents(vk, gpu))
+      /* A display (KMS) surface is made after this first pick; the
+       * pick runs again in init_device() once it exists. */
+      if (     vk->vk_surface != VK_NULL_HANDLE
+            && !vulkan_context_gpu_presents(vk, gpu))
       {
          RARCH_WARN("[OpenXR] The runtime's GPU #%u cannot present to the window.\n",
                (unsigned)i);
