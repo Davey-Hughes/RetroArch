@@ -20,6 +20,7 @@ case on any other message, or when none of the baseline's appear: the
 window's own come every run, so without them the layer did not load.
 """
 
+import ctypes
 import json
 import math
 import os
@@ -259,8 +260,13 @@ def run_case(retroarch, root, monado, case, validate):
     # and RetroArch open lives in this case's directory. The gamescope
     # WSI layer still needs gamescope's own socket, by an absolute path in
     # gamescope's private runtime dir.
+    helper = ''
+    if case.get('unfocus'):
+        helper = ' %s %s --unfocus-when %s &' % (
+            shlex.quote(sys.executable), shlex.quote(os.path.abspath(__file__)),
+            shlex.quote(os.path.join(d, 'unfocus')))
     guard = ('case "$DISPLAY" in ""|:0) echo "refusing DISPLAY=$DISPLAY" >&2;'
-             ' exit 99;; esac; cd ' + shlex.quote(d) + ' || exit 98;'
+             ' exit 99;; esac; cd ' + shlex.quote(d) + ' || exit 98;' + helper +
              ' case "${GAMESCOPE_WAYLAND_DISPLAY:-}" in ""|/*) ;;'
              ' *) GAMESCOPE_WAYLAND_DISPLAY="$XDG_RUNTIME_DIR/'
              '$GAMESCOPE_WAYLAND_DISPLAY"; export GAMESCOPE_WAYLAND_DISPLAY;;'
@@ -313,6 +319,8 @@ def run_case(retroarch, root, monado, case, validate):
                 with open(tmp, 'w') as f:
                     f.write(arg + '\n')
                 os.replace(tmp, script)
+            elif kind == 'unfocus':
+                open(os.path.join(d, 'unfocus'), 'w').close()
             elif kind == 'shot':
                 send('SCREENSHOT', port)
                 res.shot = wait_shot(d)
@@ -703,6 +711,27 @@ def check_pacing(res):
     return errors
 
 
+def check_focus(res):
+    """Pause Content When Not Active with the window unfocused: the content
+    runs while the headset session is focused, and pauses while the
+    session is only visible."""
+    if '[e2e] FocusOut sent to window' not in res.log:
+        return ['no FocusOut was sent to the window']
+    t = dict((k, v * 1e6) for k, v in res.marks.items())
+    errors = []
+    for a, b, runs, what in (('unfocused', 'visible', True, 'focused'),
+                             ('visible', 'refocused', False, 'visible'),
+                             ('refocused', 'end', True, 'focused again')):
+        n = len([r for r in res.releases if t[a] + 1e6 <= r['t_us'] <= t[b]])
+        if runs and n < 30:
+            errors.append('%d images released with the session %s, want the '
+                          'content running' % (n, what))
+        elif not runs and n > 2:
+            errors.append('%d images released with the session %s, want the '
+                          'content paused' % (n, what))
+    return errors
+
+
 def window_is(res, want, what):
     if not res.shot:
         return ['no screenshot']
@@ -887,6 +916,15 @@ CASES = [
                ('wait', 3), ('mark', 'resumed'), ('send', 'PAUSE_TOGGLE'),
                ('wait', 2)],
      'check': check_pacing},
+    # The window loses its focus; the headset session keeps it, then is
+    # only visible (4), then focused (5) again.
+    {'name': 'focus', 'map': '3ds', 'unfocus': True,
+     'settings': {'pause_nonactive': 'true'},
+     'steps': [('wait', 6), ('unfocus', None), ('mark', 'unfocused'),
+               ('wait', 3), ('mark', 'visible'), ('script', 'state 4'),
+               ('wait', 3), ('mark', 'refocused'), ('script', 'state 5'),
+               ('wait', 3), ('mark', 'end')],
+     'check': check_focus},
     {'name': 'no-runtime', 'map': '3ds', 'no_runtime': True,
      'steps': [('wait', 6), ('shot', None)],
      'check': check_no_runtime},
@@ -918,7 +956,54 @@ CASES = [
 ]
 
 
+class XFocusChangeEvent(ctypes.Structure):
+    _fields_ = [('type', ctypes.c_int), ('serial', ctypes.c_ulong),
+                ('send_event', ctypes.c_int), ('display', ctypes.c_void_p),
+                ('window', ctypes.c_ulong), ('mode', ctypes.c_int),
+                ('detail', ctypes.c_int), ('pad', ctypes.c_long * 24)]
+
+
+def unfocus_when(trigger):
+    """Inside a case's gamescope: once trigger exists, tell the window with
+    the X input focus that it lost it. gamescope gives the real focus
+    straight back to its one window, so the event is sent, not caused."""
+    if os.environ.get('DISPLAY', '') in ('', ':0'):
+        return 99
+    deadline = time.time() + 60
+    while not os.path.exists(trigger):
+        if time.time() > deadline:
+            return 1
+        time.sleep(0.1)
+    x11 = ctypes.CDLL('libX11.so.6')
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XGetInputFocus.argtypes = [ctypes.c_void_p,
+                                   ctypes.POINTER(ctypes.c_ulong),
+                                   ctypes.POINTER(ctypes.c_int)]
+    x11.XSendEvent.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
+                               ctypes.c_long, ctypes.c_void_p]
+    x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    dpy = x11.XOpenDisplay(None)
+    if not dpy:
+        return 1
+    win, revert = ctypes.c_ulong(0), ctypes.c_int(0)
+    x11.XGetInputFocus(dpy, ctypes.byref(win), ctypes.byref(revert))
+    ev = XFocusChangeEvent()
+    ev.type, ev.window = 10, win.value  # FocusOut
+    ev.mode, ev.detail = 0, 3           # NotifyNormal, NotifyNonlinear
+    sent = x11.XSendEvent(dpy, win.value, 0, 1 << 21, ctypes.byref(ev))
+    x11.XSync(dpy, 0)
+    x11.XCloseDisplay(dpy)
+    if win.value <= 1 or not sent:  # None or PointerRoot
+        return 1
+    print('[e2e] FocusOut sent to window 0x%x.' % win.value, flush=True)
+    return 0
+
+
 def main():
+    if sys.argv[1:2] == ['--unfocus-when']:
+        return unfocus_when(sys.argv[2])
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     validate = '--validate' in sys.argv[1:]
     if len(args) < 3:
