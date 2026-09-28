@@ -78,6 +78,7 @@ static dylib_t                       vulkan_library;
 static VkInstance                    cached_instance_vk;
 static VkDevice                      cached_device_vk;
 static VkPhysicalDevice              cached_gpu_vk;
+static int                           cached_gpu_index_vk;
 static retro_vulkan_destroy_device_t cached_destroy_device_vk;
 #ifdef HAVE_OPENXR
 /* Kept with a cached device: the runtime made it. */
@@ -714,7 +715,9 @@ static bool vulkan_context_openxr_gpu(gfx_ctx_vulkan_data_t *vk,
       }
       RARCH_LOG("[Vulkan] Using the headset's GPU #%u: \"%s\".\n",
             (unsigned)i, vk->gpu_list->elems[i].data);
-      vk->context.gpu = gpu;
+      vk->context.gpu       = gpu;
+      /* The runtime's pick, not GPU Index's: no index to set back. */
+      vk->context.gpu_index = 0;
       return true;
    }
    if (gpu != VK_NULL_HANDLE && i == gpu_count)
@@ -784,7 +787,8 @@ static bool vulkan_context_init_gpu(gfx_ctx_vulkan_data_t *vk)
    /* A cached device is reused as is, so it keeps the GPU it was made on. */
    if (cached_device_vk && cached_gpu_vk)
    {
-      vk->context.gpu = cached_gpu_vk;
+      vk->context.gpu       = cached_gpu_vk;
+      vk->context.gpu_index = cached_gpu_index_vk;
       free(gpus);
       return true;
    }
@@ -3829,6 +3833,7 @@ void vulkan_context_destroy(gfx_ctx_vulkan_data_t *vk,
    {
       cached_device_vk         = vk->context.device;
       cached_gpu_vk            = vk->context.gpu;
+      cached_gpu_index_vk      = vk->context.gpu_index;
       cached_instance_vk       = vk->context.instance;
       cached_destroy_device_vk = vk->context.destroy_device;
 #ifdef HAVE_OPENXR
