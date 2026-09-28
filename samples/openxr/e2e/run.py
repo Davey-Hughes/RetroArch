@@ -547,6 +547,29 @@ def check_sized_frame(res):
             + window_like(res, ((0.5, 0.5, W, H, 'frame'),)))
 
 
+def check_crop(res):
+    """Threaded video crops this frame above its second screen: the map
+    no longer fits, so the headset shows the cropped frame whole, as the
+    window does, not two screens."""
+    fr = last_snap(res)
+    if not fr:
+        return no_quads(res)
+    q = [x for x in quads(fr) if not x['flags'] & BLEND]
+    if len(q) != 1 or q[0]['eye'] != 'both':
+        return ['want one quad for both eyes, got %s' % [x['eye'] for x in q]]
+    errors = []
+    if 'cropping to 655 rows' not in res.log:
+        errors.append('threaded video did not crop the frame')
+    if not at(q[0], (0.0, 0.0, -1.8)) or not sized(q[0], (1.6, 0.96)):
+        errors.append('frame at %s size %s' % (q[0]['pose'][:3], q[0]['size']))
+    # 480 of the 655 rows are the first screen's.
+    for fx, fy, want in ((0.5, 0.25, GREEN), (0.5, 0.9, YELLOW)):
+        c, _ = colour(image(res, fr, q[0]), fx, fy)
+        if not near(c, want):
+            errors.append('(%.2f,%.2f) shows %s, want %s' % (fx, fy, c, want))
+    return errors
+
+
 def check_frame(res):
     fr = last_snap(res)
     if not fr:
@@ -1879,6 +1902,9 @@ CASES = [
     {'name': '3ds-stereo-threaded', 'map': '3ds',
      'settings': {'video_threaded': 'true'}, 'steps': SETTLE,
      'check': threaded(check_screens())},
+    {'name': 'crop-threaded', 'map': 'crop',
+     'settings': {'video_threaded': 'true'}, 'steps': SETTLE,
+     'check': threaded(check_crop)},
     {'name': '3ds-output-size', 'map': '3ds', 'settings': SIZED,
      'args': ['--set-shader=' + PRESET], 'steps': SHOT,
      'check': check_sized_screens},
