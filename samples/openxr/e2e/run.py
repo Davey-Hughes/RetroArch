@@ -1481,7 +1481,9 @@ def haptics(res, hand):
 
 
 def rumble_errors(res, want):
-    """want: hand -> amplitude every haptic call on it should have."""
+    """want: hand -> amplitude every haptic call on it should have. A
+    steady rumble is applied again at least every 0.6 s, three times or
+    more in a hand's first two-second hold."""
     errors = []
     for hand, amp in sorted(want.items()):
         got = haptics(res, hand)
@@ -1491,15 +1493,58 @@ def rumble_errors(res, want):
                           % (hand, on, amp))
         if not got or got[-1]['ev'] != 'haptic_stop':
             errors.append('the %s hand did not stop' % hand)
+        holds, hold = [], []
+        for e in got:
+            if e['ev'] == 'haptic':
+                hold.append(e['t_us'])
+            elif hold:
+                holds.append(hold)
+                hold = []
+        if hold:
+            holds.append(hold)
+        if holds and len(holds[0]) < 3:
+            errors.append('the %s hand was applied %d times in its first '
+                          'hold, want 3 or more' % (hand, len(holds[0])))
+        gaps = [b - a for h in holds for a, b in zip(h, h[1:])]
+        if gaps and max(gaps) > 600000:
+            errors.append('the %s hand went %.2f s between applies'
+                          % (hand, max(gaps) / 1e6))
     return errors
+
+
+def core_rumbled(res):
+    if find(kinds(core_events(res), 'rumble'), 0, lambda f: (
+            f['port'], f['strong'], f['weak']) == (0, 49152, 16384)) < 0:
+        return ['the core did not rumble']
+    return []
 
 
 def check_rumble(res):
+    """Combined; a pause stops the headset's rumble, and it comes back
+    after."""
     errors = rumble_errors(res, {'left': 0.75, 'right': 0.25})
-    if find(kinds(core_events(res), 'rumble'), 0, lambda f: (
-            f['port'], f['strong'], f['weak']) == (0, 49152, 16384)) < 0:
-        errors.append('the core did not rumble')
-    return errors
+    paused = res.marks['paused'] * 1e6
+    resumed = res.marks['resumed'] * 1e6
+    for hand in ('left', 'right'):
+        got = haptics(res, hand)
+        stop = find(got, 0, lambda e: e['ev'] == 'haptic_stop'
+                    and paused < e['t_us'] < resumed)
+        if stop < 0:
+            errors.append('the %s hand did not stop for the pause' % hand)
+        elif any(e['ev'] == 'haptic' and e['t_us'] < resumed
+                 for e in got[stop:]):
+            errors.append('the %s hand rumbled again while paused' % hand)
+        if not any(e['ev'] == 'haptic' and e['t_us'] > resumed for e in got):
+            errors.append('the %s hand did not rumble again after the pause'
+                          % hand)
+    return errors + core_rumbled(res)
+
+
+def check_rumble_gain(res):
+    """Vibration Strength at 50%: the test driver has no gain of its own,
+    so the core's strength is scaled once, in software."""
+    return (rumble_errors(res, {'left': 0.375, 'right': 0.125})
+            + core_rumbled(res))
 
 
 def check_rumble_separate(res):
@@ -1863,8 +1908,15 @@ CASES = [
      'check': check_menu_click_rgui},
     {'name': 'input-rumble', 'map': '3ds',
      'steps': [('wait', 6), ('script', 'action combined/start 1'),
+               ('wait', 2), ('mark', 'paused'), ('send', 'PAUSE_TOGGLE'),
+               ('wait', 2), ('mark', 'resumed'), ('send', 'PAUSE_TOGGLE'),
                ('wait', 2), ('script', ''), ('wait', 2)],
      'check': check_rumble},
+    {'name': 'input-rumble-gain', 'map': '3ds',
+     'settings': {'input_rumble_gain': '50'},
+     'steps': [('wait', 6), ('script', 'action combined/start 1'),
+               ('wait', 2), ('script', ''), ('wait', 2)],
+     'check': check_rumble_gain},
     {'name': 'input-rumble-separate', 'map': '3ds',
      'settings': {'video_openxr_controllers': '1'},
      'steps': [('wait', 6), ('script', 'action separate/start@left 1'),

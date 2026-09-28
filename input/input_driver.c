@@ -656,9 +656,16 @@ bool input_driver_set_rumble(
       rumble_state = sec_joypad->set_rumble(joy_idx, effect, strength);
 
 #ifdef HAVE_OPENXR
-   /* The headset's controllers rumble too. */
-   if (input_openxr_set_rumble(port, effect, strength))
-      rumble_state = true;
+   /* The headset's controllers rumble too. input_set_rumble_state()
+    * leaves the gain to a driver that applies it in the device. */
+   {
+      uint16_t xr_strength = strength;
+      if (!primary_joypad || primary_joypad->set_rumble_gain)
+         xr_strength = (uint16_t)((config_get_ptr()->uints.input_rumble_gain
+               * strength) / 100);
+      if (input_openxr_set_rumble(port, effect, xr_strength))
+         rumble_state = true;
+   }
 #endif
 
    return rumble_state;

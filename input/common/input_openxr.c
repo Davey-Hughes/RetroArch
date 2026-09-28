@@ -31,6 +31,7 @@
 #include "../input_defines.h"
 #include "../input_driver.h"
 #include "../../configuration.h"
+#include "../../runloop.h"
 #include "../../gfx/video_views.h"
 #include "../../gfx/common/vulkan_openxr.h"
 #include "../../gfx/video_driver.h"
@@ -893,8 +894,10 @@ static unsigned input_openxr_frame_layers(void *user, XrTime time,
 
 /* Rumble into each hand's haptics: in Combined player 1's strong motor
  * is the left hand and its weak the right; in Separate each player's
- * hand takes the stronger of its two. */
-static void input_openxr_haptics(input_openxr_t *st, bool separate)
+ * hand takes the stronger of its two. Paused, the refresh would keep
+ * the rumble going for the whole pause: stop it until resumed. */
+static void input_openxr_haptics(input_openxr_t *st, bool separate,
+      bool paused)
 {
    unsigned h;
    retro_time_t now = cpu_features_get_time_usec();
@@ -903,7 +906,9 @@ static void input_openxr_haptics(input_openxr_t *st, bool separate)
       XrHapticActionInfo info;
       float amp;
       int s;
-      if (separate)
+      if (paused)
+         s = 0;
+      else if (separate)
       {
          int strong = retro_atomic_load_acquire_int(
                &input_openxr_rumble[h][0]);
@@ -942,11 +947,13 @@ static void input_openxr_haptics(input_openxr_t *st, bool separate)
 
 void input_openxr_poll(void)
 {
+   unsigned p;
    XrResult res;
    XrActionsSyncInfo si;
    XrActiveActionSet active[2];
    input_openxr_t *st   = &input_openxr_st;
    settings_t *settings = config_get_ptr();
+   uint32_t run_flags   = runloop_state_get_ptr()->flags;
    bool separate        = settings->uints.video_openxr_controllers
       == VIDEO_OPENXR_CONTROLLERS_SEPARATE;
    bool was_pressed     = st->ptr_pressed || st->menu_pressed;
@@ -963,6 +970,15 @@ void input_openxr_poll(void)
    retro_atomic_store_release_int(&input_openxr_laser, (int)laser);
    retro_atomic_store_release_int(&input_openxr_menu_open,
          menu_open ? 1 : 0);
+
+   /* Nothing stops the last rumble of a core closed behind a menu that
+    * ran it; no later content may inherit it. */
+   if (!(run_flags & RUNLOOP_FLAG_CORE_RUNNING))
+      for (p = 0; p < INPUT_OPENXR_PADS; p++)
+      {
+         retro_atomic_store_release_int(&input_openxr_rumble[p][0], 0);
+         retro_atomic_store_release_int(&input_openxr_rumble[p][1], 0);
+      }
 
    memset(st->pads, 0, sizeof(st->pads));
    memset(st->trig, 0, sizeof(st->trig));
@@ -1022,7 +1038,8 @@ void input_openxr_poll(void)
    input_openxr_laser_poll(st, laser, menu_open, threshold, was_pressed);
    input_openxr_triggers(st, threshold);
    input_openxr_dpad(st, settings);
-   input_openxr_haptics(st, separate);
+   input_openxr_haptics(st, separate,
+         (run_flags & RUNLOOP_FLAG_PAUSED) ? true : false);
 }
 
 bool input_openxr_button(unsigned port, unsigned id)
