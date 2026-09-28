@@ -333,6 +333,7 @@ typedef struct input_openxr
    bool ptr_on;
    bool ptr_pressed;
    bool gun_pressed;                    /* also off the screens */
+   bool touch_on;                       /* the last poll touched */
    int16_t ptr_x;
    int16_t ptr_y;
    bool menu_on;
@@ -683,6 +684,7 @@ static void input_openxr_triggers_lost(input_openxr_t *st)
          st->role[h] = INPUT_OPENXR_ROLE_SPENT;
       st->trig_down[h] = true;
    }
+   st->touch_on = false;
 }
 
 /* Each hand's trigger into its L2 or R2: the value, and the button
@@ -796,11 +798,14 @@ static void input_openxr_laser_poll(input_openxr_t *st, unsigned laser,
    bool lift;
    bool can[INPUT_OPENXR_HANDS];
    bool pulled[INPUT_OPENXR_HANDS];
+   bool tracked[INPUT_OPENXR_HANDS];
    XrTime time              = 0;
    const video_xr_quad_t *q = NULL;
    bool menu_live           = false;
+   bool touch_on            = st->touch_on;
    int prev                 = st->pointer;
 
+   st->touch_on = false;
    for (h = 0; h < INPUT_OPENXR_HANDS; h++)
    {
       float v          = st->trig[h].value;
@@ -846,8 +851,9 @@ static void input_openxr_laser_poll(input_openxr_t *st, unsigned laser,
       float t;
       video_xr_vec3_t o, d;
       /* A press keeps its hand off the quads too. */
-      can[h] = input_openxr_pressing(st->role[h]);
-      if (input_openxr_ray(st, h, time, &o, &d))
+      can[h]     = input_openxr_pressing(st->role[h]);
+      tracked[h] = input_openxr_ray(st, h, time, &o, &d);
+      if (tracked[h])
       {
          st->hit[h] = video_xr_pick(&st->quads, laser, menu_open, &o, &d,
                &st->hit_u[h], &st->hit_v[h], &t);
@@ -913,10 +919,16 @@ static void input_openxr_laser_poll(input_openxr_t *st, unsigned laser,
    else if (q)
       st->ptr_on = input_openxr_frame_point(q, st->hit_u[p], st->hit_v[p],
             &st->ptr_x, &st->ptr_y);
+   /* Untracked mid-press, a touch holds its last point, as the menu's
+    * press does. */
+   else if (     !tracked[p] && touch_on && p == prev && !pulled[p]
+             && st->role[p] == INPUT_OPENXR_ROLE_TOUCH)
+      st->ptr_on = true;
    /* Held, a touch lifts off the screens and lands again back on them,
     * as a stylus does; Always's gun fires off them too. */
    st->ptr_pressed = !lift && st->ptr_on
       && st->role[p] == INPUT_OPENXR_ROLE_TOUCH;
+   st->touch_on    = st->ptr_pressed;
    st->gun_pressed = st->ptr_pressed || (!lift
          && laser == VIDEO_OPENXR_LASER_ALWAYS
          && st->role[p] == INPUT_OPENXR_ROLE_TOUCH);

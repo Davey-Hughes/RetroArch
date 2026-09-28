@@ -1208,6 +1208,49 @@ def check_laser_off(res):
     return errors
 
 
+def hold_errors(res, first, back):
+    """The pressing hand loses tracking mid-press: the touch and the gun
+    hold their last point with no lift, and follow the ray from first to
+    back once it is tracked again."""
+    evs = core_events(res)
+    t0 = (res.marks['lost'] + 0.05) * 1e6
+    t1 = res.marks['found'] * 1e6
+    lost = [f for f in res.frames if t0 < f['t_us'] < t1]
+    errors = []
+    if not lost or any(cursors(f) for f in lost):
+        errors.append('the laser\'s dot did not go while tracking was lost')
+    touches = kinds(evs, 'pointer')
+    i = find(touches, 0, lambda f: f['pressed'] and packed_at(f, first))
+    j = (find(touches, i + 1, lambda f: f['pressed'] and packed_at(f, back))
+         if i >= 0 else -1)
+    if i < 0:
+        errors.append('no touch at %s: %s' % (first, touches[:3]))
+    elif j < 0:
+        errors.append('the touch did not follow the ray to %s once tracked '
+                      'again: %s' % (back, touches[i:i + 3]))
+    elif not all(f['pressed'] for f in touches[i:j + 1]):
+        errors.append('the touch lifted while tracking was lost')
+    guns = kinds(evs, 'gun')
+    i = find(guns, 0, lambda g: g['trigger'] and packed_at(g, first))
+    j = (find(guns, i + 1, lambda g: g['trigger'] and packed_at(g, back))
+         if i >= 0 else -1)
+    if i < 0 or j < 0:
+        errors.append('the gun did not fire at %s then %s: %s'
+                      % (first, back, guns[-4:]))
+    elif any(g['offscreen'] or not g['trigger'] for g in guns[i:j + 1]):
+        errors.append('the gun left its point while tracking was lost: %s'
+                      % guns[i:j + 1])
+    return errors + trigger_errors(res)
+
+
+def check_touch_tracking(res):
+    return hold_errors(res, (320, 420), (480, 420))
+
+
+def check_gun_hold(res):
+    return hold_errors(res, (100, 60), (300, 60))
+
+
 def check_gun_sweep(res):
     """Always: the held trigger swept off screen 0 and back keeps firing,
     offscreen and on, with no new pull."""
@@ -1987,6 +2030,16 @@ CASES = [
                ('script', AIM_BOTTOM), ('wait', 1),
                ('script', ''), ('wait', 1)],
      'check': check_touch_held},
+    # The pressing hand untracked mid-touch, then tracked at a new point.
+    {'name': 'input-touch-tracking', 'map': '3ds',
+     'steps': [('wait', 6), ('script', AIM_BOTTOM), ('wait', 1),
+               ('script', script(AIM_BOTTOM, R2)), ('wait', 1),
+               ('mark', 'lost'), ('script', script('aim right off', R2)),
+               ('wait', 1), ('mark', 'found'),
+               ('script', script(AIM_RIGHT_BOTTOM, R2)), ('wait', 1),
+               ('script', AIM_RIGHT_BOTTOM), ('wait', 1),
+               ('script', ''), ('wait', 1)],
+     'check': check_touch_tracking},
     {'name': 'input-laser-off', 'map': '3ds',
      'settings': {'video_openxr_laser': '2'},
      'steps': [('wait', 6),
@@ -2009,6 +2062,16 @@ CASES = [
                ('script', AIM_GUN), ('wait', 1), ('script', ''),
                ('wait', 1)],
      'check': check_gun_sweep},
+    {'name': 'input-gun-hold', 'map': '3ds',
+     'settings': {'video_openxr_laser': '1'},
+     'steps': [('wait', 6), ('script', AIM_GUN), ('wait', 1),
+               ('script', script(AIM_GUN, R2)), ('wait', 1),
+               ('mark', 'lost'), ('script', script('aim right off', R2)),
+               ('wait', 1), ('mark', 'found'),
+               ('script', script(AIM_TOP, R2)), ('wait', 1),
+               ('script', AIM_TOP), ('wait', 1), ('script', ''),
+               ('wait', 1)],
+     'check': check_gun_hold},
     {'name': 'input-two-hands', 'map': '3ds',
      'steps': [('wait', 6),
                ('script', script(AIM_LEFT_BOTTOM, AIM_RIGHT_BOTTOM)),
