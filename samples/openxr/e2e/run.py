@@ -1747,6 +1747,13 @@ def check_kept_retry(res):
     if len(dots) != 2:
         errors.append('%d laser dot swapchains, want 2 (one per start)'
                       % len(dots))
+    # The new session's suggestions are made again, and accepted.
+    suggested = [(e['profile'], e['result']) for e in events(res, 'bindings')]
+    if (sorted(suggested) != sorted((p, 0) for p in PROFILES * 2)
+            or res.log.count('[OpenXR] Bindings suggested for')
+            != 2 * len(PROFILES) or 'Bindings refused' in res.log):
+        errors.append('bindings suggested %s, want each profile accepted '
+                      'once per session' % suggested)
     return errors
 
 
