@@ -1266,7 +1266,8 @@ AIM_MENU_LOW = 'aim right 0.2 -0.4 -0.3 0.16 -0.048 -1.7'   # the menu, 0.6 0.55
 
 def check_menu_laser(res):
     """Ozone at 1600x960: pointing lower moves the selection down, and the
-    trigger clicks."""
+    trigger presses on the menu and lets go. The press is a second long,
+    so it activates nothing; the click cases click."""
     lines = kinds(core_events(res), 'menu')
     high = [i for i, f in enumerate(lines)
             if close((f['x'], f['y']), (960, 288), 4)]
@@ -1295,7 +1296,7 @@ def check_menu_laser(res):
 
 def check_menu_rgui(res):
     """RGUI: the point is in its own small framebuffer, and a click
-    selects the entry under it."""
+    selects the entry under it, Take Screenshot, which takes one."""
     lines = kinds(core_events(res), 'menu')
     if not lines:
         return ['the laser never reached the menu']
@@ -1310,6 +1311,9 @@ def check_menu_rgui(res):
     if not any(f['selection'] > first for f in lines[press:]):
         errors.append('clicking lower did not move RGUI\'s selection (%d)'
                       % first)
+    if not [x for x in os.listdir(os.path.join(res.dir, 'shots'))
+            if x.endswith('.png')]:
+        errors.append('the click took no screenshot')
     return errors
 
 
@@ -1399,14 +1403,24 @@ AIM_RGUI_SHOT = 'aim right 0.2 -0.4 -0.3 0.16 0.09 -1.7'           # 0.6 0.406
 CLICK = 0.1
 
 
+def on_quad(c, q):
+    """A dot in the plane of a quad that faces the viewer, inside it."""
+    d = [a - b for a, b in zip(c['pose'][:3], q['pose'][:3])]
+    return (abs(d[2]) <= 0.05 and abs(d[0]) <= q['size'][0] / 2
+            and abs(d[1]) <= q['size'][1] / 2)
+
+
 def menu_cursor_errors(res, uv):
     """The laser's dot is its cursor: no menu snapshot may show the
-    menu's own mouse cursor, a bright mark, around the laser's point."""
+    menu's own mouse cursor, a bright mark, around the laser's point,
+    and at least one snapshot is taken with the laser on the menu."""
+    pointed = 0
     for fr in res.frames:
         for q in (menus(fr) if fr['snap'] else []):
             path = image(res, fr, q)
             if not os.path.exists(path):
                 continue
+            pointed += any(on_quad(c, q) for c in cursors(fr))
             w, h, bpp, rows = read_png(path)
             for y in range(max(0, int((uv[1] - 0.05) * h)),
                            min(h, int((uv[1] + 0.05) * h) + 1)):
@@ -1415,6 +1429,8 @@ def menu_cursor_errors(res, uv):
                     if min(rows[y][x * bpp:x * bpp + 3]) > 200:
                         return ['snapshot %d shows the menu\'s own cursor '
                                 'at %s' % (fr['n'], uv)]
+    if not pointed:
+        return ['no menu snapshot with the laser on the menu']
     return []
 
 
@@ -1790,11 +1806,13 @@ CASES = [
                ('script', script(AIM_LEFT_MENU_TOP, AIM_MENU_TOP)),
                ('wait', 1)],
      'check': check_menu_hands},
+    # The hover spans two of the layer's snapshots (one per 1.5 s): the
+    # click closes the menu.
     {'name': 'input-menu-click', 'map': '3ds',
      'settings': {'menu_driver': 'ozone', 'frontend_log_level': '0',
                   'confirm_reset': 'false'},
      'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),
-               ('script', AIM_MENU_HIGH), ('wait', 2),
+               ('script', AIM_MENU_HIGH), ('wait', 3),
                ('script', script(AIM_MENU_HIGH, R2)), ('wait', CLICK),
                ('script', AIM_MENU_HIGH), ('wait', 2)],
      'check': check_menu_click},
@@ -1803,7 +1821,7 @@ CASES = [
                   'confirm_reset': 'false'},
      'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3)]
      + [('send', 'MENU_DOWN'), ('wait', 0.2)] * 4
-     + [('script', AIM_RGUI_RESET), ('wait', 2),
+     + [('script', AIM_RGUI_RESET), ('wait', 3),
         ('script', script(AIM_RGUI_RESET, R2)), ('wait', CLICK),
         ('script', AIM_RGUI_RESET), ('wait', 2)],
      'check': check_menu_click_rgui},
