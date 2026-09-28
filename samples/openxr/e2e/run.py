@@ -1550,6 +1550,57 @@ def check_menu_click(res):
     return click_errors(res, 1, (0.6, 0.3))
 
 
+def check_menu_held(res):
+    """R2 held when the menu opens under the laser, on RGUI's Reset: the
+    laser points, but the held trigger neither presses nor clicks."""
+    lines = kinds(core_events(res), 'menu')
+    errors = []
+    if find(pads(res, 0), 0, lambda f: f['buttons'] & RP['R2']) < 0:
+        errors.append('the trigger was not R2 before the menu opened')
+    if not lines:
+        errors.append('the laser did not point at the menu')
+    if any(f['pressed'] for f in lines):
+        errors.append('the held trigger pressed on the menu')
+    if '[Core] Reset.' in res.log:
+        errors.append('the held trigger clicked Reset')
+    return errors
+
+
+def check_menu_glitch(res):
+    """RGUI: the pointing hand loses tracking for 0.2 s mid-click on
+    Reset. The press stays where it was: one reset, at the release."""
+    t0 = (res.marks['lost'] + 0.05) * 1e6
+    t1 = res.marks['found'] * 1e6
+    lost = [f for f in res.frames if t0 < f['t_us'] < t1]
+    errors = []
+    if not lost or any(cursors(f) for f in lost):
+        errors.append('the laser\'s dot did not go while tracking was lost')
+    return errors + click_errors(res, 0, (0.6, 0.177))
+
+
+def check_menu_close_held(res):
+    """RGUI: the menu closes while the laser presses Reset and opens after
+    the release. That press ended with the menu, so the reopened menu
+    reads no click; a fresh click then resets once."""
+    evs = []
+    for line in res.log.splitlines():
+        m = MENU_RE.search(line)
+        if m:
+            evs.append(int(m.group(3)))
+        elif '[Core] Reset.' in line:
+            evs.append('reset')
+    starts = [i for i, e in enumerate(evs)
+              if e == 1 and (i == 0 or evs[i - 1] != 1)]
+    resets = [i for i, e in enumerate(evs) if e == 'reset']
+    if resets and (len(starts) < 2 or resets[0] < starts[1]):
+        return ['the reopened menu clicked the press it closed on']
+    if len(starts) < 2:
+        return ['%d presses on the menu, want 2' % len(starts)]
+    if len(resets) != 1:
+        return ['the fresh click reset %d times, want once' % len(resets)]
+    return []
+
+
 def check_menu_click_rgui(res):
     """RGUI, with Core Options selected: a quick click on Reset restarts
     once; the press does nothing to Core Options."""
@@ -2001,6 +2052,40 @@ CASES = [
                ('script', script(AIM_MENU_HIGH, R2)), ('wait', CLICK),
                ('script', AIM_MENU_HIGH), ('wait', 2)],
      'check': check_menu_click},
+    # R2 held on the top screen, where the menu then opens on Reset; let
+    # go well inside the second RGUI still takes as a click.
+    {'name': 'input-menu-held', 'map': '3ds',
+     'settings': {'menu_driver': 'rgui', 'frontend_log_level': '0',
+                  'confirm_reset': 'false'},
+     'steps': [('wait', 6), ('script', script(AIM_RGUI_RESET, R2)),
+               ('wait', 2), ('send', 'MENU_TOGGLE'), ('wait', 0.5),
+               ('script', AIM_RGUI_RESET), ('wait', 2)],
+     'check': check_menu_held},
+    {'name': 'input-menu-glitch', 'map': '3ds',
+     'settings': {'menu_driver': 'rgui', 'frontend_log_level': '0',
+                  'confirm_reset': 'false'},
+     'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),
+               ('script', AIM_RGUI_RESET), ('wait', 3),
+               ('script', script(AIM_RGUI_RESET, R2)), ('wait', 0.1),
+               ('mark', 'lost'), ('script', script('aim right off', R2)),
+               ('wait', 0.2), ('mark', 'found'),
+               ('script', script(AIM_RGUI_RESET, R2)), ('wait', 0.1),
+               ('script', AIM_RGUI_RESET), ('wait', 2)],
+     'check': check_menu_glitch},
+    # The network command closes the menu past the press's input flush,
+    # and opens it again inside the second a click may take.
+    {'name': 'input-menu-close-held', 'map': '3ds',
+     'settings': {'menu_driver': 'rgui', 'frontend_log_level': '0',
+                  'confirm_reset': 'false'},
+     'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),
+               ('script', AIM_RGUI_RESET), ('wait', 2),
+               ('script', script(AIM_RGUI_RESET, R2)), ('wait', 0.1),
+               ('send', 'MENU_TOGGLE'), ('wait', 0.2),
+               ('script', AIM_RGUI_RESET), ('wait', 0.2),
+               ('send', 'MENU_TOGGLE'), ('wait', 2),
+               ('script', script(AIM_RGUI_RESET, R2)), ('wait', CLICK),
+               ('script', AIM_RGUI_RESET), ('wait', 2)],
+     'check': check_menu_close_held},
     {'name': 'input-menu-click-rgui', 'map': '3ds',
      'settings': {'menu_driver': 'rgui', 'frontend_log_level': '0',
                   'confirm_reset': 'false'},

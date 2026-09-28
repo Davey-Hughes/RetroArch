@@ -7004,6 +7004,18 @@ void menu_driver_toggle(
          }
       }
 #endif
+#ifdef HAVE_OPENXR
+      /* A laser press the menu closed on ended there: its release in
+       * the menu opened again is no click. */
+      if (     menu_input_headset_drives
+            && (menu_st->input_pointer_hw_state.flags
+               & MENU_INP_PTR_FLG_PRESS_SELECT))
+      {
+         menu_st->input_pointer_hw_state.flags &=
+               ~MENU_INP_PTR_FLG_PRESS_SELECT;
+         menu_input->select_inhibit = true;
+      }
+#endif
    }
    else
    {
