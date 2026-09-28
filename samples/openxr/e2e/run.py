@@ -1123,33 +1123,38 @@ def check_top_auto(res):
 
 
 def check_touch_drag(res):
-    """A touch dragged off screen 1 onto the top screen stays a touch: no
-    R2, read offscreen while off it, and back on screen 1 no touch again
-    until the trigger is pulled again."""
+    """A touch dragged off screen 1 onto the top screen and back, the
+    trigger held: no R2, read offscreen while off, and back on screen 1 it
+    touches again, as a stylus does."""
     evs = core_events(res)
     touches = kinds(evs, 'pointer')
     errors = []
     first = find(touches, 0, lambda f: f['pressed'])
     lift = (find(touches, first + 1, lambda f: not f['pressed'])
             if first >= 0 else -1)
+    again = (find(touches, lift + 1, lambda f: f['pressed'])
+             if lift >= 0 else -1)
     if first < 0:
         return ['no touch reached the core']
     if not packed_at(touches[first], (320, 420)):
         errors.append('touched at %s, want 320,420' % touches[first])
     if lift < 0:
         errors.append('the touch did not lift off the screen')
-    elif find(touches, lift + 1, lambda f: f['pressed']) >= 0:
-        errors.append('the held trigger touched again back on the screen')
+    elif again < 0:
+        errors.append('the held trigger did not touch again back on the '
+                      'screen')
+    elif not packed_at(touches[again], (320, 420)):
+        errors.append('touched again at %s, want 320,420' % touches[again])
+    runs = sum(1 for i, f in enumerate(touches) if f['pressed']
+               and (i == 0 or not touches[i - 1]['pressed']))
+    if runs != 2:
+        errors.append('touched %d times, want twice' % runs)
     t = find(evs, 0, lambda kf: kf[0] == 'pointer' and kf[1]['pressed'])
     off = find(evs, t + 1, lambda kf: kf[0] == 'gun' and kf[1]['offscreen'])
-    back = (find(evs, off + 1, lambda kf: kf[0] == 'gun'
-                 and packed_at(kf[1], (320, 420))) if off >= 0 else -1)
     if off < 0:
         errors.append('the dragged touch did not read offscreen')
-    elif back < 0:
-        errors.append('the laser did not point at screen 1 again')
-    elif evs[back][1]['trigger']:
-        errors.append('the held trigger fired the gun again on screen 1')
+    elif evs[off][1]['trigger']:
+        errors.append('the gun fired off the screens in Auto')
     return errors + trigger_errors(res)
 
 
@@ -1201,6 +1206,29 @@ def check_laser_off(res):
     if any(cursors(f) for f in res.frames):
         errors.append('a dot showed with the laser off')
     return errors
+
+
+def check_gun_sweep(res):
+    """Always: the held trigger swept off screen 0 and back keeps firing,
+    offscreen and on, with no new pull."""
+    guns = kinds(core_events(res), 'gun')
+    hit = find(guns, 0, lambda g: g['trigger'] and packed_at(g, (100, 60)))
+    off = (find(guns, hit + 1, lambda g: g['offscreen'])
+           if hit >= 0 else -1)
+    back = (find(guns, off + 1, lambda g: not g['offscreen'])
+            if off >= 0 else -1)
+    if hit < 0:
+        return ['the gun never fired on screen 0: %s' % guns[-3:]]
+    if off < 0 or back < 0:
+        return ['the gun did not leave screen 0 and come back: %s'
+                % guns[hit:hit + 4]]
+    errors = []
+    if not all(g['trigger'] for g in guns[hit:back + 1]):
+        errors.append('the held trigger stopped firing across the edge: %s'
+                      % guns[hit:back + 1])
+    if not packed_at(guns[back], (100, 60)):
+        errors.append('back on screen 0 at %s, want 100,60' % guns[back])
+    return errors + trigger_errors(res)
 
 
 def check_lightgun(res):
@@ -1973,6 +2001,14 @@ CASES = [
                ('script', script(AIM_MISS, R2, AIM_LEFT_MISS, L2)),
                ('wait', 2), ('script', ''), ('wait', 2)],
      'check': check_lightgun},
+    {'name': 'input-gun-sweep', 'map': '3ds',
+     'settings': {'video_openxr_laser': '1'},
+     'steps': [('wait', 6), ('script', script(AIM_GUN, R2)), ('wait', 1),
+               ('script', script(AIM_MISS, R2)), ('wait', 1),
+               ('script', script(AIM_GUN, R2)), ('wait', 1),
+               ('script', AIM_GUN), ('wait', 1), ('script', ''),
+               ('wait', 1)],
+     'check': check_gun_sweep},
     {'name': 'input-two-hands', 'map': '3ds',
      'steps': [('wait', 6),
                ('script', script(AIM_LEFT_BOTTOM, AIM_RIGHT_BOTTOM)),
