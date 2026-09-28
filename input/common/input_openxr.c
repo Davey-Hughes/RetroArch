@@ -273,6 +273,17 @@ typedef struct input_openxr_trigger
    unsigned slot;
 } input_openxr_trigger_t;
 
+/* What a trigger does from its pull until it is let go. */
+enum input_openxr_role
+{
+   INPUT_OPENXR_ROLE_UP = 0,
+   INPUT_OPENXR_ROLE_PAD,   /* L2 or R2 */
+   INPUT_OPENXR_ROLE_TOUCH, /* the core's pointer and gun, on a screen */
+   INPUT_OPENXR_ROLE_SHOT,  /* Always's gun, with no touch */
+   INPUT_OPENXR_ROLE_MENU,  /* the menu's press */
+   INPUT_OPENXR_ROLE_SPENT  /* nothing */
+};
+
 typedef struct input_openxr
 {
    /* Written by the session hooks, while neither the poll nor the XR
@@ -317,10 +328,12 @@ typedef struct input_openxr
    float hit_u[INPUT_OPENXR_HANDS];
    float hit_v[INPUT_OPENXR_HANDS];
    bool trig_down[INPUT_OPENXR_HANDS];
+   enum input_openxr_role role[INPUT_OPENXR_HANDS];
    int pointer;                         /* the hand that points, or -1 */
    bool ptr_owned;
    bool ptr_on;
    bool ptr_pressed;
+   bool gun_pressed;                    /* also off the screens */
    int16_t ptr_x;
    int16_t ptr_y;
    bool menu_on;
@@ -654,9 +667,29 @@ static void input_openxr_read_separate(input_openxr_t *st)
    st->recenter    = input_openxr_bool(st, IXA_S_RECENTER, XR_NULL_PATH);
 }
 
+static bool input_openxr_pressing(enum input_openxr_role role)
+{
+   return role == INPUT_OPENXR_ROLE_TOUCH
+      || role == INPUT_OPENXR_ROLE_SHOT
+      || role == INPUT_OPENXR_ROLE_MENU;
+}
+
+/* The triggers were not read: a press ends, and a trigger still held
+ * when they are read again is no new pull. */
+static void input_openxr_triggers_lost(input_openxr_t *st)
+{
+   unsigned h;
+   for (h = 0; h < INPUT_OPENXR_HANDS; h++)
+   {
+      if (input_openxr_pressing(st->role[h]))
+         st->role[h] = INPUT_OPENXR_ROLE_SPENT;
+      st->trig_down[h] = true;
+   }
+}
+
 /* Each hand's trigger into its L2 or R2: the value, and the button
- * past the threshold. A hand on a live quad, or the pointer off the
- * screens in Always, keeps its trigger for the laser. */
+ * past the threshold. Before its pull, a hand on a live quad or the
+ * pointer keeps its trigger for the laser. */
 static void input_openxr_triggers(input_openxr_t *st, float threshold)
 {
    unsigned h;
@@ -664,7 +697,10 @@ static void input_openxr_triggers(input_openxr_t *st, float threshold)
    {
       input_openxr_pad_t *pad = &st->pads[st->trig[h].pad];
       float v                 = st->trig[h].value;
-      if (v <= 0.0f || st->hit[h] >= 0 || (int)h == st->pointer)
+      if (     v <= 0.0f
+            || (st->role[h] != INPUT_OPENXR_ROLE_PAD
+               && (st->role[h] != INPUT_OPENXR_ROLE_UP
+                  || st->hit[h] >= 0 || (int)h == st->pointer)))
          continue;
       pad->trigger[st->trig[h].slot] = input_openxr_axis(v);
       if (v > threshold)
@@ -751,55 +787,81 @@ static bool input_openxr_frame_point(const video_xr_quad_t *q, float u,
 
 /* Where each hand points, which hand is the pointer, and what it points
  * at: a point in the core's frame, the menu, or in Always nothing (an
- * off-screen shot). was_pressed is the last poll's press. */
+ * off-screen shot). A trigger's role is set by its pull and kept until
+ * it is let go, so a press needs a pull of its own. was_pressed is the
+ * last poll's press. */
 static void input_openxr_laser_poll(input_openxr_t *st, unsigned laser,
       bool menu_open, float threshold, bool was_pressed)
 {
    unsigned h, i;
    int p;
-   bool pressed;
-   XrTime time;
+   bool lift;
    bool can[INPUT_OPENXR_HANDS];
-   bool active = false;
-   int prev    = st->pointer;
+   bool pulled[INPUT_OPENXR_HANDS];
+   XrTime time              = 0;
+   const video_xr_quad_t *q = NULL;
+   bool menu_live           = false;
+   int prev                 = st->pointer;
+
+   for (h = 0; h < INPUT_OPENXR_HANDS; h++)
+   {
+      float v          = st->trig[h].value;
+      bool down        = v > threshold;
+      pulled[h]        = down && !st->trig_down[h];
+      st->trig_down[h] = down;
+      /* L2 or R2, unless a live quad takes the pull below. */
+      if (pulled[h])
+         st->role[h] = INPUT_OPENXR_ROLE_PAD;
+      else if (v <= 0.0f)
+         st->role[h] = INPUT_OPENXR_ROLE_UP;
+      else if (!down && input_openxr_pressing(st->role[h]))
+         st->role[h] = INPUT_OPENXR_ROLE_SPENT;
+   }
 
    st->pointer = -1;
-   if (laser == VIDEO_OPENXR_LASER_OFF)
+   if (     laser != VIDEO_OPENXR_LASER_OFF
+         && (time = vulkan_openxr_predicted_time(st->xr))
+         && vulkan_openxr_get_quads(st->xr, &st->quads))
+      for (i = 0; i < st->quads.num_quads; i++)
+      {
+         const video_xr_quad_t *lq = &st->quads.quads[i];
+         if (!video_xr_quad_live(lq, laser, menu_open))
+            continue;
+         /* Without a live screen, the mouse and the overlay keep the
+          * core's pointer and gun. */
+         if (lq->kind == VIDEO_XR_QUAD_MENU)
+            menu_live     = true;
+         else
+            st->ptr_owned = true;
+      }
+   /* A press ends with its quads. */
+   for (h = 0; h < INPUT_OPENXR_HANDS; h++)
+      if (     (st->role[h] == INPUT_OPENXR_ROLE_MENU && !menu_live)
+            || (     (st->role[h] == INPUT_OPENXR_ROLE_TOUCH
+                   || st->role[h] == INPUT_OPENXR_ROLE_SHOT)
+                && !st->ptr_owned))
+         st->role[h] = INPUT_OPENXR_ROLE_SPENT;
+   if (!menu_live && !st->ptr_owned)
       return;
-   time        = vulkan_openxr_predicted_time(st->xr);
-   if (!time || !vulkan_openxr_get_quads(st->xr, &st->quads))
-      return;
-   for (i = 0; i < st->quads.num_quads; i++)
-   {
-      const video_xr_quad_t *q = &st->quads.quads[i];
-      if (!video_xr_quad_live(q, laser, menu_open))
-         continue;
-      active = true;
-      /* Without a live screen, the mouse and the overlay keep the
-       * core's pointer and gun. */
-      if (q->kind != VIDEO_XR_QUAD_MENU)
-         st->ptr_owned = true;
-   }
-   if (!active)
-      return;
+
    st->pointer = prev;
    for (h = 0; h < INPUT_OPENXR_HANDS; h++)
    {
       float t;
       video_xr_vec3_t o, d;
-      bool down = st->trig[h].value > threshold;
-      can[h]    = false;
+      /* A menu press keeps its hand off the quad too. */
+      can[h] = st->role[h] == INPUT_OPENXR_ROLE_MENU;
       if (input_openxr_ray(st, h, time, &o, &d))
       {
          st->hit[h] = video_xr_pick(&st->quads, laser, menu_open, &o, &d,
                &st->hit_u[h], &st->hit_v[h], &t);
          /* Always: a hand off every screen still aims the gun. */
-         can[h]     = st->hit[h] >= 0 || laser == VIDEO_OPENXR_LASER_ALWAYS;
+         if (st->hit[h] >= 0 || laser == VIDEO_OPENXR_LASER_ALWAYS)
+            can[h] = true;
       }
-      /* With both hands on the screens, the last trigger down points. */
-      if (st->hit[h] >= 0 && down && !st->trig_down[h])
+      /* With both hands on the screens, the last pull points. */
+      if (pulled[h] && st->hit[h] >= 0)
          st->pointer = (int)h;
-      st->trig_down[h] = down;
    }
    /* Always: the gun stays with its hand through a tracking loss. */
    if (laser == VIDEO_OPENXR_LASER_ALWAYS && prev >= 0)
@@ -808,32 +870,60 @@ static void input_openxr_laser_poll(input_openxr_t *st, unsigned laser,
       st->pointer = -1;
    else if (st->pointer < 0 || !can[st->pointer])
       st->pointer = can[1] ? 1 : 0;
-   if ((p = st->pointer) < 0)
+   p = st->pointer;
+
+   /* Only the pointer presses: a pull on a live quad, or in Always its
+    * pull anywhere, the gun's shot. */
+   for (h = 0; h < INPUT_OPENXR_HANDS; h++)
+   {
+      if ((int)h != p)
+      {
+         if (     input_openxr_pressing(st->role[h])
+               || (pulled[h] && st->hit[h] >= 0))
+            st->role[h] = INPUT_OPENXR_ROLE_SPENT;
+      }
+      else if (pulled[h] && st->hit[h] >= 0)
+         st->role[h] = (st->quads.quads[st->hit[h]].kind
+               == VIDEO_XR_QUAD_MENU)
+            ? INPUT_OPENXR_ROLE_MENU : INPUT_OPENXR_ROLE_TOUCH;
+      else if (pulled[h] && laser == VIDEO_OPENXR_LASER_ALWAYS)
+         st->role[h] = INPUT_OPENXR_ROLE_SHOT;
+   }
+   if (p < 0)
       return;
 
-   pressed = st->trig[p].value > threshold;
    /* A touchscreen core must see a lift between hands, not a drag. */
-   if (p != prev && was_pressed)
-      pressed = false;
-   if (st->hit[p] < 0)
-      st->ptr_pressed = pressed;
-   else
+   lift = p != prev && was_pressed;
+   if (st->hit[p] >= 0)
+      q = &st->quads.quads[st->hit[p]];
+   if (st->role[p] == INPUT_OPENXR_ROLE_MENU)
    {
-      const video_xr_quad_t *q = &st->quads.quads[st->hit[p]];
-      if (q->kind == VIDEO_XR_QUAD_MENU)
+      /* Off the quad, the press stays where it left it. */
+      if (q && q->kind == VIDEO_XR_QUAD_MENU)
       {
-         st->menu_on      = true;
-         st->menu_u       = st->hit_u[p];
-         st->menu_v       = st->hit_v[p];
-         st->menu_pressed = pressed;
+         st->menu_u = st->hit_u[p];
+         st->menu_v = st->hit_v[p];
       }
-      else if (input_openxr_frame_point(q, st->hit_u[p], st->hit_v[p],
-               &st->ptr_x, &st->ptr_y))
-      {
-         st->ptr_on      = true;
-         st->ptr_pressed = pressed;
-      }
+      st->menu_on      = true;
+      st->menu_pressed = !lift;
+      return;
    }
+   if (q && q->kind == VIDEO_XR_QUAD_MENU)
+   {
+      st->menu_on = true;
+      st->menu_u  = st->hit_u[p];
+      st->menu_v  = st->hit_v[p];
+   }
+   else if (q)
+      st->ptr_on = input_openxr_frame_point(q, st->hit_u[p], st->hit_v[p],
+            &st->ptr_x, &st->ptr_y);
+   /* A touch that leaves the screens has lifted; Always's gun fires on. */
+   if (st->role[p] == INPUT_OPENXR_ROLE_TOUCH && !st->ptr_on)
+      st->role[p] = (laser == VIDEO_OPENXR_LASER_ALWAYS)
+         ? INPUT_OPENXR_ROLE_SHOT : INPUT_OPENXR_ROLE_SPENT;
+   st->ptr_pressed = !lift && st->role[p] == INPUT_OPENXR_ROLE_TOUCH;
+   st->gun_pressed = st->ptr_pressed
+      || (!lift && st->role[p] == INPUT_OPENXR_ROLE_SHOT);
 }
 
 /* The XR thread, each headset frame: a dot where each hand points at a
@@ -956,7 +1046,7 @@ void input_openxr_poll(void)
    uint32_t run_flags   = runloop_state_get_ptr()->flags;
    bool separate        = settings->uints.video_openxr_controllers
       == VIDEO_OPENXR_CONTROLLERS_SEPARATE;
-   bool was_pressed     = st->ptr_pressed || st->menu_pressed;
+   bool was_pressed     = st->gun_pressed || st->menu_pressed;
    unsigned laser       = settings->uints.video_openxr_laser;
    float threshold      = settings->floats.input_axis_threshold;
 #ifdef HAVE_MENU
@@ -989,6 +1079,7 @@ void input_openxr_poll(void)
    st->ptr_owned    = false;
    st->ptr_on       = false;
    st->ptr_pressed  = false;
+   st->gun_pressed  = false;
    st->menu_on      = false;
    st->menu_pressed = false;
    if (!st->xr)
@@ -998,6 +1089,7 @@ void input_openxr_poll(void)
       if (st->focused)
          RARCH_LOG("[OpenXR] Controllers released: the headset is not focused.\n");
       st->focused = false;
+      input_openxr_triggers_lost(st);
       /* So their return is logged too. */
       st->mode    = -1;
       /* The runtime drops haptics out of focus: apply again after. */
@@ -1022,6 +1114,7 @@ void input_openxr_poll(void)
          RARCH_WARN("[OpenXR] Controllers not read: xrSyncActions %d.\n",
                (int)res);
       st->sync_result = res;
+      input_openxr_triggers_lost(st);
       return;
    }
    st->sync_result = XR_SUCCESS;
@@ -1125,7 +1218,7 @@ bool input_openxr_pointer(unsigned port, unsigned device, unsigned idx,
             return true;
          case RETRO_DEVICE_ID_LIGHTGUN_TRIGGER:
             /* Off the screens too: the usual reload. */
-            *res = st->ptr_pressed ? 1 : 0;
+            *res = st->gun_pressed ? 1 : 0;
             return true;
          default:
             break;

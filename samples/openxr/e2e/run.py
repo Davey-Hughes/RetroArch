@@ -1122,6 +1122,87 @@ def check_top_auto(res):
     return errors
 
 
+def check_touch_drag(res):
+    """A touch dragged off screen 1 onto the top screen stays a touch: no
+    R2, read offscreen while off it, and back on screen 1 no touch again
+    until the trigger is pulled again."""
+    evs = core_events(res)
+    touches = kinds(evs, 'pointer')
+    errors = []
+    first = find(touches, 0, lambda f: f['pressed'])
+    lift = (find(touches, first + 1, lambda f: not f['pressed'])
+            if first >= 0 else -1)
+    if first < 0:
+        return ['no touch reached the core']
+    if not packed_at(touches[first], (320, 420)):
+        errors.append('touched at %s, want 320,420' % touches[first])
+    if lift < 0:
+        errors.append('the touch did not lift off the screen')
+    elif find(touches, lift + 1, lambda f: f['pressed']) >= 0:
+        errors.append('the held trigger touched again back on the screen')
+    t = find(evs, 0, lambda kf: kf[0] == 'pointer' and kf[1]['pressed'])
+    off = find(evs, t + 1, lambda kf: kf[0] == 'gun' and kf[1]['offscreen'])
+    back = (find(evs, off + 1, lambda kf: kf[0] == 'gun'
+                 and packed_at(kf[1], (320, 420))) if off >= 0 else -1)
+    if off < 0:
+        errors.append('the dragged touch did not read offscreen')
+    elif back < 0:
+        errors.append('the laser did not point at screen 1 again')
+    elif evs[back][1]['trigger']:
+        errors.append('the held trigger fired the gun again on screen 1')
+    return errors + trigger_errors(res)
+
+
+def check_touch_held(res):
+    """R2 held on the top screen, then aimed onto screen 1: it stays R2
+    and touches nothing; let go and pulled again there, it touches."""
+    evs = core_events(res)
+
+    def r2(kf, on):
+        return (kf[0] == 'pad' and kf[1]['port'] == 0
+                and bool(kf[1]['buttons'] & RP['R2']) == on)
+    i = find(evs, 0, lambda kf: r2(kf, True))
+    j = find(evs, i + 1, lambda kf: r2(kf, False)) if i >= 0 else -1
+    touch = find(evs, 0, lambda kf: kf[0] == 'pointer' and kf[1]['pressed'])
+    if i < 0:
+        return ['the trigger on the top screen was not R2']
+    if j < 0:
+        return ['R2 was not let go']
+    errors = []
+    if not any(k == 'gun' and packed_at(f, (320, 420)) for k, f in evs[i:j]):
+        errors.append('the laser never pointed at screen 1 while R2 was held')
+    if touch < 0:
+        errors.append('a new pull on screen 1 did not touch it')
+    elif touch < j:
+        errors.append('R2 held onto screen 1 touched it')
+    elif not packed_at(evs[touch][1], (320, 420)):
+        errors.append('touched at %s, want 320,420' % evs[touch][1])
+    if any(r2(kf, True) for kf in evs[j:]):
+        errors.append('the new pull on screen 1 pressed R2')
+    return errors
+
+
+def check_laser_off(res):
+    """Laser Off: both triggers on screen 1 are L2 and R2, nothing touches
+    it, the light gun never reads where the hands aim, and no dot shows.
+    The x driver's gun reads offscreen too, so only the aim tells."""
+    evs = core_events(res)
+    both = RP['L2'] | RP['R2']
+    errors = []
+    if find(pads(res, 0), 0, lambda f: f['buttons'] & both == both
+            and (f['l2'], f['r2']) == (32767, 32767)) < 0:
+        errors.append('the triggers on screen 1 were not L2 and R2')
+    if any(f['pressed'] for f in kinds(evs, 'pointer')):
+        errors.append('screen 1 was touched with the laser off')
+    laser = [f for f in kinds(evs, 'gun') if f['trigger']
+             or packed_at(f, (320, 420)) or packed_at(f, (320, 300))]
+    if laser:
+        errors.append('the laser answered the light gun: %s' % laser[:2])
+    if any(cursors(f) for f in res.frames):
+        errors.append('a dot showed with the laser off')
+    return errors
+
+
 def check_lightgun(res):
     """Always: the trigger fires the gun on screen 0, then off every
     screen (an off-screen shot) with no R2; the other hand, off the
@@ -1804,6 +1885,29 @@ CASES = [
      'steps': [('wait', 6), ('script', script(AIM_TOP, R2)), ('wait', 2),
                ('script', ''), ('wait', 1)],
      'check': check_top_auto},
+    {'name': 'input-touch-drag', 'map': '3ds',
+     'steps': [('wait', 6), ('script', AIM_BOTTOM), ('wait', 1),
+               ('script', script(AIM_BOTTOM, R2)), ('wait', 1),
+               ('script', script(AIM_TOP, R2)), ('wait', 1),
+               ('script', script(AIM_BOTTOM, R2)), ('wait', 1),
+               ('script', AIM_BOTTOM), ('wait', 1),
+               ('script', ''), ('wait', 1)],
+     'check': check_touch_drag},
+    {'name': 'input-touch-held', 'map': '3ds',
+     'steps': [('wait', 6), ('script', script(AIM_TOP, R2)), ('wait', 1),
+               ('script', script(AIM_BOTTOM, R2)), ('wait', 1),
+               ('script', AIM_BOTTOM), ('wait', 1),
+               ('script', script(AIM_BOTTOM, R2)), ('wait', 1),
+               ('script', AIM_BOTTOM), ('wait', 1),
+               ('script', ''), ('wait', 1)],
+     'check': check_touch_held},
+    {'name': 'input-laser-off', 'map': '3ds',
+     'settings': {'video_openxr_laser': '2'},
+     'steps': [('wait', 6),
+               ('script', script(AIM_BOTTOM, R2, AIM_LEFT_BOTTOM, L2)),
+               ('wait', 2), ('script', script(AIM_BOTTOM, AIM_LEFT_BOTTOM)),
+               ('wait', 1), ('script', ''), ('wait', 1)],
+     'check': check_laser_off},
     {'name': 'input-lightgun', 'map': '3ds',
      'settings': {'video_openxr_laser': '1'},
      'steps': [('wait', 6), ('script', script(AIM_GUN, R2)), ('wait', 2),
