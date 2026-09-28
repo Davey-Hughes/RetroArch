@@ -1475,6 +1475,42 @@ def check_menu_click_rgui(res):
     return click_errors(res, 4, (0.6, 0.177))
 
 
+def haptics(res, hand):
+    return [e for e in res.events
+            if e['ev'] in ('haptic', 'haptic_stop') and e['hand'] == hand]
+
+
+def rumble_errors(res, want):
+    """want: hand -> amplitude every haptic call on it should have."""
+    errors = []
+    for hand, amp in sorted(want.items()):
+        got = haptics(res, hand)
+        on = [e['amplitude'] for e in got if e['ev'] == 'haptic']
+        if not on or any(abs(a - amp) > 0.01 for a in on):
+            errors.append('the %s hand rumbled at %s, want %.2f'
+                          % (hand, on, amp))
+        if not got or got[-1]['ev'] != 'haptic_stop':
+            errors.append('the %s hand did not stop' % hand)
+    return errors
+
+
+def check_rumble(res):
+    errors = rumble_errors(res, {'left': 0.75, 'right': 0.25})
+    if find(kinds(core_events(res), 'rumble'), 0, lambda f: (
+            f['port'], f['strong'], f['weak']) == (0, 49152, 16384)) < 0:
+        errors.append('the core did not rumble')
+    return errors
+
+
+def check_rumble_separate(res):
+    errors = rumble_errors(res, {'left': 0.75, 'right': 0.5})
+    left = [e for e in haptics(res, 'left') if e['ev'] == 'haptic']
+    right = [e for e in haptics(res, 'right') if e['ev'] == 'haptic']
+    if left and right and right[0]['t_us'] < left[0]['t_us']:
+        errors.append('the right hand rumbled before player 2 pressed Start')
+    return errors
+
+
 def check_hw_teardown(res):
     """The core's context_destroy waits on the device without the queue
     lock, at a video reinit and at unload: the headset's frames stop
@@ -1825,6 +1861,16 @@ CASES = [
         ('script', script(AIM_RGUI_RESET, R2)), ('wait', CLICK),
         ('script', AIM_RGUI_RESET), ('wait', 2)],
      'check': check_menu_click_rgui},
+    {'name': 'input-rumble', 'map': '3ds',
+     'steps': [('wait', 6), ('script', 'action combined/start 1'),
+               ('wait', 2), ('script', ''), ('wait', 2)],
+     'check': check_rumble},
+    {'name': 'input-rumble-separate', 'map': '3ds',
+     'settings': {'video_openxr_controllers': '1'},
+     'steps': [('wait', 6), ('script', 'action separate/start@left 1'),
+               ('wait', 2), ('script', 'action separate/start@right 1'),
+               ('wait', 2), ('script', ''), ('wait', 2)],
+     'check': check_rumble_separate},
 ]
 
 

@@ -26,7 +26,7 @@ RETRO_BEGIN_DECLS
 
 /* The headset's controllers through OpenXR: one RetroPad from both, or
  * one per hand, their haptics, and a laser pointer on the headset's
- * screens. Everything here runs on the main thread. */
+ * screens. Everything here but the rumble runs on the main thread. */
 
 #define INPUT_OPENXR_PADS 2
 
@@ -55,6 +55,10 @@ bool input_openxr_pointer(unsigned port, unsigned device, unsigned idx,
 /* The laser on the menu quad: where, from 0 to 1 across and down, and
  * whether its trigger is held. */
 bool input_openxr_menu_pointer(float *u, float *v, bool *pressed);
+
+/* A core's rumble for user port, applied at the next poll. Any thread. */
+bool input_openxr_set_rumble(unsigned port, enum retro_rumble_effect effect,
+      uint16_t strength);
 
 RETRO_END_DECLS
 

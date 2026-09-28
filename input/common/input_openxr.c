@@ -20,6 +20,7 @@
 #include <compat/strl.h>
 #include <retro_miscellaneous.h>
 #include <retro_atomic.h>
+#include <features/features_cpu.h>
 
 #ifdef HAVE_CONFIG_H
 #include "../../config.h"
@@ -41,6 +42,10 @@
 
 #define INPUT_OPENXR_HANDS     2
 #define INPUT_OPENXR_MAX_BINDS 48
+/* A steady rumble is applied again this often (us), each time for
+ * INPUT_OPENXR_HAPTIC_DURATION (ns). */
+#define INPUT_OPENXR_HAPTIC_REFRESH  500000
+#define INPUT_OPENXR_HAPTIC_DURATION 1000000000
 
 enum input_openxr_set
 {
@@ -303,6 +308,8 @@ typedef struct input_openxr
    bool focused;
    bool menu_toggle;
    bool recenter;
+   float haptic[INPUT_OPENXR_HANDS];      /* the amplitude last applied */
+   retro_time_t haptic_time[INPUT_OPENXR_HANDS];
    /* The laser, from this poll. */
    video_xr_quad_set_t quads;
    int hit[INPUT_OPENXR_HANDS];         /* a live quad, or -1 */
@@ -329,6 +336,11 @@ static input_openxr_t input_openxr_st;
 /* The main thread's laser mode and menu, for the XR thread's dots. */
 static retro_atomic_int_t input_openxr_laser;
 static retro_atomic_int_t input_openxr_menu_open;
+
+/* A core's rumble per player, strong then weak, and whether a session's
+ * controllers exist: cores set rumble from any thread. */
+static retro_atomic_int_t input_openxr_rumble[INPUT_OPENXR_PADS][2];
+static retro_atomic_int_t input_openxr_ready;
 
 #define INPUT_OPENXR_PROC(st, get, inst, name) \
    (XR_SUCCEEDED((get)((inst), "xr" #name, \
@@ -408,6 +420,7 @@ static void input_openxr_suggest(input_openxr_t *st,
 static void input_openxr_release(input_openxr_t *st)
 {
    unsigned i;
+   retro_atomic_store_release_int(&input_openxr_ready, 0);
    for (i = 0; i < INPUT_OPENXR_HANDS; i++)
       if (st->aim[i] && st->DestroySpace)
          st->DestroySpace(st->aim[i]);
@@ -518,6 +531,7 @@ static void input_openxr_session_created(void *user,
    }
 
    st->xr = h->xr;
+   retro_atomic_store_release_int(&input_openxr_ready, 1);
    RARCH_LOG("[OpenXR] Headset controllers ready.\n");
    return;
 
@@ -877,6 +891,55 @@ static unsigned input_openxr_frame_layers(void *user, XrTime time,
    return n;
 }
 
+/* Rumble into each hand's haptics: in Combined player 1's strong motor
+ * is the left hand and its weak the right; in Separate each player's
+ * hand takes the stronger of its two. */
+static void input_openxr_haptics(input_openxr_t *st, bool separate)
+{
+   unsigned h;
+   retro_time_t now = cpu_features_get_time_usec();
+   for (h = 0; h < INPUT_OPENXR_HANDS; h++)
+   {
+      XrHapticActionInfo info;
+      float amp;
+      int s;
+      if (separate)
+      {
+         int strong = retro_atomic_load_acquire_int(
+               &input_openxr_rumble[h][0]);
+         int weak   = retro_atomic_load_acquire_int(
+               &input_openxr_rumble[h][1]);
+         s          = MAX(strong, weak);
+      }
+      else
+         s = retro_atomic_load_acquire_int(&input_openxr_rumble[0][h]);
+      amp = (float)s / 65535.0f;
+      if (     amp == st->haptic[h]
+            && (amp <= 0.0f
+               || now - st->haptic_time[h] < INPUT_OPENXR_HAPTIC_REFRESH))
+         continue;
+      memset(&info, 0, sizeof(info));
+      info.type          = XR_TYPE_HAPTIC_ACTION_INFO;
+      info.action        = st->actions[IXA_RUMBLE];
+      info.subactionPath = st->hands[h];
+      if (amp > 0.0f)
+      {
+         XrHapticVibration vib;
+         memset(&vib, 0, sizeof(vib));
+         vib.type      = XR_TYPE_HAPTIC_VIBRATION;
+         vib.duration  = INPUT_OPENXR_HAPTIC_DURATION;
+         vib.frequency = XR_FREQUENCY_UNSPECIFIED;
+         vib.amplitude = amp;
+         st->ApplyHapticFeedback(st->session, &info,
+               (const XrHapticBaseHeader*)&vib);
+      }
+      else
+         st->StopHapticFeedback(st->session, &info);
+      st->haptic[h]      = amp;
+      st->haptic_time[h] = now;
+   }
+}
+
 void input_openxr_poll(void)
 {
    XrResult res;
@@ -921,6 +984,9 @@ void input_openxr_poll(void)
       st->focused = false;
       /* So their return is logged too. */
       st->mode    = -1;
+      /* The runtime drops haptics out of focus: apply again after. */
+      st->haptic[0] = 0.0f;
+      st->haptic[1] = 0.0f;
       return;
    }
    st->focused = true;
@@ -956,6 +1022,7 @@ void input_openxr_poll(void)
    input_openxr_laser_poll(st, laser, menu_open, threshold, was_pressed);
    input_openxr_triggers(st, threshold);
    input_openxr_dpad(st, settings);
+   input_openxr_haptics(st, separate);
 }
 
 bool input_openxr_button(unsigned port, unsigned id)
@@ -1060,6 +1127,17 @@ bool input_openxr_menu_pointer(float *u, float *v, bool *pressed)
    *v       = st->menu_v;
    *pressed = st->menu_pressed;
    return true;
+}
+
+bool input_openxr_set_rumble(unsigned port, enum retro_rumble_effect effect,
+      uint16_t strength)
+{
+   if (port >= INPUT_OPENXR_PADS)
+      return false;
+   retro_atomic_store_release_int(
+         &input_openxr_rumble[port][(effect == RETRO_RUMBLE_STRONG) ? 0 : 1],
+         (int)strength);
+   return retro_atomic_load_acquire_int(&input_openxr_ready) != 0;
 }
 
 void input_openxr_register(void)
