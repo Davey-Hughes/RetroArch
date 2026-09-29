@@ -2849,6 +2849,8 @@ static bool video_thread_frame(void *data, const void *frame_,
             &dropped, &dupe_dropped);
       if (dropped)
          thr->miss_count++;
+      if (dropped && !dupe_dropped)
+         video_thread_hw_drop(thr, thr->frame.slot[slot].hw_slot);
    }
 
    /* The picked slot is unclaimed, so the worker holds no pointer into

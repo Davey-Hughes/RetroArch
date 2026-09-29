@@ -143,6 +143,10 @@ typedef struct
    retro_atomic_int_t last_presented;
    enum hw_api api;
    thread_video_t *thr;
+#ifdef HAVE_VULKAN
+   /* For waiting a dropped frame's semaphores, see video_thread_hw_drop. */
+   PFN_vkQueueSubmit queue_submit;
+#endif
 } hw_ring_t;
 
 static hw_ring_t *hw_ring_of(void *handle)
@@ -179,6 +183,7 @@ static void hw_wait_slot(hw_ring_t *ring, unsigned i)
 
 /* --- Vulkan: the core's side, main thread ----------------------------- */
 #ifdef HAVE_VULKAN
+static void hw_wait_queued(hw_ring_t *ring, unsigned i);
 
 static uint32_t hw_get_sync_index(void *handle)
 {
@@ -192,11 +197,15 @@ static uint32_t hw_get_sync_index_mask(void *handle)
    return (1u << VIDEO_THREAD_HW_RING) - 1;
 }
 
+/* The core draws into its own image, which a queued frame may still
+ * name: see hw_wait_queued. */
 static void hw_wait_sync_index(void *handle)
 {
    hw_ring_t *ring = hw_ring_of(handle);
-   if (ring)
-      hw_wait_slot(ring, ring->index);
+   if (!ring)
+      return;
+   hw_wait_queued(ring, ring->index);
+   hw_wait_slot(ring, ring->index);
 }
 
 static void hw_set_image(void *handle,
@@ -296,16 +305,19 @@ static void hw_set_signal_semaphore(void *handle, VkSemaphore semaphore)
 #endif /* VIDEO_THREAD_HW_ANY */
 
 /* --- Direct3D 12: the core's side, main thread ------------------------ */
-#if defined(HAVE_D3D11) || defined(HAVE_D3D12)
+#if defined(HAVE_VULKAN) || defined(HAVE_D3D11) || defined(HAVE_D3D12)
 /* --- slots that are the core's own texture -----------------------------
- * libretro_d3d12.h version 2 and libretro_d3d11.h version 3: nothing is
- * copied into the slot, the driver reads the core's texture itself. */
+ * Vulkan, libretro_d3d12.h version 2 and libretro_d3d11.h version 3:
+ * nothing is copied into the slot, the driver reads the core's image or
+ * texture itself. */
 
 /* Whether a frame the video thread is drawing, or has yet to claim,
  * names ring slot i, given the ring word 'st'. The pending frame is
  * tail, both are pending at two, and the one being drawn is tail ^ 1.
- * The slots' hw_slot fields are this thread's own writes. */
-static bool hw_slot_queued(const thread_video_t *thr, unsigned i, int st)
+ * The slots' hw_slot and dupe fields are this thread's own writes. A
+ * dupe names dupe_slot, or nothing at -1. */
+static bool hw_slot_queued(const thread_video_t *thr, unsigned i, int st,
+      int dupe_slot)
 {
    unsigned w;
    unsigned tail    = VIDEO_THREAD_RING_TAIL_OF(st);
@@ -313,7 +325,9 @@ static bool hw_slot_queued(const thread_video_t *thr, unsigned i, int st)
    bool busy        = VIDEO_THREAD_RING_BUSY_OF(st);
    for (w = 0; w < 2; w++)
    {
-      if (thr->frame.slot[w].hw_slot != (int)i)
+      int named = thr->frame.slot[w].dupe
+         ? dupe_slot : thr->frame.slot[w].hw_slot;
+      if (named != (int)i)
          continue;
       if (     pending == 2
             || (pending == 1 && w == tail)
@@ -325,15 +339,21 @@ static bool hw_slot_queued(const thread_video_t *thr, unsigned i, int st)
 
 /* The wait itself, for any slot that is the core's own texture: parks
  * on the ring until the word has moved and the slot is no longer
- * named. */
+ * named. On Apple in slices with the main-thread pump between, for the
+ * reason hw_wait_slot gives. */
 static void hw_wait_queued(hw_ring_t *ring, unsigned i)
 {
    thread_video_t *thr = ring->thr;
    for (;;)
    {
       int st  = retro_atomic_load_acquire_int(&thr->frame.state);
+      /* Vulkan: a dupe draws the slot last presented again and re-arms
+       * its fence (video_thread_hw_after_frame), which the core's wait
+       * on that fence must not overlap. */
+      int dupe_slot = (ring->api == HW_API_VULKAN)
+         ? retro_atomic_load_acquire_int(&ring->last_presented) : -1;
       int key;
-      if (!hw_slot_queued(thr, i, st))
+      if (!hw_slot_queued(thr, i, st, dupe_slot))
          return;
       key = retro_eventcount_prepare_wait(&thr->frame.ring);
       if (retro_atomic_load_acquire_int(&thr->frame.state) != st)
@@ -341,7 +361,12 @@ static void hw_wait_queued(hw_ring_t *ring, unsigned i)
          retro_eventcount_cancel_wait(&thr->frame.ring);
          continue;
       }
+#ifdef __APPLE__
+      retro_eventcount_commit_wait_timeout(&thr->frame.ring, key, 1000);
+      video_thread_main_pump();
+#else
       retro_eventcount_commit_wait(&thr->frame.ring, key);
+#endif
    }
 }
 #endif
@@ -592,6 +617,10 @@ bool video_thread_get_hw_render_interface(void *data,
          ring->iface.vk.lock_queue           = hw_lock_queue;
          ring->iface.vk.unlock_queue         = hw_unlock_queue;
          ring->iface.vk.set_signal_semaphore = hw_set_signal_semaphore;
+         if (ring->iface.vk.get_device_proc_addr)
+            ring->queue_submit = (PFN_vkQueueSubmit)
+               ring->iface.vk.get_device_proc_addr(ring->iface.vk.device,
+                     "vkQueueSubmit");
          *iface = (const struct retro_hw_render_interface*)&ring->iface.vk;
          return true;
 #endif
@@ -867,6 +896,10 @@ int video_thread_hw_publish(thread_video_t *thr)
    }
    /* The slot the core fills next was last driven two frames ago;
     * normally long done, and if not this is where the core waits. */
+#ifdef HAVE_VULKAN
+   if (ring->api == HW_API_VULKAN)
+      hw_wait_queued(ring, ring->index);
+#endif
 #ifdef HAVE_D3D12
    if (ring->api == HW_API_D3D12)
       hw_d3d12_wait_queued(ring, ring->index);
@@ -936,10 +969,52 @@ void video_thread_hw_after_frame(thread_video_t *thr, int hw_slot)
    if (!ring || hw_slot < 0 || hw_slot >= VIDEO_THREAD_HW_RING)
       return;
    s = &ring->slot[hw_slot];
+   /* A dupe draws the slot again, maybe before the core has waited it,
+    * and a VkFence still signalled cannot be submitted again. The
+    * core's wait cannot overlap this one (hw_wait_queued). */
+   if (ring->api == HW_API_VULKAN && s->in_flight)
+      thr->poke->hw_ring_fence_wait(thr->driver_data, s->fence,
+            HW_RING_WAIT_FOREVER);
    /* Signalled after the submission the frame call just made; the fence
     * was reset by whoever waited it last, or is fresh. */
    thr->poke->hw_ring_fence_signal(thr->driver_data, s->fence);
    s->in_flight = true;
+}
+
+/* A binary semaphore the core signalled must be waited before the core
+ * signals it again, and a replaced frame is never drawn: its semaphores
+ * are waited here, on the queue, as a core would. */
+void video_thread_hw_drop(thread_video_t *thr, int hw_slot)
+{
+#ifdef HAVE_VULKAN
+   hw_ring_t *ring = (hw_ring_t*)thr->frame.hw_ring;
+   hw_slot_t *s;
+   unsigned i;
+   if (     !ring || ring->api != HW_API_VULKAN || !ring->queue_submit
+         || hw_slot < 0 || hw_slot >= VIDEO_THREAD_HW_RING)
+      return;
+   s = &ring->slot[hw_slot];
+   /* With command buffers the driver ignores them, and so does this. */
+   if (!s->num_semaphores || s->num_cmd)
+      return;
+   hw_lock_queue(thr);
+   for (i = 0; i < s->num_semaphores; i++)
+   {
+      VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+      VkSubmitInfo info;
+      memset(&info, 0, sizeof(info));
+      info.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+      info.waitSemaphoreCount = 1;
+      info.pWaitSemaphores    = &s->semaphores[i];
+      info.pWaitDstStageMask  = &stage;
+      ring->queue_submit(ring->iface.vk.queue, 1, &info, VK_NULL_HANDLE);
+   }
+   hw_unlock_queue(thr);
+   s->num_semaphores = 0;
+#else
+   (void)thr;
+   (void)hw_slot;
+#endif
 }
 
 static void hw_context_free_cb(void *data)
@@ -1051,6 +1126,7 @@ void video_thread_hw_note_claim(thread_video_t *thr, int hw_slot) { (void)thr; (
 int  video_thread_hw_dupe_slot(thread_video_t *thr) { (void)thr; return -1; }
 void video_thread_hw_before_frame(thread_video_t *thr, int hw_slot) { (void)thr; (void)hw_slot; }
 void video_thread_hw_after_frame(thread_video_t *thr, int hw_slot)  { (void)thr; (void)hw_slot; }
+void video_thread_hw_drop(thread_video_t *thr, int hw_slot) { (void)thr; (void)hw_slot; }
 void video_thread_hw_free(thread_video_t *thr) { (void)thr; }
 bool video_thread_hw_allowed(void) { return false; }
 bool video_thread_hw_bind_core_context(void *data) { (void)data; return false; }

@@ -44,6 +44,8 @@
 #include "../../../menu/menu_setting.h"
 #include "../../../verbosity.h"
 #include "../../../input/input_driver.h"
+#include "../../../paths.h"
+#include "../../../tasks/task_content.h"
 
 #ifdef HAVE_X11
 #include <X11/Xlib.h>
@@ -4642,6 +4644,119 @@ static void lane_x11_wsi_connection(void)
 #endif
 }
 
+/* ------------------------------------------------------------------ */
+/* Lane: a Vulkan core that hands over images of its own              */
+/*   The harness core, restarted as a set_image core, renders on      */
+/*   this thread into images the video thread reads a frame or two    */
+/*   later, behind a semaphore per frame, and dupes every third: a    */
+/*   dupe draws the last image again. Then, behind a present slower   */
+/*   than a frame, frames are replaced before they are drawn and the  */
+/*   core comes back to slots still queued. The validation layer      */
+/*   reports a fence submitted signalled, a semaphore signalled       */
+/*   twice, or a wait nothing will signal. Last: the core stays for   */
+/*   the shutdown.                                                    */
+/* ------------------------------------------------------------------ */
+
+#define VKHWLANE_FRAMES      600
+#define VKHWLANE_SLOW_FRAMES 120
+
+#ifdef HAVE_VULKAN
+static video_driver_t        vkhwlane_driver;
+static const video_driver_t *vkhwlane_inner;
+
+static bool vkhwlane_frame(void *data, const void *frame,
+      unsigned dims, uint64_t frame_count,
+      unsigned pitch, const char *msg, video_frame_info_t *video_info)
+{
+   retro_sleep(30);
+   return vkhwlane_inner->frame(data, frame, dims, frame_count,
+         pitch, msg, video_info);
+}
+#endif
+
+static void lane_vulkan_hw_ring(void)
+{
+#ifdef HAVE_VULKAN
+   char core[PATH_MAX_LENGTH];
+   unsigned had           = failures;
+   const char *drv        = getenv("HARNESS_VIDEO_DRIVER");
+   void (*use_vk)(int)    = NULL;
+   unsigned (*sent)(void) = NULL;
+   unsigned f0, f1, m0, m1;
+   thread_video_t *thr;
+   dylib_t hold;
+
+   if (!drv || strcmp(drv, "vulkan"))
+   {
+      fprintf(stderr, "[skip] vulkan hw ring lane (driver %s)\n",
+            drv ? drv : "null");
+      return;
+   }
+
+   /* Held across the restart, so the mode set here outlives the
+    * frontend's unload of the library. */
+   strlcpy(core, path_get(RARCH_PATH_CORE), sizeof(core));
+   if ((hold = dylib_load(core)))
+   {
+      use_vk = (void (*)(int))dylib_proc(hold, "harness_core_use_vulkan");
+      sent   = (unsigned (*)(void))dylib_proc(hold, "harness_core_vk_frames");
+   }
+   CHECK(use_vk && sent, "harness core lacks the Vulkan exports");
+   if (!use_vk || !sent)
+   {
+      if (hold)
+         dylib_close(hold);
+      return;
+   }
+
+   set_threaded_via_setting(false);
+   run_frames(2);
+   use_vk(1);
+   CHECK(task_push_load_contentless_core_from_menu(core),
+         "vulkan hw ring lane: the core did not restart");
+   run_frames(5);
+   CHECK(video_driver_get_hw_context()->context_type == RETRO_HW_CONTEXT_VULKAN,
+         "vulkan hw ring lane: the core has no Vulkan context");
+
+   set_threaded_via_setting(true);
+   if (menu_is_up())
+      command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+   run_frames(5);
+   expect_wrapper(true, "vulkan hw ring lane");
+   thr = (thread_video_t*)video_state_get_ptr()->data;
+   CHECK(thr->frame.hw_ring != NULL, "vulkan hw ring lane: no HW ring");
+
+   f0 = sent();
+   run_frames(VKHWLANE_FRAMES);
+   video_thread_wait_idle();
+   f1 = sent();
+   CHECK(f1 - f0 >= VKHWLANE_FRAMES / 2,
+         "vulkan hw ring lane: %u images handed over in %u frames",
+         f1 - f0, (unsigned)VKHWLANE_FRAMES);
+
+   vkhwlane_inner        = thr->driver;
+   vkhwlane_driver       = *thr->driver;
+   vkhwlane_driver.frame = vkhwlane_frame;
+   set_driver(thr, &vkhwlane_driver);
+   m0 = (unsigned)thr->miss_count;
+   run_frames(VKHWLANE_SLOW_FRAMES);
+   video_thread_wait_idle();
+   m1 = (unsigned)thr->miss_count;
+   set_driver(thr, vkhwlane_inner);
+   CHECK(m1 - m0 >= VKHWLANE_SLOW_FRAMES / 4,
+         "vulkan hw ring lane: only %u of %u frames replaced behind a slow"
+         " present: the lane proved nothing",
+         m1 - m0, (unsigned)VKHWLANE_SLOW_FRAMES);
+   run_frames(5);
+
+   dylib_close(hold);
+   if (failures == had)
+      fprintf(stderr, "[pass] vulkan hw ring lane (%u images, %u of %u"
+            " frames replaced behind a slow present)\n",
+            f1 - f0, m1 - m0, (unsigned)VKHWLANE_SLOW_FRAMES);
+#endif
+}
+
 int main(int argc, char *argv[])
 {
    char cfg_path[512];
@@ -4809,6 +4924,8 @@ int main(int argc, char *argv[])
    else
       fprintf(stderr, "[skip] null-driver instrumented lanes (real driver: %s)\n",
             getenv("HARNESS_VIDEO_DRIVER"));
+   if (real_driver())
+      lane_vulkan_hw_ring();
 
    /* Orderly shutdown: the teardown barriers are part of what is
     * under test. */
