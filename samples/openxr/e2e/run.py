@@ -1987,6 +1987,7 @@ CASES = [
      'steps': TEARDOWN, 'check': check_hw_teardown},
     {'name': 'hw-teardown-threaded', 'map': 'none', 'options': VULKAN,
      'settings': {'video_threaded': 'true'}, 'steps': TEARDOWN,
+     'baseline': THREADED_HW,
      'check': threaded(check_hw_teardown)},
     {'name': 'kept-retry', 'map': 'none',
      'options': {'video_views_test_hw': 'vulkan_keep'},
