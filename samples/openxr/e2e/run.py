@@ -1887,6 +1887,11 @@ TEARDOWN = [('wait', 6), ('send', 'FULLSCREEN_TOGGLE'), ('wait', 4),
 KEPT_LEAK = [('VUID-vkDestroyDevice-device-05137', kept_leak)]
 SIZED = {'video_shader_enable': 'true'}
 SHOT = [('wait', 8), ('shot', None)]
+# Master's threaded HW ring raises these for a core's own images.
+THREADED_HW = [
+    ('VUID-vkQueueSubmit-fence-00063', 'submitted in SIGNALED state'),
+    ('VUID-vkQueueSubmit-pSignalSemaphores-00067',
+     'pSubmits[0].pSignalSemaphores[0]')]
 
 CASES = [
     {'name': '3ds-stereo', 'map': '3ds', 'steps': SETTLE,
@@ -1912,6 +1917,7 @@ CASES = [
     {'name': 'hw-3ds-stereo-threaded', 'map': '3ds',
      'options': {'video_views_test_hw': 'vulkan'},
      'settings': {'video_threaded': 'true'}, 'steps': SETTLE,
+     'baseline': THREADED_HW,
      'check': threaded(check_screens())},
     {'name': '3ds-output-size', 'map': '3ds', 'settings': SIZED,
      'args': ['--set-shader=' + PRESET], 'steps': SHOT,
