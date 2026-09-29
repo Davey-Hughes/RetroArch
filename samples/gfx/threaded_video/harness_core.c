@@ -377,8 +377,11 @@ void retro_run(void)
 
    if (harness_vk)
    {
-      /* Every third frame a dupe, which draws the last image again. */
-      if (vk_ready && runs % 3 != 0 && vk_send())
+      /* Every third frame a dupe, which draws the last image again, or
+       * with mode 2 a software frame. */
+      if (runs % 3 == 0 && harness_vk == 2)
+         video_cb(frame, W, H, W * 2);
+      else if (vk_ready && runs % 3 != 0 && vk_send())
          video_cb(RETRO_HW_FRAME_BUFFER_VALID, W, H, 0);
       else
          video_cb(NULL, W, H, 0);

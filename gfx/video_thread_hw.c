@@ -302,9 +302,8 @@ static void hw_set_signal_semaphore(void *handle, VkSemaphore semaphore)
    if (real->set_signal_semaphore)
       real->set_signal_semaphore(real->handle, semaphore);
 }
-#endif /* VIDEO_THREAD_HW_ANY */
+#endif /* HAVE_VULKAN */
 
-/* --- Direct3D 12: the core's side, main thread ------------------------ */
 #if defined(HAVE_VULKAN) || defined(HAVE_D3D11) || defined(HAVE_D3D12)
 /* --- slots that are the core's own texture -----------------------------
  * Vulkan, libretro_d3d12.h version 2 and libretro_d3d11.h version 3:
@@ -371,6 +370,7 @@ static void hw_wait_queued(hw_ring_t *ring, unsigned i)
 }
 #endif
 
+/* --- Direct3D 12: the core's side, main thread ------------------------ */
 #ifdef HAVE_D3D12
 static void hw_d3d12_slot_release_v2(hw_slot_t *s);
 static void hw_d3d12_wait_queued(hw_ring_t *ring, unsigned i);
@@ -879,10 +879,12 @@ int video_thread_hw_publish(thread_video_t *thr)
     * its fence does not cover the dupe's read yet (the video thread
     * re-signals it only once the dupe is drawn), so wait for the dupe
     * to clear the ring first. Bounded: on a stalled presenter the core
-    * proceeds as it did before this wait existed. */
+    * proceeds as it did before this wait existed. Vulkan waits for it
+    * below, unbounded. */
    {
       int st = retro_atomic_load_acquire_int(&thr->frame.state);
-      if (     (int)ring->index
+      if (     ring->api != HW_API_VULKAN
+            && (int)ring->index
             == retro_atomic_load_acquire_int(&ring->last_presented)
             && hw_dupe_queued(thr, st))
       {

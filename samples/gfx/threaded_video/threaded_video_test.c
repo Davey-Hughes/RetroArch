@@ -4650,7 +4650,8 @@ static void lane_x11_wsi_connection(void)
 /*   this thread into images the video thread reads a frame or two    */
 /*   later, behind a semaphore per frame, and dupes every third: a    */
 /*   dupe draws the last image again. Then, behind a present slower   */
-/*   than a frame, frames are replaced before they are drawn and the  */
+/*   than a frame and with a software frame every third, the push     */
+/*   replaces hardware frames the video thread never drew, and the    */
 /*   core comes back to slots still queued. The validation layer      */
 /*   reports a fence submitted signalled, a semaphore signalled       */
 /*   twice, or a wait nothing will signal. Last: the core stays for   */
@@ -4664,10 +4665,14 @@ static void lane_x11_wsi_connection(void)
 static video_driver_t        vkhwlane_driver;
 static const video_driver_t *vkhwlane_inner;
 
+static unsigned              vkhwlane_hw_drawn;
+
 static bool vkhwlane_frame(void *data, const void *frame,
       unsigned dims, uint64_t frame_count,
       unsigned pitch, const char *msg, video_frame_info_t *video_info)
 {
+   if (frame == RETRO_HW_FRAME_BUFFER_VALID)
+      vkhwlane_hw_drawn++;
    retro_sleep(30);
    return vkhwlane_inner->frame(data, frame, dims, frame_count,
          pitch, msg, video_info);
@@ -4682,7 +4687,7 @@ static void lane_vulkan_hw_ring(void)
    const char *drv        = getenv("HARNESS_VIDEO_DRIVER");
    void (*use_vk)(int)    = NULL;
    unsigned (*sent)(void) = NULL;
-   unsigned f0, f1, m0, m1;
+   unsigned f0, f1, s0, s1, replaced;
    thread_video_t *thr;
    dylib_t hold;
 
@@ -4734,26 +4739,34 @@ static void lane_vulkan_hw_ring(void)
          "vulkan hw ring lane: %u images handed over in %u frames",
          f1 - f0, (unsigned)VKHWLANE_FRAMES);
 
+   /* A dropped dupe replaces nothing, and a hardware frame queued
+    * behind another is waited for, not replaced: what the push
+    * replaces is a hardware frame queued behind a software one, or
+    * one a software frame displaces. Every hardware frame handed
+    * over and never drawn was replaced. */
    vkhwlane_inner        = thr->driver;
    vkhwlane_driver       = *thr->driver;
    vkhwlane_driver.frame = vkhwlane_frame;
+   vkhwlane_hw_drawn     = 0;
    set_driver(thr, &vkhwlane_driver);
-   m0 = (unsigned)thr->miss_count;
+   use_vk(2);
+   s0 = sent();
    run_frames(VKHWLANE_SLOW_FRAMES);
    video_thread_wait_idle();
-   m1 = (unsigned)thr->miss_count;
+   s1 = sent();
    set_driver(thr, vkhwlane_inner);
-   CHECK(m1 - m0 >= VKHWLANE_SLOW_FRAMES / 4,
-         "vulkan hw ring lane: only %u of %u frames replaced behind a slow"
-         " present: the lane proved nothing",
-         m1 - m0, (unsigned)VKHWLANE_SLOW_FRAMES);
+   replaced = s1 - s0 - vkhwlane_hw_drawn;
+   CHECK(replaced >= VKHWLANE_SLOW_FRAMES / 12,
+         "vulkan hw ring lane: %u of %u hardware frames replaced behind a"
+         " slow present: the lane proved nothing",
+         replaced, s1 - s0);
    run_frames(5);
 
    dylib_close(hold);
    if (failures == had)
       fprintf(stderr, "[pass] vulkan hw ring lane (%u images, %u of %u"
-            " frames replaced behind a slow present)\n",
-            f1 - f0, m1 - m0, (unsigned)VKHWLANE_SLOW_FRAMES);
+            " hardware frames replaced behind a slow present)\n",
+            f1 - f0, replaced, s1 - s0);
 #endif
 }
 
