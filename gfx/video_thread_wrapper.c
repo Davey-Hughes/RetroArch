@@ -2105,7 +2105,8 @@ static void video_thread_loop(void *data)
                   /* A hardware frame: the driver reads the core's
                    * image and command buffers from its own state,
                    * which this thread now fills from the ring slot. */
-                  video_thread_hw_before_frame(thr, thr->frame.slot[slot].hw_slot);
+                  video_thread_hw_before_frame(thr, thr->frame.slot[slot].hw_slot,
+                        false);
                   ret = thr->driver->frame(thr->driver_data,
                      RETRO_HW_FRAME_BUFFER_VALID,
                      thr->frame.slot[slot].dims,
@@ -2126,11 +2127,12 @@ static void video_thread_loop(void *data)
                   unsigned fdims    = thr->frame.slot[slot].dims;
                   unsigned fpitch   = thr->frame.slot[slot].pitch;
                   /* A dupe of a hardware frame draws the last presented
-                   * HW slot again, so it is installed and fenced like
-                   * the frame that first drew it: the core's wait on
-                   * the slot then covers this read as well. */
-                  int dupe_hw_slot  = thr->frame.slot[slot].dupe
-                     ? video_thread_hw_dupe_slot(thr) : -1;
+                   * HW slot again, and on Vulkan so does a software
+                   * frame, so it is installed and fenced like the frame
+                   * that first drew it: the core's wait on the slot
+                   * then covers this read as well. */
+                  int dupe_hw_slot  = video_thread_hw_dupe_slot(thr,
+                        thr->frame.slot[slot].dupe);
                   if (fdata && thr->frame.slot[slot].convert)
                      video_thread_convert(thr, thr->frame.slot[slot].convert,
                            &fdata, fdims, &fpitch);
@@ -2139,7 +2141,7 @@ static void video_thread_loop(void *data)
                      video_thread_filter(thr, &fdata, &fdims, &fpitch);
 #endif
                   if (dupe_hw_slot >= 0)
-                     video_thread_hw_before_frame(thr, dupe_hw_slot);
+                     video_thread_hw_before_frame(thr, dupe_hw_slot, true);
                   ret = thr->driver->frame(thr->driver_data,
                      fdata, fdims,
                      thr->frame.slot[slot].count,
