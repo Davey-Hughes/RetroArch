@@ -1828,8 +1828,8 @@ def check_kept_retry(res):
                       'per session)' % ready)
     if '[OpenXR] Headset controllers unavailable' in res.log:
         errors.append('headset controllers unavailable in a session')
-    # The core logs no pads with a kept Vulkan context: RetroArch's log
-    # shows the release when the session ends, and the new session's.
+    # RetroArch's log shows the release when the session ends, and the
+    # new session's.
     seq = controllers(res)
     if seq != ['live', 'released', 'live']:
         errors.append('controllers went %s, want live, released when the '
