@@ -9050,9 +9050,10 @@ static void vulkan_xr_draw_screen(vk_t *vk, unsigned s,
    memset(vk->tracker.mvp.data, 0, sizeof(vk->tracker.mvp.data));
 }
 
-/* The UI layer this frame drew, into slot s's image: copied at its own
- * size, else drawn scaled through the slot's view in the layer's own
- * format, so the encoded values stay as they are. */
+/* The UI layer this frame drew, into slot s's image: copied when it has
+ * the slot's size and the window's format, else drawn scaled through
+ * the slot's view in the window's format, so the encoded values stay as
+ * they are. */
 static void vulkan_xr_copy_ui(vk_t *vk, unsigned s, unsigned ui_dims)
 {
    VkImageCopy region;
@@ -9060,7 +9061,7 @@ static void vulkan_xr_copy_ui(vk_t *vk, unsigned s, unsigned ui_dims)
    unsigned dims  = vk->xr.set.slots[s].dims;
    VkImage dst    = vk->xr.slots[s].images[index];
 
-   if (dims != ui_dims)
+   if (dims != ui_dims || vk->views.ui_sdr)
    {
       VkClearValue clear;
       VkRenderPassBeginInfo rp;
@@ -9099,7 +9100,8 @@ static void vulkan_xr_copy_ui(vk_t *vk, unsigned s, unsigned ui_dims)
       vk->vk_vp.minDepth   = 0.0f;
       vk->vk_vp.maxDepth   = 1.0f;
       vk->tracker.dirty   |= VULKAN_DIRTY_DYNAMIC_BIT;
-      vulkan_views_texture(vk, &vk->views.ui, ui_dims, &tex);
+      vulkan_views_texture(&vk->views.ui, ui_dims, vk->views.ui_format,
+            &tex);
       quad.texture  = &tex;
       quad.mvp      = &vk->mvp_no_rot;
       quad.pipeline = vk->pipelines.alpha_premult;
