@@ -54,6 +54,15 @@
 #include "gfx/gfx_animation.h"
 
 #include "tasks/task_content.h"
+
+/* The keychain seals values with libretro-common/crypto, which the
+ * small consoles leave out; without it the file stays in the clear. */
+#if defined(HAVE_KEYCHAIN) && !defined(HAVE_CRYPTO)
+#undef HAVE_KEYCHAIN
+#endif
+#if defined(HAVE_CONFIGFILE) && defined(HAVE_KEYCHAIN)
+#include <file/keychain.h>
+#endif
 #include "tasks/tasks_internal.h"
 #include "accessibility.h"
 #ifdef ANDROID
@@ -1036,6 +1045,108 @@ static const char *config_sensitive_keys[] = {
    "kiosk_mode_password",
    "content_show_settings_password"
 };
+
+#ifdef HAVE_KEYCHAIN
+/**
+ * config_keychain_init:
+ *
+ * Derives the keychain master key from the per-install key file that
+ * sits beside retroarch.cfg. Idempotent. Logging is left to the
+ * callers: the first config load runs before file logging is up.
+ *
+ * Returns: true when sealed values can be opened and written.
+ **/
+static bool config_keychain_init(void)
+{
+   char keyfile_path[PATH_MAX_LENGTH];
+   char config_directory[DIR_MAX_LENGTH];
+
+   if (keychain_is_ready())
+      return true;
+   if (path_is_empty(RARCH_PATH_CONFIG))
+      return false;
+
+   fill_pathname_basedir(config_directory,
+         path_get(RARCH_PATH_CONFIG), sizeof(config_directory));
+   fill_pathname_join_special(keyfile_path, config_directory,
+         "retroarch-keychain.key", sizeof(keyfile_path));
+   return keychain_init(keyfile_path);
+}
+
+/**
+ * config_keychain_open_entries:
+ *
+ * Replaces every sealed sensitive value in @conf with its plaintext so
+ * the rest of the loader reads it like any other setting. A value that
+ * cannot be opened (sealed on another machine or install, tampered)
+ * is left in place: the loader ignores it as an unknown value and the
+ * next save carries it through untouched, so nothing is destroyed by
+ * a key file that is temporarily out of reach.
+ *
+ * Returns: number of values that could not be opened.
+ **/
+static unsigned config_keychain_open_entries(config_file_t *conf)
+{
+   unsigned i;
+   unsigned failed = 0;
+
+   for (i = 0; i < ARRAY_SIZE(config_sensitive_keys); i++)
+   {
+      char *plain;
+      const char *key = config_sensitive_keys[i];
+      struct config_entry_list *entry = config_get_entry(conf, key);
+      if (!entry || !keychain_value_is_sealed(entry->value))
+         continue;
+      if (!(plain = keychain_open_alloc(key, entry->value)))
+      {
+         /* Drop it from what the loader sees, or the blob itself
+          * would be read as the setting's value. The file on disk
+          * still has it; config_keychain_set() keeps it there. */
+         config_unset(conf, key);
+         failed++;
+         continue;
+      }
+      config_set_string(conf, key, plain);
+      free(plain);
+   }
+   return failed;
+}
+
+/* Sealed values the last save carried through unopened. */
+static unsigned config_keychain_carried = 0;
+
+/**
+ * config_keychain_set:
+ *
+ * Writes @value for @key into the keychain file being built, sealed
+ * when the keychain is ready. An empty @value does not overwrite a
+ * sealed blob already in the file: that is the value this machine
+ * could not open at load time, and it belongs to whoever can.
+ **/
+static void config_keychain_set(config_file_t *conf,
+      const char *key, const char *value)
+{
+   char *sealed;
+   const struct config_entry_list *have = config_get_entry(conf, key);
+
+   if (string_is_empty(value) && have
+         && keychain_value_is_sealed(have->value))
+   {
+      config_keychain_carried++;
+      return;
+   }
+
+   if (keychain_is_ready() && (sealed = keychain_seal_alloc(key, value)))
+   {
+      config_set_string(conf, key, sealed);
+      free(sealed);
+   }
+   else
+      config_set_string(conf, key, value);
+}
+#else
+#define config_keychain_set(conf, key, value) config_set_string(conf, key, value)
+#endif
 #endif
 
 struct defaults g_defaults;
@@ -1813,6 +1924,13 @@ static struct config_array_setting *populate_settings_array(
    SETTING_ARRAY("smb_client_server_address",             settings->arrays.smb_client_server_address, false, NULL, true);
    SETTING_ARRAY("smb_client_share",                      settings->arrays.smb_client_share, false, NULL, true);
    SETTING_ARRAY("smb_client_subdir",                     settings->arrays.smb_client_subdir, false, NULL, true);
+#endif
+#ifdef HAVE_NFSCLIENT
+   SETTING_ARRAY("nfs_server",                            settings->arrays.nfs_server, false, NULL, true);
+   SETTING_ARRAY("nfs_export",                            settings->arrays.nfs_export, false, NULL, true);
+   SETTING_ARRAY("nfs_subdir",                            settings->arrays.nfs_subdir, false, NULL, true);
+#endif
+#ifdef HAVE_SMBCLIENT
    SETTING_ARRAY_SENSITIVE("smb_client_username",         settings->arrays.smb_client_username, false, NULL, true);
    SETTING_ARRAY_SENSITIVE("smb_client_password",         settings->arrays.smb_client_password, false, NULL, true);
    SETTING_ARRAY("smb_client_workgroup",                  settings->arrays.smb_client_workgroup, false, NULL, true);
@@ -2443,7 +2561,7 @@ static struct config_bool_setting *populate_settings_bool(
 #ifdef HAVE_MENU
 #include "settings/settings_def_menu_online_updater_view.h"
 #endif
-#ifdef HAVE_SMBCLIENT
+#if defined(HAVE_MENU) && defined(HAVE_SMBCLIENT)
 #include "settings/settings_def_settings_show_smb.h"
 #endif
 #ifdef HAVE_MENU
@@ -3153,7 +3271,7 @@ static struct config_float_setting *populate_settings_float(
 #ifdef HAVE_MENU
 #include "settings/settings_def_menu_online_updater_view.h"
 #endif
-#ifdef HAVE_SMBCLIENT
+#if defined(HAVE_MENU) && defined(HAVE_SMBCLIENT)
 #include "settings/settings_def_settings_show_smb.h"
 #endif
 #ifdef HAVE_MENU
@@ -3407,6 +3525,13 @@ static struct config_uint_setting *populate_settings_uint(
       return NULL;
 
    SETTING_UINT("frontend_log_level",            &settings->uints.frontend_log_level, true, DEFAULT_FRONTEND_LOG_LEVEL, false);
+#ifdef HAVE_NFSCLIENT
+   SETTING_UINT("nfs_timeout",                   &settings->uints.nfs_timeout, true, DEFAULT_NFS_TIMEOUT, false);
+   SETTING_UINT("nfs_num_contexts",              &settings->uints.nfs_num_contexts, true, DEFAULT_NFS_NUM_CONTEXTS, false);
+   SETTING_UINT("nfs_port",                      &settings->uints.nfs_port, true, DEFAULT_NFS_PORT, false);
+   SETTING_UINT("nfs_mount_port",                &settings->uints.nfs_mount_port, true, DEFAULT_NFS_MOUNT_PORT, false);
+   SETTING_UINT("nfs_version",                   &settings->uints.nfs_version, true, DEFAULT_NFS_VERSION, false);
+#endif
    SETTING_UINT("core_updater_auto_backup_history_size", &settings->uints.core_updater_auto_backup_history_size, true, DEFAULT_CORE_UPDATER_AUTO_BACKUP_HISTORY_SIZE, false);
    SETTING_UINT("run_ahead_frames",              &settings->uints.run_ahead_frames, true, DEFAULT_RUN_AHEAD_FRAMES,  false);
 #ifdef HAVE_MENU
@@ -3831,7 +3956,7 @@ static struct config_uint_setting *populate_settings_uint(
 #ifdef HAVE_MENU
 #include "settings/settings_def_menu_online_updater_view.h"
 #endif
-#ifdef HAVE_SMBCLIENT
+#if defined(HAVE_MENU) && defined(HAVE_SMBCLIENT)
 #include "settings/settings_def_settings_show_smb.h"
 #endif
 #ifdef HAVE_MENU
@@ -4561,7 +4686,7 @@ static struct config_int_setting *populate_settings_int(
 #ifdef HAVE_MENU
 #include "settings/settings_def_menu_online_updater_view.h"
 #endif
-#ifdef HAVE_SMBCLIENT
+#if defined(HAVE_MENU) && defined(HAVE_SMBCLIENT)
 #include "settings/settings_def_settings_show_smb.h"
 #endif
 #ifdef HAVE_MENU
@@ -5156,7 +5281,7 @@ static struct config_int_setting *populate_settings_int(
 #ifdef HAVE_MENU
 #include "settings/settings_def_menu_online_updater_view.h"
 #endif
-#ifdef HAVE_SMBCLIENT
+#if defined(HAVE_MENU) && defined(HAVE_SMBCLIENT)
 #include "settings/settings_def_settings_show_smb.h"
 #endif
 #ifdef HAVE_MENU
@@ -6566,6 +6691,11 @@ static bool config_load_file(global_t *global,
             && path_is_valid(credentials_path))
       {
          bool result = config_append_file(conf, credentials_path);
+#ifdef HAVE_KEYCHAIN
+         bool     keychain_ok = result && config_keychain_init();
+         unsigned unopened    = keychain_ok
+            ? config_keychain_open_entries(conf) : 0;
+#endif
          /* The first load runs before file logging is up; logging
           * here would go to the console. Same gate as the append
           * blocks below. */
@@ -6576,6 +6706,15 @@ static bool config_load_file(global_t *global,
             if (!result)
                RARCH_ERR("[Config] Failed to merge credentials from \"%s\".\n",
                      credentials_path);
+#ifdef HAVE_KEYCHAIN
+            else if (!keychain_ok)
+               RARCH_WARN("[Config] Keychain key file unavailable, "
+                     "credentials stay in the clear.\n");
+            else if (unopened)
+               RARCH_WARN("[Config] %u credential(s) were sealed on another "
+                     "machine or install and could not be opened.\n",
+                     unopened);
+#endif
          }
       }
    }
@@ -8698,13 +8837,22 @@ static bool config_save_credentials(
    if (!conf)
       return false;
 
+#ifdef HAVE_KEYCHAIN
+   config_keychain_carried = 0;
+   if (config_keychain_init())
+      config_set_int(conf, "keychain_version", 1);
+   else
+      RARCH_WARN("[Config] Keychain key file unavailable, "
+            "credentials are written in the clear.\n");
+#endif
+
    if (array_settings && (array_settings_size > 0))
    {
       for (i = 0; i < (unsigned)array_settings_size; i++)
       {
          if (!(array_settings[i].flags & CFG_BOOL_FLG_SENSITIVE))
             continue;
-         config_set_string(conf,
+         config_keychain_set(conf,
                array_settings[i].ident,
                array_settings[i].ptr);
       }
@@ -8716,7 +8864,7 @@ static bool config_save_credentials(
       {
          if (!(path_settings[i].flags & CFG_BOOL_FLG_SENSITIVE))
             continue;
-         config_set_path(conf,
+         config_keychain_set(conf,
                path_settings[i].ident,
                path_settings[i].ptr);
       }
@@ -8724,7 +8872,10 @@ static bool config_save_credentials(
 
    /* Secrets for features compiled out of this build have no
     * settings entry above; carry them over from retroarch.cfg
-    * as-is so they are not lost when it is stripped. */
+    * as-is so they are not lost when it is stripped. Anything
+    * already sealed in the keychain file (opened or not) is kept
+    * sealed; only plaintext still in retroarch.cfg gets sealed on
+    * its way over. */
    if (main_conf)
    {
       for (i = 0; i < ARRAY_SIZE(config_sensitive_keys); i++)
@@ -8735,18 +8886,27 @@ static bool config_save_credentials(
             continue;
          entry = config_get_entry(main_conf, key);
          if (entry && entry->value)
-            config_set_string(conf, key, entry->value);
+            config_keychain_set(conf, key, entry->value);
       }
    }
 
    ret = config_file_write(conf, credentials_path, true);
    config_file_free(conf);
 
+#ifdef HAVE_KEYCHAIN
+   /* Load-time logging is not up yet for the first config, so this
+    * is where the user hears about it. */
+   if (ret && config_keychain_carried)
+      RARCH_WARN("[Config] %u credential(s) in \"%s\" were sealed on "
+            "another machine or install, could not be opened here and "
+            "were kept as they are.\n",
+            config_keychain_carried, credentials_path);
+#endif
+
    if (ret)
    {
-      /* The file holds plaintext secrets: make it owner-only.
-       * Not fatal on failure (e.g. FAT/exFAT media), the write
-       * itself succeeded. */
+      /* Sealed or not, make the file owner-only. Not fatal on
+       * failure (e.g. FAT/exFAT media), the write itself succeeded. */
       if (!path_set_private(credentials_path))
          RARCH_WARN("[Config] Could not restrict permissions on \"%s\".\n",
                credentials_path);
@@ -10815,6 +10975,9 @@ void retroarch_config_deinit(void)
    if (config_st)
       free(config_st);
    config_st = NULL;
+#if defined(HAVE_CONFIGFILE) && defined(HAVE_KEYCHAIN)
+   keychain_deinit();
+#endif
 }
 
 void retroarch_config_init(void)

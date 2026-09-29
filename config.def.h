@@ -2215,3 +2215,15 @@
 #define DEFAULT_SMB_CLIENT_TIMEOUT 5
 #define DEFAULT_SMB_CLIENT_MAX_TIMEOUT 20
 #endif
+
+/* NFS client (nfs://): pool size, timeout in seconds, and the NFS and
+ * MOUNT ports, 0 meaning ask the server's portmapper. */
+#define DEFAULT_NFS_NUM_CONTEXTS 4
+#define DEFAULT_NFS_TIMEOUT 5
+#define DEFAULT_NFS_PORT 0
+#define DEFAULT_NFS_MOUNT_PORT 0
+
+/* NFS protocol version for nfs://: 3 (default) or 4. Version 4 needs
+ * no portmapper or MOUNT service and takes the export as the server's
+ * pseudo-filesystem path. */
+#define DEFAULT_NFS_VERSION 3

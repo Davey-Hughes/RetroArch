@@ -69,18 +69,27 @@ bool video_thread_get_hw_render_interface(void *data,
 int video_thread_hw_publish(struct thread_video *thr);
 
 /* Video thread, around the driver's frame call for a slot the push
- * published: install the slot's state before, fence-signal after. */
-void video_thread_hw_before_frame(struct thread_video *thr, int hw_slot);
+ * published: install the slot's state before, fence-signal after.
+ * reread: a later frame reading the slot again, which gets its image
+ * but not its semaphores or command buffers. */
+void video_thread_hw_before_frame(struct thread_video *thr, int hw_slot,
+      bool reread);
 void video_thread_hw_after_frame(struct thread_video *thr, int hw_slot);
 
-/* Video thread, under thr->lock, when it claims a frame: the HW slot
+/* Main thread, when the push replaces a frame the video thread never
+ * claimed: the HW slot that frame named, or -1. */
+void video_thread_hw_drop(struct thread_video *thr, int hw_slot);
+
+/* Video thread, when it claims a frame: the HW slot
  * that frame reads, so a later dupe knows what it re-reads. */
 void video_thread_hw_note_claim(struct thread_video *thr, int hw_slot);
 
-/* Video thread, for a dupe: the HW slot it re-reads, to install and
- * fence around the driver's NULL frame exactly as for a real frame; -1
- * if no HW frame has been presented. */
-int video_thread_hw_dupe_slot(struct thread_video *thr);
+/* Video thread, for a frame with no HW slot of its own: the HW slot
+ * the driver re-reads for it, to install and fence around the frame
+ * call as for a real frame. A dupe re-reads the last one presented,
+ * and on Vulkan so does a software frame. -1 if the frame reads none,
+ * or no HW frame has been presented. */
+int video_thread_hw_dupe_slot(struct thread_video *thr, bool dupe);
 
 /* OpenGL: takes the core's context on the calling (main) thread and
  * sets the ring up. Must run before the core's context_reset. */

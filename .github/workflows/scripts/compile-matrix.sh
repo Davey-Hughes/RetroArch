@@ -671,6 +671,23 @@ check_gates "gates: no subsystems"   "$UIDEFS"                                  
 check_gates "gates: GPU index, EGL only"    "$UIDEFS -DHAVE_EGL -DHAVE_OPENGL" configuration.c
 check_gates "gates: GPU index, Vulkan only" "$UIDEFS -DHAVE_VULKAN"            configuration.c
 
+# griffin is one translation unit, so a file-local name that is fine on
+# its own collides there: p256's fmul against gfx's did, and only the
+# MSVC job builds griffin. Both crypto shapes, on Linux, for free.
+check_gates "griffin: HAVE_CRYPTO + keychain"  "$UIDEFS -DRARCH_INTERNAL -DHAVE_GRIFFIN=1 -DHAVE_MENU -DHAVE_RGUI -DHAVE_CONFIGFILE -DHAVE_CRYPTO -DHAVE_KEYCHAIN -D_GNU_SOURCE" griffin/griffin.c
+check_gates "griffin: HAVE_RETROSSL"            "$UIDEFS -DRARCH_INTERNAL -DHAVE_GRIFFIN=1 -DHAVE_MENU -DHAVE_RGUI -DHAVE_CONFIGFILE -DHAVE_CRYPTO -DHAVE_KEYCHAIN -DHAVE_NETWORKING -DHAVE_SSL -DHAVE_RETROSSL -D_GNU_SOURCE" griffin/griffin.c
+check_gates "griffin: HAVE_RETROSMB + cloud sync"  "$UIDEFS -DRARCH_INTERNAL -DHAVE_GRIFFIN=1 -DHAVE_MENU -DHAVE_RGUI -DHAVE_CONFIGFILE -DHAVE_CRYPTO -DHAVE_NETWORKING -DHAVE_SMBCLIENT -DHAVE_RETROSMB -DHAVE_CLOUDSYNC -D_GNU_SOURCE" griffin/griffin.c
+# The SMB show-settings row read a HAVE_MENU-only default under
+# HAVE_SMBCLIENT alone; with the built-in client on by default that
+# broke every --disable-menu build. configuration.c with SMB and no
+# menu, and the same with no menu at all.
+check_gates "gates: SMB client, no menu"        "$UIDEFS -DHAVE_CONFIGFILE -DHAVE_NETWORKING -DHAVE_CRYPTO -DHAVE_SMBCLIENT -DHAVE_RETROSMB -D_GNU_SOURCE" configuration.c
+check_gates "gates: NFS client, no menu"        "$UIDEFS -DHAVE_CONFIGFILE -DHAVE_NETWORKING -DHAVE_NFSCLIENT -DHAVE_RETRONFS -D_GNU_SOURCE" configuration.c
+check_gates "gates: NFS client + menu"          "$UIDEFS -DHAVE_CONFIGFILE -DHAVE_NETWORKING -DHAVE_NFSCLIENT -DHAVE_RETRONFS -DHAVE_MENU -DHAVE_RGUI -D_GNU_SOURCE" configuration.c menu/menu_setting.c menu/menu_displaylist.c menu/cbs/menu_cbs_ok.c menu/cbs/menu_cbs_deferred_push.c menu/cbs/menu_cbs_sublabel.c menu/cbs/menu_cbs_title.c
+check_gates "gates: no menu, no SMB"            "$UIDEFS -DHAVE_CONFIGFILE -DHAVE_NETWORKING -D_GNU_SOURCE" configuration.c
+check_gates "griffin: HAVE_RETRONFS"            "$UIDEFS -DRARCH_INTERNAL -DHAVE_GRIFFIN=1 -DHAVE_MENU -DHAVE_RGUI -DHAVE_CONFIGFILE -DHAVE_NETWORKING -DHAVE_NFSCLIENT -DHAVE_RETRONFS -D_GNU_SOURCE" griffin/griffin.c
+check_gates "griffin: no crypto (console shape)" "$UIDEFS -DRARCH_INTERNAL -DHAVE_GRIFFIN=1 -DHAVE_MENU -DHAVE_RGUI -DHAVE_CONFIGFILE -DHAVE_KEYCHAIN -D_GNU_SOURCE" griffin/griffin.c
+
 # A subsystem's own unit is built only when its gate is on, so each is
 # checked with that gate on and the user interface off: the achievement
 # and netplay widgets, and the menu entries either drives, are the edges

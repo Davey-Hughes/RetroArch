@@ -74,8 +74,13 @@
 #include <rthreads/retro_eventcount.h>
 #endif
 
+#include <queues/fifo_queue.h>
+#include <audio/conversion/float_to_s32.h>
+
 #include "../audio_upmix.h"
 #include "../audio_driver.h"
+#include "../microphone_driver.h"
+#include "../../configuration.h"
 #include "../../verbosity.h"
 
 /* ---- identifiers ------------------------------------------------- */
@@ -210,6 +215,9 @@ enum
 #endif
 #ifndef FILE_WRITE_ACCESS
 #define FILE_WRITE_ACCESS 0x0002
+#endif
+#ifndef FILE_READ_ACCESS
+#define FILE_READ_ACCESS 0x0001
 #endif
 
 #define RA_FILE_DEVICE_KS 0x0000002f
@@ -380,6 +388,11 @@ typedef struct
 #define RA_IOCTL_KS_WRITE_STREAM \
    (((RA_FILE_DEVICE_KS) << 16) | ((FILE_WRITE_ACCESS) << 14) \
     | ((0x004) << 2) | (METHOD_NEITHER))
+/* IOCTL_KS_READ_STREAM:
+ * CTL_CODE(FILE_DEVICE_KS, 0x005, METHOD_NEITHER, FILE_READ_ACCESS). */
+#define RA_IOCTL_KS_READ_STREAM \
+   (((RA_FILE_DEVICE_KS) << 16) | ((FILE_READ_ACCESS) << 14) \
+    | ((0x005) << 2) | (METHOD_NEITHER))
 
 /* The audio property set, for the pin's own position. PlayOffset is
  * what the device has played, in bytes, and it is the hardware's
@@ -751,24 +764,33 @@ static ra_ksmultiple_item_t *wdmks_pin_property_multi(HANDLE filter,
 
 /* ---- what a pin will take ---------------------------------------- */
 
-/* A render pin, and the formats it said it would accept. The ranges a
- * pin reports are ranges rather than a list of formats: a minimum and
- * maximum rate, a minimum and maximum width, and a channel ceiling.
- * A pin may report several, and what this keeps is the widest of each
- * across all of them - a pin offering 44100-48000 stereo and
- * 44100-192000 8-channel is a pin that can do 192000 and 8, so the
- * ranges are collapsed here and the exact combination is settled when
- * the format is proposed. */
+/* One data range a pin reports: a minimum and maximum rate, a minimum
+ * and maximum width, a channel ceiling, and which sample type the
+ * three bound together. */
 typedef struct
 {
-   ULONG pin_id;
    ULONG max_channels;
    ULONG min_bits;
    ULONG max_bits;
    ULONG min_rate;
    ULONG max_rate;
-   bool  takes_pcm;
-   bool  takes_float;
+   bool  is_float;
+} wdmks_range_t;
+
+/* A render pin, and the formats it said it would accept. The ranges
+ * are kept apart, because each one binds its bounds together: a pin
+ * offering 44100-48000 stereo and 44100-192000 8-channel has not
+ * offered 192000 stereo, and a candidate is in the pin only when one
+ * range holds all of it at once. Past the cap the rest are folded into
+ * the last one kept, which widens it to the box the whole list would
+ * have been - still a pin the proposal settles. */
+#define WDMKS_MAX_RANGES 12
+
+typedef struct
+{
+   wdmks_range_t ranges[WDMKS_MAX_RANGES];
+   ULONG         pin_id;
+   unsigned      range_count;
 } wdmks_pin_t;
 
 /* One audio filter: the device path to open it by, the name to show,
@@ -779,35 +801,27 @@ typedef struct
 {
    WCHAR       *path;
    char        *name;
-   wdmks_pin_t  pins[WDMKS_MAX_PINS];
+   wdmks_pin_t *pins;
    unsigned     pin_count;
    bool         wavert;
 } wdmks_device_t;
 
-/* Reads one pin's data ranges and folds them into the pin record.
+/* Reads one pin's data ranges into the pin record, one kept per range.
  * Returns false where the pin reports nothing usable, which is the
  * normal answer for the many pins on a filter that are not audio
  * sinks at all. */
-static bool wdmks_pin_read_ranges(HANDLE filter, ULONG pin_id,
+static bool wdmks_pin_fold_ranges(const ra_ksmultiple_item_t *item,
       wdmks_pin_t *pin)
 {
-   ra_ksmultiple_item_t *item;
-   unsigned char        *walk;
-   unsigned char        *end;
-   ULONG                 i;
-   bool                  any = false;
-
-   if (!(item = wdmks_pin_property_multi(filter, pin_id,
-               RA_KSPROPERTY_PIN_DATARANGES)))
-      return false;
-
-   walk = (unsigned char*)(item + 1);
-   end  = (unsigned char*)item + item->Size;
+   const unsigned char *walk = (const unsigned char*)(item + 1);
+   const unsigned char *end  = (const unsigned char*)item + item->Size;
+   ULONG                i;
+   bool                 any  = false;
 
    for (i = 0; i < item->Count; i++)
    {
-      ra_ksdatarange_audio_t *r = (ra_ksdatarange_audio_t*)walk;
-      ULONG                   step;
+      const ra_ksdatarange_audio_t *r = (const ra_ksdatarange_audio_t*)walk;
+      ULONG                         step;
 
       /* Each range says its own length, and the next follows it
        * aligned to eight. A length that does not fit inside what the
@@ -831,48 +845,72 @@ static bool wdmks_pin_read_ranges(HANDLE filter, ULONG pin_id,
          bool flt   = !memcmp(&r->DataRange.f.SubFormat,
                &ra_ks_dataformat_subtype_float, sizeof(GUID));
 
-         if (pcm || flt)
+         if ((pcm || flt) && r->MaximumChannels && r->MaximumSampleFrequency)
          {
-            if (pcm)
-               pin->takes_pcm   = true;
-            if (flt)
-               pin->takes_float = true;
+            wdmks_range_t *k;
 
-            if (!any)
+            if (pin->range_count < WDMKS_MAX_RANGES)
             {
-               pin->max_channels = r->MaximumChannels;
-               pin->min_bits     = r->MinimumBitsPerSample;
-               pin->max_bits     = r->MaximumBitsPerSample;
-               pin->min_rate     = r->MinimumSampleFrequency;
-               pin->max_rate     = r->MaximumSampleFrequency;
+               k               = &pin->ranges[pin->range_count++];
+               k->max_channels = r->MaximumChannels;
+               k->min_bits     = r->MinimumBitsPerSample;
+               k->max_bits     = r->MaximumBitsPerSample;
+               k->min_rate     = r->MinimumSampleFrequency;
+               k->max_rate     = r->MaximumSampleFrequency;
+               k->is_float     = flt;
             }
             else
             {
-               if (r->MaximumChannels        > pin->max_channels)
-                  pin->max_channels = r->MaximumChannels;
-               if (r->MinimumBitsPerSample   < pin->min_bits)
-                  pin->min_bits     = r->MinimumBitsPerSample;
-               if (r->MaximumBitsPerSample   > pin->max_bits)
-                  pin->max_bits     = r->MaximumBitsPerSample;
-               if (r->MinimumSampleFrequency < pin->min_rate)
-                  pin->min_rate     = r->MinimumSampleFrequency;
-               if (r->MaximumSampleFrequency > pin->max_rate)
-                  pin->max_rate     = r->MaximumSampleFrequency;
+               unsigned j = WDMKS_MAX_RANGES;
+               k          = NULL;
+               while (j--)
+                  if (pin->ranges[j].is_float == flt)
+                  {
+                     k = &pin->ranges[j];
+                     break;
+                  }
+               if (k)
+               {
+                  if (r->MaximumChannels        > k->max_channels)
+                     k->max_channels = r->MaximumChannels;
+                  if (r->MinimumBitsPerSample   < k->min_bits)
+                     k->min_bits     = r->MinimumBitsPerSample;
+                  if (r->MaximumBitsPerSample   > k->max_bits)
+                     k->max_bits     = r->MaximumBitsPerSample;
+                  if (r->MinimumSampleFrequency < k->min_rate)
+                     k->min_rate     = r->MinimumSampleFrequency;
+                  if (r->MaximumSampleFrequency > k->max_rate)
+                     k->max_rate     = r->MaximumSampleFrequency;
+               }
             }
             any = true;
          }
       }
       walk += step;
    }
-
-   free(item);
-   return any && pin->max_channels > 0 && pin->max_rate > 0;
+   return any;
 }
 
-/* Finds the render pins on an open filter: the ones audio flows INTO
- * (a render filter's sink), that this side may be the source for, and
- * that report a usable audio range. */
-static void wdmks_filter_read_pins(HANDLE filter, wdmks_device_t *dev)
+static bool wdmks_pin_read_ranges(HANDLE filter, ULONG pin_id,
+      wdmks_pin_t *pin)
+{
+   ra_ksmultiple_item_t *item;
+   bool                  any;
+
+   if (!(item = wdmks_pin_property_multi(filter, pin_id,
+               RA_KSPROPERTY_PIN_DATARANGES)))
+      return false;
+   any = wdmks_pin_fold_ranges(item, pin);
+   free(item);
+   return any;
+}
+
+/* Finds the streaming pins on an open filter: the ones audio flows
+ * through in the given direction - INTO a render filter, OUT of a
+ * capture one - that this side may connect to, and that report a
+ * usable audio range. */
+static void wdmks_filter_read_pins(HANDLE filter, wdmks_device_t *dev,
+      ULONG flow_wanted)
 {
    ra_ksproperty_t prop;
    ULONG           pin_count = 0;
@@ -885,16 +923,19 @@ static void wdmks_filter_read_pins(HANDLE filter, wdmks_device_t *dev)
          != sizeof(pin_count))
       return;
 
+   if (!(dev->pins = (wdmks_pin_t*)calloc(WDMKS_MAX_PINS, sizeof(*dev->pins))))
+      return;
+
    for (i = 0; i < pin_count && dev->pin_count < WDMKS_MAX_PINS; i++)
    {
-      ULONG       flow = 0;
-      ULONG       comm = 0;
-      wdmks_pin_t pin;
+      ULONG        flow = 0;
+      ULONG        comm = 0;
+      wdmks_pin_t *pin  = &dev->pins[dev->pin_count];
 
       if (wdmks_pin_property(filter, i, RA_KSPROPERTY_PIN_DATAFLOW,
                &flow, sizeof(flow)) != sizeof(flow))
          continue;
-      if (flow != RA_KSPIN_DATAFLOW_IN)
+      if (flow != flow_wanted)
          continue;
 
       if (wdmks_pin_property(filter, i, RA_KSPROPERTY_PIN_COMMUNICATION,
@@ -904,12 +945,12 @@ static void wdmks_filter_read_pins(HANDLE filter, wdmks_device_t *dev)
             && comm != RA_KSPIN_COMMUNICATION_BOTH)
          continue;
 
-      memset(&pin, 0, sizeof(pin));
-      pin.pin_id = i;
-      if (!wdmks_pin_read_ranges(filter, i, &pin))
+      memset(pin, 0, sizeof(*pin));
+      pin->pin_id = i;
+      if (!wdmks_pin_read_ranges(filter, i, pin))
          continue;
 
-      dev->pins[dev->pin_count++] = pin;
+      dev->pin_count++;
    }
 }
 
@@ -923,9 +964,12 @@ static void wdmks_filter_read_pins(HANDLE filter, wdmks_device_t *dev)
  * skipped without complaint: a machine has several of these - the
  * capture side of a card, a filter that is busy, a virtual device
  * whose driver declines - and they are not errors. */
-static wdmks_device_t *wdmks_devices_scan(unsigned *count_out)
+static wdmks_device_t *wdmks_devices_scan(unsigned *count_out,
+      bool capture)
 {
    HANDLE          list;
+   const GUID     *alias_guid = capture
+      ? &ra_ks_category_capture : &ra_ks_category_render;
    wdmks_device_t *devices = NULL;
    unsigned        count   = 0;
    unsigned        cap     = 0;
@@ -962,7 +1006,7 @@ static wdmks_device_t *wdmks_devices_scan(unsigned *count_out)
        * topology node, and is not asked anything further. */
       memset(&alias, 0, sizeof(alias));
       alias.cbSize = sizeof(alias);
-      if (!g_setupapi.get_alias(list, &iface, &ra_ks_category_render, &alias))
+      if (!g_setupapi.get_alias(list, &iface, alias_guid, &alias))
          continue;
       if (!(alias.Flags & 0x00000001) || (alias.Flags & 0x00000002))
          continue;   /* not active, or removed */
@@ -1011,13 +1055,15 @@ static wdmks_device_t *wdmks_devices_scan(unsigned *count_out)
          free(detail);
          continue;
       }
-      wdmks_filter_read_pins(filter, &dev);
+      wdmks_filter_read_pins(filter, &dev,
+            capture ? RA_KSPIN_DATAFLOW_OUT : RA_KSPIN_DATAFLOW_IN);
       CloseHandle(filter);
 
       if (!dev.pin_count)
       {
-         RARCH_DBG("[WDM-KS] A filter opened but offers no render pin"
-               " this driver can write to.\n");
+         RARCH_DBG("[WDM-KS] A filter opened but offers no %s pin"
+               " this driver can use.\n", capture ? "capture" : "render");
+         free(dev.pins);
          free(detail);
          continue;
       }
@@ -1050,6 +1096,7 @@ static wdmks_device_t *wdmks_devices_scan(unsigned *count_out)
 
       if (!dev.path)
       {
+         free(dev.pins);
          free(dev.name);
          continue;
       }
@@ -1061,6 +1108,7 @@ static wdmks_device_t *wdmks_devices_scan(unsigned *count_out)
                next * sizeof(*devices));
          if (!grow)
          {
+            free(dev.pins);
             free(dev.path);
             free(dev.name);
             break;
@@ -1072,8 +1120,8 @@ static wdmks_device_t *wdmks_devices_scan(unsigned *count_out)
    }
 
    g_setupapi.destroy_list(list);
-   RARCH_DBG("[WDM-KS] %u render filter(s) usable of %u interface(s) seen.\n",
-         count, (unsigned)index);
+   RARCH_DBG("[WDM-KS] %u %s filter(s) usable of %u interface(s) seen.\n",
+         count, capture ? "capture" : "render", (unsigned)index);
    *count_out = count;
    return devices;
 }
@@ -1085,6 +1133,7 @@ static void wdmks_devices_free(wdmks_device_t *devices, unsigned count)
       return;
    for (i = 0; i < count; i++)
    {
+      free(devices[i].pins);
       free(devices[i].path);
       free(devices[i].name);
    }
@@ -1106,7 +1155,7 @@ static void *wdmks_device_list_new(void *data)
       return NULL;
 
    attr.i  = 0;
-   devices = wdmks_devices_scan(&count);
+   devices = wdmks_devices_scan(&count, false);
 
    for (i = 0; i < count; i++)
    {
@@ -1187,20 +1236,29 @@ typedef struct
 static const unsigned wdmks_rate_order[] =
 { 48000, 44100, 96000, 88200, 192000, 32000, 22050, 16000, 11025, 8000 };
 
+/* Whether one range holds every bound of a candidate at once. */
+static bool wdmks_format_in_range(const wdmks_range_t *r,
+      const wdmks_format_t *fmt)
+{
+   if (r->is_float != fmt->is_float)
+      return false;
+   if (fmt->rate < r->min_rate || fmt->rate > r->max_rate)
+      return false;
+   if (fmt->channels > r->max_channels || fmt->channels == 0)
+      return false;
+   if (fmt->bits < r->min_bits || fmt->bits > r->max_bits)
+      return false;
+   return true;
+}
+
 static bool wdmks_format_in_pin(const wdmks_pin_t *pin,
       const wdmks_format_t *fmt)
 {
-   if (fmt->rate < pin->min_rate || fmt->rate > pin->max_rate)
-      return false;
-   if (fmt->channels > pin->max_channels || fmt->channels == 0)
-      return false;
-   if (fmt->bits < pin->min_bits || fmt->bits > pin->max_bits)
-      return false;
-   if (fmt->is_float && !pin->takes_float)
-      return false;
-   if (!fmt->is_float && !pin->takes_pcm)
-      return false;
-   return true;
+   unsigned i;
+   for (i = 0; i < pin->range_count; i++)
+      if (wdmks_format_in_range(&pin->ranges[i], fmt))
+         return true;
+   return false;
 }
 
 /* Fills a WAVEFORMATEX for a format. Mono and stereo go out as the
@@ -1289,7 +1347,7 @@ typedef struct
  * the device does not want, and is how the ranges are turned into
  * fact. */
 static HANDLE wdmks_pin_try(HANDLE filter, ULONG pin_id,
-      const wdmks_format_t *fmt, bool looped)
+      const wdmks_format_t *fmt, bool looped, DWORD access)
 {
    /* Big enough for either form. The extensible one is a
     * WAVEFORMATEX with twenty-two bytes behind it, and the data
@@ -1346,7 +1404,7 @@ static HANDLE wdmks_pin_try(HANDLE filter, ULONG pin_id,
       return INVALID_HANDLE_VALUE;
 
    {
-      DWORD res = g_ks_create_pin(filter, connect, GENERIC_WRITE, &pin);
+      DWORD res = g_ks_create_pin(filter, connect, access, &pin);
       if (res != 0)
       {
          /* Only the first refusal per pin is said, and at a level
@@ -1432,29 +1490,70 @@ static HANDLE wdmks_pin_try_ac3(HANDLE filter, ULONG pin_id,
    return pin;
 }
 
+/* The sample shapes proposed, in preference order: float first (the
+ * frontend's own pipeline is float), then the integer widths this
+ * driver converts into - 32, 24 in 32 - and 16 last. 24-in-32 and
+ * 32-bit integer are the same size as float, so the conversion is a
+ * copy that changes nothing else about a write or a read. */
+typedef struct
+{
+   unsigned bits;
+   unsigned container_bits;
+   bool     is_float;
+} wdmks_shape_t;
+
+static const wdmks_shape_t wdmks_shape_order[] =
+{
+   { 32, 32, true  },
+   { 32, 32, false },
+   { 24, 32, false },
+   { 16, 16, false }
+};
+
+/* Whether a 32-bit-wide range exists at all, of either type: a pin
+ * advertising only 32-bit PCM has taken 32-bit float when proposed. */
+static bool wdmks_pin_has_wide(const wdmks_pin_t *pin, unsigned rate,
+      unsigned channels)
+{
+   unsigned i;
+   for (i = 0; i < pin->range_count; i++)
+   {
+      const wdmks_range_t *r = &pin->ranges[i];
+      if (     rate >= r->min_rate && rate <= r->max_rate
+            && channels <= r->max_channels
+            && r->min_bits <= 32 && r->max_bits >= 32)
+         return true;
+   }
+   return false;
+}
+
+static const char *wdmks_shape_name(const wdmks_format_t *fmt)
+{
+   if (fmt->is_float)
+      return "32-bit float";
+   if (fmt->container_bits == 16)
+      return "16-bit integer";
+   return fmt->bits == 24 ? "24-in-32-bit integer" : "32-bit integer";
+}
+
 /* Opens the best format a pin will actually take, rather than the
- * best its ranges claim. Preference order: the rate asked for before
- * any other, float before integer where the pin says it takes both
- * (the frontend's own pipeline is float, so that is one conversion
- * fewer), and the widest integer before the narrowest. */
+ * best its ranges claim: the rate asked for before any other, and the
+ * shapes in wdmks_shape_order. A pin whose ranges name no float
+ * subtype is still offered float once, as a last resort where it has
+ * a 32-bit-wide range: the ranges some class drivers report are
+ * narrower than what their pins accept, and a refusal costs one call. */
 static bool wdmks_pin_open(HANDLE filter, const wdmks_pin_t *pin,
-      unsigned wanted_rate, unsigned channels, bool looped,
+      unsigned wanted_rate, unsigned channels, bool looped, DWORD access,
       wdmks_stream_t *out)
 {
    unsigned r;
+   unsigned pass;
 
+   for (pass = 0; pass < 2; pass++)
    for (r = 0; r <= sizeof(wdmks_rate_order) / sizeof(*wdmks_rate_order); r++)
    {
       unsigned rate = (r == 0) ? wanted_rate : wdmks_rate_order[r - 1];
       unsigned b;
-      /* Only what the frontend can hand over: 32-bit float, or
-       * 16-bit integer. It sends one or the other according to what
-       * use_float() says, and nothing here converts - so a pin opened
-       * at 24 or 32-bit integer is a pin being fed samples half the
-       * width it is reading, which plays at the wrong pitch rather
-       * than failing. Those two widths belong here only once
-       * something converts into them. */
-      static const unsigned bits_order[] = { 32, 16 };
 
       if (!rate)
          continue;
@@ -1463,21 +1562,28 @@ static bool wdmks_pin_open(HANDLE filter, const wdmks_pin_t *pin,
       if (r > 0 && rate == wanted_rate)
          continue;
 
-      for (b = 0; b < sizeof(bits_order) / sizeof(*bits_order); b++)
+      for (b = 0; b < sizeof(wdmks_shape_order) / sizeof(*wdmks_shape_order); b++)
       {
          wdmks_format_t fmt;
          HANDLE         h;
 
-         fmt.rate     = rate;
-         fmt.channels = channels;
-         fmt.bits     = bits_order[b];
-         fmt.is_float = (b == 0);
-         fmt.container_bits = fmt.bits;
+         fmt.rate           = rate;
+         fmt.channels       = channels;
+         fmt.bits           = wdmks_shape_order[b].bits;
+         fmt.container_bits = wdmks_shape_order[b].container_bits;
+         fmt.is_float       = wdmks_shape_order[b].is_float;
 
-         if (!wdmks_format_in_pin(pin, &fmt))
+         if (pass == 0)
+         {
+            if (!wdmks_format_in_pin(pin, &fmt))
+               continue;
+         }
+         else if (     !fmt.is_float
+                    || wdmks_format_in_pin(pin, &fmt)
+                    || !wdmks_pin_has_wide(pin, rate, channels))
             continue;
 
-         h = wdmks_pin_try(filter, pin->pin_id, &fmt, looped);
+         h = wdmks_pin_try(filter, pin->pin_id, &fmt, looped, access);
          if (h == INVALID_HANDLE_VALUE)
             continue;
 
@@ -1486,16 +1592,17 @@ static bool wdmks_pin_open(HANDLE filter, const wdmks_pin_t *pin,
          out->fmt    = fmt;
          out->looped = looped;
          RARCH_LOG("[WDM-KS] Pin %u opened %s at %u Hz, %u channel(s),"
-               " %s, %u-byte frame.\n",
+               " %s, %u-byte frame%s.\n",
                (unsigned)pin->pin_id, looped ? "(WaveRT)" : "(WaveCyclic)",
-               fmt.rate, fmt.channels,
-               fmt.is_float ? "32-bit float" : "16-bit integer",
-               fmt.channels * (fmt.container_bits / 8));
+               fmt.rate, fmt.channels, wdmks_shape_name(&fmt),
+               fmt.channels * (fmt.container_bits / 8),
+               pass ? ", outside the ranges it reported" : "");
          return true;
       }
    }
    return false;
 }
+
 
 /* The pin's state. A pin is driven STOP to ACQUIRE to PAUSE to RUN on
  * the way up and back down the same way: the transitions are ordered
@@ -1596,7 +1703,8 @@ typedef struct
    retro_atomic_64_t   rt_frames_pub;  /* absolute frames played */
    retro_atomic_int_t  clk_ppm_pub;   /* AUDIO_CLOCK_PPM_NONE until known */
 #endif
-   volatile ULONG *rt_pos;      /* byte offset, updated by the device */
+   volatile ULONG *rt_pos;      /* byte position, updated by the device */
+   bool            rt_pos_wide; /* the register is 64 bits, not 32 */
    bool            rt_presentation;
    retro_time_t    rt_last_usec;  /* when the cursor was last read */
    HANDLE          rt_event;    /* signalled per notification, if offered */
@@ -1664,6 +1772,10 @@ typedef struct
     * one frame to the receiver and has to go out whole. */
    size_t          ac3_burst_len;
    size_t          ac3_burst_at;
+   /* Where the pin took 32- or 24-in-32-bit integer: the frontend's
+    * float frames are converted here on the way in, the same size. */
+   unsigned char  *cvt;
+   size_t          cvt_size;
    bool            running;
    retro_atomic_int_t dead;   /* an I/O failed; stop writing, still reclaim */
    bool            nonblock;
@@ -1689,14 +1801,15 @@ static bool wdmks_position(wdmks_t *w, uint64_t *frames);
  * a later revision can wait on; the plain form is what every WaveRT
  * driver has. The buffer belongs to the driver - it is not freed
  * here, it goes away with the pin. */
-static bool wdmks_rt_get_buffer(wdmks_t *w, size_t wanted)
+static bool wdmks_rt_buffer_request(HANDLE pin, size_t wanted,
+      ra_ksrtaudio_buffer_t *out)
 {
    ra_ksrtaudio_buffer_property_notify_t inn;
-   ra_ksrtaudio_buffer_t                 out;
+   ra_ksrtaudio_buffer_property_t        plain;
    DWORD                                 written = 0;
 
    memset(&inn, 0, sizeof(inn));
-   memset(&out, 0, sizeof(out));
+   memset(out,  0, sizeof(*out));
    inn.Property.Set      = ra_ks_propsetid_rtaudio;
    inn.Property.Id       = RA_KSPROPERTY_RTAUDIO_BUFFER_WITH_NOTIFICATION;
    inn.Property.Flags    = RA_KSPROPERTY_TYPE_GET;
@@ -1704,29 +1817,103 @@ static bool wdmks_rt_get_buffer(wdmks_t *w, size_t wanted)
    inn.RequestedBufferSize = (ULONG)wanted;
    inn.NotificationCount = 2;
 
-   if (!DeviceIoControl(w->stream.handle, RA_IOCTL_KS_PROPERTY,
-            &inn, sizeof(inn), &out, sizeof(out), &written, NULL)
-         || written < sizeof(out) || !out.BufferAddress)
-   {
-      ra_ksrtaudio_buffer_property_t plain;
-      memset(&plain, 0, sizeof(plain));
-      memset(&out,   0, sizeof(out));
-      plain.Property.Set   = ra_ks_propsetid_rtaudio;
-      plain.Property.Id    = RA_KSPROPERTY_RTAUDIO_BUFFER;
-      plain.Property.Flags = RA_KSPROPERTY_TYPE_GET;
-      plain.BaseAddress    = NULL;
-      plain.RequestedBufferSize = (ULONG)wanted;
+   if (DeviceIoControl(pin, RA_IOCTL_KS_PROPERTY,
+            &inn, sizeof(inn), out, sizeof(*out), &written, NULL)
+         && written >= sizeof(*out) && out->BufferAddress)
+      return true;
 
-      written = 0;
-      if (!DeviceIoControl(w->stream.handle, RA_IOCTL_KS_PROPERTY,
-               &plain, sizeof(plain), &out, sizeof(out), &written, NULL)
-            || written < sizeof(out) || !out.BufferAddress)
-      {
-         RARCH_ERR("[WDM-KS] The pin would not give a buffer: 0x%08lx.\n",
-               (unsigned long)GetLastError());
-         return false;
-      }
+   memset(&plain, 0, sizeof(plain));
+   memset(out,    0, sizeof(*out));
+   plain.Property.Set   = ra_ks_propsetid_rtaudio;
+   plain.Property.Id    = RA_KSPROPERTY_RTAUDIO_BUFFER;
+   plain.Property.Flags = RA_KSPROPERTY_TYPE_GET;
+   plain.BaseAddress    = NULL;
+   plain.RequestedBufferSize = (ULONG)wanted;
+
+   written = 0;
+   if (DeviceIoControl(pin, RA_IOCTL_KS_PROPERTY,
+            &plain, sizeof(plain), out, sizeof(*out), &written, NULL)
+         && written >= sizeof(*out) && out->BufferAddress)
+      return true;
+
+   RARCH_ERR("[WDM-KS] The pin would not give a buffer: 0x%08lx.\n",
+         (unsigned long)GetLastError());
+   return false;
+}
+
+/* The position register, where the driver offers one: a pointer it
+ * updates with the byte position the hardware has reached. Reading a
+ * word is cheaper and steadier than an ioctl per query. Only a 32- or
+ * 64-bit register is taken. */
+static bool wdmks_rt_register_request(HANDLE pin,
+      ra_ksrtaudio_hwregister_t *out)
+{
+   ra_ksrtaudio_hwregister_property_t inn;
+   DWORD                              written = 0;
+
+   memset(&inn, 0, sizeof(inn));
+   memset(out,  0, sizeof(*out));
+   inn.Property.Set   = ra_ks_propsetid_rtaudio;
+   inn.Property.Id    = RA_KSPROPERTY_RTAUDIO_POSITIONREGISTER;
+   inn.Property.Flags = RA_KSPROPERTY_TYPE_GET;
+   inn.BaseAddress    = NULL;
+
+   return DeviceIoControl(pin, RA_IOCTL_KS_PROPERTY,
+            &inn, sizeof(inn), out, sizeof(*out), &written, NULL)
+         && written >= sizeof(*out) && out->Register
+         && (out->Width == 32 || out->Width == 64);
+}
+
+/* The event the driver signals as it passes each notification point,
+ * or NULL where the pin offers none. */
+static HANDLE wdmks_rt_event_register(HANDLE pin)
+{
+   ra_ksrtaudio_notification_event_property_t p;
+   DWORD  written = 0;
+   HANDLE ev;
+
+   if (!(ev = CreateEvent(NULL, FALSE, FALSE, NULL)))
+      return NULL;
+
+   memset(&p, 0, sizeof(p));
+   p.Property.Set        = ra_ks_propsetid_rtaudio;
+   p.Property.Id         = RA_KSPROPERTY_RTAUDIO_REGISTER_NOTIFICATION_EVENT;
+   p.Property.Flags      = RA_KSPROPERTY_TYPE_SET;
+   p.NotificationEvent   = ev;
+
+   if (DeviceIoControl(pin, RA_IOCTL_KS_PROPERTY,
+            &p, sizeof(p), &p, sizeof(p), &written, NULL))
+      return ev;
+   CloseHandle(ev);
+   return NULL;
+}
+
+static void wdmks_rt_event_unregister(HANDLE pin, HANDLE ev)
+{
+   ra_ksrtaudio_notification_event_property_t p;
+   DWORD written = 0;
+
+   if (!ev)
+      return;
+   if (pin != INVALID_HANDLE_VALUE)
+   {
+      memset(&p, 0, sizeof(p));
+      p.Property.Set      = ra_ks_propsetid_rtaudio;
+      p.Property.Id       = RA_KSPROPERTY_RTAUDIO_UNREGISTER_NOTIFICATION_EVENT;
+      p.Property.Flags    = RA_KSPROPERTY_TYPE_SET;
+      p.NotificationEvent = ev;
+      DeviceIoControl(pin, RA_IOCTL_KS_PROPERTY,
+            &p, sizeof(p), &p, sizeof(p), &written, NULL);
    }
+   CloseHandle(ev);
+}
+
+static bool wdmks_rt_get_buffer(wdmks_t *w, size_t wanted)
+{
+   ra_ksrtaudio_buffer_t out;
+
+   if (!wdmks_rt_buffer_request(w->stream.handle, wanted, &out))
+      return false;
 
    w->rt_buf     = (unsigned char*)out.BufferAddress;
    w->rt_size    = (size_t)out.ActualBufferSize;
@@ -1836,23 +2023,40 @@ static void wdmks_rt_probe_presentation(wdmks_t *w)
 
 static void wdmks_rt_get_position_register(wdmks_t *w)
 {
-   ra_ksrtaudio_hwregister_property_t inn;
-   ra_ksrtaudio_hwregister_t          out;
-   DWORD                              written = 0;
+   ra_ksrtaudio_hwregister_t out;
 
-   memset(&inn, 0, sizeof(inn));
-   memset(&out, 0, sizeof(out));
-   inn.Property.Set   = ra_ks_propsetid_rtaudio;
-   inn.Property.Id    = RA_KSPROPERTY_RTAUDIO_POSITIONREGISTER;
-   inn.Property.Flags = RA_KSPROPERTY_TYPE_GET;
-   inn.BaseAddress    = NULL;
-
-   if (DeviceIoControl(w->stream.handle, RA_IOCTL_KS_PROPERTY,
-            &inn, sizeof(inn), &out, sizeof(out), &written, NULL)
-         && written >= sizeof(out) && out.Register)
-      w->rt_pos = (volatile ULONG*)out.Register;
+   if (wdmks_rt_register_request(w->stream.handle, &out))
+   {
+      w->rt_pos      = (volatile ULONG*)out.Register;
+      w->rt_pos_wide = (out.Width == 64);
+   }
    else
       RARCH_LOG("[WDM-KS] No position register; asking the pin instead.\n");
+}
+
+/* A register's value, brought into the loop. A 64-bit register is a
+ * byte count the low word alone cannot place once it passes 2^32 on a
+ * loop that is not a power of two, so the whole of it is read; the
+ * high word is taken twice so a 32-bit build cannot see it torn. */
+static ULONG wdmks_rt_register_value(volatile ULONG *reg, bool wide,
+      size_t loop)
+{
+   ULONG lo, hi, hi2;
+
+   if (!wide)
+      return *reg;
+   do
+   {
+      hi  = reg[1];
+      lo  = reg[0];
+      hi2 = reg[1];
+   } while (hi != hi2);
+   return (ULONG)((((uint64_t)hi << 32) | lo) % loop);
+}
+
+static ULONG wdmks_rt_register_read(const wdmks_t *w)
+{
+   return wdmks_rt_register_value(w->rt_pos, w->rt_pos_wide, w->rt_size);
 }
 
 /* What the hardware adds after this driver's buffer: the FIFO the
@@ -2051,46 +2255,14 @@ static void wdmks_rt_wait_room(wdmks_t *w, size_t want)
  * notification form first so that those which do will accept it. */
 static void wdmks_rt_register_event(wdmks_t *w)
 {
-   ra_ksrtaudio_notification_event_property_t p;
-   DWORD written = 0;
-
-   if (!(w->rt_event = CreateEvent(NULL, FALSE, FALSE, NULL)))
-      return;
-
-   memset(&p, 0, sizeof(p));
-   p.Property.Set        = ra_ks_propsetid_rtaudio;
-   p.Property.Id         = RA_KSPROPERTY_RTAUDIO_REGISTER_NOTIFICATION_EVENT;
-   p.Property.Flags      = RA_KSPROPERTY_TYPE_SET;
-   p.NotificationEvent   = w->rt_event;
-
-   if (!DeviceIoControl(w->stream.handle, RA_IOCTL_KS_PROPERTY,
-            &p, sizeof(p), &p, sizeof(p), &written, NULL))
-   {
-      CloseHandle(w->rt_event);
-      w->rt_event = NULL;
+   if (!(w->rt_event = wdmks_rt_event_register(w->stream.handle)))
       RARCH_LOG("[WDM-KS] No notification event; the write path will"
             " poll, which is worse when backgrounded.\n");
-   }
 }
 
 static void wdmks_rt_unregister_event(wdmks_t *w)
 {
-   ra_ksrtaudio_notification_event_property_t p;
-   DWORD written = 0;
-
-   if (!w->rt_event)
-      return;
-   if (w->stream.handle != INVALID_HANDLE_VALUE)
-   {
-      memset(&p, 0, sizeof(p));
-      p.Property.Set      = ra_ks_propsetid_rtaudio;
-      p.Property.Id       = RA_KSPROPERTY_RTAUDIO_UNREGISTER_NOTIFICATION_EVENT;
-      p.Property.Flags    = RA_KSPROPERTY_TYPE_SET;
-      p.NotificationEvent = w->rt_event;
-      DeviceIoControl(w->stream.handle, RA_IOCTL_KS_PROPERTY,
-            &p, sizeof(p), &p, sizeof(p), &written, NULL);
-   }
-   CloseHandle(w->rt_event);
+   wdmks_rt_event_unregister(w->stream.handle, w->rt_event);
    w->rt_event = NULL;
 }
 
@@ -2263,7 +2435,7 @@ static bool wdmks_rt_play_offset(wdmks_t *w, ULONG *offset)
 {
    if (w->rt_pos)
    {
-      ULONG v = *w->rt_pos;
+      ULONG v = wdmks_rt_register_read(w);
       if (v >= (ULONG)w->rt_size)
          v %= (ULONG)w->rt_size;
 
@@ -2642,6 +2814,22 @@ static ssize_t wdmks_write(void *data, const void *buf, size_t size)
       return -1;
    if (retro_atomic_load_acquire_int(&w->dead))
       return -1;
+
+   if (w->cvt)
+   {
+      if (size > w->cvt_size)
+      {
+         unsigned char *grow = (unsigned char*)realloc(w->cvt, size);
+         if (!grow)
+            return -1;
+         w->cvt      = grow;
+         w->cvt_size = size;
+      }
+      convert_float_to_s32((int32_t*)w->cvt, (const float*)src,
+            size / sizeof(float), w->stream.fmt.bits);
+      src = w->cvt;
+   }
+
    if (w->stream.looped)
       return wdmks_rt_write(w, src, size);
 
@@ -3310,6 +3498,7 @@ static void wdmks_free(void *data)
    if (w->ac3)
       rac3_encoder_free(w->ac3);
    free(w->ac3_in);
+   free(w->cvt);
 
    if (w->filter && w->filter != INVALID_HANDLE_VALUE)
       CloseHandle(w->filter);
@@ -3326,7 +3515,7 @@ static void *wdmks_init(const char *device, unsigned rate,
    unsigned        chosen = 0;
    bool            opened = false;
 
-   if (!(devices = wdmks_devices_scan(&count)) || !count)
+   if (!(devices = wdmks_devices_scan(&count, false)) || !count)
    {
       RARCH_LOG("[WDM-KS] No kernel-streaming render device.\n");
       wdmks_devices_free(devices, count);
@@ -3419,7 +3608,8 @@ static void *wdmks_init(const char *device, unsigned rate,
                continue;
             for (p = 0; p < devices[i].pin_count && !opened; p++)
                opened = wdmks_pin_open(w->filter, &devices[i].pins[p],
-                     rate, widths[c], devices[i].wavert, &w->stream);
+                     rate, widths[c], devices[i].wavert, GENERIC_WRITE,
+                     &w->stream);
 
             /* A wider layout the pin will not take as PCM is tried as
              * AC-3 over IEC 61937 before narrowing, which is what the
@@ -3513,9 +3703,24 @@ static void *wdmks_init(const char *device, unsigned rate,
    }
 
    w->rate        = w->stream.fmt.rate;
-   w->is_float    = w->stream.fmt.is_float;
+   /* An integer pin wider than 16 is fed float and converted here, so
+    * the frontend is told float either way. */
+   w->is_float    = w->stream.fmt.is_float
+      || w->stream.fmt.container_bits == 32;
    w->frame_bytes = w->stream.fmt.channels
       * (w->stream.fmt.container_bits / 8);
+   if (w->is_float && !w->stream.fmt.is_float)
+   {
+      w->cvt_size = (size_t)latency * w->rate / 1000 * w->frame_bytes;
+      if (w->cvt_size < 4096)
+         w->cvt_size = 4096;
+      if (!(w->cvt = (unsigned char*)malloc(w->cvt_size)))
+      {
+         wdmks_free(w);
+         return NULL;
+      }
+      convert_float_to_s32_init_simd();
+   }
    /* The pin's own channel count, except on the bit-stream path, where
     * what the frontend hands over is the encoder's layout and the pin
     * only carries it. */
@@ -3629,4 +3834,711 @@ audio_driver_t audio_wdmks = {
    wdmks_layout,
    NULL, /* frames_consumed_fallback */
    wdmks_device_clock_ppm
+};
+
+/* ---- capture ------------------------------------------------------ */
+
+/* The microphone driver: the same filters, enumerated under the
+ * capture alias, and a pin audio flows OUT of, opened for reading.
+ * WaveCyclic pins are read with IOCTL_KS_READ_STREAM packets;
+ * WaveRT pins through the mapped loop the hardware fills, read from
+ * behind its position. What the frontend takes is mono, so a pin that
+ * only captures stereo is folded on the way into the fifo. */
+
+typedef struct
+{
+   bool nonblock;
+} wdmks_mic_driver_t;
+
+typedef struct
+{
+   wdmks_stream_t   stream;
+   HANDLE           filter;
+   fifo_buffer_t   *fifo;          /* mono, in the frontend's format */
+   wdmks_packet_t   packets[WDMKS_PACKETS];
+   /* WaveRT: the loop the hardware fills and the register that says
+    * how far it has got; rt_read is where this side reads on from. */
+   unsigned char   *rt_buf;
+   volatile ULONG  *rt_pos;
+   HANDLE           rt_event;
+   size_t           packet_bytes;
+   size_t           rt_size;
+   size_t           rt_read;
+   uint64_t         rt_captured;   /* bytes the hardware has written */
+   uint64_t         rt_taken;      /* of those, bytes read out */
+   retro_time_t     rt_last_usec;
+   ULONG            rt_last_pos;
+   unsigned         next;          /* the packet that completes next */
+   unsigned         frame_bytes;   /* the pin's frame */
+   unsigned         out_bytes;     /* one mono sample as handed over */
+   unsigned         rate;
+   bool             rt_have_last;
+   bool             rt_pos_wide;
+   bool             rt_barrier;
+   bool             running;
+   bool             is_float;   /* what is handed over */
+   bool             pin_s32;    /* the pin's integer samples become float */
+} wdmks_mic_t;
+
+static void *wdmks_mic_init(void)
+{
+   wdmks_mic_driver_t *d = (wdmks_mic_driver_t*)calloc(1, sizeof(*d));
+   if (!d)
+      return NULL;
+   d->nonblock = !config_get_ptr()->bools.audio_sync;
+   return d;
+}
+
+static void wdmks_mic_free(void *driver_context)
+{
+   free(driver_context);
+}
+
+static struct string_list *wdmks_mic_device_list_new(const void *driver_context)
+{
+   union string_list_elem_attr attr;
+   struct string_list *list;
+   wdmks_device_t     *devices;
+   unsigned            count = 0;
+   unsigned            i;
+
+   (void)driver_context;
+   if (!(list = string_list_new()))
+      return NULL;
+
+   attr.i  = 0;
+   devices = wdmks_devices_scan(&count, true);
+   for (i = 0; i < count; i++)
+      string_list_append(list,
+            devices[i].name ? devices[i].name : "WDM-KS device", attr);
+   wdmks_devices_free(devices, count);
+   return list;
+}
+
+static void wdmks_mic_device_list_free(const void *driver_context,
+      struct string_list *devices)
+{
+   (void)driver_context;
+   if (devices)
+      string_list_free(devices);
+}
+
+/* Moves captured frames into the fifo in the frontend's shape: the
+ * pin's sample width is kept, a stereo pin is averaged down. Whole
+ * output samples only; returns the pin bytes consumed. */
+static size_t wdmks_mic_fold(wdmks_mic_t *m, const unsigned char *src,
+      size_t bytes)
+{
+   size_t frames = bytes / m->frame_bytes;
+   size_t room   = FIFO_WRITE_AVAIL(m->fifo) / m->out_bytes;
+   size_t i;
+
+   if (frames > room)
+      frames = room;
+   if (!frames)
+      return 0;
+
+   if (m->frame_bytes == m->out_bytes && !m->pin_s32)
+   {
+      fifo_write(m->fifo, src, frames * m->out_bytes);
+      return frames * m->frame_bytes;
+   }
+
+   for (i = 0; i < frames; i++)
+   {
+      const unsigned char *f = src + i * m->frame_bytes;
+      if (m->pin_s32)
+      {
+         int32_t l, r;
+         float   o;
+         memcpy(&l, f, sizeof(l));
+         if (m->frame_bytes == 8)
+         {
+            memcpy(&r, f + 4, sizeof(r));
+            o = ((float)l + (float)r) * (0.5f / 2147483648.0f);
+         }
+         else
+            o = (float)l * (1.0f / 2147483648.0f);
+         fifo_write(m->fifo, &o, sizeof(o));
+      }
+      else if (m->is_float)
+      {
+         float l, r, o;
+         memcpy(&l, f,     sizeof(l));
+         memcpy(&r, f + 4, sizeof(r));
+         o = (l + r) * 0.5f;
+         fifo_write(m->fifo, &o, sizeof(o));
+      }
+      else
+      {
+         int16_t l, r, o;
+         memcpy(&l, f,     sizeof(l));
+         memcpy(&r, f + 2, sizeof(r));
+         o = (int16_t)(((int)l + (int)r) / 2);
+         fifo_write(m->fifo, &o, sizeof(o));
+      }
+   }
+   return frames * m->frame_bytes;
+}
+
+/* ---- capture, packets --------------------------------------------- */
+
+static bool wdmks_mic_packet_submit(wdmks_mic_t *m, wdmks_packet_t *p)
+{
+   DWORD written = 0;
+
+   memset(&p->header, 0, sizeof(p->header));
+   p->header.Size        = sizeof(p->header);
+   p->header.Data        = p->data;
+   p->header.FrameExtent = (ULONG)m->packet_bytes;
+   p->header.DataUsed    = 0;
+
+   ResetEvent(p->overlapped.hEvent);
+   if (DeviceIoControl(m->stream.handle, RA_IOCTL_KS_READ_STREAM,
+            NULL, 0, &p->header, sizeof(p->header), &written,
+            &p->overlapped))
+   {
+      /* Completed inline: the data is there to take on the next look. */
+      p->pending = true;
+      SetEvent(p->overlapped.hEvent);
+      return true;
+   }
+   if (GetLastError() == ERROR_IO_PENDING)
+   {
+      p->pending = true;
+      return true;
+   }
+   return false;
+}
+
+/* Takes what the packets that have come back hold, in order, and hands
+ * each one back to the pin. Stops at the first still out, or when the
+ * fifo cannot take a whole packet - a packet left completed keeps its
+ * data until the fifo has drained. */
+static bool wdmks_mic_packets_drain(wdmks_mic_t *m)
+{
+   unsigned i;
+
+   for (i = 0; i < WDMKS_PACKETS; i++)
+   {
+      wdmks_packet_t *p     = &m->packets[m->next];
+      DWORD           moved = 0;
+
+      if (!p->pending)
+         return false;
+      if (!GetOverlappedResult(m->stream.handle, &p->overlapped, &moved, FALSE))
+      {
+         if (GetLastError() == ERROR_IO_INCOMPLETE)
+            return true;
+         return false;
+      }
+      if (p->header.DataUsed > m->packet_bytes)
+         p->header.DataUsed = (ULONG)m->packet_bytes;
+      if (FIFO_WRITE_AVAIL(m->fifo)
+            < (size_t)(p->header.DataUsed / m->frame_bytes) * m->out_bytes)
+         return true;
+      wdmks_mic_fold(m, p->data, p->header.DataUsed);
+      p->pending = false;
+      if (!wdmks_mic_packet_submit(m, p))
+         return false;
+      m->next = (m->next + 1) % WDMKS_PACKETS;
+   }
+   return true;
+}
+
+/* ---- capture, WaveRT ---------------------------------------------- */
+
+/* Where the hardware has written to. Every read advances the count, and
+ * a gap longer than the loop between two reads means laps went by
+ * unseen: what they held is gone, so the read cursor is moved up to
+ * the hardware and the count with it. */
+static bool wdmks_mic_rt_sample(wdmks_mic_t *m)
+{
+   ULONG        v;
+   retro_time_t now_usec  = cpu_features_get_time_usec();
+   retro_time_t ring_usec = (retro_time_t)(m->rt_size / m->frame_bytes)
+      * 1000000 / m->rate;
+   bool         lost      = false;
+
+   if (m->rt_pos)
+      v = wdmks_rt_register_value(m->rt_pos, m->rt_pos_wide, m->rt_size);
+   else
+   {
+      ra_ksproperty_t       prop;
+      ra_ksaudio_position_t pos;
+      DWORD                 written = 0;
+
+      memset(&prop, 0, sizeof(prop));
+      memset(&pos,  0, sizeof(pos));
+      prop.Set   = ra_ks_propsetid_audio;
+      prop.Id    = RA_KSPROPERTY_AUDIO_POSITION;
+      prop.Flags = RA_KSPROPERTY_TYPE_GET;
+      if (!DeviceIoControl(m->stream.handle, RA_IOCTL_KS_PROPERTY,
+               &prop, sizeof(prop), &pos, sizeof(pos), &written, NULL)
+            || written < sizeof(pos))
+         return false;
+      v = (ULONG)(pos.PlayOffset % m->rt_size);
+   }
+   if (v >= (ULONG)m->rt_size)
+      v %= (ULONG)m->rt_size;
+
+   if (m->rt_have_last && now_usec - m->rt_last_usec > ring_usec)
+      lost = true;
+   m->rt_last_usec = now_usec;
+
+   if (!m->rt_have_last)
+   {
+      m->rt_last_pos  = v;
+      m->rt_have_last = true;
+      m->rt_read      = v;
+      m->rt_captured  = m->rt_taken = 0;
+      return true;
+   }
+   if (v >= m->rt_last_pos)
+      m->rt_captured += (uint64_t)(v - m->rt_last_pos);
+   else
+      m->rt_captured += (uint64_t)(v + m->rt_size - m->rt_last_pos);
+   m->rt_last_pos = v;
+
+   /* Unread bytes cannot exceed the loop: past it the hardware has
+    * written over what was not yet read, and only what is behind the
+    * cursor now is real. */
+   if (lost || m->rt_captured - m->rt_taken >= m->rt_size)
+   {
+      m->rt_taken = m->rt_captured;
+      m->rt_read  = v;
+   }
+   return true;
+}
+
+/* Moves what the hardware has written and this side has not read into
+ * the fifo, as much as the fifo will take. */
+static bool wdmks_mic_rt_drain(wdmks_mic_t *m)
+{
+   size_t unread;
+   size_t first;
+   size_t took;
+
+   if (!wdmks_mic_rt_sample(m))
+      return false;
+   unread  = (size_t)(m->rt_captured - m->rt_taken);
+   unread -= unread % m->frame_bytes;
+   if (!unread)
+      return true;
+
+   if (m->rt_barrier)
+      MemoryBarrier();
+   first = m->rt_size - m->rt_read;
+   if (first > unread)
+      first = unread;
+   took = wdmks_mic_fold(m, m->rt_buf + m->rt_read, first);
+   if (took == first && unread > first)
+      took += wdmks_mic_fold(m, m->rt_buf, unread - first);
+   m->rt_read  = (m->rt_read + took) % m->rt_size;
+   m->rt_taken += took;
+   return true;
+}
+
+/* Waits for the device to deliver, bounded: the notification event or
+ * the packet that completes next where there is one, a slice of the
+ * loop against the register otherwise. */
+static DWORD wdmks_mic_watchdog_ms(const wdmks_mic_t *m, size_t bytes)
+{
+   uint64_t ms = (uint64_t)(bytes / m->frame_bytes) * 2000 / m->rate;
+   if (ms < 4)
+      ms = 4;
+   else if (ms > 100)
+      ms = 100;
+   return (DWORD)ms;
+}
+
+static void wdmks_mic_wait(wdmks_mic_t *m)
+{
+   if (m->stream.looped)
+   {
+      if (m->rt_event)
+         WaitForSingleObject(m->rt_event, wdmks_mic_watchdog_ms(m, m->rt_size));
+      else
+      {
+         retro_time_t slice = (retro_time_t)(m->rt_size / m->frame_bytes)
+            * 1000000 / m->rate / 4;
+         retro_sleep_us(slice < 500 ? 500 : (unsigned)slice);
+      }
+      return;
+   }
+   {
+      wdmks_packet_t *p = &m->packets[m->next];
+      if (p->pending)
+         WaitForSingleObject(p->overlapped.hEvent,
+               wdmks_mic_watchdog_ms(m, m->packet_bytes));
+   }
+}
+
+static bool wdmks_mic_drain(wdmks_mic_t *m)
+{
+   return m->stream.looped
+      ? wdmks_mic_rt_drain(m) : wdmks_mic_packets_drain(m);
+}
+
+static size_t wdmks_mic_wait_readable(void *driver_context,
+      void *mic_context, size_t len)
+{
+   wdmks_mic_t *m    = (wdmks_mic_t*)mic_context;
+   unsigned     laps = WDMKS_WAIT_LAPS;
+   size_t       avail;
+
+   (void)driver_context;
+   if (!m || !m->running)
+      return 0;
+
+   for (;;)
+   {
+      if (!wdmks_mic_drain(m))
+         return 0;
+      avail = FIFO_READ_AVAIL(m->fifo);
+      if (avail >= len)
+         return avail;
+      if (!laps--)
+         return avail;
+      wdmks_mic_wait(m);
+   }
+}
+
+static int wdmks_mic_read(void *driver_context, void *mic_context,
+      void *buffer, size_t len)
+{
+   wdmks_mic_driver_t *d    = (wdmks_mic_driver_t*)driver_context;
+   wdmks_mic_t        *m    = (wdmks_mic_t*)mic_context;
+   unsigned char      *dst  = (unsigned char*)buffer;
+   size_t              done = 0;
+   unsigned            laps = WDMKS_WAIT_LAPS;
+
+   if (!d || !m || !buffer || m->stream.handle == INVALID_HANDLE_VALUE)
+      return -1;
+
+   len -= len % m->out_bytes;
+   while (done < len)
+   {
+      size_t avail;
+      if (!wdmks_mic_drain(m))
+         return done ? (int)done : -1;
+      avail = FIFO_READ_AVAIL(m->fifo);
+      if (avail)
+      {
+         size_t take = len - done;
+         if (take > avail)
+            take = avail;
+         take -= take % m->out_bytes;
+         fifo_read(m->fifo, dst + done, take);
+         done += take;
+         continue;
+      }
+      if (d->nonblock || !m->running || !laps--)
+         break;
+      wdmks_mic_wait(m);
+   }
+   return (int)done;
+}
+
+static bool wdmks_mic_start(void *driver_context, void *mic_context)
+{
+   wdmks_mic_t *m = (wdmks_mic_t*)mic_context;
+   unsigned     i;
+
+   (void)driver_context;
+   if (!m)
+      return false;
+   if (m->running)
+      return true;
+   if (     !wdmks_pin_set_state(&m->stream, RA_KSSTATE_ACQUIRE)
+         || !wdmks_pin_set_state(&m->stream, RA_KSSTATE_PAUSE)
+         || !wdmks_pin_set_state(&m->stream, RA_KSSTATE_RUN))
+      return false;
+   if (m->stream.looped)
+      m->rt_have_last = false;
+   else
+      for (i = 0; i < WDMKS_PACKETS; i++)
+         if (!m->packets[i].pending && !wdmks_mic_packet_submit(m, &m->packets[i]))
+            return false;
+   m->running = true;
+   return true;
+}
+
+static bool wdmks_mic_stop(void *driver_context, void *mic_context)
+{
+   wdmks_mic_t *m = (wdmks_mic_t*)mic_context;
+
+   (void)driver_context;
+   if (!m)
+      return false;
+   if (!m->running)
+      return true;
+   if (!wdmks_pin_set_state(&m->stream, RA_KSSTATE_PAUSE))
+      return false;
+   m->running = false;
+   return true;
+}
+
+static bool wdmks_mic_alive(const void *driver_context, const void *mic_context)
+{
+   const wdmks_mic_t *m = (const wdmks_mic_t*)mic_context;
+   (void)driver_context;
+   return m && m->running;
+}
+
+static bool wdmks_mic_use_float(const void *driver_context,
+      const void *mic_context)
+{
+   const wdmks_mic_t *m = (const wdmks_mic_t*)mic_context;
+   (void)driver_context;
+   return m && m->is_float;
+}
+
+static void wdmks_mic_close(void *driver_context, void *mic_context)
+{
+   wdmks_mic_t *m = (wdmks_mic_t*)mic_context;
+   unsigned     i;
+
+   (void)driver_context;
+   if (!m)
+      return;
+
+   if (m->stream.handle != INVALID_HANDLE_VALUE && m->stream.looped)
+   {
+      wdmks_rt_event_unregister(m->stream.handle, m->rt_event);
+      wdmks_pin_close(&m->stream);
+   }
+   else if (m->stream.handle != INVALID_HANDLE_VALUE)
+   {
+      /* The same reclaim as the render side: a packet the kernel has
+       * not given back is memory the device may still be writing. */
+      retro_time_t deadline = cpu_features_get_time_usec() + 1000000;
+
+      CancelIo(m->stream.handle);
+      for (i = 0; i < WDMKS_PACKETS; i++)
+         while (m->packets[i].pending)
+         {
+            DWORD        moved = 0;
+            retro_time_t left;
+            if (GetOverlappedResult(m->stream.handle,
+                     &m->packets[i].overlapped, &moved, FALSE))
+            {
+               m->packets[i].pending = false;
+               break;
+            }
+            if (GetLastError() != ERROR_IO_INCOMPLETE)
+               break;
+            if ((left = deadline - cpu_features_get_time_usec()) <= 0)
+               break;
+            if (WaitForSingleObject(m->packets[i].overlapped.hEvent,
+                     (DWORD)(left / 1000) + 1) == WAIT_TIMEOUT)
+               break;
+         }
+      wdmks_pin_close(&m->stream);
+   }
+
+   for (i = 0; i < WDMKS_PACKETS; i++)
+   {
+      if (m->packets[i].pending)
+      {
+         RARCH_WARN("[WDM-KS] A capture packet did not come back;"
+               " leaking its buffer.\n");
+         continue;
+      }
+      if (m->packets[i].overlapped.hEvent)
+         CloseHandle(m->packets[i].overlapped.hEvent);
+      free(m->packets[i].data);
+   }
+   if (m->fifo)
+      fifo_free(m->fifo);
+   if (m->filter != INVALID_HANDLE_VALUE)
+      CloseHandle(m->filter);
+   free(m);
+}
+
+static void *wdmks_mic_open(void *driver_context, const char *device,
+      unsigned rate, unsigned latency, unsigned *new_rate)
+{
+   wdmks_mic_t    *m;
+   wdmks_device_t *devices;
+   unsigned        count  = 0;
+   unsigned        chosen = 0;
+   unsigned        i;
+   bool            opened = false;
+
+   (void)driver_context;
+   if (!(devices = wdmks_devices_scan(&count, true)) || !count)
+   {
+      RARCH_LOG("[WDM-KS] No kernel-streaming capture device.\n");
+      wdmks_devices_free(devices, count);
+      return NULL;
+   }
+
+   if (device && *device)
+   {
+      bool found = false;
+      for (i = 0; i < count; i++)
+         if (devices[i].name && string_is_equal(devices[i].name, device))
+         {
+            chosen = i;
+            found  = true;
+            break;
+         }
+      if (!found)
+      {
+         RARCH_ERR("[WDM-KS] No capture device named \"%s\".\n", device);
+         wdmks_devices_free(devices, count);
+         return NULL;
+      }
+   }
+
+   if (!(m = (wdmks_mic_t*)calloc(1, sizeof(*m))))
+   {
+      wdmks_devices_free(devices, count);
+      return NULL;
+   }
+   m->stream.handle = INVALID_HANDLE_VALUE;
+   m->filter        = INVALID_HANDLE_VALUE;
+
+   for (i = chosen; i < count && !opened; i++)
+   {
+      unsigned p, c;
+
+      m->filter = CreateFileW(devices[i].path,
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
+      if (m->filter == INVALID_HANDLE_VALUE)
+      {
+         RARCH_WARN("[WDM-KS] \"%s\" would not open: 0x%08lx.\n",
+               devices[i].name ? devices[i].name : "unnamed device",
+               (unsigned long)GetLastError());
+         if (device && *device)
+            break;
+         continue;
+      }
+
+      /* Mono first, since that is what is wanted; stereo folded down
+       * where the pin will not capture mono. */
+      for (c = 1; c <= 2 && !opened; c++)
+         for (p = 0; p < devices[i].pin_count && !opened; p++)
+            opened = wdmks_pin_open(m->filter, &devices[i].pins[p],
+                  rate, c, devices[i].wavert, GENERIC_READ, &m->stream);
+
+      if (!opened)
+      {
+         CloseHandle(m->filter);
+         m->filter = INVALID_HANDLE_VALUE;
+         if (device && *device)
+            break;
+      }
+      else
+         RARCH_LOG("[WDM-KS] Capturing from \"%s\".\n",
+               devices[i].name ? devices[i].name : "unnamed device");
+   }
+   wdmks_devices_free(devices, count);
+
+   if (!opened)
+   {
+      RARCH_ERR("[WDM-KS] No capture pin would take a format.\n");
+      free(m);
+      return NULL;
+   }
+
+   m->rate        = m->stream.fmt.rate;
+   m->pin_s32     = !m->stream.fmt.is_float
+      && m->stream.fmt.container_bits == 32;
+   m->is_float    = m->stream.fmt.is_float || m->pin_s32;
+   m->frame_bytes = m->stream.fmt.channels * (m->stream.fmt.container_bits / 8);
+   m->out_bytes   = m->stream.fmt.container_bits / 8;
+   if (new_rate)
+      *new_rate   = m->rate;
+
+   /* The fifo holds several latencies' worth so a late reader loses
+    * nothing the device still has to deliver. */
+   {
+      size_t frames = (size_t)latency * m->rate / 1000;
+      if (frames < 64)
+         frames = 64;
+      if (!(m->fifo = fifo_new(frames * 4 * m->out_bytes)))
+      {
+         wdmks_mic_close(NULL, m);
+         return NULL;
+      }
+   }
+
+   if (m->stream.looped)
+   {
+      ra_ksrtaudio_buffer_t     buf;
+      ra_ksrtaudio_hwregister_t reg;
+      size_t wanted = (size_t)latency * m->rate / 1000 * m->frame_bytes;
+
+      if (wanted < m->frame_bytes * 64)
+         wanted = m->frame_bytes * 64;
+      if (!wdmks_rt_buffer_request(m->stream.handle, wanted, &buf)
+            || !buf.ActualBufferSize
+            || buf.ActualBufferSize % m->frame_bytes)
+      {
+         RARCH_ERR("[WDM-KS] The WaveRT capture pin would not start.\n");
+         wdmks_mic_close(NULL, m);
+         return NULL;
+      }
+      m->rt_buf     = (unsigned char*)buf.BufferAddress;
+      m->rt_size    = (size_t)buf.ActualBufferSize;
+      m->rt_barrier = buf.CallMemoryBarrier ? true : false;
+      if (wdmks_rt_register_request(m->stream.handle, &reg))
+      {
+         m->rt_pos      = (volatile ULONG*)reg.Register;
+         m->rt_pos_wide = (reg.Width == 64);
+      }
+      m->rt_event = wdmks_rt_event_register(m->stream.handle);
+      RARCH_LOG("[WDM-KS] WaveRT capture loop of %u bytes, %u ms;"
+            " register %s, event %s.\n",
+            (unsigned)m->rt_size,
+            (unsigned)(m->rt_size * 1000 / (m->frame_bytes * m->rate)),
+            m->rt_pos ? "yes" : "no", m->rt_event ? "yes" : "no");
+      return m;
+   }
+
+   {
+      size_t total = (size_t)latency * m->rate / 1000 * m->frame_bytes;
+      size_t each  = total / WDMKS_PACKETS;
+      size_t floor_bytes = (size_t)(m->rate / 1000) * m->frame_bytes;
+
+      if (each < floor_bytes)
+         each = floor_bytes;
+      each -= each % m->frame_bytes;
+      if (!each)
+         each = m->frame_bytes;
+      m->packet_bytes = each;
+   }
+   for (i = 0; i < WDMKS_PACKETS; i++)
+   {
+      m->packets[i].data = (unsigned char*)calloc(1, m->packet_bytes);
+      m->packets[i].overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+      if (!m->packets[i].data || !m->packets[i].overlapped.hEvent)
+      {
+         wdmks_mic_close(NULL, m);
+         return NULL;
+      }
+   }
+   RARCH_LOG("[WDM-KS] Capture: %u packet(s) of %u bytes.\n",
+         (unsigned)WDMKS_PACKETS, (unsigned)m->packet_bytes);
+   return m;
+}
+
+microphone_driver_t microphone_wdmks = {
+   wdmks_mic_init,
+   wdmks_mic_free,
+   wdmks_mic_read,
+   "wdmks",
+   wdmks_mic_device_list_new,
+   wdmks_mic_device_list_free,
+   wdmks_mic_open,
+   wdmks_mic_close,
+   wdmks_mic_alive,
+   wdmks_mic_start,
+   wdmks_mic_stop,
+   wdmks_mic_use_float,
+   wdmks_mic_wait_readable
 };

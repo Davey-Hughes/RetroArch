@@ -45,6 +45,11 @@ void RARCH_ERR(const char *f, ...)  { (void)f; }
 void RARCH_DBG(const char *f, ...)  { (void)f; }
 uint32_t audio_driver_requested_layout(void) { return AUDIO_LAYOUT_STEREO; }
 void audio_driver_set_device_latency(size_t frames) { (void)frames; }
+settings_t *config_get_ptr(void)
+{
+   static settings_t settings;
+   return &settings;
+}
 
 static unsigned failures = 0;
 
@@ -316,8 +321,302 @@ static void run_contract(const char *name, put_fn put, bool pump)
    loop_teardown(&w);
 }
 
+/* The ranges a pin reports each bind their own bounds: a pin offering
+ * 44100-48000 stereo and 44100-192000 8-channel PCM, and 48000 stereo
+ * float, has not offered 192000 stereo PCM, nor float at 44100. */
+static void run_ranges(void)
+{
+   wdmks_pin_t    pin;
+   wdmks_format_t f;
+   ra_ksmultiple_item_t   *item;
+   ra_ksdatarange_audio_t *r;
+   unsigned i;
+
+   printf("pin ranges, kept apart\n");
+   memset(&pin, 0, sizeof(pin));
+   pin.range_count = 3;
+   pin.ranges[0].max_channels = 2;  pin.ranges[0].min_bits = 16;
+   pin.ranges[0].max_bits = 16;     pin.ranges[0].min_rate = 44100;
+   pin.ranges[0].max_rate = 48000;
+   pin.ranges[1].max_channels = 8;  pin.ranges[1].min_bits = 16;
+   pin.ranges[1].max_bits = 24;     pin.ranges[1].min_rate = 44100;
+   pin.ranges[1].max_rate = 192000;
+   pin.ranges[2].max_channels = 2;  pin.ranges[2].min_bits = 32;
+   pin.ranges[2].max_bits = 32;     pin.ranges[2].min_rate = 48000;
+   pin.ranges[2].max_rate = 48000;  pin.ranges[2].is_float = true;
+
+   memset(&f, 0, sizeof(f));
+   f.rate = 48000; f.channels = 2; f.bits = 16;
+   check(wdmks_format_in_pin(&pin, &f), "48000 stereo 16-bit: the first range");
+   f.rate = 192000; f.channels = 8; f.bits = 24;
+   check(wdmks_format_in_pin(&pin, &f), "192000 8-channel 24-bit: the second");
+   f.rate = 192000; f.channels = 2; f.bits = 16;
+   check(wdmks_format_in_pin(&pin, &f), "192000 stereo 16-bit: also the second");
+   f.rate = 96000; f.channels = 2; f.bits = 32;
+   check(!wdmks_format_in_pin(&pin, &f), "96000 stereo 32-bit integer: no range holds it");
+   f.rate = 48000; f.channels = 2; f.bits = 32; f.is_float = true;
+   check(wdmks_format_in_pin(&pin, &f), "48000 stereo float: the third");
+   f.rate = 44100;
+   check(!wdmks_format_in_pin(&pin, &f), "44100 float: not offered, though 44100 and float each are");
+   f.rate = 48000; f.channels = 8; f.bits = 32;
+   check(!wdmks_format_in_pin(&pin, &f), "8-channel float: not offered");
+
+   /* Past the cap, the rest fold into the last kept range of their
+    * own type, never the other's. */
+   item = (ra_ksmultiple_item_t*)calloc(1, sizeof(*item)
+         + (WDMKS_MAX_RANGES + 2) * sizeof(*r));
+   item->Count = WDMKS_MAX_RANGES + 2;
+   item->Size  = (ULONG)(sizeof(*item) + item->Count * sizeof(*r));
+   r = (ra_ksdatarange_audio_t*)(item + 1);
+   for (i = 0; i < item->Count; i++)
+   {
+      r[i].DataRange.f.FormatSize  = sizeof(*r);
+      r[i].DataRange.f.MajorFormat = ra_ks_dataformat_type_audio;
+      r[i].DataRange.f.SubFormat   = (i == 1)
+         ? ra_ks_dataformat_subtype_float : ra_ks_dataformat_subtype_pcm;
+      r[i].MaximumChannels         = 2;
+      r[i].MinimumBitsPerSample    = (i == 1) ? 32 : 16;
+      r[i].MaximumBitsPerSample    = (i == 1) ? 32 : 16;
+      r[i].MinimumSampleFrequency  = 8000 + i * 1000;
+      r[i].MaximumSampleFrequency  = 8000 + i * 1000;
+   }
+   /* The last two are the ones past the cap: one PCM at 176400, and
+    * one float at 22050. */
+   r[WDMKS_MAX_RANGES].MinimumSampleFrequency     = 176400;
+   r[WDMKS_MAX_RANGES].MaximumSampleFrequency     = 176400;
+   r[WDMKS_MAX_RANGES + 1].DataRange.f.SubFormat  = ra_ks_dataformat_subtype_float;
+   r[WDMKS_MAX_RANGES + 1].MinimumBitsPerSample   = 32;
+   r[WDMKS_MAX_RANGES + 1].MaximumBitsPerSample   = 32;
+   r[WDMKS_MAX_RANGES + 1].MinimumSampleFrequency = 22050;
+   r[WDMKS_MAX_RANGES + 1].MaximumSampleFrequency = 22050;
+
+   memset(&pin, 0, sizeof(pin));
+   wdmks_pin_fold_ranges(item, &pin);
+   free(item);
+   check(pin.range_count == WDMKS_MAX_RANGES, "the cap holds");
+   memset(&f, 0, sizeof(f));
+   f.channels = 2; f.bits = 16; f.rate = 176400;
+   check(wdmks_format_in_pin(&pin, &f), "a PCM range past the cap widened the last PCM range");
+   f.rate = 8000; f.bits = 32; f.is_float = true;
+   check(!wdmks_format_in_pin(&pin, &f), "and not the float one");
+   f.rate = 22050;
+   check(wdmks_format_in_pin(&pin, &f), "a float range past the cap widened the float range");
+   f.rate = 176400;
+   check(!wdmks_format_in_pin(&pin, &f), "and not with the PCM one's rate");
+}
+
+/* A 64-bit position register: a byte count past 2^32, on a loop that
+ * is not a power of two, lands where the count says and not where its
+ * low word alone would. */
+static void run_wide_register(void)
+{
+   wdmks_t  w;
+   ULONG    reg[2];
+   uint64_t count;
+
+   printf("64-bit position register\n");
+   memset(&w, 0, sizeof(w));
+   w.rt_size     = LOOP_BYTES;
+   w.frame_bytes = FRAME;
+   w.rate        = RATE;
+   w.rt_pos      = reg;
+   w.rt_pos_wide = true;
+
+   count  = ((uint64_t)1 << 32) + 4 * LOOP_BYTES + 1000;
+   reg[0] = (ULONG)count;
+   reg[1] = (ULONG)(count >> 32);
+   check(wdmks_rt_register_read(&w) == (ULONG)(count % LOOP_BYTES),
+         "the position is the whole count modulo the loop");
+   check(wdmks_rt_register_read(&w) != (ULONG)(reg[0] % LOOP_BYTES),
+         "which is not where the low word alone would put it");
+   w.rt_pos_wide = false;
+   reg[0]        = 1000;
+   check(wdmks_rt_register_read(&w) == 1000, "a 32-bit register is read as it is");
+}
+
+/* The capture side's fold into the fifo: a stereo pin averaged to mono
+ * in either width, a mono pin copied through, and never more than the
+ * fifo takes. */
+static void run_capture_fold(void)
+{
+   wdmks_mic_t m;
+   int16_t     s16[8] = { 100, 300, -400, -200, 32767, 32767, -32768, 0 };
+   float       f32[4] = { 0.5f, 0.25f, -1.0f, 1.0f };
+   int16_t     out16[4];
+   float       outf[2];
+   size_t      took;
+
+   printf("capture fold\n");
+   memset(&m, 0, sizeof(m));
+   m.fifo        = fifo_new(1024);
+   m.frame_bytes = 4;
+   m.out_bytes   = 2;
+   took = wdmks_mic_fold(&m, (const unsigned char*)s16, sizeof(s16));
+   check(took == sizeof(s16), "stereo s16: every frame taken");
+   check(FIFO_READ_AVAIL(m.fifo) == 4 * sizeof(int16_t), "four mono samples out");
+   fifo_read(m.fifo, out16, sizeof(out16));
+   check(out16[0] == 200 && out16[1] == -300 && out16[2] == 32767
+         && out16[3] == -16384, "each the average of its pair, without wrapping");
+
+   m.frame_bytes = 8;
+   m.out_bytes   = 4;
+   m.is_float    = true;
+   took = wdmks_mic_fold(&m, (const unsigned char*)f32, sizeof(f32));
+   check(took == sizeof(f32), "stereo float: every frame taken");
+   fifo_read(m.fifo, outf, sizeof(outf));
+   check(outf[0] == 0.375f && outf[1] == 0.0f, "averaged as float");
+
+   m.frame_bytes = 4;
+   m.is_float    = true;
+   took = wdmks_mic_fold(&m, (const unsigned char*)f32, sizeof(f32));
+   check(took == sizeof(f32) && FIFO_READ_AVAIL(m.fifo) == sizeof(f32),
+         "mono float: copied through");
+   fifo_read(m.fifo, f32, sizeof(f32));
+
+   /* A fifo with room for two samples takes two frames of the three. */
+   fifo_free(m.fifo);
+   m.fifo        = fifo_new(2 * 4);   /* two floats */
+   took = wdmks_mic_fold(&m, (const unsigned char*)f32, 12);
+   check(took == 8, "only what the fifo takes, in whole samples");
+   fifo_free(m.fifo);
+}
+
+/* The WaveRT read model: what the hardware writes is read from behind
+ * its position, wrapping with the loop; a lap unseen means what it held
+ * is gone and the read cursor moves up to the hardware. */
+static void run_capture_loop(void)
+{
+   wdmks_mic_t   m;
+   unsigned char loop[LOOP_BYTES];
+   unsigned char out[LOOP_BYTES];
+   size_t        i;
+
+   printf("capture loop\n");
+   memset(&m, 0, sizeof(m));
+   m.stream.looped = true;
+   m.stream.handle = INVALID_HANDLE_VALUE;
+   m.fifo        = fifo_new(2 * LOOP_BYTES);
+   m.frame_bytes = FRAME;
+   m.out_bytes   = FRAME;     /* a stereo-wide mono pin, no fold */
+   m.rate        = RATE;
+   m.rt_buf      = loop;
+   m.rt_size     = LOOP_BYTES;
+   m.rt_pos      = &fake_pos;
+   for (i = 0; i < LOOP_BYTES; i++)
+      loop[i] = (unsigned char)(i * 7);
+
+   fake_pos = 0;
+   check(wdmks_mic_rt_drain(&m) && FIFO_READ_AVAIL(m.fifo) == 0,
+         "the first sample places the cursor and delivers nothing");
+
+   hw_play(1000);
+   check(wdmks_mic_rt_drain(&m) && FIFO_READ_AVAIL(m.fifo) == 1000,
+         "what the hardware wrote is delivered");
+   fifo_read(m.fifo, out, 1000);
+   check(!memcmp(out, loop, 1000), "from the start of the loop");
+
+   /* Round the wrap. */
+   hw_play(LOOP_BYTES - 1000 + 500);
+   check(wdmks_mic_rt_drain(&m) && FIFO_READ_AVAIL(m.fifo) == LOOP_BYTES - 500,
+         "a delivery that wraps is whole");
+   fifo_read(m.fifo, out, LOOP_BYTES - 500);
+   check(!memcmp(out, loop + 1000, LOOP_BYTES - 1000)
+         && !memcmp(out + LOOP_BYTES - 1000, loop, 500),
+         "and in order across the wrap");
+
+   /* A lap went by unobserved: the read cursor comes up to the
+    * hardware and nothing stale is delivered. */
+   m.rt_last_usec -= (retro_time_t)LOOP_FRAMES * 1000000 / RATE * 2;
+   hw_play(LOOP_BYTES / 3);
+   check(wdmks_mic_rt_drain(&m) && FIFO_READ_AVAIL(m.fifo) == 0
+         && m.rt_read == fake_pos, "laps lost: the cursor moves up to the hardware");
+
+   /* The hardware overruns: more written than the loop holds. */
+   hw_play(LOOP_BYTES / 2);
+   wdmks_mic_rt_drain(&m);
+   fifo_read(m.fifo, out, FIFO_READ_AVAIL(m.fifo));
+   fake_pos = (ULONG)((fake_pos + LOOP_BYTES / 2) % LOOP_BYTES);
+   wdmks_mic_rt_sample(&m);   /* observed, but not drained */
+   hw_play(LOOP_BYTES / 2 + FRAME);
+   check(wdmks_mic_rt_drain(&m) && FIFO_READ_AVAIL(m.fifo) == 0
+         && m.rt_read == fake_pos, "an overrun drops what was overwritten");
+
+   fifo_free(m.fifo);
+}
+
+/* A pin whose only range is 32-bit PCM stereo, 44100-384000 - a
+ * USB Audio Class 2 DAC as its class driver reports it: the integer
+ * shapes are in the ranges, float is the last-resort proposal, and the
+ * conversion into the pin's width is full scale. */
+static void run_wide_pcm_pin(void)
+{
+   wdmks_pin_t    pin;
+   wdmks_format_t f;
+   float          in[6]  = { 0.0f, 0.5f, -0.5f, 1.0f, -1.0f, 2.0f };
+   int32_t        out[6];
+   wdmks_mic_t    m;
+   int32_t        s32[2] = { 0x40000000, (int32_t)-0x40000000 };
+   float          fo;
+
+   printf("32-bit PCM pin\n");
+   memset(&pin, 0, sizeof(pin));
+   pin.range_count = 1;
+   pin.ranges[0].max_channels = 2;
+   pin.ranges[0].min_bits     = 32;
+   pin.ranges[0].max_bits     = 32;
+   pin.ranges[0].min_rate     = 44100;
+   pin.ranges[0].max_rate     = 384000;
+
+   memset(&f, 0, sizeof(f));
+   f.rate = 48000; f.channels = 2;
+   f.bits = 32; f.container_bits = 32; f.is_float = true;
+   check(!wdmks_format_in_pin(&pin, &f), "float is not in the ranges");
+   check(wdmks_pin_has_wide(&pin, 48000, 2), "but the pin is 32 bits wide, so it is proposed last");
+   check(!wdmks_pin_has_wide(&pin, 32000, 2), "not at a rate outside the range");
+   f.is_float = false;
+   check(wdmks_format_in_pin(&pin, &f), "32-bit integer is in the ranges");
+   f.bits = 24;
+   check(!wdmks_format_in_pin(&pin, &f), "24 valid bits is not, on a 32/32 range");
+   f.bits = 16; f.container_bits = 16;
+   check(!wdmks_format_in_pin(&pin, &f), "nor 16");
+   check(wdmks_shape_order[0].is_float && wdmks_shape_order[1].bits == 32
+         && !wdmks_shape_order[1].is_float && wdmks_shape_order[2].bits == 24
+         && wdmks_shape_order[3].container_bits == 16,
+         "shapes: float, 32, 24-in-32, 16");
+
+   convert_float_to_s32(out, in, 6, 32);
+   check(out[0] == 0 && out[1] == 0x40000000 && out[2] == (int32_t)-0x40000000,
+         "float to 32-bit: full scale");
+   check(out[3] == 0x7FFFFFFF && out[4] == (int32_t)-0x7FFFFFFF - 1
+         && out[5] == 0x7FFFFFFF, "and clamped at the ends");
+   in[1] = 0.5f + 1.0f / 4096.0f;
+   convert_float_to_s32(out, in, 6, 24);
+   check(out[1] == 0x40080000 && (out[1] & 0xFF) == 0,
+         "24 in 32: the low byte is clear");
+
+   memset(&m, 0, sizeof(m));
+   m.fifo        = fifo_new(64);
+   m.frame_bytes = 8;
+   m.out_bytes   = 4;
+   m.pin_s32     = true;
+   m.is_float    = true;
+   check(wdmks_mic_fold(&m, (const unsigned char*)s32, sizeof(s32)) == 8, "capture: a stereo 32-bit frame taken");
+   fifo_read(m.fifo, &fo, sizeof(fo));
+   check(fo == 0.0f, "averaged as float");
+   m.frame_bytes = 4;
+   wdmks_mic_fold(&m, (const unsigned char*)s32, 4);
+   fifo_read(m.fifo, &fo, sizeof(fo));
+   check(fo == 0.5f, "mono 32-bit: full scale float out");
+   fifo_free(m.fifo);
+}
+
 int main(void)
 {
+   run_ranges();
+   run_wide_pcm_pin();
+   run_wide_register();
+   run_capture_fold();
+   run_capture_loop();
    fifo_frames = 0;
    run_contract("caller-driven loop, no FIFO report", put_direct, false);
    run_contract("refill thread pump, no FIFO report", put_pump, true);

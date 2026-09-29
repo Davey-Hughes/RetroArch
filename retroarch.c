@@ -78,6 +78,9 @@
 #ifdef HAVE_SMBCLIENT
 #include "libretro-common/vfs/vfs_implementation_smb.h"
 #endif
+#ifdef HAVE_NFSCLIENT
+#include "libretro-common/vfs/vfs_implementation_nfs.h"
+#endif
 
 #include <features/features_cpu.h>
 
@@ -403,6 +406,27 @@ void retroarch_smb_init(void)
    smb_global_cfg.subdir = settings->arrays.smb_client_subdir;
 
    smb_init_cfg(&smb_global_cfg);
+}
+#endif
+
+#ifdef HAVE_NFSCLIENT
+static struct nfs_settings nfs_global_cfg;
+
+/* Settings for nfs://; a URL with its own export needs none of them. */
+void retroarch_nfs_init(void)
+{
+   settings_t *settings = config_get_ptr();
+
+   nfs_global_cfg.server_address = settings->arrays.nfs_server;
+   nfs_global_cfg.export_path    = settings->arrays.nfs_export;
+   nfs_global_cfg.subdir         = settings->arrays.nfs_subdir;
+   nfs_global_cfg.timeout        = settings->uints.nfs_timeout;
+   nfs_global_cfg.num_contexts   = settings->uints.nfs_num_contexts;
+   nfs_global_cfg.nfs_port       = settings->uints.nfs_port;
+   nfs_global_cfg.mount_port     = settings->uints.nfs_mount_port;
+   nfs_global_cfg.version        = settings->uints.nfs_version;
+
+   nfs_init_cfg(&nfs_global_cfg);
 }
 #endif
 
@@ -6686,6 +6710,9 @@ int rarch_main(int argc, char *argv[], void *data)
 #ifdef HAVE_SMBCLIENT
    retroarch_smb_init();
 #endif
+#ifdef HAVE_NFSCLIENT
+   retroarch_nfs_init();
+#endif
 
    if (frontend_state_get_ptr()->current_frontend_ctx)
    {
@@ -7947,6 +7974,15 @@ static bool retroarch_parse_input_and_config(
       config_load_file_salamander();
 #endif
       config_load(global_get_ptr());
+      /* The network clients took their settings before the file was
+       * read (the string fields point at the live buffers, the numeric
+       * ones were copied); hand them the loaded values. */
+#ifdef HAVE_SMBCLIENT
+      retroarch_smb_init();
+#endif
+#ifdef HAVE_NFSCLIENT
+      retroarch_nfs_init();
+#endif
 
       /* Remember the startup config path so "Save Main
        * Configuration" can find it after config_replace()
@@ -9736,6 +9772,9 @@ bool retroarch_main_quit(void)
 
 #ifdef HAVE_SMBCLIENT
    smb_shutdown();
+#endif
+#ifdef HAVE_NFSCLIENT
+   nfs_shutdown();
 #endif
 
    return true;

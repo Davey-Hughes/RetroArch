@@ -197,6 +197,9 @@ CONFIG FILE
 #include "../libretro-common/file/config_file.c"
 #include "../libretro-common/file/config_file_io.c"
 #include "../libretro-common/file/config_file_userdata.c"
+#if defined(HAVE_KEYCHAIN) && defined(HAVE_CRYPTO)
+#include "../libretro-common/file/keychain.c"
+#endif
 #endif
 
 /*============================================================
@@ -278,6 +281,16 @@ CHEATS
 #include "../cheat_manager.c"
 #endif
 #include "../libretro-common/hash/lrc_hash.c"
+
+/*============================================================
+CRYPTO
+============================================================ */
+#ifdef HAVE_CRYPTO
+#include "../libretro-common/crypto/crypto.c"
+#include "../libretro-common/crypto/kdf.c"
+#include "../libretro-common/crypto/pk.c"
+#include "../libretro-common/crypto/x509.c"
+#endif
 
 #include "../gfx/video_driver.c"
 #include "../gfx/common/video_mode_select.c"
@@ -1717,6 +1730,7 @@ XML
 ============================================================ */
 #include "../libretro-common/audio/conversion/s16_to_float.c"
 #include "../libretro-common/audio/conversion/float_to_s16.c"
+#include "../libretro-common/audio/conversion/float_to_s32.c"
 #include "../libretro-common/audio/conversion/stereo_to_mono_float.c"
 #include "../libretro-common/audio/conversion/mono_to_stereo_float.c"
 #ifdef HAVE_AUDIOMIXER
@@ -1746,6 +1760,10 @@ HTTP SERVER
 SSL
 ============================================================ */
 #if defined(HAVE_SSL)
+#if defined(HAVE_RETROSSL)
+#include "../libretro-common/net/net_socket_ssl_retro.c"
+#include "../network/tls_log.c"
+#else
 #if defined(HAVE_NETWORKING)
 #if defined(HAVE_BUILTINMBEDTLS)
 #include "../deps/mbedtls/aes.c"
@@ -1816,6 +1834,7 @@ SSL
 #include "../libretro-common/net/net_socket_ssl_mbed.c"
 #include "../network/tls_log.c"
 #endif
+#endif /* HAVE_RETROSSL */
 #endif
 
 /*============================================================
@@ -1960,5 +1979,13 @@ SMB CLIENT
 #endif
 
 #ifdef HAVE_SMBCLIENT
+#ifdef HAVE_RETROSMB
+#include "../libretro-common/net/net_smb2.c"
+#include "../libretro-common/net/net_krb5.c"
+#endif
 #include "../libretro-common/vfs/vfs_implementation_smb.c"
+#endif
+#ifdef HAVE_NFSCLIENT
+#include "../libretro-common/net/net_nfs3.c"
+#include "../libretro-common/vfs/vfs_implementation_nfs.c"
 #endif
