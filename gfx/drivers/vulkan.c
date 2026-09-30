@@ -11395,6 +11395,19 @@ static float vulkan_get_refresh_rate(void *data)
    return 0.0f;
 }
 
+#ifdef HAVE_OPENXR
+static float vulkan_get_headset_refresh(void *data, float *rates,
+      unsigned cap, unsigned *count)
+{
+   vk_t *vk = (vk_t*)data;
+   *count   = 0;
+   if (     !vk || !vk->context || !vk->context->xr
+         || !vulkan_openxr_alive(vk->context->xr))
+      return 0.0f;
+   return vulkan_openxr_refresh_rate(vk->context->xr);
+}
+#endif
+
 static uint32_t vulkan_get_flags(void *data)
 {
    uint32_t flags = 0;
@@ -11793,9 +11806,11 @@ static const video_poke_interface_t vulkan_poke_interface = {
    NULL, /* get_swap_interval_cap */
    vulkan_set_view_count,
 #ifdef HAVE_OPENXR
-   vulkan_hw_context_destroying
+   vulkan_hw_context_destroying,
+   vulkan_get_headset_refresh
 #else
-   NULL  /* hw_context_destroying */
+   NULL, /* hw_context_destroying */
+   NULL  /* get_headset_refresh */
 #endif
 };
 

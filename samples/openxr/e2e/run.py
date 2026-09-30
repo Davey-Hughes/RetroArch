@@ -2018,6 +2018,40 @@ def check_rate_change(res):
     return errors
 
 
+# driver_adjust_system_rates() while the headset paces the core.
+PACED = re.compile(r'\[Video\] The headset paces the core: ([\d.]+) Hz / '
+                   r'(\d+)\.')
+
+
+def paced_line(hz, n):
+    return '[Video] The headset paces the core: %.2f Hz / %d.' % (hz, n)
+
+
+def check_paced(n, hz):
+    """The headset at hz paces the core, n headset frames a core
+    frame."""
+    def check(res):
+        if paced_line(hz, n) not in res.log:
+            return ['no "%s" in the log' % paced_line(hz, n)]
+        return []
+    return check
+
+
+def check_unpaced(res):
+    """No headset pacing: the core keeps the window's 60 Hz as before."""
+    if marks_missing(res, 'from', 'to'):
+        return ['the run did not reach its marks']
+    errors = []
+    if PACED.search(res.log):
+        errors.append('the headset paced the core')
+    t0, t1 = window(res, 'from', 'to')
+    fps = core_fps(res, t0, t1)
+    if fps < 30.0:
+        errors.append('the core ran at %.1f fps, want the window\'s pace '
+                      '(about 60)' % fps)
+    return errors
+
+
 SETTLE = [('wait', 8)]
 VULKAN = {'video_views_test_hw': 'vulkan'}
 TEARDOWN = [('wait', 6), ('send', 'FULLSCREEN_TOGGLE'), ('wait', 4),
@@ -2417,6 +2451,18 @@ CASES = [
                ('mark', 'change'), ('script', 'divide 2'), ('wait', 7),
                ('mark', 'to')],
      'check': check_rate_change},
+    # 10 fps on the 20 Hz headset: two headset frames a core frame.
+    {'name': 'pace-2', 'map': 'none', 'options': FPS10, 'settings': WINDOW1,
+     'steps': PACE_STEPS, 'check': check_paced(2, 20.0)},
+    # 16 fps doesn't fit 20 Hz; the video driver restarts halfway.
+    {'name': 'pace-misfit', 'map': 'none', 'options': FPS16,
+     'settings': WINDOW1,
+     'steps': [('wait', 8), ('send', 'FULLSCREEN_TOGGLE'), ('wait', 8),
+               ('mark', 'from'), ('wait', 4), ('mark', 'to')],
+     'check': check_unpaced},
+    {'name': 'pace-threaded', 'map': 'none', 'options': FPS10,
+     'settings': dict(WINDOW1, video_threaded='true'), 'steps': PACE_STEPS,
+     'check': threaded(check_unpaced)},
 ]
 
 

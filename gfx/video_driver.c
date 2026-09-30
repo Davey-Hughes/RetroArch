@@ -2678,6 +2678,8 @@ void video_driver_free_internal(void)
     * implementation dereferences that argument on entry. */
    video_st->data               = NULL;
    video_st->views_driver_count = 0;
+   /* The next driver's headset, if any, is measured afresh. */
+   video_st->headset_hz         = 0.0f;
 
    /* The poke interface is a pointer into the driver's static vtable, so
     * unlike video_st->data it survives free "working" - and
@@ -2924,6 +2926,29 @@ void video_driver_headset_recenter(void)
    video_driver_st.headset_recenter++;
    RARCH_LOG("[Video] Headset recenter requested.\n");
 }
+
+#ifdef HAVE_OPENXR
+void video_driver_headset_poll(void)
+{
+   float rates[VIDEO_HEADSET_MAX_RATES];
+   unsigned count                 = 0;
+   float hz                       = 0.0f;
+   video_driver_state_t *video_st = &video_driver_st;
+   settings_t *settings           = config_get_ptr();
+
+   if (     video_st->data && video_st->poke
+         && video_st->poke->get_headset_refresh)
+      hz = video_st->poke->get_headset_refresh(video_st->data, rates,
+            VIDEO_HEADSET_MAX_RATES, &count);
+   if (hz == video_st->headset_hz)
+      return;
+   video_st->headset_hz = hz;
+   /* The configured rate again, so nothing is saved: the rates are
+    * adjusted with the headset's standing in. */
+   driver_ctl(RARCH_DRIVER_CTL_SET_REFRESH_RATE,
+         &settings->floats.video_refresh_rate);
+}
+#endif
 
 static void video_driver_views_layout(settings_t *settings,
       const video_views_map_t *map, unsigned dims,
@@ -5179,6 +5204,7 @@ void video_driver_build_info(video_frame_info_t *video_info)
    video_info->headset_distance            = settings->floats.video_openxr_distance;
    video_info->headset_width               = settings->floats.video_openxr_width;
    video_info->headset_recenter            = video_st->headset_recenter;
+   video_info->headset_interval            = video_st->headset_interval;
    video_info->screen_layout               = settings->uints.video_screen_layout;
    video_info->stereo_swap_eyes            = settings->bools.video_stereo_swap_eyes;
    video_info->frame_repeat                = video_st->frame_repeat;

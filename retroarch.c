@@ -166,6 +166,7 @@
 #include "input/input_remapping.h"
 #ifdef HAVE_OPENXR
 #include "input/common/input_openxr.h"
+#include "gfx/video_xr.h"
 #endif
 
 #ifdef HAVE_CHEEVOS
@@ -1492,11 +1493,33 @@ static void driver_adjust_system_rates(
    bool video_adaptive_vsync              = settings->bools.video_adaptive_vsync;
    unsigned sync_plan                     = RUNLOOP_SYNC_VSYNC_HOLDS
          | (vrr_runloop_enable ? RUNLOOP_SYNC_EXACT_RATE : 0);
+#ifdef HAVE_OPENXR
+   unsigned headset_fit                   = video_xr_pace_interval(
+         video_st->headset_hz, (float)input_fps, audio_max_timing_skew,
+         MAXIMUM_SWAP_INTERVAL);
+#endif
 
    /* Update video swap interval if automatic
     * switching is enabled */
    runloop_set_video_swap_interval(settings);
    video_swap_interval = runloop_get_video_swap_interval(video_swap_interval);
+
+#ifdef HAVE_OPENXR
+   /* A headset whose rate fits the core paces it in the window's place:
+    * its rate and interval stand in for the display's. */
+   video_st->headset_interval = settings->bools.video_vsync ? headset_fit : 0;
+   if (video_st->headset_interval)
+   {
+      video_refresh_rate    = video_st->headset_hz;
+      video_swap_interval   = video_st->headset_interval;
+      black_frame_insertion = 0;
+      shader_subframes      = 1;
+      vrr_runloop_enable    = false;
+      sync_plan             = RUNLOOP_SYNC_VSYNC_HOLDS;
+      RARCH_LOG("[Video] The headset paces the core: %.2f Hz / %u.\n",
+            video_st->headset_hz, video_st->headset_interval);
+   }
+#endif
 
    if (input_fps > 0.0)
    {

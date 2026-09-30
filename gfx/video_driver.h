@@ -673,6 +673,9 @@ typedef struct video_frame_info
    float headset_distance;
    float headset_width;
    unsigned headset_recenter;
+   /* Each core frame shows for this many headset frames and waits for
+    * them in place of the window's vsync; 0 while the window paces. */
+   unsigned headset_interval;
    unsigned screen_layout;
    bool stereo_swap_eyes;
    /* The last frame sent again (paused, menu), not a new core frame. */
@@ -1019,6 +1022,12 @@ typedef struct video_poke_interface
     * queue. The driver instance is freed after it. The main thread
     * calls it, or waits while the video thread runs it. */
    void (*hw_context_destroying)(void *data);
+
+   /* A headset's refresh, for the main thread: the rate it runs at as
+    * measured, 0 until known, and up to cap of the rates it can be
+    * asked for into rates, *count of them. */
+   float (*get_headset_refresh)(void *data, float *rates, unsigned cap,
+         unsigned *count);
 } video_poke_interface_t;
 
 /* dims is the frame's size, VIDEO_SCALE_PACK'd; msg is for showing a
@@ -1469,6 +1478,12 @@ typedef struct
    bool views_fallback;
    /* Recenter requests for a headset, counted. */
    unsigned headset_recenter;
+   /* Headset pacing, main thread, never saved: the headset's measured
+    * rate, which stands in for the display's while it fits the core,
+    * and how many headset frames each core frame shows for (0: the
+    * window paces). */
+   float headset_hz;
+   unsigned headset_interval;
    /* Set while video_driver_cached_frame() sends the last frame again. */
    bool frame_repeat;
 } video_driver_state_t;
@@ -1795,6 +1810,12 @@ const video_views_layout_t *video_driver_get_views_layout(void);
 /* Main thread: ask a headset to place its screens in front of where it
  * looks now. */
 void video_driver_headset_recenter(void);
+
+#ifdef HAVE_OPENXR
+/* Main thread, once an iteration: a new headset rate reruns the rate
+ * adjustment. */
+void video_driver_headset_poll(void);
+#endif
 
 #ifdef HAVE_OVERLAY
 struct overlay;

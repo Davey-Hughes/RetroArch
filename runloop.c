@@ -8443,6 +8443,10 @@ int runloop_iterate(void)
    /* Tick deferred shader compilation (one pass per frame) */
    video_driver_shader_deferred_tick();
 
+#ifdef HAVE_OPENXR
+   video_driver_headset_poll();
+#endif
+
    if (runloop_st->frame_time.callback)
    {
       /* Updates frame timing if frame timing callback is in use by the core.
