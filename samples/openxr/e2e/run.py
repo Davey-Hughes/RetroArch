@@ -2066,15 +2066,17 @@ def check_rate_change(res):
 # driver_adjust_system_rates() while the headset paces the core.
 PACED = re.compile(r'\[Video\] The headset paces the core: ([\d.]+) Hz / '
                    r'(\d+)\.')
+LOSS_LINE = '[OpenXR] Session loss pending.'
 
 
 def paced_line(hz, n):
     return '[Video] The headset paces the core: %.2f Hz / %d.' % (hz, n)
 
 
-def check_paced(n, hz):
+def check_paced(n, hz, end=None):
     """The headset at hz paces the core: its image every n headset
-    frames at hz / n fps, and the window no longer waits for vsync."""
+    frames at hz / n fps, and the window no longer waits for vsync.
+    end: a log line past which the clock line is not held against it."""
     def check(res):
         if marks_missing(res, 'from', 'to'):
             return ['the run did not reach its marks']
@@ -2084,7 +2086,8 @@ def check_paced(n, hz):
             errors.append('no "%s" in the log' % paced_line(hz, n))
         if MAILBOX not in res.log:
             errors.append('the window never presented without waiting')
-        if CLOCK_LINE in res.log:
+        log = res.log.split(end)[0] if end else res.log
+        if CLOCK_LINE in log:
             errors.append('the core paced on the clock, not the headset')
         fps = core_fps(res, t0, t1)
         if abs(fps - hz / n) > 0.1 * hz / n:
@@ -2134,7 +2137,7 @@ def check_fastforward(res):
 def check_window_back(res):
     """Paced, then the session lost: the window's interval returns and
     the core keeps about the window's rate, not unthrottled."""
-    errors = check_paced(2, 20.0)(res)
+    errors = check_paced(2, 20.0, LOSS_LINE)(res)
     if marks_missing(res, 'lost', 'end'):
         return ['the run did not reach its marks']
     t0, t1 = window(res, 'lost', 'end', 1.0)
@@ -2614,7 +2617,7 @@ CASES = [
                       audio_max_timing_skew='0.25'),
      'steps': PACE_STEPS, 'check': check_paced(1, 20.0)},
     {'name': 'pace-window-back', 'map': 'none', 'options': FPS10,
-     'settings': dict(WINDOW1, video_openxr_refresh_rate='1'),
+     'settings': WINDOW1,
      'steps': [('wait', 8), ('mark', 'from'), ('wait', 5), ('mark', 'to'),
                ('script', 'state 7'), ('mark', 'lost'), ('wait', 6),
                ('mark', 'end')],

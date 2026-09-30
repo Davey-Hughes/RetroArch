@@ -1014,9 +1014,29 @@ static void vulkan_openxr_list_rates(vulkan_openxr_t *xr)
    if (     !xr->refresh_ext
          || XR_FAILED(xr->EnumerateDisplayRefreshRatesFB(xr->session, 0,
                &n, NULL))
-         || !n || n > VIDEO_HEADSET_MAX_RATES
-         || XR_FAILED(xr->EnumerateDisplayRefreshRatesFB(xr->session, n,
-               &n, xr->rates)))
+         || !n)
+      return;
+   if (n > VIDEO_HEADSET_MAX_RATES)
+   {
+      /* The runtime takes no less room than it lists. */
+      uint32_t all = n;
+      float *tmp   = (float*)malloc(all * sizeof(*tmp));
+      if (!tmp)
+         return;
+      if (XR_FAILED(xr->EnumerateDisplayRefreshRatesFB(xr->session, all,
+               &all, tmp)))
+      {
+         free(tmp);
+         return;
+      }
+      memcpy(xr->rates, tmp, VIDEO_HEADSET_MAX_RATES * sizeof(*tmp));
+      free(tmp);
+      RARCH_WARN("[OpenXR] The headset offers %u rates; %u dropped.\n",
+            (unsigned)n, (unsigned)(n - VIDEO_HEADSET_MAX_RATES));
+      n = VIDEO_HEADSET_MAX_RATES;
+   }
+   else if (XR_FAILED(xr->EnumerateDisplayRefreshRatesFB(xr->session, n,
+            &n, xr->rates)))
       return;
    xr->num_rates = n;
    s[0]          = '\0';
