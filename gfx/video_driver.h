@@ -676,6 +676,8 @@ typedef struct video_frame_info
    /* Each core frame shows for this many headset frames and waits for
     * them in place of the window's vsync; 0 while the window paces. */
    unsigned headset_interval;
+   /* The rate to ask the headset for, 0 for none. */
+   float headset_request_hz;
    unsigned screen_layout;
    bool stereo_swap_eyes;
    /* The last frame sent again (paused, menu), not a new core frame. */
@@ -1484,6 +1486,8 @@ typedef struct
     * window paces). */
    float headset_hz;
    unsigned headset_interval;
+   /* The rate to ask the headset for, 0 for none. */
+   float headset_request_hz;
    bool headset_vsync;
    /* Set while video_driver_cached_frame() sends the last frame again. */
    bool frame_repeat;

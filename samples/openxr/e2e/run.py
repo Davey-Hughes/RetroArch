@@ -2160,6 +2160,26 @@ def check_unpaced(res):
     return errors
 
 
+def check_request(hz, n, rate):
+    """What the headset was asked for (None: nothing), and the pace at
+    the rate it then runs at."""
+    def check(res):
+        if marks_missing(res, 'from', 'to'):
+            return ['the run did not reach its marks']
+        got = [round(e['hz'], 2) for e in events(res, 'refresh_request')]
+        want = [] if hz is None else [hz]
+        errors = []
+        if got != want:
+            errors.append('asked the headset for %s Hz, want %s'
+                          % (got, want))
+        t0, t1 = window(res, 'from', 'to')
+        errors += pace_errors(res, t0, t1, n)
+        if paced_line(rate, n) not in res.log:
+            errors.append('no "%s" in the log' % paced_line(rate, n))
+        return errors
+    return check
+
+
 SETTLE = [('wait', 8)]
 VULKAN = {'video_views_test_hw': 'vulkan'}
 TEARDOWN = [('wait', 6), ('send', 'FULLSCREEN_TOGGLE'), ('wait', 4),
@@ -2594,11 +2614,23 @@ CASES = [
                       audio_max_timing_skew='0.25'),
      'steps': PACE_STEPS, 'check': check_paced(1, 20.0)},
     {'name': 'pace-window-back', 'map': 'none', 'options': FPS10,
-     'settings': WINDOW1,
+     'settings': dict(WINDOW1, video_openxr_refresh_rate='1'),
      'steps': [('wait', 8), ('mark', 'from'), ('wait', 5), ('mark', 'to'),
                ('script', 'state 7'), ('mark', 'lost'), ('wait', 6),
                ('mark', 'end')],
      'check': check_window_back},
+    # The layer lists 20 and 10 Hz and starts at 10: Auto asks for 20.
+    {'name': 'pace-auto', 'map': 'none', 'options': FPS10,
+     'settings': WINDOW1, 'script': 'rates 20 10\ndivide 2\n',
+     'steps': PACE_STEPS, 'check': check_request(20.0, 2, 20.0)},
+    {'name': 'pace-headset-choice', 'map': 'none', 'options': FPS10,
+     'settings': dict(WINDOW1, video_openxr_refresh_rate='1'),
+     'script': 'rates 20 10\ndivide 2\n', 'steps': PACE_STEPS,
+     'check': check_request(None, 1, 10.0)},
+    {'name': 'pace-fixed-rate', 'map': 'none', 'options': FPS10,
+     'settings': dict(WINDOW1, video_openxr_refresh_rate='10'),
+     'script': 'rates 20 10\n', 'steps': PACE_STEPS,
+     'check': check_request(10.0, 1, 10.0)},
 ]
 
 

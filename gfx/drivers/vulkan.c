@@ -9270,7 +9270,10 @@ static void vulkan_xr_pace_setup(vk_t *vk,
    vulkan_openxr_t *xr = vk->context->xr;
    bool paced          = xr && video_info->headset_interval;
    if (xr)
+   {
       vulkan_openxr_set_pacing(xr, video_info->headset_interval);
+      vulkan_openxr_request_rate(xr, video_info->headset_request_hz);
+   }
    if (paced == vk->xr.paced)
       return;
    vk->xr.paced = paced;
@@ -11450,6 +11453,7 @@ static float vulkan_get_headset_refresh(void *data, float *rates,
    if (     !vk || !vk->context || !vk->context->xr
          || !vulkan_openxr_alive(vk->context->xr))
       return 0.0f;
+   *count   = vulkan_openxr_refresh_rates(vk->context->xr, rates, cap);
    return vulkan_openxr_refresh_rate(vk->context->xr);
 }
 #endif

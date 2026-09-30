@@ -65,6 +65,7 @@ struct vulkan_openxr
    uint32_t rec_width;
    bool enable2;
    bool frame_controller;
+   bool refresh_ext;               /* XR_FB_display_refresh_rate */
    /* The session is made on the thread that makes the device; its frame
     * loop runs on the XR thread. lock guards what both read. */
    XrSession session;
@@ -102,6 +103,12 @@ struct vulkan_openxr
    int64_t pace_anchor_ns;         /* video thread */
    unsigned pace_mode;             /* video thread: 0, 1 ticks, 2 clock */
    bool tick_late;                 /* video thread: logged once */
+   /* XR_FB_display_refresh_rate: the rates the session lists, the one
+    * to ask for (float bits, 0 for none), and the last one asked. */
+   float rates[VIDEO_HEADSET_MAX_RATES];
+   unsigned num_rates;
+   retro_atomic_int_t want_rate;
+   float asked_rate;               /* XR thread */
    int64_t formats[VULKAN_OPENXR_MAX_FORMATS];
    uint32_t num_formats;
    struct vulkan_openxr_slot slots[VIDEO_XR_MAX_SLOTS];
@@ -146,6 +153,8 @@ struct vulkan_openxr
    PFN_xrGetVulkanGraphicsDeviceKHR GetVulkanGraphicsDeviceKHR;
    PFN_xrGetVulkanInstanceExtensionsKHR GetVulkanInstanceExtensionsKHR;
    PFN_xrGetVulkanDeviceExtensionsKHR GetVulkanDeviceExtensionsKHR;
+   PFN_xrEnumerateDisplayRefreshRatesFB EnumerateDisplayRefreshRatesFB;
+   PFN_xrRequestDisplayRefreshRateFB RequestDisplayRefreshRateFB;
 };
 
 static PFN_xrVoidFunction vulkan_openxr_proc(const vulkan_openxr_t *xr,
@@ -240,7 +249,7 @@ vulkan_openxr_t *vulkan_openxr_new(bool enable1, uint32_t api_version)
    XrVersion api;
    uint32_t count = 0;
    uint32_t num_exts;
-   const char *exts[2];
+   const char *exts[3];
    XrInstanceCreateInfo ici;
    XrSystemGetInfo sgi;
    XrSystemProperties props;
@@ -308,6 +317,12 @@ vulkan_openxr_t *vulkan_openxr_new(bool enable1, uint32_t api_version)
       exts[num_exts++]     = VULKAN_OPENXR_FRAME_EXT;
       xr->frame_controller = true;
    }
+   if (vulkan_openxr_has_extension(enum_exts, count,
+            XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME))
+   {
+      exts[num_exts++] = XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME;
+      xr->refresh_ext  = true;
+   }
 
    memset(&ici, 0, sizeof(ici));
    ici.type                       = XR_TYPE_INSTANCE_CREATE_INFO;
@@ -337,6 +352,11 @@ vulkan_openxr_t *vulkan_openxr_new(bool enable1, uint32_t api_version)
          || !get_system || !get_system_properties
          || !enum_views || !enum_modes)
       goto missing;
+   /* Without them the rate is still measured, never asked for. */
+   if (     xr->refresh_ext
+         && (  !VULKAN_OPENXR_FN(xr, EnumerateDisplayRefreshRatesFB)
+            || !VULKAN_OPENXR_FN(xr, RequestDisplayRefreshRateFB)))
+      xr->refresh_ext = false;
    if (enable1)
    {
       if (     !VULKAN_OPENXR_FN(xr, GetVulkanGraphicsRequirementsKHR)
@@ -721,6 +741,13 @@ static void vulkan_openxr_poll(vulkan_openxr_t *xr)
       }
       else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING)
          vulkan_openxr_ended(xr, true);
+      else if (ev.type == XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB)
+      {
+         const XrEventDataDisplayRefreshRateChangedFB *rc =
+            (const XrEventDataDisplayRefreshRateChangedFB*)&ev;
+         RARCH_LOG("[OpenXR] The headset changed from %.2f to %.2f Hz.\n",
+               rc->fromDisplayRefreshRate, rc->toDisplayRefreshRate);
+      }
    }
 }
 
@@ -866,6 +893,21 @@ static void vulkan_openxr_tick(vulkan_openxr_t *xr)
    slock_unlock(xr->lock);
 }
 
+/* The rate the video thread wants, asked once a session and value. */
+static void vulkan_openxr_ask_rate(vulkan_openxr_t *xr)
+{
+   XrResult res;
+   float hz;
+   int bits = retro_atomic_load_acquire_int(&xr->want_rate);
+   memcpy(&hz, &bits, sizeof(hz));
+   if (!xr->refresh_ext || hz <= 0.0f || hz == xr->asked_rate)
+      return;
+   xr->asked_rate = hz;
+   res            = xr->RequestDisplayRefreshRateFB(xr->session, hz);
+   RARCH_LOG("[OpenXR] Asked the headset for %.2f Hz (%d).\n", hz,
+         (int)res);
+}
+
 /* One headset frame. xrWaitFrame paces this thread at the headset's
  * rate, and the core too while the headset paces it. */
 static void vulkan_openxr_frame(vulkan_openxr_t *xr)
@@ -900,6 +942,7 @@ static void vulkan_openxr_frame(vulkan_openxr_t *xr)
             1000000000.0 / (double)xr->period.published);
    }
    vulkan_openxr_tick(xr);
+   vulkan_openxr_ask_rate(xr);
    slock_lock(xr->lock);
    xr->predicted_time = state.predictedDisplayTime;
    slock_unlock(xr->lock);
@@ -958,6 +1001,29 @@ static void vulkan_openxr_thread(void *data)
       else
          retro_sleep(10);
    }
+}
+
+/* The rates XR_FB_display_refresh_rate lists for this session. */
+static void vulkan_openxr_list_rates(vulkan_openxr_t *xr)
+{
+   char s[256];
+   uint32_t i;
+   size_t len    = 0;
+   uint32_t n    = 0;
+   xr->num_rates = 0;
+   if (     !xr->refresh_ext
+         || XR_FAILED(xr->EnumerateDisplayRefreshRatesFB(xr->session, 0,
+               &n, NULL))
+         || !n || n > VIDEO_HEADSET_MAX_RATES
+         || XR_FAILED(xr->EnumerateDisplayRefreshRatesFB(xr->session, n,
+               &n, xr->rates)))
+      return;
+   xr->num_rates = n;
+   s[0]          = '\0';
+   for (i = 0; i < n && len < sizeof(s); i++)
+      len += snprintf(s + len, sizeof(s) - len, "%s%.2f",
+            i ? ", " : "", xr->rates[i]);
+   RARCH_LOG("[OpenXR] The headset offers %s Hz.\n", s);
 }
 
 static bool vulkan_openxr_create_session(vulkan_openxr_t *xr,
@@ -1038,6 +1104,7 @@ static bool vulkan_openxr_create_session(vulkan_openxr_t *xr,
                VULKAN_OPENXR_MAX_FORMATS, &count, xr->formats)))
       count = 0;
    xr->num_formats = count;
+   vulkan_openxr_list_rates(xr);
    RARCH_LOG("[OpenXR] Session created.\n");
 
    if (vulkan_openxr_hooks.session_created)
@@ -1356,6 +1423,7 @@ bool vulkan_openxr_start(vulkan_openxr_t *xr, VkInstance instance,
    retro_atomic_store_release_int(&xr->period_ns, 0);
    xr->tick_count    = 0;
    xr->tick_interval = 0;
+   xr->asked_rate    = 0.0f;
    retro_atomic_store_release_int(&xr->quit, 0);
    retro_atomic_store_release_int(&xr->alive, xr->ended ? 0 : 1);
    if (!(xr->thread = sthread_create(vulkan_openxr_thread, xr)))
@@ -1525,6 +1593,22 @@ void vulkan_openxr_pace_wait(vulkan_openxr_t *xr)
       if (sleep_us > 0)
          retro_sleep_us((unsigned)sleep_us);
    }
+}
+
+unsigned vulkan_openxr_refresh_rates(const vulkan_openxr_t *xr,
+      float *rates, unsigned cap)
+{
+   unsigned i;
+   for (i = 0; i < xr->num_rates && i < cap; i++)
+      rates[i] = xr->rates[i];
+   return i;
+}
+
+void vulkan_openxr_request_rate(vulkan_openxr_t *xr, float hz)
+{
+   int bits;
+   memcpy(&bits, &hz, sizeof(bits));
+   retro_atomic_store_release_int(&xr->want_rate, bits);
 }
 
 unsigned vulkan_openxr_max_dim(const vulkan_openxr_t *xr)

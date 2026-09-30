@@ -38,6 +38,9 @@
 
 #include "video_driver.h"
 #include "gfx_instrument.h"
+#ifdef HAVE_OPENXR
+#include "video_xr.h"
+#endif
 
 /* Decided here, at the top, because an #ifdef on a macro defined
  * later in the file is silently false: the first user of this gate
@@ -2979,6 +2982,9 @@ void video_driver_headset_poll(void)
          && video_st->poke->get_headset_refresh)
       hz = video_st->poke->get_headset_refresh(video_st->data, rates,
             VIDEO_HEADSET_MAX_RATES, &count);
+   video_st->headset_request_hz = video_xr_request_rate(
+         settings->uints.video_openxr_refresh_rate, rates, count,
+         (float)video_st->av_info.timing.fps, MAXIMUM_SWAP_INTERVAL);
    if (     hz == video_st->headset_hz
          && settings->bools.video_vsync == video_st->headset_vsync)
       return;
@@ -5245,6 +5251,7 @@ void video_driver_build_info(video_frame_info_t *video_info)
    video_info->headset_width               = settings->floats.video_openxr_width;
    video_info->headset_recenter            = video_st->headset_recenter;
    video_info->headset_interval            = video_st->headset_interval;
+   video_info->headset_request_hz          = video_st->headset_request_hz;
    video_info->screen_layout               = settings->uints.video_screen_layout;
    video_info->stereo_swap_eyes            = settings->bools.video_stereo_swap_eyes;
    video_info->frame_repeat                = video_st->frame_repeat;
