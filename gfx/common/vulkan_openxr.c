@@ -20,6 +20,7 @@
 #include <boolean.h>
 #include <compat/strl.h>
 #include <dynamic/dylib.h>
+#include <features/features_cpu.h>
 #include <retro_atomic.h>
 #include <retro_timers.h>
 #include <string/stdstring.h>
@@ -89,6 +90,18 @@ struct vulkan_openxr
     * published, 0 until known. */
    video_xr_period_t period;       /* XR thread */
    retro_atomic_int_t period_ns;
+   /* Pacing: every interval headset frames the XR thread bumps tick_seq
+    * and signals tick; the video thread waits on it once a core frame,
+    * or on the clock while the headset doesn't show the session. */
+   scond_t *tick;                  /* with lock */
+   uint64_t tick_seq;              /* lock */
+   retro_atomic_int_t interval;
+   unsigned tick_count;            /* XR thread */
+   unsigned tick_interval;         /* XR thread */
+   uint64_t tick_seen;             /* video thread */
+   int64_t pace_anchor_ns;         /* video thread */
+   unsigned pace_mode;             /* video thread: 0, 1 ticks, 2 clock */
+   bool tick_late;                 /* video thread: logged once */
    int64_t formats[VULKAN_OPENXR_MAX_FORMATS];
    uint32_t num_formats;
    struct vulkan_openxr_slot slots[VIDEO_XR_MAX_SLOTS];
@@ -462,6 +475,8 @@ void vulkan_openxr_free(vulkan_openxr_t *xr)
    vulkan_openxr_destroy_session(xr);
    if (xr->instance && xr->DestroyInstance)
       xr->DestroyInstance(xr->instance);
+   if (xr->tick)
+      scond_free(xr->tick);
    if (xr->lock)
       slock_free(xr->lock);
    if (xr->lib)
@@ -832,8 +847,27 @@ static void vulkan_openxr_recenter(vulkan_openxr_t *xr, XrTime time)
          anchor.position.x, anchor.position.y, anchor.position.z);
 }
 
+/* Every interval headset frames, a tick for the core. */
+static void vulkan_openxr_tick(vulkan_openxr_t *xr)
+{
+   unsigned interval = (unsigned)retro_atomic_load_acquire_int(
+         &xr->interval);
+   if (interval != xr->tick_interval)
+   {
+      xr->tick_interval = interval;
+      xr->tick_count    = 0;
+   }
+   if (!interval || ++xr->tick_count < interval)
+      return;
+   xr->tick_count = 0;
+   slock_lock(xr->lock);
+   xr->tick_seq++;
+   scond_signal(xr->tick);
+   slock_unlock(xr->lock);
+}
+
 /* One headset frame. xrWaitFrame paces this thread at the headset's
- * rate; the core never waits on it. */
+ * rate, and the core too while the headset paces it. */
 static void vulkan_openxr_frame(vulkan_openxr_t *xr)
 {
    XrResult res;
@@ -865,6 +899,7 @@ static void vulkan_openxr_frame(vulkan_openxr_t *xr)
       RARCH_LOG("[OpenXR] The headset runs at %.2f Hz.\n",
             1000000000.0 / (double)xr->period.published);
    }
+   vulkan_openxr_tick(xr);
    slock_lock(xr->lock);
    xr->predicted_time = state.predictedDisplayTime;
    slock_unlock(xr->lock);
@@ -1295,6 +1330,8 @@ bool vulkan_openxr_start(vulkan_openxr_t *xr, VkInstance instance,
 {
    if (!xr->lock && !(xr->lock = slock_new()))
       return false;
+   if (!xr->tick && !(xr->tick = scond_new()))
+      return false;
    /* A kept device outlives a session the runtime ended: a new one. */
    if (xr->ended)
    {
@@ -1317,6 +1354,8 @@ bool vulkan_openxr_start(vulkan_openxr_t *xr, VkInstance instance,
       vulkan_openxr_cursor_create(xr, gpu, device, queue_family);
    video_xr_period_init(&xr->period);
    retro_atomic_store_release_int(&xr->period_ns, 0);
+   xr->tick_count    = 0;
+   xr->tick_interval = 0;
    retro_atomic_store_release_int(&xr->quit, 0);
    retro_atomic_store_release_int(&xr->alive, xr->ended ? 0 : 1);
    if (!(xr->thread = sthread_create(vulkan_openxr_thread, xr)))
@@ -1416,6 +1455,66 @@ float vulkan_openxr_refresh_rate(vulkan_openxr_t *xr)
 {
    int ns = retro_atomic_load_acquire_int(&xr->period_ns);
    return (ns > 0) ? (float)(1000000000.0 / (double)ns) : 0.0f;
+}
+
+void vulkan_openxr_set_pacing(vulkan_openxr_t *xr, unsigned interval)
+{
+   retro_atomic_store_release_int(&xr->interval, (int)interval);
+   if (!interval)
+      xr->pace_mode = 0;
+}
+
+/* The next tick after the last one seen, or false after timeout_ns. */
+static bool vulkan_openxr_wait_tick(vulkan_openxr_t *xr,
+      int64_t timeout_ns)
+{
+   bool ticked;
+   retro_time_t deadline = cpu_features_get_time_usec()
+      + (retro_time_t)(timeout_ns / 1000);
+   slock_lock(xr->lock);
+   while (xr->tick_seq == xr->tick_seen)
+   {
+      retro_time_t left = deadline - cpu_features_get_time_usec();
+      if (left <= 0 || !scond_wait_timeout(xr->tick, xr->lock, left))
+         break;
+   }
+   ticked        = xr->tick_seq != xr->tick_seen;
+   xr->tick_seen = xr->tick_seq;
+   slock_unlock(xr->lock);
+   return ticked;
+}
+
+void vulkan_openxr_pace_wait(vulkan_openxr_t *xr)
+{
+   int64_t period = (int64_t)retro_atomic_load_acquire_int(&xr->period_ns)
+      * retro_atomic_load_acquire_int(&xr->interval);
+   if (period <= 0 || !xr->tick)
+      return;
+   if (vulkan_openxr_should_draw(xr))
+   {
+      if (xr->pace_mode != 1)
+         RARCH_LOG("[OpenXR] Pacing on the headset's frames.\n");
+      xr->pace_mode = 1;
+      if (!vulkan_openxr_wait_tick(xr, period * 2) && !xr->tick_late)
+      {
+         xr->tick_late = true;
+         RARCH_WARN("[OpenXR] No headset frame for two intervals; the core carries on.\n");
+      }
+      xr->pace_anchor_ns = (int64_t)cpu_features_get_time_usec() * 1000;
+   }
+   else
+   {
+      /* No ticks to wait on: keep the core's rate on the clock, from
+       * the last tick on. */
+      retro_time_t sleep_us;
+      if (xr->pace_mode != 2)
+         RARCH_LOG("[OpenXR] Pacing on the clock while the headset does not show the session.\n");
+      xr->pace_mode = 2;
+      sleep_us      = runloop_pace_schedule(&xr->pace_anchor_ns, period,
+            cpu_features_get_time_usec());
+      if (sleep_us > 0)
+         retro_sleep_us((unsigned)sleep_us);
+   }
 }
 
 unsigned vulkan_openxr_max_dim(const vulkan_openxr_t *xr)

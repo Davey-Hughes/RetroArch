@@ -158,6 +158,15 @@ float vulkan_openxr_pixels_per_radian(vulkan_openxr_t *xr);
  * until VIDEO_XR_PERIODS frames agree. */
 float vulkan_openxr_refresh_rate(vulkan_openxr_t *xr);
 
+/* Video thread, each frame: the XR thread ticks every interval headset
+ * frames; 0 stops. */
+void vulkan_openxr_set_pacing(vulkan_openxr_t *xr, unsigned interval);
+
+/* Video thread, once a core frame: wait for the next tick while the
+ * headset shows the session, at most two tick intervals; while it
+ * doesn't, sleep to where the next tick would be. */
+void vulkan_openxr_pace_wait(vulkan_openxr_t *xr);
+
 /* The largest swapchain side the headset takes. */
 unsigned vulkan_openxr_max_dim(const vulkan_openxr_t *xr);
 

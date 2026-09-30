@@ -337,6 +337,10 @@ typedef struct vk
       bool hdr_warned;
       bool recenter_seen;
       unsigned recenter;   /* the request count last seen */
+      /* The headset paces frames, so the window presents without
+       * waiting; window_interval is what set_nonblock_state asked. */
+      bool paced;
+      int window_interval;
    } xr;
 #endif
    vulkan_context_t *context;
@@ -6535,6 +6539,9 @@ static void *vulkan_init(const video_info_t *video,
          interval = -1;
       ctx_driver->swap_interval(vk->ctx_data, interval);
    }
+#ifdef HAVE_OPENXR
+   vk->xr.window_interval = interval;
+#endif
 
    win_dims  = video->dims;
 
@@ -6971,6 +6978,12 @@ static void vulkan_set_nonblock_state(void *data, bool state,
          interval = swap_interval;
       if (adaptive_vsync_enabled && interval == 1)
          interval = -1;
+#ifdef HAVE_OPENXR
+      /* Kept for when the headset stops pacing. */
+      vk->xr.window_interval = interval;
+      if (vk->xr.paced)
+         interval = 0;
+#endif
       vk->ctx_driver->swap_interval(vk->ctx_data, interval);
    }
 
@@ -9248,6 +9261,25 @@ static bool vulkan_xr_ready(vk_t *vk)
    }
    return vulkan_xr_pick_format(vk);
 }
+
+/* While the headset paces the core, the window presents without
+ * waiting, and each core frame waits for the headset instead. */
+static void vulkan_xr_pace_setup(vk_t *vk,
+      const video_frame_info_t *video_info)
+{
+   vulkan_openxr_t *xr = vk->context->xr;
+   bool paced          = xr && video_info->headset_interval;
+   if (xr)
+      vulkan_openxr_set_pacing(xr, video_info->headset_interval);
+   if (paced == vk->xr.paced)
+      return;
+   vk->xr.paced = paced;
+   if (vk->ctx_driver->swap_interval)
+      vk->ctx_driver->swap_interval(vk->ctx_data,
+            paced ? 0 : vk->xr.window_interval);
+   RARCH_LOG("[Vulkan] Headset pacing %s.\n", paced
+         ? "on: the window presents without waiting" : "off");
+}
 #endif
 
 static bool vulkan_frame(void *data, const void *frame,
@@ -9408,6 +9440,7 @@ static bool vulkan_frame(void *data, const void *frame,
 #ifdef HAVE_OPENXR
    vulkan_xr_recenter(vk, video_info);
    xr_draw                                       = vulkan_xr_ready(vk);
+   vulkan_xr_pace_setup(vk, video_info);
 #endif
 
    /* This slot's last frame, and every frame before it, has finished. */
@@ -10809,6 +10842,15 @@ static bool vulkan_frame(void *data, const void *frame,
       }
       vk->context->flags &= ~VK_CTX_FLAG_SWAP_INTERVAL_EMULATION_LOCK;
    }
+
+#ifdef HAVE_OPENXR
+   /* In place of the window's vsync: once a core frame, never under
+    * fast-forward. */
+   if (     vk->xr.paced
+         && !input_driver_nonblock_state
+         && !(vk->context->flags & VK_CTX_FLAG_SWAP_INTERVAL_EMULATION_LOCK))
+      vulkan_openxr_pace_wait(vk->context->xr);
+#endif
 
    return true;
 }

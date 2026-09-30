@@ -1991,15 +1991,60 @@ def headset_hz(res, t0, t1):
             periods[len(periods) // 2] / 1e6)
 
 
+# The window's swapchain going non-blocking under vsync (vk_x).
+MAILBOX = 'VK_DATA_FLAG_EMULATE_MAILBOX requires non-zero swap_interval'
+TICKS_LINE = "[OpenXR] Pacing on the headset's frames."
+CLOCK_LINE = ('[OpenXR] Pacing on the clock while the headset does not '
+              'show the session.')
+
+
+def pace_errors(res, t0, t1, n):
+    """Errors unless, between t0 and t1, the core's image was released
+    every n headset frames: each gap between releases within half a
+    headset frame of n periods, and n headset frames between most."""
+    frames = [f for f in res.frames if t0 <= f['t_us'] <= t1]
+    periods = sorted(f['period_ns'] for f in frames if f['period_ns'] > 0)
+    shown = [q for f in frames for q in quads(f) if not q['flags'] & BLEND]
+    if len(frames) < 10 or not periods or not shown:
+        return ['%d headset frames with the core\'s quad between %.1f and '
+                '%.1f s' % (len(frames), t0 / 1e6, t1 / 1e6)]
+    sc = shown[-1]['sc']
+    period = periods[len(periods) // 2] / 1e3
+    rel = [r['t_us'] for r in res.releases
+           if r['sc'] == sc and t0 <= r['t_us'] <= t1]
+    if len(rel) < 5:
+        return ['%d images released on sc%d, want a steady stream'
+                % (len(rel), sc)]
+    gaps = [b - a for a, b in zip(rel, rel[1:])]
+    off = [round(g / 1e3, 1) for g in gaps
+           if abs(g - n * period) > period / 2]
+    ts = [f['t_us'] for f in frames]
+    counts = sorted(sum(1 for t in ts if a < t <= b)
+                    for a, b in zip(rel, rel[1:]))
+    errors = []
+    if off:
+        errors.append('%d of %d gaps between releases are not %d headset '
+                      'frames of %.1f ms: %s'
+                      % (len(off), len(gaps), n, period / 1e3, off[:6]))
+    if counts[len(counts) // 2] != n:
+        errors.append('%d headset frames a core frame, want %d'
+                      % (counts[len(counts) // 2], n))
+    return errors
+
+
 def check_rate_change(res):
-    """Monado's 20 Hz, then a 10 Hz headset (the layer's divide 2), and
-    the core's frame log at the rate it reports."""
+    """Monado's 20 Hz, then a 10 Hz headset (the layer's divide 2): the
+    XR thread measures each, and the pace follows without a restart."""
     if marks_missing(res, 'from', 'change', 'to'):
         return ['the run did not reach its marks']
     errors = []
-    for a, b, lead, hz in (('from', 'change', 0.0, 20.0),
-                           ('change', 'to', 3.0, 10.0)):
+    for a, b, lead, hz, n in (('from', 'change', 0.0, 20.0, 2),
+                              ('change', 'to', 3.0, 10.0, 1)):
         t0, t1 = window(res, a, b, lead)
+        errors += ['at %.0f Hz: %s' % (hz, e)
+                   for e in pace_errors(res, t0, t1, n)]
+        if paced_line(hz, n) not in res.log:
+            errors.append('no "%s" in the log' % paced_line(hz, n))
         rate, period = headset_hz(res, t0, t1)
         if abs(rate - hz) > 0.1 * hz or abs(period - 1e3 / hz) > 0.5:
             errors.append('the headset ran at %.1f Hz, period %.1f ms; '
@@ -2028,13 +2073,58 @@ def paced_line(hz, n):
 
 
 def check_paced(n, hz):
-    """The headset at hz paces the core, n headset frames a core
-    frame."""
+    """The headset at hz paces the core: its image every n headset
+    frames at hz / n fps, and the window no longer waits for vsync."""
     def check(res):
+        if marks_missing(res, 'from', 'to'):
+            return ['the run did not reach its marks']
+        t0, t1 = window(res, 'from', 'to')
+        errors = pace_errors(res, t0, t1, n)
         if paced_line(hz, n) not in res.log:
-            return ['no "%s" in the log' % paced_line(hz, n)]
-        return []
+            errors.append('no "%s" in the log' % paced_line(hz, n))
+        if MAILBOX not in res.log:
+            errors.append('the window never presented without waiting')
+        fps = core_fps(res, t0, t1)
+        if abs(fps - hz / n) > 0.1 * hz / n:
+            errors.append('the core ran at %.1f fps, want %.1f'
+                          % (fps, hz / n))
+        return errors
     return check
+
+
+def check_hidden(res):
+    """The session not visible: the core keeps its rate on the clock and
+    nothing hangs; visible again, the headset paces it again."""
+    if marks_missing(res, 'hidden', 'shown', 'to'):
+        return ['the run did not reach its marks']
+    errors = []
+    t0, t1 = window(res, 'hidden', 'shown', 1.0)
+    fps = core_fps(res, t0, t1)
+    if abs(fps - 10.0) > 1.5:
+        errors.append('the core ran at %.1f fps while the headset did not '
+                      'show it, want 10' % fps)
+    t0, t1 = window(res, 'shown', 'to', 2.0)
+    errors += pace_errors(res, t0, t1, 2)
+    for line in (CLOCK_LINE, TICKS_LINE):
+        if line not in res.log:
+            errors.append('no "%s" in the log' % line)
+    return errors
+
+
+def check_fastforward(res):
+    """Fast-forward waits for nothing: the core outruns the headset.
+    After it, the headset paces the core again."""
+    if marks_missing(res, 'ff', 'ffend', 'to'):
+        return ['the run did not reach its marks']
+    errors = []
+    t0, t1 = window(res, 'ff', 'ffend', 0.5)
+    fps = core_fps(res, t0, t1)
+    if fps < 40.0:
+        errors.append('the core ran at %.1f fps in fast-forward, want well '
+                      'past the headset\'s 20 Hz' % fps)
+    t0, t1 = window(res, 'ffend', 'to', 2.0)
+    errors += pace_errors(res, t0, t1, 2)
+    return errors
 
 
 def check_unpaced(res):
@@ -2466,6 +2556,19 @@ CASES = [
     {'name': 'pace-vsync-off', 'map': 'none', 'options': FPS10,
      'settings': dict(WINDOW1, video_vsync='false'), 'steps': PACE_STEPS,
      'check': check_unpaced},
+    # The session only synchronized (3) for four seconds, then focused.
+    {'name': 'pace-hidden', 'map': 'none', 'options': FPS10,
+     'settings': WINDOW1,
+     'steps': [('wait', 8), ('mark', 'hidden'), ('script', 'state 3'),
+               ('wait', 4), ('mark', 'shown'), ('script', 'state 5'),
+               ('wait', 6), ('mark', 'to')],
+     'check': check_hidden},
+    {'name': 'pace-fastforward', 'map': 'none', 'options': FPS10,
+     'settings': WINDOW1,
+     'steps': [('wait', 8), ('mark', 'ff'), ('send', 'FAST_FORWARD'),
+               ('wait', 3), ('mark', 'ffend'), ('send', 'FAST_FORWARD'),
+               ('wait', 6), ('mark', 'to')],
+     'check': check_fastforward},
 ]
 
 
