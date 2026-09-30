@@ -183,6 +183,45 @@ int video_xr_pick(const video_xr_quad_set_t *set, unsigned laser,
 float video_xr_cursor(const video_xr_quad_t *q, float u, float v,
       float dist, video_xr_pose_t *pose);
 
+/* Headset pacing. The XR thread's filter over each frame's predicted
+ * display period: a period is published once VIDEO_XR_PERIODS frames
+ * agree within 1% of their median, and again when a new median is more
+ * than 1% from it. Periods outside (0, 1 s] are ignored. */
+#define VIDEO_XR_PERIODS       16
+#define VIDEO_XR_PERIOD_MAX_NS 1000000000
+
+typedef struct video_xr_period
+{
+   int64_t samples[VIDEO_XR_PERIODS];
+   int64_t published;   /* ns; 0 until settled */
+   unsigned count;
+   unsigned next;
+} video_xr_period_t;
+
+void video_xr_period_init(video_xr_period_t *f);
+
+/* True when the published period changed. */
+bool video_xr_period_add(video_xr_period_t *f, int64_t period_ns);
+
+/* How many headset frames at hz each core frame at fps shows for: the
+ * auto swap interval's multiple, up to ceiling, when the sync plan puts
+ * the core within skew of hz / N; 0 when it doesn't fit. */
+unsigned video_xr_pace_interval(float hz, float fps, float skew,
+      unsigned ceiling);
+
+/* Auto: of the count rates offered, the one whose nearest whole
+ * multiple of fps, up to ceiling, is closest; the higher on a tie; 0
+ * with none. */
+float video_xr_pick_rate(const float *rates, unsigned count, float fps,
+      unsigned ceiling);
+
+/* The rate to ask for under a Headset Refresh Rate setting (enum
+ * video_openxr_refresh, or Hz): Auto's pick, nothing for Headset's
+ * Choice, or the offered rate within half a hertz of the setting; 0
+ * for none. */
+float video_xr_request_rate(unsigned setting, const float *rates,
+      unsigned count, float fps, unsigned ceiling);
+
 RETRO_END_DECLS
 
 #endif

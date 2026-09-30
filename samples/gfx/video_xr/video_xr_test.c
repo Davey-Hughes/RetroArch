@@ -15,7 +15,8 @@
 
 /* Harness for gfx/video_xr.c: quad placement, swapchain image sizes,
  * recentering, ray hits and quad points mapped back to the core's
- * frame. Exit 0 on pass, 1 on any failure. */
+ * frame, and the headset pacing maths. Exit 0 on pass, 1 on any
+ * failure. */
 
 #include <stdio.h>
 #include <string.h>
@@ -501,6 +502,123 @@ static void test_cursor(void)
    CHECK(NEAR(pose.orientation.y, 0.70711));
 }
 
+/* A 120 Hz and a 72 Hz headset's predicted display periods, in ns. */
+#define P120 8333333
+#define P72  13888889
+
+/* How many times n frames of period changed the published one. */
+static unsigned feed(video_xr_period_t *f, int64_t period, unsigned n)
+{
+   unsigned i;
+   unsigned changes = 0;
+   for (i = 0; i < n; i++)
+      if (video_xr_period_add(f, period))
+         changes++;
+   return changes;
+}
+
+static void test_period_settle(void)
+{
+   video_xr_period_t f;
+   video_xr_period_init(&f);
+   CHECK(feed(&f, P120, 15) == 0);
+   CHECK(f.published == 0);
+   CHECK(feed(&f, P120, 1) == 1);
+   CHECK(f.published == P120);
+   CHECK(feed(&f, P120, 40) == 0);
+   /* Nonsense periods are ignored. */
+   CHECK(!video_xr_period_add(&f, 0));
+   CHECK(!video_xr_period_add(&f, -5));
+   CHECK(!video_xr_period_add(&f, (int64_t)VIDEO_XR_PERIOD_MAX_NS + 1));
+   CHECK(f.published == P120);
+}
+
+static void test_period_jitter(void)
+{
+   video_xr_period_t f;
+   unsigned i;
+   unsigned changes = 0;
+   video_xr_period_init(&f);
+   /* 0.4% either way settles on the median. */
+   for (i = 0; i < VIDEO_XR_PERIODS; i++)
+      if (video_xr_period_add(&f, P120 + ((i & 1) ? 33000 : -33000)))
+         changes++;
+   CHECK(changes == 1);
+   CHECK(f.published == P120);
+   /* A stall among agreeing frames publishes nothing... */
+   CHECK(!video_xr_period_add(&f, 16666667));
+   CHECK(feed(&f, P120, 15) == 0);
+   /* ...nor does a steady drift inside 1%. */
+   CHECK(feed(&f, P120 + 41667, 32) == 0);
+   CHECK(f.published == P120);
+}
+
+static void test_period_change(void)
+{
+   video_xr_period_t f;
+   video_xr_period_init(&f);
+   CHECK(feed(&f, P72, 16) == 1);
+   CHECK(f.published == P72);
+   /* The user picks 120 Hz: a mixed window publishes nothing. */
+   CHECK(feed(&f, P120, 15) == 0);
+   CHECK(f.published == P72);
+   CHECK(feed(&f, P120, 1) == 1);
+   CHECK(f.published == P120);
+}
+
+static void test_pace_interval(void)
+{
+   CHECK(video_xr_pace_interval(120.0f, 60.0988f, 0.05f, 16) == 2);
+   CHECK(video_xr_pace_interval(120.0f, 60.0f, 0.05f, 16) == 2);
+   CHECK(video_xr_pace_interval(72.0f, 60.0f, 0.05f, 16) == 0);
+   CHECK(video_xr_pace_interval(90.0f, 60.0f, 0.05f, 16) == 0);
+   CHECK(video_xr_pace_interval(144.0f, 48.0f, 0.05f, 16) == 3);
+   CHECK(video_xr_pace_interval(60.0f, 59.94f, 0.05f, 16) == 1);
+   /* The end-to-end cases: Monado's 20 Hz and the layer's 10 Hz. */
+   CHECK(video_xr_pace_interval(20.0f, 10.0f, 0.05f, 16) == 2);
+   CHECK(video_xr_pace_interval(10.0f, 10.0f, 0.05f, 16) == 1);
+   CHECK(video_xr_pace_interval(20.0f, 16.0f, 0.05f, 16) == 0);
+   CHECK(video_xr_pace_interval(20.0f, 60.0f, 0.05f, 16) == 0);
+   /* Past the ceiling the rule falls back to 1, which doesn't fit. */
+   CHECK(video_xr_pace_interval(240.0f, 10.0f, 0.05f, 16) == 0);
+   CHECK(video_xr_pace_interval(0.0f, 60.0f, 0.05f, 16) == 0);
+   CHECK(video_xr_pace_interval(120.0f, 0.0f, 0.05f, 16) == 0);
+}
+
+static void test_pick_rate(void)
+{
+   static const float quest[4]  = { 72.0f, 90.0f, 120.0f, 144.0f };
+   static const float frame[1]  = { 120.0f };
+   static const float only72[1] = { 72.0f };
+   static const float tie[3]    = { 60.0f, 90.0f, 120.0f };
+   static const float e2e[2]    = { 20.0f, 10.0f };
+   CHECK(NEAR(video_xr_pick_rate(quest, 4, 60.0988f, 16), 120.0));
+   /* 50 fps: 144 / 3 = 48 is the closest. */
+   CHECK(NEAR(video_xr_pick_rate(quest, 4, 50.0f, 16), 144.0));
+   CHECK(NEAR(video_xr_pick_rate(frame, 1, 60.0f, 16), 120.0));
+   /* The best on offer, even when it doesn't fit. */
+   CHECK(NEAR(video_xr_pick_rate(only72, 1, 60.0f, 16), 72.0));
+   CHECK(NEAR(video_xr_pick_rate(tie, 3, 30.0f, 16), 120.0));
+   CHECK(NEAR(video_xr_pick_rate(e2e, 2, 10.0f, 16), 20.0));
+   CHECK(NEAR(video_xr_pick_rate(quest, 0, 60.0f, 16), 0.0));
+   CHECK(NEAR(video_xr_pick_rate(quest, 4, 0.0f, 16), 0.0));
+}
+
+static void test_request_rate(void)
+{
+   static const float quest[4] = { 72.0f, 90.0f, 120.0f, 144.0f };
+   static const float e2e[2]   = { 20.0f, 10.0f };
+   CHECK(NEAR(video_xr_request_rate(VIDEO_OPENXR_REFRESH_AUTO,
+               quest, 4, 60.0f, 16), 120.0));
+   CHECK(NEAR(video_xr_request_rate(VIDEO_OPENXR_REFRESH_AUTO,
+               quest, 0, 60.0f, 16), 0.0));
+   CHECK(NEAR(video_xr_request_rate(VIDEO_OPENXR_REFRESH_HEADSET,
+               quest, 4, 60.0f, 16), 0.0));
+   CHECK(NEAR(video_xr_request_rate(90, quest, 4, 60.0f, 16), 90.0));
+   CHECK(NEAR(video_xr_request_rate(100, quest, 4, 60.0f, 16), 0.0));
+   CHECK(NEAR(video_xr_request_rate(10, e2e, 2, 10.0f, 16), 10.0));
+}
+
 int main(void)
 {
    test_image_dims();
@@ -515,6 +633,12 @@ int main(void)
    test_live();
    test_pick();
    test_cursor();
+   test_period_settle();
+   test_period_jitter();
+   test_period_change();
+   test_pace_interval();
+   test_pick_rate();
+   test_request_rate();
 
    if (failures)
    {

@@ -18,6 +18,7 @@
 
 #include "video_xr.h"
 #include "video_defines.h"
+#include "../runloop.h"
 
 void video_xr_pose_identity(video_xr_pose_t *pose)
 {
@@ -436,4 +437,116 @@ float video_xr_cursor(const video_xr_quad_t *q, float u, float v,
    pose->position.y    = q->pose.position.y + world.y;
    pose->position.z    = q->pose.position.z + world.z;
    return (size < VIDEO_XR_CURSOR_MIN) ? VIDEO_XR_CURSOR_MIN : size;
+}
+
+/* Two rates this close in skew are a tie. */
+#define VIDEO_XR_RATE_TIE 0.0001f
+
+void video_xr_period_init(video_xr_period_t *f)
+{
+   memset(f, 0, sizeof(*f));
+}
+
+bool video_xr_period_add(video_xr_period_t *f, int64_t period_ns)
+{
+   int64_t s[VIDEO_XR_PERIODS];
+   int64_t median, d;
+   unsigned i, j;
+
+   if (period_ns <= 0 || period_ns > VIDEO_XR_PERIOD_MAX_NS)
+      return false;
+   f->samples[f->next] = period_ns;
+   f->next             = (f->next + 1) % VIDEO_XR_PERIODS;
+   if (f->count < VIDEO_XR_PERIODS)
+      f->count++;
+   if (f->count < VIDEO_XR_PERIODS)
+      return false;
+
+   for (i = 0; i < VIDEO_XR_PERIODS; i++)
+   {
+      int64_t v = f->samples[i];
+      for (j = i; j > 0 && s[j - 1] > v; j--)
+         s[j] = s[j - 1];
+      s[j] = v;
+   }
+   median = (s[VIDEO_XR_PERIODS / 2 - 1] + s[VIDEO_XR_PERIODS / 2]) / 2;
+   if (     (median - s[0]) * 100 > median
+         || (s[VIDEO_XR_PERIODS - 1] - median) * 100 > median)
+      return false;
+   if (f->published)
+   {
+      d = median - f->published;
+      if (d < 0)
+         d = -d;
+      if (d * 100 <= f->published)
+         return false;
+   }
+   f->published = median;
+   return true;
+}
+
+unsigned video_xr_pace_interval(float hz, float fps, float skew,
+      unsigned ceiling)
+{
+   unsigned n;
+   if (hz <= 0.0f || fps <= 0.0f)
+      return 0;
+   n = runloop_video_swap_interval_for(hz, fps, skew, ceiling);
+   if (!(runloop_sync_plan_for(hz, fps, (float)n, skew, false)
+            & RUNLOOP_SYNC_WITHIN_SKEW))
+      return 0;
+   return n;
+}
+
+/* How far fps is from hz over the whole multiple nearest hz / fps, as
+ * the auto swap interval rounds it. */
+static float video_xr_rate_skew(float hz, float fps, unsigned ceiling)
+{
+   float skew;
+   unsigned n = (unsigned)(hz / fps + 0.5f);
+   if (n < 1)
+      n = 1;
+   if (n > ceiling)
+      n = ceiling;
+   skew = 1.0f - fps * (float)n / hz;
+   return (skew < 0.0f) ? -skew : skew;
+}
+
+float video_xr_pick_rate(const float *rates, unsigned count, float fps,
+      unsigned ceiling)
+{
+   unsigned i;
+   float best      = 0.0f;
+   float best_skew = 0.0f;
+   if (fps <= 0.0f)
+      return 0.0f;
+   for (i = 0; i < count; i++)
+   {
+      float skew;
+      if (rates[i] <= 0.0f)
+         continue;
+      skew = video_xr_rate_skew(rates[i], fps, ceiling);
+      if (     best <= 0.0f
+            || skew < best_skew - VIDEO_XR_RATE_TIE
+            || (skew <= best_skew + VIDEO_XR_RATE_TIE && rates[i] > best))
+      {
+         best      = rates[i];
+         best_skew = skew;
+      }
+   }
+   return best;
+}
+
+float video_xr_request_rate(unsigned setting, const float *rates,
+      unsigned count, float fps, unsigned ceiling)
+{
+   unsigned i;
+   if (setting == VIDEO_OPENXR_REFRESH_AUTO)
+      return video_xr_pick_rate(rates, count, fps, ceiling);
+   if (setting == VIDEO_OPENXR_REFRESH_HEADSET)
+      return 0.0f;
+   for (i = 0; i < count; i++)
+      if (fabs(rates[i] - (float)setting) < 0.5)
+         return rates[i];
+   return 0.0f;
 }
