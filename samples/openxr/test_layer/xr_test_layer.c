@@ -27,6 +27,10 @@
  * does: the extension is taken out before the runtime sees it, and the
  * layer accepts that profile's suggested bindings itself.
  *
+ * It can also run the headset slower than the runtime (Monado's null
+ * compositor is fixed at 20 Hz) and offer XR_FB_display_refresh_rate
+ * rates of its own; the requests it gets are recorded.
+ *
  *   RA_XR_LAYER_OUT         directory for frames.jsonl and snap_*.png
  *   RA_XR_LAYER_SNAP_EVERY  write images every Nth frame; 0 never
  *   RA_XR_LAYER_SCRIPT      script file, re-read when it changes
@@ -45,6 +49,13 @@
  *                           exists, each xrPollEvent reports the oldest
  *   space <n>               the next xrPollEvent reports reference space
  *                           type n changing (2, LOCAL: a runtime recenter)
+ *   divide <k>              the application sees one runtime frame in k,
+ *                           a headset at 1/k of the runtime's rate; the
+ *                           others are begun and left for its
+ *                           xrBeginFrame to discard
+ *   rates <hz> [<hz> ...]   xrEnumerateDisplayRefreshRatesFB lists these,
+ *                           and a request for one of them sets divide;
+ *                           rates off: the runtime's own
  *   action <set>/<name>[@left|@right] <x> [<y>]
  *                           an action's state while its set is synced:
  *                           boolean x != 0, float x, vector2f x y
@@ -53,8 +64,8 @@
  *   aim <left|right> off    that hand untracked
  *
  * A changed script (a new mtime, inode or size) is applied line by
- * line. head and fail stay in effect until a later head or fail line
- * replaces them (head off, fail off). state and space fire once per
+ * line. head, fail, divide and rates stay in effect until a later line
+ * of the same kind replaces them (head off, fail off). state and space fire once per
  * change of the file. Every read starts from no actions and no aims: a
  * script is the whole controller state. Action states and hand poses
  * never come from the runtime.
@@ -81,6 +92,7 @@
 #define MAX_IMAGES 8
 #define MAX_SPACES 64
 #define MAX_FRAME_LAYERS 64
+#define MAX_RATES 8
 
 #define MAX_SETS        16
 #define FRAME_EXT       "XR_VALVE_frame_controller_interaction"
@@ -144,6 +156,10 @@ static struct
    XrPosef head;
    uint64_t frames;
    XrDuration period;
+   XrDuration runtime_period;  /* the runtime's own */
+   unsigned divide;            /* one runtime frame in divide */
+   float rates[MAX_RATES];     /* offered in the runtime's place */
+   unsigned num_rates;
 
    VkPhysicalDevice gpu;
    VkDevice device;
@@ -171,6 +187,7 @@ static struct
    PFN_xrAcquireSwapchainImage AcquireSwapchainImage;
    PFN_xrReleaseSwapchainImage ReleaseSwapchainImage;
    PFN_xrWaitFrame WaitFrame;
+   PFN_xrBeginFrame BeginFrame;
    PFN_xrEndFrame EndFrame;
 
    XrInstance instance;
@@ -212,6 +229,8 @@ static struct
    PFN_xrApplyHapticFeedback ApplyHapticFeedback;
    PFN_xrStopHapticFeedback StopHapticFeedback;
    PFN_xrSuggestInteractionProfileBindings SuggestInteractionProfileBindings;
+   PFN_xrEnumerateDisplayRefreshRatesFB EnumerateDisplayRefreshRatesFB;
+   PFN_xrRequestDisplayRefreshRateFB RequestDisplayRefreshRateFB;
 } L = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
 static long long now_us(void)
@@ -376,6 +395,29 @@ static void script_space(const char *args)
    L.inject_space = atoi(args);
 }
 
+static void script_divide(const char *args)
+{
+   int k    = atoi(args);
+   L.divide = (k > 1) ? (unsigned)k : 1;
+}
+
+static void script_rates(const char *args)
+{
+   char *end;
+   const char *p = args;
+   L.num_rates   = 0;
+   if (!strncmp(args, "off", 3))
+      return;
+   while (L.num_rates < MAX_RATES)
+   {
+      float r = strtof(p, &end);
+      if (end == p || r <= 0.0f)
+         break;
+      L.rates[L.num_rates++] = r;
+      p = end;
+   }
+}
+
 static void script_reset(void)
 {
    L.num_scripted = 0;
@@ -458,6 +500,8 @@ static const struct
    { "action", script_action },
    { "aim", script_aim },
    { "space", script_space },
+   { "divide", script_divide },
+   { "rates", script_rates },
 };
 
 /* Caller holds L.lock. */
@@ -1065,10 +1109,12 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_WaitFrame(XrSession session,
       const XrFrameWaitInfo *info, XrFrameState *state)
 {
    bool fail;
+   unsigned i, divide;
    XrResult res;
    pthread_mutex_lock(&L.lock);
    script_poll();
-   fail = L.fail_waitframe;
+   fail   = L.fail_waitframe;
+   divide = L.divide ? L.divide : 1;
    if (fail && L.out)
    {
       fprintf(L.out, "{\"ev\":\"fail\",\"fn\":\"xrWaitFrame\",\"t_us\":%lld}\n",
@@ -1079,13 +1125,83 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_WaitFrame(XrSession session,
    if (fail)
       return XR_ERROR_SESSION_LOST;
    res = L.WaitFrame(session, info, state);
+   /* A slower headset: the frames in between are begun here, and the
+    * application's xrBeginFrame discards them. No Vulkan queue work, so
+    * the application's queue lock is not needed. */
+   for (i = 1; XR_SUCCEEDED(res) && i < divide; i++)
+   {
+      XrFrameBeginInfo bi;
+      memset(&bi, 0, sizeof(bi));
+      bi.type = XR_TYPE_FRAME_BEGIN_INFO;
+      if (XR_FAILED(res = L.BeginFrame(session, &bi)))
+         break;
+      res = L.WaitFrame(session, info, state);
+   }
    if (XR_SUCCEEDED(res))
    {
       pthread_mutex_lock(&L.lock);
-      L.period = state->predictedDisplayPeriod;
+      L.runtime_period               = state->predictedDisplayPeriod;
+      state->predictedDisplayPeriod *= divide;
+      L.period                       = state->predictedDisplayPeriod;
       pthread_mutex_unlock(&L.lock);
    }
    return res;
+}
+
+static XRAPI_ATTR XrResult XRAPI_CALL layer_EnumerateDisplayRefreshRatesFB(
+      XrSession session, uint32_t cap, uint32_t *count, float *rates)
+{
+   uint32_t i, n;
+   float r[MAX_RATES];
+   pthread_mutex_lock(&L.lock);
+   script_poll();
+   n = L.num_rates;
+   memcpy(r, L.rates, sizeof(r));
+   pthread_mutex_unlock(&L.lock);
+   if (!n)
+      return L.EnumerateDisplayRefreshRatesFB
+         ? L.EnumerateDisplayRefreshRatesFB(session, cap, count, rates)
+         : XR_ERROR_FUNCTION_UNSUPPORTED;
+   *count = n;
+   if (!cap)
+      return XR_SUCCESS;
+   if (cap < n)
+      return XR_ERROR_SIZE_INSUFFICIENT;
+   for (i = 0; i < n; i++)
+      rates[i] = r[i];
+   return XR_SUCCESS;
+}
+
+/* Recorded; with scripted rates the headset runs at the one asked for,
+ * when it divides the runtime's rate. */
+static XRAPI_ATTR XrResult XRAPI_CALL layer_RequestDisplayRefreshRateFB(
+      XrSession session, float hz)
+{
+   bool scripted;
+   unsigned k = 0;
+   pthread_mutex_lock(&L.lock);
+   scripted = L.num_rates != 0;
+   if (scripted && hz > 0.0f && L.runtime_period > 0)
+   {
+      double runtime_hz = 1e9 / (double)L.runtime_period;
+      k = (unsigned)(runtime_hz / hz + 0.5);
+      if (k < 1 || fabs(runtime_hz / k - hz) > 0.01 * hz)
+         k = 0;
+      else
+         L.divide = k;
+   }
+   if (L.out)
+   {
+      fprintf(L.out, "{\"ev\":\"refresh_request\",\"hz\":%.3f,"
+            "\"divide\":%u,\"t_us\":%lld}\n", hz, k, now_us());
+      fflush(L.out);
+   }
+   pthread_mutex_unlock(&L.lock);
+   if (scripted)
+      return XR_SUCCESS;
+   return L.RequestDisplayRefreshRateFB
+      ? L.RequestDisplayRefreshRateFB(session, hz)
+      : XR_ERROR_FUNCTION_UNSUPPORTED;
 }
 
 static const char *eye_name(XrEyeVisibility e)
@@ -1508,6 +1624,8 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_GetInstanceProcAddr(XrInstance insta
    HOOK(ApplyHapticFeedback)
    HOOK(StopHapticFeedback)
    HOOK(SuggestInteractionProfileBindings)
+   HOOK(EnumerateDisplayRefreshRatesFB)
+   HOOK(RequestDisplayRefreshRateFB)
    if (!L.gipa)
       return XR_ERROR_FUNCTION_UNSUPPORTED;
    return L.gipa(instance, name, fn);
@@ -1555,6 +1673,7 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_CreateApiLayerInstance(
    NEXT(AcquireSwapchainImage);
    NEXT(ReleaseSwapchainImage);
    NEXT(WaitFrame);
+   NEXT(BeginFrame);
    NEXT(EndFrame);
    NEXT(PathToString);
    NEXT(CreateActionSet);
@@ -1570,6 +1689,8 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_CreateApiLayerInstance(
    NEXT(ApplyHapticFeedback);
    NEXT(StopHapticFeedback);
    NEXT(SuggestInteractionProfileBindings);
+   NEXT(EnumerateDisplayRefreshRatesFB);
+   NEXT(RequestDisplayRefreshRateFB);
 #undef NEXT
    L.instance = *instance;
    pthread_mutex_lock(&L.lock);

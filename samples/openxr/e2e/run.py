@@ -1950,6 +1950,70 @@ def kept_leak(text):
     return kinds == ['VkBuffer', 'VkBuffer', 'VkDeviceMemory', 'VkDeviceMemory']
 
 
+# ---- Headset pacing ----
+# The test core's frame log (video_views_test_fps), on CLOCK_MONOTONIC
+# like the layer's t_us and the marks (time.monotonic()).
+CORE_FRAME = re.compile(r'\[video_views\] frame (\d+) at (\d+) us')
+FPS10 = {'video_views_test_fps': '10'}
+FPS16 = {'video_views_test_fps': '16'}
+# The window's own interval: without the headset the core keeps the
+# window's 60 Hz.
+WINDOW1 = {'video_swap_interval': '1'}
+PACE_STEPS = [('wait', 8), ('mark', 'from'), ('wait', 5), ('mark', 'to')]
+
+
+def marks_missing(res, *names):
+    return [n for n in names if n not in res.marks]
+
+
+def window(res, a, b, lead=0.0):
+    """From lead seconds after mark a to mark b, in us."""
+    return (res.marks[a] + lead) * 1e6, res.marks[b] * 1e6
+
+
+def core_fps(res, t0, t1):
+    """The core's frames a second between t0 and t1, from its log."""
+    pts = [(int(n), int(t)) for n, t in CORE_FRAME.findall(res.log)
+           if t0 <= int(t) <= t1]
+    if len(pts) < 2 or pts[-1][1] <= pts[0][1]:
+        return 0.0
+    return (pts[-1][0] - pts[0][0]) * 1e6 / (pts[-1][1] - pts[0][1])
+
+
+def headset_hz(res, t0, t1):
+    """The headset's frames a second between t0 and t1, and the period
+    it reported, in ms."""
+    fr = [f for f in res.frames if t0 <= f['t_us'] <= t1]
+    if len(fr) < 2 or fr[-1]['t_us'] <= fr[0]['t_us']:
+        return 0.0, 0.0
+    periods = sorted(f['period_ns'] for f in fr)
+    return ((len(fr) - 1) * 1e6 / (fr[-1]['t_us'] - fr[0]['t_us']),
+            periods[len(periods) // 2] / 1e6)
+
+
+def check_rate_change(res):
+    """Monado's 20 Hz, then a 10 Hz headset (the layer's divide 2), and
+    the core's frame log at the rate it reports."""
+    if marks_missing(res, 'from', 'change', 'to'):
+        return ['the run did not reach its marks']
+    errors = []
+    for a, b, lead, hz in (('from', 'change', 0.0, 20.0),
+                           ('change', 'to', 3.0, 10.0)):
+        t0, t1 = window(res, a, b, lead)
+        rate, period = headset_hz(res, t0, t1)
+        if abs(rate - hz) > 0.1 * hz or abs(period - 1e3 / hz) > 0.5:
+            errors.append('the headset ran at %.1f Hz, period %.1f ms; '
+                          'want %.0f Hz' % (rate, period, hz))
+    if 'Game = 10.00 Hz' not in res.log:
+        errors.append('the core did not report 10 fps')
+    if not CORE_FRAME.search(res.log):
+        errors.append('no frame lines from the core')
+    for fn in ('xrWaitFrame', 'xrBeginFrame', 'xrEndFrame'):
+        if '[OpenXR] %s failed' % fn in res.log:
+            errors.append('%s failed' % fn)
+    return errors
+
+
 SETTLE = [('wait', 8)]
 VULKAN = {'video_views_test_hw': 'vulkan'}
 TEARDOWN = [('wait', 6), ('send', 'FULLSCREEN_TOGGLE'), ('wait', 4),
@@ -2342,6 +2406,13 @@ CASES = [
                ('wait', 2), ('script', 'action separate/start@right 1'),
                ('wait', 2), ('script', ''), ('wait', 2)],
      'check': check_rumble_separate},
+    # Monado's 20 Hz, then the layer's divide 2 for a 10 Hz headset.
+    {'name': 'pace-rate-change', 'map': 'none', 'options': FPS10,
+     'settings': WINDOW1,
+     'steps': [('wait', 8), ('mark', 'from'), ('wait', 4),
+               ('mark', 'change'), ('script', 'divide 2'), ('wait', 7),
+               ('mark', 'to')],
+     'check': check_rate_change},
 ]
 
 

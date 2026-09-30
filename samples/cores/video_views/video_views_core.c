@@ -31,10 +31,15 @@
  * queue meanwhile. vulkan_keep keeps its context over video reinits.
  *
  * It also logs its pads, analog values and light gun when they change,
- * and rumbles a port while it holds Start, for the headset input tests. */
+ * and rumbles a port while it holds Start, for the headset input tests.
+ *
+ * With video_views_test_fps it reports another frame rate, and logs
+ * every tenth frame with the monotonic time, for the headset pacing
+ * tests. */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -158,6 +163,8 @@ static uint32_t frame_buf[CROP_W * CROP_H];
 static enum map_kind map_kind = MAP_3DS;
 static enum hw_kind hw_kind   = HW_OFF;
 static bool large_max;
+static double core_fps = 60.0;
+static unsigned frames_run;
 static struct retro_hw_render_callback hw_render;
 static gl_bind_framebuffer_t p_glBindFramebuffer;
 static gl_enable_t           p_glEnable;
@@ -659,6 +666,14 @@ static void read_options(void)
    large_max = environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var)
       && var.value && !strcmp(var.value, "large");
 
+   var.key   = "video_views_test_fps";
+   var.value = NULL;
+   core_fps  = 60.0;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      core_fps = atof(var.value);
+   if (core_fps <= 0.0)
+      core_fps = 60.0;
+
    var.key   = "video_views_test_map";
    var.value = NULL;
    map_kind  = MAP_3DS;
@@ -699,6 +714,8 @@ void retro_set_environment(retro_environment_t cb)
         "Hardware rendering; off|gl|gl_topleft|vulkan|vulkan_keep" },
       { "video_views_test_max",
         "Declared maximum size; normal|large" },
+      { "video_views_test_fps",
+        "Frame rate; 60|10|16" },
       { NULL, NULL }
    };
    struct retro_log_callback logging;
@@ -746,7 +763,7 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
    info->geometry.max_width    = large_max ? LARGE_MAX_W : MAX_W;
    info->geometry.max_height   = large_max ? LARGE_MAX_H : MAX_H;
    info->geometry.aspect_ratio = (float)fw / (float)fh;
-   info->timing.fps            = 60.0;
+   info->timing.fps            = core_fps;
    info->timing.sample_rate    = 48000.0;
 }
 
@@ -847,6 +864,16 @@ void retro_run(void)
    int accepted    = 0;
    unsigned status = 0;
    bool stereo;
+
+   if (core_fps != 60.0 && !(frames_run % 10))
+   {
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      log_cb(RETRO_LOG_INFO, "[video_views] frame %u at %lld us\n",
+            frames_run,
+            (long long)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000);
+   }
+   frames_run++;
 
    input_poll_cb();
    if (!environ_cb(RETRO_ENVIRONMENT_GET_VIDEO_VIEWS_STATUS, &status))
