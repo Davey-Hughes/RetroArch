@@ -53,6 +53,8 @@ from run import (CORE, free_port, isolated_env, read_png, send,  # noqa: E402
 PRESET = os.path.join(HERE, 'output_size.slangp')
 LAYER_DIR = os.path.join(ROOT, 'samples', 'openxr', 'test_layer')
 LAYER = 'XR_APILAYER_RETROARCH_test_recorder'
+# The same layer offering the Steam Frame's controller extension.
+FRAME_LAYER = 'XR_APILAYER_RETROARCH_test_frame'
 SYSTEM_LAYERS = '/usr/share/openxr/1/api_layers/explicit.d'
 W, H = 1600, 960
 TOL = 8
@@ -256,7 +258,7 @@ def run_case(retroarch, root, monado, case, validate):
     child = {
         'XR_RUNTIME_JSON': runtime,
         'XR_API_LAYER_PATH': LAYER_DIR + ':' + SYSTEM_LAYERS,
-        'XR_ENABLE_API_LAYERS': LAYER,
+        'XR_ENABLE_API_LAYERS': case.get('layer', LAYER),
         'RA_XR_LAYER_OUT': os.path.join(d, 'xr'),
         'RA_XR_LAYER_SNAP_EVERY': '30',
         'RA_XR_LAYER_SCRIPT': script,
@@ -963,6 +965,71 @@ HELD = script('action combined/b 1', 'action combined/left_stick 1 0')
 RETURNED = script('action combined/a 1', 'action combined/left_stick -1 0')
 DPAD = script('action combined/left_stick 0.8 0.8',
               'action combined/right_stick 0.5 0')
+
+
+FRAME_PROFILE = '/interaction_profiles/valve/frame_controller_valve'
+_FL = '/user/hand/left/input/'
+_FR = '/user/hand/right/input/'
+# The Frame's right controller has A, B, X and Y, the left a D-pad; the
+# grips stay unbound.
+FRAME_BINDS = set([
+    ('combined/b', _FR + 'a/click'), ('combined/a', _FR + 'b/click'),
+    ('combined/y', _FR + 'x/click'), ('combined/x', _FR + 'y/click'),
+    ('combined/dpad_up', _FL + 'dpad_up/click'),
+    ('combined/dpad_down', _FL + 'dpad_down/click'),
+    ('combined/dpad_left', _FL + 'dpad_left/click'),
+    ('combined/dpad_right', _FL + 'dpad_right/click'),
+    ('combined/select', _FL + 'view/click'),
+    ('combined/start', _FR + 'menu/click'),
+    ('combined/l', _FL + 'bumper/click'), ('combined/r', _FR + 'bumper/click'),
+    ('combined/l2', _FL + 'trigger/value'),
+    ('combined/r2', _FR + 'trigger/value'),
+    ('combined/l3', _FL + 'thumbstick/click'),
+    ('combined/r3', _FR + 'thumbstick/click'),
+    ('combined/left_stick', _FL + 'thumbstick'),
+    ('combined/right_stick', _FR + 'thumbstick'),
+    ('separate/b', _FL + 'dpad_down/click'), ('separate/b', _FR + 'a/click'),
+    ('separate/a', _FL + 'dpad_right/click'), ('separate/a', _FR + 'b/click'),
+    ('separate/r', _FL + 'bumper/click'), ('separate/r', _FR + 'bumper/click'),
+    ('separate/r2', _FL + 'trigger/value'),
+    ('separate/r2', _FR + 'trigger/value'),
+    ('separate/start', _FL + 'thumbstick/click'),
+    ('separate/start', _FR + 'thumbstick/click'),
+    ('separate/stick', _FL + 'thumbstick'),
+    ('separate/stick', _FR + 'thumbstick'),
+    ('separate/menu', _FL + 'view/click'),
+    ('pointer/aim', _FL + 'aim/pose'), ('pointer/aim', _FR + 'aim/pose'),
+    ('pointer/rumble', '/user/hand/left/output/haptic'),
+    ('pointer/rumble', '/user/hand/right/output/haptic')])
+
+
+def check_frame_profile(res):
+    """A runtime offering the Frame's extension gets it enabled and the
+    Frame's own bindings, besides the usual profiles."""
+    errors = bindings_errors(res)
+    got = [e for e in events(res, 'bindings') if e['profile'] == FRAME_PROFILE]
+    if not got:
+        return errors + ['no bindings suggested for %s' % FRAME_PROFILE]
+    if got[0]['result'] != 0:
+        errors.append('bindings for %s: %s' % (FRAME_PROFILE, got[0]['result']))
+    binds = set(tuple(b) for b in got[0]['binds'])
+    for b in sorted(FRAME_BINDS - binds):
+        errors.append('Frame binding missing: %s <- %s' % b)
+    for b in sorted(binds - FRAME_BINDS):
+        errors.append('Frame binding not wanted: %s <- %s' % b)
+    if '[OpenXR] Bindings suggested for %s.' % FRAME_PROFILE not in res.log:
+        errors.append('no "Bindings suggested for %s" in the log'
+                      % FRAME_PROFILE)
+    return errors
+
+
+def check_no_frame_profile(res):
+    """Without the extension the Frame's profile is left alone."""
+    errors = bindings_errors(res)
+    if any(e['profile'] == FRAME_PROFILE for e in events(res, 'bindings')):
+        errors.append('bindings suggested for %s without its extension'
+                      % FRAME_PROFILE)
+    return errors
 
 
 def check_combined(res):
@@ -2033,6 +2100,12 @@ CASES = [
                ('wait', 3), ('mark', 'end'), ('script', ''), ('wait', 1)],
      'check': check_input_unfocused},
     # Forced, so the core's analog reads leave it on.
+    {'name': 'input-frame-profile', 'map': '3ds', 'layer': FRAME_LAYER,
+     'steps': [('wait', 6)],
+     'check': check_frame_profile},
+    {'name': 'input-no-frame-profile', 'map': '3ds',
+     'steps': [('wait', 6)],
+     'check': check_no_frame_profile},
     {'name': 'input-dpad', 'map': '3ds',
      'settings': {'input_player1_analog_dpad_mode': '3'},
      'steps': [('wait', 6), ('script', DPAD), ('wait', 2), ('script', ''),

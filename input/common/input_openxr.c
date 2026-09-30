@@ -210,6 +210,39 @@ static const input_openxr_bind_t input_openxr_touch[] = {
    IXB_POINTER
 };
 
+/* Steam Frame: A, B, X and Y on the right, a D-pad on the left; View
+ * is Select and Menu is Start. The grips stay free. */
+static const input_openxr_bind_t input_openxr_frame[] = {
+   IXB_R(IXA_C_B,      "a/click"),
+   IXB_R(IXA_C_A,      "b/click"),
+   IXB_R(IXA_C_Y,      "x/click"),
+   IXB_R(IXA_C_X,      "y/click"),
+   IXB_L(IXA_C_UP,     "dpad_up/click"),
+   IXB_L(IXA_C_DOWN,   "dpad_down/click"),
+   IXB_L(IXA_C_LEFT,   "dpad_left/click"),
+   IXB_L(IXA_C_RIGHT,  "dpad_right/click"),
+   IXB_L(IXA_C_SELECT, "view/click"),
+   IXB_R(IXA_C_START,  "menu/click"),
+   IXB_L(IXA_C_L,      "bumper/click"),
+   IXB_R(IXA_C_R,      "bumper/click"),
+   IXB_L(IXA_C_L2,     "trigger/value"),
+   IXB_R(IXA_C_R2,     "trigger/value"),
+   IXB_L(IXA_C_L3,     "thumbstick/click"),
+   IXB_R(IXA_C_R3,     "thumbstick/click"),
+   IXB_L(IXA_C_LSTICK, "thumbstick"),
+   IXB_R(IXA_C_RSTICK, "thumbstick"),
+   IXB_L(IXA_S_B,      "dpad_down/click"),
+   IXB_R(IXA_S_B,      "a/click"),
+   IXB_L(IXA_S_A,      "dpad_right/click"),
+   IXB_R(IXA_S_A,      "b/click"),
+   IXB_BOTH(IXA_S_R,     "bumper/click"),
+   IXB_BOTH(IXA_S_R2,    "trigger/value"),
+   IXB_BOTH(IXA_S_START, "thumbstick/click"),
+   IXB_BOTH(IXA_S_STICK, "thumbstick"),
+   IXB_L(IXA_S_MENU,     "view/click"),
+   IXB_POINTER
+};
+
 /* HTC Vive: the trackpads are the sticks. */
 static const input_openxr_bind_t input_openxr_vive[] = {
    IXB_L(IXA_C_L,      "squeeze/click"),
@@ -245,17 +278,21 @@ typedef struct input_openxr_profile
    const char *path;
    const input_openxr_bind_t *binds;
    unsigned count;
+   /* Only with XR_VALVE_frame_controller_interaction. */
+   bool frame;
 } input_openxr_profile_t;
 
 static const input_openxr_profile_t input_openxr_profiles[] = {
    { "/interaction_profiles/valve/index_controller",
-      input_openxr_index,  ARRAY_SIZE(input_openxr_index)  },
+      input_openxr_index,  ARRAY_SIZE(input_openxr_index),  false },
    { "/interaction_profiles/oculus/touch_controller",
-      input_openxr_touch,  ARRAY_SIZE(input_openxr_touch)  },
+      input_openxr_touch,  ARRAY_SIZE(input_openxr_touch),  false },
+   { "/interaction_profiles/valve/frame_controller_valve",
+      input_openxr_frame,  ARRAY_SIZE(input_openxr_frame),  true  },
    { "/interaction_profiles/htc/vive_controller",
-      input_openxr_vive,   ARRAY_SIZE(input_openxr_vive)   },
+      input_openxr_vive,   ARRAY_SIZE(input_openxr_vive),   false },
    { "/interaction_profiles/khr/simple_controller",
-      input_openxr_simple, ARRAY_SIZE(input_openxr_simple) }
+      input_openxr_simple, ARRAY_SIZE(input_openxr_simple), false }
 };
 
 typedef struct input_openxr_pad
@@ -514,7 +551,8 @@ static void input_openxr_session_created(void *user,
    }
 
    for (i = 0; i < ARRAY_SIZE(input_openxr_profiles); i++)
-      input_openxr_suggest(st, &input_openxr_profiles[i]);
+      if (!input_openxr_profiles[i].frame || h->frame_controller)
+         input_openxr_suggest(st, &input_openxr_profiles[i]);
 
    /* All three are attached; each poll syncs the pad set in use and the
     * pointer set. */

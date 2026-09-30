@@ -22,6 +22,11 @@
  * actions and hand poses. Haptics, suggested bindings and synced
  * action sets are recorded.
  *
+ * Loaded through xr_test_layer_frame.json it also offers
+ * XR_VALVE_frame_controller_interaction, as the Steam Frame's runtime
+ * does: the extension is taken out before the runtime sees it, and the
+ * layer accepts that profile's suggested bindings itself.
+ *
  *   RA_XR_LAYER_OUT         directory for frames.jsonl and snap_*.png
  *   RA_XR_LAYER_SNAP_EVERY  write images every Nth frame; 0 never
  *   RA_XR_LAYER_SCRIPT      script file, re-read when it changes
@@ -74,6 +79,8 @@
 #define MAX_SPACES 64
 
 #define MAX_SETS        16
+#define FRAME_EXT       "XR_VALVE_frame_controller_interaction"
+#define FRAME_PROFILE   "/interaction_profiles/valve/frame_controller_valve"
 #define MAX_ACTIONS     128
 #define MAX_SCRIPTED    64
 #define MAX_HAND_SPACES 32
@@ -162,6 +169,7 @@ static struct
    PFN_xrEndFrame EndFrame;
 
    XrInstance instance;
+   bool frame;               /* the application enabled FRAME_EXT */
    struct
    {
       XrActionSet handle;
@@ -1400,18 +1408,37 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_SuggestInteractionProfileBindings(
       XrInstance instance, const XrInteractionProfileSuggestedBinding *sb)
 {
    char profile[XR_MAX_PATH_LENGTH];
-   uint32_t n   = 0;
-   XrResult res = L.SuggestInteractionProfileBindings(instance, sb);
-   pthread_mutex_lock(&L.lock);
+   char path[XR_MAX_PATH_LENGTH];
+   uint32_t i;
+   uint32_t n = 0;
+   XrResult res;
    if (     !L.PathToString
          || XR_FAILED(L.PathToString(instance, sb->interactionProfile,
                sizeof(profile), &n, profile)))
       snprintf(profile, sizeof(profile), "?");
+   /* The runtime underneath doesn't know the Frame's profile. */
+   if (L.frame && !strcmp(profile, FRAME_PROFILE))
+      res = XR_SUCCESS;
+   else
+      res = L.SuggestInteractionProfileBindings(instance, sb);
+   pthread_mutex_lock(&L.lock);
    if (L.out)
    {
       fprintf(L.out, "{\"ev\":\"bindings\",\"profile\":\"%s\",\"count\":%u,"
-            "\"result\":%d,\"t_us\":%lld}\n", profile,
-            (unsigned)sb->countSuggestedBindings, (int)res, now_us());
+            "\"result\":%d,\"binds\":[", profile,
+            (unsigned)sb->countSuggestedBindings, (int)res);
+      for (i = 0; i < sb->countSuggestedBindings; i++)
+      {
+         const struct action_rec *a =
+            find_action(sb->suggestedBindings[i].action);
+         if (XR_FAILED(L.PathToString(instance,
+                     sb->suggestedBindings[i].binding, sizeof(path), &n,
+                     path)))
+            snprintf(path, sizeof(path), "?");
+         fprintf(L.out, "%s[\"%s\",\"%s\"]", i ? "," : "",
+               a ? a->name : "?", path);
+      }
+      fprintf(L.out, "],\"t_us\":%lld}\n", now_us());
       fflush(L.out);
    }
    pthread_mutex_unlock(&L.lock);
@@ -1468,11 +1495,25 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_CreateApiLayerInstance(
 {
    XrResult res;
    XrApiLayerCreateInfo next;
-   if (!li || !li->nextInfo)
+   XrInstanceCreateInfo down = *info;
+   const char *exts[64];
+   uint32_t i;
+   if (!li || !li->nextInfo || info->enabledExtensionCount > 64)
       return XR_ERROR_INITIALIZATION_FAILED;
+   /* FRAME_EXT is this layer's to offer, never the runtime's. */
+   L.frame                    = false;
+   down.enabledExtensionCount = 0;
+   down.enabledExtensionNames = exts;
+   for (i = 0; i < info->enabledExtensionCount; i++)
+   {
+      if (!strcmp(info->enabledExtensionNames[i], FRAME_EXT))
+         L.frame = true;
+      else
+         exts[down.enabledExtensionCount++] = info->enabledExtensionNames[i];
+   }
    next          = *li;
    next.nextInfo = li->nextInfo->next;
-   res = li->nextInfo->nextCreateApiLayerInstance(info, &next, instance);
+   res = li->nextInfo->nextCreateApiLayerInstance(&down, &next, instance);
    if (XR_FAILED(res))
       return res;
    L.gipa = li->nextInfo->nextGetInstanceProcAddr;

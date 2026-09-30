@@ -90,6 +90,8 @@ typedef struct vulkan_openxr_handles
    XrSpace local_space;
    XrSpace view_space;
    PFN_xrGetInstanceProcAddr get_proc;
+   /* XR_VALVE_frame_controller_interaction is enabled. */
+   bool frame_controller;
 } vulkan_openxr_handles_t;
 
 #define VULKAN_OPENXR_MAX_EXTRA_LAYERS 4

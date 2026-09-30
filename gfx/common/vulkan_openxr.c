@@ -38,6 +38,8 @@
 
 #define VULKAN_OPENXR_EXT_BUF 1024
 #define VULKAN_OPENXR_MAX_FORMATS 64
+/* The Steam Frame's controllers; newer than the bundled headers. */
+#define VULKAN_OPENXR_FRAME_EXT "XR_VALVE_frame_controller_interaction"
 
 struct vulkan_openxr_slot
 {
@@ -59,6 +61,7 @@ struct vulkan_openxr
    unsigned max_dim;
    uint32_t rec_width;
    bool enable2;
+   bool frame_controller;
    /* The session is made on the thread that makes the device; its frame
     * loop runs on the XR thread. lock guards what both read. */
    XrSession session;
@@ -217,6 +220,8 @@ vulkan_openxr_t *vulkan_openxr_new(bool enable1, uint32_t api_version)
    XrResult res;
    XrVersion api;
    uint32_t count = 0;
+   uint32_t num_exts;
+   const char *exts[2];
    XrInstanceCreateInfo ici;
    XrSystemGetInfo sgi;
    XrSystemProperties props;
@@ -277,6 +282,13 @@ vulkan_openxr_t *vulkan_openxr_new(bool enable1, uint32_t api_version)
       RARCH_WARN("[OpenXR] The runtime lacks %s.\n", ext);
       goto unavailable;
    }
+   exts[0]  = ext;
+   num_exts = 1;
+   if (vulkan_openxr_has_extension(enum_exts, count, VULKAN_OPENXR_FRAME_EXT))
+   {
+      exts[num_exts++]     = VULKAN_OPENXR_FRAME_EXT;
+      xr->frame_controller = true;
+   }
 
    memset(&ici, 0, sizeof(ici));
    ici.type                       = XR_TYPE_INSTANCE_CREATE_INFO;
@@ -285,8 +297,8 @@ vulkan_openxr_t *vulkan_openxr_new(bool enable1, uint32_t api_version)
    strlcpy(ici.applicationInfo.engineName, "RetroArch",
          sizeof(ici.applicationInfo.engineName));
    ici.applicationInfo.apiVersion = XR_API_VERSION_1_0;
-   ici.enabledExtensionCount      = 1;
-   ici.enabledExtensionNames      = &ext;
+   ici.enabledExtensionCount      = num_exts;
+   ici.enabledExtensionNames      = exts;
    if (XR_FAILED(res = create_instance(&ici, &xr->instance)))
    {
       RARCH_WARN("[OpenXR] No runtime (xrCreateInstance: %d).\n", (int)res);
@@ -990,6 +1002,7 @@ static bool vulkan_openxr_create_session(vulkan_openxr_t *xr,
       h.local_space = xr->local_space;
       h.view_space  = xr->view_space;
       h.get_proc    = xr->GetInstanceProcAddr;
+      h.frame_controller = xr->frame_controller;
       vulkan_openxr_hooks.session_created(vulkan_openxr_hooks.user, &h);
    }
    return true;
