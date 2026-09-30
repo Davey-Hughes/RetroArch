@@ -18,7 +18,9 @@
  * Links the shipping objects with only main() replaced (the
  * playlist_nav pattern). A headset gives each eye its own image, so
  * the list leaves Stereo Mode out while Headset Output is on, and
- * pressing Headset Output rebuilds the open list.
+ * pressing Headset Output rebuilds the open list. Headset Refresh Rate
+ * sits under Headset Output, and with no headset lists the fixed
+ * rates.
  *
  * The video driver stays null: the list reads only the driver's name,
  * and a press's reinit runs under "null", so no Vulkan device or
@@ -204,6 +206,82 @@ static void lane_toggle(void)
    CHECK(row(MENU_ENUM_LABEL_VIDEO_STEREO_MODE_STR) >= 0,
          "Stereo Mode is not back after turning Headset Output off");
 }
+
+/* Right under Headset Output. With no headset to list its rates it
+ * steps through Auto, Headset's Choice and 72, 90, 120 and 144 Hz,
+ * round, and its dropdown lists the same. */
+static void lane_refresh_rate(void)
+{
+   static const unsigned want[]     = { 0, 1, 72, 90, 120, 144, 0 };
+   static const char *const shown[] = { "Auto", "Headset's Choice",
+      "72 Hz", "90 Hz", "120 Hz", "144 Hz", "Auto" };
+   char s[64];
+   unsigned i;
+   int enable, rate;
+   file_list_t *buf;
+   settings_t *settings     = config_get_ptr();
+   rarch_setting_t *setting = menu_setting_find_enum(
+         MENU_ENUM_LABEL_VIDEO_OPENXR_REFRESH_RATE);
+
+   set_headset(true);
+   set_driver("vulkan");
+   open_stereo_list();
+   enable = row(MENU_ENUM_LABEL_VIDEO_OPENXR_ENABLE_STR);
+   rate   = row(MENU_ENUM_LABEL_VIDEO_OPENXR_REFRESH_RATE_STR);
+   CHECK(rate >= 0 && rate == enable + 1,
+         "Headset Refresh Rate is not right under Headset Output "
+         "(rows %d and %d)", enable, rate);
+   CHECK(setting != NULL, "fixture: no Headset Refresh Rate setting");
+   if (!setting)
+      return;
+
+   configuration_set_uint(settings,
+         settings->uints.video_openxr_refresh_rate, 0);
+   for (i = 0; i < sizeof(want) / sizeof(want[0]); i++)
+   {
+      CHECK(settings->uints.video_openxr_refresh_rate == want[i],
+            "right step %u: %u, want %u", i,
+            settings->uints.video_openxr_refresh_rate, want[i]);
+      setting->actions->repr(setting, s, sizeof(s));
+      CHECK(string_is_equal(s, shown[i]),
+            "right step %u shows \"%s\", want \"%s\"", i, s, shown[i]);
+      setting->actions->right(setting, 0, true);
+   }
+
+   configuration_set_uint(settings,
+         settings->uints.video_openxr_refresh_rate, 0);
+   setting->actions->left(setting, 0, true);
+   CHECK(settings->uints.video_openxr_refresh_rate == 144,
+         "left from Auto: %u, want 144",
+         settings->uints.video_openxr_refresh_rate);
+   configuration_set_uint(settings,
+         settings->uints.video_openxr_refresh_rate, 100);
+   setting->actions->right(setting, 0, true);
+   CHECK(settings->uints.video_openxr_refresh_rate == 0,
+         "right from an unlisted 100 Hz: %u, want Auto",
+         settings->uints.video_openxr_refresh_rate);
+
+   configuration_set_uint(settings,
+         settings->uints.video_openxr_refresh_rate, 120);
+   generic_action_ok_displaylist_push(NULL, NULL, NULL, 0, 0, 0,
+         ACTION_OK_DL_DROPDOWN_BOX_LIST_HEADSET_REFRESH_RATE);
+   run_frame();
+   buf = selection_buf();
+   CHECK(buf && buf->size == 6, "the dropdown has %u rows, want 6",
+         buf ? (unsigned)buf->size : 0);
+   if (buf && buf->size == 6)
+   {
+      CHECK(     string_is_equal(buf->list[0].path, "Auto")
+            && string_is_equal(buf->list[5].path, "144 Hz"),
+            "the dropdown runs \"%s\" to \"%s\"",
+            buf->list[0].path, buf->list[5].path);
+      CHECK(menu_state_get_ptr()->selection_ptr == 4,
+            "the dropdown selects row %u, want 4 (120 Hz)",
+            (unsigned)menu_state_get_ptr()->selection_ptr);
+   }
+   configuration_set_uint(settings,
+         settings->uints.video_openxr_refresh_rate, 0);
+}
 #endif
 
 int main(int argc, char *argv[])
@@ -272,6 +350,7 @@ int main(int argc, char *argv[])
    lane_on();
    lane_on_other_driver();
    lane_toggle();
+   lane_refresh_rate();
 
    set_driver("null");
    snprintf(cmd, sizeof(cmd), "rm -rf %s", fixture_dir);
@@ -282,7 +361,8 @@ int main(int argc, char *argv[])
       fprintf(stderr, "stereo_headset_test: %u failure(s)\n", failures);
       return 1;
    }
-   printf("stereo_headset_test: Stereo Mode follows Headset Output\n");
+   printf("stereo_headset_test: Stereo Mode follows Headset Output; "
+         "Headset Refresh Rate lists its rates\n");
 #else
    (void)argc;
    (void)argv;

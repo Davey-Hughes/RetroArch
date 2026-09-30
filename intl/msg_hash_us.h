@@ -7649,6 +7649,14 @@ MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_OFF,
    "Off"
    )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_REFRESH_AUTO,
+   "Auto"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_REFRESH_HEADSET,
+   "Headset's Choice"
+   )
 
 
 /* Settings > Video > Synchronization */

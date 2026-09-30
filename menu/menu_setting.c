@@ -3539,6 +3539,68 @@ static size_t setting_get_string_representation_video_openxr_laser(
    return 0;
 }
 
+static size_t setting_get_string_representation_video_openxr_refresh_rate(
+      rarch_setting_t *setting, char *s, size_t len)
+{
+   if (!setting)
+      return 0;
+   switch (*setting->value.target.unsigned_integer)
+   {
+      case VIDEO_OPENXR_REFRESH_AUTO:
+         return strlcpy(s, msg_hash_to_str(
+                  MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_REFRESH_AUTO), len);
+      case VIDEO_OPENXR_REFRESH_HEADSET:
+         return strlcpy(s, msg_hash_to_str(
+                  MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_REFRESH_HEADSET), len);
+   }
+   return snprintf(s, len, "%u Hz", *setting->value.target.unsigned_integer);
+}
+
+static int setting_action_ok_video_openxr_refresh_rate(
+      rarch_setting_t *setting, size_t idx, bool wraparound)
+{
+   if (!setting)
+      return -1;
+   generic_action_ok_displaylist_push(
+         NULL, NULL, NULL, 0, idx, 0,
+         ACTION_OK_DL_DROPDOWN_BOX_LIST_HEADSET_REFRESH_RATE);
+   return 0;
+}
+
+/* The next or previous choice, round; a rate the headset doesn't list
+ * steps to the first or the last. */
+static int setting_uint_step_video_openxr_refresh_rate(
+      rarch_setting_t *setting, bool forward)
+{
+   unsigned values[2 + VIDEO_HEADSET_MAX_RATES];
+   unsigned i, n, cur;
+   if (!setting)
+      return -1;
+   n   = video_driver_headset_rate_choices(values,
+         sizeof(values) / sizeof(values[0]));
+   cur = *setting->value.target.unsigned_integer;
+   if (!n)
+      return -1;
+   for (i = 0; i < n && values[i] != cur; i++) { }
+   if (i == n)
+      i = forward ? n - 1 : 0;
+   i = forward ? (i + 1) % n : (i + n - 1) % n;
+   *setting->value.target.unsigned_integer = values[i];
+   return 0;
+}
+
+static int setting_uint_action_left_video_openxr_refresh_rate(
+      rarch_setting_t *setting, size_t idx, bool wraparound)
+{
+   return setting_uint_step_video_openxr_refresh_rate(setting, false);
+}
+
+static int setting_uint_action_right_video_openxr_refresh_rate(
+      rarch_setting_t *setting, size_t idx, bool wraparound)
+{
+   return setting_uint_step_video_openxr_refresh_rate(setting, true);
+}
+
 static size_t setting_get_string_representation_state_slot(
       rarch_setting_t *setting, char *s, size_t len)
 {

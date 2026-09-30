@@ -545,6 +545,7 @@ uint	keyboard_gamepad_mapping_type	1	1
 uint	video_hdr_subpixel_layout	1	0
 uint	video_stereo_mode	1	0
 uint	video_screen_layout	1	0
+uint	video_openxr_refresh_rate	1	0
 uint	video_openxr_controllers	1	0
 uint	video_openxr_laser	1	0
 uint	rewind_granularity	1	1
@@ -1219,6 +1220,7 @@ uint	keyboard_gamepad_mapping_type	1	1
 uint	video_hdr_subpixel_layout	1	0
 uint	video_stereo_mode	1	0
 uint	video_screen_layout	1	0
+uint	video_openxr_refresh_rate	1	0
 uint	video_openxr_controllers	1	0
 uint	video_openxr_laser	1	0
 uint	rewind_granularity	1	1
@@ -1916,6 +1918,7 @@ uint	keyboard_gamepad_mapping_type	1	1
 uint	video_hdr_subpixel_layout	1	0
 uint	video_stereo_mode	1	0
 uint	video_screen_layout	1	0
+uint	video_openxr_refresh_rate	1	0
 uint	video_openxr_controllers	1	0
 uint	video_openxr_laser	1	0
 uint	rewind_granularity	1	1

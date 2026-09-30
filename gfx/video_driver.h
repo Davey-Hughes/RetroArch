@@ -1812,6 +1812,12 @@ const video_views_layout_t *video_driver_get_views_layout(void);
  * looks now. */
 void video_driver_headset_recenter(void);
 
+/* Main thread: the Headset Refresh Rate choices in menu order,
+ * VIDEO_OPENXR_REFRESH_AUTO and _HEADSET, then the headset's rates in
+ * whole hertz, rising, or 72, 90, 120 and 144 while it lists none.
+ * Returns how many were written. */
+unsigned video_driver_headset_rate_choices(unsigned *values, unsigned cap);
+
 #ifdef HAVE_OPENXR
 /* Main thread, once an iteration: a new headset rate reruns the rate
  * adjustment. */

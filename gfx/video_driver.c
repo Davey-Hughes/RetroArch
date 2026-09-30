@@ -2928,6 +2928,44 @@ void video_driver_headset_recenter(void)
    RARCH_LOG("[Video] Headset recenter requested.\n");
 }
 
+unsigned video_driver_headset_rate_choices(unsigned *values, unsigned cap)
+{
+   static const unsigned fixed[] = { 72, 90, 120, 144 };
+   float rates[VIDEO_HEADSET_MAX_RATES];
+   unsigned i, j;
+   unsigned count                 = 0;
+   unsigned n                     = 0;
+   video_driver_state_t *video_st = &video_driver_st;
+
+   if (cap < 2)
+      return 0;
+   if (     video_st->data && video_st->poke
+         && video_st->poke->get_headset_refresh)
+      video_st->poke->get_headset_refresh(video_st->data, rates,
+            VIDEO_HEADSET_MAX_RATES, &count);
+   values[n++] = VIDEO_OPENXR_REFRESH_AUTO;
+   values[n++] = VIDEO_OPENXR_REFRESH_HEADSET;
+   if (!count)
+   {
+      for (i = 0; i < sizeof(fixed) / sizeof(fixed[0]) && n < cap; i++)
+         values[n++] = fixed[i];
+      return n;
+   }
+   for (i = 0; i < count && n < cap; i++)
+   {
+      unsigned hz = (unsigned)(rates[i] + 0.5f);
+      bool seen   = (hz <= VIDEO_OPENXR_REFRESH_HEADSET);
+      for (j = 2; j < n && !seen; j++)
+         seen = (values[j] == hz);
+      if (seen)
+         continue;
+      for (j = n++; j > 2 && values[j - 1] > hz; j--)
+         values[j] = values[j - 1];
+      values[j] = hz;
+   }
+   return n;
+}
+
 #ifdef HAVE_OPENXR
 void video_driver_headset_poll(void)
 {

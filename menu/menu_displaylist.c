@@ -10208,6 +10208,47 @@ unsigned menu_displaylist_build_list(
             }
          }
          break;
+      case DISPLAYLIST_DROPDOWN_LIST_HEADSET_REFRESH_RATE:
+         menu_entries_clear(list);
+         {
+            unsigned values[2 + VIDEO_HEADSET_MAX_RATES];
+            unsigned i, n, current;
+            rarch_setting_t *setting = menu_setting_find_enum(
+                  MENU_ENUM_LABEL_VIDEO_OPENXR_REFRESH_RATE);
+
+            if (!setting)
+               break;
+            current = setting_uint_get(setting);
+            n       = video_driver_headset_rate_choices(values,
+                  sizeof(values) / sizeof(values[0]));
+            /* Each row carries its value; its name is the setting's own. */
+            for (i = 0; i < n; i++)
+            {
+               char val_d[16];
+               char val_s[NAME_MAX_LENGTH];
+               setting_uint_set(setting, values[i]);
+               setting->actions->repr(setting, val_s, sizeof(val_s));
+               snprintf(val_d, sizeof(val_d), "%u", values[i]);
+               if (menu_entries_append(list,
+                        val_s,
+                        val_d,
+                        MENU_ENUM_LABEL_NO_ITEMS,
+                        MENU_SETTING_DROPDOWN_ITEM_HEADSET_REFRESH_RATE,
+                        values[i], 0, NULL))
+                  count++;
+
+               if (values[i] == current)
+               {
+                  menu_file_list_cbs_t *cbs = (menu_file_list_cbs_t*)
+                     list->list[i].actiondata;
+                  if (cbs)
+                     cbs->checked           = true;
+                  menu_st->selection_ptr    = i;
+               }
+            }
+            setting_uint_set(setting, current);
+         }
+         break;
       case DISPLAYLIST_DROPDOWN_LIST_RESOLUTION:
          menu_entries_clear(list);
          {
@@ -11912,6 +11953,10 @@ unsigned menu_displaylist_build_list(
             if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
                      MENU_ENUM_LABEL_VIDEO_OPENXR_ENABLE,
                      PARSE_ONLY_BOOL, false) == 0)
+               count++;
+            if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                     MENU_ENUM_LABEL_VIDEO_OPENXR_REFRESH_RATE,
+                     PARSE_ONLY_UINT, false) == 0)
                count++;
             if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
                      MENU_ENUM_LABEL_VIDEO_OPENXR_DISTANCE,
@@ -16431,6 +16476,7 @@ static bool menu_displaylist_ctl_internal(
          case DISPLAYLIST_NETWORK_INFO:
          case DISPLAYLIST_DROPDOWN_LIST_RESOLUTION:
          case DISPLAYLIST_DROPDOWN_LIST_CRT_SUPER_RESOLUTION:
+         case DISPLAYLIST_DROPDOWN_LIST_HEADSET_REFRESH_RATE:
          case DISPLAYLIST_DROPDOWN_LIST_PLAYLIST_DEFAULT_CORE:
          case DISPLAYLIST_DROPDOWN_LIST_PLAYLIST_LABEL_DISPLAY_MODE:
          case DISPLAYLIST_DROPDOWN_LIST_PLAYLIST_RIGHT_THUMBNAIL_MODE:
@@ -16525,6 +16571,7 @@ static bool menu_displaylist_ctl_internal(
                   case DISPLAYLIST_ADD_CONTENT_LIST:
                   case DISPLAYLIST_DROPDOWN_LIST_RESOLUTION:
                   case DISPLAYLIST_DROPDOWN_LIST_CRT_SUPER_RESOLUTION:
+                  case DISPLAYLIST_DROPDOWN_LIST_HEADSET_REFRESH_RATE:
                   case DISPLAYLIST_DROPDOWN_LIST_PLAYLIST_DEFAULT_CORE:
                   case DISPLAYLIST_DROPDOWN_LIST_PLAYLIST_LABEL_DISPLAY_MODE:
                   case DISPLAYLIST_DROPDOWN_LIST_PLAYLIST_RIGHT_THUMBNAIL_MODE:
