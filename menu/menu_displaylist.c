@@ -11886,10 +11886,17 @@ unsigned menu_displaylist_build_list(
          }
          break;
       case DISPLAYLIST_VIDEO_STEREO_SETTINGS_LIST:
-         if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
-                  MENU_ENUM_LABEL_VIDEO_STEREO_MODE,
-                  PARSE_ONLY_UINT, false) == 0)
-            count++;
+#ifdef HAVE_OPENXR
+         /* A headset gives each eye its own image (Vulkan only). */
+         if (     !settings->bools.video_openxr_enable
+               || !string_is_equal(settings->arrays.video_driver, "vulkan"))
+#endif
+         {
+            if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                     MENU_ENUM_LABEL_VIDEO_STEREO_MODE,
+                     PARSE_ONLY_UINT, false) == 0)
+               count++;
+         }
          if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
                   MENU_ENUM_LABEL_VIDEO_STEREO_SWAP_EYES,
                   PARSE_ONLY_BOOL, false) == 0)

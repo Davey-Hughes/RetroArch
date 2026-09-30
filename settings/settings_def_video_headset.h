@@ -6,7 +6,7 @@
 
 S_BOOL(video_openxr_enable, VIDEO_OPENXR_ENABLE,
       "video_openxr_enable",
-      false, SD_FLAG_CMD_APPLY_AUTO, 0, CMD_EVENT_REINIT,
+      false, SD_FLAG_CMD_APPLY_AUTO, SDESC_FLG_REFRESH, CMD_EVENT_REINIT,
       "Headset Output (OpenXR)",
       "Also show content in an OpenXR headset: each screen as its own floating screen, with both eyes of stereo 3D, and the menu in front of them. Vulkan only. The window keeps its normal output.")
 S_FLOAT(video_openxr_distance, VIDEO_OPENXR_DISTANCE,
