@@ -166,6 +166,9 @@ void vulkan_openxr_set_pacing(vulkan_openxr_t *xr, unsigned interval);
  * headset shows the session, at most two tick intervals; while it
  * doesn't, sleep to where the next tick would be. */
 void vulkan_openxr_pace_wait(vulkan_openxr_t *xr);
+/* Video thread, a paced frame that waits for no tick: the next wait
+ * wants a fresh one. */
+void vulkan_openxr_pace_skip(vulkan_openxr_t *xr);
 
 /* The largest swapchain side the headset takes. */
 unsigned vulkan_openxr_max_dim(const vulkan_openxr_t *xr);

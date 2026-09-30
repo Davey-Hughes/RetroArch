@@ -1484,6 +1484,15 @@ static bool vulkan_openxr_wait_tick(vulkan_openxr_t *xr,
    return ticked;
 }
 
+void vulkan_openxr_pace_skip(vulkan_openxr_t *xr)
+{
+   if (!xr->tick)
+      return;
+   slock_lock(xr->lock);
+   xr->tick_seen = xr->tick_seq;
+   slock_unlock(xr->lock);
+}
+
 void vulkan_openxr_pace_wait(vulkan_openxr_t *xr)
 {
    int64_t period = (int64_t)retro_atomic_load_acquire_int(&xr->period_ns)
@@ -1510,6 +1519,7 @@ void vulkan_openxr_pace_wait(vulkan_openxr_t *xr)
       if (xr->pace_mode != 2)
          RARCH_LOG("[OpenXR] Pacing on the clock while the headset does not show the session.\n");
       xr->pace_mode = 2;
+      vulkan_openxr_pace_skip(xr);
       sleep_us      = runloop_pace_schedule(&xr->pace_anchor_ns, period,
             cpu_features_get_time_usec());
       if (sleep_us > 0)

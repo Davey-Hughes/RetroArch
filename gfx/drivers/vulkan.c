@@ -10847,9 +10847,13 @@ static bool vulkan_frame(void *data, const void *frame,
    /* In place of the window's vsync: once a core frame, never under
     * fast-forward. */
    if (     vk->xr.paced
-         && !input_driver_nonblock_state
          && !(vk->context->flags & VK_CTX_FLAG_SWAP_INTERVAL_EMULATION_LOCK))
-      vulkan_openxr_pace_wait(vk->context->xr);
+   {
+      if (input_driver_nonblock_state)
+         vulkan_openxr_pace_skip(vk->context->xr);
+      else
+         vulkan_openxr_pace_wait(vk->context->xr);
+   }
 #endif
 
    return true;

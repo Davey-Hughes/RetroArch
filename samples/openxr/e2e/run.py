@@ -2084,6 +2084,8 @@ def check_paced(n, hz):
             errors.append('no "%s" in the log' % paced_line(hz, n))
         if MAILBOX not in res.log:
             errors.append('the window never presented without waiting')
+        if CLOCK_LINE in res.log:
+            errors.append('the core paced on the clock, not the headset')
         fps = core_fps(res, t0, t1)
         if abs(fps - hz / n) > 0.1 * hz / n:
             errors.append('the core ran at %.1f fps, want %.1f'
@@ -2108,6 +2110,8 @@ def check_hidden(res):
     for line in (CLOCK_LINE, TICKS_LINE):
         if line not in res.log:
             errors.append('no "%s" in the log' % line)
+    if res.log.rfind(TICKS_LINE) < res.log.rfind(CLOCK_LINE):
+        errors.append('the headset did not pace the core again')
     return errors
 
 
@@ -2124,6 +2128,20 @@ def check_fastforward(res):
                       'past the headset\'s 20 Hz' % fps)
     t0, t1 = window(res, 'ffend', 'to', 2.0)
     errors += pace_errors(res, t0, t1, 2)
+    return errors
+
+
+def check_window_back(res):
+    """Paced, then the session lost: the window's interval returns and
+    the core keeps about the window's rate, not unthrottled."""
+    errors = check_paced(2, 20.0)(res)
+    if marks_missing(res, 'lost', 'end'):
+        return ['the run did not reach its marks']
+    t0, t1 = window(res, 'lost', 'end', 1.0)
+    fps = core_fps(res, t0, t1)
+    if not 30.0 <= fps <= 90.0:
+        errors.append('the core ran at %.1f fps once the headset was gone, '
+                      'want the window\'s pace (about 60)' % fps)
     return errors
 
 
@@ -2570,9 +2588,17 @@ CASES = [
                ('wait', 6), ('mark', 'to')],
      'check': check_fastforward},
     # Sync to Exact Content Framerate is set aside while the headset paces.
-    {'name': 'pace-vrr', 'map': 'none', 'options': FPS10,
-     'settings': dict(WINDOW1, vrr_runloop_enable='true'),
-     'steps': PACE_STEPS, 'check': check_paced(2, 20.0)},
+    # 16 fps fits 20 Hz at skew 0.25: the tick paces it, not the timer.
+    {'name': 'pace-vrr', 'map': 'none', 'options': FPS16,
+     'settings': dict(WINDOW1, vrr_runloop_enable='true',
+                      audio_max_timing_skew='0.25'),
+     'steps': PACE_STEPS, 'check': check_paced(1, 20.0)},
+    {'name': 'pace-window-back', 'map': 'none', 'options': FPS10,
+     'settings': WINDOW1,
+     'steps': [('wait', 8), ('mark', 'from'), ('wait', 5), ('mark', 'to'),
+               ('script', 'state 7'), ('mark', 'lost'), ('wait', 6),
+               ('mark', 'end')],
+     'check': check_window_back},
 ]
 
 
