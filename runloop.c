@@ -5103,7 +5103,8 @@ static runloop_pace_facts_t runloop_pace_gather(settings_t *settings,
    if (menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE)   f |= PACE_FACT_MENU_ALIVE;
 #endif
    if (menu_early_exit)                                    f |= PACE_FACT_MENU_EARLY_EXIT;
-   if (settings->bools.vrr_runloop_enable)                 f |= PACE_FACT_VRR;
+   if (     settings->bools.vrr_runloop_enable
+         && !video_st->headset_interval)                   f |= PACE_FACT_VRR;
 #ifdef HAVE_THREADS
    if (video_st->thread_wrapper_active)                    f |= PACE_FACT_WRAPPER;
    if (settings->bools.video_threaded_display_pacing)      f |= PACE_FACT_DISPLAY_PACING;

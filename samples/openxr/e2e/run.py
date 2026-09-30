@@ -2569,6 +2569,10 @@ CASES = [
                ('wait', 3), ('mark', 'ffend'), ('send', 'FAST_FORWARD'),
                ('wait', 6), ('mark', 'to')],
      'check': check_fastforward},
+    # Sync to Exact Content Framerate is set aside while the headset paces.
+    {'name': 'pace-vrr', 'map': 'none', 'options': FPS10,
+     'settings': dict(WINDOW1, vrr_runloop_enable='true'),
+     'steps': PACE_STEPS, 'check': check_paced(2, 20.0)},
 ]
 
 
