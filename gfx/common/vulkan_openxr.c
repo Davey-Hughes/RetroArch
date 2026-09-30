@@ -85,6 +85,10 @@ struct vulkan_openxr
     * session. Written like ended. */
    bool lost;
    bool frame_failed;              /* XR thread */
+   /* The headset's period as the XR thread measures it, and the one it
+    * published, 0 until known. */
+   video_xr_period_t period;       /* XR thread */
+   retro_atomic_int_t period_ns;
    int64_t formats[VULKAN_OPENXR_MAX_FORMATS];
    uint32_t num_formats;
    struct vulkan_openxr_slot slots[VIDEO_XR_MAX_SLOTS];
@@ -853,6 +857,14 @@ static void vulkan_openxr_frame(vulkan_openxr_t *xr)
       retro_sleep(1);
       return;
    }
+   if (video_xr_period_add(&xr->period,
+            (int64_t)state.predictedDisplayPeriod))
+   {
+      retro_atomic_store_release_int(&xr->period_ns,
+            (int)xr->period.published);
+      RARCH_LOG("[OpenXR] The headset runs at %.2f Hz.\n",
+            1000000000.0 / (double)xr->period.published);
+   }
    slock_lock(xr->lock);
    xr->predicted_time = state.predictedDisplayTime;
    slock_unlock(xr->lock);
@@ -1303,6 +1315,8 @@ bool vulkan_openxr_start(vulkan_openxr_t *xr, VkInstance instance,
    xr->queue_lock = queue_lock;
    if (!xr->cursor)
       vulkan_openxr_cursor_create(xr, gpu, device, queue_family);
+   video_xr_period_init(&xr->period);
+   retro_atomic_store_release_int(&xr->period_ns, 0);
    retro_atomic_store_release_int(&xr->quit, 0);
    retro_atomic_store_release_int(&xr->alive, xr->ended ? 0 : 1);
    if (!(xr->thread = sthread_create(vulkan_openxr_thread, xr)))
@@ -1396,6 +1410,12 @@ float vulkan_openxr_pixels_per_radian(vulkan_openxr_t *xr)
    v = xr->px_per_rad;
    slock_unlock(xr->lock);
    return v;
+}
+
+float vulkan_openxr_refresh_rate(vulkan_openxr_t *xr)
+{
+   int ns = retro_atomic_load_acquire_int(&xr->period_ns);
+   return (ns > 0) ? (float)(1000000000.0 / (double)ns) : 0.0f;
 }
 
 unsigned vulkan_openxr_max_dim(const vulkan_openxr_t *xr)

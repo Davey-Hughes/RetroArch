@@ -154,6 +154,10 @@ bool vulkan_openxr_should_draw(vulkan_openxr_t *xr);
 /* Headset pixels per radian; 0 until the first headset frame. */
 float vulkan_openxr_pixels_per_radian(vulkan_openxr_t *xr);
 
+/* Any thread: the headset's refresh rate from its measured period, 0
+ * until VIDEO_XR_PERIODS frames agree. */
+float vulkan_openxr_refresh_rate(vulkan_openxr_t *xr);
+
 /* The largest swapchain side the headset takes. */
 unsigned vulkan_openxr_max_dim(const vulkan_openxr_t *xr);
 

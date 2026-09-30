@@ -2004,6 +2004,10 @@ def check_rate_change(res):
         if abs(rate - hz) > 0.1 * hz or abs(period - 1e3 / hz) > 0.5:
             errors.append('the headset ran at %.1f Hz, period %.1f ms; '
                           'want %.0f Hz' % (rate, period, hz))
+        line = '[OpenXR] The headset runs at %.2f Hz.' % hz
+        count = res.log.count(line)
+        if count != 1:
+            errors.append('"%s" logged %d times, want once' % (line, count))
     if 'Game = 10.00 Hz' not in res.log:
         errors.append('the core did not report 10 fps')
     if not CORE_FRAME.search(res.log):
