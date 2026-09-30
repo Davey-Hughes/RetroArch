@@ -1484,6 +1484,7 @@ typedef struct
     * window paces). */
    float headset_hz;
    unsigned headset_interval;
+   bool headset_vsync;
    /* Set while video_driver_cached_frame() sends the last frame again. */
    bool frame_repeat;
 } video_driver_state_t;

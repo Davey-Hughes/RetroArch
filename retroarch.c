@@ -1507,7 +1507,8 @@ static void driver_adjust_system_rates(
 #ifdef HAVE_OPENXR
    /* A headset whose rate fits the core paces it in the window's place:
     * its rate and interval stand in for the display's. */
-   video_st->headset_interval = settings->bools.video_vsync ? headset_fit : 0;
+   video_st->headset_vsync    = settings->bools.video_vsync;
+   video_st->headset_interval = video_st->headset_vsync ? headset_fit : 0;
    if (video_st->headset_interval)
    {
       video_refresh_rate    = video_st->headset_hz;

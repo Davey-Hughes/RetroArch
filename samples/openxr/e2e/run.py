@@ -2463,6 +2463,9 @@ CASES = [
     {'name': 'pace-threaded', 'map': 'none', 'options': FPS10,
      'settings': dict(WINDOW1, video_threaded='true'), 'steps': PACE_STEPS,
      'check': threaded(check_unpaced)},
+    {'name': 'pace-vsync-off', 'map': 'none', 'options': FPS10,
+     'settings': dict(WINDOW1, video_vsync='false'), 'steps': PACE_STEPS,
+     'check': check_unpaced},
 ]
 
 

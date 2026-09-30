@@ -2680,6 +2680,7 @@ void video_driver_free_internal(void)
    video_st->views_driver_count = 0;
    /* The next driver's headset, if any, is measured afresh. */
    video_st->headset_hz         = 0.0f;
+   video_st->headset_interval   = 0;
 
    /* The poke interface is a pointer into the driver's static vtable, so
     * unlike video_st->data it survives free "working" - and
@@ -2940,7 +2941,8 @@ void video_driver_headset_poll(void)
          && video_st->poke->get_headset_refresh)
       hz = video_st->poke->get_headset_refresh(video_st->data, rates,
             VIDEO_HEADSET_MAX_RATES, &count);
-   if (hz == video_st->headset_hz)
+   if (     hz == video_st->headset_hz
+         && settings->bools.video_vsync == video_st->headset_vsync)
       return;
    video_st->headset_hz = hz;
    /* The configured rate again, so nothing is saved: the rates are
