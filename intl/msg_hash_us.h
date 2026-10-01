@@ -12210,6 +12210,14 @@ MSG_HASH(
    "Places the headset's screens in front of where you are looking now."
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_META_LASER_POINTER_TOGGLE,
+   "Laser Pointer (Toggle)"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_META_LASER_POINTER_TOGGLE,
+   "Switches the headset's Laser Pointer between Off and its last mode."
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_META_FPS_TOGGLE,
    "Show FPS (Toggle)"
    )
@@ -33627,6 +33635,10 @@ MSG_HASH(
 MSG_HASH(
    MSG_OPENXR_RATE_MISFIT,
    "The headset runs at %u Hz, which doesn't fit this game's %.2f fps; its motion will judder. Set the headset's refresh rate for RetroArch to a multiple of the game's rate (in SteamVR: VR Video Settings)."
+   )
+MSG_HASH(
+   MSG_OPENXR_LASER_POINTER,
+   "Laser Pointer: %s"
    )
 
 

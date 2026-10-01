@@ -361,6 +361,8 @@ struct rarch_state
    struct retro_perf_counter *perf_counters_rarch[MAX_COUNTERS];
 
    unsigned perf_ptr_rarch;
+   /* Laser Pointer's mode before its toggle turned it Off; 0 is Auto. */
+   unsigned laser_last;
    uint32_t flags;
 
    char launch_arguments[4096];
@@ -6236,6 +6238,39 @@ bool command_event(enum event_command cmd, void *data)
          break;
       case CMD_EVENT_HEADSET_RECENTER:
          video_driver_headset_recenter();
+         break;
+      case CMD_EVENT_LASER_POINTER_TOGGLE:
+         {
+            char msg[256];
+            size_t _len;
+            enum msg_hash_enums value =
+               MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_AUTO;
+            unsigned laser            = settings->uints.video_openxr_laser;
+            if (laser != VIDEO_OPENXR_LASER_OFF)
+            {
+               p_rarch->laser_last = laser;
+               laser               = VIDEO_OPENXR_LASER_OFF;
+            }
+            else
+               laser               = p_rarch->laser_last;
+            configuration_set_uint(settings,
+                  settings->uints.video_openxr_laser, laser);
+            if (laser == VIDEO_OPENXR_LASER_ALWAYS)
+               value = MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_ALWAYS;
+            else if (laser == VIDEO_OPENXR_LASER_OFF)
+               value = MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_OFF;
+            _len = snprintf(msg, sizeof(msg),
+                  msg_hash_to_str(MSG_OPENXR_LASER_POINTER),
+                  msg_hash_to_str(value));
+            RARCH_LOG("[OpenXR] %s\n", msg);
+            runloop_msg_queue_push(msg, _len, 1, 180, true, NULL,
+                  MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+#ifdef HAVE_MENU
+            /* As a menu setting change does: the list shows the value. */
+            menu_st->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH
+                            | MENU_ST_FLAG_PREVENT_POPULATE;
+#endif
+         }
          break;
       case CMD_EVENT_NONE:
          return false;

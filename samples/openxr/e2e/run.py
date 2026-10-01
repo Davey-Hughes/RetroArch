@@ -1679,6 +1679,26 @@ def check_menu_press_pull(res):
     return errors + hidden_errors(res, 'yield', 'pull', DOT_HIGH)
 
 
+LASER_NOTICE = '[OpenXR] Laser Pointer: '
+
+
+def check_laser_toggle(back, want):
+    """The toggle turns the laser Off and then back to back, with a
+    notice each time: a dot at want before and after, none while Off."""
+    def check(res):
+        notices = [line.split(LASER_NOTICE, 1)[1].strip()
+                   for line in res.log.splitlines() if LASER_NOTICE in line]
+        errors = []
+        if notices != ['Off', back]:
+            errors.append('notices %s, want Off then %s' % (notices, back))
+        t = res.marks['off'] * 1e6
+        if not any(at(c, want) for f in res.frames if f['t_us'] < t
+                   for c in cursors(f)):
+            errors.append('no dot at %s before the toggle' % (want,))
+        return errors + hidden_errors(res, 'off', 'on', want)
+    return check
+
+
 def check_menu_hands(res):
     """Both hands on the menu: the right points first, the left's trigger
     takes the press, and the right's, pulled while the left's is held,
@@ -2647,6 +2667,22 @@ CASES = [
                ('script', script(AIM_MENU_HIGH, R2)), ('wait', 0.5),
                ('script', AIM_MENU_HIGH), ('wait', 2)],
      'check': check_menu_pull},
+    # The hotkey over the network, with the menu open: it works there.
+    {'name': 'input-laser-toggle', 'map': '3ds',
+     'settings': {'menu_driver': 'ozone'},
+     'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),
+               ('script', AIM_MENU_HIGH), ('wait', 2), ('mark', 'off'),
+               ('send', 'LASER_POINTER_TOGGLE'), ('wait', 2), ('mark', 'on'),
+               ('send', 'LASER_POINTER_TOGGLE'), ('wait', 2)],
+     'check': check_laser_toggle('Auto', DOT_HIGH)},
+    # Back to Always, not Auto: Auto shows no dot on the top screen.
+    {'name': 'input-laser-toggle-always', 'map': '3ds',
+     'settings': {'video_openxr_laser': '1'},
+     'steps': [('wait', 6), ('script', AIM_GUN), ('wait', 2),
+               ('mark', 'off'), ('send', 'LASER_POINTER_TOGGLE'),
+               ('wait', 2), ('mark', 'on'),
+               ('send', 'LASER_POINTER_TOGGLE'), ('wait', 2)],
+     'check': check_laser_toggle('Always', (-0.4, 0.24, -1.8))},
     {'name': 'input-menu-press-pull', 'map': '3ds',
      'settings': {'menu_driver': 'ozone', 'frontend_log_level': '0'},
      'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),

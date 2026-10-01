@@ -7466,6 +7466,9 @@ static enum runloop_state_enum runloop_check_state(
    /* Check statistics hotkey */
    HOTKEY_CHECK(RARCH_STATISTICS_TOGGLE, CMD_EVENT_STATISTICS_TOGGLE, true, NULL);
 
+   /* Check laser pointer hotkey: here, so it works in the menu too */
+   HOTKEY_CHECK(RARCH_LASER_POINTER_TOGGLE, CMD_EVENT_LASER_POINTER_TOGGLE, true, NULL);
+
    /* Check netplay host hotkey */
    HOTKEY_CHECK(RARCH_NETPLAY_HOST_TOGGLE, CMD_EVENT_NETPLAY_HOST_TOGGLE, true, NULL);
 
