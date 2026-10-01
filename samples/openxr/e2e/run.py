@@ -1615,30 +1615,41 @@ def hidden_errors(res, hide, show, want, until=None):
     return errors
 
 
+def stayed_hidden_errors(res, lines):
+    """Hover lines: none off the row the laser left until the pull, and
+    the pull's own line unpressed on the moved aim."""
+    back = find(lines, 0, lambda f: at_px(f, MENU_MOVE_PX))
+    if back < 1:
+        return ['the laser did not come back on the menu after the pull: %s'
+                % lines[:6]], back
+    errors = []
+    if any(not at_px(f, MENU_HIGH_PX) for f in lines[:back]):
+        errors.append('the laser read on the menu while it yielded: %s'
+                      % [(f['x'], f['selection']) for f in lines[:back]])
+    if any(f['pressed'] for f in lines):
+        errors.append('the pull pressed the menu: %s'
+                      % [(f['selection'], f['pressed']) for f in lines])
+    return errors, back
+
+
 def check_menu_stick(res):
     """Ozone: the headset's stick takes the menu from the laser. The
     laser hovers Restart (1); the stick taps once under it still and
     once while it drifts 2 degrees, and nothing of the laser reads or
-    shows; turned 6 degrees it comes back, hovers its row again and
-    shows its dot. Its first line back still has the stick's selection
-    (3): the menu reads that before the hover acts."""
+    shows, nor when turned 6 degrees; a pull brings it back unpressed,
+    hovering its row. Its first line back still has the stick's
+    selection (3): the menu reads that before the hover acts."""
     lines = kinds(core_events(res), 'menu')
-    back = find(lines, 0, lambda f: at_px(f, MENU_MOVE_PX))
+    errors, back = stayed_hidden_errors(res, lines)
     if back < 1:
-        return ['the laser did not reach the menu and come back 6 degrees '
-                'over: %s' % lines[:6]]
-    errors = []
-    if lines[back - 1]['selection'] != 1 or any(
-            not at_px(f, MENU_HIGH_PX) for f in lines[:back]):
-        errors.append('the laser read on the menu while it yielded: %s'
-                      % [(f['x'], f['selection']) for f in lines[:back]])
+        return errors
     if lines[back]['selection'] != 3:
         errors.append('the laser came back to selection %d, want the '
                       'stick\'s 3' % lines[back]['selection'])
     if lines[-1]['selection'] != 1 or not at_px(lines[-1], MENU_MOVE_PX):
         errors.append('the laser\'s hover did not come back: %s'
                       % [(f['x'], f['selection']) for f in lines[back:]])
-    return errors + hidden_errors(res, 'yield', 'move', DOT_MOVE)
+    return errors + hidden_errors(res, 'yield', 'pull', DOT_MOVE)
 
 
 def check_menu_pull(res):
@@ -1682,20 +1693,11 @@ def check_menu_press_pull(res):
     return errors + hidden_errors(res, 'yield', 'pull', DOT_HIGH)
 
 
-def check_menu_yield_hands(res):
-    """Ozone: the yield ends only by the pointing hand's turn. The left
-    hand turning 6 degrees changes nothing; the right one turning back to
-    its row brings the hover and the dot."""
-    lines = kinds(core_events(res), 'menu')
-    back = find(lines, 0, lambda f: at_px(f, MENU_MOVE_PX))
-    if back < 1:
-        return ['the right laser did not come back on the menu: %s'
-                % lines[:6]]
-    errors = []
-    if any(not at_px(f, MENU_HIGH_PX) for f in lines[:back]):
-        errors.append('the laser read on the menu while it yielded: %s'
-                      % [(f['x'], f['selection']) for f in lines[:back]])
-    return errors + hidden_errors(res, 'yield', 'move', DOT_MOVE)
+def check_menu_yield_moves(res):
+    """Ozone: both hands turning 6 degrees and more leave the yield
+    alone: no hover, no dot until a pull brings the laser back."""
+    errors, back = stayed_hidden_errors(res, kinds(core_events(res), 'menu'))
+    return errors + hidden_errors(res, 'yield', 'pull', DOT_MOVE)
 
 
 def check_menu_yield_ends(res):
@@ -2703,8 +2705,9 @@ CASES = [
                ('script', AIM_MENU_HIGH), ('wait', 2), ('mark', 'yield'),
                ('script', script(AIM_MENU_HIGH, STICK_DOWN)), ('wait', 0.1),
                ('script', AIM_MENU_HIGH), ('wait', 1)] + SHAKE
-     + [('wait', 1), ('mark', 'move'), ('script', AIM_MENU_MOVE),
-        ('wait', 2)],
+     + [('wait', 1), ('script', AIM_MENU_MOVE), ('wait', 2),
+        ('mark', 'pull'), ('script', script(AIM_MENU_MOVE, R2)),
+        ('wait', 0.5), ('script', AIM_MENU_MOVE), ('wait', 2)],
      'check': check_menu_stick},
     # Each pull half a second: a short press only highlights, so a
     # failing run's extra press restarts nothing.
@@ -2755,9 +2758,9 @@ CASES = [
                ('script', script(AIM_MENU_HIGH, R2)), ('wait', 0.5),
                ('script', AIM_MENU_HIGH), ('wait', 2)],
      'check': check_menu_press_pull},
-    # The left hand turns 6 degrees (off the menu, still tracked) while
-    # the right one stays: the yield holds until the right one turns.
-    {'name': 'input-menu-yield-hands', 'map': '3ds',
+    # Both hands turn 6 degrees and more: the laser stays hidden until
+    # the pull.
+    {'name': 'input-menu-yield-moves', 'map': '3ds',
      'settings': {'menu_driver': 'ozone', 'frontend_log_level': '0'},
      'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),
                ('script', script(AIM_MENU_HIGH, AIM_LEFT_YIELD)),
@@ -2767,10 +2770,14 @@ CASES = [
                ('script', script(AIM_MENU_HIGH, AIM_LEFT_YIELD)),
                ('wait', 1),
                ('script', script(AIM_MENU_HIGH, AIM_LEFT_TURN)),
-               ('wait', 2), ('mark', 'move'),
+               ('wait', 2),
+               ('script', script(AIM_MENU_MOVE, AIM_LEFT_TURN)),
+               ('wait', 2), ('mark', 'pull'),
+               ('script', script(AIM_MENU_MOVE, AIM_LEFT_TURN, R2)),
+               ('wait', 0.5),
                ('script', script(AIM_MENU_MOVE, AIM_LEFT_TURN)),
                ('wait', 2)],
-     'check': check_menu_yield_hands},
+     'check': check_menu_yield_moves},
     {'name': 'input-menu-yield-ends', 'map': '3ds',
      'settings': {'menu_driver': 'ozone', 'frontend_log_level': '0'},
      'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),

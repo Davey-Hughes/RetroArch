@@ -49,7 +49,6 @@
 #define INPUT_OPENXR_HAPTIC_DURATION 1000000000
 /* A deliberate point turns the aim further than this, in degrees; a
  * held hand drifts well under it. */
-#define INPUT_OPENXR_YIELD_DEGREES 3.0f
 /* Half a stick's travel. */
 #define INPUT_OPENXR_YIELD_STICK   0x4000
 
@@ -389,11 +388,8 @@ typedef struct input_openxr
    float menu_u;
    float menu_v;
    /* The laser's yield to the controllers: the last read's buttons and
-    * sticks past half, and each hand's aim at the last press. */
+    * sticks past half. */
    bool yield;
-   int yield_hand;                      /* the hand that pointed, or -1 */
-   bool yield_has[INPUT_OPENXR_HANDS];
-   video_xr_vec3_t yield_dir[INPUT_OPENXR_HANDS];
    uint16_t last_buttons[INPUT_OPENXR_PADS];
    unsigned last_sticks[INPUT_OPENXR_PADS];
 
@@ -1021,27 +1017,19 @@ static bool input_openxr_new_press(input_openxr_t *st)
 
 /* With the menu open, the laser yields to the controllers' buttons and
  * sticks, so hand drift cannot undo their navigation: from a press until
- * the hand that pointed turns away from where it aimed then (any hand,
- * if none pointed), or a trigger is pulled.
+ * a trigger is pulled. Moving the controllers does not end it: a D-pad
+ * press alone tilts one by over 3 degrees on the Steam Frame.
  * That pull is spent, with a press's or without: an unseen laser must
  * not click. */
 static void input_openxr_yield(input_openxr_t *st, unsigned laser,
       bool menu_open, float threshold)
 {
    unsigned h;
-   XrTime time;
-   video_xr_vec3_t o;
-   video_xr_vec3_t dir[INPUT_OPENXR_HANDS];
-   bool tracked[INPUT_OPENXR_HANDS];
    bool press = input_openxr_new_press(st);
-   bool was   = st->yield;
 
    if (     !menu_open || laser == VIDEO_OPENXR_LASER_OFF
          || (!st->yield && !press))
       return;
-   time = vulkan_openxr_predicted_time(st->xr);
-   for (h = 0; h < INPUT_OPENXR_HANDS; h++)
-      tracked[h] = input_openxr_ray(st, h, time, &o, &dir[h]);
    for (h = 0; h < INPUT_OPENXR_HANDS; h++)
    {
       if (st->trig[h].value > threshold && !st->trig_down[h])
@@ -1051,31 +1039,9 @@ static void input_openxr_yield(input_openxr_t *st, unsigned laser,
          st->role[h]      = INPUT_OPENXR_ROLE_SPENT;
          st->yield        = false;
       }
-      else if (st->yield && tracked[h] && st->yield_has[h]
-            && (st->yield_hand < 0 || st->yield_hand == (int)h)
-            && video_xr_aim_moved(&st->yield_dir[h], &dir[h],
-               INPUT_OPENXR_YIELD_DEGREES))
-         st->yield = false;
    }
    if (press)
-   {
-      if (!was)
-         st->yield_hand = st->pointer;
       st->yield = true;
-   }
-   if (!st->yield)
-      return;
-   /* A hand untracked at the press takes its first tracked aim. */
-   for (h = 0; h < INPUT_OPENXR_HANDS; h++)
-   {
-      if (press)
-         st->yield_has[h] = false;
-      if (tracked[h] && !st->yield_has[h])
-      {
-         st->yield_dir[h] = dir[h];
-         st->yield_has[h] = true;
-      }
-   }
 }
 
 /* The XR thread, each headset frame: a dot where each hand points at a
