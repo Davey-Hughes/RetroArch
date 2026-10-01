@@ -43,11 +43,15 @@
  *                           XR_KHR_vulkan_enable, leaving the application
  *                           XR_KHR_vulkan_enable2 as a runtime with only
  *                           that one would
+ *   RA_XR_LAYER_DEVICE_EXT  a name xrGetVulkanDeviceExtensionsKHR's list
+ *                           gains: a device extension the GPU may lack
  *
  * Script lines:
  *   head <x> <y> <z> <yaw>  the VIEW space's pose in LOCAL, yaw in degrees
  *   head off                the runtime's own pose again
  *   fail session            xrCreateSession fails
+ *   fail session once       the next xrCreateSession fails, later ones
+ *                           do not
  *   fail waitframe          xrWaitFrame reports XR_ERROR_SESSION_LOST
  *   fail instance           xrPollEvent reports XR_ERROR_INSTANCE_LOST
  *                           while a session exists
@@ -153,6 +157,7 @@ static struct
    off_t script_size;
    bool head_set;
    bool fail_session;
+   bool fail_session_once;
    bool fail_waitframe;
    bool fail_instance;
    int inject_states[8];     /* oldest first */
@@ -196,6 +201,7 @@ static struct
    PFN_xrWaitFrame WaitFrame;
    PFN_xrBeginFrame BeginFrame;
    PFN_xrEndFrame EndFrame;
+   PFN_xrGetVulkanDeviceExtensionsKHR GetVulkanDeviceExtensionsKHR;
 
    XrInstance instance;
    bool frame;               /* the application enabled FRAME_EXT */
@@ -384,9 +390,10 @@ static void script_head(const char *args)
 
 static void script_fail(const char *args)
 {
-   L.fail_session   = !strncmp(args, "session", 7);
-   L.fail_waitframe = !strncmp(args, "waitframe", 9);
-   L.fail_instance  = !strncmp(args, "instance", 8);
+   L.fail_session      = !strncmp(args, "session", 7);
+   L.fail_session_once = !strncmp(args, "session once", 12);
+   L.fail_waitframe    = !strncmp(args, "waitframe", 9);
+   L.fail_instance     = !strncmp(args, "instance", 8);
 }
 
 /* Queued until a session exists, so a script may lead with states. */
@@ -795,6 +802,11 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_CreateSession(XrInstance instance,
    pthread_mutex_lock(&L.lock);
    script_poll();
    fail = L.fail_session;
+   if (L.fail_session_once)
+   {
+      L.fail_session      = false;
+      L.fail_session_once = false;
+   }
    pthread_mutex_unlock(&L.lock);
    if (fail)
       return XR_ERROR_RUNTIME_FAILURE;
@@ -1628,6 +1640,35 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_SuggestInteractionProfileBindings(
    return res;
 }
 
+/* RA_XR_LAYER_DEVICE_EXT: the runtime's list and one more name. */
+static XRAPI_ATTR XrResult XRAPI_CALL layer_GetVulkanDeviceExtensionsKHR(
+      XrInstance instance, XrSystemId system, uint32_t cap, uint32_t *count,
+      char *buffer)
+{
+   XrResult res;
+   uint32_t total;
+   uint32_t n      = 0;
+   const char *add = getenv("RA_XR_LAYER_DEVICE_EXT");
+   if (XR_FAILED(res = L.GetVulkanDeviceExtensionsKHR(instance, system, 0,
+               &n, NULL)))
+      return res;
+   /* n counts the terminator; a space joins the name to a list. */
+   total  = (n > 1 ? n + 1 : 1) + (uint32_t)strlen(add);
+   *count = total;
+   if (!cap)
+      return XR_SUCCESS;
+   if (cap < total)
+      return XR_ERROR_SIZE_INSUFFICIENT;
+   buffer[0] = '\0';
+   if (XR_FAILED(res = L.GetVulkanDeviceExtensionsKHR(instance, system, cap,
+               &n, buffer)))
+      return res;
+   if (buffer[0])
+      strcat(buffer, " ");
+   strcat(buffer, add);
+   return XR_SUCCESS;
+}
+
 /* ---- Loader interface ---- */
 
 static XRAPI_ATTR XrResult XRAPI_CALL layer_GetInstanceProcAddr(XrInstance instance,
@@ -1668,6 +1709,8 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_GetInstanceProcAddr(XrInstance insta
    HOOK(SuggestInteractionProfileBindings)
    HOOK(EnumerateDisplayRefreshRatesFB)
    HOOK(RequestDisplayRefreshRateFB)
+   if (L.GetVulkanDeviceExtensionsKHR)
+      HOOK(GetVulkanDeviceExtensionsKHR)
    if (!L.gipa)
       return XR_ERROR_FUNCTION_UNSUPPORTED;
    return L.gipa(instance, name, fn);
@@ -1754,6 +1797,13 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_CreateApiLayerInstance(
    NEXT(SuggestInteractionProfileBindings);
    NEXT(EnumerateDisplayRefreshRatesFB);
    NEXT(RequestDisplayRefreshRateFB);
+   /* Only an instance with XR_KHR_vulkan_enable has it. */
+   L.GetVulkanDeviceExtensionsKHR = NULL;
+   {
+      const char *add = getenv("RA_XR_LAYER_DEVICE_EXT");
+      if (add && *add)
+         NEXT(GetVulkanDeviceExtensionsKHR);
+   }
 #undef NEXT
    L.instance = *instance;
    pthread_mutex_lock(&L.lock);
