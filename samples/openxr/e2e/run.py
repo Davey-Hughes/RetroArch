@@ -977,6 +977,22 @@ def check_exit_window(res):
     return errors
 
 
+def check_options_follow(res):
+    """With the menu open the core runs no frames; when the headset's
+    session ends its views status changes, and the frontend asks the core
+    to update its options' display there and then."""
+    errors = []
+    if '[OpenXR] The headset session ended' not in res.log:
+        errors.append('no "[OpenXR] The headset session ended" in the log')
+    seen = re.findall(r'\[video_views\] options display status=(\d+)',
+                      res.log)
+    # Status 3 while the headset shows; 1 only after it ended.
+    if '3' not in seen or '1' not in seen[seen.index('3'):]:
+        errors.append('no options display update from status 3 to 1 (2D) '
+                      'after the session ended: %s' % seen)
+    return errors
+
+
 # ---- Headset input ----
 
 PAD_RE = re.compile(r'\[video_views\] pad port=(\d) buttons=0x([0-9a-f]+) '
@@ -2896,6 +2912,11 @@ CASES = [
      'steps': [('wait', 6), ('mark', 'lost'), ('script', 'state 8'),
                ('wait_exit', 3), ('shot', None)],
      'check': check_exit_window},
+    {'name': 'options-follow-headset', 'map': '3ds',
+     'settings': {'menu_driver': 'ozone'},
+     'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 2),
+               ('script', 'state 8'), ('wait', 3)],
+     'check': check_options_follow},
     # A Vulkan core: reinit and unload while the headset runs.
     {'name': 'hw-teardown', 'map': 'none', 'options': VULKAN,
      'steps': TEARDOWN, 'check': check_hw_teardown},
