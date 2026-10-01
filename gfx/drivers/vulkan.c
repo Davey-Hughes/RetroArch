@@ -314,8 +314,11 @@ typedef struct vk
    {
       vulkan_filter_chain_t *chains[RETRO_VIDEO_VIEWS_MAX];
       vulkan_filter_chain_t *stock[RETRO_VIDEO_VIEWS_MAX];
+      /* The stock chains' form for a source larger than its image. */
+      vulkan_filter_chain_t *shrink[RETRO_VIDEO_VIEWS_MAX];
       vulkan_filter_chain_t *frame_chain;
       vulkan_filter_chain_t *frame_stock;
+      vulkan_filter_chain_t *frame_shrink;
       struct
       {
          VkImage images[VULKAN_OPENXR_MAX_IMAGES][2];
@@ -336,6 +339,8 @@ typedef struct vk
       bool mutable_format;
       bool hdr_warned;
       bool recenter_seen;
+      /* A shrinking chain could not be made: the stock one draws. */
+      bool shrink_failed;
       unsigned recenter;   /* the request count last seen */
       /* The headset paces frames, so the window presents without
        * waiting; window_interval is what set_nonblock_state asked. */
@@ -5592,8 +5597,11 @@ static void vulkan_views_free_chains(vk_t *vk, unsigned first)
          vulkan_filter_chain_free(vk->xr.chains[i]);
       if (vk->xr.stock[i])
          vulkan_filter_chain_free(vk->xr.stock[i]);
+      if (vk->xr.shrink[i])
+         vulkan_filter_chain_free(vk->xr.shrink[i]);
       vk->xr.chains[i] = NULL;
       vk->xr.stock[i]  = NULL;
+      vk->xr.shrink[i] = NULL;
 #endif
    }
 #ifdef HAVE_OPENXR
@@ -5603,9 +5611,13 @@ static void vulkan_views_free_chains(vk_t *vk, unsigned first)
          vulkan_filter_chain_free(vk->xr.frame_chain);
       if (vk->xr.frame_stock)
          vulkan_filter_chain_free(vk->xr.frame_stock);
-      vk->xr.frame_chain = NULL;
-      vk->xr.frame_stock = NULL;
+      if (vk->xr.frame_shrink)
+         vulkan_filter_chain_free(vk->xr.frame_shrink);
+      vk->xr.frame_chain  = NULL;
+      vk->xr.frame_stock  = NULL;
+      vk->xr.frame_shrink = NULL;
    }
+   vk->xr.shrink_failed = false;
 #endif
    vk->views.stock_failed = false;
 }
@@ -6933,6 +6945,9 @@ static void vulkan_check_swapchain(vk_t *vk)
       if (vk->xr.stock[v])
          vulkan_filter_chain_update_swapchain_info(vk->xr.stock[v],
                &filter_info);
+      if (vk->xr.shrink[v])
+         vulkan_filter_chain_update_swapchain_info(vk->xr.shrink[v],
+               &filter_info);
 #endif
    }
 #ifdef HAVE_OPENXR
@@ -6941,6 +6956,9 @@ static void vulkan_check_swapchain(vk_t *vk)
             &filter_info);
    if (vk->xr.frame_stock)
       vulkan_filter_chain_update_swapchain_info(vk->xr.frame_stock,
+            &filter_info);
+   if (vk->xr.frame_shrink)
+      vulkan_filter_chain_update_swapchain_info(vk->xr.frame_shrink,
             &filter_info);
 #endif
 
@@ -8941,6 +8959,35 @@ error:
    return false;
 }
 
+/* Whether the headset's screens are drawn by its stock chains. */
+static bool vulkan_xr_stock(const vk_t *vk,
+      const video_frame_info_t *video_info)
+{
+   return !video_info->shader_active
+      || !vk->filter_chain
+      || vk->filter_chain == vk->filter_chain_default;
+}
+
+/* The stock chain's form for a source larger than its image, for a view
+ * or, when view is negative, the whole frame. Made on first use, as the
+ * stock chains are; NULL if it can't be. */
+static vulkan_filter_chain_t *vulkan_xr_shrink_chain(vk_t *vk, int view)
+{
+   struct vulkan_filter_chain_create_info info;
+   vulkan_filter_chain_t **chain = (view >= 0)
+      ? &vk->xr.shrink[view] : &vk->xr.frame_shrink;
+
+   if (*chain || vk->xr.shrink_failed)
+      return *chain;
+   vulkan_views_chain_info(vk, &info);
+   if (!(*chain = vulkan_filter_chain_create_shrink(&info)))
+   {
+      vk->xr.shrink_failed = true;
+      RARCH_ERR("[OpenXR] Failed to create the headset's shrinking chain.\n");
+   }
+   return *chain;
+}
+
 /* This frame's quads: the views' screens, or the whole frame at
  * frame_dims' shape, and the UI when ui_dims is set. */
 static void vulkan_xr_plan(vk_t *vk, const video_frame_info_t *video_info,
@@ -8964,25 +9011,29 @@ static void vulkan_xr_plan(vk_t *vk, const video_frame_info_t *video_info,
    p.rotation      = vk->rotation_raw;
    p.ui_dims       = ui_dims;
    p.swap_eyes     = video_info->stereo_swap_eyes;
+   p.stock         = vulkan_xr_stock(vk, video_info);
    video_xr_place(&p, &vk->xr.set);
 }
 
 /* The headset's chain for a view, or for the whole frame when view is
- * negative, from the set the window uses this frame; NULL if none. */
+ * negative, from the set the window uses this frame; NULL if none.
+ * shrink: the source is larger than its image, which the stock chain
+ * then draws smoothly. */
 static vulkan_filter_chain_t *vulkan_xr_chain(vk_t *vk,
-      const video_frame_info_t *video_info, int view)
+      const video_frame_info_t *video_info, int view, bool shrink)
 {
    unsigned j;
    struct video_shader *live;
    struct video_shader *preset;
    vulkan_filter_chain_t **chain;
-   bool stock = !video_info->shader_active
-      || !vk->filter_chain
-      || vk->filter_chain == vk->filter_chain_default;
+   vulkan_filter_chain_t *shrinking;
+   bool stock = vulkan_xr_stock(vk, video_info);
 
    /* A threaded frame queued before the count shrank. */
    if (view >= (int)vk->views.count)
       return NULL;
+   if (stock && shrink && (shrinking = vulkan_xr_shrink_chain(vk, view)))
+      return shrinking;
    if (view >= 0)
       chain = stock ? &vk->xr.stock[view] : &vk->xr.chains[view];
    else
@@ -9169,11 +9220,13 @@ static void vulkan_xr_copy_ui(vk_t *vk, unsigned s, unsigned ui_dims)
 }
 
 /* Draws this frame into the headset's slots, outside any render pass:
- * screens when a core frame arrived, the UI when this frame drew any. */
+ * screens when a core frame arrived, the UI when this frame drew any.
+ * xr_shrink, if set, draws a whole frame larger than its image. */
 static void vulkan_xr_draw(vk_t *vk, const video_frame_info_t *video_info,
       bool new_frame, bool map, vulkan_filter_chain_t **xr_chains,
-      vulkan_filter_chain_t *xr_frame, unsigned frame_dims,
-      unsigned src_dims, unsigned ui_dims, bool window_drawn)
+      vulkan_filter_chain_t *xr_frame, vulkan_filter_chain_t *xr_shrink,
+      unsigned frame_dims, unsigned src_dims, unsigned ui_dims,
+      bool window_drawn)
 {
    unsigned s;
    vulkan_openxr_t *xr = vk->context->xr;
@@ -9182,6 +9235,10 @@ static void vulkan_xr_draw(vk_t *vk, const video_frame_info_t *video_info,
       vk->xr.ui_dims = ui_dims;
    vulkan_xr_plan(vk, video_info, map, frame_dims, src_dims,
          vk->xr.ui_dims);
+   if (     xr_shrink
+         && video_xr_shrinks(vk->xr.set.slots[0].dims, src_dims,
+            vk->rotation_raw))
+      xr_frame = xr_shrink;
    for (s = 0; s < VIDEO_XR_MAX_SLOTS; s++)
    {
       bool ok;
@@ -9362,6 +9419,7 @@ static bool vulkan_frame(void *data, const void *frame,
    vulkan_filter_chain_t *xr_chains[RETRO_VIDEO_VIEWS_MAX];
    vulkan_filter_chain_t *xr_copy[RETRO_VIDEO_VIEWS_MAX];
    vulkan_filter_chain_t *xr_frame               = NULL;
+   vulkan_filter_chain_t *xr_frame_shrink        = NULL;
    unsigned xr_frame_dims                        = 0;
    unsigned xr_src_dims                          = 0;
    unsigned xr_ui_dims                           = 0;
@@ -9685,7 +9743,15 @@ static bool vulkan_frame(void *data, const void *frame,
          for (l = 0; l < vk->xr.set.slots[s].layers; l++)
          {
             int v = vk->xr.set.slots[s].view[l];
-            if (v >= 0 && !(xr_chains[v] = vulkan_xr_chain(vk, video_info, v)))
+            const struct retro_video_view *rv;
+            if (v < 0)
+               continue;
+            /* A view larger than its image is shrunk smoothly. */
+            rv = &video_info->views.views[v];
+            if (!(xr_chains[v] = vulkan_xr_chain(vk, video_info, v,
+                        video_xr_shrinks(vk->xr.set.slots[s].dims,
+                           VIDEO_SCALE_PACK(rv->width, rv->height),
+                           vk->rotation_raw))))
                xr_map = false;
          }
    }
@@ -9769,8 +9835,12 @@ static bool vulkan_frame(void *data, const void *frame,
    if (xr_draw && !xr_map)
    {
       memset(xr_chains, 0, sizeof(xr_chains));
-      if (!(xr_frame = vulkan_xr_chain(vk, video_info, -1)))
+      if (!(xr_frame = vulkan_xr_chain(vk, video_info, -1, false)))
          xr_draw = false;
+      /* Whether the frame is larger than its image is known once
+       * vulkan_xr_draw() plans it, so the shrinking form is set up too. */
+      else if (vulkan_xr_stock(vk, video_info))
+         xr_frame_shrink = vulkan_xr_shrink_chain(vk, -1);
    }
 #endif
 
@@ -9799,6 +9869,11 @@ static bool vulkan_frame(void *data, const void *frame,
       if (xr_frame)
       {
          setup_chains[num_setup]  = xr_frame;
+         setup_views[num_setup++] = -1;
+      }
+      if (xr_frame_shrink)
+      {
+         setup_chains[num_setup]  = xr_frame_shrink;
          setup_views[num_setup++] = -1;
       }
    }
@@ -9965,6 +10040,8 @@ static bool vulkan_frame(void *data, const void *frame,
       xr_src_dims = input.dims;
       if (xr_frame)
          vulkan_filter_chain_set_input_texture(xr_frame, &input);
+      if (xr_frame_shrink)
+         vulkan_filter_chain_set_input_texture(xr_frame_shrink, &input);
 #endif
       if (views)
       {
@@ -10407,8 +10484,8 @@ static bool vulkan_frame(void *data, const void *frame,
 #ifdef HAVE_OPENXR
    if (xr_draw)
       vulkan_xr_draw(vk, video_info, frame && !video_info->frame_repeat,
-            xr_map, xr_chains, xr_frame, xr_frame_dims, xr_src_dims,
-            xr_ui_dims, xr_window_drawn);
+            xr_map, xr_chains, xr_frame, xr_frame_shrink, xr_frame_dims,
+            xr_src_dims, xr_ui_dims, xr_window_drawn);
    else
       vk->xr.ui_dims = 0;
 #endif

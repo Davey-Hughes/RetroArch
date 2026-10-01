@@ -405,19 +405,21 @@ def no_quads(res):
             % os.path.join(res.dir, 'run.log')]
 
 
-def image_size(res, q, native, distance=1.8):
+def image_size(res, q, native=None, distance=1.8):
     """Errors unless q's swapchain has the size video_xr_image_dims()
     gives at the density the runtime recommended: the quad's angular
-    width in headset pixels, never below the source's width, in the
-    quad's shape. The log rounds the angle, so allow a pixel or two."""
+    width in headset pixels, in the quad's shape; with a shader preset
+    (native, the source's size), never below the source's width. The log
+    rounds the angle, so allow a pixel or two."""
     m = DENSITY.search(res.log)
     sc = res.chains.get(q['sc'])
     if not m or not sc:
         return ['no headset density or swapchain for quad sc%d' % q['sc']]
     px_per_rad = int(m.group(1)) / math.radians(int(m.group(2)))
     angular = 2.0 * math.atan(q['size'][0] / (2.0 * distance)) * px_per_rad
-    slack = 0 if native[0] > angular * 1.02 + 1 else 2 + int(angular * 0.01)
-    w = max(native[0], math.ceil(angular))
+    floor = native[0] if native else 0
+    slack = 0 if floor > angular * 1.02 + 1 else 2 + int(angular * 0.01)
+    w = max(floor, math.ceil(angular))
     h = w * q['size'][1] / q['size'][0]
     errors = []
     if abs(sc['w'] - w) > slack or abs(sc['h'] - h) > slack + 1:
@@ -454,9 +456,9 @@ def check_screens(swap=False, horizontal=False):
         if not at(bq, want) or not sized(bq, (1.28, 0.96)):
             errors.append('bottom screen at %s size %s, want %s'
                           % (bq['pose'][:3], bq['size'], want))
-        errors += image_size(res, lq, (400, 240))
-        errors += image_size(res, rq, (400, 240))
-        errors += image_size(res, bq, (320, 240))
+        errors += image_size(res, lq)
+        errors += image_size(res, rq)
+        errors += image_size(res, bq)
         if any(res.chains.get(x['sc'], {}).get('layers') != 1
                for x in (lq, rq)):
             errors.append('the eyes\' images are not one layer each')
@@ -531,9 +533,12 @@ def check_sized_screens(res):
         return ['want a left, a right and a both-eye quad, got %s'
                 % [x['eye'] for x in q]]
     errors = []
-    for eye, what in (('left', 'left eye'), ('right', 'right eye'),
-                      ('both', 'bottom screen')):
+    for eye, what, native in (('left', 'left eye', (400, 240)),
+                              ('right', 'right eye', (400, 240)),
+                              ('both', 'bottom screen', (320, 240))):
         errors += sized_like(res, fr, eyes[eye], what)
+        # A preset's images are never smaller than their sources.
+        errors += image_size(res, eyes[eye], native)
     k = min(W / 400.0, H / 480.0)
     return errors + window_like(res, (
         (0.5, 0.25, 400 * k, 240 * k, 'top screen'),
@@ -549,6 +554,7 @@ def check_sized_frame(res):
         return ['want one quad for both eyes, got %s' % [x['eye'] for x in q]]
     # The core's frame has the window's shape, so it fills the window.
     return (sized_like(res, fr, q[0], 'frame')
+            + image_size(res, q[0], (800, 480))
             + window_like(res, ((0.5, 0.5, W, H, 'frame'),)))
 
 
@@ -585,13 +591,99 @@ def check_frame(res):
     errors = []
     if not at(q[0], (0.0, 0.0, -1.8)) or not sized(q[0], (1.6, 0.96)):
         errors.append('frame at %s size %s' % (q[0]['pose'][:3], q[0]['size']))
-    errors += image_size(res, q[0], (800, 480))
+    errors += image_size(res, q[0])
     for fx, fy, want in ((0.25, 0.25, RED), (0.75, 0.25, BLUE),
                          (0.5, 0.75, YELLOW), (0.1, 0.75, GREY)):
         c, _ = colour(image(res, fr, q[0]), fx, fy)
         if not near(c, want):
             errors.append('(%.2f,%.2f) shows %s, want %s' % (fx, fy, c, want))
     return errors
+
+
+MID = (128, 128, 128)
+
+
+def pattern_errors(res, fr, q, what, smooth, box=(0.2, 0.2, 0.8, 0.8)):
+    """A one-pixel checkerboard in q's image, over box (fractions of the
+    image): mid grey throughout when shrunk smoothly, else only black and
+    white pixels, both of them."""
+    w, h, bpp, rows = read_png(image(res, fr, q))
+    seen = set()
+    for y in range(int(box[1] * h), int(box[3] * h)):
+        for x in range(int(box[0] * w), int(box[2] * w)):
+            px = tuple(rows[y][x * bpp:x * bpp + 3])
+            if smooth:
+                if not near(px, MID, 24):
+                    return ['%s is %s at (%d,%d), want grey: the checkerboard '
+                            'shrunk smoothly' % (what, px, x, y)]
+            elif near(px, (0, 0, 0)):
+                seen.add('black')
+            elif near(px, WHITE):
+                seen.add('white')
+            else:
+                return ['%s is %s at (%d,%d), want black or white: the '
+                        'checkerboard enlarged unfiltered' % (what, px, x, y)]
+    if not smooth and len(seen) < 2:
+        return ['%s shows only %s' % (what, sorted(seen))]
+    return []
+
+
+def check_checker(smooth, distance=1.8):
+    """The 3DS screens as one-pixel checkerboards: each image the size
+    the headset shows, smaller than its source with the checkerboard
+    shrunk smoothly into it (smooth), or no smaller and enlarged with
+    Bilinear Filtering off, as before."""
+    def check(res):
+        fr = last_snap(res)
+        if not fr:
+            return no_quads(res)
+        eyes = dict((x['eye'], x) for x in quads(fr)
+                    if not x['flags'] & BLEND)
+        if sorted(eyes) != ['both', 'left', 'right']:
+            return ['want a left, a right and a both-eye quad, got %s'
+                    % sorted(eyes)]
+        errors = []
+        for eye, what, src in (('left', 'left eye', (400, 240)),
+                               ('right', 'right eye', (400, 240)),
+                               ('both', 'bottom screen', (320, 240))):
+            q = eyes[eye]
+            sc = res.chains.get(q['sc'])
+            if not sc:
+                errors.append('no swapchain for the %s' % what)
+                continue
+            errors += image_size(res, q, distance=distance)
+            if (sc['w'] < src[0] or sc['h'] < src[1]) != smooth:
+                errors.append('the %s\'s image is %dx%d for its %dx%d '
+                              'source, want it %s'
+                              % (what, sc['w'], sc['h'], src[0], src[1],
+                                 'smaller' if smooth else 'no smaller'))
+            errors += pattern_errors(res, fr, q, what, smooth)
+        if smooth and '[OpenXR] Slot 0: 400x240,' in res.log:
+            errors.append('slot 0 was made at its source\'s 400x240')
+        return errors
+    return check
+
+
+def check_frame_checker(res):
+    """No map: the whole 800x480 frame, its top screens one-pixel
+    checkerboards, in an image the size the headset shows with the
+    checkerboard shrunk smoothly into it."""
+    fr = last_snap(res)
+    if not fr:
+        return no_quads(res)
+    q = [x for x in quads(fr) if not x['flags'] & BLEND]
+    if len(q) != 1 or q[0]['eye'] != 'both':
+        return ['want one quad for both eyes, got %s' % [x['eye'] for x in q]]
+    sc = res.chains.get(q[0]['sc'])
+    if not sc:
+        return ['no swapchain for the frame']
+    errors = image_size(res, q[0])
+    if sc['w'] >= 800 or sc['h'] >= 480:
+        errors.append('the frame\'s image is %dx%d, want it smaller than '
+                      'the 800x480 frame' % (sc['w'], sc['h']))
+    # The left top screen, clear of its marker and its edges.
+    return errors + pattern_errors(res, fr, q[0], 'frame', True,
+                                   (0.1, 0.1, 0.45, 0.4))
 
 
 def menu_size(res, q, ui, distance=1.7):
@@ -2406,6 +2498,7 @@ TEARDOWN = [('wait', 6), ('send', 'FULLSCREEN_TOGGLE'), ('wait', 4),
             ('send', 'CLOSE_CONTENT'), ('wait', 4)]
 KEPT_LEAK = [('VUID-vkDestroyDevice-device-05137', kept_leak)]
 SIZED = {'video_shader_enable': 'true'}
+CHECKER = {'video_views_test_pattern': 'checker'}
 SHOT = [('wait', 8), ('shot', None)]
 # SteamVR on the Steam Frame shows array layer 0 of every quad.
 INDEX0 = {'RA_XR_LAYER_QUAD_INDEX0': '1'}
@@ -2452,6 +2545,16 @@ CASES = [
     {'name': 'no-map-output-size', 'map': 'none', 'settings': SIZED,
      'args': ['--set-shader=' + PRESET], 'steps': SHOT,
      'check': check_sized_frame},
+    # Monado shows a screen here about 180 px wide, smaller than any
+    # source, so the stock chain shrinks it.
+    {'name': '3ds-shrink', 'map': '3ds', 'options': CHECKER,
+     'steps': SETTLE, 'check': check_checker(True)},
+    {'name': 'no-map-shrink', 'map': 'none', 'options': CHECKER,
+     'steps': SETTLE, 'check': check_frame_checker},
+    # Half a metre away the screens show larger than their sources.
+    {'name': '3ds-enlarge', 'map': '3ds', 'options': CHECKER,
+     'settings': {'video_openxr_distance': '0.5'}, 'steps': SETTLE,
+     'check': check_checker(False, 0.5)},
     {'name': 'menu', 'map': '3ds', 'settings': {'menu_driver': 'ozone'},
      'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 4)],
      'check': check_menu()},

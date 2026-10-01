@@ -35,7 +35,9 @@
  *
  * With video_views_test_fps it reports another frame rate, and logs
  * every tenth frame with the monotonic time, for the headset pacing
- * tests. */
+ * tests. With video_views_test_pattern checker it fills each view with
+ * a one-pixel black and white checkerboard instead of its colour, in
+ * software or its own Vulkan images, for the headset's shrinking. */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -62,6 +64,7 @@
 #define COL_GREEN  0x00FF00
 #define COL_YELLOW 0xFFFF00
 #define COL_WHITE  0xFFFFFF
+#define COL_BLACK  0x000000
 
 enum map_kind
 {
@@ -163,6 +166,7 @@ static uint32_t frame_buf[CROP_W * CROP_H];
 static enum map_kind map_kind = MAP_3DS;
 static enum hw_kind hw_kind   = HW_OFF;
 static bool large_max;
+static bool checker;
 static double core_fps = 60.0;
 static unsigned frames_run;
 static struct retro_hw_render_callback hw_render;
@@ -220,6 +224,16 @@ static void fill(unsigned x, unsigned y, unsigned w, unsigned h,
    for (j = y; j < y + h; j++)
       for (i = x; i < x + w; i++)
          frame_buf[j * fw + i] = c;
+}
+
+/* By frame position, so neighbouring views meet seamlessly. */
+static void fill_checker(unsigned x, unsigned y, unsigned w, unsigned h,
+      unsigned fw)
+{
+   unsigned i, j;
+   for (j = y; j < y + h; j++)
+      for (i = x; i < x + w; i++)
+         frame_buf[j * fw + i] = ((i ^ j) & 1) ? COL_WHITE : COL_BLACK;
 }
 
 /* A top-left rectangle of the frame, cleared to c through the scissor.
@@ -666,6 +680,11 @@ static void read_options(void)
    large_max = environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var)
       && var.value && !strcmp(var.value, "large");
 
+   var.key   = "video_views_test_pattern";
+   var.value = NULL;
+   checker   = environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var)
+      && var.value && !strcmp(var.value, "checker");
+
    var.key   = "video_views_test_fps";
    var.value = NULL;
    core_fps  = 60.0;
@@ -716,6 +735,8 @@ void retro_set_environment(retro_environment_t cb)
         "Declared maximum size; normal|large" },
       { "video_views_test_fps",
         "Frame rate; 60|10|16" },
+      { "video_views_test_pattern",
+        "View fill; solid|checker" },
       { NULL, NULL }
    };
    struct retro_log_callback logging;
@@ -904,7 +925,11 @@ void retro_run(void)
    rect(0, 0, fw, fh, fw, fh, COL_BG);
    for (i = 0; i < n; i++)
    {
-      rect(v[i].x, v[i].y, v[i].width, v[i].height, fw, fh, c[i]);
+      /* GL clears through a scissor, so it keeps solid colours. */
+      if (checker && (hw_kind == HW_OFF || hw_kind >= HW_VULKAN))
+         fill_checker(v[i].x, v[i].y, v[i].width, v[i].height, fw);
+      else
+         rect(v[i].x, v[i].y, v[i].width, v[i].height, fw, fh, c[i]);
       rect(v[i].x, v[i].y, 8, 8, fw, fh, COL_WHITE);
    }
 
