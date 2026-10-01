@@ -29,6 +29,8 @@
  * the queue lock, as a core draining its work may, and logs when:
  * samples/openxr/e2e/run.py checks nothing of the frontend's used the
  * queue meanwhile. vulkan_keep keeps its context over video reinits.
+ * vulkan_v1 makes its own device through create_device (version 1), as
+ * Azahar does, so a headset needs XR_KHR_vulkan_enable.
  *
  * It also logs its pads, analog values and light gun when they change,
  * and rumbles a port while it holds Start, for the headset input tests.
@@ -83,7 +85,8 @@ enum hw_kind
    HW_GL,         /* bottom-left origin */
    HW_GL_TOPLEFT,
    HW_VULKAN,
-   HW_VULKAN_KEEP
+   HW_VULKAN_KEEP,
+   HW_VULKAN_V1
 };
 
 /* The GL the hardware mode uses, loaded through the frontend's
@@ -673,6 +676,8 @@ static void read_options(void)
          hw_kind = HW_VULKAN;
       else if (!strcmp(var.value, "vulkan_keep"))
          hw_kind = HW_VULKAN_KEEP;
+      else if (!strcmp(var.value, "vulkan_v1"))
+         hw_kind = HW_VULKAN_V1;
    }
 
    var.key   = "video_views_test_max";
@@ -730,7 +735,7 @@ void retro_set_environment(retro_environment_t cb)
       { "video_views_test_map",
         "View map; 3ds|3ds_force|ds|vb|invalid|none|crop" },
       { "video_views_test_hw",
-        "Hardware rendering; off|gl|gl_topleft|vulkan|vulkan_keep" },
+        "Hardware rendering; off|gl|gl_topleft|vulkan|vulkan_keep|vulkan_v1" },
       { "video_views_test_max",
         "Declared maximum size; normal|large" },
       { "video_views_test_fps",
@@ -997,6 +1002,105 @@ void retro_cheat_set(unsigned index, bool enabled, const char *code)
    (void)code;
 }
 
+static const VkApplicationInfo *vk_app_info(void)
+{
+   static VkApplicationInfo app;
+   memset(&app, 0, sizeof(app));
+   app.sType            = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+   app.pApplicationName = "video_views test";
+   app.apiVersion       = VK_API_VERSION_1_1;
+   return &app;
+}
+
+/* vulkan_v1: the device is the core's own, with what the frontend
+ * asks for, on the first queue family that draws and presents. */
+static bool vk_create_device(struct retro_vulkan_context *ctx,
+      VkInstance instance, VkPhysicalDevice gpu, VkSurfaceKHR surface,
+      PFN_vkGetInstanceProcAddr gipa, const char **exts,
+      unsigned num_exts, const char **layers, unsigned num_layers,
+      const VkPhysicalDeviceFeatures *features)
+{
+   uint32_t i;
+   uint32_t count = 16;
+   float prio     = 1.0f;
+   VkPhysicalDevice gpus[16];
+   VkQueueFamilyProperties props[16];
+   VkDeviceQueueCreateInfo qi;
+   VkDeviceCreateInfo di;
+   VkPhysicalDeviceFeatures none;
+   PFN_vkEnumeratePhysicalDevices enum_gpus =
+      (PFN_vkEnumeratePhysicalDevices)gipa(instance,
+            "vkEnumeratePhysicalDevices");
+   PFN_vkGetPhysicalDeviceQueueFamilyProperties families =
+      (PFN_vkGetPhysicalDeviceQueueFamilyProperties)gipa(instance,
+            "vkGetPhysicalDeviceQueueFamilyProperties");
+   PFN_vkGetPhysicalDeviceSurfaceSupportKHR presents =
+      (PFN_vkGetPhysicalDeviceSurfaceSupportKHR)gipa(instance,
+            "vkGetPhysicalDeviceSurfaceSupportKHR");
+   PFN_vkCreateDevice create =
+      (PFN_vkCreateDevice)gipa(instance, "vkCreateDevice");
+   PFN_vkGetDeviceProcAddr gdpa =
+      (PFN_vkGetDeviceProcAddr)gipa(instance, "vkGetDeviceProcAddr");
+   PFN_vkGetDeviceQueue get_queue;
+   PFN_vkDestroyDevice destroy;
+
+   if (!enum_gpus || !families || !create || !gdpa)
+      return false;
+   if (gpu == VK_NULL_HANDLE)
+   {
+      if (enum_gpus(instance, &count, gpus) < 0 || !count)
+         return false;
+      gpu = gpus[0];
+   }
+   count = 16;
+   families(gpu, &count, props);
+   for (i = 0; i < count; i++)
+   {
+      VkBool32 present = VK_TRUE;
+      if (surface != VK_NULL_HANDLE && presents)
+         presents(gpu, i, surface, &present);
+      if ((props[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && present)
+         break;
+   }
+   if (i == count)
+      return false;
+
+   memset(&qi, 0, sizeof(qi));
+   qi.sType            = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+   qi.queueFamilyIndex = i;
+   qi.queueCount       = 1;
+   qi.pQueuePriorities = &prio;
+   memset(&none, 0, sizeof(none));
+   memset(&di, 0, sizeof(di));
+   di.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+   di.queueCreateInfoCount    = 1;
+   di.pQueueCreateInfos       = &qi;
+   di.enabledExtensionCount   = num_exts;
+   di.ppEnabledExtensionNames = exts;
+   di.enabledLayerCount       = num_layers;
+   di.ppEnabledLayerNames     = layers;
+   di.pEnabledFeatures        = features ? features : &none;
+   if (create(gpu, &di, NULL, &ctx->device) != VK_SUCCESS)
+      return false;
+   get_queue = (PFN_vkGetDeviceQueue)gdpa(ctx->device, "vkGetDeviceQueue");
+   if (!get_queue)
+   {
+      destroy = (PFN_vkDestroyDevice)gdpa(ctx->device, "vkDestroyDevice");
+      if (destroy)
+         destroy(ctx->device, NULL);
+      return false;
+   }
+   get_queue(ctx->device, i, 0, &ctx->queue);
+   ctx->gpu                             = gpu;
+   ctx->queue_family_index              = i;
+   ctx->presentation_queue              = ctx->queue;
+   ctx->presentation_queue_family_index = i;
+   log_cb(RETRO_LOG_INFO, "[video_views] made its own Vulkan device\n");
+   return true;
+}
+
+static struct retro_hw_render_context_negotiation_interface_vulkan vk_v1;
+
 bool retro_load_game(const struct retro_game_info *game)
 {
    enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
@@ -1016,6 +1120,19 @@ bool retro_load_game(const struct retro_game_info *game)
       hw_render.context_destroy = vk_context_destroy;
       if (!environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw_render))
          return false;
+      if (hw_kind == HW_VULKAN_V1)
+      {
+         memset(&vk_v1, 0, sizeof(vk_v1));
+         vk_v1.interface_type       =
+            RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN;
+         vk_v1.interface_version    = 1;
+         vk_v1.get_application_info = vk_app_info;
+         vk_v1.create_device        = vk_create_device;
+         if (!environ_cb(
+                  RETRO_ENVIRONMENT_SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE,
+                  &vk_v1))
+            return false;
+      }
    }
    else if (hw_kind != HW_OFF)
    {
