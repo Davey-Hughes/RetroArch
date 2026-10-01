@@ -391,6 +391,7 @@ typedef struct input_openxr
    /* The laser's yield to the controllers: the last read's buttons and
     * sticks past half, and each hand's aim at the last press. */
    bool yield;
+   int yield_hand;                      /* the hand that pointed, or -1 */
    bool yield_has[INPUT_OPENXR_HANDS];
    video_xr_vec3_t yield_dir[INPUT_OPENXR_HANDS];
    uint16_t last_buttons[INPUT_OPENXR_PADS];
@@ -1020,7 +1021,8 @@ static bool input_openxr_new_press(input_openxr_t *st)
 
 /* With the menu open, the laser yields to the controllers' buttons and
  * sticks, so hand drift cannot undo their navigation: from a press until
- * a hand turns away from where it aimed then, or a trigger is pulled.
+ * the hand that pointed turns away from where it aimed then (any hand,
+ * if none pointed), or a trigger is pulled.
  * That pull is spent, with a press's or without: an unseen laser must
  * not click. */
 static void input_openxr_yield(input_openxr_t *st, unsigned laser,
@@ -1032,6 +1034,7 @@ static void input_openxr_yield(input_openxr_t *st, unsigned laser,
    video_xr_vec3_t dir[INPUT_OPENXR_HANDS];
    bool tracked[INPUT_OPENXR_HANDS];
    bool press = input_openxr_new_press(st);
+   bool was   = st->yield;
 
    if (     !menu_open || laser == VIDEO_OPENXR_LASER_OFF
          || (!st->yield && !press))
@@ -1049,12 +1052,17 @@ static void input_openxr_yield(input_openxr_t *st, unsigned laser,
          st->yield        = false;
       }
       else if (st->yield && tracked[h] && st->yield_has[h]
+            && (st->yield_hand < 0 || st->yield_hand == (int)h)
             && video_xr_aim_moved(&st->yield_dir[h], &dir[h],
                INPUT_OPENXR_YIELD_DEGREES))
          st->yield = false;
    }
    if (press)
+   {
+      if (!was)
+         st->yield_hand = st->pointer;
       st->yield = true;
+   }
    if (!st->yield)
       return;
    /* A hand untracked at the press takes its first tracked aim. */

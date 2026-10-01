@@ -1572,6 +1572,8 @@ AIM_MENU_MOVE = 'aim right 0.2 -0.4 -0.3 0.0 0.192 -1.7'      # 0.5 0.3
 # it wraps the Vulkan viewport (master's gfx_display_vk_draw()).
 AIM_MENU_TOP = 'aim right 0.2 -0.4 -0.3 0.16 0.4224 -1.7'         # 0.6 0.06
 AIM_LEFT_MENU_TOP = 'aim left -0.2 -0.4 -0.3 -0.16 0.4224 -1.7'   # 0.4 0.06
+AIM_LEFT_YIELD = 'aim left -0.2 -0.4 -0.3 -3.0 0.0 -1.8'   # off every quad
+AIM_LEFT_TURN = 'aim left -0.2 -0.4 -0.3 -3.9 0.0 -1.8'    # 6 degrees on
 STICK_DOWN = 'action combined/left_stick 0 -1'
 # Stick taps shorter than the menu's repeat delay move one entry each;
 # two from Restart keep Ozone's list from scrolling (scrolling wraps the
@@ -1677,6 +1679,30 @@ def check_menu_press_pull(res):
         errors.append('the menu scrolled past the stick\'s selection: %s'
                       % [f['selection'] for f in lines])
     return errors + hidden_errors(res, 'yield', 'pull', DOT_HIGH)
+
+
+def check_menu_yield_hands(res):
+    """Ozone: the yield ends only by the pointing hand's turn. The left
+    hand turning 6 degrees changes nothing; the right one turning back to
+    its row brings the hover and the dot."""
+    lines = kinds(core_events(res), 'menu')
+    back = find(lines, 0, lambda f: at_px(f, MENU_MOVE_PX))
+    if back < 1:
+        return ['the right laser did not come back on the menu: %s'
+                % lines[:6]]
+    errors = []
+    if any(not at_px(f, MENU_HIGH_PX) for f in lines[:back]):
+        errors.append('the laser read on the menu while it yielded: %s'
+                      % [(f['x'], f['selection']) for f in lines[:back]])
+    return errors + hidden_errors(res, 'yield', 'move', DOT_MOVE)
+
+
+def check_menu_yield_ends(res):
+    """Ozone: the laser's toggle twice, and the menu closing and
+    reopening, each end a stick tap's yield: the dot is back on the menu
+    after each, and gone between a tap and its end."""
+    errors = hidden_errors(res, 'yield1', 'toggle', DOT_HIGH)
+    return errors + hidden_errors(res, 'yield2', 'reopen', DOT_HIGH)
 
 
 LASER_NOTICE = '[OpenXR] Laser Pointer: '
@@ -2728,6 +2754,36 @@ CASES = [
                ('script', script(AIM_MENU_HIGH, R2)), ('wait', 0.5),
                ('script', AIM_MENU_HIGH), ('wait', 2)],
      'check': check_menu_press_pull},
+    # The left hand turns 6 degrees (off the menu, still tracked) while
+    # the right one stays: the yield holds until the right one turns.
+    {'name': 'input-menu-yield-hands', 'map': '3ds',
+     'settings': {'menu_driver': 'ozone', 'frontend_log_level': '0'},
+     'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),
+               ('script', script(AIM_MENU_HIGH, AIM_LEFT_YIELD)),
+               ('wait', 2), ('mark', 'yield'),
+               ('script', script(AIM_MENU_HIGH, AIM_LEFT_YIELD, STICK_DOWN)),
+               ('wait', 0.1),
+               ('script', script(AIM_MENU_HIGH, AIM_LEFT_YIELD)),
+               ('wait', 1),
+               ('script', script(AIM_MENU_HIGH, AIM_LEFT_TURN)),
+               ('wait', 2), ('mark', 'move'),
+               ('script', script(AIM_MENU_MOVE, AIM_LEFT_TURN)),
+               ('wait', 2)],
+     'check': check_menu_yield_hands},
+    {'name': 'input-menu-yield-ends', 'map': '3ds',
+     'settings': {'menu_driver': 'ozone', 'frontend_log_level': '0'},
+     'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),
+               ('script', AIM_MENU_HIGH), ('wait', 2), ('mark', 'yield1'),
+               ('script', script(AIM_MENU_HIGH, STICK_DOWN)), ('wait', 0.1),
+               ('script', AIM_MENU_HIGH), ('wait', 1.5), ('mark', 'toggle'),
+               ('send', 'LASER_POINTER_TOGGLE'), ('wait', 0.5),
+               ('send', 'LASER_POINTER_TOGGLE'), ('wait', 2),
+               ('mark', 'yield2'),
+               ('script', script(AIM_MENU_HIGH, STICK_DOWN)), ('wait', 0.1),
+               ('script', AIM_MENU_HIGH), ('wait', 1.5),
+               ('send', 'MENU_TOGGLE'), ('wait', 1), ('mark', 'reopen'),
+               ('send', 'MENU_TOGGLE'), ('wait', 3)],
+     'check': check_menu_yield_ends},
     {'name': 'input-menu-hands', 'map': '3ds',
      'settings': {'menu_driver': 'ozone', 'frontend_log_level': '0'},
      'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),
