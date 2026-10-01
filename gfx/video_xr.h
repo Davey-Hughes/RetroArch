@@ -183,12 +183,6 @@ int video_xr_pick(const video_xr_quad_set_t *set, unsigned laser,
 float video_xr_cursor(const video_xr_quad_t *q, float u, float v,
       float dist, video_xr_pose_t *pose);
 
-/* Whether an aim turned more than degrees from where it pointed: the
- * angle between from and to, whatever their lengths. Without a
- * direction (zero length) it counts as moved. */
-bool video_xr_aim_moved(const video_xr_vec3_t *from,
-      const video_xr_vec3_t *to, float degrees);
-
 /* Headset pacing. The XR thread's filter over each frame's predicted
  * display period: a period is published once VIDEO_XR_PERIODS frames
  * agree within 1% of their median, and again when a new median is more
