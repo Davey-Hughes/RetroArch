@@ -2159,8 +2159,53 @@ def check_loss_waiting(res):
     errors = []
     if LOSS_LINE not in res.log:
         errors.append('no "%s" in the log' % LOSS_LINE)
+    if paced_line(20.0, 2) not in res.log.split(LOSS_LINE)[0]:
+        errors.append('the headset did not pace the core before the loss')
     if LATE_LINE in res.log:
         errors.append('the core waited out the headset that was gone')
+    return errors
+
+
+def check_hidden_slow(res):
+    """A headset that slows while it does not show the session: its
+    periods are not measured then, so the rate and the pace stay."""
+    if marks_missing(res, 'hidden', 'shown', 'to'):
+        return ['the run did not reach its marks']
+    errors = []
+    line = '[OpenXR] The headset runs at'
+    n = res.log.count(line)
+    if n != 1:
+        errors.append('"%s" logged %d times, want once' % (line, n))
+    for hz, k in PACED.findall(res.log):
+        if (float(hz), int(k)) != (20.0, 2):
+            errors.append('the core was paced at %s Hz / %s' % (hz, k))
+    t0, t1 = window(res, 'hidden', 'shown', 1.0)
+    fps = core_fps(res, t0, t1)
+    if abs(fps - 10.0) > 1.5:
+        errors.append('the core ran at %.1f fps while the headset did not '
+                      'show it, want 10' % fps)
+    t0, t1 = window(res, 'shown', 'to', 2.0)
+    errors += pace_errors(res, t0, t1, 2)
+    return errors
+
+
+def check_stopping(res):
+    """The session stopping while the core waits on the headset: the wait
+    ends with it, not after two intervals, and the core keeps its rate."""
+    if marks_missing(res, 'from', 'stop', 'end'):
+        return ['the run did not reach its marks']
+    errors = []
+    if '[OpenXR] Session stopping.' not in res.log:
+        errors.append('the session did not stop')
+    if paced_line(20.0, 2) not in res.log:
+        errors.append('the headset did not pace the core')
+    if LATE_LINE in res.log:
+        errors.append('the core waited out the headset that stopped')
+    t0, t1 = window(res, 'stop', 'end', 1.0)
+    fps = core_fps(res, t0, t1)
+    if abs(fps - 10.0) > 1.5:
+        errors.append('the core ran at %.1f fps once the session stopped, '
+                      'want 10' % fps)
     return errors
 
 
@@ -2637,6 +2682,25 @@ CASES = [
                ('wait', 4), ('mark', 'shown'), ('script', 'state 5'),
                ('wait', 6), ('mark', 'to')],
      'check': check_hidden},
+    # The layer's divide 4 only while the session is synchronized.
+    {'name': 'pace-hidden-slow', 'map': 'none', 'options': FPS10,
+     'settings': WINDOW1,
+     'steps': [('wait', 8), ('mark', 'hidden'),
+               ('script', 'state 3\ndivide 4'), ('wait', 7),
+               ('mark', 'shown'), ('script', 'divide 1\nstate 5'),
+               ('wait', 6), ('mark', 'to')],
+     'check': check_hidden_slow},
+    {'name': 'pace-stopping', 'map': 'none', 'options': FPS10,
+     'settings': WINDOW1,
+     'steps': [('wait', 8), ('mark', 'from'), ('wait', 3),
+               ('mark', 'stop'), ('script', 'state 6'), ('wait', 5),
+               ('mark', 'end')],
+     'check': check_stopping},
+    # Black frame insertion and subframes wait for the window's display,
+    # which the headset's pace replaces.
+    {'name': 'pace-2-bfi', 'map': 'none', 'options': FPS10,
+     'settings': dict(WINDOW1, video_black_frame_insertion='1'),
+     'steps': PACE_STEPS, 'check': check_paced(2, 20.0)},
     {'name': 'pace-fastforward', 'map': 'none', 'options': FPS10,
      'settings': WINDOW1,
      'steps': [('wait', 8), ('mark', 'ff'), ('send', 'FAST_FORWARD'),

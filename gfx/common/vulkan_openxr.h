@@ -167,6 +167,10 @@ void vulkan_openxr_set_pacing(vulkan_openxr_t *xr, unsigned interval);
  * doesn't, sleep to where the next tick would be. */
 void vulkan_openxr_pace_wait(vulkan_openxr_t *xr);
 
+/* Video thread, a paced frame that waits for no tick: the next wait
+ * wants a fresh one. */
+void vulkan_openxr_pace_skip(vulkan_openxr_t *xr);
+
 /* The rates XR_FB_display_refresh_rate lists for the session, none
  * without it; up to cap of them. */
 unsigned vulkan_openxr_refresh_rates(const vulkan_openxr_t *xr,
@@ -175,9 +179,6 @@ unsigned vulkan_openxr_refresh_rates(const vulkan_openxr_t *xr,
 /* Any thread: the XR thread asks the headset for hz (one it listed; 0
  * asks nothing), once a session and value. */
 void vulkan_openxr_request_rate(vulkan_openxr_t *xr, float hz);
-/* Video thread, a paced frame that waits for no tick: the next wait
- * wants a fresh one. */
-void vulkan_openxr_pace_skip(vulkan_openxr_t *xr);
 
 /* The largest swapchain side the headset takes. */
 unsigned vulkan_openxr_max_dim(const vulkan_openxr_t *xr);

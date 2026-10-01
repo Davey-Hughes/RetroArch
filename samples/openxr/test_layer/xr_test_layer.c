@@ -65,10 +65,10 @@
  *
  * A changed script (a new mtime, inode or size) is applied line by
  * line. head, fail, divide and rates stay in effect until a later line
- * of the same kind replaces them (head off, fail off). state and space fire once per
- * change of the file. Every read starts from no actions and no aims: a
- * script is the whole controller state. Action states and hand poses
- * never come from the runtime.
+ * of the same kind replaces them (head off, fail off). state and space
+ * fire once per change of the file. Every read starts from no actions
+ * and no aims: a script is the whole controller state. Action states
+ * and hand poses never come from the runtime.
  */
 
 #include <math.h>
