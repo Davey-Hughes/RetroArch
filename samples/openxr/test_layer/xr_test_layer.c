@@ -30,6 +30,8 @@
  * It can also run the headset slower than the runtime (Monado's null
  * compositor is fixed at 20 Hz) and offer XR_FB_display_refresh_rate
  * rates of its own; the requests it gets are recorded.
+ * Instances are recorded as they are made and destroyed, with the
+ * extensions the application enabled.
  *
  *   RA_XR_LAYER_OUT         directory for frames.jsonl and snap_*.png
  *   RA_XR_LAYER_SNAP_EVERY  write images every Nth frame; 0 never
@@ -37,6 +39,9 @@
  *   RA_XR_LAYER_QUAD_INDEX0 1: quads show array layer 0 whatever their
  *                           imageArrayIndex, as SteamVR on the Steam
  *                           Frame does
+ *   RA_XR_LAYER_ONE_VULKAN  1: refuse an instance that enables both
+ *                           XR_KHR_vulkan_enable and _enable2, as a
+ *                           runtime taking one Vulkan path might
  *
  * Script lines:
  *   head <x> <y> <z> <yaw>  the VIEW space's pose in LOCAL, yaw in degrees
@@ -178,6 +183,7 @@ static struct
    PFN_xrGetInstanceProcAddr gipa;
    PFN_xrCreateSession CreateSession;
    PFN_xrDestroySession DestroySession;
+   PFN_xrDestroyInstance DestroyInstance;
    PFN_xrPollEvent PollEvent;
    PFN_xrCreateReferenceSpace CreateReferenceSpace;
    PFN_xrLocateSpace LocateSpace;
@@ -846,6 +852,19 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_DestroySession(XrSession session)
    L.session         = XR_NULL_HANDLE;
    pthread_mutex_unlock(&L.lock);
    return L.DestroySession(session);
+}
+
+static XRAPI_ATTR XrResult XRAPI_CALL layer_DestroyInstance(XrInstance instance)
+{
+   pthread_mutex_lock(&L.lock);
+   if (L.out)
+   {
+      fprintf(L.out, "{\"ev\":\"instance_destroy\",\"t_us\":%lld}\n",
+            now_us());
+      fflush(L.out);
+   }
+   pthread_mutex_unlock(&L.lock);
+   return L.DestroyInstance(instance);
 }
 
 /* A scripted reference space change into ev, once, while a session
@@ -1599,6 +1618,7 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_GetInstanceProcAddr(XrInstance insta
       const char *name, PFN_xrVoidFunction *fn)
 {
    HOOK(GetInstanceProcAddr)
+   HOOK(DestroyInstance)
    HOOK(CreateSession)
    HOOK(DestroySession)
    HOOK(PollEvent)
@@ -1655,6 +1675,31 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_CreateApiLayerInstance(
       else
          exts[down.enabledExtensionCount++] = info->enabledExtensionNames[i];
    }
+   {
+      const char *one = getenv("RA_XR_LAYER_ONE_VULKAN");
+      bool v1 = false, v2 = false;
+      for (i = 0; i < info->enabledExtensionCount; i++)
+      {
+         if (!strcmp(info->enabledExtensionNames[i], "XR_KHR_vulkan_enable"))
+            v1 = true;
+         else if (!strcmp(info->enabledExtensionNames[i],
+                  "XR_KHR_vulkan_enable2"))
+            v2 = true;
+      }
+      if (one && atoi(one) != 0 && v1 && v2)
+      {
+         pthread_mutex_lock(&L.lock);
+         layer_open();
+         if (L.out)
+         {
+            fprintf(L.out, "{\"ev\":\"instance_refused\",\"t_us\":%lld}\n",
+                  now_us());
+            fflush(L.out);
+         }
+         pthread_mutex_unlock(&L.lock);
+         return XR_ERROR_EXTENSION_NOT_PRESENT;
+      }
+   }
    next          = *li;
    next.nextInfo = li->nextInfo->next;
    res = li->nextInfo->nextCreateApiLayerInstance(&down, &next, instance);
@@ -1664,6 +1709,7 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_CreateApiLayerInstance(
 #define NEXT(n) L.gipa(*instance, "xr" #n, (PFN_xrVoidFunction*)&L.n)
    NEXT(CreateSession);
    NEXT(DestroySession);
+   NEXT(DestroyInstance);
    NEXT(PollEvent);
    NEXT(CreateReferenceSpace);
    NEXT(LocateSpace);
@@ -1695,6 +1741,15 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_CreateApiLayerInstance(
    L.instance = *instance;
    pthread_mutex_lock(&L.lock);
    layer_open();
+   if (L.out)
+   {
+      fprintf(L.out, "{\"ev\":\"instance\",\"exts\":[");
+      for (i = 0; i < info->enabledExtensionCount; i++)
+         fprintf(L.out, "%s\"%s\"", i ? "," : "",
+               info->enabledExtensionNames[i]);
+      fprintf(L.out, "],\"t_us\":%lld}\n", now_us());
+      fflush(L.out);
+   }
    pthread_mutex_unlock(&L.lock);
    return res;
 }

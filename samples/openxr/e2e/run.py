@@ -288,10 +288,14 @@ def run_case(retroarch, root, monado, case, validate):
              ' esac; export ' + exports + '; exec "$0" "$@"')
 
     w, h = case.get('screen', (W, H))
+    # menu_start: no core, as when RetroArch opens to its menu; the steps
+    # load one with LOAD_CORE and START_CORE.
+    start = (['--menu'] if case.get('menu_start')
+             else ['-L', case.get('core', CORE)])
     cmd = ['gamescope', '--backend', 'headless',
            '-w', str(w), '-h', str(h), '-W', str(w), '-H', str(h),
            '-r', '60', '--', 'sh', '-c', guard,
-           retroarch, '--config', cfg, '-L', case.get('core', CORE),
+           retroarch, '--config', cfg] + start + [
            '--verbose'] + case.get('args', [])
     if case.get('content'):
         cmd.append(case['content'])
@@ -337,6 +341,12 @@ def run_case(retroarch, root, monado, case, validate):
                 os.replace(tmp, script)
             elif kind == 'unfocus':
                 open(os.path.join(d, 'unfocus'), 'w').close()
+            elif kind == 'wait_exit':
+                try:
+                    p.wait(arg)
+                    res.marks['exited'] = time.monotonic()
+                except subprocess.TimeoutExpired:
+                    pass
             elif kind == 'shot':
                 send('SCREENSHOT', port)
                 res.shot = wait_shot(d)
@@ -987,6 +997,13 @@ def kinds(evs, kind):
 
 def pads(res, port):
     return [f for f in kinds(core_events(res), 'pad') if f['port'] == port]
+
+
+def instances(res):
+    """The runtime's instances as the layer saw them, in order:
+    'instance' when one was made, 'instance_destroy' when destroyed."""
+    return [e['ev'] for e in res.events
+            if e['ev'] in ('instance', 'instance_destroy')]
 
 
 def events(res, name):
@@ -2519,6 +2536,18 @@ THREADED_HW = [
     ('VUID-vkQueueSubmit-pSignalSemaphores-00067',
      'pSubmits[0].pSignalSemaphores[0]')]
 
+def check_hw_v1(res):
+    errors = check_screens()(res)
+    for line in ('[video_views] made its own Vulkan device',
+                 '[OpenXR] Vulkan through XR_KHR_vulkan_enable,'):
+        if line not in res.log:
+            errors.append('missing "%s"' % line)
+    if instances(res) != ['instance', 'instance_destroy']:
+        errors.append('instances %s, want one made and destroyed'
+                      % instances(res))
+    return errors
+
+
 CASES = [
     {'name': '3ds-stereo', 'map': '3ds', 'steps': SETTLE,
      'check': check_screens()},
@@ -2545,6 +2574,10 @@ CASES = [
     {'name': 'hw-3ds-stereo', 'map': '3ds',
      'options': {'video_views_test_hw': 'vulkan'}, 'steps': SETTLE,
      'check': check_screens()},
+    # A core making its own device: the headset through XR_KHR_vulkan_enable.
+    {'name': 'hw-v1', 'map': '3ds',
+     'options': {'video_views_test_hw': 'vulkan_v1'}, 'steps': SETTLE,
+     'check': check_hw_v1},
     {'name': 'hw-3ds-stereo-threaded', 'map': '3ds',
      'options': {'video_views_test_hw': 'vulkan'},
      'settings': {'video_threaded': 'true'}, 'steps': SETTLE,
