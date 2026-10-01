@@ -1478,6 +1478,9 @@ void vulkan_openxr_stop_thread(vulkan_openxr_t *xr)
    retro_atomic_store_release_int(&xr->quit, 1);
    sthread_join(xr->thread);
    xr->thread = NULL;
+   /* Nothing shows the session's frames now: a driver that presents on
+    * (a staged content load keeps it up) draws none for it. */
+   retro_atomic_store_release_int(&xr->alive, 0);
 }
 
 void vulkan_openxr_stop(vulkan_openxr_t *xr)

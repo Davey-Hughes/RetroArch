@@ -2101,6 +2101,17 @@ def check_hw_teardown(res):
         if not [f for f in res.frames if t1 < f['t_us'] < end]:
             errors.append('no headset frames after the %s'
                           % ('reinit', 'unload')[i])
+    # A staged close keeps the driver presenting the window after the
+    # unload: with its XR thread stopped, it draws nothing for the headset.
+    shown = True
+    for line in res.log.splitlines():
+        if '[OpenXR] Session created.' in line:
+            shown = True
+        elif '[Core] Unloading game...' in line:
+            shown = False
+        elif '[OpenXR] Slot ' in line and not shown:
+            errors.append('a headset image made after the unload, before '
+                          'the next session: ' + line.strip())
     return errors
 
 

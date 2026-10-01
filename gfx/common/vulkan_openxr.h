@@ -134,7 +134,8 @@ void vulkan_openxr_stop_thread(vulkan_openxr_t *xr);
  * and has the next video init skip the runtime. */
 void vulkan_openxr_drop_and_reinit(vulkan_openxr_t *xr);
 
-/* Until the runtime ends the session: the headset shows both eyes. */
+/* Until the runtime ends the session or its thread stops: the headset
+ * shows both eyes. */
 bool vulkan_openxr_alive(vulkan_openxr_t *xr);
 
 /* While stopped: the runtime lost the instance, so no session can be
