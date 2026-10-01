@@ -69,7 +69,8 @@ bool vulkan_openxr_healthy(const vulkan_openxr_t *xr);
 bool vulkan_openxr_reuse(vulkan_openxr_t *xr, bool own_device,
       uint32_t api_version);
 
-/* OpenXR failed before the device existed: log, tell the user, free. */
+/* OpenXR failed before the device existed: log, tell the user, free.
+ * NULL is fine. */
 void vulkan_openxr_drop(vulkan_openxr_t *xr);
 
 /* A kept Vulkan context cannot take the runtime in: tell the user. */
@@ -142,6 +143,15 @@ bool vulkan_openxr_start(vulkan_openxr_t *xr, VkInstance instance,
       VkPhysicalDevice gpu, VkDevice device, uint32_t queue_family,
       slock_t *queue_lock);
 
+/* After vulkan_openxr_start() failed on a kept instance: frees it and
+ * starts a new one's session on the same Vulkan instance and device, if
+ * the new one lists the extensions they were made with and names the same
+ * GPU. False without a session, *xr then the instance to drop or NULL;
+ * any other instance is left as it is. */
+bool vulkan_openxr_restart(vulkan_openxr_t **xr, VkInstance instance,
+      VkPhysicalDevice gpu, VkDevice device, uint32_t queue_family,
+      slock_t *queue_lock);
+
 /* Stops the XR thread; the session stays. NULL is fine. */
 void vulkan_openxr_stop(vulkan_openxr_t *xr);
 
@@ -150,8 +160,7 @@ void vulkan_openxr_stop(vulkan_openxr_t *xr);
 void vulkan_openxr_stop_thread(vulkan_openxr_t *xr);
 
 /* The session failed on a device made for it: frees, tells the user,
- * and has the next video init skip the runtime. A kept instance is only
- * freed, so the next video init tries a new one. */
+ * and has the next video init skip the runtime. NULL is fine. */
 void vulkan_openxr_drop_and_reinit(vulkan_openxr_t *xr);
 
 /* Until the runtime ends the session or its thread stops: the headset

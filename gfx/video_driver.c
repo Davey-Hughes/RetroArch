@@ -40,6 +40,7 @@
 #include "gfx_instrument.h"
 #ifdef HAVE_OPENXR
 #include "video_xr.h"
+#include "common/vulkan_common.h"
 #endif
 
 /* Decided here, at the top, because an #ifdef on a macro defined
@@ -6345,6 +6346,12 @@ bool video_driver_init_internal(bool *video_is_threaded, bool verbosity_enabled)
    tmp                               = input_state_get_ptr()->current_driver;
    /* Need to grab the "real" video driver interface on a reinit. */
    video_driver_find_driver(settings, "video driver", verbosity_enabled);
+#ifdef HAVE_OPENXR
+   /* Only Vulkan makes headset sessions. */
+   if (     !video_st->current_video
+         || !string_is_equal(video_st->current_video->ident, "vulkan"))
+      vulkan_context_openxr_forget();
+#endif
 
 #ifdef HAVE_THREADS
    video.is_threaded                 = VIDEO_DRIVER_IS_THREADED_INTERNAL(video_st);

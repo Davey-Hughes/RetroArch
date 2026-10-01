@@ -894,11 +894,11 @@ static void vulkan_context_openxr_device_exts(gfx_ctx_vulkan_data_t *vk,
       return;
    if (     vkEnumerateDeviceExtensionProperties(gpu, NULL, &num_props,
                NULL) != VK_SUCCESS
-         || !num_props
-         || !(props = (VkExtensionProperties*)
-               malloc(num_props * sizeof(*props)))
-         || vkEnumerateDeviceExtensionProperties(gpu, NULL, &num_props,
-               props) != VK_SUCCESS)
+         || (  num_props
+            && (  !(props = (VkExtensionProperties*)
+                     malloc(num_props * sizeof(*props)))
+               || vkEnumerateDeviceExtensionProperties(gpu, NULL,
+                     &num_props, props) != VK_SUCCESS)))
    {
       RARCH_WARN("[OpenXR] The GPU's device extensions could not be listed.\n");
       i = 0;
@@ -1377,7 +1377,11 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
 #endif
 
 #ifdef HAVE_OPENXR
-   if (vk->context.xr && !vulkan_openxr_start(vk->context.xr,
+   if (     vk->context.xr
+         && !vulkan_openxr_start(vk->context.xr,
+            vk->context.instance, vk->context.gpu, vk->context.device,
+            vk->context.graphics_queue_index, vk->context.queue_lock)
+         && !vulkan_openxr_restart(&vk->context.xr,
             vk->context.instance, vk->context.gpu, vk->context.device,
             vk->context.graphics_queue_index, vk->context.queue_lock))
    {

@@ -66,6 +66,7 @@ struct vulkan_openxr
    uint32_t rec_width;
    bool enable2;                   /* the instance's one Vulkan path */
    bool reused;                    /* kept from an earlier Vulkan context */
+   uint32_t api_version;           /* the Vulkan context's */
    bool frame_controller;
    bool refresh_ext;               /* XR_FB_display_refresh_rate */
    /* The session is made on the thread that makes the device; its frame
@@ -254,6 +255,7 @@ static bool vulkan_openxr_use(vulkan_openxr_t *xr, uint32_t api_version)
    XrVersion api;
    XrGraphicsRequirementsVulkanKHR reqs;
 
+   xr->api_version = api_version;
    memset(&reqs, 0, sizeof(reqs));
    reqs.type = XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR;
    res       = xr->enable2
@@ -522,10 +524,9 @@ static void vulkan_openxr_destroy_session(vulkan_openxr_t *xr)
    xr->session     = XR_NULL_HANDLE;
 }
 
-void vulkan_openxr_free(vulkan_openxr_t *xr)
+/* Everything but xr's memory. */
+static void vulkan_openxr_close(vulkan_openxr_t *xr)
 {
-   if (!xr)
-      return;
    vulkan_openxr_stop(xr);
    vulkan_openxr_destroy_session(xr);
    if (xr->instance && xr->DestroyInstance)
@@ -536,6 +537,13 @@ void vulkan_openxr_free(vulkan_openxr_t *xr)
       slock_free(xr->lock);
    if (xr->lib)
       dylib_close(xr->lib);
+}
+
+void vulkan_openxr_free(vulkan_openxr_t *xr)
+{
+   if (!xr)
+      return;
+   vulkan_openxr_close(xr);
    free(xr);
 }
 
@@ -1579,6 +1587,46 @@ bool vulkan_openxr_start(vulkan_openxr_t *xr, VkInstance instance,
    return true;
 }
 
+static bool vulkan_openxr_same_exts(const char **a, unsigned num_a,
+      const char **b, unsigned num_b)
+{
+   unsigned i;
+   if (num_a != num_b)
+      return false;
+   for (i = 0; i < num_a; i++)
+      if (!string_is_equal(a[i], b[i]))
+         return false;
+   return true;
+}
+
+bool vulkan_openxr_restart(vulkan_openxr_t **xr, VkInstance instance,
+      VkPhysicalDevice gpu, VkDevice device, uint32_t queue_family,
+      slock_t *queue_lock)
+{
+   bool same;
+   vulkan_openxr_t *fresh;
+   vulkan_openxr_t *old = *xr;
+
+   if (!old->reused || old->enable2)
+      return false;
+   /* One instance at a time: the old one goes first, and its lists stay
+    * to compare. Only XR_KHR_vulkan_enable takes a device that exists. */
+   vulkan_openxr_close(old);
+   fresh = vulkan_openxr_new(true, old->api_version);
+   same  = fresh
+      && vulkan_openxr_same_exts(old->inst_exts, old->num_inst_exts,
+            fresh->inst_exts, fresh->num_inst_exts)
+      && vulkan_openxr_same_exts(old->dev_exts, old->num_dev_exts,
+            fresh->dev_exts, fresh->num_dev_exts);
+   free(old);
+   *xr   = fresh;
+   if (!same || vulkan_openxr_gpu(fresh, instance) != gpu)
+      return false;
+   RARCH_LOG("[OpenXR] No session on the kept instance; a new instance on the same device.\n");
+   return vulkan_openxr_start(fresh, instance, gpu, device, queue_family,
+         queue_lock);
+}
+
 void vulkan_openxr_stop_thread(vulkan_openxr_t *xr)
 {
    if (!xr || !xr->thread)
@@ -1619,13 +1667,6 @@ void vulkan_openxr_stop(vulkan_openxr_t *xr)
 
 void vulkan_openxr_drop_and_reinit(vulkan_openxr_t *xr)
 {
-   /* A new instance may make the session a kept one could not. */
-   if (xr->reused)
-   {
-      RARCH_LOG("[OpenXR] No session on the kept instance; making a new one.\n");
-      vulkan_openxr_free(xr);
-      return;
-   }
    RARCH_ERR("[OpenXR] Rebuilding video without headset output.\n");
    vulkan_openxr_notify(MSG_OPENXR_FAILED);
    vulkan_openxr_free(xr);

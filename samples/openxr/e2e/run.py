@@ -2667,19 +2667,46 @@ def check_menu_load(made, refused=0, v1=False, enable2=False):
     return check
 
 
-RETRY_LINE = '[OpenXR] No session on the kept instance; making a new one.'
-GIVEN_UP = '[OpenXR] Rebuilding video without headset output.'
+RETRY_LINE = ('[OpenXR] No session on the kept instance; a new instance on '
+              'the same device.')
+REBUILT = '[OpenXR] Rebuilding video without headset output.'
+DROPPED = '[OpenXR] Continuing without headset output.'
 
 
 def check_session_retry(res):
-    """The kept instance refuses the load's session: a new instance is
-    made for it rather than the headset given up."""
+    """The kept instance refuses the load's session: a new instance takes
+    the same Vulkan device rather than the headset being given up."""
     errors = check_menu_load(2)(res)
     if RETRY_LINE not in res.log:
         errors.append('missing "%s"' % RETRY_LINE)
-    if GIVEN_UP in res.log:
-        errors.append('the headset was given up: "%s"' % GIVEN_UP)
+    for line in (REBUILT, DROPPED):
+        if line in res.log:
+            errors.append('the headset was given up: "%s"' % line)
     return errors
+
+
+def check_session_fails_twice(res):
+    """The new instance's session fails too: video is rebuilt once without
+    the headset and the core shows in the window."""
+    errors = []
+    made = instances(res).count('instance')
+    if made != 2:
+        errors.append('%d instances made, want 2 (%s)' % (made, instances(res)))
+    at = [res.log.find(line) for line in (
+        RETRY_LINE, REBUILT,
+        '[OpenXR] Starting once without headset output after a failure.')]
+    if -1 in at or at != sorted(at):
+        errors.append('want the retry, then the rebuild without the headset, '
+                      'then the start without it (log offsets %s)' % at)
+    if res.log.count(REBUILT) != 1:
+        errors.append('video rebuilt %d times, want once'
+                      % res.log.count(REBUILT))
+    if res.log.count('[OpenXR] Session created.') != 1:
+        errors.append('want one session (the menu\'s)')
+    t = res.marks.get('load', 0) * 1e6
+    if [f for f in res.frames if f['t_us'] > t + 3e6 and quads(f)]:
+        errors.append('quads were submitted after the session failed twice')
+    return errors + window_is(res, GREEN, 'the 2D map')
 
 
 def check_load_gl(res):
@@ -2961,10 +2988,29 @@ CASES = [
      'options': VULKAN,
      'steps': [('wait', 6), ('script', 'fail session once')] + LOAD_HW[1:],
      'check': check_session_retry},
+    {'name': 'menu-load-session-retry-threaded', 'menu_start': True,
+     'options': VULKAN, 'settings': {'video_threaded': 'true'},
+     'steps': [('wait', 6), ('script', 'fail session once')] + LOAD_HW[1:],
+     'baseline': THREADED_HW, 'check': threaded(check_session_retry)},
+    # A core that keeps its context cannot reinitialise for a new instance.
+    {'name': 'menu-load-session-retry-keep', 'menu_start': True,
+     'options': {'video_views_test_hw': 'vulkan_keep'},
+     'steps': [('wait', 6), ('script', 'fail session once')] + LOAD_HW[1:],
+     'check': check_session_retry},
+    # The new instance fails too.
+    {'name': 'menu-load-session-fails', 'menu_start': True,
+     'options': VULKAN,
+     'steps': ([('wait', 6), ('script', 'fail session')] + LOAD_HW[1:]
+               + [('shot', None)]),
+     'check': check_session_fails_twice},
     # A core that takes RetroArch to another video driver.
     {'name': 'menu-load-gl', 'menu_start': True,
      'options': {'video_views_test_hw': 'gl'},
      'steps': LOAD_HW + [('shot', None)], 'check': check_load_gl},
+    {'name': 'menu-load-gl-threaded', 'menu_start': True,
+     'options': {'video_views_test_hw': 'gl'},
+     'settings': {'video_threaded': 'true'},
+     'steps': LOAD_HW + [('shot', None)], 'check': threaded(check_load_gl)},
     # The runtime wants a device extension the GPU lacks.
     {'name': 'hw-bad-device-ext', 'map': '3ds',
      'env': {'RA_XR_LAYER_DEVICE_EXT': BAD_EXT}, 'options': VULKAN,

@@ -165,7 +165,6 @@
 
 #include "input/input_remapping.h"
 #ifdef HAVE_OPENXR
-#include "gfx/common/vulkan_common.h"
 #include "input/common/input_openxr.h"
 #include "gfx/video_xr.h"
 #endif
@@ -1724,14 +1723,6 @@ void drivers_init(
       if (!video_driver_init_internal(&video_is_threaded,
                verbosity_enabled))
          retroarch_fail(1, "video_driver_init_internal()");
-#ifdef HAVE_OPENXR
-      /* Only Vulkan makes headset sessions. */
-      {
-         const char *ident = video_driver_get_ident();
-         if (!ident || !string_is_equal(ident, "vulkan"))
-            vulkan_context_openxr_forget();
-      }
-#endif
 
 #ifdef HAVE_THREADS
       /* An OpenGL core under the threaded wrapper renders on this
