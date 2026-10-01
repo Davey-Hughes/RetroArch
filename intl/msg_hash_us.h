@@ -33626,7 +33626,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MSG_OPENXR_RATE_MISFIT,
-   "The headset runs at %u Hz, which doesn't fit this game's %.2f fps; its motion will judder. In SteamVR, set RetroArch's refresh rate (VR Video Settings) to a multiple of the game's rate."
+   "The headset runs at %u Hz, which doesn't fit this game's %.2f fps; its motion will judder. Set the headset's refresh rate for RetroArch to a multiple of the game's rate (in SteamVR: VR Video Settings)."
    )
 
 
