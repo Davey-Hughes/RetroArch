@@ -1021,8 +1021,9 @@ typedef struct video_poke_interface
    /* The core's hardware context goes next: from its context_destroy
     * to its unload the core may wait on the device without the queue
     * lock, so stop the driver's own threads that submit to the core's
-    * queue. The driver instance is freed after it. The main thread
-    * calls it, or waits while the video thread runs it. */
+    * queue. The driver may present on until it is freed: a staged
+    * content load keeps it up until the next session's drivers. The
+    * main thread calls it, or waits while the video thread runs it. */
    void (*hw_context_destroying)(void *data);
 
    /* A headset's refresh, for the main thread: the rate it runs at as
