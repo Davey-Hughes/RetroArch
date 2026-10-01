@@ -1477,6 +1477,30 @@ static float audio_driver_monitor_adjust_system_rates(
    return inp_sample_rate;
 }
 
+#ifdef HAVE_OPENXR
+/* Once per content and rate: a headset whose rate doesn't fit the core
+ * judders, and only its runtime can change the rate. */
+static void driver_headset_notice(runloop_state_t *runloop_st,
+      video_driver_state_t *video_st, unsigned fit, double input_fps)
+{
+   char msg[512];
+   size_t _len;
+   unsigned hz = (unsigned)(video_st->headset_hz + 0.5f);
+   if (     fit || !hz || input_fps <= 0.0
+         || runloop_st->current_core_type == CORE_TYPE_DUMMY
+         || (     hz        == video_st->headset_notice_hz
+               && input_fps == video_st->headset_notice_fps))
+      return;
+   video_st->headset_notice_hz  = hz;
+   video_st->headset_notice_fps = input_fps;
+   _len = snprintf(msg, sizeof(msg),
+         msg_hash_to_str(MSG_OPENXR_RATE_MISFIT), hz, input_fps);
+   RARCH_WARN("[OpenXR] %s\n", msg);
+   runloop_msg_queue_push(msg, _len, 2, 480, false, NULL,
+         MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+}
+#endif
+
 static void driver_adjust_system_rates(
       runloop_state_t *runloop_st,
       video_driver_state_t *video_st,
@@ -1520,6 +1544,7 @@ static void driver_adjust_system_rates(
       RARCH_LOG("[Video] The headset paces the core: %.2f Hz / %u.\n",
             video_st->headset_hz, video_st->headset_interval);
    }
+   driver_headset_notice(runloop_st, video_st, headset_fit, input_fps);
 #endif
 
    if (input_fps > 0.0)

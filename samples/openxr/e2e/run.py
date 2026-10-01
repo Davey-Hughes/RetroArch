@@ -2199,6 +2199,23 @@ def check_request(hz, n, rate):
     return check
 
 
+MISFIT = ("[OpenXR] The headset runs at %d Hz, which doesn't fit this "
+          "game's %.2f fps")
+
+
+def check_misfit(res):
+    """16 fps on the 20 Hz headset: no pacing, the notice once however
+    often the video driver restarts, and the core at the window's
+    pace."""
+    errors = check_unpaced(res)
+    n = res.log.count(MISFIT % (20, 16.0))
+    if n != 1:
+        errors.append('the misfit notice was logged %d times, want once' % n)
+    if res.log.count('[OpenXR] Session created.') < 2:
+        errors.append('the video driver did not restart')
+    return errors
+
+
 SETTLE = [('wait', 8)]
 VULKAN = {'video_views_test_hw': 'vulkan'}
 TEARDOWN = [('wait', 6), ('send', 'FULLSCREEN_TOGGLE'), ('wait', 4),
@@ -2606,7 +2623,7 @@ CASES = [
      'settings': WINDOW1,
      'steps': [('wait', 8), ('send', 'FULLSCREEN_TOGGLE'), ('wait', 8),
                ('mark', 'from'), ('wait', 4), ('mark', 'to')],
-     'check': check_unpaced},
+     'check': check_misfit},
     {'name': 'pace-threaded', 'map': 'none', 'options': FPS10,
      'settings': dict(WINDOW1, video_threaded='true'), 'steps': PACE_STEPS,
      'check': threaded(check_unpaced)},

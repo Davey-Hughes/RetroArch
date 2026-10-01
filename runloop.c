@@ -4692,6 +4692,8 @@ void runloop_event_deinit_core(void)
 
    video_driver_cached_frame_retire();
    video_driver_clear_views();
+   /* The next content gets its own headset notice. */
+   video_st->headset_notice_hz = 0;
 
    if (runloop_st->current_core.flags & RETRO_CORE_FLAG_INITED)
    {

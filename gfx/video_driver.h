@@ -1488,6 +1488,10 @@ typedef struct
    unsigned headset_interval;
    /* The rate to ask the headset for, 0 for none. */
    float headset_request_hz;
+   /* The headset rate and core fps the misfit notice was last shown
+    * for; the rate is cleared when content unloads. */
+   double headset_notice_fps;
+   unsigned headset_notice_hz;
    bool headset_vsync;
    /* Set while video_driver_cached_frame() sends the last frame again. */
    bool frame_repeat;

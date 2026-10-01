@@ -33624,6 +33624,10 @@ MSG_HASH(
    MSG_OPENXR_NEEDS_RELOAD,
    "Headset output starts when the content is loaded again."
    )
+MSG_HASH(
+   MSG_OPENXR_RATE_MISFIT,
+   "The headset runs at %u Hz, which doesn't fit this game's %.2f fps; its motion will judder. In SteamVR, set RetroArch's refresh rate (VR Video Settings) to a multiple of the game's rate."
+   )
 
 
 /* Lakka */
