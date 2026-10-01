@@ -502,6 +502,64 @@ static void test_cursor(void)
    CHECK(NEAR(pose.orientation.y, 0.70711));
 }
 
+/* (0, 0, -len) turned deg degrees about +Y. */
+static video_xr_vec3_t aim_at(double deg, float len)
+{
+   video_xr_vec3_t d;
+   d.x = (float)(-sin(deg * M_PI / 180.0)) * len;
+   d.y = 0.0f;
+   d.z = (float)(-cos(deg * M_PI / 180.0)) * len;
+   return d;
+}
+
+/* From the end-to-end cases' right hand to a point. */
+static video_xr_vec3_t aim_to(float x, float y, float z)
+{
+   video_xr_vec3_t d;
+   d.x = x - 0.2f;
+   d.y = y + 0.4f;
+   d.z = z + 0.3f;
+   return d;
+}
+
+static void test_aim_moved(void)
+{
+   video_xr_vec3_t ahead = aim_at(0.0, 1.0f);
+   video_xr_vec3_t back  = aim_at(180.0, 1.0f);
+   video_xr_vec3_t zero, below, above, longer;
+
+   memset(&zero, 0, sizeof(zero));
+   below = aim_at(2.9, 1.0f);
+   above = aim_at(3.1, 1.0f);
+   /* Below the threshold holds, above it moves, either way round. */
+   CHECK(!video_xr_aim_moved(&ahead, &below, 3.0f));
+   CHECK( video_xr_aim_moved(&ahead, &above, 3.0f));
+   CHECK(!video_xr_aim_moved(&below, &ahead, 3.0f));
+   CHECK( video_xr_aim_moved(&above, &ahead, 3.0f));
+   /* At the threshold is not past it: exact for an unturned aim. */
+   CHECK(!video_xr_aim_moved(&ahead, &ahead, 0.0f));
+   /* Lengths don't matter. */
+   longer = aim_at(0.0, 4.0f);
+   below  = aim_at(2.9, 0.2f);
+   above  = aim_at(3.1, 5.0f);
+   CHECK(!video_xr_aim_moved(&ahead, &longer, 0.0f));
+   CHECK(!video_xr_aim_moved(&ahead, &below, 3.0f));
+   CHECK( video_xr_aim_moved(&ahead, &above, 3.0f));
+   /* Opposite. */
+   CHECK( video_xr_aim_moved(&ahead, &back, 3.0f));
+   CHECK( video_xr_aim_moved(&ahead, &back, 179.0f));
+   /* No direction counts as moved. */
+   CHECK( video_xr_aim_moved(&zero, &ahead, 3.0f));
+   CHECK( video_xr_aim_moved(&ahead, &zero, 3.0f));
+   /* The end-to-end drift holds; its deliberate move does not. */
+   ahead = aim_to(0.16f, 0.192f, -1.7f);
+   below = aim_to(0.214f, 0.192f, -1.7f);
+   above = aim_to(0.0f, 0.192f, -1.7f);
+   CHECK(!video_xr_aim_moved(&ahead, &below, 3.0f));
+   CHECK( video_xr_aim_moved(&ahead, &above, 3.0f));
+   CHECK( video_xr_aim_moved(&below, &above, 3.0f));
+}
+
 /* A 120 Hz and a 72 Hz headset's predicted display periods, in ns. */
 #define P120 8333333
 #define P72  13888889
@@ -633,6 +691,7 @@ int main(void)
    test_live();
    test_pick();
    test_cursor();
+   test_aim_moved();
    test_period_settle();
    test_period_jitter();
    test_period_change();

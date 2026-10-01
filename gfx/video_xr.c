@@ -20,6 +20,10 @@
 #include "video_defines.h"
 #include "../runloop.h"
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 void video_xr_pose_identity(video_xr_pose_t *pose)
 {
    memset(pose, 0, sizeof(*pose));
@@ -437,6 +441,20 @@ float video_xr_cursor(const video_xr_quad_t *q, float u, float v,
    pose->position.y    = q->pose.position.y + world.y;
    pose->position.z    = q->pose.position.z + world.z;
    return (size < VIDEO_XR_CURSOR_MIN) ? VIDEO_XR_CURSOR_MIN : size;
+}
+
+bool video_xr_aim_moved(const video_xr_vec3_t *from,
+      const video_xr_vec3_t *to, float degrees)
+{
+   double dot = (double)from->x * to->x + (double)from->y * to->y
+      + (double)from->z * to->z;
+   double ff  = (double)from->x * from->x + (double)from->y * from->y
+      + (double)from->z * from->z;
+   double tt  = (double)to->x * to->x + (double)to->y * to->y
+      + (double)to->z * to->z;
+   if (ff <= 0.0 || tt <= 0.0)
+      return true;
+   return dot < cos(degrees * M_PI / 180.0) * sqrt(ff * tt);
 }
 
 /* Two rates this close in skew are a tie. */
