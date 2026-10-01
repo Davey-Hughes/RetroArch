@@ -32,6 +32,7 @@
 #include "vksym.h"
 #include "vulkan_openxr.h"
 #include "../video_defines.h"
+#include "../video_driver.h"
 
 #include "../../msg_hash.h"
 #include "../../runloop.h"
@@ -808,6 +809,9 @@ static void vulkan_openxr_session_state(vulkan_openxr_t *xr,
          xr->running = false;
          break;
       case XR_SESSION_STATE_EXITING:
+         vulkan_openxr_ended(xr, false);
+         video_driver_headset_exit_request();
+         break;
       case XR_SESSION_STATE_LOSS_PENDING:
          vulkan_openxr_ended(xr, false);
          break;

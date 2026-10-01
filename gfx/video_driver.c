@@ -2931,6 +2931,11 @@ void video_driver_headset_recenter(void)
    RARCH_LOG("[Video] Headset recenter requested.\n");
 }
 
+void video_driver_headset_exit_request(void)
+{
+   retro_atomic_store_release_int(&video_driver_st.headset_exit, 1);
+}
+
 unsigned video_driver_headset_rate_choices(unsigned *values, unsigned cap)
 {
    static const unsigned fixed[] = { 72, 90, 120, 144 };
@@ -2979,6 +2984,20 @@ void video_driver_headset_poll(void)
    float hz                       = 0.0f;
    video_driver_state_t *video_st = &video_driver_st;
    settings_t *settings           = config_get_ptr();
+
+   if (retro_atomic_load_acquire_int(&video_st->headset_exit))
+   {
+      retro_atomic_store_release_int(&video_st->headset_exit, 0);
+      /* Steam's Exit Game kills a game that keeps running: quit first,
+       * saving what a quit saves. */
+      if (!string_is_empty(getenv("SteamAppId")))
+      {
+         RARCH_LOG("[Video] The headset asked to exit; quitting for Steam.\n");
+         command_event(CMD_EVENT_QUIT, NULL);
+         return;
+      }
+      RARCH_LOG("[Video] The headset asked to exit; the window keeps running.\n");
+   }
 
    if (     video_st->data && video_st->poke
          && video_st->poke->get_headset_refresh)

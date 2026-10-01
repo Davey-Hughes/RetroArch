@@ -1481,6 +1481,8 @@ typedef struct
    bool views_fallback;
    /* Recenter requests for a headset, counted. */
    unsigned headset_recenter;
+   /* The headset's runtime asked RetroArch to exit (OpenXR EXITING). */
+   retro_atomic_int_t headset_exit;
    /* Headset pacing, main thread, never saved: the headset's measured
     * rate, which stands in for the display's while it fits the core,
     * and how many headset frames each core frame shows for (0: the
@@ -1820,6 +1822,8 @@ const video_views_layout_t *video_driver_get_views_layout(void);
 /* Main thread: ask a headset to place its screens in front of where it
  * looks now. */
 void video_driver_headset_recenter(void);
+/* Any thread: the headset's runtime asked RetroArch to exit. */
+void video_driver_headset_exit_request(void);
 
 /* Main thread: the Headset Refresh Rate choices in menu order,
  * VIDEO_OPENXR_REFRESH_AUTO and _HEADSET, then the headset's rates in

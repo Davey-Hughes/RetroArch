@@ -951,6 +951,32 @@ def check_session_lost(res):
     return errors + window_is(res, GREEN, 'the 2D map again')
 
 
+def check_exit_steam(res):
+    """Launched by Steam, the runtime's EXITING (Steam's Exit Game) quits
+    RetroArch cleanly before Steam would kill it."""
+    errors = []
+    if 'exited' not in res.marks:
+        errors.append('RetroArch kept running after EXITING')
+    elif res.marks['exited'] - res.marks.get('exit', 0) > 3:
+        errors.append('quit %.1f s after EXITING, want under 3'
+                      % (res.marks['exited'] - res.marks.get('exit', 0)))
+    if '[Video] The headset asked to exit; quitting for Steam.' not in res.log:
+        errors.append('no quit line in the log')
+    return errors
+
+
+def check_exit_window(res):
+    """Not launched by Steam: EXITING ends the session, the window keeps
+    the picture and RetroArch keeps running."""
+    errors = check_session_lost(res)
+    if 'exited' in res.marks:
+        errors.append('RetroArch quit without Steam')
+    if ('[Video] The headset asked to exit; the window keeps running.'
+            not in res.log):
+        errors.append('no "window keeps running" line in the log')
+    return errors
+
+
 # ---- Headset input ----
 
 PAD_RE = re.compile(r'\[video_views\] pad port=(\d) buttons=0x([0-9a-f]+) '
@@ -2862,6 +2888,14 @@ CASES = [
      'steps': [('wait', 6), ('script', 'state 7'), ('mark', 'lost'),
                ('wait', 3), ('shot', None)],
      'check': check_session_lost},
+    {'name': 'exit-steam', 'map': '3ds', 'env': {'SteamAppId': '1118310'},
+     'steps': [('wait', 6), ('mark', 'exit'), ('script', 'state 8'),
+               ('wait_exit', 5)],
+     'check': check_exit_steam},
+    {'name': 'exit-window', 'map': '3ds', 'env': {'SteamAppId': ''},
+     'steps': [('wait', 6), ('mark', 'lost'), ('script', 'state 8'),
+               ('wait_exit', 3), ('shot', None)],
+     'check': check_exit_window},
     # A Vulkan core: reinit and unload while the headset runs.
     {'name': 'hw-teardown', 'map': 'none', 'options': VULKAN,
      'steps': TEARDOWN, 'check': check_hw_teardown},
