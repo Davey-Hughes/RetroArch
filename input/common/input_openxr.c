@@ -84,6 +84,7 @@ enum input_openxr_action
    IXA_C_RSTICK,
    IXA_C_MENU,
    IXA_C_RECENTER,
+   IXA_C_LASER,
    IXA_S_B,
    IXA_S_A,
    IXA_S_R,
@@ -92,6 +93,7 @@ enum input_openxr_action
    IXA_S_STICK,
    IXA_S_MENU,
    IXA_S_RECENTER,
+   IXA_S_LASER,
    IXA_AIM,
    IXA_RUMBLE,
    IXA_COUNT
@@ -129,6 +131,7 @@ static const input_openxr_action_def_t input_openxr_actions[IXA_COUNT] = {
    { INPUT_OPENXR_SET_COMBINED, "right_stick", "Right Stick",    XR_ACTION_TYPE_VECTOR2F_INPUT,   false },
    { INPUT_OPENXR_SET_COMBINED, "menu",        "RetroArch Menu", XR_ACTION_TYPE_BOOLEAN_INPUT,    false },
    { INPUT_OPENXR_SET_COMBINED, "recenter",    "Recenter",       XR_ACTION_TYPE_BOOLEAN_INPUT,    false },
+   { INPUT_OPENXR_SET_COMBINED, "laser",       "Laser Pointer",  XR_ACTION_TYPE_BOOLEAN_INPUT,    false },
    { INPUT_OPENXR_SET_SEPARATE, "b",           "B",              XR_ACTION_TYPE_BOOLEAN_INPUT,    true  },
    { INPUT_OPENXR_SET_SEPARATE, "a",           "A",              XR_ACTION_TYPE_BOOLEAN_INPUT,    true  },
    { INPUT_OPENXR_SET_SEPARATE, "r",           "R",              XR_ACTION_TYPE_BOOLEAN_INPUT,    true  },
@@ -137,6 +140,7 @@ static const input_openxr_action_def_t input_openxr_actions[IXA_COUNT] = {
    { INPUT_OPENXR_SET_SEPARATE, "stick",       "Stick",          XR_ACTION_TYPE_VECTOR2F_INPUT,   true  },
    { INPUT_OPENXR_SET_SEPARATE, "menu",        "RetroArch Menu", XR_ACTION_TYPE_BOOLEAN_INPUT,    false },
    { INPUT_OPENXR_SET_SEPARATE, "recenter",    "Recenter",       XR_ACTION_TYPE_BOOLEAN_INPUT,    false },
+   { INPUT_OPENXR_SET_SEPARATE, "laser",       "Laser Pointer",  XR_ACTION_TYPE_BOOLEAN_INPUT,    false },
    { INPUT_OPENXR_SET_POINTER,  "aim",         "Aim",            XR_ACTION_TYPE_POSE_INPUT,       true  },
    { INPUT_OPENXR_SET_POINTER,  "rumble",      "Rumble",         XR_ACTION_TYPE_VIBRATION_OUTPUT, true  }
 };
@@ -362,6 +366,7 @@ typedef struct input_openxr
    bool focused;
    bool menu_toggle;
    bool recenter;
+   bool laser_toggle;
    float haptic[INPUT_OPENXR_HANDS];      /* the amplitude last applied */
    retro_time_t haptic_time[INPUT_OPENXR_HANDS];
    /* The laser, from this poll. */
@@ -691,6 +696,7 @@ static void input_openxr_read_combined(input_openxr_t *st)
    st->trig[1].slot  = 1;
    st->menu_toggle   = input_openxr_bool(st, IXA_C_MENU, XR_NULL_PATH);
    st->recenter      = input_openxr_bool(st, IXA_C_RECENTER, XR_NULL_PATH);
+   st->laser_toggle  = input_openxr_bool(st, IXA_C_LASER, XR_NULL_PATH);
 }
 
 /* The left hand player 1, the right player 2. */
@@ -714,8 +720,9 @@ static void input_openxr_read_separate(input_openxr_t *st)
       st->trig[h].pad   = h;
       st->trig[h].slot  = 1;
    }
-   st->menu_toggle = input_openxr_bool(st, IXA_S_MENU, XR_NULL_PATH);
-   st->recenter    = input_openxr_bool(st, IXA_S_RECENTER, XR_NULL_PATH);
+   st->menu_toggle  = input_openxr_bool(st, IXA_S_MENU, XR_NULL_PATH);
+   st->recenter     = input_openxr_bool(st, IXA_S_RECENTER, XR_NULL_PATH);
+   st->laser_toggle = input_openxr_bool(st, IXA_S_LASER, XR_NULL_PATH);
 }
 
 static bool input_openxr_pressing(enum input_openxr_role role)
@@ -1215,6 +1222,7 @@ void input_openxr_poll(void)
    memset(st->trig, 0, sizeof(st->trig));
    st->menu_toggle  = false;
    st->recenter     = false;
+   st->laser_toggle = false;
    st->hit[0]       = -1;
    st->hit[1]       = -1;
    st->ptr_owned    = false;
@@ -1290,6 +1298,8 @@ bool input_openxr_button(unsigned port, unsigned id)
       return st->menu_toggle;
    if (id == RARCH_HEADSET_RECENTER)
       return st->recenter;
+   if (id == RARCH_LASER_POINTER_TOGGLE)
+      return st->laser_toggle;
    return false;
 }
 

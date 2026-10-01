@@ -1699,6 +1699,31 @@ def check_laser_toggle(back, want):
     return check
 
 
+DOT_BOTTOM = (-0.32, -1.232, -1.8)
+
+
+def check_laser_action(res):
+    """The headset's Laser Pointer action toggles as the hotkey does, and
+    no profile suggests a binding for it, as for Recenter: the user binds
+    it in the runtime."""
+    bound = ['%s <- %s' % (b[0], b[1]) for e in events(res, 'bindings')
+             for b in e['binds'] if b[0].endswith('/laser')]
+    errors = bindings_errors(res)
+    if bound:
+        errors.append('Laser Pointer suggested: %s' % bound)
+    return errors + check_laser_toggle('Auto', DOT_BOTTOM)(res)
+
+
+def laser_action_steps(action):
+    """The laser on screen 1 and the action pressed twice: Off, back."""
+    press = script(AIM_BOTTOM, action)
+    return [('wait', 6), ('script', AIM_BOTTOM), ('wait', 2),
+            ('mark', 'off'), ('script', press), ('wait', 1),
+            ('script', AIM_BOTTOM), ('wait', 1), ('mark', 'on'),
+            ('script', press), ('wait', 1), ('script', AIM_BOTTOM),
+            ('wait', 2)]
+
+
 def check_menu_hands(res):
     """Both hands on the menu: the right points first, the left's trigger
     takes the press, and the right's, pulled while the left's is held,
@@ -2683,6 +2708,13 @@ CASES = [
                ('wait', 2), ('mark', 'on'),
                ('send', 'LASER_POINTER_TOGGLE'), ('wait', 2)],
      'check': check_laser_toggle('Always', (-0.4, 0.24, -1.8))},
+    {'name': 'input-laser-action', 'map': '3ds',
+     'steps': laser_action_steps('action combined/laser 1'),
+     'check': check_laser_action},
+    {'name': 'input-laser-action-separate', 'map': '3ds',
+     'settings': {'video_openxr_controllers': '1'},
+     'steps': laser_action_steps('action separate/laser 1'),
+     'check': check_laser_action},
     {'name': 'input-menu-press-pull', 'map': '3ds',
      'settings': {'menu_driver': 'ozone', 'frontend_log_level': '0'},
      'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),

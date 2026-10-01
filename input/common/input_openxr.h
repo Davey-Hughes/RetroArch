@@ -36,8 +36,9 @@ void input_openxr_register(void);
 /* Syncs the controllers; once per input poll. */
 void input_openxr_poll(void);
 
-/* A RetroPad button held on user port's pad, or RARCH_MENU_TOGGLE or
- * RARCH_HEADSET_RECENTER, which answer for any port. */
+/* A RetroPad button held on user port's pad, or RARCH_MENU_TOGGLE,
+ * RARCH_HEADSET_RECENTER or RARCH_LASER_POINTER_TOGGLE, which answer
+ * for any port. */
 bool input_openxr_button(unsigned port, unsigned id);
 
 /* A stick axis (idx LEFT/RIGHT, id X/Y) or analog L2/R2 (idx
