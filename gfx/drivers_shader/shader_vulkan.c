@@ -4535,8 +4535,8 @@ vulkan_filter_chain_t *vulkan_filter_chain_create_shrink(
    if (!chain)
       return NULL;
 
-   /* A copy at the source's size, with every mip level: a pass gets
-    * them when the next one samples its output mipmapped. */
+   /* A copy at the source's size; max_levels gives its framebuffer
+    * every mip level, which the chain builds after the pass. */
    pass_info.scale_type_x  = GLSLANG_FILTER_CHAIN_SCALE_ORIGINAL;
    pass_info.scale_type_y  = GLSLANG_FILTER_CHAIN_SCALE_ORIGINAL;
    pass_info.scale_x       = 1.0f;
