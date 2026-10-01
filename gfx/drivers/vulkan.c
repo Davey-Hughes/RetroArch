@@ -341,6 +341,9 @@ typedef struct vk
        * waiting; window_interval is what set_nonblock_state asked. */
       bool paced;
       int window_interval;
+      /* The UI's size the last frame the window drew: only those draw
+       * the UI, so the others keep showing the last. */
+      unsigned ui_dims;
    } xr;
 #endif
    vulkan_context_t *context;
@@ -9170,12 +9173,15 @@ static void vulkan_xr_copy_ui(vk_t *vk, unsigned s, unsigned ui_dims)
 static void vulkan_xr_draw(vk_t *vk, const video_frame_info_t *video_info,
       bool new_frame, bool map, vulkan_filter_chain_t **xr_chains,
       vulkan_filter_chain_t *xr_frame, unsigned frame_dims,
-      unsigned src_dims, unsigned ui_dims)
+      unsigned src_dims, unsigned ui_dims, bool window_drawn)
 {
    unsigned s;
    vulkan_openxr_t *xr = vk->context->xr;
 
-   vulkan_xr_plan(vk, video_info, map, frame_dims, src_dims, ui_dims);
+   if (window_drawn)
+      vk->xr.ui_dims = ui_dims;
+   vulkan_xr_plan(vk, video_info, map, frame_dims, src_dims,
+         vk->xr.ui_dims);
    for (s = 0; s < VIDEO_XR_MAX_SLOTS; s++)
    {
       bool ok;
@@ -9191,6 +9197,8 @@ static void vulkan_xr_draw(vk_t *vk, const video_frame_info_t *video_info,
          continue;
       if (     s != VIDEO_XR_MENU_SLOT && !new_frame
             && vk->xr.slots[s].released)
+         continue;
+      if (s == VIDEO_XR_MENU_SLOT && !window_drawn)
          continue;
 #ifdef HAVE_THREADS
       slock_lock(vk->context->queue_lock);
@@ -9359,6 +9367,7 @@ static bool vulkan_frame(void *data, const void *frame,
    unsigned xr_ui_dims                           = 0;
    bool xr_draw                                  = false;
    bool xr_map                                   = false;
+   bool xr_window_drawn                          = false;
 #endif
 #ifdef VULKAN_HDR_SWAPCHAIN
    bool use_offscreen_buffer                     = false;
@@ -10106,6 +10115,9 @@ static bool vulkan_frame(void *data, const void *frame,
          && (backbuffer->framebuffer != VK_NULL_HANDLE)
          && (vk->context->flags & VK_CTX_FLAG_HAS_ACQUIRED_SWAPCHAIN))
    {
+#ifdef HAVE_OPENXR
+      xr_window_drawn                  = true;
+#endif
       rp_info.sType                    = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
       rp_info.pNext                    = NULL;
 #ifdef VULKAN_HDR_SWAPCHAIN
@@ -10396,7 +10408,9 @@ static bool vulkan_frame(void *data, const void *frame,
    if (xr_draw)
       vulkan_xr_draw(vk, video_info, frame && !video_info->frame_repeat,
             xr_map, xr_chains, xr_frame, xr_frame_dims, xr_src_dims,
-            xr_ui_dims);
+            xr_ui_dims, xr_window_drawn);
+   else
+      vk->xr.ui_dims = 0;
 #endif
 
    /* End the filter chain frame.
