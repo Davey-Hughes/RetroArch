@@ -1563,56 +1563,101 @@ def check_menu_rgui(res):
     return errors
 
 
-# A held hand is never still: a pixel, then two, right of AIM_MENU_HIGH
-# (half a pixel in, so x truncates to 961 and 962 either side of float
-# error).
-AIM_MENU_SHAKE = 'aim right 0.2 -0.4 -0.3 0.1615 0.192 -1.7'
-AIM_MENU_BACK = 'aim right 0.2 -0.4 -0.3 0.1625 0.192 -1.7'
+# A held hand drifts: 2 degrees right of AIM_MENU_HIGH, on its row. A
+# deliberate point: 6 degrees left of it, on its row too.
+AIM_MENU_SHAKE = 'aim right 0.2 -0.4 -0.3 0.214 0.192 -1.7'   # 0.634 0.3
+AIM_MENU_MOVE = 'aim right 0.2 -0.4 -0.3 0.0 0.192 -1.7'      # 0.5 0.3
 # The menu's header: Ozone takes a tap or short press there as Back, a
 # long press as nothing. Not at its top edge: a menu cursor drawn across
 # it wraps the Vulkan viewport (master's gfx_display_vk_draw()).
 AIM_MENU_TOP = 'aim right 0.2 -0.4 -0.3 0.16 0.4224 -1.7'         # 0.6 0.06
 AIM_LEFT_MENU_TOP = 'aim left -0.2 -0.4 -0.3 -0.16 0.4224 -1.7'   # 0.4 0.06
 STICK_DOWN = 'action combined/left_stick 0 -1'
-# Stick taps shorter than the menu's repeat delay move one entry each,
-# so Ozone's list never scrolls (scrolling wraps the viewport too). Each
-# starts with the laser moving.
-SHAKE = [('script', AIM_MENU_SHAKE), ('wait', 0.05)] + [
-    step for _ in range(2) for step in (
-        ('script', script(AIM_MENU_HIGH, STICK_DOWN)), ('wait', 0.05),
-        ('script', script(AIM_MENU_SHAKE, STICK_DOWN)), ('wait', 0.05),
-        ('script', AIM_MENU_HIGH), ('wait', 0.05),
-        ('script', AIM_MENU_SHAKE), ('wait', 0.05))]
+# Stick taps shorter than the menu's repeat delay move one entry each;
+# two from Restart keep Ozone's list from scrolling (scrolling wraps the
+# viewport too). Each drift lasts a tenth of a second, long enough for
+# Ozone to take it as a move, and the stick taps once mid-drift.
+SHAKE = [step for _ in range(2) for step in (
+    ('script', AIM_MENU_SHAKE), ('wait', 0.1),
+    ('script', AIM_MENU_HIGH), ('wait', 0.1))] + [
+    ('script', script(AIM_MENU_SHAKE, STICK_DOWN)), ('wait', 0.05),
+    ('script', script(AIM_MENU_HIGH, STICK_DOWN)), ('wait', 0.05),
+    ('script', AIM_MENU_SHAKE), ('wait', 0.1),
+    ('script', AIM_MENU_HIGH), ('wait', 0.1)]
+# Where AIM_MENU_HIGH and AIM_MENU_MOVE land in Ozone's 1600x960, and
+# their dots.
+MENU_HIGH_PX, MENU_MOVE_PX = (960, 288), (800, 288)
+DOT_HIGH, DOT_MOVE = (0.16, 0.192, -1.7), (0.0, 0.192, -1.7)
 
 
-def changes(seq):
-    return sum(1 for a, b in zip(seq, seq[1:]) if a != b)
+def at_px(f, want):
+    return close((f['x'], f['y']), want, 4)
+
+
+def hidden_errors(res, hide, show, want):
+    """No dot from 0.3 s after the mark hide until the mark show, and a
+    dot at want from 0.3 s after show."""
+    t0 = (res.marks[hide] + 0.3) * 1e6
+    t1 = res.marks[show] * 1e6
+    t2 = (res.marks[show] + 0.3) * 1e6
+    hidden = [f for f in res.frames if t0 < f['t_us'] < t1]
+    errors = []
+    if not hidden:
+        errors.append('no headset frame between %s and %s' % (hide, show))
+    elif any(cursors(f) for f in hidden):
+        errors.append('a dot showed between %s and %s' % (hide, show))
+    if not any(at(c, want) for f in res.frames if f['t_us'] > t2
+               for c in cursors(f)):
+        errors.append('no dot at %s after %s' % (want, show))
+    return errors
 
 
 def check_menu_stick(res):
-    """Ozone: the headset's stick moves the selection under a still laser
-    and under one that shakes by a pixel; the laser leaving the menu and
-    coming back a pixel from where it left keeps the stick's selection."""
+    """Ozone: the headset's stick takes the menu from the laser. The
+    laser hovers Restart (1); the stick taps once under it still and
+    once while it drifts 2 degrees, and nothing of the laser reads or
+    shows; turned 6 degrees it comes back, hovers its row again and
+    shows its dot. Its first line back still has the stick's selection
+    (3): the menu reads that before the hover acts."""
     lines = kinds(core_events(res), 'menu')
-    shake = [i for i, f in enumerate(lines) if f['x'] == 961]
-    back = find(lines, 0, lambda f: f['x'] == 962)
-    if not shake or back < 1:
-        return ['the laser did not shake on the menu and come back: %s'
-                % lines[:6]]
-    sel = [f['selection'] for f in lines]
+    back = find(lines, 0, lambda f: at_px(f, MENU_MOVE_PX))
+    if back < 1:
+        return ['the laser did not reach the menu and come back 6 degrees '
+                'over: %s' % lines[:6]]
     errors = []
-    # A still laser selects once, where it first lands; the rest is the
-    # stick's.
-    if changes(sel[:shake[0]]) < 2:
-        errors.append('the stick did not move the selection under a still '
-                      'laser: %s' % sel[:shake[0]])
-    if not changes(sel[shake[0]:shake[-1] + 1]):
-        errors.append('the stick did not move the selection under a shaking '
-                      'laser (%d)' % sel[shake[0]])
-    if len(set(sel[back - 1:])) != 1:
-        errors.append('the laser leaving the menu and coming back moved the '
-                      'selection: %s' % sel[back - 1:])
-    return errors
+    if lines[back - 1]['selection'] != 1 or any(
+            not at_px(f, MENU_HIGH_PX) for f in lines[:back]):
+        errors.append('the laser read on the menu while it yielded: %s'
+                      % [(f['x'], f['selection']) for f in lines[:back]])
+    if lines[back]['selection'] != 3:
+        errors.append('the laser came back to selection %d, want the '
+                      'stick\'s 3' % lines[back]['selection'])
+    if lines[-1]['selection'] != 1 or not at_px(lines[-1], MENU_MOVE_PX):
+        errors.append('the laser\'s hover did not come back: %s'
+                      % [(f['x'], f['selection']) for f in lines[back:]])
+    return errors + hidden_errors(res, 'yield', 'move', DOT_MOVE)
+
+
+def check_menu_pull(res):
+    """Ozone: the laser hovers Restart (1) and yields to a stick tap (2).
+    A trigger pulled then brings the laser back and is spent: it presses
+    nothing, and no R2 scrolls the menu past 2. The next pull presses."""
+    lines = kinds(core_events(res), 'menu')
+    presses = [i for i, f in enumerate(lines) if f['pressed']
+               and (i == 0 or not lines[i - 1]['pressed'])]
+    errors = []
+    if not any(f['selection'] == 2 and not f['pressed'] for f in lines):
+        errors.append('the laser never read the stick\'s selection (2) '
+                      'unpressed: %s'
+                      % [(f['selection'], f['pressed']) for f in lines])
+    if len(presses) != 1:
+        errors.append('the menu was pressed %d times, want once: %s'
+                      % (len(presses),
+                         [(f['selection'], f['pressed']) for f in lines]))
+    if lines and max(f['selection'] for f in lines) > 2:
+        errors.append('the menu scrolled past the stick\'s selection: %s'
+                      % [f['selection'] for f in lines])
+    return errors + hidden_errors(res, 'yield', 'pull', DOT_HIGH)
 
 
 def check_menu_hands(res):
@@ -2564,12 +2609,25 @@ CASES = [
     {'name': 'input-menu-stick', 'map': '3ds',
      'settings': {'menu_driver': 'ozone', 'frontend_log_level': '0'},
      'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),
-               ('script', AIM_MENU_HIGH), ('wait', 2),
+               ('script', AIM_MENU_HIGH), ('wait', 2), ('mark', 'yield'),
                ('script', script(AIM_MENU_HIGH, STICK_DOWN)), ('wait', 0.1),
                ('script', AIM_MENU_HIGH), ('wait', 1)] + SHAKE
-     + [('wait', 1), ('script', AIM_MISS), ('wait', 1),
-        ('script', AIM_MENU_BACK), ('wait', 1)],
+     + [('wait', 1), ('mark', 'move'), ('script', AIM_MENU_MOVE),
+        ('wait', 2)],
      'check': check_menu_stick},
+    # Each pull half a second: a short press only highlights, so a
+    # failing run's extra press restarts nothing.
+    {'name': 'input-menu-pull', 'map': '3ds',
+     'settings': {'menu_driver': 'ozone', 'frontend_log_level': '0'},
+     'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),
+               ('script', AIM_MENU_HIGH), ('wait', 2), ('mark', 'yield'),
+               ('script', script(AIM_MENU_HIGH, STICK_DOWN)), ('wait', 0.1),
+               ('script', AIM_MENU_HIGH), ('wait', 1), ('mark', 'pull'),
+               ('script', script(AIM_MENU_HIGH, R2)), ('wait', 0.5),
+               ('script', AIM_MENU_HIGH), ('wait', 1),
+               ('script', script(AIM_MENU_HIGH, R2)), ('wait', 0.5),
+               ('script', AIM_MENU_HIGH), ('wait', 2)],
+     'check': check_menu_pull},
     {'name': 'input-menu-hands', 'map': '3ds',
      'settings': {'menu_driver': 'ozone', 'frontend_log_level': '0'},
      'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),

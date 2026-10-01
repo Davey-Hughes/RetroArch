@@ -47,6 +47,11 @@
  * INPUT_OPENXR_HAPTIC_DURATION (ns). */
 #define INPUT_OPENXR_HAPTIC_REFRESH  500000
 #define INPUT_OPENXR_HAPTIC_DURATION 1000000000
+/* A deliberate point turns the aim further than this, in degrees; a
+ * held hand drifts well under it. */
+#define INPUT_OPENXR_YIELD_DEGREES 3.0f
+/* Half a stick's travel. */
+#define INPUT_OPENXR_YIELD_STICK   0x4000
 
 enum input_openxr_set
 {
@@ -378,6 +383,13 @@ typedef struct input_openxr
    bool menu_pressed;
    float menu_u;
    float menu_v;
+   /* The laser's yield to the controllers: the last read's buttons and
+    * sticks past half, and each hand's aim at the last press. */
+   bool yield;
+   bool yield_has[INPUT_OPENXR_HANDS];
+   video_xr_vec3_t yield_dir[INPUT_OPENXR_HANDS];
+   uint16_t last_buttons[INPUT_OPENXR_PADS];
+   unsigned last_sticks[INPUT_OPENXR_PADS];
 
    /* XR thread. */
    XrCompositionLayerQuad cursors[INPUT_OPENXR_HANDS];
@@ -973,6 +985,84 @@ static void input_openxr_laser_poll(input_openxr_t *st, unsigned laser,
          && st->role[p] == INPUT_OPENXR_ROLE_TOUCH);
 }
 
+/* Whether this read newly presses a button other than the triggers' L2
+ * and R2, or pushes a stick past half. */
+static bool input_openxr_new_press(input_openxr_t *st)
+{
+   unsigned p, s;
+   bool press = false;
+   for (p = 0; p < INPUT_OPENXR_PADS; p++)
+   {
+      const input_openxr_pad_t *pad = &st->pads[p];
+      unsigned sticks               = 0;
+      uint16_t buttons              = (uint16_t)(pad->buttons
+            & ~((1u << RETRO_DEVICE_ID_JOYPAD_L2)
+               | (1u << RETRO_DEVICE_ID_JOYPAD_R2)));
+      for (s = 0; s < 2; s++)
+         if (     abs(pad->analog[s * 2])     > INPUT_OPENXR_YIELD_STICK
+               || abs(pad->analog[s * 2 + 1]) > INPUT_OPENXR_YIELD_STICK)
+            sticks |= 1u << s;
+      if (     (buttons & ~st->last_buttons[p])
+            || (sticks  & ~st->last_sticks[p]))
+         press = true;
+      st->last_buttons[p] = buttons;
+      st->last_sticks[p]  = sticks;
+   }
+   return press;
+}
+
+/* With the menu open, the laser yields to the controllers' buttons and
+ * sticks, so hand drift cannot undo their navigation: from a press until
+ * a hand turns away from where it aimed then, or a trigger is pulled.
+ * That pull is spent: an unseen laser must not click. */
+static void input_openxr_yield(input_openxr_t *st, unsigned laser,
+      bool menu_open, float threshold)
+{
+   unsigned h;
+   XrTime time;
+   video_xr_vec3_t o;
+   video_xr_vec3_t dir[INPUT_OPENXR_HANDS];
+   bool tracked[INPUT_OPENXR_HANDS];
+   bool press = input_openxr_new_press(st);
+
+   if (     !menu_open || laser == VIDEO_OPENXR_LASER_OFF
+         || (!st->yield && !press))
+      return;
+   time = vulkan_openxr_predicted_time(st->xr);
+   for (h = 0; h < INPUT_OPENXR_HANDS; h++)
+      tracked[h] = input_openxr_ray(st, h, time, &o, &dir[h]);
+   if (st->yield)
+      for (h = 0; h < INPUT_OPENXR_HANDS; h++)
+      {
+         if (st->trig[h].value > threshold && !st->trig_down[h])
+         {
+            /* No pull until let go, as after a loss. */
+            st->trig_down[h] = true;
+            st->role[h]      = INPUT_OPENXR_ROLE_SPENT;
+            st->yield        = false;
+         }
+         else if (tracked[h] && st->yield_has[h]
+               && video_xr_aim_moved(&st->yield_dir[h], &dir[h],
+                  INPUT_OPENXR_YIELD_DEGREES))
+            st->yield = false;
+      }
+   if (press)
+      st->yield = true;
+   if (!st->yield)
+      return;
+   /* A hand untracked at the press takes its first tracked aim. */
+   for (h = 0; h < INPUT_OPENXR_HANDS; h++)
+   {
+      if (press)
+         st->yield_has[h] = false;
+      if (tracked[h] && !st->yield_has[h])
+      {
+         st->yield_dir[h] = dir[h];
+         st->yield_has[h] = true;
+      }
+   }
+}
+
 /* The XR thread, each headset frame: a dot where each hand points at a
  * live quad, from its own locate at the frame's display time. */
 static unsigned input_openxr_frame_layers(void *user, XrTime time,
@@ -1103,8 +1193,12 @@ void input_openxr_poll(void)
    bool menu_open       = false;
 #endif
 
-   /* The XR thread places the dots by these. */
-   retro_atomic_store_release_int(&input_openxr_laser, (int)laser);
+   /* The XR thread places the dots by these: none while the laser
+    * yields, which a closed menu or the laser Off ends. */
+   if (!menu_open || laser == VIDEO_OPENXR_LASER_OFF)
+      st->yield = false;
+   retro_atomic_store_release_int(&input_openxr_laser,
+         st->yield ? VIDEO_OPENXR_LASER_OFF : (int)laser);
    retro_atomic_store_release_int(&input_openxr_menu_open,
          menu_open ? 1 : 0);
 
@@ -1175,6 +1269,10 @@ void input_openxr_poll(void)
       input_openxr_read_separate(st);
    else
       input_openxr_read_combined(st);
+   input_openxr_yield(st, laser, menu_open, threshold);
+   if (st->yield)
+      laser = VIDEO_OPENXR_LASER_OFF;
+   retro_atomic_store_release_int(&input_openxr_laser, (int)laser);
    input_openxr_laser_poll(st, laser, menu_open, threshold, was_pressed);
    input_openxr_triggers(st, threshold);
    input_openxr_dpad(st, settings);
