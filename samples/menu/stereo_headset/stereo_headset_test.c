@@ -279,6 +279,33 @@ static void lane_refresh_rate(void)
             "the dropdown selects row %u, want 4 (120 Hz)",
             (unsigned)menu_state_get_ptr()->selection_ptr);
    }
+
+   /* A menu driver passes the row's position as the press's index,
+    * not the row's value. */
+   for (i = 0; i < 6; i++)
+   {
+      static const unsigned stored[] = { 0, 1, 72, 90, 120, 144 };
+      menu_file_list_cbs_t *cbs;
+      file_list_t *list;
+
+      configuration_set_uint(settings,
+            settings->uints.video_openxr_refresh_rate, 999);
+      generic_action_ok_displaylist_push(NULL, NULL, NULL, 0, 0, 0,
+            ACTION_OK_DL_DROPDOWN_BOX_LIST_HEADSET_REFRESH_RATE);
+      run_frame();
+      list = selection_buf();
+      cbs  = (list && list->size == 6)
+         ? (menu_file_list_cbs_t*)list->list[i].actiondata : NULL;
+      CHECK(cbs && cbs->action_ok, "fixture: dropdown row %u has no press",
+            i);
+      if (!cbs || !cbs->action_ok)
+         continue;
+      cbs->action_ok(list->list[i].path, list->list[i].label,
+            list->list[i].type, i, list->list[i].entry_idx);
+      CHECK(settings->uints.video_openxr_refresh_rate == stored[i],
+            "pressing dropdown row %u stores %u, want %u", i,
+            settings->uints.video_openxr_refresh_rate, stored[i]);
+   }
    configuration_set_uint(settings,
          settings->uints.video_openxr_refresh_rate, 0);
 }

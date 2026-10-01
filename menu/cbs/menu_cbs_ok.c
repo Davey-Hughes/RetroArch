@@ -7904,16 +7904,23 @@ static int action_ok_push_dropdown_item_crt_super_resolution(const char *path,
    return action_cancel_pop_default(NULL, NULL, 0, 0);
 }
 
-/* The row carries the setting's value itself: Auto, Headset's Choice,
- * or a rate in Hz. */
+/* The values are Auto, Headset's Choice and rates in Hz, not an
+ * index, so they are rebuilt as the list was and the row picks one. */
 static int action_ok_push_dropdown_item_headset_refresh_rate(
       const char *path, const char *label, unsigned type, size_t idx,
       size_t entry_idx)
 {
+   unsigned values[2 + VIDEO_HEADSET_MAX_RATES];
+   unsigned n;
    settings_t *settings = config_get_ptr();
 
+   n = video_driver_headset_rate_choices(values,
+         sizeof(values) / sizeof(values[0]));
+   if (idx >= n)
+      return -1;
+
    configuration_set_uint(settings,
-         settings->uints.video_openxr_refresh_rate, (unsigned)idx);
+         settings->uints.video_openxr_refresh_rate, values[idx]);
 
    return action_cancel_pop_default(NULL, NULL, 0, 0);
 }
