@@ -2946,6 +2946,8 @@ unsigned video_driver_headset_rate_choices(unsigned *values, unsigned cap)
          && video_st->poke->get_headset_refresh)
       video_st->poke->get_headset_refresh(video_st->data, rates,
             VIDEO_HEADSET_MAX_RATES, &count);
+   if (count > VIDEO_HEADSET_MAX_RATES)
+      count = VIDEO_HEADSET_MAX_RATES;
    values[n++] = VIDEO_OPENXR_REFRESH_AUTO;
    values[n++] = VIDEO_OPENXR_REFRESH_HEADSET;
    if (!count)
@@ -2986,7 +2988,7 @@ void video_driver_headset_poll(void)
          settings->uints.video_openxr_refresh_rate, rates, count,
          (float)video_st->av_info.timing.fps, MAXIMUM_SWAP_INTERVAL);
    if (     hz == video_st->headset_hz
-         && settings->bools.video_vsync == video_st->headset_vsync)
+         && (!hz || settings->bools.video_vsync == video_st->headset_vsync))
       return;
    video_st->headset_hz = hz;
    /* The configured rate again, so nothing is saved: the rates are
@@ -5244,9 +5246,11 @@ void video_driver_build_info(video_frame_info_t *video_info)
    video_info->crt_switch_porch_adjust     = settings->ints.crt_switch_porch_adjust;
    video_info->crt_switch_vert_adjust      = settings->ints.crt_switch_vertical_adjust;
    video_info->crt_switch_hires_menu       = settings->bools.crt_switch_hires_menu;
-   video_info->black_frame_insertion       = settings->uints.video_black_frame_insertion;
+   video_info->black_frame_insertion       = video_st->headset_interval
+      ? 0 : settings->uints.video_black_frame_insertion;
    video_info->bfi_dark_frames             = settings->uints.video_bfi_dark_frames;
-   video_info->shader_subframes            = settings->uints.video_shader_subframes;
+   video_info->shader_subframes            = video_st->headset_interval
+      ? 1 : settings->uints.video_shader_subframes;
    video_info->headset_distance            = settings->floats.video_openxr_distance;
    video_info->headset_width               = settings->floats.video_openxr_width;
    video_info->headset_recenter            = video_st->headset_recenter;
