@@ -1660,6 +1660,25 @@ def check_menu_pull(res):
     return errors + hidden_errors(res, 'yield', 'pull', DOT_HIGH)
 
 
+def check_menu_press_pull(res):
+    """Ozone: a stick tap and a trigger pull in one poll yield the laser
+    and spend the pull: no press, no R2 past the stick's selection (2),
+    no dot. A second pull brings the laser back unpressed; the third
+    presses."""
+    lines = kinds(core_events(res), 'menu')
+    presses = [i for i, f in enumerate(lines) if f['pressed']
+               and (i == 0 or not lines[i - 1]['pressed'])]
+    errors = []
+    if len(presses) != 1:
+        errors.append('the menu was pressed %d times, want once: %s'
+                      % (len(presses),
+                         [(f['selection'], f['pressed']) for f in lines]))
+    if lines and max(f['selection'] for f in lines) > 2:
+        errors.append('the menu scrolled past the stick\'s selection: %s'
+                      % [f['selection'] for f in lines])
+    return errors + hidden_errors(res, 'yield', 'pull', DOT_HIGH)
+
+
 def check_menu_hands(res):
     """Both hands on the menu: the right points first, the left's trigger
     takes the press, and the right's, pulled while the left's is held,
@@ -2628,6 +2647,19 @@ CASES = [
                ('script', script(AIM_MENU_HIGH, R2)), ('wait', 0.5),
                ('script', AIM_MENU_HIGH), ('wait', 2)],
      'check': check_menu_pull},
+    {'name': 'input-menu-press-pull', 'map': '3ds',
+     'settings': {'menu_driver': 'ozone', 'frontend_log_level': '0'},
+     'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),
+               ('script', AIM_MENU_HIGH), ('wait', 2), ('mark', 'yield'),
+               ('script', script(AIM_MENU_HIGH, STICK_DOWN, R2)),
+               ('wait', 0.1),
+               ('script', script(AIM_MENU_HIGH, R2)), ('wait', 0.4),
+               ('script', AIM_MENU_HIGH), ('wait', 1), ('mark', 'pull'),
+               ('script', script(AIM_MENU_HIGH, R2)), ('wait', 0.5),
+               ('script', AIM_MENU_HIGH), ('wait', 1),
+               ('script', script(AIM_MENU_HIGH, R2)), ('wait', 0.5),
+               ('script', AIM_MENU_HIGH), ('wait', 2)],
+     'check': check_menu_press_pull},
     {'name': 'input-menu-hands', 'map': '3ds',
      'settings': {'menu_driver': 'ozone', 'frontend_log_level': '0'},
      'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 3),

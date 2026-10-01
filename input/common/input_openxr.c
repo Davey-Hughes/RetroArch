@@ -1014,7 +1014,8 @@ static bool input_openxr_new_press(input_openxr_t *st)
 /* With the menu open, the laser yields to the controllers' buttons and
  * sticks, so hand drift cannot undo their navigation: from a press until
  * a hand turns away from where it aimed then, or a trigger is pulled.
- * That pull is spent: an unseen laser must not click. */
+ * That pull is spent, with a press's or without: an unseen laser must
+ * not click. */
 static void input_openxr_yield(input_openxr_t *st, unsigned laser,
       bool menu_open, float threshold)
 {
@@ -1031,21 +1032,20 @@ static void input_openxr_yield(input_openxr_t *st, unsigned laser,
    time = vulkan_openxr_predicted_time(st->xr);
    for (h = 0; h < INPUT_OPENXR_HANDS; h++)
       tracked[h] = input_openxr_ray(st, h, time, &o, &dir[h]);
-   if (st->yield)
-      for (h = 0; h < INPUT_OPENXR_HANDS; h++)
+   for (h = 0; h < INPUT_OPENXR_HANDS; h++)
+   {
+      if (st->trig[h].value > threshold && !st->trig_down[h])
       {
-         if (st->trig[h].value > threshold && !st->trig_down[h])
-         {
-            /* No pull until let go, as after a loss. */
-            st->trig_down[h] = true;
-            st->role[h]      = INPUT_OPENXR_ROLE_SPENT;
-            st->yield        = false;
-         }
-         else if (tracked[h] && st->yield_has[h]
-               && video_xr_aim_moved(&st->yield_dir[h], &dir[h],
-                  INPUT_OPENXR_YIELD_DEGREES))
-            st->yield = false;
+         /* No pull until let go, as after a loss. */
+         st->trig_down[h] = true;
+         st->role[h]      = INPUT_OPENXR_ROLE_SPENT;
+         st->yield        = false;
       }
+      else if (st->yield && tracked[h] && st->yield_has[h]
+            && video_xr_aim_moved(&st->yield_dir[h], &dir[h],
+               INPUT_OPENXR_YIELD_DEGREES))
+         st->yield = false;
+   }
    if (press)
       st->yield = true;
    if (!st->yield)
