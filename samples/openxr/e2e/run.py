@@ -1596,19 +1596,20 @@ def at_px(f, want):
     return close((f['x'], f['y']), want, 4)
 
 
-def hidden_errors(res, hide, show, want):
+def hidden_errors(res, hide, show, want, until=None):
     """No dot from 0.3 s after the mark hide until the mark show, and a
-    dot at want from 0.3 s after show."""
+    dot at want from 0.3 s after show (and before the mark until)."""
     t0 = (res.marks[hide] + 0.3) * 1e6
     t1 = res.marks[show] * 1e6
     t2 = (res.marks[show] + 0.3) * 1e6
+    t3 = res.marks[until] * 1e6 if until else float('inf')
     hidden = [f for f in res.frames if t0 < f['t_us'] < t1]
     errors = []
     if not hidden:
         errors.append('no headset frame between %s and %s' % (hide, show))
     elif any(cursors(f) for f in hidden):
         errors.append('a dot showed between %s and %s' % (hide, show))
-    if not any(at(c, want) for f in res.frames if f['t_us'] > t2
+    if not any(at(c, want) for f in res.frames if t2 < f['t_us'] < t3
                for c in cursors(f)):
         errors.append('no dot at %s after %s' % (want, show))
     return errors
@@ -1701,7 +1702,7 @@ def check_menu_yield_ends(res):
     """Ozone: the laser's toggle twice, and the menu closing and
     reopening, each end a stick tap's yield: the dot is back on the menu
     after each, and gone between a tap and its end."""
-    errors = hidden_errors(res, 'yield1', 'toggle', DOT_HIGH)
+    errors = hidden_errors(res, 'yield1', 'toggle', DOT_HIGH, 'yield2')
     return errors + hidden_errors(res, 'yield2', 'reopen', DOT_HIGH)
 
 
