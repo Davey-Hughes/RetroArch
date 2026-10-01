@@ -974,6 +974,7 @@ FRAME_PROFILE = '/interaction_profiles/valve/frame_controller_valve'
 _FL = '/user/hand/left/input/'
 _FR = '/user/hand/right/input/'
 # The Frame's right controller has A, B, X and Y, the left a D-pad; the
+# right stick's click opens the RetroArch menu in place of R3, and the
 # grips stay unbound.
 FRAME_BINDS = set([
     ('combined/b', _FR + 'a/click'), ('combined/a', _FR + 'b/click'),
@@ -988,9 +989,9 @@ FRAME_BINDS = set([
     ('combined/l2', _FL + 'trigger/value'),
     ('combined/r2', _FR + 'trigger/value'),
     ('combined/l3', _FL + 'thumbstick/click'),
-    ('combined/r3', _FR + 'thumbstick/click'),
     ('combined/left_stick', _FL + 'thumbstick'),
     ('combined/right_stick', _FR + 'thumbstick'),
+    ('combined/menu', _FR + 'thumbstick/click'),
     ('separate/b', _FL + 'dpad_down/click'), ('separate/b', _FR + 'a/click'),
     ('separate/a', _FL + 'dpad_right/click'), ('separate/a', _FR + 'b/click'),
     ('separate/r', _FL + 'bumper/click'), ('separate/r', _FR + 'bumper/click'),

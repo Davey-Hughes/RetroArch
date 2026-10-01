@@ -211,7 +211,8 @@ static const input_openxr_bind_t input_openxr_touch[] = {
 };
 
 /* Steam Frame: A, B, X and Y on the right, a D-pad on the left; View
- * is Select and Menu is Start. The grips stay free. */
+ * is Select, Menu is Start, and the right stick's click is the
+ * RetroArch menu in place of R3. The grips stay free. */
 static const input_openxr_bind_t input_openxr_frame[] = {
    IXB_R(IXA_C_B,      "a/click"),
    IXB_R(IXA_C_A,      "b/click"),
@@ -228,7 +229,7 @@ static const input_openxr_bind_t input_openxr_frame[] = {
    IXB_L(IXA_C_L2,     "trigger/value"),
    IXB_R(IXA_C_R2,     "trigger/value"),
    IXB_L(IXA_C_L3,     "thumbstick/click"),
-   IXB_R(IXA_C_R3,     "thumbstick/click"),
+   IXB_R(IXA_C_MENU,   "thumbstick/click"),
    IXB_L(IXA_C_LSTICK, "thumbstick"),
    IXB_R(IXA_C_RSTICK, "thumbstick"),
    IXB_L(IXA_S_B,      "dpad_down/click"),
