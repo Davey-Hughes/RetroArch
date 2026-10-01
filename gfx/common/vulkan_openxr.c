@@ -657,6 +657,12 @@ static void vulkan_openxr_ended(vulkan_openxr_t *xr, bool instance_lost)
       return;
    xr->ended = true;
    retro_atomic_store_release_int(&xr->alive, 0);
+   if (xr->lock && xr->tick)
+   {
+      slock_lock(xr->lock);
+      scond_signal(xr->tick);
+      slock_unlock(xr->lock);
+   }
    RARCH_WARN("[OpenXR] The headset session ended; the window keeps the output.\n");
    vulkan_openxr_notify(MSG_OPENXR_SESSION_ENDED);
 }
@@ -1560,7 +1566,8 @@ static bool vulkan_openxr_wait_tick(vulkan_openxr_t *xr,
    retro_time_t deadline = cpu_features_get_time_usec()
       + (retro_time_t)(timeout_ns / 1000);
    slock_lock(xr->lock);
-   while (xr->tick_seq == xr->tick_seen)
+   while (xr->tick_seq == xr->tick_seen
+         && retro_atomic_load_acquire_int(&xr->alive))
    {
       retro_time_t left = deadline - cpu_features_get_time_usec();
       if (left <= 0 || !scond_wait_timeout(xr->tick, xr->lock, left))
@@ -1592,7 +1599,8 @@ void vulkan_openxr_pace_wait(vulkan_openxr_t *xr)
       if (xr->pace_mode != 1)
          RARCH_LOG("[OpenXR] Pacing on the headset's frames.\n");
       xr->pace_mode = 1;
-      if (!vulkan_openxr_wait_tick(xr, period * 2) && !xr->tick_late)
+      if (     !vulkan_openxr_wait_tick(xr, period * 2)
+            && vulkan_openxr_alive(xr) && !xr->tick_late)
       {
          xr->tick_late = true;
          RARCH_WARN("[OpenXR] No headset frame for two intervals; the core carries on.\n");

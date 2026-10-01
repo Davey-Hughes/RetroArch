@@ -2067,6 +2067,7 @@ def check_rate_change(res):
 PACED = re.compile(r'\[Video\] The headset paces the core: ([\d.]+) Hz / '
                    r'(\d+)\.')
 LOSS_LINE = '[OpenXR] Session loss pending.'
+LATE_LINE = '[OpenXR] No headset frame for two intervals'
 
 
 def paced_line(hz, n):
@@ -2138,6 +2139,8 @@ def check_window_back(res):
     """Paced, then the session lost: the window's interval returns and
     the core keeps about the window's rate, not unthrottled."""
     errors = check_paced(2, 20.0, LOSS_LINE)(res)
+    if LATE_LINE in res.log:
+        errors.append('the core waited out the headset that was gone')
     if marks_missing(res, 'lost', 'end'):
         return ['the run did not reach its marks']
     t0, t1 = window(res, 'lost', 'end', 1.0)
@@ -2145,6 +2148,19 @@ def check_window_back(res):
     if not 30.0 <= fps <= 90.0:
         errors.append('the core ran at %.1f fps once the headset was gone, '
                       'want the window\'s pace (about 60)' % fps)
+    return errors
+
+
+def check_loss_waiting(res):
+    """The session lost while the core waits on the headset: the wait
+    ends with the loss, not after two intervals."""
+    if marks_missing(res, 'lost', 'end'):
+        return ['the run did not reach its marks']
+    errors = []
+    if LOSS_LINE not in res.log:
+        errors.append('no "%s" in the log' % LOSS_LINE)
+    if LATE_LINE in res.log:
+        errors.append('the core waited out the headset that was gone')
     return errors
 
 
@@ -2622,6 +2638,14 @@ CASES = [
                ('script', 'state 7'), ('mark', 'lost'), ('wait', 6),
                ('mark', 'end')],
      'check': check_window_back},
+    # The core is waiting on the headset when the loss lands, on some
+    # runs: the tick's phase against the script's is not controlled.
+    {'name': 'pace-loss-waiting', 'map': 'none', 'options': FPS10,
+     'settings': dict(WINDOW1, video_openxr_refresh_rate='1'),
+     'steps': [('wait', 8), ('mark', 'from'), ('wait', 5), ('mark', 'to'),
+               ('script', 'state 7'), ('mark', 'lost'), ('wait', 6),
+               ('mark', 'end')],
+     'check': check_loss_waiting},
     # The layer lists 20 and 10 Hz and starts at 10: Auto asks for 20.
     {'name': 'pace-auto', 'map': 'none', 'options': FPS10,
      'settings': WINDOW1, 'script': 'rates 20 10\ndivide 2\n',
