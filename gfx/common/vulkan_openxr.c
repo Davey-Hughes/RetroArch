@@ -102,7 +102,7 @@ struct vulkan_openxr
    uint64_t tick_seen;             /* video thread */
    int64_t pace_anchor_ns;         /* video thread */
    unsigned pace_mode;             /* video thread: 0, 1 ticks, 2 clock */
-   bool tick_late;                 /* video thread: logged once */
+   bool tick_late;                 /* video thread: warned, no tick since */
    /* XR_FB_display_refresh_rate: the rates the session lists, the one
     * to ask for (float bits, 0 for none), and the last one asked. */
    float rates[VIDEO_HEADSET_MAX_RATES];
@@ -673,6 +673,12 @@ static void vulkan_openxr_session_state(vulkan_openxr_t *xr,
    XrResult res;
    retro_atomic_store_release_int(&xr->state, (int)state);
    RARCH_LOG("[OpenXR] Session %s.\n", vulkan_openxr_state_name(state));
+   if (state == XR_SESSION_STATE_STOPPING && xr->lock && xr->tick)
+   {
+      slock_lock(xr->lock);
+      scond_signal(xr->tick);
+      slock_unlock(xr->lock);
+   }
    switch (state)
    {
       case XR_SESSION_STATE_READY:
@@ -939,7 +945,11 @@ static void vulkan_openxr_frame(vulkan_openxr_t *xr)
       retro_sleep(1);
       return;
    }
-   if (video_xr_period_add(&xr->period,
+   session_state = retro_atomic_load_acquire_int(&xr->state);
+   /* A headset that is not worn reports periods that are not its own. */
+   if (    (   session_state == XR_SESSION_STATE_VISIBLE
+            || session_state == XR_SESSION_STATE_FOCUSED)
+         && video_xr_period_add(&xr->period,
             (int64_t)state.predictedDisplayPeriod))
    {
       retro_atomic_store_release_int(&xr->period_ns,
@@ -1035,11 +1045,12 @@ static void vulkan_openxr_list_rates(vulkan_openxr_t *xr)
          free(tmp);
          return;
       }
-      memcpy(xr->rates, tmp, VIDEO_HEADSET_MAX_RATES * sizeof(*tmp));
+      n = (all < VIDEO_HEADSET_MAX_RATES) ? all : VIDEO_HEADSET_MAX_RATES;
+      memcpy(xr->rates, tmp, n * sizeof(*tmp));
       free(tmp);
-      RARCH_WARN("[OpenXR] The headset offers %u rates; %u dropped.\n",
-            (unsigned)n, (unsigned)(n - VIDEO_HEADSET_MAX_RATES));
-      n = VIDEO_HEADSET_MAX_RATES;
+      if (all > n)
+         RARCH_WARN("[OpenXR] The headset offers %u rates; %u dropped.\n",
+               (unsigned)all, (unsigned)(all - n));
    }
    else if (XR_FAILED(xr->EnumerateDisplayRefreshRatesFB(xr->session, n,
             &n, xr->rates)))
@@ -1566,8 +1577,7 @@ static bool vulkan_openxr_wait_tick(vulkan_openxr_t *xr,
    retro_time_t deadline = cpu_features_get_time_usec()
       + (retro_time_t)(timeout_ns / 1000);
    slock_lock(xr->lock);
-   while (xr->tick_seq == xr->tick_seen
-         && retro_atomic_load_acquire_int(&xr->alive))
+   while (xr->tick_seq == xr->tick_seen && vulkan_openxr_should_draw(xr))
    {
       retro_time_t left = deadline - cpu_features_get_time_usec();
       if (left <= 0 || !scond_wait_timeout(xr->tick, xr->lock, left))
@@ -1599,8 +1609,9 @@ void vulkan_openxr_pace_wait(vulkan_openxr_t *xr)
       if (xr->pace_mode != 1)
          RARCH_LOG("[OpenXR] Pacing on the headset's frames.\n");
       xr->pace_mode = 1;
-      if (     !vulkan_openxr_wait_tick(xr, period * 2)
-            && vulkan_openxr_alive(xr) && !xr->tick_late)
+      if (vulkan_openxr_wait_tick(xr, period * 2))
+         xr->tick_late = false;
+      else if (vulkan_openxr_should_draw(xr) && !xr->tick_late)
       {
          xr->tick_late = true;
          RARCH_WARN("[OpenXR] No headset frame for two intervals; the core carries on.\n");
