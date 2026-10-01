@@ -63,7 +63,7 @@ struct vulkan_openxr
    XrEnvironmentBlendMode blend_mode;
    unsigned max_dim;
    uint32_t rec_width;
-   bool enable2;
+   bool enable2;                   /* the instance's one Vulkan path */
    bool frame_controller;
    bool refresh_ext;               /* XR_FB_display_refresh_rate */
    /* The session is made on the thread that makes the device; its frame
@@ -243,10 +243,68 @@ static bool vulkan_openxr_list(vulkan_openxr_t *xr,
    return vulkan_openxr_split(buf, names, count);
 }
 
-vulkan_openxr_t *vulkan_openxr_new(bool enable1, uint32_t api_version)
+/* Before each Vulkan context: the runtime's requirements asked again
+ * (each session needs them), the version checked, and for
+ * XR_KHR_vulkan_enable the runtime's extension lists read. */
+static bool vulkan_openxr_use(vulkan_openxr_t *xr, uint32_t api_version)
 {
    XrResult res;
    XrVersion api;
+   XrGraphicsRequirementsVulkanKHR reqs;
+
+   memset(&reqs, 0, sizeof(reqs));
+   reqs.type = XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR;
+   res       = xr->enable2
+      ? xr->GetVulkanGraphicsRequirements2KHR(xr->instance, xr->system, &reqs)
+      : xr->GetVulkanGraphicsRequirementsKHR(xr->instance, xr->system, &reqs);
+   if (XR_FAILED(res))
+   {
+      RARCH_ERR("[OpenXR] xrGetVulkanGraphicsRequirements failed (%d).\n",
+            (int)res);
+      return false;
+   }
+   RARCH_LOG("[OpenXR] Vulkan through %s, %u.%u to %u.%u.\n",
+         xr->enable2 ? XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME
+                     : XR_KHR_VULKAN_ENABLE_EXTENSION_NAME,
+         (unsigned)XR_VERSION_MAJOR(reqs.minApiVersionSupported),
+         (unsigned)XR_VERSION_MINOR(reqs.minApiVersionSupported),
+         (unsigned)XR_VERSION_MAJOR(reqs.maxApiVersionSupported),
+         (unsigned)XR_VERSION_MINOR(reqs.maxApiVersionSupported));
+
+   /* Major and minor only. The maximum is what the runtime was tested
+    * with, so only a newer major is refused. */
+   api = XR_MAKE_VERSION(VK_VERSION_MAJOR(api_version),
+         VK_VERSION_MINOR(api_version), 0);
+   if (     api < XR_MAKE_VERSION(
+               XR_VERSION_MAJOR(reqs.minApiVersionSupported),
+               XR_VERSION_MINOR(reqs.minApiVersionSupported), 0)
+         || VK_VERSION_MAJOR(api_version)
+            > XR_VERSION_MAJOR(reqs.maxApiVersionSupported))
+   {
+      RARCH_WARN("[OpenXR] The runtime does not take Vulkan %u.%u.\n",
+            (unsigned)VK_VERSION_MAJOR(api_version),
+            (unsigned)VK_VERSION_MINOR(api_version));
+      return false;
+   }
+
+   xr->num_inst_exts = 0;
+   xr->num_dev_exts  = 0;
+   if (     !xr->enable2
+         && (  !vulkan_openxr_list(xr, xr->GetVulkanInstanceExtensionsKHR,
+                  xr->inst_ext_buf, xr->inst_exts, &xr->num_inst_exts)
+            || !vulkan_openxr_list(xr, xr->GetVulkanDeviceExtensionsKHR,
+                  xr->dev_ext_buf, xr->dev_exts, &xr->num_dev_exts)))
+   {
+      RARCH_ERR("[OpenXR] The runtime's Vulkan extension lists could not be read.\n");
+      return false;
+   }
+   return true;
+}
+
+vulkan_openxr_t *vulkan_openxr_new(bool own_device, uint32_t api_version)
+{
+   XrResult res;
+   bool has_enable, has_enable2;
    uint32_t count = 0;
    uint32_t num_exts;
    const char *exts[3];
@@ -255,8 +313,6 @@ vulkan_openxr_t *vulkan_openxr_new(bool enable1, uint32_t api_version)
    XrSystemProperties props;
    XrViewConfigurationView views[2];
    XrEnvironmentBlendMode modes[8];
-   XrGraphicsRequirementsVulkanKHR reqs;
-   const char *ext;
    PFN_xrEnumerateInstanceExtensionProperties enum_exts;
    PFN_xrCreateInstance create_instance;
    PFN_xrGetSystem get_system;
@@ -273,9 +329,6 @@ vulkan_openxr_t *vulkan_openxr_new(bool enable1, uint32_t api_version)
    }
    if (!(xr = (vulkan_openxr_t*)calloc(1, sizeof(*xr))))
       return NULL;
-   xr->enable2 = !enable1;
-   ext         = enable1 ? XR_KHR_VULKAN_ENABLE_EXTENSION_NAME
-                         : XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME;
 
    if (!(xr->lib = dylib_load("libopenxr_loader.so.1")))
    {
@@ -305,13 +358,24 @@ vulkan_openxr_t *vulkan_openxr_new(bool enable1, uint32_t api_version)
             (int)res);
       goto unavailable;
    }
-   if (!vulkan_openxr_has_extension(enum_exts, count, ext))
+   /* One Vulkan extension per instance: a runtime may keep what an
+    * enable2 device enabled for the instance's later sessions. Enable
+    * serves every device, a core's own too, so its instance is kept
+    * across any video reinit; enable2 is for a runtime without it. */
+   has_enable  = vulkan_openxr_has_extension(enum_exts, count,
+         XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
+   has_enable2 = !own_device && vulkan_openxr_has_extension(enum_exts,
+         count, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME);
+   if (!has_enable && !has_enable2)
    {
-      RARCH_WARN("[OpenXR] The runtime lacks %s.\n", ext);
+      RARCH_WARN("[OpenXR] The runtime lacks %s.\n",
+            XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
       goto unavailable;
    }
-   exts[0]  = ext;
-   num_exts = 1;
+   xr->enable2 = !has_enable;
+   exts[0]     = has_enable ? XR_KHR_VULKAN_ENABLE_EXTENSION_NAME
+                            : XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME;
+   num_exts    = 1;
    if (vulkan_openxr_has_extension(enum_exts, count, VULKAN_OPENXR_FRAME_EXT))
    {
       exts[num_exts++]     = VULKAN_OPENXR_FRAME_EXT;
@@ -333,7 +397,16 @@ vulkan_openxr_t *vulkan_openxr_new(bool enable1, uint32_t api_version)
    ici.applicationInfo.apiVersion = XR_API_VERSION_1_0;
    ici.enabledExtensionCount      = num_exts;
    ici.enabledExtensionNames      = exts;
-   if (XR_FAILED(res = create_instance(&ici, &xr->instance)))
+   res = create_instance(&ici, &xr->instance);
+   if (XR_FAILED(res) && has_enable && has_enable2)
+   {
+      RARCH_WARN("[OpenXR] The runtime refused XR_KHR_vulkan_enable (%d); asking for XR_KHR_vulkan_enable2.\n",
+            (int)res);
+      xr->enable2 = true;
+      exts[0]     = XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME;
+      res         = create_instance(&ici, &xr->instance);
+   }
+   if (XR_FAILED(res))
    {
       RARCH_WARN("[OpenXR] No runtime (xrCreateInstance: %d).\n", (int)res);
       xr->instance = XR_NULL_HANDLE;
@@ -357,7 +430,7 @@ vulkan_openxr_t *vulkan_openxr_new(bool enable1, uint32_t api_version)
          && (  !VULKAN_OPENXR_FN(xr, EnumerateDisplayRefreshRatesFB)
             || !VULKAN_OPENXR_FN(xr, RequestDisplayRefreshRateFB)))
       xr->refresh_ext = false;
-   if (enable1)
+   if (!xr->enable2)
    {
       if (     !VULKAN_OPENXR_FN(xr, GetVulkanGraphicsRequirementsKHR)
             || !VULKAN_OPENXR_FN(xr, GetVulkanGraphicsDeviceKHR)
@@ -415,48 +488,8 @@ vulkan_openxr_t *vulkan_openxr_new(bool enable1, uint32_t api_version)
       xr->blend_mode = modes[0];
 
    /* The runtime must be asked before any Vulkan object is made. */
-   memset(&reqs, 0, sizeof(reqs));
-   reqs.type = XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR;
-   res       = enable1
-      ? xr->GetVulkanGraphicsRequirementsKHR(xr->instance, xr->system, &reqs)
-      : xr->GetVulkanGraphicsRequirements2KHR(xr->instance, xr->system, &reqs);
-   if (XR_FAILED(res))
-   {
-      RARCH_ERR("[OpenXR] xrGetVulkanGraphicsRequirements failed (%d).\n",
-            (int)res);
+   if (!vulkan_openxr_use(xr, api_version))
       goto failed;
-   }
-   RARCH_LOG("[OpenXR] Vulkan through %s, %u.%u to %u.%u.\n", ext,
-         (unsigned)XR_VERSION_MAJOR(reqs.minApiVersionSupported),
-         (unsigned)XR_VERSION_MINOR(reqs.minApiVersionSupported),
-         (unsigned)XR_VERSION_MAJOR(reqs.maxApiVersionSupported),
-         (unsigned)XR_VERSION_MINOR(reqs.maxApiVersionSupported));
-
-   /* Major and minor only. The maximum is what the runtime was tested
-    * with, so only a newer major is refused. */
-   api = XR_MAKE_VERSION(VK_VERSION_MAJOR(api_version),
-         VK_VERSION_MINOR(api_version), 0);
-   if (     api < XR_MAKE_VERSION(
-               XR_VERSION_MAJOR(reqs.minApiVersionSupported),
-               XR_VERSION_MINOR(reqs.minApiVersionSupported), 0)
-         || VK_VERSION_MAJOR(api_version)
-            > XR_VERSION_MAJOR(reqs.maxApiVersionSupported))
-   {
-      RARCH_WARN("[OpenXR] The runtime does not take Vulkan %u.%u.\n",
-            (unsigned)VK_VERSION_MAJOR(api_version),
-            (unsigned)VK_VERSION_MINOR(api_version));
-      goto failed;
-   }
-
-   if (     enable1
-         && (  !vulkan_openxr_list(xr, xr->GetVulkanInstanceExtensionsKHR,
-                  xr->inst_ext_buf, xr->inst_exts, &xr->num_inst_exts)
-            || !vulkan_openxr_list(xr, xr->GetVulkanDeviceExtensionsKHR,
-                  xr->dev_ext_buf, xr->dev_exts, &xr->num_dev_exts)))
-   {
-      RARCH_ERR("[OpenXR] The runtime's Vulkan extension lists could not be read.\n");
-      goto failed;
-   }
    return xr;
 
 unavailable:
@@ -502,6 +535,51 @@ void vulkan_openxr_free(vulkan_openxr_t *xr)
    if (xr->lib)
       dylib_close(xr->lib);
    free(xr);
+}
+
+bool vulkan_openxr_reuse(vulkan_openxr_t *xr, bool own_device,
+      uint32_t api_version)
+{
+   if (xr->lost)
+      return false;
+   if (own_device && xr->enable2)
+   {
+      RARCH_LOG("[OpenXR] The runtime's instance lacks %s.\n",
+            XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
+      return false;
+   }
+   if (!vulkan_openxr_use(xr, api_version))
+      return false;
+   RARCH_LOG("[OpenXR] Keeping the runtime's instance.\n");
+   return true;
+}
+
+bool vulkan_openxr_healthy(const vulkan_openxr_t *xr)
+{
+   return xr->session != XR_NULL_HANDLE && !xr->ended && !xr->lost;
+}
+
+void vulkan_openxr_release(vulkan_openxr_t *xr)
+{
+   if (!xr)
+      return;
+   vulkan_openxr_stop(xr);
+   vulkan_openxr_destroy_session(xr);
+   /* What the next session measures and asks for again. */
+   xr->device         = VK_NULL_HANDLE;
+   xr->running        = false;
+   xr->ended          = false;
+   xr->frame_failed   = false;
+   xr->predicted_time = 0;
+   xr->px_per_rad     = 0.0f;
+   xr->num_formats    = 0;
+   xr->num_rates      = 0;
+   xr->tick_seen      = xr->tick_seq;
+   xr->pace_anchor_ns = 0;
+   xr->pace_mode      = 0;
+   xr->tick_late      = false;
+   retro_atomic_store_release_int(&xr->state, XR_SESSION_STATE_UNKNOWN);
+   retro_atomic_store_release_int(&xr->alive, 0);
 }
 
 void vulkan_openxr_drop(vulkan_openxr_t *xr)

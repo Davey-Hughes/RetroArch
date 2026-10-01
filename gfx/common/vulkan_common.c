@@ -42,6 +42,9 @@
 
 #include "../../verbosity.h"
 #include "../../configuration.h"
+#ifdef HAVE_OPENXR
+#include "../../runloop.h"
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -83,6 +86,9 @@ static retro_vulkan_destroy_device_t cached_destroy_device_vk;
 #ifdef HAVE_OPENXR
 /* Kept with a cached device: the runtime made it. */
 static vulkan_openxr_t              *cached_xr;
+/* The runtime's instance between two Vulkan contexts, so it never sees
+ * RetroArch leave over a video reinit. */
+static vulkan_openxr_t              *kept_xr;
 #endif
 
 #ifdef __APPLE__
@@ -867,8 +873,50 @@ static const char *vulkan_optional_device_extensions[] = {
 #endif
 };
 
-/* vkCreateDevice, or the runtime's, which adds what it needs. A device
- * the runtime refuses drops the headset, not the device. */
+#ifdef HAVE_OPENXR
+/* XR_KHR_vulkan_enable: the runtime's device extensions added to list,
+ * whoever makes the device. A GPU without one of them drops the
+ * headset, not the device. */
+static void vulkan_context_openxr_device_exts(gfx_ctx_vulkan_data_t *vk,
+      VkPhysicalDevice gpu, const char **list, uint32_t *count,
+      uint32_t cap)
+{
+   unsigned i, n;
+   uint32_t num_props           = 0;
+   VkExtensionProperties *props = NULL;
+   const char *xr_exts[VULKAN_OPENXR_MAX_EXTS];
+
+   if (!vk->context.xr || vulkan_openxr_uses_enable2(vk->context.xr))
+      return;
+   n = vulkan_openxr_device_extensions(vk->context.xr, xr_exts,
+         VULKAN_OPENXR_MAX_EXTS);
+   if (!n)
+      return;
+   if (     vkEnumerateDeviceExtensionProperties(gpu, NULL, &num_props,
+               NULL) == VK_SUCCESS
+         && num_props
+         && (props = (VkExtensionProperties*)
+               malloc(num_props * sizeof(*props)))
+         && vkEnumerateDeviceExtensionProperties(gpu, NULL, &num_props,
+               props) == VK_SUCCESS
+         && vulkan_find_extensions(xr_exts, n, props, num_props))
+   {
+      for (i = 0; i < n; i++)
+         vulkan_append_ext(list, count, cap, xr_exts[i]);
+   }
+   else
+   {
+      RARCH_WARN("[OpenXR] The GPU lacks a device extension the runtime needs.\n");
+      vulkan_openxr_drop(vk->context.xr);
+      vk->context.xr = NULL;
+   }
+   free(props);
+}
+#endif
+
+/* vkCreateDevice with the runtime's extensions (XR_KHR_vulkan_enable),
+ * or the runtime's own, which adds what it needs (XR_KHR_vulkan_enable2).
+ * A device that cannot take them drops the headset, not the device. */
 static VkResult vulkan_context_create_device(gfx_ctx_vulkan_data_t *vk,
       VkPhysicalDevice gpu, const VkDeviceCreateInfo *info,
       VkDevice *device)
@@ -883,28 +931,37 @@ static VkResult vulkan_context_create_device(gfx_ctx_vulkan_data_t *vk,
       vulkan_openxr_drop(vk->context.xr);
       vk->context.xr = NULL;
    }
+   else if (vk->context.xr)
+   {
+      VkDeviceCreateInfo xr_info = *info;
+      uint32_t cap               = info->enabledExtensionCount
+         + VULKAN_OPENXR_MAX_EXTS;
+      const char **exts          = (const char**)malloc(cap * sizeof(*exts));
+      if (exts)
+      {
+         VkResult res = VK_ERROR_EXTENSION_NOT_PRESENT;
+         if (info->enabledExtensionCount)
+            memcpy((void*)exts, info->ppEnabledExtensionNames,
+                  info->enabledExtensionCount * sizeof(*exts));
+         xr_info.ppEnabledExtensionNames = exts;
+         vulkan_context_openxr_device_exts(vk, gpu, exts,
+               &xr_info.enabledExtensionCount, cap);
+         /* Still there: the GPU has them all. */
+         if (vk->context.xr)
+            res = vkCreateDevice(gpu, &xr_info, NULL, device);
+         free((void*)exts);
+         if (res == VK_SUCCESS)
+            return res;
+      }
+      if (vk->context.xr)
+      {
+         vulkan_openxr_drop(vk->context.xr);
+         vk->context.xr = NULL;
+      }
+   }
 #endif
    return vkCreateDevice(gpu, info, NULL, device);
 }
-
-#ifdef HAVE_OPENXR
-/* RetroArch's device extensions, and the runtime's for a core that
- * makes the device with create_device (v1). */
-static void vulkan_context_openxr_device_exts(gfx_ctx_vulkan_data_t *vk,
-      const char **list, uint32_t *count, uint32_t cap)
-{
-   unsigned i, n;
-   const char *xr_exts[VULKAN_OPENXR_MAX_EXTS];
-   for (i = 0; i < ARRAY_SIZE(vulkan_device_extensions); i++)
-      vulkan_append_ext(list, count, cap, vulkan_device_extensions[i]);
-   if (!vk->context.xr)
-      return;
-   n = vulkan_openxr_device_extensions(vk->context.xr, xr_exts,
-         VULKAN_OPENXR_MAX_EXTS);
-   for (i = 0; i < n; i++)
-      vulkan_append_ext(list, count, cap, xr_exts[i]);
-}
-#endif
 
 static VkDevice vulkan_context_create_device_wrapper(
       VkPhysicalDevice gpu, void *opaque,
@@ -1048,8 +1105,10 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
          const char *dev_exts[ARRAY_SIZE(vulkan_device_extensions)
             + VULKAN_OPENXR_MAX_EXTS];
          uint32_t num_dev_exts = 0;
-         vulkan_context_openxr_device_exts(vk, dev_exts, &num_dev_exts,
-               ARRAY_SIZE(dev_exts));
+         for (i = 0; i < ARRAY_SIZE(vulkan_device_extensions); i++)
+            dev_exts[num_dev_exts++] = vulkan_device_extensions[i];
+         vulkan_context_openxr_device_exts(vk, vk->context.gpu, dev_exts,
+               &num_dev_exts, ARRAY_SIZE(dev_exts));
 #endif
          ret = iface->create_device(&context, vk->context.instance,
                vk->context.gpu,
@@ -1089,14 +1148,6 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
       else
       {
          RARCH_WARN("[Vulkan] Failed to create device with negotiation interface. Falling back to default path.\n");
-#ifdef HAVE_OPENXR
-         /* The runtime's lists were for the core's device. */
-         if (vk->context.xr && !vulkan_openxr_uses_enable2(vk->context.xr))
-         {
-            vulkan_openxr_drop(vk->context.xr);
-            vk->context.xr = NULL;
-         }
-#endif
       }
    }
 
@@ -3526,23 +3577,25 @@ static bool vulkan_context_openxr_instance_exts_ok(vulkan_openxr_t *xr)
    return ok;
 }
 
-/* Chosen before the instance exists: the runtime makes it, or lists
- * what it needs. A core making its own device with create_device (v1)
- * gets XR_KHR_vulkan_enable's lists; everything else goes through
- * XR_KHR_vulkan_enable2. */
+/* Chosen before the instance exists: the runtime lists what it needs
+ * (XR_KHR_vulkan_enable), or makes the instance and device itself
+ * (XR_KHR_vulkan_enable2), which a core making its own device with
+ * create_device (v1) cannot use. */
 static void vulkan_context_openxr_init(gfx_ctx_vulkan_data_t *vk,
       const struct retro_hw_render_context_negotiation_interface_vulkan *iface,
       uint32_t api_version)
 {
    settings_t *settings = config_get_ptr();
    bool enable          = settings->bools.video_openxr_enable;
-   bool enable1         = iface && iface->create_device
+   bool own_device      = iface && iface->create_device
       && !(iface->interface_version >= 2 && iface->create_device2);
 
    /* A kept device keeps the runtime it was made for, while the runtime
     * keeps the instance. */
    if (cached_instance_vk)
    {
+      vulkan_openxr_free(kept_xr);
+      kept_xr = NULL;
       if (cached_xr && enable && !vulkan_openxr_lost(cached_xr))
          vk->context.xr = cached_xr;
       else
@@ -3560,9 +3613,21 @@ static void vulkan_context_openxr_init(gfx_ctx_vulkan_data_t *vk,
       cached_xr = NULL;
    }
    if (!enable)
+   {
+      vulkan_openxr_free(kept_xr);
+      kept_xr = NULL;
       return;
-   vk->context.xr = vulkan_openxr_new(enable1, api_version);
-   if (     vk->context.xr && enable1
+   }
+   if (kept_xr && vulkan_openxr_reuse(kept_xr, own_device, api_version))
+      vk->context.xr = kept_xr;
+   else
+   {
+      vulkan_openxr_free(kept_xr);
+      vk->context.xr = vulkan_openxr_new(own_device, api_version);
+   }
+   kept_xr = NULL;
+   if (     vk->context.xr
+         && !vulkan_openxr_uses_enable2(vk->context.xr)
          && !vulkan_context_openxr_instance_exts_ok(vk->context.xr))
    {
       vulkan_openxr_drop(vk->context.xr);
@@ -3782,6 +3847,18 @@ bool vulkan_context_init(gfx_ctx_vulkan_data_t *vk,
    return true;
 }
 
+#ifdef HAVE_OPENXR
+/* Kept while the headset stays on, its session is healthy and RetroArch
+ * is not quitting; an ended session takes its instance with it. */
+static bool vulkan_context_openxr_keep(vulkan_openxr_t *xr)
+{
+   settings_t *settings = config_get_ptr();
+   return xr
+      && settings->bools.video_openxr_enable
+      && !(runloop_get_flags() & RUNLOOP_FLAG_SHUTDOWN_INITIATED)
+      && vulkan_openxr_healthy(xr);
+}
+#endif
 
 void vulkan_context_destroy(gfx_ctx_vulkan_data_t *vk,
       bool destroy_surface)
@@ -3845,7 +3922,13 @@ void vulkan_context_destroy(gfx_ctx_vulkan_data_t *vk,
    {
 #ifdef HAVE_OPENXR
       /* The runtime's objects on the device go first. */
-      vulkan_openxr_free(vk->context.xr);
+      if (vulkan_context_openxr_keep(vk->context.xr))
+      {
+         vulkan_openxr_release(vk->context.xr);
+         kept_xr = vk->context.xr;
+      }
+      else
+         vulkan_openxr_free(vk->context.xr);
       vk->context.xr = NULL;
 #endif
       if (vk->context.device)

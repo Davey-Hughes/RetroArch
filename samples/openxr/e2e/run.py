@@ -259,6 +259,13 @@ def run_case(retroarch, root, monado, case, validate):
     with open(os.path.join(d, 'opts.cfg'), 'w') as f:
         for k in sorted(options):
             f.write('%s = "%s"\n' % (k, options[k]))
+    if case.get('core_override'):
+        # A core override, as config/<core name>/<core name>.cfg.
+        od = os.path.join(d, 'video_views test')
+        os.makedirs(od)
+        with open(os.path.join(od, 'video_views test.cfg'), 'w') as f:
+            for k in sorted(case['core_override']):
+                f.write('%s = "%s"\n' % (k, case['core_override'][k]))
     script = os.path.join(d, 'script.txt')
     with open(script, 'w') as f:
         f.write(case.get('script', ''))
@@ -2567,6 +2574,124 @@ def check_hw_v1(res):
     return errors
 
 
+LOAD_HW = [('wait', 6), ('mark', 'load'), ('send', 'LOAD_CORE ' + CORE),
+           ('wait', 1), ('send', 'START_CORE'), ('wait', 8)]
+
+
+ENABLE_LINE = '[OpenXR] Vulkan through XR_KHR_vulkan_enable,'
+ENABLE2_LINE = '[OpenXR] Vulkan through XR_KHR_vulkan_enable2,'
+OWN_DEVICE = '[video_views] made its own Vulkan device'
+
+
+def check_menu_load(made, refused=0, v1=False, enable2=False):
+    """RetroArch opens to its menu in the headset, then a core loads: the
+    instance stays (made instances in all), and the core's screens show
+    in a second session. Every context is on one Vulkan path: enable,
+    or enable2 for a runtime without it."""
+    def check(res):
+        errors = []
+        got = instances(res).count('instance')
+        if got != made:
+            errors.append('%d instances made, want %d (%s)'
+                          % (got, made, instances(res)))
+        if len(events(res, 'instance_refused')) != refused:
+            errors.append('%d instances refused, want %d'
+                          % (len(events(res, 'instance_refused')), refused))
+        sessions = res.log.count('[OpenXR] Session created.')
+        if sessions != 2:
+            errors.append('%d sessions created, want 2 (menu, core)'
+                          % sessions)
+        if made == 1 and "[OpenXR] Keeping the runtime's instance." not in res.log:
+            errors.append('no "Keeping the runtime\'s instance" in the log')
+        t = res.marks.get('load', 0) * 1e6
+        after = [f for f in res.frames if f['t_us'] > t + 3e6 and quads(f)]
+        if len(after) < 40:
+            errors.append('%d headset frames with quads after the load'
+                          % len(after))
+        want, other = ((ENABLE2_LINE, ENABLE_LINE) if enable2
+                       else (ENABLE_LINE, ENABLE2_LINE))
+        if want not in res.log:
+            errors.append('missing "%s"' % want)
+        if other in res.log:
+            errors.append('a context went "%s"' % other)
+        if v1 and OWN_DEVICE not in res.log:
+            errors.append('missing "%s"' % OWN_DEVICE)
+        return errors
+    return check
+
+
+def check_v1_enable2(res):
+    """A runtime with enable2 alone cannot serve a core that makes its
+    own device: the menu's instance goes at the load, and the core shows
+    in the window without the headset."""
+    errors = []
+    seq = instances(res)
+    if seq != ['instance', 'instance_destroy']:
+        errors.append('instances %s, want the menu\'s made and destroyed'
+                      % seq)
+    for line in (ENABLE2_LINE, OWN_DEVICE,
+                 "[OpenXR] The runtime's instance lacks XR_KHR_vulkan_enable."):
+        if line not in res.log:
+            errors.append('missing "%s"' % line)
+    if "[OpenXR] Keeping the runtime's instance." in res.log:
+        errors.append('the enable2 instance was kept for the core')
+    if res.log.count('[OpenXR] Session created.') != 1:
+        errors.append('want one session (the menu\'s)')
+    t = res.marks.get('load', 0) * 1e6
+    after = [f for f in res.frames if f['t_us'] > t + 3e6]
+    if after:
+        errors.append('%d headset frames after the load' % len(after))
+    return errors + window_is(res, GREEN, 'the 2D map')
+
+
+def check_override_off(res):
+    """A core override turns Headset Output off: the menu's instance goes
+    at the load and no session follows."""
+    errors = []
+    seq = instances(res)
+    if seq != ['instance', 'instance_destroy']:
+        errors.append('instances %s, want the menu\'s made and destroyed'
+                      % seq)
+    t = res.marks.get('load', 0) * 1e6
+    gone = [e for e in res.events if e['ev'] == 'instance_destroy']
+    if gone and gone[0]['t_us'] < t:
+        errors.append('the instance went before the load')
+    if res.log.count('[OpenXR] Session created.') != 1:
+        errors.append('want one session (the menu\'s)')
+    return errors
+
+
+def check_close_keeps(res):
+    """A HW core's video reinit, then its content closed to the menu:
+    the XR thread stops before the core's context_destroy both times, and
+    the instance still stays."""
+    errors = []
+    if instances(res).count('instance') != 1:
+        errors.append('instances %s, want one for the run' % instances(res))
+    sessions = res.log.count('[OpenXR] Session created.')
+    if sessions != 3:
+        errors.append('%d sessions created, want 3 (start, reinit, menu)'
+                      % sessions)
+    return errors
+
+
+def check_lost_new(res):
+    """A lost instance is not kept: the reinit after the loss makes a new
+    one, and its session shows the screens."""
+    errors = []
+    if instances(res).count('instance') != 2:
+        errors.append('instances %s, want a second made after the loss'
+                      % instances(res))
+    if "[OpenXR] Keeping the runtime's instance." in res.log:
+        errors.append('a lost instance was kept')
+    t = res.marks.get('reinit', 0) * 1e6
+    after = [f for f in res.frames if f['t_us'] > t + 3e6 and quads(f)]
+    if len(after) < 40:
+        errors.append('%d headset frames with quads after the reinit'
+                      % len(after))
+    return errors
+
+
 CASES = [
     {'name': '3ds-stereo', 'map': '3ds', 'steps': SETTLE,
      'check': check_screens()},
@@ -2694,6 +2819,37 @@ CASES = [
                ('mark', 'reinit'), ('send', 'FULLSCREEN_TOGGLE'),
                ('wait', 4)],
      'baseline': KEPT_LEAK, 'check': check_kept_lost},
+    # The Steam Frame's theatre mode came from these: a core loaded from
+    # the menu remade the instance, and SteamVR saw RetroArch leave.
+    {'name': 'menu-load-hw', 'menu_start': True,
+     'options': VULKAN, 'steps': LOAD_HW, 'check': check_menu_load(1)},
+    {'name': 'menu-load-hw-threaded', 'menu_start': True,
+     'options': VULKAN, 'settings': {'video_threaded': 'true'},
+     'steps': LOAD_HW, 'baseline': THREADED_HW,
+     'check': threaded(check_menu_load(1))},
+    {'name': 'menu-load-v1', 'menu_start': True,
+     'options': {'video_views_test_hw': 'vulkan_v1'}, 'steps': LOAD_HW,
+     'check': check_menu_load(1, v1=True)},
+    # A runtime with enable2 alone: the fallback, kept across the load too.
+    {'name': 'menu-load-enable2', 'menu_start': True,
+     'env': {'RA_XR_LAYER_NO_ENABLE': '1'},
+     'options': VULKAN, 'steps': LOAD_HW,
+     'check': check_menu_load(1, refused=1, enable2=True)},
+    {'name': 'menu-load-v1-enable2', 'menu_start': True,
+     'env': {'RA_XR_LAYER_NO_ENABLE': '1'},
+     'options': {'video_views_test_hw': 'vulkan_v1'},
+     'steps': LOAD_HW + [('shot', None)], 'check': check_v1_enable2},
+    {'name': 'override-off', 'menu_start': True, 'core_override':
+     {'video_openxr_enable': 'false'},
+     'options': VULKAN, 'steps': LOAD_HW, 'check': check_override_off},
+    # A HW core's reinit and its close back to the menu: one instance.
+    {'name': 'hw-close-keeps', 'map': 'none', 'options': VULKAN,
+     'steps': TEARDOWN, 'check': check_close_keeps},
+    {'name': 'lost-new-instance', 'map': 'none', 'options': VULKAN,
+     'steps': [('wait', 6), ('script', 'fail instance'), ('wait', 2),
+               ('script', 'fail off'), ('mark', 'reinit'),
+               ('send', 'FULLSCREEN_TOGGLE'), ('wait', 6)],
+     'check': check_lost_new},
     {'name': 'input-combined', 'map': '3ds',
      'steps': [('wait', 6), ('script', ALL_BUTTONS), ('wait', 2),
                ('script', STICKS), ('wait', 2), ('script', ''), ('wait', 2),

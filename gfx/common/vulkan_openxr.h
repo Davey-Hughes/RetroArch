@@ -44,13 +44,29 @@ typedef struct vulkan_openxr vulkan_openxr_t;
 #define VULKAN_OPENXR_MAX_EXTS 16
 
 /* The runtime's instance and headset, or NULL after a notification.
- * enable1 is for a core that makes its own device with create_device
- * (v1): the runtime then only lists what the instance and device
- * need. api_version is the Vulkan version the instance will ask for. */
-vulkan_openxr_t *vulkan_openxr_new(bool enable1, uint32_t api_version);
+ * It enables one Vulkan extension: XR_KHR_vulkan_enable when the runtime
+ * has it, which serves every device, so the instance outlives any video
+ * reinit; else XR_KHR_vulkan_enable2, which cannot serve own_device, a
+ * core that makes its own device with create_device (v1). api_version
+ * is the Vulkan version the instance will ask for. */
+vulkan_openxr_t *vulkan_openxr_new(bool own_device, uint32_t api_version);
 
 /* Before the Vulkan device is destroyed. NULL is fine. */
 void vulkan_openxr_free(vulkan_openxr_t *xr);
+
+/* A video reinit keeps the instance: stops the XR thread and destroys the
+ * session, before the Vulkan device it is bound to goes. NULL is fine. */
+void vulkan_openxr_release(vulkan_openxr_t *xr);
+
+/* While the XR thread is stopped: the session exists and the runtime
+ * ended neither it nor the instance. */
+bool vulkan_openxr_healthy(const vulkan_openxr_t *xr);
+
+/* The kept instance for the next Vulkan context: false when it was lost
+ * or cannot serve own_device, then the caller frees it and makes
+ * another. */
+bool vulkan_openxr_reuse(vulkan_openxr_t *xr, bool own_device,
+      uint32_t api_version);
 
 /* OpenXR failed before the device existed: log, tell the user, free. */
 void vulkan_openxr_drop(vulkan_openxr_t *xr);
@@ -60,15 +76,17 @@ void vulkan_openxr_needs_reload(void);
 
 bool vulkan_openxr_uses_enable2(const vulkan_openxr_t *xr);
 
-/* XR_KHR_vulkan_enable: the extensions the runtime needs, valid until
- * vulkan_openxr_free(). Returns how many were written. */
+/* XR_KHR_vulkan_enable: the extensions the runtime needs on the instance
+ * and device of every context, whoever makes them; valid until the
+ * instance is reused or freed. Returns how many were written. */
 unsigned vulkan_openxr_instance_extensions(const vulkan_openxr_t *xr,
       const char **out, unsigned cap);
 unsigned vulkan_openxr_device_extensions(const vulkan_openxr_t *xr,
       const char **out, unsigned cap);
 
-/* XR_KHR_vulkan_enable2: vkCreateInstance and vkCreateDevice through
- * the runtime, which adds what it needs. */
+/* XR_KHR_vulkan_enable2, for a runtime without XR_KHR_vulkan_enable:
+ * vkCreateInstance and vkCreateDevice through the runtime, which adds
+ * what it needs. */
 VkResult vulkan_openxr_create_instance(vulkan_openxr_t *xr,
       PFN_vkGetInstanceProcAddr gipa, const VkInstanceCreateInfo *info,
       VkInstance *instance);
