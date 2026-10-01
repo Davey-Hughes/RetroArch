@@ -893,20 +893,32 @@ static void vulkan_context_openxr_device_exts(gfx_ctx_vulkan_data_t *vk,
    if (!n)
       return;
    if (     vkEnumerateDeviceExtensionProperties(gpu, NULL, &num_props,
-               NULL) == VK_SUCCESS
-         && num_props
-         && (props = (VkExtensionProperties*)
+               NULL) != VK_SUCCESS
+         || !num_props
+         || !(props = (VkExtensionProperties*)
                malloc(num_props * sizeof(*props)))
-         && vkEnumerateDeviceExtensionProperties(gpu, NULL, &num_props,
-               props) == VK_SUCCESS
-         && vulkan_find_extensions(xr_exts, n, props, num_props))
+         || vkEnumerateDeviceExtensionProperties(gpu, NULL, &num_props,
+               props) != VK_SUCCESS)
+   {
+      RARCH_WARN("[OpenXR] The GPU's device extensions could not be listed.\n");
+      i = 0;
+   }
+   else
+   {
+      for (i = 0; i < n; i++)
+         if (!vulkan_find_extensions(&xr_exts[i], 1, props, num_props))
+            break;
+      if (i < n)
+         RARCH_WARN("[OpenXR] The GPU lacks %s, which the runtime needs.\n",
+               xr_exts[i]);
+   }
+   if (i == n)
    {
       for (i = 0; i < n; i++)
          vulkan_append_ext(list, count, cap, xr_exts[i]);
    }
    else
    {
-      RARCH_WARN("[OpenXR] The GPU lacks a device extension the runtime needs.\n");
       vulkan_openxr_drop(vk->context.xr);
       vk->context.xr = NULL;
    }
@@ -3848,6 +3860,12 @@ bool vulkan_context_init(gfx_ctx_vulkan_data_t *vk,
 }
 
 #ifdef HAVE_OPENXR
+void vulkan_context_openxr_forget(void)
+{
+   vulkan_openxr_free(kept_xr);
+   kept_xr = NULL;
+}
+
 /* Kept while the headset stays on, its session is healthy and RetroArch
  * is not quitting; an ended session takes its instance with it. */
 static bool vulkan_context_openxr_keep(vulkan_openxr_t *xr)

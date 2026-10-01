@@ -921,6 +921,9 @@ def check_no_runtime(res):
         errors.append('no "[OpenXR] No runtime" in the log')
     if any(quads(f) for f in res.frames):
         errors.append('quads were submitted without a runtime')
+    # Only a refused extension is asked for again another way.
+    if '[OpenXR] The runtime refused' in res.log:
+        errors.append('a second instance was tried without a runtime')
     return errors + window_is(res, GREEN, 'the 2D map')
 
 
@@ -2562,10 +2565,14 @@ THREADED_HW = [
     ('VUID-vkQueueSubmit-pSignalSemaphores-00067',
      'pSubmits[0].pSignalSemaphores[0]')]
 
+ENABLE_LINE = '[OpenXR] Vulkan through XR_KHR_vulkan_enable,'
+ENABLE2_LINE = '[OpenXR] Vulkan through XR_KHR_vulkan_enable2,'
+OWN_DEVICE = '[video_views] made its own Vulkan device'
+
+
 def check_hw_v1(res):
     errors = check_screens()(res)
-    for line in ('[video_views] made its own Vulkan device',
-                 '[OpenXR] Vulkan through XR_KHR_vulkan_enable,'):
+    for line in (OWN_DEVICE, ENABLE_LINE):
         if line not in res.log:
             errors.append('missing "%s"' % line)
     if instances(res) != ['instance', 'instance_destroy']:
@@ -2578,16 +2585,11 @@ LOAD_HW = [('wait', 6), ('mark', 'load'), ('send', 'LOAD_CORE ' + CORE),
            ('wait', 1), ('send', 'START_CORE'), ('wait', 8)]
 
 
-ENABLE_LINE = '[OpenXR] Vulkan through XR_KHR_vulkan_enable,'
-ENABLE2_LINE = '[OpenXR] Vulkan through XR_KHR_vulkan_enable2,'
-OWN_DEVICE = '[video_views] made its own Vulkan device'
-
-
 def check_menu_load(made, refused=0, v1=False, enable2=False):
     """RetroArch opens to its menu in the headset, then a core loads: the
-    instance stays (made instances in all), and the core's screens show
-    in a second session. Every context is on one Vulkan path: enable,
-    or enable2 for a runtime without it."""
+    instance stays (made instances in all), and the core's three screens
+    show in a second session. Every context is on one Vulkan path:
+    enable, or enable2 for a runtime without it."""
     def check(res):
         errors = []
         got = instances(res).count('instance')
@@ -2604,10 +2606,13 @@ def check_menu_load(made, refused=0, v1=False, enable2=False):
         if made == 1 and "[OpenXR] Keeping the runtime's instance." not in res.log:
             errors.append('no "Keeping the runtime\'s instance" in the log')
         t = res.marks.get('load', 0) * 1e6
-        after = [f for f in res.frames if f['t_us'] > t + 3e6 and quads(f)]
+        # The menu's frames have a quad too: the core's are not blended.
+        after = [f for f in res.frames if f['t_us'] > t + 3e6
+                 and len([q for q in quads(f) if not q['flags'] & BLEND]) == 3]
         if len(after) < 40:
-            errors.append('%d headset frames with quads after the load'
-                          % len(after))
+            errors.append('%d headset frames with the core\'s screens after '
+                          'the load' % len(after))
+        errors += check_screens()(res)
         want, other = ((ENABLE2_LINE, ENABLE_LINE) if enable2
                        else (ENABLE_LINE, ENABLE2_LINE))
         if want not in res.log:
@@ -2617,6 +2622,63 @@ def check_menu_load(made, refused=0, v1=False, enable2=False):
         if v1 and OWN_DEVICE not in res.log:
             errors.append('missing "%s"' % OWN_DEVICE)
         return errors
+    return check
+
+
+RETRY_LINE = '[OpenXR] No session on the kept instance; making a new one.'
+GIVEN_UP = '[OpenXR] Rebuilding video without headset output.'
+
+
+def check_session_retry(res):
+    """The kept instance refuses the load's session: a new instance is
+    made for it rather than the headset given up."""
+    errors = check_menu_load(2)(res)
+    if RETRY_LINE not in res.log:
+        errors.append('missing "%s"' % RETRY_LINE)
+    if GIVEN_UP in res.log:
+        errors.append('the headset was given up: "%s"' % GIVEN_UP)
+    return errors
+
+
+def check_load_gl(res):
+    """A core that needs another video driver: the menu's instance goes
+    at the load, and the core shows in the window."""
+    errors = []
+    seq = instances(res)
+    if seq != ['instance', 'instance_destroy']:
+        errors.append('instances %s, want the menu\'s made and destroyed'
+                      % seq)
+    t = res.marks.get('load', 0) * 1e6
+    gone = events(res, 'instance_destroy')
+    if gone and not t < gone[0]['t_us'] < t + 5e6:
+        errors.append('the instance did not go at the load')
+    if res.log.count('[OpenXR] Session created.') != 1:
+        errors.append('want one session (the menu\'s)')
+    if '[Video] Using HW render, glcore driver forced.' not in res.log:
+        errors.append('the video driver did not change to glcore')
+    return errors + window_is(res, GREEN, 'the 2D map')
+
+
+BAD_EXT = 'VK_RA_test_missing'
+
+
+def check_bad_device_ext(v1=False):
+    """The runtime names a device extension the GPU lacks: the headset is
+    dropped, the device is made without it and the window shows the core."""
+    def check(res):
+        errors = []
+        for line in ('[OpenXR] The GPU lacks %s, which the runtime needs.'
+                     % BAD_EXT,
+                     '[OpenXR] Continuing without headset output.'):
+            if line not in res.log:
+                errors.append('missing "%s"' % line)
+        if '[OpenXR] Session created.' in res.log:
+            errors.append('a session was made')
+        if any(quads(f) for f in res.frames):
+            errors.append('quads were submitted without the headset')
+        if v1 and OWN_DEVICE not in res.log:
+            errors.append('missing "%s"' % OWN_DEVICE)
+        return errors + window_is(res, GREEN, 'the 2D map')
     return check
 
 
@@ -2839,6 +2901,25 @@ CASES = [
      'env': {'RA_XR_LAYER_NO_ENABLE': '1'},
      'options': {'video_views_test_hw': 'vulkan_v1'},
      'steps': LOAD_HW + [('shot', None)], 'check': check_v1_enable2},
+    # The kept instance refuses the core's session: a new one, once.
+    {'name': 'menu-load-session-retry', 'menu_start': True,
+     'options': VULKAN,
+     'steps': [('wait', 6), ('script', 'fail session once')] + LOAD_HW[1:],
+     'check': check_session_retry},
+    # A core that takes RetroArch to another video driver.
+    {'name': 'menu-load-gl', 'menu_start': True,
+     'options': {'video_views_test_hw': 'gl'},
+     'steps': LOAD_HW + [('shot', None)], 'check': check_load_gl},
+    # The runtime wants a device extension the GPU lacks.
+    {'name': 'hw-bad-device-ext', 'map': '3ds',
+     'env': {'RA_XR_LAYER_DEVICE_EXT': BAD_EXT}, 'options': VULKAN,
+     'steps': [('wait', 6), ('shot', None)],
+     'check': check_bad_device_ext()},
+    {'name': 'hw-bad-device-ext-v1', 'map': '3ds',
+     'env': {'RA_XR_LAYER_DEVICE_EXT': BAD_EXT},
+     'options': {'video_views_test_hw': 'vulkan_v1'},
+     'steps': [('wait', 6), ('shot', None)],
+     'check': check_bad_device_ext(v1=True)},
     {'name': 'override-off', 'menu_start': True, 'core_override':
      {'video_openxr_enable': 'false'},
      'options': VULKAN, 'steps': LOAD_HW, 'check': check_override_off},

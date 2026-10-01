@@ -64,6 +64,7 @@ struct vulkan_openxr
    unsigned max_dim;
    uint32_t rec_width;
    bool enable2;                   /* the instance's one Vulkan path */
+   bool reused;                    /* kept from an earlier Vulkan context */
    bool frame_controller;
    bool refresh_ext;               /* XR_FB_display_refresh_rate */
    /* The session is made on the thread that makes the device; its frame
@@ -398,7 +399,7 @@ vulkan_openxr_t *vulkan_openxr_new(bool own_device, uint32_t api_version)
    ici.enabledExtensionCount      = num_exts;
    ici.enabledExtensionNames      = exts;
    res = create_instance(&ici, &xr->instance);
-   if (XR_FAILED(res) && has_enable && has_enable2)
+   if (res == XR_ERROR_EXTENSION_NOT_PRESENT && has_enable && has_enable2)
    {
       RARCH_WARN("[OpenXR] The runtime refused XR_KHR_vulkan_enable (%d); asking for XR_KHR_vulkan_enable2.\n",
             (int)res);
@@ -550,8 +551,32 @@ bool vulkan_openxr_reuse(vulkan_openxr_t *xr, bool own_device,
    }
    if (!vulkan_openxr_use(xr, api_version))
       return false;
+   xr->reused = true;
    RARCH_LOG("[OpenXR] Keeping the runtime's instance.\n");
    return true;
+}
+
+/* The destroyed session's queued events, which a new session with its
+ * handle would take for its own. Only the instance's loss counts. */
+static void vulkan_openxr_drain(vulkan_openxr_t *xr)
+{
+   unsigned i;
+   XrResult res;
+   XrEventDataBuffer ev;
+   if (!xr->PollEvent)
+      return;
+   for (i = 0; i < 64; i++)
+   {
+      memset(&ev, 0, sizeof(ev));
+      ev.type = XR_TYPE_EVENT_DATA_BUFFER;
+      res     = xr->PollEvent(xr->instance, &ev);
+      if (     res == XR_ERROR_INSTANCE_LOST
+            || (  res == XR_SUCCESS
+               && ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING))
+         xr->lost = true;
+      if (res != XR_SUCCESS)
+         break;
+   }
 }
 
 bool vulkan_openxr_healthy(const vulkan_openxr_t *xr)
@@ -565,6 +590,7 @@ void vulkan_openxr_release(vulkan_openxr_t *xr)
       return;
    vulkan_openxr_stop(xr);
    vulkan_openxr_destroy_session(xr);
+   vulkan_openxr_drain(xr);
    /* What the next session measures and asks for again. */
    xr->device         = VK_NULL_HANDLE;
    xr->running        = false;
@@ -1589,6 +1615,13 @@ void vulkan_openxr_stop(vulkan_openxr_t *xr)
 
 void vulkan_openxr_drop_and_reinit(vulkan_openxr_t *xr)
 {
+   /* A new instance may make the session a kept one could not. */
+   if (xr->reused)
+   {
+      RARCH_LOG("[OpenXR] No session on the kept instance; making a new one.\n");
+      vulkan_openxr_free(xr);
+      return;
+   }
    RARCH_ERR("[OpenXR] Rebuilding video without headset output.\n");
    vulkan_openxr_notify(MSG_OPENXR_FAILED);
    vulkan_openxr_free(xr);

@@ -438,6 +438,12 @@ const char *vulkan_get_moltenvk_version(void);
 void vulkan_context_destroy(gfx_ctx_vulkan_data_t *vk,
       bool destroy_surface);
 
+#ifdef HAVE_OPENXR
+/* Frees the headset runtime's instance kept across a video reinit, when
+ * the video driver that follows is not Vulkan. */
+void vulkan_context_openxr_forget(void);
+#endif
+
 bool vulkan_surface_create(gfx_ctx_vulkan_data_t *vk,
       enum vulkan_wsi_type type,
       void *display, void *surface,

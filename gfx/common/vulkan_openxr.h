@@ -54,8 +54,9 @@ vulkan_openxr_t *vulkan_openxr_new(bool own_device, uint32_t api_version);
 /* Before the Vulkan device is destroyed. NULL is fine. */
 void vulkan_openxr_free(vulkan_openxr_t *xr);
 
-/* A video reinit keeps the instance: stops the XR thread and destroys the
- * session, before the Vulkan device it is bound to goes. NULL is fine. */
+/* A video reinit keeps the instance: stops the XR thread, destroys the
+ * session before the Vulkan device it is bound to goes, and discards its
+ * queued events. NULL is fine. */
 void vulkan_openxr_release(vulkan_openxr_t *xr);
 
 /* While the XR thread is stopped: the session exists and the runtime
@@ -149,7 +150,8 @@ void vulkan_openxr_stop(vulkan_openxr_t *xr);
 void vulkan_openxr_stop_thread(vulkan_openxr_t *xr);
 
 /* The session failed on a device made for it: frees, tells the user,
- * and has the next video init skip the runtime. */
+ * and has the next video init skip the runtime. A kept instance is only
+ * freed, so the next video init tries a new one. */
 void vulkan_openxr_drop_and_reinit(vulkan_openxr_t *xr);
 
 /* Until the runtime ends the session or its thread stops: the headset
