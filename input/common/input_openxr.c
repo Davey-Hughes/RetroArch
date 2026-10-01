@@ -47,8 +47,6 @@
  * INPUT_OPENXR_HAPTIC_DURATION (ns). */
 #define INPUT_OPENXR_HAPTIC_REFRESH  500000
 #define INPUT_OPENXR_HAPTIC_DURATION 1000000000
-/* A deliberate point turns the aim further than this, in degrees; a
- * held hand drifts well under it. */
 /* Half a stick's travel. */
 #define INPUT_OPENXR_YIELD_STICK   0x4000
 
