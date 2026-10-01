@@ -63,6 +63,8 @@ BLEND = 2  # XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
 VUID = re.compile(r'(VUID-[A-Za-z0-9_-]+|UNASSIGNED-[A-Za-z0-9_.-]+)')
 MESSAGE = re.compile(r'Validation (Error|Warning|Performance Warning):')
 DENSITY = re.compile(r'\[OpenXR\] (\d+) pixels across (\d+) degrees per eye')
+DESTROYED = re.compile(r"vkDestroyImage\(\): can't be called on VkImage "
+                       r'(0x[0-9a-f]+)')
 DESTROY = re.compile(r'\[video_views\] context_destroy waited on the device '
                      r'from (\d+) to (\d+) us')
 # The Monado client's sockets live under a relative XDG_RUNTIME_DIR in
@@ -130,6 +132,23 @@ def unexpected(log, baseline):
         else:
             extra.add(vuid)
     return sorted(extra), known
+
+
+def runtime_images(res):
+    """A baseline entry for the headset swapchains' own images, by handle.
+    Monado destroys a client swapchain's images without waiting for its
+    own release command buffer, and names nothing without
+    VK_EXT_debug_utils on the instance, so the baseline's names miss it.
+    An image of RetroArch's own still fails the case."""
+    images = set()
+    for e in res.events:
+        if e['ev'] == 'swapchain':
+            images.update(e.get('images', []))
+
+    def match(text):
+        m = DESTROYED.search(text)
+        return bool(m) and m.group(1) in images
+    return [('VUID-vkDestroyImage-image-01000', match)]
 
 
 class Result(object):
@@ -3185,8 +3204,8 @@ def main():
         if 'hung' in res.marks:
             errors.append('RetroArch did not quit')
         if validate:
-            extra, known = unexpected(res.log,
-                                      baseline + case.get('baseline', []))
+            extra, known = unexpected(res.log, baseline + runtime_images(res)
+                                      + case.get('baseline', []))
             if extra:
                 errors.append('validation: ' + ', '.join(extra))
             if not known:

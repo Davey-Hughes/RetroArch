@@ -39,9 +39,10 @@
  *   RA_XR_LAYER_QUAD_INDEX0 1: quads show array layer 0 whatever their
  *                           imageArrayIndex, as SteamVR on the Steam
  *                           Frame does
- *   RA_XR_LAYER_ONE_VULKAN  1: refuse an instance that enables both
- *                           XR_KHR_vulkan_enable and _enable2, as a
- *                           runtime taking one Vulkan path might
+ *   RA_XR_LAYER_NO_ENABLE   1: refuse an instance that enables
+ *                           XR_KHR_vulkan_enable, leaving the application
+ *                           XR_KHR_vulkan_enable2 as a runtime with only
+ *                           that one would
  *
  * Script lines:
  *   head <x> <y> <z> <yaw>  the VIEW space's pose in LOCAL, yaw in degrees
@@ -1015,13 +1016,26 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_CreateSwapchain(XrSession session,
       const XrSwapchainCreateInfo *info, XrSwapchain *sc)
 {
    int i;
+   uint32_t k;
    XrResult res;
+   uint32_t n               = 0;
    XrSwapchainCreateInfo ci = *info;
+   XrSwapchainImageVulkanKHR imgs[MAX_IMAGES];
    /* So released images can be copied back. */
    ci.usageFlags |= XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT;
    res = L.CreateSwapchain(session, &ci, sc);
    if (XR_FAILED(res))
       return res;
+   /* Its images now, for the event: the validation layer names an image
+    * by its handle alone when the runtime's objects have no names. */
+   memset(imgs, 0, sizeof(imgs));
+   for (k = 0; k < MAX_IMAGES; k++)
+      imgs[k].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
+   if (     XR_FAILED(L.EnumerateSwapchainImages(*sc, 0, &n, NULL))
+         || n > MAX_IMAGES
+         || XR_FAILED(L.EnumerateSwapchainImages(*sc, n, &n,
+               (XrSwapchainImageBaseHeader*)imgs)))
+      n = 0;
    pthread_mutex_lock(&L.lock);
    for (i = 0; i < MAX_CHAINS; i++)
       if (!L.chains[i].handle)
@@ -1029,17 +1043,25 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_CreateSwapchain(XrSession session,
          struct chain *c = &L.chains[i];
          free(c->pixels);
          memset(c, 0, sizeof(*c));
-         c->handle = *sc;
-         c->id     = L.next_id++;
-         c->width  = info->width;
-         c->height = info->height;
-         c->layers = info->arraySize;
-         c->format = info->format;
+         c->handle     = *sc;
+         c->id         = L.next_id++;
+         c->width      = info->width;
+         c->height     = info->height;
+         c->layers     = info->arraySize;
+         c->format     = info->format;
+         c->num_images = n;
+         for (k = 0; k < n; k++)
+            c->images[k] = imgs[k].image;
          if (L.out)
          {
             fprintf(L.out, "{\"ev\":\"swapchain\",\"sc\":%d,\"w\":%u,\"h\":%u,"
-                  "\"layers\":%u,\"format\":%lld}\n", c->id, c->width,
-                  c->height, c->layers, (long long)c->format);
+                  "\"layers\":%u,\"format\":%lld,\"images\":[", c->id,
+                  c->width, c->height, c->layers, (long long)c->format);
+            /* As the validation layer prints a handle. */
+            for (k = 0; k < n; k++)
+               fprintf(L.out, "%s\"0x%llx\"", k ? "," : "",
+                     (unsigned long long)(uintptr_t)c->images[k]);
+            fprintf(L.out, "]}\n");
             fflush(L.out);
          }
          break;
@@ -1676,17 +1698,12 @@ static XRAPI_ATTR XrResult XRAPI_CALL layer_CreateApiLayerInstance(
          exts[down.enabledExtensionCount++] = info->enabledExtensionNames[i];
    }
    {
-      const char *one = getenv("RA_XR_LAYER_ONE_VULKAN");
-      bool v1 = false, v2 = false;
+      const char *no = getenv("RA_XR_LAYER_NO_ENABLE");
+      bool v1 = false;
       for (i = 0; i < info->enabledExtensionCount; i++)
-      {
          if (!strcmp(info->enabledExtensionNames[i], "XR_KHR_vulkan_enable"))
             v1 = true;
-         else if (!strcmp(info->enabledExtensionNames[i],
-                  "XR_KHR_vulkan_enable2"))
-            v2 = true;
-      }
-      if (one && atoi(one) != 0 && v1 && v2)
+      if (no && atoi(no) != 0 && v1)
       {
          pthread_mutex_lock(&L.lock);
          layer_open();
