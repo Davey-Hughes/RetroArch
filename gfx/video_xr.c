@@ -92,6 +92,22 @@ unsigned video_xr_image_dims(float width_m, float height_m, float distance,
    return VIDEO_SCALE_PACK((unsigned)w, (unsigned)h);
 }
 
+bool video_xr_shrinks(unsigned image_dims, unsigned source_dims,
+      unsigned rotation)
+{
+   unsigned sw = VIDEO_SCALE_W(source_dims);
+   unsigned sh = VIDEO_SCALE_H(source_dims);
+   if (rotation & 1)
+   {
+      unsigned t = sw;
+      sw         = sh;
+      sh         = t;
+   }
+   if (!VIDEO_SCALE_W(image_dims) || !VIDEO_SCALE_H(image_dims))
+      return false;
+   return VIDEO_SCALE_W(image_dims) < sw || VIDEO_SCALE_H(image_dims) < sh;
+}
+
 /* A point in the anchor's frame, as a pose in LOCAL space facing the
  * way the anchor does. */
 static void video_xr_put(const video_xr_params_t *p,
@@ -124,6 +140,18 @@ static void video_xr_add(video_xr_quad_set_t *out, unsigned kind,
    q->screen = screen;
    q->slot   = slot;
    q->layer  = layer;
+}
+
+/* A screen's image: the shown size for the stock chain, which shrinks
+ * smoothly; a preset's passes get at least the source's pixels. Without
+ * a density, the source's size either way. */
+static unsigned video_xr_screen_dims(const video_xr_params_t *p,
+      float width, float height, unsigned native_dims)
+{
+   if (p->stock && p->px_per_rad > 0.0f)
+      native_dims = 0;
+   return video_xr_image_dims(width, height, p->distance, p->px_per_rad,
+         native_dims, p->max_dim);
 }
 
 /* Screens sized by display width against screen 0's; screen 0 straight
@@ -184,9 +212,9 @@ static void video_xr_place_screens(const video_xr_params_t *p,
       }
       video_xr_put(p, x, y, -p->distance, &pose);
 
-      slot->dims    = video_xr_image_dims((float)w, (float)h, p->distance,
-            p->px_per_rad, VIDEO_SCALE_PACK((unsigned)(disp_w[s] + 0.5),
-               (unsigned)(disp_h[s] + 0.5)), p->max_dim);
+      slot->dims    = video_xr_screen_dims(p, (float)w, (float)h,
+            VIDEO_SCALE_PACK((unsigned)(disp_w[s] + 0.5),
+               (unsigned)(disp_h[s] + 0.5)));
       slot->view[0] = left;
       if (left != right)
       {
@@ -255,8 +283,8 @@ void video_xr_place(const video_xr_params_t *p, video_xr_quad_set_t *out)
          aspect = 4.0f / 3.0f;
       h = p->width / aspect;
       video_xr_put(p, 0.0, 0.0, -p->distance, &pose);
-      out->slots[0].dims   = video_xr_image_dims(p->width, h,
-            p->distance, p->px_per_rad, p->frame_dims, p->max_dim);
+      out->slots[0].dims   = video_xr_screen_dims(p, p->width, h,
+            p->frame_dims);
       out->slots[0].layers = 1;
       video_xr_add(out, VIDEO_XR_QUAD_FRAME, VIDEO_XR_EYE_BOTH, 0, 0, 0,
             &pose, p->width, h);

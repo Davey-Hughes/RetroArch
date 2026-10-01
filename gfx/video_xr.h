@@ -124,6 +124,9 @@ typedef struct video_xr_params
    /* The UI layer's size, or 0 for no menu quad. */
    unsigned ui_dims;
    bool swap_eyes;
+   /* The screens are drawn by the stock chain, which shrinks smoothly:
+    * their images are the shown size, even below the source's. */
+   bool stock;
 } video_xr_params_t;
 
 void video_xr_pose_identity(video_xr_pose_t *pose);
@@ -138,10 +141,15 @@ bool video_xr_anchor_from_head(const video_xr_pose_t *head,
       video_xr_pose_t *anchor);
 
 /* A quad's image size: its angular width at px_per_rad, never below
- * the source's own width, the quad's shape, at most max_dim a side.
- * 0 for an empty quad. */
+ * native_dims' width (the source's; 0 for no floor), the quad's shape,
+ * at most max_dim a side. 0 for an empty quad. */
 unsigned video_xr_image_dims(float width_m, float height_m, float distance,
       float px_per_rad, unsigned native_dims, unsigned max_dim);
+
+/* Whether an image of image_dims shows a source of source_dims smaller
+ * in either dimension, the source turned rotation quarter turns. */
+bool video_xr_shrinks(unsigned image_dims, unsigned source_dims,
+      unsigned rotation);
 
 void video_xr_place(const video_xr_params_t *p, video_xr_quad_set_t *out);
 

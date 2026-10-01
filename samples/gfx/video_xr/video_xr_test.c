@@ -108,7 +108,30 @@ static void test_image_dims(void)
                VIDEO_SCALE_PACK(400, 240), 4096), 400, 240));
    CHECK(dims_is(video_xr_image_dims(1.6f, 0.96f, 1.8f, 200.0f,
                VIDEO_SCALE_PACK(400, 240), 4096), 400, 240));
+   /* No floor without a source size. */
+   CHECK(dims_is(video_xr_image_dims(1.6f, 0.96f, 1.8f, 200.0f, 0, 4096),
+            168, 101));
    CHECK(video_xr_image_dims(0.0f, 0.96f, 1.8f, 1000.0f, 0, 4096) == 0);
+}
+
+static void test_shrinks(void)
+{
+   unsigned top = VIDEO_SCALE_PACK(400, 240);
+   /* Smaller in either dimension shrinks; the same size or larger does
+    * not. */
+   CHECK( video_xr_shrinks(VIDEO_SCALE_PACK(181, 109), top, 0));
+   CHECK( video_xr_shrinks(VIDEO_SCALE_PACK(399, 300), top, 0));
+   CHECK( video_xr_shrinks(VIDEO_SCALE_PACK(500, 239), top, 0));
+   CHECK(!video_xr_shrinks(top, top, 0));
+   CHECK(!video_xr_shrinks(VIDEO_SCALE_PACK(437, 262), top, 0));
+   /* A quarter turn shows the source's width down the image. */
+   CHECK(!video_xr_shrinks(VIDEO_SCALE_PACK(240, 400), top, 1));
+   CHECK( video_xr_shrinks(VIDEO_SCALE_PACK(240, 400), top, 0));
+   CHECK( video_xr_shrinks(top, top, 3));
+   CHECK(!video_xr_shrinks(top, top, 2));
+   /* Nothing to shrink, or nothing to shrink into. */
+   CHECK(!video_xr_shrinks(VIDEO_SCALE_PACK(181, 109), 0, 0));
+   CHECK(!video_xr_shrinks(0, top, 0));
 }
 
 static void test_place_3ds(void)
@@ -258,6 +281,58 @@ static void test_place_menu_size(void)
    CHECK(pos_is(&set.quads[1], 0.0, 0.0, -1.7));
    CHECK(NEAR(set.quads[1].width, 1.0) && NEAR(set.quads[1].height, 1.2));
    CHECK(set.slots[VIDEO_XR_MENU_SLOT].dims == VIDEO_SCALE_PACK(800, 960));
+}
+
+static void test_place_stock(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+
+   /* Shown larger than the source: the shown size, as with a preset. */
+   map_3ds(&map);
+   params_init(&p, &map);
+   p.stock = true;
+   video_xr_place(&p, &set);
+   CHECK(dims_is(set.slots[0].dims, 837, 502));
+   CHECK(dims_is(set.slots[1].dims, 684, 513));
+
+   /* Shown smaller: the stock chain's images are the shown size, a
+    * preset's never below the source's. */
+   p.px_per_rad = 200.0f;
+   video_xr_place(&p, &set);
+   CHECK(dims_is(set.slots[0].dims, 168, 101));
+   CHECK(dims_is(set.slots[1].dims, 137, 103));
+   p.stock = false;
+   video_xr_place(&p, &set);
+   CHECK(dims_is(set.slots[0].dims, 400, 240));
+   CHECK(dims_is(set.slots[1].dims, 320, 240));
+
+   /* Still at most max_dim a side, in its shape. */
+   p.stock   = true;
+   p.max_dim = 100;
+   video_xr_place(&p, &set);
+   CHECK(dims_is(set.slots[0].dims, 100, 60));
+
+   /* A whole frame the same; the menu's image as before. */
+   params_init(&p, NULL);
+   p.stock      = true;
+   p.frame_dims = VIDEO_SCALE_PACK(800, 480);
+   p.px_per_rad = 200.0f;
+   p.ui_dims    = VIDEO_SCALE_PACK(1600, 960);
+   video_xr_place(&p, &set);
+   CHECK(dims_is(set.slots[0].dims, 168, 101));
+   CHECK(dims_is(set.slots[VIDEO_XR_MENU_SLOT].dims, 352, 211));
+   p.stock = false;
+   video_xr_place(&p, &set);
+   CHECK(dims_is(set.slots[0].dims, 800, 480));
+   CHECK(dims_is(set.slots[VIDEO_XR_MENU_SLOT].dims, 352, 211));
+
+   /* Without a density, the source's size either way. */
+   p.stock      = true;
+   p.px_per_rad = 0.0f;
+   video_xr_place(&p, &set);
+   CHECK(dims_is(set.slots[0].dims, 800, 480));
 }
 
 static void test_anchor(void)
@@ -622,11 +697,13 @@ static void test_request_rate(void)
 int main(void)
 {
    test_image_dims();
+   test_shrinks();
    test_place_3ds();
    test_place_swap_horizontal();
    test_place_ds_rotation();
    test_place_frame_menu();
    test_place_menu_size();
+   test_place_stock();
    test_anchor();
    test_ray_hit();
    test_quad_to_frame();
