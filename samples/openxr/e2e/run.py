@@ -964,6 +964,9 @@ def check_exit_steam(res):
                       % (res.marks['exited'] - res.marks.get('exit', 0)))
     if '[Video] The headset asked to exit; quitting for Steam.' not in res.log:
         errors.append('no quit line in the log')
+    if instances(res) != ['instance', 'instance_destroy']:
+        errors.append('instances %s, want one made and destroyed on the way '
+                      'out' % instances(res))
     return errors
 
 
