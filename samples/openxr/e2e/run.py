@@ -139,7 +139,9 @@ def runtime_images(res):
     Monado destroys a client swapchain's images without waiting for its
     own release command buffer, and names nothing without
     VK_EXT_debug_utils on the instance, so the baseline's names miss it.
-    An image of RetroArch's own still fails the case."""
+    An image of RetroArch's own still fails the case. The validation
+    layer's handle values restart with each Vulkan instance, so in a case
+    with several video contexts the rule is not exact."""
     images = set()
     for e in res.events:
         if e['ev'] == 'swapchain':
