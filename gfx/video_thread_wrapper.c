@@ -2339,6 +2339,16 @@ static bool video_thread_alive(void *data)
    if (!thr)
       return false;
 
+   /* On the video thread, as the Win32 size/move tick is: the driver
+    * is asked here, which is where it takes the window's new size. */
+   if (video_thread_is_self(thr))
+   {
+      thread_packet_t pkt;
+      pkt.type = CMD_ALIVE;
+      video_thread_send_and_wait_user_to_thread(thr, &pkt);
+      return pkt.data.b;
+   }
+
    runloop_flags       = runloop_get_flags();
 
    /* Paused, the video thread draws nothing, and what it publishes

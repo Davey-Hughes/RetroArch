@@ -738,25 +738,29 @@ static bool    win32_sizemove_stopped_audio;
  * invalidates the client area - the compositor keeps the last buffer -
  * so a plain drag presents nothing at all. */
 static bool    win32_sizemove_dirty;
+/* Threaded video pumps inside the driver's alive(), which went into
+ * the loop holding the old size and writes it back on return unless
+ * a resize is there for it to take. */
+static bool    win32_sizemove_resized;
 static HWND    win32_sizemove_timer_hwnd;
 
 void win32_sizemove_enter(HWND hwnd)
 {
    if (win32_sizemove_depth++)
       return;
-   /* The window lives on the video thread; the run loop is elsewhere
-    * and keeps going on its own. */
-   if (video_driver_is_threaded())
-      return;
 
    /* A user who pressed P already stopped the driver and must not get
     * it restarted on release. audio_driver_stop() returns false when
-    * the driver is not alive, so the latch is a real transition. */
+    * the driver is not alive, so the latch is a real transition.
+    * Threaded video keeps its audio: the window lives on the video
+    * thread and the run loop goes on elsewhere. */
    win32_sizemove_stopped_audio = false;
-   if (!(runloop_state_get_ptr()->flags & RUNLOOP_FLAG_PAUSED))
+   if (     !video_driver_is_threaded()
+         && !(runloop_state_get_ptr()->flags & RUNLOOP_FLAG_PAUSED))
       win32_sizemove_stopped_audio = audio_driver_stop();
 
-   win32_sizemove_dirty = false;
+   win32_sizemove_dirty   = false;
+   win32_sizemove_resized = false;
    if (SetTimer(hwnd, WIN32_SIZEMOVE_TIMER_ID, 16, NULL))
       win32_sizemove_timer_hwnd = hwnd;
 }
@@ -766,14 +770,15 @@ void win32_sizemove_exit(HWND hwnd)
    (void)hwnd;
    if (!win32_sizemove_depth || --win32_sizemove_depth)
       return;
-   if (video_driver_is_threaded())
-      return;
 
    if (win32_sizemove_timer_hwnd)
    {
       KillTimer(win32_sizemove_timer_hwnd, WIN32_SIZEMOVE_TIMER_ID);
       win32_sizemove_timer_hwnd = NULL;
    }
+   if (win32_sizemove_resized)
+      g_win32_flags |= WIN32_CMN_FLAG_RESIZED;
+   win32_sizemove_resized = false;
    /* A failed start clears AUDIO_FLAG_ACTIVE for the session; say so. */
    if (win32_sizemove_stopped_audio && !audio_driver_start(false))
       RARCH_WARN("[Win32] Audio did not restart after a window size/move.\n");
@@ -791,6 +796,7 @@ void win32_sizemove_abort(void)
    win32_sizemove_depth         = 0;
    win32_sizemove_stopped_audio = false;
    win32_sizemove_dirty         = false;
+   win32_sizemove_resized       = false;
 }
 
 /* WM_TIMER with WIN32_SIZEMOVE_TIMER_ID, delivered on the thread that
@@ -819,6 +825,8 @@ void win32_sizemove_tick(void)
    if (video_st->current_video && video_st->data)
       video_st->current_video->alive(video_st->data);
    video_driver_cached_frame();
+   if (video_driver_is_threaded())
+      win32_sizemove_resized = true;
 }
 
 /* Older SDK headers stop short of the resume notification. */
