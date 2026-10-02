@@ -249,6 +249,7 @@ typedef REASON_CONTEXT POWER_REQUEST_CONTEXT, *PPOWER_REQUEST_CONTEXT, *LPPOWER_
 #ifdef HAVE_D3DKMT
 static d3dkmt_adapter_t d3dkmt_adapter;
 static LUID d3dkmt_adapter_luid;
+static HMONITOR d3dkmt_monitor;
 
 static void d3dkmt_init(void)
 {
@@ -334,6 +335,39 @@ bool d3dkmt_wait_vblank(void)
       return false;
    return (pD3DKMTWaitForVerticalBlankEvent(&d3dkmt_adapter.vb)
          == STATUS_SUCCESS);
+}
+
+/* d3dkmt_init() runs before there is a window and takes the first
+ * display that opens; this moves the read to the window's monitor. */
+void d3dkmt_follow_window(void)
+{
+   MONITORINFOEX info;
+   D3DKMT_OPENADAPTERFROMHDC open_data = {0};
+   HDC hdc                             = NULL;
+   HWND window                         = win32_get_window();
+   HMONITOR monitor                    = window
+      ? MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) : NULL;
+
+   if (!pD3DKMTOpenAdapterFromHdc || !monitor || monitor == d3dkmt_monitor)
+      return;
+
+   memset(&info, 0, sizeof(info));
+   info.cbSize = sizeof(info);
+   if (     !GetMonitorInfo(monitor, (LPMONITORINFO)&info)
+         || !(hdc = CreateDC(NULL, info.szDevice, NULL, NULL)))
+      return;
+
+   open_data.hDc = hdc;
+   if (pD3DKMTOpenAdapterFromHdc(&open_data) == STATUS_SUCCESS)
+   {
+      d3dkmt_adapter.sl.hAdapter      = open_data.hAdapter;
+      d3dkmt_adapter.sl.VidPnSourceId = open_data.VidPnSourceId;
+      d3dkmt_adapter.vb.hAdapter      = open_data.hAdapter;
+      d3dkmt_adapter.vb.VidPnSourceId = open_data.VidPnSourceId;
+      d3dkmt_adapter_luid             = open_data.AdapterLuid;
+      d3dkmt_monitor                  = monitor;
+   }
+   DeleteDC(hdc);
 }
 
 bool d3dkmt_source_get(LUID *luid, unsigned *source_id)

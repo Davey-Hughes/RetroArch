@@ -1105,6 +1105,7 @@ static bool win32_display_server_get_metrics(void *data,
       unsigned total  = 0;
 
       *value = 0;
+      d3dkmt_follow_window();
       if (!win32_display_server_scanout_lines(&active, &total))
          return false;
       *value = (type == DISPLAY_METRIC_ACTIVE_LINES)

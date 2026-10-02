@@ -286,6 +286,9 @@ extern int d3dkmt_scanline_get(void);
 /* The adapter and VidPn source the scanline is read from */
 extern bool d3dkmt_source_get(LUID *luid, unsigned *source_id);
 
+/* Reads the scanline of the monitor the window is on from here on */
+extern void d3dkmt_follow_window(void);
+
 /* Block until the display signals vertical blank. Returns false when
  * the entry point is unavailable or the wait fails, in which case the
  * caller has no anchor and must fall back to polling.
