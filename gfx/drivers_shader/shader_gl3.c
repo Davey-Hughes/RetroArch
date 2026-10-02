@@ -2512,7 +2512,8 @@ static void gl3_chain_update_history_info(struct gl3_filter_chain *chain);
 static void gl3_chain_update_feedback_info(struct gl3_filter_chain *chain);
 static void gl3_chain_build_offscreen_passes(struct gl3_filter_chain *chain, const gl3_viewport vp);
 static void gl3_chain_end_frame(struct gl3_filter_chain *chain);
-static void gl3_chain_build_viewport_pass(struct gl3_filter_chain *chain, const gl3_viewport vp, const float *mvp);
+static void gl3_chain_build_viewport_pass(struct gl3_filter_chain *chain, const gl3_viewport vp, const float *mvp,
+      bool again);
 static bool gl3_chain_init_history(struct gl3_filter_chain *chain);
 static bool gl3_chain_init_feedback(struct gl3_filter_chain *chain);
 static bool gl3_chain_init_alias(struct gl3_filter_chain *chain);
@@ -2721,7 +2722,8 @@ static void gl3_chain_end_frame(struct gl3_filter_chain *chain)
    }
 }
 
-static void gl3_chain_build_viewport_pass(struct gl3_filter_chain *chain, const gl3_viewport vp, const float *mvp)
+static void gl3_chain_build_viewport_pass(struct gl3_filter_chain *chain, const gl3_viewport vp, const float *mvp,
+      bool again)
 {
    unsigned i;
    /* First frame, make sure our history and
@@ -2748,6 +2750,10 @@ static void gl3_chain_build_viewport_pass(struct gl3_filter_chain *chain, const 
       source.address    =
          gl3_pass_get_address_mode(chain->passes[chain->num_passes - 1]);
    }
+   else if (again)
+      /* The first draw's feedback swap moved this pass's framebuffer:
+       * read what the first draw read. */
+      source = chain->common.pass_outputs[chain->num_passes - 2];
    else
    {
       const struct gl3_framebuffer *fb =
@@ -2763,12 +2769,13 @@ static void gl3_chain_build_viewport_pass(struct gl3_filter_chain *chain, const 
          &original, &source, &vp, mvp);
 
    /* For feedback FBOs, swap current and previous. */
-   for (i = 0; i < chain->num_passes; i++)
-   {
-      struct gl3_framebuffer *fb = gl3_pass_get_feedback_framebuffer(chain->passes[i]);
-      if (fb)
-         gl3_pass_end_frame(chain->passes[i]);
-   }
+   if (!again)
+      for (i = 0; i < chain->num_passes; i++)
+      {
+         struct gl3_framebuffer *fb = gl3_pass_get_feedback_framebuffer(chain->passes[i]);
+         if (fb)
+            gl3_pass_end_frame(chain->passes[i]);
+      }
 }
 
 static bool gl3_chain_init_history(struct gl3_filter_chain *chain)
@@ -4192,7 +4199,14 @@ void gl3_filter_chain_build_viewport_pass(
       gl3_filter_chain_t *chain,
       const gl3_viewport *vp, const float *mvp)
 {
-   gl3_chain_build_viewport_pass(chain, *vp, mvp);
+   gl3_chain_build_viewport_pass(chain, *vp, mvp, false);
+}
+
+void gl3_filter_chain_build_viewport_pass_again(
+      gl3_filter_chain_t *chain,
+      const gl3_viewport *vp, const float *mvp)
+{
+   gl3_chain_build_viewport_pass(chain, *vp, mvp, true);
 }
 
 void gl3_filter_chain_end_frame(gl3_filter_chain_t *chain)

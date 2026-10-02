@@ -89,6 +89,9 @@
 #include "../tasks/tasks_internal.h"
 #include "../verbosity.h"
 #include "../gfx/video_driver.h"
+#ifdef HAVE_OPENXR
+#include "common/input_openxr.h"
+#endif
 
 #ifdef ANDROID
 #include "../frontend/drivers/platform_unix.h"
@@ -554,7 +557,8 @@ static void input_driver_update_joypad_focus(
       input_driver_state_t *input_st, const settings_t *settings)
 {
    if (     !settings->bools.input_joypad_background
-         && !video_driver_has_focus())
+         && !video_driver_has_focus()
+         && !video_driver_headset_focused())
       input_st->flags |=  INP_FLAG_JOYPAD_UNFOCUSED;
    else
       input_st->flags &= ~INP_FLAG_JOYPAD_UNFOCUSED;
@@ -650,6 +654,19 @@ bool input_driver_set_rumble(
    /* if sec_joypad exists, this set_rumble() return value will replace primary_joypad's return */
    if (sec_joypad     && sec_joypad->set_rumble)
       rumble_state = sec_joypad->set_rumble(joy_idx, effect, strength);
+
+#ifdef HAVE_OPENXR
+   /* The headset's controllers rumble too. input_set_rumble_state()
+    * leaves the gain to a driver that applies it in the device. */
+   {
+      uint16_t xr_strength = strength;
+      if (!primary_joypad || primary_joypad->set_rumble_gain)
+         xr_strength = (uint16_t)((config_get_ptr()->uints.input_rumble_gain
+               * strength) / 100);
+      if (input_openxr_set_rumble(port, effect, xr_strength))
+         rumble_state = true;
+   }
+#endif
 
    return rumble_state;
 }
@@ -890,6 +907,93 @@ unsigned input_driver_lightgun_id_convert(unsigned id)
    }
 
    return 0;
+}
+
+unsigned input_driver_analog_dpad_mode(const settings_t *settings,
+      unsigned port)
+{
+   unsigned mode = settings->uints.input_analog_dpad_mode[port];
+
+   switch (mode)
+   {
+      case ANALOG_DPAD_LSTICK:
+      case ANALOG_DPAD_RSTICK:
+      case ANALOG_DPAD_LRSTICK:
+      case ANALOG_DPAD_TWINSTICK:
+         if (input_driver_st.analog_requested[
+               settings->uints.input_remap_ports[port]])
+            return ANALOG_DPAD_NONE;
+         break;
+      case ANALOG_DPAD_LSTICK_FORCED:
+         return ANALOG_DPAD_LSTICK;
+      case ANALOG_DPAD_RSTICK_FORCED:
+         return ANALOG_DPAD_RSTICK;
+      case ANALOG_DPAD_LRSTICK_FORCED:
+         return ANALOG_DPAD_LRSTICK;
+      case ANALOG_DPAD_TWINSTICK_FORCED:
+         return ANALOG_DPAD_TWINSTICK;
+      default:
+         break;
+   }
+
+   return mode;
+}
+
+uint16_t input_driver_analog_dpad_buttons(unsigned mode,
+      const int16_t *analog, float axis_threshold)
+{
+   float analog_x, analog_y;
+   uint16_t buttons = 0;
+
+   switch (mode)
+   {
+      case ANALOG_DPAD_LSTICK:
+      case ANALOG_DPAD_TWINSTICK:
+         analog_x = (float)analog[0] / 0x7fff;
+         analog_y = (float)analog[1] / 0x7fff;
+         break;
+      case ANALOG_DPAD_RSTICK:
+         analog_x = (float)analog[2] / 0x7fff;
+         analog_y = (float)analog[3] / 0x7fff;
+         break;
+      case ANALOG_DPAD_LRSTICK:
+         analog_x = (float)analog[0] / 0x7fff;
+         analog_y = (float)analog[1] / 0x7fff;
+         if (!analog_x)
+            analog_x = (float)analog[2] / 0x7fff;
+         if (!analog_y)
+            analog_y = (float)analog[3] / 0x7fff;
+         break;
+      default:
+         return 0;
+   }
+
+   if (analog_x <= -axis_threshold)
+      buttons |= (1 << RETRO_DEVICE_ID_JOYPAD_LEFT);
+   if (analog_x >=  axis_threshold)
+      buttons |= (1 << RETRO_DEVICE_ID_JOYPAD_RIGHT);
+   if (analog_y <= -axis_threshold)
+      buttons |= (1 << RETRO_DEVICE_ID_JOYPAD_UP);
+   if (analog_y >=  axis_threshold)
+      buttons |= (1 << RETRO_DEVICE_ID_JOYPAD_DOWN);
+
+   /* Twin Stick's right stick is the face buttons. */
+   if (mode == ANALOG_DPAD_TWINSTICK)
+   {
+      analog_x = (float)analog[2] / 0x7fff;
+      analog_y = (float)analog[3] / 0x7fff;
+
+      if (analog_x <= -axis_threshold)
+         buttons |= (1 << RETRO_DEVICE_ID_JOYPAD_Y);
+      if (analog_x >=  axis_threshold)
+         buttons |= (1 << RETRO_DEVICE_ID_JOYPAD_A);
+      if (analog_y <= -axis_threshold)
+         buttons |= (1 << RETRO_DEVICE_ID_JOYPAD_X);
+      if (analog_y >=  axis_threshold)
+         buttons |= (1 << RETRO_DEVICE_ID_JOYPAD_B);
+   }
+
+   return buttons;
 }
 
 
@@ -2082,6 +2186,23 @@ static int16_t input_state_device(
                      res |= 1;
                }
 #endif
+#ifdef HAVE_OPENXR
+               /* The headset's controllers, as the overlay's buttons: a
+                * remapped button was mapped in input_driver_poll(). */
+               if (input_openxr_button(port, id))
+               {
+#ifdef HAVE_MENU
+                  bool menu_alive = (menu_state_get_ptr()->flags
+                        & MENU_ST_FLAG_ALIVE) ? true : false;
+#else
+                  bool menu_alive = false;
+#endif
+                  if (     menu_alive
+                        || !settings->bools.input_remap_binds_enable
+                        || (id == remap_button))
+                     res |= 1;
+               }
+#endif
             }
 
             if (id <= RETRO_DEVICE_ID_JOYPAD_R3)
@@ -2375,6 +2496,9 @@ static int16_t input_state_device(
                            }
                         }
 #endif
+#ifdef HAVE_OPENXR
+                        res = input_openxr_analog(port, idx, id, res);
+#endif
                      }
                   }
                }
@@ -2401,6 +2525,12 @@ static int16_t input_state_device(
       case RETRO_DEVICE_MOUSE:
       case RETRO_DEVICE_LIGHTGUN:
       case RETRO_DEVICE_POINTER:
+
+#ifdef HAVE_OPENXR
+         /* The headset's laser, ahead of the overlay and the mouse. */
+         if (input_openxr_pointer(port, device, idx, id, &res))
+            break;
+#endif
 
 #ifdef HAVE_OVERLAY
          if (     (input_st->overlay_ptr)
@@ -4411,6 +4541,7 @@ INPUT_NOINLINE static void input_poll_overlay(
    float touch_scale                        = (float)settings->uints.input_touch_scale;
    bool ol_ptr_enable                       = settings->bools.input_overlay_pointer_enable;
    bool osk_state_changed                   = false;
+   const video_views_layout_t *views        = video_driver_get_views_layout();
 
    static int old_ptr_count;
    static int old_blocked_touch_idx;
@@ -4437,7 +4568,10 @@ INPUT_NOINLINE static void input_poll_overlay(
    if (input->input_state && input_data)
    {
       rarch_joypad_info_t joypad_info;
-      unsigned device                 = (ol->active->flags & OVERLAY_FULL_SCREEN)
+      /* Views draw a non-fullscreen overlay over the whole window, and
+       * the pointer device reports packed-frame coordinates. */
+      unsigned device                 =
+            ((ol->active->flags & OVERLAY_FULL_SCREEN) || views)
          ? RARCH_DEVICE_POINTER_SCREEN
          : RETRO_DEVICE_POINTER;
       const input_device_driver_t
@@ -4531,9 +4665,11 @@ INPUT_NOINLINE static void input_poll_overlay(
          memset(&polled_data, 0, sizeof(struct input_overlay_state));
 
          /* Check hitboxes only if this touch pointer
-          * is not controlling a pointing device */
+          * is not controlling a pointing device.
+          * Drivers hide the overlay while views draw the UI per eye. */
          if (   ol->flags & INPUT_OVERLAY_ENABLE
              && !(ol->flags & INPUT_OVERLAY_GAMEPAD_HIDDEN)
+             && !(views && views->ui_per_eye)
              && !BIT16_GET(ptrdev_touch_mask, i))
             hitbox_pressed = input_overlay_poll(
                   ol, &polled_data, i, old_i,
@@ -4635,87 +4771,13 @@ INPUT_NOINLINE static void input_poll_overlay(
 
    /* Check for analog_dpad_mode.
     * Map analogs to d-pad buttons when configured. */
-   switch (analog_dpad_mode)
    {
-      case ANALOG_DPAD_LSTICK:
-      case ANALOG_DPAD_RSTICK:
-      {
-         float analog_x, analog_y;
-         unsigned analog_base = 2;
+      uint16_t dpad = input_driver_analog_dpad_buttons(analog_dpad_mode,
+            ol_state->analog, axis_threshold);
 
-         if (analog_dpad_mode == ANALOG_DPAD_LSTICK)
-            analog_base = 0;
-
-         analog_x = (float)ol_state->analog[analog_base + 0] / 0x7fff;
-         analog_y = (float)ol_state->analog[analog_base + 1] / 0x7fff;
-
-         if (analog_x <= -axis_threshold)
-            BIT256_SET(ol_state->buttons, RETRO_DEVICE_ID_JOYPAD_LEFT);
-         if (analog_x >=  axis_threshold)
-            BIT256_SET(ol_state->buttons, RETRO_DEVICE_ID_JOYPAD_RIGHT);
-         if (analog_y <= -axis_threshold)
-            BIT256_SET(ol_state->buttons, RETRO_DEVICE_ID_JOYPAD_UP);
-         if (analog_y >=  axis_threshold)
-            BIT256_SET(ol_state->buttons, RETRO_DEVICE_ID_JOYPAD_DOWN);
-         break;
-      }
-
-      case ANALOG_DPAD_LRSTICK:
-      {
-         float analog_x, analog_y;
-
-         analog_x = (float)ol_state->analog[0] / 0x7fff;
-         analog_y = (float)ol_state->analog[1] / 0x7fff;
-
-         if (!analog_x)
-            analog_x = (float)ol_state->analog[2] / 0x7fff;
-
-         if (!analog_y)
-            analog_y = (float)ol_state->analog[3] / 0x7fff;
-
-         if (analog_x <= -axis_threshold)
-            BIT256_SET(ol_state->buttons, RETRO_DEVICE_ID_JOYPAD_LEFT);
-         if (analog_x >=  axis_threshold)
-            BIT256_SET(ol_state->buttons, RETRO_DEVICE_ID_JOYPAD_RIGHT);
-         if (analog_y <= -axis_threshold)
-            BIT256_SET(ol_state->buttons, RETRO_DEVICE_ID_JOYPAD_UP);
-         if (analog_y >=  axis_threshold)
-            BIT256_SET(ol_state->buttons, RETRO_DEVICE_ID_JOYPAD_DOWN);
-         break;
-      }
-
-      case ANALOG_DPAD_TWINSTICK:
-      {
-         float analog_x, analog_y;
-
-         analog_x = (float)ol_state->analog[0] / 0x7fff;
-         analog_y = (float)ol_state->analog[1] / 0x7fff;
-
-         if (analog_x <= -axis_threshold)
-            BIT256_SET(ol_state->buttons, RETRO_DEVICE_ID_JOYPAD_LEFT);
-         if (analog_x >=  axis_threshold)
-            BIT256_SET(ol_state->buttons, RETRO_DEVICE_ID_JOYPAD_RIGHT);
-         if (analog_y <= -axis_threshold)
-            BIT256_SET(ol_state->buttons, RETRO_DEVICE_ID_JOYPAD_UP);
-         if (analog_y >=  axis_threshold)
-            BIT256_SET(ol_state->buttons, RETRO_DEVICE_ID_JOYPAD_DOWN);
-
-         analog_x = (float)ol_state->analog[2] / 0x7fff;
-         analog_y = (float)ol_state->analog[3] / 0x7fff;
-
-         if (analog_x <= -axis_threshold)
-            BIT256_SET(ol_state->buttons, RETRO_DEVICE_ID_JOYPAD_Y);
-         if (analog_x >=  axis_threshold)
-            BIT256_SET(ol_state->buttons, RETRO_DEVICE_ID_JOYPAD_A);
-         if (analog_y <= -axis_threshold)
-            BIT256_SET(ol_state->buttons, RETRO_DEVICE_ID_JOYPAD_X);
-         if (analog_y >=  axis_threshold)
-            BIT256_SET(ol_state->buttons, RETRO_DEVICE_ID_JOYPAD_B);
-         break;
-      }
-
-      default:
-         break;
+      for (j = 0; j < RARCH_FIRST_CUSTOM_BIND; j++)
+         if (dpad & (1 << j))
+            BIT256_SET(ol_state->buttons, j);
    }
 
    button_pressed = input_overlay_add_inputs(ol, ol_state, input_st,
@@ -7204,6 +7266,7 @@ void input_pad_connect(unsigned port, input_device_driver_t *driver)
 
 static bool input_keys_pressed_other_sources(
       input_driver_state_t *input_st,
+      unsigned port,
       unsigned i,
       input_bits_t *p_new_state)
 {
@@ -7226,6 +7289,11 @@ static bool input_keys_pressed_other_sources(
    if (i < RARCH_CUSTOM_BIND_LIST_END
          && input_st->remote
          && INPUT_REMOTE_KEY_PRESSED(input_st, i, 0))
+      return true;
+#endif
+
+#ifdef HAVE_OPENXR
+   if (input_openxr_button(port, i))
       return true;
 #endif
 
@@ -7356,7 +7424,7 @@ static void input_keys_pressed(
    for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
    {
       if (     (ret & (UINT64_C(1) << i))
-            || input_keys_pressed_other_sources(input_st, i, p_new_state))
+            || input_keys_pressed_other_sources(input_st, port, i, p_new_state))
       {
          any_pressed = true;
          held_now   |= (uint16_t)(1u << i);
@@ -7416,7 +7484,7 @@ static void input_keys_pressed(
 
          if (     bit_pressed
                || BIT64_GET(lifecycle_state, i)
-               || input_keys_pressed_other_sources(input_st, i, p_new_state))
+               || input_keys_pressed_other_sources(input_st, port, i, p_new_state))
          {
             if (!(input_st->flags & INP_FLAG_MENU_PRESS_PENDING))
                input_st->flags &= ~INP_FLAG_MENU_PRESS_CANCEL;
@@ -7592,7 +7660,7 @@ static void input_keys_pressed(
 
    for (i = RARCH_FIRST_META_KEY; i < RARCH_BIND_LIST_END; i++)
    {
-      bool other_pressed = input_keys_pressed_other_sources(input_st, i, p_new_state);
+      bool other_pressed = input_keys_pressed_other_sources(input_st, port, i, p_new_state);
       bool bit_pressed   = RETRO_KEYBIND_VALID(&binds[port][i])
             && input_state_wrap(
                   input_st->current_driver,
@@ -7739,6 +7807,9 @@ void input_driver_poll(void)
       sec_joypad->poll();
    if (input && input->poll)
       input->poll(input_st->current_data);
+#ifdef HAVE_OPENXR
+   input_openxr_poll();
+#endif
 
    /* The real drivers are polled regardless, so their state stays
     * current and nothing is replayed on refocus; everything read
@@ -7844,38 +7915,11 @@ void input_driver_poll(void)
    if (      input_st->overlay_ptr
          && (input_st->overlay_ptr->flags & INPUT_OVERLAY_ALIVE))
    {
-      unsigned input_analog_dpad_mode = settings->uints.input_analog_dpad_mode[0];
+      unsigned input_analog_dpad_mode = input_driver_analog_dpad_mode(
+            settings, 0);
       float input_overlay_opacity     = (input_st->overlay_ptr->flags & INPUT_OVERLAY_IS_OSK)
          ? settings->floats.input_osk_overlay_opacity
          : settings->floats.input_overlay_opacity;
-
-      switch (input_analog_dpad_mode)
-      {
-         case ANALOG_DPAD_LSTICK:
-         case ANALOG_DPAD_RSTICK:
-         case ANALOG_DPAD_LRSTICK:
-         case ANALOG_DPAD_TWINSTICK:
-            {
-               unsigned mapped_port      = settings->uints.input_remap_ports[0];
-               if (input_st->analog_requested[mapped_port])
-                  input_analog_dpad_mode = ANALOG_DPAD_NONE;
-            }
-            break;
-         case ANALOG_DPAD_LSTICK_FORCED:
-            input_analog_dpad_mode       = ANALOG_DPAD_LSTICK;
-            break;
-         case ANALOG_DPAD_RSTICK_FORCED:
-            input_analog_dpad_mode       = ANALOG_DPAD_RSTICK;
-            break;
-         case ANALOG_DPAD_LRSTICK_FORCED:
-            input_analog_dpad_mode       = ANALOG_DPAD_LRSTICK;
-            break;
-         case ANALOG_DPAD_TWINSTICK_FORCED:
-            input_analog_dpad_mode       = ANALOG_DPAD_TWINSTICK;
-            break;
-         default:
-            break;
-      }
 
       /* Under threaded video the pack's textures arrive after the
        * page was first shown; the page moves over to them here. */
@@ -8145,6 +8189,10 @@ void input_driver_poll(void)
                         current_button_value |= BIT256_GET(ol_state->buttons, j);
                   }
 #endif
+#ifdef HAVE_OPENXR
+                  if (input_openxr_button((unsigned)i, (unsigned)j))
+                     current_button_value = 1;
+#endif
                   /* Press */
                   if ((current_button_value == 1)
                         && !MAPPER_GET_KEY(handle, remap_key))
@@ -8202,6 +8250,10 @@ void input_driver_poll(void)
                      if (ol_state)
                         current_button_value |= BIT256_GET(ol_state->buttons, j);
                   }
+#endif
+#ifdef HAVE_OPENXR
+                  if (input_openxr_button((unsigned)i, (unsigned)j))
+                     current_button_value = 1;
 #endif
                   remap_valid                   =
                         (current_button_value == 1)
@@ -8737,6 +8789,9 @@ void input_driver_collect_system_input(input_driver_state_t *input_st,
                      a,
                      (input_st->libretro_input_binds[port]
                         ? *input_st->libretro_input_binds[port] : NULL));
+#ifdef HAVE_OPENXR
+               ret = input_openxr_analog(port, s, a, ret);
+#endif
 
                if (ret)
                {

@@ -331,6 +331,7 @@ OBJ += \
        led/led_driver.o \
        gfx/video_driver.o \
        gfx/common/video_mode_select.o \
+       gfx/video_views.o \
        gfx/gfx_display.o \
        gfx/gfx_animation.o \
        gfx/gfx_instrument.o \
@@ -1723,6 +1724,11 @@ ifeq ($(HAVE_VULKAN), 1)
 
    ifeq ($(HAVE_VULKAN_DISPLAY), 1)
       OBJ += gfx/drivers_context/khr_display_ctx.o
+   endif
+   ifeq ($(HAVE_OPENXR), 1)
+      OBJ += gfx/common/vulkan_openxr.o \
+             gfx/video_xr.o \
+             input/common/input_openxr.o
    endif
    NEED_CXX_LINKER = 1
    DEFINES += -DHAVE_VULKAN

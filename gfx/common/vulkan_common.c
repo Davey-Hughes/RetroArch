@@ -28,6 +28,9 @@
 #include "vulkan_common.h"
 #include "../include/vulkan/vulkan.h"
 #include "vksym.h"
+#ifdef HAVE_OPENXR
+#include "vulkan_openxr.h"
+#endif
 #include <libretro_vulkan.h>
 
 #ifdef HAVE_SDL3
@@ -39,6 +42,9 @@
 
 #include "../../verbosity.h"
 #include "../../configuration.h"
+#ifdef HAVE_OPENXR
+#include "../../runloop.h"
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -74,7 +80,16 @@
 static dylib_t                       vulkan_library;
 static VkInstance                    cached_instance_vk;
 static VkDevice                      cached_device_vk;
+static VkPhysicalDevice              cached_gpu_vk;
+static int                           cached_gpu_index_vk;
 static retro_vulkan_destroy_device_t cached_destroy_device_vk;
+#ifdef HAVE_OPENXR
+/* Kept with a cached device: the runtime made it. */
+static vulkan_openxr_t              *cached_xr;
+/* The runtime's instance between two Vulkan contexts, so it never sees
+ * RetroArch leave over a video reinit. */
+static vulkan_openxr_t              *kept_xr;
+#endif
 
 #ifdef __APPLE__
 /* On Apple platforms the Vulkan implementation is provided by MoltenVK
@@ -643,6 +658,82 @@ end:
    return ret;
 }
 
+#ifdef HAVE_OPENXR
+/* Appends name unless the list has it. */
+static void vulkan_append_ext(const char **list, uint32_t *count,
+      uint32_t cap, const char *name)
+{
+   uint32_t i;
+   for (i = 0; i < *count; i++)
+      if (string_is_equal(list[i], name))
+         return;
+   if (*count < cap)
+      list[(*count)++] = name;
+}
+
+/* Whether a queue family init_device() can use presents to the window. */
+static bool vulkan_context_gpu_presents(gfx_ctx_vulkan_data_t *vk,
+      VkPhysicalDevice gpu)
+{
+   uint32_t i;
+   uint32_t count                 = 0;
+   bool found                     = false;
+   VkQueueFamilyProperties *props = NULL;
+   vkGetPhysicalDeviceQueueFamilyProperties(gpu, &count, NULL);
+   if (!count || !(props = (VkQueueFamilyProperties*)
+            malloc(count * sizeof(*props))))
+      return false;
+   vkGetPhysicalDeviceQueueFamilyProperties(gpu, &count, props);
+   for (i = 0; i < count && !found; i++)
+   {
+      VkQueueFlags required = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT;
+      VkBool32 supported    = VK_FALSE;
+      if ((props[i].queueFlags & required) != required)
+         continue;
+      vkGetPhysicalDeviceSurfaceSupportKHR(gpu, i, vk->vk_surface,
+            &supported);
+      found = (supported == VK_TRUE);
+   }
+   free(props);
+   return found;
+}
+
+/* The headset's GPU, which must be one the loader lists and able to
+ * present to the window; otherwise the headset is dropped. */
+static bool vulkan_context_openxr_gpu(gfx_ctx_vulkan_data_t *vk,
+      const VkPhysicalDevice *gpus, uint32_t gpu_count)
+{
+   uint32_t i;
+   VkPhysicalDevice gpu = vulkan_openxr_gpu(vk->context.xr,
+         vk->context.instance);
+   for (i = 0; i < gpu_count; i++)
+   {
+      if (gpus[i] != gpu)
+         continue;
+      /* A display (KMS) surface is made after this first pick; the
+       * pick runs again in init_device() once it exists. */
+      if (     vk->vk_surface != VK_NULL_HANDLE
+            && !vulkan_context_gpu_presents(vk, gpu))
+      {
+         RARCH_WARN("[OpenXR] The runtime's GPU #%u cannot present to the window.\n",
+               (unsigned)i);
+         break;
+      }
+      RARCH_LOG("[Vulkan] Using the headset's GPU #%u: \"%s\".\n",
+            (unsigned)i, vk->gpu_list->elems[i].data);
+      vk->context.gpu       = gpu;
+      /* The runtime's pick, not GPU Index's: no index to set back. */
+      vk->context.gpu_index = 0;
+      return true;
+   }
+   if (gpu != VK_NULL_HANDLE && i == gpu_count)
+      RARCH_WARN("[OpenXR] The runtime's GPU is not one Vulkan lists.\n");
+   vulkan_openxr_drop(vk->context.xr);
+   vk->context.xr = NULL;
+   return false;
+}
+#endif
+
 static bool vulkan_context_init_gpu(gfx_ctx_vulkan_data_t *vk)
 {
    unsigned i;
@@ -698,6 +789,23 @@ static bool vulkan_context_init_gpu(gfx_ctx_vulkan_data_t *vk)
    }
 
    video_driver_set_gpu_api_devices(GFX_CTX_VULKAN_API, vk->gpu_list);
+
+   /* A cached device is reused as is, so it keeps the GPU it was made on. */
+   if (cached_device_vk && cached_gpu_vk)
+   {
+      vk->context.gpu       = cached_gpu_vk;
+      vk->context.gpu_index = cached_gpu_index_vk;
+      free(gpus);
+      return true;
+   }
+
+#ifdef HAVE_OPENXR
+   if (vk->context.xr && vulkan_context_openxr_gpu(vk, gpus, gpu_count))
+   {
+      free(gpus);
+      return true;
+   }
+#endif
 
    /* The device the index was chosen as, wherever the list now puts it */
    gpu_index = video_driver_gpu_index_resolve(GFX_CTX_VULKAN_API,
@@ -765,11 +873,114 @@ static const char *vulkan_optional_device_extensions[] = {
 #endif
 };
 
+#ifdef HAVE_OPENXR
+/* XR_KHR_vulkan_enable: the runtime's device extensions added to list,
+ * whoever makes the device. A GPU without one of them drops the
+ * headset, not the device. */
+static void vulkan_context_openxr_device_exts(gfx_ctx_vulkan_data_t *vk,
+      VkPhysicalDevice gpu, const char **list, uint32_t *count,
+      uint32_t cap)
+{
+   unsigned i, n;
+   uint32_t num_props           = 0;
+   VkExtensionProperties *props = NULL;
+   const char *xr_exts[VULKAN_OPENXR_MAX_EXTS];
+
+   if (!vk->context.xr || vulkan_openxr_uses_enable2(vk->context.xr))
+      return;
+   n = vulkan_openxr_device_extensions(vk->context.xr, xr_exts,
+         VULKAN_OPENXR_MAX_EXTS);
+   if (!n)
+      return;
+   if (     vkEnumerateDeviceExtensionProperties(gpu, NULL, &num_props,
+               NULL) != VK_SUCCESS
+         || (  num_props
+            && (  !(props = (VkExtensionProperties*)
+                     malloc(num_props * sizeof(*props)))
+               || vkEnumerateDeviceExtensionProperties(gpu, NULL,
+                     &num_props, props) != VK_SUCCESS)))
+   {
+      RARCH_WARN("[OpenXR] The GPU's device extensions could not be listed.\n");
+      i = 0;
+   }
+   else
+   {
+      for (i = 0; i < n; i++)
+         if (!vulkan_find_extensions(&xr_exts[i], 1, props, num_props))
+            break;
+      if (i < n)
+         RARCH_WARN("[OpenXR] The GPU lacks %s, which the runtime needs.\n",
+               xr_exts[i]);
+   }
+   if (i == n)
+   {
+      for (i = 0; i < n; i++)
+         vulkan_append_ext(list, count, cap, xr_exts[i]);
+   }
+   else
+   {
+      vulkan_openxr_drop(vk->context.xr);
+      vk->context.xr = NULL;
+   }
+   free(props);
+}
+#endif
+
+/* vkCreateDevice with the runtime's extensions (XR_KHR_vulkan_enable),
+ * or the runtime's own, which adds what it needs (XR_KHR_vulkan_enable2).
+ * A device that cannot take them drops the headset, not the device. */
+static VkResult vulkan_context_create_device(gfx_ctx_vulkan_data_t *vk,
+      VkPhysicalDevice gpu, const VkDeviceCreateInfo *info,
+      VkDevice *device)
+{
+#ifdef HAVE_OPENXR
+   if (vk->context.xr && vulkan_openxr_uses_enable2(vk->context.xr))
+   {
+      VkResult res = vulkan_openxr_create_device(vk->context.xr,
+            vulkan_symbol_wrapper_instance_proc_addr(), gpu, info, device);
+      if (res == VK_SUCCESS)
+         return res;
+      vulkan_openxr_drop(vk->context.xr);
+      vk->context.xr = NULL;
+   }
+   else if (vk->context.xr)
+   {
+      VkDeviceCreateInfo xr_info = *info;
+      uint32_t cap               = info->enabledExtensionCount
+         + VULKAN_OPENXR_MAX_EXTS;
+      const char **exts          = (const char**)malloc(cap * sizeof(*exts));
+      if (exts)
+      {
+         VkResult res = VK_ERROR_EXTENSION_NOT_PRESENT;
+         if (info->enabledExtensionCount)
+            memcpy((void*)exts, info->ppEnabledExtensionNames,
+                  info->enabledExtensionCount * sizeof(*exts));
+         xr_info.ppEnabledExtensionNames = exts;
+         vulkan_context_openxr_device_exts(vk, gpu, exts,
+               &xr_info.enabledExtensionCount, cap);
+         /* Still there: the GPU has them all. */
+         if (vk->context.xr)
+            res = vkCreateDevice(gpu, &xr_info, NULL, device);
+         free((void*)exts);
+         if (res == VK_SUCCESS)
+            return res;
+      }
+      if (vk->context.xr)
+      {
+         vulkan_openxr_drop(vk->context.xr);
+         vk->context.xr = NULL;
+      }
+   }
+#endif
+   return vkCreateDevice(gpu, info, NULL, device);
+}
+
 static VkDevice vulkan_context_create_device_wrapper(
       VkPhysicalDevice gpu, void *opaque,
       const VkDeviceCreateInfo *create_info)
 {
    VkResult res;
+   gfx_ctx_vulkan_data_t *vk      = (gfx_ctx_vulkan_data_t*)opaque;
    VkDeviceCreateInfo info        = *create_info;
    VkDevice device                = VK_NULL_HANDLE;
    const char **device_extensions = (const char **)malloc(
@@ -792,7 +1003,7 @@ static VkDevice vulkan_context_create_device_wrapper(
    }
 
    /* When we get around to using fancier features we can chain in PDF2 stuff. */
-   if ((res = vkCreateDevice(gpu, &info, NULL, &device)) != VK_SUCCESS)
+   if ((res = vulkan_context_create_device(vk, gpu, &info, &device)) != VK_SUCCESS)
    {
       RARCH_ERR("[Vulkan] Failed to create device (%d).\n", res);
       device = VK_NULL_HANDLE;
@@ -884,6 +1095,14 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
          if (!ret)
          {
             RARCH_WARN("[Vulkan] Failed to create_device2 on provided VkPhysicalDevice, letting core decide which GPU to use.\n");
+#ifdef HAVE_OPENXR
+            /* The headset's GPU was refused. */
+            if (vk->context.xr)
+            {
+               vulkan_openxr_drop(vk->context.xr);
+               vk->context.xr = NULL;
+            }
+#endif
             vk->context.gpu = VK_NULL_HANDLE;
             ret = iface->create_device2(&context, vk->context.instance,
                   vk->context.gpu,
@@ -894,12 +1113,26 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
       }
       else
       {
+#ifdef HAVE_OPENXR
+         const char *dev_exts[ARRAY_SIZE(vulkan_device_extensions)
+            + VULKAN_OPENXR_MAX_EXTS];
+         uint32_t num_dev_exts = 0;
+         for (i = 0; i < ARRAY_SIZE(vulkan_device_extensions); i++)
+            dev_exts[num_dev_exts++] = vulkan_device_extensions[i];
+         vulkan_context_openxr_device_exts(vk, vk->context.gpu, dev_exts,
+               &num_dev_exts, ARRAY_SIZE(dev_exts));
+#endif
          ret = iface->create_device(&context, vk->context.instance,
                vk->context.gpu,
                vk->vk_surface,
                vulkan_symbol_wrapper_instance_proc_addr(),
+#ifdef HAVE_OPENXR
+               dev_exts,
+               num_dev_exts,
+#else
                vulkan_device_extensions,
                ARRAY_SIZE(vulkan_device_extensions),
+#endif
                NULL,
                0,
                &features);
@@ -1076,6 +1309,7 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
       {
          vk->context.device = cached_device_vk;
          cached_device_vk   = NULL;
+         cached_gpu_vk      = VK_NULL_HANDLE;
 
          if (cached_destroy_device_vk)
          {
@@ -1086,8 +1320,8 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
          video_driver_cache_context_ack_set();
          RARCH_LOG("[Vulkan] Using cached Vulkan context.\n");
       }
-      else if (vkCreateDevice(vk->context.gpu, &device_info,
-               NULL, &vk->context.device) != VK_SUCCESS)
+      else if (vulkan_context_create_device(vk, vk->context.gpu,
+               &device_info, &vk->context.device) != VK_SUCCESS)
       {
          RARCH_ERR("[Vulkan] Failed to create device.\n");
          return false;
@@ -1142,6 +1376,28 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
    }
 #endif
 
+#ifdef HAVE_OPENXR
+   if (     vk->context.xr
+         && !vulkan_openxr_start(vk->context.xr,
+            vk->context.instance, vk->context.gpu, vk->context.device,
+            vk->context.graphics_queue_index, vk->context.queue_lock)
+         && !vulkan_openxr_restart(&vk->context.xr,
+            vk->context.instance, vk->context.gpu, vk->context.device,
+            vk->context.graphics_queue_index, vk->context.queue_lock))
+   {
+      /* The device was made for the runtime: rebuild video without it,
+       * unless the core keeps its context, which a reinit would reuse. */
+      if (video_st->hw_render.cache_context)
+         vulkan_openxr_drop(vk->context.xr);
+      else
+      {
+         vulkan_openxr_drop_and_reinit(vk->context.xr);
+         video_driver_modify_disp_flags(VIDEO_FLAG_DRIVER_REINIT, 0);
+      }
+      vk->context.xr = NULL;
+   }
+#endif
+
    return true;
 }
 
@@ -1161,6 +1417,25 @@ static const char *vulkan_optional_instance_extensions[] = {
 #endif
 };
 
+/* vkCreateInstance, or the runtime's, which adds what it needs. An
+ * instance the runtime refuses drops the headset. */
+static VkResult vulkan_context_create_instance(gfx_ctx_vulkan_data_t *vk,
+      const VkInstanceCreateInfo *info, VkInstance *instance)
+{
+#ifdef HAVE_OPENXR
+   if (vk->context.xr && vulkan_openxr_uses_enable2(vk->context.xr))
+   {
+      VkResult res = vulkan_openxr_create_instance(vk->context.xr,
+            vulkan_symbol_wrapper_instance_proc_addr(), info, instance);
+      if (res == VK_SUCCESS)
+         return res;
+      vulkan_openxr_drop(vk->context.xr);
+      vk->context.xr = NULL;
+   }
+#endif
+   return vkCreateInstance(info, NULL, instance);
+}
+
 static VkInstance vulkan_context_create_instance_wrapper(void *opaque, const VkInstanceCreateInfo *create_info)
 {
    VkResult res;
@@ -1168,8 +1443,8 @@ static VkInstance vulkan_context_create_instance_wrapper(void *opaque, const VkI
    gfx_ctx_vulkan_data_t *vk        = (gfx_ctx_vulkan_data_t *)opaque;
    VkInstanceCreateInfo info        = *create_info;
    VkInstance instance              = VK_NULL_HANDLE;
-   /* Room for VK_KHR_surface, WSI, SDL3, and the debug extension. */
-   const char *required_extensions[16];
+   /* Room for VK_KHR_surface, WSI, SDL3, the debug extension and a headset runtime's. */
+   const char *required_extensions[32];
    uint32_t required_extension_count = 0;
    const char **instance_extensions = (const char**)malloc((info.enabledExtensionCount
                                                           + ARRAY_SIZE(required_extensions)
@@ -1258,6 +1533,19 @@ static VkInstance vulkan_context_create_instance_wrapper(void *opaque, const VkI
       RARCH_WARN("[Vulkan] Dropping VK_EXT_debug_utils: extension list full.\n");
 #endif
 
+#ifdef HAVE_OPENXR
+   /* XR_KHR_vulkan_enable lists what its instance needs. */
+   if (vk->context.xr && !vulkan_openxr_uses_enable2(vk->context.xr))
+   {
+      const char *xr_exts[VULKAN_OPENXR_MAX_EXTS];
+      unsigned n = vulkan_openxr_instance_extensions(vk->context.xr,
+            xr_exts, VULKAN_OPENXR_MAX_EXTS);
+      for (i = 0; i < n; i++)
+         vulkan_append_ext(required_extensions, &required_extension_count,
+               ARRAY_SIZE(required_extensions), xr_exts[i]);
+   }
+#endif
+
    if (!(vulkan_find_instance_extensions(
             instance_extensions, &info.enabledExtensionCount,
             required_extensions, required_extension_count,
@@ -1308,7 +1596,7 @@ static VkInstance vulkan_context_create_instance_wrapper(void *opaque, const VkI
       }
    }
 
-   if ((res = vkCreateInstance(&info, NULL, &instance)) != VK_SUCCESS)
+   if ((res = vulkan_context_create_instance(vk, &info, &instance)) != VK_SUCCESS)
    {
       RARCH_ERR("[Vulkan] Failed to create Vulkan instance (%d).\n", res);
       RARCH_ERR("[Vulkan] If VULKAN_DEBUG=1 is enabled, make sure Vulkan validation layers are installed.\n");
@@ -3279,6 +3567,91 @@ bool vulkan_create_swapchain(gfx_ctx_vulkan_data_t *vk,
    return true;
 }
 
+#ifdef HAVE_OPENXR
+/* Every instance extension XR_KHR_vulkan_enable names must exist, or
+ * the instance itself would fail. */
+static bool vulkan_context_openxr_instance_exts_ok(vulkan_openxr_t *xr)
+{
+   uint32_t count = 0;
+   unsigned i, n;
+   bool ok        = true;
+   const char *xr_exts[VULKAN_OPENXR_MAX_EXTS];
+   VkExtensionProperties *props;
+
+   n = vulkan_openxr_instance_extensions(xr, xr_exts, VULKAN_OPENXR_MAX_EXTS);
+   if (!n)
+      return true;
+   if (     vkEnumerateInstanceExtensionProperties(NULL, &count, NULL) != VK_SUCCESS
+         || !count
+         || !(props = (VkExtensionProperties*)malloc(count * sizeof(*props))))
+      return false;
+   if (vkEnumerateInstanceExtensionProperties(NULL, &count, props) != VK_SUCCESS)
+      ok = false;
+   for (i = 0; ok && i < n; i++)
+      ok = vulkan_find_extensions(&xr_exts[i], 1, props, count);
+   free(props);
+   return ok;
+}
+
+/* Chosen before the instance exists: the runtime lists what it needs
+ * (XR_KHR_vulkan_enable), or makes the instance and device itself
+ * (XR_KHR_vulkan_enable2), which a core making its own device with
+ * create_device (v1) cannot use. */
+static void vulkan_context_openxr_init(gfx_ctx_vulkan_data_t *vk,
+      const struct retro_hw_render_context_negotiation_interface_vulkan *iface,
+      uint32_t api_version)
+{
+   settings_t *settings = config_get_ptr();
+   bool enable          = settings->bools.video_openxr_enable;
+   bool own_device      = iface && iface->create_device
+      && !(iface->interface_version >= 2 && iface->create_device2);
+
+   /* A kept device keeps the runtime it was made for, while the runtime
+    * keeps the instance. */
+   if (cached_instance_vk)
+   {
+      vulkan_openxr_free(kept_xr);
+      kept_xr = NULL;
+      if (cached_xr && enable && !vulkan_openxr_lost(cached_xr))
+         vk->context.xr = cached_xr;
+      else
+      {
+         vulkan_openxr_free(cached_xr);
+         if (enable)
+            vulkan_openxr_needs_reload();
+      }
+      cached_xr = NULL;
+      return;
+   }
+   if (cached_xr)
+   {
+      vulkan_openxr_free(cached_xr);
+      cached_xr = NULL;
+   }
+   if (!enable)
+   {
+      vulkan_openxr_free(kept_xr);
+      kept_xr = NULL;
+      return;
+   }
+   if (kept_xr && vulkan_openxr_reuse(kept_xr, own_device, api_version))
+      vk->context.xr = kept_xr;
+   else
+   {
+      vulkan_openxr_free(kept_xr);
+      vk->context.xr = vulkan_openxr_new(own_device, api_version);
+   }
+   kept_xr = NULL;
+   if (     vk->context.xr
+         && !vulkan_openxr_uses_enable2(vk->context.xr)
+         && !vulkan_context_openxr_instance_exts_ok(vk->context.xr))
+   {
+      vulkan_openxr_drop(vk->context.xr);
+      vk->context.xr = NULL;
+   }
+}
+#endif
+
 bool vulkan_context_init(gfx_ctx_vulkan_data_t *vk,
       enum vulkan_wsi_type type)
 {
@@ -3416,6 +3789,10 @@ bool vulkan_context_init(gfx_ctx_vulkan_data_t *vk,
          app.apiVersion = VK_API_VERSION_1_1;
    }
 
+#ifdef HAVE_OPENXR
+   vulkan_context_openxr_init(vk, iface, app.apiVersion);
+#endif
+
    if (cached_instance_vk)
    {
       vk->context.instance = cached_instance_vk;
@@ -3486,14 +3863,43 @@ bool vulkan_context_init(gfx_ctx_vulkan_data_t *vk,
    return true;
 }
 
+#ifdef HAVE_OPENXR
+void vulkan_context_openxr_forget(void)
+{
+   vulkan_openxr_free(kept_xr);
+   kept_xr = NULL;
+}
+
+/* Kept while the headset stays on, its session is healthy and RetroArch
+ * is not quitting; an ended session takes its instance with it. */
+static bool vulkan_context_openxr_keep(vulkan_openxr_t *xr)
+{
+   settings_t *settings = config_get_ptr();
+   return xr
+      && vulkan_openxr_keeps()
+      && settings->bools.video_openxr_enable
+      && !(runloop_get_flags() & RUNLOOP_FLAG_SHUTDOWN_INITIATED)
+      && vulkan_openxr_healthy(xr);
+}
+#endif
 
 void vulkan_context_destroy(gfx_ctx_vulkan_data_t *vk,
       bool destroy_surface)
 {
    video_driver_state_t *video_st = video_state_get_ptr();
    uint32_t video_st_flags        = 0;
+#ifdef HAVE_OPENXR
+   /* Its thread uses the queue, which is drained below. */
+   vulkan_openxr_stop(vk->context.xr);
+#endif
    if (!vk->context.instance)
+   {
+#ifdef HAVE_OPENXR
+      vulkan_openxr_free(vk->context.xr);
+      vk->context.xr = NULL;
+#endif
       return;
+   }
 
    if (vk->context.device)
       vkDeviceWaitIdle(vk->context.device);
@@ -3526,11 +3932,28 @@ void vulkan_context_destroy(gfx_ctx_vulkan_data_t *vk,
    if (video_st_flags & VIDEO_FLAG_CACHE_CONTEXT)
    {
       cached_device_vk         = vk->context.device;
+      cached_gpu_vk            = vk->context.gpu;
+      cached_gpu_index_vk      = vk->context.gpu_index;
       cached_instance_vk       = vk->context.instance;
       cached_destroy_device_vk = vk->context.destroy_device;
+#ifdef HAVE_OPENXR
+      cached_xr                = vk->context.xr;
+      vk->context.xr           = NULL;
+#endif
    }
    else
    {
+#ifdef HAVE_OPENXR
+      /* The runtime's objects on the device go first. */
+      if (vulkan_context_openxr_keep(vk->context.xr))
+      {
+         vulkan_openxr_release(vk->context.xr);
+         kept_xr = vk->context.xr;
+      }
+      else
+         vulkan_openxr_free(vk->context.xr);
+      vk->context.xr = NULL;
+#endif
       if (vk->context.device)
       {
          /* Call the frontend's destroy_device callback BEFORE

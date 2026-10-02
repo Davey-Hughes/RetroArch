@@ -3914,6 +3914,17 @@ bool runloop_environment_cb(unsigned cmd, void *data)
          break;
       }
 
+      case RETRO_ENVIRONMENT_SET_VIDEO_VIEWS:
+         if (!video_driver_set_views((const struct retro_video_views*)data))
+            return false;
+         break;
+
+      case RETRO_ENVIRONMENT_GET_VIDEO_VIEWS_STATUS:
+         if (!data)
+            return false;
+         *(unsigned*)data = video_driver_views_status();
+         break;
+
       case RETRO_ENVIRONMENT_GET_JIT_CAPABLE:
          {
 #if TARGET_OS_IPHONE
@@ -4680,6 +4691,9 @@ void runloop_event_deinit_core(void)
    }
 
    video_driver_cached_frame_retire();
+   video_driver_clear_views();
+   /* The next content gets its own headset notice. */
+   video_st->headset_notice_hz = 0;
 
    if (runloop_st->current_core.flags & RETRO_CORE_FLAG_INITED)
    {
@@ -5091,7 +5105,8 @@ static runloop_pace_facts_t runloop_pace_gather(settings_t *settings,
    if (menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE)   f |= PACE_FACT_MENU_ALIVE;
 #endif
    if (menu_early_exit)                                    f |= PACE_FACT_MENU_EARLY_EXIT;
-   if (settings->bools.vrr_runloop_enable)                 f |= PACE_FACT_VRR;
+   if (     settings->bools.vrr_runloop_enable
+         && !video_st->headset_interval)                   f |= PACE_FACT_VRR;
 #ifdef HAVE_THREADS
    if (video_st->thread_wrapper_active)                    f |= PACE_FACT_WRAPPER;
    if (settings->bools.video_threaded_display_pacing)      f |= PACE_FACT_DISPLAY_PACING;
@@ -6885,7 +6900,8 @@ static enum runloop_state_enum runloop_check_state(
 #endif
 
 #if defined(HAVE_MENU) || defined(HAVE_GFX_WIDGETS)
-   output_dims = video_driver_get_output_dims();
+   /* Per-eye UI lays out at one eye's size. */
+   output_dims = video_driver_get_ui_dims();
 
    gfx_animation_update(
          current_time,
@@ -6978,7 +6994,7 @@ static enum runloop_state_enum runloop_check_state(
 #endif
       {
          if (pause_nonactive)
-            focused = is_focused;
+            focused = is_focused || video_driver_headset_focused();
          else
             focused = true;
       }
@@ -7035,6 +7051,13 @@ static enum runloop_state_enum runloop_check_state(
       }
 
       /* Iterate the menu driver for one frame. */
+
+      /* A paused core asks for the views status only when it runs, so a
+       * change (Stereo Mode, a headset) may show or hide its options. */
+      if (     video_driver_views_status_changed()
+            && retroarch_ctl(RARCH_CTL_CORE_OPTION_UPDATE_DISPLAY, NULL))
+         menu_st->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH
+                         | MENU_ST_FLAG_PREVENT_POPULATE;
 
 #ifdef HAVE_CONFIGFILE
       /* If a configuration file load was requested on the previous
@@ -7443,6 +7466,9 @@ static enum runloop_state_enum runloop_check_state(
    /* Check statistics hotkey */
    HOTKEY_CHECK(RARCH_STATISTICS_TOGGLE, CMD_EVENT_STATISTICS_TOGGLE, true, NULL);
 
+   /* Check laser pointer hotkey: here, so it works in the menu too */
+   HOTKEY_CHECK(RARCH_LASER_POINTER_TOGGLE, CMD_EVENT_LASER_POINTER_TOGGLE, true, NULL);
+
    /* Check netplay host hotkey */
    HOTKEY_CHECK(RARCH_NETPLAY_HOST_TOGGLE, CMD_EVENT_NETPLAY_HOST_TOGGLE, true, NULL);
 
@@ -7616,7 +7642,8 @@ static enum runloop_state_enum runloop_check_state(
    if (netplay_allow_pause)
 #endif
    if (pause_nonactive)
-      focused                = is_focused;
+      focused                = is_focused
+                            || video_driver_headset_focused();
 
    /* Check pause hotkey */
    {
@@ -8122,6 +8149,9 @@ static enum runloop_state_enum runloop_check_state(
    /* Check VRR runloop hotkey */
    HOTKEY_CHECK(RARCH_VRR_RUNLOOP_TOGGLE, CMD_EVENT_VRR_RUNLOOP_TOGGLE, true, NULL);
 
+   /* Check headset recenter hotkey */
+   HOTKEY_CHECK(RARCH_HEADSET_RECENTER, CMD_EVENT_HEADSET_RECENTER, true, NULL);
+
    /* Check bsv movie hotkeys */
    HOTKEY_CHECK(RARCH_PLAY_REPLAY_KEY, CMD_EVENT_PLAY_REPLAY, true, NULL);
    HOTKEY_CHECK(RARCH_RECORD_REPLAY_KEY, CMD_EVENT_RECORD_REPLAY, true, NULL);
@@ -8385,6 +8415,16 @@ int runloop_iterate(void)
          & VIDEO_FLAG_GPU_DEVICE_LOST)
       runloop_gpu_device_lost(runloop_st);
 
+   if ((uint32_t)retro_atomic_load_relaxed_int(&video_st->flags)
+         & VIDEO_FLAG_DRIVER_REINIT)
+   {
+      int reinit_flags = DRIVER_VIDEO_MASK | DRIVER_INPUT_MASK
+         | DRIVER_MENU_MASK;
+      video_driver_modify_disp_flags(0, VIDEO_FLAG_DRIVER_REINIT);
+      RARCH_LOG("[Video] Reinitialising the video driver at its request.\n");
+      command_event(CMD_EVENT_REINIT, &reinit_flags);
+   }
+
 #ifdef HAVE_DISCORD
    if (runloop_st->frame_work & RUNLOOP_WORK_DISCORD)
       discord_poll(current_time);
@@ -8408,6 +8448,10 @@ int runloop_iterate(void)
 
    /* Tick deferred shader compilation (one pass per frame) */
    video_driver_shader_deferred_tick();
+
+#ifdef HAVE_OPENXR
+   video_driver_headset_poll();
+#endif
 
    if (runloop_st->frame_time.callback)
    {

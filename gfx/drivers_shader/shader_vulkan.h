@@ -201,12 +201,24 @@ void vulkan_filter_chain_build_offscreen_passes(vulkan_filter_chain_t *chain,
       VkCommandBuffer cmd, const VkViewport *vp);
 void vulkan_filter_chain_build_viewport_pass(vulkan_filter_chain_t *chain,
       VkCommandBuffer cmd, const VkViewport *vp, const float *mvp);
+/* The final pass again, into another viewport in the same frame, for a
+ * view shown in both eyes. It keeps the first draw's uniforms, and the
+ * feedback buffers swap once per frame. */
+void vulkan_filter_chain_build_viewport_pass_again(
+      vulkan_filter_chain_t *chain,
+      VkCommandBuffer cmd, const VkViewport *vp, const float *mvp);
 void vulkan_filter_chain_end_frame(vulkan_filter_chain_t *chain,
       VkCommandBuffer cmd);
 
 vulkan_filter_chain_t *vulkan_filter_chain_create_default(
       const struct vulkan_filter_chain_create_info *info,
       enum glslang_filter_chain_filter filter);
+
+/* The stock chain's form for drawing a source smaller than it is: the
+ * source at its own size into a mipmapped framebuffer, then trilinear
+ * into the viewport, whatever the filter setting. SDR only. */
+vulkan_filter_chain_t *vulkan_filter_chain_create_shrink(
+      const struct vulkan_filter_chain_create_info *info);
 
 vulkan_filter_chain_t *vulkan_filter_chain_create_from_preset(
       const struct vulkan_filter_chain_create_info *info,

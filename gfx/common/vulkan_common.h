@@ -206,6 +206,9 @@ typedef struct vulkan_context
 {
    slock_t *queue_lock;
    retro_vulkan_destroy_device_t destroy_device;   /* ptr alignment */
+   /* Headset output, or NULL. Always present, like debug_callback: every
+    * translation unit that includes this header shares the layout. */
+   struct vulkan_openxr *xr;
 
    VkInstance instance;
    VkPhysicalDevice gpu;
@@ -434,6 +437,12 @@ const char *vulkan_get_moltenvk_version(void);
 
 void vulkan_context_destroy(gfx_ctx_vulkan_data_t *vk,
       bool destroy_surface);
+
+#ifdef HAVE_OPENXR
+/* Frees the headset runtime's instance kept across a video reinit, when
+ * the video driver that follows is not Vulkan. */
+void vulkan_context_openxr_forget(void);
+#endif
 
 bool vulkan_surface_create(gfx_ctx_vulkan_data_t *vk,
       enum vulkan_wsi_type type,
