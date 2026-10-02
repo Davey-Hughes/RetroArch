@@ -39,6 +39,7 @@
 #define QDC_ONLY_ACTIVE_PATHS 0x00000002
 #endif
 #define DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE_CUSTOM 1
+#define DISPLAYCONFIG_MODE_INFO_TYPE_TARGET_CUSTOM 2
 #ifndef QDC_DATABASE_CURRENT
 #define QDC_DATABASE_CURRENT 0x00000004
 #endif
@@ -982,6 +983,109 @@ static void win32_display_server_get_video_output_next(void *data)
    }
 }
 
+#ifdef HAVE_D3DKMT
+/* Visible and total lines of the mode on the source the scanline is
+ * read from */
+static bool win32_display_server_scanout_lines(unsigned *active,
+      unsigned *total)
+{
+#if _WIN32_WINNT >= 0x0601 || _WIN32_WINDOWS >= 0x0601 /* Win 7 */
+   static DWORD cached_tick;
+   static unsigned cached_active;
+   static unsigned cached_total;
+   LUID luid;
+   unsigned i;
+   DWORD tick;
+   unsigned source_id                    = 0;
+   unsigned int num_paths                = 0;
+   unsigned int num_modes                = 0;
+   DISPLAYCONFIG_PATH_INFO_CUSTOM *paths = NULL;
+   DISPLAYCONFIG_MODE_INFO_CUSTOM *modes = NULL;
+   bool ret                              = false;
+#ifdef HAVE_DYLIB
+   static QUERYDISPLAYCONFIG          pQueryDisplayConfig;
+   static GETDISPLAYCONFIGBUFFERSIZES pGetDisplayConfigBufferSizes;
+
+   if (!pQueryDisplayConfig || !pGetDisplayConfigBufferSizes)
+   {
+      HMODULE user32                  = GetModuleHandle("user32.dll");
+      if (!pQueryDisplayConfig)
+         pQueryDisplayConfig          = (QUERYDISPLAYCONFIG)
+            GetProcAddress(user32, "QueryDisplayConfig");
+      if (!pGetDisplayConfigBufferSizes)
+         pGetDisplayConfigBufferSizes = (GETDISPLAYCONFIGBUFFERSIZES)
+            GetProcAddress(user32, "GetDisplayConfigBufferSizes");
+   }
+#else
+   static QUERYDISPLAYCONFIG          pQueryDisplayConfig          =
+      (QUERYDISPLAYCONFIG)QueryDisplayConfig;
+   static GETDISPLAYCONFIGBUFFERSIZES pGetDisplayConfigBufferSizes = GetDisplayConfigBufferSizes;
+#endif
+
+   if (!pQueryDisplayConfig || !pGetDisplayConfigBufferSizes)
+      return false;
+
+   /* Both counts are asked for in turn: one query answers the pair */
+   tick = GetTickCount();
+   if (cached_total && tick == cached_tick)
+   {
+      *active = cached_active;
+      *total  = cached_total;
+      return true;
+   }
+
+   if (!d3dkmt_source_get(&luid, &source_id))
+      return false;
+
+   if (     pGetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS,
+               &num_paths, &num_modes) != ERROR_SUCCESS
+         || !num_paths
+         || !num_modes)
+      return false;
+
+   paths = (DISPLAYCONFIG_PATH_INFO_CUSTOM *)
+      malloc(sizeof(DISPLAYCONFIG_PATH_INFO_CUSTOM) * num_paths);
+   modes = (DISPLAYCONFIG_MODE_INFO_CUSTOM *)
+      malloc(sizeof(DISPLAYCONFIG_MODE_INFO_CUSTOM) * num_modes);
+
+   if (     paths
+         && modes
+         && pQueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &num_paths, paths,
+               &num_modes, modes, NULL) == ERROR_SUCCESS)
+   {
+      for (i = 0; i < num_paths; i++)
+      {
+         const DISPLAYCONFIG_VIDEO_SIGNAL_INFO_CUSTOM *signal;
+         unsigned idx = paths[i].targetInfo.dummyunionname.modeInfoIdx;
+
+         if (     paths[i].sourceInfo.id                 != source_id
+               || paths[i].sourceInfo.adapterId.LowPart  != luid.LowPart
+               || paths[i].sourceInfo.adapterId.HighPart != luid.HighPart
+               || idx                                    >= num_modes
+               || modes[idx].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_TARGET_CUSTOM)
+            continue;
+
+         signal        = &modes[idx].dummyunionname.targetMode.targetVideoSignalInfo;
+         *active       = signal->activeSize.cy;
+         *total        = signal->totalSize.cy;
+         cached_active = *active;
+         cached_total  = *total;
+         cached_tick   = tick;
+         ret           = true;
+         break;
+      }
+   }
+
+   free(modes);
+   free(paths);
+
+   return ret;
+#else
+   return false;
+#endif
+}
+#endif
+
 static bool win32_display_server_get_metrics(void *data,
       enum display_metric_types type, float *value)
 {
@@ -992,6 +1096,22 @@ static bool win32_display_server_get_metrics(void *data,
       *value = 0;
       return false;
    }
+
+#ifdef HAVE_D3DKMT
+   if (     type == DISPLAY_METRIC_ACTIVE_LINES
+         || type == DISPLAY_METRIC_TOTAL_LINES)
+   {
+      unsigned active = 0;
+      unsigned total  = 0;
+
+      *value = 0;
+      if (!win32_display_server_scanout_lines(&active, &total))
+         return false;
+      *value = (type == DISPLAY_METRIC_ACTIVE_LINES)
+         ? (float)active : (float)total;
+      return true;
+   }
+#endif
 
    monitor = GetDC(NULL);
    if (!monitor)

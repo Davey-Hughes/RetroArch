@@ -248,6 +248,7 @@ typedef REASON_CONTEXT POWER_REQUEST_CONTEXT, *PPOWER_REQUEST_CONTEXT, *LPPOWER_
 
 #ifdef HAVE_D3DKMT
 static d3dkmt_adapter_t d3dkmt_adapter;
+static LUID d3dkmt_adapter_luid;
 
 static void d3dkmt_init(void)
 {
@@ -296,6 +297,7 @@ static void d3dkmt_init(void)
             {
                d3dkmt_adapter_hAdapter      = OpenAdapterData.hAdapter;
                d3dkmt_adapter_VidPnSourceId = OpenAdapterData.VidPnSourceId;
+               d3dkmt_adapter_luid          = OpenAdapterData.AdapterLuid;
             }
             DeleteDC(hdc);
 
@@ -332,6 +334,15 @@ bool d3dkmt_wait_vblank(void)
       return false;
    return (pD3DKMTWaitForVerticalBlankEvent(&d3dkmt_adapter.vb)
          == STATUS_SUCCESS);
+}
+
+bool d3dkmt_source_get(LUID *luid, unsigned *source_id)
+{
+   if (!d3dkmt_adapter.sl.hAdapter)
+      return false;
+   *luid      = d3dkmt_adapter_luid;
+   *source_id = d3dkmt_adapter.sl.VidPnSourceId;
+   return true;
 }
 
 int d3dkmt_scanline_get(void)
