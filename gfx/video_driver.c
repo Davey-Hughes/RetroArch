@@ -4973,6 +4973,20 @@ void video_driver_cached_frame_retire(void)
    frame_cache_hazard_drain(NULL);
 }
 
+void video_driver_cached_frame_retire_within(const void *base, size_t size)
+{
+   const void *data;
+   unsigned    dims;
+   size_t      pitch;
+
+   frame_cache_peek(&data, &dims, &pitch);
+
+   if (     base
+         && (uintptr_t)data >= (uintptr_t)base
+         && (uintptr_t)data -  (uintptr_t)base < size)
+      video_driver_cached_frame_retire();
+}
+
 bool video_driver_has_focus(void)
 {
    video_driver_state_t *video_st = &video_driver_st;

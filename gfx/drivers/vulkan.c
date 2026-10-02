@@ -5134,8 +5134,13 @@ static void vulkan_deinit_textures(vk_t *vk)
    int i;
    unsigned j;
    /* The cache may point into a swapchain texture we are about to
-    * unmap. Retire it and wait out any reader before doing so. */
-   video_driver_cached_frame_retire();
+    * unmap. Retire it then and wait out any reader before doing so.
+    * A frame in memory that is not ours stays cached: a swapchain
+    * rebuilt for a new window size has it to draw again. */
+   for (i = 0; i < (int) vk->num_swapchain_images; i++)
+      video_driver_cached_frame_retire_within(
+            vk->swapchain[i].texture.mapped,
+            (size_t)vk->swapchain[i].texture.size);
 
    vkDestroySampler(vk->context->device, vk->samplers.nearest,        NULL);
    vkDestroySampler(vk->context->device, vk->samplers.linear,         NULL);

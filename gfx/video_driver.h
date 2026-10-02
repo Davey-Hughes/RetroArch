@@ -1649,6 +1649,16 @@ void video_driver_cached_frame_invalidate(void);
  */
 void video_driver_cached_frame_retire(void);
 
+/**
+ * video_driver_cached_frame_retire_within:
+ *
+ * video_driver_cached_frame_retire(), but only when the cached frame
+ * points into the size bytes at base.  For a driver releasing memory
+ * it lent while it stays up: a frame in memory that is not the
+ * driver's stays cached and can be drawn again afterwards.
+ */
+void video_driver_cached_frame_retire_within(const void *base, size_t size);
+
 bool video_driver_is_hw_context(void);
 
 /* True when the active video driver's render context can only be driven
