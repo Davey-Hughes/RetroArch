@@ -6629,7 +6629,7 @@ static void *vulkan_init(const video_info_t *video,
     * Without this, the first frame after init renders the menu inside
     * the HDR render pass (A2B10G10R10) but uses pipelines compiled for
     * the SDR render pass (B8G8R8A8), causing a render pass format
-    * mismatch. The end-of-frame resize handler will recreate these. */
+    * mismatch. The resize handler will recreate these. */
    if (vk->context->flags & VK_CTX_FLAG_HDR_ENABLE)
    {
       vulkan_init_render_target(&vk->offscreen_buffer, vk->video_dims,
@@ -8673,6 +8673,112 @@ static void vulkan_views_ui_end(vk_t *vk, video_frame_info_t *video_info,
       vulkan_set_viewport(vk, video_info->dims, false, true);
 }
 
+/* Takes a pending resize, or a change of HDR mode: the swapchain and
+ * what is sized from it are made again. */
+static void vulkan_frame_resize(vk_t *vk, const video_frame_info_t *video_info)
+{
+#ifdef VULKAN_HDR_SWAPCHAIN
+   bool video_hdr_enable;
+#endif
+
+#ifdef VULKAN_HDR_SWAPCHAIN
+   video_hdr_enable = (video_driver_get_disp_flags() & VIDEO_FLAG_HDR_SUPPORT) && (video_info->hdr_mode > 0);
+   if (       (vk->flags & VK_FLAG_SHOULD_RESIZE)
+         || (((vk->context->flags & VK_CTX_FLAG_HDR_ENABLE) > 0)
+         != video_hdr_enable))
+#else
+   if (vk->flags & VK_FLAG_SHOULD_RESIZE)
+#endif /* VULKAN_HDR_SWAPCHAIN */
+   {
+#ifdef VULKAN_HDR_SWAPCHAIN
+      if (video_hdr_enable)
+      {
+         vk->context->flags |= VK_CTX_FLAG_HDR_ENABLE;
+         vulkan_wait_own_submissions(vk);
+         vulkan_destroy_hdr_buffer(vk->context->device, &vk->offscreen_buffer);
+         vulkan_destroy_hdr_buffer(vk->context->device, &vk->readback_image);
+         vulkan_retained_free(vk);
+      }
+      else
+         vk->context->flags &= ~VK_CTX_FLAG_HDR_ENABLE;
+
+#endif /* VULKAN_HDR_SWAPCHAIN */
+
+#ifdef VULKAN_HDR_SWAPCHAIN
+      /* Force swapchain recreation if the HDR format mode changed.
+       * Without this, vulkan_create_swapchain's early-return check
+       * (same width/height/interval) would skip the recreation. */
+      {
+         bool need_16bit = (vk->context->flags & VK_CTX_FLAG_HDR_SCRGB) != 0;
+         bool have_16bit = vk->context->swapchain_format
+            == VK_FORMAT_R16G16B16A16_SFLOAT;
+         if (need_16bit != have_16bit)
+            vk->context->flags |= VK_CTX_FLAG_INVALID_SWAPCHAIN;
+      }
+#endif
+
+      /* Same hazard as the HDR case above, for the SDR path: changing
+       * the requested bit depth does not change width/height/interval,
+       * so vulkan_create_swapchain would early-return and keep the old
+       * format.  Force recreation when the depth we want and the depth
+       * we have disagree. */
+      {
+         bool want_10bit        = (video_info->swapchain_bit_depth == 2);
+         bool have_10bit        =
+               (   vk->context->swapchain_format
+                     == VK_FORMAT_A2B10G10R10_UNORM_PACK32
+                || vk->context->swapchain_format
+                     == VK_FORMAT_A2R10G10B10_UNORM_PACK32);
+         bool sdr               =
+#ifdef VULKAN_HDR_SWAPCHAIN
+               !(vk->context->flags & VK_CTX_FLAG_HDR_ENABLE);
+#else
+               true;
+#endif
+         if (sdr && (want_10bit != have_10bit))
+            vk->context->flags |= VK_CTX_FLAG_INVALID_SWAPCHAIN;
+      }
+
+      if (vk->ctx_driver->set_resize)
+         vk->ctx_driver->set_resize(vk->ctx_data, video_info->dims);
+#ifdef VULKAN_HDR_SWAPCHAIN
+      if (vk->context->flags & VK_CTX_FLAG_HDR_ENABLE)
+      {
+         /* Create intermediary buffer to render menu/overlay content to.
+          * In HDR10 mode the game also renders through this buffer;
+          * in HDR16 (scRGB) mode only the menu/overlay uses it so
+          * that the copy pass can linearize sRGB content. */
+         vulkan_init_render_target(&vk->offscreen_buffer, video_info->dims,
+               VK_FORMAT_B8G8R8A8_UNORM, vk->sdr_render_pass, vk->context);
+         /* Create image for readback target in bgra8 format */
+         vulkan_init_render_target(&vk->readback_image, video_info->dims,
+               VK_FORMAT_B8G8R8A8_UNORM, vk->readback_render_pass, vk->context);
+      }
+#endif /* VULKAN_HDR_SWAPCHAIN */
+      vk->flags &= ~VK_FLAG_SHOULD_RESIZE;
+      vulkan_views_publish(vk);
+   }
+
+   if (vk->context->flags & VK_CTX_FLAG_INVALID_SWAPCHAIN)
+      vulkan_check_swapchain(vk);
+}
+
+/* A frame inside one of the swapchain textures lent to the core:
+ * rebuilding the swapchain frees them */
+static bool vulkan_frame_is_lent(const vk_t *vk, const void *frame)
+{
+   unsigned i;
+   for (i = 0; i < vk->num_swapchain_images; i++)
+   {
+      uintptr_t base = (uintptr_t)vk->swapchain[i].texture.mapped;
+      if (     base
+            && (uintptr_t)frame >= base
+            && (uintptr_t)frame -  base < vk->swapchain[i].texture.size)
+         return true;
+   }
+   return false;
+}
+
 static bool vulkan_frame(void *data, const void *frame,
       unsigned dims,
       uint64_t frame_count,
@@ -8717,7 +8823,6 @@ static bool vulkan_frame(void *data, const void *frame,
 #ifdef VULKAN_HDR_SWAPCHAIN
    bool end_pass;
    bool end_main_pass;
-   bool video_hdr_enable;
 #endif
    struct vk_per_frame *chain;
    struct vk_image *backbuffer;
@@ -8735,6 +8840,29 @@ static bool vulkan_frame(void *data, const void *frame,
 #ifdef VULKAN_HDR_SWAPCHAIN
    bool use_offscreen_buffer                     = false;
 #endif
+
+   /* A resize already asked for is taken before the frame, so that
+    * this frame is drawn at the new size and not the one after it.
+    * Not for a frame that depends on what the rebuild frees or
+    * resets, which resizes after presenting: one the core drew into
+    * a lent swapchain texture, a hardware frame from a running core,
+    * whose command buffers can still be pending, or a read-back on
+    * its staging slot.
+    * A new swapchain has no image acquired, and swap_buffers with
+    * nothing to present only acquires; under the emulated mailbox
+    * that acquire is a poll and can leave this frame without an
+    * image. */
+   if (     (vk->flags & VK_FLAG_SHOULD_RESIZE)
+         && !(vk->flags & VK_FLAG_READBACK_PENDING)
+         && !vulkan_frame_is_lent(vk, frame)
+         && !(   (vk->flags & VK_FLAG_HW_ENABLE)
+              && video_info->core_running))
+   {
+      vulkan_frame_resize(vk, video_info);
+      if (     !(vk->context->flags & VK_CTX_FLAG_HAS_ACQUIRED_SWAPCHAIN)
+            && vk->ctx_driver->swap_buffers)
+         vk->ctx_driver->swap_buffers(vk->ctx_data);
+   }
 
    /* The context may recreate its swapchain while acquiring the next
     * image. Rebuild driver-owned framebuffers before recording commands
@@ -9877,86 +10005,7 @@ static bool vulkan_frame(void *data, const void *frame,
 
    /* Handle spurious swapchain invalidations as soon as we can,
     * i.e. right after swap buffers. */
-#ifdef VULKAN_HDR_SWAPCHAIN
-   video_hdr_enable = (video_driver_get_disp_flags() & VIDEO_FLAG_HDR_SUPPORT) && (video_info->hdr_mode > 0);
-   if (       (vk->flags & VK_FLAG_SHOULD_RESIZE)
-         || (((vk->context->flags & VK_CTX_FLAG_HDR_ENABLE) > 0)
-         != video_hdr_enable))
-#else
-   if (vk->flags & VK_FLAG_SHOULD_RESIZE)
-#endif /* VULKAN_HDR_SWAPCHAIN */
-   {
-#ifdef VULKAN_HDR_SWAPCHAIN
-      if (video_hdr_enable)
-      {
-         vk->context->flags |= VK_CTX_FLAG_HDR_ENABLE;
-         vulkan_wait_own_submissions(vk);
-         vulkan_destroy_hdr_buffer(vk->context->device, &vk->offscreen_buffer);
-         vulkan_destroy_hdr_buffer(vk->context->device, &vk->readback_image);
-         vulkan_retained_free(vk);
-      }
-      else
-         vk->context->flags &= ~VK_CTX_FLAG_HDR_ENABLE;
-
-#endif /* VULKAN_HDR_SWAPCHAIN */
-
-#ifdef VULKAN_HDR_SWAPCHAIN
-      /* Force swapchain recreation if the HDR format mode changed.
-       * Without this, vulkan_create_swapchain's early-return check
-       * (same width/height/interval) would skip the recreation. */
-      {
-         bool need_16bit = (vk->context->flags & VK_CTX_FLAG_HDR_SCRGB) != 0;
-         bool have_16bit = vk->context->swapchain_format
-            == VK_FORMAT_R16G16B16A16_SFLOAT;
-         if (need_16bit != have_16bit)
-            vk->context->flags |= VK_CTX_FLAG_INVALID_SWAPCHAIN;
-      }
-#endif
-
-      /* Same hazard as the HDR case above, for the SDR path: changing
-       * the requested bit depth does not change width/height/interval,
-       * so vulkan_create_swapchain would early-return and keep the old
-       * format.  Force recreation when the depth we want and the depth
-       * we have disagree. */
-      {
-         bool want_10bit        = (video_info->swapchain_bit_depth == 2);
-         bool have_10bit        =
-               (   vk->context->swapchain_format
-                     == VK_FORMAT_A2B10G10R10_UNORM_PACK32
-                || vk->context->swapchain_format
-                     == VK_FORMAT_A2R10G10B10_UNORM_PACK32);
-         bool sdr               =
-#ifdef VULKAN_HDR_SWAPCHAIN
-               !(vk->context->flags & VK_CTX_FLAG_HDR_ENABLE);
-#else
-               true;
-#endif
-         if (sdr && (want_10bit != have_10bit))
-            vk->context->flags |= VK_CTX_FLAG_INVALID_SWAPCHAIN;
-      }
-
-      if (vk->ctx_driver->set_resize)
-         vk->ctx_driver->set_resize(vk->ctx_data, video_info->dims);
-#ifdef VULKAN_HDR_SWAPCHAIN
-      if (vk->context->flags & VK_CTX_FLAG_HDR_ENABLE)
-      {
-         /* Create intermediary buffer to render menu/overlay content to.
-          * In HDR10 mode the game also renders through this buffer;
-          * in HDR16 (scRGB) mode only the menu/overlay uses it so
-          * that the copy pass can linearize sRGB content. */
-         vulkan_init_render_target(&vk->offscreen_buffer, video_info->dims,
-               VK_FORMAT_B8G8R8A8_UNORM, vk->sdr_render_pass, vk->context);
-         /* Create image for readback target in bgra8 format */
-         vulkan_init_render_target(&vk->readback_image, video_info->dims,
-               VK_FORMAT_B8G8R8A8_UNORM, vk->readback_render_pass, vk->context);
-      }
-#endif /* VULKAN_HDR_SWAPCHAIN */
-      vk->flags &= ~VK_FLAG_SHOULD_RESIZE;
-      vulkan_views_publish(vk);
-   }
-
-   if (vk->context->flags & VK_CTX_FLAG_INVALID_SWAPCHAIN)
-      vulkan_check_swapchain(vk);
+   vulkan_frame_resize(vk, video_info);
 
    /* Disable BFI during fast forward, slow-motion,
     * pause, and menu to prevent flicker. */
