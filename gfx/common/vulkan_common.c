@@ -3876,6 +3876,7 @@ static bool vulkan_context_openxr_keep(vulkan_openxr_t *xr)
 {
    settings_t *settings = config_get_ptr();
    return xr
+      && vulkan_openxr_keeps()
       && settings->bools.video_openxr_enable
       && !(runloop_get_flags() & RUNLOOP_FLAG_SHUTDOWN_INITIATED)
       && vulkan_openxr_healthy(xr);

@@ -63,6 +63,10 @@ void vulkan_openxr_release(vulkan_openxr_t *xr);
  * ended neither it nor the instance. */
 bool vulkan_openxr_healthy(const vulkan_openxr_t *xr);
 
+/* False once the runtime did not take a kept instance, for the rest of
+ * the run: a reused one was dropped or could not be replaced. */
+bool vulkan_openxr_keeps(void);
+
 /* The kept instance for the next Vulkan context: false when it was lost
  * or cannot serve own_device, then the caller frees it and makes
  * another. */
@@ -70,7 +74,7 @@ bool vulkan_openxr_reuse(vulkan_openxr_t *xr, bool own_device,
       uint32_t api_version);
 
 /* OpenXR failed before the device existed: log, tell the user, free.
- * NULL is fine. */
+ * With NULL only the log: vulkan_openxr_new() has told the user. */
 void vulkan_openxr_drop(vulkan_openxr_t *xr);
 
 /* A kept Vulkan context cannot take the runtime in: tell the user. */
@@ -160,7 +164,8 @@ void vulkan_openxr_stop(vulkan_openxr_t *xr);
 void vulkan_openxr_stop_thread(vulkan_openxr_t *xr);
 
 /* The session failed on a device made for it: frees, tells the user,
- * and has the next video init skip the runtime. NULL is fine. */
+ * and has the next video init skip the runtime. NULL as for
+ * vulkan_openxr_drop(). */
 void vulkan_openxr_drop_and_reinit(vulkan_openxr_t *xr);
 
 /* Until the runtime ends the session or its thread stops: the headset

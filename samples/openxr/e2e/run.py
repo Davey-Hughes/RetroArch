@@ -2208,6 +2208,25 @@ def check_hw_teardown(res):
     return errors
 
 
+def controller_errors(res, sessions):
+    """Each session readies the controllers and has its bindings
+    suggested and accepted."""
+    errors = []
+    ready = res.log.count('[OpenXR] Headset controllers ready.')
+    if ready != sessions:
+        errors.append('headset controllers ready %d times, want %d (one '
+                      'per session)' % (ready, sessions))
+    if '[OpenXR] Headset controllers unavailable' in res.log:
+        errors.append('headset controllers unavailable in a session')
+    suggested = [(e['profile'], e['result']) for e in events(res, 'bindings')]
+    if (sorted(suggested) != sorted((p, 0) for p in PROFILES * sessions)
+            or res.log.count('[OpenXR] Bindings suggested for')
+            != sessions * len(PROFILES) or 'Bindings refused' in res.log):
+        errors.append('bindings suggested %s, want each profile accepted '
+                      'once per session' % suggested)
+    return errors
+
+
 def check_kept_retry(res):
     """A kept context's session that the runtime ended starts again at
     the next video reinit, on the same device."""
@@ -2227,12 +2246,8 @@ def check_kept_retry(res):
     if '0' not in stereo or stereo[-1:] != ['1']:
         errors.append('the core saw stereo %s, want it off and on again'
                       % ' '.join(stereo))
-    ready = res.log.count('[OpenXR] Headset controllers ready.')
-    if ready != 2:
-        errors.append('headset controllers ready %d times, want 2 (one '
-                      'per session)' % ready)
-    if '[OpenXR] Headset controllers unavailable' in res.log:
-        errors.append('headset controllers unavailable in a session')
+    # The new session's suggestions are made again, and accepted.
+    errors += controller_errors(res, 2)
     # RetroArch's log shows the release when the session ends, and the
     # new session's.
     seq = controllers(res)
@@ -2246,13 +2261,6 @@ def check_kept_retry(res):
     if len(dots) != 2:
         errors.append('%d laser dot swapchains, want 2 (one per start)'
                       % len(dots))
-    # The new session's suggestions are made again, and accepted.
-    suggested = [(e['profile'], e['result']) for e in events(res, 'bindings')]
-    if (sorted(suggested) != sorted((p, 0) for p in PROFILES * 2)
-            or res.log.count('[OpenXR] Bindings suggested for')
-            != 2 * len(PROFILES) or 'Bindings refused' in res.log):
-        errors.append('bindings suggested %s, want each profile accepted '
-                      'once per session' % suggested)
     return errors
 
 
@@ -2660,6 +2668,7 @@ def check_menu_load(made, refused=0, v1=False, enable2=False):
             errors.append('%d headset frames with the core\'s screens after '
                           'the load' % len(after))
         errors += check_screens()(res)
+        errors += controller_errors(res, 2)
         want, other = ((ENABLE2_LINE, ENABLE_LINE) if enable2
                        else (ENABLE_LINE, ENABLE2_LINE))
         if want not in res.log:
@@ -2712,6 +2721,44 @@ def check_session_fails_twice(res):
     if [f for f in res.frames if f['t_us'] > t + 3e6 and quads(f)]:
         errors.append('quads were submitted after the session failed twice')
     return errors + window_is(res, GREEN, 'the 2D map')
+
+
+TRIP_LINE = ('[OpenXR] The runtime did not take a kept instance; instances '
+             'are remade from now on.')
+KEEP_LINE = "[OpenXR] Keeping the runtime's instance."
+
+
+def check_no_keep(res):
+    """A kept instance that had to be dropped is the last one kept: the
+    first load loses the headset, and every later context makes a new
+    instance, which shows the second load's core."""
+    errors = []
+    trip = res.log.find(TRIP_LINE)
+    if trip < 0:
+        errors.append('missing "%s"' % TRIP_LINE)
+    elif res.log.count(TRIP_LINE) != 1:
+        errors.append('"%s" logged %d times, want once'
+                      % (TRIP_LINE, res.log.count(TRIP_LINE)))
+    elif KEEP_LINE in res.log[trip:]:
+        errors.append('an instance was kept after the runtime did not take '
+                      'one')
+    if REBUILT not in res.log:
+        errors.append('the first load did not lose the headset')
+    made = instances(res).count('instance')
+    if made != 3:
+        errors.append('%d instances made, want 3: the menu\'s, the menu\'s '
+                      'again, the second load\'s (%s)' % (made, instances(res)))
+    sessions = res.log.count('[OpenXR] Session created.')
+    if sessions != 3:
+        errors.append('%d sessions created, want 3 (menu, menu, second load)'
+                      % sessions)
+    t = res.marks.get('load2', 0) * 1e6
+    after = [f for f in res.frames if f['t_us'] > t + 3e6
+             and len([q for q in quads(f) if not q['flags'] & BLEND]) == 3]
+    if len(after) < 40:
+        errors.append('%d headset frames with the core\'s screens after the '
+                      'second load' % len(after))
+    return errors + check_screens()(res)
 
 
 def check_load_gl(res):
@@ -2808,7 +2855,7 @@ def check_close_keeps(res):
     if sessions != 3:
         errors.append('%d sessions created, want 3 (start, reinit, menu)'
                       % sessions)
-    return errors
+    return errors + controller_errors(res, 3)
 
 
 def check_lost_new(res):
@@ -3008,6 +3055,15 @@ CASES = [
      'steps': ([('wait', 6), ('script', 'fail session')] + LOAD_HW[1:]
                + [('shot', None)]),
      'check': check_session_fails_twice},
+    # A kept instance on enable2 cannot be replaced in place: it is
+    # dropped, and no later context keeps one.
+    {'name': 'menu-load-no-keep', 'menu_start': True,
+     'env': {'RA_XR_LAYER_NO_ENABLE': '1'}, 'options': VULKAN,
+     'steps': ([('wait', 6), ('script', 'fail session once')] + LOAD_HW[1:]
+               + [('send', 'CLOSE_CONTENT'), ('wait', 4), ('mark', 'load2'),
+                  ('send', 'LOAD_CORE ' + CORE), ('wait', 1),
+                  ('send', 'START_CORE'), ('wait', 8)]),
+     'check': check_no_keep},
     # A core that takes RetroArch to another video driver.
     {'name': 'menu-load-gl', 'menu_start': True,
      'options': {'video_views_test_hw': 'gl'},
