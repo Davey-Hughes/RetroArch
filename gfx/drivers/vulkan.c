@@ -8866,7 +8866,18 @@ static bool vulkan_frame(void *data, const void *frame,
       }
       if (     !resize_late
             && !vulkan_frame_resizes_late(vk, frame, video_info))
+      {
+         bool resize = (vk->flags & VK_FLAG_SHOULD_RESIZE) ? true : false;
          vulkan_apply_pending_resize(vk, video_info);
+         /* A new swapchain has no image acquired, and swap_buffers
+          * with nothing to present only acquires. Under the emulated
+          * mailbox that acquire is a poll, and can leave this frame
+          * without one. */
+         if (     resize
+               && !(vk->context->flags & VK_CTX_FLAG_HAS_ACQUIRED_SWAPCHAIN)
+               && vk->ctx_driver->swap_buffers)
+            vk->ctx_driver->swap_buffers(vk->ctx_data);
+      }
    }
 
    /* The context may recreate its swapchain while acquiring the next
