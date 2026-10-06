@@ -9467,6 +9467,33 @@ static void vulkan_views_ui_end(vk_t *vk, video_frame_info_t *video_info,
       vulkan_set_viewport(vk, video_info->dims, false, true);
 }
 
+/* A frame that a resize before it would break, which resizes after
+ * presenting instead: a hardware frame from a running core, whose
+ * command buffers can still be pending on the frame index a new
+ * swapchain starts from; one in a frame texture lent to the core,
+ * which a rebuild of everything frees; or one with a read-back
+ * pending, whose record a swapchain change clears. */
+static bool vulkan_frame_resizes_late(const vk_t *vk, const void *frame,
+      const video_frame_info_t *video_info)
+{
+   unsigned i;
+
+   if (     (vk->flags & VK_FLAG_READBACK_PENDING)
+         || (   (vk->flags & VK_FLAG_HW_ENABLE)
+             && video_info->core_running))
+      return true;
+
+   for (i = 0; i < vk->num_swapchain_images; i++)
+   {
+      uintptr_t base = (uintptr_t)vk->swapchain[i].texture.mapped;
+      if (     base
+            && (uintptr_t)frame >= base
+            && (uintptr_t)frame -  base < vk->swapchain[i].texture.size)
+         return true;
+   }
+   return false;
+}
+
 static bool vulkan_frame(void *data, const void *frame,
       unsigned dims,
       uint64_t frame_count,
@@ -9552,7 +9579,8 @@ static bool vulkan_frame(void *data, const void *frame,
          const char *env = getenv("RETROARCH_VULKAN_RESIZE_LATE");
          resize_late     = (env && env[0] == '1') ? 1 : 0;
       }
-      if (!resize_late)
+      if (     !resize_late
+            && !vulkan_frame_resizes_late(vk, frame, video_info))
          vulkan_apply_pending_resize(vk, video_info);
    }
 
