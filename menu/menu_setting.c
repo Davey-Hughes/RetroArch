@@ -8555,6 +8555,13 @@ int menu_action_handle_setting(rarch_setting_t *setting,
             int ret                       = -1;
             struct menu_state *menu_st    = menu_state_get_ptr();
             size_t selection              = menu_st->selection_ptr;
+            /* A handler may run the change handler itself;
+             * menu_setting_generic() fires the command. */
+            uint32_t cmd_flags            = setting->flags
+               & (SD_FLAG_CMD_APPLY_AUTO
+               |  SD_FLAG_CMD_TRIGGER_EVENT_TRIGGERED);
+
+            setting->flags               &= ~cmd_flags;
             switch (action)
             {
                case MENU_ACTION_UP:
@@ -8588,6 +8595,7 @@ int menu_action_handle_setting(rarch_setting_t *setting,
                      ret = setting->actions->start(setting);
                   break;
             }
+            setting->flags               |= cmd_flags;
 
             if (ret == 0)
                return menu_setting_generic(setting, selection, wraparound);
