@@ -934,6 +934,7 @@ static void lane_context_api_behind_wrapper(void)
    thread_video_t *thr;
    struct string_list *names;
    union string_list_elem_attr attr;
+   void *ctx_data;
 
    set_threaded_via_setting(true);
    run_frames(4);
@@ -946,6 +947,10 @@ static void lane_context_api_behind_wrapper(void)
    apilane_driver      = *thr->driver;
    apilane_driver.ident = "d3d11";
    set_driver(thr, &apilane_driver);
+   /* gl and vulkan answer through a context driver, which the driver
+    * stood in for does not have */
+   ctx_data               = video_st->context_data;
+   video_st->context_data = NULL;
 
    CHECK(!strcmp(video_driver_get_ident(), "d3d11"),
          "ident behind the wrapper: %s", video_driver_get_ident());
@@ -963,6 +968,7 @@ static void lane_context_api_behind_wrapper(void)
    video_driver_set_gpu_api_devices(GFX_CTX_DIRECT3D11_API, NULL);
    string_list_free(names);
 
+   video_st->context_data = ctx_data;
    video_thread_wait_idle();
    set_driver(thr, apilane_inner);
    run_frames(2);
