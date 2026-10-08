@@ -47,6 +47,18 @@ jobs:
           make clean
           rm -f openxr_input.log
 
+      - name: Run the shared OpenXR units against a stand-in runtime
+        working-directory: samples/openxr/core
+        shell: bash
+        run: |
+          set -euo pipefail
+          make clean all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+            ./openxr_core_test | tee openxr_core.log
+          grep -q "PASS openxr_core_test" openxr_core.log
+          make clean
+          rm -f openxr_core.log
+
   openxr-loader-threads:
     name: OpenXR loader under concurrent use (TSan, ASan+UBSan)
     runs-on: ubuntu-latest

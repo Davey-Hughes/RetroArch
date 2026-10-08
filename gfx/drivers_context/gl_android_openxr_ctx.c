@@ -284,9 +284,14 @@ bool gl_android_openxr_active(void)
    return gl_xr.session != XR_NULL_HANDLE;
 }
 
-bool gl_android_openxr_is_session_ready(void)
+bool gl_android_openxr_has_session(void)
 {
    return gl_xr.session != XR_NULL_HANDLE && gl_xr.images != NULL;
+}
+
+bool gl_android_openxr_is_session_ready(void)
+{
+   return gl_android_openxr_has_session() && gl_xr.running;
 }
 
 uint32_t gl_android_openxr_get_framebuffer(void)
