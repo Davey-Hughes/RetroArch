@@ -369,6 +369,7 @@ VIDEO CONTEXT
 #include "../libretro-common/vulkan/vulkan_symbol_wrapper.c"
 #ifdef HAVE_OPENXR
 #include "../gfx/video_xr.c"
+#include "../gfx/common/openxr_runtime.c"
 #include "../gfx/common/vulkan_openxr.c"
 #include "../input/common/input_openxr.c"
 #endif
