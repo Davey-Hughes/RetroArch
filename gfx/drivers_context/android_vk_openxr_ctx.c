@@ -1199,12 +1199,18 @@ static void *android_vk_openxr_gfx_ctx_get_context_data(void *data)
    return &xr->vk.context;
 }
 
-bool android_vk_openxr_is_session_ready(void)
+bool android_vk_openxr_has_session(void)
 {
    android_vk_openxr_t *xr = &android_vk_openxr_ctx;
 
    return xr->session != XR_NULL_HANDLE
        && xr->combined_images != NULL;
+}
+
+bool android_vk_openxr_is_session_ready(void)
+{
+   return android_vk_openxr_has_session()
+       && android_vk_openxr_ctx.running;
 }
 
 static void android_vk_openxr_gfx_ctx_release_current(void *data)

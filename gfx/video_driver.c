@@ -3061,6 +3061,10 @@ unsigned video_driver_views_status(void)
       status = video_st->current_video->get_video_views_status(
             video_st->data);
 #endif
+   /* HMD only with both eyes shown on a headset that presents. */
+   if (status & RETRO_VIDEO_VIEWS_STATUS_HMD)
+      status |= RETRO_VIDEO_VIEWS_STATUS_PRESENTS
+              | RETRO_VIDEO_VIEWS_STATUS_STEREO;
    if (!video_driver_test_all_flags(GFX_CTX_FLAGS_VIDEO_VIEWS))
       return status;
    status |= RETRO_VIDEO_VIEWS_STATUS_PRESENTS;

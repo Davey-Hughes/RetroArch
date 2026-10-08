@@ -12083,7 +12083,7 @@ static bool vulkan_set_vr_content_info(void *data,
     * context driver AND its session and reached a usable state. */
    if (     !vk->ctx_driver
          || !string_is_equal(vk->ctx_driver->ident, "android_vk_openxr")
-         || !android_vk_openxr_is_session_ready())
+         || !android_vk_openxr_has_session())
    {
       if (info)
          vk->flags &= ~VK_FLAG_XR_STEREO;
