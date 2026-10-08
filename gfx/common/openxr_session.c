@@ -60,13 +60,13 @@ void openxr_session_end(openxr_session_t *s, bool instance_lost)
       s->hooks.ended(s->hooks.user);
 }
 
-static void openxr_session_lock(openxr_session_t *s)
+void openxr_session_lock(openxr_session_t *s)
 {
    if (s->hooks.lock)
       s->hooks.lock(s->hooks.user);
 }
 
-static void openxr_session_unlock(openxr_session_t *s)
+void openxr_session_unlock(openxr_session_t *s)
 {
    if (s->hooks.unlock)
       s->hooks.unlock(s->hooks.user);

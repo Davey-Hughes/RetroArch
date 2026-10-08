@@ -76,6 +76,8 @@ bool openxr_session_load(openxr_session_t *s, const openxr_runtime_t *rt);
  * with LOCAL and VIEW spaces. */
 bool openxr_session_create(openxr_session_t *s, const void *graphics_binding);
 void openxr_session_destroy(openxr_session_t *s);
+void openxr_session_lock(openxr_session_t *s);
+void openxr_session_unlock(openxr_session_t *s);
 /* After a session the runtime ended: forget it, ready for a new one. */
 void openxr_session_reset(openxr_session_t *s);
 void openxr_session_poll(openxr_session_t *s);

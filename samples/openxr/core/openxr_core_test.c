@@ -216,6 +216,86 @@ static void t_hook_local(void *u) { t_h_local++; }
 static void t_hook_lock(void *u) { t_locks++; }
 static void t_hook_unlock(void *u) { t_unlocks++; }
 
+/* the swapchain stand-in */
+static uint32_t t_sc_images = 3;
+static uint32_t t_sc_images_second;
+static unsigned t_sc_count_queries;
+static unsigned t_sc_made, t_sc_destroyed, t_sc_created_total;
+static XrResult t_sc_wait = XR_SUCCESS;
+static XrResult t_sc_release = XR_SUCCESS;
+static XrDuration t_sc_wait_timeout;
+static int64_t  t_ci_format;
+static bool     t_ci_mutable;
+static uint32_t t_ci_width, t_ci_height;
+static unsigned t_sc_unlocked;
+static unsigned t_sc_acquires, t_sc_releases;
+static int64_t  t_formats[2] = { 50, 44 };
+
+static XRAPI_ATTR XrResult XRAPI_CALL t_enum_formats(XrSession s,
+      uint32_t cap, uint32_t *n, int64_t *f)
+{
+   uint32_t i;
+   *n = 2;
+   for (i = 0; i < cap && i < 2; i++)
+      f[i] = t_formats[i];
+   return XR_SUCCESS;
+}
+static XRAPI_ATTR XrResult XRAPI_CALL t_create_sc(XrSession s,
+      const XrSwapchainCreateInfo *ci, XrSwapchain *out)
+{
+   *out = (XrSwapchain)(uintptr_t)(0x100 + (++t_sc_created_total));
+   t_sc_made++;
+   t_ci_format  = ci->format;
+   t_ci_mutable = (ci->usageFlags & XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT) != 0;
+   t_ci_width   = ci->width;
+   t_ci_height  = ci->height;
+   if (t_locks <= t_unlocks)
+      t_sc_unlocked++;
+   return XR_SUCCESS;
+}
+static XRAPI_ATTR XrResult XRAPI_CALL t_destroy_sc(XrSwapchain s)
+{
+   t_sc_destroyed++;
+   if (t_locks <= t_unlocks)
+      t_sc_unlocked++;
+   return XR_SUCCESS;
+}
+static XRAPI_ATTR XrResult XRAPI_CALL t_enum_images(XrSwapchain s,
+      uint32_t cap, uint32_t *n, XrSwapchainImageBaseHeader *imgs)
+{
+   /* Only count queries reach here: the binding lists the images. */
+   t_sc_count_queries++;
+   *n = (t_sc_images_second && (t_sc_count_queries % 2) == 0)
+      ? t_sc_images_second : t_sc_images;
+   return XR_SUCCESS;
+}
+static XRAPI_ATTR XrResult XRAPI_CALL t_acquire(XrSwapchain s,
+      const XrSwapchainImageAcquireInfo *ai, uint32_t *i)
+{ t_sc_acquires++; *i = 1; return XR_SUCCESS; }
+static XRAPI_ATTR XrResult XRAPI_CALL t_wait(XrSwapchain s,
+      const XrSwapchainImageWaitInfo *wi)
+{ t_sc_wait_timeout = wi->timeout; return t_sc_wait; }
+static XRAPI_ATTR XrResult XRAPI_CALL t_release(XrSwapchain s,
+      const XrSwapchainImageReleaseInfo *ri)
+{ t_sc_releases++; return t_sc_release; }
+
+static unsigned t_listed[2];
+static XrSwapchain t_listed_sc[2];
+static void *t_listed_user[2];
+static int t_listed_got = -1;   /* images the binding gets; -1 all */
+static XrResult t_images_cb(void *user, XrSwapchain sc, unsigned layer,
+      uint32_t *count)
+{
+   t_listed[layer]      = *count;
+   t_listed_sc[layer]   = sc;
+   t_listed_user[layer] = user;
+   if (t_listed_got >= 0)
+      *count = (uint32_t)t_listed_got;
+   if (t_locks <= t_unlocks)
+      t_sc_unlocked++;
+   return XR_SUCCESS;
+}
+
 /* STANDIN-FUNCTIONS: later tasks add stand-in functions above this line. */
 
 static const struct { const char *name; PFN_xrVoidFunction fn; } t_procs[] = {
@@ -237,6 +317,13 @@ static const struct { const char *name; PFN_xrVoidFunction fn; } t_procs[] = {
    { "xrDestroySpace",         (PFN_xrVoidFunction)t_destroy_space },
    { "xrLocateViews",          (PFN_xrVoidFunction)t_locate_views },
    { "xrLocateSpace",          (PFN_xrVoidFunction)t_locate_space },
+   { "xrEnumerateSwapchainFormats", (PFN_xrVoidFunction)t_enum_formats },
+   { "xrCreateSwapchain",           (PFN_xrVoidFunction)t_create_sc },
+   { "xrDestroySwapchain",          (PFN_xrVoidFunction)t_destroy_sc },
+   { "xrEnumerateSwapchainImages",  (PFN_xrVoidFunction)t_enum_images },
+   { "xrAcquireSwapchainImage",     (PFN_xrVoidFunction)t_acquire },
+   { "xrWaitSwapchainImage",        (PFN_xrVoidFunction)t_wait },
+   { "xrReleaseSwapchainImage",     (PFN_xrVoidFunction)t_release },
    /* STANDIN-PROCS: later tasks add rows above this line. */
    { NULL, NULL }
 };
@@ -260,6 +347,7 @@ static XRAPI_ATTR XrResult XRAPI_CALL t_get_proc(XrInstance i,
 /* ---- the units, as they ship ---- */
 #include "../../../gfx/common/openxr_runtime.c"
 #include "../../../gfx/common/openxr_session.c"
+#include "../../../gfx/common/openxr_swapchain.c"
 /* STANDIN-UNITS: later tasks add #includes above this line. */
 
 static void t_runtime_defaults(void)
@@ -501,12 +589,143 @@ static void test_session(void)
    openxr_runtime_deinit(&rt);
 }
 
+static void test_swapchain(void)
+{
+   openxr_runtime_t rt;
+   openxr_session_t s;
+   openxr_swapchains_t sc;
+   unsigned n = 0, idx[2] = { 0, 0 };
+   int dummy_binding = 0;
+   int cb_user       = 0;
+
+   t_session_fresh(&rt, &s);
+   t_sc_images = 3;
+   t_sc_images_second = 0;
+   t_sc_count_queries = t_sc_made = t_sc_destroyed = 0;
+   t_sc_acquires = t_sc_releases = 0;
+   t_sc_wait = XR_SUCCESS;
+   openxr_session_load(&s, &rt);
+   CHECK(openxr_session_create(&s, &dummy_binding), "session create");
+   memset(&sc, 0, sizeof(sc));
+   t_missing = "xrCreateSwapchain";
+   CHECK(!openxr_swapchains_load(&sc, &rt, &s),
+         "loaded without xrCreateSwapchain");
+   t_missing = NULL;
+   memset(&sc, 0, sizeof(sc));
+   CHECK(openxr_swapchains_load(&sc, &rt, &s), "load");
+   openxr_swapchains_list_formats(&sc);
+   CHECK(openxr_swapchains_supports(&sc, 44)
+         && !openxr_swapchains_supports(&sc, 37), "formats");
+
+   t_locks = t_unlocks = 0;
+   t_listed[0] = t_listed[1] = 0;
+   t_sc_unlocked = 0;
+   CHECK(openxr_slot_create(&sc, 1, 44, true, VIDEO_SCALE_PACK(640, 480), 2,
+            t_images_cb, &cb_user, &n), "create");
+   CHECK(t_sc_made == 2 && n == 3 && t_listed[0] == 3 && t_listed[1] == 3,
+         "made %u n %u listed %u,%u", t_sc_made, n, t_listed[0], t_listed[1]);
+   CHECK(t_locks == 1 && t_unlocks == 1, "create not under one lock");
+   CHECK(!t_sc_unlocked, "%u create/callback calls outside the lock",
+         t_sc_unlocked);
+   CHECK(t_ci_format == 44 && t_ci_mutable
+         && t_ci_width == 640 && t_ci_height == 480,
+         "create info: format %d mutable %d %ux%u", (int)t_ci_format,
+         (int)t_ci_mutable, t_ci_width, t_ci_height);
+   CHECK(t_listed_sc[0] && t_listed_sc[1] && t_listed_sc[0] != t_listed_sc[1]
+         && t_listed_sc[0] == sc.slots[1].swapchains[0]
+         && t_listed_sc[1] == sc.slots[1].swapchains[1],
+         "callback swapchains not one per layer");
+   CHECK(t_listed_user[0] == &cb_user && t_listed_user[1] == &cb_user,
+         "callback user lost");
+   CHECK(LOGGED("[OpenXR] Slot 1: 640x480, 2 layer(s), 3 images.\n"),
+         "log: %s", t_log);
+
+   CHECK(!retro_atomic_load_acquire_int(&sc.slots[1].content),
+         "content before release");
+   t_locks = t_unlocks = 0;
+   t_sc_wait = XR_TIMEOUT_EXPIRED;
+   t_sc_wait_timeout = -1;
+   CHECK(!openxr_slot_acquire(&sc, 1, idx), "acquired while the image is busy");
+   CHECK(t_sc_wait_timeout == 0, "the image wait may block: timeout %lld",
+         (long long)t_sc_wait_timeout);
+   t_sc_wait = XR_SUCCESS;
+   CHECK(openxr_slot_acquire(&sc, 1, idx), "acquire after wait");
+   CHECK(idx[0] == 1 && idx[1] == 1, "acquired index %u,%u", idx[0], idx[1]);
+   CHECK(t_sc_acquires == 2, "an image acquired twice: %u acquires",
+         t_sc_acquires);
+   openxr_slot_release(&sc, 1);
+   CHECK(t_sc_releases == 2, "released %u of 2 layers", t_sc_releases);
+   CHECK(!t_locks && !t_unlocks, "acquire or release took the lock");
+   CHECK(retro_atomic_load_acquire_int(&sc.slots[1].content),
+         "no content after release");
+   openxr_slot_forget(&sc, 1);
+   CHECK(!retro_atomic_load_acquire_int(&sc.slots[1].content),
+         "forget kept content");
+   CHECK(openxr_slot_acquire(&sc, 1, idx), "acquire again");
+   t_sc_release = XR_ERROR_RUNTIME_FAILURE;
+   openxr_slot_release(&sc, 1);
+   t_sc_release = XR_SUCCESS;
+   CHECK(!retro_atomic_load_acquire_int(&sc.slots[1].content),
+         "content after a failed release");
+
+   /* Layers that disagree on their image count: nothing kept. */
+   t_sc_made = t_sc_destroyed = 0;
+   t_sc_count_queries = 0;
+   t_sc_images_second = 4;
+   t_listed[0] = t_listed[1] = 0;
+   t_reset_log();
+   CHECK(!openxr_slot_create(&sc, 2, 44, false, VIDEO_SCALE_PACK(64, 64), 2,
+            t_images_cb, NULL, &n), "made with mismatched layers");
+   CHECK(t_listed[0] == 3 && !t_listed[1],
+         "callback ran for the mismatched layer: %u,%u",
+         t_listed[0], t_listed[1]);
+   CHECK(LOGGED("[OpenXR] No 64x64 swapchain with 2 layer(s) ("),
+         "log: %s", t_log);
+   CHECK(t_sc_made == 2 && t_sc_destroyed == t_sc_made
+         && !sc.slots[2].swapchains[0],
+         "made %u destroyed %u", t_sc_made, t_sc_destroyed);
+   t_sc_images_second = 0;
+
+   /* The slot has the images the binding got, fewer than asked or none,
+    * and a second layer must have as many. */
+   t_reset_log();
+   t_listed_got = 2;
+   CHECK(openxr_slot_create(&sc, 3, 44, false, VIDEO_SCALE_PACK(64, 64), 1,
+            t_images_cb, NULL, &n) && n == 2,
+         "a binding that got 2 of 3 images: %u", n);
+   CHECK(LOGGED("[OpenXR] Slot 3: 64x64, 1 layer(s), 2 images.\n"),
+         "log: %s", t_log);
+   t_listed_got = 0;
+   CHECK(openxr_slot_create(&sc, 3, 44, false, VIDEO_SCALE_PACK(64, 64), 1,
+            t_images_cb, NULL, &n) && n == 0,
+         "a binding that got none: %u", n);
+   t_listed_got = 2;
+   t_listed[0] = t_listed[1] = 0;
+   CHECK(!openxr_slot_create(&sc, 4, 44, false, VIDEO_SCALE_PACK(64, 64), 2,
+            t_images_cb, NULL, &n) && !sc.slots[4].swapchains[0],
+         "a second layer of 3 after a first of 2");
+   CHECK(t_listed[0] == 3 && !t_listed[1],
+         "callback ran for the second layer: %u,%u",
+         t_listed[0], t_listed[1]);
+   t_listed_got = -1;
+   openxr_slot_destroy(&sc, 3);
+
+   t_sc_destroyed = 0;
+   t_sc_unlocked  = 0;
+   openxr_slot_destroy(&sc, 1);
+   CHECK(!t_sc_unlocked, "destroy outside the lock");
+   CHECK(t_sc_destroyed == 2 && !sc.slots[1].swapchains[0], "destroy");
+   openxr_session_destroy(&s);
+   openxr_runtime_deinit(&rt);
+}
+
 /* STANDIN-TESTS: later tasks add test functions above this line. */
 
 int main(void)
 {
    test_runtime();
    test_session();
+   test_swapchain();
    /* STANDIN-CALLS: later tasks add calls above this line. */
    if (failures)
    {
