@@ -202,8 +202,18 @@ static XRAPI_ATTR XrResult XRAPI_CALL t_destroy_space(XrSpace s) { t_spaces_dest
 static XRAPI_ATTR XrResult XRAPI_CALL t_locate_views(XrSession s,
       const XrViewLocateInfo *li, XrViewState *vs, uint32_t cap, uint32_t *n, XrView *v)
 { *n = 0; return XR_ERROR_RUNTIME_FAILURE; }
+static bool    t_head_tracked;   /* xrLocateSpace finds the head at t_head */
+static XrPosef t_head;
 static XRAPI_ATTR XrResult XRAPI_CALL t_locate_space(XrSpace a, XrSpace b,
-      XrTime t, XrSpaceLocation *loc) { return XR_ERROR_RUNTIME_FAILURE; }
+      XrTime t, XrSpaceLocation *loc)
+{
+   if (!t_head_tracked)
+      return XR_ERROR_RUNTIME_FAILURE;
+   loc->locationFlags = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT
+      | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+   loc->pose          = t_head;
+   return XR_SUCCESS;
+}
 
 /* the session's hooks, counted */
 static unsigned t_h_ended, t_h_exiting, t_h_local;
@@ -296,6 +306,49 @@ static XrResult t_images_cb(void *user, XrSwapchain sc, unsigned layer,
    return XR_SUCCESS;
 }
 
+/* the frame stand-in: a 72 Hz headset */
+static unsigned t_waits, t_begins, t_ends, t_frame_unlocked;
+static uint32_t t_last_layer_count;
+static unsigned t_extra_cap;
+static XrResult t_wait_frame_res = XR_SUCCESS;
+static XrResult t_end_frame_res  = XR_SUCCESS;
+static XRAPI_ATTR XrResult XRAPI_CALL t_wait_frame(XrSession s,
+      const XrFrameWaitInfo *wi, XrFrameState *st)
+{
+   t_waits++;
+   if (t_wait_frame_res != XR_SUCCESS)
+      return t_wait_frame_res;
+   st->predictedDisplayTime   = 1000000000LL + (XrTime)t_waits * 13888889LL;
+   st->predictedDisplayPeriod = 13888889LL;
+   st->shouldRender           = XR_TRUE;
+   return XR_SUCCESS;
+}
+static XRAPI_ATTR XrResult XRAPI_CALL t_begin_frame(XrSession s,
+      const XrFrameBeginInfo *bi)
+{
+   t_begins++;
+   if (t_locks - t_unlocks != 1)
+      t_frame_unlocked++;
+   return XR_SUCCESS;
+}
+static XRAPI_ATTR XrResult XRAPI_CALL t_end_frame(XrSession s,
+      const XrFrameEndInfo *ei)
+{
+   t_ends++;
+   t_last_layer_count = ei->layerCount;
+   if (t_locks - t_unlocks != 1)
+      t_frame_unlocked++;
+   return t_end_frame_res;
+}
+static unsigned t_extra_layers(void *user, XrTime time,
+      const XrCompositionLayerBaseHeader **layers, unsigned cap)
+{
+   static XrCompositionLayerQuad dot;
+   t_extra_cap = cap;
+   layers[0]   = (const XrCompositionLayerBaseHeader*)&dot;
+   return 1;
+}
+
 /* STANDIN-FUNCTIONS: later tasks add stand-in functions above this line. */
 
 static const struct { const char *name; PFN_xrVoidFunction fn; } t_procs[] = {
@@ -324,6 +377,9 @@ static const struct { const char *name; PFN_xrVoidFunction fn; } t_procs[] = {
    { "xrAcquireSwapchainImage",     (PFN_xrVoidFunction)t_acquire },
    { "xrWaitSwapchainImage",        (PFN_xrVoidFunction)t_wait },
    { "xrReleaseSwapchainImage",     (PFN_xrVoidFunction)t_release },
+   { "xrWaitFrame",  (PFN_xrVoidFunction)t_wait_frame },
+   { "xrBeginFrame", (PFN_xrVoidFunction)t_begin_frame },
+   { "xrEndFrame",   (PFN_xrVoidFunction)t_end_frame },
    /* STANDIN-PROCS: later tasks add rows above this line. */
    { NULL, NULL }
 };
@@ -348,6 +404,7 @@ static XRAPI_ATTR XrResult XRAPI_CALL t_get_proc(XrInstance i,
 #include "../../../gfx/common/openxr_runtime.c"
 #include "../../../gfx/common/openxr_session.c"
 #include "../../../gfx/common/openxr_swapchain.c"
+#include "../../../gfx/common/openxr_frame.c"
 /* STANDIN-UNITS: later tasks add #includes above this line. */
 
 static void t_runtime_defaults(void)
@@ -719,6 +776,357 @@ static void test_swapchain(void)
    openxr_runtime_deinit(&rt);
 }
 
+static bool t_near(float a, float b)
+{
+   float d = a - b;
+   return d < 1e-4f && d > -1e-4f;
+}
+
+/* A level pose, turned about y by the quaternion's y and w. */
+static bool t_pose_is(const video_xr_pose_t *p, float qy, float qw,
+      float x, float y, float z)
+{
+   return t_near(p->orientation.x, 0.0f) && t_near(p->orientation.y, qy)
+       && t_near(p->orientation.z, 0.0f) && t_near(p->orientation.w, qw)
+       && t_near(p->position.x, x) && t_near(p->position.y, y)
+       && t_near(p->position.z, z);
+}
+
+static void test_frame(void)
+{
+   openxr_runtime_t rt;
+   openxr_session_t s;
+   openxr_swapchains_t sc;
+   openxr_frame_t f;
+   video_xr_quad_set_t set, got;
+   video_xr_pose_t anchor;
+   unsigned n = 0, i;
+   int tick_key;
+   int dummy_binding = 0;
+   int cb_user       = 0;
+
+   t_session_fresh(&rt, &s);
+   openxr_session_load(&s, &rt);
+   openxr_session_create(&s, &dummy_binding);
+   memset(&sc, 0, sizeof(sc));
+   openxr_swapchains_load(&sc, &rt, &s);
+   memset(&f, 0, sizeof(f));
+   CHECK(openxr_frame_load(&f, &rt, &s, &sc), "load");
+   openxr_frame_session_created(&f);
+
+   /* What is published is what is read back, whole. */
+   memset(&set, 0, sizeof(set));
+   set.num_quads                = 2;
+   set.quads[0].slot            = 1;
+   set.quads[0].width           = 1.25f;
+   set.quads[1].slot            = 2;
+   set.quads[1].pose.position.z = -1.5f;
+   openxr_frame_publish(&f, &set);
+   openxr_frame_get_quads(&f, &got);
+   CHECK(!memcmp(&set, &got, sizeof(set)), "quads not read back whole");
+
+   /* Only quads whose slot has content become layers. */
+   openxr_slot_create(&sc, 1, 44, false, VIDEO_SCALE_PACK(64, 64), 1,
+         t_images_cb, &cb_user, &n);
+   openxr_slot_create(&sc, 2, 44, false, VIDEO_SCALE_PACK(64, 64), 1,
+         t_images_cb, &cb_user, &n);
+   retro_atomic_store_release_int(&sc.slots[1].content, 1);
+   {
+      XrCompositionLayerQuad layers[VIDEO_XR_MAX_QUADS];
+      const XrCompositionLayerBaseHeader *ptrs[VIDEO_XR_MAX_QUADS];
+      CHECK(openxr_frame_layers(&f, layers, ptrs) == 1,
+            "a quad without content shown");
+   }
+
+   /* A tick every interval headset frames. */
+   openxr_frame_set_pacing(&f, 3);
+   for (i = 0; i < 7; i++)
+      openxr_frame_tick(&f);
+   CHECK(retro_atomic_load_acquire_int(&f.tick_seq) == 2,
+         "%d ticks in 7 frames at interval 3",
+         retro_atomic_load_acquire_int(&f.tick_seq));
+   /* A waiter from here on: the frames below make the next tick. */
+   tick_key = retro_eventcount_prepare_wait(&f.tick);
+
+   /* One frame: wait, begin, end, with layers only while visible. */
+   openxr_session_set_alive(&s, true);
+   retro_atomic_store_release_int(&s.state, XR_SESSION_STATE_SYNCHRONIZED);
+   t_locks = t_unlocks = 0;
+   openxr_frame_run(&f);
+   CHECK(t_ends >= 1 && t_last_layer_count == 0, "layers while synchronized");
+   CHECK(t_locks == 1 && t_unlocks == 1 && !t_frame_unlocked,
+         "begin and end not under one lock");
+   retro_atomic_store_release_int(&s.state, XR_SESSION_STATE_FOCUSED);
+   openxr_frame_run(&f);
+   CHECK(t_last_layer_count == 1, "%u layers while focused", t_last_layer_count);
+   CHECK(openxr_frame_predicted_time(&f) > 0, "predicted time not published");
+
+   /* The host's layers follow the screens. */
+   f.extra_layers = t_extra_layers;
+   openxr_frame_run(&f);
+   CHECK(t_last_layer_count == 2 && t_extra_cap == OPENXR_MAX_EXTRA_LAYERS,
+         "%u layers with the host's, cap %u", t_last_layer_count, t_extra_cap);
+
+   /* Each frame counts toward the tick: the ninth at interval 3 makes
+    * one, and it wakes the waiter. */
+   CHECK(retro_atomic_load_acquire_int(&f.tick_seq) == 3,
+         "%d ticks in 10 frames at interval 3",
+         retro_atomic_load_acquire_int(&f.tick_seq));
+   CHECK(retro_eventcount_commit_wait_timeout(&f.tick, tick_key, 0),
+         "the tick woke no waiter");
+
+   /* The menu is premultiplied; a stereo screen's layers go one to each
+    * eye. */
+   openxr_slot_create(&sc, 3, 44, false, VIDEO_SCALE_PACK(64, 64), 2,
+         t_images_cb, &cb_user, &n);
+   retro_atomic_store_release_int(&sc.slots[3].content, 1);
+   memset(&set, 0, sizeof(set));
+   set.num_quads      = 3;
+   set.quads[0].kind  = VIDEO_XR_QUAD_MENU;
+   set.quads[0].slot  = 1;
+   set.quads[1].eye   = VIDEO_XR_EYE_LEFT;
+   set.quads[1].slot  = 3;
+   set.quads[2].eye   = VIDEO_XR_EYE_RIGHT;
+   set.quads[2].slot  = 3;
+   set.quads[2].layer = 1;
+   openxr_frame_publish(&f, &set);
+   {
+      XrCompositionLayerQuad layers[VIDEO_XR_MAX_QUADS];
+      const XrCompositionLayerBaseHeader *ptrs[VIDEO_XR_MAX_QUADS];
+      CHECK(openxr_frame_layers(&f, layers, ptrs) == 3, "menu and stereo");
+      CHECK(layers[0].layerFlags
+               == XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
+            && layers[0].eyeVisibility == XR_EYE_VISIBILITY_BOTH,
+            "menu: flags %x eyes %d", (unsigned)layers[0].layerFlags,
+            (int)layers[0].eyeVisibility);
+      CHECK(!layers[1].layerFlags
+            && layers[1].eyeVisibility == XR_EYE_VISIBILITY_LEFT
+            && layers[1].subImage.swapchain == sc.slots[3].swapchains[0]
+            && !layers[2].layerFlags
+            && layers[2].eyeVisibility == XR_EYE_VISIBILITY_RIGHT
+            && layers[2].subImage.swapchain == sc.slots[3].swapchains[1],
+            "stereo screen: eyes %d,%d", (int)layers[1].eyeVisibility,
+            (int)layers[2].eyeVisibility);
+   }
+
+   /* A recenter makes the tracked head's level pose the anchor; the
+    * runtime's recenter and a new session put it back and drop one
+    * asked for. The head here is turned a quarter left: level already. */
+   t_head_tracked        = true;
+   memset(&t_head, 0, sizeof(t_head));
+   t_head.orientation.y  = 0.70710678f;
+   t_head.orientation.w  = 0.70710678f;
+   t_head.position.x     = 0.25f;
+   t_head.position.y     = 1.5f;
+   t_head.position.z     = -0.5f;
+   openxr_frame_request_recenter(&f);
+   openxr_frame_run(&f);
+   openxr_frame_get_anchor(&f, &anchor);
+   CHECK(t_pose_is(&anchor, 0.70710678f, 0.70710678f, 0.25f, 1.5f, -0.5f)
+         && !retro_atomic_load_acquire_int(&f.recenter),
+         "recentered at %.2f,%.2f,%.2f yaw %.3f", anchor.position.x,
+         anchor.position.y, anchor.position.z, anchor.orientation.y);
+   openxr_frame_request_recenter(&f);
+   openxr_frame_local_changed(&f);
+   openxr_frame_get_anchor(&f, &anchor);
+   CHECK(t_pose_is(&anchor, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f),
+         "the runtime's recenter kept the anchor");
+   openxr_frame_run(&f);
+   openxr_frame_get_anchor(&f, &anchor);
+   CHECK(t_pose_is(&anchor, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f),
+         "a recenter asked before the runtime's ran after it");
+   openxr_frame_request_recenter(&f);
+   openxr_frame_run(&f);
+   openxr_frame_get_anchor(&f, &anchor);
+   CHECK(t_pose_is(&anchor, 0.70710678f, 0.70710678f, 0.25f, 1.5f, -0.5f),
+         "not recentered again");
+   openxr_frame_request_recenter(&f);
+   openxr_frame_session_created(&f);
+   openxr_frame_get_anchor(&f, &anchor);
+   CHECK(t_pose_is(&anchor, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f),
+         "a new session kept the anchor");
+   openxr_frame_run(&f);
+   openxr_frame_get_anchor(&f, &anchor);
+   CHECK(t_pose_is(&anchor, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f),
+         "a recenter asked before a new session ran in it");
+   t_head_tracked = false;
+
+   openxr_frame_deinit(&f);
+   openxr_slot_destroy(&sc, 1);
+   openxr_slot_destroy(&sc, 2);
+   openxr_slot_destroy(&sc, 3);
+   openxr_session_destroy(&s);
+   openxr_runtime_deinit(&rt);
+}
+
+static void t_frame_fresh(openxr_runtime_t *rt, openxr_session_t *s,
+      openxr_swapchains_t *sc, openxr_frame_t *f)
+{
+   static int binding;
+   t_session_fresh(rt, s);
+   openxr_session_load(s, rt);
+   openxr_session_create(s, &binding);
+   memset(sc, 0, sizeof(*sc));
+   openxr_swapchains_load(sc, rt, s);
+   memset(f, 0, sizeof(*f));
+   openxr_frame_load(f, rt, s, sc);
+   openxr_frame_session_created(f);
+}
+
+static void t_frame_free(openxr_runtime_t *rt, openxr_session_t *s,
+      openxr_frame_t *f)
+{
+   openxr_frame_deinit(f);
+   openxr_session_destroy(s);
+   openxr_runtime_deinit(rt);
+}
+
+/* The XR thread for one wait: a tick once the waiter parks, nothing if
+ * it returns first. */
+static retro_atomic_int_t t_ticker_done, t_ticker_ticked;
+static void t_ticker(void *data)
+{
+   openxr_frame_t *f = (openxr_frame_t*)data;
+   while (!retro_atomic_load_acquire_int(&t_ticker_done))
+   {
+      if (retro_atomic_load_acquire_int(&f->tick.waiters))
+      {
+         openxr_frame_tick(f);
+         retro_atomic_store_release_int(&t_ticker_ticked, 1);
+         return;
+      }
+      retro_sleep(1);
+   }
+}
+
+static bool t_wait_with_ticker(openxr_frame_t *f, bool *ticked)
+{
+   bool woke;
+   sthread_t *thread;
+   retro_atomic_store_release_int(&t_ticker_done, 0);
+   retro_atomic_store_release_int(&t_ticker_ticked, 0);
+   openxr_frame_pace_skip(f);
+   thread = sthread_create(t_ticker, f);
+   CHECK(thread, "no ticker thread");
+   woke   = openxr_frame_wait_tick(f, 10000000000LL);
+   retro_atomic_store_release_int(&t_ticker_done, 1);
+   if (thread)
+      sthread_join(thread);
+   *ticked = retro_atomic_load_acquire_int(&t_ticker_ticked) != 0;
+   return woke;
+}
+
+static void test_frame_pacing(void)
+{
+   openxr_runtime_t rt;
+   openxr_session_t s;
+   openxr_swapchains_t sc;
+   openxr_frame_t f;
+   bool ticked = false;
+
+   t_frame_fresh(&rt, &s, &sc, &f);
+   openxr_session_set_alive(&s, true);
+   retro_atomic_store_release_int(&f.period_ns, 13888889);
+   openxr_frame_set_pacing(&f, 1);
+
+   /* The core runs on the clock while the headset does not show the
+    * session, on its ticks while it does. */
+   retro_atomic_store_release_int(&s.state, XR_SESSION_STATE_SYNCHRONIZED);
+   openxr_frame_pace_wait(&f);
+   CHECK(f.pace_mode == 2, "hidden: pace mode %u", f.pace_mode);
+   CHECK(LOGGED("[OpenXR] Pacing on the clock while the headset does not show the session.\n"),
+         "log: %s", t_log);
+   retro_atomic_store_release_int(&s.state, XR_SESSION_STATE_FOCUSED);
+   openxr_frame_tick(&f);
+   openxr_frame_pace_wait(&f);
+   CHECK(f.pace_mode == 1 && !f.tick_late, "shown: pace mode %u late %d",
+         f.pace_mode, (int)f.tick_late);
+   CHECK(LOGGED("[OpenXR] Pacing on the headset's frames.\n"),
+         "log: %s", t_log);
+
+   /* A shown session's waiter sleeps until a tick wakes it; a hidden
+    * one's returns without one. */
+   CHECK(t_wait_with_ticker(&f, &ticked) && ticked,
+         "a tick did not end the wait");
+   retro_atomic_store_release_int(&s.state, XR_SESSION_STATE_SYNCHRONIZED);
+   CHECK(!t_wait_with_ticker(&f, &ticked) && !ticked,
+         "waited for a tick the hidden headset would not send");
+
+   /* The session's frames reach the headset from the XR thread's start
+    * to its stop, which joins it. The session never began, so the
+    * thread only polls. */
+   openxr_session_set_alive(&s, false);
+   CHECK(openxr_frame_start(&f), "start");
+   CHECK(f.thread && openxr_session_alive(&s), "not alive after start");
+   openxr_frame_stop(&f);
+   CHECK(!f.thread && !openxr_session_alive(&s),
+         "after stop: thread %p alive %d", (void*)f.thread,
+         (int)openxr_session_alive(&s));
+
+   t_frame_free(&rt, &s, &f);
+}
+
+static unsigned t_logged_times(const char *line)
+{
+   unsigned n    = 0;
+   const char *p = t_log;
+   while ((p = strstr(p, line)))
+   {
+      n++;
+      p += strlen(line);
+   }
+   return n;
+}
+
+/* A runtime may report the session or the instance lost from a frame
+ * call, without an event: the session ends once, logged once. */
+static void test_frame_lost(void)
+{
+   static const struct
+   {
+      XrResult wait, end;
+      const char *line;
+      bool lost;
+   } cases[] = {
+      { XR_ERROR_SESSION_LOST,  XR_SUCCESS,
+         "[OpenXR] xrWaitFrame failed (-17).\n", false },
+      { XR_SUCCESS, XR_ERROR_SESSION_LOST,
+         "[OpenXR] xrEndFrame failed (-17).\n", false },
+      { XR_ERROR_INSTANCE_LOST, XR_SUCCESS,
+         "[OpenXR] xrWaitFrame failed (-13).\n", true },
+      { XR_SUCCESS, XR_ERROR_INSTANCE_LOST,
+         "[OpenXR] xrEndFrame failed (-13).\n", true }
+   };
+   unsigned i;
+
+   for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+   {
+      openxr_runtime_t rt;
+      openxr_session_t s;
+      openxr_swapchains_t sc;
+      openxr_frame_t f;
+
+      t_frame_fresh(&rt, &s, &sc, &f);
+      t_push_state(T_SESSION, XR_SESSION_STATE_READY);
+      openxr_session_poll(&s);
+      openxr_session_set_alive(&s, true);
+      t_reset_log();
+      t_wait_frame_res = cases[i].wait;
+      t_end_frame_res  = cases[i].end;
+      openxr_frame_run(&f);
+      openxr_frame_run(&f);
+      t_wait_frame_res = XR_SUCCESS;
+      t_end_frame_res  = XR_SUCCESS;
+      CHECK(t_h_ended == 1, "%u: ended %u times", i, t_h_ended);
+      CHECK(!openxr_session_alive(&s) && !s.running && s.lost == cases[i].lost,
+            "%u: alive %d running %d lost %d", i,
+            (int)openxr_session_alive(&s), (int)s.running, (int)s.lost);
+      CHECK(t_logged_times(cases[i].line) == 1, "%u: logged %u times: %s",
+            i, t_logged_times(cases[i].line), t_log);
+      t_frame_free(&rt, &s, &f);
+   }
+}
+
 /* STANDIN-TESTS: later tasks add test functions above this line. */
 
 int main(void)
@@ -726,6 +1134,9 @@ int main(void)
    test_runtime();
    test_session();
    test_swapchain();
+   test_frame();
+   test_frame_pacing();
+   test_frame_lost();
    /* STANDIN-CALLS: later tasks add calls above this line. */
    if (failures)
    {

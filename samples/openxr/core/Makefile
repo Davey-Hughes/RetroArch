@@ -15,7 +15,13 @@ endif
 SRCS := openxr_core_test.c \
         $(ROOT)/libretro-common/compat/compat_strl.c \
         $(ROOT)/libretro-common/string/stdstring.c \
-        $(ROOT)/libretro-common/encodings/encoding_utf.c
+        $(ROOT)/libretro-common/encodings/encoding_utf.c \
+        $(ROOT)/gfx/video_xr.c \
+        $(ROOT)/gfx/video_views.c \
+        $(ROOT)/libretro-common/rthreads/rthreads.c \
+        $(ROOT)/libretro-common/rthreads/retro_eventcount.c \
+        $(ROOT)/libretro-common/time/rtime.c \
+        $(ROOT)/libretro-common/features/features_cpu.c
 
 all: $(TARGET)
 
