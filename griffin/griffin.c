@@ -370,6 +370,7 @@ VIDEO CONTEXT
 #ifdef HAVE_OPENXR
 #include "../gfx/video_xr.c"
 #include "../gfx/common/openxr_runtime.c"
+#include "../gfx/common/openxr_session.c"
 #include "../gfx/common/vulkan_openxr.c"
 #include "../input/common/input_openxr.c"
 #endif

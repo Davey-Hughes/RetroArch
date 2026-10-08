@@ -119,6 +119,103 @@ static XRAPI_ATTR XrResult XRAPI_CALL t_refresh_rates(XrSession s,
 static XRAPI_ATTR XrResult XRAPI_CALL t_request_rate(XrSession s, float hz)
 { return XR_SUCCESS; }
 
+#define T_SESSION ((XrSession)(uintptr_t)0x30)
+#define T_OTHER   ((XrSession)(uintptr_t)0x31)
+static XrEventDataBuffer t_events[8];
+static unsigned t_num_events, t_next_event;
+static XrResult t_poll_result = XR_SUCCESS;  /* after the queue runs dry */
+static unsigned t_begun, t_ended_sessions, t_locks, t_unlocks;
+static unsigned t_spaces_made, t_spaces_destroyed, t_space_fail_at;
+static unsigned t_seq, t_state_seq, t_begin_seq, t_ended_seq, t_exiting_seq;
+static bool t_begin_in_lock, t_end_in_lock;
+
+static bool t_event_room(void)
+{
+   CHECK(t_num_events < sizeof(t_events) / sizeof(t_events[0]),
+         "event queue full");
+   return t_num_events < sizeof(t_events) / sizeof(t_events[0]);
+}
+static void t_push_state(XrSession s, XrSessionState state)
+{
+   XrEventDataSessionStateChanged *e;
+   if (!t_event_room())
+      return;
+   e = (XrEventDataSessionStateChanged*)&t_events[t_num_events++];
+   memset(e, 0, sizeof(t_events[0]));
+   e->type    = XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED;
+   e->session = s;
+   e->state   = state;
+}
+static void t_push_space(XrSession s, XrReferenceSpaceType type)
+{
+   XrEventDataReferenceSpaceChangePending *e;
+   if (!t_event_room())
+      return;
+   e = (XrEventDataReferenceSpaceChangePending*)&t_events[t_num_events++];
+   memset(e, 0, sizeof(t_events[0]));
+   e->type               = XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING;
+   e->session            = s;
+   e->referenceSpaceType = type;
+}
+static void t_push_instance_loss(void)
+{
+   if (!t_event_room())
+      return;
+   memset(&t_events[t_num_events], 0, sizeof(t_events[0]));
+   t_events[t_num_events++].type = XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING;
+}
+static XRAPI_ATTR XrResult XRAPI_CALL t_poll_event(XrInstance i, XrEventDataBuffer *ev)
+{
+   if (t_next_event < t_num_events)
+   {
+      memcpy(ev, &t_events[t_next_event++], sizeof(*ev));
+      return XR_SUCCESS;
+   }
+   return t_poll_result == XR_SUCCESS ? XR_EVENT_UNAVAILABLE : t_poll_result;
+}
+static XRAPI_ATTR XrResult XRAPI_CALL t_create_session(XrInstance i,
+      const XrSessionCreateInfo *ci, XrSession *s) { *s = T_SESSION; return XR_SUCCESS; }
+static XRAPI_ATTR XrResult XRAPI_CALL t_destroy_session(XrSession s) { return XR_SUCCESS; }
+static XRAPI_ATTR XrResult XRAPI_CALL t_begin_session(XrSession s,
+      const XrSessionBeginInfo *b)
+{
+   t_begun++;
+   t_begin_seq     = ++t_seq;
+   t_begin_in_lock = (t_locks - t_unlocks == 1);
+   return XR_SUCCESS;
+}
+static XRAPI_ATTR XrResult XRAPI_CALL t_end_session(XrSession s)
+{
+   t_ended_sessions++;
+   t_end_in_lock = (t_locks - t_unlocks == 1);
+   return XR_SUCCESS;
+}
+static XRAPI_ATTR XrResult XRAPI_CALL t_create_space(XrSession s,
+      const XrReferenceSpaceCreateInfo *ci, XrSpace *out)
+{
+   if (t_space_fail_at && t_spaces_made + 1 == t_space_fail_at)
+      return XR_ERROR_RUNTIME_FAILURE;
+   *out = (XrSpace)(uintptr_t)(0x40 + (++t_spaces_made));
+   return XR_SUCCESS;
+}
+static XRAPI_ATTR XrResult XRAPI_CALL t_destroy_space(XrSpace s) { t_spaces_destroyed++; return XR_SUCCESS; }
+static XRAPI_ATTR XrResult XRAPI_CALL t_locate_views(XrSession s,
+      const XrViewLocateInfo *li, XrViewState *vs, uint32_t cap, uint32_t *n, XrView *v)
+{ *n = 0; return XR_ERROR_RUNTIME_FAILURE; }
+static XRAPI_ATTR XrResult XRAPI_CALL t_locate_space(XrSpace a, XrSpace b,
+      XrTime t, XrSpaceLocation *loc) { return XR_ERROR_RUNTIME_FAILURE; }
+
+/* the session's hooks, counted */
+static unsigned t_h_ended, t_h_exiting, t_h_local;
+static XrSessionState t_h_last_state;
+static void t_hook_state(void *u, XrSessionState s)
+{ t_h_last_state = s; t_state_seq = ++t_seq; }
+static void t_hook_ended(void *u) { t_h_ended++; t_ended_seq = ++t_seq; }
+static void t_hook_exiting(void *u) { t_h_exiting++; t_exiting_seq = ++t_seq; }
+static void t_hook_local(void *u) { t_h_local++; }
+static void t_hook_lock(void *u) { t_locks++; }
+static void t_hook_unlock(void *u) { t_unlocks++; }
+
 /* STANDIN-FUNCTIONS: later tasks add stand-in functions above this line. */
 
 static const struct { const char *name; PFN_xrVoidFunction fn; } t_procs[] = {
@@ -131,6 +228,15 @@ static const struct { const char *name; PFN_xrVoidFunction fn; } t_procs[] = {
    { "xrEnumerateEnvironmentBlendModes",  (PFN_xrVoidFunction)t_enum_modes },
    { "xrEnumerateDisplayRefreshRatesFB",  (PFN_xrVoidFunction)t_refresh_rates },
    { "xrRequestDisplayRefreshRateFB",     (PFN_xrVoidFunction)t_request_rate },
+   { "xrPollEvent",            (PFN_xrVoidFunction)t_poll_event },
+   { "xrCreateSession",        (PFN_xrVoidFunction)t_create_session },
+   { "xrDestroySession",       (PFN_xrVoidFunction)t_destroy_session },
+   { "xrBeginSession",         (PFN_xrVoidFunction)t_begin_session },
+   { "xrEndSession",           (PFN_xrVoidFunction)t_end_session },
+   { "xrCreateReferenceSpace", (PFN_xrVoidFunction)t_create_space },
+   { "xrDestroySpace",         (PFN_xrVoidFunction)t_destroy_space },
+   { "xrLocateViews",          (PFN_xrVoidFunction)t_locate_views },
+   { "xrLocateSpace",          (PFN_xrVoidFunction)t_locate_space },
    /* STANDIN-PROCS: later tasks add rows above this line. */
    { NULL, NULL }
 };
@@ -153,6 +259,7 @@ static XRAPI_ATTR XrResult XRAPI_CALL t_get_proc(XrInstance i,
 
 /* ---- the units, as they ship ---- */
 #include "../../../gfx/common/openxr_runtime.c"
+#include "../../../gfx/common/openxr_session.c"
 /* STANDIN-UNITS: later tasks add #includes above this line. */
 
 static void t_runtime_defaults(void)
@@ -246,11 +353,160 @@ static void test_runtime(void)
    openxr_runtime_deinit(&rt);
 }
 
+static void t_session_fresh(openxr_runtime_t *rt, openxr_session_t *s)
+{
+   t_runtime_defaults();
+   memset(rt, 0, sizeof(*rt));
+   openxr_runtime_create_instance(rt, t_get_proc, "XR_KHR_vulkan_enable2");
+   openxr_runtime_find_system(rt);
+   memset(s, 0, sizeof(*s));
+   s->hooks.state_changed = t_hook_state;
+   s->hooks.ended         = t_hook_ended;
+   s->hooks.exiting       = t_hook_exiting;
+   s->hooks.local_changed = t_hook_local;
+   s->hooks.lock          = t_hook_lock;
+   s->hooks.unlock        = t_hook_unlock;
+   t_num_events = t_next_event = 0;
+   t_poll_result = XR_SUCCESS;
+   t_begun = t_ended_sessions = t_locks = t_unlocks = 0;
+   t_spaces_made = t_spaces_destroyed = t_space_fail_at = 0;
+   t_h_ended = t_h_exiting = t_h_local = 0;
+   t_h_last_state = XR_SESSION_STATE_UNKNOWN;
+   t_seq = t_state_seq = t_begin_seq = t_ended_seq = t_exiting_seq = 0;
+   t_begin_in_lock = t_end_in_lock = false;
+}
+
+static void test_session(void)
+{
+   openxr_runtime_t rt;
+   openxr_session_t s;
+   int dummy_binding = 0;
+
+   /* READY begins under the lock; FOCUSED is focused; STOPPING ends. */
+   t_session_fresh(&rt, &s);
+   CHECK(openxr_session_load(&s, &rt), "load");
+   CHECK(openxr_session_create(&s, &dummy_binding), "create");
+   CHECK(t_spaces_made == 2, "LOCAL and VIEW: %u spaces", t_spaces_made);
+   openxr_session_set_alive(&s, true);
+   t_push_state(T_SESSION, XR_SESSION_STATE_READY);
+   openxr_session_poll(&s);
+   CHECK(t_begun == 1 && s.running, "not begun");
+   CHECK(t_locks == 1 && t_unlocks == 1, "begin not under the lock");
+   CHECK(t_begin_in_lock, "xrBeginSession ran outside the lock");
+   CHECK(t_state_seq && t_state_seq < t_begin_seq,
+         "state_changed (%u) not before begin (%u)", t_state_seq, t_begin_seq);
+   t_push_state(T_SESSION, XR_SESSION_STATE_SYNCHRONIZED);
+   t_push_state(T_SESSION, XR_SESSION_STATE_VISIBLE);
+   t_push_state(T_SESSION, XR_SESSION_STATE_FOCUSED);
+   openxr_session_poll(&s);
+   CHECK(openxr_session_focused(&s) && openxr_session_visible(&s), "not focused");
+   CHECK(t_h_last_state == XR_SESSION_STATE_FOCUSED, "hook missed a state");
+   CHECK(LOGGED("[OpenXR] Session focused.\n"), "log: %s", t_log);
+   t_push_state(T_SESSION, XR_SESSION_STATE_VISIBLE);
+   openxr_session_poll(&s);
+   CHECK(!openxr_session_focused(&s) && openxr_session_visible(&s), "visible");
+   t_push_state(T_SESSION, XR_SESSION_STATE_STOPPING);
+   openxr_session_poll(&s);
+   CHECK(t_ended_sessions == 1 && !s.running, "STOPPING did not end it");
+   CHECK(t_end_in_lock, "xrEndSession ran outside the lock");
+   CHECK(!openxr_session_visible(&s), "visible while stopping");
+
+   /* Another session's events are not this one's. */
+   t_session_fresh(&rt, &s);
+   openxr_session_load(&s, &rt);
+   openxr_session_create(&s, &dummy_binding);
+   t_push_state(T_OTHER, XR_SESSION_STATE_READY);
+   t_push_space(T_OTHER, XR_REFERENCE_SPACE_TYPE_LOCAL);
+   openxr_session_poll(&s);
+   CHECK(t_begun == 0 && t_h_local == 0, "acted on another session's events");
+
+   /* LOCAL recentered for this session; STAGE is not LOCAL. */
+   t_push_space(T_SESSION, XR_REFERENCE_SPACE_TYPE_STAGE);
+   t_push_space(T_SESSION, XR_REFERENCE_SPACE_TYPE_LOCAL);
+   openxr_session_poll(&s);
+   CHECK(t_h_local == 1, "local_changed %u times", t_h_local);
+
+   /* EXITING: ended once, exiting every time. */
+   openxr_session_set_alive(&s, true);
+   t_push_state(T_SESSION, XR_SESSION_STATE_EXITING);
+   openxr_session_poll(&s);
+   CHECK(t_h_ended == 1 && t_h_exiting == 1, "exiting: ended %u exiting %u",
+         t_h_ended, t_h_exiting);
+   CHECK(s.ended && !openxr_session_alive(&s) && !s.lost, "exit state");
+   CHECK(t_ended_seq && t_ended_seq < t_exiting_seq,
+         "ended (%u) not before exiting (%u)", t_ended_seq, t_exiting_seq);
+   t_push_state(T_SESSION, XR_SESSION_STATE_EXITING);
+   openxr_session_poll(&s);
+   CHECK(t_h_ended == 1 && t_h_exiting == 2, "second EXITING");
+
+   /* LOSS_PENDING ends it, not lost; instance loss is lost. */
+   t_session_fresh(&rt, &s);
+   openxr_session_load(&s, &rt);
+   openxr_session_create(&s, &dummy_binding);
+   t_push_state(T_SESSION, XR_SESSION_STATE_LOSS_PENDING);
+   openxr_session_poll(&s);
+   CHECK(s.ended && !s.lost && t_h_ended == 1, "loss pending");
+   t_push_instance_loss();
+   openxr_session_poll(&s);
+   CHECK(s.lost && t_h_ended == 1, "instance loss: lost %d ended %u", s.lost, t_h_ended);
+
+   /* xrPollEvent reporting the instance lost, from FOCUSED. */
+   t_session_fresh(&rt, &s);
+   openxr_session_load(&s, &rt);
+   openxr_session_create(&s, &dummy_binding);
+   openxr_session_set_alive(&s, true);
+   t_push_state(T_SESSION, XR_SESSION_STATE_READY);
+   t_push_state(T_SESSION, XR_SESSION_STATE_SYNCHRONIZED);
+   t_push_state(T_SESSION, XR_SESSION_STATE_VISIBLE);
+   t_push_state(T_SESSION, XR_SESSION_STATE_FOCUSED);
+   openxr_session_poll(&s);
+   CHECK(openxr_session_focused(&s), "not focused before the loss");
+   t_poll_result = XR_ERROR_INSTANCE_LOST;
+   openxr_session_poll(&s);
+   CHECK(s.lost && s.ended, "XR_ERROR_INSTANCE_LOST not lost");
+
+   /* Reset forgets an ended session but not a lost instance (the host
+    * drops the runtime on it); destroy frees the spaces. */
+   openxr_session_reset(&s);
+   CHECK(!s.session && !s.ended && s.lost, "reset keeps lost");
+   CHECK(t_spaces_destroyed == 2, "spaces destroyed: %u", t_spaces_destroyed);
+   CHECK(retro_atomic_load_acquire_int(&s.state) == XR_SESSION_STATE_UNKNOWN,
+         "state not cleared by reset");
+   openxr_session_set_alive(&s, true);
+   CHECK(!openxr_session_focused(&s), "focused after reset");
+
+   /* A failed space leaves nothing behind. */
+   t_session_fresh(&rt, &s);
+   openxr_session_load(&s, &rt);
+   t_space_fail_at = 2;
+   t_reset_log();
+   CHECK(!openxr_session_create(&s, &dummy_binding), "created without VIEW");
+   CHECK(t_spaces_destroyed == 1 && !s.session && !s.local_space,
+         "VIEW failure left spaces: %u destroyed", t_spaces_destroyed);
+   CHECK(LOGGED("[OpenXR] No VIEW space ("), "log: %s", t_log);
+   t_session_fresh(&rt, &s);
+   openxr_session_load(&s, &rt);
+   t_space_fail_at = 1;
+   t_reset_log();
+   CHECK(!openxr_session_create(&s, &dummy_binding), "created without LOCAL");
+   CHECK(t_spaces_destroyed == 0 && !s.session && !s.local_space,
+         "LOCAL failure left spaces");
+   CHECK(LOGGED("[OpenXR] No LOCAL space ("), "log: %s", t_log);
+   t_space_fail_at = 0;
+
+   /* A runtime that lacks a session function. */
+   t_session_fresh(&rt, &s);
+   t_missing = "xrLocateSpace";
+   CHECK(!openxr_session_load(&s, &rt), "loaded without xrLocateSpace");
+   openxr_runtime_deinit(&rt);
+}
+
 /* STANDIN-TESTS: later tasks add test functions above this line. */
 
 int main(void)
 {
    test_runtime();
+   test_session();
    /* STANDIN-CALLS: later tasks add calls above this line. */
    if (failures)
    {
