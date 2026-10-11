@@ -326,7 +326,6 @@ VIDEO CONTEXT
 #if defined(ANDROID)
 #include "../gfx/drivers_context/android_ctx.c"
 #if defined(HAVE_OPENXR)
-#include "../input/drivers/openxr_input.c"
 #if defined(HAVE_OPENGLES3)
 #include "../gfx/drivers_context/gl_android_openxr_ctx.c"
 #endif
@@ -374,7 +373,6 @@ VIDEO CONTEXT
 #include "../libretro-common/vulkan/vulkan_symbol_wrapper.c"
 #ifdef HAVE_OPENXR
 #include "../gfx/common/vulkan_openxr.c"
-#include "../input/common/input_openxr.c"
 #endif
 #ifdef HAVE_VULKAN_DISPLAY
 #include "../gfx/drivers_context/khr_display_ctx.c"
@@ -390,6 +388,7 @@ VIDEO CONTEXT
 #include "../gfx/common/openxr_host.c"
 #include "../gfx/common/openxr_swapchain.c"
 #include "../gfx/common/openxr_frame.c"
+#include "../input/common/input_openxr.c"
 #if defined(ANDROID) && defined(HAVE_OPENGLES3)
 #include "../gfx/common/openxr_binding_gles.c"
 #endif
