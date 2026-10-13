@@ -39,6 +39,10 @@ jobs:
     - name: Compile RA
       run: |
         cd pkg/android/phoenix
+        # Only the flavors whose native build differs, plus the APKs
+        # uploaded below: ra32 builds the same native code as normal,
+        # and playStoreNormal is normal with PLAY_STORE_BUILD=1, which
+        # playStorePlus also builds.
         # A repository that answers with a server error is retried with
         # a backoff (2 s doubling, six tries) before Gradle gives up on
         # it for the rest of the build. A build that still fails to fetch
@@ -46,7 +50,8 @@ jobs:
         # built; any other failure fails the step at once.
         set -o pipefail
         for i in 1 2 3; do
-          ./gradlew assembleDebug \
+          ./gradlew assembleNormalDebug assembleAarch64Debug \
+            assemblePlayStorePlusDebug assembleQuestDebug \
             -Dorg.gradle.internal.repository.max.tentatives=6 \
             -Dorg.gradle.internal.repository.initial.backoff=2000 \
             2>&1 | tee gradle.log && break
