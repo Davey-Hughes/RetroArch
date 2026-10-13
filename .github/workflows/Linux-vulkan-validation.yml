@@ -337,6 +337,11 @@ jobs:
             python3 samples/cores/video_views/e2e/run.py ./retroarch \
             "$RUNNER_TEMP/views-e2e" gl glcore vulkan
 
+      - name: ccache statistics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache -sv
+
       - name: Save ccache
         # Only master's pushes keep a cache: pull requests restore
         # master's, so one push does not evict the next one's.
@@ -436,6 +441,11 @@ jobs:
           export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
           SAN=none VK_DEBUG=1 CYCLES=1 make -C samples/gfx/threaded_video check-vulkan
           make -C samples/gfx/threaded_video clean
+
+      - name: ccache statistics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache -sv
 
       - name: Save ccache
         # Only master's pushes keep a cache: pull requests restore
@@ -644,6 +654,11 @@ jobs:
           HARNESS_CORE_HW_VULKAN=1 SAN=address VK_DEBUG=1 CYCLES=1 make -C samples/gfx/threaded_video check-vulkan
           make -C samples/gfx/threaded_video clean
 
+      - name: ccache statistics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache -sv
+
       - name: Save ccache
         # Only master's pushes keep a cache: pull requests restore
         # master's, so one push does not evict the next one's.
@@ -760,6 +775,11 @@ jobs:
           export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
           SAN=thread VK_DEBUG=1 CYCLES=1 make -C samples/gfx/threaded_video check-vulkan
           make -C samples/gfx/threaded_video clean
+
+      - name: ccache statistics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache -sv
 
       - name: Save ccache
         # Only master's pushes keep a cache: pull requests restore
@@ -903,6 +923,11 @@ jobs:
           SAN=${{ matrix.san }} DRIVER=${{ matrix.driver }} CYCLES=1 \
             make -C samples/gfx/threaded_video check-driver
           make -C samples/gfx/threaded_video clean
+
+      - name: ccache statistics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache -sv
 
       - name: Save ccache
         # Only master's pushes keep a cache: pull requests restore
