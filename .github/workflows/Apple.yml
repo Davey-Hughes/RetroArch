@@ -144,7 +144,7 @@ jobs:
       run: |
         set -o pipefail
         xcodebuild -workspace pkg/apple/RetroArch.xcworkspace \
-          -destination generic/platform=tvOS -config Release \
+          -destination generic/platform=tvOS -config Debug \
           -scheme "RetroArch tvOS Release" \
           -xcconfig pkg/apple/GitHubCI.xcconfig \
           CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
