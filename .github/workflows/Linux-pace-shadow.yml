@@ -37,6 +37,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
+    env:
+      # Line tables are all a sanitizer report needs: -g1 keeps file
+      # and line, drops what only a debugger reads, and keeps the
+      # cache and the compile small. Make's CFLAGS ?= takes it in
+      # place of DEBUG=1's -O0 -g, the Makefile's own flags still added.
+      CFLAGS: -O0 -g1
+      CXXFLAGS: -O0 -g1
+
     steps:
       - name: Install dependencies
         timeout-minutes: 20
