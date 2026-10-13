@@ -65,11 +65,43 @@ jobs:
           --disable-glslang --disable-crtswitchres --disable-al \
           --disable-cdrom
 
+    - name: Set up ccache
+      run: |
+        command -v ccache > /dev/null || {
+          s=$(command -v sudo || true)
+          $s apt-get update -qq
+          $s apt-get install -y -qq --no-install-recommends ccache > /dev/null
+        }
+        echo "CCACHE_DIR=$GITHUB_WORKSPACE/.ccache" >> "$GITHUB_ENV"
+
+    - name: Restore ccache
+      uses: actions/cache/restore@v4
+      with:
+        path: .ccache
+        key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+        restore-keys: |
+          ccache-${{ github.workflow }}-${{ github.job }}-
+
     - name: Compile RA
       run: |
-        make ARCH=ppc -j$(getconf _NPROCESSORS_ONLN)
+        bash .github/workflows/scripts/ccache-make.sh ARCH=ppc -j$(getconf _NPROCESSORS_ONLN)
         file retroarch
         $TARGET-otool -l retroarch | grep -A2 LC_VERSION_MIN_MACOSX
+
+    - name: ccache statistics
+      if: ${{ !cancelled() }}
+      continue-on-error: true
+      run: ccache -sv
+
+    - name: Save ccache
+      # Only master's pushes keep a cache: pull requests restore
+      # master's, so one push does not evict the next one's.
+      if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+      uses: actions/cache/save@v4
+      with:
+        path: .ccache
+        key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+
 
     - name: Audit imports against the 10.4u SDK
       if: matrix.deployment_target == '10.4'
