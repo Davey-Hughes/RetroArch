@@ -120,13 +120,30 @@ jobs:
           curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
             --connect-timeout 30 -o "/tmp/sdl2-prebuilt/$SDL2_NAME" "$SDL2_URL"
 
+      - name: Set up ccache
+        run: |
+          command -v ccache > /dev/null || {
+            s=$(command -v sudo || true)
+            $s apt-get update -qq
+            $s apt-get install -y -qq --no-install-recommends ccache > /dev/null
+          }
+          echo "CCACHE_DIR=$GITHUB_WORKSPACE/.ccache" >> "$GITHUB_ENV"
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.workflow }}-${{ github.job }}-
+
       - name: Compile RA (GLES2, no wayland legacy variant)
         shell: bash
         run: |
           . /tmp/arm-webos-linux-gnueabi_sdk-buildroot/environment-setup
           export SDK_PATH=/tmp/arm-webos-linux-gnueabi_sdk-buildroot
           make -f Makefile.webos clean
-          make -f Makefile.webos ipk PACKAGE_NAME=${PACKAGE_NAME} ADD_SDL2_LIB=1 \
+          bash .github/workflows/scripts/ccache-make.sh -f Makefile.webos ipk PACKAGE_NAME=${PACKAGE_NAME} ADD_SDL2_LIB=1 \
           SDL2_PREBUILT_ARCHIVE="file:///tmp/sdl2-prebuilt/${SDL2_NAME}" \
           -j"$(getconf _NPROCESSORS_ONLN)"
           mkdir -p webos/arm
@@ -150,7 +167,7 @@ jobs:
           export SDK_PATH=/tmp/arm-webos-linux-gnueabi_sdk-buildroot
           make -f Makefile.webos clean
           bash gfx/common/wayland/generate_wayland_protos.sh
-          make -f Makefile.webos ipk PACKAGE_NAME=${PACKAGE_NAME} ADD_SDL2_LIB=1 \
+          bash .github/workflows/scripts/ccache-make.sh -f Makefile.webos ipk PACKAGE_NAME=${PACKAGE_NAME} ADD_SDL2_LIB=1 \
           SDL2_PREBUILT_ARCHIVE="file:///tmp/sdl2-prebuilt/${SDL2_NAME}" \
           HAVE_XKBCOMMON=1 HAVE_USERLAND=1 HAVE_EGL=1 HAVE_WAYLAND=1 \
           HAVE_OPENGLES3=1 HAVE_OPENGLES3_1=1 HAVE_OPENGLES3_2=1 -j"$(getconf _NPROCESSORS_ONLN)"
@@ -184,7 +201,7 @@ jobs:
           export SDK_PATH=/tmp/aarch64-webos-linux-gnu_sdk-buildroot
           make -f Makefile.webos clean
           bash gfx/common/wayland/generate_wayland_protos.sh
-          make -f Makefile.webos ipk PACKAGE_NAME=${PACKAGE_NAME} \
+          bash .github/workflows/scripts/ccache-make.sh -f Makefile.webos ipk PACKAGE_NAME=${PACKAGE_NAME} \
           ADD_SDL2_LIB=0 HAVE_SDL2=0 HAVE_SDL3=1 \
           HAVE_XKBCOMMON=1 HAVE_USERLAND=1 HAVE_EGL=1 HAVE_WAYLAND=1 \
           HAVE_OPENGLES3=1 HAVE_OPENGLES3_1=1 HAVE_OPENGLES3_2=1 \
@@ -195,6 +212,21 @@ jobs:
             webos/aarch64/com.retroarch.webos_${{ env.RARCH_VERSION }}_aarch64.ipk
         env:
           DEBUG: ${{ github.event_name == 'release' && '0' || '1' }}
+
+      - name: ccache statistics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache -sv
+
+      - name: Save ccache
+        # Only master's pushes keep a cache: pull requests restore
+        # master's, so one push does not evict the next one's.
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+
 
       - name: Upload aarch64 artifact
         uses: actions/upload-artifact@v7
