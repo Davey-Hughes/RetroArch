@@ -31,6 +31,10 @@ jobs:
         exclude:
           - version: UWP
             configuration: Debug
+          # Release builds the same project; Debug only drops the
+          # optimiser and whole-program optimisation.
+          - version: 2022
+            configuration: Debug
         include:
           - version: UWP
             configuration: ReleaseAngle

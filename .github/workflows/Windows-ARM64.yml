@@ -38,7 +38,7 @@ jobs:
     strategy:
       matrix:
         version: [2022]
-        configuration: [Debug, Release]
+        configuration: [Release]
         platform: [ARM64]
 
     steps:
