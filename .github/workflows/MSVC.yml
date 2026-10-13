@@ -25,7 +25,7 @@ jobs:
     timeout-minutes: 90
     strategy:
       matrix:
-        version: [UWP, 2019, 2022]
+        version: [UWP, 2022]
         configuration: [Debug, Release]
         platform: [x64]
         exclude:
