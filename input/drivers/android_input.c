@@ -1094,6 +1094,15 @@ static void android_input_poll_main_cmd(void)
          android_keypress_vibrate_pending = false;
          android_app->destroyRequested = 1;
          break;
+
+      case APP_CMD_SECOND_WINDOW_CHANGED:
+         video_driver_restore_windows();
+         break;
+
+      case APP_CMD_SECOND_TERM_WINDOW:
+         android_second_display_retire(android_app);
+         android_lifecycle_done(&android_app->lc);
+         break;
    }
 }
 
