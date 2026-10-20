@@ -1040,6 +1040,88 @@ static void test_window_redraw(void)
 #endif
 }
 
+static unsigned window_test_retired;
+static void *window_test_retired_data;
+static bool window_test_retired_on_video;
+
+static void window_test_retire(void *data)
+{
+   window_test_retired++;
+   window_test_retired_data = data;
+#ifdef HAVE_THREADS
+   window_test_retired_on_video = video_thread_is_video_thread();
+#endif
+}
+
+#ifdef HAVE_THREADS
+static video_poke_interface_t retire_poke;
+
+static void retire_poke_interface(void *data,
+      const video_poke_interface_t **iface)
+{
+   (void)data;
+   *iface = &retire_poke;
+}
+#endif
+
+/* The windows let go of through the driver's hook, on the video
+ * thread when there is one */
+static void test_window_retire(void)
+{
+#ifdef HAVE_THREADS
+   static video_driver_t driver;
+   const video_driver_t *threaded       = NULL;
+   const video_poke_interface_t *iface  = NULL;
+   void *data                           = NULL;
+   video_info_t info;
+#endif
+   video_driver_state_t *video_st       = video_state_get_ptr();
+   window_test_begin();
+   window_test_retired = 0;
+   video_driver_windows_retire();
+   CHECK(window_test_retired == 0);
+   window_test_poke.windows_retire = window_test_retire;
+   video_driver_windows_retire();
+   CHECK(window_test_retired == 1);
+   CHECK(window_test_retired_data == &window_test_driver);
+   CHECK(!window_test_retired_on_video);
+   window_test_end();
+#ifdef HAVE_THREADS
+   memset(&driver, 0, sizeof(driver));
+   memset(&retire_poke, 0, sizeof(retire_poke));
+   memset(&info, 0, sizeof(info));
+   driver.init                = snapshot_init;
+   driver.frame               = snapshot_frame;
+   driver.free                = snapshot_free;
+   driver.poke_interface      = retire_poke_interface;
+   driver.ident               = "retire";
+   retire_poke.windows_retire = window_test_retire;
+   info.input_scale           = 1;
+   info.rgb32                 = true;
+   if (video_init_thread(&threaded, &data, &driver, info))
+   {
+      void *saved_data  = video_st->data;
+      bool saved_active = video_st->thread_wrapper_active;
+      threaded->poke_interface(data, &iface);
+      CHECK(iface != NULL);
+      video_st->data                  = data;
+      video_st->thread_wrapper_active = true;
+      window_test_retired             = 0;
+      video_driver_windows_retire();
+      CHECK(window_test_retired == 1);
+      CHECK(window_test_retired_data == &snapshot_data);
+      CHECK(window_test_retired_on_video);
+      video_st->data                  = saved_data;
+      video_st->thread_wrapper_active = saved_active;
+      threaded->free(data);
+   }
+   else
+      CHECK(false);
+#else
+   (void)video_st;
+#endif
+}
+
 int main(int argc, char **argv)
 {
    if (argc != 2)
@@ -1062,6 +1144,7 @@ int main(int argc, char **argv)
    test_window_generation();
    test_window_frame_snapshot();
    test_window_redraw();
+   test_window_retire();
    menu_setting_free(menu_state_get_ptr()->entries.list_settings);
    free(menu_state_get_ptr()->entries.list_settings);
    menu_state_get_ptr()->entries.list_settings = NULL;

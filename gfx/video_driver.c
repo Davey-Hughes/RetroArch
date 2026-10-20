@@ -6944,6 +6944,35 @@ void video_context_surface_destroy(void)
 #endif
 }
 
+#ifdef HAVE_THREADS
+static uintptr_t video_driver_windows_retire_cb(void *data)
+{
+   thread_video_t *thr = (thread_video_t*)data;
+   if (thr->driver_data && thr->poke && thr->poke->windows_retire)
+      thr->poke->windows_retire(thr->driver_data);
+   return 0;
+}
+#endif
+
+void video_driver_windows_retire(void)
+{
+   video_driver_state_t *video_st = &video_driver_st;
+#ifdef HAVE_THREADS
+   if (video_st->thread_wrapper_active)
+   {
+      if (!video_st->data)
+         return;
+      /* No frame still being drawn may use a window this lets go of */
+      video_thread_wait_idle();
+      video_thread_texture_handle(video_st->data,
+            video_driver_windows_retire_cb);
+      return;
+   }
+#endif
+   if (video_st->data && video_st->poke && video_st->poke->windows_retire)
+      video_st->poke->windows_retire(video_st->data);
+}
+
 const char *video_driver_get_configured_ident(void)
 {
    video_driver_state_t *video_st = &video_driver_st;
