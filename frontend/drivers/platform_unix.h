@@ -91,6 +91,7 @@ struct android_second_surface
    ANativeWindow *window;
    unsigned dims;       /* VIDEO_SCALE_PACK */
    int generation;
+   int request;         /* the show request it was made for */
 };
 
 struct android_second_display
@@ -106,7 +107,16 @@ struct android_second_display
    retro_atomic_int_t bound_surface;     /* surface generation, 0 none */
    retro_atomic_int_t bound_window;      /* window id */
    retro_atomic_int_t bound_generation;  /* window generation */
+   /* Video thread: the last request number sent to Java */
+   retro_atomic_int_t requests;
+   /* Video thread: a hide sent while no window held anything; the
+    * surfaces made for earlier requests are given up, 0 none */
+   retro_atomic_int_t released;
 };
+
+/* Request number @a was sent before @b; wrap-safe */
+#define ANDROID_SECOND_BEFORE(a, b) \
+   ((int)((unsigned)(a) - (unsigned)(b)) < 0)
 
 struct android_app
 {
@@ -159,10 +169,11 @@ struct android_app
     * a change of window has it give up first. */
    ANativeWindow *posted_window;
 
-   /* UI thread only: the second display's window last handed over, and
-    * its size, VIDEO_SCALE_PACK */
+   /* UI thread only: the second display's window last handed over,
+    * its size, VIDEO_SCALE_PACK, and the request it was made for */
    ANativeWindow *posted_second_window;
    unsigned posted_second_dims;
+   int posted_second_request;
 
    /* Set by android_app_free() before it asks the app thread to shut
     * down, so android_app_destroy() knows the activity is already being
@@ -439,8 +450,11 @@ void android_run_lifecycle_hook(struct android_app *android_app,
 extern struct android_app *g_android;
 
 /* Any native thread, never waits: asks Java to show the second display
- * on display @ordinal of the last published list, or to hide it for 0. */
-void android_second_display_request(unsigned ordinal);
+ * on display @ordinal of the last published list, or to hide it for 0.
+ * A hide @given_up comes from a caller that holds nothing of the
+ * display's surfaces: those made for earlier requests are given up,
+ * so their surfaceDestroyed does not wait for the app thread. */
+void android_second_display_request(unsigned ordinal, bool given_up);
 
 /* App thread, APP_CMD_SECOND_TERM_WINDOW: lets go of the second
  * display's surface, the renderer's windows with it. */
