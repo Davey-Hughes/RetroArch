@@ -7844,6 +7844,23 @@ static void menu_displaylist_restore_plays_as_row(
    menu->plays_as_row = 0;
 }
 
+/* A hotplug makes the list again with the cursor at its index: note the
+ * controller it is on, for the pass above to put it back. */
+static void menu_displaylist_keep_plays_as_row(
+      struct menu_state *menu_st, file_list_t *list)
+{
+   unsigned type;
+   menu_handle_t *menu = menu_st->driver_data;
+   size_t sel          = menu_st->selection_ptr;
+
+   if (!menu || sel >= list->size)
+      return;
+   type = list->list[sel].type;
+   if (     type >= MENU_SETTINGS_INPUT_PLAYS_AS_BEGIN
+         && type <  MENU_SETTINGS_INPUT_PLAYS_AS_END)
+      menu->plays_as_row = type - MENU_SETTINGS_INPUT_PLAYS_AS_BEGIN + 1;
+}
+
 #ifdef HAVE_NETWORKING
 /* Put the cursor back on the Content Downloader directory the user
  * just backed out of.  Called for both the stack push and the rebuild
@@ -14971,6 +14988,9 @@ static bool menu_displaylist_ctl_internal(
       bool use_filebrowser        = false;
       unsigned count              = 0;
       int ret                     = 0;
+
+      if (type == DISPLAYLIST_INPUT_CONTROLLERS_LIST)
+         menu_displaylist_keep_plays_as_row(menu_st, info->list);
       switch (type)
       {
          case DISPLAYLIST_NETWORK_HOSTING_SETTINGS_LIST:

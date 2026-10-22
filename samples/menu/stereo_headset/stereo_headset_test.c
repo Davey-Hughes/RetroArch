@@ -120,6 +120,25 @@ static void run_frame(void)
          cpu_features_get_time_usec());
 }
 
+/* What a hotplug does to the open Controllers list. */
+static void rebuild_as_hotplug(void)
+{
+   struct menu_state *menu_st = menu_state_get_ptr();
+   menu_st->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH
+                   | MENU_ST_FLAG_PREVENT_POPULATE;
+   run_frame();
+}
+
+/* The type of the row under the cursor, or 0. */
+static unsigned cursor_type(void)
+{
+   struct menu_state *menu_st = menu_state_get_ptr();
+   file_list_t *buf           = selection_buf();
+   if (!buf || menu_st->selection_ptr >= buf->size)
+      return 0;
+   return buf->list[menu_st->selection_ptr].type;
+}
+
 static void set_driver(const char *ident)
 {
    settings_t *settings = config_get_ptr();
@@ -485,6 +504,46 @@ static void lane_refresh_rate(void)
    configuration_set_uint(settings,
          settings->uints.video_openxr_refresh_rate, 0);
 }
+
+/* A controller connecting or going above the cursor's controller in
+ * Controllers leaves the cursor on it; with its own row gone, the
+ * cursor stays in the list. */
+static void lane_controller_rows(void)
+{
+   file_list_t *buf;
+   struct menu_state *menu_st = menu_state_get_ptr();
+   unsigned pad_b             = MENU_SETTINGS_INPUT_PLAYS_AS_BEGIN + 1;
+
+   input_config_set_device_name(1, "Pad B");
+   generic_action_ok_displaylist_push("", NULL, "", 0, 0, 0,
+         ACTION_OK_DL_INPUT_CONTROLLERS_LIST);
+   run_frame();
+   menu_st->selection_ptr = 0;
+   CHECK(cursor_type() == pad_b, "Pad B is not the first row");
+
+   input_config_set_device_name(0, "Pad A");
+   rebuild_as_hotplug();
+   CHECK(cursor_type() == pad_b && menu_st->selection_ptr == 1,
+         "a controller connecting above took the cursor (cursor %u)",
+         (unsigned)menu_st->selection_ptr);
+
+   menu_st->selection_ptr = 1;
+   input_config_clear_device_name(0);
+   rebuild_as_hotplug();
+   CHECK(cursor_type() == pad_b && menu_st->selection_ptr == 0,
+         "a controller going above took the cursor (cursor %u)",
+         (unsigned)menu_st->selection_ptr);
+
+   input_config_set_device_name(0, "Pad A");
+   rebuild_as_hotplug();
+   input_config_clear_device_name(1);
+   rebuild_as_hotplug();
+   buf = selection_buf();
+   CHECK(buf && menu_st->selection_ptr < buf->size,
+         "the cursor is past the list once its controller went "
+         "(cursor %u)", (unsigned)menu_st->selection_ptr);
+   input_config_clear_device_name(0);
+}
 #endif
 
 int main(int argc, char *argv[])
@@ -565,6 +624,7 @@ int main(int argc, char *argv[])
    lane_controller_layout();
    lane_placement();
    lane_refresh_rate();
+   lane_controller_rows();
 
    set_driver("null");
    snprintf(cmd, sizeof(cmd), "rm -rf %s", fixture_dir);
