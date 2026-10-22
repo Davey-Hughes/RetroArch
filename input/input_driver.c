@@ -9076,7 +9076,7 @@ static void input_driver_registry_restore_ports(void)
       }
    }
    /* and so are the controllers' own players */
-   if (input_config_plays_as_active())
+   if (input_config_plays_as_any_player())
    {
       input_registry_restart_cancel(&input_registry);
       return;
@@ -10531,6 +10531,17 @@ bool input_config_plays_as_active(void)
    return false;
 }
 
+bool input_config_plays_as_any_player(void)
+{
+   unsigned e;
+   unsigned max_users = config_get_ptr()->uints.input_max_users;
+   for (e = 0; e < MAX_USERS; e++)
+      if (     input_plays_as[e].player
+            && input_plays_as[e].player <= max_users)
+         return true;
+   return false;
+}
+
 unsigned input_config_plays_as_player(unsigned slot)
 {
    int e = input_config_plays_as_entry(slot);
@@ -10735,7 +10746,7 @@ bool input_config_plays_as_place(unsigned slot)
          if (settings->uints.input_device_reservation_type[u]
                != INPUT_DEVICE_RESERVATION_NONE)
             return false;
-      if (!input_config_plays_as_active())
+      if (!input_config_plays_as_any_player())
          return false;
       input_plays_as_move(settings,
             input_plays_as_free(settings, max_users, slot, MAX_USERS, false),

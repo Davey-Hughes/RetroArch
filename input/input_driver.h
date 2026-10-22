@@ -1945,6 +1945,8 @@ bool input_config_plays_as_entry_taken(unsigned e);
 void input_config_plays_as_set_entry(unsigned e, unsigned player);
 /* Whether any entry is in use. */
 bool input_config_plays_as_active(void);
+/* Whether any entry gives a player within Max Users. */
+bool input_config_plays_as_any_player(void);
 /* The controller just connected in @slot takes its entry and its port:
  * true when it was placed, false for one the reservations place. */
 bool input_config_plays_as_place(unsigned slot);

@@ -35,6 +35,7 @@ static int               failures;
 settings_t *config_get_ptr(void) { return &settings; }
 runloop_state_t *runloop_state_get_ptr(void) { return &runloop_st; }
 void RARCH_LOG(const char *fmt, ...) { (void)fmt; }
+void RARCH_WARN(const char *fmt, ...) { (void)fmt; }
 bool command_event(enum event_command cmd, void *data)
 { (void)cmd; (void)data; return false; }
 bool retroarch_ctl(enum rarch_ctl_state state, void *data)
@@ -675,6 +676,46 @@ static void test_place_leave_and_change(void)
    input_config_plays_as_place(1);
    CHECK(t_user_of(1) == 0 && t_user_of(0) == 1,
          "connected again, the controller set to Player 1 is not on port 1");
+}
+
+/* Entries that give no player within Max Users: Auto controllers are
+ * placed as with no entries, a Device Index swap kept, and a driver
+ * restart still puts each controller back on its port. */
+static void test_place_no_player(void)
+{
+   t_reset();
+   settings.uints.input_joypad_index[0] = 1;
+   settings.uints.input_joypad_index[1] = 0;
+   t_entries(
+         "input_plays_as_device_1 = \"0009:0009 Away\"\n"
+         "input_plays_as_player_1 = \"0\"\n"
+         "input_plays_as_device_2 = \"0002:0002 B\"\n"
+         "input_plays_as_player_2 = \"5\"\n");
+   CHECK(input_config_plays_as_active(), "the entries are not in use");
+   t_dev(0, "A", 1, 1);
+   CHECK(!input_config_plays_as_place(0) && t_user_of(0) == 1,
+         "an entry with no player undid a Device Index swap");
+   t_dev(2, "C", 3, 3);
+   CHECK(!input_config_plays_as_place(2) && t_user_of(2) == 2,
+         "an entry with no player moved an Auto controller");
+   t_connect(1, "B", 2, 2);
+   CHECK(t_user_of(1) == 0 && t_user_of(0) == 1,
+         "Player 5 with Max Users 4 was placed");
+
+   t_reset();
+   t_entries(
+         "input_plays_as_device_1 = \"0001:0001 A\"\n"
+         "input_plays_as_player_1 = \"0\"\n");
+   input_driver_registry_connect(0, "x", "A", "", 1, 1);
+   input_driver_registry_connect(1, "x", "B", "", 2, 2);
+   input_driver_registry_restart();
+   input_driver_registry_connect(0, "x", "B", "", 2, 2);
+   input_driver_registry_connect(1, "x", "A", "", 1, 1);
+   CHECK(settings.uints.input_joypad_index[0] == 1
+         && settings.uints.input_joypad_index[1] == 0,
+         "an entry with no player kept a restart from restoring the ports");
+   input_driver_registry_disconnect(0);
+   input_driver_registry_disconnect(1);
 }
 
 /* A load made only to compare against, as saving an override makes
@@ -1468,6 +1509,7 @@ int main(void)
    test_place_limits();
    test_place_reservation();
    test_place_leave_and_change();
+   test_place_no_player();
    test_plays_as_copy();
    test_menu_shared();
    test_hotkeys_shared();
