@@ -9052,6 +9052,12 @@ void input_driver_registry_restart(void)
     * each takes its entry afresh, not by the slot it had */
    for (i = 0; i < MAX_INPUT_DEVICES; i++)
       input_config_plays_as_release(i);
+   /* runtime moves the setting no longer holds are over: the next
+    * video restart need not start the driver again for them */
+   if (     input_ports_runtime_active
+         && memcmp(settings->uints.input_joypad_index,
+               input_ports_runtime, sizeof(input_ports_runtime)))
+      input_ports_runtime_active = false;
 
    /* the lowest port on a pad: the ports sharing it follow that one */
    memset(port_of_slot, INPUT_REGISTRY_NO_PORT, sizeof(port_of_slot));
@@ -9596,12 +9602,15 @@ uint64_t input_driver_get_capabilities(void)
    return input->get_capabilities(input_driver_st.current_data);
 }
 
+static uint32_t input_plays_as_mix(uint32_t h);
+
 /* The settings read when a controller is reported and given a port:
  * whether controllers are configured at all, where their profiles
- * are, how many ports there are, and which controller each port is
- * reserved for. A joypad driver reports its controllers when it
- * starts, so a change to any of these is applied by starting it
- * again. One number for the lot, to tell a change by. */
+ * are, how many ports there are, which controller each port is
+ * reserved for, and the controllers' own players. A joypad driver
+ * reports its controllers when it starts, so a change to any of these
+ * is applied by starting it again. One number for the lot, to tell a
+ * change by. */
 static uint32_t input_driver_detect_settings(const settings_t *settings)
 {
    unsigned i;
@@ -9620,7 +9629,7 @@ static uint32_t input_driver_detect_settings(const settings_t *settings)
       DETECT_MIX(0xff);
    }
 #undef DETECT_MIX
-   return h;
+   return input_plays_as_mix(h);
 }
 
 void input_driver_init_joypads(void)
@@ -9767,6 +9776,7 @@ bool input_driver_is_sdl3(void)
  * restarted; when the input or the joypad driver setting, or a
  * setting that decides which port a controller gets, has changed
  * since it started, since a restart is how such a change is applied;
+ * when a config reload has undone the ports' runtime moves;
  * when its data is the video driver's own; once, after the
  * controllers' configuration has been reset while running
  * (input_driver_restart_with_next_video_restart()); or with
@@ -9819,6 +9829,13 @@ void input_driver_keep_for_video_restart(bool restart,
             " driver.\n");
       return;
    }
+   /* A config reload read the configured ports over runtime moves
+    * (Plays As, the headset's, a restart's): only placing the
+    * controllers again puts them back. */
+   if (     input_ports_runtime_active
+         && memcmp(settings->uints.input_joypad_index,
+               input_ports_runtime, sizeof(input_ports_runtime)))
+      return;
    if (     !drv->survives_video(data)
          || !input_st->primary_joypad->survives_video
          || !input_st->primary_joypad->survives_video())
@@ -10458,6 +10475,25 @@ static unsigned input_plays_as_gen;
 static uint8_t input_plays_as_shares[MAX_INPUT_DEVICES];
 /* the Max Users the controllers were last placed under */
 static unsigned input_plays_as_placed_max_users;
+
+/* @h with each entry's controller and player mixed in, as
+ * input_driver_detect_settings() mixes the reservations */
+static uint32_t input_plays_as_mix(uint32_t h)
+{
+   unsigned e;
+   const char *p;
+   for (e = 0; e < MAX_USERS; e++)
+   {
+      for (p = input_plays_as[e].device; *p; p++)
+      {
+         h ^= (unsigned char)*p;
+         h *= 16777619u;
+      }
+      h ^= input_plays_as[e].player;
+      h *= 16777619u;
+   }
+   return h;
+}
 
 bool input_config_parse_vid_pid(const char *s, unsigned long *vid,
       unsigned long *pid, const char **name)

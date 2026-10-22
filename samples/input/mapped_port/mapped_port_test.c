@@ -48,6 +48,11 @@ static unsigned t_device[4];
 settings_t *config_get_ptr(void) { return &settings; }
 runloop_state_t *runloop_state_get_ptr(void) { return &runloop_st; }
 void RARCH_LOG(const char *fmt, ...) { (void)fmt; }
+void RARCH_DBG(const char *fmt, ...) { (void)fmt; }
+#if defined(__linux) && !defined(ANDROID)
+/* joypad_drivers[]'s, which no test starts */
+input_device_driver_t linuxraw_joypad;
+#endif
 void RARCH_WARN(const char *fmt, ...) { (void)fmt; }
 /* as retroarch.c's: command.c tells the core */
 bool command_event(enum event_command cmd, void *data)
@@ -1350,6 +1355,99 @@ static void test_place_saved_ports(void)
          "a reservation's write saved the ports Plays As moved");
 }
 
+/* An input driver and a joypad driver that can be left running
+ * across a video driver restart. */
+static bool t_kv_survives(void *data) { (void)data; return true; }
+static bool t_kv_pad_survives(void) { return true; }
+static input_driver_t        t_kv;
+static input_device_driver_t t_kv_joypad;
+
+/* They start, under the settings and entries as they are. */
+static void t_kv_start(void)
+{
+   input_driver_state_t *st = input_state_get_ptr();
+   t_kv.ident                 = "kv";
+   t_kv.survives_video        = t_kv_survives;
+   t_kv_joypad                = t_joypad;
+   t_kv_joypad.survives_video = t_kv_pad_survives;
+   strlcpy(settings.arrays.input_driver, "kv",
+         sizeof(settings.arrays.input_driver));
+   strlcpy(settings.arrays.input_joypad_driver, "kvpad",
+         sizeof(settings.arrays.input_joypad_driver));
+   st->current_driver = &t_kv;
+   st->current_data   = &t_kv;
+   st->primary_joypad = NULL;
+   input_driver_init_joypads();
+   st->primary_joypad = &t_kv_joypad;
+}
+
+/* Whether the input driver is kept across a video driver restart, as
+ * the drivers' teardown asks. */
+static bool t_kv_kept(void)
+{
+   input_driver_state_t *st = input_state_get_ptr();
+   bool kept;
+   input_driver_keep_for_video_restart(true, NULL);
+   kept            = st->kept_driver != NULL;
+   st->kept_driver = NULL;
+   st->kept_data   = NULL;
+   return kept;
+}
+
+/* A config reload, as an override comes or goes, with the input
+ * driver left running: the configured ports read again undo the
+ * Plays As moves, and an override's entries change who goes where.
+ * Either way the driver starts again, to place the controllers. */
+static void test_place_reload_kept(void)
+{
+   unsigned u;
+   static const char *p2 =
+         "input_plays_as_device_1 = \"0001:0001 P\"\n"
+         "input_plays_as_player_1 = \"2\"\n";
+   input_driver_state_t *st = input_state_get_ptr();
+
+   t_reset();
+   t_entries(p2);
+   t_kv_start();
+   t_connect(0, "P", 1, 1);
+   t_connect(1, "A", 9, 9);
+   CHECK(t_user_of(0) == 1 && t_user_of(1) == 0 && t_kv_kept(),
+         "placed by Plays As, the input driver was not kept");
+   for (u = 0; u < MAX_USERS; u++)
+      settings.uints.input_joypad_index[u] = u;
+   t_entries(p2);
+   CHECK(!t_kv_kept(),
+         "a reload undid the Plays As moves and the driver was kept");
+   t_kv_start();
+   t_connect(0, "P", 1, 1);
+   t_connect(1, "A", 9, 9);
+   CHECK(t_user_of(0) == 1 && t_user_of(1) == 0 && t_kv_kept(),
+         "started again, the controllers were not placed as before");
+
+   /* moves undone by a reload that also took the entry away: once
+    * started again with nothing to move, the driver is kept again */
+   for (u = 0; u < MAX_USERS; u++)
+      settings.uints.input_joypad_index[u] = u;
+   input_plays_as_read(NULL);
+   CHECK(!t_kv_kept(),
+         "a reload took the entry away and the driver was kept");
+   t_kv_start();
+   t_connect(0, "P", 1, 1);
+   t_connect(1, "A", 9, 9);
+   CHECK(t_user_of(0) == 0 && t_kv_kept(),
+         "started again with nothing moved, the driver was not kept");
+
+   t_reset();
+   t_kv_start();
+   t_connect(0, "P", 1, 1);
+   CHECK(t_kv_kept(), "with no entries the input driver was not kept");
+   t_entries(p2);
+   CHECK(!t_kv_kept(),
+         "an override set a player and the driver was kept");
+   st->current_driver = NULL;
+   st->current_data   = NULL;
+}
+
 /* A load made only to compare against, as saving an override makes
  * one, leaves the entries and claims as they were once the copy taken
  * before it is put back. */
@@ -2621,6 +2719,7 @@ int main(void)
    test_place_no_player();
    test_place_restart();
    test_place_saved_ports();
+   test_place_reload_kept();
    test_plays_as_copy();
    test_menu_shared();
    test_hotkeys_shared();
