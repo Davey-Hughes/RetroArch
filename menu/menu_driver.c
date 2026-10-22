@@ -5272,6 +5272,13 @@ void menu_input_plays_as_change(unsigned row, unsigned player)
 
    if (row < MAX_INPUT_DEVICES)
    {
+      /* gone since the list was made: the list is made again */
+      if (!input_config_get_device_name(row))
+      {
+         menu_st->flags &= ~MENU_ST_FLAG_PREVENT_POPULATE;
+         menu_st->flags |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+         return;
+      }
       if (!input_config_plays_as_set(row, player))
       {
          const char *msg = msg_hash_to_str(MSG_INPUT_PLAYS_AS_FULL);

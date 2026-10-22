@@ -44,6 +44,7 @@
 
 #ifdef HAVE_MENU
 #include "../menu/menu_driver.h"
+#include "../msg_hash_lbl_str.h"
 #endif
 
 #include "../retroarch.h"
@@ -1429,6 +1430,20 @@ void input_autoconfigure_reallocate_ports(unsigned slot)
    input_driver_deadzones_refresh();
 }
 
+#ifdef HAVE_MENU
+/* Settings > Input > Controllers has a row per controller: if shown,
+ * it is made again. */
+static void input_autoconfigure_refresh_controllers(void)
+{
+   const char *menu_label = NULL;
+   menu_entries_get_last_stack(NULL, &menu_label, NULL, NULL, NULL);
+   if (string_is_equal(menu_label,
+            MENU_ENUM_LABEL_DEFERRED_INPUT_CONTROLLERS_LIST_STR))
+      menu_state_get_ptr()->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH
+                                   | MENU_ST_FLAG_PREVENT_POPULATE;
+}
+#endif
+
 /*************************/
 /* Autoconfigure Connect */
 /*************************/
@@ -1555,6 +1570,9 @@ static void cb_input_autoconfigure_connect(
          autoconfig_handle->device_info.phys,
          autoconfig_handle->device_info.vid,
          autoconfig_handle->device_info.pid);
+#ifdef HAVE_MENU
+   input_autoconfigure_refresh_controllers();
+#endif
 }
 
 static void input_autoconfigure_connect_handler(retro_task_t *task)
@@ -2072,6 +2090,9 @@ static void cb_input_autoconfigure_disconnect(
    input_config_plays_as_release(port);
 
    input_driver_registry_disconnect(port);
+#ifdef HAVE_MENU
+   input_autoconfigure_refresh_controllers();
+#endif
 }
 
 static void input_autoconfigure_disconnect_handler(retro_task_t *task)
