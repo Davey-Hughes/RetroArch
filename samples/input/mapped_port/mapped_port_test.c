@@ -24,6 +24,7 @@
 #include "../../../gfx/video_driver.h"
 #include "../../../input/input_driver.h"
 #include "../../../input/input_remapping.h"
+#include "../../../input/common/input_openxr.h"
 #include "../../../menu/menu_driver.h"
 #include "../../../menu/menu_entries.h"
 #include "../../../menu/menu_input.h"
@@ -132,6 +133,24 @@ void runloop_msg_queue_push(const char *msg, size_t len,
       enum message_queue_icon icon, enum message_queue_category category)
 { (void)msg; (void)len; (void)prio; (void)duration; (void)flush;
   (void)title; (void)icon; (void)category; }
+
+#ifdef HAVE_OPENXR
+/* the headset's controllers, announced by the tests */
+void input_openxr_poll(unsigned max_users, unsigned controllers,
+      unsigned laser, float threshold)
+{ (void)max_users; (void)controllers; (void)laser; (void)threshold; }
+const input_device_driver_t *input_openxr_joypad(
+      const input_device_driver_t *joypad) { return joypad; }
+bool input_openxr_has_slot(unsigned slot) { (void)slot; return false; }
+bool input_openxr_hotkey(unsigned id) { (void)id; return false; }
+bool input_openxr_pointer(unsigned port, unsigned device, unsigned idx,
+      unsigned id, int16_t *res)
+{ (void)port; (void)device; (void)idx; (void)id; (void)res; return false; }
+bool input_openxr_can_rumble(void) { return false; }
+void input_openxr_slot_connected(unsigned slot, const char *provider)
+{ (void)slot; (void)provider; }
+void input_openxr_reannounce(void) { }
+#endif
 
 /* Slot n holds t_buttons[n] and pushes axis t_axis_held[n] all the
  * way; every slot's profile has the RetroPad's ids as its buttons and
@@ -248,6 +267,7 @@ static void t_reset(void)
    {
       input_config_clear_device_name(u);
       input_config_clear_device_display_name(u);
+      input_config_clear_device_joypad_driver(u);
       input_config_plays_as_release(u);
       input_config_set_device_vid(u, 0);
       input_config_set_device_pid(u, 0);
@@ -2445,6 +2465,126 @@ static void test_hotkey_own_binding(void)
          "the row shows a controller that is gone");
 }
 
+#ifdef HAVE_OPENXR
+/* The headset's controllers in slot @slot, as input_openxr.c announces
+ * them. */
+static void t_headset(unsigned slot, const char *name)
+{
+   t_dev(slot, name, 0, 0);
+   input_config_set_device_joypad_driver(slot, INPUT_OPENXR_JOYPAD);
+   input_config_plays_as_place(slot);
+}
+
+/* The headset plays as player 1 with no entry, from the highest free
+ * port, whoever is on port 1 or nobody, and moves no one; an Auto pad
+ * turned on later takes port 1 and shares with it. */
+static void test_headset_shares(void)
+{
+   t_reset();
+   t_headset(3, INPUT_OPENXR_JOYPAD_COMBINED);
+   input_driver_poll();
+   t_buttons[3] = T_B;
+   CHECK(input_config_plays_as_player(3) == 1
+         && input_config_plays_as_entry(3) < 0,
+         "the headset is not player 1 by default");
+   CHECK(t_user_of(3) == 3 && t_read(0) == T_B,
+         "the headset alone does not feed player 1 from port 4");
+
+   t_connect(0, "Pad", 1, 1);
+   input_driver_poll();
+   t_buttons[0] = T_A;
+   CHECK(t_user_of(0) == 0 && t_read(0) == (T_A | T_B),
+         "a pad turned on later does not share port 1 with the headset");
+
+   /* a Player 1 pad on port 1 first: the headset still shares */
+   t_reset();
+   t_entries(
+         "input_plays_as_device_1 = \"0001:0001 Pad\"\n"
+         "input_plays_as_player_1 = \"1\"\n");
+   t_connect(0, "Pad", 1, 1);
+   t_headset(1, INPUT_OPENXR_JOYPAD_COMBINED);
+   CHECK(t_user_of(0) == 0 && t_user_of(1) == 3,
+         "the headset moved the pad off port 1 or did not take port 4");
+}
+
+/* Separate: both hands are player 1, each from the highest port free;
+ * set to Auto, the headset keeps an entry of player 0 and plays alone. */
+static void test_headset_separate_auto(void)
+{
+   t_reset();
+   t_connect(0, "Pad", 1, 1);
+   t_headset(3, INPUT_OPENXR_JOYPAD_LEFT);
+   t_headset(2, INPUT_OPENXR_JOYPAD_RIGHT);
+   input_driver_poll();
+   CHECK(input_remapping_join_user(3) == 0
+         && input_remapping_join_user(2) == 0,
+         "Separate: the hands are not both player 1's");
+
+   CHECK(input_config_plays_as_set(3, 0)
+         && input_config_plays_as_entry(3) >= 0
+         && input_config_plays_as_player(3) == 0,
+         "the headset set to Auto kept no entry of player 0");
+   input_driver_poll();
+   CHECK(input_remapping_join_user(3) == MAX_USERS,
+         "the headset set to Auto still shares player 1");
+   CHECK(input_config_plays_as_set(3, 1)
+         && input_config_plays_as_entry(3) < 0,
+         "the headset set back to player 1 kept its entry");
+}
+
+/* First Press: the headset alone claims player 1's core port; a
+ * button bound on it makes it an entry at player 1. */
+static void test_headset_first_press_and_hotkey(void)
+{
+   unsigned u;
+   input_driver_state_t *st = input_state_get_ptr();
+
+   t_reset();
+   for (u = 0; u < MAX_USERS; u++)
+      settings.uints.input_remap_ports[u] = MAX_USERS;
+   st->first_press_on = true;
+   t_headset(3, INPUT_OPENXR_JOYPAD_COMBINED);
+   input_remapping_update_port_map();
+   input_driver_poll();
+   t_buttons[3] = T_A;
+   input_driver_poll();
+   input_first_press_apply();
+   CHECK(settings.uints.input_remap_ports[0] == 0
+         && t_read(0) == T_A,
+         "the headset alone did not claim player 1");
+   st->first_press_on = false;
+
+   CHECK(input_config_plays_as_set_hotkey(3, RARCH_ENABLE_HOTKEY, 9,
+            AXIS_NONE)
+         && input_config_plays_as_entry(3) >= 0
+         && input_config_plays_as_player(3) == 1,
+         "a hotkey bound on the headset made no entry at player 1");
+   t_buttons[3] = 0;
+}
+
+/* The headset's player 1 puts Plays As in effect with no entry; set
+ * to Auto, or gone, it does not. */
+static void test_headset_in_effect(void)
+{
+   t_reset();
+   t_headset(3, INPUT_OPENXR_JOYPAD_COMBINED);
+   CHECK(input_config_plays_as_active()
+         && input_config_plays_as_any_player(),
+         "the headset's player 1 is not in effect");
+   CHECK(input_config_plays_as_set(3, 0)
+         && !input_config_plays_as_active()
+         && !input_config_plays_as_any_player(),
+         "the headset set to Auto is in effect");
+   CHECK(input_config_plays_as_set(3, 1)
+         && input_config_plays_as_any_player(),
+         "the headset set back to player 1 is not in effect");
+   t_disconnect(3);
+   CHECK(!input_config_plays_as_active()
+         && !input_config_plays_as_any_player(),
+         "a headset gone is in effect");
+}
+#endif
+
 int main(void)
 {
    test_identity();
@@ -2504,6 +2644,12 @@ int main(void)
    test_hotkey_own_storage();
    test_hotkey_enable_own();
    test_hotkey_own_binding();
+#ifdef HAVE_OPENXR
+   test_headset_shares();
+   test_headset_separate_auto();
+   test_headset_first_press_and_hotkey();
+   test_headset_in_effect();
+#endif
    test_hotkey_enable_own_delay();
    test_hotkey_enable_own_game_focus();
    test_hotkey_enable_own_menu_tap();
@@ -2512,6 +2658,10 @@ int main(void)
       printf("%d failure(s)\n", failures);
       return 1;
    }
+#ifdef HAVE_OPENXR
+   printf("PASS mapped_port_openxr_test\n");
+#else
    printf("PASS mapped_port_test\n");
+#endif
    return 0;
 }

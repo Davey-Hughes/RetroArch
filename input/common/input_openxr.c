@@ -455,10 +455,18 @@ typedef struct input_openxr_devices
    unsigned count;                 /* named for 1 (Combined) or 2 pads */
    bool landed[INPUT_OPENXR_PADS]; /* its last connect was applied */
    bool warned;
+   /* placed as a player's (Plays As), sharing it from a high slot */
+   bool join[INPUT_OPENXR_PADS];
+   /* each pad's player, as looked up for player_want devices and the
+    * entries' generation player_gen */
+   uint8_t player[INPUT_OPENXR_PADS];
+   unsigned player_want;
+   unsigned player_gen;
 } input_openxr_devices_t;
 
 static input_openxr_devices_t input_openxr_devs = {
-   { -1, -1 }, { -1, -1 }, 0, { false, false }, false };
+   { -1, -1 }, { -1, -1 }, 0, { false, false }, false, { false, false },
+   { 0, 0 }, 0, 0 };
 
 /* The joypad driver under the devices' slots, and two tables to hand
  * out: a new driver under them gets the other, as the snapshot bridge
@@ -1395,12 +1403,18 @@ static void input_openxr_slots_publish(void)
    retro_atomic_store_release_int(&input_openxr_rumble_slots, (int)slots);
 }
 
-static const char *input_openxr_device_name(unsigned p)
+/* Pad @p's device's name, of @count devices. */
+static const char *input_openxr_name(unsigned p, unsigned count)
 {
    if (p)
       return INPUT_OPENXR_JOYPAD_RIGHT;
-   return input_openxr_devs.count < 2 ? INPUT_OPENXR_JOYPAD_COMBINED
+   return count < 2 ? INPUT_OPENXR_JOYPAD_COMBINED
       : INPUT_OPENXR_JOYPAD_LEFT;
+}
+
+static const char *input_openxr_device_name(unsigned p)
+{
+   return input_openxr_name(p, input_openxr_devs.count);
 }
 
 /* Pad @p's device reported in its slot. Its layout is RetroArch's own,
@@ -1414,14 +1428,47 @@ static void input_openxr_announce(unsigned p)
          AUTOCONF_FLAG_AUTOCONFIG_ENABLED);
 }
 
-/* The lowest slot no controller has, as a pad plugged in gets. */
-static int input_openxr_free_slot(void)
+/* The lowest slot no controller has, as a pad plugged in gets; for a
+ * device that plays as a player, the highest below Max Users, so pads
+ * keep the low ones. */
+static int input_openxr_free_slot(unsigned max_users, bool join)
 {
    unsigned s;
+   if (join)
+   {
+      if (max_users > MAX_USERS)
+         max_users = MAX_USERS;
+      for (s = max_users; s-- > 0; )
+         if (!input_config_get_device_name(s) && input_openxr_pad_of(s) < 0)
+            return (int)s;
+   }
    for (s = 0; s < MAX_USERS; s++)
       if (!input_config_get_device_name(s) && input_openxr_pad_of(s) < 0)
          return (int)s;
    return -1;
+}
+
+/* Pad @p's device out of its slot. */
+static void input_openxr_unplace(unsigned p)
+{
+   input_autoconfigure_disconnect((unsigned)input_openxr_devs.slot[p],
+         input_openxr_device_name(p));
+   input_openxr_devs.slot[p]   = -1;
+   input_openxr_devs.landed[p] = false;
+}
+
+/* Pad @p's device placed as a player's and now not, or the other way
+ * round, or a player's past Max Users with a slot below it free. */
+static bool input_openxr_misplaced(unsigned p, unsigned max_users,
+      bool join, bool pending)
+{
+   int s = input_openxr_devs.slot[p];
+   if (join != input_openxr_devs.join[p])
+      return true;
+   if (!join || pending || (unsigned)s < max_users)
+      return false;
+   s = input_openxr_free_slot(max_users, true);
+   return s >= 0 && (unsigned)s < max_users;
 }
 
 /* A device for each pad the session's controllers make: none without
@@ -1430,6 +1477,7 @@ static int input_openxr_free_slot(void)
 static void input_openxr_devices(unsigned max_users, bool separate)
 {
    unsigned p;
+   bool join[INPUT_OPENXR_PADS];
    input_openxr_devices_t *dv = &input_openxr_devs;
    input_openxr_t *st         = &input_openxr_st;
    /* an ended session keeps its controllers until the driver goes */
@@ -1440,18 +1488,37 @@ static void input_openxr_devices(unsigned max_users, bool separate)
    /* a connect still to come may be for a slot that looks free */
    bool pending               = input_autoconfigure_pending();
 
+   /* each pad's player (Plays As, Player 1 by default), looked up only
+    * when the devices or the entries have changed */
+   if (     want != dv->player_want
+         || input_config_plays_as_generation() != dv->player_gen)
+   {
+      dv->player_want = want;
+      dv->player_gen  = input_config_plays_as_generation();
+      for (p = 0; p < INPUT_OPENXR_PADS; p++)
+         dv->player[p] = (p < want) ? (uint8_t)input_config_plays_as_named(
+               input_openxr_name(p, want)) : 0;
+   }
+   /* placed again by a later poll, as it plays now; one still landing
+    * once it has */
+   for (p = 0; p < INPUT_OPENXR_PADS; p++)
+   {
+      join[p] = dv->player[p] && dv->player[p] <= max_users;
+      if (     dv->slot[p] < 0
+            || !dv->landed[p]
+            || !input_openxr_misplaced(p, max_users, join[p], pending))
+         continue;
+      input_openxr_unplace(p);
+      pending = true;
+   }
+
    /* Gone once its connect has landed, so the registry is told of the
     * one before the other. */
    for (p = want; p < INPUT_OPENXR_PADS; p++)
    {
       dv->lost[p] = -1;
       if (dv->slot[p] >= 0 && dv->landed[p])
-      {
-         input_autoconfigure_disconnect((unsigned)dv->slot[p],
-               input_openxr_device_name(p));
-         dv->slot[p]   = -1;
-         dv->landed[p] = false;
-      }
+         input_openxr_unplace(p);
    }
    if (!want)
    {
@@ -1481,7 +1548,7 @@ static void input_openxr_devices(unsigned max_users, bool separate)
       }
       if (pending)
          continue;
-      if ((s = input_openxr_free_slot()) < 0)
+      if ((s = input_openxr_free_slot(max_users, join[p])) < 0)
       {
          if (!dv->warned)
             RARCH_WARN("[OpenXR] No free slot for the headset's controllers.\n");
@@ -1489,8 +1556,10 @@ static void input_openxr_devices(unsigned max_users, bool separate)
          continue;
       }
       dv->slot[p] = s;
-      /* a pad took its slot: the port goes where it went, for this run */
-      if (dv->lost[p] >= 0)
+      dv->join[p] = join[p];
+      /* a pad took its slot: the port goes where it went, for this run;
+       * a player's is placed by its player instead */
+      if (dv->lost[p] >= 0 && !join[p])
          input_driver_exchange_ports((unsigned)dv->lost[p], (unsigned)s);
       dv->lost[p] = -1;
       input_openxr_announce(p);

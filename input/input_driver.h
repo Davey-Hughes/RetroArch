@@ -1932,7 +1932,8 @@ bool input_config_parse_vid_pid(const char *s, unsigned long *vid,
  * that no other has taken. Main thread. */
 /* The entry the controller in @slot took, or -1. */
 int input_config_plays_as_entry(unsigned slot);
-/* The controller in @slot's player: 0 Auto, else 1 and up. */
+/* The controller in @slot's player: 0 Auto, else 1 and up; with no
+ * entry, its default (the headset's is 1). */
 unsigned input_config_plays_as_player(unsigned slot);
 /* Gives the controller in @slot player @player (0 Auto), taking an
  * entry for it if it has none. False, with nothing changed, when it
@@ -1944,10 +1945,18 @@ const char *input_config_plays_as_entry_name(unsigned e);
 unsigned input_config_plays_as_entry_player(unsigned e);
 bool input_config_plays_as_entry_taken(unsigned e);
 void input_config_plays_as_set_entry(unsigned e, unsigned player);
-/* Whether any entry gives a player, within Max Users or past it. */
+/* Whether any entry gives a player, within Max Users or past it, or a
+ * connected controller has one with no entry (the headset's). */
 bool input_config_plays_as_active(void);
-/* Whether any entry gives a player within Max Users. */
+/* Whether any entry, or a connected controller with none, gives a
+ * player within Max Users. */
 bool input_config_plays_as_any_player(void);
+/* The player of a controller called @name, which has no vid:pid: the
+ * first entry naming it, else its default. */
+unsigned input_config_plays_as_named(const char *name);
+/* Moves on whenever an entry's controller or player may have: a cache
+ * of input_config_plays_as_named() looks again when it does. */
+unsigned input_config_plays_as_generation(void);
 /* The controller just connected in @slot takes its entry and its port:
  * true when it was placed, false for one the reservations place. */
 bool input_config_plays_as_place(unsigned slot);

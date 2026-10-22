@@ -10432,7 +10432,7 @@ void input_config_follow_shared_ports(const uint8_t *leader)
 /* Plays As: a controller's own player, kept by the controller as a
  * reservation names one, "vid:pid name". A connected controller takes
  * the first entry naming it that no other connected controller has
- * taken; one with none plays Auto. */
+ * taken; one with none plays its default, Auto but for the headset's. */
 #define INPUT_PLAYS_AS_HOTKEYS (RARCH_BIND_LIST_END - RARCH_FIRST_META_KEY)
 
 typedef struct
@@ -10448,6 +10448,10 @@ typedef struct
 static input_plays_as_entry_t input_plays_as[MAX_USERS];
 /* by slot: the entry its controller took, and one; 0 for none */
 static uint8_t input_plays_as_claim[MAX_INPUT_DEVICES];
+/* by slot: its controller's player with no entry, set as it connects */
+static uint8_t input_plays_as_dflt[MAX_INPUT_DEVICES];
+/* moves on whenever an entry's controller or player may have */
+static unsigned input_plays_as_gen;
 /* by slot: for an Auto controller placed to share with the user whose
  * reservation names it, that user and one, kept while it stays
  * connected; 0 for none */
@@ -10492,6 +10496,20 @@ static bool input_plays_as_names(const char *entry, bool zero_by_name,
       return v == vid && p == pid;
    return (name && *name && string_is_equal(name, n))
       || (display && *display && string_is_equal(display, n));
+}
+
+/* The player of a controller called @name with no entry: the
+ * headset's controllers are player 1's, every other plays Auto. */
+static unsigned input_plays_as_default(const char *name)
+{
+#ifdef HAVE_OPENXR
+   if (     string_is_equal(name, INPUT_OPENXR_JOYPAD_COMBINED)
+         || string_is_equal(name, INPUT_OPENXR_JOYPAD_LEFT)
+         || string_is_equal(name, INPUT_OPENXR_JOYPAD_RIGHT))
+      return 1;
+#endif
+   (void)name;
+   return 0;
 }
 
 int input_config_plays_as_entry(unsigned slot)
@@ -10573,7 +10591,11 @@ static void input_plays_as_hot_count(unsigned e)
  * have without it. */
 static void input_plays_as_tidy(unsigned e)
 {
-   if (!input_plays_as[e].player && !input_plays_as[e].own_hot)
+   /* the headset's cached players are looked up again */
+   input_plays_as_gen++;
+   if (     !input_plays_as[e].own_hot
+         && input_plays_as[e].player
+            == input_plays_as_default(input_config_plays_as_entry_name(e)))
       input_plays_as_drop(e);
 }
 
@@ -10582,6 +10604,9 @@ bool input_config_plays_as_active(void)
    unsigned e;
    for (e = 0; e < MAX_USERS; e++)
       if (input_plays_as[e].player)
+         return true;
+   for (e = 0; e < MAX_INPUT_DEVICES; e++)
+      if (input_config_plays_as_player(e))
          return true;
    return false;
 }
@@ -10594,13 +10619,40 @@ bool input_config_plays_as_any_player(void)
       if (     input_plays_as[e].player
             && input_plays_as[e].player <= max_users)
          return true;
+   for (e = 0; e < MAX_INPUT_DEVICES; e++)
+   {
+      unsigned player = input_config_plays_as_player(e);
+      if (player && player <= max_users)
+         return true;
+   }
    return false;
 }
 
 unsigned input_config_plays_as_player(unsigned slot)
 {
    int e = input_config_plays_as_entry(slot);
-   return (e >= 0) ? input_plays_as[e].player : 0;
+   if (e >= 0)
+      return input_plays_as[e].player;
+   if (     slot >= MAX_INPUT_DEVICES
+         || !*input_driver_st.input_device_info[slot].name)
+      return 0;
+   return input_plays_as_dflt[slot];
+}
+
+unsigned input_config_plays_as_named(const char *name)
+{
+   unsigned e;
+   for (e = 0; e < MAX_USERS; e++)
+      if (     *input_plays_as[e].device
+            && input_plays_as_names(input_plays_as[e].device, true, name,
+               NULL, 0, 0))
+         return input_plays_as[e].player;
+   return input_plays_as_default(name);
+}
+
+unsigned input_config_plays_as_generation(void)
+{
+   return input_plays_as_gen;
 }
 
 /* A free entry naming the controller in @slot, at its player, which
@@ -10799,6 +10851,7 @@ void input_config_plays_as_release(unsigned slot)
    if (slot < MAX_INPUT_DEVICES)
    {
       input_plays_as_claim[slot]  = 0;
+      input_plays_as_dflt[slot]   = 0;
       input_plays_as_shares[slot] = 0;
    }
 }
@@ -11005,6 +11058,7 @@ void input_plays_as_read(void *data)
       input_plays_as_hot_read(conf, e);
    }
    input_plays_as_reclaim();
+   input_plays_as_gen++;
    /* the hotkeys read through these */
    input_config_binds_changed();
 }
@@ -11133,6 +11187,8 @@ bool input_config_plays_as_place(unsigned slot)
       max_users = MAX_USERS;
    input_plays_as_placed_max_users = max_users;
    input_plays_as_take(slot);
+   input_plays_as_dflt[slot] = (uint8_t)input_plays_as_default(
+         input_driver_st.input_device_info[slot].name);
    input_plays_as_shares[slot] = 0;
 
    if (!(player = input_plays_as_now(slot, max_users)))
@@ -11161,6 +11217,18 @@ bool input_config_plays_as_place(unsigned slot)
    }
 
    t    = player - 1;
+#ifdef HAVE_OPENXR
+   /* the headset's controllers share their player whoever is there, or
+    * nobody, from the highest free port, and move no one */
+   if (string_is_equal(input_driver_st.input_device_info[slot].joypad_driver,
+            INPUT_OPENXR_JOYPAD))
+   {
+      input_plays_as_move(settings,
+            input_plays_as_free(settings, max_users, slot, MAX_USERS, true),
+            slot);
+      return true;
+   }
+#endif
    held = settings->uints.input_joypad_index[t];
    if (held == slot)
       return true;
