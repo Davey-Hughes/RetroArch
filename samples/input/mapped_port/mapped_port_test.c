@@ -1130,6 +1130,18 @@ static void test_announce_join_netplay(void)
    t_netplay = false;
 }
 
+/* The port a controller's row shows: the user reading its slot below
+ * Max Users, a sharer's included; none past Max Users. */
+static void test_slot_user(void)
+{
+   t_reset();
+   t_two_player_1();
+   CHECK(input_config_slot_user(0) == 0 && input_config_slot_user(1) == 3,
+         "the rows' ports are not the users reading the slots");
+   CHECK(input_config_slot_user(7) == MAX_USERS,
+         "a slot past Max Users has a port");
+}
+
 /* Entries that give no player within Max Users: Auto controllers are
  * placed as with no entries, a Device Index swap kept, and a driver
  * restart still puts each controller back on its port. */
@@ -2061,6 +2073,7 @@ int main(void)
    test_announce_first_press();
    test_announce_join_ends();
    test_announce_join_netplay();
+   test_slot_user();
    test_place_no_player();
    test_place_restart();
    test_place_restart_twins();

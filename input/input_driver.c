@@ -11214,6 +11214,20 @@ static void input_join_make(const settings_t *settings, uint8_t *join)
    }
 }
 
+unsigned input_config_slot_user(unsigned slot)
+{
+   unsigned u;
+   const settings_t *settings = config_get_ptr();
+   unsigned max_users         = settings->uints.input_max_users;
+
+   if (max_users > MAX_USERS)
+      max_users = MAX_USERS;
+   for (u = 0; u < max_users; u++)
+      if (settings->uints.input_joypad_index[u] == slot)
+         return u;
+   return MAX_USERS;
+}
+
 unsigned input_remapping_join_user(unsigned user)
 {
    return (user < MAX_USERS && input_join_to[user])

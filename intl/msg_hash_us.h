@@ -12531,6 +12531,26 @@ MSG_HASH(
    "Device Reservation Type"
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_PLAYS_AS_AUTO_PLAYER,
+   "Auto (%u)"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_PLAYS_AS_PLAYER,
+   "Player %u"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_PLAYS_AS_SHARING,
+   "Player %u, shared · binds in Port %u Controls"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_PLAYS_AS_NO_PORT,
+   "Not playing: more controllers than Max Users"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_PLAYS_AS_GONE,
+   "Not connected"
+   )
+MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_DEVICE_RESERVATION_TYPE,
    "Preferred: if specified device is present, it will be allocated for this player. Reserved: no other controller will be allocated for this player."
    )

@@ -8927,6 +8927,52 @@ static VIDEO_NOINLINE void menu_displaylist_monitor_index_range(void)
       setting->max          = (float)(cur > (unsigned)n ? cur : (unsigned)n);
 }
 
+/* Settings > Input > Controllers: the connected controllers in port
+ * order, then those past Max Users, then the Plays As entries of the
+ * controllers that are gone. */
+static unsigned menu_displaylist_parse_input_controllers(
+      file_list_t *list, settings_t *settings)
+{
+   unsigned u, e;
+   unsigned count     = 0;
+   uint32_t listed    = 0;
+   unsigned max_users = settings->uints.input_max_users;
+
+   if (max_users > MAX_USERS)
+      max_users = MAX_USERS;
+   for (u = 0; u < max_users + MAX_INPUT_DEVICES; u++)
+   {
+      const char *name;
+      unsigned s = (u < max_users)
+         ? settings->uints.input_joypad_index[u] : u - max_users;
+      if (     s >= MAX_INPUT_DEVICES
+            || (listed & (1U << s))
+            || !(name = input_config_get_device_name(s)))
+         continue;
+      listed |= 1U << s;
+      if (input_config_get_device_display_name(s))
+         name = input_config_get_device_display_name(s);
+      if (menu_entries_append(list, name,
+               MENU_ENUM_LABEL_INPUT_PLAYS_AS_STR,
+               MENU_ENUM_LABEL_INPUT_PLAYS_AS,
+               MENU_SETTINGS_INPUT_PLAYS_AS_BEGIN + s, 0, 0, NULL))
+         count++;
+   }
+   for (e = 0; e < MAX_USERS; e++)
+   {
+      const char *name = input_config_plays_as_entry_name(e);
+      if (!name || input_config_plays_as_entry_taken(e))
+         continue;
+      if (menu_entries_append(list, name,
+               MENU_ENUM_LABEL_INPUT_PLAYS_AS_STR,
+               MENU_ENUM_LABEL_INPUT_PLAYS_AS,
+               MENU_SETTINGS_INPUT_PLAYS_AS_BEGIN + MAX_INPUT_DEVICES + e,
+               0, 0, NULL))
+         count++;
+   }
+   return count;
+}
+
 unsigned menu_displaylist_build_list(
       file_list_t *list,
       settings_t *settings,
@@ -9304,6 +9350,9 @@ unsigned menu_displaylist_build_list(
                      PARSE_ONLY_FLOAT, false) == 0)
                count++;
          }
+         break;
+      case DISPLAYLIST_INPUT_CONTROLLERS_LIST:
+         count = menu_displaylist_parse_input_controllers(list, settings);
          break;
       case DISPLAYLIST_INPUT_RETROPAD_BINDS_LIST:
          {
@@ -10170,6 +10219,7 @@ unsigned menu_displaylist_build_list(
          {
             static menu_displaylist_build_info_selective_t build_list[] = {
                {MENU_ENUM_LABEL_INPUT_RETROPAD_BINDS,                  PARSE_ACTION,     true},
+               {MENU_ENUM_LABEL_INPUT_CONTROLLERS,                     PARSE_ACTION,     true},
                {MENU_ENUM_LABEL_INPUT_TURBO_FIRE_SETTINGS,             PARSE_ACTION,     true},
                {MENU_ENUM_LABEL_INPUT_HOTKEY_BINDS,                    PARSE_ACTION,     true},
                {MENU_ENUM_LABEL_INPUT_MENU_SETTINGS,                   PARSE_ACTION,     true},
@@ -17171,6 +17221,7 @@ static bool menu_displaylist_ctl_internal(
          case DISPLAYLIST_NETPLAY_ROOM_LIST:
          case DISPLAYLIST_SHADER_PRESET_MANAGER:
          case DISPLAYLIST_INPUT_RETROPAD_BINDS_LIST:
+         case DISPLAYLIST_INPUT_CONTROLLERS_LIST:
          case DISPLAYLIST_INPUT_HOTKEY_BINDS_LIST:
          case DISPLAYLIST_INPUT_TURBO_FIRE_SETTINGS_LIST:
          case DISPLAYLIST_INPUT_HAPTIC_FEEDBACK_SETTINGS_LIST:
@@ -17229,6 +17280,7 @@ static bool menu_displaylist_ctl_internal(
                   case DISPLAYLIST_INFORMATION_LIST:
                   case DISPLAYLIST_SCAN_DIRECTORY_LIST:
                   case DISPLAYLIST_INPUT_INFO:
+                  case DISPLAYLIST_INPUT_CONTROLLERS_LIST:
                      menu_entries_append(info->list,
                            msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NO_ENTRIES_TO_DISPLAY),
                            MENU_ENUM_LABEL_NO_ENTRIES_TO_DISPLAY_STR,
