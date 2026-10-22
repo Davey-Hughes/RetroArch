@@ -1398,22 +1398,32 @@ static void reallocate_port_if_needed(
       input_driver_ports_runtime_moved();
 }
 
-/* Every connected controller placed again, lowest slot first, as its
- * connect placed it: a player of its own or Max Users has changed. No
- * driver restarts; the headset's hands follow on the next poll. */
-void input_autoconfigure_reallocate_ports(void)
+/* Only what a Player or Max Users change moves is placed again, as its
+ * connect placed it: no other controller moves into a port emptied
+ * since. No driver restarts; the headset's hands follow on the next
+ * poll. */
+void input_autoconfigure_reallocate_ports(unsigned slot)
 {
-   unsigned slot;
-   for (slot = 0; slot < MAX_USERS; slot++)
+   unsigned s;
+   uint8_t again[MAX_USERS];
+
+   if (slot < MAX_USERS)
    {
-      const char *name = input_config_get_device_name(slot);
-      if (!name)
+      memset(again, 0, sizeof(again));
+      again[slot] = 1;
+   }
+   else
+      input_config_plays_as_max_users_changed(again);
+   for (s = 0; s < MAX_USERS; s++)
+   {
+      const char *name = input_config_get_device_name(s);
+      if (!again[s] || !name)
          continue;
-      reallocate_port_if_needed(slot,
-            input_config_get_device_vid(slot),
-            input_config_get_device_pid(slot),
+      reallocate_port_if_needed(s,
+            input_config_get_device_vid(s),
+            input_config_get_device_pid(s),
             name,
-            input_config_get_device_display_name(slot));
+            input_config_get_device_display_name(s));
    }
    /* the ports may have changed controllers: their deadzones with them */
    input_driver_deadzones_refresh();

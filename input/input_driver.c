@@ -10440,6 +10440,8 @@ static uint8_t input_plays_as_claim[MAX_INPUT_DEVICES];
  * reservation names it, that user and one, kept while it stays
  * connected; 0 for none */
 static uint8_t input_plays_as_shares[MAX_INPUT_DEVICES];
+/* the Max Users the controllers were last placed under */
+static unsigned input_plays_as_placed_max_users;
 
 bool input_config_parse_vid_pid(const char *s, unsigned long *vid,
       unsigned long *pid, const char **name)
@@ -10797,6 +10799,7 @@ bool input_config_plays_as_place(unsigned slot)
       return false;
    if (max_users > MAX_USERS)
       max_users = MAX_USERS;
+   input_plays_as_placed_max_users = max_users;
    input_plays_as_take(slot);
    input_plays_as_shares[slot] = 0;
 
@@ -10850,6 +10853,24 @@ bool input_config_plays_as_place(unsigned slot)
    }
    input_plays_as_move(settings, t, slot);
    return true;
+}
+
+void input_config_plays_as_max_users_changed(uint8_t *again)
+{
+   unsigned s;
+   unsigned before    = input_plays_as_placed_max_users;
+   unsigned max_users = config_get_ptr()->uints.input_max_users;
+
+   if (max_users > MAX_USERS)
+      max_users = MAX_USERS;
+   input_plays_as_placed_max_users = max_users;
+   for (s = 0; s < MAX_USERS; s++)
+   {
+      unsigned player = input_config_plays_as_player(s);
+      again[s] = *input_driver_st.input_device_info[s].name
+         && (     input_config_slot_user(s) >= MAX_USERS
+               || (player > before && player <= max_users));
+   }
 }
 
 /* By user: for a controller playing as another user's player, that

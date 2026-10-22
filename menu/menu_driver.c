@@ -5279,7 +5279,7 @@ void menu_input_plays_as_change(unsigned row, unsigned player)
                MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
          return;
       }
-      input_autoconfigure_reallocate_ports();
+      input_autoconfigure_reallocate_ports(row);
    }
    else
       input_config_plays_as_set_entry(row - MAX_INPUT_DEVICES, player);

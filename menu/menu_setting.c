@@ -10523,7 +10523,7 @@ static void general_write_handler(rarch_setting_t *setting)
          command_event(CMD_EVENT_CONTROLLER_INIT, NULL);
          /* a player past Max Users plays Auto: placed again */
          if (input_config_plays_as_active())
-            input_autoconfigure_reallocate_ports();
+            input_autoconfigure_reallocate_ports(MAX_USERS);
          break;
 #ifdef ANDROID
       case MENU_ENUM_LABEL_INPUT_SELECT_PHYSICAL_KEYBOARD:

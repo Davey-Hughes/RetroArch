@@ -1951,6 +1951,11 @@ bool input_config_plays_as_any_player(void);
 /* The controller just connected in @slot takes its entry and its port:
  * true when it was placed, false for one the reservations place. */
 bool input_config_plays_as_place(unsigned slot);
+/* Max Users has changed: @again gets, for each of the MAX_USERS slots,
+ * whether its controller is placed again - one with no port below Max
+ * Users now, or one whose player was above Max Users when controllers
+ * were last placed and is within it now. */
+void input_config_plays_as_max_users_changed(uint8_t *again);
 /* The controller in @slot is gone. */
 void input_config_plays_as_release(unsigned slot);
 /* The lowest user below Max Users reading @slot, or MAX_USERS. */
