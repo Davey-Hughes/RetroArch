@@ -783,6 +783,47 @@ static void test_place_leave_and_change(void)
          "connected again, the controller set to Player 1 is not on port 1");
 }
 
+/* The controllers placed again as input_autoconfigure_reallocate_ports()
+ * places them: each connected one, lowest slot first, as on connect. */
+static void t_place_again(void)
+{
+   unsigned s;
+   for (s = 0; s < MAX_USERS; s++)
+      if (input_config_get_device_name(s))
+         input_config_plays_as_place(s);
+}
+
+/* Placed again, a steady arrangement stays; a Player change and a
+ * lower Max Users move what they change. */
+static void test_place_again(void)
+{
+   t_reset();
+   t_entries(
+         "input_plays_as_device_1 = \"0001:0001 A\"\n"
+         "input_plays_as_player_1 = \"1\"\n"
+         "input_plays_as_device_2 = \"0002:0002 B\"\n"
+         "input_plays_as_player_2 = \"1\"\n");
+   t_connect(0, "A", 1, 1);
+   t_connect(1, "B", 2, 2);
+   t_place_again();
+   CHECK(t_user_of(0) == 0 && t_user_of(1) == 3,
+         "placed again, a steady arrangement moved");
+
+   CHECK(input_config_plays_as_set(1, 2), "Player 2 was refused");
+   t_place_again();
+   CHECK(t_user_of(0) == 0 && t_user_of(1) == 1,
+         "placed again, Player 2 is not on port 2");
+
+   CHECK(input_config_plays_as_set(1, 1), "Player 1 was refused");
+   t_place_again();
+   CHECK(t_user_of(1) == 3,
+         "placed again, Player 1 does not share from port 4");
+   settings.uints.input_max_users = 2;
+   t_place_again();
+   CHECK(t_user_of(0) == 0 && t_user_of(1) == 1,
+         "with Max Users 2 the sharer was not placed below it");
+}
+
 /* The frame's end, as runloop.c's: what the poll left for it is done
  * with the core off the stack. */
 static void t_frame_end(void)
@@ -2002,6 +2043,7 @@ int main(void)
    test_place_reservation();
    test_place_reservation_order();
    test_place_leave_and_change();
+   test_place_again();
    test_announce_nothing();
    test_join_port_map();
    test_join_follows_mapped_port();

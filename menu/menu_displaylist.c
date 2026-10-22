@@ -7144,6 +7144,52 @@ static int menu_displaylist_parse_input_device_type_list(
    return count;
 }
 
+/* A controller's Plays As: Auto, then 1 to Max Users; the row goes
+ * in each item's label, as for the input descriptions. */
+static unsigned menu_displaylist_parse_input_plays_as_list(
+      menu_displaylist_info_t *info, settings_t *settings)
+{
+   char entry_lbl[21];
+   char text[16];
+   unsigned p, current, row;
+   unsigned count             = 0;
+   unsigned max_users         = settings->uints.input_max_users;
+   struct menu_state *menu_st = menu_state_get_ptr();
+
+   if (     info->type < MENU_SETTINGS_INPUT_PLAYS_AS_BEGIN
+         || info->type > MENU_SETTINGS_INPUT_PLAYS_AS_END)
+      return 0;
+   if (max_users > MAX_USERS)
+      max_users = MAX_USERS;
+   row     = info->type - MENU_SETTINGS_INPUT_PLAYS_AS_BEGIN;
+   current = (row < MAX_INPUT_DEVICES)
+      ? input_config_plays_as_player(row)
+      : input_config_plays_as_entry_player(row - MAX_INPUT_DEVICES);
+   snprintf(entry_lbl, sizeof(entry_lbl), "%u", info->type);
+
+   for (p = 0; p <= max_users; p++)
+   {
+      if (p)
+         snprintf(text, sizeof(text), "%u", p);
+      else
+         strlcpy(text, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_AUTO),
+               sizeof(text));
+      if (!menu_entries_append(info->list, text, entry_lbl, MSG_UNKNOWN,
+               MENU_SETTING_DROPDOWN_ITEM_INPUT_PLAYS_AS, 0, p, NULL))
+         continue;
+      if (p == current)
+      {
+         menu_file_list_cbs_t *cbs = (menu_file_list_cbs_t*)
+            info->list->list[count].actiondata;
+         if (cbs)
+            cbs->checked           = true;
+         menu_st->selection_ptr    = count;
+      }
+      count++;
+   }
+   return count;
+}
+
 static int menu_displaylist_parse_input_select_reserved_device_list(
       file_list_t *info_list, const char *info_path,
       settings_t *settings)
@@ -8738,6 +8784,7 @@ void menu_displaylist_validation_dump(rarch_setting_t *list_settings)
             || t == (unsigned)DISPLAYLIST_DROPDOWN_LIST_INPUT_RETROPAD_BIND
             || t == (unsigned)DISPLAYLIST_DROPDOWN_LIST_INPUT_DEVICE_TYPE
             || t == (unsigned)DISPLAYLIST_DROPDOWN_LIST_INPUT_SELECT_RESERVED_DEVICE
+            || t == (unsigned)DISPLAYLIST_DROPDOWN_LIST_INPUT_PLAYS_AS
             || t == (unsigned)DISPLAYLIST_CDROM_DETAIL_INFO
             || t == (unsigned)DISPLAYLIST_PLAYLIST
             || t == (unsigned)DISPLAYLIST_PLAYLIST_COLLECTION
@@ -16927,6 +16974,15 @@ static bool menu_displaylist_ctl_internal(
             menu_entries_clear(info->list);
             count              = menu_displaylist_parse_input_select_reserved_device_list(
                   info->list, info->path, settings);
+
+            count = menu_displaylist_no_entries_fallback(info->list, count, FILE_TYPE_NONE);
+            info->flags       |= MD_FLAG_NEED_REFRESH
+                               | MD_FLAG_NEED_PUSH;
+            break;
+         case DISPLAYLIST_DROPDOWN_LIST_INPUT_PLAYS_AS:
+            menu_entries_clear(info->list);
+            count              = menu_displaylist_parse_input_plays_as_list(
+                  info, settings);
 
             count = menu_displaylist_no_entries_fallback(info->list, count, FILE_TYPE_NONE);
             info->flags       |= MD_FLAG_NEED_REFRESH

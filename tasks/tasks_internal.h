@@ -481,6 +481,9 @@ bool input_autoconfigure_connect_ex(
 bool input_autoconfigure_disconnect(
       unsigned port, const char *name);
 bool input_autoconfigure_reconnect(unsigned port);
+/* Every connected controller placed again, as its connect placed it,
+ * with no driver restarted. Main thread. */
+void input_autoconfigure_reallocate_ports(void);
 #if defined(HAVE_TEST_DRIVERS) || defined(HAVE_OPENXR)
 bool input_autoconfigure_pending(void);
 #endif

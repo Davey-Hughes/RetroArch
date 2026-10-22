@@ -1398,6 +1398,27 @@ static void reallocate_port_if_needed(
       input_driver_ports_runtime_moved();
 }
 
+/* Every connected controller placed again, lowest slot first, as its
+ * connect placed it: a player of its own or Max Users has changed. No
+ * driver restarts; the headset's hands follow on the next poll. */
+void input_autoconfigure_reallocate_ports(void)
+{
+   unsigned slot;
+   for (slot = 0; slot < MAX_USERS; slot++)
+   {
+      const char *name = input_config_get_device_name(slot);
+      if (!name)
+         continue;
+      reallocate_port_if_needed(slot,
+            input_config_get_device_vid(slot),
+            input_config_get_device_pid(slot),
+            name,
+            input_config_get_device_display_name(slot));
+   }
+   /* the ports may have changed controllers: their deadzones with them */
+   input_driver_deadzones_refresh();
+}
+
 /*************************/
 /* Autoconfigure Connect */
 /*************************/

@@ -5265,6 +5265,30 @@ static bool menu_input_key_bind_custom_bind_keyboard_cb(
 }
 #endif
 
+void menu_input_plays_as_change(unsigned row, unsigned player)
+{
+   settings_t *settings       = config_get_ptr();
+   struct menu_state *menu_st = &menu_driver_state;
+
+   if (row < MAX_INPUT_DEVICES)
+   {
+      if (!input_config_plays_as_set(row, player))
+      {
+         const char *msg = msg_hash_to_str(MSG_INPUT_PLAYS_AS_FULL);
+         runloop_msg_queue_push(msg, strlen(msg), 1, 180, true, NULL,
+               MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+         return;
+      }
+      input_autoconfigure_reallocate_ports();
+   }
+   else
+      input_config_plays_as_set_entry(row - MAX_INPUT_DEVICES, player);
+   settings->flags |= SETTINGS_FLG_MODIFIED;
+   /* the rows follow the controllers: the list is made again */
+   menu_st->flags  &= ~MENU_ST_FLAG_PREVENT_POPULATE;
+   menu_st->flags  |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+}
+
 bool menu_input_key_bind_set_mode(
       enum menu_input_binds_ctl_state state, void *data)
 {

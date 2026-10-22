@@ -128,6 +128,7 @@ enum menu_settings_type
    MENU_SETTING_DROPDOWN_ITEM_INPUT_DEVICE_TYPE,
    MENU_SETTING_DROPDOWN_ITEM_INPUT_DEVICE_INDEX,
    MENU_SETTING_DROPDOWN_ITEM_INPUT_SELECT_RESERVED_DEVICE,
+   MENU_SETTING_DROPDOWN_ITEM_INPUT_PLAYS_AS,
 #ifdef ANDROID
     MENU_SETTING_DROPDOWN_ITEM_INPUT_SELECT_PHYSICAL_KEYBOARD,
 #endif
@@ -839,6 +840,11 @@ void menu_input_remap_find_begin(unsigned port);
  * that takes the menu's input meanwhile. False if there is no such
  * combination. */
 bool menu_input_entry_capture_begin(unsigned number);
+
+/* Settings > Input > Controllers row @row (a slot, or from
+ * MAX_INPUT_DEVICES the entry of a controller that is gone) set to
+ * player @player, 0 for Auto; the controllers are placed again. */
+void menu_input_plays_as_change(unsigned row, unsigned player);
 
 bool menu_input_key_bind_set_mode(
       enum menu_input_binds_ctl_state state, void *data);

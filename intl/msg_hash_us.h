@@ -33345,6 +33345,10 @@ MSG_HASH(
    "%s and keyboard assigned to core port %u"
    )
 MSG_HASH(
+   MSG_INPUT_PLAYS_AS_FULL,
+   "Controller list full: set a disconnected controller to Auto"
+   )
+MSG_HASH(
    MSG_DEVICE_DISCONNECTED_FROM_PORT_NR,
    "%s disconnected from port %u"
    )

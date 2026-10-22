@@ -855,6 +855,17 @@ static int action_get_title_dropdown_input_description_kbd(
       path, port, s, len);
 }
 
+/* A controller's Plays As: its name. */
+static int action_get_title_dropdown_input_plays_as(
+      const char *path, const char *label, unsigned menu_type,
+      char *s, size_t len)
+{
+   if (!path || !*path)
+      return 0;
+   strlcpy(s, path, len);
+   return 1;
+}
+
 #ifdef HAVE_CHEEVOS
 static int action_get_title_achievements_submenu_list(
       const char* path, const char* label, unsigned menu_type, char* s, size_t len)
@@ -1217,6 +1228,7 @@ int menu_cbs_init_bind_title(menu_file_list_cbs_t *cbs,
       {MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_DESCRIPTION,                        action_get_title_dropdown_input_description},
       {MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_DESCRIPTION_KBD,                    action_get_title_dropdown_input_description_kbd},
       {MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_SELECT_RESERVED_DEVICE,             action_get_title_dropdown_item},
+      {MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_PLAYS_AS,                           action_get_title_dropdown_input_plays_as},
 #ifdef ANDROID
       {MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_SELECT_PHYSICAL_KEYBOARD,           action_get_title_dropdown_item},
 #endif
