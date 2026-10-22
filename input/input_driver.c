@@ -14727,6 +14727,9 @@ static void input_keys_pressed(
       }
       else if (hk->flags & INPUT_HK_ENABLER)
          input_st->flags |= INP_FLAG_BLOCK_HOTKEY;
+      else
+         /* the reset below needs INP_FLAG_BLOCK_HOTKEY */
+         input_st->input_hotkey_block_counter = 0;
    }
 
    /* While the wait is clear nothing has been captured; the first

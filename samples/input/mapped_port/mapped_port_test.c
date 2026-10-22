@@ -208,6 +208,7 @@ static void t_reset(void)
    st->remap_worked = 0;
    /* a test that ends with Hotkey Enable held leaves input held back */
    st->flags       &= ~(INP_FLAG_BLOCK_LIBRETRO_INPUT | INP_FLAG_BLOCK_HOTKEY);
+   st->input_hotkey_block_counter = 0;
    t_rumble_refused = 0;
    t_inits          = 0;
    runloop_st.system.ports.data = t_core_ports;
@@ -2286,6 +2287,36 @@ static void test_hotkey_enable_own(void)
    t_buttons[1] = 0;
 }
 
+/* A sharer's own Hotkey Enable, with user 1's pad having none: let go
+ * after a long hold, its next press waits out the delay again. */
+static void test_hotkey_enable_own_delay(void)
+{
+   unsigned f;
+   input_bits_t bits;
+   input_driver_state_t *st = input_state_get_ptr();
+
+   t_reset();
+   settings.uints.input_hotkey_block_delay = 5;
+   t_two_player_1();
+   input_driver_poll();
+   input_config_plays_as_set_hotkey(1, RARCH_ENABLE_HOTKEY, T_ENABLE,
+         AXIS_NONE);
+
+   t_buttons[1] = T_BIT(T_ENABLE);
+   for (f = 0; f < 10; f++)
+      t_collect(&bits);
+   CHECK(st->flags & INP_FLAG_BLOCK_LIBRETRO_INPUT,
+         "a sharer's own Hotkey Enable held past the delay held nothing back");
+   t_buttons[1] = 0;
+   t_collect(&bits);
+   t_buttons[1] = T_BIT(T_ENABLE);
+   t_collect(&bits);
+   CHECK(!(st->flags & INP_FLAG_BLOCK_LIBRETRO_INPUT),
+         "a sharer's own Hotkey Enable, pressed again, skipped the delay");
+   t_buttons[1] = 0;
+   settings.uints.input_hotkey_block_delay = 0;
+}
+
 int main(void)
 {
    test_identity();
@@ -2344,6 +2375,7 @@ int main(void)
    test_hotkey_own_lookup();
    test_hotkey_own_storage();
    test_hotkey_enable_own();
+   test_hotkey_enable_own_delay();
    if (failures)
    {
       printf("%d failure(s)\n", failures);
