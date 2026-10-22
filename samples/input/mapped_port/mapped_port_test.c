@@ -718,6 +718,34 @@ static void test_place_no_player(void)
    input_driver_registry_disconnect(1);
 }
 
+/* t_connect, with the registry told as the connect callback tells it. */
+static void t_plug(unsigned slot, const char *name, uint16_t vid,
+      uint16_t pid)
+{
+   t_connect(slot, name, vid, pid);
+   input_driver_registry_connect(slot, "x", name, "", vid, pid);
+}
+
+/* A driver restart that reports the pads in other slots with no
+ * disconnects between: the Player 1 pad keeps its entry and port 1. */
+static void test_place_restart(void)
+{
+   t_reset();
+   t_entries(
+         "input_plays_as_device_1 = \"0002:0002 B\"\n"
+         "input_plays_as_player_1 = \"1\"\n");
+   t_plug(0, "A", 1, 1);
+   t_plug(1, "B", 2, 2);
+   input_driver_registry_restart();
+   t_plug(0, "B", 2, 2);
+   t_plug(1, "A", 1, 1);
+   CHECK(t_user_of(0) == 0 && input_config_plays_as_player(0) == 1
+         && t_user_of(1) == 1,
+         "after a restart the Player 1 pad lost its entry or port 1");
+   input_driver_registry_disconnect(0);
+   input_driver_registry_disconnect(1);
+}
+
 /* A load made only to compare against, as saving an override makes
  * one, leaves the entries and claims as they were once the copy taken
  * before it is put back. */
@@ -1510,6 +1538,7 @@ int main(void)
    test_place_reservation();
    test_place_leave_and_change();
    test_place_no_player();
+   test_place_restart();
    test_plays_as_copy();
    test_menu_shared();
    test_hotkeys_shared();

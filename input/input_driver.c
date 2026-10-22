@@ -9041,6 +9041,10 @@ void input_driver_registry_restart(void)
    input_driver_device_pool()->driver = 0;
    input_player_lights_tick           = 0;
    input_player_lights_told           = false;
+   /* pads can come back in other slots with no disconnect between:
+    * each takes its entry afresh, not by the slot it had */
+   for (i = 0; i < MAX_INPUT_DEVICES; i++)
+      input_config_plays_as_release(i);
 
    /* the lowest port on a pad: the ports sharing it follow that one */
    memset(port_of_slot, INPUT_REGISTRY_NO_PORT, sizeof(port_of_slot));
