@@ -14915,6 +14915,9 @@ static void input_keys_pressed(
          && (hk->flags & INPUT_HK_ENABLER))
       blk.mode             = block_mode;
    share_open              = share_enabled | (share & ~share_enablers);
+   /* no enabler of its own: nothing blocks the port's, Game Focus too */
+   if (!libretro_hotkey_set && !keyboard_hotkey_set)
+      blk.mode             = 0;
 
    /* Which hotkeys anything could be holding: all that is gone through
     * below. The rest have nothing to do here - but for the menu toggle,

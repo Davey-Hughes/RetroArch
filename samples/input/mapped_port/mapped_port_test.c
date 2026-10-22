@@ -1361,12 +1361,14 @@ static void test_plays_as_copy(void)
 #define T_MENU   22
 #define T_Y      T_BIT(RETRO_DEVICE_ID_JOYPAD_Y)
 
-/* A frame's system input, the block flags cleared first as the run
- * loop clears them. */
+/* A frame's system input, the block flags cleared first, and set
+ * under Game Focus, as the run loop does. */
 static void t_collect(input_bits_t *bits)
 {
    input_driver_state_t *st = input_state_get_ptr();
    st->flags &= ~(INP_FLAG_BLOCK_LIBRETRO_INPUT | INP_FLAG_BLOCK_HOTKEY);
+   if (st->flags & INP_FLAG_KB_MAPPING_BLOCKED)
+      st->flags |= INP_FLAG_BLOCK_HOTKEY;
    memset(bits, 0, sizeof(*bits));
    input_driver_collect_system_input(st, &settings, bits);
 }
@@ -2317,6 +2319,50 @@ static void test_hotkey_enable_own_delay(void)
    settings.uints.input_hotkey_block_delay = 0;
 }
 
+/* Game Focus, with a sharer's own Hotkey Enable held or not: user 1's
+ * pad, with none, keeps its hotkeys, one with a key as well and one
+ * from its profile. */
+static void test_hotkey_enable_own_game_focus(void)
+{
+   unsigned held;
+   input_bits_t bits;
+   input_driver_state_t *st = input_state_get_ptr();
+
+   t_reset();
+   t_two_player_1();
+   input_driver_poll();
+   input_config_plays_as_set_hotkey(1, RARCH_ENABLE_HOTKEY, T_ENABLE,
+         AXIS_NONE);
+   st->flags |= INP_FLAG_KB_MAPPING_BLOCKED;
+
+   for (held = 0; held < 2; held++)
+   {
+      t_buttons[1] = held ? T_BIT(T_ENABLE) : 0;
+
+      t_bind(RARCH_FAST_FORWARD_KEY, T_FF);
+      input_config_binds[0][RARCH_FAST_FORWARD_KEY].attr =
+         RETRO_KEYBIND_ATTR(RETROK_SPACE, NO_BTN, true);
+      input_config_binds_changed();
+      input_autoconf_binds[0] = t_auto;
+      t_buttons[0] = T_BIT(T_FF);
+      t_collect(&bits);
+      CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY), held
+            ? "Game Focus: a sharer's held Hotkey Enable blocked user 1's keyed hotkey"
+            : "Game Focus: a sharer's Hotkey Enable blocked user 1's keyed hotkey");
+
+      t_bind(RARCH_FAST_FORWARD_KEY, NO_BTN);
+      input_autoconf_binds[0] = t_auto_own;
+      t_buttons[0] = T_BIT(T_OWN_FF);
+      t_collect(&bits);
+      CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY), held
+            ? "Game Focus: a sharer's held Hotkey Enable blocked user 1's profile hotkey"
+            : "Game Focus: a sharer's Hotkey Enable blocked user 1's profile hotkey");
+   }
+   t_buttons[0] = 0;
+   t_buttons[1] = 0;
+   st->flags   &= ~INP_FLAG_KB_MAPPING_BLOCKED;
+}
+
 int main(void)
 {
    test_identity();
@@ -2376,6 +2422,7 @@ int main(void)
    test_hotkey_own_storage();
    test_hotkey_enable_own();
    test_hotkey_enable_own_delay();
+   test_hotkey_enable_own_game_focus();
    if (failures)
    {
       printf("%d failure(s)\n", failures);
