@@ -18303,26 +18303,30 @@ void input_remapping_update_port_map(void)
 static uint32_t input_port_sharers(const settings_t *settings,
       unsigned user);
 
+/* The user the hotkeys are read on, as
+ * input_driver_collect_system_input() works it out: user 1, or with
+ * Hotkeys Follow Player 1 the first user on core port 1. */
+static unsigned input_hotkey_user(const settings_t *settings)
+{
+   unsigned user;
+   if (!settings->bools.input_hotkey_follows_player1)
+      return 0;
+   user = settings->uints.input_remap_port_map[0][0];
+   return (user < MAX_USERS) ? user : 0;
+}
+
 uint32_t input_config_hotkey_listen_slots(void)
 {
    unsigned u;
-   uint32_t users;
    uint32_t slots             = 0;
    const settings_t *settings = config_get_ptr();
    unsigned max_users         = settings->uints.input_max_users;
-   unsigned hotkey_port       = 0;
+   /* who fires the hotkeys: the users on the hotkey user's core port */
+   uint32_t users             = input_port_sharers(settings,
+         input_hotkey_user(settings));
 
    if (max_users > MAX_USERS)
       max_users = MAX_USERS;
-   /* who fires the hotkeys: the users on the hotkey port's core port,
-    * the port as input_driver_collect_system_input() works it out */
-   if (settings->bools.input_hotkey_follows_player1)
-   {
-      hotkey_port = settings->uints.input_remap_port_map[0][0];
-      if (hotkey_port >= MAX_USERS)
-         hotkey_port = 0;
-   }
-   users = input_port_sharers(settings, hotkey_port);
    for (u = 1; u < max_users; u++)
    {
       unsigned s = settings->uints.input_joypad_index[u];
@@ -18332,6 +18336,20 @@ uint32_t input_config_hotkey_listen_slots(void)
          slots |= 1U << s;
    }
    return slots;
+}
+
+bool input_config_hotkey_bind_own(unsigned slot, unsigned id)
+{
+   uint16_t joykey;
+   uint32_t joyaxis;
+   const settings_t *settings = config_get_ptr();
+
+   input_config_plays_as_hotkey(slot, id, &joykey, &joyaxis);
+   if (joykey != NO_BTN || joyaxis != AXIS_NONE)
+      return true;
+   return slot != settings->uints.input_joypad_index[0]
+      && slot != settings->uints.input_joypad_index[
+            input_hotkey_user(settings)];
 }
 
 static uint32_t input_port_sharers(const settings_t *settings,

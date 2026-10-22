@@ -5563,24 +5563,20 @@ MENU_NOINLINE static bool menu_input_key_bind_iterate(
       {
          /* Always stop binding when not binding all */
          bool stop_binding                   = new_binds.order == 0 && new_binds.begin == new_binds.last;
-         uint16_t own_key;
-         uint32_t own_axis;
 
-         input_config_plays_as_hotkey(new_binds.from, new_binds.out_id,
-               &own_key, &own_axis);
          /* Update bind */
-         /* a sharing controller's press goes to its own bind, and user
-          * 1's pad's does where it has its own for the hotkey; keys,
-          * mouse buttons and the rest go to the set */
+         /* a sharing controller's press goes to its own bind, and that
+          * of user 1's pad or the hotkey user's does where it has its
+          * own for the hotkey; keys, mouse buttons and the rest go to
+          * the set */
          /* written where the bind is kept now, which is asked for
           * here: the write is counted as a change when it is made,
           * and no address is carried from the frame the capture
           * began in */
          if (     !new_binds.skip
                && !new_binds.from_keys
-               && (     new_binds.from != new_binds.port
-                     || own_key  != NO_BTN
-                     || own_axis != AXIS_NONE))
+               && input_config_hotkey_bind_own(new_binds.from,
+                     new_binds.out_id))
          {
             /* refused with the controller still connected only when
              * the list is full */

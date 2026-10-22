@@ -2670,6 +2670,19 @@ static void test_hotkey_listen_follows(void)
    input_remapping_update_port_map();
    CHECK(input_config_hotkey_listen_slots() == ((1u << 1) | (1u << 2)),
          "binding a hotkey does not listen to who fires them");
+   /* the hotkey user's pad binds the set, as user 1's does, until it
+    * has its own; a sharer's binds its own */
+   t_dev(0, "A", 1, 1);
+   t_dev(1, "B", 2, 2);
+   t_dev(2, "C", 3, 3);
+   CHECK(!input_config_hotkey_bind_own(1, RARCH_FAST_FORWARD_KEY)
+         && !input_config_hotkey_bind_own(0, RARCH_FAST_FORWARD_KEY)
+         && input_config_hotkey_bind_own(2, RARCH_FAST_FORWARD_KEY),
+         "the hotkey user's pad binds its own, or a sharer's the set");
+   input_config_plays_as_set_hotkey(1, RARCH_FAST_FORWARD_KEY, T_OWN_KEY,
+         AXIS_NONE);
+   CHECK(input_config_hotkey_bind_own(1, RARCH_FAST_FORWARD_KEY),
+         "the hotkey user's pad with its own bind binds the set");
    settings.bools.input_hotkey_follows_player1 = false;
 }
 

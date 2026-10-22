@@ -1986,6 +1986,10 @@ size_t input_config_plays_as_hotkey_string(unsigned id, char *s,
  * port's core port), but user 1's own, as bits: a hotkey being bound
  * listens to these too. */
 uint32_t input_config_hotkey_listen_slots(void);
+/* Whether a pad's press binding hotkey @id is kept as the own bind of
+ * the controller in @slot: it has one for @id already, or it fires
+ * the hotkeys as neither user 1's pad nor the hotkey user's. */
+bool input_config_hotkey_bind_own(unsigned slot, unsigned id);
 
 unsigned *input_config_get_device_ptr(unsigned port);
 
