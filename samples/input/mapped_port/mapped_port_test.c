@@ -2642,6 +2642,23 @@ static void test_hotkey_enable_own_menu_tap(void)
    settings.uints.input_hotkey_block_delay = 0;
 }
 
+/* With Hotkeys Follow Player 1 on and user 1 mapped off core port 1,
+ * binding a hotkey listens to who fires them: the first user on core
+ * port 1 and the users sharing it, not user 1's core port. */
+static void test_hotkey_listen_follows(void)
+{
+   t_reset();
+   settings.bools.input_hotkey_follows_player1 = true;
+   settings.uints.input_remap_ports[0] = 1;
+   settings.uints.input_remap_ports[1] = 0;
+   settings.uints.input_remap_ports[2] = 0;
+   settings.uints.input_remap_ports[3] = 1;
+   input_remapping_update_port_map();
+   CHECK(input_config_hotkey_listen_slots() == ((1u << 1) | (1u << 2)),
+         "binding a hotkey does not listen to who fires them");
+   settings.bools.input_hotkey_follows_player1 = false;
+}
+
 /* Binding a hotkey listens to the controllers sharing user 1's core
  * port, not to other players'; its row shows each connected
  * controller's own. */
@@ -2883,6 +2900,7 @@ int main(void)
    test_hotkey_own_lookup();
    test_hotkey_own_storage();
    test_hotkey_enable_own();
+   test_hotkey_listen_follows();
    test_hotkey_own_binding();
 #ifdef HAVE_OPENXR
    test_headset_shares();

@@ -5356,8 +5356,8 @@ bool menu_input_key_bind_set_mode(
    index_offset                        = setting->index_offset;
    binds->port                         = settings->uints.input_joypad_index[
       index_offset];
-   /* a hotkey is bound from user 1's pad or a controller sharing its
-    * core port, which keeps the press as its own */
+   /* a hotkey is bound from user 1's pad or a controller that fires
+    * the hotkeys, which keeps the press as its own */
    binds->listen                       = (binds->out_id >= RARCH_FIRST_META_KEY)
       ? input_config_hotkey_listen_slots() : 0;
    binds->from                         = binds->port;

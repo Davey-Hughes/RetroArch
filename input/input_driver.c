@@ -18304,13 +18304,23 @@ static uint32_t input_port_sharers(const settings_t *settings,
 uint32_t input_config_hotkey_listen_slots(void)
 {
    unsigned u;
+   uint32_t users;
    uint32_t slots             = 0;
    const settings_t *settings = config_get_ptr();
    unsigned max_users         = settings->uints.input_max_users;
-   uint32_t users             = input_port_sharers(settings, 0);
+   unsigned hotkey_port       = 0;
 
    if (max_users > MAX_USERS)
       max_users = MAX_USERS;
+   /* who fires the hotkeys: the users on the hotkey port's core port,
+    * the port as input_driver_collect_system_input() works it out */
+   if (settings->bools.input_hotkey_follows_player1)
+   {
+      hotkey_port = settings->uints.input_remap_port_map[0][0];
+      if (hotkey_port >= MAX_USERS)
+         hotkey_port = 0;
+   }
+   users = input_port_sharers(settings, hotkey_port);
    for (u = 1; u < max_users; u++)
    {
       unsigned s = settings->uints.input_joypad_index[u];
