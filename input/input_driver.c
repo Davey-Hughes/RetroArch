@@ -10700,6 +10700,32 @@ static bool input_plays_as_plays(const settings_t *settings,
             false, d->name, d->display_name, d->vid, d->pid);
 }
 
+/* The user whose reservation first names the controller in @slot, if
+ * that user's controller plays as its player by its own; else
+ * MAX_USERS. Placed second, either one shares. */
+static unsigned input_plays_as_reserved_held(const settings_t *settings,
+      unsigned slot, unsigned max_users)
+{
+   unsigned u;
+   const input_device_info_t *d = &input_driver_st.input_device_info[slot];
+   for (u = 0; u < MAX_USERS; u++)
+   {
+      unsigned held = settings->uints.input_joypad_index[u];
+      if (     settings->uints.input_device_reservation_type[u]
+               == INPUT_DEVICE_RESERVATION_NONE
+            || !input_plays_as_names(settings->arrays.input_reserved_devices[u],
+               false, d->name, d->display_name, d->vid, d->pid))
+         continue;
+      if (     held != slot
+            && held < MAX_INPUT_DEVICES
+            && *input_driver_st.input_device_info[held].name
+            && input_plays_as_now(held, max_users) == u + 1)
+         return u;
+      break;
+   }
+   return MAX_USERS;
+}
+
 /* The lowest (@last: highest) user below @max_users, but @skip, whose
  * slot is @slot or has no controller, and that no reservation keeps
  * for another; MAX_USERS for none. */
@@ -10745,7 +10771,15 @@ bool input_config_plays_as_place(unsigned slot)
    if (!(player = input_plays_as_now(slot, max_users)))
    {
       /* Auto: the first free port; the reservations' to give where
-       * any is set */
+       * any is set, but beside the player a reservation names */
+      if ((t = input_plays_as_reserved_held(settings, slot, max_users))
+            < MAX_USERS)
+      {
+         input_plays_as_move(settings,
+               input_plays_as_free(settings, max_users, slot, t, true),
+               slot);
+         return true;
+      }
       for (u = 0; u < MAX_USERS; u++)
          if (settings->uints.input_device_reservation_type[u]
                != INPUT_DEVICE_RESERVATION_NONE)

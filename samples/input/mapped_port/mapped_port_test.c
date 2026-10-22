@@ -650,6 +650,39 @@ static void test_place_reservation(void)
          "it places");
 }
 
+/* Port 1 reserved for one controller, another set to Player 1: either
+ * order, the first has port 1 and the second shares. */
+static void test_place_reservation_order(void)
+{
+   t_reset();
+   settings.uints.input_device_reservation_type[0] =
+      INPUT_DEVICE_RESERVATION_PREFERRED;
+   strlcpy(settings.arrays.input_reserved_devices[0], "0005:0005 Res",
+         sizeof(settings.arrays.input_reserved_devices[0]));
+   t_entries(
+         "input_plays_as_device_1 = \"0002:0002 B\"\n"
+         "input_plays_as_player_1 = \"1\"\n");
+   t_dev(0, "Res", 5, 5);
+   CHECK(!input_config_plays_as_place(0), "the reservation did not place");
+   t_connect(1, "B", 2, 2);
+   CHECK(t_user_of(0) == 0 && t_user_of(1) == 3,
+         "reserved first: Player 1 did not share");
+
+   t_reset();
+   settings.uints.input_device_reservation_type[0] =
+      INPUT_DEVICE_RESERVATION_PREFERRED;
+   strlcpy(settings.arrays.input_reserved_devices[0], "0005:0005 Res",
+         sizeof(settings.arrays.input_reserved_devices[0]));
+   t_entries(
+         "input_plays_as_device_1 = \"0002:0002 B\"\n"
+         "input_plays_as_player_1 = \"1\"\n");
+   t_connect(0, "B", 2, 2);
+   t_dev(1, "Res", 5, 5);
+   CHECK(input_config_plays_as_place(1)
+         && t_user_of(0) == 0 && t_user_of(1) == 3,
+         "Player 1 first: the reserved controller did not share");
+}
+
 /* The controller on port N leaving: its sharers stay; the next Auto
  * controller takes port N. A player set and the controllers connected
  * again place them by it. */
@@ -1536,6 +1569,7 @@ int main(void)
    test_place_player();
    test_place_limits();
    test_place_reservation();
+   test_place_reservation_order();
    test_place_leave_and_change();
    test_place_no_player();
    test_place_restart();
