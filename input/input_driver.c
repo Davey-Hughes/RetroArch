@@ -10973,6 +10973,8 @@ bool input_config_parse_joyaxis(const char *s, uint32_t *joyaxis)
 void input_config_format_joykey(char *s, size_t len, uint16_t joykey)
 {
    size_t _len;
+   if (len == 0)
+      return;
    if (joykey == NO_BTN)
    {
       strlcpy(s, "nul", len);
@@ -10983,7 +10985,8 @@ void input_config_format_joykey(char *s, size_t len, uint16_t joykey)
       snprintf(s, len, "%u", (unsigned)joykey);
       return;
    }
-   _len = snprintf(s, len, "h%u", (unsigned)GET_HAT(joykey));
+   _len = BIND_STR_CLAMP((size_t)snprintf(s, len, "h%u",
+            (unsigned)GET_HAT(joykey)), len);
    switch (GET_HAT_DIR(joykey))
    {
       case HAT_UP_MASK:

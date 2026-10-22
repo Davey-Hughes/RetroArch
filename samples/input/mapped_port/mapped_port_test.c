@@ -2312,6 +2312,13 @@ static void test_bind_value_strings(void)
    CHECK(!strcmp(s, "-0"), "an axis was not written as -0");
    input_config_format_joyaxis(s, sizeof(s), AXIS_NONE);
    CHECK(!strcmp(s, "nul"), "no axis was not written as nul");
+   {
+      struct { char s[1]; char after[7]; } b;
+      memset(&b, 'x', sizeof(b));
+      input_config_format_joykey(b.s, sizeof(b.s), HAT_MAP(0, HAT_UP_MASK));
+      CHECK(!b.s[0] && !memcmp(b.after, "xxxxxxx", sizeof(b.after)),
+            "a hat was written past a short buffer");
+   }
 }
 
 /* A button no profile in these tests has */
