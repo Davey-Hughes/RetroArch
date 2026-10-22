@@ -2041,6 +2041,11 @@ unsigned input_driver_lightgun_id_convert(unsigned id);
 /* The ports that read slot @a read slot @b, and the other way round,
  * for this run only: the config file keeps what the user set. */
 void input_driver_exchange_ports(unsigned a, unsigned b);
+/* Whether the ports are as runtime moves left them; and, written
+ * directly since (a reserved device's placement), that they still are,
+ * so the config file keeps what the user set. */
+bool input_driver_ports_runtime(void);
+void input_driver_ports_runtime_moved(void);
 
 bool input_driver_pointer_is_offscreen(int16_t x, int16_t y);
 

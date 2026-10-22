@@ -779,6 +779,31 @@ static void test_place_restart(void)
    input_driver_registry_disconnect(1);
 }
 
+/* The reservations writing the ports after a Plays As move, as
+ * reallocate_port_if_needed() hands them on: the config file still
+ * gets the ports the user set. */
+static void test_place_saved_ports(void)
+{
+   unsigned u;
+   bool runtime;
+   bool configured = true;
+   t_reset();
+   t_entries(
+         "input_plays_as_device_1 = \"0002:0002 B\"\n"
+         "input_plays_as_player_1 = \"2\"\n");
+   t_connect(0, "B", 2, 2);
+   runtime = input_driver_ports_runtime();
+   settings.uints.input_joypad_index[2] = 3;
+   settings.uints.input_joypad_index[3] = 2;
+   if (runtime)
+      input_driver_ports_runtime_moved();
+   for (u = 0; u < MAX_USERS; u++)
+      if (input_config_get_saved_joypad_index(u) != u)
+         configured = false;
+   CHECK(runtime && t_user_of(0) == 1 && configured,
+         "a reservation's write saved the ports Plays As moved");
+}
+
 /* A load made only to compare against, as saving an override makes
  * one, leaves the entries and claims as they were once the copy taken
  * before it is put back. */
@@ -1573,6 +1598,7 @@ int main(void)
    test_place_leave_and_change();
    test_place_no_player();
    test_place_restart();
+   test_place_saved_ports();
    test_plays_as_copy();
    test_menu_shared();
    test_hotkeys_shared();

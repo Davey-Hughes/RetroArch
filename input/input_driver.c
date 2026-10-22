@@ -9006,7 +9006,8 @@ const struct input_registry *input_driver_get_registry(void)
  *
  * input_ports_runtime is the setting as the last restore left it. If
  * the setting no longer matches, something else has written it since -
- * the menu, a reserved device - and what it holds is the user's again. */
+ * the menu, a reserved device - and what it holds is the user's again;
+ * but a reserved device placed over runtime moves is runtime too. */
 static unsigned input_ports_configured[MAX_USERS];
 static unsigned input_ports_runtime[MAX_USERS];
 static bool     input_ports_runtime_active;
@@ -9142,6 +9143,21 @@ void input_driver_exchange_ports(unsigned a, unsigned b)
    input_ports_runtime_active = memcmp(input_ports_runtime,
          input_ports_configured, sizeof(input_ports_runtime)) != 0;
    input_driver_deadzones_refresh();
+}
+
+bool input_driver_ports_runtime(void)
+{
+   return input_ports_runtime_active
+      && !memcmp(config_get_ptr()->uints.input_joypad_index,
+            input_ports_runtime, sizeof(input_ports_runtime));
+}
+
+void input_driver_ports_runtime_moved(void)
+{
+   memcpy(input_ports_runtime, config_get_ptr()->uints.input_joypad_index,
+         sizeof(input_ports_runtime));
+   input_ports_runtime_active = memcmp(input_ports_runtime,
+         input_ports_configured, sizeof(input_ports_runtime)) != 0;
 }
 
 void input_driver_registry_connect(unsigned slot, const char *provider,

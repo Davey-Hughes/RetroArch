@@ -1380,6 +1380,7 @@ static void reallocate_port_if_needed(
       const char *device_display_name)
 {
    uint8_t leader[MAX_USERS];
+   bool runtime;
 
    if (detected_port >= MAX_USERS)
       return;
@@ -1387,10 +1388,14 @@ static void reallocate_port_if_needed(
    /* a controller with a player of its own goes by it */
    if (input_config_plays_as_place(detected_port))
       return;
+   runtime = input_driver_ports_runtime();
    input_config_shared_ports(leader);
    reallocate_leading_ports(leader, detected_port, vendor_id, product_id,
          device_name, device_display_name);
    input_config_follow_shared_ports(leader);
+   /* placed over runtime moves, the reservation's are runtime too */
+   if (runtime)
+      input_driver_ports_runtime_moved();
 }
 
 /*************************/
