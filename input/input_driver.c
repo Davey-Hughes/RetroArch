@@ -9075,6 +9075,12 @@ static void input_driver_registry_restore_ports(void)
          return;
       }
    }
+   /* and so are the controllers' own players */
+   if (input_config_plays_as_active())
+   {
+      input_registry_restart_cancel(&input_registry);
+      return;
+   }
 
    input_config_sanitize_joypad_indices();
 
@@ -9108,9 +9114,8 @@ static void input_driver_registry_restore_ports(void)
             " had.\n");
 }
 
-#ifdef HAVE_OPENXR
 /* For the headset's controllers, moved on by a pad that took their
- * slot: a runtime matter, as a restart's is. */
+ * slot, and for Plays As: a runtime matter, as a restart's is. */
 void input_driver_exchange_ports(unsigned a, unsigned b)
 {
    unsigned i;
@@ -9134,7 +9139,6 @@ void input_driver_exchange_ports(unsigned a, unsigned b)
          input_ports_configured, sizeof(input_ports_runtime)) != 0;
    input_driver_deadzones_refresh();
 }
-#endif
 
 void input_driver_registry_connect(unsigned slot, const char *provider,
       const char *name, const char *phys, uint16_t vid, uint16_t pid)
@@ -10656,6 +10660,114 @@ void input_plays_as_write(void *data)
       else
          config_unset(conf, key);
    }
+}
+
+/* @slot's player, as it plays now: Auto past Max Users. */
+static unsigned input_plays_as_now(unsigned slot, unsigned max_users)
+{
+   unsigned player = input_config_plays_as_player(slot);
+   return (player <= max_users) ? player : 0;
+}
+
+/* Whether the controller in @slot plays as user @user's player: by its
+ * own player, which beats any reservation; playing Auto, by @user's
+ * reservation naming it, as the reservation reads its string. */
+static bool input_plays_as_plays(const settings_t *settings,
+      unsigned slot, unsigned user, unsigned max_users)
+{
+   const input_device_info_t *d = &input_driver_st.input_device_info[slot];
+   unsigned player              = input_plays_as_now(slot, max_users);
+   if (player)
+      return player == user + 1;
+   return settings->uints.input_device_reservation_type[user]
+            != INPUT_DEVICE_RESERVATION_NONE
+      && input_plays_as_names(settings->arrays.input_reserved_devices[user],
+            false, d->name, d->display_name, d->vid, d->pid);
+}
+
+/* The lowest (@last: highest) user below @max_users, but @skip, whose
+ * slot is @slot or has no controller, and that no reservation keeps
+ * for another; MAX_USERS for none. */
+static unsigned input_plays_as_free(const settings_t *settings,
+      unsigned max_users, unsigned slot, unsigned skip, bool last)
+{
+   unsigned i;
+   for (i = 0; i < max_users; i++)
+   {
+      unsigned u = last ? max_users - 1 - i : i;
+      unsigned s = settings->uints.input_joypad_index[u];
+      if (     u != skip
+            && (s == slot || s >= MAX_INPUT_DEVICES
+               || !*input_driver_st.input_device_info[s].name)
+            && settings->uints.input_device_reservation_type[u]
+               != INPUT_DEVICE_RESERVATION_RESERVED)
+         return u;
+   }
+   return MAX_USERS;
+}
+
+/* User @user reads @slot, for this run. */
+static void input_plays_as_move(const settings_t *settings,
+      unsigned user, unsigned slot)
+{
+   if (user < MAX_USERS)
+      input_driver_exchange_ports(
+            settings->uints.input_joypad_index[user], slot);
+}
+
+bool input_config_plays_as_place(unsigned slot)
+{
+   unsigned u, t, held, player;
+   settings_t *settings = config_get_ptr();
+   unsigned max_users   = settings->uints.input_max_users;
+
+   if (slot >= MAX_INPUT_DEVICES)
+      return false;
+   if (max_users > MAX_USERS)
+      max_users = MAX_USERS;
+   input_plays_as_take(slot);
+
+   if (!(player = input_plays_as_now(slot, max_users)))
+   {
+      /* Auto: the first free port; the reservations' to give where
+       * any is set */
+      for (u = 0; u < MAX_USERS; u++)
+         if (settings->uints.input_device_reservation_type[u]
+               != INPUT_DEVICE_RESERVATION_NONE)
+            return false;
+      if (!input_config_plays_as_active())
+         return false;
+      input_plays_as_move(settings,
+            input_plays_as_free(settings, max_users, slot, MAX_USERS, false),
+            slot);
+      return true;
+   }
+
+   t    = player - 1;
+   held = settings->uints.input_joypad_index[t];
+   if (held == slot)
+      return true;
+   if (     held < MAX_INPUT_DEVICES
+         && *input_driver_st.input_device_info[held].name)
+   {
+      /* another of the player's: this one shares, from the highest
+       * free port */
+      if (input_plays_as_plays(settings, held, t, max_users))
+      {
+         input_plays_as_move(settings,
+               input_plays_as_free(settings, max_users, slot, t, true),
+               slot);
+         return true;
+      }
+      /* an Auto one: it moves to the first free port */
+      input_plays_as_move(settings, t, slot);
+      input_plays_as_move(settings,
+            input_plays_as_free(settings, max_users, held, t, false),
+            held);
+      return true;
+   }
+   input_plays_as_move(settings, t, slot);
+   return true;
 }
 
 struct input_plays_as_copy

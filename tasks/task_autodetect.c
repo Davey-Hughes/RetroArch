@@ -1384,6 +1384,9 @@ static void reallocate_port_if_needed(
    if (detected_port >= MAX_USERS)
       return;
    input_config_sanitize_joypad_indices();
+   /* a controller with a player of its own goes by it */
+   if (input_config_plays_as_place(detected_port))
+      return;
    input_config_shared_ports(leader);
    reallocate_leading_ports(leader, detected_port, vendor_id, product_id,
          device_name, device_display_name);
@@ -2030,6 +2033,7 @@ static void cb_input_autoconfigure_disconnect(
    input_config_set_device_pid(port, 0);
    input_config_set_device_autoconfigured(port, false);
    input_config_reset_autoconfig_binds(port);
+   input_config_plays_as_release(port);
 
    input_driver_registry_disconnect(port);
 }

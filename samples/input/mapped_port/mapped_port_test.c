@@ -500,6 +500,183 @@ static void test_plays_as_entry_life(void)
          "a gone controller's entry set to Auto was kept");
 }
 
+/* A controller in slot @slot, connected as the frontend connects one:
+ * named, then placed. */
+static void t_connect(unsigned slot, const char *name, uint16_t vid,
+      uint16_t pid)
+{
+   t_dev(slot, name, vid, pid);
+   input_config_plays_as_place(slot);
+}
+
+/* The user reading @slot below Max Users, or MAX_USERS. */
+static unsigned t_user_of(unsigned slot)
+{
+   unsigned u;
+   for (u = 0; u < settings.uints.input_max_users; u++)
+      if (settings.uints.input_joypad_index[u] == slot)
+         return u;
+   return MAX_USERS;
+}
+
+/* Auto: with no entries the reservations place it, as before; with
+ * entries, the first free port. */
+static void test_place_auto(void)
+{
+   t_reset();
+   t_dev(2, "Pad", 1, 1);
+   CHECK(!input_config_plays_as_place(2) && t_user_of(2) == 2,
+         "with no entries Plays As placed an Auto controller");
+   t_entries(
+         "input_plays_as_device_1 = \"Away\"\n"
+         "input_plays_as_player_1 = \"4\"\n");
+   CHECK(input_config_plays_as_place(2) && t_user_of(2) == 0,
+         "an Auto controller is not on the first free port");
+}
+
+/* Player N: a free port N is its; an Auto controller there moves to
+ * the first free port; another of player N's makes it share, from the
+ * highest free port below Max Users. */
+static void test_place_player(void)
+{
+   t_reset();
+   t_entries(
+         "input_plays_as_device_1 = \"0001:0001 A\"\n"
+         "input_plays_as_player_1 = \"2\"\n");
+   t_connect(0, "A", 1, 1);
+   CHECK(t_user_of(0) == 1, "Player 2 did not take a free port 2");
+
+   t_reset();
+   t_entries(
+         "input_plays_as_device_1 = \"0002:0002 B\"\n"
+         "input_plays_as_player_1 = \"1\"\n");
+   t_connect(0, "Auto", 9, 9);
+   CHECK(t_user_of(0) == 0, "the Auto controller is not on port 1");
+   t_connect(1, "B", 2, 2);
+   CHECK(t_user_of(1) == 0 && t_user_of(0) == 1,
+         "Player 1 did not take port 1 from an Auto controller");
+
+   t_reset();
+   t_entries(
+         "input_plays_as_device_1 = \"0001:0001 A\"\n"
+         "input_plays_as_player_1 = \"1\"\n"
+         "input_plays_as_device_2 = \"0002:0002 B\"\n"
+         "input_plays_as_player_2 = \"1\"\n");
+   t_connect(0, "A", 1, 1);
+   t_connect(1, "B", 2, 2);
+   CHECK(t_user_of(0) == 0 && t_user_of(1) == 3,
+         "a second Player 1 does not share from the highest free port");
+   CHECK(settings.uints.input_joypad_index[1] == 3,
+         "the port the sharer left does not read the slot it came from");
+}
+
+/* A controller a reservation put on port N is player N's; an explicit
+ * player above Max Users plays Auto; with no free port a sharer gets
+ * none. */
+static void test_place_limits(void)
+{
+   t_reset();
+   settings.uints.input_device_reservation_type[0] =
+      INPUT_DEVICE_RESERVATION_PREFERRED;
+   strlcpy(settings.arrays.input_reserved_devices[0], "0005:0005 Res",
+         sizeof(settings.arrays.input_reserved_devices[0]));
+   t_entries(
+         "input_plays_as_device_1 = \"0002:0002 B\"\n"
+         "input_plays_as_player_1 = \"1\"\n");
+   t_dev(0, "Res", 5, 5);
+   CHECK(!input_config_plays_as_place(0),
+         "an Auto controller was placed with a reservation set");
+   t_connect(1, "B", 2, 2);
+   CHECK(t_user_of(0) == 0 && t_user_of(1) == 3,
+         "Player 1 did not share with the reserved controller on port 1");
+
+   t_reset();
+   t_entries(
+         "input_plays_as_device_1 = \"0002:0002 B\"\n"
+         "input_plays_as_player_1 = \"5\"\n");
+   t_connect(0, "A", 1, 1);
+   t_connect(1, "B", 2, 2);
+   CHECK(t_user_of(0) == 0 && t_user_of(1) == 1,
+         "Player 5 with Max Users 4 did not play Auto");
+
+   t_reset();
+   settings.uints.input_max_users = 2;
+   t_entries(
+         "input_plays_as_device_1 = \"0001:0001 A\"\n"
+         "input_plays_as_player_1 = \"1\"\n"
+         "input_plays_as_device_2 = \"0002:0002 B\"\n"
+         "input_plays_as_player_2 = \"1\"\n");
+   t_connect(0, "A", 1, 1);
+   t_connect(1, "C", 3, 3);
+   t_connect(2, "B", 2, 2);
+   CHECK(t_user_of(0) == 0 && t_user_of(1) == 1 && t_user_of(2) == MAX_USERS,
+         "a sharer with no free port took one");
+}
+
+/* An explicit player beats a reservation naming the controller; a
+ * reservation names as it places, a 0000:0000 one every controller
+ * with no vid:pid. */
+static void test_place_reservation(void)
+{
+   t_reset();
+   settings.uints.input_device_reservation_type[0] =
+      INPUT_DEVICE_RESERVATION_PREFERRED;
+   strlcpy(settings.arrays.input_reserved_devices[0], "0005:0005 Res",
+         sizeof(settings.arrays.input_reserved_devices[0]));
+   t_dev(0, "Res", 5, 5);
+   t_entries(
+         "input_plays_as_device_1 = \"0005:0005 Res\"\n"
+         "input_plays_as_player_1 = \"3\"\n"
+         "input_plays_as_device_2 = \"0002:0002 B\"\n"
+         "input_plays_as_player_2 = \"1\"\n");
+   t_connect(1, "B", 2, 2);
+   CHECK(t_user_of(1) == 0 && t_user_of(0) == 1,
+         "a Player 3 controller that port 1's reservation names kept "
+         "port 1 from Player 1");
+
+   t_reset();
+   settings.uints.input_device_reservation_type[0] =
+      INPUT_DEVICE_RESERVATION_PREFERRED;
+   strlcpy(settings.arrays.input_reserved_devices[0], "0000:0000 Res",
+         sizeof(settings.arrays.input_reserved_devices[0]));
+   t_entries(
+         "input_plays_as_device_1 = \"0002:0002 B\"\n"
+         "input_plays_as_player_1 = \"1\"\n");
+   t_dev(0, "Other", 0, 0);
+   t_connect(1, "B", 2, 2);
+   CHECK(t_user_of(0) == 0 && t_user_of(1) == 3,
+         "a 0000:0000 reservation did not name an unnumbered controller "
+         "it places");
+}
+
+/* The controller on port N leaving: its sharers stay; the next Auto
+ * controller takes port N. A player set and the controllers connected
+ * again place them by it. */
+static void test_place_leave_and_change(void)
+{
+   t_reset();
+   t_entries(
+         "input_plays_as_device_1 = \"0001:0001 A\"\n"
+         "input_plays_as_player_1 = \"1\"\n"
+         "input_plays_as_device_2 = \"0002:0002 B\"\n"
+         "input_plays_as_player_2 = \"1\"\n");
+   t_connect(0, "A", 1, 1);
+   t_connect(1, "B", 2, 2);
+   t_disconnect(0);
+   CHECK(t_user_of(1) == 3, "the sharer moved when port 1 emptied");
+   t_connect(0, "Auto", 9, 9);
+   CHECK(t_user_of(0) == 0, "an Auto controller did not take the empty port 1");
+
+   t_reset();
+   t_connect(0, "A", 1, 1);
+   t_connect(1, "B", 2, 2);
+   CHECK(input_config_plays_as_set(1, 1), "Player 1 took no entry");
+   input_config_plays_as_place(0);
+   input_config_plays_as_place(1);
+   CHECK(t_user_of(1) == 0 && t_user_of(0) == 1,
+         "connected again, the controller set to Player 1 is not on port 1");
+}
+
 /* A load made only to compare against, as saving an override makes
  * one, leaves the entries and claims as they were once the copy taken
  * before it is put back. */
@@ -1286,6 +1463,11 @@ int main(void)
    test_plays_as_match();
    test_plays_as_round_trip();
    test_plays_as_entry_life();
+   test_place_auto();
+   test_place_player();
+   test_place_limits();
+   test_place_reservation();
+   test_place_leave_and_change();
    test_plays_as_copy();
    test_menu_shared();
    test_hotkeys_shared();
