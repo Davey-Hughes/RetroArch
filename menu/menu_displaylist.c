@@ -7812,6 +7812,8 @@ static void menu_displaylist_restore_plays_as_row(
          continue;
 
       menu_st->selection_ptr = i;
+      if (menu_st->driver_ctx && menu_st->driver_ctx->navigation_set)
+         menu_st->driver_ctx->navigation_set(menu_st->userdata, true);
       break;
    }
    menu->plays_as_row = 0;
