@@ -1953,6 +1953,8 @@ bool input_config_plays_as_any_player(void);
 bool input_config_plays_as_place(unsigned slot);
 /* The controller in @slot is gone. */
 void input_config_plays_as_release(unsigned slot);
+/* The lowest user below Max Users reading @slot, or MAX_USERS. */
+unsigned input_config_slot_user(unsigned slot);
 
 unsigned *input_config_get_device_ptr(unsigned port);
 
