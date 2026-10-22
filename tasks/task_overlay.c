@@ -23,7 +23,10 @@
 #ifdef HAVE_COMPRESSION
 #include <file/archive_file.h>
 #endif
+#include <formats/data_transfer.h>
 #include <formats/image.h>
+#include <features/features_cpu.h>
+#include <queues/task_queue.h>
 #include <streams/file_stream.h>
 #include <string/stdstring.h>
 #include <lrc_hash.h>
@@ -31,9 +34,11 @@
 #include "tasks_internal.h"
 
 #include "../gfx/video_driver.h"
+#include "../gfx/gfx_surface.h"
 #include "../input/input_driver.h"
 #include "../input/input_overlay.h"
 #include "../input/input_remapping.h"
+#include "../led/led_defines.h"
 #include "../verbosity.h"
 #include <string/rstrtod.h>
 
@@ -52,6 +57,10 @@ struct overlay_loader
    struct overlay *overlays;
    struct overlay *active;
    struct string_list *image_list;
+   struct string_list *anim_list; /* APNG file bytes, parallel */
+   /* Images decoded ahead, by relative path: overlay_predecoded_t in
+    * attr.p, each taken by the item that names it first */
+   struct string_list *predecoded;
 
    size_t resolve_pos;
    unsigned size;
@@ -59,6 +68,11 @@ struct overlay_loader
 
    enum overlay_status state;
    enum overlay_image_transfer_status loading_status;
+
+   /* What the pack's images are decoded as: made on the main thread
+    * from the driver's answers when the load is pushed, since the
+    * decode runs where the driver cannot be asked */
+   image_texture_request_t req;
 
    uint16_t overlay_types;
 
@@ -293,6 +307,159 @@ static bool task_overlay_within_budget(void *ud)
    return task_nbio_slice_within_budget(ud, 0, 0);
 }
 
+typedef struct
+{
+   struct texture_image img;
+   int png_probe;
+   bool ok;
+} overlay_predecoded_t;
+
+typedef struct
+{
+   overlay_predecoded_t **items;
+   char **paths;
+   image_texture_request_t req;
+} overlay_predecode_set_t;
+
+static void task_overlay_predecode_one(unsigned i, void *ud)
+{
+   overlay_predecode_set_t *set = (overlay_predecode_set_t*)ud;
+   overlay_predecoded_t *item   = set->items[i];
+   item->png_probe              = -1;
+   item->ok = image_texture_load_request_ex(&item->img, set->paths[i],
+         &set->req, NULL, NULL, &item->png_probe);
+}
+
+/* Every image file the pack names, decoded at once across the cores
+ * before the first overlay is parsed; each item then takes its image
+ * from here instead of decoding it. Only where the task queue has a
+ * thread of its own - without one the decodes are paced item by item
+ * on the main thread - and not for a pack in an archive, whose members
+ * come out of it one at a time. */
+static void task_overlay_predecode(overlay_loader_t *loader)
+{
+   overlay_predecode_set_t set;
+   struct string_list *rel;
+   char key[64];
+   char rel_path[PATH_MAX_LENGTH];
+   char full_path[PATH_MAX_LENGTH];
+   unsigned o, d, n, i;
+
+   loader->flags |= OVERLAY_LOADER_PREDECODED;
+   if (     !task_queue_is_threaded()
+         || cpu_features_get_core_amount() < 2
+#ifdef HAVE_COMPRESSION
+         || path_get_archive_delim(loader->overlay_path)
+#endif
+         || !(rel = string_list_new()))
+      return;
+
+   for (o = 0; o < loader->size; o++)
+   {
+      unsigned descs = 0;
+      union string_list_elem_attr attr;
+      attr.i = 0;
+      snprintf(key, sizeof(key), "overlay%u_overlay", o);
+      if (     config_get_path(loader->conf, key, rel_path, sizeof(rel_path))
+            && *rel_path && string_list_find_elem(rel, rel_path) == 0)
+         string_list_append(rel, rel_path, attr);
+      snprintf(key, sizeof(key), "overlay%u_descs", o);
+      if (!config_get_uint(loader->conf, key, &descs))
+         continue;
+      for (d = 0; d < descs; d++)
+      {
+         snprintf(key, sizeof(key), "overlay%u_desc%u_overlay", o, d);
+         if (     config_get_path(loader->conf, key, rel_path,
+                     sizeof(rel_path))
+               && *rel_path && string_list_find_elem(rel, rel_path) == 0)
+            string_list_append(rel, rel_path, attr);
+      }
+   }
+
+   set.items = NULL;
+   set.paths = NULL;
+   if (     (n = (unsigned)rel->size) < 2
+         || !(set.items = (overlay_predecoded_t**)calloc(n,
+               sizeof(*set.items)))
+         || !(set.paths = (char**)calloc(n, sizeof(*set.paths))))
+   {
+      free(set.items);
+      string_list_free(rel);
+      return;
+   }
+   for (i = 0; i < n; i++)
+   {
+      overlay_resolve_path(full_path, loader->overlay_path,
+            rel->elems[i].data, sizeof(full_path));
+      if (     !(set.items[i] = (overlay_predecoded_t*)calloc(1,
+                  sizeof(**set.items)))
+            || !(set.paths[i] = strdup(full_path)))
+         break;
+      rel->elems[i].attr.p = set.items[i];
+   }
+   set.req                 = loader->req;
+
+   /* Out of memory part way: no predecode, every item decodes its own */
+   if (i < n)
+   {
+      for (i = 0; i < n; i++)
+      {
+         free(set.items[i]);
+         free(set.paths[i]);
+      }
+      free(set.items);
+      free(set.paths);
+      string_list_free(rel);
+      return;
+   }
+
+   image_texture_set_run_ex(n, task_overlay_predecode_one, &set,
+         data_transfer_pool_flush);
+   for (i = 0; i < n; i++)
+      free(set.paths[i]);
+   free(set.items);
+   free(set.paths);
+   loader->predecoded = rel;
+}
+
+/* The image predecoded for @rel_path, taken: false when there is none,
+ * which leaves the item to decode it itself */
+static bool task_overlay_take_predecoded(overlay_loader_t *loader,
+      const char *rel_path, struct texture_image *image, int *png_probe)
+{
+   overlay_predecoded_t *item;
+   int idx;
+   if (     !loader->predecoded
+         || !(idx = string_list_find_elem(loader->predecoded, rel_path))
+         || !(item = (overlay_predecoded_t*)
+               loader->predecoded->elems[idx - 1].attr.p))
+      return false;
+   loader->predecoded->elems[idx - 1].attr.p = NULL;
+   if (item->ok)
+   {
+      *image     = item->img;
+      *png_probe = item->png_probe;
+   }
+   free(item);
+   return true;
+}
+
+static void task_overlay_predecoded_free(struct string_list *list)
+{
+   size_t i;
+   if (!list)
+      return;
+   for (i = 0; i < list->size; i++)
+   {
+      overlay_predecoded_t *item =
+            (overlay_predecoded_t*)list->elems[i].attr.p;
+      if (item)
+         image_texture_free(&item->img);
+      free(item);
+   }
+   string_list_free(list);
+}
+
 static void task_overlay_image_done(struct overlay *overlay)
 {
    overlay->pos           = 0;
@@ -303,7 +470,8 @@ static bool task_overlay_load_image_texture(
       struct overlay *overlay,
       struct texture_image *image,
       const char *full_path,
-      const char *rel_path)
+      const char *rel_path,
+      unsigned *pack_idx)
 {
    int img_idx = string_list_find_elem(loader->image_list, rel_path) - 1;
 
@@ -311,9 +479,13 @@ static bool task_overlay_load_image_texture(
    if (img_idx == -1)
    {
       union string_list_elem_attr attr;
+      int png_probe = -1;
 
-      image->supports_rgba =
-            (loader->flags & OVERLAY_LOADER_RGBA_SUPPORT) ? true : false;
+      image->supports_rgba = loader->req.rgba;
+      /* An ask, answered by the decode: a 16-bit PNG comes back at
+       * ten bits a channel where the driver can sample it, anything
+       * else comes back eight. */
+      image->pix10         = loader->req.want_10bit;
 
 #ifdef HAVE_COMPRESSION
       if (path_get_archive_delim(full_path))
@@ -345,14 +517,61 @@ static bool task_overlay_load_image_texture(
       }
       else
 #endif
-      if (!image_texture_load(image, full_path))
-         return false;
+      {
+         image_texture_request_t req = loader->req;
+         /* A predecoded image that failed is as failed as a decode
+          * here: an empty image */
+         if (task_overlay_take_predecoded(loader, rel_path, image,
+                  &png_probe))
+         {
+            if (!image->pixels && !image->compressed)
+               return false;
+         }
+         else if (!image_texture_load_request_ex(image, full_path, &req,
+                  NULL, NULL, &png_probe))
+            return false;
+      }
 
       attr.p = (void*)image;
       string_list_append(loader->image_list, rel_path, attr);
+      if (pack_idx)
+         *pack_idx = (unsigned)(loader->image_list->size - 1);
+
+#ifdef HAVE_RPNG
+      /* An animated PNG keeps its file bytes: the pack composes the
+       * frames from them one at a time. The decode above said which
+       * files those are and is the animation's first frame, so a
+       * still is read once and nothing decodes twice. */
+      {
+         union string_list_elem_attr aattr;
+         overlay_anim_src_t *src = NULL;
+         int64_t len             = 0;
+         void *buf               = NULL;
+
+         aattr.i = 0;
+         if (     png_probe == 1
+               && filestream_read_file(full_path, &buf, &len)
+               && buf && len > 0
+               && (src = (overlay_anim_src_t*)calloc(1, sizeof(*src))))
+         {
+            src->data = buf;
+            src->len  = (size_t)len;
+            buf       = NULL;
+         }
+         free(buf);
+         aattr.p = (void*)src;
+         string_list_append(loader->anim_list, rel_path, aattr);
+      }
+#else
+      (void)png_probe;
+#endif
    }
    else
+   {
       *image = *((struct texture_image*)loader->image_list->elems[img_idx].attr.p);
+      if (pack_idx)
+         *pack_idx = (unsigned)img_idx;
+   }
 
    overlay->load_images[overlay->load_images_size++] = *image;
 
@@ -383,7 +602,7 @@ static void task_overlay_load_desc_image(
             image_path, sizeof(path));
 
       if (task_overlay_load_image_texture(loader, overlay, &desc->image,
-               path, image_path))
+               path, image_path, &desc->pack_image_index))
          desc->image_index = overlay->load_images_size - 1;
    }
 
@@ -415,7 +634,6 @@ static void task_overlay_desc_populate_eightway_config(
       unsigned ol_idx, unsigned desc_idx)
 {
    size_t _len;
-   input_driver_state_t *input_st = input_state_get_ptr();
    overlay_eightway_config_t *eightway;
    char conf_key[64];
    char *str;
@@ -446,8 +664,8 @@ static void task_overlay_desc_populate_eightway_config(
          BIT256_SET(eightway->left,  RETRO_DEVICE_ID_JOYPAD_LEFT);
          BIT256_SET(eightway->right, RETRO_DEVICE_ID_JOYPAD_RIGHT);
 
-         eightway->slope_low  = &input_st->overlay_eightway_dpad_slopes[0];
-         eightway->slope_high = &input_st->overlay_eightway_dpad_slopes[1];
+         eightway->slope_low  = &input_driver_overlay_eightway_slopes(false)[0];
+         eightway->slope_high = &input_driver_overlay_eightway_slopes(false)[1];
          break;
 
       case OVERLAY_TYPE_ABXY_AREA:
@@ -456,8 +674,8 @@ static void task_overlay_desc_populate_eightway_config(
          BIT256_SET(eightway->left,  RETRO_DEVICE_ID_JOYPAD_Y);
          BIT256_SET(eightway->right, RETRO_DEVICE_ID_JOYPAD_A);
 
-         eightway->slope_low  = &input_st->overlay_eightway_abxy_slopes[0];
-         eightway->slope_high = &input_st->overlay_eightway_abxy_slopes[1];
+         eightway->slope_low  = &input_driver_overlay_eightway_slopes(true)[0];
+         eightway->slope_high = &input_driver_overlay_eightway_slopes(true)[1];
          break;
 
       default:
@@ -526,7 +744,7 @@ static bool task_overlay_load_desc(
       struct overlay_desc *desc,
       struct overlay *input_overlay,
       unsigned ol_idx, unsigned desc_idx,
-      unsigned width, unsigned height,
+      unsigned image_dims,
       bool normalized, float alpha_mod, float range_mod)
 {
    size_t _len;
@@ -540,6 +758,9 @@ static bool task_overlay_load_desc(
    float tmp_float             = 0.0f;
    bool tmp_bool               = false;
    bool by_pixel               = false;
+   /* Every type but a button acts on a press; a button acts only
+    * if it binds something other than "nul". */
+   bool takes_input            = true;
    const char *box             = NULL;
    config_file_t *conf         = loader->conf;
 
@@ -558,7 +779,7 @@ static bool task_overlay_load_desc(
 
    by_pixel = !normalized;
 
-   if (by_pixel && (width == 0 || height == 0))
+   if (by_pixel && (!VIDEO_SCALE_W(image_dims) || !VIDEO_SCALE_H(image_dims)))
    {
       RARCH_ERR("[Overlay] Base overlay is not set and not using normalized coordinates.\n");
       return false;
@@ -624,7 +845,8 @@ static bool task_overlay_load_desc(
       const char *tmp;
       char *p = elems[0];
 
-      desc->type = OVERLAY_TYPE_BUTTONS;
+      desc->type  = OVERLAY_TYPE_BUTTONS;
+      takes_input = false;
 
       while (p)
       {
@@ -649,6 +871,7 @@ static bool task_overlay_load_desc(
                }
             }
             BIT256_SET(desc->button_mask, bind_id);
+            takes_input = true;
          }
       }
 
@@ -664,14 +887,16 @@ static bool task_overlay_load_desc(
    }
 
    BIT16_SET(loader->overlay_types, desc->type);
+   if (takes_input)
+      input_overlay->flags |= OVERLAY_TAKES_INPUT;
 
    width_mod  = 1.0f;
    height_mod = 1.0f;
 
    if (by_pixel)
    {
-      width_mod  /= width;
-      height_mod /= height;
+      width_mod  /= VIDEO_SCALE_W(image_dims);
+      height_mod /= VIDEO_SCALE_H(image_dims);
    }
 
    desc->x       = (float)rstrtod(elems[1], NULL) * width_mod;
@@ -746,6 +971,19 @@ static bool task_overlay_load_desc(
    if (config_get_bool(conf, conf_key, &tmp_bool)
          && tmp_bool)
       desc->flags |= OVERLAY_DESC_MOVABLE;
+
+   /* The LED this desc's image shows, counted as ledN_map counts. */
+   strlcpy_lit(conf_key + _len, "_led", sizeof(conf_key) - _len);
+   desc->led = 0;
+   {
+      unsigned led = 0;
+      if (     config_get_uint(conf, conf_key, &led)
+            && led >= 1 && led <= MAX_LEDS)
+      {
+         desc->led      = (uint8_t)led;
+         loader->flags |= OVERLAY_LOADER_HAS_LEDS;
+      }
+   }
 
    strlcpy_lit(conf_key + _len, "_reach_up", sizeof(conf_key) - _len);
    if (config_get_float(conf, conf_key, &tmp_float))
@@ -920,7 +1158,8 @@ static void task_overlay_deferred_loading(retro_task_t *task, void *budget)
                if (!task_overlay_load_desc(loader,
                         &overlay->descs[overlay->pos], overlay,
                         loader->pos, (unsigned)overlay->pos,
-                        overlay->image.width, overlay->image.height,
+                        VIDEO_SCALE_PACK(overlay->image.width,
+                           overlay->image.height),
                         overlay->config.normalized,
                         overlay->config.alpha_mod, overlay->config.range_mod))
                {
@@ -962,6 +1201,9 @@ static void task_overlay_deferred_load(retro_task_t *task, void *budget)
 {
    overlay_loader_t *loader  = (overlay_loader_t*)task->state;
    config_file_t       *conf = loader->conf;
+
+   if (!(loader->flags & OVERLAY_LOADER_PREDECODED))
+      task_overlay_predecode(loader);
 
    for (;; loader->pos++)
    {
@@ -1078,7 +1320,7 @@ static void task_overlay_deferred_load(retro_task_t *task, void *budget)
                overlay->config.paths.path, sizeof(overlay_resolved_path));
 
          if (!task_overlay_load_image_texture(loader, overlay, &overlay->image,
-               overlay_resolved_path, overlay->config.paths.path))
+               overlay_resolved_path, overlay->config.paths.path, NULL))
          {
             RARCH_ERR("[Overlay] Failed to load image: \"%s\".\n",
                   overlay_resolved_path);
@@ -1273,6 +1515,10 @@ static void task_overlay_free(retro_task_t *task)
    unsigned i;
    overlay_loader_t *loader  = (overlay_loader_t*)task->state;
 
+   /* Images no item came to take: a load cut short */
+   task_overlay_predecoded_free(loader->predecoded);
+   loader->predecoded = NULL;
+
    /* Release what the loader still owns.
     *
     * A successful load hands the overlays, the path and the image
@@ -1295,6 +1541,20 @@ static void task_overlay_free(retro_task_t *task)
          image_texture_free((struct texture_image*)loader->image_list->elems[i].attr.p);
 
       string_list_free(loader->image_list);
+   }
+
+   if (loader->anim_list)
+   {
+      /* Same shape: the elements are file buffers nobody took. */
+      for (i = 0; i < loader->anim_list->size; i++)
+      {
+         overlay_anim_src_t *src =
+            (overlay_anim_src_t*)loader->anim_list->elems[i].attr.p;
+         if (src)
+            free(src->data);
+         free(src);
+      }
+      string_list_free(loader->anim_list);
    }
 
    if (loader->overlays)
@@ -1337,7 +1597,9 @@ static void task_overlay_handler(retro_task_t *task)
          task_overlay_resolve_iterate(task);
          break;
       case OVERLAY_STATUS_DEFERRED_ERROR:
-         task_set_flags(task, RETRO_TASK_FLG_CANCELLED, true);
+         /* The queue retires a task on FINISHED alone. */
+         task_set_flags(task,
+               RETRO_TASK_FLG_CANCELLED | RETRO_TASK_FLG_FINISHED, true);
          break;
       case OVERLAY_STATUS_DEFERRED_DONE:
       default:
@@ -1373,6 +1635,7 @@ static void task_overlay_handler(retro_task_t *task)
       data->overlay_types               = loader->overlay_types;
       data->overlay_path                = loader->overlay_path;
       data->image_list                  = loader->image_list;
+      data->anim_list                   = loader->anim_list;
 
       /* Ownership moves with the pointers, so drop the loader's
        * references to them.  task_overlay_free() below releases
@@ -1387,6 +1650,7 @@ static void task_overlay_handler(retro_task_t *task)
       loader->active                    = NULL;
       loader->overlay_path              = NULL;
       loader->image_list                = NULL;
+      loader->anim_list                 = NULL;
 
       task_set_data(task, data);
    }
@@ -1439,6 +1703,15 @@ bool task_push_overlay_load_default(
 
    if (!image_list)
    {
+      free(loader);
+      return false;
+   }
+
+   loader->anim_list        = string_list_new();
+
+   if (!loader->anim_list)
+   {
+      string_list_free(image_list);
       free(loader);
       return false;
    }
@@ -1541,8 +1814,10 @@ bool task_push_overlay_load_default(
    if (is_osk)
       loader->flags        |= OVERLAY_LOADER_IS_OSK;
 #ifdef RARCH_INTERNAL
-   if ((video_driver_get_disp_flags() & VIDEO_FLAG_USE_RGBA))
-      loader->flags        |= OVERLAY_LOADER_RGBA_SUPPORT;
+   gfx_surface_image_request(&loader->req, gfx_surface_wants_rgba(),
+         GFX_SURFACE_REQ_COMPRESSED);
+#else
+   loader->req.want_compressed = true;
 #endif
 
    t                        = task_init();

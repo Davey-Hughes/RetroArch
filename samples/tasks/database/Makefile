@@ -1,3 +1,5 @@
+include ../../sample_objdir.mk
+
 compiler     := gcc
 extra_flags  :=
 use_neon     := 0
@@ -57,10 +59,10 @@ LDFLAGS += -O2
 endif
 
 ifeq (debug,$(build))
-extra_flags += -O0 -g
-CFLAGS += -O0 -g
-CXXFLAGS += -O0 -g
-LDFLAGS += -O0 -g
+extra_flags += -O0 -g1
+CFLAGS += -O0 -g1
+CXXFLAGS += -O0 -g1
+LDFLAGS += -O0 -g1
 endif
 
 ifneq ($(SANITIZER),)
@@ -161,7 +163,8 @@ endif
 
 ifeq ($(HAVE_THREADS), 1)
 SOURCES_C +=  \
-				 $(LIBRETRO_COMM_DIR)/rthreads/rthreads.c
+				 $(LIBRETRO_COMM_DIR)/rthreads/rthreads.c \
+				 $(LIBRETRO_COMM_DIR)/rthreads/retro_eventcount.c
 DEFINES += -DHAVE_THREADS
 
 ifeq (,$(findstring MSYS,$(uname -s)))
@@ -175,23 +178,23 @@ INCFLAGS  := $(INCDIRS)
 CFLAGS    += $(DEFINES)
 CXXFLAGS  += $(DEFINES)
 
-OBJECTS    = $(SOURCES_C:.c=.o)
+OBJECTS    = $(call sample_objs,$(SOURCES_C:.c=.o))
 
 # The index pairing test links the same objects but its own entry
 # point, so the scanner's main() is swapped out for it.
 SCAN_TEST         := database_scan_test
 SCAN_TEST_MAIN    := $(CORE_DIR)/samples/tasks/database/database_scan_test.o
-SCAN_TEST_OBJECTS  = $(filter-out $(CORE_DIR)/samples/tasks/database/main.o,$(OBJECTS)) \
+SCAN_TEST_OBJECTS  = $(filter-out $(call sample_objs,$(CORE_DIR)/samples/tasks/database/main.o),$(OBJECTS)) \
 	$(SCAN_TEST_MAIN)
 
 INDEX_TEST        := database_index_test
 INDEX_TEST_MAIN   := $(CORE_DIR)/samples/tasks/database/database_index_test.o
-INDEX_TEST_OBJECTS = $(filter-out $(CORE_DIR)/samples/tasks/database/main.o,$(OBJECTS)) \
+INDEX_TEST_OBJECTS = $(filter-out $(call sample_objs,$(CORE_DIR)/samples/tasks/database/main.o),$(OBJECTS)) \
 	$(INDEX_TEST_MAIN)
 
 BEGIN_TEST        := scan_begin_budget_test
 BEGIN_TEST_MAIN   := $(CORE_DIR)/samples/tasks/database/scan_begin_budget_test.o
-BEGIN_TEST_OBJECTS = $(filter-out $(CORE_DIR)/samples/tasks/database/main.o,$(OBJECTS)) \
+BEGIN_TEST_OBJECTS = $(filter-out $(call sample_objs,$(CORE_DIR)/samples/tasks/database/main.o),$(OBJECTS)) \
 	$(BEGIN_TEST_MAIN)
 
 OBJOUT   = -o
@@ -231,11 +234,21 @@ check: $(INDEX_TEST)$(EXE_EXT) $(SCAN_TEST)$(EXE_EXT) $(BEGIN_TEST)$(EXE_EXT)
 %.o: %.c
 	$(CC) $(INCFLAGS) $(CFLAGS) -c $(OBJOUT)$@ $<
 
+$(SAMPLE_OBJDIR)/%.o: $$(call sample_src,$$*).c
+	@mkdir -p $(@D)
+	$(CC) $(INCFLAGS) $(CFLAGS) -c $(OBJOUT)$@ $<
+
 %.o: %.cpp
 	$(CXX) $(INCFLAGS) $(CXXFLAGS) -c $(OBJOUT)$@ $<
 
+$(SAMPLE_OBJDIR)/%.o: $$(call sample_src,$$*).cpp
+	@mkdir -p $(@D)
+	$(CXX) $(INCFLAGS) $(CXXFLAGS) -c $(OBJOUT)$@ $<
+
 clean:
-	rm -f $(OBJECTS) $(INDEX_TEST_MAIN) $(SCAN_TEST_MAIN) \
-	      $(TARGET)$(EXE_EXT) $(INDEX_TEST)$(EXE_EXT) $(SCAN_TEST)$(EXE_EXT)
+	rm -rf $(SAMPLE_OBJDIR)
+	rm -f $(OBJECTS) $(INDEX_TEST_MAIN) $(SCAN_TEST_MAIN) $(BEGIN_TEST_MAIN) \
+	      $(TARGET)$(EXE_EXT) $(INDEX_TEST)$(EXE_EXT) $(SCAN_TEST)$(EXE_EXT) \
+	      $(BEGIN_TEST)$(EXE_EXT)
 
 .PHONY: all check clean

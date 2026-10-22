@@ -55,9 +55,12 @@ enum pl_thumb_flags
 {
    PL_THUMB_FLAG_OVERWRITE          = (1 << 0),
    PL_THUMB_FLAG_RIGHT_THUMB_EXISTS = (1 << 1),
-   PL_THUMB_FLAG_LEFT_THUMB_EXISTS  = (1 << 2),
-   PL_THUMB_FLAG_HTTP_TASK_COMPLETE = (1 << 3)
+   PL_THUMB_FLAG_LEFT_THUMB_EXISTS  = (1 << 2)
 };
+
+/* Watchdog for a pass waiting on its transfer: the transfer's callback
+ * wakes the task, and the transfer ends itself when its peer stalls. */
+#define PL_THUMB_HTTP_PARK_USEC 1000000
 
 typedef struct pl_thumb_handle
 {
@@ -68,11 +71,22 @@ typedef struct pl_thumb_handle
    gfx_thumbnail_path_data_t *thumbnail_path_data;
    retro_task_t *http_task;
 
+   /* Captured on the main thread when the per-entry task is pushed:
+    * its handler runs on the threaded task queue's worker and
+    * resolves thumbnail paths from this, never from live settings. */
+   gfx_thumbnail_dir_config_t thumb_dir_config;
+
    playlist_config_t playlist_config; /* size_t alignment */
 
    size_t list_size;
    size_t list_index;
    unsigned type_idx;
+
+   /* Set by the transfer's callback on the main thread, read by the
+    * handler on the worker. */
+   retro_atomic_int_t http_done;
+   /* The task's ident, for the callback's wake. */
+   uint32_t ident;
 
    enum pl_thumb_status status;
    enum playlist_thumbnail_name_flags name_flags;
@@ -272,7 +286,10 @@ void cb_http_task_download_pl_thumbnail(
    if (!(pl_thumb = (pl_thumb_handle_t*)transf->user_data))
       goto finish;
 
-   pl_thumb->flags |= PL_THUMB_FLAG_HTTP_TASK_COMPLETE;
+   /* The task keeps pl_thumb until it has seen this, so both stay
+    * valid here. */
+   retro_atomic_store_release_int(&pl_thumb->http_done, 1);
+   task_queue_wake(pl_thumb->ident);
 
    /* Remaining sanity checks...
     * > data->data is NULL by design: the body was streamed to
@@ -326,7 +343,7 @@ static void download_pl_thumbnail(pl_thumb_handle_t *pl_thumb)
             return; /* If this happens then everything is broken anyway... */
 
          /* Initialise http task status */
-         pl_thumb->flags             &= ~PL_THUMB_FLAG_HTTP_TASK_COMPLETE;
+         retro_atomic_store_release_int(&pl_thumb->http_done, 0);
 
          transf->enum_idx             = MSG_UNKNOWN;
          transf->path[0]              = '\0';
@@ -349,7 +366,7 @@ static void download_pl_thumbnail(pl_thumb_handle_t *pl_thumb)
                      transf->path,
                      msg_hash_to_str(MSG_FAILED_TO_CREATE_THE_DIRECTORY));
                free(transf);
-               pl_thumb->flags |= PL_THUMB_FLAG_HTTP_TASK_COMPLETE;
+               retro_atomic_store_release_int(&pl_thumb->http_done, 1);
                return;
             }
          }
@@ -363,9 +380,26 @@ static void download_pl_thumbnail(pl_thumb_handle_t *pl_thumb)
          if (!(pl_thumb->http_task = (retro_task_t*)task_push_http_download_file(
                url, transf->path, true, NULL,
                cb_http_task_download_pl_thumbnail, transf)))
-            pl_thumb->flags             |= PL_THUMB_FLAG_HTTP_TASK_COMPLETE;
+            retro_atomic_store_release_int(&pl_thumb->http_done, 1);
       }
    }
+}
+
+/* Whether the transfer this task started has yet to call back.  The
+ * callback writes into pl_thumb, so the task does not free it - even
+ * when cancelled - until it has; meanwhile a pass parks until the
+ * callback wakes it. */
+static bool pl_thumb_http_pending(retro_task_t *task,
+      pl_thumb_handle_t *pl_thumb)
+{
+   if (     pl_thumb->http_task
+         && !retro_atomic_load_acquire_int(&pl_thumb->http_done))
+   {
+      task_queue_park(task, PL_THUMB_HTTP_PARK_USEC);
+      return true;
+   }
+   pl_thumb->http_task = NULL;
+   return false;
 }
 
 static void free_pl_thumb_handle(pl_thumb_handle_t *pl_thumb)
@@ -423,7 +457,11 @@ static void task_pl_thumbnail_download_handler(retro_task_t *task)
    flg = task_get_flags(task);
 
    if ((flg & RETRO_TASK_FLG_CANCELLED) > 0)
+   {
+      if (pl_thumb_http_pending(task, pl_thumb))
+         return;
       goto task_finished;
+   }
 
    switch (pl_thumb->status)
    {
@@ -484,17 +522,8 @@ static void task_pl_thumbnail_download_handler(retro_task_t *task)
          /* Ensure that we only enqueue one transfer
           * at a time... */
 
-         /* > If HTTP task is NULL, then it either finished
-          *   or an error occurred - in either case,
-          *   current task is 'complete' */
-         if (!pl_thumb->http_task)
-            pl_thumb->flags             |= PL_THUMB_FLAG_HTTP_TASK_COMPLETE;
-         /* > Wait for task_push_http_download_file()
-          *   callback to trigger */
-         else if (!(pl_thumb->flags & PL_THUMB_FLAG_HTTP_TASK_COMPLETE))
+         if (pl_thumb_http_pending(task, pl_thumb))
             break;
-
-         pl_thumb->http_task = NULL;
 
          /* Check whether all thumbnail types have been processed */
          /* TODO/FIXME - turn 3 into 4 when we re-enable Named_Logos for fetching */
@@ -613,6 +642,8 @@ bool task_push_pl_thumbnail_download(
    pl_thumb->playlist            = NULL;
    pl_thumb->thumbnail_path_data = NULL;
    pl_thumb->http_task           = NULL;
+   pl_thumb->ident               = task->ident;
+   retro_atomic_int_init(&pl_thumb->http_done, 0);
    pl_thumb->list_size           = 0;
    pl_thumb->list_index          = 0;
    pl_thumb->type_idx            = 1;
@@ -758,7 +789,11 @@ static void task_pl_entry_thumbnail_download_handler(retro_task_t *task)
    flg = task_get_flags(task);
 
    if ((flg & RETRO_TASK_FLG_CANCELLED) > 0)
+   {
+      if (pl_thumb_http_pending(task, pl_thumb))
+         return;
       goto task_finished;
+   }
 
    switch (pl_thumb->status)
    {
@@ -768,16 +803,16 @@ static void task_pl_entry_thumbnail_download_handler(retro_task_t *task)
          pl_thumb->flags &= ~PL_THUMB_FLAG_RIGHT_THUMB_EXISTS;
          pl_thumb->flags &= ~PL_THUMB_FLAG_LEFT_THUMB_EXISTS;
 
-         if (gfx_thumbnail_update_path(pl_thumb->thumbnail_path_data,
-                  GFX_THUMBNAIL_RIGHT))
+         if (gfx_thumbnail_update_path_cfg(pl_thumb->thumbnail_path_data,
+                  GFX_THUMBNAIL_RIGHT, &pl_thumb->thumb_dir_config))
          {
             if (     *pl_thumb->thumbnail_path_data->right_path
                   && path_is_valid(pl_thumb->thumbnail_path_data->right_path))
                pl_thumb->flags |= PL_THUMB_FLAG_RIGHT_THUMB_EXISTS;
          }
 
-         if (gfx_thumbnail_update_path(pl_thumb->thumbnail_path_data,
-                  GFX_THUMBNAIL_LEFT))
+         if (gfx_thumbnail_update_path_cfg(pl_thumb->thumbnail_path_data,
+                  GFX_THUMBNAIL_LEFT, &pl_thumb->thumb_dir_config))
          {
             if (     *pl_thumb->thumbnail_path_data->left_path
                   && path_is_valid(pl_thumb->thumbnail_path_data->left_path))
@@ -800,17 +835,8 @@ static void task_pl_entry_thumbnail_download_handler(retro_task_t *task)
             /* Ensure that we only enqueue one transfer
              * at a time... */
 
-            /* > If HTTP task is NULL, then it either finished
-             *   or an error occurred - in either case,
-             *   current task is 'complete' */
-            if (!pl_thumb->http_task)
-               pl_thumb->flags |= PL_THUMB_FLAG_HTTP_TASK_COMPLETE;
-            /* > Wait for task_push_http_download_file()
-             *   callback to trigger */
-            else if (!(pl_thumb->flags & PL_THUMB_FLAG_HTTP_TASK_COMPLETE))
+            if (pl_thumb_http_pending(task, pl_thumb))
                break;
-
-            pl_thumb->http_task = NULL;
 
             /* Check whether all thumbnail types have been processed */
             if (pl_thumb->type_idx > 3)
@@ -961,11 +987,14 @@ bool task_push_pl_entry_thumbnail_download(
    pl_thumb->playlist            = NULL;
    pl_thumb->thumbnail_path_data = thumbnail_path_data;
    pl_thumb->http_task           = NULL;
+   pl_thumb->ident               = task->ident;
+   retro_atomic_int_init(&pl_thumb->http_done, 0);
    pl_thumb->list_size           = playlist_size(playlist);
    pl_thumb->list_index          = idx;
    pl_thumb->type_idx            = 1;
    pl_thumb->name_flags          = next_flag;
    pl_thumb->status              = PL_THUMB_BEGIN;
+   gfx_thumbnail_dir_config_capture(&pl_thumb->thumb_dir_config);
 
    if (overwrite)
       pl_thumb->flags            = PL_THUMB_FLAG_OVERWRITE;

@@ -388,12 +388,12 @@ static void gl_cg_set_params(void *dat, void *shader_data)
    float originalaspectrotated;
    video_shader_ctx_params_t          *params =
       (video_shader_ctx_params_t*)dat;
-   unsigned width                             = params->width;
-   unsigned height                            = params->height;
-   unsigned tex_width                         = params->tex_width;
-   unsigned tex_height                        = params->tex_height;
-   unsigned out_width                         = params->out_width;
-   unsigned out_height                        = params->out_height;
+   unsigned width                             = VIDEO_SCALE_W(params->dims);
+   unsigned height                            = VIDEO_SCALE_H(params->dims);
+   unsigned tex_width                         = VIDEO_SCALE_W(params->tex_dims);
+   unsigned tex_height                        = VIDEO_SCALE_H(params->tex_dims);
+   unsigned out_width                         = VIDEO_SCALE_W(params->out_dims);
+   unsigned out_height                        = VIDEO_SCALE_H(params->out_dims);
    unsigned frame_count                       = params->frame_counter;
    const void *_info                          = params->info;
    const void *_prev_info                     = params->prev_info;
@@ -433,14 +433,14 @@ static void gl_cg_set_params(void *dat, void *shader_data)
             1.0);
    }
 #endif
-   cg_gl_set_param_1f(cg->prg[cg->active_idx].rotation_f, (float)retroarch_get_rotation());
-   cg_gl_set_param_1f(cg->prg[cg->active_idx].rotation_v, (float)retroarch_get_rotation());
+   cg_gl_set_param_1f(cg->prg[cg->active_idx].rotation_f, (float)video_driver_get_rotation_snapshot());
+   cg_gl_set_param_1f(cg->prg[cg->active_idx].rotation_v, (float)video_driver_get_rotation_snapshot());
 
    cg_gl_set_param_1f(cg->prg[cg->active_idx].originalaspect_f, (float)video_driver_get_core_aspect());
    cg_gl_set_param_1f(cg->prg[cg->active_idx].originalaspect_v, (float)video_driver_get_core_aspect());
 
    /* OriginalAspectRotated: return 1/aspect for 90 and 270 rotated content */
-   rot = retroarch_get_rotation();
+   rot = video_driver_get_rotation_snapshot();
    originalaspectrotated = video_driver_get_core_aspect();
    if (rot == 1 || rot == 3)
       originalaspectrotated = 1/originalaspectrotated;
@@ -505,8 +505,9 @@ static void gl_cg_set_params(void *dat, void *shader_data)
             cg->prg[cg->active_idx].vprg, cg->shader->parameters[i].id);
       CGparameter param_f = cgGetNamedParameter(
             cg->prg[cg->active_idx].fprg, cg->shader->parameters[i].id);
-      cg_gl_set_param_1f(param_v, cg->shader->parameters[i].current);
-      cg_gl_set_param_1f(param_f, cg->shader->parameters[i].current);
+      float v = video_shader_param_get(&cg->shader->parameters[i]);
+      cg_gl_set_param_1f(param_v, v);
+      cg_gl_set_param_1f(param_f, v);
    }
 }
 

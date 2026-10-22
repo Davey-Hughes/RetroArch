@@ -22,6 +22,9 @@
  *                stays within BENCH_FACTOR of blocking
  *                dir_list_new() + sort.  A non-blocking walk that is
  *                slower overall is a regression, not a feature.
+ *                Measured with the window held open (see the clock
+ *                below): the number is the mechanism's cost, not
+ *                the pacing, which the pacing lane owns.
  *   threaded   - the deferred lane again under the threaded task
  *                queue (the TSan target: the handler runs on a
  *                worker, hand-off happens in the main-thread
@@ -59,16 +62,22 @@
 #define PACING_SLACK_MULTIPLIER 4
 
 /* Wall-clock to a consumed result vs blocking walk + sort, both
- * sides warmed and taken as the best of three so the page cache and
- * the scheduler stop voting.  The incremental path's honest cost at
+ * sides warmed.  Each bench round times a blocking walk immediately
+ * followed by a deferred one, and the gate takes the best per-pair
+ * ratio: a regression is slow in every pair, while runner noise (a
+ * preempted vCPU, a neighbour flushing the page cache) only has to
+ * miss one pair.  Timing the blocking side once up front and the
+ * deferred side much later let drift between the two moments vote -
+ * a CI run measured 24.0ms vs 17.1ms (1.40) on unchanged code.  The incremental path's honest cost at
  * 40k entries - per-entry budget checks, slice bookkeeping, task
  * scheduling, and a mergesort in place of qsort - measures ~10-15%;
  * the factor rejects a mechanism that regresses to a second
  * enumeration or a quadratic anywhere (those measure 2x and up),
  * while the pacing lane, not this one, owns the interactivity
  * claim. */
-#define BENCH_FACTOR 1.35
-#define BENCH_ROUNDS 3
+#define BENCH_FACTOR 1.5
+#define BENCH_ROUNDS 5
+#define PACED_ROUNDS 3
 
 static char fixture_root[256];
 
@@ -80,13 +89,42 @@ static char fixture_root[256];
  * advances virtual time by a fixed amount, so "the shared window is
  * exhausted" becomes a deterministic event after a known number of
  * budget checks - which is what makes the deferred and cancel
- * mechanics assertable on any machine at any cache temperature. */
+ * mechanics assertable on any machine at any cache temperature.
+ *
+ * With clock_frozen set, the instrument stands still: no budget
+ * check ever sees the window exhaust, so the deferred machinery
+ * (iterator, task hand-off, resumable mergesort, callback) runs in
+ * as few invocations as the queue allows.  That is the instrument
+ * of the bench lane and of the fast-path and sort-only deferral
+ * lanes, whose inline-versus-deferred outcome must not depend on
+ * how fast the machine walks the small tree.  Under the real clock
+ * the window admits 4ms of work per 16.67ms period and then one
+ * item per task_queue_check() until the period rolls over, so
+ * wall-clock to a result is quantised to whole periods: on the CI
+ * runner a 22ms blocking walk landed the deferred path across
+ * three periods (34ms, ratio 1.57) while a slower box measured
+ * 27ms blocking against the same 34ms (ratio 1.27) - the ratio was
+ * grading the runner's speed against the period length, not the
+ * mechanism.  Holding the window open removes the period from the
+ * measurement; the pacing assertion keeps the real clock.
+ *
+ * The test's own stopwatch is real_clock_usec(), independent of
+ * whatever the instrument is doing. */
 /* ------------------------------------------------------------------ */
 
 #include <time.h>
 
 static retro_time_t clock_virtual_now = 1000000;
 static retro_time_t clock_step        = 0;
+static bool clock_frozen              = false;
+
+static retro_time_t real_clock_usec(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (retro_time_t)ts.tv_sec * 1000000
+        + (retro_time_t)(ts.tv_nsec / 1000);
+}
 
 retro_time_t cpu_features_get_time_usec(void)
 {
@@ -96,12 +134,9 @@ retro_time_t cpu_features_get_time_usec(void)
       clock_virtual_now += clock_step;
       return t;
    }
-   {
-      struct timespec ts;
-      clock_gettime(CLOCK_MONOTONIC, &ts);
-      return (retro_time_t)ts.tv_sec * 1000000
-           + (retro_time_t)(ts.tv_nsec / 1000);
-   }
+   if (clock_frozen)
+      return clock_virtual_now;
+   return real_clock_usec();
 }
 
 /* Unused half of features_cpu on this path. */
@@ -272,10 +307,10 @@ static bool pump_until_refresh(unsigned had_fired,
    unsigned spins = 0;
    while (refresh_fired == had_fired)
    {
-      retro_time_t t0 = cpu_features_get_time_usec();
+      retro_time_t t0 = real_clock_usec();
       retro_time_t dt;
       task_queue_check();
-      dt = cpu_features_get_time_usec() - t0;
+      dt = real_clock_usec() - t0;
       if (max_check_usec && dt > *max_check_usec)
          *max_check_usec = dt;
       if (++spins > 60000000)
@@ -295,11 +330,11 @@ static struct string_list *drive_to_done(const char *dir,
       unsigned tag, retro_time_t *max_stall_usec, bool *was_deferred)
 {
    struct string_list *out = NULL;
-   retro_time_t t0         = cpu_features_get_time_usec();
+   retro_time_t t0         = real_clock_usec();
    enum menu_dirwalk_status st = menu_dirwalk_request(dir, ext,
          include_dirs, include_hidden, include_compressed,
          sort_mode, tag, &out);
-   retro_time_t dt         = cpu_features_get_time_usec() - t0;
+   retro_time_t dt         = real_clock_usec() - t0;
    unsigned had_fired      = refresh_fired;
 
    if (max_stall_usec && dt > *max_stall_usec)
@@ -338,10 +373,10 @@ static struct string_list *drive_to_done(const char *dir,
       return NULL;
    }
 
-   t0 = cpu_features_get_time_usec();
+   t0 = real_clock_usec();
    st = menu_dirwalk_request(dir, ext, include_dirs, include_hidden,
          include_compressed, sort_mode, tag, &out);
-   dt = cpu_features_get_time_usec() - t0;
+   dt = real_clock_usec() - t0;
    if (max_stall_usec && dt > *max_stall_usec)
       *max_stall_usec = dt;
 
@@ -439,10 +474,9 @@ int main(int argc, char *argv[])
       goto out;
    }
 
-   /* Blocking reference timing: one unmeasured warmup walk, then
-    * best of BENCH_ROUNDS, before any queue exists. */
+   /* One unmeasured blocking warmup walk before any queue exists;
+    * the timed blocking walks are paired with the bench rounds. */
    {
-      int round;
       struct string_list *warm = reference_list(big_dir, NULL, true,
             false, true, MENU_DIRWALK_SORT_DIR_FIRST);
       if (!warm)
@@ -451,23 +485,6 @@ int main(int argc, char *argv[])
          goto out;
       }
       string_list_free(warm);
-
-      for (round = 0; round < BENCH_ROUNDS; round++)
-      {
-         retro_time_t t0 = cpu_features_get_time_usec();
-         retro_time_t dt;
-         struct string_list *ref = reference_list(big_dir, NULL, true,
-               false, true, MENU_DIRWALK_SORT_DIR_FIRST);
-         dt = cpu_features_get_time_usec() - t0;
-         if (!ref)
-         {
-            fprintf(stderr, "blocking reference failed\n");
-            goto out;
-         }
-         string_list_free(ref);
-         if (!blocking_usec || dt < blocking_usec)
-            blocking_usec = dt;
-      }
    }
 
    task_queue_init(false, msgq_push);
@@ -476,7 +493,17 @@ int main(int argc, char *argv[])
    /* Fast path: the small tree completes on the first request.
     * SORT_NONE, because the build shrinks MENU_DIRWALK_SORT_SYNC_MAX
     * to 64 so that sort-only deferral is testable below; an unsorted
-    * request is the one whose fast path is size-independent. */
+    * request is the one whose fast path is size-independent.
+    *
+    * This lane and the sort-only deferral lane run with the window
+    * held open.  What they pin is the mechanism - a walk that fits
+    * the window completes inline with no task and no refresh, and a
+    * completed walk too large to sort inline hands only the sort to
+    * the task - not whether 200-odd entries fit 4ms of wall-clock.
+    * Under TSan on a CI runner they do not, and the lane would be
+    * grading the runner.  The pacing lane owns the wall-clock
+    * claim. */
+   clock_frozen = true;
    {
       struct string_list *out = NULL;
       unsigned had_fired      = refresh_fired;
@@ -495,8 +522,8 @@ int main(int argc, char *argv[])
    }
    fprintf(stderr, "[pass] fast path lane\n");
 
-   /* Sort-only deferral: under the real clock the small tree's walk
-    * fits one window, but with the shrunken threshold its 200+
+   /* Sort-only deferral: with the window held open the small tree's
+    * walk fits one window, but with the shrunken threshold its 200+
     * entries are "too many to sort inline".  The request must go
     * PENDING carrying a completed walk, the task must do nothing but
     * the resumable sort, and the consumed listing must have full
@@ -531,6 +558,7 @@ int main(int argc, char *argv[])
       }
    }
    fprintf(stderr, "[pass] sort-only deferral lane\n");
+   clock_frozen = false;
 
    if (!check_parity(small_dir, "parity/small"))
       goto out_queue;
@@ -641,15 +669,18 @@ int main(int argc, char *argv[])
    fprintf(stderr, "[pass] cancel lane (virtual clock)\n");
    clock_step = 0;
 
-   /* Deferred + pacing + bench on the big tree: parity checked on
-    * every round, best-of-rounds total against the best blocking
-    * reference, worst stall across all rounds (pacing must hold in
-    * every round, not the friendliest one). */
+   /* Deferred + pacing + bench on the big tree, parity checked on
+    * every round.  Pacing rounds run the real clock: worst stall
+    * across all rounds (pacing must hold in every round, not the
+    * friendliest one).  Bench rounds run with the window held open:
+    * best per-pair ratio of deferred total to blocking walk. */
    {
       struct string_list *ref = NULL;
       retro_time_t max_stall  = 0;
+      retro_time_t paced      = 0;
       retro_time_t total      = 0;
       bool deferred           = false;
+      int paced_rounds, bench_rounds;
       int round;
 
       ref = reference_list(big_dir, NULL, true, false, true,
@@ -657,48 +688,93 @@ int main(int argc, char *argv[])
       if (!ref)
          goto out_queue;
 
-      for (round = 0; round < BENCH_ROUNDS; round++)
+      /* PACED_ROUNDS on the real clock, then BENCH_ROUNDS frozen,
+       * each frozen round paired with a blocking walk just before. */
+      /* Under a sanitizer the wall-clock asserts are skipped, so the
+       * rounds only check parity: one of each does that, and the 40k
+       * fixture walked eight times is most of this job's sanitizer
+       * time. */
+      paced_rounds = sanitize ? 1 : PACED_ROUNDS;
+      bench_rounds = sanitize ? 1 : BENCH_ROUNDS;
+      for (round = 0; round < paced_rounds + bench_rounds; round++)
       {
          struct string_list *got = NULL;
          retro_time_t t0, dt;
+         retro_time_t bdt        = 0;
          bool this_deferred      = false;
+         bool frozen             = (round >= paced_rounds);
          bool equal;
 
-         t0  = cpu_features_get_time_usec();
+         if (frozen)
+         {
+            struct string_list *blk;
+            t0  = real_clock_usec();
+            blk = reference_list(big_dir, NULL, true, false, true,
+                  MENU_DIRWALK_SORT_DIR_FIRST);
+            bdt = real_clock_usec() - t0;
+            if (!blk)
+            {
+               fprintf(stderr, "blocking reference failed\n");
+               string_list_free(ref);
+               goto out_queue;
+            }
+            string_list_free(blk);
+            if (bdt < 1)
+               bdt = 1;
+         }
+
+         clock_frozen = frozen;
+         t0  = real_clock_usec();
          got = drive_to_done(big_dir, NULL, true, false, true,
-               MENU_DIRWALK_SORT_DIR_FIRST, 3, &max_stall,
-               &this_deferred);
-         dt  = cpu_features_get_time_usec() - t0;
+               MENU_DIRWALK_SORT_DIR_FIRST, 3,
+               frozen ? NULL : &max_stall, &this_deferred);
+         dt  = real_clock_usec() - t0;
+         clock_frozen = false;
 
          if (!got)
          {
             string_list_free(ref);
             goto out_queue;
          }
-         equal = lists_equal(ref, got, "bench");
+         equal = lists_equal(ref, got, frozen ? "bench" : "pacing");
          string_list_free(got);
          if (!equal)
          {
             string_list_free(ref);
             goto out_queue;
          }
-         deferred = deferred || this_deferred;
-         if (!total || dt < total)
-            total = dt;
+         if (frozen)
+         {
+            /* Keep the pair with the best ratio. */
+            if (!total || (double)dt * (double)blocking_usec
+                  < (double)total * (double)bdt)
+            {
+               total         = dt;
+               blocking_usec = bdt;
+            }
+         }
+         else
+         {
+            deferred = deferred || this_deferred;
+            if (!paced || dt < paced)
+               paced = dt;
+         }
       }
       string_list_free(ref);
 
       /* Whether this machine's real clock took the fast or the
-       * deferred path (any round deferring counts), both asserts
-       * below apply: the worst stall is bounded by the window either
-       * way, and the total may not regress past the blocking
-       * baseline.  The deterministic deferred coverage lives in the
-       * virtual-clock lanes above. */
+       * deferred path (any paced round deferring counts), the worst
+       * stall is bounded by the window either way; the frozen
+       * rounds always defer the sort (the fixture exceeds
+       * MENU_DIRWALK_SORT_SYNC_MAX) and their total may not regress
+       * past the paired blocking baseline.  The deterministic deferred
+       * coverage lives in the virtual-clock lanes above. */
       fprintf(stderr,
-            "[metrics] big=%u files path=%s total=%.1fms "
-            "max_stall=%.2fms blocking_ref=%.1fms ratio=%.2f\n",
+            "[metrics] big=%u files path=%s paced=%.1fms "
+            "max_stall=%.2fms total=%.1fms blocking_ref=%.1fms "
+            "ratio=%.2f\n",
             (unsigned)BIG_FILES, deferred ? "deferred" : "fast",
-            total / 1000.0, max_stall / 1000.0,
+            paced / 1000.0, max_stall / 1000.0, total / 1000.0,
             blocking_usec / 1000.0, (double)total / (double)blocking_usec);
 
       if (!sanitize)

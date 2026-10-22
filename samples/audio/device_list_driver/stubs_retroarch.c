@@ -18,6 +18,7 @@
 #include <audio/audio_mixer.h>
 
 #include "../../../configuration.h"
+#include "../../../defaults.h"
 #include "../../../record/record_driver.h"
 #include "../../../runloop.h"
 #include "../../../menu/menu_driver.h"
@@ -143,10 +144,12 @@ audio_mixer_voice_t *audio_mixer_play(audio_mixer_sound_t *sound,
 }
 
 audio_mixer_voice_t *audio_mixer_play_s16(audio_mixer_sound_t *sound,
-      bool repeat, int32_t gain, enum resampler_quality quality,
+      bool repeat, int32_t gain, const char *resampler_ident,
+      enum resampler_quality quality,
       audio_mixer_stop_cb_t stop_cb)
 {
-   (void)sound; (void)repeat; (void)gain; (void)quality; (void)stop_cb;
+   (void)sound; (void)repeat; (void)gain; (void)resampler_ident;
+   (void)quality; (void)stop_cb;
    return new_voice();
 }
 
@@ -278,11 +281,11 @@ const audio_driver_t *audio_thread_wrapped_driver(void *data)
 
 bool audio_init_thread(const audio_driver_t **out_driver, void **out_data,
       const char *device, unsigned out_rate, unsigned *new_rate,
-      unsigned latency, unsigned block_frames, bool raise_priority,
+      unsigned latency, bool raise_priority,
       bool prefer_fast_cores, const audio_driver_t *driver)
 {
    (void)out_driver; (void)out_data; (void)device; (void)out_rate;
-   (void)new_rate; (void)latency; (void)block_frames;
+   (void)new_rate; (void)latency;
    (void)raise_priority; (void)prefer_fast_cores; (void)driver;
    unreachable("audio_init_thread");
    return false;
@@ -308,3 +311,34 @@ const char *msg_hash_to_str(enum msg_hash_enums msg)
 /* The microphone path checks whether rewind is running frames
  * backwards before it feeds a core; no rewind here. */
 bool state_manager_frame_is_reversed(void) { return false; }
+
+/* The platform's audio defaults: audio_driver_device_block_frames()
+ * reads the device's transfer granularity from here, and no platform
+ * in a harness reports one. */
+struct defaults g_defaults;
+
+/* These fixtures have no wrapper worker; control runs synchronously. */
+void audio_thread_apply_control(void *data,
+      void (*control)(void *userdata), void *userdata)
+{
+   (void)data;
+   if (control) control(userdata);
+}
+
+/* The driver exposes transport pause; these harnesses stub mixer I/O. */
+void audio_mixer_voice_set_paused(audio_mixer_voice_t *voice, bool paused)
+{
+   (void)voice;
+   (void)paused;
+}
+
+/* No real PCM is mixed by this stand-in, so no mix clock is available. */
+bool audio_mixer_voice_clock(audio_mixer_voice_t *voice,
+      size_t *frames, unsigned *rate, size_t *serial)
+{
+   (void)voice;
+   if (frames) *frames = 0;
+   if (rate) *rate = 0;
+   if (serial) *serial = 0;
+   return false;
+}

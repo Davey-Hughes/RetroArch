@@ -16,9 +16,15 @@
 #ifndef __SETTING_LIST_H
 #define __SETTING_LIST_H
 
+#include <stdint.h>
+#include <stddef.h>
+
 #include <boolean.h>
 
 #include <retro_common_api.h>
+#include <retro_inline.h>
+
+#include "gfx/video_defines.h"
 
 #include "command.h"
 #include "msg_hash.h"
@@ -98,8 +104,25 @@ enum settings_free_flags
     * string the callbacks compared against - equality with the main
     * menu label was the only thing that string was ever read for.
     * Lives here because the byte has spare bits. */
-   SD_FREE_FLAG_MAIN_MENU_GROUP = (1 << 3)
+   SD_FREE_FLAG_MAIN_MENU_GROUP = (1 << 3),
+   /* Also not ownership bits. A row carrying one of these has a
+    * target that addresses a packed word rather than a value of its
+    * own, and the bit says which half of it the row edits: the high
+    * half for a width or an x, the low half for a height or a y.
+    * Set on every row whose settings_t value shares one word with a
+    * partner axis: the custom viewport's origin and size, the window
+    * size pairs and the desktop menu window geometry.
+    *
+    * Anything that can reach such a row - the generic ST_UINT and
+    * ST_INT handlers, the dropdown lists and the desktop UIs - reads
+    * and writes it through setting_uint_get / setting_uint_set and
+    * the signed pair below, never through value.target directly. */
+   SD_FREE_FLAG_PACKED_HI       = (1 << 4),
+   SD_FREE_FLAG_PACKED_LO       = (1 << 5)
 };
+
+#define SD_FREE_FLAG_PACKED_ANY \
+   (SD_FREE_FLAG_PACKED_HI | SD_FREE_FLAG_PACKED_LO)
 
 typedef struct rarch_setting rarch_setting_t;
 typedef struct setting_actions setting_actions_t;
@@ -142,15 +165,15 @@ struct rarch_setting
    float               min;
    float               max;
    /* Disjoint by type: float entries store their printf rounding
-    * string, directory entries the string shown while unset. */
+    * string; option rows their '|'-separated choices, path and
+    * browser-action rows their extension filter. */
    union
    {
       const char        *rounding_fraction;   /* ST_FLOAT */
-      const char        *empty_path;          /* ST_DIR   */
+      const char        *values;
    } aux;
    const char           *name;
    const char           *short_description;
-   const char           *values;
 
    /* Every per-entry handler lives in shared interned tuples: the
     * full eight-handler combination counts 150 distinct blocks
@@ -167,7 +190,6 @@ struct rarch_setting
          int                  *integer;
          unsigned int         *unsigned_integer;
          float                *fraction;
-         struct retro_keybind *keybind;
          size_t               *sizet;
       } target;
    } value;
@@ -176,7 +198,7 @@ struct rarch_setting
    union
    {
       const char                 *string;
-      const struct retro_keybind *keybind;
+      const struct retro_keybind_def *keybind;
       size_t                     sizet;
       int                        integer;
       unsigned int               unsigned_integer;
@@ -184,14 +206,15 @@ struct rarch_setting
       bool                       boolean;
    } default_value;
 
-   uint32_t             index_offset;
-   uint32_t             size;
    float                step;
 
-   /* Narrow storage for enum-valued fields; every value in use fits,
-    * reads promote back to int, and nothing takes their address.
-    * enum event_command tops out below 1024, the setting and ui type
-    * enums below 64, and the hash enums below 65536. */
+   /* Narrow storage; every value in use fits, reads promote back to
+    * int, and nothing takes their address. enum event_command tops
+    * out below 1024, the setting and ui type enums below 64, the hash
+    * enums below 65536, the largest string target is 8 KiB, and
+    * index_offset holds a user, an entry or a hash enum base. */
+   uint16_t             index_offset;
+   uint16_t             size;
    uint16_t             bind_type;
    uint16_t             cmd_trigger_idx;   /* enum event_command      */
    uint16_t             enum_idx;          /* enum msg_hash_enums     */
@@ -202,8 +225,50 @@ struct rarch_setting
    uint8_t              browser_selection_type; /* enum setting_type  */
    uint8_t              type;              /* enum setting_type       */
    uint8_t              free_flags;
-   uint8_t              index;
 };
+
+/* An ST_UINT or ST_INT row's value. Most rows own the word their
+ * target addresses; a row flagged SD_FREE_FLAG_PACKED_HI or _LO owns
+ * one half of it, in VIDEO_SCALE_PACK's layout for a uint row and
+ * VIDEO_POS_PACK's for an int row, and a write leaves the partner
+ * half as it stands. */
+static INLINE unsigned setting_uint_get(const rarch_setting_t *setting)
+{
+   if (setting->free_flags & SD_FREE_FLAG_PACKED_HI)
+      return VIDEO_SCALE_W(*setting->value.target.unsigned_integer);
+   if (setting->free_flags & SD_FREE_FLAG_PACKED_LO)
+      return VIDEO_SCALE_H(*setting->value.target.unsigned_integer);
+   return *setting->value.target.unsigned_integer;
+}
+
+static INLINE void setting_uint_set(rarch_setting_t *setting, unsigned v)
+{
+   if (setting->free_flags & SD_FREE_FLAG_PACKED_HI)
+      VIDEO_SCALE_PUT_W(*setting->value.target.unsigned_integer, v);
+   else if (setting->free_flags & SD_FREE_FLAG_PACKED_LO)
+      VIDEO_SCALE_PUT_H(*setting->value.target.unsigned_integer, v);
+   else
+      *setting->value.target.unsigned_integer = v;
+}
+
+static INLINE int setting_int_get(const rarch_setting_t *setting)
+{
+   if (setting->free_flags & SD_FREE_FLAG_PACKED_HI)
+      return VIDEO_POS_X(*setting->value.target.integer);
+   if (setting->free_flags & SD_FREE_FLAG_PACKED_LO)
+      return VIDEO_POS_Y(*setting->value.target.integer);
+   return *setting->value.target.integer;
+}
+
+static INLINE void setting_int_set(rarch_setting_t *setting, int v)
+{
+   if (setting->free_flags & SD_FREE_FLAG_PACKED_HI)
+      VIDEO_POS_PUT_X(*setting->value.target.integer, v);
+   else if (setting->free_flags & SD_FREE_FLAG_PACKED_LO)
+      VIDEO_POS_PUT_Y(*setting->value.target.integer, v);
+   else
+      *setting->value.target.integer = v;
+}
 
 RETRO_END_DECLS
 

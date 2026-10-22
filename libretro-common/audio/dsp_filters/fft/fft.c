@@ -20,6 +20,8 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#include <retro_posix_source.h>
+
 #include <math.h>
 #include <stdlib.h>
 
@@ -62,7 +64,9 @@ static void build_bitinverse(unsigned *bitinverse, unsigned size_log2)
 
 static fft_complex_t exp_imag(double phase)
 {
-   fft_complex_t out = { cos(phase), sin(phase) };
+   fft_complex_t out;
+   out.real = cos(phase);
+   out.imag = sin(phase);
    return out;
 }
 

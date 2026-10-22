@@ -62,6 +62,7 @@ static void wpad_deregister(unsigned channel)
 
    input_autoconfigure_disconnect(slot, wpad_driver.ident);
    joypad_state.pads[slot].connected           = false;
+   pad_connection_release_slot(&joypad_state.pads[slot]);
    joypad_state.wpad.channel_slot_map[channel] = WPAD_INVALID_CHANNEL;
 }
 
@@ -115,33 +116,33 @@ static void wpad_get_calibrated_point(VPADTouchData *point,
    VPADTouchData calibrated720p = {0};
 
    VPADGetTPCalibratedPoint(channel, &calibrated720p, &(vpad->tpNormal));
-   point->x = wpad_scale_touchpad(12, 1268, 0, viewport->full_width, calibrated720p.x);
-   point->y = wpad_scale_touchpad(12, 708, 0, viewport->full_height, calibrated720p.y);
+   point->x = wpad_scale_touchpad(12, 1268, 0, VIDEO_SCALE_W(viewport->full_dims), calibrated720p.x);
+   point->y = wpad_scale_touchpad(12, 708, 0, VIDEO_SCALE_H(viewport->full_dims), calibrated720p.y);
 }
 
 static void wpad_apply_clamping(VPADTouchData *point, struct video_viewport *viewport, bool *clamped)
 {
    /* clamp the x domain to the viewport */
-   if (point->x < viewport->x)
+   if (point->x < VIDEO_POS_X(viewport->pos))
    {
-      point->x = viewport->x;
+      point->x = VIDEO_POS_X(viewport->pos);
       *clamped = true;
    }
-   else if (point->x > (viewport->x + viewport->width))
+   else if (point->x > (VIDEO_POS_X(viewport->pos) + VIDEO_SCALE_W(viewport->dims)))
    {
-      point->x = viewport->x + viewport->width;
+      point->x = VIDEO_POS_X(viewport->pos) + VIDEO_SCALE_W(viewport->dims);
       *clamped = true;
    }
 
    /* clamp the y domain to the viewport */
-   if (point->y < viewport->y)
+   if (point->y < VIDEO_POS_Y(viewport->pos))
    {
-      point->y = viewport->y;
+      point->y = VIDEO_POS_Y(viewport->pos);
       *clamped = true;
    }
-   else if (point->y > (viewport->y + viewport->height))
+   else if (point->y > (VIDEO_POS_Y(viewport->pos) + VIDEO_SCALE_H(viewport->dims)))
    {
-      point->y =  viewport->y + viewport->height;
+      point->y =  VIDEO_POS_Y(viewport->pos) + VIDEO_SCALE_H(viewport->dims);
       *clamped = true;
    }
 }
@@ -170,9 +171,9 @@ static void wpad_update_touch_state(int16_t state[3][2],
    wpad_get_touch_coordinates(&point, vpad, channel, &viewport, &touch_clamped);
 
    state[WIIU_DEVICE_INDEX_TOUCHPAD][RETRO_DEVICE_ID_ANALOG_X] = wpad_scale_touchpad(
-         viewport.x, viewport.x + viewport.width, -0x7fff, 0x7fff, point.x);
+         VIDEO_POS_X(viewport.pos), VIDEO_POS_X(viewport.pos) + VIDEO_SCALE_W(viewport.dims), -0x7fff, 0x7fff, point.x);
    state[WIIU_DEVICE_INDEX_TOUCHPAD][RETRO_DEVICE_ID_ANALOG_Y] = wpad_scale_touchpad(
-         viewport.y, viewport.y + viewport.height, -0x7fff, 0x7fff, point.y);
+         VIDEO_POS_Y(viewport.pos), VIDEO_POS_Y(viewport.pos) + VIDEO_SCALE_H(viewport.dims), -0x7fff, 0x7fff, point.y);
 
    if (!touch_clamped)
       *buttons |= VPAD_BUTTON_TOUCH;
@@ -183,7 +184,7 @@ static void wpad_update_touch_state(int16_t state[3][2],
 static void wpad_check_panic_button(uint32_t held_buttons)
 {
    if ((held_buttons & PANIC_BUTTON_MASK) == PANIC_BUTTON_MASK)
-      command_event(CMD_EVENT_QUIT, NULL);
+      input_driver_platform_request(INPUT_PLATFORM_QUIT);
 }
 
 static void wpad_poll(void)
@@ -280,7 +281,8 @@ static int16_t wpad_axis(unsigned port, uint32_t axis)
 
 static int16_t wpad_state(
       rarch_joypad_info_t *joypad_info,
-      const struct retro_keybind *binds,
+      const uint16_t *joykeys,
+      const uint32_t *joyaxes,
       unsigned port)
 {
    int i;
@@ -289,11 +291,8 @@ static int16_t wpad_state(
 
    for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
    {
-      /* Auto-binds are per joypad, not per user. */
-      const uint64_t joykey  = (binds[i].joykey != NO_BTN)
-         ? binds[i].joykey  : joypad_info->auto_binds[i].joykey;
-      const uint32_t joyaxis = (binds[i].joyaxis != AXIS_NONE)
-         ? binds[i].joyaxis : joypad_info->auto_binds[i].joyaxis;
+      const uint64_t joykey  = joykeys[i];
+      const uint32_t joyaxis = joyaxes[i];
       if (
                (uint16_t)joykey != NO_BTN
             && wpad_button(port_idx, (uint16_t)joykey))

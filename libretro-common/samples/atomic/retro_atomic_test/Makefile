@@ -1,3 +1,5 @@
+include ../../sample_objdir.mk
+
 TARGET := retro_atomic_test
 
 LIBRETRO_COMM_DIR := ../../..
@@ -11,7 +13,7 @@ HAVE_THREADS ?= 1
 
 SOURCES := retro_atomic_test.c
 
-CFLAGS  += -Wall -pedantic -std=gnu99 -g -O0 -I$(LIBRETRO_COMM_DIR)/include
+CFLAGS  += -Wall -pedantic -std=gnu99 -g1 -O0 -I$(LIBRETRO_COMM_DIR)/include
 
 ifeq ($(HAVE_THREADS),1)
    CFLAGS  += -DHAVE_THREADS
@@ -22,7 +24,7 @@ ifeq ($(HAVE_THREADS),1)
    LDFLAGS += -lrt
 endif
 
-OBJS := $(SOURCES:.c=.o)
+OBJS := $(call sample_objs,$(SOURCES:.c=.o))
 
 ifneq ($(SANITIZER),)
    CFLAGS  := -fsanitize=$(SANITIZER) -fno-omit-frame-pointer $(CFLAGS)
@@ -34,10 +36,28 @@ all: $(TARGET)
 %.o: %.c
 	$(CC) -c -o $@ $< $(CFLAGS)
 
+$(SAMPLE_OBJDIR)/%.o: $$(call sample_src,$$*).c
+	@mkdir -p $(@D)
+	$(CC) -c -o $@ $< $(CFLAGS)
+
 $(TARGET): $(OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
+check: all
+	./$(TARGET)
+	./check-barriers.sh
+
+# The seqlock's fences cannot be checked by running the test: x86_64
+# supplies the ordering they ask for, and qemu-aarch64 does not model
+# reordering either, so a build with a fence deleted passes on both.
+# The emitted code does change, so check-barriers.sh cross compiles
+# and looks for the barriers.  It skips when no aarch64 toolchain is
+# installed.
+check-barriers:
+	./check-barriers.sh
+
 clean:
+	rm -rf $(SAMPLE_OBJDIR)
 	rm -f $(TARGET) $(OBJS)
 
-.PHONY: clean
+.PHONY: all check check-barriers clean

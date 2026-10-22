@@ -77,6 +77,15 @@ const char *config_get_default_ai_service_backend(void)
  * Abstraction layer for translation backends (HTTP, local, etc.)
  */
 
+/* A little-endian 32-bit field of an image header. */
+#define TRANSLATION_LE32(p) \
+   (  (uint32_t)(p)[0]        | ((uint32_t)(p)[1] << 8) \
+   | ((uint32_t)(p)[2] << 16) | ((uint32_t)(p)[3] << 24))
+
+/* The largest side a server's image may have: past it the decode is
+ * refused rather than sized from untrusted fields. */
+#define TRANSLATION_IMAGE_DIM_MAX 16384
+
 typedef struct translation_response
 {
    /* Decoded image data (BMP/PNG file bytes, NOT base64) */
@@ -118,7 +127,7 @@ typedef struct translation_driver
    /* Perform translation (async - results via callback)
     *
     * bgr24_data: Frame data in BGR24 format
-    * width/height: Frame dimensions
+    * dims: Frame size, one packed word (VIDEO_SCALE_PACK)
     * source_lang: Source language code or NULL for auto-detect
     * target_lang: Target language code
     * mode: 0=image, 1=speech, 2=narrator, 3=image+speech
@@ -129,8 +138,7 @@ typedef struct translation_driver
     */
    bool (*translate)(
          const uint8_t *bgr24_data,
-         unsigned width,
-         unsigned height,
+         unsigned dims,
          const char *source_lang,
          const char *target_lang,
          unsigned mode,
@@ -143,8 +151,7 @@ typedef struct translation_driver
 /* Driver declarations */
 static bool http_translate(
       const uint8_t *bit24_image,
-      unsigned width,
-      unsigned height,
+      unsigned dims,
       const char *source_lang,
       const char *target_lang,
       unsigned mode,
@@ -206,6 +213,9 @@ bool is_narrator_running(bool accessibility_enable)
 }
 #endif
 
+/* Between looks at whether the speech or the narration has ended. */
+#define AUTO_TRANSLATE_PARK_USEC 50000
+
 static void task_auto_translate_handler(retro_task_t *task)
 {
    int               *mode_ptr = (int*)task->user_data;
@@ -237,6 +247,9 @@ static void task_auto_translate_handler(retro_task_t *task)
          break;
    }
 
+   /* Nothing signals the end of the speech or the narration, so look
+    * again shortly. */
+   task_queue_park(task, AUTO_TRANSLATE_PARK_USEC);
    return;
 
 task_finished:
@@ -267,22 +280,22 @@ static void ai_service_call_auto_translate_task(access_state_t *access_st,
    }
    else /* Speech or Narrator Mode */
    {
-      int* mode          = NULL;
+      int* mode          = (int*)malloc(sizeof(int));
       retro_task_t  *t   = task_init();
-      if (!t)
-         return;
-
-      mode               = (int*)malloc(sizeof(int));
-
-      t->user_data       = NULL;
-      t->handler         = task_auto_translate_handler;
-      t->flags          |= RETRO_TASK_FLG_MUTE;
-
-      if (mode)
+      if (!t || !mode)
       {
-         *mode           = ai_service_mode;
-         t->user_data    = mode;
+         free(t);
+         free(mode);
+         return;
       }
+
+      *mode              = ai_service_mode;
+      t->user_data       = mode;
+      t->handler         = task_auto_translate_handler;
+      /* It waits on the mixer and the narrator, then sets the next
+       * request off: the frontend's state, read and written where the
+       * frontend runs. */
+      t->flags          |= RETRO_TASK_FLG_MUTE | RETRO_TASK_FLG_MAIN_THREAD;
 
       task_queue_push(t);
    }
@@ -299,7 +312,6 @@ static void handle_translation_response(
    settings_t* settings              = config_get_ptr();
    uint32_t runloop_flags            = runloop_get_flags();
 #ifdef HAVE_ACCESSIBILITY
-   input_driver_state_t *input_st    = input_state_get_ptr();
 #endif
    video_driver_state_t
       *video_st                      = video_state_get_ptr();
@@ -307,7 +319,7 @@ static void handle_translation_response(
       video_driver_pix_fmt           = video_st->pix_fmt;
    access_state_t *access_st         = access_state_get_ptr();
 #ifdef HAVE_GFX_WIDGETS
-   bool gfx_widgets_paused           = (video_st->flags &
+   bool gfx_widgets_paused           = (video_st->main_flags &
       VIDEO_FLAG_WIDGETS_PAUSED) ? true : false;
 #endif
    bool ai_service_pause             = settings->bools.ai_service_pause;
@@ -345,17 +357,25 @@ static void handle_translation_response(
    }
 
    /* Handle image overlay */
-   if (response->image_data && response->image_size > 0)
+   /* Shorter than a PNG signature is no image at all, and both paths
+    * below read the first bytes to tell the format. */
+   if (     response->image_data
+         && response->image_size >= 8
+         && response->image_size <= 0x7fffffff)
    {
       char *raw_image_file_data = (char*)response->image_data;
       int new_image_size        = (int)response->image_size;
       unsigned image_width, image_height;
+      /* Bytes from one row of raw_image_data to the next, and whether
+       * the first row in memory is the top of the image. */
+      size_t   image_row        = 0;
+      bool     image_top_down   = false;
       /* Get the video frame dimensions reference */
-      unsigned width  = 0;
-      unsigned height = 0;
+      unsigned dims   = 0;
       bool     is_hw_fb;
-      video_driver_cached_frame_info(&width, &height, NULL, NULL);
-      is_hw_fb = video_driver_cached_frame_is_hw_render();
+      video_driver_cached_frame_info(&dims, NULL, NULL);
+      is_hw_fb = video_driver_cached_frame_is_hw_render()
+         || video_driver_pix_fmt == RETRO_PIXEL_FORMAT_SCRGB_RGBA16F;
 
       /* try two different modes for text display *
        * In the first mode, we use display widget overlays, but they require
@@ -408,31 +428,49 @@ static void handle_translation_response(
          size_t pitch;
          /* Write to video buffer directly (software cores only) */
 
-         /* This is a BMP file coming back. */
-         if (     raw_image_file_data[0] == 'B'
+         /* This is a BMP file coming back: a 54-byte header and 24-bit
+          * rows padded to four bytes, bottom-up unless the height is
+          * negative. Every field comes from the server's reply, so the
+          * pixels it describes must be in that reply. */
+         if (     new_image_size >= 54
+               && raw_image_file_data[0] == 'B'
                && raw_image_file_data[1] == 'M')
          {
-            /* Get image data (24 bit), and convert to the emulated pixel format */
-            image_width    =
-                 ((uint32_t) ((uint8_t)raw_image_file_data[21]) << 24)
-               + ((uint32_t) ((uint8_t)raw_image_file_data[20]) << 16)
-               + ((uint32_t) ((uint8_t)raw_image_file_data[19]) << 8)
-               + ((uint32_t) ((uint8_t)raw_image_file_data[18]) << 0);
+            const uint8_t *hdr = (const uint8_t*)raw_image_file_data;
+            uint32_t offset    = TRANSLATION_LE32(hdr + 10);
+            int32_t  width     = (int32_t)TRANSLATION_LE32(hdr + 18);
+            int32_t  height    = (int32_t)TRANSLATION_LE32(hdr + 22);
+            unsigned bpp       = hdr[28] | ((unsigned)hdr[29] << 8);
 
-            image_height   =
-                 ((uint32_t) ((uint8_t)raw_image_file_data[25]) << 24)
-               + ((uint32_t) ((uint8_t)raw_image_file_data[24]) << 16)
-               + ((uint32_t) ((uint8_t)raw_image_file_data[23]) << 8)
-               + ((uint32_t) ((uint8_t)raw_image_file_data[22]) << 0);
-            raw_image_data = (void*)malloc(image_width * image_height * 3 * sizeof(uint8_t));
-            if (raw_image_data)
-               memcpy(raw_image_data,
-                     raw_image_file_data + 54       * sizeof(uint8_t),
-                     image_width * image_height * 3 * sizeof(uint8_t));
+            image_top_down     = height < 0;
+            image_width        = width  > 0 ? (unsigned)width : 0;
+            image_height       = height < 0 ? (unsigned)-(int64_t)height
+                                            : (unsigned)height;
+            image_row          = ((size_t)image_width * 3 + 3) & ~(size_t)3;
+
+            if (     bpp != 24
+                  || !image_width
+                  || !image_height
+                  || image_width  > TRANSLATION_IMAGE_DIM_MAX
+                  || image_height > TRANSLATION_IMAGE_DIM_MAX
+                  || offset < 54
+                  || offset > (uint32_t)new_image_size
+                  || (uint64_t)image_row * image_height
+                     > (uint64_t)new_image_size - offset)
+            {
+               RARCH_LOG("[Translation] BMP size does not match its data.\n");
+               goto finish;
+            }
+
+            if (!(raw_image_data = malloc(image_row * image_height)))
+               goto finish;
+            memcpy(raw_image_data, raw_image_file_data + offset,
+                  image_row * image_height);
          }
-         else if (raw_image_file_data[1] == 'P'
-               && raw_image_file_data[2] == 'N'
-               && raw_image_file_data[3] == 'G')
+         else if (   new_image_size >= 24
+                  && raw_image_file_data[1] == 'P'
+                  && raw_image_file_data[2] == 'N'
+                  && raw_image_file_data[3] == 'G')
          {
             /* PNG file */
 #ifdef HAVE_RPNG
@@ -462,6 +500,21 @@ static void handle_translation_response(
                      (size_t)new_image_size, &image_width, &image_height,
                      false);
             } while (retval == IMAGE_PROCESS_NEXT);
+
+            if (     retval == IMAGE_PROCESS_ERROR
+                  || retval == IMAGE_PROCESS_ERROR_END
+                  || !raw_image_data_alpha
+                  || !image_width
+                  || !image_height
+                  || image_width  > TRANSLATION_IMAGE_DIM_MAX
+                  || image_height > TRANSLATION_IMAGE_DIM_MAX)
+            {
+               RARCH_LOG("[Translation] PNG reply did not decode.\n");
+               rpng_free(rpng);
+               goto finish;
+            }
+            /* Written below as tight rows, bottom-up. */
+            image_row = (size_t)image_width * 3;
 
             /* Returned output from the png processor is an upside down RGBA
              * image, so we have to change that to RGB first.  This should
@@ -507,7 +560,9 @@ static void handle_translation_response(
             goto finish;
          }
 
-         if (!(scaler = (struct scaler_ctx*)calloc(1, sizeof(struct scaler_ctx))))
+         if (    !VIDEO_SCALE_W(dims)
+              || !VIDEO_SCALE_H(dims)
+              || !(scaler = (struct scaler_ctx*)calloc(1, sizeof(struct scaler_ctx))))
             goto finish;
 
          if (is_hw_fb)
@@ -529,17 +584,17 @@ static void handle_translation_response(
 
          if (video_driver_pix_fmt == RETRO_PIXEL_FORMAT_XRGB8888)
          {
-            raw_output_data    = (uint8_t*)malloc(width * height * 4 * sizeof(uint8_t));
+            raw_output_data    = (uint8_t*)malloc(VIDEO_SCALE_AREA(dims) * 4 * sizeof(uint8_t));
             scaler->out_fmt    = SCALER_FMT_ARGB8888;
-            pitch              = width * 4;
+            pitch              = VIDEO_SCALE_W(dims) * 4;
             scaler->out_stride = (int)pitch;
          }
          else
          {
-            raw_output_data    = (uint8_t*)malloc(width * height * 2 * sizeof(uint8_t));
+            raw_output_data    = (uint8_t*)malloc(VIDEO_SCALE_AREA(dims) * 2 * sizeof(uint8_t));
             scaler->out_fmt    = SCALER_FMT_RGB565;
-            pitch              = width * 2;
-            scaler->out_stride = width;
+            pitch              = VIDEO_SCALE_W(dims) * 2;
+            scaler->out_stride = (int)pitch;
          }
 
          if (!raw_output_data)
@@ -548,15 +603,30 @@ static void handle_translation_response(
          scaler->in_fmt        = SCALER_FMT_BGR24;
          scaler->in_width      = image_width;
          scaler->in_height     = image_height;
-         scaler->out_width     = width;
-         scaler->out_height    = height;
+         scaler->out_width     = VIDEO_SCALE_W(dims);
+         scaler->out_height    = VIDEO_SCALE_H(dims);
          scaler->scaler_type   = SCALER_TYPE_POINT;
-         scaler_ctx_gen_filter(scaler);
-         scaler->in_stride     = -1 * width * 3;
+         if (!scaler_ctx_gen_filter(scaler))
+            goto finish;
 
-         scaler_ctx_scale_direct(scaler, raw_output_data,
-               (uint8_t*)raw_image_data + (image_height - 1) * width * 3);
-         video_driver_frame(raw_output_data, image_width, image_height, pitch);
+         /* The server's image need not match the frame: the input
+          * steps by its own rows, top row first, and the output is the
+          * frame's size. */
+         if (image_top_down)
+         {
+            scaler->in_stride  = (int)image_row;
+            scaler_ctx_scale_direct(scaler, raw_output_data,
+                  raw_image_data);
+         }
+         else
+         {
+            scaler->in_stride  = -(int)image_row;
+            scaler_ctx_scale_direct(scaler, raw_output_data,
+                  (uint8_t*)raw_image_data
+                  + (image_height - 1) * image_row);
+         }
+         video_driver_frame(raw_output_data,
+               VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims), pitch);
       }
    }
 
@@ -614,47 +684,47 @@ static void handle_translation_response(
                case 1:
 #ifdef HAVE_ACCESSIBILITY
                   if (key[0] == 'b')
-                     input_st->ai_gamepad_state[0]  = 2;
+                     input_driver_ai_gamepad_press(0);
                   else if (key[0] == 'y')
-                     input_st->ai_gamepad_state[1]  = 2;
+                     input_driver_ai_gamepad_press(1);
                   else if (key[0] == 'a')
-                     input_st->ai_gamepad_state[8]  = 2;
+                     input_driver_ai_gamepad_press(8);
                   else if (key[0] == 'x')
-                     input_st->ai_gamepad_state[9]  = 2;
+                     input_driver_ai_gamepad_press(9);
                   else if (key[0] == 'l')
-                     input_st->ai_gamepad_state[10] = 2;
+                     input_driver_ai_gamepad_press(10);
                   else if (key[0] == 'r')
-                     input_st->ai_gamepad_state[11] = 2;
+                     input_driver_ai_gamepad_press(11);
 #endif
                   break;
                case 2:
 #ifdef HAVE_ACCESSIBILITY
                   if (memcmp(key, "up", 2) == 0)
-                     input_st->ai_gamepad_state[4]  = 2;
+                     input_driver_ai_gamepad_press(4);
                   else if (memcmp(key, "l2", 2) == 0)
-                     input_st->ai_gamepad_state[12] = 2;
+                     input_driver_ai_gamepad_press(12);
                   else if (memcmp(key, "r2", 2) == 0)
-                     input_st->ai_gamepad_state[13] = 2;
+                     input_driver_ai_gamepad_press(13);
                   else if (memcmp(key, "l3", 2) == 0)
-                     input_st->ai_gamepad_state[14] = 2;
+                     input_driver_ai_gamepad_press(14);
                   else if (memcmp(key, "r3", 2) == 0)
-                     input_st->ai_gamepad_state[15] = 2;
+                     input_driver_ai_gamepad_press(15);
 #endif
                   break;
                case 4:
 #ifdef HAVE_ACCESSIBILITY
                   if (memcmp(key, "down", 4) == 0)
-                     input_st->ai_gamepad_state[5]  = 2;
+                     input_driver_ai_gamepad_press(5);
                   else if (memcmp(key, "left", 4) == 0)
-                     input_st->ai_gamepad_state[6]  = 2;
+                     input_driver_ai_gamepad_press(6);
 #endif
                   break;
                case 5:
 #ifdef HAVE_ACCESSIBILITY
                   if (memcmp(key, "start", 5) == 0)
-                     input_st->ai_gamepad_state[3]  = 2;
+                     input_driver_ai_gamepad_press(3);
                   else if (memcmp(key, "right", 5) == 0)
-                     input_st->ai_gamepad_state[7]  = 2;
+                     input_driver_ai_gamepad_press(7);
                   else
 #endif
                   if (memcmp(key, "pause", 5) == 0)
@@ -663,7 +733,7 @@ static void handle_translation_response(
                case 6:
 #ifdef HAVE_ACCESSIBILITY
                   if (memcmp(key, "select", 6) == 0)
-                     input_st->ai_gamepad_state[2]  = 2;
+                     input_driver_ai_gamepad_press(2);
 #endif
                   break;
                case 7:
@@ -693,7 +763,10 @@ finish:
    if (raw_image_data)
       free(raw_image_data);
    if (scaler)
+   {
+      scaler_ctx_gen_reset(scaler);
       free(scaler);
+   }
    if (raw_output_data)
       free(raw_output_data);
 
@@ -849,6 +922,29 @@ static const char *ai_service_get_str(enum translation_lang id)
    return "";
 }
 
+/* A caller of run_translation_service_notify(), told after the usual
+ * handling. */
+typedef struct
+{
+   retro_task_callback_t cb;
+   void *user_data;
+} translation_notify_t;
+
+static void translation_notify(void *userdata, const char *text,
+      const char *error)
+{
+   translation_notify_t *n = (translation_notify_t*)userdata;
+   n->cb(NULL, (void*)text, n->user_data, error);
+   free(n);
+}
+
+static void handle_translation_response_notify(
+      translation_response_t *response, void *userdata)
+{
+   handle_translation_response(response, NULL);
+   translation_notify(userdata, response->text, response->error);
+}
+
 /* Read-side callback used by run_translation_service for the SW
  * core path: convert the cached frame's pixels to BGR24 in-place
  * into a pre-allocated heap buffer.  The callback runs inside
@@ -858,15 +954,15 @@ struct translation_sw_ctx
 {
    struct scaler_ctx *scaler;
    uint8_t           *dst;
-   unsigned           width;
-   unsigned           height;
    size_t             pitch;
 };
 
 static void translation_sw_convert_cb(void *userdata,
       const void *data,
-      unsigned width, unsigned height, size_t pitch)
+      unsigned dims, size_t pitch)
 {
+   unsigned width = VIDEO_SCALE_W(dims);
+   unsigned height = VIDEO_SCALE_H(dims);
    struct translation_sw_ctx *ctx = (struct translation_sw_ctx*)userdata;
    if (!data || !ctx || !ctx->dst)
       return;
@@ -886,9 +982,16 @@ static void translation_sw_convert_cb(void *userdata,
 
 bool run_translation_service(settings_t *settings, bool paused)
 {
+   return run_translation_service_notify(settings, paused, NULL, NULL);
+}
+
+bool run_translation_service_notify(settings_t *settings, bool paused,
+      retro_task_callback_t cb, void *user_data)
+{
+   translation_notify_t *notify      = NULL;
    struct video_viewport vp;
    size_t pitch;
-   unsigned width, height;
+   unsigned dims                     = 0;
    uint8_t *bit24_image              = NULL;
    uint8_t *bit24_image_prev         = NULL;
    struct scaler_ctx *scaler         = NULL;
@@ -896,8 +999,8 @@ bool run_translation_service(settings_t *settings, bool paused)
    char *sys_lbl                     = NULL;
    core_info_t *core_info            = NULL;
    video_driver_state_t *video_st    = video_state_get_ptr();
-   access_state_t *access_st         = access_state_get_ptr();
 #ifdef HAVE_GFX_WIDGETS
+   access_state_t *access_st         = access_state_get_ptr();
    /* For the case when ai service pause is disabled. */
    if (     (gfx_widgets_ai_service_overlay_get_state() != 0)
          && (access_st->ai_service_auto == 1))
@@ -948,11 +1051,12 @@ bool run_translation_service(settings_t *settings, bool paused)
 
    {
       bool has_cpu_pixels = false;
-      if (!video_driver_cached_frame_info(&width, &height, &pitch,
+      if (!video_driver_cached_frame_info(&dims, &pitch,
                &has_cpu_pixels))
          goto finish;
 
-      if (!has_cpu_pixels)
+      if (!has_cpu_pixels
+            || video_st->pix_fmt == RETRO_PIXEL_FORMAT_SCRGB_RGBA16F)
       {
          /* HW render core, or no cached frame yet.  Fall back to
           * read_viewport for OCR -- not ideal (the viewport may
@@ -962,20 +1066,17 @@ bool run_translation_service(settings_t *settings, bool paused)
           * RETRO_HW_FRAME_BUFFER_VALID is treated identically to
           * "no cached frame yet" here: in both cases there are no
           * CPU-side pixels to read directly. */
-         vp.x                           = 0;
-         vp.y                           = 0;
-         vp.width                       = 0;
-         vp.height                      = 0;
-         vp.full_width                  = 0;
-         vp.full_height                 = 0;
+         vp.pos                         = VIDEO_POS_PACK(0, 0);
+         vp.dims                        = 0;
+         vp.full_dims                   = 0;
 
          video_driver_get_viewport_info(&vp);
 
-         if (!vp.width || !vp.height)
+         if (!VIDEO_SCALE_W(vp.dims) || !VIDEO_SCALE_H(vp.dims))
             goto finish;
 
-         bit24_image_prev = (uint8_t*)malloc(vp.width * vp.height * 3);
-         bit24_image      = (uint8_t*)malloc(width * height * 3);
+         bit24_image_prev = (uint8_t*)malloc(VIDEO_SCALE_AREA(vp.dims) * 3);
+         bit24_image      = (uint8_t*)malloc(VIDEO_SCALE_AREA(dims) * 3);
 
          if (!bit24_image_prev || !bit24_image)
             goto finish;
@@ -992,14 +1093,14 @@ bool run_translation_service(settings_t *settings, bool paused)
          scaler->in_fmt      = SCALER_FMT_BGR24;
          scaler->out_fmt     = SCALER_FMT_BGR24;
          scaler->scaler_type = SCALER_TYPE_POINT;
-         scaler->in_width    = vp.width;
-         scaler->in_height   = vp.height;
-         scaler->out_width   = width;
-         scaler->out_height  = height;
+         scaler->in_width    = VIDEO_SCALE_W(vp.dims);
+         scaler->in_height   = VIDEO_SCALE_H(vp.dims);
+         scaler->out_width   = VIDEO_SCALE_W(dims);
+         scaler->out_height  = VIDEO_SCALE_H(dims);
          scaler_ctx_gen_filter(scaler);
 
-         scaler->in_stride   = vp.width*3;
-         scaler->out_stride  = width*3;
+         scaler->in_stride   = VIDEO_SCALE_W(vp.dims)*3;
+         scaler->out_stride  = VIDEO_SCALE_W(dims)*3;
          scaler_ctx_scale_direct(scaler, bit24_image, bit24_image_prev);
       }
       else
@@ -1018,7 +1119,7 @@ bool run_translation_service(settings_t *settings, bool paused)
          const enum retro_pixel_format
             video_driver_pix_fmt           = video_st->pix_fmt;
 
-         if (!(bit24_image = (uint8_t*)malloc(width * height * 3)))
+         if (!(bit24_image = (uint8_t*)malloc(VIDEO_SCALE_AREA(dims) * 3)))
             goto finish;
 
          if (video_driver_pix_fmt == RETRO_PIXEL_FORMAT_XRGB8888)
@@ -1030,8 +1131,6 @@ bool run_translation_service(settings_t *settings, bool paused)
             struct translation_sw_ctx ctx;
             ctx.scaler = scaler;
             ctx.dst    = bit24_image;
-            ctx.width  = width;
-            ctx.height = height;
             ctx.pitch  = pitch;
             video_driver_cached_frame_read(&ctx,
                   translation_sw_convert_cb);
@@ -1066,12 +1165,21 @@ bool run_translation_service(settings_t *settings, bool paused)
             target_lang = ai_service_get_str(
                   (enum translation_lang)ai_service_target_lang);
 
-         success = driver->translate(
-               bit24_image, width, height,
+         if (cb)
+         {
+            if (!(notify = (translation_notify_t*)malloc(sizeof(*notify))))
+               goto finish;
+            notify->cb        = cb;
+            notify->user_data = user_data;
+         }
+         if (!(success = driver->translate(
+               bit24_image, dims,
                source_lang, target_lang,
                ai_service_mode,
                sys_lbl, paused,
-               handle_translation_response, NULL);
+               notify ? handle_translation_response_notify
+                      : handle_translation_response, notify)))
+            free(notify);
       }
    }
 
@@ -1127,11 +1235,15 @@ static void handle_translation_cb(
    {
       if (error)
          RARCH_ERR("[Translation] HTTP error: %s\n", error);
-      goto finish;
+      err_str = strdup(error ? error : "The AI service did not answer.");
+      goto failed;
    }
 
    if (!(json = rjson_open_buffer(data->data, data->len)))
-      goto finish;
+   {
+      err_str = strdup("Invalid JSON body.");
+      goto failed;
+   }
 
    /* Parse JSON body for the image and sound data */
    for (;;)
@@ -1215,12 +1327,21 @@ static void handle_translation_cb(
        && access_st->ai_service_auto != 2)
    {
       RARCH_ERR("[Translation] Invalid JSON body.\n");
-      goto finish;
+      if (!err_str)
+         err_str = strdup("Invalid JSON body.");
+      goto failed;
    }
 
    /* Hand off to caller's response handler */
    if (ctx && ctx->callback)
       ctx->callback(&response, ctx->userdata);
+   goto finish;
+
+failed:
+   /* Only a notified caller hears of a request that came to nothing;
+    * the usual handling never did. */
+   if (ctx && ctx->callback == handle_translation_response_notify)
+      translation_notify(ctx->userdata, NULL, err_str);
 
 finish:
    if (ctx)
@@ -1253,8 +1374,7 @@ finish:
 
 static bool http_translate(
       const uint8_t *bit24_image,
-      unsigned width,
-      unsigned height,
+      unsigned dims,
       const char *source_lang,
       const char *target_lang,
       unsigned mode,
@@ -1272,9 +1392,8 @@ static bool http_translate(
    int bmp64_len                     = 0;
    bool success                      = false;
    settings_t *settings              = config_get_ptr();
+#ifdef HAVE_GFX_WIDGETS
    video_driver_state_t *video_st    = video_state_get_ptr();
-#ifdef HAVE_ACCESSIBILITY
-   input_driver_state_t *input_st    = input_state_get_ptr();
 #endif
 #ifdef DEBUG
    access_state_t *access_st         = access_state_get_ptr();
@@ -1288,11 +1407,11 @@ static bool http_translate(
     * blob gated on an always-false TRANSLATE_USE_BMP local; that
     * branch has been deleted as dead code). */
    {
-      size_t pitch = width * 3;
+      size_t pitch = VIDEO_SCALE_W(dims) * 3;
 #ifdef HAVE_RPNG
       bmp_buffer   = rpng_save_image_bgr24_string(
-            bit24_image + width * (height - 1) * 3,
-            width, height, (signed)-pitch, &buffer_bytes);
+            bit24_image + VIDEO_SCALE_W(dims) * (VIDEO_SCALE_H(dims) - 1) * 3,
+            VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims), (signed)-pitch, &buffer_bytes);
 #else
       /* Encoding the screenshot requires RPNG; without it the translation
        * request cannot be built, so fail cleanly below on the NULL buffer. */
@@ -1341,6 +1460,10 @@ static bool http_translate(
    {
       static const char* state_labels[] = { "b", "y", "select", "start", "up", "down", "left", "right", "a", "x", "l", "r", "l2", "r2", "l3", "r3" };
       int i;
+#ifdef HAVE_ACCESSIBILITY
+      /* in RetroPad order, as the labels are */
+      uint16_t held = input_driver_ai_gamepad_held();
+#endif
       for (i = 0; i < (int)ARRAY_SIZE(state_labels); i++)
       {
          rjsonwriter_raw(jsonwriter, ",", 1);
@@ -1350,7 +1473,7 @@ static bool http_translate(
          rjsonwriter_raw(jsonwriter, " ", 1);
 #ifdef HAVE_ACCESSIBILITY
          rjsonwriter_rawf(jsonwriter, "%u",
-               (input_st->ai_gamepad_state[i] ? 1 : 0));
+               (unsigned)((held >> i) & 1u));
 #else
          rjsonwriter_rawf(jsonwriter, "%u", 0);
 #endif
@@ -1530,14 +1653,19 @@ static void handle_apple_translation_cb(
          apple_translate_free_data(sound_data);
    }
    else
+   {
       RARCH_ERR("[Translation] Apple translation failed: %s\n",
             error ? error : "unknown error");
+      /* as for the HTTP backend: only a notified caller hears of it */
+      if (apple_translate_ctx.callback == handle_translation_response_notify)
+         translation_notify(apple_translate_ctx.userdata, NULL,
+               error ? error : "Apple translation failed.");
+   }
 }
 
 static bool apple_translate(
       const uint8_t *bgr24_data,
-      unsigned width,
-      unsigned height,
+      unsigned dims,
       const char *source_lang,
       const char *target_lang,
       unsigned mode,
@@ -1554,7 +1682,8 @@ static bool apple_translate(
 
    /* Async: callback will be invoked on main thread when done */
    apple_translate_image(
-         bgr24_data, width, height, width * 3,
+         bgr24_data, VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims),
+         VIDEO_SCALE_W(dims) * 3,
          source_lang, target_lang,
          mode,
          handle_apple_translation_cb, NULL);

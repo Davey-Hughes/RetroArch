@@ -22,6 +22,7 @@
 #endif
 
 #include "../menu_driver.h"
+#include "../menu_setting.h"
 #include "../../gfx/gfx_animation.h"
 #include "../menu_cbs.h"
 #if defined(HAVE_CG) || defined(HAVE_GLSL) || defined(HAVE_SLANG) || defined(HAVE_HLSL)
@@ -47,6 +48,12 @@
 #include "../../playlist.h"
 #include "../../manual_content_scan.h"
 #include "../misc/cpufreq/cpufreq.h"
+#ifdef HAVE_LAKKA
+#include "../../lakka.h"
+#endif
+#ifdef HAVE_LAKKA_SWITCH
+#include "../../misc/reboot2payload/reboot2payload.h"
+#endif
 #include "../../audio/audio_driver.h"
 
 #ifdef HAVE_NETWORKING
@@ -70,7 +77,6 @@
 #endif
 
 extern struct key_desc key_descriptors[RARCH_MAX_KEYS];
-extern size_t setting_get_string_representation_default(rarch_setting_t *setting, char *s, size_t len);
 
 #ifdef HAVE_AUDIOMIXER
 static size_t menu_action_setting_audio_mixer_stream_name(
@@ -232,24 +238,6 @@ static size_t menu_action_setting_disp_set_label_shader_filter_pass(
    return 0;
 }
 
-static size_t menu_action_setting_disp_set_label_shader_watch_for_changes(
-      file_list_t* list,
-      unsigned *w, unsigned type, unsigned i,
-      const char *label,
-      char *s, size_t len,
-      const char *path,
-      char *s2, size_t len2)
-{
-   menu_file_list_cbs_t *cbs = (menu_file_list_cbs_t*)
-      list->list[i].actiondata;
-   *w = 19;
-   if (path && *path)
-      strlcpy(s2, path, len2);
-   if (cbs && cbs->setting && *cbs->setting->value.target.boolean)
-      return strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_TRUE), len);
-   return strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_FALSE), len);
-}
-
 static size_t menu_action_setting_disp_set_label_shader_num_passes(
       file_list_t* list,
       unsigned *w, unsigned type, unsigned i,
@@ -318,7 +306,7 @@ static size_t menu_action_setting_disp_set_label_shader_parameter_internal(
    video_shader_driver_get_current_shader(&shader_info);
    if (shader_info.data && (param = &shader_info.data->parameters[type - offset]))
       return snprintf(s, len, "%.2f [%.2f %.2f]",
-            param->current, param->minimum, param->maximum);
+            video_shader_param_get(param), param->minimum, param->maximum);
    *s = '\0';
    return 0;
 }
@@ -658,9 +646,9 @@ static size_t menu_action_cpu_managed_freq_label(
    }
 
    if (freq == 1)
-      return strlcpy_lit(s, "Min.", len);
+      return strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_MIN_ABBREV), len);
    else if (freq == ~0U)
-      return strlcpy_lit(s, "Max.", len);
+      return strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_MAX_ABBREV), len);
    return snprintf(s, len, "%u MHz", freq / 1000);
 }
 
@@ -709,6 +697,54 @@ static size_t menu_action_cpu_governor_label(
    strlcpy(s2, msg_hash_to_str(
       MENU_ENUM_LABEL_VALUE_CPU_POLICY_GOVERNOR), len2);
    return strlcpy(s, d->scaling_governor, len);
+}
+
+/* Value column of the main menu "Reboot" entry: shows
+ * "Install Update" while an update image is staged, so the user
+ * knows the next reboot will install it. On Switch with pmc_r2p it
+ * otherwise shows the selected reboot payload (and an update only
+ * wins when reboot_force_self_on_update is set). Empty otherwise. */
+static size_t menu_action_setting_disp_reboot(
+      file_list_t* list,
+      unsigned *w, unsigned type, unsigned i,
+      const char *label,
+      char *s, size_t len,
+      const char *path,
+      char *s2, size_t len2)
+{
+   *s = '\0';
+   *w = 19;
+   if (path)
+      strlcpy(s2, path, len2);
+#ifdef HAVE_LAKKA_SWITCH
+   if (r2p_is_supported())
+   {
+      settings_t *settings = config_get_ptr();
+      if (     settings->bools.reboot_force_self_on_update
+            && lakka_update_pending())
+         return strlcpy(s, msg_hash_to_str(MSG_VALUE_INSTALL_UPDATE), len);
+      return strlcpy(s, r2p_get_destination_name(), len);
+   }
+#endif
+   if (lakka_update_pending())
+      return strlcpy(s, msg_hash_to_str(MSG_VALUE_INSTALL_UPDATE), len);
+   return 0;
+}
+#endif
+
+#ifdef HAVE_LAKKA_SWITCH
+static size_t menu_action_setting_disp_reboot_payload(
+      file_list_t* list,
+      unsigned *w, unsigned type, unsigned i,
+      const char *label,
+      char *s, size_t len,
+      const char *path,
+      char *s2, size_t len2)
+{
+   *w = 19;
+   if (path)
+      strlcpy(s2, path, len2);
+   return strlcpy(s, r2p_get_destination_name(), len);
 }
 #endif
 
@@ -797,8 +833,9 @@ static size_t menu_action_setting_disp_set_label_input_desc(
          RARCH_UNMAPPED)
    {
       unsigned mapped_port   = settings->uints.input_remap_ports[user_idx];
-      const char *descriptor = runloop_state_get_ptr()->
-         system.input_desc_btn[mapped_port][remap_idx];
+      const char *descriptor = (mapped_port < MAX_USERS)
+         ? runloop_state_get_ptr()->system.input_desc_btn[mapped_port][remap_idx]
+         : NULL;
       if (descriptor && *descriptor)
       {
          size_t _len = strlcpy(s, descriptor, len);
@@ -847,9 +884,9 @@ static size_t menu_action_setting_disp_set_label_input_desc_kbd(
 
    if (key_descriptors[key_id].key != RETROK_FIRST)
    {
-      /* TODO/FIXME - Localize */
-      _len  = strlcpy_lit(s, "Keyboard ", len);
-      _len += strlcpy(s + _len, key_descriptors[key_id].desc, len - _len);
+      _len  = snprintf(s, len, /* Format string below */
+            msg_hash_to_str(MENU_ENUM_LABEL_VALUE_INPUT_KEYBOARD_KEY),
+            key_descriptors[key_id].desc);
    }
    else
       _len  = strlcpy(s, RARCH_NO_BIND, len);
@@ -903,7 +940,6 @@ static size_t menu_action_setting_disp_set_label_cheat_match(
    cheat_manager_match_action(CHEAT_MATCH_ACTION_TYPE_VIEW,
          cheat_manager_state.match_idx,
          &address, &address_mask, &prev_val, &curr_val);
-   /* TODO/FIXME - localize */
    _len = snprintf(s, len, "Prev: %u Curr: %u", prev_val, curr_val);
    *w = 19;
    if (path && *path)
@@ -989,6 +1025,56 @@ static size_t menu_action_setting_disp_set_label_menu_more(
       strlcpy(s2, path, len2);
    return _len;
 }
+
+#ifdef HAVE_NETWORKING
+/* The player slots asked for, as "1, 3", or "None". */
+static size_t menu_action_setting_disp_set_label_netplay_request_devices(
+      file_list_t* list,
+      unsigned *w, unsigned type, unsigned i,
+      const char *label,
+      char *s, size_t len,
+      const char *path,
+      char *s2, size_t len2)
+{
+   unsigned user;
+   size_t _len          = 0;
+   settings_t *settings = config_get_ptr();
+
+   for (user = 0; user < MAX_USERS; user++)
+      if (settings->bools.netplay_request_devices[user] && _len < len)
+         _len += snprintf(s + _len, len - _len, _len ? ", %u" : "%u", user + 1);
+   if (!_len)
+      _len = strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NONE), len);
+   *w = 19;
+   if (path && *path)
+      strlcpy(s2, path, len2);
+   return _len;
+}
+
+/* The users with a Network RetroPad, as "1, 2", or "None". */
+static size_t menu_action_setting_disp_set_label_network_remote_users(
+      file_list_t* list,
+      unsigned *w, unsigned type, unsigned i,
+      const char *label,
+      char *s, size_t len,
+      const char *path,
+      char *s2, size_t len2)
+{
+   unsigned user;
+   size_t _len          = 0;
+   settings_t *settings = config_get_ptr();
+
+   for (user = 0; user < MAX_USERS; user++)
+      if (settings->bools.network_remote_enable_user[user] && _len < len)
+         _len += snprintf(s + _len, len - _len, _len ? ", %u" : "%u", user + 1);
+   if (!_len)
+      _len = strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NONE), len);
+   *w = 19;
+   if (path && *path)
+      strlcpy(s2, path, len2);
+   return _len;
+}
+#endif
 
 static size_t menu_action_setting_disp_set_label_db_entry(
       file_list_t* list,
@@ -1146,7 +1232,7 @@ static size_t menu_action_setting_disp_set_label_menu_video_resolution(
       char *s2, size_t len2)
 {
    size_t _len    = 0;
-   unsigned width = 0, height = 0;
+   unsigned dims  = 0;
    char desc[64]  = {0};
    *w = 19;
    *s = '\0';
@@ -1154,20 +1240,20 @@ static size_t menu_action_setting_disp_set_label_menu_video_resolution(
    if (path && *path)
       strlcpy(s2, path, len2);
 
-   if (video_driver_get_video_output_size(&width, &height, desc, sizeof(desc)))
+   if (video_driver_get_video_output_size(&dims, desc, sizeof(desc)))
    {
 #ifdef GEKKO
-      if (width == 0 || height == 0)
+      if (!VIDEO_SCALE_W(dims) || !VIDEO_SCALE_H(dims))
          _len = strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_DONT_CARE), len);
       else
 #endif
       {
          if (*desc)
             _len = snprintf(s, len, msg_hash_to_str(MSG_SCREEN_RESOLUTION_FORMAT_DESC),
-               width, height, desc);
+               VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims), desc);
          else
             _len = snprintf(s, len, msg_hash_to_str(MSG_SCREEN_RESOLUTION_FORMAT_NO_DESC),
-               width, height);
+               VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims));
       }
    }
    else
@@ -1943,6 +2029,7 @@ static int menu_cbs_init_bind_get_string_representation_compare_label(
          case MENU_ENUM_LABEL_AUDIO_RESAMPLER_DRIVER:
          case MENU_ENUM_LABEL_RECORD_DRIVER:
          case MENU_ENUM_LABEL_MIDI_DRIVER:
+         case MENU_ENUM_LABEL_UI_COMPANION_DRIVER:
          case MENU_ENUM_LABEL_LOCATION_DRIVER:
          case MENU_ENUM_LABEL_CAMERA_DRIVER:
          case MENU_ENUM_LABEL_BLUETOOTH_DRIVER:
@@ -2001,6 +2088,16 @@ static int menu_cbs_init_bind_get_string_representation_compare_label(
             BIND_ACTION_GET_VALUE(cbs,
                   menu_action_setting_disp_set_label_remap_file_info);
             break;
+#ifdef HAVE_NETWORKING
+         case MENU_ENUM_LABEL_NETPLAY_REQUEST_DEVICES:
+            BIND_ACTION_GET_VALUE(cbs,
+                  menu_action_setting_disp_set_label_netplay_request_devices);
+            break;
+         case MENU_ENUM_LABEL_NETWORK_REMOTE_USERS:
+            BIND_ACTION_GET_VALUE(cbs,
+                  menu_action_setting_disp_set_label_network_remote_users);
+            break;
+#endif
          case MENU_ENUM_LABEL_OVERRIDE_FILE_INFO:
             BIND_ACTION_GET_VALUE(cbs,
                   menu_action_setting_disp_set_label_override_file_info);
@@ -2030,7 +2127,7 @@ static int menu_cbs_init_bind_get_string_representation_compare_label(
          case MENU_ENUM_LABEL_SHADER_WATCH_FOR_CHANGES:
 #if defined(HAVE_CG) || defined(HAVE_GLSL) || defined(HAVE_SLANG) || defined(HAVE_HLSL)
             BIND_ACTION_GET_VALUE(cbs,
-                  menu_action_setting_disp_set_label_shader_watch_for_changes);
+                  menu_action_setting_disp_set_label_setting_bool);
 #endif
             break;
          case MENU_ENUM_LABEL_VIDEO_SHADER_PASS:
@@ -2078,6 +2175,9 @@ static int menu_cbs_init_bind_get_string_representation_compare_label(
          case MENU_ENUM_LABEL_CORE_INPUT_REMAPPING_OPTIONS:
          case MENU_ENUM_LABEL_CORE_INFORMATION:
          case MENU_ENUM_LABEL_SYSTEM_INFORMATION:
+         case MENU_ENUM_LABEL_DISPLAY_INFORMATION:
+         case MENU_ENUM_LABEL_DISPLAY_EDID_INFORMATION:
+         case MENU_ENUM_LABEL_INPUT_INFORMATION:
          case MENU_ENUM_LABEL_ACHIEVEMENT_LIST:
 #ifdef HAVE_GAME_AI
          case MENU_ENUM_LABEL_CORE_GAME_AI_OPTIONS:
@@ -2161,6 +2261,12 @@ static int menu_cbs_init_bind_get_string_representation_compare_label(
             BIND_ACTION_GET_VALUE(cbs,
                   menu_action_setting_disp_cpu_gov_mode);
             break;
+#ifdef HAVE_LAKKA_SWITCH
+         case MENU_ENUM_LABEL_REBOOT_PAYLOAD:
+            BIND_ACTION_GET_VALUE(cbs,
+                  menu_action_setting_disp_reboot_payload);
+            break;
+#endif
          case MENU_ENUM_LABEL_CPU_POLICY_CORE_GOVERNOR:
          case MENU_ENUM_LABEL_CPU_POLICY_MENU_GOVERNOR:
             BIND_ACTION_GET_VALUE(cbs,
@@ -2346,26 +2452,29 @@ static int menu_cbs_init_bind_get_string_representation_compare_type(
                menu_action_setting_disp_set_label_cheat_match);
 #endif
          break;
-       case MENU_SETTING_SUBGROUP:
-       case MENU_SETTING_ACTION_REMAP_FILE_MANAGER_LIST:
-       case MENU_SETTING_ACTION_REMAP_FILE_LOAD:
-       case MENU_SETTING_ACTION_CORE_DISK_OPTIONS:
-       case MENU_SETTINGS_CORE_DISK_OPTIONS_DISK_IMAGE_APPEND:
-       case MENU_EXPLORE_TAB:
-       case MENU_CONTENTLESS_CORES_TAB:
-       case MENU_PLAYLISTS_TAB:
-           BIND_ACTION_GET_VALUE(cbs,
-                                 menu_action_setting_disp_set_label_menu_more);
-           break;
-       case MENU_SETTING_ACTION:
-           if (cbs->setting
+      case MENU_SETTING_SUBGROUP:
+      case MENU_SETTING_ACTION_REMAP_FILE_MANAGER_LIST:
+      case MENU_SETTING_ACTION_REMAP_FILE_LOAD:
+      case MENU_SETTING_ACTION_CORE_DISK_OPTIONS:
+      case MENU_SETTINGS_CORE_DISK_OPTIONS_DISK_IMAGE_APPEND:
+      case MENU_EXPLORE_TAB:
+      case MENU_CONTENTLESS_CORES_TAB:
+      case MENU_PLAYLISTS_TAB:
+         BIND_ACTION_GET_VALUE(cbs,
+               menu_action_setting_disp_set_label_menu_more);
+         break;
+      case MENU_SETTING_ACTION:
+         /* An action with a representation of its own shows it; one
+          * without falls back to the "more" label. */
+         if (cbs->setting
                && cbs->setting->actions->repr
                && cbs->setting->actions->repr != &setting_get_string_representation_default)
-               BIND_ACTION_GET_VALUE(cbs, menu_action_setting_disp_set_label);
-           else
-               BIND_ACTION_GET_VALUE(cbs,
-                                     menu_action_setting_disp_set_label_menu_more);
-           break;
+            BIND_ACTION_GET_VALUE(cbs,
+                  menu_action_setting_disp_set_label);
+         else
+            BIND_ACTION_GET_VALUE(cbs,
+                  menu_action_setting_disp_set_label_menu_more);
+         break;
       case MENU_SETTINGS_CORE_DISK_OPTIONS_DISK_INDEX:
          BIND_ACTION_GET_VALUE(cbs,
                menu_action_setting_disp_set_label_menu_disk_index);
@@ -2423,7 +2532,8 @@ int menu_cbs_init_bind_get_string_representation(menu_file_list_cbs_t *cbs,
    {
       switch (cbs->enum_idx)
       {
-         case MENU_ENUM_LABEL_CHEEVOS_LOCKED_ENTRY:
+         case MENU_ENUM_LABEL_CHEEVOS_MENU_ENTRY:
+         case MENU_ENUM_LABEL_CHEEVOS_MENU_SUBMENU:
 #ifdef HAVE_CHEEVOS
             BIND_ACTION_GET_VALUE(cbs,
                   menu_action_setting_disp_set_label_cheevos_entry);
@@ -2439,10 +2549,14 @@ int menu_cbs_init_bind_get_string_representation(menu_file_list_cbs_t *cbs,
                   menu_action_setting_disp_set_label_netplay_mitm_server);
 #endif
             return 0;
+         case MENU_ENUM_LABEL_REBOOT:
+#ifdef HAVE_LAKKA
+            BIND_ACTION_GET_VALUE(cbs, menu_action_setting_disp_reboot);
+#endif
+            return 0;
          case MENU_ENUM_LABEL_RESTART_RETROARCH:
          case MENU_ENUM_LABEL_QUIT_RETROARCH:
          case MENU_ENUM_LABEL_SWITCH_GPU_PROFILE:
-         case MENU_ENUM_LABEL_REBOOT:
          case MENU_ENUM_LABEL_SHUTDOWN:
          case MENU_ENUM_LABEL_SAVE_CURRENT_CONFIG:
          case MENU_ENUM_LABEL_SAVE_NEW_CONFIG:

@@ -16,6 +16,8 @@
  *  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <stdlib.h>
+
 #include <string/stdstring.h>
 #include <file/file_path.h>
 
@@ -29,6 +31,7 @@
 #ifdef HAVE_MENU
 #include "../../menu/menu_driver.h"
 #include <compat/strl.h>
+#include <queues/mpsc_stack.h>
 #endif
 
 #define LOAD_CONTENT_ANIMATION_FADE_IN_DURATION   466.0f
@@ -52,7 +55,7 @@ struct gfx_widget_load_content_animation_state
 {
    /* Hot fields - accessed every frame in _frame() */
    gfx_display_t *p_disp;
-   uintptr_t icon_texture;
+   gfx_surface_t *icon_texture;
    unsigned bg_shadow_height;
    unsigned margin_shadow_width;
    unsigned icon_size;
@@ -123,7 +126,7 @@ typedef struct gfx_widget_load_content_animation_state gfx_widget_load_content_a
 
 static gfx_widget_load_content_animation_state_t p_w_load_content_animation_st = {
    NULL,                               /* p_disp */
-   0,                                  /* icon_texture */
+   NULL,                               /* icon_texture */
    0,                                  /* bg_shadow_height */
    0,                                  /* margin_shadow_width */
    0,                                  /* icon_size */
@@ -191,9 +194,9 @@ static void gfx_widget_load_content_animation_reset(void)
    uintptr_t timer_tag                              = (uintptr_t)&state->timer;
 
    /* Kill any existing timers/animations */
-   gfx_animation_kill_by_tag(&timer_tag);
-   gfx_animation_kill_by_tag(&alpha_tag);
-   gfx_animation_kill_by_tag(&slide_offset_tag);
+   gfx_animation_kill_widget_by_tag(&timer_tag);
+   gfx_animation_kill_widget_by_tag(&alpha_tag);
+   gfx_animation_kill_widget_by_tag(&slide_offset_tag);
 
    /* Reset pertinent state parameters */
    state->status             = GFX_WIDGET_LOAD_CONTENT_IDLE;
@@ -209,12 +212,8 @@ static void gfx_widget_load_content_animation_reset(void)
    state->content_name_len   = 0;
    state->system_name_len    = 0;
 
-   /* Unload any icon texture */
-   if (state->icon_texture)
-   {
-      video_driver_texture_unload(&state->icon_texture);
-      state->icon_texture = 0;
-   }
+   gfx_surface_free(state->icon_texture);
+   state->icon_texture = NULL;
 }
 
 static void gfx_widget_load_content_animation_load_icon(void)
@@ -222,18 +221,20 @@ static void gfx_widget_load_content_animation_load_icon(void)
    gfx_widget_load_content_animation_state_t *state = &p_w_load_content_animation_st;
 
    /* In all cases, unload any existing icon texture */
-   if (state->icon_texture)
-   {
-      video_driver_texture_unload(&state->icon_texture);
-      state->icon_texture = 0;
-   }
+   gfx_surface_free(state->icon_texture);
+   state->icon_texture = NULL;
 
    /* If widget has a valid icon set, load it */
    if (state->has_icon)
-      gfx_display_reset_textures_list(
-            state->icon_file, state->icon_directory,
-            &state->icon_texture,
-            gfx_display_texture_filter(), NULL, NULL);
+   {
+      char path[PATH_MAX_LENGTH];
+      fill_pathname_join_special(path, state->icon_directory,
+            state->icon_file, sizeof(path));
+      state->icon_texture = gfx_surface_new_still(
+            gfx_display_texture_filter());
+      gfx_surface_submit_file(state->icon_texture, path,
+            gfx_surface_wants_rgba());
+   }
 }
 
 /* Callbacks */
@@ -261,7 +262,7 @@ static void gfx_widget_load_content_animation_wait_cb(void *userdata)
    animation_entry.cb           = gfx_widget_load_content_animation_fade_out_cb;
    animation_entry.userdata     = NULL;
 
-   gfx_animation_push(&animation_entry);
+   gfx_animation_push_widget(&animation_entry);
    state->status = GFX_WIDGET_LOAD_CONTENT_FADE_OUT;
 }
 
@@ -275,7 +276,7 @@ static void gfx_widget_load_content_animation_slide_cb(void *userdata)
    timer.cb       = gfx_widget_load_content_animation_wait_cb;
    timer.userdata = state;
 
-   gfx_animation_timer_start(&state->timer, &timer);
+   gfx_animation_timer_start_widget(&state->timer, &timer);
    state->status = GFX_WIDGET_LOAD_CONTENT_WAIT;
 }
 
@@ -296,7 +297,7 @@ static void gfx_widget_load_content_animation_fade_in_cb(void *userdata)
    animation_entry.cb           = gfx_widget_load_content_animation_slide_cb;
    animation_entry.userdata     = state;
 
-   gfx_animation_push(&animation_entry);
+   gfx_animation_push_widget(&animation_entry);
    state->status = GFX_WIDGET_LOAD_CONTENT_SLIDE;
 }
 
@@ -306,15 +307,47 @@ static void gfx_widget_load_content_animation_fade_in_cb(void *userdata)
  * show none.  Safe to call whether or not the animation is running:
  * a value set while idle is simply what the next animation starts
  * with, and the reset on start clears it. */
-void gfx_widget_set_load_content_progress(int8_t progress)
+static void gfx_widget_set_load_content_progress_state(int8_t progress)
 {
    p_w_load_content_animation_st.progress =
          (progress > 100) ? 100 : progress;
 }
 
-bool gfx_widget_start_load_content_animation(void)
+/* A start or a progress update from any thread, applied by the
+ * widgets' owner in iterate(). A start carries what was resolved for
+ * it on the producer's thread, under the names the widget keeps. */
+struct load_content_cmd
 {
-   gfx_widget_load_content_animation_state_t *state = &p_w_load_content_animation_st;
+   mpsc_stack_node_t link;  /* first: the stack's, from push to drain */
+   size_t content_name_len;
+   size_t system_name_len;
+   bool   start;
+   bool   resolved;         /* a start with something to show */
+   bool   has_icon;
+   int8_t progress;         /* not a start */
+   char   content_name[512];
+   char   system_name[512];
+   char   icon_directory[DIR_MAX_LENGTH];
+   char   icon_file[NAME_MAX_LENGTH];
+   char   icon_path[PATH_MAX_LENGTH];
+};
+
+static mpsc_stack_t load_content_pending;
+
+void gfx_widget_set_load_content_progress(int8_t progress)
+{
+   struct load_content_cmd *cmd = (struct load_content_cmd*)
+      malloc(sizeof(*cmd));
+   if (!cmd)
+      return;
+   cmd->start    = false;
+   cmd->progress = progress;
+   mpsc_stack_push(&load_content_pending, &cmd->link);
+}
+
+static bool gfx_widget_start_load_content_animation_resolve(
+      struct load_content_cmd *state)
+{
 
    const char *content_path                         = path_get(RARCH_PATH_CONTENT);
    const char *core_path                            = path_get(RARCH_PATH_CORE);
@@ -326,9 +359,16 @@ bool gfx_widget_start_load_content_animation(void)
    bool has_system                                  = false;
    bool has_db_name                                 = false;
 
-   /* To ensure we leave the widget in a well defined
-    * state, perform a reset before parsing variables */
-   gfx_widget_load_content_animation_reset();
+   state->content_name[0]   = '\0';
+   state->system_name[0]    = '\0';
+   /* The directory the widgets set at init, before any start */
+   strlcpy(state->icon_directory, dispwidget_get_ptr()->monochrome_png_path,
+         sizeof(state->icon_directory));
+   state->icon_file[0]      = '\0';
+   state->icon_path[0]      = '\0';
+   state->content_name_len  = 0;
+   state->system_name_len   = 0;
+   state->has_icon          = false;
 
    /* Sanity check - we require a valid core path,
     * and must reject the dummy/builtin core.
@@ -561,11 +601,62 @@ icon_done:
       state->system_name_len  = 54;
    }
 
-   /* All parameters are initialised
-    * > Signal that animation should begin */
-   state->status = GFX_WIDGET_LOAD_CONTENT_BEGIN;
-
    return true;
+}
+
+bool gfx_widget_start_load_content_animation(void)
+{
+   bool resolved;
+   struct load_content_cmd *cmd = (struct load_content_cmd*)
+      malloc(sizeof(*cmd));
+   if (!cmd)
+      return false;
+   resolved      = gfx_widget_start_load_content_animation_resolve(cmd);
+   cmd->start    = true;
+   cmd->resolved = resolved;
+   /* The owner may free it from here on */
+   mpsc_stack_push(&load_content_pending, &cmd->link);
+   return resolved;
+}
+
+/* The owner's side: a start resets the widget and takes what was
+ * resolved for it; a progress update only takes the value. */
+static void gfx_widget_load_content_animation_apply_pending(void)
+{
+   gfx_widget_load_content_animation_state_t *state =
+         &p_w_load_content_animation_st;
+   mpsc_stack_node_t *link =
+         mpsc_stack_reverse(mpsc_stack_drain(&load_content_pending));
+
+   while (link)
+   {
+      struct load_content_cmd *cmd = (struct load_content_cmd*)link;
+      link                         = link->next;
+      if (!cmd->start)
+         gfx_widget_set_load_content_progress_state(cmd->progress);
+      else
+      {
+         gfx_widget_load_content_animation_reset();
+         if (cmd->resolved)
+         {
+            strlcpy(state->content_name, cmd->content_name,
+                  sizeof(state->content_name));
+            strlcpy(state->system_name, cmd->system_name,
+                  sizeof(state->system_name));
+            strlcpy(state->icon_directory, cmd->icon_directory,
+                  sizeof(state->icon_directory));
+            strlcpy(state->icon_file, cmd->icon_file,
+                  sizeof(state->icon_file));
+            strlcpy(state->icon_path, cmd->icon_path,
+                  sizeof(state->icon_path));
+            state->content_name_len = cmd->content_name_len;
+            state->system_name_len  = cmd->system_name_len;
+            state->has_icon         = cmd->has_icon;
+            state->status           = GFX_WIDGET_LOAD_CONTENT_BEGIN;
+         }
+      }
+      free(cmd);
+   }
 }
 
 /* Widget layout() */
@@ -578,7 +669,7 @@ static void gfx_widget_load_content_animation_calculate(
    int system_name_width;
    int text_width;
 
-   unsigned last_video_width            = p_dispwidget->last_video_width;
+   unsigned last_video_width            = VIDEO_SCALE_W(p_dispwidget->last_video_dims);
    unsigned widget_padding              = p_dispwidget->simple_widget_padding;
 
    gfx_widget_font_data_t *font_regular = &p_dispwidget->gfx_widget_fonts.regular;
@@ -620,8 +711,8 @@ static void gfx_widget_load_content_animation_layout(
    dispgfx_widget_t *p_dispwidget                   = (dispgfx_widget_t*)data;
    gfx_widget_load_content_animation_state_t *state = &p_w_load_content_animation_st;
 
-   unsigned last_video_width                        = p_dispwidget->last_video_width;
-   unsigned last_video_height                       = p_dispwidget->last_video_height;
+   unsigned last_video_width                        = VIDEO_SCALE_W(p_dispwidget->last_video_dims);
+   unsigned last_video_height                       = VIDEO_SCALE_H(p_dispwidget->last_video_dims);
    unsigned widget_padding                          = p_dispwidget->simple_widget_padding;
 
    gfx_widget_font_data_t *font_regular             = &p_dispwidget->gfx_widget_fonts.regular;
@@ -671,11 +762,13 @@ static void gfx_widget_load_content_animation_layout(
 /* Widget iterate() */
 
 static void gfx_widget_load_content_animation_iterate(void *user_data,
-      unsigned width, unsigned height, bool fullscreen,
+      unsigned dims, bool fullscreen,
       const char *dir_assets, char *font_path,
       bool is_threaded)
 {
    gfx_widget_load_content_animation_state_t *state = &p_w_load_content_animation_st;
+
+   gfx_widget_load_content_animation_apply_pending();
 
    if (state->status == GFX_WIDGET_LOAD_CONTENT_BEGIN)
    {
@@ -711,7 +804,7 @@ static void gfx_widget_load_content_animation_iterate(void *user_data,
       animation_entry.cb           = gfx_widget_load_content_animation_fade_in_cb;
       animation_entry.userdata     = state;
 
-      gfx_animation_push(&animation_entry);
+      gfx_animation_push_widget(&animation_entry);
       state->status = GFX_WIDGET_LOAD_CONTENT_FADE_IN;
    }
 }
@@ -733,8 +826,8 @@ static void gfx_widget_load_content_animation_frame(void *data, void *user_data)
       video_frame_info_t *video_info       = (video_frame_info_t*)data;
       dispgfx_widget_t *p_dispwidget       = (dispgfx_widget_t*)user_data;
 
-      unsigned video_width                 = video_info->width;
-      unsigned video_height                = video_info->height;
+      unsigned video_width                 = VIDEO_SCALE_W(video_info->dims);
+      unsigned video_height                = VIDEO_SCALE_H(video_info->dims);
       void *userdata                       = video_info->userdata;
 
       gfx_widget_font_data_t *font_regular = &p_dispwidget->gfx_widget_fonts.regular;
@@ -852,14 +945,11 @@ static void gfx_widget_load_content_animation_frame(void *data, void *user_data)
          gfx_display_draw_quad(
                p_disp,
                userdata,
-               video_width,
-               video_height,
+               VIDEO_SCALE_PACK(video_width, video_height),
                0,
                0,
-               video_width,
-               video_height,
-               video_width,
-               video_height,
+               VIDEO_SCALE_PACK(video_width, video_height),
+               VIDEO_SCALE_PACK(video_width, video_height),
                bg_underlay_color,
                NULL);
 
@@ -867,28 +957,22 @@ static void gfx_widget_load_content_animation_frame(void *data, void *user_data)
          gfx_display_draw_quad(
                p_disp,
                userdata,
-               video_width,
-               video_height,
+               VIDEO_SCALE_PACK(video_width, video_height),
                state->bg_x,
                state->bg_shadow_top_y,
-               state->bg_width,
-               state->bg_shadow_height,
-               video_width,
-               video_height,
+               VIDEO_SCALE_PACK(state->bg_width, state->bg_shadow_height),
+               VIDEO_SCALE_PACK(video_width, video_height),
                bg_shadow_top_color,
                NULL);
 
          gfx_display_draw_quad(
                p_disp,
                userdata,
-               video_width,
-               video_height,
+               VIDEO_SCALE_PACK(video_width, video_height),
                state->bg_x,
                state->bg_shadow_bottom_y,
-               state->bg_width,
-               state->bg_shadow_height,
-               video_width,
-               video_height,
+               VIDEO_SCALE_PACK(state->bg_width, state->bg_shadow_height),
+               VIDEO_SCALE_PACK(video_width, video_height),
                bg_shadow_bottom_color,
                NULL);
 
@@ -896,14 +980,11 @@ static void gfx_widget_load_content_animation_frame(void *data, void *user_data)
          gfx_display_draw_quad(
                p_disp,
                userdata,
-               video_width,
-               video_height,
+               VIDEO_SCALE_PACK(video_width, video_height),
                state->bg_x,
                state->bg_y,
-               state->bg_width,
-               state->bg_height,
-               video_width,
-               video_height,
+               VIDEO_SCALE_PACK(state->bg_width, state->bg_height),
+               VIDEO_SCALE_PACK(video_width, video_height),
                bg_color,
                NULL);
       }
@@ -913,19 +994,16 @@ static void gfx_widget_load_content_animation_frame(void *data, void *user_data)
       {
          gfx_display_set_alpha(icon_color, icon_alpha);
 
-         if (state->icon_texture)
+         if (GFX_SURFACE_HANDLE(state->icon_texture))
          {
-            if (dispctx && dispctx->blend_begin)
-               dispctx->blend_begin(userdata);
+            gfx_display_blend_begin(dispctx, userdata);
 
             gfx_widgets_draw_icon(
                   userdata,
                   p_disp,
-                  video_width,
-                  video_height,
-                  state->icon_size,
-                  state->icon_size,
-                  state->icon_texture,
+                  VIDEO_SCALE_PACK(video_width, video_height),
+                  VIDEO_SCALE_PACK(state->icon_size, state->icon_size),
+                  GFX_SURFACE_HANDLE(state->icon_texture),
                   icon_x,
                   state->icon_y,
                   0.0f, /* rad */
@@ -933,8 +1011,7 @@ static void gfx_widget_load_content_animation_frame(void *data, void *user_data)
                   0.0f, /* sine(rad)  = sine(0) = 0.0f */
                   icon_color);
 
-            if (dispctx && dispctx->blend_end)
-               dispctx->blend_end(userdata);
+            gfx_display_blend_end(dispctx, userdata);
          }
          /* If there is no icon, draw a placeholder
           * (otherwise layout will look terrible...) */
@@ -942,14 +1019,11 @@ static void gfx_widget_load_content_animation_frame(void *data, void *user_data)
             gfx_display_draw_quad(
                   p_disp,
                   userdata,
-                  video_width,
-                  video_height,
+                  VIDEO_SCALE_PACK(video_width, video_height),
                   icon_x,
                   state->icon_y,
-                  state->icon_size,
-                  state->icon_size,
-                  video_width,
-                  video_height,
+                  VIDEO_SCALE_PACK(state->icon_size, state->icon_size),
+                  VIDEO_SCALE_PACK(video_width, video_height),
                   icon_color,
 		  NULL);
       }
@@ -986,8 +1060,7 @@ static void gfx_widget_load_content_animation_frame(void *data, void *user_data)
                      with_progress,
                      text_x,
                      state->content_name_y,
-                     video_width,
-                     video_height,
+                     VIDEO_SCALE_PACK(video_width, video_height),
                      content_name_color,
                      TEXT_ALIGN_LEFT,
                      true);
@@ -998,8 +1071,7 @@ static void gfx_widget_load_content_animation_frame(void *data, void *user_data)
                      state->content_name,
                      text_x,
                      state->content_name_y,
-                     video_width,
-                     video_height,
+                     VIDEO_SCALE_PACK(video_width, video_height),
                      content_name_color,
                      TEXT_ALIGN_LEFT,
                      true);
@@ -1014,8 +1086,7 @@ static void gfx_widget_load_content_animation_frame(void *data, void *user_data)
                   state->system_name,
                   text_x,
                   state->system_name_y,
-                  video_width,
-                  video_height,
+                  VIDEO_SCALE_PACK(video_width, video_height),
                   system_name_color,
                   TEXT_ALIGN_LEFT,
                   true);
@@ -1029,8 +1100,10 @@ static void gfx_widget_load_content_animation_frame(void *data, void *user_data)
              * text here to avoid overlaps */
             if (msg_queue_size > 0)
             {
-               gfx_widgets_flush_text(video_width, video_height, font_regular);
-               gfx_widgets_flush_text(video_width, video_height, font_bold);
+               gfx_widgets_flush_text(VIDEO_SCALE_PACK(video_width,
+                     video_height), font_regular);
+               gfx_widgets_flush_text(VIDEO_SCALE_PACK(video_width,
+                     video_height), font_bold);
             }
             /* Must also flush text if it overlaps the edge of
              * the screen (otherwise it will bleed through the
@@ -1039,11 +1112,13 @@ static void gfx_widget_load_content_animation_frame(void *data, void *user_data)
             {
                if (state->system_name_width > video_width -
                      (unsigned)text_x - state->margin_shadow_width)
-                  gfx_widgets_flush_text(video_width, video_height, font_regular);
+                  gfx_widgets_flush_text(VIDEO_SCALE_PACK(video_width,
+                        video_height), font_regular);
 
                if (state->content_name_width > video_width -
                      (unsigned)text_x - state->margin_shadow_width)
-                  gfx_widgets_flush_text(video_width, video_height, font_bold);
+                  gfx_widgets_flush_text(VIDEO_SCALE_PACK(video_width,
+                        video_height), font_bold);
             }
          }
       }
@@ -1064,14 +1139,11 @@ static void gfx_widget_load_content_animation_frame(void *data, void *user_data)
          gfx_display_draw_quad(
                p_disp,
                userdata,
-               video_width,
-               video_height,
+               VIDEO_SCALE_PACK(video_width, video_height),
                state->margin_shadow_left_x,
                state->bg_y,
-               state->margin_shadow_width,
-               state->bg_height,
-               video_width,
-               video_height,
+               VIDEO_SCALE_PACK(state->margin_shadow_width, state->bg_height),
+               VIDEO_SCALE_PACK(video_width, video_height),
                margin_shadow_left_color,
 	       NULL);
 
@@ -1079,14 +1151,11 @@ static void gfx_widget_load_content_animation_frame(void *data, void *user_data)
          gfx_display_draw_quad(
                p_disp,
                userdata,
-               video_width,
-               video_height,
+               VIDEO_SCALE_PACK(video_width, video_height),
                state->margin_shadow_right_x,
                state->bg_y,
-               state->margin_shadow_width,
-               state->bg_height,
-               video_width,
-               video_height,
+               VIDEO_SCALE_PACK(state->margin_shadow_width, state->bg_height),
+               VIDEO_SCALE_PACK(video_width, video_height),
                margin_shadow_right_color,
 	       NULL);
       }
@@ -1097,7 +1166,7 @@ static void gfx_widget_load_content_animation_frame(void *data, void *user_data)
 
 static void gfx_widget_load_content_animation_context_reset(
       bool is_threaded,
-      unsigned width, unsigned height, bool fullscreen,
+      unsigned dims, bool fullscreen,
       const char *dir_assets, char *font_path,
       char* menu_png_path,
       char* widgets_png_path)
@@ -1121,18 +1190,21 @@ static void gfx_widget_load_content_animation_context_destroy(void)
 {
    gfx_widget_load_content_animation_state_t *state = &p_w_load_content_animation_st;
 
-   /* Unload any icon texture */
-   if (state->icon_texture)
-   {
-      video_driver_texture_unload(&state->icon_texture);
-      state->icon_texture = 0;
-   }
+   gfx_surface_free(state->icon_texture);
+   state->icon_texture = NULL;
 }
 
 /* Widget free() */
 
 static void gfx_widget_load_content_animation_free(void)
 {
+   mpsc_stack_node_t *link = mpsc_stack_drain(&load_content_pending);
+   while (link)
+   {
+      mpsc_stack_node_t *next = link->next;
+      free(link);
+      link                    = next;
+   }
    gfx_widget_load_content_animation_reset();
 }
 

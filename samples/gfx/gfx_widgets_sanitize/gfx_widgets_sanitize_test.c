@@ -60,6 +60,7 @@
 #include "../../../gfx/gfx_widgets.h"
 #include "../../../gfx/gfx_display.h"
 #include "../../../gfx/gfx_animation.h"
+#include "../../../gfx/video_driver.h"
 
 static int failures;
 static int pushes;
@@ -79,7 +80,7 @@ static bool widgets_up(void)
    memset(s_settings, 0, sizeof(s_settings));
 
    return gfx_widgets_init(&s_disp, &s_anim, s_settings,
-         (uintptr_t)&s_disp, false, 1920, 1080, false,
+         (uintptr_t)&s_disp, false, VIDEO_SCALE_PACK(1920, 1080), false,
          "/tmp/nonexistent-assets", NULL);
 }
 
@@ -97,13 +98,13 @@ static void pump(int frames)
       video_frame_info_t video_info;
 
       gfx_widgets_iterate(&s_disp, s_settings,
-            1920, 1080, false, "/tmp/nonexistent-assets", NULL, false);
+            VIDEO_SCALE_PACK(1920, 1080), false,
+            "/tmp/nonexistent-assets", NULL, false);
 
       memset(&video_info, 0, sizeof(video_info));
       video_info.disp_userdata    = &s_disp;
       video_info.widgets_userdata = dispwidget_get_ptr();
-      video_info.width            = 1920;
-      video_info.height           = 1080;
+      video_info.dims             = VIDEO_SCALE_PACK(1920, 1080);
 
       gfx_widgets_frame(&video_info);
       iterations++;
@@ -237,12 +238,94 @@ static void test_init_deinit_cycles(void)
    }
 }
 
+/* An icon draw carries its size to the display driver as one packed
+ * word. Asymmetric dimensions, so a transposition cannot pass. */
+extern unsigned stub_draw_dims;
+extern unsigned stub_draw_count;
+
+static void test_icon_draw_size(void)
+{
+   gfx_display_ctx_driver_t dispctx;
+   unsigned before;
+
+   if (!widgets_up())
+      return;
+
+   memset(&dispctx, 0, sizeof(dispctx));
+   dispctx.handles_transform = true;
+   s_disp.dispctx            = &dispctx;
+
+   before          = stub_draw_count;
+   stub_draw_dims  = 0;
+   /* A texture handle of 0 is the one early return; any non-zero
+    * value reaches the descriptor. */
+   gfx_widgets_draw_icon(NULL, &s_disp, VIDEO_SCALE_PACK(640,
+         480), VIDEO_SCALE_PACK(64, 16),
+         (uintptr_t)1, 8.0f, 8.0f, 0.0f, 1.0f, 0.0f, NULL);
+
+   CHECK(stub_draw_count > before, "the icon draw never reached the driver");
+   CHECK(VIDEO_SCALE_W(stub_draw_dims) == 64,
+         "the icon draw's width did not survive the packed word");
+   CHECK(VIDEO_SCALE_H(stub_draw_dims) == 16,
+         "the icon draw's height did not survive the packed word");
+
+   s_disp.dispctx = NULL;
+   gfx_widgets_deinit(false);
+}
+
+/* Under the threaded video wrapper the widgets' fonts are the video
+ * thread's. Deinit takes the worker away and hands the fonts back to
+ * that thread rather than freeing them here or waiting on it. */
+extern unsigned stub_fonts_freed;
+extern unsigned stub_fonts_retired;
+
+static void test_worker_deinit(void)
+{
+   static int fonts[3];
+   dispgfx_widget_t *p_dispwidget = dispwidget_get_ptr();
+
+   video_state_get_ptr()->thread_wrapper_active = true;
+   if (!widgets_up())
+   {
+      CHECK(0, "gfx_widgets_init() refused under the worker");
+      video_state_get_ptr()->thread_wrapper_active = false;
+      return;
+   }
+   CHECK(retro_atomic_load_acquire_int(&p_dispwidget->worker),
+         "the widgets did not go to the worker");
+
+   /* What the worker's layout would have built */
+   p_dispwidget->gfx_widget_fonts.regular.font   = (font_data_t*)&fonts[0];
+   p_dispwidget->gfx_widget_fonts.bold.font      = (font_data_t*)&fonts[1];
+   p_dispwidget->gfx_widget_fonts.msg_queue.font = (font_data_t*)&fonts[2];
+   stub_fonts_freed   = 0;
+   stub_fonts_retired = 0;
+
+   gfx_widgets_deinit(false);
+
+   CHECK(!retro_atomic_load_acquire_int(&p_dispwidget->worker),
+         "the worker kept the widgets");
+   CHECK(stub_fonts_retired == 3,
+         "the worker's fonts were not handed back to it");
+   CHECK(stub_fonts_freed == 0,
+         "the worker's fonts were freed off its thread");
+   CHECK(!p_dispwidget->gfx_widget_fonts.regular.font
+         && !p_dispwidget->gfx_widget_fonts.bold.font
+         && !p_dispwidget->gfx_widget_fonts.msg_queue.font,
+         "a handed-back font is still referenced");
+
+   video_state_get_ptr()->thread_wrapper_active = false;
+}
+
 int main(void)
 {
+   task_queue_init(false, NULL);
    test_push_and_expire();
    test_titles();
    test_queue_overflow();
    test_init_deinit_cycles();
+   test_icon_draw_size();
+   test_worker_deinit();
 
    printf("pushes=%d frames=%d\n", pushes, iterations);
 
@@ -250,6 +333,8 @@ int main(void)
     * sweep nothing and report success. */
    CHECK(pushes > 0,     "no message was ever pushed");
    CHECK(iterations > 0, "no frame was ever iterated");
+
+   task_queue_deinit();
 
    if (failures)
    {

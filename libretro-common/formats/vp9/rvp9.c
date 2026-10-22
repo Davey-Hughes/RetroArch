@@ -25,7 +25,78 @@
 #include <string.h>
 
 #include <retro_inline.h>
-#include <formats/rvp9.h>
+#include <formats/rvp9_hw.h>
+#include <retro_atomic.h>
+#ifdef HAVE_THREADS
+#include <rthreads/tpool.h>
+#include <rthreads/rthreads.h>
+#include <rthreads/retro_eventcount.h>
+#endif
+
+#ifdef RETRO_ATOMIC_HAS_PTR
+static retro_atomic_ptr_t rvp9_backend;
+#define RVP9_BACKEND_GET() ((const rvp9_hw_backend_t*)retro_atomic_load_acquire_ptr(&rvp9_backend))
+#else
+static const rvp9_hw_backend_t *rvp9_backend;
+#define RVP9_BACKEND_GET() (rvp9_backend)
+#endif
+
+void rvp9_set_hw_backend(const rvp9_hw_backend_t *backend)
+{
+#ifdef RETRO_ATOMIC_HAS_PTR
+   retro_atomic_store_release_ptr(&rvp9_backend, (void*)backend);
+#else
+   rvp9_backend = backend;
+#endif
+}
+
+bool rvp9_hw_backend_open(const rvp9_hdr *header, unsigned slots,
+      rvp9_hw_ops_t *ops, rvp9_hw_backend_t *backend)
+{
+   const rvp9_hw_backend_t *factory = RVP9_BACKEND_GET();
+   if (!ops || !backend) return false;
+   memset(ops, 0, sizeof(*ops)); memset(backend, 0, sizeof(*backend));
+   if (!header || slots < 10 || slots > 32 || !factory || !factory->open || !factory->close)
+      return false;
+   if (!factory->open(factory->user, header, slots, ops)
+         || !ops->decoder || !ops->decode || !ops->output)
+   {
+      if (ops->decoder) factory->close(ops);
+      memset(ops, 0, sizeof(*ops));
+      return false;
+   }
+   *backend = *factory;
+   return true;
+}
+
+/* Tile columns decoded side by side at most; VP9 allows 64. */
+#define RVP9_TILE_THREADS_MAX 8
+
+/* One thread's share of a frame's tile columns (rvp9_decode_tile_cols
+ * in the reconstruction layer). */
+typedef struct
+{
+   rvp9_dec      *d;
+   const uint8_t *tiles;   /* first tile's size prefix (or data) */
+   const uint8_t *end;
+   int            col_first, col_last;
+   int            rc;
+   struct rvp9_tile_group_s *group;   /* NULL for the caller's own share */
+} rvp9_tile_job;
+
+#ifdef HAVE_THREADS
+/* A frame's tile jobs and what they share: how many are still to
+ * finish, and the eventcount the caller waits on for exactly those -
+ * never for the pool to fall idle, which would be a wait for anything
+ * else on it. Made by the first decoder given a pool. */
+typedef struct rvp9_tile_group_s
+{
+   retro_atomic_int_t left;
+} rvp9_tile_group;
+
+static retro_eventcount_t rvp9_tile_ec;
+static int rvp9_tile_ec_ok;
+#endif
 
 #if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 #define RVP9_SSE2 1
@@ -1219,8 +1290,8 @@ static void rvp9_render_size(rvp9_rb *rb, rvp9_hdr *hd)
 }
 
 /* Parse the uncompressed header. Returns 0 on success, -1 on failure,
- * 1 for show_existing_frame (no further data).  ref_dims: 3 pairs of
- * w,h for LAST/GOLDEN/ALT (used to resolve size-from-ref); may be NULL
+ * 1 for show_existing_frame (no further data).  ref_dims: 8 slot pairs of
+ * w,h (used to resolve size-from-ref); may be NULL
  * when the caller knows the frame cannot reference (keyframes). */
 static int rvp9_parse_uncompressed(const uint8_t *data, size_t len,
       rvp9_hdr *hd, const int *ref_dims)
@@ -1230,22 +1301,21 @@ static int rvp9_parse_uncompressed(const uint8_t *data, size_t len,
    rb.data = data; rb.size = len; rb.pos = 0; rb.error = 0;
 
    {
-      /* bit_depth is sequence-sticky (only keyframe / intra_only frames
-       * re-signal it); preserve it across the per-frame reset */
+      /* Inter headers inherit the sequence color configuration. */
       int prev_bd = hd->bit_depth;
+      int color_space = hd->color_space, color_range = hd->color_range;
+      int sub_x = hd->subsampling_x, sub_y = hd->subsampling_y;
       memset(hd, 0, sizeof(*hd));
       hd->bit_depth = prev_bd;
+      hd->color_space = color_space; hd->color_range = color_range;
+      hd->subsampling_x = sub_x; hd->subsampling_y = sub_y;
    }
 
    if (rvp9_rb_lit(&rb, 2) != 2) return -1;      /* frame marker */
    hd->profile  = rvp9_rb_bit(&rb);
    hd->profile |= rvp9_rb_bit(&rb) << 1;
    if (hd->profile > 2) hd->profile += rvp9_rb_bit(&rb);
-   /* Profile 0 (8-bit 4:2:0) decodes; profile 2 (10/12-bit 4:2:0)
-    * parses fully so callers can identify HDR streams, but
-    * reconstruction is gated in rvp9_decode_frame until the
-    * high-bit-depth pixel path exists.  Profiles 1/3 (4:4:4 / 4:2:2)
-    * are rejected outright. */
+   /* Only 4:2:0 profiles are supported. */
    if (hd->profile == 1 || hd->profile >= 3) return -15;
    /* bit_depth is signalled only in keyframe / intra_only color configs;
     * inter frames inherit it, so default it once and keep it sticky. */
@@ -1255,7 +1325,8 @@ static int rvp9_parse_uncompressed(const uint8_t *data, size_t len,
    if (hd->show_existing_frame)
    {
       hd->frame_to_show = rvp9_rb_lit(&rb, 3);
-      return 1;
+      hd->uncomp_size = (rb.pos + 7) >> 3;
+      return rb.error ? -1 : 1;
    }
 
    hd->frame_type      = rvp9_rb_bit(&rb);
@@ -1271,6 +1342,8 @@ static int rvp9_parse_uncompressed(const uint8_t *data, size_t len,
        * 4:2:0 subsampling is implied for both profile 0 and 2. */
       if (hd->profile >= 2)
          hd->bit_depth = rvp9_rb_bit(&rb) ? 12 : 10;
+      else
+         hd->bit_depth = 8;
       hd->color_space = rvp9_rb_lit(&rb, 3);
       if (hd->color_space != 7)                  /* != SRGB */
       {
@@ -1311,6 +1384,8 @@ static int rvp9_parse_uncompressed(const uint8_t *data, size_t len,
          {
             /* profile 0: BT601 4:2:0 8-bit implied (normative) */
             hd->color_space = 1;
+            hd->color_range = 0;
+            hd->bit_depth = 8;
             hd->subsampling_x = hd->subsampling_y = 1;
          }
          hd->refresh_frame_flags = rvp9_rb_lit(&rb, RVP9_REF_FRAMES);
@@ -1332,8 +1407,9 @@ static int rvp9_parse_uncompressed(const uint8_t *data, size_t len,
             if (rvp9_rb_bit(&rb))
             {
                if (!ref_dims) return -9;
-               hd->w = ref_dims[i * 2 + 0];
-               hd->h = ref_dims[i * 2 + 1];
+               hd->w = ref_dims[hd->ref_idx[i] * 2 + 0];
+               hd->h = ref_dims[hd->ref_idx[i] * 2 + 1];
+               if (hd->w <= 0 || hd->h <= 0) return -9;
                found = 1;
                break;
             }
@@ -1458,6 +1534,22 @@ static int rvp9_parse_uncompressed(const uint8_t *data, size_t len,
    hd->first_partition_size = rvp9_rb_lit(&rb, 16);
    hd->uncomp_size = (rb.pos + 7) >> 3;
    return rb.error ? -1 : 0;
+}
+
+int rvp9_parse_frame_header(const uint8_t *data, size_t len,
+      const rvp9_hdr *previous, const int *ref_dims, rvp9_hdr *out)
+{
+   int ret;
+   if (!data || !len || !out || previous == out) return -1;
+   if (previous) *out = *previous;
+   else memset(out, 0, sizeof(*out));
+   ret = rvp9_parse_uncompressed(data, len, out, ref_dims);
+   if (ret) return ret;
+   if (out->w <= 0 || out->h <= 0 || !out->first_partition_size
+         || out->uncomp_size >= len
+         || (size_t)out->first_partition_size >= len - out->uncomp_size)
+      return -1;
+   return 0;
 }
 
 /* ==================================================================== */
@@ -2964,20 +3056,18 @@ int rvp9_decode_frame(rvp9_dec *d, const uint8_t *data, size_t len,
 {
    rvp9_hdr *hd = &d->hd;
    int i, r;
-   int ref_dims[6];
+   int ref_dims[RVP9_REF_FRAMES * 2];
 
    *show_fb = -1;
 
-   for (i = 0; i < 3; i++)
+   for (i = 0; i < RVP9_REF_FRAMES; i++)
    {
-      int fb = d->frame_refs[i];
-      ref_dims[i * 2 + 0] = (fb >= 0 && d->fbs[fb].valid) ? d->fbs[fb].w : 0;
-      ref_dims[i * 2 + 1] = (fb >= 0 && d->fbs[fb].valid) ? d->fbs[fb].h : 0;
+      int fb = d->ref_frame_map[i];
+      int valid = fb >= 0 && fb < RVP9_FRAME_BUFS && d->fbs[fb].valid;
+      ref_dims[i * 2 + 0] = valid ? d->fbs[fb].w : 0;
+      ref_dims[i * 2 + 1] = valid ? d->fbs[fb].h : 0;
    }
 
-   /* Resolve frame_refs BEFORE parse for size-from-refs: the header
-    * names slots first; parse needs dims of the named slots.  We parse
-    * in two steps: peek the ref slots, then full parse. */
    r = rvp9_parse_uncompressed(data, len, hd, ref_dims);
    if (r < 0) return r;
    /* 10-bit (profile 2) dispatches to the high-bit-depth pipeline;
@@ -3081,6 +3171,8 @@ int rvp9_decode_frame(rvp9_dec *d, const uint8_t *data, size_t len,
 #define rvp9_decode_block rvp9_decode_block_hbd
 #define rvp9_decode_frame_impl rvp9_decode_frame_impl_hbd
 #define rvp9_decode_partition rvp9_decode_partition_hbd
+#define rvp9_decode_tile_cols rvp9_decode_tile_cols_hbd
+#define rvp9_tile_job_run rvp9_tile_job_run_hbd
 #define rvp9_extend_modes rvp9_extend_modes_hbd
 #define rvp9_filter16 rvp9_filter16_hbd
 #define rvp9_filter4 rvp9_filter4_hbd
@@ -3221,6 +3313,8 @@ int rvp9_decode_frame(rvp9_dec *d, const uint8_t *data, size_t len,
 #undef rvp9_decode_block
 #undef rvp9_decode_frame_impl
 #undef rvp9_decode_partition
+#undef rvp9_decode_tile_cols
+#undef rvp9_tile_job_run
 #undef rvp9_extend_modes
 #undef rvp9_filter16
 #undef rvp9_filter4
@@ -3324,11 +3418,57 @@ int rvp9_decode_frame(rvp9_dec *d, const uint8_t *data, size_t len,
 /* ==================================================================== */
 /* Public teardown.                                                     */
 /* ==================================================================== */
+void rvp9_set_tile_pool(rvp9_dec *d, void *pool, unsigned threads)
+{
+   if (!d)
+      return;
+   if (threads > RVP9_TILE_THREADS_MAX)
+      threads = RVP9_TILE_THREADS_MAX;
+   if (!pool || threads <= 1)
+   {
+      d->tile_pool    = NULL;
+      d->tile_threads = 1;
+      return;
+   }
+   if (d->num_shadows < threads - 1)
+   {
+      void *n = realloc(d->shadows, (size_t)(threads - 1) * sizeof(rvp9_dec));
+      if (!n)
+      {
+         d->tile_pool    = NULL;
+         d->tile_threads = 1;
+         return;
+      }
+      d->shadows     = n;
+      d->num_shadows = threads - 1;
+   }
+#ifdef HAVE_THREADS
+   if (!rvp9_tile_ec_ok)
+   {
+      if (!retro_eventcount_init(&rvp9_tile_ec))
+      {
+         retro_eventcount_free(&rvp9_tile_ec);
+         d->tile_pool    = NULL;
+         d->tile_threads = 1;
+         return;
+      }
+      rvp9_tile_ec_ok = 1;
+   }
+#endif
+   d->tile_pool    = pool;
+   d->tile_threads = threads;
+}
+
 void rvp9_free(rvp9_dec *d)
 {
    int i;
    if (!d)
       return;
+   free(d->shadows);
+   d->shadows      = NULL;
+   d->num_shadows  = 0;
+   d->tile_pool    = NULL;
+   d->tile_threads = 1;
    for (i = 0; i < RVP9_FRAME_BUFS; i++)
    {
       free(d->fbs[i].y);

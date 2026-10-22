@@ -26,15 +26,23 @@
 #include <string.h>
 
 #include <retro_miscellaneous.h>
+#include <retro_math.h>
 #include <libretro_dspfilter.h>
 
 #define sqr(a) ((a) * (a))
 
 #define VIBRATO_BASE_DELAY_SEC 0.002f /* 2 ms */
 #define VIBRATO_FREQUENCY_DEFAULT_HZ 2.0f
+#define VIBRATO_FREQUENCY_MIN_HZ 0.1f
 #define VIBRATO_FREQUENCY_MAX_HZ 14.0f
 #define VIBRATO_DEPTH_DEFAULT_PERCENT 50.0f
 #define VIBRATO_ADD_DELAY 3
+
+/* Ordered so NaN, which compares false against everything, lands on lo. */
+static float vibrato_clampf(float x, float lo, float hi)
+{
+   return (x >= lo) ? ((x <= hi) ? x : hi) : lo;
+}
 
 static float hermite_interp(float x, float *y)
 {
@@ -121,6 +129,9 @@ static size_t vibratocore_carve(struct vibrato_core *core, int samplerate,
 {
    size_t line;
    core->size     = VIBRATO_BASE_DELAY_SEC * samplerate * 2;
+   /* The Hermite tap reads buffer[ipart .. ipart + 3]. */
+   if (core->size < 8)
+      core->size  = 8;
    core->maxphase = samplerate / freq;
    if (core->maxphase < 1)
       core->maxphase = 1;
@@ -171,10 +182,9 @@ float vibratocore_core(struct vibrato_core *core,float in)
    int ipart;
    float delay, readindex, fpart, value;
    float M                        = core->freq / core->samplerate;
-   int maxphase                   = core->samplerate / core->freq;
    float lfo                      = sin(M * 2. * M_PI * core->phase++);
    int maxdelay                   = VIBRATO_BASE_DELAY_SEC * core->samplerate;
-   core->phase                    = core->phase % maxphase;
+   core->phase                    = core->phase % core->maxphase;
    lfo                            = (lfo + 1) * 1.; /* Transform from [-1; 1] to [0; 1] */
    delay                          =  lfo * core->depth * maxdelay;
    delay                         += VIBRATO_ADD_DELAY;
@@ -240,7 +250,9 @@ static void vibrato_process_i16(void *data,
 
    for (i = 0; i < input->frames; i++, out += 2)
    {
-      int16_t in[2] = { out[0], out[1] };
+      int16_t in[2];
+      in[0]         = out[0];
+      in[1]         = out[1];
       out[0]        = vibratocore_core_i16(&vib->left, in[0]);
       out[1]        = vibratocore_core_i16(&vib->right, in[1]);
    }
@@ -260,7 +272,9 @@ static void vibrato_process(void *data,
 
    for (i = 0; i < input->frames; i++, out += 2)
    {
-      float in[2] = { out[0], out[1] };
+      float in[2];
+      in[0]       = out[0];
+      in[1]       = out[1];
       out[0]      = vibratocore_core(&vib->left, in[0]);
       out[1]      = vibratocore_core(&vib->right, in[1]);
    }
@@ -271,12 +285,20 @@ static void *vibrato_init(const struct dspfilter_info *info,
 {
    float freq, depth;
    size_t len, lines;
-   struct vibrato *vib = (struct vibrato*)calloc(1, sizeof(*vib));
-   if (!vib)
+   struct vibrato *vib;
+
+   if (!info || info->input_rate < 1)
+      return NULL;
+   if (!(vib = (struct vibrato*)calloc(1, sizeof(*vib))))
       return NULL;
 
    config->get_float(userdata, "freq", &freq,5.0f);
    config->get_float(userdata, "depth", &depth, 0.5f);
+   /* Both come from the preset. freq sets the LFO period and so the LUT
+    * length; depth scales the delay, which the line is sized for at 1.0. */
+   freq  = vibrato_clampf(freq, VIBRATO_FREQUENCY_MIN_HZ,
+         VIBRATO_FREQUENCY_MAX_HZ);
+   depth = vibrato_clampf(depth, 0.0f, 1.0f);
    len   = vibratocore_carve(&vib->left,  info->input_rate, freq, NULL, 0);
    lines = vibratocore_carve(&vib->right, info->input_rate, freq, NULL, len);
    len   = vibratocore_carve_lut(&vib->left,  NULL, lines);
@@ -316,6 +338,7 @@ static const struct dspfilter_implementation vibrato_plug = {
 
 const struct dspfilter_implementation *dspfilter_get_implementation(dspfilter_simd_mask_t mask)
 {
+   (void)mask;
    return &vibrato_plug;
 }
 

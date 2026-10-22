@@ -35,6 +35,9 @@ on:
       - 'libretro-common/include/vfs/**'
       - 'libretro-common/include/streams/file_stream.h'
       - 'libretro-common/samples/file/vfs/**'
+      - 'libretro-common/fastjmp/**'
+      - 'libretro-common/include/fastjmp.h'
+      - 'libretro-common/samples/fastjmp/**'
       - '.github/workflows/Cross-libc-vfs-samples.yml'
   pull_request:
     paths:
@@ -43,11 +46,18 @@ on:
       - 'libretro-common/include/vfs/**'
       - 'libretro-common/include/streams/file_stream.h'
       - 'libretro-common/samples/file/vfs/**'
+      - 'libretro-common/fastjmp/**'
+      - 'libretro-common/include/fastjmp.h'
+      - 'libretro-common/samples/fastjmp/**'
       - '.github/workflows/Cross-libc-vfs-samples.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 jobs:
   # glibc and Apple libc.  Both take the descriptor path, since
@@ -75,7 +85,7 @@ jobs:
             asan_opts: detect_leaks=0
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build and run
         shell: bash
@@ -89,6 +99,7 @@ jobs:
             ASAN_OPTIONS=${{ matrix.asan_opts }} ./vfs_bulk_read_test
             ./vfs_seek_contract_test
             ./vfs_mapped_ptr_test
+            ./vfs_v5_metadata_test
           }
           # Mapping on (what the platform actually ships), mapping off
           # with the descriptor path forced (what the consoles have),
@@ -128,16 +139,36 @@ jobs:
         shell: msys2 {0}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
+      # The system upgrade runs in the action: an msys2-runtime update
+      # kills every MSYS2 process, which a run step's own shell would
+      # not survive.
       - uses: msys2/setup-msys2@v2
         with:
           msystem: ${{ matrix.sys }}
           update: true
-          install: >-
-            base-devel
-          pacboy: >-
-            toolchain:p
+
+      - name: Install packages
+        shell: msys2 {0}
+        run: |
+          # A mirror that stalls or rate-limits (HTTP 429) fails pacman's
+          # whole transaction; what it fetched stays in the cache, so a
+          # retry fetches only the rest, one file at a time after a
+          # growing wait so a shared runner's rate limit can clear.
+          # pacman waits out a slow mirror instead of aborting;
+          # timeout-minutes bounds a hang.
+          p=$MINGW_PACKAGE_PREFIX
+          pkgs="base-devel $p-toolchain"
+          for i in 1 2 3 4 5; do
+            pacman -S --noconfirm --needed --disable-download-timeout $pkgs &&
+            exit 0
+            [ $i = 5 ] && break
+            echo "package install failed (attempt $i); retrying in $((30 * i))s, serial downloads"
+            sed -i -e '/^#*ParallelDownloads/d' -e '/^\[options\]/a ParallelDownloads = 1' /etc/pacman.conf
+            sleep $((30 * i))
+          done
+          exit 1
 
       - name: Build and run
         working-directory: libretro-common/samples/file/vfs
@@ -158,6 +189,21 @@ jobs:
           make MMAP=0
           ./vfs_bulk_read_test.exe
           ./vfs_seek_contract_test.exe
+          # Win32 branches of the v5 metadata ops: attributes,
+          # SetFileTime, CopyFileW, find-data dirent_stat.
+          ./vfs_v5_metadata_test.exe
           # Exercises the Win32 CreateFileMapping/MapViewOfFile
           # backend, which no other job in the tree reaches.
           ./vfs_mapped_ptr_test.exe
+
+      # The Win64 fastjmp_set stores xmm6-xmm15 with movaps and faults
+      # on a misaligned buffer. Linux has no such stores, so the Linux
+      # samples job cannot see a fastjmp_buf that lost its alignment;
+      # this is the only lane that can. Under a second to build and run.
+      - name: fastjmp on Win64
+        working-directory: libretro-common/samples/fastjmp/fastjmp_test
+        run: |
+          set -euo pipefail
+          make clean
+          make
+          ./fastjmp_test.exe

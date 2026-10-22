@@ -678,6 +678,11 @@ enum msg_file_type msg_hash_to_file_type(const char *value)
       { "m4a",       FILE_TYPE_M4A },
 #endif
       { "aac",       FILE_TYPE_AAC },
+      { "ac3",       FILE_TYPE_AC3 },
+      { "eac3",      FILE_TYPE_AC3 },
+      { "ec3",       FILE_TYPE_AC3 },
+      { "lpcm",      FILE_TYPE_LPCM },
+      { "pcm",       FILE_TYPE_LPCM },
 #endif
 #if defined(HAVE_AUDIOMIXER) && defined(HAVE_ROPUS)
       { "opus",      FILE_TYPE_OPUS },
@@ -686,6 +691,40 @@ enum msg_file_type msg_hash_to_file_type(const char *value)
       && (defined(HAVE_ROPUS) || defined(HAVE_RVORBIS))
       { "weba",      FILE_TYPE_WEBA },
 #endif
+#endif
+#if defined(HAVE_FFMPEG) || defined(HAVE_MPV)
+      /* Further media formats; with FFmpeg, only routed to the player
+       * if its build can open them. Extensions claimed above win. */
+      { "ogv",       FILE_TYPE_MOVIE_OTHER },
+      { "mk3d",      FILE_TYPE_MOVIE_OTHER },
+      { "mts",       FILE_TYPE_MOVIE_OTHER },
+      { "m2t",       FILE_TYPE_MOVIE_OTHER },
+      { "m2v",       FILE_TYPE_MOVIE_OTHER },
+      { "rm",        FILE_TYPE_MOVIE_OTHER },
+      { "rmvb",      FILE_TYPE_MOVIE_OTHER },
+      { "nut",       FILE_TYPE_MOVIE_OTHER },
+      { "dv",        FILE_TYPE_MOVIE_OTHER },
+      { "ivf",       FILE_TYPE_MOVIE_OTHER },
+      { "oga",       FILE_TYPE_MUSIC_OTHER },
+      { "opus",      FILE_TYPE_MUSIC_OTHER },
+      { "spx",       FILE_TYPE_MUSIC_OTHER },
+      { "mka",       FILE_TYPE_MUSIC_OTHER },
+      { "weba",      FILE_TYPE_MUSIC_OTHER },
+      { "m4b",       FILE_TYPE_MUSIC_OTHER },
+      { "aac",       FILE_TYPE_MUSIC_OTHER },
+      { "ac3",       FILE_TYPE_MUSIC_OTHER },
+      { "eac3",      FILE_TYPE_MUSIC_OTHER },
+      { "dts",       FILE_TYPE_MUSIC_OTHER },
+      { "mp2",       FILE_TYPE_MUSIC_OTHER },
+      { "aif",       FILE_TYPE_MUSIC_OTHER },
+      { "aiff",      FILE_TYPE_MUSIC_OTHER },
+      { "wv",        FILE_TYPE_MUSIC_OTHER },
+      { "ape",       FILE_TYPE_MUSIC_OTHER },
+      { "tta",       FILE_TYPE_MUSIC_OTHER },
+      { "mpc",       FILE_TYPE_MUSIC_OTHER },
+      { "amr",       FILE_TYPE_MUSIC_OTHER },
+      { "au",        FILE_TYPE_MUSIC_OTHER },
+      { "caf",       FILE_TYPE_MUSIC_OTHER },
 #endif
 #ifdef HAVE_IMAGEVIEWER
       { "jpg",       FILE_TYPE_JPEG },

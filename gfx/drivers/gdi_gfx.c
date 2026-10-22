@@ -51,6 +51,10 @@
 #include "../common/win32_common.h"
 #endif
 
+#ifdef HAVE_THREADS
+#include "../video_thread_wrapper.h"
+#endif
+
 /* AlphaBlend / GradientFill / TransparentBlt are msimg32 imports
  * that became available with Windows 98 / 2000.  Most of the menu
  * draw path requires real per-pixel alpha (Ozone shadows, XMB
@@ -92,11 +96,9 @@ typedef struct gdi_texture
    HBITMAP bmp;
    HBITMAP bmp_old;
    void *data;            /* Owned BGRA premultiplied pixel buffer. */
+   void *bits;            /* bmp's pixels, once realized. */
 
-   int width;
-   int height;
-   int active_width;
-   int active_height;
+   unsigned dims;         /* Pixel size of `data`, packed. */
 
    bool has_alpha;
    bool premultiplied;
@@ -106,7 +108,6 @@ typedef struct gdi_texture
 
 
 HDC          win32_gdi_hdc;
-static void *dinput_gdi;
 
 /* Forward declarations for static helpers used across the display
  * driver / video driver / font driver sections. */
@@ -117,7 +118,7 @@ static bool gdi_ensure_menu_surface(gdi_t *gdi,
 static void gdi_release_menu_surface(gdi_t *gdi);
 /* Defined alongside the vtable near the bottom of the file, but
  * gdi_frame calls it through the should_resize path. */
-static void gdi_set_viewport(void *data, unsigned vp_width, unsigned vp_height,
+static void gdi_set_viewport(void *data, unsigned dims,
       bool force_full, bool allow_rotate);
 #ifdef HAVE_OVERLAY
 /* Overlay impl lives near the bottom alongside the vtable; gdi_frame
@@ -274,8 +275,8 @@ static bool gdi_ensure_menu_surface(gdi_t *gdi,
       return false;
 
    if (     gdi->bmp_menu
-         && gdi->menu_surface_width  == width
-         && gdi->menu_surface_height == height)
+         && VIDEO_SCALE_W(gdi->menu_surface_dims)  == width
+         && VIDEO_SCALE_H(gdi->menu_surface_dims) == height)
       return true;
 
    /* Tear down any prior surface before creating the new one.  The
@@ -283,13 +284,21 @@ static bool gdi_ensure_menu_surface(gdi_t *gdi,
     * deselect first if it's currently the selected object. */
    gdi_release_menu_surface(gdi);
 
-   memset(&bmi, 0, sizeof(bmi));
-   bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-   bmi.bmiHeader.biWidth       = (LONG)width;
-   bmi.bmiHeader.biHeight      = -(LONG)height; /* top-down */
-   bmi.bmiHeader.biPlanes      = 1;
-   bmi.bmiHeader.biBitCount    = 32;
-   bmi.bmiHeader.biCompression = BI_RGB;
+   bmi.bmiHeader.biSize          = sizeof(BITMAPINFOHEADER);
+   bmi.bmiHeader.biWidth         = (LONG)width;
+   bmi.bmiHeader.biHeight        = -(LONG)height; /* top-down */
+   bmi.bmiHeader.biPlanes        = 1;
+   bmi.bmiHeader.biBitCount      = 32;
+   bmi.bmiHeader.biCompression   = BI_RGB;
+   bmi.bmiHeader.biSizeImage     = 0;
+   bmi.bmiHeader.biXPelsPerMeter = 0;
+   bmi.bmiHeader.biYPelsPerMeter = 0;
+   bmi.bmiHeader.biClrUsed       = 0;
+   bmi.bmiHeader.biClrImportant  = 0;
+   bmi.bmiColors[0].rgbBlue      = 0;
+   bmi.bmiColors[0].rgbGreen     = 0;
+   bmi.bmiColors[0].rgbRed       = 0;
+   bmi.bmiColors[0].rgbReserved  = 0;
 
    gdi->bmp_menu = CreateDIBSection(gdi->memDC, &bmi, DIB_RGB_COLORS,
          &pixels, NULL, 0);
@@ -298,14 +307,12 @@ static bool gdi_ensure_menu_surface(gdi_t *gdi,
    {
       gdi->bmp_menu          = NULL;
       gdi->menu_pixels       = NULL;
-      gdi->menu_surface_width  = 0;
-      gdi->menu_surface_height = 0;
+      gdi->menu_surface_dims = 0;
       return false;
    }
 
    gdi->menu_pixels         = (uint32_t*)pixels;
-   gdi->menu_surface_width  = width;
-   gdi->menu_surface_height = height;
+   gdi->menu_surface_dims = VIDEO_SCALE_PACK(width, height);
    return true;
 }
 
@@ -322,8 +329,7 @@ static void gdi_release_menu_surface(gdi_t *gdi)
       DeleteObject(gdi->bmp_menu);
    gdi->bmp_menu          = NULL;
    gdi->menu_pixels       = NULL;
-   gdi->menu_surface_width  = 0;
-   gdi->menu_surface_height = 0;
+   gdi->menu_surface_dims = 0;
 }
 
 /* Allocate (or reuse) a BGRA32 scratch DIB section of at least
@@ -350,32 +356,39 @@ static bool gdi_ensure_scratch_quad(gdi_t *gdi, unsigned w, unsigned h)
    /* Existing allocation big enough? */
    if (     gdi->scratch_quad_bmp
          && gdi->scratch_quad_pixels
-         && gdi->scratch_quad_w >= w
-         && gdi->scratch_quad_h >= h)
+         && VIDEO_SCALE_W(gdi->scratch_quad_dims) >= w
+         && VIDEO_SCALE_H(gdi->scratch_quad_dims) >= h)
       return true;
 
    /* Grow.  Take the max of the current cap and the new request so
     * we don't shrink any axis (one big draw shouldn't force the next
     * smaller draw to reallocate). */
-   if (gdi->scratch_quad_w > w)
-      w = gdi->scratch_quad_w;
-   if (gdi->scratch_quad_h > h)
-      h = gdi->scratch_quad_h;
+   if (VIDEO_SCALE_W(gdi->scratch_quad_dims) > w)
+      w = VIDEO_SCALE_W(gdi->scratch_quad_dims);
+   if (VIDEO_SCALE_H(gdi->scratch_quad_dims) > h)
+      h = VIDEO_SCALE_H(gdi->scratch_quad_dims);
 
    if (gdi->scratch_quad_bmp)
       DeleteObject(gdi->scratch_quad_bmp);
    gdi->scratch_quad_bmp    = NULL;
    gdi->scratch_quad_pixels = NULL;
-   gdi->scratch_quad_w      = 0;
-   gdi->scratch_quad_h      = 0;
+   gdi->scratch_quad_dims = 0;
 
-   memset(&bmi, 0, sizeof(bmi));
-   bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-   bmi.bmiHeader.biWidth       = (LONG)w;
-   bmi.bmiHeader.biHeight      = -(LONG)h;
-   bmi.bmiHeader.biPlanes      = 1;
-   bmi.bmiHeader.biBitCount    = 32;
-   bmi.bmiHeader.biCompression = BI_RGB;
+   bmi.bmiHeader.biSize          = sizeof(BITMAPINFOHEADER);
+   bmi.bmiHeader.biWidth         = (LONG)w;
+   bmi.bmiHeader.biHeight        = -(LONG)h;
+   bmi.bmiHeader.biPlanes        = 1;
+   bmi.bmiHeader.biBitCount      = 32;
+   bmi.bmiHeader.biCompression   = BI_RGB;
+   bmi.bmiHeader.biSizeImage     = 0;
+   bmi.bmiHeader.biXPelsPerMeter = 0;
+   bmi.bmiHeader.biYPelsPerMeter = 0;
+   bmi.bmiHeader.biClrUsed       = 0;
+   bmi.bmiHeader.biClrImportant  = 0;
+   bmi.bmiColors[0].rgbBlue      = 0;
+   bmi.bmiColors[0].rgbGreen     = 0;
+   bmi.bmiColors[0].rgbRed       = 0;
+   bmi.bmiColors[0].rgbReserved  = 0;
 
    gdi->scratch_quad_bmp = CreateDIBSection(gdi->memDC, &bmi,
          DIB_RGB_COLORS, &pixels, NULL, 0);
@@ -389,8 +402,7 @@ static bool gdi_ensure_scratch_quad(gdi_t *gdi, unsigned w, unsigned h)
    }
 
    gdi->scratch_quad_pixels = (uint32_t*)pixels;
-   gdi->scratch_quad_w      = w;
-   gdi->scratch_quad_h      = h;
+   gdi->scratch_quad_dims = VIDEO_SCALE_PACK(w, h);
    return true;
 }
 
@@ -408,29 +420,36 @@ static bool gdi_ensure_scratch_rgui(gdi_t *gdi, unsigned w, unsigned h)
 
    if (     gdi->scratch_rgui_bmp
          && gdi->scratch_rgui_pixels
-         && gdi->scratch_rgui_w >= w
-         && gdi->scratch_rgui_h >= h)
+         && VIDEO_SCALE_W(gdi->scratch_rgui_dims) >= w
+         && VIDEO_SCALE_H(gdi->scratch_rgui_dims) >= h)
       return true;
 
-   if (gdi->scratch_rgui_w > w)
-      w = gdi->scratch_rgui_w;
-   if (gdi->scratch_rgui_h > h)
-      h = gdi->scratch_rgui_h;
+   if (VIDEO_SCALE_W(gdi->scratch_rgui_dims) > w)
+      w = VIDEO_SCALE_W(gdi->scratch_rgui_dims);
+   if (VIDEO_SCALE_H(gdi->scratch_rgui_dims) > h)
+      h = VIDEO_SCALE_H(gdi->scratch_rgui_dims);
 
    if (gdi->scratch_rgui_bmp)
       DeleteObject(gdi->scratch_rgui_bmp);
    gdi->scratch_rgui_bmp    = NULL;
    gdi->scratch_rgui_pixels = NULL;
-   gdi->scratch_rgui_w      = 0;
-   gdi->scratch_rgui_h      = 0;
+   gdi->scratch_rgui_dims = 0;
 
-   memset(&bmi, 0, sizeof(bmi));
-   bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-   bmi.bmiHeader.biWidth       = (LONG)w;
-   bmi.bmiHeader.biHeight      = -(LONG)h;
-   bmi.bmiHeader.biPlanes      = 1;
-   bmi.bmiHeader.biBitCount    = 32;
-   bmi.bmiHeader.biCompression = BI_RGB;
+   bmi.bmiHeader.biSize          = sizeof(BITMAPINFOHEADER);
+   bmi.bmiHeader.biWidth         = (LONG)w;
+   bmi.bmiHeader.biHeight        = -(LONG)h;
+   bmi.bmiHeader.biPlanes        = 1;
+   bmi.bmiHeader.biBitCount      = 32;
+   bmi.bmiHeader.biCompression   = BI_RGB;
+   bmi.bmiHeader.biSizeImage     = 0;
+   bmi.bmiHeader.biXPelsPerMeter = 0;
+   bmi.bmiHeader.biYPelsPerMeter = 0;
+   bmi.bmiHeader.biClrUsed       = 0;
+   bmi.bmiHeader.biClrImportant  = 0;
+   bmi.bmiColors[0].rgbBlue      = 0;
+   bmi.bmiColors[0].rgbGreen     = 0;
+   bmi.bmiColors[0].rgbRed       = 0;
+   bmi.bmiColors[0].rgbReserved  = 0;
 
    gdi->scratch_rgui_bmp = CreateDIBSection(gdi->memDC, &bmi,
          DIB_RGB_COLORS, &pixels, NULL, 0);
@@ -444,8 +463,7 @@ static bool gdi_ensure_scratch_rgui(gdi_t *gdi, unsigned w, unsigned h)
    }
 
    gdi->scratch_rgui_pixels = (uint32_t*)pixels;
-   gdi->scratch_rgui_w      = w;
-   gdi->scratch_rgui_h      = h;
+   gdi->scratch_rgui_dims = VIDEO_SCALE_PACK(w, h);
    return true;
 }
 
@@ -467,13 +485,21 @@ static bool gdi_ensure_scratch_1x1(gdi_t *gdi)
    if (gdi->scratch_1x1_bmp && gdi->scratch_1x1_pixels)
       return true;
 
-   memset(&bmi, 0, sizeof(bmi));
-   bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-   bmi.bmiHeader.biWidth       = 1;
-   bmi.bmiHeader.biHeight      = -1;
-   bmi.bmiHeader.biPlanes      = 1;
-   bmi.bmiHeader.biBitCount    = 32;
-   bmi.bmiHeader.biCompression = BI_RGB;
+   bmi.bmiHeader.biSize          = sizeof(BITMAPINFOHEADER);
+   bmi.bmiHeader.biWidth         = 1;
+   bmi.bmiHeader.biHeight        = -1;
+   bmi.bmiHeader.biPlanes        = 1;
+   bmi.bmiHeader.biBitCount      = 32;
+   bmi.bmiHeader.biCompression   = BI_RGB;
+   bmi.bmiHeader.biSizeImage     = 0;
+   bmi.bmiHeader.biXPelsPerMeter = 0;
+   bmi.bmiHeader.biYPelsPerMeter = 0;
+   bmi.bmiHeader.biClrUsed       = 0;
+   bmi.bmiHeader.biClrImportant  = 0;
+   bmi.bmiColors[0].rgbBlue      = 0;
+   bmi.bmiColors[0].rgbGreen     = 0;
+   bmi.bmiColors[0].rgbRed       = 0;
+   bmi.bmiColors[0].rgbReserved  = 0;
 
    gdi->scratch_1x1_bmp = CreateDIBSection(gdi->memDC, &bmi,
          DIB_RGB_COLORS, &pixels, NULL, 0);
@@ -505,12 +531,10 @@ static void gdi_release_scratch(gdi_t *gdi)
    gdi->scratch_1x1_pixels  = NULL;
    gdi->scratch_quad_bmp    = NULL;
    gdi->scratch_quad_pixels = NULL;
-   gdi->scratch_quad_w      = 0;
-   gdi->scratch_quad_h      = 0;
+   gdi->scratch_quad_dims = 0;
    gdi->scratch_rgui_bmp    = NULL;
    gdi->scratch_rgui_pixels = NULL;
-   gdi->scratch_rgui_w      = 0;
-   gdi->scratch_rgui_h      = 0;
+   gdi->scratch_rgui_dims = 0;
 }
 
 /* Clear the menu surface to a solid (premultiplied) BGRA value.
@@ -532,8 +556,8 @@ static void gdi_menu_surface_clear(gdi_t *gdi, uint8_t r, uint8_t g, uint8_t b)
       return;
    rect.left   = 0;
    rect.top    = 0;
-   rect.right  = (LONG)gdi->menu_surface_width;
-   rect.bottom = (LONG)gdi->menu_surface_height;
+   rect.right  = (LONG)VIDEO_SCALE_W(gdi->menu_surface_dims);
+   rect.bottom = (LONG)VIDEO_SCALE_H(gdi->menu_surface_dims);
    gdi_ensure_brush(gdi, RGB(r, g, b));
    if (gdi->brush_cached)
       FillRect(gdi->memDC, &rect, gdi->brush_cached);
@@ -620,13 +644,13 @@ static void gdi_upload_core_frame_to_menu(gdi_t *gdi,
     * was already cleared to black in Step 4, so we leave it
     * untouched and the bars appear automatically. */
    StretchDIBits(gdi->memDC,
-         gdi->vp.x, gdi->vp.y, gdi->vp.width, gdi->vp.height,
+         VIDEO_POS_X(gdi->vp.pos), VIDEO_POS_Y(gdi->vp.pos), VIDEO_SCALE_W(gdi->vp.dims), VIDEO_SCALE_H(gdi->vp.dims),
          0, 0, frame_w, frame_h,
          src, (BITMAPINFO*)&info, DIB_RGB_COLORS, SRCCOPY);
 }
 #endif
 
-#ifdef GDI_HAS_ALPHABLEND
+#if GDI_HAS_ALPHABLEND
 /* Composite RGUI's RGBA4444 menu_frame onto bmp_menu using
  * source-over alpha blending.
  *
@@ -674,7 +698,7 @@ static void gdi_blit_rgui_alpha(gdi_t *gdi,
     * the DIB are ignored. */
    if (!gdi_ensure_scratch_rgui(gdi, frame_w, frame_h))
       return;
-   stride = gdi->scratch_rgui_w;
+   stride = VIDEO_SCALE_W(gdi->scratch_rgui_dims);
 
    /* RGBA4444 → BGRA32 premultiplied.  Layout from
     * argb32_to_rgba4444:
@@ -738,8 +762,8 @@ static void gdi_blit_rgui_alpha(gdi_t *gdi,
  * The menu drivers (XMB, Ozone, MaterialUI) and gfx_widgets issue
  * draw calls in three flavours:
  *
- *   1. Solid-colour rectangle (texture is gfx_white_texture, a 1x1
- *      white pixel).  By far the most common: backgrounds, panels,
+ *   1. Solid-colour rectangle (no texture).  By far the most
+ *      common: backgrounds, panels,
  *      separator lines.  Per-vertex colour from coords->color.
  *      We render this with FillRect + cached SolidBrush.
  *
@@ -810,10 +834,11 @@ static void gfx_display_gdi_blend_end  (void *data) { (void)data; }
  * arrive in the same conventions as the rest of the menu draw path:
  * (x,y) is the top-left of the scissor rect, with y measured from
  * the top of the screen. */
-static void gfx_display_gdi_scissor_begin(void *data,
-      unsigned video_width, unsigned video_height,
-      int x, int y, unsigned width, unsigned height)
+static void gfx_display_gdi_scissor_begin(void *data, unsigned video_dims,
+      int x, int y, unsigned dims)
 {
+   unsigned width        = VIDEO_SCALE_W(dims);
+   unsigned height       = VIDEO_SCALE_H(dims);
    gdi_t *gdi = (gdi_t*)data;
    HRGN rgn;
 
@@ -837,8 +862,7 @@ static void gfx_display_gdi_scissor_begin(void *data,
    gdi->scissor_active = true;
 }
 
-static void gfx_display_gdi_scissor_end(void *data,
-      unsigned video_width, unsigned video_height)
+static void gfx_display_gdi_scissor_end(void *data, unsigned video_dims)
 {
    gdi_t *gdi = (gdi_t*)data;
    if (!gdi || !gdi->memDC)
@@ -880,8 +904,8 @@ static void gdi_blit_texture_modulated(
    {
       src_x = 0;
       src_y = 0;
-      src_w = (unsigned)texture->width;
-      src_h = (unsigned)texture->height;
+      src_w = VIDEO_SCALE_W(texture->dims);
+      src_h = VIDEO_SCALE_H(texture->dims);
    }
 
    /* Fast path: no RGB tint, only an alpha multiplier.  The texture
@@ -918,7 +942,7 @@ static void gdi_blit_texture_modulated(
     * the cached DIB's row width which may exceed src_w. */
    if (!gdi_ensure_scratch_quad(gdi, src_w, src_h))
       return;
-   stride = gdi->scratch_quad_w;
+   stride = VIDEO_SCALE_W(gdi->scratch_quad_dims);
 
    src   = (const uint32_t*)texture->data;
    dst   = gdi->scratch_quad_pixels;
@@ -931,7 +955,7 @@ static void gdi_blit_texture_modulated(
    for (y_idx = 0; y_idx < src_h; y_idx++)
    {
       const uint32_t *src_row = src
-         + ((size_t)src_y + y_idx) * (size_t)texture->width
+         + ((size_t)src_y + y_idx) * (size_t)VIDEO_SCALE_W(texture->dims)
          + (size_t)src_x;
       uint32_t       *dst_row = dst + y_idx * stride;
       for (x_idx = 0; x_idx < src_w; x_idx++)
@@ -990,13 +1014,21 @@ static bool gdi_texture_realize(gdi_t *gdi, gdi_texture_t *texture)
    if (!gdi || !gdi->memDC)
       return false;
 
-   memset(&bmi, 0, sizeof(bmi));
-   bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-   bmi.bmiHeader.biWidth       = texture->width;
-   bmi.bmiHeader.biHeight      = -texture->height;
-   bmi.bmiHeader.biPlanes      = 1;
-   bmi.bmiHeader.biBitCount    = 32;
-   bmi.bmiHeader.biCompression = BI_RGB;
+   bmi.bmiHeader.biSize          = sizeof(BITMAPINFOHEADER);
+   bmi.bmiHeader.biWidth         = (LONG)VIDEO_SCALE_W(texture->dims);
+   bmi.bmiHeader.biHeight        = -(LONG)VIDEO_SCALE_H(texture->dims);
+   bmi.bmiHeader.biPlanes        = 1;
+   bmi.bmiHeader.biBitCount      = 32;
+   bmi.bmiHeader.biCompression   = BI_RGB;
+   bmi.bmiHeader.biSizeImage     = 0;
+   bmi.bmiHeader.biXPelsPerMeter = 0;
+   bmi.bmiHeader.biYPelsPerMeter = 0;
+   bmi.bmiHeader.biClrUsed       = 0;
+   bmi.bmiHeader.biClrImportant  = 0;
+   bmi.bmiColors[0].rgbBlue      = 0;
+   bmi.bmiColors[0].rgbGreen     = 0;
+   bmi.bmiColors[0].rgbRed       = 0;
+   bmi.bmiColors[0].rgbReserved  = 0;
 
    bmp = CreateDIBSection(gdi->memDC, &bmi, DIB_RGB_COLORS,
          &pixels, NULL, 0);
@@ -1010,15 +1042,18 @@ static bool gdi_texture_realize(gdi_t *gdi, gdi_texture_t *texture)
    /* texture->data was already premultiplied at load time
     * (gdi_load_texture).  Just copy it into the DIB-backed memory. */
    memcpy(pixels, texture->data,
-         (size_t)texture->width * (size_t)texture->height * sizeof(uint32_t));
+         VIDEO_SCALE_AREA(texture->dims) * sizeof(uint32_t));
 
-   texture->bmp = bmp;
+   texture->bmp  = bmp;
+   texture->bits = pixels;
    return true;
 }
 
 static void gfx_display_gdi_draw(gfx_display_ctx_draw_t *draw,
-      void *data, unsigned video_width, unsigned video_height)
+      void *data, unsigned video_dims)
 {
+   unsigned video_width  = VIDEO_SCALE_W(video_dims);
+   unsigned video_height = VIDEO_SCALE_H(video_dims);
    gdi_t        *gdi     = (gdi_t*)data;
    gdi_texture_t *texture = NULL;
    uint32_t bl, br, tl, tr;
@@ -1052,13 +1087,13 @@ static void gfx_display_gdi_draw(gfx_display_ctx_draw_t *draw,
     *     video_height the caller passed us. */
    if (gdi->menu_textured_active && gdi->bmp_menu)
    {
-      target_w = gdi->menu_surface_width;
-      target_h = gdi->menu_surface_height;
+      target_w = VIDEO_SCALE_W(gdi->menu_surface_dims);
+      target_h = VIDEO_SCALE_H(gdi->menu_surface_dims);
    }
-   else if (gdi->bmp_width && gdi->bmp_height)
+   else if (VIDEO_SCALE_W(gdi->bmp_dims) && VIDEO_SCALE_H(gdi->bmp_dims))
    {
-      target_w = gdi->bmp_width;
-      target_h = gdi->bmp_height;
+      target_w = VIDEO_SCALE_W(gdi->bmp_dims);
+      target_h = VIDEO_SCALE_H(gdi->bmp_dims);
    }
    else
    {
@@ -1076,13 +1111,13 @@ static void gfx_display_gdi_draw(gfx_display_ctx_draw_t *draw,
    /* Two coordinate-input conventions in this vtable:
     *
     *   1. Plain quad:  coords->vertex is NULL, geometry comes from
-    *      draw->x / draw->y / draw->width / draw->height.  draw->y
+    *      the origin in draw->pos and the size in draw->dims.  Its y
     *      is "Y from bottom" because gfx_display_draw_quad flips it
     *      to match GL's bottom-up convention.  This is what
     *      menu/widget code uses for the simple-rect path.
     *
     *   2. Custom geometry:  coords->vertex points to 4 (x,y) pairs
-    *      in NORMALISED 0..1 space, bottom-up.  draw->x/y/width/h
+    *      in NORMALISED 0..1 space, bottom-up.  draw->pos/dims
     *      are unrelated junk in this case (typically 0/0/full
     *      target dim).  Used by gfx_display_draw_texture_slice
     *      (9-patch), among others.  Without recognising this we
@@ -1136,15 +1171,15 @@ static void gfx_display_gdi_draw(gfx_display_ctx_draw_t *draw,
    }
    else
    {
-      if (draw->width == 0 || draw->height == 0)
+      if (VIDEO_SCALE_W(draw->dims) == 0 || VIDEO_SCALE_H(draw->dims) == 0)
          return;
-      /* Plain quad path: draw->y is bottom-up in caller's
+      /* Plain quad path: the origin's y is bottom-up in caller's
        * coordinate system (the video_height value we were
        * passed), so flip. */
-      dst_x = (int)draw->x;
-      dst_y = (int)video_height - (int)draw->height - (int)draw->y;
-      dst_w = draw->width;
-      dst_h = draw->height;
+      dst_x = (int)VIDEO_POS_X(draw->pos);
+      dst_y = VIDEO_POS_FLIP_Y(video_height, draw->pos, draw->dims);
+      dst_w = VIDEO_SCALE_W(draw->dims);
+      dst_h = VIDEO_SCALE_H(draw->dims);
 
       /* Apply draw->scale_factor (centered scaling around the
        * quad's midpoint).  XMB sets this on icon draws (node->zoom)
@@ -1202,7 +1237,9 @@ static void gfx_display_gdi_draw(gfx_display_ctx_draw_t *draw,
     * the cursor texture.  Without this we'd sample the full source
     * for every slice, which would re-tile the entire cursor PNG
     * onto each section. */
-   if (have_tex_coords && texture && texture->width > 0 && texture->height > 0)
+   if (have_tex_coords && texture
+         && VIDEO_SCALE_W(texture->dims) > 0
+         && VIDEO_SCALE_H(texture->dims) > 0)
    {
       const float *t = draw->coords->tex_coord;
       float min_u, max_u, min_v, max_v;
@@ -1224,11 +1261,11 @@ static void gfx_display_gdi_draw(gfx_display_ctx_draw_t *draw,
          if (tv[i] > max_v) max_v = tv[i];
       }
 
-      src_x = (int)(min_u * (float)texture->width  + 0.5f);
-      src_y = (int)(min_v * (float)texture->height + 0.5f);
+      src_x = (int)(min_u * (float)VIDEO_SCALE_W(texture->dims) + 0.5f);
+      src_y = (int)(min_v * (float)VIDEO_SCALE_H(texture->dims) + 0.5f);
       {
-         int x_end = (int)(max_u * (float)texture->width  + 0.5f);
-         int y_end = (int)(max_v * (float)texture->height + 0.5f);
+         int x_end = (int)(max_u * (float)VIDEO_SCALE_W(texture->dims) + 0.5f);
+         int y_end = (int)(max_v * (float)VIDEO_SCALE_H(texture->dims) + 0.5f);
          src_w = (x_end > src_x) ? (unsigned)(x_end - src_x) : 0;
          src_h = (y_end > src_y) ? (unsigned)(y_end - src_y) : 0;
       }
@@ -1241,11 +1278,11 @@ static void gfx_display_gdi_draw(gfx_display_ctx_draw_t *draw,
          return;
    }
 
-   /* gfx_white_texture is a 1x1 white pixel; the menu code uses
-    * "draw a textured quad with the white texture" as its idiom
-    * for solid-colour rectangles.  Detect that case so we can
-    * skip the (much more expensive) blit path entirely. */
-   is_white_texture = (!texture || (texture->width <= 1 && texture->height <= 1));
+   /* A quad with no texture is a solid-colour rectangle; so is one
+    * with a 1x1 texture. Neither takes the blit path. */
+   is_white_texture = (!texture
+         || (   VIDEO_SCALE_W(texture->dims) <= 1
+             && VIDEO_SCALE_H(texture->dims) <= 1));
 
    if (is_white_texture)
    {
@@ -1261,7 +1298,9 @@ static void gfx_display_gdi_draw(gfx_display_ctx_draw_t *draw,
        *      directly express. */
       bool     gradient = gdi_color_is_gradient(bl, br, tl, tr);
 
-      if (!gradient && avg_a == 255)
+      /* A fill leaves a DIB's alpha at zero: the UI layer's, which
+       * must be opaque there, is blended instead. */
+      if (!gradient && avg_a == 255 && !gdi->views.ui_pass)
       {
          RECT rect;
          rect.left   = dst_x;
@@ -1315,7 +1354,7 @@ static void gfx_display_gdi_draw(gfx_display_ctx_draw_t *draw,
          if (!gdi_ensure_scratch_quad(gdi, dst_w, dst_h))
             return;
          out    = gdi->scratch_quad_pixels;
-         stride = gdi->scratch_quad_w;
+         stride = VIDEO_SCALE_W(gdi->scratch_quad_dims);
 
          /* In practice the menu / widget code almost always draws 1D
           * gradients: vertical (header strips, drop shadows, sidebar
@@ -1568,9 +1607,9 @@ static void gfx_display_gdi_draw(gfx_display_ctx_draw_t *draw,
       int  bx_src = have_tex_coords ? src_x : 0;
       int  by_src = have_tex_coords ? src_y : 0;
       unsigned bw_src = (have_tex_coords && src_w) ? src_w
-         : (unsigned)texture->width;
+         : VIDEO_SCALE_W(texture->dims);
       unsigned bh_src = (have_tex_coords && src_h) ? src_h
-         : (unsigned)texture->height;
+         : VIDEO_SCALE_H(texture->dims);
       if (!gdi->texDC)
          gdi->texDC        = CreateCompatibleDC(gdi->winDC);
       texture->bmp_old     = (HBITMAP)SelectObject(gdi->texDC, texture->bmp);
@@ -1624,16 +1663,14 @@ typedef struct
     * dirty flag is set.  Sized to atlas width × height, top-down. */
    HBITMAP                       atlas_bmp;
    uint32_t                     *atlas_pixels;
-   unsigned                      atlas_width;
-   unsigned                      atlas_height;
+   unsigned                      atlas_dims;
    /* Scratch DIB used to bake an RGB tint into a copy of the atlas
     * for one render_msg call.  Sized to the largest line we've
     * encountered; we reuse it across calls to keep allocations
     * bounded. */
    HBITMAP                       scratch_bmp;
    uint32_t                     *scratch_pixels;
-   unsigned                      scratch_width;
-   unsigned                      scratch_height;
+   unsigned                      scratch_dims;
 } gdi_raster_t;
 
 /* Build / refresh the BGRA premultiplied DIB that mirrors the A8
@@ -1645,14 +1682,23 @@ static bool gdi_font_upload_atlas(gdi_raster_t *font)
    BITMAPINFO bmi;
    void *pixels = NULL;
    unsigned i, j;
+   unsigned atlas_dims;
    bool recreated = false;
 
    if (!font || !font->atlas || !font->gdi || !font->gdi->memDC)
       return false;
 
+   /* The mirror's size has to survive the round trip through the
+    * word: the row stride below is read back out of it, and a
+    * clamped axis would index the DIB with a stride the DIB does
+    * not have. */
+   if (!VIDEO_SCALE_FITS(font->atlas->width, font->atlas->height))
+      return false;
+
+   atlas_dims = VIDEO_SCALE_PACK(font->atlas->width, font->atlas->height);
+
    if (     !font->atlas_bmp
-         || font->atlas_width  != font->atlas->width
-         || font->atlas_height != font->atlas->height)
+         || font->atlas_dims != atlas_dims)
    {
       recreated = true;
       if (font->atlas_bmp)
@@ -1662,13 +1708,21 @@ static bool gdi_font_upload_atlas(gdi_raster_t *font)
          font->atlas_pixels = NULL;
       }
 
-      memset(&bmi, 0, sizeof(bmi));
-      bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-      bmi.bmiHeader.biWidth       = (LONG)font->atlas->width;
-      bmi.bmiHeader.biHeight      = -(LONG)font->atlas->height;
-      bmi.bmiHeader.biPlanes      = 1;
-      bmi.bmiHeader.biBitCount    = 32;
-      bmi.bmiHeader.biCompression = BI_RGB;
+      bmi.bmiHeader.biSize          = sizeof(BITMAPINFOHEADER);
+      bmi.bmiHeader.biWidth         = (LONG)font->atlas->width;
+      bmi.bmiHeader.biHeight        = -(LONG)font->atlas->height;
+      bmi.bmiHeader.biPlanes        = 1;
+      bmi.bmiHeader.biBitCount      = 32;
+      bmi.bmiHeader.biCompression   = BI_RGB;
+      bmi.bmiHeader.biSizeImage     = 0;
+      bmi.bmiHeader.biXPelsPerMeter = 0;
+      bmi.bmiHeader.biYPelsPerMeter = 0;
+      bmi.bmiHeader.biClrUsed       = 0;
+      bmi.bmiHeader.biClrImportant  = 0;
+      bmi.bmiColors[0].rgbBlue      = 0;
+      bmi.bmiColors[0].rgbGreen     = 0;
+      bmi.bmiColors[0].rgbRed       = 0;
+      bmi.bmiColors[0].rgbReserved  = 0;
 
       font->atlas_bmp = CreateDIBSection(font->gdi->memDC, &bmi,
             DIB_RGB_COLORS, &pixels, NULL, 0);
@@ -1681,43 +1735,49 @@ static bool gdi_font_upload_atlas(gdi_raster_t *font)
       }
 
       font->atlas_pixels = (uint32_t*)pixels;
-      font->atlas_width  = font->atlas->width;
-      font->atlas_height = font->atlas->height;
+      font->atlas_dims   = atlas_dims;
    }
 
    /* Expand A8 -> BGRA premultiplied: A=atlas[i], R=G=B=A.  This
     * gives us a "white glyph with embedded alpha" source that
     * AlphaBlend can composite directly with AC_SRC_ALPHA.  Only the
-    * dirty rectangle tracked by the font renderers is expanded; a
+    * dirty rectangles tracked by the font renderers are expanded; a
     * freshly (re)created DIB has no previous contents and is
     * converted in full. */
    {
-      unsigned x0 = font->atlas->dirty_x0;
-      unsigned y0 = font->atlas->dirty_y0;
-      unsigned x1 = font->atlas->dirty_x1;
-      unsigned y1 = font->atlas->dirty_y1;
-
-      if (     recreated
-            || x1 <= x0 || y1 <= y0
-            || x1 > (unsigned)font->atlas->width
-            || y1 > (unsigned)font->atlas->height)
+      unsigned r;
+      unsigned rects = recreated ? 1 : font_atlas_dirty_rects(font->atlas);
+      for (r = 0; r < rects; r++)
       {
-         x0 = 0;
-         y0 = 0;
-         x1 = font->atlas->width;
-         y1 = font->atlas->height;
-      }
+         unsigned xy0, xy1, x0, y0, x1, y1;
+         font_atlas_dirty_rect(font->atlas, r, &xy0, &xy1);
+         x0 = VIDEO_SCALE_W(xy0);
+         y0 = VIDEO_SCALE_H(xy0);
+         x1 = VIDEO_SCALE_W(xy1);
+         y1 = VIDEO_SCALE_H(xy1);
 
-      for (j = y0; j < y1; j++)
-      {
-         uint32_t      *dst = font->atlas_pixels
-            + (size_t)j * font->atlas_width + x0;
-         const uint8_t *src = font->atlas->buffer
-            + (size_t)j * font->atlas->width + x0;
-         for (i = 0; i < x1 - x0; i++)
+         if (     recreated
+               || x1 <= x0 || y1 <= y0
+               || x1 > (unsigned)font->atlas->width
+               || y1 > (unsigned)font->atlas->height)
          {
-            uint32_t a = src[i];
-            dst[i] = (a << 24) | (a << 16) | (a << 8) | a;
+            x0 = 0;
+            y0 = 0;
+            x1 = font->atlas->width;
+            y1 = font->atlas->height;
+         }
+
+         for (j = y0; j < y1; j++)
+         {
+            uint32_t      *dst = font->atlas_pixels
+               + (size_t)j * VIDEO_SCALE_W(font->atlas_dims) + x0;
+            const uint8_t *src = font->atlas->buffer
+               + (size_t)j * font->atlas->width + x0;
+            for (i = 0; i < x1 - x0; i++)
+            {
+               uint32_t a = src[i];
+               dst[i] = (a << 24) | (a << 16) | (a << 8) | a;
+            }
          }
       }
    }
@@ -1730,13 +1790,20 @@ static bool gdi_font_ensure_scratch(gdi_raster_t *font,
 {
    BITMAPINFO bmi;
    void *pixels = NULL;
+   unsigned sw, sh;
 
    if (!font || !font->gdi || !font->gdi->memDC)
       return false;
 
+   /* A line past what a word holds would be recorded as a smaller
+    * capacity than the DIB it describes, and every later call would
+    * find that capacity short and rebuild. */
+   if (!VIDEO_SCALE_FITS(width, height))
+      return false;
+
    if (     font->scratch_bmp
-         && font->scratch_width  >= width
-         && font->scratch_height >= height)
+         && VIDEO_SCALE_W(font->scratch_dims) >= width
+         && VIDEO_SCALE_H(font->scratch_dims) >= height)
       return true;
 
    /* Grow only - never shrink, so a long line followed by short
@@ -1748,18 +1815,31 @@ static bool gdi_font_ensure_scratch(gdi_raster_t *font,
       font->scratch_bmp    = NULL;
       font->scratch_pixels = NULL;
    }
-   if (font->scratch_width  < width)
-      font->scratch_width  = width  + width  / 2 + 1;
-   if (font->scratch_height < height)
-      font->scratch_height = height + height / 2 + 1;
+   sw = VIDEO_SCALE_W(font->scratch_dims);
+   sh = VIDEO_SCALE_H(font->scratch_dims);
+   if (sw < width)
+      sw = width  + width  / 2 + 1;
+   if (sh < height)
+      sh = height + height / 2 + 1;
+   /* The geometric step can overshoot what the word holds; the
+    * clamp still leaves it at or above the size asked for. */
+   font->scratch_dims = VIDEO_SCALE_PACK(sw, sh);
 
-   memset(&bmi, 0, sizeof(bmi));
-   bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-   bmi.bmiHeader.biWidth       = (LONG)font->scratch_width;
-   bmi.bmiHeader.biHeight      = -(LONG)font->scratch_height;
-   bmi.bmiHeader.biPlanes      = 1;
-   bmi.bmiHeader.biBitCount    = 32;
-   bmi.bmiHeader.biCompression = BI_RGB;
+   bmi.bmiHeader.biSize          = sizeof(BITMAPINFOHEADER);
+   bmi.bmiHeader.biWidth         = (LONG)VIDEO_SCALE_W(font->scratch_dims);
+   bmi.bmiHeader.biHeight        = -(LONG)VIDEO_SCALE_H(font->scratch_dims);
+   bmi.bmiHeader.biPlanes        = 1;
+   bmi.bmiHeader.biBitCount      = 32;
+   bmi.bmiHeader.biCompression   = BI_RGB;
+   bmi.bmiHeader.biSizeImage     = 0;
+   bmi.bmiHeader.biXPelsPerMeter = 0;
+   bmi.bmiHeader.biYPelsPerMeter = 0;
+   bmi.bmiHeader.biClrUsed       = 0;
+   bmi.bmiHeader.biClrImportant  = 0;
+   bmi.bmiColors[0].rgbBlue      = 0;
+   bmi.bmiColors[0].rgbGreen     = 0;
+   bmi.bmiColors[0].rgbRed       = 0;
+   bmi.bmiColors[0].rgbReserved  = 0;
 
    font->scratch_bmp = CreateDIBSection(font->gdi->memDC, &bmi,
          DIB_RGB_COLORS, &pixels, NULL, 0);
@@ -1795,6 +1875,9 @@ static void *gdi_font_init(void *data,
    }
 
    font->atlas = font->font_driver->get_atlas(font->font_data);
+   /* The atlas may grow; the DIB mirroring it is made again whenever
+    * its size changes */
+   font->atlas->max_dims = VIDEO_SCALE_PACK(2048, 2048);
 
    /* The atlas DIB is created lazily on first render_msg, since
     * gdi->memDC may not exist yet at font init time (font_driver
@@ -1820,31 +1903,14 @@ static void gdi_font_free(void *data, bool is_threaded)
    free(font);
 }
 
-static int gdi_font_get_message_width(void *data,
-      const char *msg, size_t msg_len, float scale)
+static int gdi_font_get_message_width(void *data, const char *msg,
+      size_t msg_len, float scale)
 {
-   const struct font_glyph *glyph_q = NULL;
    gdi_raster_t *font = (gdi_raster_t*)data;
-   const char *msg_end;
-   int delta_x = 0;
-
-   if (!font || !font->font_driver || !font->font_data || !msg)
+   if (!font)
       return 0;
-
-   msg_end = msg + msg_len;
-   glyph_q = font->font_driver->get_glyph(font->font_data, '?');
-
-   while (msg < msg_end)
-   {
-      const struct font_glyph *glyph;
-      unsigned code = utf8_walk(&msg);
-      if (!(glyph = font->font_driver->get_glyph(font->font_data, code)))
-         if (!(glyph = glyph_q))
-            continue;
-      delta_x += glyph->advance_x;
-   }
-
-   return (int)(delta_x * scale);
+   return font_renderer_get_message_width(font->font_driver,
+         font->font_data, msg, msg_len, scale);
 }
 
 static const struct font_glyph *gdi_font_get_glyph(
@@ -1887,11 +1953,20 @@ static void gdi_font_render_line(
 {
 #if GDI_HAS_ALPHABLEND
    const struct font_glyph *glyph_q;
-   const char *msg_ptr;
-   const char *msg_end;
+   const struct font_glyph* (*get_glyph)(void*, uint32_t);
+   void    *font_data;
    HDC      atlas_dc;
    HBITMAP  atlas_old;
+   BLENDFUNCTION blend;
+   struct font_line_metrics *metrics = NULL;
+   uint32_t pre_a    = 0;
+   uint32_t pre_r    = 0;
+   uint32_t pre_g    = 0;
+   uint32_t pre_b    = 0;
+   int      line_w   = 0;
+   int      line_h   = 0;
    int      x_offset = 0;
+   bool     line_ok  = true;
    bool     plain_white;
 #endif
 
@@ -1922,219 +1997,223 @@ static void gdi_font_render_line(
       return;
 
    plain_white = (r == 255 && g == 255 && b == 255);
-   glyph_q     = font->font_driver->get_glyph(font->font_data, '?');
+   get_glyph   = font->font_driver->get_glyph;
+   font_data   = font->font_data;
+   glyph_q     = get_glyph(font_data, '?');
 
    atlas_dc = CreateCompatibleDC(dst_dc);
    if (!atlas_dc)
       return;
+
    atlas_old = (HBITMAP)SelectObject(atlas_dc, font->atlas_bmp);
 
-   /* Optimisation: handle alignment up front by pre-measuring the
-    * line.  The caller has already pre-positioned line_x for left-
-    * aligned text, but for centre/right we need the line width. */
-   if (text_align == TEXT_ALIGN_RIGHT || text_align == TEXT_ALIGN_CENTER)
-   {
-      int line_w = gdi_font_get_message_width(font, msg, msg_len, scale);
-      if (text_align == TEXT_ALIGN_RIGHT)
-         line_x -= line_w;
-      else
-         line_x -= line_w / 2;
-   }
+   /* Untinted text is AlphaBlended a glyph at a time straight from the
+    * atlas; AC_SRC_ALPHA + SourceConstantAlpha=a gives per-glyph alpha
+    * modulated by the requested overall opacity. Tinted text is baked
+    * into the scratch DIB with the requested colour and the line
+    * AlphaBlended in one go, so it needs the line's width up front -
+    * as right and centred text does, for its position. */
+   blend.BlendOp             = AC_SRC_OVER;
+   blend.BlendFlags          = 0;
+   blend.SourceConstantAlpha = plain_white ? a : 255;
+   blend.AlphaFormat         = AC_SRC_ALPHA;
 
-   msg_ptr = msg;
-   msg_end = msg + msg_len;
+#define FONT_LAYOUT_ALIGNED (!plain_white \
+      || text_align == TEXT_ALIGN_RIGHT || text_align == TEXT_ALIGN_CENTER)
+#define FONT_LAYOUT_LINE(line, line_width, count, bytes) \
+   do \
+   { \
+      (void)(line); \
+      (void)(count); \
+      (void)(bytes); \
+      line_w = (int)((line_width) * scale); \
+      if (text_align == TEXT_ALIGN_RIGHT) \
+         line_x -= line_w; \
+      else if (text_align == TEXT_ALIGN_CENTER) \
+         line_x -= line_w / 2; \
+      if (plain_white) \
+         break; \
+      /* The scratch DIB fits the line's pixel extent, descenders \
+       * included, cleared to fully transparent; the colour is \
+       * premultiplied here and by the atlas alpha per pixel */ \
+      line_ok = false; \
+      if (line_w <= 0) \
+         break; \
+      font->font_driver->get_line_metrics(font->font_data, &metrics); \
+      line_h = metrics ? (int)(metrics->height * scale + 0.5f) : 32; \
+      if (line_h <= 0) \
+         line_h = 32; \
+      if (!gdi_font_ensure_scratch(font, (unsigned)line_w, (unsigned)line_h)) \
+         break; \
+      memset(font->scratch_pixels, 0, \
+            VIDEO_SCALE_AREA(font->scratch_dims) * sizeof(uint32_t)); \
+      pre_a   = a; \
+      pre_r   = GDI_DIV255((uint32_t)r * a); \
+      pre_g   = GDI_DIV255((uint32_t)g * a); \
+      pre_b   = GDI_DIV255((uint32_t)b * a); \
+      line_ok = true; \
+   } while (0)
+#define FONT_LAYOUT_GLYPH(gl, pen_x, pen_y) \
+   do \
+   { \
+      /* This driver keeps its own truncating pen */ \
+      (void)(pen_x); \
+      (void)(pen_y); \
+      if (!line_ok) \
+         break; \
+      if (plain_white) \
+      { \
+         int gx, gy, gw, gh; \
+         gw = (int)((float)VIDEO_SCALE_W((gl)->dims) * scale); \
+         gh = (int)((float)VIDEO_SCALE_H((gl)->dims) * scale); \
+         if (gw > 0 && gh > 0) \
+         { \
+            gx = line_x + x_offset + (int)((float)(gl)->draw_offset_x * scale); \
+            gy = line_y           + (int)((float)(gl)->draw_offset_y * scale); \
+            AlphaBlend(dst_dc, gx, gy, gw, gh, \
+                  atlas_dc, \
+                  VIDEO_SCALE_W((gl)->atlas_pos), VIDEO_SCALE_H((gl)->atlas_pos), \
+                  VIDEO_SCALE_W((gl)->dims), VIDEO_SCALE_H((gl)->dims), \
+                  blend); \
+         } \
+      } \
+      else \
+      { \
+         int gx_dst, gy_dst, gw, gh; \
+         int gx_src, gy_src; \
+         gw     = (int)((float)VIDEO_SCALE_W((gl)->dims) * scale); \
+         gh     = (int)((float)VIDEO_SCALE_H((gl)->dims) * scale); \
+         gx_dst = x_offset + (int)((float)(gl)->draw_offset_x * scale); \
+         gy_dst = (metrics ? (int)(metrics->ascender * scale + 0.5f) : 0) \
+                + (int)((float)(gl)->draw_offset_y * scale); \
+         gx_src = (int)VIDEO_SCALE_W((gl)->atlas_pos); \
+         gy_src = (int)VIDEO_SCALE_H((gl)->atlas_pos); \
+         if (gw > 0 && gh > 0) \
+         { \
+            int yy, xx; \
+            for (yy = 0; yy < gh; yy++) \
+            { \
+               int dst_y2 = gy_dst + yy; \
+               int src_y2; \
+               uint32_t *dst_row; \
+               const uint8_t *src_row; \
+               if (dst_y2 < 0 || dst_y2 >= (int)VIDEO_SCALE_H(font->scratch_dims)) \
+                  continue; \
+               src_y2  = gy_src + (int)((float)yy \
+                     * (float)VIDEO_SCALE_H((gl)->dims) / (float)gh); \
+               if (src_y2 < 0 || src_y2 >= (int)VIDEO_SCALE_H(font->atlas_dims)) \
+                  continue; \
+               dst_row = font->scratch_pixels \
+                  + (size_t)dst_y2 * VIDEO_SCALE_W(font->scratch_dims); \
+               src_row = font->atlas->buffer \
+                  + (size_t)src_y2 * font->atlas->width; \
+               for (xx = 0; xx < gw; xx++) \
+               { \
+                  int dst_x2 = gx_dst + xx; \
+                  int src_x2; \
+                  uint8_t  alpha; \
+                  uint32_t out_a, out_r, out_g, out_b; \
+                  if (dst_x2 < 0 || dst_x2 >= (int)VIDEO_SCALE_W(font->scratch_dims)) \
+                     continue; \
+                  src_x2 = gx_src + (int)((float)xx \
+                        * (float)VIDEO_SCALE_W((gl)->dims) / (float)gw); \
+                  if (src_x2 < 0 || src_x2 >= (int)VIDEO_SCALE_W(font->atlas_dims)) \
+                     continue; \
+                  alpha = src_row[src_x2]; \
+                  if (alpha == 0) \
+                     continue; \
+                  /* Premultiplied glyph pixel at the requested tint. \
+                   * Output alpha = atlas_a * tint_a; output RGB = \
+                   * tint_RGB premultiplied by output alpha. */ \
+                  out_a = GDI_DIV255((uint32_t)alpha * pre_a); \
+                  out_r = GDI_DIV255((uint32_t)alpha * pre_r); \
+                  out_g = GDI_DIV255((uint32_t)alpha * pre_g); \
+                  out_b = GDI_DIV255((uint32_t)alpha * pre_b); \
+                  /* Last-write wins where glyphs overlap: kerned \
+                   * fonts can produce overlapping bounding boxes, \
+                   * but the actual coverage rarely overlaps. */ \
+                  dst_row[dst_x2] = \
+                       (out_a << 24) \
+                     | (out_r << 16) \
+                     | (out_g <<  8) \
+                     |  out_b; \
+               } \
+            } \
+         } \
+      } \
+      x_offset += (int)((float)(gl)->advance_x * scale); \
+   } while (0)
+#define FONT_LAYOUT_LINE_END() \
+   do \
+   { \
+      if (plain_white || !line_ok) \
+         break; \
+      /* Bind scratch and AlphaBlend the whole line. */ \
+      { \
+         HDC scratch_dc = CreateCompatibleDC(dst_dc); \
+         HBITMAP scratch_old; \
+         if (!scratch_dc) \
+            break; \
+         scratch_old = (HBITMAP)SelectObject(scratch_dc, font->scratch_bmp); \
+         /* Compute Y offset: line_y was passed as the baseline \
+          * approximation; we drew with ascender baked in, so adjust \
+          * back so that line_y aligns with the glyph baseline. */ \
+         { \
+            int draw_y = line_y; \
+            if (metrics) \
+               draw_y = line_y - (int)(metrics->ascender * scale + 0.5f); \
+            blend.BlendOp             = AC_SRC_OVER; \
+            blend.BlendFlags          = 0; \
+            blend.SourceConstantAlpha = 255; \
+            blend.AlphaFormat         = AC_SRC_ALPHA; \
+            AlphaBlend(dst_dc, line_x, draw_y, line_w, line_h, \
+                  scratch_dc, 0, 0, line_w, line_h, blend); \
+         } \
+         SelectObject(scratch_dc, scratch_old); \
+         DeleteDC(scratch_dc); \
+      } \
+   } while (0)
+#include "../font_layout.h"
 
-   if (plain_white)
-   {
-      /* Hot path: no tint, AlphaBlend straight from the atlas.
-       * AC_SRC_ALPHA + SourceConstantAlpha=a gives us per-glyph
-       * alpha modulated by the requested overall opacity. */
-      BLENDFUNCTION blend;
-      blend.BlendOp             = AC_SRC_OVER;
-      blend.BlendFlags          = 0;
-      blend.SourceConstantAlpha = a;
-      blend.AlphaFormat         = AC_SRC_ALPHA;
-
-      while (msg_ptr < msg_end)
-      {
-         const struct font_glyph *glyph;
-         unsigned code = utf8_walk(&msg_ptr);
-         int gx, gy, gw, gh;
-
-         if (!(glyph = font->font_driver->get_glyph(font->font_data, code)))
-            if (!(glyph = glyph_q))
-               continue;
-
-         gw = (int)((float)glyph->width  * scale);
-         gh = (int)((float)glyph->height * scale);
-
-         if (gw > 0 && gh > 0)
-         {
-            gx = line_x + x_offset + (int)((float)glyph->draw_offset_x * scale);
-            gy = line_y           + (int)((float)glyph->draw_offset_y * scale);
-
-            AlphaBlend(dst_dc, gx, gy, gw, gh,
-                  atlas_dc,
-                  glyph->atlas_offset_x, glyph->atlas_offset_y,
-                  glyph->width, glyph->height,
-                  blend);
-         }
-         x_offset += (int)((float)glyph->advance_x * scale);
-      }
-   }
-   else
-   {
-      /* Tinted path: bake the line into the scratch DIB with the
-       * requested RGB colour, then AlphaBlend the whole line in
-       * one go.  We size the scratch buffer to fit the line's
-       * pixel extent including descender height. */
-      struct font_line_metrics *metrics = NULL;
-      int line_w = gdi_font_get_message_width(font, msg, msg_len, scale);
-      int line_h;
-      uint32_t pre_a, pre_r, pre_g, pre_b;
-      BLENDFUNCTION blend;
-
-      if (line_w <= 0)
-         goto done;
-
-      font->font_driver->get_line_metrics(font->font_data, &metrics);
-      line_h = metrics ? (int)(metrics->height * scale + 0.5f) : 32;
-      if (line_h <= 0)
-         line_h = 32;
-
-      if (!gdi_font_ensure_scratch(font, (unsigned)line_w, (unsigned)line_h))
-         goto done;
-
-      /* Clear scratch pixels to fully transparent. */
-      {
-         size_t total = (size_t)font->scratch_width * (size_t)font->scratch_height;
-         memset(font->scratch_pixels, 0, total * sizeof(uint32_t));
-      }
-
-      /* Premultiply the requested colour.  We'll multiply by the
-       * atlas alpha per pixel below. */
-      pre_a = a;
-      pre_r = GDI_DIV255((uint32_t)r * a);
-      pre_g = GDI_DIV255((uint32_t)g * a);
-      pre_b = GDI_DIV255((uint32_t)b * a);
-
-      /* Composite glyphs into the scratch DIB.  Scale-1.0 fast path
-       * does direct A8 → premultiplied BGRA copy; scaled glyphs go
-       * through nearest-neighbour for simplicity (the menu fonts
-       * are pre-rasterised at the right size, so scale is almost
-       * always 1.0 in practice). */
-      while (msg_ptr < msg_end)
-      {
-         const struct font_glyph *glyph;
-         unsigned code = utf8_walk(&msg_ptr);
-         int gx_dst, gy_dst, gw, gh;
-         int gx_src, gy_src;
-
-         if (!(glyph = font->font_driver->get_glyph(font->font_data, code)))
-            if (!(glyph = glyph_q))
-               continue;
-
-         gw     = (int)((float)glyph->width  * scale);
-         gh     = (int)((float)glyph->height * scale);
-         gx_dst = x_offset + (int)((float)glyph->draw_offset_x * scale);
-         gy_dst = (metrics ? (int)(metrics->ascender * scale + 0.5f) : 0)
-                + (int)((float)glyph->draw_offset_y * scale);
-         gx_src = (int)glyph->atlas_offset_x;
-         gy_src = (int)glyph->atlas_offset_y;
-
-         if (gw > 0 && gh > 0)
-         {
-            int yy, xx;
-            for (yy = 0; yy < gh; yy++)
-            {
-               int dst_y2 = gy_dst + yy;
-               int src_y2;
-               uint32_t *dst_row;
-               const uint8_t *src_row;
-               if (dst_y2 < 0 || dst_y2 >= (int)font->scratch_height)
-                  continue;
-               src_y2  = gy_src + (int)((float)yy * (float)glyph->height
-                     / (float)gh);
-               if (src_y2 < 0 || src_y2 >= (int)font->atlas_height)
-                  continue;
-
-               dst_row = font->scratch_pixels
-                  + (size_t)dst_y2 * font->scratch_width;
-               src_row = font->atlas->buffer
-                  + (size_t)src_y2 * font->atlas->width;
-
-               for (xx = 0; xx < gw; xx++)
-               {
-                  int dst_x2 = gx_dst + xx;
-                  int src_x2;
-                  uint8_t  alpha;
-                  uint32_t out_a, out_r, out_g, out_b;
-                  if (dst_x2 < 0 || dst_x2 >= (int)font->scratch_width)
-                     continue;
-                  src_x2 = gx_src + (int)((float)xx * (float)glyph->width
-                        / (float)gw);
-                  if (src_x2 < 0 || src_x2 >= (int)font->atlas_width)
-                     continue;
-
-                  alpha = src_row[src_x2];
-                  if (alpha == 0)
-                     continue;
-
-                  /* Premultiplied glyph pixel at the requested tint.
-                   * Output alpha = atlas_a * tint_a; output RGB =
-                   * tint_RGB premultiplied by output alpha. */
-                  out_a = GDI_DIV255((uint32_t)alpha * pre_a);
-                  out_r = GDI_DIV255((uint32_t)alpha * pre_r);
-                  out_g = GDI_DIV255((uint32_t)alpha * pre_g);
-                  out_b = GDI_DIV255((uint32_t)alpha * pre_b);
-                  /* Last-write wins where glyphs overlap: kerned
-                   * fonts can produce overlapping bounding boxes,
-                   * but the actual coverage rarely overlaps. */
-                  dst_row[dst_x2] =
-                       (out_a << 24)
-                     | (out_r << 16)
-                     | (out_g <<  8)
-                     |  out_b;
-               }
-            }
-         }
-         x_offset += (int)((float)glyph->advance_x * scale);
-      }
-
-      /* Bind scratch and AlphaBlend the whole line. */
-      {
-         HDC scratch_dc = CreateCompatibleDC(dst_dc);
-         HBITMAP scratch_old;
-         if (!scratch_dc)
-            goto done;
-         scratch_old = (HBITMAP)SelectObject(scratch_dc, font->scratch_bmp);
-
-         /* Compute Y offset: line_y was passed as the baseline
-          * approximation; we drew with ascender baked in, so adjust
-          * back so that line_y aligns with the glyph baseline. */
-         {
-            int draw_y = line_y;
-            if (metrics)
-               draw_y = line_y - (int)(metrics->ascender * scale + 0.5f);
-
-            blend.BlendOp             = AC_SRC_OVER;
-            blend.BlendFlags          = 0;
-            blend.SourceConstantAlpha = 255;
-            blend.AlphaFormat         = AC_SRC_ALPHA;
-
-            AlphaBlend(dst_dc, line_x, draw_y, line_w, line_h,
-                  scratch_dc, 0, 0, line_w, line_h, blend);
-         }
-
-         SelectObject(scratch_dc, scratch_old);
-         DeleteDC(scratch_dc);
-      }
-   }
-
-done:
    SelectObject(atlas_dc, atlas_old);
    DeleteDC(atlas_dc);
 #endif /* GDI_HAS_ALPHABLEND */
+}
+
+/* Draws one line, its shadow run first (when it has one) and then its
+ * text run, with its top-left at (pixel_x, pixel_y). */
+static void gdi_font_render_runs(gdi_raster_t *font, HDC dst_dc,
+      const char *line, size_t line_len, int pixel_x, int pixel_y,
+      float scale, enum text_alignment text_align,
+      int drop_x, int drop_y, float drop_mod, float drop_alpha,
+      unsigned r, unsigned g, unsigned b, unsigned a,
+      unsigned width, unsigned height)
+{
+   if (!line_len)
+      return;
+
+   if (drop_x || drop_y)
+   {
+      unsigned dr = (unsigned)((float)r * drop_mod);
+      unsigned dg = (unsigned)((float)g * drop_mod);
+      unsigned db = (unsigned)((float)b * drop_mod);
+      unsigned da = (unsigned)((float)a * drop_alpha);
+      if (dr > 255) dr = 255;
+      if (dg > 255) dg = 255;
+      if (db > 255) db = 255;
+      if (da > 255) da = 255;
+      /* params->drop_y in the GL/D3D drivers is "up", we want
+       * "down" on a top-down surface, so subtract. */
+      gdi_font_render_line(font, dst_dc, line, line_len,
+            pixel_x + drop_x, pixel_y - drop_y, scale, text_align,
+            (uint8_t)dr, (uint8_t)dg, (uint8_t)db, (uint8_t)da,
+            (int)width, (int)height);
+   }
+
+   gdi_font_render_line(font, dst_dc, line, line_len,
+         pixel_x, pixel_y, scale, text_align,
+         (uint8_t)r, (uint8_t)g, (uint8_t)b, (uint8_t)a,
+         (int)width, (int)height);
 }
 
 static void gdi_font_render_msg(
@@ -2143,6 +2222,7 @@ static void gdi_font_render_msg(
       const char *msg, size_t msg_len,
       const struct font_params *params)
 {
+   font_params_resolved_t rp;
    float    x, y, scale, drop_mod, drop_alpha;
    int      drop_x, drop_y;
    unsigned r, g, b, a;
@@ -2155,8 +2235,6 @@ static void gdi_font_render_msg(
    unsigned      width, height;
    struct font_line_metrics *line_metrics = NULL;
    int           line_h;
-   const char   *line_start;
-   int           line_index = 0;
 
    if (!font || !msg || !*msg || !gdi)
       return;
@@ -2174,55 +2252,41 @@ static void gdi_font_render_msg(
    if (gdi->menu_textured_active && gdi->bmp_menu)
    {
       dst_bmp = gdi->bmp_menu;
-      width   = gdi->menu_surface_width;
-      height  = gdi->menu_surface_height;
+      width   = VIDEO_SCALE_W(gdi->menu_surface_dims);
+      height  = VIDEO_SCALE_H(gdi->menu_surface_dims);
    }
    else
    {
       dst_bmp = gdi->bmp;
-      width   = gdi->bmp_width  ? gdi->bmp_width  : gdi->frame_width;
-      height  = gdi->bmp_height ? gdi->bmp_height : gdi->frame_height;
+      {
+         unsigned src_dims = gdi->bmp_dims
+               ? gdi->bmp_dims : gdi->frame_dims;
+         width  = VIDEO_SCALE_W(src_dims);
+         height = VIDEO_SCALE_H(src_dims);
+      }
    }
 
    if (!dst_bmp || !width || !height)
       return;
 
-   if (params)
-   {
-      x          = params->x;
-      y          = params->y;
-      drop_x     = params->drop_x;
-      drop_y     = params->drop_y;
-      drop_mod   = params->drop_mod;
-      drop_alpha = params->drop_alpha;
-      scale      = params->scale;
-      text_align = params->text_align;
-      r          = FONT_COLOR_GET_RED  (params->color);
-      g          = FONT_COLOR_GET_GREEN(params->color);
-      b          = FONT_COLOR_GET_BLUE (params->color);
-      a          = FONT_COLOR_GET_ALPHA(params->color);
-   }
-   else
-   {
-      settings_t *settings    = config_get_ptr();
-      float video_msg_pos_x   = settings->floats.video_msg_pos_x;
-      float video_msg_pos_y   = settings->floats.video_msg_pos_y;
-      float video_msg_color_r = settings->floats.video_msg_color_r;
-      float video_msg_color_g = settings->floats.video_msg_color_g;
-      float video_msg_color_b = settings->floats.video_msg_color_b;
-      x          = video_msg_pos_x;
-      y          = video_msg_pos_y;
-      drop_x     = -2;
-      drop_y     = -2;
-      drop_mod   = 0.3f;
-      drop_alpha = 1.0f;
-      scale      = 1.0f;
-      text_align = TEXT_ALIGN_LEFT;
-      r          = (unsigned)(video_msg_color_r * 255.0f);
-      g          = (unsigned)(video_msg_color_g * 255.0f);
-      b          = (unsigned)(video_msg_color_b * 255.0f);
-      a          = 255;
-   }
+   font_driver_resolve_params(params, &rp);
+   x          = rp.x;
+   y          = rp.y;
+   scale      = rp.scale;
+   text_align = rp.text_align;
+   drop_x     = rp.drop_x;
+   drop_y     = rp.drop_y;
+   drop_mod   = rp.drop_mod;
+   drop_alpha = rp.drop_alpha;
+   r          = rp.rgba[0];
+   g          = rp.rgba[1];
+   b          = rp.rgba[2];
+   a               = rp.rgba[3];
+
+
+   /* Asked for first: it may have grown, which marks it dirty */
+   if (font->font_driver && font->font_data)
+      font->atlas = font->font_driver->get_atlas(font->font_data);
 
    /* Refresh the atlas if the backend reports new glyphs.  We do
     * this once per render_msg, before any line rendering, so the
@@ -2245,66 +2309,39 @@ static void gdi_font_render_msg(
    dst_dc  = gdi->memDC;
    dst_old = (HBITMAP)SelectObject(dst_dc, dst_bmp);
 
-   /* Iterate over '\n'-separated lines.  Coordinates are normalised
-    * 0..1 with Y from the bottom (gfx_display_draw_text passes
-    * params.y = 1 - y_pixels/height); convert to top-down pixels
-    * and apply per-line offsets. */
-   line_start = msg;
-   for (;;)
+   /* Coordinates are normalised 0..1 with Y from the bottom
+    * (gfx_display_draw_text passes params.y = 1 - y_pixels/height);
+    * convert to top-down pixels, successive lines stepping downward by
+    * line_h. Each line is drawn as its shadow run and then its text
+    * run, so the text lands on top; the shared layout hands each line
+    * over and gdi_font_render_line() walks its glyphs. */
    {
-      const char *line_end = line_start;
-      size_t      line_len;
-      int         pixel_x, pixel_y;
-      int         drop_pixel_x, drop_pixel_y;
-
-      while (*line_end && *line_end != '\n')
-         line_end++;
-      line_len = (size_t)(line_end - line_start);
-
-      if (line_len > 0)
-      {
-         /* Convert (x_norm, y_norm) -> pixel.  y_norm starts as
-          * (1 - y_pixels_from_top / height); invert.  Successive
-          * lines step downward by line_h. */
-         pixel_x = (int)(x * (float)width);
-         pixel_y = (int)((1.0f - y) * (float)height) + line_index * line_h;
-
-         /* Drop shadow pass (rendered first so the main glyph
-          * lands on top). */
-         if (drop_x || drop_y)
-         {
-            unsigned dr = (unsigned)((float)r * drop_mod);
-            unsigned dg = (unsigned)((float)g * drop_mod);
-            unsigned db = (unsigned)((float)b * drop_mod);
-            unsigned da = (unsigned)((float)a * drop_alpha);
-            if (dr > 255) dr = 255;
-            if (dg > 255) dg = 255;
-            if (db > 255) db = 255;
-            if (da > 255) da = 255;
-
-            /* params->drop_y in the GL/D3D drivers is "up", we want
-             * "down" on a top-down surface, so subtract. */
-            drop_pixel_x = pixel_x + drop_x;
-            drop_pixel_y = pixel_y - drop_y;
-
-            gdi_font_render_line(font, dst_dc,
-                  line_start, line_len,
-                  drop_pixel_x, drop_pixel_y, scale, text_align,
-                  (uint8_t)dr, (uint8_t)dg, (uint8_t)db, (uint8_t)da,
-                  (int)width, (int)height);
-         }
-
-         gdi_font_render_line(font, dst_dc,
-               line_start, line_len,
-               pixel_x, pixel_y, scale, text_align,
-               (uint8_t)r, (uint8_t)g, (uint8_t)b, (uint8_t)a,
-               (int)width, (int)height);
-      }
-
-      if (*line_end != '\n')
-         break;
-      line_start = line_end + 1;
-      line_index++;
+      int pixel_x = (int)(x * (float)width);
+      int pixel_y = (int)((1.0f - y) * (float)height);
+#define FONT_LAYOUT_ALIGNED 0
+#define FONT_LAYOUT_SKIP(line, bytes) \
+      (gdi_font_render_runs(font, dst_dc, fl_m, (bytes), pixel_x, \
+            pixel_y + (line) * line_h, scale, text_align, drop_x, drop_y, \
+            drop_mod, drop_alpha, r, g, b, a, width, height), 1)
+#define FONT_LAYOUT_LINE(line, line_width, count, bytes) \
+      do \
+      { \
+         (void)(line_width); \
+         (void)(count); \
+      } while (0)
+#define FONT_LAYOUT_GLYPH(glyph, pen_x, pen_y) \
+      do \
+      { \
+         (void)(pen_x); \
+         (void)(pen_y); \
+      } while (0)
+      const struct font_glyph *glyph_q = NULL;
+      void *font_data                  = NULL;
+      const struct font_glyph* (*get_glyph)(void*, uint32_t) = NULL;
+#include "../font_layout.h"
+      (void)glyph_q;
+      (void)font_data;
+      (void)get_glyph;
    }
 
    SelectObject(dst_dc, dst_old);
@@ -2315,14 +2352,13 @@ static void gdi_font_render_msg(
  */
 
 static void gfx_ctx_gdi_get_video_size(
-      unsigned *width, unsigned *height)
+      unsigned *dims)
 {
    HWND window                  = win32_get_window();
 
    if (window)
    {
-      *width                    = g_win32_resize_width;
-      *height                   = g_win32_resize_height;
+      *dims = VIDEO_SCALE_PACK(g_win32_resize_width, g_win32_resize_height);
    }
    else
    {
@@ -2333,8 +2369,8 @@ static void gfx_ctx_gdi_get_video_size(
 
       win32_monitor_info(&current_mon, &hm_to_use, &mon_id);
       mon_rect = current_mon.rcMonitor;
-      *width   = mon_rect.right - mon_rect.left;
-      *height  = mon_rect.bottom - mon_rect.top;
+      *dims    = VIDEO_SCALE_PACK(mon_rect.right - mon_rect.left,
+            mon_rect.bottom - mon_rect.top);
    }
 }
 
@@ -2350,15 +2386,10 @@ static bool gfx_ctx_gdi_init(void)
    win32_window_reset();
    win32_monitor_init();
 
-   wndclass.lpfnWndProc   = wnd_proc_gdi_common;
-#ifdef HAVE_DINPUT
-   if (string_is_equal(settings->arrays.input_driver, "dinput"))
-      wndclass.lpfnWndProc   = wnd_proc_gdi_dinput;
-#endif
-#ifdef HAVE_WINRAWINPUT
-   if (string_is_equal(settings->arrays.input_driver, "raw"))
-      wndclass.lpfnWndProc   = wnd_proc_gdi_winraw;
-#endif
+   /* one window procedure for every video and input driver; the
+    * family says what creating the window sets up */
+   wndclass.lpfnWndProc = win32_window_proc;
+   win32_window_proc_setup(WIN32_WINDOW_GDI);
    if (!win32_window_init(&wndclass, true, NULL))
       return false;
    return true;
@@ -2374,7 +2405,8 @@ static void gfx_ctx_gdi_destroy(void)
       win32_gdi_hdc = NULL;
    }
 
-   if (window)
+   /* left up for the driver that comes next, where it can be */
+   if (window && !win32_window_keep())
    {
       win32_monitor_from_window();
       win32_destroy_window();
@@ -2390,46 +2422,16 @@ static void gfx_ctx_gdi_destroy(void)
 }
 
 static bool gfx_ctx_gdi_set_video_mode(
-      unsigned width, unsigned height,
+      unsigned dims,
       bool fullscreen)
 {
-   if (!win32_set_video_mode(NULL, width, height, fullscreen))
+   if (!win32_set_video_mode(NULL, dims, fullscreen))
    {
       gfx_ctx_gdi_destroy();
       return false;
    }
 
    return true;
-}
-
-static void gfx_ctx_gdi_input_driver(
-      input_driver_t **input, void **input_data)
-{
-   settings_t *settings = config_get_ptr();
-#if _WIN32_WINNT >= 0x0501
-#ifdef HAVE_WINRAWINPUT
-   /* winraw only available since XP */
-   if (string_is_equal(settings->arrays.input_driver, "raw"))
-   {
-      *input_data = input_driver_init_wrap(&input_winraw, settings->arrays.input_driver);
-      if (*input_data)
-      {
-         *input     = &input_winraw;
-         dinput_gdi = NULL;
-         return;
-      }
-   }
-#endif
-#endif
-
-#ifdef HAVE_DINPUT
-   dinput_gdi  = input_driver_init_wrap(&input_dinput, settings->arrays.input_driver);
-   *input      = dinput_gdi ? &input_dinput : NULL;
-#else
-   dinput_gdi  = NULL;
-   *input      = NULL;
-#endif
-   *input_data = dinput_gdi;
 }
 
 static void gdi_create(gdi_t *gdi)
@@ -2454,32 +2456,28 @@ static void gdi_create(gdi_t *gdi)
    }
 }
 
-static void *gdi_init(const video_info_t *video,
-      input_driver_t **input, void **input_data)
+static void *gdi_init(const video_info_t *video)
 {
    unsigned full_x, full_y;
-   unsigned mode_width = 0, mode_height = 0;
-   unsigned win_width  = 0, win_height  = 0;
-   unsigned temp_width = 0, temp_height = 0;
+   unsigned mode_dims = 0;
+   unsigned win_dims   = 0;
+   unsigned temp_dims = 0;
    settings_t *settings                 = config_get_ptr();
    gdi_t *gdi                           = (gdi_t*)calloc(1, sizeof(*gdi));
 
    if (!gdi)
       return NULL;
 
-   *input                               = NULL;
-   *input_data                          = NULL;
 
-   gdi->frame_width                     = video->width;
-   gdi->frame_height                    = video->height;
+   gdi->frame_dims = video->dims;
    gdi->rgb32                           = video->rgb32;
 
    gdi->frame_bits                      = video->rgb32 ? 32 : 16;
 
    if (video->rgb32)
-      gdi->frame_pitch                  = video->width * 4;
+      gdi->frame_pitch                  = VIDEO_SCALE_W(video->dims) * 4;
    else
-      gdi->frame_pitch                  = video->width * 2;
+      gdi->frame_pitch                  = VIDEO_SCALE_W(video->dims) * 2;
 
    /* Aspect-ratio handling.  Pulled from video_info_t at init the
     * same way d3d8/d3d9 do it; the user can override via the
@@ -2493,56 +2491,51 @@ static void *gdi_init(const video_info_t *video,
    if (!gfx_ctx_gdi_init())
       goto error;
 
-   gfx_ctx_gdi_get_video_size(&mode_width, &mode_height);
+   gfx_ctx_gdi_get_video_size(&mode_dims);
 
-   full_x      = mode_width;
-   full_y      = mode_height;
-   mode_width  = 0;
-   mode_height = 0;
+   full_x      = VIDEO_SCALE_W(mode_dims);
+   full_y      = VIDEO_SCALE_H(mode_dims);
+   mode_dims  = 0;
 
    RARCH_LOG("[GDI] Detecting screen resolution: %ux%u.\n", full_x, full_y);
 
-   win_width   = video->width;
-   win_height  = video->height;
+   win_dims    = video->dims;
 
-   if (video->fullscreen && (win_width == 0) && (win_height == 0))
-   {
-      win_width  = full_x;
-      win_height = full_y;
-   }
+   /* Neither axis set is the whole word clear */
+   if (video->fullscreen && (win_dims == 0))
+      win_dims = VIDEO_SCALE_PACK(full_x, full_y);
 
-   mode_width      = win_width;
-   mode_height     = win_height;
+   mode_dims       = win_dims;
 
-   if (!gfx_ctx_gdi_set_video_mode(mode_width,
-            mode_height, video->fullscreen))
+   if (!gfx_ctx_gdi_set_video_mode(win_dims, video->fullscreen))
       goto error;
 
-   mode_width     = 0;
-   mode_height    = 0;
+   mode_dims     = 0;
 
-   gfx_ctx_gdi_get_video_size(&mode_width, &mode_height);
+   gfx_ctx_gdi_get_video_size(&mode_dims);
 
-   temp_width     = mode_width;
-   temp_height    = mode_height;
-   mode_width     = 0;
-   mode_height    = 0;
+   temp_dims     = mode_dims;
+   mode_dims     = 0;
 
    /* Get real known video size, which might have been altered by context. */
 
-   if (temp_width != 0 && temp_height != 0)
-      video_driver_set_output_size(temp_width, temp_height);
+   /* One axis alone is not a size, so both have to be set */
+   if (VIDEO_SCALE_W(temp_dims) != 0 && VIDEO_SCALE_H(temp_dims) != 0)
+      video_driver_set_output_dims(temp_dims);
    else
-      video_driver_get_output_size(&temp_width, &temp_height);
-   gdi->full_width  = temp_width;
-   gdi->full_height = temp_height;
+      temp_dims = video_driver_get_output_dims();
+   gdi->full_dims = temp_dims;
 
-   RARCH_LOG("[GDI] Using resolution %ux%u.\n", temp_width, temp_height);
+   RARCH_LOG("[GDI] Using resolution %ux%u.\n",
+         VIDEO_SCALE_W(temp_dims), VIDEO_SCALE_H(temp_dims));
 
-   gfx_ctx_gdi_input_driver(input, input_data);
+   /* no input driver of this driver's own: the frontend starts the
+    * one that goes with a Windows window */
+   input_driver_video_window(INPUT_WINDOW_WINDOWS, NULL);
 
 
    RARCH_LOG("[GDI] Init complete.\n");
+   retro_atomic_store_release_int(&gdi->views.allowed, 1);
 
    return gdi;
 
@@ -2553,13 +2546,341 @@ error:
    return NULL;
 }
 
-static bool gdi_frame(void *data, const void *frame,
-      unsigned frame_width, unsigned frame_height, uint64_t frame_count,
-      unsigned pitch, const char *msg, video_frame_info_t *video_info)
+/* What a frame's placement draws read: the frame, its rows' bytes and
+ * bits a pixel, and the DC drawn into */
+struct gdi_views_draw
+{
+   const video_views_map_t *map;
+   const void *frame;
+   unsigned pitch;
+   unsigned bits;
+   HDC dc;
+};
+
+static void gdi_views_draw_direct(gdi_t *gdi,
+      const struct gdi_views_draw *d, unsigned view,
+      const video_views_rect_t *dst, const video_views_rect_t *cut);
+static bool gdi_views_target_make(gdi_t *gdi, struct gdi_views_dib *t,
+      unsigned dims);
+static bool gdi_views_target_retire(gdi_t *gdi, struct gdi_views_dib *t);
+
+/* The views compositor, with these calls bound in. GDI takes no preset:
+ * every view is drawn straight from the frame, its chain the driver
+ * itself. */
+#define VV_FN(name)                     gdi_vv_##name
+#define VV_DRV                          gdi_t
+#define VV_CHAIN                        void
+#define VV_CREATE_STOCK(drv)            ((void*)(drv))
+#define VV_SYNC_PARAMS(drv, c)          ((void)0)
+#define VV_DRAW                         struct gdi_views_draw
+#define VV_DIRECT(p, d, v, r, c)        gdi_views_draw_direct(p, d, v, r, c)
+#define VV_PASS(p, d, f, r, c, a)       ((void)0)
+#define VV_TARGET                       struct gdi_views_dib
+#define VV_TARGET_MAKE(drv, t, dims)    gdi_views_target_make(drv, t, dims)
+#define VV_TARGET_RETIRE(drv, t)        gdi_views_target_retire(drv, t)
+#include "../video_views_draw.h"
+
+static bool gdi_views_target_retire(gdi_t *gdi, struct gdi_views_dib *t)
+{
+   if (t->bmp)
+      DeleteObject(t->bmp);
+   t->bmp    = NULL;
+   t->pixels = NULL;
+   return true;
+}
+
+/* A top-down 32-bit DIB section sized @dims */
+static bool gdi_views_target_make(gdi_t *gdi, struct gdi_views_dib *t,
+      unsigned dims)
+{
+   BITMAPINFO bmi;
+   void *pixels = NULL;
+   bmi.bmiHeader.biSize          = sizeof(BITMAPINFOHEADER);
+   bmi.bmiHeader.biWidth         = (LONG)VIDEO_SCALE_W(dims);
+   bmi.bmiHeader.biHeight        = -(LONG)VIDEO_SCALE_H(dims);
+   bmi.bmiHeader.biPlanes        = 1;
+   bmi.bmiHeader.biBitCount      = 32;
+   bmi.bmiHeader.biCompression   = BI_RGB;
+   bmi.bmiHeader.biSizeImage     = 0;
+   bmi.bmiHeader.biXPelsPerMeter = 0;
+   bmi.bmiHeader.biYPelsPerMeter = 0;
+   bmi.bmiHeader.biClrUsed       = 0;
+   bmi.bmiHeader.biClrImportant  = 0;
+   bmi.bmiColors[0].rgbBlue      = 0;
+   bmi.bmiColors[0].rgbGreen     = 0;
+   bmi.bmiColors[0].rgbRed       = 0;
+   bmi.bmiColors[0].rgbReserved  = 0;
+   if (     gdi->memDC
+         && (t->bmp = CreateDIBSection(gdi->memDC, &bmi, DIB_RGB_COLORS,
+               &pixels, NULL, 0))
+         && pixels)
+   {
+      t->pixels = (uint32_t*)pixels;
+      return true;
+   }
+   gdi_views_target_retire(gdi, t);
+   RARCH_WARN("[GDI] Views can't draw into a %ux%u image. "
+         "Drawing without it.\n", VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims));
+   return false;
+}
+
+static void gdi_views_release(gdi_t *gdi)
+{
+   gdi_vv_target_drop(gdi, &gdi->views.canvas_target, &gdi->views.canvas);
+   gdi_vv_target_drop(gdi, &gdi->views.ui_target, &gdi->views.ui);
+   if (gdi->views.dc)
+      DeleteDC(gdi->views.dc);
+   gdi->views.dc = NULL;
+}
+
+/* View @view over @dst, cut to @cut, straight from the frame: the
+ * view's first row is where the DIB starts, so a top-down DIB's source
+ * rectangle needs no row from its bottom */
+static void gdi_views_draw_direct(gdi_t *gdi,
+      const struct gdi_views_draw *d, unsigned view,
+      const video_views_rect_t *dst, const video_views_rect_t *cut)
 {
    struct bitmap_info info;
-   unsigned mode_width              = 0;
-   unsigned mode_height             = 0;
+   const struct retro_video_view *v = &d->map->views[view];
+   int saved                        = SaveDC(d->dc);
+
+   memset(&info, 0, sizeof(info));
+   info.header.biSize      = sizeof(BITMAPINFOHEADER);
+   info.header.biWidth     = (LONG)(d->pitch / (d->bits / 8));
+   info.header.biHeight    = -(LONG)v->height;
+   info.header.biPlanes    = 1;
+   info.header.biBitCount  = (WORD)d->bits;
+   if (d->bits == 16)
+   {
+      info.header.biCompression = BI_BITFIELDS;
+      info.u.masks[0]           = 0xF800;
+      info.u.masks[1]           = 0x07E0;
+      info.u.masks[2]           = 0x001F;
+   }
+   else
+      info.header.biCompression = BI_RGB;
+
+   IntersectClipRect(d->dc, VIDEO_POS_X(cut->pos), VIDEO_POS_Y(cut->pos),
+         VIDEO_POS_X(cut->pos) + (int)VIDEO_SCALE_W(cut->dims),
+         VIDEO_POS_Y(cut->pos) + (int)VIDEO_SCALE_H(cut->dims));
+   SetStretchBltMode(d->dc, COLORONCOLOR);
+   StretchDIBits(d->dc,
+         VIDEO_POS_X(dst->pos), VIDEO_POS_Y(dst->pos),
+         (int)VIDEO_SCALE_W(dst->dims), (int)VIDEO_SCALE_H(dst->dims),
+         (int)v->x, 0, (int)v->width, (int)v->height,
+         (const uint8_t*)d->frame + (size_t)v->y * d->pitch,
+         (BITMAPINFO*)&info, DIB_RGB_COLORS, SRCCOPY);
+   RestoreDC(d->dc, saved);
+}
+
+/* Whether the UI is drawn this frame once, into the layer placed in
+ * each eye */
+static bool gdi_views_ui_wanted(gdi_t *gdi, video_frame_info_t *video_info,
+      const char *msg)
+{
+   bool ui;
+   bool per_eye = video_views_ui_per_eye(&video_info->views,
+         &video_info->views_layout, true);
+   /* No directive inside the macro's arguments: MSVC's preprocessor
+    * takes it as tokens. */
+#ifdef HAVE_GFX_WIDGETS
+   ui = VIDEO_VIEWS_UI_WANTED(per_eye, gdi->menu_enable, msg,
+         video_info->statistics_show,
+         video_info->widgets_active && gfx_widgets_visible(video_info));
+#else
+   ui = VIDEO_VIEWS_UI_WANTED(per_eye, gdi->menu_enable, msg,
+         video_info->statistics_show, false);
+#endif
+#ifdef HAVE_MENU
+   ui = ui || (per_eye
+         && (video_info->menu_st_flags & MENU_ST_FLAG_ALIVE));
+#endif
+   return ui;
+}
+
+/* Whether this frame draws its views, with each drawn view's chain
+ * picked and the rectangle its first placement takes, and in *blend
+ * whether through the canvas. The UI layer takes AlphaBlend; without
+ * it a frame whose UI is drawn per eye is drawn whole. */
+static bool gdi_views_setup(gdi_t *gdi, video_frame_info_t *video_info,
+      const char *msg, bool *blend, void **chains, video_views_rect_t *rects)
+{
+   bool views;
+   const video_views_layout_t *layout = &video_info->views_layout;
+   bool offscreen = video_info->views.num_views && layout->offscreen;
+
+   *blend = offscreen
+      && gdi_vv_target_ensure(gdi, &gdi->views.canvas_target,
+            &gdi->views.canvas, layout->canvas_dims);
+   /* A frame without the blend modes frees the canvas. */
+   if (!offscreen)
+      gdi_vv_target_drop(gdi, &gdi->views.canvas_target,
+            &gdi->views.canvas);
+   views = video_info->views.num_views
+      && (!offscreen || *blend)
+#if !GDI_HAS_ALPHABLEND
+      && !gdi_views_ui_wanted(gdi, video_info, msg)
+#endif
+      && video_views_fit_frame(&video_info->views, gdi->views.frame_dims)
+      && gdi_vv_pick_chains(gdi, &gdi->views.chains, &video_info->views,
+            layout, true, *blend || !layout->offscreen,
+            *blend ? layout->canvas_dims : video_info->dims, chains, rects);
+   *blend = views && *blend;
+   if (views && !gdi->views.direct_seen)
+   {
+      gdi->views.direct_seen = true;
+      RARCH_LOG("[GDI] Views drawn straight from the frame.\n");
+   }
+   return views;
+}
+
+/* The canvas's halves into the window surface's @dims */
+static void gdi_views_blend(gdi_t *gdi, const video_views_layout_t *layout,
+      unsigned dims)
+{
+   unsigned w     = VIDEO_SCALE_W(dims);
+   unsigned h     = VIDEO_SCALE_H(dims);
+   unsigned cw    = VIDEO_SCALE_W(layout->canvas_dims);
+   unsigned ch    = VIDEO_SCALE_H(layout->canvas_dims);
+   unsigned sw    = VIDEO_SCALE_W(gdi->menu_surface_dims);
+   if (cw < 2 * w || ch < h || sw < w)
+      return;
+   video_views_blend_xrgb8888(gdi->views.canvas.pixels, cw,
+         gdi->menu_pixels, sw, dims, layout->stereo_mode);
+}
+
+/* Draws the frame's views into the window surface, selected in memDC,
+ * or through the canvas, whose halves the CPU then blends into it */
+static void gdi_views_render(gdi_t *gdi, video_frame_info_t *video_info,
+      void **chains, bool blend, const void *frame, unsigned pitch,
+      unsigned bits)
+{
+   struct gdi_views_draw d;
+   const video_views_layout_t *layout = &video_info->views_layout;
+   HBITMAP old                        = NULL;
+
+   d.map   = &video_info->views;
+   d.frame = frame;
+   d.pitch = pitch;
+   d.bits  = bits;
+   d.dc    = gdi->memDC;
+   if (blend)
+   {
+      if (!gdi->views.dc)
+         gdi->views.dc = CreateCompatibleDC(gdi->winDC);
+      if (!gdi->views.dc)
+         return;
+      old  = (HBITMAP)SelectObject(gdi->views.dc, gdi->views.canvas.bmp);
+      d.dc = gdi->views.dc;
+      GdiFlush();
+      memset(gdi->views.canvas.pixels, 0,
+            VIDEO_SCALE_AREA(layout->canvas_dims) * sizeof(uint32_t));
+   }
+   gdi_vv_draw_placements(gdi, &d, layout, chains,
+         blend || !layout->offscreen,
+         blend ? layout->canvas_dims : video_info->dims, true);
+   if (blend)
+   {
+      GdiFlush();
+      gdi_views_blend(gdi, layout, video_info->dims);
+      SelectObject(gdi->views.dc, old);
+   }
+}
+
+#if GDI_HAS_ALPHABLEND
+/* Moves UI drawing into the UI layer, laid out at one eye's size: the
+ * layer stands in for the window surface, cleared to transparent, and
+ * the opaque fills that would leave its alpha at zero are blended. */
+static void gdi_views_ui_begin(gdi_t *gdi, video_frame_info_t *video_info)
+{
+   unsigned ui_dims = video_info->views_layout.ui_dims;
+   struct video_viewport vp;
+
+   SelectObject(gdi->memDC, gdi->bmp_menu_old);
+   gdi->views.surface        = gdi->bmp_menu;
+   gdi->views.surface_pixels = gdi->menu_pixels;
+   gdi->views.surface_dims   = gdi->menu_surface_dims;
+   gdi->bmp_menu             = gdi->views.ui.bmp;
+   gdi->menu_pixels          = gdi->views.ui.pixels;
+   gdi->menu_surface_dims    = ui_dims;
+   gdi->bmp_menu_old         = (HBITMAP)SelectObject(gdi->memDC,
+         gdi->bmp_menu);
+   GdiFlush();
+   memset(gdi->menu_pixels, 0, VIDEO_SCALE_AREA(ui_dims) * sizeof(uint32_t));
+   /* Menus and widgets size from video_info->dims, a menu texture
+    * from the game viewport, fitted to the layer. */
+   video_views_ui_enter(&gdi->views.saved, &video_info->dims,
+         &gdi->vp.full_dims, ui_dims);
+   gdi->views.vp = gdi->vp;
+   memset(&vp, 0, sizeof(vp));
+   vp.full_dims  = ui_dims;
+   video_driver_update_viewport(&vp, false, gdi->keep_aspect, true);
+   gdi->vp       = vp;
+   gdi->views.ui_pass = true;
+}
+
+/* Back onto the window surface, and the UI layer into each eye's area,
+ * its colour premultiplied */
+static void gdi_views_ui_end(gdi_t *gdi, video_frame_info_t *video_info)
+{
+   unsigned a;
+   BLENDFUNCTION blend;
+   const video_views_layout_t *layout = &video_info->views_layout;
+   unsigned ui_dims                   = gdi->menu_surface_dims;
+
+   gdi->views.ui_pass     = false;
+   gdi->vp                = gdi->views.vp;
+   video_views_ui_leave(&gdi->views.saved, &video_info->dims,
+         &gdi->vp.full_dims);
+   SelectObject(gdi->memDC, gdi->bmp_menu_old);
+   gdi->bmp_menu          = gdi->views.surface;
+   gdi->menu_pixels       = gdi->views.surface_pixels;
+   gdi->menu_surface_dims = gdi->views.surface_dims;
+   gdi->bmp_menu_old      = (HBITMAP)SelectObject(gdi->memDC,
+         gdi->bmp_menu);
+
+   if (!gdi->views.dc)
+      gdi->views.dc = CreateCompatibleDC(gdi->winDC);
+   if (!gdi->views.dc)
+      return;
+   blend.BlendOp             = AC_SRC_OVER;
+   blend.BlendFlags          = 0;
+   blend.SourceConstantAlpha = 255;
+   blend.AlphaFormat         = AC_SRC_ALPHA;
+   {
+      HBITMAP old = (HBITMAP)SelectObject(gdi->views.dc, gdi->views.ui.bmp);
+      for (a = 0; a < layout->num_areas; a++)
+      {
+         const video_views_rect_t *r = &layout->areas[a];
+         AlphaBlend(gdi->memDC, VIDEO_POS_X(r->pos), VIDEO_POS_Y(r->pos),
+               (int)VIDEO_SCALE_W(r->dims), (int)VIDEO_SCALE_H(r->dims),
+               gdi->views.dc, 0, 0, (int)VIDEO_SCALE_W(ui_dims),
+               (int)VIDEO_SCALE_H(ui_dims), blend);
+      }
+      SelectObject(gdi->views.dc, old);
+   }
+}
+#endif
+
+static void gdi_set_view_count(void *data, unsigned count)
+{
+   unsigned i;
+   gdi_t *gdi = (gdi_t*)data;
+   if (!gdi)
+      return;
+   gdi->views.chains.count = MIN(count, RETRO_VIDEO_VIEWS_MAX);
+   for (i = gdi->views.chains.count; i < RETRO_VIDEO_VIEWS_MAX; i++)
+      gdi->views.chains.stock[i] = NULL;
+}
+
+static bool gdi_frame(void *data, const void *frame,
+      unsigned dims, uint64_t frame_count,
+      unsigned pitch, const char *msg, video_frame_info_t *video_info)
+{
+   unsigned frame_width = VIDEO_SCALE_W(dims);
+   unsigned frame_height = VIDEO_SCALE_H(dims);
+   struct bitmap_info info;
+   unsigned mode_dims              = 0;
    const void *frame_to_copy        = frame;
    unsigned width                   = 0;
    unsigned height                  = 0;
@@ -2601,6 +2922,12 @@ static bool gdi_frame(void *data, const void *frame,
                                       ;
    unsigned surface_width;
    unsigned surface_height;
+   void *view_chains[RETRO_VIDEO_VIEWS_MAX];
+   video_views_rect_t view_rects[RETRO_VIDEO_VIEWS_MAX];
+   bool views                       = false;
+   bool views_blend                 = false;
+   bool views_per_eye               = false;
+   bool views_ui                    = false;
 
    /* GDI has no programmable shader pipeline, so the animated XMB
     * backgrounds (Ribbon / Snow / Bokeh / etc.) can't run — force
@@ -2627,21 +2954,20 @@ static bool gdi_frame(void *data, const void *frame,
        * with whatever size the core has just announced. */
       gdi->bmp          = CreateCompatibleBitmap(
             gdi->winDC, frame_width, frame_height);
-      gdi->bmp_width    = frame_width;
-      gdi->bmp_height   = frame_height;
-      gdi->frame_width  = frame_width;
-      gdi->frame_height = frame_height;
+      gdi->bmp_dims     = dims;
+      gdi->frame_dims   = dims;
    }
 
    /* --- Step 2: figure out the on-screen surface size. */
-   gfx_ctx_gdi_get_video_size(&mode_width, &mode_height);
-   surface_width  = mode_width  ? mode_width  : gdi->full_width;
-   surface_height = mode_height ? mode_height : gdi->full_height;
+   gfx_ctx_gdi_get_video_size(&mode_dims);
+   surface_width  = VIDEO_SCALE_W(mode_dims)
+      ? VIDEO_SCALE_W(mode_dims)  : VIDEO_SCALE_W(gdi->full_dims);
+   surface_height = VIDEO_SCALE_H(mode_dims)
+      ? VIDEO_SCALE_H(mode_dims) : VIDEO_SCALE_H(gdi->full_dims);
    if (!surface_width)  surface_width  = frame_width;
    if (!surface_height) surface_height = frame_height;
 
-   gdi->screen_width  = surface_width;
-   gdi->screen_height = surface_height;
+   gdi->screen_dims = VIDEO_SCALE_PACK(surface_width, surface_height);
 
    /* --- Step 2b: recompute the aspect-ratio-aware viewport when
     * something has dirtied it.  Triggers: window resize (caught in
@@ -2651,22 +2977,34 @@ static bool gdi_frame(void *data, const void *frame,
     * for the core frame inside the window; everything outside it
     * is filled black at present time to produce letterbox /
     * pillarbox bars.  Mirrors d3d8's should_resize pattern. */
+   /* The viewport is the whole window while views draw. */
+   gdi->views.frame_dims = dims;
+   views = gdi_views_setup(gdi, video_info, msg, &views_blend,
+         view_chains, view_rects);
+   if (views != gdi->views.active)
+   {
+      gdi->views.active  = views;
+      gdi->should_resize = true;
+   }
+   retro_atomic_store_release_int(&gdi->views.fallback,
+         (video_info->views.num_views && !views) ? 1 : 0);
+   views_per_eye = video_views_ui_per_eye(&video_info->views,
+         &video_info->views_layout, true);
+
    if (gdi->should_resize)
    {
-      gdi_set_viewport(gdi, surface_width, surface_height, false, true);
+      gdi_set_viewport(gdi, VIDEO_SCALE_PACK(surface_width, surface_height),
+            gdi->views.active, true);
       gdi->should_resize = false;
    }
    /* Defensive: if vp was never populated (e.g. should_resize
     * cleared without us recomputing), fall back to full-window
     * destination so we still draw something. */
-   if (gdi->vp.width == 0 || gdi->vp.height == 0)
+   if (VIDEO_SCALE_W(gdi->vp.dims) == 0 || VIDEO_SCALE_H(gdi->vp.dims) == 0)
    {
-      gdi->vp.x           = 0;
-      gdi->vp.y           = 0;
-      gdi->vp.width       = surface_width;
-      gdi->vp.height      = surface_height;
-      gdi->vp.full_width  = surface_width;
-      gdi->vp.full_height = surface_height;
+      gdi->vp.pos         = VIDEO_POS_PACK(0, 0);
+      gdi->vp.dims        = VIDEO_SCALE_PACK(surface_width, surface_height);
+      gdi->vp.full_dims   = VIDEO_SCALE_PACK(surface_width, surface_height);
    }
 
    /* --- Step 3: detect whether any window-resolution content needs
@@ -2720,6 +3058,9 @@ static bool gdi_frame(void *data, const void *frame,
          need_bmp_menu = true;
       if (show_stats)
          need_bmp_menu = true;
+      /* Views draw into the window surface. */
+      if (views)
+         need_bmp_menu = true;
 
       if (need_bmp_menu)
          gdi_ensure_menu_surface(gdi, surface_width, surface_height);
@@ -2741,7 +3082,12 @@ static bool gdi_frame(void *data, const void *frame,
        * here because the clear is a fully-opaque FillRect, not an
        * AlphaBlend source. */
       gdi_menu_surface_clear(gdi, 0, 0, 0);
+      if (views)
+         gdi_views_render(gdi, video_info, view_chains, views_blend,
+               frame, pitch, gdi->frame_bits);
    }
+   else if (views)
+      views = false;
 
    /* --- Step 4b: menu-over-running-game underlay.
     *
@@ -2773,6 +3119,7 @@ static bool gdi_frame(void *data, const void *frame,
    if (     gdi->menu_textured_active
          && gdi->bmp_menu
          && menu_is_alive
+         && !views
          && frame
          && frame_width  > 4
          && frame_height > 4)
@@ -2780,6 +3127,20 @@ static bool gdi_frame(void *data, const void *frame,
       gdi_upload_core_frame_to_menu(gdi, frame,
             frame_width, frame_height, pitch, gdi->frame_bits);
    }
+#endif
+
+   /* The UI drawn once, into the layer placed in each eye; touch
+    * overlays, which would straddle both eyes, hidden. A frame drawn
+    * whole lays its UI out per eye as the main thread did. */
+   if (!views_per_eye)
+      gdi_vv_target_drop(gdi, &gdi->views.ui_target, &gdi->views.ui);
+#if GDI_HAS_ALPHABLEND
+   views_ui = gdi->menu_textured_active && gdi->bmp_menu
+      && gdi_views_ui_wanted(gdi, video_info, msg)
+      && gdi_vv_target_ensure(gdi, &gdi->views.ui_target, &gdi->views.ui,
+            video_info->views_layout.ui_dims);
+   if (views_ui)
+      gdi_views_ui_begin(gdi, video_info);
 #endif
 
    /* --- Step 5: invoke the menu driver.  This is what actually
@@ -2793,14 +3154,12 @@ static bool gdi_frame(void *data, const void *frame,
    /* --- Step 6: track core-frame size changes (needed for both the
     * RGUI-overlay path and the no-menu path).  We resize bmp here
     * if the core's announced dimensions changed. */
-   if (     (gdi->frame_width  != frame_width)
-         || (gdi->frame_height != frame_height)
-         || (gdi->frame_pitch  != pitch))
+   if (     (gdi->frame_dims  != dims)
+         || (gdi->frame_pitch != pitch))
    {
       if (frame_width > 4 && frame_height > 4)
       {
-         gdi->frame_width  = frame_width;
-         gdi->frame_height = frame_height;
+         gdi->frame_dims   = dims;
          gdi->frame_pitch  = pitch;
       }
    }
@@ -2814,16 +3173,16 @@ static bool gdi_frame(void *data, const void *frame,
    if (gdi->menu_frame && menu_is_alive)
    {
       frame_to_copy = gdi->menu_frame;
-      width         = gdi->menu_width;
-      height        = gdi->menu_height;
+      width         = VIDEO_SCALE_W(gdi->menu_dims);
+      height        = VIDEO_SCALE_H(gdi->menu_dims);
       pitch         = gdi->menu_pitch;
       bits          = gdi->menu_bits;
    }
    else
 #endif
    {
-      width         = gdi->frame_width;
-      height        = gdi->frame_height;
+      width         = VIDEO_SCALE_W(gdi->frame_dims);
+      height        = VIDEO_SCALE_H(gdi->frame_dims);
       pitch         = gdi->frame_pitch;
 
       if (  frame_width  == 4
@@ -2835,16 +3194,19 @@ static bool gdi_frame(void *data, const void *frame,
       if (menu_is_alive)
          draw = false;
 #endif
+      /* The views were drawn already. */
+      if (views)
+         draw = false;
    }
 
    /* --- Step 8: resize bmp if its current size doesn't match the
     * effective draw target size (width/height computed in Step 7).
-    * We compare against bmp_width/bmp_height (the DDB's own size),
-    * NOT frame_width — the latter holds the core's announced frame
+    * We compare against bmp_dims (the DDB's own size), NOT
+    * frame_dims — the latter holds the core's announced frame
     * size, which can legitimately differ from the menu's frame size
     * when RGUI is alive.  Conflating the two causes a destructive
     * recreate every frame as Steps 6 and 8 fight over the field. */
-   if (gdi->bmp_width != width || gdi->bmp_height != height)
+   if (gdi->bmp_dims != VIDEO_SCALE_PACK(width, height))
    {
       /* Deselect bmp_menu temporarily so we can reselect bmp for
        * the resize; restore bmp_menu afterwards if it was selected. */
@@ -2857,10 +3219,10 @@ static bool gdi_frame(void *data, const void *frame,
       if (gdi->bmp)
          DeleteObject(gdi->bmp);
 
-      gdi->bmp_width    = width;
-      gdi->bmp_height   = height;
+      gdi->bmp_dims = VIDEO_SCALE_PACK(width, height);
       gdi->bmp          = CreateCompatibleBitmap(
-            gdi->winDC, gdi->bmp_width, gdi->bmp_height);
+            gdi->winDC,
+            VIDEO_SCALE_W(gdi->bmp_dims), VIDEO_SCALE_H(gdi->bmp_dims));
 
       if (reselect_menu && gdi->bmp_menu)
          gdi->bmp_menu_old = (HBITMAP)SelectObject(gdi->memDC, gdi->bmp_menu);
@@ -2893,6 +3255,15 @@ static bool gdi_frame(void *data, const void *frame,
     * was already set in Step 7 because menu_is_alive is true and
     * menu_frame is NULL — the menu itself owns the bmp_menu image
     * and we have no underlying core frame to upload. */
+   /* The viewport is the whole window while views draw: a menu frame
+    * is fitted to it here. The UI layer fitted its own. */
+   if (draw && views && !views_ui)
+   {
+      gdi->views.vp = gdi->vp;
+      memset(&gdi->vp, 0, sizeof(gdi->vp));
+      gdi->vp.full_dims = gdi->views.vp.full_dims;
+      video_driver_update_viewport(&gdi->vp, false, gdi->keep_aspect, true);
+   }
    if (draw)
    {
       memset(&info, 0, sizeof(info));
@@ -2980,17 +3351,17 @@ static bool gdi_frame(void *data, const void *frame,
           *     transparency degrades to opaque, RGUI's chequer
           *     becomes solid, which is the same behaviour
           *     non-transparency-capable backends give. */
-#ifdef GDI_HAS_ALPHABLEND
+#if GDI_HAS_ALPHABLEND
          if (frame_to_copy == gdi->menu_frame && bits == 16)
          {
             gdi_blit_rgui_alpha(gdi, frame_to_copy, width, height,
-                  gdi->vp.x, gdi->vp.y, gdi->vp.width, gdi->vp.height);
+                  VIDEO_POS_X(gdi->vp.pos), VIDEO_POS_Y(gdi->vp.pos), VIDEO_SCALE_W(gdi->vp.dims), VIDEO_SCALE_H(gdi->vp.dims));
          }
          else
 #endif
          {
             StretchDIBits(gdi->memDC,
-                  gdi->vp.x, gdi->vp.y, gdi->vp.width, gdi->vp.height,
+                  VIDEO_POS_X(gdi->vp.pos), VIDEO_POS_Y(gdi->vp.pos), VIDEO_SCALE_W(gdi->vp.dims), VIDEO_SCALE_H(gdi->vp.dims),
                   0, 0, width, height,
                   frame_to_copy, (BITMAPINFO*)&info, DIB_RGB_COLORS, SRCCOPY);
          }
@@ -3007,6 +3378,9 @@ static bool gdi_frame(void *data, const void *frame,
          gdi->bmp_old = NULL;
       }
    }
+
+   if (draw && views && !views_ui)
+      gdi->vp = gdi->views.vp;
 
    /* --- Step 10: Display Statistics overlay (statistics_show +
     * stat_text).  Gated by Settings → User Interface → Onscreen
@@ -3030,7 +3404,7 @@ static bool gdi_frame(void *data, const void *frame,
     * backends means an overlay-on-d3d9 config carries over here
     * unchanged). */
 #ifdef HAVE_OVERLAY
-   if (gdi->overlays_enabled)
+   if (gdi->overlays_enabled && !views_per_eye)
       gdi_overlays_render(gdi, surface_width, surface_height);
 #endif
 
@@ -3078,6 +3452,11 @@ static bool gdi_frame(void *data, const void *frame,
     * needs to be visible. */
    if (msg)
       font_driver_render_msg(gdi, msg, strlen(msg), NULL, NULL);
+
+#if GDI_HAS_ALPHABLEND
+   if (views_ui)
+      gdi_views_ui_end(gdi, video_info);
+#endif
 
    /* --- Step 13: final deselection.  If bmp_menu is still selected,
     * pop it now so memDC is back to its baseline (no bitmap selected,
@@ -3128,13 +3507,21 @@ static bool gdi_frame(void *data, const void *frame,
           * actually committed to the underlying pixel buffer.
           * Without this, sporadic missing-draw artifacts. */
          BITMAPINFO bmi;
-         memset(&bmi, 0, sizeof(bmi));
-         bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-         bmi.bmiHeader.biWidth       = (LONG)surface_width;
-         bmi.bmiHeader.biHeight      = -(LONG)surface_height;
-         bmi.bmiHeader.biPlanes      = 1;
-         bmi.bmiHeader.biBitCount    = 32;
-         bmi.bmiHeader.biCompression = BI_RGB;
+         bmi.bmiHeader.biSize          = sizeof(BITMAPINFOHEADER);
+         bmi.bmiHeader.biWidth         = (LONG)surface_width;
+         bmi.bmiHeader.biHeight        = -(LONG)surface_height;
+         bmi.bmiHeader.biPlanes        = 1;
+         bmi.bmiHeader.biBitCount      = 32;
+         bmi.bmiHeader.biCompression   = BI_RGB;
+         bmi.bmiHeader.biSizeImage     = 0;
+         bmi.bmiHeader.biXPelsPerMeter = 0;
+         bmi.bmiHeader.biYPelsPerMeter = 0;
+         bmi.bmiHeader.biClrUsed       = 0;
+         bmi.bmiHeader.biClrImportant  = 0;
+         bmi.bmiColors[0].rgbBlue      = 0;
+         bmi.bmiColors[0].rgbGreen     = 0;
+         bmi.bmiColors[0].rgbRed       = 0;
+         bmi.bmiColors[0].rgbReserved  = 0;
 
          GdiFlush();
          SetDIBitsToDevice(gdi->winDC,
@@ -3159,32 +3546,30 @@ static bool gdi_frame(void *data, const void *frame,
 
 static bool gdi_alive(void *data)
 {
-   unsigned temp_width  = 0;
-   unsigned temp_height = 0;
+   unsigned temp_dims  = VIDEO_SCALE_PACK(0,
+         0);
    bool quit            = false;
    bool resize          = false;
    bool ret             = false;
    gdi_t *gdi           = (gdi_t*)data;
 
    /* Read from local bookkeeping rather than video_st (which would
-    * acquire context_lock + display_lock).  gdi->full_{width,height}
+    * cross threads needlessly).  gdi->full_{width,height}
     * is written at every set_size call site in this driver. */
-   temp_width  = gdi->full_width;
-   temp_height = gdi->full_height;
+   temp_dims  = gdi->full_dims;
 
    win32_check_window(NULL,
-            &quit, &resize, &temp_width, &temp_height);
+            &quit, &resize, &temp_dims);
 
    ret = !quit;
 
    if (resize)
       gdi->should_resize = true;
 
-   if (temp_width != 0 && temp_height != 0)
+   if (VIDEO_SCALE_W(temp_dims) != 0 && VIDEO_SCALE_H(temp_dims) != 0)
    {
-      video_driver_set_output_size(temp_width, temp_height);
-      gdi->full_width  = temp_width;
-      gdi->full_height = temp_height;
+      video_driver_set_output_dims(temp_dims);
+      gdi->full_dims = temp_dims;
    }
 
    return ret;
@@ -3213,6 +3598,7 @@ static void gdi_free(void *data)
 
    /* Tear down menu surface (DIB section + selection state) before
     * the DC it's selected into goes away. */
+   gdi_views_release(gdi);
    gdi_release_menu_surface(gdi);
    gdi_release_brush(gdi);
 
@@ -3268,17 +3654,17 @@ static void gdi_set_texture_enable(
 }
 
 static void gdi_set_texture_frame(void *data,
-      const void *frame, bool rgb32, unsigned width, unsigned height,
+      const void *frame, bool rgb32, unsigned dims,
       float alpha)
 {
    gdi_t   *gdi     = (gdi_t*)data;
-   unsigned pitch   = width * (rgb32 ? 4 : 2);
+   unsigned pitch   = VIDEO_SCALE_W(dims) * (rgb32 ? 4 : 2);
    size_t   required;
 
-   if (!frame || !width || !height || !pitch)
+   if (!frame || !VIDEO_SCALE_W(dims) || !VIDEO_SCALE_H(dims) || !pitch)
       return;
 
-   required = (size_t)pitch * (size_t)height;
+   required = (size_t)pitch * (size_t)VIDEO_SCALE_H(dims);
 
    if (required > gdi->menu_frame_cap)
    {
@@ -3290,58 +3676,28 @@ static void gdi_set_texture_frame(void *data,
    }
 
    memcpy(gdi->menu_frame, frame, required);
-   gdi->menu_width  = width;
-   gdi->menu_height = height;
+   gdi->menu_dims = dims;
    gdi->menu_pitch  = pitch;
    gdi->menu_bits   = rgb32 ? 32 : 16;
 }
 
-static void gdi_set_video_mode(void *data, unsigned width, unsigned height,
+static void gdi_set_video_mode(void *data, unsigned dims,
       bool fullscreen)
 {
-   gfx_ctx_gdi_set_video_mode(width, height, fullscreen);
+   gfx_ctx_gdi_set_video_mode(dims, fullscreen);
 }
 
-static uintptr_t gdi_load_texture(void *video_data, void *data,
-      bool threaded, enum texture_filter_type filter_type)
+/* Source pixels arrive in BGRA byte order (PNG -> ARGB32 little-
+ * endian when supports_rgba is false, which is the GDI default).
+ * AlphaBlend with AC_SRC_ALPHA needs *premultiplied* alpha source
+ * pixels: do that conversion once here so the per-frame draw path
+ * is a straight blit.  Also detect "no transparency anywhere" so
+ * the draw path can use a faster opaque blit when appropriate. */
+static bool gdi_texture_premultiply(uint32_t *dst, const uint32_t *src,
+      size_t total)
 {
-   gdi_texture_t *texture      = NULL;
-   struct texture_image *image = (struct texture_image*)data;
-   const uint32_t *src;
-   uint32_t       *dst;
-   size_t          i, total;
-   bool            has_alpha   = false;
-
-   if (!image || image->width > 2048 || image->height > 2048)
-      return 0;
-
-   texture                     = (gdi_texture_t*)calloc(1, sizeof(*texture));
-
-   if (!texture)
-      return 0;
-
-   texture->width              = image->width;
-   texture->height             = image->height;
-   texture->active_width       = image->width;
-   texture->active_height      = image->height;
-   texture->type               = filter_type;
-   total                       = (size_t)texture->width * (size_t)texture->height;
-   texture->data               = calloc(1, total * sizeof(uint32_t));
-
-   if (!texture->data)
-   {
-      free(texture);
-      return 0;
-   }
-
-   /* Source pixels arrive in BGRA byte order (PNG -> ARGB32 little-
-    * endian when supports_rgba is false, which is the GDI default).
-    * AlphaBlend with AC_SRC_ALPHA needs *premultiplied* alpha source
-    * pixels: do that conversion once here so the per-frame draw path
-    * is a straight blit.  Also detect "no transparency anywhere" so
-    * the draw path can use a faster opaque blit when appropriate. */
-   src   = (const uint32_t*)image->pixels;
-   dst   = (uint32_t*)texture->data;
+   size_t i;
+   bool has_alpha = false;
 
    for (i = 0; i < total; i++)
    {
@@ -3375,10 +3731,94 @@ static uintptr_t gdi_load_texture(void *video_data, void *data,
              |  (uint32_t)pb;
    }
 
-   texture->has_alpha     = has_alpha;
+   return has_alpha;
+}
+
+static uintptr_t gdi_load_texture(void *video_data, void *data,
+      bool threaded, enum texture_filter_type filter_type)
+{
+   gdi_texture_t *texture      = NULL;
+   struct texture_image *image = (struct texture_image*)data;
+   size_t          total;
+
+   if (!image || image->width > 2048 || image->height > 2048)
+      return 0;
+
+   texture                     = (gdi_texture_t*)calloc(1, sizeof(*texture));
+
+   if (!texture)
+      return 0;
+
+   texture->dims               = VIDEO_SCALE_PACK(image->width, image->height);
+   texture->type               = filter_type;
+   total                       = VIDEO_SCALE_AREA(texture->dims);
+   texture->data               = calloc(1, total * sizeof(uint32_t));
+
+   if (!texture->data)
+   {
+      free(texture);
+      return 0;
+   }
+
+   texture->has_alpha     = gdi_texture_premultiply(
+         (uint32_t*)texture->data, (const uint32_t*)image->pixels, total);
    texture->premultiplied = true;
 
    return (uintptr_t)texture;
+}
+
+/* Runs where the draws run, so the DIB is never read while written;
+ * GdiFlush retires any batched blit still sourcing it. */
+static void gdi_update_texture_internal(gdi_texture_t *texture,
+      const struct texture_image *ti)
+{
+   size_t total       = VIDEO_SCALE_AREA(texture->dims);
+   texture->has_alpha = gdi_texture_premultiply(
+         (uint32_t*)texture->data, (const uint32_t*)ti->pixels, total);
+   if (texture->bits)
+   {
+      GdiFlush();
+      memcpy(texture->bits, texture->data, total * sizeof(uint32_t));
+   }
+}
+
+#ifdef HAVE_THREADS
+typedef struct
+{
+   gdi_texture_t *texture;
+   const struct texture_image *ti;
+} gdi_update_cmd_t;
+
+static uintptr_t gdi_update_texture_wrap(void *data)
+{
+   gdi_update_cmd_t *cmd = (gdi_update_cmd_t*)data;
+   gdi_update_texture_internal(cmd->texture, cmd->ti);
+   return 1;
+}
+#endif
+
+static enum video_texture_update gdi_update_texture(void *video_data,
+      uintptr_t id, const struct texture_image *ti, bool threaded)
+{
+   gdi_texture_t *texture = (gdi_texture_t*)id;
+
+   if (     !texture || !ti || !ti->pixels || ti->pix10 || ti->fp16
+         || texture->dims != VIDEO_SCALE_PACK(ti->width, ti->height))
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
+
+#ifdef HAVE_THREADS
+   if (threaded)
+   {
+      gdi_update_cmd_t cmd;
+      cmd.texture = texture;
+      cmd.ti      = ti;
+      video_thread_texture_handle(&cmd, gdi_update_texture_wrap);
+      return VIDEO_TEXTURE_UPDATE_DONE;
+   }
+#endif
+
+   gdi_update_texture_internal(texture, ti);
+   return VIDEO_TEXTURE_UPDATE_DONE;
 }
 
 static void gdi_unload_texture(void *data,
@@ -3401,7 +3841,91 @@ static void gdi_unload_texture(void *data,
    free(texture);
 }
 
-static uint32_t gdi_get_flags(void *data) { return 0; }
+static uint32_t gdi_get_flags(void *data)
+{
+   uint32_t flags = 0;
+   gdi_t *gdi     = (gdi_t*)data;
+   if (gdi && retro_atomic_load_acquire_int(&gdi->views.allowed))
+      BIT32_SET(flags, GFX_CTX_FLAGS_VIDEO_VIEWS);
+   if (gdi && retro_atomic_load_acquire_int(&gdi->views.fallback))
+      BIT32_SET(flags, GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK);
+   return flags;
+}
+
+/* The viewport's pixels, bottom row first as BGR24: from the window
+ * surface the last frame was composed in, or from the frame's bitmap
+ * scaled into the viewport as WM_PAINT draws it */
+static bool gdi_read_viewport(void *data, uint8_t *buffer, bool is_idle)
+{
+   unsigned x, y;
+   gdi_t *gdi = (gdi_t*)data;
+   unsigned vx, vy, vw, vh;
+   if (!gdi)
+      return false;
+   vx = (VIDEO_POS_X(gdi->vp.pos) > 0) ? (unsigned)VIDEO_POS_X(gdi->vp.pos) : 0;
+   vy = (VIDEO_POS_Y(gdi->vp.pos) > 0) ? (unsigned)VIDEO_POS_Y(gdi->vp.pos) : 0;
+   vw = VIDEO_SCALE_W(gdi->vp.dims);
+   vh = VIDEO_SCALE_H(gdi->vp.dims);
+   if (gdi->menu_textured_active && gdi->menu_pixels)
+   {
+      unsigned sw = VIDEO_SCALE_W(gdi->menu_surface_dims);
+      unsigned sh = VIDEO_SCALE_H(gdi->menu_surface_dims);
+      GdiFlush();
+      for (y = 0; y < vh; y++)
+      {
+         unsigned sy = vy + vh - 1 - y;
+         for (x = 0; x < vw; x++)
+         {
+            unsigned sx = vx + x;
+            uint32_t px = (sy < sh && sx < sw)
+               ? gdi->menu_pixels[(size_t)sy * sw + sx] : 0;
+            *buffer++   = (uint8_t)(px);
+            *buffer++   = (uint8_t)(px >> 8);
+            *buffer++   = (uint8_t)(px >> 16);
+         }
+      }
+      return true;
+   }
+   if (gdi->bmp && gdi->memDC && vw && vh)
+   {
+      struct gdi_views_dib dib;
+      HDC dc;
+      HBITMAP old_dst, old_src;
+      unsigned src_dims = gdi->bmp_dims ? gdi->bmp_dims : gdi->frame_dims;
+      dib.bmp    = NULL;
+      dib.pixels = NULL;
+      if (     !(dc = CreateCompatibleDC(gdi->winDC))
+            || !gdi_views_target_make(gdi, &dib, VIDEO_SCALE_PACK(vw, vh)))
+      {
+         if (dc)
+            DeleteDC(dc);
+         return false;
+      }
+      old_dst = (HBITMAP)SelectObject(dc, dib.bmp);
+      old_src = (HBITMAP)SelectObject(gdi->memDC, gdi->bmp);
+      SetStretchBltMode(dc, COLORONCOLOR);
+      StretchBlt(dc, 0, 0, (int)vw, (int)vh, gdi->memDC, 0, 0,
+            (int)VIDEO_SCALE_W(src_dims), (int)VIDEO_SCALE_H(src_dims),
+            SRCCOPY);
+      GdiFlush();
+      SelectObject(gdi->memDC, old_src);
+      SelectObject(dc, old_dst);
+      for (y = 0; y < vh; y++)
+      {
+         const uint32_t *row = dib.pixels + (size_t)(vh - 1 - y) * vw;
+         for (x = 0; x < vw; x++)
+         {
+            *buffer++ = (uint8_t)(row[x]);
+            *buffer++ = (uint8_t)(row[x] >> 8);
+            *buffer++ = (uint8_t)(row[x] >> 16);
+         }
+      }
+      gdi_views_target_retire(gdi, &dib);
+      DeleteDC(dc);
+      return true;
+   }
+   return false;
+}
 
 #ifdef HAVE_GFX_WIDGETS
 /* gfx_widgets is enabled whenever the driver can route the widget
@@ -3456,7 +3980,27 @@ static const video_poke_interface_t gdi_poke_interface = {
    NULL, /* set_hdr_paper_white_nits */
    NULL, /* set_hdr_expand_gamut */
    NULL, /* set_hdr_scanlines */
-   NULL  /* set_hdr_subpixel_layout */
+   NULL, /* set_hdr_subpixel_layout */
+   NULL, /* supports_texture_format */
+   NULL, /* load_texture_compressed */
+   NULL, /* present_last */
+   NULL, /* get_last_present_time */
+   NULL, /* hw_ring_install */
+   NULL, /* hw_ring_fence_new */
+   NULL, /* hw_ring_fence_free */
+   NULL, /* hw_ring_fence_signal */
+   NULL, /* hw_ring_fence_wait */
+   NULL, /* hw_ring_capture */
+   NULL, /* hw_ring_present_slot */
+   NULL, /* hw_ring_context_new */
+   NULL, /* hw_ring_context_free */
+   NULL, /* hw_ring_framebuffer */
+   gdi_update_texture,
+   NULL, /* get_swap_interval_cap */
+   NULL, /* texture_lend */
+   NULL, /* texture_lend_ready */
+   NULL, /* get_last_present_wait */
+   gdi_set_view_count
 };
 
 static void gdi_get_poke_interface(void *data,
@@ -3464,18 +4008,17 @@ static void gdi_get_poke_interface(void *data,
 /* Recompute the destination rect (gdi->vp.x/y/width/height) for
  * the core frame inside the window based on the current aspect
  * ratio settings.  Called from gdi_frame when should_resize is
- * set, mirroring d3d8 / d3d9 timing.  vp.full_width/full_height
- * must already hold the current window size (the caller refreshes
+ * set, mirroring d3d8 / d3d9 timing.  vp.full_dims must already
+ * hold the current window size (the caller refreshes
  * those via gfx_ctx_gdi_get_video_size first). */
-static void gdi_set_viewport(void *data, unsigned vp_width, unsigned vp_height,
+static void gdi_set_viewport(void *data, unsigned dims,
       bool force_full, bool allow_rotate)
 {
    gdi_t *gdi = (gdi_t*)data;
    if (!gdi)
       return;
 
-   gdi->vp.full_width  = vp_width;
-   gdi->vp.full_height = vp_height;
+   gdi->vp.full_dims   = dims;
 
    video_driver_update_viewport(&gdi->vp, force_full, gdi->keep_aspect, true);
 }
@@ -3484,9 +4027,8 @@ static void gdi_set_viewport(void *data, unsigned vp_width, unsigned vp_height,
  *
  * Many subsystems call into video_driver_get_viewport_info() to
  * read viewport / window dimensions — most importantly the menu's
- * "Custom Aspect Ratio" handlers, which read vp.full_width /
- * vp.full_height to compute width-from-x / height-from-y for the
- * custom viewport.
+ * "Custom Aspect Ratio" handlers, which read vp.full_dims to
+ * compute width-from-x / height-from-y for the custom viewport.
  *
  * Without this hookup video_driver_get_viewport_info silently
  * returns false; that contract is now also strengthened on the
@@ -3502,12 +4044,9 @@ static void gdi_viewport_info(void *data, struct video_viewport *vp)
    if (!gdi || !vp)
       return;
 
-   vp->x           = gdi->vp.x;
-   vp->y           = gdi->vp.y;
-   vp->width       = gdi->vp.width;
-   vp->height      = gdi->vp.height;
-   vp->full_width  = gdi->vp.full_width;
-   vp->full_height = gdi->vp.full_height;
+   vp->pos         = gdi->vp.pos;
+   vp->dims        = gdi->vp.dims;
+   vp->full_dims   = gdi->vp.full_dims;
 }
 
 #ifdef HAVE_OVERLAY
@@ -3547,14 +4086,36 @@ static void gdi_overlay_free(gdi_t *gdi)
    unsigned i;
    if (!gdi || !gdi->overlays)
       return;
-   for (i = 0; i < gdi->overlays_size; i++)
-   {
-      if (gdi->overlays[i].bmp)
-         DeleteObject(gdi->overlays[i].bmp);
-   }
+   if (!gdi->overlays_borrowed)
+      for (i = 0; i < gdi->overlays_size; i++)
+      {
+         if (gdi->overlays[i].bmp)
+            DeleteObject(gdi->overlays[i].bmp);
+      }
    free(gdi->overlays);
-   gdi->overlays      = NULL;
-   gdi->overlays_size = 0;
+   gdi->overlays          = NULL;
+   gdi->overlays_size     = 0;
+   gdi->overlays_borrowed = false;
+}
+
+static void gdi_overlay_defaults(struct gdi_overlay *o, HBITMAP bmp,
+      unsigned dims)
+{
+   o->bmp            = bmp;
+   o->tex_dims       = dims;
+   o->alpha_mod      = 1.0f;
+   o->fullscreen     = false;
+   /* Stretch to the full target rect by default.  The overlay
+    * descriptor drives subsequent vertex_geom calls before
+    * anything is actually drawn. */
+   o->tex_coords[0]  = 0.0f;
+   o->tex_coords[1]  = 0.0f;
+   o->tex_coords[2]  = 1.0f;
+   o->tex_coords[3]  = 1.0f;
+   o->vert_coords[0] = 0.0f;
+   o->vert_coords[1] = 0.0f;
+   o->vert_coords[2] = 1.0f;
+   o->vert_coords[3] = 1.0f;
 }
 
 static bool gdi_overlay_load(void *data,
@@ -3586,9 +4147,6 @@ static bool gdi_overlay_load(void *data,
       BITMAPINFO bmi;
       void              *bits = NULL;
       HBITMAP            bmp;
-      const uint32_t    *src;
-      uint32_t          *dst;
-      size_t             j, total;
       struct gdi_overlay *o = &gdi->overlays[i];
       unsigned           w  = imgs[i].width;
       unsigned           h  = imgs[i].height;
@@ -3596,13 +4154,21 @@ static bool gdi_overlay_load(void *data,
       if (w == 0 || h == 0 || !imgs[i].pixels)
          continue;
 
-      memset(&bmi, 0, sizeof(bmi));
-      bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-      bmi.bmiHeader.biWidth       = (LONG)w;
-      bmi.bmiHeader.biHeight      = -(LONG)h; /* top-down */
-      bmi.bmiHeader.biPlanes      = 1;
-      bmi.bmiHeader.biBitCount    = 32;
-      bmi.bmiHeader.biCompression = BI_RGB;
+      bmi.bmiHeader.biSize          = sizeof(BITMAPINFOHEADER);
+      bmi.bmiHeader.biWidth         = (LONG)w;
+      bmi.bmiHeader.biHeight        = -(LONG)h; /* top-down */
+      bmi.bmiHeader.biPlanes        = 1;
+      bmi.bmiHeader.biBitCount      = 32;
+      bmi.bmiHeader.biCompression   = BI_RGB;
+      bmi.bmiHeader.biSizeImage     = 0;
+      bmi.bmiHeader.biXPelsPerMeter = 0;
+      bmi.bmiHeader.biYPelsPerMeter = 0;
+      bmi.bmiHeader.biClrUsed       = 0;
+      bmi.bmiHeader.biClrImportant  = 0;
+      bmi.bmiColors[0].rgbBlue      = 0;
+      bmi.bmiColors[0].rgbGreen     = 0;
+      bmi.bmiColors[0].rgbRed       = 0;
+      bmi.bmiColors[0].rgbReserved  = 0;
 
       bmp = CreateDIBSection(gdi->memDC ? gdi->memDC : NULL,
             &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
@@ -3613,53 +4179,45 @@ static bool gdi_overlay_load(void *data,
          continue;
       }
 
-      /* Premultiply alpha at load: AlphaBlend with AC_SRC_ALPHA
-       * needs premultiplied RGB or transparent pixels bleed
-       * background colour through their fringes.  Source pixels
-       * are 0xAARRGGBB (BGRA in memory order, the GDI default
-       * when supports_rgba is false). */
-      src   = imgs[i].pixels;
-      dst   = (uint32_t*)bits;
-      total = (size_t)w * (size_t)h;
-      for (j = 0; j < total; j++)
-      {
-         uint32_t s  = src[j];
-         uint8_t  sa = (uint8_t)((s >> 24) & 0xFF);
-         uint8_t  sr = (uint8_t)((s >> 16) & 0xFF);
-         uint8_t  sg = (uint8_t)((s >>  8) & 0xFF);
-         uint8_t  sb = (uint8_t)( s        & 0xFF);
-         uint8_t  pr, pg, pb;
+      /* AlphaBlend with AC_SRC_ALPHA needs premultiplied RGB or
+       * transparent pixels bleed background colour through their
+       * fringes. */
+      gdi_texture_premultiply((uint32_t*)bits, imgs[i].pixels,
+            (size_t)w * (size_t)h);
+      gdi_overlay_defaults(o, bmp, VIDEO_SCALE_PACK(w, h));
+   }
 
-         if (sa == 255)      { pr = sr; pg = sg; pb = sb; }
-         else if (sa == 0)   { pr = pg = pb = 0; }
-         else
-         {
-            pr = (uint8_t)GDI_DIV255((unsigned)sr * sa);
-            pg = (uint8_t)GDI_DIV255((unsigned)sg * sa);
-            pb = (uint8_t)GDI_DIV255((unsigned)sb * sa);
-         }
-         dst[j] = ((uint32_t)sa << 24)
-                | ((uint32_t)pr << 16)
-                | ((uint32_t)pg <<  8)
-                |  (uint32_t)pb;
-      }
+   return true;
+}
 
-      o->bmp           = bmp;
-      o->tex_w         = w;
-      o->tex_h         = h;
-      o->alpha_mod     = 1.0f;
-      o->fullscreen    = false;
-      /* Stretch to the full target rect by default.  The overlay
-       * descriptor drives subsequent vertex_geom calls before
-       * anything is actually drawn. */
-      o->tex_coords[0]  = 0.0f;
-      o->tex_coords[1]  = 0.0f;
-      o->tex_coords[2]  = 1.0f;
-      o->tex_coords[3]  = 1.0f;
-      o->vert_coords[0] = 0.0f;
-      o->vert_coords[1] = 0.0f;
-      o->vert_coords[2] = 1.0f;
-      o->vert_coords[3] = 1.0f;
+/* A page of the pack's textures: each one's DIB, realized here once
+ * for every page it is on */
+static bool gdi_overlay_load_textures(void *data,
+      const uintptr_t *textures, unsigned num_textures)
+{
+   unsigned i;
+   gdi_t *gdi = (gdi_t*)data;
+
+   if (!gdi)
+      return false;
+
+   gdi_overlay_free(gdi);
+
+   if (num_textures == 0 || !textures)
+      return true;
+
+   if (!(gdi->overlays = (struct gdi_overlay*)calloc(num_textures,
+         sizeof(*gdi->overlays))))
+      return false;
+   gdi->overlays_size     = num_textures;
+   gdi->overlays_borrowed = true;
+
+   for (i = 0; i < num_textures; i++)
+   {
+      gdi_texture_t *texture = (gdi_texture_t*)textures[i];
+      if (texture && gdi_texture_realize(gdi, texture))
+         gdi_overlay_defaults(&gdi->overlays[i], texture->bmp,
+               texture->dims);
    }
 
    return true;
@@ -3770,7 +4328,9 @@ static void gdi_overlays_render(gdi_t *gdi,
       int    dst_w, dst_h;
       unsigned alpha_byte;
 
-      if (!o->bmp || o->tex_w == 0 || o->tex_h == 0)
+      if (     !o->bmp
+            || VIDEO_SCALE_W(o->tex_dims) == 0
+            || VIDEO_SCALE_H(o->tex_dims) == 0)
          continue;
       if (o->alpha_mod <= 0.0f)
          continue;
@@ -3792,10 +4352,10 @@ static void gdi_overlays_render(gdi_t *gdi,
       }
       else
       {
-         base_x = gdi->vp.x;
-         base_y = gdi->vp.y;
-         base_w = gdi->vp.width  ? gdi->vp.width  : surface_width;
-         base_h = gdi->vp.height ? gdi->vp.height : surface_height;
+         base_x = VIDEO_POS_X(gdi->vp.pos);
+         base_y = VIDEO_POS_Y(gdi->vp.pos);
+         base_w = VIDEO_SCALE_W(gdi->vp.dims)  ? VIDEO_SCALE_W(gdi->vp.dims)  : surface_width;
+         base_h = VIDEO_SCALE_H(gdi->vp.dims) ? VIDEO_SCALE_H(gdi->vp.dims) : surface_height;
       }
 
       dst_x = base_x + (int)(vx * (float)base_w + 0.5f);
@@ -3805,9 +4365,7 @@ static void gdi_overlays_render(gdi_t *gdi,
       if (dst_w <= 0 || dst_h <= 0)
          continue;
 
-      alpha_byte = (unsigned)(o->alpha_mod * 255.0f);
-      if (alpha_byte > 255)
-         alpha_byte = 255;
+      alpha_byte = VIDEO_ALPHA_BYTE(o->alpha_mod);
 
       /* The overlay's own per-pixel alpha was premultiplied at
        * load.  alpha_mod is applied as SourceConstantAlpha so the
@@ -3824,7 +4382,8 @@ static void gdi_overlays_render(gdi_t *gdi,
       AlphaBlend(gdi->memDC,
             dst_x, dst_y, dst_w, dst_h,
             gdi->texDC,
-            0, 0, o->tex_w, o->tex_h, blend);
+            0, 0,
+            VIDEO_SCALE_W(o->tex_dims), VIDEO_SCALE_H(o->tex_dims), blend);
       SelectObject(gdi->texDC, tex_old);
    }
 #else
@@ -3837,6 +4396,7 @@ static void gdi_overlays_render(gdi_t *gdi,
 static const video_overlay_interface_t gdi_overlay_interface = {
    gdi_overlay_enable,
    gdi_overlay_load,
+   gdi_overlay_load_textures,
    gdi_overlay_tex_geom,
    gdi_overlay_vertex_geom,
    gdi_overlay_full_screen,
@@ -3877,8 +4437,7 @@ video_driver_t video_gdi = {
    gdi_set_viewport,
    NULL, /* set_rotation */
    gdi_viewport_info,
-   NULL, /* read_viewport */
-   NULL, /* read_frame_raw */
+   gdi_read_viewport,
 #ifdef HAVE_OVERLAY
    gdi_get_overlay_interface,
 #endif
@@ -3905,6 +4464,7 @@ gfx_display_ctx_driver_t gfx_display_ctx_gdi = {
    &gdi_font,
    GFX_VIDEO_DRIVER_GDI,
    "gdi",
+   false,
    false,
    gfx_display_gdi_scissor_begin,
    gfx_display_gdi_scissor_end

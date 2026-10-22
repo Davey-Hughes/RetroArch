@@ -1,9 +1,14 @@
+include ../../sample_objdir.mk
+
 TARGET      := vfs_read_overflow_test
 TARGET_TEST := vfs_mapped_ptr_test
 TARGET_TEST2 := vfs_large_file_test
 TARGET_TEST3 := vfs_seek_contract_test
 TARGET_TEST4 := vfs_bulk_read_test
 TARGET_TEST5 := filestream_rbuf_fault_test
+TARGET_TEST6 := vfs_v5_metadata_test
+TARGET_TEST7 := vfs_rename_replace_test
+TARGET_TEST8 := vfs_prefetch_test
 
 LIBRETRO_COMM_DIR := ../../..
 
@@ -13,15 +18,18 @@ COMMON_SOURCES := \
 	$(LIBRETRO_COMM_DIR)/encodings/encoding_utf.c \
 	$(LIBRETRO_COMM_DIR)/file/file_path.c \
 	$(LIBRETRO_COMM_DIR)/file/file_path_io.c \
+	$(LIBRETRO_COMM_DIR)/file/retro_dirent.c \
 	$(LIBRETRO_COMM_DIR)/streams/file_stream.c \
 	$(LIBRETRO_COMM_DIR)/string/rstrtod.c \
 	$(LIBRETRO_COMM_DIR)/time/rtime.c \
 	$(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
 
-COMMON_OBJS := $(COMMON_SOURCES:.c=.o)
+COMMON_OBJS := $(call sample_objs,$(COMMON_SOURCES:.c=.o))
 OBJS        := vfs_read_overflow_test.o vfs_mapped_ptr_test.o \
 	vfs_large_file_test.o vfs_seek_contract_test.o \
-	vfs_bulk_read_test.o filestream_rbuf_fault_test.o $(COMMON_OBJS)
+	vfs_bulk_read_test.o filestream_rbuf_fault_test.o \
+	vfs_v5_metadata_test.o vfs_rename_replace_test.o \
+	vfs_prefetch_test.o $(COMMON_OBJS)
 
 # filestream_rbuf_fault_test drives the two arms on which
 # filestream_rbuf_fill() gives up and hands the caller back to the
@@ -35,6 +43,15 @@ OBJS        := vfs_read_overflow_test.o vfs_mapped_ptr_test.o \
 FAULT_FS_OBJ := file_stream_rbuf_fault.o
 FAULT_OBJS   := $(filter-out %/file_stream.o,$(COMMON_OBJS)) \
 	$(FAULT_FS_OBJ)
+
+# vfs_rename_replace_test runs the replace-on-rename branch the consoles
+# take, so that one target links its own vfs_implementation.o built
+# with -DGEKKO (and, like GameCube and Wii, no mmap), and wraps
+# rename/remove/stat to refuse a rename onto an existing name as those
+# filesystems do.
+RENAME_VFS_OBJ := vfs_implementation_gekko.o
+RENAME_OBJS    := $(filter-out %/vfs_implementation.o,$(COMMON_OBJS)) \
+	$(RENAME_VFS_OBJ)
 
 # -DHAVE_MMAP is required for vfs_read_overflow_test to exercise the
 # patched code path; without it the implementation falls back to
@@ -72,7 +89,18 @@ ifeq ($(DESCRIPTOR_IO),1)
    CFLAGS += -DVFS_HAVE_DESCRIPTOR_IO=1
 endif
 
-CFLAGS += -Wall -pedantic -std=gnu99 -g -I$(LIBRETRO_COMM_DIR)/include
+# FAKE_CFR=1 stands in a copy_file_range that copies to EOF whatever
+# len it was given (what gVisor was observed doing); FAKE_CFR=2 one
+# that copies three times len.  Both exercise vfs_v5_metadata_test's
+# distrust-and-resume path on a kernel that would never trip it.
+ifneq ($(FAKE_CFR),)
+   CFLAGS += -DVFS_COPY_TEST_FAKE_CFR=$(FAKE_CFR)
+endif
+# Every sample build narrates the copy stepper's platform calls on
+# stderr (which path, what was asked, what came back); a frontend
+# build never defines this.
+CFLAGS += -DVFS_COPY_DEBUG
+CFLAGS += -Wall -pedantic -std=gnu99 -g1 -I$(LIBRETRO_COMM_DIR)/include
 
 # The samples workflow passes SANITIZER=address,undefined to every
 # sample dir; without this block the variable was silently ignored
@@ -82,16 +110,30 @@ ifneq ($(SANITIZER),)
    LDFLAGS := -fsanitize=$(SANITIZER) $(LDFLAGS)
 endif
 
+# --wrap is a GNU ld option, and on a Windows host the _WIN32 rename
+# branch would be compiled ahead of the GEKKO one, so the console
+# rename target is built on Linux only.
+ifeq ($(UNAME_S),Linux)
+   RENAME_TARGET := $(TARGET_TEST7)
+endif
+
 all: $(TARGET) $(TARGET_TEST) $(TARGET_TEST2) $(TARGET_TEST3) $(TARGET_TEST4) \
-	$(TARGET_TEST5)
+	$(TARGET_TEST5) $(TARGET_TEST6) $(TARGET_TEST8) $(RENAME_TARGET)
 
 %.o: %.c
+	$(CC) -c -o $@ $< $(CFLAGS)
+
+$(SAMPLE_OBJDIR)/%.o: $$(call sample_src,$$*).c
+	@mkdir -p $(@D)
 	$(CC) -c -o $@ $< $(CFLAGS)
 
 $(TARGET): vfs_read_overflow_test.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 $(TARGET_TEST): vfs_mapped_ptr_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+$(TARGET_TEST8): vfs_prefetch_test.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 # vfs_large_file_test builds sparse fixtures of 3 GiB and 5 GiB.  They
@@ -125,11 +167,28 @@ $(FAULT_FS_OBJ): $(LIBRETRO_COMM_DIR)/streams/file_stream.c \
 $(TARGET_TEST5): filestream_rbuf_fault_test.o $(FAULT_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
+# vfs_v5_metadata_test covers the VFS API v5 additions (read-only
+# state, mtime, begin/step/close copy, dirent_stat) through the path_*,
+# filestream_copy* and retro_dirent_stat wrappers.  The copy is a
+# caller-stepped state machine: no threads, no extra objects.
+$(TARGET_TEST6): vfs_v5_metadata_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+$(RENAME_VFS_OBJ): $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
+	$(CC) -c -o $@ $< $(filter-out -DHAVE_MMAP,$(CFLAGS)) -DGEKKO
+
+$(TARGET_TEST7): vfs_rename_replace_test.o $(RENAME_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=rename,--wrap=remove,--wrap=stat
+
 clean:
+	rm -rf $(SAMPLE_OBJDIR)
 	rm -f $(TARGET) $(TARGET_TEST) $(TARGET_TEST2) $(TARGET_TEST3) \
-		$(TARGET_TEST4) $(TARGET_TEST5) $(OBJS) $(FAULT_FS_OBJ)
+		$(TARGET_TEST4) $(TARGET_TEST5) $(TARGET_TEST6) \
+		$(TARGET_TEST7) $(TARGET_TEST8) $(OBJS) $(FAULT_FS_OBJ) $(RENAME_VFS_OBJ)
+	rm -rf v5_meta_dir
 	rm -f large_3gib.bin large_5gib.bin seek_small.bin seek_4gib.bin
 	rm -f rbuf_fault.txt
+	rm -f rename_replace.bin rename_replace.bin.old rename_replace.bin.tmp
 	rm -f bulk_select.bin bulk_select_w.bin bulk_roundtrip.bin \
 		bulk_short.bin bulk_shrank.bin bulk_error.bin \
 		bulk_binary.bin bulk_threads.bin

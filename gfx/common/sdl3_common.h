@@ -22,14 +22,19 @@
 
 #include <SDL3/SDL.h>
 
+#include <retro_atomic.h>
 #include "../video_defines.h"
+#include "../video_views.h"
 #include "../../retroarch.h"
 
 enum sdl3_flags
 {
-   SDL3_FLAG_QUITTING       = (1 << 0),
-   SDL3_FLAG_SHOULD_RESIZE  = (1 << 1),
-   SDL3_FLAG_ADAPTIVE_VSYNC = (1 << 2)
+   SDL3_FLAG_QUITTING         = (1 << 0),
+   SDL3_FLAG_SHOULD_RESIZE    = (1 << 1),
+   SDL3_FLAG_ADAPTIVE_VSYNC   = (1 << 2),
+   /* The overlay textures are the overlay pack's (load_textures),
+    * not this driver's to destroy. */
+   SDL3_FLAG_OVERLAY_BORROWED = (1 << 3)
 };
 
 typedef struct sdl3_tex
@@ -41,6 +46,18 @@ typedef struct sdl3_tex
    bool active;
    bool rgb32;
 } sdl3_tex_t;
+
+#ifdef HAVE_OVERLAY
+/* On-screen overlay for SDL3. */
+struct sdl3_overlay
+{
+   SDL_Texture *tex;
+   SDL_FRect tex_coords; /* Normalized 0..1 for the source. */
+   SDL_FRect vert_coords; /* Normalized 0..1 within the base area. */
+   float alpha_mod;
+   bool fullscreen;
+};
+#endif
 
 typedef struct _sdl3_video
 {
@@ -56,7 +73,52 @@ typedef struct _sdl3_video
 
    SDL_Renderer *renderer;
 
+   /* Display draw geometry, grown to the largest draw */
+   SDL_Vertex *display_verts;
+   int *display_indices;
+   size_t display_verts_cap;
+   size_t display_indices_cap;
+
+#ifdef HAVE_OVERLAY
+   struct sdl3_overlay *overlays;
+   unsigned overlays_size;
+   bool overlays_enabled;
+#endif
+
    uint8_t flags;
+
+   struct
+   {
+      video_views_chains_t  chains;
+      video_views_target_t  canvas_target;
+      video_views_target_t  ui_target;
+      video_views_ui_dims_t saved;
+      /* What the last frame drew, kept for the viewport readback to
+       * draw again: its map, layout, chains and the window's size */
+      video_views_map_t     map;
+      video_views_layout_t  layout;
+      void                 *drawn[RETRO_VIDEO_VIEWS_MAX];
+      unsigned              dims;
+      /* Each view of the frame, written straight into its own texture */
+      SDL_Texture          *tex[RETRO_VIDEO_VIEWS_MAX];
+      unsigned              tex_dims[RETRO_VIDEO_VIEWS_MAX];
+      SDL_Texture          *canvas;
+      SDL_Texture          *ui;
+      SDL_BlendMode         premultiplied;
+      unsigned              frame_dims;
+      /* The game viewport while the UI layer is drawn */
+      struct video_viewport vp;
+      /* For get_flags on the main thread: whether views may be drawn,
+       * and whether the last frame with a map drew it whole */
+      retro_atomic_int_t    allowed;
+      retro_atomic_int_t    fallback;
+      bool                  tried;
+      /* The premultiplied blend the UI layer is placed with */
+      bool                  layer;
+      bool                  active;
+      bool                  blend;
+      bool                  direct_seen;
+   } views;
 } sdl3_video_t;
 
 /* Registers the application name, version and metadata. */
@@ -74,15 +136,19 @@ void sdl3_set_handles(SDL_Window *window);
  * for the SDL input driver to handle itself. */
 void sdl3_pump_window_events(bool *quit, bool *resize);
 
+/* Pumps the SDL event queue for the input drivers, unless the video
+ * thread owns the window and pumps it already. */
+void sdl3_pump_input_events(void);
+
 /* Creates or resizes the window, or toggles fullscreen. */
 bool sdl3_window_set_video_mode(SDL_Window **win,
-      unsigned width, unsigned height, bool fullscreen,
+      unsigned dims, bool fullscreen,
       SDL_WindowFlags backend_flags);
 
 /* Retrieves the window size in pixels, or the desktop mode when the
  * window doesn't exist yet. */
 void sdl3_window_get_video_size(SDL_Window *win,
-      unsigned *width, unsigned *height);
+      unsigned *dims);
 
 /* Get the refresh rate of the display the window is on, in Hz.
  * Returns 0.0f when there is no window or when we can't tell. */
@@ -98,12 +164,10 @@ bool sdl3_window_has_focus(SDL_Window *win);
 bool sdl3_suppress_screensaver(void *data, bool enable);
 
 /* Initializes the input driver paired with an SDL3 window. */
-void sdl3_input_driver(const char *joypad_name,
-      input_driver_t **input, void **input_data);
+void sdl3_input_driver(const char *joypad_name);
 
 /* gfx_ctx_driver_t input_driver callback wrapping sdl3_input_driver. */
-void sdl3_ctx_input_driver(void *data, const char *name,
-      input_driver_t **input, void **input_data);
+void sdl3_ctx_input_driver(void *data, const char *name);
 
 /* Determines whether or not an SDL3 context driver should be
  * initialized. Will return true when the user is using the
@@ -111,12 +175,12 @@ void sdl3_ctx_input_driver(void *data, const char *name,
  * as the context driver. */
 bool sdl3_ctx_enabled(const char *ctx_ident);
 
-void sdl3_ctx_get_video_size(void *data, unsigned *width, unsigned *height);
+void sdl3_ctx_get_video_size(void *data, unsigned *dims);
 float sdl3_ctx_get_refresh_rate(void *data);
 void sdl3_ctx_update_title(void *data);
 bool sdl3_ctx_has_focus(void *data);
 void sdl3_ctx_check_window(void *data, bool *quit, bool *resize,
-      unsigned *width, unsigned *height);
+      unsigned *dims);
 
 /* Retrieve the DISPLAY_METRIC_DPI for the window's display scale.
  * This usually ends up being scale * 96 DPI, or false otherwise. */
@@ -125,5 +189,15 @@ bool sdl3_ctx_get_metrics(void *data, enum display_metric_types type,
 
 /* Shows or hides the mouse cursor. */
 void sdl3_show_mouse(void *data, bool state);
+
+/* Returns the active SDL_Window, whether it belongs to the sdl3
+ * video driver or one of the gl/vk sdl3 context drivers. NULL when
+ * SDL3 isn't driving the window. */
+SDL_Window *sdl3_get_window(void);
+
+/* True when SDL_StartTextInput() on this device pops up a system
+ * screen keyboard, rather than just enabling text events in the
+ * background. False whenever a physical keyboard is attached. */
+bool sdl3_uses_screen_keyboard(void);
 
 #endif

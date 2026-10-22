@@ -31,6 +31,7 @@
 #include <retro_atomic.h>
 
 #include "gfx_animation.h"
+#include "gfx_media_state.h"
 
 #include "../playlist.h"
 
@@ -67,7 +68,6 @@ struct gfx_thumbnail_path_data
    enum playlist_thumbnail_mode playlist_icon_mode;
    size_t playlist_index;
    size_t system_len;
-   size_t content_label_len;
    char content_label[NAME_MAX_LENGTH];
    char content_core_name[NAME_MAX_LENGTH];
    char system[NAME_MAX_LENGTH];
@@ -141,6 +141,24 @@ bool gfx_thumbnail_set_content_playlist(gfx_thumbnail_path_data_t *path_data, pl
  * - gfx_thumbnail_get_path()
  * Returns true if generated path is valid */
 bool gfx_thumbnail_update_path(gfx_thumbnail_path_data_t *path_data, enum gfx_thumbnail_id thumbnail_id);
+
+/* The settings gfx_thumbnail_update_path() consults, as a value: a
+ * worker captures these on the main thread when its task is pushed
+ * and calls the _cfg variant, which reads no live settings at all.
+ * Main-thread callers keep the plain variant, which reads live. */
+typedef struct gfx_thumbnail_dir_config
+{
+   char dir_thumbnails[DIR_MAX_LENGTH];
+   bool playlist_allow_non_png;
+   unsigned gfx_thumbnails;
+   unsigned menu_left_thumbnails;
+   unsigned menu_icon_thumbnails;
+} gfx_thumbnail_dir_config_t;
+
+void gfx_thumbnail_dir_config_capture(gfx_thumbnail_dir_config_t *cfg);
+bool gfx_thumbnail_update_path_cfg(gfx_thumbnail_path_data_t *path_data,
+      enum gfx_thumbnail_id thumbnail_id,
+      const gfx_thumbnail_dir_config_t *cfg);
 
 /* Getters */
 
@@ -216,6 +234,7 @@ enum gfx_thumbnail_flags
  * happened; do not reintroduce it. */
 typedef struct
 {
+   /* The animation surface's, which owns and unloads it */
    uintptr_t texture;
    /* Animated thumbnail state (all main-thread only). 'anim' is a
     * streaming image_transfer handle which BORROWS 'anim_buf'; both
@@ -226,55 +245,40 @@ typedef struct
     * data_transfer_free(anim_dt); anim_buf itself must not be
     * freed). */
    void *anim;
+   /* Shared preview session (gfx_anim_preview_t*) over anim / anim_dt:
+    * the window feeder and the preview audio. Non-owning. */
+   void *anim_sess;
    void *anim_buf;
    struct data_transfer *anim_dt; /* transfer owning anim_buf (and the
                                       adopted nbio handle beneath it)   */
-   /* Preview audio on a WINDOWED handle.  anim_buf is a sliding
-    * mapping there, only partly resident, so the mixer cannot be
-    * handed a copy of it - it needs the whole container.  This is a
-    * second, independent read of the same file, pumped a frame
-    * budget at a time by gfx_thumbnail_animate and handed over when
-    * complete.  NULL on every other path, where anim_buf is already
-    * the whole file and the hand-off is immediate. */
-   struct data_transfer *anim_audio_dt;
-   /* Windowed preview audio: the mixer borrows this window's mapping
-    * for the container and is told, through params.avail and
-    * audio_driver_mixer_stream_set_avail, how much of it is resident.
-    * anim_audio_hi is that figure - never above the committed
-    * frontier, which is what keeps a stale feeder a stall rather than
-    * a read of reserved pages.  anim_audio_slot is the mixer slot the
-    * feeder follows with audio_driver_mixer_stream_byte_tell. */
-   size_t anim_audio_hi;
-   int    anim_audio_slot;
-   char *anim_audio_path;  /* strdup'd source for the read above; only
-                              set on windowed handles, freed by
-                              gfx_thumbnail_anim_close */
-   /* Decode-worker ping-pong job pair (HAVE_THREADS builds): while
-    * the frame held in one job waits for its due time, the other is
-    * already decoding its successor.  anim_job_upload selects which
-    * of the two uploads next. */
-   void *anim_job;
-   void *anim_job2;
+   /* The playback (gfx_surface_player_t*): its clock and loops, and
+    * the decode, a frame ahead on a worker where there is one. */
+   void *anim_player;
+   void *anim_lifetime;
+   /* The GPU surface (gfx_surface_t*) the still goes to, and the
+    * animation's frames are decoded into and shown from: one
+    * persistent texture updated per frame, kept after the animation
+    * ends so its last frame stays as the still. Freed by
+    * gfx_thumbnail_reset. */
+   void *anim_surface;
    size_t anim_buf_len;    /* size of anim_buf                         */
-   int64_t anim_next_us;   /* time the next frame is due (0 = at once) */
    /* Generation the in-flight request was issued under.  Only
     * meaningful while status is PENDING: if it no longer matches the
     * current generation, that request was superseded and nothing will
     * ever deliver it, so the slot must be re-requested rather than
     * waited on. */
    uint64_t list_id;
-   int32_t anim_loops_left; /* remaining loops, -1 = infinite */
-   unsigned width;
-   unsigned height;
+   /* Both axes in one word, VIDEO_SCALE_PACK's layout. */
+   unsigned dims;
    float alpha;
    float delay_timer;
    retro_atomic_int_t status;
    uint8_t flags;
    uint8_t anim_type;      /* enum image_type_enum of 'anim' */
-   uint8_t anim_job_upload; /* index of the next job to upload (0/1) */
    uint8_t anim_read_pending; /* adopted nbio read still in flight;
                                  animation/audio held at the static
                                  frame until it completes */
+
    uint8_t anim_windowed;  /* anim_dt is a sliding window fed from the
                               decoder frontier during playback, not a
                               buffer pumped to completion: residency is
@@ -306,24 +310,18 @@ static INLINE void gfx_thumbnail_init_blank(gfx_thumbnail_t *t)
    t->anim            = NULL;
    t->anim_buf        = NULL;
    t->anim_dt         = NULL;
-   t->anim_audio_dt   = NULL;
-   t->anim_audio_hi   = 0;
-   t->anim_audio_slot = -1;
-   t->anim_audio_path = NULL;
-   t->anim_job        = NULL;
-   t->anim_job2       = NULL;
+   t->anim_sess       = NULL;
+   t->anim_player     = NULL;
+   t->anim_lifetime   = NULL;
+   t->anim_surface    = NULL;
    t->anim_buf_len    = 0;
-   t->anim_next_us    = 0;
    t->list_id         = 0;
-   t->anim_loops_left = 0;
-   t->width           = 0;
-   t->height          = 0;
+   t->dims            = 0;
    t->alpha           = 0.0f;
    t->delay_timer     = 0.0f;
    retro_atomic_int_init(&t->status, 0 /* GFX_THUMBNAIL_STATUS_UNKNOWN */);
    t->flags           = 0;
    t->anim_type       = 0;
-   t->anim_job_upload = 0;
    t->anim_read_pending = 0;
    t->anim_windowed   = 0;
 }
@@ -366,12 +364,6 @@ struct gfx_thumbnail_state
     * playlists), we delay loading until an entry has been on screen
     * for at least gfx_thumbnail_delay ms */
    float stream_delay;
-
-   /* Animated thumbnails: per-vsync frame-decode budget, so many
-    * simultaneously visible animations degrade to a lower frame rate
-    * instead of stalling the menu (main thread only) */
-   int64_t anim_budget_start_us;
-   int64_t anim_budget_used_us;
 
    /* Duration in ms of the thumbnail 'fade in' animation */
    float fade_duration;
@@ -419,6 +411,16 @@ void gfx_thumbnail_anim_worker_deinit(void);
  *    heap-use-after-free errors *will* occur */
 void gfx_thumbnail_cancel_pending_requests(void);
 
+/* While on, still requests land decoded and are held instead of
+ * uploaded (at most four, by path); the next request for the same
+ * path uploads the held image without reading or decoding the file.
+ * For a menu whose thumbnails are not shown while content runs:
+ * requested as content starts, they upload when shown or on close. */
+void gfx_thumbnail_park_requests(bool park);
+
+/* Frees the held images */
+void gfx_thumbnail_parked_free(void);
+
 /* True if 'thumbnail' is waiting on a request that has since been
  * superseded, i.e. it is PENDING with nothing behind it.  Resets the
  * thumbnail (returning it to UNKNOWN) and returns true in that case, so
@@ -458,6 +460,12 @@ void gfx_thumbnail_request_file(
       const char *file_path, gfx_thumbnail_t *thumbnail,
       unsigned gfx_thumbnail_upscale_threshold);
 
+/* Sends the stills asked for since the last call to the task queue,
+ * in sets decoded across the cores at once. Called by a menu driver
+ * at the end of a frame that may have asked for thumbnails; nothing
+ * to send is a no-op. */
+void gfx_thumbnail_flush_requests(void);
+
 /* Resets (and free()s the current texture of) the
  * specified thumbnail */
 void gfx_thumbnail_reset(gfx_thumbnail_t *thumbnail);
@@ -467,7 +475,38 @@ void gfx_thumbnail_reset(gfx_thumbnail_t *thumbnail);
  * thread, for every on-screen thumbnail. Non-animated thumbnails and
  * non-WebP image types return immediately (single flag test), so this
  * is safe and near-free to call for every thumbnail unconditionally. */
-void gfx_thumbnail_animate(gfx_thumbnail_t *thumbnail);
+/* @current_time is the frame's monotonic timestamp, as sampled once
+ * per iteration by the runloop and handed to gfx_animation_update():
+ * this function reads no clock of its own, so every thumbnail
+ * advanced in a frame paces off one coherent 'now', and a harness can
+ * drive it with synthetic time. */
+unsigned gfx_thumbnail_anim_threads_wanted(void);
+
+/* Main-thread identity check for an installed preview session. */
+bool gfx_thumbnail_has_file(const gfx_thumbnail_t *thumbnail, const char *path);
+
+void gfx_thumbnail_animate(gfx_thumbnail_t *thumbnail,
+      retro_time_t current_time);
+
+/* Main-thread media command: retain the current picture and preview PCM.
+ * Uses the same monotonic clock as animate. False for a still or a
+ * thumbnail whose animation session has not been installed yet. */
+bool gfx_thumbnail_set_paused(gfx_thumbnail_t *thumbnail, bool paused,
+      retro_time_t current_time);
+
+typedef gfx_media_playback_state_t gfx_thumbnail_playback_state_t;
+
+/* Main-thread UI snapshot using the same monotonic time as animate.
+ * Position follows mixed PCM when available. While seeking it shows
+ * the latest requested target. False for a still/non-media thumbnail. */
+bool gfx_thumbnail_get_playback_state(gfx_thumbnail_t *thumbnail,
+      retro_time_t current_time, gfx_thumbnail_playback_state_t *state);
+
+/* Main-thread absolute media seek, currently MP4. Latest request wins;
+ * decoding and audio preparation use the existing player worker.
+ * Keeps the last texture visible and preserves the user's pause state. */
+bool gfx_thumbnail_seek(gfx_thumbnail_t *thumbnail, int64_t target_us,
+      retro_time_t current_time);
 
 /* Stream processing */
 
@@ -582,7 +621,7 @@ void gfx_thumbnail_process_streams(
  * scaling within a rectangle of (width x height) */
 void gfx_thumbnail_get_draw_dimensions(
       gfx_thumbnail_t *thumbnail,
-      unsigned width, unsigned height, float scale_factor,
+      unsigned dims, float scale_factor,
       float *draw_width, float *draw_height);
 
 /* Draws specified thumbnail with specified alignment
@@ -594,12 +633,14 @@ void gfx_thumbnail_get_draw_dimensions(
  *       size of the thumbnail beyond the limits of the
  *       (width x height) rectangle (alignment + aspect
  *       correct scaling is preserved). Use with caution */
+/* @video_dims and @dims: the output size and the rectangle the
+ * thumbnail is fitted into, each with both axes in one word,
+ * VIDEO_SCALE_PACK's layout. */
 void gfx_thumbnail_draw(
       void *userdata,
-      unsigned video_width,
-      unsigned video_height,
+      unsigned video_dims,
       gfx_thumbnail_t *thumbnail,
-      float x, float y, unsigned width, unsigned height,
+      float x, float y, unsigned dims,
       enum gfx_thumbnail_alignment alignment,
       float alpha, float scale_factor,
       gfx_thumbnail_shadow_t *shadow);

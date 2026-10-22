@@ -3,7 +3,6 @@ DEPS_DIR       := $(ROOT_DIR)/deps
 DEBUG          = 0
 HAVE_LOGGER       = 0
 HAVE_FILE_LOGGER     = 0
-HAVE_CC_RESAMPLER    = 1
 WHOLE_ARCHIVE_LINK      = 0
 BIG_STACK            = 1
 PC_DEVELOPMENT_IP_ADDRESS  = 255.255.255.255
@@ -113,9 +112,8 @@ else ifeq ($(platform), ps3-cobra)
    MEDIA_SHADER_DIR := ps3/iso/PS3_GAME/USRDIR/cores/shaders
    RARCH_CONSOLE          = 1
 
-# NGC/Wii - libogc
+# NGC/Wii - devkitPro's libogc
 else ifeq ($(libogc_platform), 1)
-   EXTERNAL_LIBOGC   ?= 0
    HAVE_OGG_OGC      ?= 0
    CC = $(DEVKITPPC)/bin/powerpc-eabi-gcc$(EXE_EXT)
    CXX = $(DEVKITPPC)/bin/powerpc-eabi-g++$(EXE_EXT)
@@ -131,28 +129,14 @@ else ifeq ($(libogc_platform), 1)
 
    INCLUDE += -I.
 
-   ifeq ($(EXTERNAL_LIBOGC), 1)
-      CFLAGS   += -DEXTERNAL_LIBOGC
-      CXXFLAGS += -DEXTERNAL_LIBOGC
-      INCLUDE += -I$(DEVKITPRO)/libogc/include
+   CFLAGS   += -DHAVE_LIBOGC
+   CXXFLAGS += -DHAVE_LIBOGC
+   INCLUDE += -I$(DEVKITPRO)/libogc/include
 
-      ifeq ($(platform), ngc)
-         LIBDIRS += -L$(DEVKITPRO)/libogc/lib/cube
-      else ifeq ($(platform), wii)
-         LIBDIRS += -L$(DEVKITPRO)/libogc/lib/wii
-      endif
-
-   else
-      CFLAGS   += -DINTERNAL_LIBOGC
-      CXXFLAGS += -DINTERNAL_LIBOGC
-      INCLUDE += -Iwii/libogc/include
-
-      ifeq ($(platform), ngc)
-         LIBDIRS += -Lwii/libogc/libs/cube
-      else ifeq ($(platform), wii)
-         LIBDIRS += -Lwii/libogc/libs/wii
-      endif
-
+   ifeq ($(platform), ngc)
+      LIBDIRS += -L$(DEVKITPRO)/libogc/lib/cube
+   else ifeq ($(platform), wii)
+      LIBDIRS += -L$(DEVKITPRO)/libogc/lib/wii
    endif
 
 
@@ -183,9 +167,7 @@ else ifeq ($(libogc_platform), 1)
       LIBS += -L$(DEVKITPRO)/portlibs/ppc/lib -lvorbisfile -lvorbis -logg
    endif
 
-   ifeq ($(EXTERNAL_LIBOGC), 1)
-      LIBS += -lfat
-   endif
+   LIBS += -lfat
 
    ifeq ($(platform), wii)
       LIBS += -lwiiuse -lbte
@@ -217,6 +199,7 @@ else ifeq ($(libogc_platform), 1)
    HAVE_RMODTRACKER                := 1
    HAVE_OVERLAY             := 1
    HAVE_7ZIP                := 1
+   HAVE_RZSTD               := 1
    HAVE_CONFIGFILE          := 1
    HAVE_PATCH               := 1
    HAVE_CHEATS              := 1
@@ -327,8 +310,7 @@ else ifeq ($(platform), vita)
       libretro-common/audio/conversion/s16_to_float_neon.o \
       libretro-common/audio/conversion/float_to_s16_neon.o \
       memory/neon/memcpy-neon.o \
-      libretro-common/audio/resampler/drivers/sinc_resampler_neon.o \
-      audio/drivers_resampler/cc_resampler_neon.o
+      libretro-common/audio/resampler/drivers/sinc_resampler_neon.o
 
    LIBDIRS += -L.
    LDFLAGS +=  -Wl,-q
@@ -1008,7 +990,7 @@ else ifneq (,$(findstring unix,$(platform)))
    EXT_TARGET := $(TARGET_NAME)
    EXT_INTER_TARGET := $(TARGET_NAME)
    INCLUDE += -Ilibretro-common/include -Igfx/include -Ideps -Ideps/rcheevos/include -Ideps/SPIRV-Cross -Ideps/glslang -I.
-   LIBS += -ldl -lm -lpthread -lGL -ludev -lpulse -lX11 -lX11-xcb -lXxf86vm
+   LIBS += -ldl -lm -lpthread -lGL -ludev -lpulse -lX11 -lX11-xcb -lxcb -lXxf86vm
 endif
 
 ifneq (,$(findstring msvc,$(platform)))
@@ -1109,6 +1091,9 @@ endif
 ifeq ($(HAVE_7ZIP), 1)
    CFLAGS      += -DHAVE_7ZIP
 endif
+ifeq ($(HAVE_RZSTD), 1)
+   CFLAGS      += -DHAVE_RZSTD
+endif
 
 ifeq ($(HAVE_SCREENSHOTS), 1)
 	CFLAGS      += -DHAVE_SCREENSHOTS
@@ -1124,6 +1109,11 @@ endif
 
 ifeq ($(HAVE_RWAV), 1)
    CFLAGS      += -DHAVE_RWAV
+endif
+
+# AC-3 (rac3) and IEC 61937: no dependencies, on wherever the mixer is.
+ifeq ($(HAVE_AUDIOMIXER), 1)
+   CFLAGS      += -DHAVE_RAC3
 endif
 
 ifeq ($(HAVE_OVERLAY), 1)
@@ -1258,10 +1248,10 @@ else ifeq ($(platform), vita)
 else ifneq (,$(findstring msvc,$(platform)))
    ifeq ($(platform), windows_msvc2003_x86)
       CFLAGS += -Wp64
-      LDFLAGS += -SUBSYSTEM:WINDOWS -ENTRY:mainCRTStartup
    endif
 
    CFLAGS += -O2 -DNDEBUG -MT
+   LDFLAGS += -SUBSYSTEM:WINDOWS -ENTRY:mainCRTStartup
 else
    CFLAGS += -O3
 endif

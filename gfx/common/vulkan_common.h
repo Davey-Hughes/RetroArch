@@ -33,10 +33,13 @@
 
 #include "vksym.h"
 
+#include <stddef.h>
 #include <boolean.h>
 #include <retro_inline.h>
 #include <retro_common_api.h>
 #include <retro_miscellaneous.h>
+#include <retro_atomic.h>
+#include <rthreads/retro_eventcount.h>
 
 #include <libretro.h>
 #include <libretro_vulkan.h>
@@ -45,6 +48,19 @@
 #include "../font_driver.h"
 #include "../drivers_shader/shader_vulkan.h"
 #include "../include/vulkan/vulkan.h"
+
+#ifndef VK_KHR_unified_image_layouts
+#define VK_KHR_unified_image_layouts 1
+#define VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME "VK_KHR_unified_image_layouts"
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR ((VkStructureType)1000527000)
+typedef struct VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR
+{
+   VkStructureType sType;
+   void *pNext;
+   VkBool32 unifiedImageLayouts;
+   VkBool32 unifiedImageLayoutsVideo;
+} VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR;
+#endif
 
 #define VULKAN_IMAGE_LAYOUT_TRANSITION_LEVELS(cmd, img, levels, old_layout, new_layout, src_access, dst_access, src_stages, dst_stages, src_queue_family_idx, dst_queue_family_idx) \
 { \
@@ -117,7 +133,23 @@ enum vk_flags
     * should copy the HDR backbuffer (not the tone-mapped SDR one) into the
     * HDR readback staging buffer. Distinct from READBACK_PENDING so the two
     * never interfere. */
-   VK_FLAG_READBACK_HDR        = (1 << 18)
+   VK_FLAG_READBACK_HDR        = (1 << 18),
+   /* GPU recording is on: taken from the frame the frontend hands over,
+    * so this thread never reads the recording state the main thread
+    * writes (video_frame_info_t::gpu_recording). */
+   VK_FLAG_GPU_RECORDING       = (1 << 19),
+   /* VK_ERROR_DEVICE_LOST was seen and reported to the runloop once;
+    * the frames until the reinit fail quietly. */
+   VK_FLAG_DEVICE_LOST_REPORTED = (1 << 20),
+   /* Held across creating a frame texture to lend the core: it stays in
+    * cached system memory, never video memory, because the core and the
+    * frontend may read a lent frame back. */
+   VK_FLAG_TEXTURE_FOR_LEND     = (1 << 21),
+   /* A headset's own context: the window is images nothing presents,
+    * and the headset's frame is begun and ended around this one. */
+   VK_FLAG_OPEN_XR              = (1 << 22),
+   /* Held across creating a texture a compute shader writes */
+   VK_FLAG_TEXTURE_FOR_STORAGE  = (1 << 24)
 };
 
 enum vk_texture_type
@@ -167,15 +199,16 @@ enum vulkan_context_flags
    /* Whether HDR colorspaces are supported by the instance */
    VK_CTX_FLAG_HDR_SUPPORT                  = (1 << 5),
    /* scRGB mode: RGBA16F swapchain with extended linear sRGB colour space */
-   VK_CTX_FLAG_HDR_SCRGB                    = (1 << 6)
-};
-
-enum vulkan_emulated_mailbox_flags
-{
-   VK_MAILBOX_FLAG_ACQUIRED            = (1 << 0),
-   VK_MAILBOX_FLAG_REQUEST_ACQUIRE     = (1 << 1),
-   VK_MAILBOX_FLAG_DEAD                = (1 << 2),
-   VK_MAILBOX_FLAG_HAS_PENDING_REQUEST = (1 << 3)
+   VK_CTX_FLAG_HDR_SCRGB                    = (1 << 6),
+   /* The device was made with timeline semaphores, which imported
+    * frames are synchronised with */
+   VK_CTX_FLAG_TIMELINE_SEMAPHORE           = (1 << 7),
+   /* The swapchain was rebuilt because the one before it presented
+    * suboptimal, and has not presented optimally since: a suboptimal
+    * present from it is the surface's standing answer, not a request
+    * to rebuild again. */
+   VK_CTX_FLAG_SUBOPTIMAL_REBUILT           = (1 << 8),
+   VK_CTX_FLAG_VIDEO_GENERAL                = (1 << 9)
 };
 
 enum gfx_ctx_vulkan_data_flags
@@ -197,13 +230,36 @@ enum vk_texture_flags
 {
    VK_TEX_FLAG_DEFAULT_SMOOTH               = (1 << 0),
    VK_TEX_FLAG_NEED_MANUAL_CACHE_MANAGEMENT = (1 << 1),
-   VK_TEX_FLAG_MIPMAP                       = (1 << 2)
+   VK_TEX_FLAG_MIPMAP                       = (1 << 2),
+   /* Streamed texture in device-local host-visible memory: written by
+    * the CPU, never read by it. */
+   VK_TEX_FLAG_BAR_MAPPED                   = (1 << 3)
 };
+
+/* The settings a swapchain is made from.  The thread that draws can
+ * make one (a lost swapchain is remade on the next acquire), so it is
+ * made from this copy: seeded when the context is made, and taken
+ * from each frame after that, never read from the settings there. */
+typedef struct vulkan_swapchain_settings
+{
+   float    display_peak;        /* nits; 0 for the fixed metadata  */
+   unsigned hdr_mode;
+   unsigned bit_depth;           /* video_swapchain_bit_depth       */
+   unsigned max_images;
+   unsigned fse_negotiation;
+   bool     vsync;
+   bool     adaptive_vsync;
+   bool     windowed_fullscreen;
+   bool     dxgi_present;
+} vulkan_swapchain_settings_t;
 
 typedef struct vulkan_context
 {
    slock_t *queue_lock;
    retro_vulkan_destroy_device_t destroy_device;   /* ptr alignment */
+   /* Headset output, or NULL. Always present, like debug_callback: every
+    * translation unit that includes this header shares the layout. */
+   struct vulkan_openxr *xr;
 
    VkInstance instance;
    VkPhysicalDevice gpu;
@@ -214,6 +270,19 @@ typedef struct vulkan_context
    VkPhysicalDeviceMemoryProperties memory_properties;
 
    VkPresentModeKHR present_modes[16];
+   /* Whether the surface offers FIFO_RELAXED, which is what the
+    * context drivers answer GFX_CTX_FLAGS_ADAPTIVE_VSYNC from. Settled
+    * where the swapchain is created and read through an acquire: the
+    * array above is rewritten by the thread that draws, while the main
+    * thread is the one asking. */
+   retro_atomic_int_t supports_adaptive_vsync;
+   /* Swapchains made and thrown away without a frame ever reaching the
+    * display: says the chosen GPU cannot present here, which no Vulkan
+    * query reports in advance. */
+   unsigned swapchain_never_presented;
+   /* The device in use, as the GPU list numbers it */
+   int gpu_index;
+   bool swapchain_external;
    VkImage swapchain_images[VULKAN_MAX_SWAPCHAIN_IMAGES];
    VkFence swapchain_fences[VULKAN_MAX_SWAPCHAIN_IMAGES];
    VkFormat swapchain_format;
@@ -223,47 +292,239 @@ typedef struct vulkan_context
 
    VkSemaphore swapchain_semaphores[VULKAN_MAX_SWAPCHAIN_IMAGES];
    VkSemaphore swapchain_acquire_semaphore;
-   VkSemaphore swapchain_recycled_semaphores[VULKAN_MAX_SWAPCHAIN_IMAGES];
-   VkSemaphore swapchain_wait_semaphores[VULKAN_MAX_SWAPCHAIN_IMAGES];
+   /* Acquire semaphores not in use: one per frame in flight, one
+    * for the current acquire, and up to VULKAN_MAX_SWAPCHAIN_IMAGES
+    * stale ones (below) - all of them can be recycled at once. */
+   VkSemaphore swapchain_recycled_semaphores[2 * VULKAN_MAX_SWAPCHAIN_IMAGES + 1];
+   /* The acquire semaphores each frame's submission waits on: its
+    * own acquire plus any stale ones it drained (see
+    * swapchain_stale_acquire_semaphores). Recycled once that frame's
+    * fence has signalled. */
+   VkSemaphore swapchain_wait_semaphores[VULKAN_MAX_SWAPCHAIN_IMAGES][VULKAN_MAX_SWAPCHAIN_IMAGES + 1];
+   unsigned    swapchain_num_wait_semaphores[VULKAN_MAX_SWAPCHAIN_IMAGES];
+   /* Acquire semaphores whose acquire happened but whose frame never
+    * submitted - so their signal is still pending, and they can be
+    * neither reused for an acquire nor destroyed. The next submission
+    * waits on them alongside its own acquire, which consumes the
+    * signal, and they recycle with that frame. Before, each one
+    * drained the whole device to be destroyed. */
+   VkSemaphore swapchain_stale_acquire_semaphores[VULKAN_MAX_SWAPCHAIN_IMAGES];
+   unsigned    num_stale_acquire_semaphores;
+   /* Fence an empty submission on the queue signals, taken behind
+    * the presents when a swapchain is rebuilt or torn down: a present
+    * is a queue operation that vkQueuePresentKHR returns ahead of, its
+    * wait on the frame's swapchain semaphore is not covered by any
+    * frame fence, and the semaphore and the swapchain must outlive it.
+    * Nothing per frame. See vulkan_context_wait_frames(). */
+   VkFence     present_fence;
 
-#ifdef VULKAN_DEBUG
+   /* Only used under VULKAN_DEBUG, but always present: this struct
+    * is shared by every TU that includes this header, and a member
+    * that exists in some builds of it and not others shifts every
+    * field after it - a debug and a non-debug object linked together
+    * disagreed on graphics_queue_index. VK_NULL_HANDLE otherwise. */
    VkDebugUtilsMessengerEXT debug_callback;
-#endif
    uint32_t graphics_queue_index;
    uint32_t num_swapchain_images;
    uint32_t current_swapchain_index;
    uint32_t current_frame_index;
 
-   unsigned swapchain_width;
-   unsigned swapchain_height;
+   unsigned swapchain_dims;      /* VIDEO_SCALE_PACK */
    unsigned num_recycled_acquire_semaphores;
+   vulkan_swapchain_settings_t swapchain_settings;
+   /* Present mode the current swapchain was created with; compared
+    * against the mode a new swap_interval resolves to so a request
+    * that would not change the swapchain does not recreate it. */
+   VkPresentModeKHR swapchain_present_mode;
 
+   uint16_t flags;
    int8_t swap_interval;
-   uint8_t flags;
 
    bool swapchain_fences_signalled[VULKAN_MAX_SWAPCHAIN_IMAGES];
+   /* A present was queued since present_fence was last waited on. */
+   bool present_pending;
+   /* Hardware video decode (vulkan_video_decode.c), where the device
+    * was made with it: the family of the video decode queues, and the
+    * family and first index of as many transfer queues beside them,
+    * which decoded pictures are copied out on. One of each per stream
+    * decoding at once; video_lanes 0 when there are none. */
+   uint32_t video_decode_family;
+   uint32_t video_xfer_family;
+   uint32_t video_xfer_first;
+   uint32_t video_lanes;
+   uint32_t video_codec_operations;
 } vulkan_context_t;
 
+/* The acquire thread behind emulated mailbox, and the thread that
+ * presents. There is no lock between them: three words, each written
+ * by one side and taken by the other, and an eventcount each way.
+ *
+ *   request   the presenting thread wants an image; the acquire
+ *             thread takes it (exchange) and acquires
+ *   acquired  the acquire thread has an answer; result and index were
+ *             written before it was raised, and are not written again
+ *             until the presenting thread has lowered it and asked
+ *             again
+ *   dead      teardown
+ */
 struct vulkan_emulated_mailbox
 {
    sthread_t *thread;
-   slock_t *lock;
-   scond_t *cond;
    VkDevice device;              /* ptr alignment */
    VkSwapchainKHR swapchain;     /* ptr alignment */
+   /* Every wait this object makes, from the display's rate; sampled at
+    * init so the thread never reads video state. */
+   int64_t timeout_us;
+
+   retro_eventcount_t work;      /* the acquire thread sleeps: request, dead */
+   retro_eventcount_t answered;  /* the presenting thread sleeps: acquired */
+   retro_atomic_int_t request;
+   retro_atomic_int_t acquired;
+   retro_atomic_int_t dead;
 
    unsigned index;
    VkResult result;              /* enum alignment */
-   uint8_t flags;
+   /* The presenting thread only: a request is out and its answer has
+    * not been taken yet. */
+   bool has_pending_request;
 };
+
+/* VK_NV_low_latency2 (NVIDIA Reflex) on the native swapchain, behind
+ * the driver_pacing_* pokes. The mode is a property of one swapchain:
+ * a replacement starts from nothing, and @swapchain records which one
+ * the mode was set on so a sleep or a marker never names an obsolete
+ * one. Each content frame's present is followed by one sleep that
+ * signals @semaphore, a timeline semaphore of the device, to the
+ * frame's identity; the frame loop waits for the identity of the frame
+ * it last handed over. @frame_id is the identity the presenter is on
+ * and @stage how far its markers have gone: 1 its render submission
+ * began, 2 it was presented (any present after that is out of band:
+ * a repeat, a dark frame, a sub-frame, the same frame again).
+ *
+ * The presenter's thread owns everything above; under the threaded
+ * wrapper the frame loop is another thread, and what crosses is
+ * lock-free: @want and @answer carry the mode request and the answer
+ * the presenter gave it; @pub_gen and @pub_table publish the swapchain
+ * the mode is on for the frame loop's own markers, written only while
+ * that thread is seen out of a call (@in_call), and @retired keeps a
+ * replaced swapchain alive until it is (vulkan_low_latency_mark_main). @failed latches
+ * on a backend error, or on sleeps the driver stopped signalling,
+ * until the mode is asked for again; the semaphore is then left to the
+ * device. */
+/* VK_AMD_anti_lag postdates the tree's Vulkan headers; the types it
+ * uses are the registry's, declared here when the headers lack them */
+#ifndef VK_AMD_anti_lag
+#define VK_AMD_ANTI_LAG_EXTENSION_NAME "VK_AMD_anti_lag"
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD ((VkStructureType)1000476000)
+#define VK_STRUCTURE_TYPE_ANTI_LAG_DATA_AMD                     ((VkStructureType)1000476001)
+#define VK_STRUCTURE_TYPE_ANTI_LAG_PRESENTATION_INFO_AMD        ((VkStructureType)1000476002)
+typedef enum VkAntiLagModeAMD
+{
+   VK_ANTI_LAG_MODE_DRIVER_CONTROL_AMD = 0,
+   VK_ANTI_LAG_MODE_ON_AMD             = 1,
+   VK_ANTI_LAG_MODE_OFF_AMD            = 2,
+   VK_ANTI_LAG_MODE_MAX_ENUM_AMD       = 0x7FFFFFFF
+} VkAntiLagModeAMD;
+typedef enum VkAntiLagStageAMD
+{
+   VK_ANTI_LAG_STAGE_INPUT_AMD    = 0,
+   VK_ANTI_LAG_STAGE_PRESENT_AMD  = 1,
+   VK_ANTI_LAG_STAGE_MAX_ENUM_AMD = 0x7FFFFFFF
+} VkAntiLagStageAMD;
+typedef struct VkPhysicalDeviceAntiLagFeaturesAMD
+{
+   VkStructureType sType;
+   void           *pNext;
+   VkBool32        antiLag;
+} VkPhysicalDeviceAntiLagFeaturesAMD;
+typedef struct VkAntiLagPresentationInfoAMD
+{
+   VkStructureType   sType;
+   void             *pNext;
+   VkAntiLagStageAMD stage;
+   uint64_t          frameIndex;
+} VkAntiLagPresentationInfoAMD;
+typedef struct VkAntiLagDataAMD
+{
+   VkStructureType                     sType;
+   const void                         *pNext;
+   VkAntiLagModeAMD                    mode;
+   uint32_t                            maxFPS;
+   const VkAntiLagPresentationInfoAMD *pPresentationInfo;
+} VkAntiLagDataAMD;
+typedef void (VKAPI_PTR *PFN_vkAntiLagUpdateAMD)(VkDevice device,
+      const VkAntiLagDataAMD *pData);
+#endif
+
+#if defined(_WIN32) && !defined(__WINRT__)
+#include "d3d_driver_pacing.h"
+#define VULKAN_DXGI_PACING
+#endif
+
+typedef struct vulkan_low_latency
+{
+   uint64_t frame_id;
+   uint64_t sleep_value;
+   VkSemaphore semaphore;        /* 64-bit handle */
+   VkSwapchainKHR swapchain;     /* 64-bit handle */
+   VkSwapchainKHR pub_table[2];
+   VkSwapchainKHR pub_pending;
+   VkSwapchainKHR retired[4];
+   PFN_vkVoidFunction set_sleep_mode;
+   PFN_vkVoidFunction sleep;
+   PFN_vkVoidFunction set_marker;
+   PFN_vkVoidFunction wait_semaphores;
+   /* VK_AMD_anti_lag, where the device has it and not the above: the
+    * frame loop's INPUT update is the hold, the presenter's PRESENT
+    * update names the same frame. Device-wide, no swapchain, so the
+    * mode crosses threads as @amd_mode alone. */
+   PFN_vkVoidFunction anti_lag_update;
+   retro_atomic_size_t pub_gen;
+   retro_atomic_int_t want;
+   retro_atomic_int_t answer;
+   retro_atomic_int_t in_call;
+   retro_atomic_int_t stalled;   /* the frame loop gave up waiting */
+   retro_atomic_int_t amd_mode;  /* enum video_driver_pacing_mode in effect */
+   retro_atomic_int_t amd_max_fps; /* the frame limit, from the presenter */
+   uint32_t min_interval_us;
+   uint32_t spec_version;
+   unsigned num_retired;
+   unsigned timeouts;
+   uint8_t mode;        /* enum video_driver_pacing_mode set on @swapchain */
+   uint8_t stage;
+   bool supported;
+   bool failed;
+   bool publish_pending;
+   bool anti_lag;        /* VK_AMD_anti_lag and its feature are on */
+   bool anti_lag_ext;    /* the extension is in the device's list */
+   /* The device is a core's, made without RetroArch's list (an older
+    * negotiation interface, or the core's own) */
+   bool core_device;
+   bool noted;           /* this device's extensions were seen */
+#ifdef VULKAN_DXGI_PACING
+   /* Presented through DXGI: Reflex through NVAPI on the D3D12 device
+    * that presents, the presenter's to set as the native path's mode
+    * is. @dxgi_pub is the device the frame loop sleeps and marks on
+    * while the mode is in effect there, 0 otherwise; every device it
+    * has been is referenced in @dxgi_held until the context goes. */
+   d3d_driver_pacing_t dxgi;
+   void *dxgi_held[4];
+   unsigned dxgi_num_held;
+   retro_atomic_size_t dxgi_pub;
+#endif
+} vulkan_low_latency_t;
 
 typedef struct gfx_ctx_vulkan_data
 {
    struct string_list *gpu_list;
    vulkan_context_t context;
+   vulkan_low_latency_t low_latency;
    VkSurfaceKHR vk_surface;      /* ptr alignment */
    VkSwapchainKHR swapchain;     /* ptr alignment */
    struct vulkan_emulated_mailbox mailbox;
+   void *dxgi_presenter;
+   void *dxgi_window;
+   bool dxgi_failed;
    uint8_t flags;
    enum vulkan_wsi_type wsi_type;
    bool fse_supported;
@@ -276,6 +537,18 @@ typedef struct gfx_ctx_vulkan_data
     * most of which never see vulkan_win32.h. Cast at the call site. */
    PFN_vkVoidFunction fse_acquire;
    PFN_vkVoidFunction fse_release;
+   /* VK_GOOGLE_display_timing, when the device has it: each present
+    * carries a present ID and the driver reports when it actually
+    * reached the display, on the platform's monotonic clock. */
+   PFN_vkVoidFunction display_timing_query;
+   uint32_t present_id;
+   bool display_timing_supported;
+#ifdef HAVE_OPENXR
+   /* A headset's own context (the Quest's): OpenXR starts whatever
+    * Headset Output says, and a failure falls through to the flat
+    * context instead of rebuilding video. */
+   bool openxr_headset;
+#endif
 #ifdef VULKAN_HDR_SWAPCHAIN
    /* Loaded from VK_EXT_hdr_metadata when that optional device extension is
     * present; NULL otherwise. Used to signal SMPTE-2086 mastering-display
@@ -284,10 +557,20 @@ typedef struct gfx_ctx_vulkan_data
 #endif
 } gfx_ctx_vulkan_data_t;
 
+static INLINE bool vulkan_has_swapchain(const gfx_ctx_vulkan_data_t *vk)
+{
+   return vk->swapchain != VK_NULL_HANDLE || vk->context.swapchain_external;
+}
+
+static INLINE VkImageLayout vulkan_swapchain_layout(const vulkan_context_t *ctx)
+{
+   return ctx->swapchain_external ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+}
+
+
 struct vulkan_display_surface_info
 {
-   unsigned width;
-   unsigned height;
+   unsigned dims;                /* VIDEO_SCALE_PACK; 0 for the largest mode */
    unsigned monitor_index;
    unsigned refresh_rate_x1000;
 };
@@ -344,6 +627,16 @@ uint32_t vulkan_find_memory_type(
       const VkPhysicalDeviceMemoryProperties *mem_props,
       uint32_t device_reqs, uint32_t host_reqs);
 
+/* Allocates alloc->allocationSize for a buffer the CPU only writes and
+ * the GPU reads. alloc->memoryTypeIndex is the caller's host-visible
+ * choice; it is used as given unless the device maps all of its memory
+ * host-visible (resizable BAR, unified memory), where the device-local
+ * host-visible coherent type is tried first. */
+VkResult vulkan_allocate_cpu_write_memory(VkDevice device,
+      const VkPhysicalDeviceMemoryProperties *mem_props,
+      uint32_t type_bits, const VkMemoryAllocateInfo *alloc,
+      VkDeviceMemory *memory);
+
 uint32_t vulkan_find_memory_type_fallback(
       const VkPhysicalDeviceMemoryProperties *mem_props,
       uint32_t device_reqs, uint32_t host_reqs_first,
@@ -353,6 +646,17 @@ void vulkan_debug_mark_buffer(VkDevice device, VkBuffer buffer);
 
 bool vulkan_context_init(gfx_ctx_vulkan_data_t *vk,
       enum vulkan_wsi_type type);
+
+#ifdef HAVE_OPENXR
+bool vulkan_context_init_headless_device(gfx_ctx_vulkan_data_t *vk);
+#endif
+#if defined(HAVE_OPENXR) && defined(ANDROID)
+bool vulkan_context_create_android_surface(gfx_ctx_vulkan_data_t *vk,
+   void *window);
+void vulkan_context_advance_frame(gfx_ctx_vulkan_data_t *vk);
+/* Waits on the frame fences, not the device: no queue lock needed. */
+void vulkan_context_finish_frames(gfx_ctx_vulkan_data_t *vk);
+#endif
 
 #ifdef __APPLE__
 /* Returns the version string of the MoltenVK implementation in use,
@@ -367,18 +671,64 @@ void vulkan_context_destroy(gfx_ctx_vulkan_data_t *vk,
 bool vulkan_surface_create(gfx_ctx_vulkan_data_t *vk,
       enum vulkan_wsi_type type,
       void *display, void *surface,
-      unsigned width, unsigned height,
-      int8_t swap_interval);
+      unsigned dims, int8_t swap_interval);
 
 bool vulkan_surface_destroy(gfx_ctx_vulkan_data_t *vk);
 
 void vulkan_present(gfx_ctx_vulkan_data_t *vk, unsigned index);
 
+retro_time_t vulkan_last_present_time(gfx_ctx_vulkan_data_t *vk);
+
+/* The context driver hands the video driver &data->vk.context and keeps
+ * the swapchain beside it; every context embeds gfx_ctx_vulkan_data_t
+ * that way, so the owner is recoverable from the pointer the driver
+ * holds. Used by the driver for the timing query, which needs the
+ * swapchain handle. */
+#define VULKAN_CTX_DATA_FROM_CONTEXT(ctx) \
+   ((gfx_ctx_vulkan_data_t*)((char*)(ctx) - offsetof(gfx_ctx_vulkan_data_t, context)))
+
 void vulkan_acquire_next_image(gfx_ctx_vulkan_data_t *vk);
 
+/* Takes the acquire semaphore of the current frame, if one was
+ * acquired, and every stale one, into sems[] and stages[] (each with
+ * room for VULKAN_MAX_SWAPCHAIN_IMAGES + 1 entries) for a submission
+ * that will wait on them, records them against frame_index so they
+ * recycle with its fence, and returns how many it added. stage is the
+ * wait stage for all of them. */
+unsigned vulkan_context_take_acquire_waits(struct vulkan_context *ctx,
+      unsigned frame_index, VkSemaphore *sems,
+      VkPipelineStageFlags *stages, VkPipelineStageFlags stage);
+
+/* dims is the size wanted, VIDEO_SCALE_PACK'd; used where the surface
+ * leaves the extent to the swapchain. */
 bool vulkan_create_swapchain(gfx_ctx_vulkan_data_t *vk,
-      unsigned width, unsigned height,
-      int8_t swap_interval);
+      unsigned dims, int8_t swap_interval);
+
+/* The low-latency release, behind the video driver's driver_pacing_*
+ * pokes (gfx/video_driver.h says what each does and answers). The
+ * three below are the frame loop's, safe from a thread other than the
+ * presenter's; the rest run on the presenter's thread. */
+unsigned vulkan_low_latency_set(gfx_ctx_vulkan_data_t *vk, unsigned mode);
+bool vulkan_low_latency_wait(gfx_ctx_vulkan_data_t *vk,
+      uint64_t frame_id, uint64_t next_id, unsigned max_wait_us);
+void vulkan_low_latency_mark_main(gfx_ctx_vulkan_data_t *vk,
+      uint64_t frame_id, unsigned marker);
+/* The driver's frame begins, with the frame's identity and interval
+ * from its info: applies a mode the frame loop asked for, takes the
+ * identity, and says the frame's simulation ended and its render
+ * submission began, once per identity. */
+void vulkan_low_latency_frame_begin(gfx_ctx_vulkan_data_t *vk,
+      uint64_t frame_id, unsigned min_interval_us);
+/* Around every present of the swapchain: the released frame's own
+ * present gets its markers and the sleep that follows; any other is
+ * marked out of band on the same identity. */
+void vulkan_low_latency_present_begin(gfx_ctx_vulkan_data_t *vk);
+void vulkan_low_latency_present_end(gfx_ctx_vulkan_data_t *vk);
+/* A swapchain goes: destroyed now, or once the frame loop is seen out
+ * of a marker call that may name it. Every swapchain destroy of the
+ * context goes through here. */
+void vulkan_low_latency_retire(gfx_ctx_vulkan_data_t *vk,
+      VkSwapchainKHR swapchain);
 
 void vulkan_debug_mark_image(VkDevice device, VkImage image);
 void vulkan_debug_mark_memory(VkDevice device, VkDeviceMemory memory);

@@ -16,6 +16,7 @@
  */
 
 #include <stdint.h>
+#include "../../apple_runtime.h"
 #include <stddef.h>
 #include <string.h>
 #include <unistd.h>
@@ -38,7 +39,7 @@
 
 #ifdef __OBJC__
 #include <Foundation/NSPathUtilities.h>
-#include <objc/message.h>
+#import <objc/message.h>
 #endif
 
 #if TARGET_OS_OSX
@@ -370,6 +371,37 @@ static size_t frontend_darwin_get_os(char *s, size_t len, int *major, int *minor
    return _len;
 }
 
+#if TARGET_OS_OSX
+/* Steam, RAPortableInstall or portable.txt: everything stays in
+ * the application data directory. */
+static bool darwin_portable_install(const char *application_data)
+{
+#if HAVE_STEAM
+   return true;
+#else
+   char portable_buf[PATH_MAX_LENGTH];
+   if ([[[NSBundle mainBundle] objectForInfoDictionaryKey:@"RAPortableInstall"] boolValue])
+      return true;
+   fill_pathname_join(portable_buf, application_data, "portable.txt", sizeof(portable_buf));
+   return path_is_valid(portable_buf);
+#endif
+}
+
+/* The user Documents folder the default directories go under;
+ * false for a portable install, which does not use it. */
+bool frontend_darwin_documents_dir(char *s, size_t len)
+{
+   char application_data[PATH_MAX_LENGTH];
+   application_data[0] = '\0';
+   fill_pathname_application_data(application_data, sizeof(application_data));
+   if (darwin_portable_install(application_data))
+      return false;
+   s[0] = '\0';
+   CFSearchPathForDirectoriesInDomains(s, len);
+   return s[0] != '\0';
+}
+#endif
+
 static void frontend_darwin_get_env(int *argc, char *argv[],
       void *args, void *params_data)
 {
@@ -395,20 +427,7 @@ static void frontend_darwin_get_env(int *argc, char *argv[],
 #if TARGET_OS_OSX
    fill_pathname_application_data(application_data, sizeof(application_data));
 
-   BOOL portable; /* steam || RAPortableInstall || portable.txt */
-#if HAVE_STEAM
-   /* For Steam, we're going to put everything next to the .app */
-   portable = YES;
-#else
-   portable = [[[NSBundle mainBundle] objectForInfoDictionaryKey:@"RAPortableInstall"] boolValue];
-   if (!portable)
-   {
-      char portable_buf[PATH_MAX_LENGTH] = {0};
-      fill_pathname_join(portable_buf, application_data, "portable.txt", sizeof(portable_buf));
-      portable = path_is_valid(portable_buf);
-   }
-#endif
-   if (portable)
+   if (darwin_portable_install(application_data))
       strlcpy(documents_dir_buf, application_data, sizeof(documents_dir_buf));
    else
    {
@@ -460,11 +479,15 @@ static void frontend_darwin_get_env(int *argc, char *argv[],
     * exist and the runtime throws "unrecognized selector".  Guard
     * with respondsToSelector: and fall through to the existing
     * fill_pathname_join fallback on older systems, which simply
-    * won't do bundle-shipped filter auto-discovery. */
+    * won't do bundle-shipped filter auto-discovery. The send goes by
+    * selector, since a 10.5 SDK does not declare the method. */
+#define PLATFORM_DARWIN_BUNDLE_URL(sel, ext, subdir) \
+   ((NSURL *)((id (*)(id, SEL, id, id, id))objc_msgSend)( \
+      [NSBundle mainBundle], (sel), nil, (ext), (subdir)))
    NSURL *url = nil;
-   SEL url_for_resource_sel = @selector(URLForResource:withExtension:subdirectory:);
+   SEL url_for_resource_sel = sel_registerName("URLForResource:withExtension:subdirectory:");
    if ([[NSBundle mainBundle] respondsToSelector:url_for_resource_sel])
-      url = [[NSBundle mainBundle] URLForResource:nil withExtension:@"dsp" subdirectory:@"filters/audio"];
+      url = PLATFORM_DARWIN_BUNDLE_URL(url_for_resource_sel, @"dsp", @"filters/audio");
    if (url)
        /* URLForResource: with a nil name returns a URL pointing at
         * the first matching .dsp file.  What we want is the directory
@@ -482,7 +505,7 @@ static void frontend_darwin_get_env(int *argc, char *argv[],
        fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_AUDIO_FILTER], application_data, "filters/audio", sizeof(g_defaults.dirs[DEFAULT_DIR_AUDIO_FILTER]));
    url = nil;
    if ([[NSBundle mainBundle] respondsToSelector:url_for_resource_sel])
-      url = [[NSBundle mainBundle] URLForResource:nil withExtension:@"filt" subdirectory:@"filters/video"];
+      url = PLATFORM_DARWIN_BUNDLE_URL(url_for_resource_sel, @"filt", @"filters/video");
    if (url)
        strlcpy(g_defaults.dirs[DEFAULT_DIR_VIDEO_FILTER], [[[url path] stringByDeletingLastPathComponent] UTF8String], sizeof(g_defaults.dirs[DEFAULT_DIR_VIDEO_FILTER]));
    else
@@ -716,9 +739,24 @@ static const char* frontend_darwin_get_cpu_model_name(void)
 static enum retro_language frontend_darwin_get_user_language(void)
 {
    char s[128];
-   CFArrayRef langs = CFLocaleCopyPreferredLanguages();
-   CFStringRef langCode = CFArrayGetValueAtIndex(langs, 0);
+   CFArrayRef langs;
+   CFStringRef langCode;
+   /* CFLocaleCopyPreferredLanguages is 10.5; looked up at run time so
+    * one binary builds against, and runs on, 10.4 as well. */
+   CFArrayRef (*copy_langs)(void) = (CFArrayRef (*)(void))
+      dlsym(RTLD_DEFAULT, "CFLocaleCopyPreferredLanguages");
+   if (!copy_langs)
+      return RETRO_LANGUAGE_ENGLISH;
+   langs = copy_langs();
+   if (!langs || CFArrayGetCount(langs) < 1)
+   {
+      if (langs)
+         CFRelease(langs);
+      return RETRO_LANGUAGE_ENGLISH;
+   }
+   langCode = CFArrayGetValueAtIndex(langs, 0);
    CFStringGetCString(langCode, s, sizeof(s), kCFStringEncodingUTF8);
+   CFRelease(langs);
    /* iOS and OS X only support the language ID syntax consisting
     * of a language designator and optional region or script designator. */
    string_replace_all_chars(s, '-', '_');
@@ -861,7 +899,7 @@ static bool accessibility_speak_macos(int speed,
 static bool frontend_darwin_is_narrator_running(void)
 {
 #if !TARGET_OS_OSX || (MAC_OS_X_VERSION_MAX_ALLOWED >= 101400)
-   if (@available(macOS 10.14, iOS 7, tvOS 9, *))
+   if (apple_runtime_available(APPLE_RUNTIME_VER(10, 14, 0), APPLE_RUNTIME_VER(7, 0, 0), APPLE_RUNTIME_VER(9, 0, 0)))
       return true;
 #endif
 #if TARGET_OS_OSX
@@ -870,6 +908,47 @@ static bool frontend_darwin_is_narrator_running(void)
    return false;
 #endif
 }
+
+#if !TARGET_OS_OSX || (MAC_OS_X_VERSION_MAX_ALLOWED >= 101400)
+/* AVSpeechSynthesizer is macOS 10.14 (iOS 7, tvOS 9): the speaking is
+ * done in a class with that availability and reached by selector once
+ * the OS has been checked. */
+API_AVAILABLE(macos(10.14), ios(7.0), tvos(9.0))
+@interface RASpeech : NSObject
++ (bool)speak:(const char *)speak_text speed:(int)speed priority:(int)priority;
+@end
+
+@implementation RASpeech
+
++ (bool)speak:(const char *)speak_text speed:(int)speed priority:(int)priority
+{
+   static dispatch_once_t once;
+   static AVSpeechSynthesizer *synth;
+   AVSpeechUtterance *utterance;
+   const char *language;
+   dispatch_once(&once, ^{
+      synth = [[AVSpeechSynthesizer alloc] init];
+   });
+   if ([synth isSpeaking])
+   {
+      if (priority < 10)
+         return true;
+      else
+         [synth stopSpeakingAtBoundary:AVSpeechBoundaryImmediate];
+   }
+
+   utterance = [AVSpeechUtterance speechUtteranceWithString:[NSString stringWithUTF8String:speak_text]];
+   if (!utterance)
+      return false;
+   utterance.rate = (float)speed / 10.0f;
+   language = get_user_language_iso639_1(false);
+   utterance.voice = [AVSpeechSynthesisVoice voiceWithLanguage:[NSString stringWithUTF8String:language]];
+   [synth speakUtterance:utterance];
+   return true;
+}
+
+@end
+#endif
 
 static bool frontend_darwin_accessibility_speak(int speed,
       const char* speak_text, int priority)
@@ -880,30 +959,10 @@ static bool frontend_darwin_accessibility_speak(int speed,
       speed               = 10;
 
 #if !TARGET_OS_OSX || (MAC_OS_X_VERSION_MAX_ALLOWED >= 101400)
-   if (@available(macOS 10.14, iOS 7, tvOS 9, *))
-   {
-      static dispatch_once_t once;
-      static AVSpeechSynthesizer *synth;
-      dispatch_once(&once, ^{
-         synth = [[AVSpeechSynthesizer alloc] init];
-      });
-      if ([synth isSpeaking])
-      {
-         if (priority < 10)
-            return true;
-         else
-            [synth stopSpeakingAtBoundary:AVSpeechBoundaryImmediate];
-      }
-
-      AVSpeechUtterance *utterance = [AVSpeechUtterance speechUtteranceWithString:[NSString stringWithUTF8String:speak_text]];
-      if (!utterance)
-         return false;
-      utterance.rate = (float)speed / 10.0f;
-      const char *language = get_user_language_iso639_1(false);
-      utterance.voice = [AVSpeechSynthesisVoice voiceWithLanguage:[NSString stringWithUTF8String:language]];
-      [synth speakUtterance:utterance];
-      return true;
-   }
+   if (apple_runtime_available(APPLE_RUNTIME_VER(10, 14, 0), APPLE_RUNTIME_VER(7, 0, 0), APPLE_RUNTIME_VER(9, 0, 0)))
+      return ((bool (*)(id, SEL, const char *, int, int))objc_msgSend)(
+            apple_rt_class("RASpeech"), @selector(speak:speed:priority:),
+            speak_text, speed, priority);
 #endif
 
 #if TARGET_OS_OSX
@@ -916,9 +975,9 @@ static bool frontend_darwin_accessibility_speak(int speed,
 static void frontend_darwin_content_loaded(void)
 {
 #ifdef HAVE_SWIFT
-   if (@available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
-      [RetroArchAppShortcuts contentLoaded];
-   }
+   if (apple_runtime_available(APPLE_RUNTIME_VER(13, 0, 0), APPLE_RUNTIME_VER(16, 0, 0), APPLE_RUNTIME_VER(16, 0, 0)))
+      apple_rt_send_void(apple_rt_class("RetroArchAppShortcuts"),
+            sel_registerName("contentLoaded"));
 #endif
 }
 

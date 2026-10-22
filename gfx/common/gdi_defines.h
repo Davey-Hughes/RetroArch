@@ -23,7 +23,17 @@
 #include <retro_environment.h>
 #include <boolean.h>
 
+#include <retro_atomic.h>
+
 #include "../video_defines.h"
+#include "../video_views.h"
+
+/* A DIB section views draw into, and its pixels */
+struct gdi_views_dib
+{
+   HBITMAP   bmp;
+   uint32_t *pixels;
+};
 
 #ifdef HAVE_OVERLAY
 /* On-screen input overlay entry. Defined at file scope (not inside
@@ -32,8 +42,8 @@
 struct gdi_overlay
 {
    HBITMAP   bmp;
-   unsigned  tex_w;
-   unsigned  tex_h;
+   /* In VIDEO_SCALE_PACK's layout. */
+   unsigned  tex_dims;
    float     tex_coords[4];
    float     vert_coords[4];
    float     alpha_mod;
@@ -66,8 +76,7 @@ typedef struct gdi
    HBITMAP bmp_menu;
    HBITMAP bmp_menu_old;
    uint32_t *menu_pixels;          /* DIB-backing pointer; passed straight to SetDIBitsToDevice in the present path. */
-   unsigned menu_surface_width;
-   unsigned menu_surface_height;
+   unsigned menu_surface_dims;
 
    /* Pre-allocated brushes for solid-fill quads. The current brush is
     * cached and reused when consecutive quads share a colour, which
@@ -109,39 +118,33 @@ typedef struct gdi
     *     slot back and forth.
     *
     * Each slot tracks the HBITMAP, the DIB pixel pointer (we write
-    * into it directly), and the current capacity in width/height.
-    * Width and height are tracked separately rather than as a
-    * pixel count because BITMAPINFOHEADER cares about both. */
+    * into it directly), and the current capacity as a packed size.
+    * Both axes are kept rather than a pixel count because
+    * BITMAPINFOHEADER cares about each of them. */
    HBITMAP   scratch_1x1_bmp;
    uint32_t *scratch_1x1_pixels;
    HBITMAP   scratch_quad_bmp;
    uint32_t *scratch_quad_pixels;
-   unsigned  scratch_quad_w;
-   unsigned  scratch_quad_h;
+   unsigned  scratch_quad_dims;
    HBITMAP   scratch_rgui_bmp;
    uint32_t *scratch_rgui_pixels;
-   unsigned  scratch_rgui_w;
-   unsigned  scratch_rgui_h;
+   unsigned  scratch_rgui_dims;
 
-   unsigned frame_width;
-   unsigned frame_height;
-   unsigned screen_width;
-   unsigned screen_height;
-   /* Surface (window) size last published via video_driver_set_output_size,
-    * tracked here so gdi_alive can read it without locking. */
-   unsigned full_width;
-   unsigned full_height;
-   /* Actual size of gdi->bmp (the DDB).  Separate from frame_width
+   unsigned frame_dims;
+   unsigned screen_dims;
+   /* Surface (window) size last published via video_driver_set_output_dims,
+    * tracked here so gdi_alive can read it without locking. In
+    * VIDEO_SCALE_PACK's layout, as are the sizes around it. */
+   unsigned full_dims;
+   /* Actual size of gdi->bmp (the DDB).  Separate from frame_dims
     * because when RGUI is active we draw the menu (a different size
     * than the core) into bmp; without a dedicated tracker, the
-    * comparison against frame_width would trigger a destructive
+    * comparison against frame_dims would trigger a destructive
     * DeleteObject + CreateCompatibleBitmap on every frame, racing
     * with WM_PAINT and producing visible flicker. */
-   unsigned bmp_width;
-   unsigned bmp_height;
+   unsigned bmp_dims;
 
-   unsigned menu_width;
-   unsigned menu_height;
+   unsigned menu_dims;
    unsigned menu_pitch;
    unsigned frame_pitch;
    unsigned frame_bits;
@@ -178,6 +181,33 @@ typedef struct gdi
    bool keep_aspect;
    bool should_resize;
 
+   struct
+   {
+      video_views_chains_t  chains;
+      video_views_target_t  canvas_target;
+      video_views_target_t  ui_target;
+      video_views_ui_dims_t saved;
+      /* Both eyes side by side, blended into the window by the CPU */
+      struct gdi_views_dib  canvas;
+      /* The UI, drawn once and placed in each eye */
+      struct gdi_views_dib  ui;
+      /* The DC the canvas draws through, and the window surface while
+       * the UI layer stands in for it */
+      HDC                   dc;
+      HBITMAP               surface;
+      uint32_t             *surface_pixels;
+      unsigned              surface_dims;
+      video_viewport_t      vp;
+      unsigned              frame_dims;
+      /* For get_flags on the main thread: whether views may be drawn,
+       * and whether the last frame with a map drew it whole */
+      retro_atomic_int_t    allowed;
+      retro_atomic_int_t    fallback;
+      bool                  active;
+      bool                  ui_pass;
+      bool                  direct_seen;
+   } views;
+
 #ifdef HAVE_OVERLAY
    /* On-screen input overlay state.  Each entry holds an HBITMAP
     * DIB section (32-bit BGRA, premultiplied alpha) that's
@@ -198,6 +228,8 @@ typedef struct gdi
    struct gdi_overlay *overlays;
    unsigned overlays_size;
    bool overlays_enabled;
+   /* overlays[].bmp are the overlay pack's (load_textures) */
+   bool overlays_borrowed;
 #endif
 } gdi_t;
 

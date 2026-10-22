@@ -13,9 +13,12 @@ layout(set = 0, binding = 0, std140) uniform UBO
 {
    mat4 MVP;
    /* x = content nits (paper white), y = expand gamut mode,
-    * z = content is PQ Rec.2020 (0 = SDR gamma 2.4),
+    * z = source: 0 SDR gamma, 1 PQ, 2 PQ-to-SDR, 3 linear scRGB,
     * w = UI layer nits; <= 0 disables the separate UI composite. */
    vec4 hdr_params;
+   /* x > 0.5: the output is HDR10 (Rec.2020 PQ, a 10-bit scanout)
+    * rather than scRGB; yzw unused. */
+   vec4 hdr_out;
 } global;
 
 /* scRGB encode for the composited frame. The SDR branch mirrors the
@@ -72,6 +75,14 @@ vec3 ST2084ToLinear(vec3 pq)
    return pow(abs(n / d), vec3(1.0 / 0.1593017578));
 }
 
+/* Normalized linear (1.0 = 10,000 nits) -> ST.2084 (PQ). */
+vec3 LinearToST2084(vec3 lin)
+{
+   vec3 p = pow(max(lin, vec3(0.0)), vec3(0.1593017578125));
+   return pow((0.8359375 + 18.8515625 * p) / (1.0 + 18.6875 * p),
+         vec3(78.84375));
+}
+
 /* SDR gamma 2.4 -> linear scRGB at `nits` paper white. */
 vec3 SDRToscRGB(vec3 rgb, float nits)
 {
@@ -85,7 +96,10 @@ void main()
    vec4 src = texture(uTex, vTexCoord);
    vec3 lin;
 
-   if (global.hdr_params.z > 1.5)
+   if (global.hdr_params.z > 2.5)
+      /* Native scRGB already has canonical 80-nit linear units. */
+      lin = src.rgb;
+   else if (global.hdr_params.z > 1.5)
    {
       /* Mode 2: PQ content, but the output is *not* HDR after all (the
        * frontend accepted HDR10 before it could know whether this
@@ -127,5 +141,15 @@ void main()
       }
    }
 
+   /* HDR10 output: the same composited scRGB (1.0 = 80 nits, BT.709
+    * primaries, negative values for wider colours) rotated to Rec.2020
+    * and PQ-encoded at absolute luminance. A PQ source comes back out
+    * as it went in, less rounding. Scanout is opaque. */
+   if (global.hdr_out.x > 0.5)
+   {
+      FragColor = vec4(LinearToST2084(
+               k709to2020 * lin * (80.0 / 10000.0)), 1.0);
+      return;
+   }
    FragColor = vec4(lin, src.a);
 }

@@ -65,7 +65,10 @@ static const struct
    char s_f0ce97f7[25];
    char s_b92166cd[5];
    char s_5d29b870[20];
+   char s_6996339b[5];
    char s_4927597c[12];
+   char s_ab49119c[7];
+   char s_ddf679b9[6];
    char s_10342503[12];
    char s_d31f6d88[15];
    char s_f03e9c42[23];
@@ -246,6 +249,8 @@ static const struct
    char s_eb4eab83[7];
    char s_c6d5bcb5[6];
    char s_78585119[8];
+   char s_2c868ae4[13];
+   char s_9c535394[11];
    char s_c017f975[11];
    char s_730df420[15];
    char s_bcddf275[12];
@@ -291,6 +296,7 @@ static const struct
    char s_46c57dde[55];
    char s_6e9f0493[55];
    char s_f7e279a6[11];
+   char s_3fe94404[13];
 } msg_hash_hr_blob =
 {
    "Pristupa\304\215nost",
@@ -344,7 +350,10 @@ static const struct
    "Upravitelj baza podataka",
    "Mape",
    "Informacije o disku",
+   "Zvuk",
    "Izbaci disk",
+   "Sirovo",
+   "Izlaz",
    "Preuzimanja",
    "Preuzmi jezgru",
    "Preuzimatelj sadr\305\276aja",
@@ -525,6 +534,8 @@ static const struct
    "Visoka",
    "Niska",
    "Pametno",
+   "Horizontalno",
+   "Vertikalno",
    "Automatski",
    "Sinkronizacija",
    "Videozapisi",
@@ -573,13 +584,14 @@ static const struct
    "Instaliraj ili vrati jezgru iz mape \342\200\236Preuzimanja\342\200\235.",
    "A\305\276uriraj sve instalirane jezgre na najnoviju verziju.",
    "Prevodilac",
+   "Ravno (Flat)",
 };
 
 /* Contiguity check: char members have alignment 1, so any
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_hr_blob_check[
-      (sizeof(msg_hash_hr_blob) == (4177u
+      (sizeof(msg_hash_hr_blob) == (4232u
 #ifdef HAVE_CDROM
 #ifdef HAVE_LAKKA
        + 12u
@@ -674,7 +686,10 @@ static const uint32_t msg_hash_hr_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_DATABASE_MANAGER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DIRECTORY_SETTINGS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISC_INFORMATION,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISC_INFO_TRACK_AUDIO,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISK_TRAY_EJECT,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISPLAY_EDID_RAW,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISPLAY_INFO_OUTPUT,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DOWNLOADED_FILE_DETECT_CORE_LIST,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DOWNLOAD_CORE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DOWNLOAD_CORE_CONTENT,
@@ -855,6 +870,8 @@ static const uint32_t msg_hash_hr_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_RECORD_CONFIG_TYPE_STREAMING_HIGH_QUALITY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_RECORD_CONFIG_TYPE_STREAMING_LOW_QUALITY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCALE_INTEGER_SCALING_SMART,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_LAYOUT_HORIZONTAL,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_LAYOUT_VERTICAL,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SWAP_INTERVAL_AUTO,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SYNCHRONIZATION_SETTINGS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_TAB,
@@ -900,4 +917,5 @@ static const uint32_t msg_hash_hr_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_SIDELOAD_CORE_LIST,
    (uint32_t)MENU_ENUM_SUBLABEL_UPDATE_INSTALLED_CORES,
    (uint32_t)MSG_COMPILER,
+   (uint32_t)MSG_OPENXR_HEADSET_VIEW_FLAT,
 };

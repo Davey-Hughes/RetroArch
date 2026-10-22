@@ -101,12 +101,19 @@
 @property(readwrite) UIInterfaceOrientation lockInterfaceOrientation;
 #endif
 
-@property(nonatomic,readwrite) CADisplayLink *displayLink;
+@property(nonatomic,readwrite,retain) CADisplayLink *displayLink;
 
 + (CocoaView*)get;
 @end
 
 void get_ios_version(int *major, int *minor);
+
+/* A display link's refresh rate, set and read the way the running OS
+ * provides it: a frame-rate range from iOS/tvOS 15,
+ * preferredFramesPerSecond from 10, and before that frameInterval, the
+ * screen refreshes per callback on a 60 Hz panel. */
+void  cocoa_display_link_set_rate(id link, float hz);
+float cocoa_display_link_get_rate(id link);
 #else
 #define RAScreen NSScreen
 
@@ -116,16 +123,49 @@ void get_ios_version(int *major, int *minor);
 /* Sets the title of the window this view is in; the target of a
  * performSelectorOnMainThread: from ui_window_cocoa_set_title(). */
 - (void)setWindowTitle:(NSString *)title;
-#if !defined(HAVE_COCOA) && !defined(HAVE_COCOA_METAL)
-- (void)display;
-#endif
 
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
 @property(nonatomic,readwrite,retain) CADisplayLink *displayLink API_AVAILABLE(macos(14.0));
 #endif
 
 @end
+
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
+/* The display link above is macOS 14; the callers check the OS first
+ * and reach it by selector, the send the property syntax makes. */
+#define COCOA_VIEW_DISPLAY_LINK(view) \
+   apple_rt_get_id((view), @selector(displayLink))
+#define COCOA_VIEW_SET_DISPLAY_LINK(view, link) \
+   apple_rt_send_id((view), @selector(setDisplayLink:), (link))
 #endif
+#endif
+
+/* A display link's frame-rate range (macOS 14, iOS/tvOS 15), set by
+ * selector: callers check the OS first. The range is CAFrameRateRange
+ * (macOS 12, iOS 15) restated - three floats, so the same layout and
+ * the same argument passing - and the link travels as id, because
+ * naming either type at a lower floor warns as using it would. */
+typedef struct
+{
+   float minimum;
+   float maximum;
+   float preferred;
+} cocoa_frame_rate_range_t;
+
+/* The preferred rate of a display link's range, read by selector: the
+ * 12-byte range comes back the way apple_rt_get_mid_struct says. */
+#define COCOA_DISPLAY_LINK_PREFERRED_RATE(link) \
+   (apple_rt_get_mid_struct(cocoa_frame_rate_range_t, (link), \
+      sel_registerName("preferredFrameRateRange")).preferred)
+
+#define COCOA_DISPLAY_LINK_SET_RATE(link, hz) do { \
+   cocoa_frame_rate_range_t cocoa_range_; \
+   cocoa_range_.minimum   = (float)((hz) * 0.9); \
+   cocoa_range_.maximum   = (float)((hz) * 1.2); \
+   cocoa_range_.preferred = (float)(hz); \
+   ((void (*)(id, SEL, cocoa_frame_rate_range_t))objc_msgSend)((id)(link), \
+      sel_registerName("setPreferredFrameRateRange:"), cocoa_range_); \
+} while (0)
 
 #define BOXSTRING(x) [NSString stringWithUTF8String:x]
 #define BOXINT(x)    [NSNumber numberWithInt:x]
@@ -135,20 +175,18 @@ void get_ios_version(int *major, int *minor);
 #if defined(__clang__)
 /* ARC is only available for Clang */
 #if __has_feature(objc_arc)
-#define RELEASE(x)   x = nil
+#define RELEASE(x)   do { x = nil; } while (0)
 #define BRIDGE       __bridge
 #define UNSAFE_UNRETAINED __unsafe_unretained
 #else
-#define RELEASE(x)   [x release]; \
-   x = nil
+#define RELEASE(x)   do { [x release]; x = nil; } while (0)
 #define BRIDGE
 #define UNSAFE_UNRETAINED
 #endif
 #else
 /* On compilers other than Clang (e.g. GCC), assume ARC 
    is going to be unavailable */
-#define RELEASE(x)   [x release]; \
-   x = nil
+#define RELEASE(x)   do { [x release]; x = nil; } while (0)
 #define BRIDGE
 #define UNSAFE_UNRETAINED
 #endif
@@ -193,7 +231,13 @@ bool cocoa_get_metrics(
  * funnel here so there is only one implementation per platform. */
 float cocoa_get_refresh_rate(void);
 
-void  cocoa_get_video_output_size(unsigned *width, unsigned *height,
+/* The refresh rate of the screen the window is on, or 0 when unknown,
+ * for the display server's get_window_refresh_rate; and the observer
+ * that has the frontend read it again when that screen changes. */
+float cocoa_get_window_refresh_rate(void);
+void  cocoa_watch_window_output(void);
+
+void  cocoa_get_video_output_size(unsigned *dims,
       char *desc, size_t desc_len);
 
 #endif

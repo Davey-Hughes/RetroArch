@@ -167,19 +167,12 @@ typedef struct
 #endif
 } dingux_joypad_t;
 
-#if defined(SDL_DINGUX_HAS_MENU_TOGGLE)
-/* TODO/FIXME - global referenced outside */
-extern uint64_t lifecycle_state;
-#endif
-
 static dingux_joypad_t dingux_joypad;
 
 #if defined(HAVE_LIBSHAKE)
 static bool sdl_dingux_rumble_init(dingux_joypad_rumble_t *rumble)
 {
-   settings_t *settings = config_get_ptr();
-   unsigned rumble_gain = settings ? settings->uints.input_rumble_gain
-                                   : DEFAULT_RUMBLE_GAIN;
+   unsigned rumble_gain = input_config_get_rumble_gain();
    bool weak_uploaded   = false;
    bool strong_uploaded = false;
 
@@ -263,13 +256,9 @@ static bool sdl_dingux_rumble_update(Shake_Device *device,
    {
       if (effect->active)
       {
-         if (Shake_Stop(device, effect->id) == SHAKE_OK)
-         {
-            effect->active = false;
-            return true;
-         }
-         else
+         if (Shake_Stop(device, effect->id) != SHAKE_OK)
             return false;
+         effect->active = false;
       }
 
       return true;
@@ -294,13 +283,9 @@ static bool sdl_dingux_rumble_update(Shake_Device *device,
    /* If effect is currently idle, activate it */
    if (!effect->active)
    {
-      if (Shake_Play(device, effect->id) == SHAKE_OK)
-      {
-         effect->active = true;
-         return true;
-      }
-      else
+      if (Shake_Play(device, effect->id) != SHAKE_OK)
          return false;
+      effect->active = true;
    }
 
    return true;
@@ -441,7 +426,7 @@ static void sdl_dingux_joypad_destroy(void)
 #endif
 
 #if defined(SDL_DINGUX_HAS_MENU_TOGGLE)
-   BIT64_CLEAR(lifecycle_state, RARCH_MENU_TOGGLE);
+   input_driver_set_platform_menu_button(false);
 #endif
 }
 
@@ -452,7 +437,7 @@ static void *sdl_dingux_joypad_init(void *data)
 
    memset(joypad, 0, sizeof(dingux_joypad_t));
 #if defined(SDL_DINGUX_HAS_MENU_TOGGLE)
-   BIT64_CLEAR(lifecycle_state, RARCH_MENU_TOGGLE);
+   input_driver_set_platform_menu_button(false);
 #endif
 
 #if defined(SDL_DINGUX_HAS_ANALOG)
@@ -569,7 +554,8 @@ static int16_t sdl_dingux_joypad_axis(unsigned port, uint32_t joyaxis)
 
 static int16_t sdl_dingux_joypad_state(
       rarch_joypad_info_t *joypad_info,
-      const struct retro_keybind *binds,
+      const uint16_t *joykeys,
+      const uint32_t *joyaxes,
       unsigned port)
 {
    dingux_joypad_t *joypad = (dingux_joypad_t*)&dingux_joypad;
@@ -582,12 +568,9 @@ static int16_t sdl_dingux_joypad_state(
 
    for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
    {
-      /* Auto-binds are per joypad, not per user. */
-      const uint64_t joykey  = (binds[i].joykey != NO_BTN)
-         ? binds[i].joykey  : joypad_info->auto_binds[i].joykey;
+      const uint64_t joykey  = joykeys[i];
 #if defined(SDL_DINGUX_HAS_ANALOG)
-      const uint32_t joyaxis = (binds[i].joyaxis != AXIS_NONE)
-         ? binds[i].joyaxis : joypad_info->auto_binds[i].joyaxis;
+      const uint32_t joyaxis = joyaxes[i];
 #endif
 
       if ((uint16_t)joykey != NO_BTN &&
@@ -618,7 +601,7 @@ static void sdl_dingux_joypad_poll(void)
     * to wait until the *next* frame to release it */
    if (joypad->menu_toggle)
    {
-      BIT64_CLEAR(lifecycle_state, RARCH_MENU_TOGGLE);
+      input_driver_set_platform_menu_button(false);
       joypad->menu_toggle = false;
    }
 #endif
@@ -681,7 +664,7 @@ static void sdl_dingux_joypad_poll(void)
                   break;
 #if defined(SDL_DINGUX_HAS_MENU_TOGGLE)
                case SDL_DINGUX_SDLK_MENU:
-                  BIT64_SET(lifecycle_state, RARCH_MENU_TOGGLE);
+                  input_driver_set_platform_menu_button(true);
                   joypad->menu_toggle = true;
                   break;
 #endif

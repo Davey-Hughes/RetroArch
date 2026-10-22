@@ -30,6 +30,8 @@
 
 #include <libretro.h>
 
+#include <compat/strl.h>
+
 #ifdef HAVE_CONFIG_H
 #include "../../config.h"
 #endif
@@ -40,7 +42,11 @@
 
 #include "frontend/frontend_driver.h"
 
+#include <encodings/utf.h>
+
 #include "../font_driver.h"
+#include "../video_driver.h"
+#include "../video_views.h"
 
 #include "../../configuration.h"
 #include "../../retroarch.h"
@@ -86,6 +92,9 @@ typedef struct oga_video
    oga_surface_t *menu_surface;
    oga_framebuf_t *pages[NUM_PAGES];
    oga_surface_t *msg_surface;
+   /* A core's views laid out on the screen, upright, for the blit that
+    * turns them onto the panel */
+   oga_surface_t *views_surface;
    const font_renderer_driver_t *font_driver;
    void *font;
    int msg_width;
@@ -99,7 +108,10 @@ typedef struct oga_video
    uint32_t crtc_id;
    uint32_t connector_id;
    float display_ar;
+   /* For get_flags: the last frame with a map was drawn whole */
+   retro_atomic_int_t views_fallback;
    bool threaded;
+   bool views_seen;
    char last_msg[128];
 } oga_video_t;
 
@@ -328,9 +340,16 @@ static void oga_free(void *data)
    for (i = 0; i < NUM_PAGES; ++i)
       oga_destroy_framebuf(vid->pages[i]);
 
+   /* frame_surface->map is handed to the core through
+    * oga_get_current_software_framebuffer, so the cached frame can
+    * point straight into it. Retire before tearing it down. */
+   video_driver_cached_frame_retire();
+
    oga_destroy_surface(vid->frame_surface);
    oga_destroy_surface(vid->msg_surface);
    oga_destroy_surface(vid->menu_surface);
+   if (vid->views_surface)
+      oga_destroy_surface(vid->views_surface);
 
    close(vid->fd);
 
@@ -338,8 +357,7 @@ static void oga_free(void *data)
    vid = NULL;
 }
 
-static void *oga_init(const video_info_t *video,
-      input_driver_t **input, void **input_data)
+static void *oga_init(const video_info_t *video)
 {
    int i;
    oga_video_t *vid                     = NULL;
@@ -350,18 +368,9 @@ static void *oga_init(const video_info_t *video,
 
    frontend_driver_install_signal_handler();
 
-   if (input && input_data)
-   {
-      void* udev = input_driver_init_wrap(
-            &input_udev, settings->arrays.input_joypad_driver);
-      if (udev)
-      {
-         *input       = &input_udev;
-         *input_data  = udev;
-      }
-      else
-         *input = NULL;
-   }
+   /* no input driver of this driver's own: there is no window system
+    * here, and the frontend starts the one that goes with that */
+   input_driver_video_window(INPUT_WINDOW_KMS, NULL);
 
    vid = (oga_video_t*)calloc(1, sizeof(*vid));
    if (!vid)
@@ -417,6 +426,14 @@ static void *oga_init(const video_info_t *video,
          vid->font_driver = NULL;
          vid->font        = NULL;
       }
+      else
+      {
+         /* The atlas may grow when a message needs more glyphs than it
+          * holds; the glyphs are blitted from it in memory, so there is
+          * no texture to make again */
+         struct font_atlas *grow = vid->font_driver->get_atlas(vid->font);
+         grow->max_dims = VIDEO_SCALE_PACK(2048, 2048);
+      }
    }
 
    for (i = 0; i < NUM_PAGES; ++i)
@@ -426,6 +443,10 @@ static void *oga_init(const video_info_t *video,
       if (!vid->pages[i])
          return NULL;
    }
+
+   /* What views are laid out on: the screen as it is seen */
+   video_driver_set_output_dims(VIDEO_SCALE_PACK(vid->drm_width,
+            vid->drm_height));
 
    return vid;
 }
@@ -451,7 +472,6 @@ static bool render_msg(oga_video_t* vid, const char* msg)
 {
    const struct font_atlas* atlas;
    uint32_t* fb;
-   const char *c    = msg;
    int dest_x       = 0;
    int dest_y       = 0;
    int dest_stride;
@@ -462,7 +482,7 @@ static bool render_msg(oga_video_t* vid, const char* msg)
    if (strcmp(msg, vid->last_msg) == 0)
       return true;
 
-   strlcpy(vid->last_msg, c, sizeof(vid->last_msg));
+   strlcpy(vid->last_msg, msg, sizeof(vid->last_msg));
    rga_clear_surface(vid->msg_surface, 0);
 
    atlas          = vid->font_driver->get_atlas(vid->font);
@@ -470,46 +490,91 @@ static bool render_msg(oga_video_t* vid, const char* msg)
    dest_stride    = vid->msg_surface->pitch / 4;
    vid->msg_width = vid->msg_height = 0;
 
-   while (*c)
    {
-      int x, y;
-      uint32_t* dest             = NULL;
-      const uint8_t *source      = NULL;
-      const struct font_glyph* g = vid->font_driver->get_glyph(vid->font, *c);
+      const struct font_glyph* (*get_glyph)(void*, uint32_t)
+                                             = vid->font_driver->get_glyph;
+      void *font_data                        = vid->font;
+      const struct font_glyph *glyph_q       = get_glyph(font_data, '?');
+      struct font_line_metrics *line_metrics = NULL;
+      size_t msg_len                         = strlen(msg);
+      int line_h                             = 0;
+      int surf_w                             = vid->msg_surface->width;
+      int surf_h                             = vid->msg_surface->height;
+      bool full                              = false;
 
-      if (!g)
-         continue;
+      vid->font_driver->get_line_metrics(font_data, &line_metrics);
+      if (line_metrics)
+         line_h = (int)line_metrics->height;
 
-      if (vid->msg_height == 0)
-         vid->msg_height = g->height;
+      /* UTF-8; a line break starts a new row, as running out of width
+       * does. A glyph is laid in the surface whole or not at all: it
+       * wraps before it would cross the right edge, and nothing is
+       * drawn once a row would cross the bottom. */
+#define FONT_LAYOUT_ALIGNED 0
+#define FONT_LAYOUT_LINE(line, line_width, count, bytes) \
+      do \
+      { \
+         (void)(line_width); \
+         (void)(count); \
+         (void)(bytes); \
+         if (line) \
+         { \
+            dest_x           = 0; \
+            dest_y          += line_h; \
+            vid->msg_height += line_h; \
+         } \
+      } while (0)
+#define FONT_LAYOUT_GLYPH(g, pen_x, pen_y) \
+      do \
+      { \
+         int x, y, drawn; \
+         uint32_t* dest        = NULL; \
+         const uint8_t *source = NULL; \
+         (void)(pen_x); \
+         (void)(pen_y); \
+         if (full) \
+            break; \
+         if (vid->msg_height == 0) \
+            vid->msg_height = VIDEO_SCALE_H((g)->dims); \
+         if (dest_x + (g)->advance_x > surf_w) \
+         { \
+            dest_x           = 0; \
+            dest_y          += VIDEO_SCALE_H((g)->dims); \
+            vid->msg_height += VIDEO_SCALE_H((g)->dims); \
+         } \
+         if (     (g)->advance_x > surf_w \
+               || dest_y + (int)VIDEO_SCALE_H((g)->dims) > surf_h) \
+         { \
+            full = true; \
+            break; \
+         } \
+         source = atlas->buffer + VIDEO_SCALE_H((g)->atlas_pos) * \
+            atlas->width  + VIDEO_SCALE_W((g)->atlas_pos); \
+         dest   = fb + dest_y * dest_stride + dest_x; \
+         /* The glyph's texels up to its advance, then clear ones */ \
+         drawn  = MIN((int)VIDEO_SCALE_W((g)->dims), (g)->advance_x); \
+         for (y = 0; y < (int)VIDEO_SCALE_H((g)->dims); y++) \
+         { \
+            for (x = 0; x < drawn; x++) \
+            { \
+               uint32_t px = source[x]; \
+               dest[x]     = (0xCDu << 24) | (px * 0x010101u); \
+            } \
+            for (; x < (g)->advance_x; x++) \
+               dest[x]     = 0xCDu << 24; \
+            dest   += dest_stride; \
+            source += atlas->width; \
+         } \
+         dest_x += (g)->advance_x; \
+         if (vid->msg_width < dest_x) \
+            vid->msg_width = MIN(dest_x, surf_w); \
+      } while (0)
+#include "../font_layout.h"
 
-      if (dest_x >= vid->drm_width)
-      {
-         dest_x = 0;
-         dest_y += g->height;
-         vid->msg_height += g->height;
-      }
-
-      source = atlas->buffer + g->atlas_offset_y *
-         atlas->width  + g->atlas_offset_x;
-      dest   = fb + dest_y * dest_stride + dest_x;
-
-      for (y = 0; y < (int)g->height; y++)
-      {
-         for (x = 0; x < (int)g->advance_x; x++)
-         {
-            uint32_t px = (x < (int)g->width) ? *(source++) : 0x00;
-            *(dest++)   = (0xCD << 24) | (px << 16) | (px << 8) | px;
-         }
-         dest   += dest_stride - g->advance_x;
-         source += atlas->width - g->width;
-      }
-
-      c++;
-      dest_x += g->advance_x;
-
-      if (vid->msg_width < dest_x)
-         vid->msg_width = MIN(dest_x, vid->msg_surface->width);
+      /* A row that did not fit counted towards the height before it was
+       * found not to; the blit takes no more than the surface holds */
+      if (vid->msg_height > surf_h)
+         vid->msg_height = surf_h;
    }
 
 
@@ -538,6 +603,53 @@ static void oga_blit(oga_surface_t* src, int sx, int sy, int sw, int sh,
    c_RkRgaBlit(&s, &d, NULL);
 }
 
+/* Where a pushed frame lies in the lent surface.
+ *
+ * A core that renders into the buffer
+ * GET_CURRENT_SOFTWARE_FRAMEBUFFER lends it may push back a pointer
+ * partway into that buffer, at the buffer's pitch, with the size of
+ * the window it wants shown: that is how an overscan crop is done by
+ * offset (beetle-psx renders its whole 700x480 scanout surface into
+ * the loan and pushes the visible part). The threaded wrapper accepts
+ * that as a lend since 9ed0db58c3 and the vulkan and d3d12 drivers
+ * since 7510039d5d; this is the same test for this driver's loan.
+ *
+ * True, with the window's pixel origin, when @frame lies inside
+ * @surface's mapping on that mapping's pitch and starts on a pixel.
+ * Anything else is a frame of the core's own and is copied in. */
+static bool oga_frame_window(const oga_surface_t *surface,
+      const void *frame, size_t pitch, int *x, int *y)
+{
+   uintptr_t base = (uintptr_t)surface->map;
+   uintptr_t p    = (uintptr_t)frame;
+   size_t    bpp  = (surface->rk_format == RK_FORMAT_BGRA_8888) ? 4 : 2;
+   size_t    off;
+   size_t    row;
+
+   if (!surface->map || surface->pitch <= 0 || surface->height <= 0)
+      return false;
+   if (p < base || (p - base) >= (uintptr_t)surface->pitch *
+         (uintptr_t)surface->height)
+      return false;
+
+   off = (size_t)(p - base);
+   row = off % (size_t)surface->pitch;
+
+   /* Inside the mapping but not addressable as a window: copying it
+    * would memcpy the surface onto itself and shred it, so show the
+    * loan from its origin instead. */
+   if (pitch != (size_t)surface->pitch || (row % bpp))
+   {
+      *x = 0;
+      *y = 0;
+      return true;
+   }
+
+   *y = (int)(off / (size_t)surface->pitch);
+   *x = (int)(row / bpp);
+   return true;
+}
+
 static void oga_calc_bounds(oga_rect_t* r, int dw, int dh, int sw, int sh, float aspect, float dar)
 {
    if (dar >= aspect)
@@ -556,10 +668,74 @@ static void oga_calc_bounds(oga_rect_t* r, int dw, int dh, int sw, int sh, float
    }
 }
 
-static bool oga_frame(void *data, const void *frame, unsigned width,
-      unsigned height, uint64_t frame_count,
+/* A core's views: each placement scaled by the RGA straight from the
+ * frame's surface into an upright surface the size of the screen, cut
+ * to its own eye's area and the screen, which one more blit turns onto
+ * the panel. Only while the panel's own turn is the one applied:
+ * anaglyph and interlaced, which blend the eyes, and a turned core draw
+ * the frame whole. False when the frame is to be drawn whole. */
+static bool oga_views_frame(oga_video_t *vid, const void *frame,
+      unsigned dims, unsigned width, unsigned height, int sx, int sy,
+      const video_frame_info_t *info, oga_surface_t *page_surface,
+      unsigned int blend)
+{
+   unsigned i;
+   unsigned screen;
+   const video_views_layout_t *layout;
+   bool views = info && frame && info->views.num_views
+      && !info->views_layout.offscreen
+      && vid->rotation == HAL_TRANSFORM_ROT_270
+      /* All of the frame in its surface */
+      && width == VIDEO_SCALE_W(dims) && height == VIDEO_SCALE_H(dims)
+      && video_views_fit_frame(&info->views, dims);
+
+   if (views && !vid->views_surface)
+   {
+      vid->views_surface = oga_create_surface(vid->fd, vid->drm_width,
+            vid->drm_height, RK_FORMAT_BGRA_8888);
+      views              = vid->views_surface != NULL;
+   }
+   retro_atomic_store_release_int(&vid->views_fallback,
+         (info && info->views.num_views && !views) ? 1 : 0);
+   if (!views)
+      return false;
+   if (!vid->views_seen)
+   {
+      vid->views_seen = true;
+      RARCH_LOG("[OGA] Views drawn straight from the frame.\n");
+   }
+
+   layout = &info->views_layout;
+   screen = VIDEO_SCALE_PACK(vid->drm_width, vid->drm_height);
+   rga_clear_surface(vid->views_surface, 0);
+   for (i = 0; i < layout->num_placements; i++)
+   {
+      video_views_rect_t cut, from;
+      const video_views_placement_t *p = &layout->placements[i];
+
+      if (!video_views_visible(layout, p, screen, &cut))
+         continue;
+      video_views_cut_source(&info->views.views[p->view], &p->dst, &cut,
+            &from);
+      oga_blit(vid->frame_surface,
+            sx + VIDEO_POS_X(from.pos), sy + VIDEO_POS_Y(from.pos),
+            (int)VIDEO_SCALE_W(from.dims), (int)VIDEO_SCALE_H(from.dims),
+            vid->views_surface, VIDEO_POS_X(cut.pos), VIDEO_POS_Y(cut.pos),
+            (int)VIDEO_SCALE_W(cut.dims), (int)VIDEO_SCALE_H(cut.dims),
+            0, vid->scale_mode, 0);
+   }
+   oga_blit(vid->views_surface, 0, 0, vid->drm_width, vid->drm_height,
+         page_surface, 0, 0, vid->drm_height, vid->drm_width,
+         vid->rotation, vid->scale_mode, blend);
+   return true;
+}
+
+static bool oga_frame(void *data, const void *frame,
+      unsigned dims, uint64_t frame_count,
       unsigned pitch, const char *msg, video_frame_info_t *video_info)
 {
+   unsigned width = VIDEO_SCALE_W(dims);
+   unsigned height = VIDEO_SCALE_H(dims);
    oga_video_t *vid            = (oga_video_t*)data;
    oga_framebuf_t* page        = vid->pages[vid->cur_page];
    oga_surface_t *page_surface = page->surface;
@@ -606,24 +782,44 @@ static bool oga_frame(void *data, const void *frame, unsigned width,
       uint8_t* dst = (uint8_t*)vid->frame_surface->map;
       unsigned int blend = video_info->runloop_is_paused ? 0x800105 : 0;
       oga_rect_t r;
+      int sx       = 0;
+      int sy       = 0;
+      bool lent    = oga_frame_window(vid->frame_surface, frame,
+            (size_t)pitch, &sx, &sy);
 
-      if (src != dst)
+      /* The surface holds the geometry declared at init. A core is
+       * free to hand over more than it declared, so take what fits:
+       * the rows the surface has from the window's origin, and the
+       * bytes one of its rows holds. Both the copy below and the blit
+       * that follows read and write this allocation. */
+      if (width  > (unsigned)(vid->frame_surface->width  - sx))
+         width  = (unsigned)(vid->frame_surface->width  - sx);
+      if (height > (unsigned)(vid->frame_surface->height - sy))
+         height = (unsigned)(vid->frame_surface->height - sy);
+
+      if (!lent)
       {
-         int dst_pitch = vid->frame_surface->pitch;
-         int yy = height;
+         int    dst_pitch = vid->frame_surface->pitch;
+         size_t row       = (pitch < (unsigned)dst_pitch)
+            ? (size_t)pitch : (size_t)dst_pitch;
+         int    yy        = (int)height;
 
          while (yy > 0)
          {
-             memcpy(dst, src, pitch);
+             memcpy(dst, src, row);
              src += pitch;
              dst += dst_pitch;
              --yy;
          }
       }
 
-      oga_calc_bounds(&r, vid->drm_width, vid->drm_height, width, height, aspect_ratio, vid->display_ar);
-      oga_blit(vid->frame_surface, 0, 0, width, height,
-            page_surface, r.y, r.x, r.h, r.w, vid->rotation, vid->scale_mode, blend);
+      if (!oga_views_frame(vid, frame, dims, width, height, sx, sy,
+               video_info, page_surface, blend))
+      {
+         oga_calc_bounds(&r, vid->drm_width, vid->drm_height, width, height, aspect_ratio, vid->display_ar);
+         oga_blit(vid->frame_surface, sx, sy, width, height,
+               page_surface, r.y, r.x, r.h, r.w, vid->rotation, vid->scale_mode, blend);
+      }
    }
 
    if (msg)
@@ -642,7 +838,7 @@ static bool oga_frame(void *data, const void *frame, unsigned width,
 }
 
 static void oga_set_texture_frame(void *data, const void *frame, bool rgb32,
-      unsigned width, unsigned height, float alpha)
+      unsigned dims, float alpha)
 {
    oga_video_t *vid             = (oga_video_t*)data;
    unsigned i, j;
@@ -651,22 +847,22 @@ static void oga_set_texture_frame(void *data, const void *frame, bool rgb32,
     * We have to go on a pixel format conversion adventure
     * for now, until we can convince RGUI to output
     * in an 8888 format. */
-   unsigned int src_pitch        = width * 2;
-   unsigned int dst_pitch        = width * 4;
+   unsigned int src_pitch        = VIDEO_SCALE_W(dims) * 2;
+   unsigned int dst_pitch        = VIDEO_SCALE_W(dims) * 4;
    char *frame_output;
 
-   if (     vid->menu_surface->width  != (int)width
-         || vid->menu_surface->height != (int)height)
+   if (     vid->menu_surface->width  != (int)VIDEO_SCALE_W(dims)
+         || vid->menu_surface->height != (int)VIDEO_SCALE_H(dims))
    {
       oga_destroy_surface(vid->menu_surface);
-      vid->menu_surface = oga_create_surface(vid->fd, width, height,
+      vid->menu_surface = oga_create_surface(vid->fd, VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims),
             RK_FORMAT_BGRA_8888);
    }
 
    /* The output pixel array with the converted pixels. */
    frame_output = (char*)vid->menu_surface->map;
 
-   for (i = 0; i < height; i++)
+   for (i = 0; i < VIDEO_SCALE_H(dims); i++)
    {
       const uint16_t *src_row = (const uint16_t*)frame + (src_pitch / 2 * i);
       uint32_t *dst_row       = (uint32_t*)(void*)
@@ -704,9 +900,9 @@ static void oga_viewport_info(void *data, struct video_viewport *vp)
    if (unlikely(!vid))
       return;
 
-   vp->x = vp->y = 0;
-   vp->width = vp->full_width = vid->mode.vdisplay;
-   vp->height = vp->full_height = vid->mode.hdisplay;
+   vp->pos = VIDEO_POS_PACK(0, 0);
+   vp->dims  = vp->full_dims  = VIDEO_SCALE_PACK(vid->mode.vdisplay,
+         vid->mode.hdisplay);
 }
 
 static bool oga_set_shader(void *data, enum rarch_shader_type type, const char *path)
@@ -743,7 +939,15 @@ static void oga_set_rotation(void *data, unsigned rotation)
 static bool oga_get_current_software_framebuffer(void *data, struct retro_framebuffer *framebuffer)
 {
    oga_video_t *vid = (oga_video_t*)data;
-   if (!vid)
+   if (!vid || !vid->frame_surface)
+      return false;
+
+   /* The surface is allocated once, to the geometry the core declared
+    * at init. A core that asks for more than that -- after raising its
+    * geometry, say -- gets nothing rather than a buffer it would
+    * render past the end of. */
+   if (     (int)framebuffer->width  > vid->frame_surface->width
+         || (int)framebuffer->height > vid->frame_surface->height)
       return false;
 
    framebuffer->format = vid->frame_surface->rk_format == RK_FORMAT_BGRA_8888 ?
@@ -754,8 +958,21 @@ static bool oga_get_current_software_framebuffer(void *data, struct retro_frameb
    return true;
 }
 
+static uint32_t oga_get_flags(void *data)
+{
+   uint32_t flags   = 0;
+   oga_video_t *vid = (oga_video_t*)data;
+   if (vid)
+   {
+      BIT32_SET(flags, GFX_CTX_FLAGS_VIDEO_VIEWS);
+      if (retro_atomic_load_acquire_int(&vid->views_fallback))
+         BIT32_SET(flags, GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK);
+   }
+   return flags;
+}
+
 video_poke_interface_t oga_poke_interface = {
-   NULL, /* get_flags */
+   oga_get_flags,
    NULL, /* load_texture */
    NULL, /* unload_texture */
    NULL, /* set_video_mode */
@@ -803,7 +1020,6 @@ video_driver_t video_oga = {
    oga_set_rotation,
    oga_viewport_info,
    NULL, /* read_viewport */
-   NULL, /* read_frame_raw */
 #ifdef HAVE_OVERLAY
    NULL, /* get_overlay_interface */
 #endif

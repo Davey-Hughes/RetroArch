@@ -104,6 +104,15 @@ struct sdl_rs90_video
    bool menu_active;
    bool was_in_menu;
    bool mode_valid;
+   /* What the last frame said the softfilter should be: set_filtering()
+    * runs on the video thread under the threaded wrapper, and reading
+    * the setting there races the menu writing it. */
+   unsigned frame_softfilter_type;
+   /* What the last frame said these should be: apply_state_changes()
+    * is run by the video thread from thread_update_driver_state(), and
+    * reading the settings there races the menu writing them. */
+   bool frame_ipu_keep_aspect;
+   bool frame_integer_scaling;
 };
 
 /* Image interpolation START */
@@ -712,75 +721,7 @@ static void sdl_rs90_gfx_free(void *data)
    free(vid);
 }
 
-static void sdl_rs90_input_driver_init(
-      const char *input_drv_name, const char *joypad_drv_name,
-      input_driver_t **input, void **input_data)
-{
-   /* Sanity check */
-   if (!input || !input_data)
-      return;
-
-   *input      = NULL;
-   *input_data = NULL;
-
-   /* If input driver name is empty, cannot
-    * initialise anything... */
-   if (!input_drv_name || !*input_drv_name)
-      return;
-
-   if (string_is_equal(input_drv_name, "sdl_dingux"))
-   {
-      *input_data = input_driver_init_wrap(&input_sdl_dingux,
-            joypad_drv_name);
-
-      if (*input_data)
-         *input = &input_sdl_dingux;
-
-      return;
-   }
-
-#if defined(HAVE_SDL) || defined(HAVE_SDL2)
-   if (string_is_equal(input_drv_name, "sdl"))
-   {
-      *input_data = input_driver_init_wrap(&input_sdl,
-            joypad_drv_name);
-
-      if (*input_data)
-         *input = &input_sdl;
-
-      return;
-   }
-#endif
-
-#if defined(HAVE_UDEV)
-   if (string_is_equal(input_drv_name, "udev"))
-   {
-      *input_data = input_driver_init_wrap(&input_udev,
-            joypad_drv_name);
-
-      if (*input_data)
-         *input = &input_udev;
-
-      return;
-   }
-#endif
-
-#if defined(__linux__)
-   if (string_is_equal(input_drv_name, "linuxraw"))
-   {
-      *input_data = input_driver_init_wrap(&input_linuxraw,
-            joypad_drv_name);
-
-      if (*input_data)
-         *input = &input_linuxraw;
-
-      return;
-   }
-#endif
-}
-
-static void *sdl_rs90_gfx_init(const video_info_t *video,
-      input_driver_t **input, void **input_data)
+static void *sdl_rs90_gfx_init(const video_info_t *video)
 {
    sdl_rs90_video_t *vid                         = NULL;
    uint32_t sdl_subsystem_flags                  = SDL_WasInit(0);
@@ -792,8 +733,6 @@ static void *sdl_rs90_gfx_init(const video_info_t *video,
    bool refresh_rate_valid                       = false;
    float hw_refresh_rate                         = 0.0f;
 #endif
-   const char *input_drv_name                    = settings->arrays.input_driver;
-   const char *joypad_drv_name                   = settings->arrays.input_joypad_driver;
    uint32_t surface_flags                        = (video->vsync) ?
          SDL_RS90_SURFACE_FLAGS_VSYNC_ON :
          SDL_RS90_SURFACE_FLAGS_VSYNC_OFF;
@@ -888,8 +827,10 @@ static void *sdl_rs90_gfx_init(const video_info_t *video,
 
    SDL_ShowCursor(SDL_DISABLE);
 
-   sdl_rs90_input_driver_init(input_drv_name,
-         joypad_drv_name, input, input_data);
+   /* No input driver of this driver's own: the frontend starts the
+    * one the setting names - which is what was done here, for the
+    * four it can be on these devices. */
+   input_driver_video_window(INPUT_WINDOW_OTHER, NULL);
 
    /* Initialise OSD font */
    sdl_rs90_init_font_color(vid);
@@ -1056,9 +997,11 @@ static void sdl_rs90_blit_frame32(sdl_rs90_video_t *vid,
 }
 
 static bool sdl_rs90_gfx_frame(void *data, const void *frame,
-      unsigned width, unsigned height, uint64_t frame_count,
+      unsigned dims, uint64_t frame_count,
       unsigned pitch, const char *msg, video_frame_info_t *video_info)
 {
+   unsigned width = VIDEO_SCALE_W(dims);
+   unsigned height = VIDEO_SCALE_H(dims);
    sdl_rs90_video_t* vid = (sdl_rs90_video_t*)data;
 #ifdef HAVE_MENU
    bool menu_is_alive    = (video_info->menu_st_flags & MENU_ST_FLAG_ALIVE) ? true : false;
@@ -1072,6 +1015,13 @@ static bool sdl_rs90_gfx_frame(void *data, const void *frame,
     *   core skips a frame) */
    if (unlikely(!vid || (!frame && !vid->menu_active)))
       return true;
+
+   /* Travels with the frame, for set_filtering() and
+    * apply_state_changes() to read rather than the settings the menu
+    * writes: both are run by the video thread. */
+   vid->frame_softfilter_type = video_info->dingux_rs90_softfilter_type;
+   vid->frame_ipu_keep_aspect = video_info->dingux_ipu_keep_aspect;
+   vid->frame_integer_scaling = video_info->scale_integer;
 
    /* If fast forward is currently active, we may
     * push frames at an 'unlimited' rate. Since the
@@ -1187,18 +1137,18 @@ static void sdl_rs90_set_texture_enable(void *data, bool state, bool full_screen
 }
 
 static void sdl_rs90_set_texture_frame(void *data, const void *frame, bool rgb32,
-      unsigned width, unsigned height, float alpha)
+      unsigned dims, float alpha)
 {
    sdl_rs90_video_t *vid = (sdl_rs90_video_t*)data;
 
    if (unlikely(
          !vid ||
          rgb32 ||
-         (width > SDL_RS90_WIDTH) ||
-         (height > SDL_RS90_HEIGHT)))
+         (VIDEO_SCALE_W(dims) > SDL_RS90_WIDTH) ||
+         (VIDEO_SCALE_H(dims) > SDL_RS90_HEIGHT)))
       return;
 
-   memcpy(vid->menu_texture, frame, width * height * sizeof(uint16_t));
+   memcpy(vid->menu_texture, frame, VIDEO_SCALE_AREA(dims) * sizeof(uint16_t));
 }
 
 static void sdl_rs90_gfx_set_nonblock_state(void *data, bool toggle,
@@ -1299,10 +1249,9 @@ static void sdl_rs90_gfx_viewport_info(void *data, struct video_viewport *vp)
    if (unlikely(!vid))
       return;
 
-   vp->x      = 0;
-   vp->y      = 0;
-   vp->width  = vp->full_width  = vid->frame_width;
-   vp->height = vp->full_height = vid->frame_height;
+   vp->pos    = VIDEO_POS_PACK(0, 0);
+   vp->dims   = vp->full_dims   = VIDEO_SCALE_PACK(vid->frame_width,
+         vid->frame_height);
 }
 
 static float sdl_rs90_get_refresh_rate(void *data)
@@ -1328,12 +1277,13 @@ static float sdl_rs90_get_refresh_rate(void *data)
 static void sdl_rs90_set_filtering(void *data, unsigned index, bool smooth, bool ctx_scaling)
 {
    sdl_rs90_video_t *vid                            = (sdl_rs90_video_t*)data;
-   settings_t *settings                             = config_get_ptr();
-   enum dingux_rs90_softfilter_type softfilter_type = (settings) ?
-         (enum dingux_rs90_softfilter_type)settings->uints.video_dingux_rs90_softfilter_type :
+   /* What the last frame carried, not what the setting says now: this
+    * runs on the video thread under the threaded wrapper. */
+   enum dingux_rs90_softfilter_type softfilter_type = (vid) ?
+         (enum dingux_rs90_softfilter_type)vid->frame_softfilter_type :
                DINGUX_RS90_SOFTFILTER_POINT;
 
-   if (!vid || !settings)
+   if (!vid)
       return;
 
    /* Update software filter setting, if required */
@@ -1347,11 +1297,12 @@ static void sdl_rs90_set_filtering(void *data, unsigned index, bool smooth, bool
 static void sdl_rs90_apply_state_changes(void *data)
 {
    sdl_rs90_video_t *vid  = (sdl_rs90_video_t*)data;
-   settings_t *settings   = config_get_ptr();
-   bool keep_aspect       = (settings) ? settings->bools.video_dingux_ipu_keep_aspect : true;
-   bool integer_scaling   = (settings) ? settings->bools.video_scale_integer : false;
+   /* What the last frame carried, not what the settings say now: the
+    * video thread runs this from thread_update_driver_state(). */
+   bool keep_aspect       = (vid) ? vid->frame_ipu_keep_aspect : true;
+   bool integer_scaling   = (vid) ? vid->frame_integer_scaling : false;
 
-   if (!vid || !settings)
+   if (!vid)
       return;
 
    if ((vid->keep_aspect != keep_aspect) ||
@@ -1434,7 +1385,6 @@ video_driver_t video_sdl_rs90 = {
    NULL, /* set_rotation */
    sdl_rs90_gfx_viewport_info,
    NULL, /* read_viewport  */
-   NULL, /* read_frame_raw */
 #ifdef HAVE_OVERLAY
    NULL, /* get_overlay_interface */
 #endif

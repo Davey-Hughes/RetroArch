@@ -2,6 +2,8 @@
 # a latency setting and checked against what the interface promises of
 # buffer_size() and write_avail().
 
+include ../../sample_objdir.mk
+
 CORE_DIR          := ../../..
 LIBRETRO_COMM_DIR := $(CORE_DIR)/libretro-common
 
@@ -9,20 +11,23 @@ TARGET    := latency_contract_test
 
 SOURCES_C := \
 	latency_contract_test.c \
+	../../../audio/audio_upmix.c \
+	../../../audio/audio_binaural.c \
 	stubs_retroarch.c \
 	$(CORE_DIR)/audio/drivers/alsa.c \
 	$(CORE_DIR)/audio/common/alsa.c \
-	$(CORE_DIR)/audio/drivers/sdl_audio.c \
+	$(CORE_DIR)/audio/drivers/sdl2_audio.c \
 	$(CORE_DIR)/audio/drivers/openal.c \
 	$(LIBRETRO_COMM_DIR)/lists/string_list.c \
-	$(LIBRETRO_COMM_DIR)/queues/fifo_queue.c \
+	$(LIBRETRO_COMM_DIR)/queues/retro_spsc.c \
 	$(LIBRETRO_COMM_DIR)/rthreads/rthreads.c \
+	$(LIBRETRO_COMM_DIR)/rthreads/retro_eventcount.c \
 	$(LIBRETRO_COMM_DIR)/compat/compat_strl.c \
 	$(LIBRETRO_COMM_DIR)/compat/compat_strldup.c \
 	$(LIBRETRO_COMM_DIR)/string/stdstring.c \
 	$(LIBRETRO_COMM_DIR)/encodings/encoding_utf.c
 
-OBJS      := $(SOURCES_C:.c=.o)
+OBJS      := $(call sample_objs,$(SOURCES_C:.c=.o))
 
 INCDIRS   := -I$(LIBRETRO_COMM_DIR)/include -I$(CORE_DIR) -I$(CORE_DIR)/deps
 SDL_CFLAGS := $(shell pkg-config --cflags sdl2 2>/dev/null)
@@ -33,10 +38,10 @@ CFLAGS  += -DRARCH_INTERNAL -DHAVE_ALSA -DHAVE_SDL2 -DHAVE_AL -DHAVE_THREADS -D_
 LDFLAGS += -lasound -lopenal $(SDL_LIBS) -lm -lpthread
 
 ifneq ($(SANITIZER),)
-CFLAGS  += -fsanitize=$(SANITIZER) -fno-omit-frame-pointer -g
+CFLAGS  += -fsanitize=$(SANITIZER) -fno-omit-frame-pointer -g1
 LDFLAGS += -fsanitize=$(SANITIZER)
 else
-CFLAGS  += -g -O1
+CFLAGS  += -g1 -O1
 endif
 
 all: $(TARGET)
@@ -47,7 +52,12 @@ $(TARGET): $(OBJS)
 %.o: %.c
 	$(CC) $(CFLAGS) -std=gnu99 -c -o $@ $<
 
+$(SAMPLE_OBJDIR)/%.o: $$(call sample_src,$$*).c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -std=gnu99 -c -o $@ $<
+
 clean:
+	rm -rf $(SAMPLE_OBJDIR)
 	rm -f $(OBJS) $(TARGET)
 
 .PHONY: all clean

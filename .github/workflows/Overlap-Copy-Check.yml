@@ -12,6 +12,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
 jobs:
   overlap-copy-check:
     name: Overlapping dst/src in copy calls
@@ -20,7 +24,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v5
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
 
       - name: Checker self-test
         shell: bash
@@ -33,7 +40,7 @@ jobs:
           # allowlist suppresses audited same-base copies but can
           # never suppress an exact alias, and stale allowlist
           # entries are reported.
-          python3 tools/overlap_copy_check.py --selftest
+          tools/check.sh tools/overlap_copy_check.c --selftest
 
       - name: Tree check
         shell: bash
@@ -47,4 +54,4 @@ jobs:
           # on Linux/Windows, so nothing else in CI can catch this
           # class before it ships to Mac users. Audited-intentional
           # same-buffer copies live in tools/overlap_copy_allow.list.
-          python3 tools/overlap_copy_check.py
+          tools/check.sh tools/overlap_copy_check.c

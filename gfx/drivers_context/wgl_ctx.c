@@ -135,14 +135,6 @@ WINGDIAPI BOOL WINAPI wglSwapBuffers(HDC);
 #endif
 #endif
 
-/* Forward declarations */
-LRESULT CALLBACK wnd_proc_wgl_common(HWND hwnd, UINT message,
-      WPARAM wparam, LPARAM lparam);
-LRESULT CALLBACK wnd_proc_wgl_dinput(HWND hwnd, UINT message,
-      WPARAM wparam, LPARAM lparam);
-LRESULT CALLBACK wnd_proc_wgl_winraw(HWND hwnd, UINT message,
-      WPARAM wparam, LPARAM lparam);
-
 static BOOL (APIENTRY *p_swap_interval)(int);
 
 enum wgl_flags
@@ -160,7 +152,6 @@ static uint8_t wgl_flags;
 #ifdef HAVE_EGL
 static egl_ctx_data_t win32_egl;
 #endif
-static void             *dinput_wgl       = NULL;
 static unsigned         win32_major       = 0;
 static unsigned         win32_minor       = 0;
 static int              win32_interval    = 0;
@@ -169,13 +160,21 @@ enum gfx_ctx_api win32_api                = GFX_CTX_NONE;
 static dylib_t          dll_handle        = NULL; /* Handle to OpenGL32.dll/libGLESv2.dll */
 #endif
 
+#ifndef __WINRT__
+#include "../common/win_wgl_dxgi.h"
+#endif
+
 typedef struct gfx_ctx_cgl_data
 {
-   void *empty;
+   void *dxgi;
+   unsigned dxgi_dims;
+   bool dxgi_requested;
+   bool dxgi_failed;
+   bool dxgi_fp16;
 } gfx_ctx_wgl_data_t;
 
 /* FORWARD DECLARATIONS */
-void win32_get_video_size(void *data, unsigned *width, unsigned *height);
+void win32_get_video_size(void *data, unsigned *dims);
 
 static gfx_ctx_proc_t gfx_ctx_wgl_get_proc_address(const char *symbol)
 {
@@ -419,11 +418,10 @@ void create_gl_context(HWND hwnd, bool *quit)
     * masked back out. On builds without a D3D driver the probe reports
     * false and the settings simply stay hidden, as before. */
    {
-      uint32_t disp_flags = video_driver_get_disp_flags();
-      disp_flags         &= ~(  VIDEO_FLAG_HDR_SUPPORT
-                              | VIDEO_FLAG_HDR10_SUPPORT
-                              | VIDEO_FLAG_SCRGB_SUPPORT);
-      video_driver_set_disp_flags(disp_flags);
+      video_driver_modify_disp_flags(0,
+              VIDEO_FLAG_HDR_SUPPORT
+            | VIDEO_FLAG_HDR10_SUPPORT
+            | VIDEO_FLAG_SCRGB_SUPPORT);
 
       /* The probe lives in win32_common's desktop-only region; UWP
        * configurations that define HAVE_OPENGL compile this function
@@ -433,10 +431,9 @@ void create_gl_context(HWND hwnd, bool *quit)
 #if !defined(__WINRT__)
       if (win32_display_hdr_active(win32_get_window()))
       {
-         disp_flags  = video_driver_get_disp_flags();
-         disp_flags |=  (VIDEO_FLAG_HDR_SUPPORT | VIDEO_FLAG_SCRGB_SUPPORT);
-         disp_flags &= ~VIDEO_FLAG_HDR10_SUPPORT;
-         video_driver_set_disp_flags(disp_flags);
+         video_driver_modify_disp_flags(
+               VIDEO_FLAG_HDR_SUPPORT | VIDEO_FLAG_SCRGB_SUPPORT,
+               VIDEO_FLAG_HDR10_SUPPORT);
          RARCH_LOG("[WGL] Display is in HDR mode; HDR settings available (scRGB).\n");
       }
 #endif
@@ -534,6 +531,52 @@ static void gfx_ctx_wgl_swap_buffers(void *data)
    switch (win32_api)
    {
       case GFX_CTX_OPENGL_API:
+#ifndef __WINRT__
+         {
+            gfx_ctx_wgl_data_t *wgl = (gfx_ctx_wgl_data_t *)data;
+            RECT rect;
+            if (wgl && wgl->dxgi_requested && !wgl->dxgi_failed
+                  && GetClientRect(win32_get_window(), &rect)
+                  && rect.right > 0 && rect.bottom > 0
+                  && !IsIconic(win32_get_window()))
+            {
+               unsigned dims = VIDEO_SCALE_PACK(rect.right, rect.bottom);
+               bool fp16 = win32_backbuffer_is_scrgb();
+               if (wgl->dxgi && (wgl->dxgi_dims != dims || wgl->dxgi_fp16 != fp16))
+               {
+                  if (ra_wgl_dxgi_resize((ra_wgl_dxgi_t *)wgl->dxgi,
+                           rect.right, rect.bottom, fp16 ? 10 : 28,
+                           fp16 ? 0x881A : 0x8058))
+                  {
+                     wgl->dxgi_dims = dims;
+                     wgl->dxgi_fp16 = fp16;
+                  }
+                  else
+                  {
+                     ra_wgl_dxgi_destroy((ra_wgl_dxgi_t *)wgl->dxgi);
+                     wgl->dxgi = NULL;
+                  }
+               }
+               if (!wgl->dxgi)
+               {
+                  wgl->dxgi = ra_wgl_dxgi_create(win32_get_window(),
+                        rect.right, rect.bottom, fp16 ? 10 : 28,
+                        fp16 ? 0x881A : 0x8058);
+                  wgl->dxgi_dims = dims;
+                  wgl->dxgi_fp16 = fp16;
+                  if (wgl->dxgi)
+                     RARCH_LOG("[WGL] DXGI presentation active.\n");
+               }
+               if (wgl->dxgi && ra_wgl_dxgi_present((ra_wgl_dxgi_t *)wgl->dxgi,
+                        win32_interval > 0 ? (unsigned)win32_interval : 0) != 0)
+                  return;
+               ra_wgl_dxgi_destroy((ra_wgl_dxgi_t *)wgl->dxgi);
+               wgl->dxgi = NULL;
+               wgl->dxgi_failed = true;
+               RARCH_WARN("[WGL] DXGI presentation unavailable; using native presentation.\n");
+            }
+         }
+#endif
          /* gdi32's SwapBuffers only locates and forwards to this, and
           * re-resolves it on every call. See the commit message. */
          wglSwapBuffers(win32_hdc);
@@ -549,8 +592,7 @@ static void gfx_ctx_wgl_swap_buffers(void *data)
    }
 }
 
-static bool gfx_ctx_wgl_set_resize(void *data,
-      unsigned width, unsigned height) { return false; }
+static bool gfx_ctx_wgl_set_resize(void *data, unsigned dims) { return false; }
 
 static void gfx_ctx_wgl_destroy(void *data)
 {
@@ -561,18 +603,26 @@ static void gfx_ctx_wgl_destroy(void *data)
    {
       case GFX_CTX_OPENGL_API:
 #if (defined(HAVE_OPENGL) || defined(HAVE_OPENGL1) || defined(HAVE_OPENGL_CORE)) && !defined(HAVE_OPENGLES)
-         video_driver_set_disp_flags(video_driver_get_disp_flags()
-               & ~(  VIDEO_FLAG_HDR_SUPPORT
-                   | VIDEO_FLAG_HDR10_SUPPORT
-                   | VIDEO_FLAG_SCRGB_SUPPORT));
+         video_driver_modify_disp_flags(0,
+                 VIDEO_FLAG_HDR_SUPPORT
+               | VIDEO_FLAG_HDR10_SUPPORT
+               | VIDEO_FLAG_SCRGB_SUPPORT);
          if (win32_hrc)
          {
             uint32_t video_st_flags;
             video_driver_state_t *video_st = video_state_get_ptr();
+#ifndef __WINRT__
+            if (wgl && wgl->dxgi)
+            {
+               wglMakeCurrent(win32_hdc, win32_hrc);
+               ra_wgl_dxgi_destroy((ra_wgl_dxgi_t *)wgl->dxgi);
+               wgl->dxgi = NULL;
+            }
+#endif
             gl_finish();
             wglMakeCurrent(NULL, NULL);
 
-            video_st_flags = video_st->flags;
+            video_st_flags = (uint32_t)retro_atomic_load_relaxed_int(&video_st->flags);
             if (!(video_st_flags & VIDEO_FLAG_CACHE_CONTEXT))
             {
                if (win32_hw_hrc)
@@ -605,7 +655,13 @@ static void gfx_ctx_wgl_destroy(void *data)
    }
 
 #ifndef __WINRT__
-   if (window)
+   /* Left up for the next OpenGL driver, where it can be: it is taken
+    * back if the pixel format it has is still the one wanted
+    * (win32_window_keep()). Desktop OpenGL only; an EGL window goes
+    * as it did. */
+   if (     window
+         && !(   win32_api == GFX_CTX_OPENGL_API
+              && win32_window_keep()))
    {
       win32_monitor_from_window();
       win32_destroy_window();
@@ -649,6 +705,8 @@ static void *gfx_ctx_wgl_init(void *video_driver)
    if (!wgl)
       return NULL;
 
+   wgl->dxgi_requested = settings->bools.video_dxgi_present;
+
    if (win32_flags & WIN32_CMN_FLAG_INITED)
       gfx_ctx_wgl_destroy(NULL);
 
@@ -665,15 +723,11 @@ static void *gfx_ctx_wgl_init(void *video_driver)
    win32_monitor_init();
 
 
-   wndclass.lpfnWndProc    = wnd_proc_wgl_common;
-#ifdef HAVE_DINPUT
-   if (string_is_equal(settings->arrays.input_driver, "dinput"))
-	   wndclass.lpfnWndProc = wnd_proc_wgl_dinput;
-#endif
-#ifdef HAVE_WINRAWINPUT
-   if (string_is_equal(settings->arrays.input_driver, "raw"))
-	   wndclass.lpfnWndProc = wnd_proc_wgl_winraw;
-#endif
+   /* one window procedure for every video and input driver; the
+    * family says what creating the window sets up */
+   wndclass.lpfnWndProc = win32_window_proc;
+   win32_window_proc_setup(WIN32_WINDOW_WGL);
+   win32_window_tag_presentation(wgl->dxgi_requested);
 
    if (!win32_window_init(&wndclass, true, NULL))
    {
@@ -694,10 +748,16 @@ static void *gfx_ctx_wgl_init(void *video_driver)
 }
 
 static bool gfx_ctx_wgl_set_video_mode(void *data,
-      unsigned width, unsigned height,
+      unsigned dims,
       bool fullscreen)
 {
-   if (!win32_set_video_mode(NULL, width, height, fullscreen))
+#ifndef __WINRT__
+   /* Keep the context on live transitions; let the caller recover failures. */
+   if (win32_get_window())
+      return win32_window_set_fullscreen_exclusive(dims, fullscreen);
+#endif
+
+   if (!win32_set_video_mode(NULL, dims, fullscreen))
    {
       RARCH_ERR("[WGL] win32_set_video_mode failed.\n");
       gfx_ctx_wgl_destroy(data);
@@ -713,53 +773,11 @@ static bool gfx_ctx_wgl_set_video_mode(void *data,
 }
 
 static void gfx_ctx_wgl_input_driver(void *data,
-      const char *joypad_name,
-      input_driver_t **input, void **input_data)
+      const char *joypad_name)
 {
-   settings_t *settings     = config_get_ptr();
-
-#if _WIN32_WINNT >= 0x0501
-#ifdef HAVE_WINRAWINPUT
-   const char *input_driver = settings->arrays.input_driver;
-
-   /* winraw only available since XP */
-   if (string_is_equal(input_driver, "raw"))
-   {
-      *input_data = input_driver_init_wrap(&input_winraw, joypad_name);
-      if (*input_data)
-      {
-         *input     = &input_winraw;
-         dinput_wgl = NULL;
-         return;
-      }
-   }
-#endif
-#endif
-
-#ifdef HAVE_DINPUT
-   dinput_wgl  = input_driver_init_wrap(&input_dinput, joypad_name);
-   *input      = dinput_wgl ? &input_dinput : NULL;
-   *input_data = dinput_wgl;
-#elif defined(__WINRT__)
-   /* Plain xinput is supported on UWP, but it
-    * supports joypad only (uwp driver was added later) */
-   if (string_is_equal(settings->arrays.input_driver, "xinput"))
-   {
-      void* xinput = input_driver_init_wrap(&input_xinput, joypad_name);
-      *input = xinput ? (input_driver_t*)&input_xinput : NULL;
-      *input_data = xinput;
-   }
-   else
-   {
-      void* uwp = input_driver_init_wrap(&input_uwp, joypad_name);
-      *input = uwp ? (input_driver_t*)&input_uwp : NULL;
-      *input_data = uwp;
-   }
-#elif defined(_XBOX)
-   void* xinput = input_driver_init_wrap(&input_xinput, joypad_name);
-   *input = xinput ? (input_driver_t*)&input_xinput : NULL;
-   *input_data = xinput;
-#endif
+   /* no input driver of this driver's own: the frontend starts the
+    * one that goes with a Windows window */
+   input_driver_video_window(INPUT_WINDOW_WINDOWS, NULL);
 }
 
 static enum gfx_ctx_api gfx_ctx_wgl_get_api(void *data) { return win32_api; }
@@ -783,6 +801,21 @@ static bool gfx_ctx_wgl_bind_api(void *data,
    return false;
 }
 
+static void gfx_ctx_wgl_release_current(void *data)
+{
+   (void)data;
+   switch (win32_api)
+   {
+      case GFX_CTX_OPENGL_API:
+#if (defined(HAVE_OPENGL) || defined(HAVE_OPENGL1) || defined(HAVE_OPENGL_CORE)) && !defined(HAVE_OPENGLES)
+         wglMakeCurrent(NULL, NULL);
+#endif
+         break;
+      default:
+         break;
+   }
+}
+
 static void gfx_ctx_wgl_bind_hw_render(void *data, bool enable)
 {
    switch (win32_api)
@@ -793,10 +826,15 @@ static void gfx_ctx_wgl_bind_hw_render(void *data, bool enable)
 
          if (win32_hdc)
          {
-            if (enable)
-               wglMakeCurrent(win32_hdc, win32_hw_hrc);
-            else
-               wglMakeCurrent(win32_hdc, win32_hrc);
+            /* A failed make-current leaves the calling thread with no
+             * context, and every GL call after it - the core's
+             * function lookups first - fails with nothing to say why.
+             * The usual cause is the context being current on another
+             * thread, which the threaded wrapper's ring must never let
+             * happen; if it does, this is the line that says so. */
+            if (!wglMakeCurrent(win32_hdc, enable ? win32_hw_hrc : win32_hrc))
+               RARCH_ERR("[WGL] wglMakeCurrent(%s context) failed: 0x%08lx.\n",
+                     enable ? "core" : "driver", (unsigned long)GetLastError());
          }
 #endif
          break;
@@ -826,6 +864,14 @@ static uint32_t gfx_ctx_wgl_get_flags(void *data)
 #ifndef __WINRT__
          if (win32_backbuffer_is_scrgb())
             BIT32_SET(flags, GFX_CTX_FLAGS_SCRGB_FRAMEBUFFER);
+         /* a borderless fullscreen toggle restyles the window; see
+          * gfx_ctx_wgl_set_video_mode() */
+         if (win32_fullscreen_in_place())
+         {
+            BIT32_SET(flags, GFX_CTX_FLAGS_FULLSCREEN_IN_PLACE);
+            BIT32_SET(flags, GFX_CTX_FLAGS_WINDOW_RESIZE_IN_PLACE);
+            BIT32_SET(flags, GFX_CTX_FLAGS_FULLSCREEN_EXCLUSIVE_IN_PLACE);
+         }
 #endif
 
          if (wgl_flags & WGL_FLAG_CORE_HW_CTX_ENABLE)
@@ -909,13 +955,14 @@ static bool gfx_ctx_wgl_destroy_surface(void *data)
 /* TODO: maybe create an uwp_mesa_common.c? */
 #ifdef __WINRT__
 static void win32_get_video_size(void* data,
-   unsigned* width, unsigned* height)
+   unsigned *dims)
 {
-   bool quit = false;
-   bool resize = false;
-   win32_check_window(NULL, &quit, &resize, width, height);
-   width = uwp_get_width();
-   height = uwp_get_height();
+   bool quit         = false;
+   bool resize       = false;
+   unsigned win_dims = 0;
+   win32_check_window(NULL, &quit, &resize, &win_dims);
+   /* Match the output res to the display resolution. */
+   *dims             = VIDEO_SCALE_PACK(uwp_get_width(), uwp_get_height());
 }
 
 bool win32_suspend_screensaver(void* data, bool enable)
@@ -948,12 +995,28 @@ void win32_setup_pixel_format(HDC hdc, bool supports_gl) { }
  * context does not see; always presentable, as it was before. */
 static bool gfx_ctx_wgl_presentable(void *data)
 {
-   (void)data;
 #ifdef __WINRT__
+   (void)data;
    return true;
 #else
-   return !IsIconic(win32_get_window());
+   gfx_ctx_wgl_data_t *wgl = (gfx_ctx_wgl_data_t *)data;
+   return !IsIconic(win32_get_window())
+      && (!wgl || !wgl->dxgi || ra_wgl_dxgi_presentable((ra_wgl_dxgi_t *)wgl->dxgi));
 #endif
+}
+
+/* When the last vertical blank happened, from the compositor, on the QPC
+ * clock cpu_features_get_time_usec() keeps here. DWM reports it rather
+ * than estimating from a scanline, and composition is on for windowed
+ * and for the borderless-fullscreen path Windows gives GL, which is
+ * where this is wanted. A context that bypasses the compositor gets a
+ * timestamp that stops advancing; the presenter treats a report older
+ * than its own clock reading as absent and paces on the clock, so no
+ * check is needed here beyond what it already does. */
+static retro_time_t gfx_ctx_wgl_last_present_time(void *data)
+{
+   (void)data;
+   return win32_dwm_last_vblank_time();
 }
 
 const gfx_ctx_driver_t gfx_ctx_wgl = {
@@ -990,5 +1053,7 @@ const gfx_ctx_driver_t gfx_ctx_wgl = {
    NULL,
    gfx_ctx_wgl_create_surface,
    gfx_ctx_wgl_destroy_surface,
-   gfx_ctx_wgl_presentable
+   gfx_ctx_wgl_presentable,
+   gfx_ctx_wgl_last_present_time,
+   gfx_ctx_wgl_release_current
 };

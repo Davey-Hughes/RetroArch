@@ -34,6 +34,7 @@ static const struct
    char s_71b54013[16];
    char s_f72667c9[19];
    char s_adce4374[22];
+   char s_5984f4f9[8];
    char s_12e77e8f[10];
    char s_da068369[8];
    char s_daead8a5[6];
@@ -41,6 +42,7 @@ static const struct
    char s_dcf2e800[6];
    char s_f7e668f4[8];
    char s_c82d0aee[8];
+   char s_fcd64038[9];
    char s_fb84857a[7];
    char s_49b0b12a[6];
    char s_ad7c73f6[16];
@@ -160,6 +162,10 @@ static const struct
    char s_eae59928[26];
    char s_b92166cd[12];
    char s_b18effee[33];
+   char s_6996339b[6];
+   char s_690efede[10];
+   char s_ab49119c[9];
+   char s_ddf679b9[7];
    char s_10342503[11];
    char s_d31f6d88[16];
    char s_f03e9c42[21];
@@ -290,6 +296,8 @@ static const struct
    char s_d3574e33[12];
    char s_9da5609f[16];
    char s_8d3a8b68[6];
+   char s_e5b971a0[8];
+   char s_17615fcf[9];
    char s_3a0a3fef[23];
    char s_1e09db79[9];
    char s_400523e5[22];
@@ -311,7 +319,6 @@ static const struct
    char s_5e519829[40];
 #endif
 #endif
-   char s_f228c6c5[28];
    char s_11926382[35];
    char s_645ae416[39];
    char s_dcbf8b04[39];
@@ -473,7 +480,6 @@ static const struct
    char s_74b77b4a[21];
    char s_7534cfc9[7];
    char s_36259b63[20];
-   char s_37368130[15];
    char s_d51f54a2[15];
    char s_b35f573c[7];
    char s_1cad7751[14];
@@ -557,7 +563,6 @@ static const struct
    char s_ccfe26d1[17];
    char s_728ca1d3[4];
    char s_5f612db6[19];
-   char s_9f29f708[27];
    char s_22f52844[13];
    char s_06842e2b[14];
    char s_d7677494[15];
@@ -728,6 +733,7 @@ static const struct
    char s_0571321b[31];
    char s_4b582a0b[37];
    char s_4b582a0c[35];
+   char s_60258de0[8];
    char s_317b17ed[6];
    char s_94c8d15f[6];
    char s_1f66aac3[5];
@@ -971,6 +977,7 @@ static const struct
    char s_27bf01b6[42];
    char s_ed159cd6[23];
    char s_a56efbe2[7];
+   char s_a63c824a[10];
    char s_0e7aca8a[30];
    char s_3b7c0dd8[30];
    char s_c4a8e97c[9];
@@ -1036,6 +1043,7 @@ static const struct
    "Llingua d'orixe",
    "Llingua de dest\303\255n",
    "URL del serviciu d'IA",
+   "Siempre",
    "Gr\303\241ficos",
    "Pres\303\251u",
    "Audiu",
@@ -1043,6 +1051,7 @@ static const struct
    "Audiu",
    "Mecedor",
    "Mecedor",
+   "Est\303\251reu",
    "Salida",
    "Audiu",
    "Sincronizaci\303\263n",
@@ -1162,6 +1171,10 @@ static const struct
    "Nun s'atop\303\263'l direutoriu",
    "Direutorios",
    "Presencia arriquecida de Discord",
+   "Audiu",
+   "D'acuerdu",
+   "En bruto",
+   "Salida",
    "Descargues",
    "Baxar un nucleu",
    "Baxador de conten\303\255u",
@@ -1292,6 +1305,8 @@ static const struct
    "Iconu doble",
    "Men\303\272 principal",
    "Men\303\272",
+   "Siempre",
+   "Enxam\303\241s",
    "Restolador de ficheros",
    "Opacid\303\241",
    "Animaci\303\263n horizontal",
@@ -1313,7 +1328,6 @@ static const struct
    "Amosar la opci\303\263n \302\253Espulsar el discu\302\273",
 #endif
 #endif
-   "Amosar la opci\303\263n \302\253Ayuda\302\273",
    "Amosar la opci\303\263n \302\253Informaci\303\263n\302\273",
    "Amosar la opci\303\263n \302\253Cargar conten\303\255u\302\273",
    "Amosar la opci\303\263n \302\253Cargar un nucleu\302\273",
@@ -1475,7 +1489,6 @@ static const struct
    "&Descargar el nucleu",
    "&Ayuda",
    "Tocante a RetroArch",
-   "Collaboradores",
    "Documentaci\303\263n",
    "Borrar",
    "&Ferramientes",
@@ -1560,7 +1573,6 @@ static const struct
    "Escala d'enteros",
    "Non",
    "Direutoriu inicial",
-   "Ficheros de configuraci\303\263n",
    "Verde mazana",
    "Azul cl\303\241sico",
    "Verde cl\303\241sico",
@@ -1731,6 +1743,7 @@ static const struct
    "Color de los avisos (color\303\241u)",
    "Posici\303\263n de los avisos (horizontal)",
    "Posici\303\263n de los avisos (vertical)",
+   "Siempre",
    "180\302\272",
    "270\302\272",
    "90\302\272",
@@ -2015,6 +2028,7 @@ static const struct
    "Diendo en cata de la llista de nucleos\342\200\246",
    "Nun s'atop\303\263'l ficheru",
    "\303\215ndiz",
+   "Nel intre",
    "La contrase\303\261a ye incorreuta.",
    "La contrase\303\261a ye incorreuta.",
    "Interfaz",
@@ -2060,7 +2074,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_ast_blob_check[
-      (sizeof(msg_hash_ast_blob) == (24502u
+      (sizeof(msg_hash_ast_blob) == (24516u
 #ifdef HAVE_MIST
        + 20u
 #endif
@@ -2168,6 +2182,7 @@ static const uint32_t msg_hash_ast_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_AI_SERVICE_SOURCE_LANG,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AI_SERVICE_TARGET_LANG,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AI_SERVICE_URL,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_ALWAYS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_ASSETS_DIRECTORY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_DEVICE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_DRIVER,
@@ -2175,6 +2190,7 @@ static const uint32_t msg_hash_ast_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_ENABLE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_ENABLE_MENU,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_MIXER_SETTINGS,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_OUTPUT_LAYOUT_STEREO,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_OUTPUT_SETTINGS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_SETTINGS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_SYNC,
@@ -2294,6 +2310,10 @@ static const uint32_t msg_hash_ast_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_DIRECTORY_NOT_FOUND,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DIRECTORY_SETTINGS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISCORD_ALLOW,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISC_INFO_TRACK_AUDIO,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISPLAY_EDID_CHECKSUM_OK,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISPLAY_EDID_RAW,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISPLAY_INFO_OUTPUT,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DOWNLOADED_FILE_DETECT_CORE_LIST,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DOWNLOAD_CORE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DOWNLOAD_CORE_CONTENT,
@@ -2424,6 +2444,8 @@ static const uint32_t msg_hash_ast_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_MATERIALUI_THUMBNAIL_VIEW_PORTRAIT_DUAL_ICON,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_ADD_CONTENT_ENTRY_DISPLAY_MAIN_TAB,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_DRIVER,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_FILE_BROWSER_EXTENSION_DISPLAY_ALWAYS,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_FILE_BROWSER_EXTENSION_DISPLAY_NEVER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_FILE_BROWSER_SETTINGS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_FRAMEBUFFER_OPACITY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_HORIZONTAL_ANIMATION,
@@ -2445,7 +2467,6 @@ static const uint32_t msg_hash_ast_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_SHOW_EJECT_DISC,
 #endif
 #endif
-   (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_SHOW_HELP,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_SHOW_INFORMATION,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_SHOW_LOAD_CONTENT,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_SHOW_LOAD_CORE,
@@ -2607,7 +2628,6 @@ static const uint32_t msg_hash_ast_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_QT_MENU_FILE_UNLOAD_CORE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_QT_MENU_HELP,
    (uint32_t)MENU_ENUM_LABEL_VALUE_QT_MENU_HELP_ABOUT,
-   (uint32_t)MENU_ENUM_LABEL_VALUE_QT_MENU_HELP_ABOUT_CONTRIBUTORS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_QT_MENU_HELP_DOCUMENTATION,
    (uint32_t)MENU_ENUM_LABEL_VALUE_QT_MENU_SEARCH_CLEAR,
    (uint32_t)MENU_ENUM_LABEL_VALUE_QT_MENU_TOOLS,
@@ -2691,7 +2711,6 @@ static const uint32_t msg_hash_ast_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_ASPECT_RATIO_LOCK_INTEGER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_ASPECT_RATIO_LOCK_NONE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_BROWSER_DIRECTORY,
-   (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_CONFIG_DIRECTORY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME_APPLE_GREEN,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME_CLASSIC_BLUE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME_CLASSIC_GREEN,
@@ -2862,6 +2881,7 @@ static const uint32_t msg_hash_ast_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MESSAGE_COLOR_RED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MESSAGE_POS_X,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MESSAGE_POS_Y,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_ALWAYS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED_ROTATED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_VERTICAL,
@@ -3105,6 +3125,7 @@ static const uint32_t msg_hash_ast_ids[] =
    (uint32_t)MSG_FETCHING_CORE_LIST,
    (uint32_t)MSG_FILE_NOT_FOUND,
    (uint32_t)MSG_INDEX_FILE,
+   (uint32_t)MSG_INPUT_COMBO_INSTANT,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD_NOK,
    (uint32_t)MSG_INPUT_KIOSK_MODE_PASSWORD_NOK,
    (uint32_t)MSG_INTERFACE,

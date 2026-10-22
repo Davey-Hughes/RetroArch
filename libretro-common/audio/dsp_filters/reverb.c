@@ -83,6 +83,21 @@ static INLINE float allpass_process(struct allpass *a, float input)
    return output;
 }
 
+/* A loop gain of exactly 1 - reachable from a preset - never decays, so
+ * the Q16 state is held to a magnitude whose products and comb sums stay
+ * inside int64. 2^36 is 2^20 times full scale; a setting that decays
+ * never reaches it. */
+#define REVERB_Q16_MAX ((int64_t)1 << 36)
+
+static INLINE int64_t rsat_q16(int64_t v)
+{
+   if (v >  REVERB_Q16_MAX)
+      return  REVERB_Q16_MAX;
+   if (v < -REVERB_Q16_MAX)
+      return -REVERB_Q16_MAX;
+   return v;
+}
+
 /* Q16 multiply with round-half-away-from-zero, for the int16 path. */
 static INLINE int64_t rmul_q16(int64_t x, int32_t g)
 {
@@ -93,9 +108,10 @@ static INLINE int64_t rmul_q16(int64_t x, int32_t g)
 static INLINE int64_t comb_process_i16(struct comb *c, int64_t input)
 {
    int64_t output         = c->buffer_i[c->bufidx];
-   c->filterstore_i       = rmul_q16(output, c->damp2_q)
-                          + rmul_q16(c->filterstore_i, c->damp1_q);
-   c->buffer_i[c->bufidx] = input + rmul_q16(c->filterstore_i, c->feedback_q);
+   c->filterstore_i       = rsat_q16(rmul_q16(output, c->damp2_q)
+                          + rmul_q16(c->filterstore_i, c->damp1_q));
+   c->buffer_i[c->bufidx] = rsat_q16(input
+         + rmul_q16(c->filterstore_i, c->feedback_q));
 
    c->bufidx++;
    if (c->bufidx >= c->bufsize)
@@ -108,7 +124,8 @@ static INLINE int64_t allpass_process_i16(struct allpass *a, int64_t input)
 {
    int64_t bufout         = a->buffer_i[a->bufidx];
    int64_t output         = -input + bufout;
-   a->buffer_i[a->bufidx] = input + rmul_q16(bufout, a->feedback_q);
+   a->buffer_i[a->bufidx] = rsat_q16(input
+         + rmul_q16(bufout, a->feedback_q));
 
    a->bufidx++;
    if (a->bufidx >= a->bufsize)
@@ -297,6 +314,8 @@ static size_t revmodel_carve(struct revmodel *rev, int srate,
    for (c = 0; c < numcombs; ++c)
    {
       unsigned bufsize         = (unsigned)(r * comb_lengths[c]);
+      if (bufsize < 1)         /* a low rate rounds the line away */
+         bufsize               = 1;
       rev->combL[c].bufsize    = bufsize;
       rev->combL[c].buffer     = base ? (float*)(base + cur) : NULL;
       cur                      = REVERB_ARENA_NEXT(cur, bufsize * sizeof(float));
@@ -307,6 +326,8 @@ static size_t revmodel_carve(struct revmodel *rev, int srate,
    for (c = 0; c < numallpasses; ++c)
    {
       unsigned bufsize          = (unsigned)(r * allpass_lengths[c]);
+      if (bufsize < 1)
+         bufsize                = 1;
       rev->allpassL[c].bufsize  = bufsize;
       rev->allpassL[c].feedback = 0.5f;
       rev->allpassL[c].buffer   = base ? (float*)(base + cur) : NULL;
@@ -358,7 +379,9 @@ static void reverb_process(void *data, struct dspfilter_output *output,
 
    for (i = 0; i < input->frames; i++, out += 2)
    {
-      float in[2] = { out[0], out[1] };
+      float in[2];
+      in[0] = out[0];
+      in[1] = out[1];
 
       out[0] = revmodel_process(&rev->left, in[0]);
       out[1] = revmodel_process(&rev->right, in[1]);
@@ -386,6 +409,12 @@ static void reverb_process_i16(void *data, struct dspfilter_output_i16 *output,
    }
 }
 
+/* Ordered so NaN, which compares false against everything, lands on lo. */
+static float reverb_clampf(float x, float lo, float hi)
+{
+   return (x >= lo) ? ((x <= hi) ? x : hi) : lo;
+}
+
 static void *reverb_init(const struct dspfilter_info *info,
       const struct dspfilter_config *config, void *userdata)
 {
@@ -395,6 +424,12 @@ static void *reverb_init(const struct dspfilter_info *info,
       calloc(1, sizeof(*rev));
    if (!rev)
       return NULL;
+   /* 0 is what the rate is when the audio device never opened. */
+   if (!info || info->input_rate < 1)
+   {
+      free(rev);
+      return NULL;
+   }
 
    /* Measure both channels, then carve them out of one zeroed block. */
    arena_len  = revmodel_carve(&rev->left,  info->input_rate, NULL, 0);
@@ -413,6 +448,14 @@ static void *reverb_init(const struct dspfilter_info *info,
    config->get_float(userdata, "damping", &damping, 0.8f);
    config->get_float(userdata, "roomwidth", &roomwidth, 0.56f);
    config->get_float(userdata, "roomsize", &roomsize, 0.56f);
+
+   /* All five are normalized controls the setters scale; the comb and
+    * allpass coefficients they produce are quantized to Q16. */
+   drytime   = reverb_clampf(drytime,   0.0f, 1.0f);
+   wettime   = reverb_clampf(wettime,   0.0f, 1.0f);
+   damping   = reverb_clampf(damping,   0.0f, 1.0f);
+   roomwidth = reverb_clampf(roomwidth, 0.0f, 1.0f);
+   roomsize  = reverb_clampf(roomsize,  0.0f, 1.0f);
 
    revmodel_init(&rev->left);
    revmodel_init(&rev->right);
@@ -453,6 +496,7 @@ static const struct dspfilter_implementation reverb_plug = {
 
 const struct dspfilter_implementation *dspfilter_get_implementation(dspfilter_simd_mask_t mask)
 {
+   (void)mask;
    return &reverb_plug;
 }
 

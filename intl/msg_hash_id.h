@@ -65,6 +65,7 @@ static const struct
    char s_e5aeacf9[22];
    char s_24976a5b[20];
    char s_5209cc72[29];
+   char s_e2eedfe1[9];
    char s_14ec7b7e[11];
    char s_00614813[9];
    char s_8584f1d6[15];
@@ -163,11 +164,13 @@ static const struct
    char s_15f24ff4[7];
    char s_ec7e8026[12];
    char s_5d29b870[17];
+   char s_6996339b[6];
    char s_08e9410c[17];
    char s_d95824aa[14];
    char s_639f529e[20];
    char s_4927597c[17];
    char s_77b74366[16];
+   char s_ddf679b9[9];
    char s_10342503[8];
    char s_d31f6d88[11];
    char s_f03e9c42[17];
@@ -497,7 +500,6 @@ static const struct
    char s_ccfe26d1[21];
    char s_728ca1d3[5];
    char s_5f612db6[15];
-   char s_9f29f708[19];
    char s_b30b56ad[5];
    char s_2c04084b[22];
    char s_bd84f1a3[9];
@@ -553,6 +555,7 @@ static const struct
    char s_cd916c68[17];
    char s_8fe41f79[18];
    char s_43ac80a0[10];
+   char s_aa628249[12];
    char s_ebe994b4[12];
    char s_da093426[16];
    char s_d9b00fbd[21];
@@ -626,6 +629,8 @@ static const struct
    char s_59f183c9[19];
    char s_59dc5d76[26];
    char s_61213f1d[15];
+   char s_caf61308[9];
+   char s_c7a27b20[9];
    char s_57665cff[9];
    char s_0e2c0fca[33];
    char s_93ac5ec8[31];
@@ -636,6 +641,7 @@ static const struct
    char s_6c1369c6[17];
    char s_4d7e9b13[21];
    char s_69b801ef[11];
+   char s_9c535394[9];
    char s_f5911f43[24];
    char s_552163d9[32];
    char s_ef3d53d8[21];
@@ -733,7 +739,6 @@ static const struct
    char s_92cf524f[28];
    char s_79b8ce4a[61];
    char s_a1a8257e[101];
-   char s_d5231783[97];
    char s_a68d6d11[52];
    char s_74022c02[84];
    char s_8abad013[70];
@@ -849,7 +854,6 @@ static const struct
    char s_5deae9b2[122];
    char s_c7c09eb0[81];
    char s_6f122164[43];
-   char s_61942cf6[53];
 #ifdef HAVE_LAKKA
 #ifdef HAVE_RETROFLAG
    char s_96c461f7[125];
@@ -917,7 +921,6 @@ static const struct
    char s_67d549fd[32];
    char s_3aaf6bf1[123];
    char s_7e96b5ce[36];
-   char s_3547866d[120];
    char s_8010a29e[87];
    char s_81120e85[86];
    char s_47ae341f[83];
@@ -1040,6 +1043,7 @@ static const struct
    "Mode Eksklusif WASAPI",
    "Format Apung WASAPI",
    "Panjang Dapar Bersama WASAPI",
+   "Otomatis",
    "Konfirmasi",
    "Berhenti",
    "Gulir ke Bawah",
@@ -1138,11 +1142,13 @@ static const struct
    "Dijeda",
    "Sedang Main",
    "Informasi Cakram",
+   "Suara",
    "Muat Cakram Baru",
    "Indeks Cakram",
    "Pengendalian Cakram",
    "Keluarkan Cakram",
    "Sisipkan Cakram",
+   "Keluaran",
    "Unduhan",
    "Unduh Core",
    "Pengunduh Konten",
@@ -1472,7 +1478,6 @@ static const struct
    "Skala Bilangan Bulat",
    "MATI",
    "Direktori Awal",
-   "Berkas konfigurasi",
    "MATI",
    "Munculkan Layar Mulai",
    "Otomatis",
@@ -1528,6 +1533,7 @@ static const struct
    "Lebar Layar (mm)",
    "Pengenal Frontend",
    "Versi Git",
+   "Kadar Gerak",
    "Sumber daya",
    "Versi RetroArch",
    "Driver Konteks Video",
@@ -1601,6 +1607,8 @@ static const struct
    "Tinggi Layar Penuh",
    "Bingkai Sinkron GPU Keras",
    "Indeks Monitor",
+   "Otomatis",
+   "Otomatis",
    "Keluaran",
    "Perbaikan Lebihan Pindai (Bawah)",
    "Betulkan Lebihan Pindai (Atas)",
@@ -1611,6 +1619,7 @@ static const struct
    "Skala Berjendela",
    "Skala Bilangan Bulat",
    "Penskalaan",
+   "Vertikal",
    "Tundaan Shader Otomatis",
    "Konteks Bagi-Bagi Peranti Keras",
    "Penyaringan Bilinear",
@@ -1719,7 +1728,6 @@ static const struct
    "Berkeluaran lokal, sinyal beresolusi rendah untuk layar CRT.",
    "Beralih ke modeline resolusi tinggi untuk menampilkan menu resolusi tinggi jika belum memuat kon"
    "ten.",
-   "Hanya untuk tampilan CRT. Mencoba memakai resolusi tepat dari core/p'mainan dan laju penyegaran.",
    "Mengganti ke resolusi lokal atau super ultra lebar.",
    "Gunakan laju penyegaran kustom yang ditentukan dalam berkas konfigurasi jika perlu.",
    "Atur opsi ini jika gambar tidak dapat ditampilkan memusat semestinya.",
@@ -1847,7 +1855,6 @@ static const struct
    "bah riwayat gerak mundur.",
    "Jumlah laju bingkai saat gerak mundur per langkah. Semakin tinggi semakin cepat.",
    "Atur Direktori Awal untuk Peramban Berkas.",
-   "Berkas konfigurasi bawaan disimpan di direktori ini.",
 #ifdef HAVE_LAKKA
 #ifdef HAVE_RETROFLAG
    "For use with compatible Retroflag case.\"\n#else\n   \"For use with compatible Retroflag case. R"
@@ -1929,8 +1936,6 @@ static const struct
    "Menunda muat-langsung 'shader' (dalam milidetik). Dapat mengatasi 'glitch' grafis saat menggunak"
    "an aplikasi 'screen grab'.",
    "Ubah pengaturan sinkronisasi video.",
-   "Meningkatkan kinerja tapi akan banyak latensi dan video patah-patah. Gunakan hanya jika tidak da"
-   "pat berkecepatan penuh.",
    "Tinggi viewport kustom yang digunakan jika Rasio Aspek diatur ke 'Rasio Aspek Kustom'.",
    "Lebar viewport kustom yang digunakan jika Rasio Aspek diatur ke 'Rasio Aspek Kustom'.",
    "Sinkronkan video keluaran kartu grafis ke laju penyegaran layar. Direkomendasikan.",
@@ -2007,7 +2012,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_id_blob_check[
-      (sizeof(msg_hash_id_blob) == (26917u
+      (sizeof(msg_hash_id_blob) == (26691u
 #ifdef HAVE_MIST
        + 10u
 #endif
@@ -2169,6 +2174,7 @@ static const uint32_t msg_hash_id_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_WASAPI_EXCLUSIVE_MODE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_WASAPI_FLOAT_FORMAT,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_WASAPI_SH_BUFFER_LENGTH,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_AUTO,
    (uint32_t)MENU_ENUM_LABEL_VALUE_BASIC_MENU_CONTROLS_CONFIRM,
    (uint32_t)MENU_ENUM_LABEL_VALUE_BASIC_MENU_CONTROLS_QUIT,
    (uint32_t)MENU_ENUM_LABEL_VALUE_BASIC_MENU_CONTROLS_SCROLL_DOWN,
@@ -2267,11 +2273,13 @@ static const uint32_t msg_hash_id_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISCORD_STATUS_PAUSED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISCORD_STATUS_PLAYING,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISC_INFORMATION,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISC_INFO_TRACK_AUDIO,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISK_IMAGE_APPEND,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISK_INDEX,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISK_OPTIONS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISK_TRAY_EJECT,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISK_TRAY_INSERT,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISPLAY_INFO_OUTPUT,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DOWNLOADED_FILE_DETECT_CORE_LIST,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DOWNLOAD_CORE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DOWNLOAD_CORE_CONTENT,
@@ -2601,7 +2609,6 @@ static const uint32_t msg_hash_id_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_ASPECT_RATIO_LOCK_INTEGER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_ASPECT_RATIO_LOCK_NONE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_BROWSER_DIRECTORY,
-   (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_CONFIG_DIRECTORY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_PARTICLE_EFFECT_NONE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_SHOW_START_SCREEN,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_UPSCALE_AUTO,
@@ -2657,6 +2664,7 @@ static const uint32_t msg_hash_id_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_DISPLAY_METRIC_MM_WIDTH,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_FRONTEND_IDENTIFIER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_GIT_VERSION,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_PACING,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_POWER_SOURCE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_RETROARCH_VERSION,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_VIDEO_CONTEXT_DRIVER,
@@ -2730,6 +2738,8 @@ static const uint32_t msg_hash_id_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_FULLSCREEN_Y,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_HARD_SYNC_FRAMES,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MONITOR_INDEX,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_AUTO,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_REFRESH_AUTO,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OUTPUT_SETTINGS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OVERSCAN_CORRECTION_BOTTOM,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OVERSCAN_CORRECTION_TOP,
@@ -2740,6 +2750,7 @@ static const uint32_t msg_hash_id_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCALE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCALE_INTEGER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCALING_SETTINGS,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_LAYOUT_VERTICAL,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_DELAY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SHARED_CONTEXT,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SMOOTH,
@@ -2837,7 +2848,6 @@ static const uint32_t msg_hash_id_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_CORE_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCHRES_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_HIRES_MENU,
-   (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION_SUPER,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION_USE_CUSTOM_REFRESH_RATE,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_VERTICAL_ADJUST,
@@ -2953,7 +2963,6 @@ static const uint32_t msg_hash_id_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_REWIND_BUFFER_SIZE,
    (uint32_t)MENU_ENUM_SUBLABEL_REWIND_GRANULARITY,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_BROWSER_DIRECTORY,
-   (uint32_t)MENU_ENUM_SUBLABEL_RGUI_CONFIG_DIRECTORY,
 #ifdef HAVE_LAKKA
 #ifdef HAVE_RETROFLAG
    (uint32_t)MENU_ENUM_SUBLABEL_SAFESHUTDOWN_ENABLE,
@@ -3021,7 +3030,6 @@ static const uint32_t msg_hash_id_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_DELAY,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SYNCHRONIZATION_SETTINGS,
-   (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_THREADED,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_CUSTOM_HEIGHT,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_CUSTOM_WIDTH,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_VSYNC,

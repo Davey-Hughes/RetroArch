@@ -77,7 +77,13 @@ VIDEO DRIVER
 #endif
 
 #if defined(HAVE_SPIRV_CROSS)
-#if defined(HAVE_HLSL)
+/* The HLSL emitter is what slang shaders reach the Direct3D 10/11/12
+ * drivers through, and what the D3D9 HLSL driver builds on */
+#if defined(HAVE_HLSL) || defined(HAVE_D3D10) || defined(HAVE_D3D11) \
+ || defined(HAVE_D3D12)
+#define RARCH_SPIRV_CROSS_HLSL
+#endif
+#if defined(RARCH_SPIRV_CROSS_HLSL)
 #include "../deps/SPIRV-Cross/spirv_hlsl.cpp"
 #endif
 #include "../deps/SPIRV-Cross/spirv_cross.cpp"
@@ -90,13 +96,13 @@ VIDEO DRIVER
  * be truthy exactly when the matching backend source is amalgamated
  * above - a wrapper section compiled against an absent backend is an
  * undefined-symbol link failure on every lane lacking that backend's
- * feature flag (spirv_hlsl.cpp is HAVE_HLSL-gated; glsl and msl are
- * unconditional here). */
+ * feature flag (spirv_hlsl.cpp is RARCH_SPIRV_CROSS_HLSL-gated; glsl
+ * and msl are unconditional here). */
 #ifndef SPIRV_CROSS_C_API_GLSL
 #define SPIRV_CROSS_C_API_GLSL 1
 #endif
 #ifndef SPIRV_CROSS_C_API_HLSL
-#if defined(HAVE_HLSL)
+#if defined(RARCH_SPIRV_CROSS_HLSL)
 #define SPIRV_CROSS_C_API_HLSL 1
 #else
 #define SPIRV_CROSS_C_API_HLSL 0
@@ -113,9 +119,6 @@ VIDEO DRIVER
 #endif
 #include "../deps/SPIRV-Cross/spirv_cross_c.cpp"
 #include "../deps/SPIRV-Cross/spirv_cross_parsed_ir.cpp"
-#ifdef HAVE_SLANG
-
-#endif
 #endif
 
 #ifdef WANT_GLSLANG
@@ -126,4 +129,25 @@ VIDEO DRIVER
 #if defined(__linux__)
 #include "../deps/glslang/glslang/glslang/OSDependent/Unix/ossource.cpp"
 #endif
+#endif
+
+#ifdef HAVE_OPENXR
+/* Vendored OpenXR loader, built into this TU instead of as a separate
+ * CMake artifact.  C++17. */
+#include "../deps/openxr/src/common/object_info.cpp"
+#include "../deps/openxr/src/common/filesystem_utils.cpp"
+#include "../deps/openxr/src/loader/loader_json.cpp"
+#if defined(ANDROID)
+#include "../deps/openxr/src/loader/android_utilities.cpp"
+#endif
+#include "../deps/openxr/src/loader/api_layer_interface.cpp"
+#include "../deps/openxr/src/loader/loader_core.cpp"
+#include "../deps/openxr/src/loader/loader_init_data.cpp"
+#include "../deps/openxr/src/loader/loader_instance.cpp"
+#include "../deps/openxr/src/loader/loader_logger.cpp"
+#include "../deps/openxr/src/loader/loader_logger_recorders.cpp"
+#include "../deps/openxr/src/loader/loader_properties.cpp"
+#include "../deps/openxr/src/loader/manifest_file.cpp"
+#include "../deps/openxr/src/loader/runtime_interface.cpp"
+#include "../deps/openxr/src/loader/xr_generated_loader.cpp"
 #endif

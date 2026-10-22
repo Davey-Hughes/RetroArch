@@ -1,3 +1,5 @@
+include ../../sample_objdir.mk
+
 TARGET := archive_zip_test
 
 LIBRETRO_COMM_DIR := ../../..
@@ -25,10 +27,10 @@ SOURCES := \
 	$(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c \
 	$(LIBRETRO_COMM_DIR)/time/rtime.c
 
-OBJS := $(SOURCES:.c=.o)
+OBJS := $(call sample_objs,$(SOURCES:.c=.o))
 
 override CPPFLAGS += -DHAVE_COMPRESSION -I$(LIBRETRO_COMM_DIR)/include
-CFLAGS            += -Wall -pedantic -std=gnu99 -g
+CFLAGS            += -Wall -pedantic -std=gnu99 -g1
 
 ifneq ($(SANITIZER),)
    CFLAGS  := -fsanitize=$(SANITIZER) -fno-omit-frame-pointer $(CFLAGS)
@@ -45,6 +47,10 @@ all: $(TARGET)
 %.o: %.c Makefile
 	$(CC) -c -o $@ $< $(CPPFLAGS) $(CFLAGS)
 
+$(SAMPLE_OBJDIR)/%.o: $$(call sample_src,$$*).c Makefile
+	@mkdir -p $(@D)
+	$(CC) -c -o $@ $< $(CPPFLAGS) $(CFLAGS)
+
 $(TARGET): $(OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
@@ -52,6 +58,7 @@ check: $(TARGET)
 	./$(TARGET)
 
 clean:
+	rm -rf $(SAMPLE_OBJDIR)
 	rm -f $(TARGET) $(OBJS)
 
 .PHONY: all check clean

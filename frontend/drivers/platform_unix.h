@@ -33,6 +33,9 @@
 #include <jni.h>
 #include <poll.h>
 #include <sched.h>
+/* struct android_app below is sized by DEFAULT_MAX_PADS; include its
+ * home rather than rely on whoever included this header first. */
+#include "../../input/input_driver.h"
 
 #include <android/looper.h>
 #include <android/configuration.h>
@@ -42,6 +45,8 @@
 
 #include <rthreads/rthreads.h>
 #include <retro_atomic.h>
+
+#include "android_lifecycle.h"
 
 /* struct android_app below embeds retro_atomic_int_t, which is
  * atomic_int under C and std::atomic<int> under C++. If this header were
@@ -62,38 +67,9 @@ char internal_storage_app_path[PATH_MAX_LENGTH];
 
 struct android_app;
 
-struct android_poll_source
-{
-   /* The identifier of this source.  May be LOOPER_ID_MAIN or
-    * LOOPER_ID_INPUT. */
-   int32_t id;
-
-   /* The android_app this ident is associated with. */
-   struct android_app* app;
-
-   /* Function to call to perform the standard processing of data from
-    * this source. */
-   void (*process)(struct android_app* app, struct android_poll_source* source);
-};
-
-#define PLAT_ANDROID_PERM_RESOLVED (1 << 0)
-#define PLAT_ANDROID_PERM_GRANTED  (1 << 1)
 
 struct android_app
 {
-   /* The application can place a pointer to its own state object
-    * here if it likes. */
-   void* userData;
-
-   /* Fill this in with the function to process main app commands (APP_CMD_*) */
-   void (*onAppCmd)(struct android_app* app, int32_t cmd);
-
-   /* Fill this in with the function to process input events.  At this point
-    * the event has already been pre-dispatched, and it will be finished upon
-    * return.  Return 1 if you have handled the event, 0 for any default
-    * dispatching. */
-   int32_t (*onInputEvent)(struct android_app* app, AInputEvent* event);
-
    /* The ANativeActivity object instance that this app is running in. */
    ANativeActivity* activity;
 
@@ -115,77 +91,42 @@ struct android_app
     * receive user input events. */
    AInputQueue* inputQueue;
 
-   /* When non-NULL, this is the window surface that the app can draw in. */
-   ANativeWindow* window;
+   /* The window, the activity state the app thread has acknowledged,
+    * and every other answer a lifecycle callback on the UI thread
+    * waits for; see android_lifecycle.h. android_app_window() reads the
+    * window. */
+   android_lifecycle_t lc;
 
-   /* Current state of the app's activity.  May be either APP_CMD_START,
-    * APP_CMD_RESUME, APP_CMD_PAUSE, or APP_CMD_STOP; see below. */
-   int activityState;
-
+   /* App thread only. */
    int reinitRequested;
 
    /* This is non-zero when the application's NativeActivity is being
     * destroyed and waiting for the app thread to complete. */
    int destroyRequested;
 
-   /* Below are "private" implementation of the glue code. */
-   slock_t *mutex;
-   scond_t *cond;
-
+   /* The command pipe: struct android_app_msg records, one per
+    * command, each written whole. */
    int msgread;
    int msgwrite;
 
-   /* Startup storage-permission gate.  Written from the Java UI
-    * thread via permissionsResolved() under 'mutex'; read by the
-    * native thread in frontend_unix_init before any filesystem-
-    * dependent startup work runs. */
-   unsigned permission_state;
-
-   /* Completion counters for the lifecycle commands a Java callback
-    * blocks on: APP_CMD_INIT_WINDOW, APP_CMD_TERM_WINDOW and
-    * APP_CMD_INPUT_CHANGED.  The UI thread takes a ticket from
-    * 'cmd_seq' for every such command it posts and waits for
-    * 'done_seq' to reach it; the app thread advances 'done_seq' once
-    * it has finished acting on one.  Both are written only under
-    * 'mutex', and both are compared wrap-safely rather than for
-    * equality, so neither needs to be atomic or reset.
-    *
-    * A waiter must key on these rather than on the window or input
-    * queue handle it asked for: the framework reuses those addresses,
-    * so a handle comparison can already hold when the command is still
-    * queued and lets the callback return while the app thread is about
-    * to tear the surface down behind it. */
-   unsigned cmd_seq;
-   unsigned done_seq;
-
-   /* Set (under 'mutex') by the app thread as it leaves
-    * android_app_entry(). From then on nothing consumes the command
-    * pipe, so no acknowledgement can ever arrive: waiters treat the
-    * flag as a standing acknowledgement of everything instead of
-    * blocking the UI thread forever. A normal quit never sets it -
-    * frontend_android_shutdown() exits the process inside
-    * rarch_main() - so it marks early-failure returns and the
-    * framework-destroy unwind. */
-   int app_thread_exited;
+   /* The app thread's looper, for permissionsResolved() on the UI
+    * thread to wake. */
+   retro_atomic_ptr_t looper_to_wake;
 
    sthread_t *thread;
 
-   struct android_poll_source cmdPollSource;
-   struct android_poll_source inputPollSource;
-
-   int running;
-   int destroyed;
+   /* UI thread only: the window last handed to the app thread, which
+    * a change of window has it give up first. */
+   ANativeWindow *posted_window;
 
    /* Set by android_app_free() before it asks the app thread to shut
     * down, so android_app_destroy() knows the activity is already being
     * torn down by the framework and must not call finish() on it. */
    int destroy_from_framework;
-   AInputQueue* pendingInputQueue;
-   ANativeWindow* pendingWindow;
 
    /*  Below are "private" implementation of RA code. */
    /* Written by the app thread on APP_CMD_GAINED_FOCUS/LOST_FOCUS, read
-    * by the video thread in dispserv_android.c without the mutex. */
+    * by the video thread in dispserv_android.c. */
    retro_atomic_int_t unfocused;
    unsigned accelerometer_event_rate;
    unsigned gyroscope_event_rate;
@@ -217,6 +158,7 @@ struct android_app
    jmethodID getPendingIntentScreenshotsLocation;
    jmethodID isAndroidTV;
    jmethodID getRefreshRate;
+   jmethodID getHdrMaxLuminance;
    jmethodID getDisplayModes;
    jmethodID getCurrentDisplayModeId;
    jmethodID setDisplayModeId;
@@ -232,6 +174,7 @@ struct android_app
    jmethodID doHapticFeedback;
 
    jmethodID isPlayStoreBuild;
+   jmethodID isMetaQuestBuild;
    jmethodID getAvailableCores;
    jmethodID getInstalledCores;
    jmethodID downloadCore;
@@ -249,15 +192,16 @@ struct android_app
 
    /* Written by the Android UI thread in onContentRectChanged(), read by
     * the video thread in the context drivers, with no lock on either
-    * side. Publication is ordered: the dimensions are stored first, then
-    * @changed with a release store, and the reader acquires @changed
-    * before consuming them.
+    * side. @dims is the size as one VIDEO_SCALE_PACK word, so a reader
+    * never pairs one report's width with another's height. It is stored
+    * before @changed is raised, and the reader takes @changed with an
+    * exchange, so a change raised while it reads is not cleared unseen.
     *
     * The atomic type makes this struct C-only; see the __cplusplus
     * guard at the top of the ANDROID block. */
    struct
    {
-      retro_atomic_int_t width, height;
+      retro_atomic_int_t dims;
       retro_atomic_int_t changed;
    } content_rect;
    uint16_t rumble_last_strength_strong[MAX_USERS];
@@ -266,6 +210,7 @@ struct android_app
    int id[MAX_USERS];
 
    bool is_play_store_build;
+   bool is_meta_quest_build;
 
 #ifdef HAVE_SAF
    jmethodID requestOpenDocumentTree;
@@ -384,126 +329,9 @@ enum
    APP_CMD_REINIT_DONE
 };
 
-/* Every macro below is wrapped in do/while(0). Without it the trailing
- * JNI_EXCEPTION escapes any unbraced guard at the call site, so
- *
- *    if (env != NULL)
- *       CALL_BOOLEAN_METHOD(env, ...);
- *
- * expanded to a guarded call followed by an *unguarded* exception check
- * that dereferences env regardless - a null dereference on exactly the
- * path the guard existed to protect. */
-#define JNI_EXCEPTION(env) \
-   do { \
-      if ((*env)->ExceptionOccurred(env)) \
-      { \
-         (*env)->ExceptionDescribe(env); \
-         (*env)->ExceptionClear(env); \
-      } \
-   } while (0)
-
-#define FIND_CLASS(env, var, classname) \
-   do { \
-      var = (*env)->FindClass(env, classname); \
-      JNI_EXCEPTION(env); \
-   } while (0)
-
-#define GET_OBJECT_CLASS(env, var, clazz_obj) \
-   do { \
-      var = (*env)->GetObjectClass(env, clazz_obj); \
-      JNI_EXCEPTION(env); \
-   } while (0)
-
-#define GET_FIELD_ID(env, var, clazz, fieldName, fieldDescriptor) \
-   do { \
-      var = (*env)->GetFieldID(env, clazz, fieldName, fieldDescriptor); \
-      JNI_EXCEPTION(env); \
-   } while (0)
-
-#define GET_METHOD_ID(env, var, clazz, methodName, fieldDescriptor) \
-   do { \
-      var = (*env)->GetMethodID(env, clazz, methodName, fieldDescriptor); \
-      JNI_EXCEPTION(env); \
-   } while (0)
-
-#define GET_STATIC_METHOD_ID(env, var, clazz, methodName, fieldDescriptor) \
-   do { \
-      var = (*env)->GetStaticMethodID(env, clazz, methodName, fieldDescriptor); \
-      JNI_EXCEPTION(env); \
-   } while (0)
-
-#define CALL_OBJ_METHOD(env, var, clazz_obj, methodId) \
-   do { \
-      var = (*env)->CallObjectMethod(env, clazz_obj, methodId); \
-      JNI_EXCEPTION(env); \
-   } while (0)
-
-#define CALL_OBJ_STATIC_METHOD(env, var, clazz, methodId) \
-   do { \
-      var = (*env)->CallStaticObjectMethod(env, clazz, methodId); \
-      JNI_EXCEPTION(env); \
-   } while (0)
-
-#define CALL_OBJ_STATIC_METHOD_PARAM(env, var, clazz, methodId, ...) \
-   do { \
-      var = (*env)->CallStaticObjectMethod(env, clazz, methodId, __VA_ARGS__); \
-      JNI_EXCEPTION(env); \
-   } while (0)
-
-#define CALL_OBJ_METHOD_PARAM(env, var, clazz_obj, methodId, ...) \
-   do { \
-      var = (*env)->CallObjectMethod(env, clazz_obj, methodId, __VA_ARGS__); \
-      JNI_EXCEPTION(env); \
-   } while (0)
-
-#define CALL_VOID_METHOD(env, clazz_obj, methodId) \
-   do { \
-      (*env)->CallVoidMethod(env, clazz_obj, methodId); \
-      JNI_EXCEPTION(env); \
-   } while (0)
-
-#define CALL_VOID_METHOD_PARAM(env, clazz_obj, methodId, ...) \
-   do { \
-      (*env)->CallVoidMethod(env, clazz_obj, methodId, __VA_ARGS__); \
-      JNI_EXCEPTION(env); \
-   } while (0)
-
-#define CALL_BOOLEAN_METHOD(env, var, clazz_obj, methodId) \
-   do { \
-      var = (*env)->CallBooleanMethod(env, clazz_obj, methodId); \
-      JNI_EXCEPTION(env); \
-   } while (0)
-
-#define CALL_BOOLEAN_METHOD_PARAM(env, var, clazz_obj, methodId, ...) \
-   do { \
-      var = (*env)->CallBooleanMethod(env, clazz_obj, methodId, __VA_ARGS__); \
-      JNI_EXCEPTION(env); \
-   } while (0)
-
-#define CALL_DOUBLE_METHOD(env, var, clazz_obj, methodId) \
-   do { \
-      var = (*env)->CallDoubleMethod(env, clazz_obj, methodId); \
-      JNI_EXCEPTION(env); \
-   } while (0)
-
-#define CALL_INT_METHOD(env, var, clazz_obj, methodId) \
-   do { \
-      var = (*env)->CallIntMethod(env, clazz_obj, methodId); \
-      JNI_EXCEPTION(env); \
-   } while (0)
-
-#define CALL_INT_METHOD_PARAM(env, var, clazz_obj, methodId, ...) \
-   do { \
-      var = (*env)->CallIntMethod(env, clazz_obj, methodId, __VA_ARGS__); \
-      JNI_EXCEPTION(env); \
-   } while (0)
-
-#define CALL_FLOAT_METHOD(env, var, clazz_obj, methodId) \
-   do { \
-      var = (*env)->CallFloatMethod(env, clazz_obj, methodId); \
-      JNI_EXCEPTION(env); \
-   } while (0)
-
+/* The JNI exception guard and call wrappers live in
+ * libretro-common now, shared by every JNI user in the tree. */
+#include <jni/rjni.h>
 extern JNIEnv *jni_thread_getenv(void);
 
 /* Re-assert a chosen display mode and window frame rate after a new
@@ -512,14 +340,36 @@ extern JNIEnv *jni_thread_getenv(void);
  * silently reverts on the next resume. */
 void android_display_server_reapply_mode(void);
 
-/* Performs the pause-time save of SRAM and config requested by
- * APP_CMD_PAUSE, if one is outstanding. Called from the runloop, which is
- * the nearest point outside the core: the command that requests it is read
- * by the input driver's poll, and a core reaches that poll from inside
- * retro_run(). No-op when nothing is pending. */
+/* Performs the background save of SRAM, core options and config requested
+ * by APP_CMD_PAUSE/APP_CMD_STOP, if one is outstanding, then acknowledges
+ * the command. Called from the runloop, which is the nearest point outside
+ * the core: the command that requests it is read by the input driver's
+ * poll, and a core reaches that poll from inside retro_run(). No-op when
+ * nothing is pending. */
 void android_input_flush_pending_state(void);
 
+/* Dispatches an outstanding keypress haptic. Called from the runloop for
+ * the same reason as the flush above, and only from there: entering Java
+ * is only safe on the OS stack. No-op when nothing is pending. */
+void android_input_flush_pending_haptics(void);
+
+/* One command through the pipe. 'arg' is the window or input queue
+ * that APP_CMD_INIT_WINDOW and APP_CMD_INPUT_CHANGED hand over, NULL
+ * otherwise. Under PIPE_BUF, so a write is never split. */
+struct android_app_msg
+{
+   void *arg;
+   int8_t cmd;
+};
+
 bool android_app_write_cmd(struct android_app *android_app, int8_t cmd);
+bool android_app_write_cmd_arg(struct android_app *android_app,
+      int8_t cmd, void *arg);
+
+/* The window the app thread has, or NULL. A user that needs it to stay
+ * for a while takes it with android_lifecycle_window_acquire(). */
+#define android_app_window(app) \
+   ((ANativeWindow*)android_lifecycle_window(&(app)->lc))
 
 #ifdef HAVE_ANDROID_LIFECYCLE_HOOKS
 /* Runs a named shell script from the app's private data directory, if one

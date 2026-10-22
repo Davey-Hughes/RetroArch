@@ -80,7 +80,6 @@ import java.util.Locale;
  * Class which provides common methods for RetroActivity related classes.
  */
 public class RetroActivityCommon extends NativeActivity
-        implements InputManager.InputDeviceListener
 {
   static {
     System.loadLibrary("retroarch-activity");
@@ -104,8 +103,9 @@ public class RetroActivityCommon extends NativeActivity
   public static final int REQUEST_CODE_VULKAN_DRIVER_ZIP = 1;
   /* Startup permission flow; distinct from the in-session all-files
    * re-ask loop on requestCode 124, which restarts the app on grant. */
-  private static final int REQUEST_CODE_STARTUP_ALL_FILES = 125;
   private static final int REQUEST_CODE_STARTUP_PERMISSIONS = 126;
+  private boolean mStartupSettingsPending;
+  private boolean mStartupSettingsPaused;
   public boolean sustainedPerformanceMode = true;
   public int screenOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED;
 
@@ -165,11 +165,83 @@ public class RetroActivityCommon extends NativeActivity
     }
   };
 
-@Override
+  /* Startup gate bookkeeping.  The native thread is held on one gate
+   * until both the storage permission has been resolved and the core
+   * symlink pass has finished; whichever of the two lands last
+   * releases it.  All fields are guarded by mStartupGateLock. */
+  private final Object mStartupGateLock = new Object();
+  private boolean mStartupPermissionResolved;
+  private boolean mStartupPermissionGranted;
+  private boolean mStartupSymlinksDone;
+  private boolean mStartupGateReleased;
+
+  /* Serializes the symlink pass against the one PlayCoreManager runs
+   * after a module install, so two passes never delete and recreate
+   * the same links at once. */
+  private final Object mSymlinkLock = new Object();
+  private Object mInputDeviceListener;
+
+  /* Keep the API 16 interface off the activity loaded on Android 2.x. */
+  @TargetApi(16)
+  private static final class DeviceListener implements InputManager.InputDeviceListener
+  {
+    private final RetroActivityCommon activity;
+    private final InputManager manager;
+
+    DeviceListener(RetroActivityCommon activity)
+    {
+      this.activity = activity;
+      manager = (InputManager) activity.getSystemService(Context.INPUT_SERVICE);
+      manager.registerInputDeviceListener(this, null);
+    }
+
+    public void onInputDeviceAdded(int id) { activity.onInputDeviceAdded(id); }
+    public void onInputDeviceChanged(int id) { activity.onInputDeviceChanged(id); }
+    public void onInputDeviceRemoved(int id) { activity.onInputDeviceRemoved(id); }
+    void unregister() { manager.unregisterInputDeviceListener(this); }
+  }
+
+  @Override
+  protected void onSaveInstanceState(Bundle state)
+  {
+    super.onSaveInstanceState(state);
+    state.putBoolean("startupSettingsPending", mStartupSettingsPending);
+  }
+
+  @Override
+  protected void onPause()
+  {
+    if (mStartupSettingsPending)
+      mStartupSettingsPaused = true;
+    super.onPause();
+  }
+
+  @Override
   protected void onCreate(Bundle savedInstanceState) {
+    /* The native side reads the driver paths while it sets up Vulkan,
+     * so this has to run before super.onCreate starts the native thread. */
     initCustomVulkanDriver();
-    cleanupSymlinks();
-    updateSymlinks();
+    if (savedInstanceState != null)
+      mStartupSettingsPending = savedInstanceState.getBoolean("startupSettingsPending");
+    /* The symlink pass walks the app data and native library trees,
+     * which is disk I/O that does not belong on the UI thread.  Run
+     * it on a worker and let it release its half of the startup gate
+     * when done; the native side keeps waiting for it, so cores are
+     * still in place before native core enumeration runs. */
+    if (Build.VERSION.SDK_INT >= 21)
+      new Thread(new Runnable() {
+        @Override
+        public void run() {
+          try {
+            cleanupSymlinks();
+            updateSymlinks();
+          } finally {
+            startupSymlinksDone();
+          }
+        }
+      }, "RetroArch-symlinks").start();
+    else
+      startupSymlinksDone();
 
     if (Build.VERSION.SDK_INT >= 33) {
       registerReceiver(
@@ -183,9 +255,10 @@ public class RetroActivityCommon extends NativeActivity
         new IntentFilter(ACTION_USB_PERMISSION)
       );
     }
-    ((InputManager) getSystemService(Context.INPUT_SERVICE))
-            .registerInputDeviceListener(this, null);
-    /* Bind the hardware volume keys to the game audio stream */
+    if (Build.VERSION.SDK_INT >= 16)
+      mInputDeviceListener = new DeviceListener(this);
+    /* Bind the hardware volume keys to the game audio stream;
+     * previously done by the Java launcher activity. */
     setVolumeControlStream(AudioManager.STREAM_MUSIC);
 
     PlayCoreManager.getInstance().onCreate(this);
@@ -194,7 +267,10 @@ public class RetroActivityCommon extends NativeActivity
     /* super.onCreate has loaded the native library and started the
      * native thread; it now waits on the permission gate until this
      * resolves. */
-    resolveStartupPermissions();
+    if (!mStartupSettingsPending)
+      resolveStartupPermissions();
+    else
+      mStartupSettingsPaused = true;
   }
 
     @android.annotation.TargetApi(26)
@@ -262,8 +338,10 @@ private void initCustomVulkanDriver() {
     nativeSetVulkanDriverDir(dir, hookDir, tmpDir, fileRedirectDir, driverLibName, driverDisplayName);
 }
   protected void onDestroy() {
-    ((InputManager) getSystemService(Context.INPUT_SERVICE))
-            .unregisterInputDeviceListener(this);
+    mTouchHapticHandler.removeCallbacks(mTouchHaptic);
+    mTouchHapticPending.set(false);
+    if (Build.VERSION.SDK_INT >= 16 && mInputDeviceListener != null)
+      ((DeviceListener) mInputDeviceListener).unregister();
     unregisterReceiver(mUsbPermissionReceiver);
     closeAllUsbConnections();
     PlayCoreManager.getInstance().onDestroy();
@@ -284,6 +362,48 @@ private void initCustomVulkanDriver() {
   }
 
   /**
+   * Records the startup permission outcome and releases the native
+   * gate if the symlink pass has already finished.  Runs on the UI
+   * thread, after super.onCreate has loaded the native library.
+   */
+  private void startupPermissionResolved(boolean granted)
+  {
+    synchronized (mStartupGateLock)
+    {
+      mStartupPermissionResolved = true;
+      mStartupPermissionGranted  = granted;
+      releaseStartupGateLocked();
+    }
+  }
+
+  /**
+   * Records completion of the symlink pass and releases the native
+   * gate if the permission outcome is already known.  Runs on the
+   * symlink worker; the native library is guaranteed loaded by then
+   * because the permission outcome is only recorded after
+   * super.onCreate.
+   */
+  private void startupSymlinksDone()
+  {
+    synchronized (mStartupGateLock)
+    {
+      mStartupSymlinksDone = true;
+      releaseStartupGateLocked();
+    }
+  }
+
+  /** Caller holds mStartupGateLock. */
+  private void releaseStartupGateLocked()
+  {
+    if (mStartupGateReleased
+        || !mStartupPermissionResolved
+        || !mStartupSymlinksDone)
+      return;
+    mStartupGateReleased = true;
+    permissionsResolved(mStartupPermissionGranted);
+  }
+
+  /**
    * Resolves the startup storage permission and releases the native
    * startup gate.  A launch through the Java launcher (recognized by
    * its CONFIGFILE extra), a Play Store build, or an already-settled
@@ -295,10 +415,11 @@ private void initCustomVulkanDriver() {
   private void resolveStartupPermissions()
   {
     boolean viaLauncher = getIntent() != null && getIntent().hasExtra("CONFIGFILE");
+    boolean granted = hasStoragePermission();
 
-    if (viaLauncher || isPlayStoreBuild() || hasStoragePermission())
+    if (viaLauncher || isPlayStoreBuild() || granted)
     {
-      permissionsResolved(hasStoragePermission());
+      startupPermissionResolved(granted);
       return;
     }
 
@@ -311,23 +432,30 @@ private void initCustomVulkanDriver() {
           @Override
           public void onClick(android.content.DialogInterface dialog, int which)
           {
+            mStartupSettingsPending = true;
+            mStartupSettingsPaused = false;
+            /* Settings may finish a redirect activity before the user
+             * responds. Resolve on return from its task, not a result. */
             try
             {
               Intent intent = new Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
               intent.addCategory("android.intent.category.DEFAULT");
-              intent.setData(Uri.parse(String.format("package:%s", getPackageName())));
-              startActivityForResult(intent, REQUEST_CODE_STARTUP_ALL_FILES);
+              intent.setData(Uri.parse("package:" + getPackageName()));
+              intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+              startActivity(intent);
             }
             catch (Exception e)
             {
               try
               {
                 Intent intent = new Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION);
-                startActivityForResult(intent, REQUEST_CODE_STARTUP_ALL_FILES);
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivity(intent);
               }
               catch (Exception e2)
               {
-                permissionsResolved(false);
+                mStartupSettingsPending = false;
+                startupPermissionResolved(false);
               }
             }
           }
@@ -337,7 +465,7 @@ private void initCustomVulkanDriver() {
           @Override
           public void onClick(android.content.DialogInterface dialog, int which)
           {
-            permissionsResolved(false);
+            startupPermissionResolved(false);
           }
         })
         .setOnCancelListener(new android.content.DialogInterface.OnCancelListener()
@@ -345,7 +473,7 @@ private void initCustomVulkanDriver() {
           @Override
           public void onCancel(android.content.DialogInterface dialog)
           {
-            permissionsResolved(false);
+            startupPermissionResolved(false);
           }
         })
         .show();
@@ -364,7 +492,7 @@ private void initCustomVulkanDriver() {
   {
     if (requestCode == REQUEST_CODE_STARTUP_PERMISSIONS)
     {
-      permissionsResolved(hasStoragePermission());
+      startupPermissionResolved(hasStoragePermission());
       return;
     }
     super.onRequestPermissionsResult(requestCode, permissions, grantResults);
@@ -373,17 +501,6 @@ private void initCustomVulkanDriver() {
 @Override
   public void onActivityResult(int requestCode, int resultCode, Intent intent)
   {
-    android.util.Log.i("RetroArch/VulkanDriver", "onActivityResult: requestCode=" + requestCode
-          + " resultCode=" + resultCode + " intent=" + intent);
-
-    if (requestCode == REQUEST_CODE_STARTUP_ALL_FILES)
-    {
-      /* The Settings return carries no intent; resolve from the live
-       * state and proceed either way. */
-      permissionsResolved(hasStoragePermission());
-      return;
-    }
-
     if (requestCode == 124)
     {
       if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R)
@@ -916,11 +1033,12 @@ private void initCustomVulkanDriver() {
   /* InputManager.InputDeviceListener — request USB permission as soon as a
    * supported controller is connected, before any rumble call can occur. */
 
-  @Override
   public void onInputDeviceAdded(int deviceId)
   {
     invalidateDeviceCaches(deviceId);
 
+    if (Build.VERSION.SDK_INT < 19)
+      return;
     UsbDevice usbDevice = findUsbDeviceForInputDevice(deviceId);
     if (usbDevice == null)
       return;
@@ -944,6 +1062,8 @@ private void initCustomVulkanDriver() {
    */
   private void requestPermissionForConnectedSonyControllers()
   {
+    if (Build.VERSION.SDK_INT < 19)
+      return;
     UsbManager usbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
     if (usbManager == null)
       return;
@@ -962,25 +1082,32 @@ private void initCustomVulkanDriver() {
   protected void onResume()
   {
     super.onResume();
+    if (mStartupSettingsPending && mStartupSettingsPaused)
+    {
+      mStartupSettingsPending = false;
+      mStartupSettingsPaused = false;
+      startupPermissionResolved(hasStoragePermission());
+    }
     /* Covers controllers connected at startup or while the activity was
      * backgrounded — cases where onInputDeviceAdded() never fires. */
     requestPermissionForConnectedSonyControllers();
   }
 
-  @Override
   public void onInputDeviceChanged(int deviceId)
   {
     /* The vibrator topology can change with the device. */
     invalidateDeviceCaches(deviceId);
   }
 
-  @Override
   public void onInputDeviceRemoved(int deviceId)
   {
     /* Close any cached USB connection so we don't hold a stale handle. */
     closeUsbConnection(deviceId);
     mUsbPermissionPending.remove(Integer.valueOf(deviceId));
     invalidateDeviceCaches(deviceId);
+    /* Tell the native input driver: no input event marks a removal, so
+     * this callback is the only way it learns that a pad is gone. */
+    inputDeviceRemoved(deviceId);
   }
 
   /** Drops every cached per-device lookup for an input device id. */
@@ -1038,30 +1165,87 @@ private void initCustomVulkanDriver() {
     return result == report.length;
   }
 
-  public void doHapticFeedback(int effect, int amplitude)
+  @TargetApi(21)
+  private static final class TouchHapticAttributes
   {
-    /* Direct short high-amplitude pulse for overlay button presses,
-     * bypassing the system's generic performHapticFeedback (which
-     * tends to feel weak/vague on many devices). Fixed 20ms duration,
-     * amplitude driven by the existing Vibration Strength setting so
-     * overlay button haptics scale together with regular rumble. */
-    if (Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O && amplitude > 0) {
-      Vibrator vibrator = (Vibrator)getSystemService(Context.VIBRATOR_SERVICE);
-      if (vibrator != null && vibrator.hasVibrator()) {
-        int clampedAmplitude = Math.min(255, Math.max(1, amplitude));
-        vibrator.vibrate(
-              VibrationEffect.createOneShot(80, clampedAmplitude),
-              new AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_GAME)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                    .build());
-        Log.i("RetroActivity", "Haptic Feedback (direct pulse) effect " + effect + " amplitude " + clampedAmplitude);
-        return;
+    static final AudioAttributes VALUE = new AudioAttributes.Builder()
+        .setUsage(AudioAttributes.USAGE_GAME)
+        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build();
+  }
+
+  @TargetApi(26)
+  private static final class TouchHapticEffect
+  {
+    static final VibrationEffect VALUE = VibrationEffect.createOneShot(
+        80, VibrationEffect.DEFAULT_AMPLITUDE);
+  }
+
+  private final android.os.Handler mTouchHapticHandler =
+      new android.os.Handler(android.os.Looper.getMainLooper());
+  private final java.util.concurrent.atomic.AtomicBoolean mTouchHapticPending =
+      new java.util.concurrent.atomic.AtomicBoolean();
+  /* Amplitude handed over by the native side with the effect. It scales the
+   * buzz with the Vibration Strength setting, so 0 means the default. */
+  private volatile int mTouchHapticAmplitude;
+  private boolean mTouchVibratorResolved;
+  private Vibrator mTouchVibrator;
+  private final Runnable mTouchHaptic = new Runnable() {
+    @Override
+    public void run() {
+      mTouchHapticPending.set(false);
+
+      if (!mTouchVibratorResolved) {
+        mTouchVibrator = (Vibrator)getSystemService(Context.VIBRATOR_SERVICE);
+        if (mTouchVibrator != null && !mTouchVibrator.hasVibrator())
+          mTouchVibrator = null;
+        mTouchVibratorResolved = true;
       }
+      if (mTouchVibrator == null)
+        return;
+
+      if (Build.VERSION.SDK_INT >= 26)
+        mTouchVibrator.vibrate(touchHapticEffect(mTouchHapticAmplitude),
+            TouchHapticAttributes.VALUE);
+      else if (Build.VERSION.SDK_INT >= 21)
+        mTouchVibrator.vibrate(80, TouchHapticAttributes.VALUE);
+      else
+        mTouchVibrator.vibrate(80);
     }
-    getWindow().getDecorView().performHapticFeedback(effect,
-        HapticFeedbackConstants.FLAG_IGNORE_GLOBAL_SETTING | HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING);
-    Log.i("RetroActivity", "Haptic Feedback effect " + effect);
+  };
+
+  /* Overlay button presses get a direct 80 ms pulse; the generic
+   * performHapticFeedback feels weak and vague on many devices. */
+  @TargetApi(26)
+  private static VibrationEffect touchHapticEffect(int amplitude)
+  {
+    if (amplitude <= 0)
+      return TouchHapticEffect.VALUE;
+    return VibrationEffect.createOneShot(80, Math.min(255, Math.max(1, amplitude)));
+  }
+
+  public void doHapticFeedback(final int effect)
+  {
+    doHapticFeedback(effect, 0);
+  }
+
+  public void doHapticFeedback(final int effect, final int amplitude)
+  {
+    if (effect == HapticFeedbackConstants.KEYBOARD_PRESS) {
+      mTouchHapticAmplitude = amplitude;
+      if (mTouchHapticPending.compareAndSet(false, true)
+          && !mTouchHapticHandler.post(mTouchHaptic))
+        mTouchHapticPending.set(false);
+      return;
+    }
+    // Called from the native app thread. View.performHapticFeedback is not
+    // documented as thread safe, so hand it to the UI thread.
+    runOnUiThread(new Runnable() {
+      @Override
+      public void run() {
+        getWindow().getDecorView().performHapticFeedback(effect,
+            HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING);
+      }
+    });
   }
 
   // Exiting cleanly from NDK seems to be nearly impossible.
@@ -1559,6 +1743,32 @@ private void initCustomVulkanDriver() {
   }
 
   @SuppressWarnings("deprecation")
+  /**
+   * The display's peak luminance in nits, as its HDR capabilities
+   * report it (API 24); 0 where the display reports none or is not HDR.
+   */
+  public float getHdrMaxLuminance()
+  {
+    try
+    {
+      Display display = getActiveDisplay();
+
+      if (display == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.N)
+        return 0.0f;
+
+      Display.HdrCapabilities caps = display.getHdrCapabilities();
+      if (caps == null || caps.getSupportedHdrTypes().length == 0)
+        return 0.0f;
+
+      float peak = caps.getDesiredMaxLuminance();
+      return (Float.isNaN(peak) || peak <= 0.0f) ? 0.0f : peak;
+    }
+    catch (Exception e)
+    {
+      return 0.0f;
+    }
+  }
+
   public float getRefreshRate()
   {
     try
@@ -1655,9 +1865,16 @@ private void initCustomVulkanDriver() {
    * @return true if this is a Play Store build, false otherwise
    */
   public boolean isPlayStoreBuild() {
-    Log.i("RetroActivity", "isPlayStoreBuild: " + BuildConfig.PLAY_STORE_BUILD);
-
     return BuildConfig.PLAY_STORE_BUILD;
+  }
+
+  /**
+   * Checks if this version of RetroArch is a Meta Quest build.
+   *
+   * @return true if this is a Meta Quest build, false otherwise
+   */
+  public boolean isMetaQuestBuild() {
+    return BuildConfig.META_QUEST_BUILD;
   }
 
   /**
@@ -1814,7 +2031,7 @@ private void initCustomVulkanDriver() {
         keyboardActive = true;
         keyboardSuppressWatcher = true;
         keyboardEditText.setText(initialText != null ? initialText : "");
-        keyboardEditText.setSelection(keyboardEditText.getText().length());
+        keyboardEditText.setSelection(0, keyboardEditText.getText().length());
         keyboardSuppressWatcher = false;
         if (label != null)
           keyboardEditText.setHint(label);
@@ -1896,6 +2113,13 @@ private void initCustomVulkanDriver() {
    */
   public native void onSystemKeyboardInput(String text, boolean finished);
 
+  /**
+   * Tells the native input driver that Android removed an input device.
+   *
+   * @param deviceId The id the device had.
+   */
+  public native void inputDeviceRemoved(int deviceId);
+
 
 
   /////////////// Private methods ///////////////
@@ -1946,13 +2170,16 @@ private void initCustomVulkanDriver() {
   private void cleanupSymlinks() {
     if(Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) return;
 
-    File[] files = new File(getCorePath()).listFiles();
-    for(int i = 0; i < files.length; i++) {
-      try {
-        Os.readlink(files[i].getAbsolutePath());
-        files[i].delete();
-      } catch (Exception e) {
-        // File is not a symlink, so don't delete.
+    synchronized (mSymlinkLock) {
+      File[] files = new File(getCorePath()).listFiles();
+      if(files == null) return;
+      for(int i = 0; i < files.length; i++) {
+        try {
+          Os.readlink(files[i].getAbsolutePath());
+          files[i].delete();
+        } catch (Exception e) {
+          // File is not a symlink, so don't delete.
+        }
       }
     }
   }
@@ -1964,8 +2191,14 @@ private void initCustomVulkanDriver() {
   public void updateSymlinks() {
     if(!isPlayStoreBuild()) return;
 
-    traverseFilesystem(getFilesDir());
-    traverseFilesystem(new File(getApplicationInfo().nativeLibraryDir));
+    synchronized (mSymlinkLock) {
+      List<String> availableCores = Arrays.asList(getAvailableCores());
+      SharedPreferences prefs = UserPreferences.getPreferences(this);
+      String corePath = getCorePath();
+      traverseFilesystem(getFilesDir(), availableCores, prefs, corePath);
+      traverseFilesystem(new File(getApplicationInfo().nativeLibraryDir),
+              availableCores, prefs, corePath);
+    }
   }
 
   /**
@@ -1983,13 +2216,12 @@ private void initCustomVulkanDriver() {
    * @param cores List of cores to update.
    * @param filenames List of filenames to update.
    */
-  private void traverseFilesystem(File file) {
+  private void traverseFilesystem(File file, List<String> availableCores,
+          SharedPreferences prefs, String corePath) {
     if(Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) return;
 
     File[] list = file.listFiles();
     if(list == null) return;
-
-    List<String> availableCores = Arrays.asList(getAvailableCores());
 
     // Check each file in a directory to see if it's a native library.
     for(int i = 0; i < list.length; i++) {
@@ -2001,11 +2233,10 @@ private void initCustomVulkanDriver() {
         String core = name.subSequence(3, name.length() - 3).toString();
         String filename = child.getAbsolutePath();
 
-        SharedPreferences prefs = UserPreferences.getPreferences(this);
         if(!prefs.getBoolean("core_deleted_" + core, false)
                 && availableCores.contains(core)) {
           // Generate the destination filename and delete any existing symlinks / cores
-          String newFilename = getCorePath() + core + "_libretro_android.so";
+          String newFilename = corePath + core + "_libretro_android.so";
           new File(newFilename).delete();
 
           try {
@@ -2014,9 +2245,9 @@ private void initCustomVulkanDriver() {
             // Symlink failed to be created. Should never happen.
           }
         }
-      } else if(file.isDirectory()) {
+      } else if(child.isDirectory()) {
         // Found another directory, so traverse it
-        traverseFilesystem(child);
+        traverseFilesystem(child, availableCores, prefs, corePath);
       }
     }
   }

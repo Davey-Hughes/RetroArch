@@ -166,7 +166,7 @@ static void sdl3_vk_ctx_swap_buffers(void *data)
 }
 
 static void sdl3_vk_ctx_check_window(void *data, bool *quit,
-      bool *resize, unsigned *width, unsigned *height)
+      bool *resize, unsigned *dims)
 {
    gfx_ctx_sdl3_vk_data_t *sdl = (gfx_ctx_sdl3_vk_data_t*)data;
 
@@ -175,18 +175,17 @@ static void sdl3_vk_ctx_check_window(void *data, bool *quit,
    if (sdl->vk.flags & VK_DATA_FLAG_NEED_NEW_SWAPCHAIN)
       *resize = true;
 
-   sdl3_ctx_check_window(data, quit, resize, width, height);
+   sdl3_ctx_check_window(data, quit, resize, dims);
 }
 
-static bool sdl3_vk_ctx_set_resize(void *data,
-      unsigned width, unsigned height)
+static bool sdl3_vk_ctx_set_resize(void *data, unsigned dims)
 {
    gfx_ctx_sdl3_vk_data_t *sdl = (gfx_ctx_sdl3_vk_data_t*)data;
 
    if (!sdl)
       return false;
 
-   if (!vulkan_create_swapchain(&sdl->vk, width, height, sdl->interval))
+   if (!vulkan_create_swapchain(&sdl->vk, dims, sdl->interval))
    {
       RARCH_ERR("[SDL3 Vulkan] Failed to update swapchain.\n");
       sdl->vk.swapchain           = VK_NULL_HANDLE;
@@ -194,32 +193,32 @@ static bool sdl3_vk_ctx_set_resize(void *data,
    }
 
    if (sdl->vk.flags & VK_DATA_FLAG_CREATED_NEW_SWAPCHAIN)
+   {
       vulkan_acquire_next_image(&sdl->vk);
-   sdl->vk.context.flags         |=  VK_CTX_FLAG_INVALID_SWAPCHAIN;
+      sdl->vk.context.flags      |=  VK_CTX_FLAG_INVALID_SWAPCHAIN;
+   }
    sdl->vk.flags                 &= ~VK_DATA_FLAG_NEED_NEW_SWAPCHAIN;
    return true;
 }
 
 static bool sdl3_vk_ctx_set_video_mode(void *data,
-      unsigned width, unsigned height,
+      unsigned dims,
       bool fullscreen)
 {
    gfx_ctx_sdl3_vk_data_t *sdl = (gfx_ctx_sdl3_vk_data_t*)data;
-   unsigned win_width = 0;
-   unsigned win_height = 0;
+   unsigned win_dims           = 0;
 
    if (!sdl)
       return false;
 
-   if (!sdl3_window_set_video_mode(&sdl->win, width, height, fullscreen,
+   if (!sdl3_window_set_video_mode(&sdl->win, dims, fullscreen,
             SDL_WINDOW_VULKAN))
       goto error;
 
-   sdl3_window_get_video_size(sdl->win, &win_width, &win_height);
+   sdl3_window_get_video_size(sdl->win, &win_dims);
 
    if (!vulkan_surface_create(&sdl->vk, VULKAN_WSI_SDL3,
-            NULL, sdl->win,
-            win_width, win_height, sdl->interval))
+            NULL, sdl->win, win_dims, sdl->interval))
       goto error;
 
    return true;
@@ -255,21 +254,13 @@ static uint32_t sdl3_vk_ctx_get_flags(void *data)
 {
    gfx_ctx_sdl3_vk_data_t *sdl = (gfx_ctx_sdl3_vk_data_t*)data;
    uint32_t flags              = 0;
-   uint8_t present_mode_count  = 16;
-   uint8_t i                   = 0;
 
-   /* Check for FIFO_RELAXED_KHR capability. */
-   if (sdl)
-   {
-      for (i = 0; i < present_mode_count; i++)
-      {
-         if (sdl->vk.context.present_modes[i] == VK_PRESENT_MODE_FIFO_RELAXED_KHR)
-         {
-            BIT32_SET(flags, GFX_CTX_FLAGS_ADAPTIVE_VSYNC);
-            break;
-         }
-      }
-   }
+   /* What the swapchain settled when it was made, rather than a walk of
+    * present_modes while the thread that draws rewrites it */
+   if (     sdl
+         && retro_atomic_load_acquire_int(
+            &sdl->vk.context.supports_adaptive_vsync))
+      BIT32_SET(flags, GFX_CTX_FLAGS_ADAPTIVE_VSYNC);
 
 #if defined(HAVE_SLANG) && defined(HAVE_SPIRV_CROSS)
    BIT32_SET(flags, GFX_CTX_FLAGS_SHADERS_SLANG);

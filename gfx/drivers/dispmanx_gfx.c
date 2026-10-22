@@ -17,6 +17,8 @@
 #include <bcm_host.h>
 
 #include <rthreads/rthreads.h>
+#include <rthreads/retro_eventcount.h>
+#include <retro_atomic.h>
 
 #ifdef HAVE_CONFIG_H
 #include "../../config.h"
@@ -28,16 +30,21 @@
 
 #include "../../driver.h"
 #include "../../retroarch.h"
+#include "../../verbosity.h"
+#include "../video_views.h"
+#include "../video_views_cpu.h"
 
 struct dispmanx_page
 {
    /* Each page contains it's own resource handler
     * instead of pointing to in by page number */
    DISPMANX_RESOURCE_HANDLE_T resource;
-   bool used;
-   /* Each page has it's own mutex for
-    * isolating it's used flag access. */
-   slock_t *page_used_mutex;
+   /* Whether the flip that put this page on screen is still in flight.
+    * The frame thread sets it when it takes the page and the vsync
+    * callback clears it for the page that was visible until then, so a
+    * release store and an acquire load carry the handoff on their own -
+    * the free-page scan below has always read this without a lock. */
+   retro_atomic_int_t used;
 
    /* This field will allow us to access the
     * main _dispvars struct from the vsync CB function */
@@ -88,14 +95,25 @@ struct dispmanx_video
    struct dispmanx_surface *main_surface;
    struct dispmanx_surface *menu_surface;
    struct dispmanx_surface *back_surface;
+   /* A core's views composed for the element to scale to the screen,
+    * from the buffer the composer draws in */
+   struct dispmanx_surface *views_surface;
+   video_views_cpu_t views_cpu;
+   uint32_t *views_pixels;
+   size_t views_pixels_size;
+   /* Both eyes side by side, for anaglyph and interlaced */
+   uint32_t *views_canvas;
+   size_t views_canvas_size;
+   unsigned views_dims;
+   /* For get_flags: the last frame with a map was drawn whole */
+   retro_atomic_int_t views_fallback;
 
    /* For console blanking */
    uint8_t *fb_addr;
    uint8_t *screen_bck;
 
    /* For threading */
-   scond_t *vsync_condition;
-   slock_t *pending_mutex;
+   retro_eventcount_t vsync_ec;
    /* We use this to keep track of internal resolution changes
     * done by cores in the main surface or in the menu.
     * We need these outside the surface because we free surfaces
@@ -113,7 +131,11 @@ struct dispmanx_video
    /* Total dispmanx video dimensions. Not counting overscan settings. */
    unsigned int dispmanx_width;
    unsigned int dispmanx_height;
-   unsigned int pageflip_pending; /* For threading */
+   /* Flips issued and not yet reported by the vsync callback. The
+    * callback decrements it and notifies; a waiter re-tests it inside
+    * the eventcount's wait window, so a callback landing between the
+    * test and the park cannot be missed. */
+   retro_atomic_int_t pageflip_pending;
 
    uint32_t vc_image_ptr;
 
@@ -124,13 +146,33 @@ struct dispmanx_video
    /* Menu */
    bool menu_active;
    bool rgb32;
+   bool views_seen;
 };
+
+/* Park until every issued flip has been reported by the vsync
+ * callback. The re-test sits inside the wait window, so a callback
+ * that lands after the first test still releases the waiter. */
+static void dispmanx_drain_flips(struct dispmanx_video *_dispvars)
+{
+   int key;
+
+   while (retro_atomic_load_acquire_int(&_dispvars->pageflip_pending) > 0)
+   {
+      key = retro_eventcount_prepare_wait(&_dispvars->vsync_ec);
+
+      if (retro_atomic_load_acquire_int(&_dispvars->pageflip_pending) > 0)
+         retro_eventcount_commit_wait(&_dispvars->vsync_ec, key);
+      else
+         retro_eventcount_cancel_wait(&_dispvars->vsync_ec);
+   }
+}
 
 /* If no free page is available when called, wait for a page flip. */
 static struct dispmanx_page *dispmanx_get_free_page(struct dispmanx_video *_dispvars,
       struct dispmanx_surface *surface)
 {
    unsigned i;
+   int key;
    struct dispmanx_page *page = NULL;
 
    while (!page)
@@ -138,7 +180,7 @@ static struct dispmanx_page *dispmanx_get_free_page(struct dispmanx_video *_disp
       /* Try to find a free page */
       for (i = 0; i < surface->numpages; ++i)
       {
-         if (!surface->pages[i].used)
+         if (!retro_atomic_load_acquire_int(&surface->pages[i].used))
          {
             page = (surface->pages) + i;
             break;
@@ -149,17 +191,20 @@ static struct dispmanx_page *dispmanx_get_free_page(struct dispmanx_video *_disp
        * wait until a free page is freed by vsync CB. */
       if (!page)
       {
-         slock_lock(_dispvars->pending_mutex);
-          if (_dispvars->pageflip_pending > 0)
-             scond_wait(_dispvars->vsync_condition, _dispvars->pending_mutex);
-         slock_unlock(_dispvars->pending_mutex);
+         /* One flip's worth of progress, then the scan above runs
+          * again - the window opens before the test so a callback in
+          * between is counted, not missed. */
+         key = retro_eventcount_prepare_wait(&_dispvars->vsync_ec);
+
+         if (retro_atomic_load_acquire_int(&_dispvars->pageflip_pending) > 0)
+            retro_eventcount_commit_wait(&_dispvars->vsync_ec, key);
+         else
+            retro_eventcount_cancel_wait(&_dispvars->vsync_ec);
       }
    }
 
    /* We mark the chosen page as used */
-   slock_lock(page->page_used_mutex);
-   page->used = true;
-   slock_unlock(page->page_used_mutex);
+   retro_atomic_store_release_int(&page->used, 1);
 
    return page;
 }
@@ -174,25 +219,18 @@ static void dispmanx_vsync_callback(DISPMANX_UPDATE_HANDLE_T u, void *data)
     * we can chose this page as free */
    if (surface->current_page)
    {
-      slock_lock(surface->current_page->page_used_mutex);
-
       /* We mark as free the page that was visible until now */
-      surface->current_page->used = false;
-      slock_unlock(surface->current_page->page_used_mutex);
+      retro_atomic_store_release_int(&surface->current_page->used, 0);
    }
 
    /* The page on which we issued the flip that
     * caused this callback becomes the visible one */
    surface->current_page = page;
 
-   /* These two things must be isolated "atomically" to avoid getting
-    * a false positive in the pending_mutex test in update_main. */
-   slock_lock(page->dispvars->pending_mutex);
-
-   page->dispvars->pageflip_pending--;
-   scond_signal(page->dispvars->vsync_condition);
-
-   slock_unlock(page->dispvars->pending_mutex);
+   /* Decrement before the notify, so a waiter released by it sees the
+    * count this callback settled on. */
+   retro_atomic_fetch_sub_int(&page->dispvars->pageflip_pending, 1);
+   retro_eventcount_notify(&page->dispvars->vsync_ec);
 }
 
 static void dispmanx_surface_free(struct dispmanx_video *_dispvars,
@@ -204,16 +242,12 @@ static void dispmanx_surface_free(struct dispmanx_video *_dispvars,
    /* What if we run into the vsync cb code after freeing the surface?
     * We could be trying to get non-existent lock, signal non-existent condition..
     * So we wait for any pending flips to complete before freeing any surface. */
-   slock_lock(_dispvars->pending_mutex);
-   if (_dispvars->pageflip_pending > 0)
-      scond_wait(_dispvars->vsync_condition, _dispvars->pending_mutex);
-   slock_unlock(_dispvars->pending_mutex);
+   dispmanx_drain_flips(_dispvars);
 
    for (i = 0; i < surface->numpages; i++)
    {
       vc_dispmanx_resource_delete(surface->pages[i].resource);
-      surface->pages[i].used = false;
-      slock_free(surface->pages[i].page_used_mutex);
+      retro_atomic_store_release_int(&surface->pages[i].used, 0);
    }
 
    free(surface->pages);
@@ -281,16 +315,15 @@ static void dispmanx_surface_setup(struct dispmanx_video *_dispvars,
 
    for (i = 0; i < surface->numpages; i++)
    {
-      surface->pages[i].used = false;
+      retro_atomic_store_release_int(&surface->pages[i].used, 0);
       surface->pages[i].surface = surface;
       surface->pages[i].dispvars = _dispvars;
-      surface->pages[i].page_used_mutex = slock_new();
    }
 
-   /* No need to mutex this access to the "used" member because
-    * the flipping/callbacks are not still running */
+   /* The flipping/callbacks are not still running, so nothing races
+    * this first claim */
    surface->next_page = &(surface->pages[0]);
-   surface->next_page->used = true;
+   retro_atomic_store_release_int(&surface->next_page->used, 1);
 
    /* The "visible" width obtained from the core pitch. We blit based on
     * the "visible" width, for cores with things between scanlines. */
@@ -350,10 +383,7 @@ static void dispmanx_surface_update(struct dispmanx_video *_dispvars, const void
 
    /* Dispmanx doesn't support more than one pending pageflip. Doing so would overwrite
     * the page in the callback function, so we would be always freeing the same page. */
-   slock_lock(_dispvars->pending_mutex);
-   if (_dispvars->pageflip_pending > 0)
-      scond_wait(_dispvars->vsync_condition, _dispvars->pending_mutex);
-   slock_unlock(_dispvars->pending_mutex);
+   dispmanx_drain_flips(_dispvars);
 
    /* Issue a page flip that will be done at the next vsync. */
    _dispvars->update = vc_dispmanx_update_start(0);
@@ -361,9 +391,7 @@ static void dispmanx_surface_update(struct dispmanx_video *_dispvars, const void
    vc_dispmanx_element_change_source(_dispvars->update, surface->element,
          surface->next_page->resource);
 
-   slock_lock(_dispvars->pending_mutex);
-   _dispvars->pageflip_pending++;
-   slock_unlock(_dispvars->pending_mutex);
+   retro_atomic_fetch_add_int(&_dispvars->pageflip_pending, 1);
 
    vc_dispmanx_update_submit(_dispvars->update,
       dispmanx_vsync_callback, (void*)(surface->next_page));
@@ -405,8 +433,7 @@ static void dispmanx_blank_console (struct dispmanx_video *_dispvars)
    dispmanx_surface_update_async(image, _dispvars->back_surface);
 }
 
-static void *dispmanx_init(const video_info_t *video,
-      input_driver_t **input, void **input_data)
+static void *dispmanx_init(const video_info_t *video)
 {
    struct dispmanx_video *_dispvars = calloc(1, sizeof(struct dispmanx_video));
 
@@ -424,7 +451,7 @@ static void *dispmanx_init(const video_info_t *video,
 
    /* Setup surface parameters */
    _dispvars->vc_image_ptr     = 0;
-   _dispvars->pageflip_pending = 0;
+   retro_atomic_store_release_int(&_dispvars->pageflip_pending, 0);
    _dispvars->menu_active      = false;
    _dispvars->rgb32            = video->rgb32;
 
@@ -434,9 +461,14 @@ static void *dispmanx_init(const video_info_t *video,
     * before we get to gfx_frame(). */
    _dispvars->aspect_ratio = video_driver_get_aspect_ratio();
 
-   /* Initialize the rest of the mutexes and conditions. */
-   _dispvars->vsync_condition  = scond_new();
-   _dispvars->pending_mutex    = slock_new();
+   if (!retro_eventcount_init(&_dispvars->vsync_ec))
+   {
+      vc_dispmanx_display_close(_dispvars->display);
+      bcm_host_deinit();
+      free(_dispvars);
+      return NULL;
+   }
+
    _dispvars->core_width       = 0;
    _dispvars->core_height      = 0;
    _dispvars->menu_width       = 0;
@@ -445,20 +477,115 @@ static void *dispmanx_init(const video_info_t *video,
    _dispvars->main_surface     = NULL;
    _dispvars->menu_surface     = NULL;
 
-   if (input && input_data)
-      *input = NULL;
 
    /* Enable/disable dispmanx bilinear filtering. */
    dispmanx_set_scaling(video->smooth);
 
    dispmanx_blank_console(_dispvars);
+
+   video_driver_display_type_set(RARCH_DISPLAY_VIDEOCORE);
+   /* What views are laid out on */
+   video_driver_set_output_dims(VIDEO_SCALE_PACK(_dispvars->dispmanx_width,
+            _dispvars->dispmanx_height));
+
    return _dispvars;
 }
 
-static bool dispmanx_frame(void *data, const void *frame, unsigned width,
-      unsigned height, uint64_t frame_count, unsigned pitch, const char *msg,
+/* Grows *@buf to at least @size bytes */
+static bool dispmanx_views_grow(uint32_t **buf, size_t *have, size_t size)
+{
+   uint32_t *grown;
+   if (size <= *have)
+      return true;
+   if (!(grown = (uint32_t*)realloc(*buf, size)))
+      return false;
+   *buf  = grown;
+   *have = size;
+   return true;
+}
+
+/* A core's views: laid out on the screen, composed at the scale that
+ * draws no view larger than it is, into a surface whose element the
+ * HVS enlarges to the whole screen. Each view straight from the frame.
+ * False when the frame is to be drawn whole. */
+static bool dispmanx_views_frame(struct dispmanx_video *_dispvars,
+      const void *frame, unsigned dims, unsigned pitch,
+      const video_frame_info_t *info)
+{
+   float scale;
+   unsigned cdims;
+   const video_views_layout_t *layout;
+   bool views = info && frame && info->views.num_views
+      && video_views_fit_frame(&info->views, dims);
+
+   retro_atomic_store_release_int(&_dispvars->views_fallback,
+         (info && info->views.num_views && !views) ? 1 : 0);
+   if (!views)
+   {
+      if (_dispvars->views_surface)
+      {
+         dispmanx_surface_free(_dispvars, &_dispvars->views_surface);
+         /* The frame's surface is set up again on its way back */
+         _dispvars->core_width = 0;
+      }
+      return false;
+   }
+
+   layout = &info->views_layout;
+   scale  = video_views_cpu_scale(&info->views, layout);
+   cdims  = video_views_cpu_dims(info->dims, scale);
+   if (!_dispvars->views_surface || _dispvars->views_dims != cdims)
+   {
+      if (_dispvars->views_surface)
+         dispmanx_surface_free(_dispvars, &_dispvars->views_surface);
+      /* The views take the frame's place on the screen */
+      if (_dispvars->main_surface)
+         dispmanx_surface_free(_dispvars, &_dispvars->main_surface);
+      dispmanx_surface_setup(_dispvars,
+            VIDEO_SCALE_W(cdims), VIDEO_SCALE_H(cdims),
+            VIDEO_SCALE_W(cdims) * 4, 32, VC_IMAGE_XRGB8888, 255,
+            (float)_dispvars->dispmanx_width / _dispvars->dispmanx_height,
+            info->max_swapchain_images, 0, &_dispvars->views_surface);
+      if (!_dispvars->views_surface)
+         return false;
+      _dispvars->views_dims = cdims;
+      /* The menu goes back on top: set_texture_frame sets it up again */
+      if (_dispvars->menu_surface)
+         dispmanx_surface_free(_dispvars, &_dispvars->menu_surface);
+   }
+   if (!dispmanx_views_grow(&_dispvars->views_pixels,
+            &_dispvars->views_pixels_size,
+            (size_t)_dispvars->views_surface->pitch * VIDEO_SCALE_H(cdims)))
+      return false;
+   if (     layout->offscreen
+         && !dispmanx_views_grow(&_dispvars->views_canvas,
+            &_dispvars->views_canvas_size,
+            (size_t)2 * VIDEO_SCALE_AREA(cdims) * sizeof(uint32_t)))
+      return false;
+   if (!_dispvars->views_seen)
+   {
+      _dispvars->views_seen = true;
+      RARCH_LOG("[Dispmanx] Views drawn straight from the frame.\n");
+   }
+
+   video_views_cpu_compose(&_dispvars->views_cpu, &info->views, layout,
+         frame, pitch,
+         _dispvars->rgb32 ? SCALER_FMT_ARGB8888 : SCALER_FMT_RGB565,
+         info->video_smooth ? SCALER_TYPE_BILINEAR : SCALER_TYPE_POINT,
+         scale, cdims, _dispvars->views_pixels,
+         _dispvars->views_surface->pitch / 4,
+         layout->offscreen ? _dispvars->views_canvas : NULL);
+   dispmanx_surface_update(_dispvars, _dispvars->views_pixels,
+         _dispvars->views_surface);
+   return true;
+}
+
+static bool dispmanx_frame(void *data, const void *frame,
+      unsigned dims, uint64_t frame_count, unsigned pitch, const char *msg,
       video_frame_info_t *video_info)
 {
+   unsigned width = VIDEO_SCALE_W(dims);
+   unsigned height = VIDEO_SCALE_H(dims);
    struct dispmanx_video *_dispvars = data;
    float                     aspect = video_driver_get_aspect_ratio();
    unsigned    max_swapchain_images = video_info->max_swapchain_images;
@@ -466,6 +593,14 @@ static bool dispmanx_frame(void *data, const void *frame, unsigned width,
 
    if (!frame)
       return true;
+
+   if (dispmanx_views_frame(_dispvars, frame, dims, pitch, video_info))
+   {
+#ifdef HAVE_MENU
+      menu_driver_frame(menu_is_alive, video_info);
+#endif
+      return true;
+   }
 
    if (     (width  != _dispvars->core_width)
          || (height != _dispvars->core_height)
@@ -524,7 +659,7 @@ static void dispmanx_set_texture_enable(void *data, bool state, bool full_screen
 }
 
 static void dispmanx_set_texture_frame(void *data, const void *frame, bool rgb32,
-      unsigned width, unsigned height, float alpha)
+      unsigned dims, float alpha)
 {
    struct dispmanx_video *_dispvars = data;
 
@@ -534,14 +669,14 @@ static void dispmanx_set_texture_frame(void *data, const void *frame, bool rgb32
    /* If menu is active in this frame but our menu surface is NULL, we allocate a new one.*/
    if (!_dispvars->menu_surface)
    {
-      _dispvars->menu_width  = width;
-      _dispvars->menu_height = height;
-      _dispvars->menu_pitch  = width * (rgb32 ? 4 : 2);
+      _dispvars->menu_width  = VIDEO_SCALE_W(dims);
+      _dispvars->menu_height = VIDEO_SCALE_H(dims);
+      _dispvars->menu_pitch  = VIDEO_SCALE_W(dims) * (rgb32 ? 4 : 2);
 
       /* Menu surface only needs a page as it will be updated asynchronously. */
       dispmanx_surface_setup(_dispvars,
-            width,
-            height,
+            VIDEO_SCALE_W(dims),
+            VIDEO_SCALE_H(dims),
             _dispvars->menu_pitch,
             16,
             VC_IMAGE_RGBA16,
@@ -571,10 +706,12 @@ static void dispmanx_viewport_info(void *data, struct video_viewport *vp)
    if (!vid)
       return;
 
-   vp->x = vp->y = 0;
+   vp->pos = VIDEO_POS_PACK(0, 0);
 
-   vp->width  = vp->full_width  = vid->core_width;
-   vp->height = vp->full_height = vid->core_height;
+   /* The whole screen while views draw */
+   vp->dims   = vp->full_dims   = vid->views_surface
+      ? VIDEO_SCALE_PACK(vid->dispmanx_width, vid->dispmanx_height)
+      : VIDEO_SCALE_PACK(vid->core_width, vid->core_height);
 }
 
 static bool dispmanx_suppress_screensaver(void *data, bool enable) { return false; }
@@ -584,7 +721,13 @@ static bool dispmanx_set_shader(void *data,
 static uint32_t dispmanx_get_flags(void *data)
 {
    uint32_t             flags = 0;
-
+   struct dispmanx_video *_dispvars = data;
+   if (_dispvars)
+   {
+      BIT32_SET(flags, GFX_CTX_FLAGS_VIDEO_VIEWS);
+      if (retro_atomic_load_acquire_int(&_dispvars->views_fallback))
+         BIT32_SET(flags, GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK);
+   }
    return flags;
 }
 
@@ -630,8 +773,14 @@ static void dispmanx_free(void *data)
    if (!_dispvars)
       return;
 
-   dispmanx_surface_free(_dispvars, &_dispvars->main_surface);
+   if (_dispvars->main_surface)
+      dispmanx_surface_free(_dispvars, &_dispvars->main_surface);
+   if (_dispvars->views_surface)
+      dispmanx_surface_free(_dispvars, &_dispvars->views_surface);
    dispmanx_surface_free(_dispvars, &_dispvars->back_surface);
+   video_views_cpu_free(&_dispvars->views_cpu);
+   free(_dispvars->views_pixels);
+   free(_dispvars->views_canvas);
 
    if (_dispvars->menu_surface)
       dispmanx_surface_free(_dispvars, &_dispvars->menu_surface);
@@ -641,8 +790,7 @@ static void dispmanx_free(void *data)
    bcm_host_deinit();
 
    /* Destroy mutexes and conditions. */
-   slock_free(_dispvars->pending_mutex);
-   scond_free(_dispvars->vsync_condition);
+   retro_eventcount_free(&_dispvars->vsync_ec);
 
    free(_dispvars);
 }
@@ -662,7 +810,6 @@ video_driver_t video_dispmanx = {
    NULL, /* set_rotation */
    dispmanx_viewport_info,
    NULL, /* read_viewport */
-   NULL, /* read_frame_raw */
 #ifdef HAVE_OVERLAY
    NULL, /* overlay_interface */
 #endif

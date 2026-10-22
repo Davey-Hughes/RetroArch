@@ -18,6 +18,7 @@
 #include <audio/audio_mixer.h>
 
 #include "../../../configuration.h"
+#include "../../../defaults.h"
 #include "../../../record/record_driver.h"
 #include "../../../runloop.h"
 #include "../../../menu/menu_driver.h"
@@ -71,9 +72,18 @@ struct menu_state *menu_state_get_ptr(void) { return &menu_st; }
 struct audio_mixer_sound { void *owned_data; };
 struct audio_mixer_voice { int tag; };
 
+/* Called by every load stub, which is where a sound is built: the test
+ * looks at whether the state lock is held while it is. */
+void (*stub_load_hook)(void) = NULL;
+unsigned stub_sound_destroys = 0;
+bool stub_play_fail = false;
+
 static audio_mixer_sound_t *new_sound_owning(void *data)
 {
-   audio_mixer_sound_t *s = (audio_mixer_sound_t*)calloc(1, sizeof(*s));
+   audio_mixer_sound_t *s;
+   if (stub_load_hook)
+      stub_load_hook();
+   s = (audio_mixer_sound_t*)calloc(1, sizeof(*s));
    if (s)
       s->owned_data = data;
    return s;
@@ -125,6 +135,7 @@ void audio_mixer_destroy(audio_mixer_sound_t *sound)
 {
    if (!sound)
       return;
+   stub_sound_destroys++;
    if (sound->owned_data)
       free(sound->owned_data);
    free(sound);
@@ -136,15 +147,17 @@ audio_mixer_voice_t *audio_mixer_play(audio_mixer_sound_t *sound,
 {
    (void)sound; (void)repeat; (void)volume; (void)resampler_ident;
    (void)quality; (void)stop_cb;
-   return new_voice();
+   return stub_play_fail ? NULL : new_voice();
 }
 
 audio_mixer_voice_t *audio_mixer_play_s16(audio_mixer_sound_t *sound,
-      bool repeat, int32_t gain, enum resampler_quality quality,
+      bool repeat, int32_t gain, const char *resampler_ident,
+      enum resampler_quality quality,
       audio_mixer_stop_cb_t stop_cb)
 {
-   (void)sound; (void)repeat; (void)gain; (void)quality; (void)stop_cb;
-   return new_voice();
+   (void)sound; (void)repeat; (void)gain; (void)resampler_ident;
+   (void)quality; (void)stop_cb;
+   return stub_play_fail ? NULL : new_voice();
 }
 
 void audio_mixer_stop(audio_mixer_voice_t *voice)
@@ -262,11 +275,11 @@ const audio_driver_t *audio_thread_wrapped_driver(void *data)
 
 bool audio_init_thread(const audio_driver_t **out_driver, void **out_data,
       const char *device, unsigned out_rate, unsigned *new_rate,
-      unsigned latency, unsigned block_frames, bool raise_priority,
+      unsigned latency, bool raise_priority,
       bool prefer_fast_cores, const audio_driver_t *driver)
 {
    (void)out_driver; (void)out_data; (void)device; (void)out_rate;
-   (void)new_rate; (void)latency; (void)block_frames;
+   (void)new_rate; (void)latency;
    (void)raise_priority; (void)prefer_fast_cores; (void)driver;
    unreachable("audio_init_thread");
    return false;
@@ -288,3 +301,34 @@ const char *msg_hash_to_str(enum msg_hash_enums msg)
 }
 
 /* retro_resampler_realloc: the real one is linked in. */
+
+/* The platform's audio defaults: audio_driver_device_block_frames()
+ * reads the device's transfer granularity from here, and no platform
+ * in a harness reports one. */
+struct defaults g_defaults;
+
+/* These fixtures have no wrapper worker; control runs synchronously. */
+void audio_thread_apply_control(void *data,
+      void (*control)(void *userdata), void *userdata)
+{
+   (void)data;
+   if (control) control(userdata);
+}
+
+/* The driver exposes transport pause; these harnesses stub mixer I/O. */
+void audio_mixer_voice_set_paused(audio_mixer_voice_t *voice, bool paused)
+{
+   (void)voice;
+   (void)paused;
+}
+
+/* No real PCM is mixed by this stand-in, so no mix clock is available. */
+bool audio_mixer_voice_clock(audio_mixer_voice_t *voice,
+      size_t *frames, unsigned *rate, size_t *serial)
+{
+   (void)voice;
+   if (frames) *frames = 0;
+   if (rate) *rate = 0;
+   if (serial) *serial = 0;
+   return false;
+}

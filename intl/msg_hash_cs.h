@@ -201,7 +201,6 @@ static const struct
    char s_9834febe_1[4];
    char s_93805cc8_0[500];
    char s_93805cc8_1[58];
-   char s_b495662b[140];
    char s_9953f4e2[273];
    char s_79e212bd[5];
    char s_6342700c[7];
@@ -250,13 +249,13 @@ static const struct
    char s_35a1323d[14];
    char s_f72667c9[15];
    char s_adce4374[15];
+   char s_5984f4f9[6];
 #ifndef HAVE_DYNAMIC
    char s_e011fe61[52];
 #endif
    char s_4e447c6c[29];
    char s_d9a51d02[15];
    char s_12e77e8f[12];
-   char s_af6007a1[17];
    char s_da068369[12];
    char s_daead8a5[5];
    char s_a38cafbb[21];
@@ -592,11 +591,14 @@ static const struct
    char s_15f24ff4[12];
    char s_ec7e8026[15];
    char s_5d29b870[18];
+   char s_6996339b[5];
    char s_08e9410c[20];
    char s_d95824aa[23];
    char s_639f529e[18];
    char s_4927597c[14];
    char s_77b74366[13];
+   char s_ab49119c[19];
+   char s_ddf679b9[8];
    char s_3b7e9d77[10];
    char s_10342503[19];
    char s_d31f6d88[17];
@@ -763,6 +765,7 @@ static const struct
    char s_56e1b336[21];
    char s_313d15c0[10];
    char s_e9f0dd82[27];
+   char s_0bd714f7[5];
    char s_72765a06[13];
    char s_72765a07[13];
    char s_72765a08[13];
@@ -1027,7 +1030,8 @@ static const struct
 #endif
    char s_136eaaf4[25];
    char s_68d27147[16];
-   char s_f02f73fc[37];
+   char s_e5b971a0[6];
+   char s_17615fcf[6];
    char s_3a0a3fef[18];
    char s_1e09db79[15];
    char s_400523e5[23];
@@ -1075,7 +1079,6 @@ static const struct
    char s_5e519829[25];
 #endif
 #endif
-   char s_f228c6c5[21];
    char s_11926382[21];
    char s_645ae416[26];
    char s_df92f5b5[42];
@@ -1458,7 +1461,6 @@ static const struct
    char s_74b77b4a[17];
    char s_7534cfc9[12];
    char s_36259b63[13];
-   char s_37368130[16];
    char s_d51f54a2[12];
    char s_b35f573c[10];
    char s_1cad7751[11];
@@ -1661,7 +1663,6 @@ static const struct
    char s_ccfe26d1[29];
    char s_728ca1d3[8];
    char s_5f612db6[22];
-   char s_9f29f708[23];
    char s_a9145c83[15];
    char s_a26e1351[26];
    char s_22f52844[18];
@@ -1855,6 +1856,7 @@ static const struct
    char s_2c296537[17];
    char s_43ac80a0[11];
    char s_6959ce80[12];
+   char s_aa628249[7];
    char s_ebe994b4[17];
    char s_1c62c301[7];
    char s_a8bb35b6[11];
@@ -2028,6 +2030,7 @@ static const struct
    char s_4b582a0c[28];
    char s_61213f1d[15];
    char s_95e4b29f[100];
+   char s_60258de0[6];
    char s_317b17ed[6];
    char s_94c8d15f[6];
    char s_de16b5d2[11];
@@ -2064,6 +2067,8 @@ static const struct
    char s_78585119[8];
    char s_69b801ef[14];
    char s_52e3d6ea[34];
+   char s_2c868ae4[15];
+   char s_9c535394[13];
    char s_a9c8430e[14];
    char s_f5911f43[22];
    char s_9017e0d3[14];
@@ -2093,7 +2098,6 @@ static const struct
    char s_45816e1d[24];
    char s_730df420[14];
    char s_bcddf275[6];
-   char s_258060bf[15];
 #if defined(RARCH_MOBILE)
    char s_774121c7[62];
    char s_774121c8[62];
@@ -2367,7 +2371,6 @@ static const struct
    char s_9831f77b[173];
    char s_79b8ce4a[81];
    char s_a1a8257e[135];
-   char s_d5231783[101];
    char s_a68d6d11[65];
    char s_74022c02[98];
    char s_8abad013[80];
@@ -2489,8 +2492,6 @@ static const struct
    char s_16ee5cf4[36];
    char s_d9153542[47];
    char s_8e48ec69[39];
-   char s_cd46e260[94];
-   char s_cd482ffe[98];
    char s_49336383[40];
    char s_e92351d4[104];
    char s_8e22cdce[61];
@@ -2503,7 +2504,6 @@ static const struct
    char s_74d87c7a[47];
    char s_12adb1e7[47];
    char s_070529d4[67];
-   char s_30d1fc05[47];
 #ifdef GEKKO
    char s_3180dcf5[65];
 #endif
@@ -2544,7 +2544,6 @@ static const struct
    char s_47df0525[66];
    char s_03e272fc[50];
    char s_5c2cc60f[84];
-   char s_d6d8d4be[87];
    char s_e86d2704[82];
    char s_dda608b5[369];
    char s_6f5a032a[51];
@@ -2627,7 +2626,6 @@ static const struct
    char s_193e1462[59];
    char s_6895dfd6[43];
    char s_788364f5[79];
-   char s_dd9ff22a[54];
    char s_db495a9d[42];
    char s_ddc672a7[50];
    char s_f754a0d3[68];
@@ -2674,7 +2672,6 @@ static const struct
    char s_6435c857[54];
 #endif
 #endif
-   char s_01efec73[54];
    char s_d3fc9970[53];
    char s_740bd7c4[58];
    char s_f052dae3[69];
@@ -2929,7 +2926,6 @@ static const struct
    char s_14b5b145[103];
    char s_c7c09eb0[103];
    char s_6f122164[66];
-   char s_61942cf6[63];
    char s_6b7e9271[126];
    char s_68b6e245[57];
    char s_3bb4fbf9[116];
@@ -3168,13 +3164,11 @@ static const struct
    char s_261210b3[76];
    char s_3a4b246c[107];
    char s_2ceab671[137];
-   char s_977f8e82[121];
    char s_3c679f0a[349];
    char s_5b059407[164];
    char s_36033606[178];
    char s_2e69508b[350];
    char s_7e96b5ce[40];
-   char s_3547866d[144];
 #if defined(RARCH_MOBILE)
    char s_82c9e375[169];
    char s_82c9e376[152];
@@ -3469,6 +3463,7 @@ static const struct
    char s_543fcabd[15];
    char s_59212b5f[15];
    char s_f26b6cff[25];
+   char s_a63c824a[11];
    char s_a9f3b2c3[14];
    char s_0e7aca8a[19];
    char s_ab1afe7c[20];
@@ -3578,6 +3573,7 @@ static const struct
    char s_52d42c75[36];
    char s_a181214b[37];
    char s_8ab54d62[89];
+   char s_3fe94404[8];
    char s_80528b14[40];
    char s_eae21890[33];
    char s_1451fe0d[38];
@@ -4239,9 +4235,6 @@ static const struct
    "\231esn\303\251 sn\303\255mkov\303\251 frekvence obsahu. Ponech\303\241n\303\255 zapnut\303\251h"
    "o ",
    "syst\303\251mov\303\251ho VRR je v po\305\231\303\241dku, jen ne toto nastaven\303\255.",
-   "Pou\305\276ijte ovlada\304\215 videa se z\303\241vitem. Jeho pou\305\276it\303\255 m\305\257\305"
-   "\276e zv\303\275\305\241it v\303\275kon za cenu mo\305\276n\303\251ho zpo\305\276d\304\233n\303"
-   "\255 a v\304\233t\305\241\303\255ho zadrh\303\241v\303\241n\303\255 videa.",
    "Synchronizace s p\305\231esn\303\275m sn\303\255mkov\303\275m kmito\304\215tem obsahu. Tato mo"
    "\305\276nost je ekvivalentem vynucen\303\255 rychlosti x1 a z\303\241rove\305\210 umo\305\276"
    "\305\210uje rychl\303\251 p\305\231ev\303\255jen\303\255 vp\305\231ed. \305\275\303\241dn\303"
@@ -4294,6 +4287,7 @@ static const struct
    "Re\305\276im \305\231e\304\215i",
    "C\303\255lov\303\275 jazyk",
    "AI slu\305\276ba URL",
+   "V\305\276dy",
 #ifndef HAVE_DYNAMIC
    "V\305\276dy znovu na\304\215\303\255st j\303\241dro p\305\231i spu\305\241t\304\233n\303\255 obs"
    "ahu",
@@ -4301,7 +4295,6 @@ static const struct
    "\305\230e\305\241en\303\255 odpojen\303\255 Androidu",
    "Ikona aplikace",
    "Prost\305\231edky",
-   "Blokov\303\251 sn\303\255mky",
    "Za\305\231\303\255zen\303\255",
    "Zvuk",
    "Odstranit DSP Plugin",
@@ -4641,11 +4634,14 @@ static const struct
    "Pozastaveno",
    "P\305\231ehr\303\241v\303\241 se",
    "Informace o disku",
+   "Zvuk",
    "Na\304\215\303\255st nov\303\275 disk",
    "Aktu\303\241ln\303\255 index disku",
    "Ovl\303\241d\303\241n\303\255 disku",
    "Vysunout disk",
    "Vlo\305\276it disk",
+   "Nezpracovan\303\241 Data",
+   "V\303\275stup",
    "V\303\275choz\303\255",
    "Sta\305\276en\303\251 polo\305\276ky",
    "St\303\241hnout j\303\241dro",
@@ -4815,6 +4811,7 @@ static const struct
    "Y Tla\304\215\303\255tko (Vlevo)",
    "Kl\303\255\304\215 %s",
    "Typ mapov\303\241n\303\255 kl\303\241vesnice",
+   "V\305\241e",
    "Zbra\305\210 Aux A",
    "Zbra\305\210 Aux B",
    "Zbra\305\210 Aux C",
@@ -5081,7 +5078,8 @@ static const struct
 #endif
    "Zak\303\241zat re\305\276im Prodejna",
    "Re\305\276im prodejna",
-   "Omezen\303\255 sn\303\255mkov\303\251 frekvence v menu",
+   "V\305\276dy",
+   "Nikdy",
    "Spr\303\241vce soubor\305\257",
    "Nepr\305\257hlednost",
    "Horizont\303\241ln\303\255 animace",
@@ -5129,7 +5127,6 @@ static const struct
    "Zobrazit 'Vysunout disk'",
 #endif
 #endif
-   "Uk\303\241zat 'N\303\241pov\304\233da'",
    "Zobrazit 'Informace'",
    "Zobrazit 'Na\304\215\303\255st obsah'",
    "Ozn\303\241men\303\255 o spu\305\241t\304\233n\303\255 \"Na\304\215\303\255st obsah\"",
@@ -5518,7 +5515,6 @@ static const struct
    "&Vylo\305\276it j\303\241dro",
    "&N\303\241pov\304\233da",
    "O RetroArchu",
-   "P\305\231isp\304\233vatel\303\251",
    "Dokumentace",
    "Vy\304\215istit",
    "&N\303\241stroje",
@@ -5734,7 +5730,6 @@ static const struct
    "Celo\304\215\303\255seln\303\251 \305\241k\303\241lov\303\241n\303\255",
    "Vypnout",
    "Startovac\303\255 adres\303\241\305\231",
-   "Konfigura\304\215n\303\255 soubory",
    "Barevn\303\275 motiv",
    "Proti - Vypalov\303\241n\303\255 zenu",
    "Jablkov\304\233 zelen\303\241",
@@ -5928,6 +5923,7 @@ static const struct
    "N\303\241zev Frontendu",
    "Verze Gitu",
    "Verze Lakky",
+   "Pokrok",
    "Zdroj nap\303\241jen\303\255",
    "Nabito",
    "Nab\303\255jen\303\255",
@@ -6108,6 +6104,7 @@ static const struct
    "Index monitoru",
    "Povolen\303\255 zobrazen\303\255 na celou obrazovku p\305\231es notifikaci v za\305\231\303\255z"
    "en\303\255ch se syst\303\251mem Android a iOS",
+   "V\305\276dy",
    "180\302\272",
    "270\302\272",
    "Norm\303\241ln\303\255",
@@ -6144,6 +6141,8 @@ static const struct
    "Chytr\303\241",
    "\305\240k\303\241lov\303\241n\303\255",
    "Simulace valiv\303\251 skenovac\303\255 linie",
+   "Horizont\303\241ln\303\255",
+   "Vertik\303\241ln\303\255",
    "Shadery videa",
    "Prodleva auto-shaderu",
    "Shadery videa",
@@ -6174,7 +6173,6 @@ static const struct
    "Interval v\303\275m\304\233ny VSync",
    "Synchronizace",
    "Videa",
-   "Threaded video",
 #if defined(RARCH_MOBILE)
    "P\305\231edsazen\303\255 kotvy panelu zobrazen\303\255 X (orientace na v\303\275\305\241ku)",
    "P\305\231edsazen\303\255 kotvy panelu zobrazen\303\255 Y (orientace na v\303\275\305\241ku)",
@@ -6598,8 +6596,6 @@ static const struct
    "P\305\231epnut\303\255 na modelinu s vysok\303\275m rozli\305\241en\303\255m pro pou\305\276it"
    "\303\255 s nab\303\255dkami s vysok\303\275m rozli\305\241en\303\255m, kdy\305\276 nen\303\255 n"
    "a\304\215ten \305\276\303\241dn\303\275 obsah.",
-   "Pouze pro CRT displeje. Pokus\303\255 se pou\305\276\303\255t p\305\231esn\303\251 rozli\305\241"
-   "en\303\255 j\303\241dra/hry a obnovovac\303\255 frekvenci.",
    "P\305\231ep\303\255nejte mezi nativn\303\255m a ultra\305\241irok\303\275m super rozli\305\241en"
    "\303\255m.",
    "V p\305\231\303\255pad\304\233 pot\305\231eby pou\305\276ijte vlastn\303\255 obnovovac\303\255 f"
@@ -6820,10 +6816,6 @@ static const struct
    "Zapnut\303\255/vypnut\303\255 funkce Run-Ahead.",
    "Ulo\305\276\303\255 pozici do aktu\303\241ln\304\233 vybran\303\251ho slotu.",
    "Zachyt\303\255 obr\303\241zek aktu\303\241ln\303\255ho obsahu.",
-   "Na\304\215te a pou\305\276ije dal\305\241\303\255 soubor p\305\231edvolby shaderu v ko\305\231en"
-   "ov\303\251m adres\303\241\305\231i 'Video Shadery'.",
-   "Na\304\215te a pou\305\276ije p\305\231edchoz\303\255 soubor p\305\231edvolby shaderu v ko\305"
-   "\231enov\303\251m adres\303\241\305\231i 'Video Shadery'.",
    "Zapne/vypne aktu\303\241ln\304\233 vybran\303\275 shader.",
    "Povol\303\255 zpomalen\303\275 pohyb p\305\231i podr\305\276en\303\255. Po uvoln\304\233n\303"
    "\255 tla\304\215\303\255tka b\304\233\305\276\303\255 obsah norm\303\241ln\303\255 rychlost\303"
@@ -6843,7 +6835,6 @@ static const struct
    "Sn\303\255\305\276\303\255 \303\272rove\305\210 v\303\275stupn\303\255 hlasitosti zvuku.",
    "Zvy\305\241uje \303\272rove\305\210 v\303\275stupn\303\255 hlasitosti zvuku.",
    "Zapne/vypne synchronizaci s p\305\231esnou sn\303\255mkovou frekvenc\303\255 obsahu.",
-   "Fyzick\303\241 my\305\241 rozpoznan\303\241 aplikac\303\255 RetroArch.",
 #ifdef GEKKO
    "Nastaven\303\255 stupnice x/y pro rychlost sv\304\233teln\303\251 pistole Wiimote.",
 #endif
@@ -6926,8 +6917,6 @@ static const struct
    "V tomto adres\303\241\305\231i jsou ulo\305\276eny vstupn\303\255 remapy.",
    "P\305\231epsat vstupn\303\255 vazby p\305\231emapovan\303\275mi vazbami nastaven\303\275mi pro a"
    "ktu\303\241ln\303\255 j\303\241dro.",
-   "Ur\304\215uje, kter\303\275 port j\303\241dra bude p\305\231ij\303\255mat vstup z portu frontend"
-   "ov\303\251ho ovlada\304\215e %u.",
    "P\305\231emapov\303\241n\303\255 se pou\305\276ije pouze pro aktivn\303\255 gamepad, do kter\303"
    "\251ho bylo ulo\305\276eno.",
    "Zm\304\233na zp\305\257sobu mapov\303\241n\303\255 virtu\303\241ln\303\255ho za\305\231\303\255z"
@@ -7090,7 +7079,6 @@ static const struct
    "Pou\305\276it\303\255 ovlada\304\215e menu. (nutn\303\275 restart)",
    "Chr\303\241n\303\255 nastaven\303\255 skryt\303\255m v\305\241ech nastaven\303\255 souvisej\303"
    "\255c\303\255ch s konfigurac\303\255.",
-   "Zaji\305\241\305\245uje omezen\303\255 sn\303\255mkov\303\251 frekvence v nab\303\255dce.",
    "Zm\304\233na nastaven\303\255 prohl\303\255\305\276e\304\215e soubor\305\257.",
    "\303\232prava nepr\305\257hlednosti v\303\275choz\303\255ho pozad\303\255 menu.",
    "Povolit horizont\303\241ln\303\255 animaci v menu. To bude m\303\255t vliv na v\303\275kon.",
@@ -7185,7 +7173,6 @@ static const struct
    "V hlavn\303\255 nab\303\255dce zobrazte mo\305\276nost 'Vysunout disk'.",
 #endif
 #endif
-   "Zobrazen\303\255 mo\305\276nosti \"N\303\241pov\304\233da\" v hlavn\303\255 nab\303\255dce.",
    "Zobrazen\303\255 mo\305\276nosti 'Informace' v hlavn\303\255 nab\303\255dce.",
    "Zobrazen\303\255 mo\305\276nosti 'Na\304\215\303\255st obsah' v hlavn\303\255 nab\303\255dce.",
    "Zobrazen\303\255 kr\303\241tk\303\251 animace zp\304\233tn\303\251 vazby p\305\231i na\304\215"
@@ -7686,8 +7673,6 @@ static const struct
    "\305\241\303\255 hodnoty zvy\305\241uj\303\255 rychlost p\305\231ev\303\255jen\303\255.",
    "Nastaven\303\255 po\304\215\303\241te\304\215n\303\255ho adres\303\241\305\231e pro Pr\305\257zk"
    "umn\303\255ka soubor\305\257.",
-   "V tomto adres\303\241\305\231i je ulo\305\276en v\303\275choz\303\255 konfigura\304\215n\303\255"
-   " soubor.",
    "Vyberte jin\303\275 barevn\303\275 motiv. V\303\275b\304\233r mo\305\276nosti 'Vlastn\303\255' u"
    "mo\305\276\305\210uje pou\305\276it\303\255 soubor\305\257 s p\305\231ednastaven\303\275mi motiv"
    "y nab\303\255dek.",
@@ -8112,9 +8097,6 @@ static const struct
    "Ulo\305\276it p\305\231edvolbu shaderu, kter\303\241 m\303\241 odkaz na p\305\257vodn\303\255 na"
    "\304\215tenou p\305\231edvolbu a obsahuje pouze zm\304\233ny parametr\305\257, kter\303\251 jste"
    " provedli.",
-   "Otev\305\231en\303\255 Pr\305\257zkumn\303\255ka soubor\305\257 v posledn\303\255m pou\305\276it"
-   "\303\251m adres\303\241\305\231i p\305\231i na\304\215\303\255t\303\241n\303\255 p\305\231edvole"
-   "b a pr\305\257chod\305\257 shader\305\257.",
    "UPOZORN\304\232N\303\215: Rychl\303\251 blik\303\241n\303\255 m\305\257\305\276e na n\304\233kte"
    "r\303\275ch displej\303\255ch zp\305\257sobit p\305\231etrv\303\241v\303\241n\303\255 obrazu. Po"
    "u\305\276\303\255vejte na vlastn\303\255 nebezpe\304\215\303\255 // Simuluje z\303\241kladn\303"
@@ -8135,9 +8117,6 @@ static const struct
    "\303\255 krokov\303\241n\303\255 sn\303\255mk\305\257 p\305\231i spu\305\241t\304\233n\303\255 n"
    "ap\305\231. obsahu s 30 fps na displeji s 60 Hz nebo obsahu s 60 fps na displeji se 120 Hz.",
    "Zm\304\233nit nastaven\303\255 synchronizace videa.",
-   "Zvy\305\241uje v\303\275kon za cenu zpo\305\276d\304\233n\303\255 a v\304\233t\305\241\303\255ho"
-   " zadrh\303\241v\303\241n\303\255 videa. Pou\305\276ijte pouze v p\305\231\303\255pad\304\233, "
-   "\305\276e nelze dos\303\241hnout pln\303\251 rychlosti jinak.",
 #if defined(RARCH_MOBILE)
    "Vodorovn\303\241 poloha obsahu, kdy\305\276 je zobrazovac\303\255 plocha \305\241ir\305\241\303"
    "\255 ne\305\276 \305\241\303\255\305\231ka obsahu. 0,0 je zcela vlevo, 0,5 je uprost\305\231ed, "
@@ -8502,6 +8481,7 @@ static const struct
    "\304\214asov\303\275 limit",
    "Vstupn\303\255 cheat",
    "N\303\241zev vstupn\303\255ho cheatu",
+   "Okam\305\276it\303\251",
    "Zadejte heslo",
    "Nespr\303\241vn\303\251 heslo.",
    "Heslo je spr\303\241vn\303\251.",
@@ -8628,6 +8608,7 @@ static const struct
    "Nen\303\255 k dispozici \305\276\303\241dn\303\241 miniatura",
    "Pro tuto polo\305\276ku Playlist ji\305\276 byly vyzkou\305\241eny v\305\241echny mo\305\276n"
    "\303\251 n\303\241hledy ke sta\305\276en\303\255.",
+   "Ploch\303\251",
    "P\305\231ekryt\303\255 kl\303\241vesnice nen\303\255 nastaveno.",
    "Neulo\305\276eno. P\305\231episuje aktivn\303\255.",
    "Chyba p\305\231i odstra\305\210ov\303\241n\303\255 p\305\231epis\305\257.",
@@ -8811,7 +8792,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_cs_blob_check[
-      (sizeof(msg_hash_cs_blob) == (163248u
+      (sizeof(msg_hash_cs_blob) == (162231u
 #ifdef ANDROID
        + 390u
 #endif
@@ -9362,7 +9343,6 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_LABEL_HELP_VIDEO_SHADER_PRESET,
    (uint32_t)MENU_ENUM_LABEL_HELP_VIDEO_SHADER_SCALE_PASS,
    (uint32_t)MENU_ENUM_LABEL_HELP_VIDEO_SHADER_SUBFRAMES,
-   (uint32_t)MENU_ENUM_LABEL_HELP_VIDEO_THREADED,
    (uint32_t)MENU_ENUM_LABEL_HELP_VRR_RUNLOOP_ENABLE,
    (uint32_t)MENU_ENUM_LABEL_RUMBLE_PORT_16,
    (uint32_t)MENU_ENUM_LABEL_RUMBLE_TYPE_CHANGES,
@@ -9411,13 +9391,13 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_AI_SERVICE_SPEECH_MODE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AI_SERVICE_TARGET_LANG,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AI_SERVICE_URL,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_ALWAYS,
 #ifndef HAVE_DYNAMIC
    (uint32_t)MENU_ENUM_LABEL_VALUE_ALWAYS_RELOAD_CORE_ON_RUN_CONTENT,
 #endif
    (uint32_t)MENU_ENUM_LABEL_VALUE_ANDROID_INPUT_DISCONNECT_WORKAROUND,
    (uint32_t)MENU_ENUM_LABEL_VALUE_APPICON_SETTINGS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_ASSETS_DIRECTORY,
-   (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_BLOCK_FRAMES,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_DEVICE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_DRIVER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AUDIO_DSP_PLUGIN_REMOVE,
@@ -9753,11 +9733,14 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISCORD_STATUS_PAUSED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISCORD_STATUS_PLAYING,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISC_INFORMATION,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISC_INFO_TRACK_AUDIO,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISK_IMAGE_APPEND,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISK_INDEX,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISK_OPTIONS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISK_TRAY_EJECT,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISK_TRAY_INSERT,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISPLAY_EDID_RAW,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISPLAY_INFO_OUTPUT,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DONT_CARE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DOWNLOADED_FILE_DETECT_CORE_LIST,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DOWNLOAD_CORE,
@@ -9924,6 +9907,7 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_JOYPAD_Y,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_KEY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_KEYBOARD_GAMEPAD_MAPPING_TYPE,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_KEYBOARD_INDEX_ALL,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_LIGHTGUN_AUX_A,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_LIGHTGUN_AUX_B,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_LIGHTGUN_AUX_C,
@@ -10188,7 +10172,8 @@ static const uint32_t msg_hash_cs_ids[] =
 #endif
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_DISABLE_KIOSK_MODE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_ENABLE_KIOSK_MODE,
-   (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_ENUM_THROTTLE_FRAMERATE,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_FILE_BROWSER_EXTENSION_DISPLAY_ALWAYS,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_FILE_BROWSER_EXTENSION_DISPLAY_NEVER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_FILE_BROWSER_SETTINGS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_FRAMEBUFFER_OPACITY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_HORIZONTAL_ANIMATION,
@@ -10236,7 +10221,6 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_SHOW_EJECT_DISC,
 #endif
 #endif
-   (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_SHOW_HELP,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_SHOW_INFORMATION,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_SHOW_LOAD_CONTENT,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_SHOW_LOAD_CONTENT_ANIMATION,
@@ -10619,7 +10603,6 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_QT_MENU_FILE_UNLOAD_CORE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_QT_MENU_HELP,
    (uint32_t)MENU_ENUM_LABEL_VALUE_QT_MENU_HELP_ABOUT,
-   (uint32_t)MENU_ENUM_LABEL_VALUE_QT_MENU_HELP_ABOUT_CONTRIBUTORS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_QT_MENU_HELP_DOCUMENTATION,
    (uint32_t)MENU_ENUM_LABEL_VALUE_QT_MENU_SEARCH_CLEAR,
    (uint32_t)MENU_ENUM_LABEL_VALUE_QT_MENU_TOOLS,
@@ -10821,7 +10804,6 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_ASPECT_RATIO_LOCK_INTEGER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_ASPECT_RATIO_LOCK_NONE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_BROWSER_DIRECTORY,
-   (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_CONFIG_DIRECTORY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME_ANTI_ZENBURN,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_MENU_COLOR_THEME_APPLE_GREEN,
@@ -11015,6 +10997,7 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_FRONTEND_NAME,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_GIT_VERSION,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_LAKKA_VERSION,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_PACING,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_POWER_SOURCE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_POWER_SOURCE_CHARGED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_POWER_SOURCE_CHARGING,
@@ -11188,6 +11171,7 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MESSAGE_POS_Y,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MONITOR_INDEX,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_NOTCH_WRITE_OVER,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_ALWAYS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED_ROTATED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_NORMAL,
@@ -11224,6 +11208,8 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCALE_INTEGER_SCALING_SMART,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCALING_SETTINGS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCAN_SUBFRAMES,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_LAYOUT_HORIZONTAL,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_LAYOUT_VERTICAL,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SHADERS_ENABLE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_DELAY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SHADER_DIR,
@@ -11253,7 +11239,6 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SWAP_INTERVAL,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SYNCHRONIZATION_SETTINGS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_TAB,
-   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_THREADED,
 #if defined(RARCH_MOBILE)
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_VIEWPORT_BIAS_PORTRAIT_X,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_VIEWPORT_BIAS_PORTRAIT_Y,
@@ -11527,7 +11512,6 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_CORE_UPDATER_SHOW_EXPERIMENTAL_CORES,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCHRES_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_HIRES_MENU,
-   (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION_SUPER,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION_USE_CUSTOM_REFRESH_RATE,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_VERTICAL_ADJUST,
@@ -11649,8 +11633,6 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_RUNAHEAD_TOGGLE,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SAVE_STATE_KEY,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SCREENSHOT,
-   (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_NEXT,
-   (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_PREV,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SHADER_TOGGLE,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SLOWMOTION_HOLD_KEY,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_SLOWMOTION_KEY,
@@ -11663,7 +11645,6 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_VOLUME_DOWN,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_VOLUME_UP,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_META_VRR_RUNLOOP_TOGGLE,
-   (uint32_t)MENU_ENUM_SUBLABEL_INPUT_MOUSE_INDEX,
 #ifdef GEKKO
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_MOUSE_SCALE,
 #endif
@@ -11704,7 +11685,6 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_QUIT_GAMEPAD_COMBO,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_REMAPPING_DIRECTORY,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_REMAP_BINDS_ENABLE,
-   (uint32_t)MENU_ENUM_SUBLABEL_INPUT_REMAP_PORT,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_REMAP_SORT_BY_CONTROLLER_ENABLE,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_RETROPAD_BINDS,
    (uint32_t)MENU_ENUM_SUBLABEL_INPUT_RUMBLE_GAIN,
@@ -11787,7 +11767,6 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_DISABLE_KIOSK_MODE,
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_DRIVER,
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_ENABLE_KIOSK_MODE,
-   (uint32_t)MENU_ENUM_SUBLABEL_MENU_ENUM_THROTTLE_FRAMERATE,
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_FILE_BROWSER_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_FRAMEBUFFER_OPACITY,
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_HORIZONTAL_ANIMATION,
@@ -11834,7 +11813,6 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_SHOW_EJECT_DISC,
 #endif
 #endif
-   (uint32_t)MENU_ENUM_SUBLABEL_MENU_SHOW_HELP,
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_SHOW_INFORMATION,
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_SHOW_LOAD_CONTENT,
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_SHOW_LOAD_CONTENT_ANIMATION,
@@ -12089,7 +12067,6 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_REWIND_ENABLE,
    (uint32_t)MENU_ENUM_SUBLABEL_REWIND_GRANULARITY,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_BROWSER_DIRECTORY,
-   (uint32_t)MENU_ENUM_SUBLABEL_RGUI_CONFIG_DIRECTORY,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_MENU_COLOR_THEME,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_MENU_THEME_PRESET,
    (uint32_t)MENU_ENUM_SUBLABEL_RGUI_SHOW_START_SCREEN,
@@ -12328,13 +12305,11 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_GLOBAL,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_PARENT,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_PRESET_SAVE_REFERENCE,
-   (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_REMEMBER_LAST_DIR,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_SUBFRAMES,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHARED_CONTEXT,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SMOOTH,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SWAP_INTERVAL,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SYNCHRONIZATION_SETTINGS,
-   (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_THREADED,
 #if defined(RARCH_MOBILE)
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_BIAS_PORTRAIT_X,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_BIAS_PORTRAIT_Y,
@@ -12629,6 +12604,7 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MSG_INPUT_BIND_TIMEOUT,
    (uint32_t)MSG_INPUT_CHEAT,
    (uint32_t)MSG_INPUT_CHEAT_FILENAME,
+   (uint32_t)MSG_INPUT_COMBO_INSTANT,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD_NOK,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD_OK,
@@ -12738,6 +12714,7 @@ static const uint32_t msg_hash_cs_ids[] =
    (uint32_t)MSG_NO_STATE_HAS_BEEN_LOADED_YET,
    (uint32_t)MSG_NO_THUMBNAIL_AVAILABLE,
    (uint32_t)MSG_NO_THUMBNAIL_DOWNLOAD_POSSIBLE,
+   (uint32_t)MSG_OPENXR_HEADSET_VIEW_FLAT,
    (uint32_t)MSG_OSK_OVERLAY_NOT_SET,
    (uint32_t)MSG_OVERRIDES_ACTIVE_NOT_SAVING,
    (uint32_t)MSG_OVERRIDES_ERROR_REMOVING,

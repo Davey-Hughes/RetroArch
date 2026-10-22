@@ -26,9 +26,19 @@
 #include <string.h>
 
 #include <retro_miscellaneous.h>
+#include <retro_math.h>
 #include <libretro_dspfilter.h>
 
 #define sqr(a) ((a) * (a))
+
+#define TREMOLO_FREQUENCY_MIN_HZ 0.1f
+#define TREMOLO_FREQUENCY_MAX_HZ 20.0f
+
+/* Ordered so NaN, which compares false against everything, lands on lo. */
+static float tremolo_clampf(float x, float lo, float hi)
+{
+   return (x >= lo) ? ((x <= hi) ? x : hi) : lo;
+}
 
 struct tremolo_core
 {
@@ -68,6 +78,9 @@ static size_t tremolocore_carve(struct tremolo_core *core, int samplerate,
       float freq, uint8_t *base, size_t cur)
 {
    core->maxindex    = samplerate / freq;
+   /* Divisor of the wavetable index on both paths. */
+   if (core->maxindex < 1)
+      core->maxindex = 1;
    core->wavetable   = base ? (float*)(base + cur) : NULL;
    cur               = TREMOLO_ARENA_NEXT(cur, (size_t)core->maxindex * sizeof(float));
    core->wavetable_i = base ? (int32_t*)(base + cur) : NULL;
@@ -110,7 +123,9 @@ static void tremolo_process(void *data, struct dspfilter_output *output,
 
    for (i = 0; i < input->frames; i++, out += 2)
    {
-      float in[2]      = { out[0], out[1] };
+      float in[2];
+      in[0]            = out[0];
+      in[1]            = out[1];
       out[0]           = tremolocore_core(&tre->left, in[0]);
       out[1]           = tremolocore_core(&tre->right, in[1]);
    }
@@ -146,7 +161,9 @@ static void tremolo_process_i16(void *data,
 
    for (i = 0; i < input->frames; i++, out += 2)
    {
-      int16_t in[2]    = { out[0], out[1] };
+      int16_t in[2];
+      in[0]            = out[0];
+      in[1]            = out[1];
       out[0]           = tremolocore_core_i16(&tre->left, in[0]);
       out[1]           = tremolocore_core_i16(&tre->right, in[1]);
    }
@@ -157,12 +174,20 @@ static void *tremolo_init(const struct dspfilter_info *info,
 {
    float freq, depth;
    size_t len;
-   struct tremolo *tre = (struct tremolo*)calloc(1, sizeof(*tre));
-   if (!tre)
+   struct tremolo *tre;
+
+   if (!info || info->input_rate < 1)
+      return NULL;
+   if (!(tre = (struct tremolo*)calloc(1, sizeof(*tre))))
       return NULL;
 
    config->get_float(userdata, "freq", &freq,4.0f);
    config->get_float(userdata, "depth", &depth, 0.9f);
+   /* Both come from the preset. freq sets the wavetable length, which the
+    * index is taken modulo of; depth has to keep the envelope inside Q16. */
+   freq  = tremolo_clampf(freq, TREMOLO_FREQUENCY_MIN_HZ,
+         TREMOLO_FREQUENCY_MAX_HZ);
+   depth = tremolo_clampf(depth, 0.0f, 1.0f);
    len = tremolocore_carve(&tre->left,  info->input_rate, freq, NULL, 0);
    len = tremolocore_carve(&tre->right, info->input_rate, freq, NULL, len);
    /* Every entry is written by init, so the block is not zeroed first. */
@@ -196,6 +221,7 @@ static const struct dspfilter_implementation tremolo_plug = {
 
 const struct dspfilter_implementation *dspfilter_get_implementation(dspfilter_simd_mask_t mask)
 {
+   (void)mask;
    return &tremolo_plug;
 }
 

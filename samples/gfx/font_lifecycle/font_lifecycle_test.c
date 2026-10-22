@@ -91,6 +91,18 @@ int main(void)
    unsigned n;
    uint32_t g0, g1;
 
+   /* 0. Before the video-state capture is bound (production binds it
+    * in video_driver_init_internal, before any driver or wrapper
+    * exists), the OSD entry points must degrade exactly as the old
+    * getter path did before video init: no font, no work, no crash. */
+   CHECK(font_driver_get_message_width(NULL, "x", 1, 1.0f) == -1,
+         "unbound width query degrades to no-font -1");
+   font_driver_render_msg(NULL, "x", 1, NULL, NULL);
+   CHECK(!font_driver_reinit_osd(NULL, 0.0f),
+         "unbound reinit refuses gracefully");
+
+   font_driver_bind_video_state(video_state_get_ptr());
+
    /* 1. create/free balances the renderer state */
    a = mk("/tmp/san/font_a.ttf", 16.0f);
    CHECK(a != NULL, "create");
@@ -362,9 +374,13 @@ int main(void)
       test_language = 0;
       font_driver_free(hinted);
 
-      /* No hint - the OSD font's case - must not marshal. Both
-       * callers of font_driver_init_osd() already run on the thread
-       * that owns the context. */
+      /* No hint either: a rebuild marshals whenever the wrapper is up,
+       * whatever thread made the font. The OSD font is made on the
+       * thread that owns the context and carries no hint, but a font
+       * size change rebuilds it from the settings path on the main
+       * thread, and a GL backend making its context current there
+       * while the video thread holds it is an X BadAccess. The hint
+       * decides where a font is CREATED, not where it is rebuilt. */
       plain = font_driver_init_first(NULL, "/tmp/san/plain.ttf", 16.0f,
             false, true, &fake_font);
       CHECK(plain != NULL, "unhinted font created");
@@ -373,8 +389,8 @@ int main(void)
             "/tmp/san/plain.ttf");
       test_language = TEST_LANG_KOREAN;
       font_driver_reload_fonts();
-      CHECK(video_thread_font_init_calls == n0,
-            "unhinted rebuild stays on the calling thread");
+      CHECK(video_thread_font_init_calls > n0,
+            "unhinted rebuild marshals too, because the wrapper is up");
       test_language = 0;
       font_driver_free(plain);
    }

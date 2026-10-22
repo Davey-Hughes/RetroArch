@@ -26,6 +26,10 @@
 #include <string/stdstring.h>
 #include <net/net_compat.h>
 
+#ifdef GEKKO_NATIVE
+#include <unistd.h>
+#endif
+
 #if defined(_WIN32) && !defined(_XBOX)
 #ifdef _MSC_VER
 #pragma comment(lib, "Iphlpapi")
@@ -47,6 +51,20 @@
 
 #include <net/net_ifinfo.h>
 #include <compat/strl.h>
+
+/* IFF_UP is 0x1 on every system that has interface flags at all -
+ * BSD, Linux and Darwin alike - but it is not always visible. Apple
+ * hides it with the rest of the BSD names when the strict POSIX
+ * namespace is in effect, and griffin is one translation unit, so
+ * whether it is in effect by the time this file is reached depends on
+ * what was included before it rather than on anything here.
+ *
+ * Rather than chase that ordering, the flag is defined when it is
+ * missing. Where the platform declares it, the platform's own
+ * definition stands and this does nothing. */
+#ifndef IFF_UP
+#define IFF_UP 0x1
+#endif
 
 bool net_ifinfo_new(net_ifinfo_t *list)
 {
@@ -201,7 +219,7 @@ failure:
       if (!R_SUCCEEDED(rc))
          return true;
    }
-#elif defined(_3DS)
+#elif defined(_3DS) || defined(GEKKO_NATIVE)
    addr = gethostid();
 #else
    addr = net_gethostip();

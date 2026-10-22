@@ -1,3 +1,5 @@
+include ../../sample_objdir.mk
+
 TARGET := save_state_io_test
 
 # Path back to the repo root from this sample dir.  The unit under
@@ -44,7 +46,7 @@ SOURCES := save_state_io_test.c \
            $(LIBRETRO_COMM_DIR)/time/rtime.c \
            $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
 
-CFLAGS  += -Wall -std=gnu99 -g -O1 \
+CFLAGS  += -Wall -std=gnu99 -g1 -O1 \
            -DHAVE_THREADS \
            -I$(REPO_ROOT) \
            -I$(LIBRETRO_COMM_DIR)/include
@@ -54,13 +56,17 @@ CFLAGS  += -Wall -std=gnu99 -g -O1 \
 # to observe the undo snapshot reusing its buffer: the addresses are
 # identical either way, because a state-sized block is mmap'd and the
 # kernel hands back the same region on the next request.
-LDFLAGS += -Wl,--wrap=malloc -lpthread -lm
+# --wrap=calloc so a lane can fail the allocations a finishing task
+# would make, to show the notified caller is told regardless.
+# --wrap=task_queue_park so a lane can count the load handler's parks.
+LDFLAGS += -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=task_queue_park \
+           -lpthread -lm
 
 # Extra flags for the caller; CFLAGS= on the command line would replace
 # everything set above instead of adding to it.
 CFLAGS += $(EXTRA_CFLAGS)
 
-OBJS := $(SOURCES:.c=.o)
+OBJS := $(call sample_objs,$(SOURCES:.c=.o))
 
 ifneq ($(SANITIZER),)
    CFLAGS  := -fsanitize=$(SANITIZER) -fno-omit-frame-pointer $(CFLAGS)
@@ -70,6 +76,10 @@ endif
 all: $(TARGET)
 
 %.o: %.c
+	$(CC) -c -o $@ $< $(CFLAGS)
+
+$(SAMPLE_OBJDIR)/%.o: $$(call sample_src,$$*).c
+	@mkdir -p $(@D)
 	$(CC) -c -o $@ $< $(CFLAGS)
 
 $(TARGET): $(OBJS)
@@ -93,6 +103,7 @@ sweep:
 	@echo "sweep clean"
 
 clean:
+	rm -rf $(SAMPLE_OBJDIR)
 	rm -f $(TARGET) $(OBJS)
 
 .PHONY: all sweep clean

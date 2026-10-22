@@ -50,6 +50,7 @@ static const struct
    char s_29398124[21];
    char s_0615a7c8[11];
    char s_35a1323d[10];
+   char s_5984f4f9[7];
 #ifndef HAVE_DYNAMIC
    char s_e011fe61[46];
 #endif
@@ -162,6 +163,7 @@ static const struct
    char s_78083010[20];
    char s_cc781d49[14];
    char s_e3d18c38[9];
+   char s_19e9df3c[56];
    char s_0a2e0504[10];
    char s_49c9bf91[7];
    char s_04ecbe77[12];
@@ -214,7 +216,22 @@ static const struct
    char s_15f24ff4[15];
    char s_ec7e8026[8];
    char s_5d29b870[17];
+   char s_3cc9b420[15];
+   char s_bdea22f3[16];
+   char s_54250975[16];
+   char s_558faf3a[9];
+   char s_5fb85af7[9];
+   char s_5fbcf86a[8];
+   char s_575c05fd[15];
+   char s_6996339b[4];
+   char s_9104dbe7[9];
+   char s_b4e9520b[26];
+   char s_12bd74ce[13];
+   char s_12c0a864[22];
+   char s_bfba8cdb[10];
    char s_4927597c[15];
+   char s_ef2d0a03[18];
+   char s_ddf679b9[7];
    char s_10342503[13];
    char s_d31f6d88[19];
    char s_f03e9c42[17];
@@ -291,6 +308,8 @@ static const struct
    char s_0d5e69d1[28];
    char s_54e5819b[23];
    char s_009a10e3[8];
+   char s_0bd714f7[5];
+   char s_0bebb490[11];
    char s_7c68a1ee[20];
    char s_f8b9e275[13];
    char s_8bc79213[23];
@@ -370,6 +389,8 @@ static const struct
    char s_269e5dff[17];
    char s_8d3a8b68[5];
    char s_68d27147[12];
+   char s_e5b971a0[7];
+   char s_17615fcf[6];
    char s_3a0a3fef[13];
    char s_1e09db79[9];
    char s_2696c793[45];
@@ -383,7 +404,6 @@ static const struct
 #ifdef HAVE_MIST
    char s_53788998[23];
 #endif
-   char s_f228c6c5[12];
    char s_11926382[18];
    char s_645ae416[20];
    char s_dcbf8b04[19];
@@ -639,7 +659,6 @@ static const struct
    char s_ccfe26d1[18];
    char s_728ca1d3[3];
    char s_5f612db6[11];
-   char s_9f29f708[20];
    char s_b30b56ad[3];
    char s_2c04084b[16];
    char s_404e69aa[10];
@@ -705,6 +724,8 @@ static const struct
    char s_b24d8753[14];
    char s_52e94a24[11];
    char s_d748f469[35];
+   char s_773482e7[12];
+   char s_f05bb3b5[8];
    char s_9374b989[20];
    char s_7943e750[21];
    char s_cec8f66d[24];
@@ -719,6 +740,7 @@ static const struct
    char s_8fe41f79[24];
    char s_519cd5f8[12];
    char s_43ac80a0[12];
+   char s_886631ec[17];
    char s_ebe994b4[12];
    char s_da093426[18];
    char s_d9b00fbd[21];
@@ -822,6 +844,7 @@ static const struct
    char s_71747541[11];
    char s_ff960910[18];
    char s_61213f1d[13];
+   char s_60258de0[7];
    char s_317b17ed[11];
    char s_94c8d15f[11];
    char s_1f66aac3[10];
@@ -856,7 +879,6 @@ static const struct
    char s_d2fe3ed2[17];
    char s_730df420[15];
    char s_bcddf275[8];
-   char s_258060bf[14];
    char s_92a02470[41];
    char s_b7ef9e17[41];
    char s_8f37930f[45];
@@ -936,6 +958,7 @@ static const struct
    char s_6b3cfbe5[33];
    char s_a64647a4[41];
    char s_35f2309a[35];
+   char s_35f24807[225];
    char s_c8781974[150];
 #ifdef HAVE_MIST
    char s_c9c04b6d[59];
@@ -945,7 +968,6 @@ static const struct
    char s_48e88dc4[129];
    char s_79b8ce4a[62];
    char s_a1a8257e[113];
-   char s_d5231783[112];
    char s_a68d6d11[56];
    char s_74022c02[89];
    char s_8abad013[82];
@@ -956,6 +978,7 @@ static const struct
    char s_b0d3045a[36];
    char s_fe3fb37b[45];
    char s_7b51019e[43];
+   char s_d814ec71[76];
    char s_f2a19576[44];
    char s_b2a8d230[48];
    char s_11c7fa0c[78];
@@ -1004,7 +1027,6 @@ static const struct
 #ifdef HAVE_MIST
    char s_40e907c6[55];
 #endif
-   char s_01efec73[40];
    char s_d3fc9970[46];
    char s_740bd7c4[48];
    char s_c5a76d72[48];
@@ -1140,7 +1162,6 @@ static const struct
    char s_67d549fd[38];
    char s_3aaf6bf1[120];
    char s_7e96b5ce[45];
-   char s_3547866d[132];
    char s_8010a29e[116];
    char s_81120e85[116];
 #if defined (WIIU)
@@ -1215,6 +1236,7 @@ static const struct
    char s_ed159cd6[16];
    char s_a56efbe2[7];
    char s_543fcabd[12];
+   char s_a63c824a[14];
    char s_a9f3b2c3[18];
    char s_0e7aca8a[17];
    char s_ab1afe7c[16];
@@ -1306,6 +1328,7 @@ static const struct
    "Legg til spilleliste",
    "Bildemodus",
    "Talemodus",
+   "Alltid",
 #ifndef HAVE_DYNAMIC
    "Alltid start kjerne p\303\245nytt ved Kj\303\270r innhold",
 #endif
@@ -1418,6 +1441,7 @@ static const struct
    "Fullstending Filsti",
    "Kjerneversjon",
    "Fastvare",
+   "NB: \"systemfiler er i innholdskatalogen\" er sl\303\245tt p\303\245.",
    "Ser i: %s",
    "Lisens",
    "Tillatelser",
@@ -1470,7 +1494,22 @@ static const struct
    "Satt P\303\245 Pause",
    "Spiller",
    "Disk informasjon",
+   "Genuin plate%s",
+   "Utgivelses\303\245r%s",
+   "Serienummer: %s",
+   "System%s",
+   "Tittel%s",
+   "Spor%d:",
+   "Antall spor:%d",
+   "Lyd",
+   "Modus %d",
+   " - Lengde: %02d:%02d.%02d",
+   " - Modus: %s",
+   " - St\303\270rrelse:%.1f MB",
+   "Versjon%s",
    "L\303\270s ut platen",
+   "Skjerminformasjon",
+   "Utdata",
    "Nedlastinger",
    "Last ned en Kjerne",
    "Innholdnedlaster",
@@ -1547,6 +1586,8 @@ static const struct
    "Deaktiver Informasjonsknapp",
    "Deaktiver s\303\270keknappen",
    "Inndata",
+   "Alle",
+   "Tastatur%s",
    "Maks antall brukere",
    "Lukk innhold",
    "L\303\270s ut plate (inn/ut)",
@@ -1626,6 +1667,8 @@ static const struct
    "Spilleliste Meny",
    "Meny",
    "Kiosk-modus",
+   "Alltid",
+   "Aldri",
    "Filutforsker",
    "Opasitet",
    "Angi passord for deaktivering av Kiosk modus",
@@ -1639,7 +1682,6 @@ static const struct
 #ifdef HAVE_MIST
    "Vis 'Behandle kjerner'",
 #endif
-   "Vis 'Hjelp'",
    "Vis 'informasjon'",
    "Vis \"\303\205pne innhold\"",
    "Vis '\303\205pne Kjerne'",
@@ -1895,7 +1937,6 @@ static const struct
    "Heltall skalering",
    "AV",
    "Startmappe",
-   "Konfigurasjonsfiler",
    "AV",
    "Vis Startskjerm",
    "Biline\303\246r",
@@ -1961,6 +2002,8 @@ static const struct
    "Str\303\270m tittel",
    "Str\303\270m URL",
    "Egendefinert str\303\270mmekonfigurasjon",
+   "Last inn %s",
+   "Start%s",
    "Foresl\303\245tte kjerner",
    "Sl\303\245 av skjermsparer",
    "Vedvarende ytelsesmodus",
@@ -1975,6 +2018,7 @@ static const struct
    "Frontend indentifikator",
    "Frontdel OS",
    "Git versjon",
+   "MoltenVK versjon",
    "Str\303\270mkilde",
    "RetroArch versjon",
    "Videokontekst driver",
@@ -2078,6 +2122,7 @@ static const struct
    "GPU indeks",
    "Varslingsbakgrunn",
    "Skjermindeks",
+   "Alltid",
    "180 grader",
    "270 grader",
    "90 grader",
@@ -2112,7 +2157,6 @@ static const struct
    "Str\303\270mmekvalitet",
    "Synkronisering",
    "Videoer",
-   "Tr\303\245det video",
    "Egendefinert st\303\270rrelsesforhold (h\303\270yde)",
    "Egendefinert st\303\270rrelsesforhold (bredde)",
    "Egendefinert st\303\270rrelsesforhold (X posisjon)",
@@ -2201,6 +2245,9 @@ static const struct
    "Vis gjeldende kjernenavn i meny.",
    "Se informasjon om applikasjonen/kjernen.",
    "Velg hvilken kjerne du skal bruke.",
+   "Hindrer endringer av den installerte kjernen. Kan brukes for \303\245 unng\303\245 u\303\270nske"
+   "de oppdateringer n\303\245r innhold krever en spesifikk kjerneversjon (f. eks. arkade ROM-sett) "
+   "eller n\303\245r kjernens egen lagringstilstand-format endres.",
    "Utf\303\270r nett-frakoblede oppgaver for vedlikehold av installerte kjerner (sikkerhetskopierin"
    "g, gjenoppretting, sletting osv.) og vis kjerneinformasjon.",
 #ifdef HAVE_MIST
@@ -2213,8 +2260,6 @@ static const struct
    "Send ut innebygde, lavoppl\303\270selige signaler for CRT-skjermer.",
    "Bytt til modeline med h\303\270y oppl\303\270sning for bruk med h\303\270yoppl\303\270selige men"
    "yer n\303\245r ikke noe innhold er lastet inn.",
-   "Kun for CRT skjermer. Denne innstillingen pr\303\270ver \303\245 bruke eksakt kjernen/spilloppl"
-   "\303\270sning og oppfriskingsrate.",
    "Bytt mellom innebygde og ultrabrede superoppl\303\270sninger.",
    "Bruk en egendefinert oppdateringsrate spesifisert i konfigurasjonsfilen hvis n\303\270dvendig.",
    "Bla gjennom disse alternativene hvis bildet ikke er sentrert riktig p\303\245 skjermen.",
@@ -2225,6 +2270,7 @@ static const struct
    "Fjern spillelisten fra filsystemet.",
    "Endre standardmapper hvor filer er plassert.",
    "Se informasjon om mediadisken i konsollen.",
+   "Vis Skjermserveren, utdata, modus og fysisk st\303\270rrelse p\303\245 skjermen i bruk.",
    "Last ned og installer en kjerne fra nettet.",
    "Last ned gratis innhold for den valgte kjernen.",
    "Last ned tilleggssystemfiler som kreves for korrekt/optimal kjerne operasjon.",
@@ -2276,7 +2322,6 @@ static const struct
 #ifdef HAVE_MIST
    "Vis 'Administrere kjerner' alternativet i hovedmenyen.",
 #endif
-   "Vis alternativet 'Hjelp' i hovedmenyen.",
    "Vis alternativet 'Informasjon' i hovedmenyen.",
    "Vis alternativet '\303\205pne innhold' i hovedmenyen.",
    "Vis alternativet '\303\245pne kjernen' i hovedmenyen.",
@@ -2435,8 +2480,6 @@ static const struct
    "Forsink auto-lasting av shader (i ms). Kan jobbe rundt grafiske glitcher n\303\245r du bruker pr"
    "ogramvare for \"skjermkopier\".",
    "Endre innstillinger for videosynkronisering.",
-   "Forbedrer ytelsen p\303\245 bekostning av latens og mer hakk i videoen. Bruk bare hvis full hast"
-   "ighet ikke kan oppn\303\245s p\303\245 noe annet vis.",
    "Tilpasset visningsregionsh\303\270yde som er brukt hvis st\303\270rrelsesforhold er satt til \"e"
    "gendefinert st\303\270rrelsesforhold\".",
    "Tilpasset visningsregionsbredde som er brukt hvis st\303\270rrelsesforhold er satt til \"egendef"
@@ -2525,6 +2568,7 @@ static const struct
    "Fil ikke funnet",
    "indeks",
    "Tidsavbrudd",
+   "\303\230yeblikkelig",
    "Skriv inn passord",
    "Ugyldig passord.",
    "Passord riktig.",
@@ -2579,7 +2623,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_no_blob_check[
-      (sizeof(msg_hash_no_blob) == (28984u
+      (sizeof(msg_hash_no_blob) == (29302u
 #ifdef HAVE_LAKKA
        + 178u
 #endif
@@ -2759,6 +2803,7 @@ static const uint32_t msg_hash_no_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_ADD_TO_PLAYLIST,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AI_SERVICE_IMAGE_MODE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_AI_SERVICE_SPEECH_MODE,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_ALWAYS,
 #ifndef HAVE_DYNAMIC
    (uint32_t)MENU_ENUM_LABEL_VALUE_ALWAYS_RELOAD_CORE_ON_RUN_CONTENT,
 #endif
@@ -2871,6 +2916,7 @@ static const uint32_t msg_hash_no_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_CORE_INFO_CORE_PATH,
    (uint32_t)MENU_ENUM_LABEL_VALUE_CORE_INFO_CORE_VERSION,
    (uint32_t)MENU_ENUM_LABEL_VALUE_CORE_INFO_FIRMWARE,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_CORE_INFO_FIRMWARE_IN_CONTENT_DIRECTORY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_CORE_INFO_FIRMWARE_PATH,
    (uint32_t)MENU_ENUM_LABEL_VALUE_CORE_INFO_LICENSES,
    (uint32_t)MENU_ENUM_LABEL_VALUE_CORE_INFO_PERMISSIONS,
@@ -2923,7 +2969,22 @@ static const uint32_t msg_hash_no_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISCORD_STATUS_PAUSED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISCORD_STATUS_PLAYING,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISC_INFORMATION,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISC_INFO_GENUINE,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISC_INFO_RELEASE_DATE,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISC_INFO_SERIAL,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISC_INFO_SYSTEM,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISC_INFO_TITLE,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISC_INFO_TRACK,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISC_INFO_TRACKS,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISC_INFO_TRACK_AUDIO,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISC_INFO_TRACK_DATA_MODE,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISC_INFO_TRACK_LENGTH,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISC_INFO_TRACK_MODE,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISC_INFO_TRACK_SIZE,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISC_INFO_VERSION,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DISK_TRAY_EJECT,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISPLAY_INFORMATION,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_DISPLAY_INFO_OUTPUT,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DOWNLOADED_FILE_DETECT_CORE_LIST,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DOWNLOAD_CORE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_DOWNLOAD_CORE_CONTENT,
@@ -3000,6 +3061,8 @@ static const uint32_t msg_hash_no_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_DISABLE_INFO_BUTTON,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_DISABLE_SEARCH_BUTTON,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_DRIVER,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_KEYBOARD_INDEX_ALL,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_KEYBOARD_KEY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_MAX_USERS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_META_CLOSE_CONTENT_KEY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_INPUT_META_DISK_EJECT_TOGGLE,
@@ -3079,6 +3142,8 @@ static const uint32_t msg_hash_no_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_ADD_CONTENT_ENTRY_DISPLAY_PLAYLISTS_TAB,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_DRIVER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_ENABLE_KIOSK_MODE,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_FILE_BROWSER_EXTENSION_DISPLAY_ALWAYS,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_FILE_BROWSER_EXTENSION_DISPLAY_NEVER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_FILE_BROWSER_SETTINGS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_FRAMEBUFFER_OPACITY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_KIOSK_MODE_PASSWORD,
@@ -3092,7 +3157,6 @@ static const uint32_t msg_hash_no_ids[] =
 #ifdef HAVE_MIST
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_SHOW_CORE_MANAGER_STEAM,
 #endif
-   (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_SHOW_HELP,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_SHOW_INFORMATION,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_SHOW_LOAD_CONTENT,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_SHOW_LOAD_CORE,
@@ -3348,7 +3412,6 @@ static const uint32_t msg_hash_no_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_ASPECT_RATIO_LOCK_INTEGER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_ASPECT_RATIO_LOCK_NONE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_BROWSER_DIRECTORY,
-   (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_CONFIG_DIRECTORY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_PARTICLE_EFFECT_NONE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_SHOW_START_SCREEN,
    (uint32_t)MENU_ENUM_LABEL_VALUE_RGUI_THUMB_SCALE_BILINEAR,
@@ -3414,6 +3477,8 @@ static const uint32_t msg_hash_no_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_STREAMING_TITLE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_STREAMING_URL,
    (uint32_t)MENU_ENUM_LABEL_VALUE_STREAM_CONFIG,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_SUBSYSTEM_LOAD_ENTRY,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_SUBSYSTEM_START_ENTRY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SUPPORTED_CORES,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SUSPEND_SCREENSAVER_ENABLE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SUSTAINED_PERFORMANCE_MODE,
@@ -3428,6 +3493,7 @@ static const uint32_t msg_hash_no_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_FRONTEND_IDENTIFIER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_FRONTEND_OS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_GIT_VERSION,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_MOLTENVK_VERSION,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_POWER_SOURCE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_RETROARCH_VERSION,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SYSTEM_INFO_VIDEO_CONTEXT_DRIVER,
@@ -3531,6 +3597,7 @@ static const uint32_t msg_hash_no_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_GPU_INDEX,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MESSAGE_BGCOLOR_ENABLE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_MONITOR_INDEX,
+   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_LASER_ALWAYS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_FLIPPED_ROTATED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_ORIENTATION_VERTICAL,
@@ -3565,7 +3632,6 @@ static const uint32_t msg_hash_no_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_STREAM_QUALITY,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_SYNCHRONIZATION_SETTINGS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_TAB,
-   (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_THREADED,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_VIEWPORT_CUSTOM_HEIGHT,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_VIEWPORT_CUSTOM_WIDTH,
    (uint32_t)MENU_ENUM_LABEL_VALUE_VIDEO_VIEWPORT_CUSTOM_X,
@@ -3645,6 +3711,7 @@ static const uint32_t msg_hash_no_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_CORE_ENABLE,
    (uint32_t)MENU_ENUM_SUBLABEL_CORE_INFORMATION,
    (uint32_t)MENU_ENUM_SUBLABEL_CORE_LIST,
+   (uint32_t)MENU_ENUM_SUBLABEL_CORE_LOCK,
    (uint32_t)MENU_ENUM_SUBLABEL_CORE_MANAGER_LIST,
 #ifdef HAVE_MIST
    (uint32_t)MENU_ENUM_SUBLABEL_CORE_MANAGER_STEAM_LIST,
@@ -3654,7 +3721,6 @@ static const uint32_t msg_hash_no_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_CORE_SET_STANDALONE_EXEMPT,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCHRES_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_HIRES_MENU,
-   (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION_SUPER,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_RESOLUTION_USE_CUSTOM_REFRESH_RATE,
    (uint32_t)MENU_ENUM_SUBLABEL_CRT_SWITCH_VERTICAL_ADJUST,
@@ -3665,6 +3731,7 @@ static const uint32_t msg_hash_no_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_DELETE_PLAYLIST,
    (uint32_t)MENU_ENUM_SUBLABEL_DIRECTORY_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_DISC_INFORMATION,
+   (uint32_t)MENU_ENUM_SUBLABEL_DISPLAY_INFORMATION,
    (uint32_t)MENU_ENUM_SUBLABEL_DOWNLOAD_CORE,
    (uint32_t)MENU_ENUM_SUBLABEL_DOWNLOAD_CORE_CONTENT,
    (uint32_t)MENU_ENUM_SUBLABEL_DOWNLOAD_CORE_SYSTEM_FILES,
@@ -3713,7 +3780,6 @@ static const uint32_t msg_hash_no_ids[] =
 #ifdef HAVE_MIST
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_SHOW_CORE_MANAGER_STEAM,
 #endif
-   (uint32_t)MENU_ENUM_SUBLABEL_MENU_SHOW_HELP,
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_SHOW_INFORMATION,
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_SHOW_LOAD_CONTENT,
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_SHOW_LOAD_CORE,
@@ -3849,7 +3915,6 @@ static const uint32_t msg_hash_no_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SHADER_DELAY,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_SYNCHRONIZATION_SETTINGS,
-   (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_THREADED,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_CUSTOM_HEIGHT,
    (uint32_t)MENU_ENUM_SUBLABEL_VIDEO_VIEWPORT_CUSTOM_WIDTH,
 #if defined (WIIU)
@@ -3924,6 +3989,7 @@ static const uint32_t msg_hash_no_ids[] =
    (uint32_t)MSG_FILE_NOT_FOUND,
    (uint32_t)MSG_INDEX_FILE,
    (uint32_t)MSG_INPUT_BIND_TIMEOUT,
+   (uint32_t)MSG_INPUT_COMBO_INSTANT,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD_NOK,
    (uint32_t)MSG_INPUT_ENABLE_SETTINGS_PASSWORD_OK,

@@ -192,10 +192,18 @@ bool cheat_manager_save(
       conf = config_file_new_from_path_to_string(cheats_file);
 
    if (!conf)
+   {
       if (!(conf = config_file_new_alloc()))
          return false;
-
-   conf->flags |= CONF_FILE_FLG_GUARANTEED_NO_DUPLICATES;
+      /* Only a config this function fills from empty can promise
+       * the setters that no key is already present.  The parsed
+       * one above already holds every key written below - claiming
+       * otherwise appended a duplicate of each, and since the
+       * first of a duplicate pair wins on reload, the save looked
+       * fine in memory while the file kept its old values and grew
+       * by a full copy on every save. */
+      conf->flags |= CONF_FILE_FLG_GUARANTEED_NO_DUPLICATES;
+   }
 
    config_set_int(conf, "cheats", cheat_st->size);
 
@@ -403,7 +411,7 @@ static void cheat_manager_free(void)
    cheat_st->num_memory_buffers        = 0;
    cheat_st->total_memory_size         = 0;
    cheat_st->memory_initialized        = false;
-   cheat_st->memory_search_initialized = false;
+   runloop_frame_work_set(RUNLOOP_WORK_CHEATS, false);
 }
 
 static void cheat_manager_new(unsigned size)
@@ -424,8 +432,10 @@ static void cheat_manager_new(unsigned size)
       cheat_st->buf_size       = 0;
       cheat_st->size           = 0;
       cheat_st->cheats         = NULL;
+      runloop_frame_work_set(RUNLOOP_WORK_CHEATS, false);
       return;
    }
+   runloop_frame_work_set(RUNLOOP_WORK_CHEATS, true);
 
    for (i = 0; i < cheat_st->size; i++)
    {
@@ -667,8 +677,10 @@ bool cheat_manager_realloc(unsigned new_size, unsigned default_handler)
    {
       cheat_st->buf_size = cheat_st->size = 0;
       cheat_st->cheats   = NULL;
+      runloop_frame_work_set(RUNLOOP_WORK_CHEATS, false);
       return false;
    }
+   runloop_frame_work_set(RUNLOOP_WORK_CHEATS, true);
 
    cheat_st->buf_size = new_size;
    cheat_st->size     = new_size;
@@ -864,6 +876,52 @@ void cheat_manager_alloc_if_empty(void)
       cheat_manager_new(0);
 }
 
+/* The core memory region an address lies in, kept across a walk so
+ * that only a step out of it searches the region list again */
+typedef struct
+{
+   unsigned char *base;
+   unsigned       start;
+   unsigned       len;
+} cheat_region_t;
+
+/* Points @r at the region holding @size bytes from @address; false
+ * when they do not lie within one region. */
+static bool cheat_region_seek(cheat_region_t *r, unsigned address,
+      unsigned size)
+{
+   unsigned i;
+   unsigned start             = 0;
+   cheat_manager_t *cheat_st  = &cheat_manager_state;
+
+   if (     r->base
+         && address - r->start < r->len
+         && size <= r->len - (address - r->start))
+      return true;
+
+   for (i = 0; i < cheat_st->num_memory_buffers; i++)
+   {
+      unsigned len = cheat_st->memory_size_list[i];
+      if (address - start < len)
+      {
+         if (size > len - (address - start))
+            return false;
+         r->base  = cheat_st->memory_buf_list[i];
+         r->start = start;
+         r->len   = len;
+         return true;
+      }
+      start += len;
+   }
+   return false;
+}
+
+static void cheat_manager_setup_search_meta(
+      unsigned int bitsize,
+      unsigned int *bytes_per_item,
+      unsigned int *mask,
+      unsigned int *bits);
+
 int cheat_manager_initialize_memory(rarch_setting_t *setting, size_t idx, bool wraparound)
 {
    unsigned i;
@@ -1043,6 +1101,28 @@ int cheat_manager_initialize_memory(rarch_setting_t *setting, size_t idx, bool w
 
       memset(cheat_st->matches, 0xFF, cheat_st->total_memory_size);
 
+      /* an item crossing a region's end cannot be read: never a match */
+      {
+         cheat_region_t region = { NULL, 0, 0 };
+         unsigned bytes_per_item = 1;
+         unsigned mask           = 0;
+         unsigned bits           = 8;
+         unsigned addr;
+         cheat_manager_setup_search_meta(cheat_st->search_bit_size,
+               &bytes_per_item, &mask, &bits);
+         for (addr = 0; addr < cheat_st->total_memory_size;
+               addr += bytes_per_item)
+         {
+            if (cheat_region_seek(&region, addr, bytes_per_item))
+               continue;
+            memset(cheat_st->matches + addr, 0,
+                  MIN(bytes_per_item, cheat_st->total_memory_size - addr));
+            if (     addr + bytes_per_item <= cheat_st->total_memory_size
+                  && cheat_st->num_matches > 0)
+               cheat_st->num_matches--;
+         }
+      }
+
       offset = 0;
 
       for (i = 0; i < cheat_st->num_memory_buffers; i++)
@@ -1059,8 +1139,6 @@ int cheat_manager_initialize_memory(rarch_setting_t *setting, size_t idx, bool w
          runloop_msg_queue_push(msg, _len, 1, 180, true, NULL,
                MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
       }
-
-      cheat_st->memory_search_initialized = true;
    }
 
    cheat_st->memory_initialized = true;
@@ -1072,26 +1150,6 @@ int cheat_manager_initialize_memory(rarch_setting_t *setting, size_t idx, bool w
 #endif
 
    return 0;
-}
-
-static unsigned translate_address(unsigned address, unsigned char **curr)
-{
-   unsigned             offset = 0;
-   unsigned                  i = 0;
-   cheat_manager_t   *cheat_st = &cheat_manager_state;
-
-   for (i = 0; i < cheat_st->num_memory_buffers; i++)
-   {
-      if ((address >= offset) && (address < offset + cheat_st->memory_size_list[i]))
-      {
-         *curr = cheat_st->memory_buf_list[i];
-         break;
-      }
-      else
-         offset += cheat_st->memory_size_list[i];
-   }
-
-   return offset;
 }
 
 static void cheat_manager_setup_search_meta(
@@ -1140,7 +1198,8 @@ static int cheat_manager_search(enum cheat_search_type search_type)
    size_t _len;
    char msg[100];
    cheat_manager_t   *cheat_st = &cheat_manager_state;
-   unsigned char *curr         = cheat_st->curr_memory_buf;
+   cheat_region_t region       = { NULL, 0, 0 };
+   unsigned char *curr         = NULL;
    unsigned char *prev         = cheat_st->prev_memory_buf;
    unsigned int idx            = 0;
    unsigned int curr_val       = 0;
@@ -1169,7 +1228,10 @@ static int cheat_manager_search(enum cheat_search_type search_type)
    {
       unsigned byte_part;
 
-      offset = translate_address(idx, &curr);
+      if (!cheat_region_seek(&region, idx, bytes_per_item))
+         continue;
+      curr   = region.base;
+      offset = region.start;
 
       switch (bytes_per_item)
       {
@@ -1370,6 +1432,10 @@ static int cheat_manager_search_input_start(
    line.label_setting = value_buf;
    line.type          = label;
    line.idx           = (unsigned)idx;
+   /* Not KB_TYPE_NUMBER: cheat_manager_search_input_cb_common() parses
+    * with strtoul(base 0), so '0x1f' is valid input here and a numeric
+    * keypad has no 'x' or 'a'-'f' to type it with. */
+   line.text_type     = MENU_INPUT_DIALOG_KB_TYPE_TEXT;
    line.cb            = cb;
 
    if (menu_input_dialog_start(&line))
@@ -1504,7 +1570,8 @@ int cheat_manager_add_matches(const char *path,
    unsigned       int curr_val = 0;
    unsigned         int offset = 0;
    cheat_manager_t   *cheat_st = &cheat_manager_state;
-   unsigned char         *curr = cheat_st->curr_memory_buf;
+   cheat_region_t       region = { NULL, 0, 0 };
+   unsigned char         *curr = NULL;
 #ifdef HAVE_MENU
    struct menu_state *menu_st  = menu_state_get_ptr();
 #endif
@@ -1520,7 +1587,10 @@ int cheat_manager_add_matches(const char *path,
 
    for (idx = 0; idx < cheat_st->total_memory_size; idx = idx + bytes_per_item)
    {
-      offset = translate_address(idx, &curr);
+      if (!cheat_region_seek(&region, idx, bytes_per_item))
+         continue;
+      curr   = region.base;
+      offset = region.start;
 
       switch (bytes_per_item)
       {
@@ -1588,10 +1658,10 @@ int cheat_manager_add_matches(const char *path,
    return 0;
 }
 
-void cheat_manager_apply_rumble(struct item_cheat *cheat, unsigned int curr_value)
+static void cheat_manager_apply_rumble(struct item_cheat *cheat,
+      unsigned int curr_value, retro_time_t current_time)
 {
-   bool rumble               = false;
-   retro_time_t current_time = cpu_features_get_time_usec();
+   bool rumble = false;
 
    switch (cheat->rumble_type)
    {
@@ -1676,6 +1746,7 @@ void cheat_manager_apply_retro_cheats(void)
 {
    unsigned i;
    unsigned int offset;
+   cheat_region_t region       = { NULL, 0, 0 };
    unsigned int mask           = 0;
    unsigned int bytes_per_item = 1;
    unsigned int bits           = 8;
@@ -1685,9 +1756,16 @@ void cheat_manager_apply_retro_cheats(void)
    bool cheat_applied          = false;
 #endif
    cheat_manager_t   *cheat_st = &cheat_manager_state;
+   retro_time_t current_time;
 
    if ((!cheat_st->cheats))
       return;
+
+   /* One reading for the whole pass: every cheat in it is applied at
+    * the same instant, and the clock is a syscall on more than one
+    * platform - a large cheat file would otherwise pay for one per
+    * entry, per frame. */
+   current_time = cpu_features_get_time_usec();
 
    for (i = 0; i < cheat_st->size; i++)
    {
@@ -1715,10 +1793,17 @@ void cheat_manager_apply_retro_cheats(void)
       }
       cheat_manager_setup_search_meta(cheat_st->cheats[i].memory_search_size, &bytes_per_item, &mask, &bits);
 
-      curr   = cheat_st->curr_memory_buf;
       idx    = cheat_st->cheats[i].address;
 
-      offset = translate_address(idx, &curr);
+      if (!cheat_region_seek(&region, idx, bytes_per_item))
+      {
+         /* a condition that cannot be read does not hold */
+         if (cheat_st->cheats[i].cheat_type >= CHEAT_TYPE_RUN_NEXT_IF_EQ)
+            run_cheat = false;
+         continue;
+      }
+      curr   = region.base;
+      offset = region.start;
 
       switch (bytes_per_item)
       {
@@ -1738,7 +1823,8 @@ void cheat_manager_apply_retro_cheats(void)
             break;
       }
 
-      cheat_manager_apply_rumble(&cheat_st->cheats[i], curr_val);
+      cheat_manager_apply_rumble(&cheat_st->cheats[i], curr_val,
+            current_time);
 
       switch (cheat_st->cheats[i].cheat_type)
       {
@@ -1779,6 +1865,11 @@ void cheat_manager_apply_retro_cheats(void)
 #endif
          for (repeat_iter = 1; repeat_iter <= cheat_st->cheats[i].repeat_count; repeat_iter++)
          {
+            if (!cheat_region_seek(&region, idx, bytes_per_item))
+               break;
+            curr   = region.base;
+            offset = region.start;
+
             switch (bytes_per_item)
             {
                case 2:
@@ -1860,8 +1951,6 @@ void cheat_manager_apply_retro_cheats(void)
                idx += (cheat_st->cheats[i].repeat_add_to_address * bytes_per_item);
 
             idx = idx % cheat_st->total_memory_size;
-
-            offset = translate_address(idx, &curr);
          }
       }
    }
@@ -1885,7 +1974,8 @@ void cheat_manager_match_action(enum cheat_match_action_type match_action, unsig
    unsigned int       prev_val = 0;
    unsigned int         offset = 0;
    cheat_manager_t   *cheat_st = &cheat_manager_state;
-   unsigned char         *curr = cheat_st->curr_memory_buf;
+   cheat_region_t       region = { NULL, 0, 0 };
+   unsigned char         *curr = NULL;
    unsigned char         *prev = cheat_st->prev_memory_buf;
    unsigned int curr_match_idx = 0;
 
@@ -1904,7 +1994,14 @@ void cheat_manager_match_action(enum cheat_match_action_type match_action, unsig
 
    for (idx = start_idx; idx < cheat_st->total_memory_size; idx = idx + bytes_per_item)
    {
-      offset = translate_address(idx, &curr);
+      if (!cheat_region_seek(&region, idx, bytes_per_item))
+      {
+         if (match_action == CHEAT_MATCH_ACTION_TYPE_BROWSE)
+            return;
+         continue;
+      }
+      curr   = region.base;
+      offset = region.start;
 
       switch (bytes_per_item)
       {

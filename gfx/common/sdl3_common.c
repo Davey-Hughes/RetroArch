@@ -90,10 +90,17 @@ static void sdl3_window_save_position(SDL_Window *win)
        || w <= 0 || h <= 0)
       return;
 
-   settings->uints.window_position_x = (unsigned)x;
-   settings->uints.window_position_y = (unsigned)y;
-   settings->uints.window_position_width = (unsigned)w;
-   settings->uints.window_position_height = (unsigned)h;
+   settings->uints.window_position_pos  = VIDEO_POS_PACK(x, y);
+   settings->uints.window_position_dims = VIDEO_SCALE_PACK(w, h);
+}
+
+void sdl3_pump_input_events(void)
+{
+   /* Two threads pumping at once deadlock in the X11 backend. */
+   if (     video_driver_thread_wrapper_active()
+         && SDL_WasInit(SDL_INIT_VIDEO))
+      return;
+   SDL_PumpEvents();
 }
 
 void sdl3_pump_window_events(bool *quit, bool *resize)
@@ -115,6 +122,11 @@ void sdl3_pump_window_events(bool *quit, bool *resize)
 
       if (event.type == SDL_EVENT_WINDOW_RESIZED || event.type == SDL_EVENT_WINDOW_MOVED)
          sdl3_window_save_position(SDL_GetWindowFromID(event.window.windowID));
+
+      /* It may be on another display now */
+      if (     event.type == SDL_EVENT_WINDOW_MOVED
+            || event.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED)
+         video_driver_window_output_changed();
    }
 
    while (SDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_EVENT_DISPLAY_FIRST, SDL_EVENT_DISPLAY_LAST) > 0)
@@ -125,7 +137,7 @@ void sdl3_pump_window_events(bool *quit, bool *resize)
 
     /* Clear out the input queue if we're not using the
      * SDL driver. */
-   if (input_state_get_ptr()->current_driver != &input_sdl3)
+   if (!input_driver_is_sdl3())
    {
       SDL_FlushEvents(SDL_EVENT_KEY_DOWN,         SDL_EVENT_MOUSE_REMOVED);
       SDL_FlushEvents(SDL_EVENT_FINGER_DOWN,      SDL_EVENT_FINGER_CANCELED);
@@ -246,7 +258,22 @@ static SDL_Window *sdl3_window_create(unsigned width, unsigned height,
          | SDL_WINDOW_HIGH_PIXEL_DENSITY;
 
    if (fullscreen)
+   {
       flags |= SDL_WINDOW_FULLSCREEN;
+      /* Desktop full screen at the desktop's size: a window made
+       * smaller is only grown by a window manager, and without one it
+       * keeps the size it was made at. */
+      if (settings->bools.video_windowed_fullscreen)
+      {
+         const SDL_DisplayMode *mode = SDL_GetDesktopDisplayMode(
+               SDL_GetPrimaryDisplay());
+         if (mode)
+         {
+            width  = (unsigned)mode->w;
+            height = (unsigned)mode->h;
+         }
+      }
+   }
 
    if (!settings->bools.video_window_show_decorations)
       flags |= SDL_WINDOW_BORDERLESS;
@@ -260,13 +287,13 @@ static SDL_Window *sdl3_window_create(unsigned width, unsigned height,
     * in Wayland where windows are not manually positioned. */
    if (settings->bools.video_window_save_positions
          && !fullscreen
-         && settings->uints.window_position_width
-         && settings->uints.window_position_height
+         && VIDEO_SCALE_W(settings->uints.window_position_dims)
+         && VIDEO_SCALE_H(settings->uints.window_position_dims)
          && !string_is_equal(SDL_GetCurrentVideoDriver(), "wayland"))
    {
       SDL_SetWindowPosition(win,
-            (int)settings->uints.window_position_x,
-            (int)settings->uints.window_position_y);
+            VIDEO_POS_X(settings->uints.window_position_pos),
+            VIDEO_POS_Y(settings->uints.window_position_pos));
       SDL_SyncWindow(win);
    }
    else
@@ -275,7 +302,10 @@ static SDL_Window *sdl3_window_create(unsigned width, unsigned height,
    /* SDL_EVENT_TEXT_INPUT is emitted for windows that opted in for
     * it. The SDL3 input driver handles those events for menu
     * text entry and core keyboard callbacks. */
-   SDL_StartTextInput(win);
+#ifndef WEBOS
+   if (!sdl3_uses_screen_keyboard())
+      SDL_StartTextInput(win);
+#endif
 
    return win;
 }
@@ -296,23 +326,23 @@ static void sdl3_window_apply_fullscreen(SDL_Window *win,
    SDL_SetWindowFullscreenMode(win, exclusive ? &mode : NULL);
    SDL_SetWindowFullscreen(win, fullscreen);
 
-   if (fullscreen)
-      SDL_HideCursor();
-   else
+   /* The cursor is the frontend's, applied through sdl3_show_mouse(). */
+   if (!fullscreen)
    {
       /* Leaving fullscreen is asynchronous, and size requests
        * are dropped while still fullscreen, so we wait until
        * it has completed. */
       SDL_SyncWindow(win);
       SDL_SetWindowSize(win, width, height);
-      SDL_ShowCursor();
    }
 }
 
 bool sdl3_window_set_video_mode(SDL_Window **win,
-      unsigned width, unsigned height, bool fullscreen,
+      unsigned dims, bool fullscreen,
       SDL_WindowFlags backend_flags)
 {
+   unsigned width  = VIDEO_SCALE_W(dims);
+   unsigned height = VIDEO_SCALE_H(dims);
    if (*win)
       SDL_SetWindowBordered(*win, config_get_ptr()->bools.video_window_show_decorations);
    else if (!(*win = sdl3_window_create(width, height, fullscreen, backend_flags)))
@@ -326,7 +356,7 @@ bool sdl3_window_set_video_mode(SDL_Window **win,
 }
 
 void sdl3_window_get_video_size(SDL_Window *win,
-      unsigned *width, unsigned *height)
+      unsigned *dims)
 {
    const SDL_DisplayMode *mode;
 
@@ -334,8 +364,7 @@ void sdl3_window_get_video_size(SDL_Window *win,
    {
       int w, h;
       SDL_GetWindowSizeInPixels(win, &w, &h);
-      *width = w;
-      *height = h;
+      *dims = VIDEO_SCALE_PACK(w, h);
       return;
    }
 
@@ -343,8 +372,7 @@ void sdl3_window_get_video_size(SDL_Window *win,
    mode = SDL_GetCurrentDisplayMode(SDL_GetPrimaryDisplay());
    if (mode)
    {
-      *width = mode->w;
-      *height = mode->h;
+      *dims = VIDEO_SCALE_PACK(mode->w, mode->h);
    }
 }
 
@@ -387,61 +415,17 @@ bool sdl3_suppress_screensaver(void *data, bool enable)
    return enable ? SDL_DisableScreenSaver() : SDL_EnableScreenSaver();
 }
 
-/* Returns the configured input driver if it works alongside an SDL3
- * window, or NULL if the SDL3 input driver should be used instead.
- *
- * The udev, linuxraw, raw and dinput input drivers read input devices
- * directly, so they will function inside an SDL3 window. Drivers tied
- * to a windowing system like x, wayland, or cocoa however, should end
- * up using the SDL3 input driver. */
-static input_driver_t *sdl3_passthrough_input(const char *ident)
+void sdl3_input_driver(const char *joypad_name)
 {
-#ifdef HAVE_UDEV
-   if (string_is_equal(ident, "udev"))
-      return &input_udev;
-#endif
-#if defined(__linux__) && !defined(ANDROID)
-   if (string_is_equal(ident, "linuxraw"))
-      return &input_linuxraw;
-#endif
-#if defined(_WIN32) && !defined(_XBOX) && _WIN32_WINNT >= 0x0501 && !defined(__WINRT__)
-#ifdef HAVE_WINRAWINPUT
-   if (string_is_equal(ident, "raw"))
-      return &input_winraw;
-#endif
-#endif
-#ifdef HAVE_DINPUT
-   if (string_is_equal(ident, "dinput"))
-      return &input_dinput;
-#endif
-   return NULL;
-}
-
-void sdl3_input_driver(const char *joypad_name,
-      input_driver_t **input, void **input_data)
-{
-   input_driver_t *passthrough = sdl3_passthrough_input(config_get_ptr()->arrays.input_driver);
-
-   if (passthrough)
-   {
-      if ((*input_data = input_driver_init_wrap(passthrough, joypad_name)))
-      {
-         *input = passthrough;
-         return;
-      }
-      /* The configured input driver failed, so fallback to SDL3. */
-   }
-
-   /* Use the SDL3 input driver, taking advantage of the window's event queue. */
-   *input_data = input_driver_init_wrap(&input_sdl3, joypad_name);
-   *input = *input_data ? &input_sdl3 : NULL;
+   /* no input driver of this window's own: the frontend starts the
+    * one that goes with an SDL 3 window */
+   input_driver_video_window(INPUT_WINDOW_SDL3, NULL);
 }
 
 void sdl3_ctx_input_driver(void *data,
-      const char *name,
-      input_driver_t **input, void **input_data)
+      const char *name)
 {
-   sdl3_input_driver(name, input, input_data);
+   sdl3_input_driver(name);
 }
 
 bool sdl3_ctx_enabled(const char *ctx_ident)
@@ -469,10 +453,10 @@ static SDL_Window *sdl3_ctx_window(void *data)
    return data ? *(SDL_Window**)data : NULL;
 }
 
-void sdl3_ctx_get_video_size(void *data, unsigned *width, unsigned *height)
+void sdl3_ctx_get_video_size(void *data, unsigned *dims)
 {
    if (data)
-      sdl3_window_get_video_size(sdl3_ctx_window(data), width, height);
+      sdl3_window_get_video_size(sdl3_ctx_window(data), dims);
 }
 
 float sdl3_ctx_get_refresh_rate(void *data)
@@ -491,14 +475,14 @@ bool sdl3_ctx_has_focus(void *data)
 }
 
 void sdl3_ctx_check_window(void *data, bool *quit, bool *resize,
-      unsigned *width, unsigned *height)
+      unsigned *dims)
 {
    SDL_Window *win = sdl3_ctx_window(data);
 
    sdl3_pump_window_events(quit, resize);
 
    if (*resize && win)
-      sdl3_window_get_video_size(win, width, height);
+      sdl3_window_get_video_size(win, dims);
 }
 
 bool sdl3_ctx_get_metrics(void *data,
@@ -540,4 +524,40 @@ void sdl3_show_mouse(void *data, bool state)
       SDL_ShowCursor();
    else
       SDL_HideCursor();
+}
+
+SDL_Window *sdl3_get_window(void)
+{
+   gfx_ctx_ident_t ident_info;
+
+   if (string_is_equal(video_driver_get_ident(), "sdl3"))
+   {
+      sdl3_video_t *video_ptr = (sdl3_video_t*)video_driver_get_ptr();
+      return video_ptr != NULL ? video_ptr->window : NULL;
+   }
+
+   /* gl/gl1/glcore/vulkan running on the SDL3 context drivers. They
+    * register their SDL_Window as the display userdata via sdl3_set_handles. */
+   ident_info.ident = NULL;
+   video_context_driver_get_ident(&ident_info);
+   if (string_is_equal(ident_info.ident, "gl_sdl3") || string_is_equal(ident_info.ident, "vk_sdl3"))
+      return (SDL_Window*)video_driver_display_userdata_get();
+
+   return NULL;
+}
+
+/* Whether SDL_StartTextInput() on this device means "pop up a screen
+ * keyboard" rather than "quietly enable text events".
+ *
+ * SDL_HasScreenKeyboardSupport() alone is not that question. The X11
+ * backend answers it true for the whole Steam Deck whether or not a
+ * USB keyboard is plugged in, and the GDK and OpenVR backends do the
+ * same; only Wayland checks for a physical keyboard first. Where one
+ * is attached the user is typing on it, so keep text input running in
+ * the background as on any desktop - otherwise SDL_EVENT_TEXT_INPUT
+ * never fires, sdl3_translate_control_key() returns 0 for printable
+ * keys, and nothing the user types reaches the keyboard line. */
+bool sdl3_uses_screen_keyboard(void)
+{
+   return SDL_HasScreenKeyboardSupport() && !SDL_HasKeyboard();
 }

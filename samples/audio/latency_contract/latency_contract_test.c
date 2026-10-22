@@ -30,7 +30,7 @@
 #include "../../../audio/audio_driver.h"
 
 extern audio_driver_t audio_alsa;
-extern audio_driver_t audio_sdl;
+extern audio_driver_t audio_sdl2;
 extern audio_driver_t audio_openal;
 
 static unsigned failures = 0;
@@ -73,7 +73,7 @@ static void exercise(const case_t *c, unsigned latency_ms)
 
    printf("-- %s at %u ms\n", d->ident, latency_ms);
 
-   ctx = d->init(c->device, rate, latency_ms, 0, &new_rate);
+   ctx = d->init(c->device, rate, latency_ms, &new_rate);
    CHECK(ctx != NULL, "%s: did not open on its null backend", d->ident);
    if (!ctx)
       return;
@@ -167,7 +167,7 @@ int main(void)
    static const case_t cases[] = {
       { &audio_alsa,   "null", 0.05, false },
       { &audio_openal, NULL,   0.10, true  },
-      { &audio_sdl,    NULL,   0.05, true  },
+      { &audio_sdl2,   NULL,   0.05, true  },
    };
    unsigned i;
 

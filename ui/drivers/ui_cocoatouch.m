@@ -14,6 +14,7 @@
  */
 
 #include <stdint.h>
+#include "../../apple_runtime.h"
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,8 +33,8 @@
 #import "cocoa/RetroArchPlaylistManager.h"
 #endif
 
-#if defined(HAVE_COCOA_METAL)
-#include "../../gfx/common/metal_view.h"
+#ifdef HAVE_METAL
+#include "../../gfx/drivers/metal.h"
 #endif
 
 #include "../ui_companion_driver.h"
@@ -43,6 +44,7 @@
 #include "cocoa/cocoa_audio_session.h"
 #endif
 #include "../../gfx/video_display_server.h"
+#include "../../gfx/gfx_surface.h"
 #include "../../configuration.h"
 #include "../../frontend/frontend.h"
 #include "../../input/drivers/cocoa_input.h"
@@ -75,8 +77,20 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreFoundation/CoreFoundation.h>
 
+/* MetricKit (iOS 13) and pointer interactions (iOS 13.4) need an SDK
+ * that has them; built against an older one, the app has neither and
+ * does not register for them. */
+#if (defined(__IPHONE_OS_VERSION_MAX_ALLOWED) && __IPHONE_OS_VERSION_MAX_ALLOWED >= 130000) \
+   || (defined(__TV_OS_VERSION_MAX_ALLOWED) && __TV_OS_VERSION_MAX_ALLOWED >= 130000)
+#define RARCH_SDK_METRICKIT 1
+#define RARCH_SDK_SCENES 1
 #import <MetricKit/MetricKit.h>
 #import <MetricKit/MXMetricManager.h>
+#endif
+#if (defined(__IPHONE_OS_VERSION_MAX_ALLOWED) && __IPHONE_OS_VERSION_MAX_ALLOWED >= 130400) \
+   || (defined(__TV_OS_VERSION_MAX_ALLOWED) && __TV_OS_VERSION_MAX_ALLOWED >= 130400)
+#define RARCH_SDK_POINTER 1
+#endif
 
 #import "../../pkg/apple/WebServer/WebServer.h"
 
@@ -99,12 +113,7 @@
 #include "SDL.h"
 #endif
 
-#if defined(HAVE_COCOA_METAL) || defined(HAVE_COCOATOUCH)
 #import "JITSupport.h"
-id<ApplePlatform> apple_platform;
-#else
-static id apple_platform;
-#endif
 
 static void ui_companion_cocoatouch_event_command(
       void *data, enum event_command cmd) { }
@@ -148,23 +157,53 @@ static struct string_list *ui_companion_cocoatouch_get_app_icons(void)
    return list;
 }
 
+/* nil restores the primary icon, which is what "Default" means here, so
+ * the nil is deliberate - but it has to be written down. ARC
+ * zero-initialises a strong local; MRC, which is how the Makefile
+ * builds this file, leaves it indeterminate, so asking for "Default"
+ * passed whatever was on the stack to setAlternateIconName:. */
 static void ui_companion_cocoatouch_set_app_icon(const char *iconName)
 {
-   NSString *str;
+   NSString *str = nil;
    if (!string_is_equal(iconName, "Default"))
       str = [NSString stringWithCString:iconName encoding:NSUTF8StringEncoding];
-   [[UIApplication sharedApplication] setAlternateIconName:str completionHandler:nil];
+   /* Alternate icons are iOS 10.3 / tvOS 10.2 */
+   if (apple_runtime_available(0, APPLE_RUNTIME_VER(10, 3, 0), APPLE_RUNTIME_VER(10, 2, 0)))
+      ((void (*)(id, SEL, id, id))objc_msgSend)([UIApplication sharedApplication],
+            sel_registerName("setAlternateIconName:completionHandler:"), str, nil);
 }
 
+/* Main thread only: the sole caller is materialui's icon draw, which
+ * runs from the menu's frame.
+ *
+ * The cache used to be created under dispatch_once, which read as a
+ * thread-safety guarantee the rest of the function does not make - the
+ * very next lines mutate the dictionary with no synchronisation at
+ * all, so were this ever reached from two threads the once would be
+ * the one part that was safe. A plain lazy create says what is true:
+ * one thread, so neither the create nor the mutation needs guarding.
+ *
+ * +dictionaryWithCapacity: hands back an autoreleased object, which is
+ * wrong for something a static holds across calls: this file is built
+ * MRC by the Makefile - it is not in the -fobjc-arc list at Makefile:275
+ * - so the pool drains at the end of the run loop pass that created it
+ * and every later call messages freed memory. Under Xcode, where
+ * griffin_objc.m is ARC, the strong static retains it and the same
+ * code is fine, which is why this has sat here. -initWithCapacity: is
+ * +1 owned and correct in both: the object is kept for the process
+ * lifetime deliberately, as the dock indicator in dispserv_apple.m is. */
 static uintptr_t ui_companion_cocoatouch_get_app_icon_texture(const char *icon)
 {
-   static NSMutableDictionary<NSString *, NSNumber *> *textures = nil;
-   static dispatch_once_t once;
-   dispatch_once(&once, ^{
-      textures = [NSMutableDictionary dictionaryWithCapacity:6];
-   });
+   /* Each icon's still, kept for the process lifetime; its texture is
+    * read at every call, since an upload under threaded video lands a
+    * frame after the submit */
+   static NSMutableDictionary<NSString *, NSValue *> *textures = nil;
+   NSString *iconName;
 
-   NSString *iconName = [NSString stringWithUTF8String:icon];
+   if (!textures)
+      textures = [[NSMutableDictionary alloc] initWithCapacity:6];
+
+   iconName = [NSString stringWithUTF8String:icon];
    if (!textures[iconName])
    {
       UIImage *img = [UIImage imageNamed:iconName];
@@ -180,14 +219,15 @@ static uintptr_t ui_companion_cocoatouch_get_app_icon_texture(const char *icon)
          return 0;
       }
 
-      uintptr_t item;
-      gfx_display_reset_textures_list_buffer(&item, TEXTURE_FILTER_MIPMAP_LINEAR,
-                                             (void*)[png bytes], (unsigned int)[png length], IMAGE_TYPE_PNG,
-                                             NULL, NULL);
-      textures[iconName] = [NSNumber numberWithUnsignedLong:item];
+      gfx_surface_t *s = gfx_surface_new_still(TEXTURE_FILTER_MIPMAP_LINEAR);
+      if (!s)
+         return 0;
+      gfx_surface_submit_buffer(s, IMAGE_TYPE_PNG, [png bytes],
+            (size_t)[png length], gfx_surface_wants_rgba());
+      textures[iconName] = [NSValue valueWithPointer:s];
    }
 
-   return [textures[iconName] unsignedLongValue];
+   return GFX_SURFACE_HANDLE((gfx_surface_t*)[textures[iconName] pointerValue]);
 }
 
 void get_ios_version(int *major, int *minor)
@@ -208,7 +248,7 @@ void get_ios_version(int *major, int *minor)
 
 bool ios_running_on_ipad(void)
 {
-   return (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad);
+   return ([[UIDevice currentDevice] userInterfaceIdiom] == UIUserInterfaceIdiomPad);
 }
 
 /* Input helpers: This is kept here because it needs ObjC */
@@ -216,24 +256,18 @@ static void handle_touch_event(NSArray* touches)
 {
 #if !TARGET_OS_TV
    unsigned i;
-   cocoa_input_data_t *apple = (cocoa_input_data_t*)
-      input_state_get_ptr()->current_data;
    float scale               = cocoa_screen_get_native_scale();
 
-   if (!apple)
-      return;
+   cocoa_input_touches_begin();
 
-   apple->touch_count = 0;
-
-   for (i = 0; i < touches.count && (apple->touch_count < MAX_TOUCHES); i++)
+   for (i = 0; i < touches.count; i++)
    {
       UITouch      *touch = [touches objectAtIndex:i];
       CGPoint       coord = [touch locationInView:[touch view]];
       if (touch.phase != UITouchPhaseEnded && touch.phase != UITouchPhaseCancelled)
-      {
-         apple->touches[apple->touch_count   ].screen_x = coord.x * scale;
-         apple->touches[apple->touch_count ++].screen_y = coord.y * scale;
-      }
+         if (!cocoa_input_touch_add((int16_t)(coord.x * scale),
+                  (int16_t)(coord.y * scale)))
+            break;
    }
 #endif
 }
@@ -280,57 +314,80 @@ enum
 /* This is specifically for iOS 9, according to the private headers */
 -(void)handleKeyUIEvent:(UIEvent *)event
 {
-    /* This gets called twice with the same timestamp
-     * for each keypress, that's fine for polling
-     * but is bad for business with events. */
-    static double last_time_stamp;
-
-    if (last_time_stamp == event.timestamp)
-       return [super handleKeyUIEvent:event];
-
-    last_time_stamp        = event.timestamp;
+    /* UIKit hands every key event over twice. Polling does not care,
+     * the event path does, so one event per (key, direction) pair is
+     * accepted per timestamp and the rest go straight to super.
+     * The record is a bitmap rather than a single slot because any
+     * number of keys can change state within one frame and they all
+     * carry that frame's timestamp - a single slot only keeps the
+     * key that happened to arrive last, and the others are either
+     * dropped or let through twice depending on the order UIKit
+     * chose. */
+    static double   last_time_stamp;
+    static uint32_t seen[2][MAX_KEYS / 32];
+    NSString       *ch;
+    uint32_t       *row;
+    NSUInteger      mods;
+    long long       code;
+    uint32_t        character = 0;
+    uint32_t        mod       = 0;
 
     /* If the _hidEvent is NULL, [event _keyCode] will crash.
      * (This happens with the on screen keyboard). */
-    if (event._hidEvent)
+    if (!event._hidEvent)
+       return [super handleKeyUIEvent:event];
+
+    /* apple_input_keyboard_event() indexes apple_key_state with the
+     * keycode and ignores anything outside it. */
+    code = event._keyCode;
+    if (code <= 0 || code >= MAX_KEYS)
+       return [super handleKeyUIEvent:event];
+
+    if (last_time_stamp != event.timestamp)
     {
-        NSString       *ch = (NSString*)event._privateInput;
-        uint32_t character = 0;
-        uint32_t mod       = 0;
-        NSUInteger mods    = event._modifierFlags;
+        last_time_stamp = event.timestamp;
+        memset(seen, 0, sizeof(seen));
+    }
 
-        if (mods & NSAlphaShiftKeyMask)
-           mod |= RETROKMOD_CAPSLOCK;
-        if (mods & NSShiftKeyMask)
-           mod |= RETROKMOD_SHIFT;
-        if (mods & NSControlKeyMask)
-           mod |= RETROKMOD_CTRL;
-        if (mods & NSAlternateKeyMask)
-           mod |= RETROKMOD_ALT;
-        if (mods & NSCommandKeyMask)
-           mod |= RETROKMOD_META;
-        if (mods & NSNumericPadKeyMask)
-           mod |= RETROKMOD_NUMLOCK;
+    row = seen[event._isKeyDown ? 1 : 0];
+    if (row[code >> 5] & (1u << (code & 31)))
+       return [super handleKeyUIEvent:event];
+    row[code >> 5] |= 1u << (code & 31);
 
-        if (ch && ch.length != 0)
-        {
-            unsigned i;
-            character = [ch characterAtIndex:0];
+    ch   = (NSString*)event._privateInput;
+    mods = event._modifierFlags;
 
-            apple_input_keyboard_event(event._isKeyDown,
-                  (uint32_t)event._keyCode, 0, mod,
-                  RETRO_DEVICE_KEYBOARD);
+    if (mods & NSAlphaShiftKeyMask)
+       mod |= RETROKMOD_CAPSLOCK;
+    if (mods & NSShiftKeyMask)
+       mod |= RETROKMOD_SHIFT;
+    if (mods & NSControlKeyMask)
+       mod |= RETROKMOD_CTRL;
+    if (mods & NSAlternateKeyMask)
+       mod |= RETROKMOD_ALT;
+    if (mods & NSCommandKeyMask)
+       mod |= RETROKMOD_META;
+    if (mods & NSNumericPadKeyMask)
+       mod |= RETROKMOD_NUMLOCK;
 
-            for (i = 1; i < ch.length; i++)
-                apple_input_keyboard_event(event._isKeyDown,
-                      0, [ch characterAtIndex:i], mod,
-                      RETRO_DEVICE_KEYBOARD);
-        }
+    if (ch && ch.length != 0)
+    {
+        unsigned i;
+        character = [ch characterAtIndex:0];
 
         apple_input_keyboard_event(event._isKeyDown,
-              (uint32_t)event._keyCode, character, mod,
+              (uint32_t)code, 0, mod,
               RETRO_DEVICE_KEYBOARD);
+
+        for (i = 1; i < ch.length; i++)
+            apple_input_keyboard_event(event._isKeyDown,
+                  0, [ch characterAtIndex:i], mod,
+                  RETRO_DEVICE_KEYBOARD);
     }
+
+    apple_input_keyboard_event(event._isKeyDown,
+          (uint32_t)code, character, mod,
+          RETRO_DEVICE_KEYBOARD);
 
     [super handleKeyUIEvent:event];
 }
@@ -338,56 +395,72 @@ enum
 /* This is for iOS versions < 9.0 */
 - (id)_keyCommandForEvent:(UIEvent*)event
 {
-   /* This gets called twice with the same timestamp
-    * for each keypress, that's fine for polling
-    * but is bad for business with events. */
-   static double last_time_stamp;
-
-   if (last_time_stamp == event.timestamp)
-      return [super _keyCommandForEvent:event];
-   last_time_stamp = event.timestamp;
+   /* Same per (key, direction) record as -handleKeyUIEvent:, kept
+    * separately because only one of the two paths is live on any
+    * given iOS version. */
+   static double   last_time_stamp;
+   static uint32_t seen[2][MAX_KEYS / 32];
+   NSString       *ch;
+   uint32_t       *row;
+   NSUInteger      mods;
+   long long       code;
+   uint32_t        character = 0;
+   uint32_t        mod       = 0;
 
    /* If the _hidEvent is null, [event _keyCode] will crash.
     * (This happens with the on screen keyboard). */
-   if (event._hidEvent)
+   if (!event._hidEvent)
+      return [super _keyCommandForEvent:event];
+
+   code = event._keyCode;
+   if (code <= 0 || code >= MAX_KEYS)
+      return [super _keyCommandForEvent:event];
+
+   if (last_time_stamp != event.timestamp)
    {
-      NSString       *ch = (NSString*)event._privateInput;
-      uint32_t character = 0;
-      uint32_t mod       = 0;
-      NSUInteger mods    = event._modifierFlags;
+      last_time_stamp = event.timestamp;
+      memset(seen, 0, sizeof(seen));
+   }
 
-      if (mods & NSAlphaShiftKeyMask)
-         mod |= RETROKMOD_CAPSLOCK;
-      if (mods & NSShiftKeyMask)
-         mod |= RETROKMOD_SHIFT;
-      if (mods & NSControlKeyMask)
-         mod |= RETROKMOD_CTRL;
-      if (mods & NSAlternateKeyMask)
-         mod |= RETROKMOD_ALT;
-      if (mods & NSCommandKeyMask)
-         mod |= RETROKMOD_META;
-      if (mods & NSNumericPadKeyMask)
-         mod |= RETROKMOD_NUMLOCK;
+   row = seen[event._isKeyDown ? 1 : 0];
+   if (row[code >> 5] & (1u << (code & 31)))
+      return [super _keyCommandForEvent:event];
+   row[code >> 5] |= 1u << (code & 31);
 
-      if (ch && ch.length != 0)
-      {
-         unsigned i;
-         character = [ch characterAtIndex:0];
+   ch   = (NSString*)event._privateInput;
+   mods = event._modifierFlags;
 
-         apple_input_keyboard_event(event._isKeyDown,
-               (uint32_t)event._keyCode, 0, mod,
-               RETRO_DEVICE_KEYBOARD);
+   if (mods & NSAlphaShiftKeyMask)
+      mod |= RETROKMOD_CAPSLOCK;
+   if (mods & NSShiftKeyMask)
+      mod |= RETROKMOD_SHIFT;
+   if (mods & NSControlKeyMask)
+      mod |= RETROKMOD_CTRL;
+   if (mods & NSAlternateKeyMask)
+      mod |= RETROKMOD_ALT;
+   if (mods & NSCommandKeyMask)
+      mod |= RETROKMOD_META;
+   if (mods & NSNumericPadKeyMask)
+      mod |= RETROKMOD_NUMLOCK;
 
-         for (i = 1; i < ch.length; i++)
-            apple_input_keyboard_event(event._isKeyDown,
-                  0, [ch characterAtIndex:i], mod,
-                  RETRO_DEVICE_KEYBOARD);
-      }
+   if (ch && ch.length != 0)
+   {
+      unsigned i;
+      character = [ch characterAtIndex:0];
 
       apple_input_keyboard_event(event._isKeyDown,
-            (uint32_t)event._keyCode, character, mod,
+            (uint32_t)code, 0, mod,
             RETRO_DEVICE_KEYBOARD);
+
+      for (i = 1; i < ch.length; i++)
+         apple_input_keyboard_event(event._isKeyDown,
+               0, [ch characterAtIndex:i], mod,
+               RETRO_DEVICE_KEYBOARD);
    }
+
+   apple_input_keyboard_event(event._isKeyDown,
+         (uint32_t)code, character, mod,
+         RETRO_DEVICE_KEYBOARD);
 
    return [super _keyCommandForEvent:event];
 }
@@ -398,10 +471,11 @@ enum
    uint32_t character = 0;
    uint32_t mod       = 0;
    NSUInteger mods    = 0;
-   if (@available(iOS 13.4, tvOS 13.4, *))
+   if (apple_runtime_available(0, APPLE_RUNTIME_VER(13, 4, 0), APPLE_RUNTIME_VER(13, 4, 0)))
    {
       ch = (NSString*)press.key.characters;
-      mods = event.modifierFlags;
+      /* -[UIEvent modifierFlags], iOS / tvOS 13.4 */
+      mods = (NSUInteger)apple_rt_get_long(event, sel_registerName("modifierFlags"));
    }
 
    if (mods & UIKeyModifierAlphaShift)
@@ -432,7 +506,7 @@ enum
                                     RETRO_DEVICE_KEYBOARD);
    }
 
-   if (@available(iOS 13.4, tvOS 13.4, *))
+   if (apple_runtime_available(0, APPLE_RUNTIME_VER(13, 4, 0), APPLE_RUNTIME_VER(13, 4, 0)))
       apple_input_keyboard_event(down,
                                  (uint32_t)press.key.keyCode, character, mod,
                                  RETRO_DEVICE_KEYBOARD);
@@ -461,6 +535,20 @@ enum
       [self handleUIPress:press withEvent:event down:NO];
    [super pressesEnded:presses withEvent:event];
 }
+
+- (void)pressesCancelled:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event
+{
+   /* UIKit delivers pressesCancelled instead of pressesEnded when the
+    * system interrupts a press (incoming call, app switcher, keyboard
+    * shortcut HUD, ...). Without treating it as a release the key stays
+    * latched in apple_key_state until it is pressed again. */
+   if (ios_keyboard_active())
+      return [super pressesCancelled:presses withEvent:event];
+
+   for (UIPress *press in presses)
+      [self handleUIPress:press withEvent:event down:NO];
+   [super pressesCancelled:presses withEvent:event];
+}
 #endif
 
 #define GSEVENT_TYPE_KEYDOWN 10
@@ -469,9 +557,10 @@ enum
 - (void)sendEvent:(UIEvent *)event
 {
    [super sendEvent:event];
-   if (@available(iOS 13.4, tvOS 13.4, *))
+   if (apple_runtime_available(0, APPLE_RUNTIME_VER(13, 4, 0), APPLE_RUNTIME_VER(13, 4, 0)))
    {
-      if (event.type == UIEventTypeHover)
+      /* UIEventTypeHover (iOS / tvOS 13.4), by value */
+      if (event.type == (UIEventType)11)
          return;
    }
    if (event.allTouches.count)
@@ -508,7 +597,7 @@ enum
 
 @end
 
-#ifdef HAVE_COCOA_METAL
+#ifdef HAVE_VULKAN
 @implementation MetalLayerView
 
 + (Class)layerClass {
@@ -542,8 +631,57 @@ enum
 @end
 #endif
 
-#if TARGET_OS_IOS
-@interface RetroArch_iOS () <MXMetricManagerSubscriber, UIPointerInteractionDelegate>
+/* Scenes need an iOS 13 SDK; an app built against an older one is run
+ * by UIKit without them, through the app delegate. */
+#ifdef RARCH_SDK_SCENES
+API_AVAILABLE(ios(13.0), tvos(13.0))
+@interface RetroArchSceneDelegate : UIResponder <UIWindowSceneDelegate>
+@end
+@implementation RetroArchSceneDelegate
+
+- (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)connectionOptions {
+   RetroArch_iOS *app = [RetroArch_iOS get];
+   app.window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
+
+   [app.window makeKeyAndVisible];
+
+   /* A URL that launched the app comes here, not to
+    * scene:openURLContexts:; RetroArch is up by now
+    * (applicationDidFinishLaunching ran rarch_main) */
+   for (UIOpenURLContext *urlContext in connectionOptions.URLContexts)
+      [app application:[UIApplication sharedApplication] openURL:urlContext.URL options:@{}];
+}
+
+- (void)sceneDidBecomeActive:(UIScene *)scene {
+   RetroArch_iOS *app = [RetroArch_iOS get];
+   [app applicationDidBecomeActive:[UIApplication sharedApplication]];
+}
+
+- (void)sceneWillResignActive:(UIScene *)scene {
+   RetroArch_iOS *app = [RetroArch_iOS get];
+   [app applicationWillResignActive:[UIApplication sharedApplication]];
+}
+
+- (void)sceneDidEnterBackground:(UIScene *)scene {
+   RetroArch_iOS *app = [RetroArch_iOS get];
+   [app applicationDidEnterBackground:[UIApplication sharedApplication]];
+}
+
+- (void)scene:(UIScene *)scene openURLContexts:(NSSet<UIOpenURLContext *> *)URLContexts {
+   RetroArch_iOS *app = [RetroArch_iOS get];
+   for (UIOpenURLContext *urlContext in URLContexts)
+      [app application:[UIApplication sharedApplication] openURL:urlContext.URL options:@{}];
+}
+
+@end
+#endif
+
+#if TARGET_OS_IOS && defined(RARCH_SDK_METRICKIT)
+@interface RetroArch_iOS () <MXMetricManagerSubscriber>
+@end
+#endif
+#if TARGET_OS_IOS && defined(RARCH_SDK_POINTER)
+@interface RetroArch_iOS () <UIPointerInteractionDelegate>
 @end
 #endif
 
@@ -590,7 +728,7 @@ enum
 
    switch (vt)
    {
-#ifdef HAVE_COCOA_METAL
+#ifdef HAVE_VULKAN
        case APPLE_VIEW_TYPE_VULKAN:
          /* +new returns a +1 object; that retain transfers into
           * _renderView and satisfies the ivar's ownership invariant
@@ -600,6 +738,8 @@ enum
          _renderView.multipleTouchEnabled = YES;
 #endif
          break;
+#endif
+#ifdef HAVE_METAL
        case APPLE_VIEW_TYPE_METAL:
          {
             MetalView *v = [MetalView new];
@@ -626,11 +766,10 @@ enum
          return;
    }
 
-   _renderView.translatesAutoresizingMaskIntoConstraints = NO;
    UIView *rootView = [CocoaView get].view;
    [rootView addSubview:_renderView];
-#if TARGET_OS_IOS
-   if (@available(iOS 13.4, *))
+#if TARGET_OS_IOS && defined(RARCH_SDK_POINTER)
+   if (apple_runtime_available(0, APPLE_RUNTIME_VER(13, 4, 0), 0))
    {
       /* +[UIPointerInteraction alloc] initWithDelegate: returns +1.
        * -addInteraction: retains internally, so autorelease our own
@@ -639,16 +778,40 @@ enum
        * statement-only macro (it expands to ((void)0) under ARC)
        * so it must appear on its own line rather than wrapping the
        * rvalue. */
-      UIPointerInteraction *interaction = [[UIPointerInteraction alloc] initWithDelegate:self];
+      id interaction = apple_rt_init_id(
+            apple_rt_get_id(apple_rt_class("UIPointerInteraction"), @selector(alloc)),
+            sel_registerName("initWithDelegate:"), self);
       RARCH_AUTORELEASE(interaction);
-      [_renderView addInteraction:interaction];
+      apple_rt_send_id(_renderView, sel_registerName("addInteraction:"),
+            interaction);
       _renderView.userInteractionEnabled = YES;
    }
 #endif
-   [[_renderView.topAnchor constraintEqualToAnchor:rootView.topAnchor] setActive:YES];
-   [[_renderView.bottomAnchor constraintEqualToAnchor:rootView.bottomAnchor] setActive:YES];
-   [[_renderView.leadingAnchor constraintEqualToAnchor:rootView.leadingAnchor] setActive:YES];
-   [[_renderView.trailingAnchor constraintEqualToAnchor:rootView.trailingAnchor] setActive:YES];
+   /* Layout anchors are iOS 9; the view is asked whether it has them
+    * and pinned to the container's edges either way. The anchors, the
+    * constraint between them and its activation (iOS 8) go by selector,
+    * so any SDK builds this. */
+   if ([_renderView respondsToSelector:sel_registerName("topAnchor")])
+   {
+      static const char *const edges[4] = {
+         "topAnchor", "bottomAnchor", "leadingAnchor", "trailingAnchor" };
+      SEL set_active = sel_registerName("setActive:");
+      SEL equal_to   = sel_registerName("constraintEqualToAnchor:");
+      int i;
+      _renderView.translatesAutoresizingMaskIntoConstraints = NO;
+      for (i = 0; i < 4; i++)
+      {
+         SEL edge = sel_registerName(edges[i]);
+         id  c    = apple_rt_get_id_arg(apple_rt_get_id(_renderView, edge),
+               equal_to, apple_rt_get_id(rootView, edge));
+         apple_rt_send_bool(c, set_active, YES);
+      }
+   }
+   else
+   {
+      _renderView.frame            = rootView.bounds;
+      _renderView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+   }
    [_renderView layoutIfNeeded];
 }
 
@@ -656,13 +819,18 @@ enum
 
 - (void)setVideoMode:(gfx_ctx_mode_t)mode
 {
-#ifdef HAVE_COCOA_METAL
-   MetalView *metalView = (MetalView*) _renderView;
-   CGFloat scale        = [[UIScreen mainScreen] scale];
-   [metalView setDrawableSize:CGSizeMake(
-         _renderView.bounds.size.width * scale,
-         _renderView.bounds.size.height * scale
-         )];
+#ifdef HAVE_METAL
+   /* Only the MTKView has a drawable size to set; the GLKView and
+    * the CAMetalLayer-backed Vulkan view size themselves. */
+   if (_vt == APPLE_VIEW_TYPE_METAL)
+   {
+      MetalView *metalView = (MetalView*) _renderView;
+      CGFloat scale        = [[UIScreen mainScreen] scale];
+      [metalView setDrawableSize:CGSizeMake(
+            _renderView.bounds.size.width * scale,
+            _renderView.bounds.size.height * scale
+            )];
+   }
 #endif
 }
 
@@ -699,8 +867,11 @@ bool cocoa_audio_session_begin_record(unsigned preferred_rate,
 {
    AVAudioSession *session = [AVAudioSession sharedInstance];
    NSError *error = nil;
+   /* AVAudioSessionCategoryOptionAllowBluetoothA2DP (0x20) is iOS /
+    * tvOS 10; an older system is not handed a bit it does not know. */
    AVAudioSessionCategoryOptions options =
-      AVAudioSessionCategoryOptionAllowBluetoothA2DP;
+      apple_runtime_available(0, APPLE_RUNTIME_VER(10, 0, 0), APPLE_RUNTIME_VER(10, 0, 0))
+      ? (AVAudioSessionCategoryOptions)0x20 : (AVAudioSessionCategoryOptions)0;
 
 #if TARGET_OS_IOS
    /* PlayAndRecord routes output to the receiver on iPhone unless
@@ -835,6 +1006,8 @@ bool cocoa_audio_session_begin_record(unsigned preferred_rate,
    config.enableMemoryIntrospection = YES;
    config.enableQueueNameSearch = YES;
    config.addConsoleLogToReport = YES;
+   /* The __cxa_throw rebinding breaks exceptions cores catch themselves. */
+   config.enableSwapCxaThrow = NO;
 
    /* Install KSCrash without any network sink */
    NSError *installError = nil;
@@ -1007,7 +1180,11 @@ bool cocoa_audio_session_begin_record(unsigned preferred_rate,
       const char *icon_name;
 
       appicon_setting->default_value.string = icons->elems[0].data;
-      icon_name = [[application alternateIconName] cStringUsingEncoding:NSUTF8StringEncoding]; /* need to ask uico_st for this */
+      /* need to ask uico_st for this; alternate icons are iOS 10.3 / tvOS 10.2 */
+      icon_name = apple_runtime_available(0, APPLE_RUNTIME_VER(10, 3, 0), APPLE_RUNTIME_VER(10, 2, 0))
+         ? [(NSString *)apple_rt_get_id(application, sel_registerName("alternateIconName"))
+               cStringUsingEncoding:NSUTF8StringEncoding]
+         : NULL;
       for (i = 0; i < (int)icons->size; i++)
       {
          _len += strlen(icons->elems[i].data) + 1;
@@ -1016,9 +1193,9 @@ bool cocoa_audio_session_begin_record(unsigned preferred_rate,
       }
       options = (char*)calloc(_len, sizeof(char));
       string_list_join_concat(options, _len, icons, "|");
-      if (appicon_setting->values)
-         free((void*)appicon_setting->values);
-      appicon_setting->values = options;
+      if (appicon_setting->aux.values)
+         free((void*)appicon_setting->aux.values);
+      appicon_setting->aux.values = options;
    }
 
 #if TARGET_OS_TV
@@ -1026,56 +1203,54 @@ bool cocoa_audio_session_begin_record(unsigned preferred_rate,
 #endif
 
 #if HAVE_SWIFT
-   if (@available(iOS 16.0, tvOS 16.0, *)) {
-      [RetroArchAppShortcuts updateAppShortcuts];
-   }
+   if (apple_runtime_available(0, APPLE_RUNTIME_VER(16, 0, 0), APPLE_RUNTIME_VER(16, 0, 0)))
+      apple_rt_send_void(apple_rt_class("RetroArchAppShortcuts"),
+            sel_registerName("updateAppShortcuts"));
 #endif
 
-#if TARGET_OS_IOS
-   if (@available(iOS 13.0, *))
-      [MXMetricManager.sharedManager addSubscriber:self];
+#if TARGET_OS_IOS && defined(RARCH_SDK_METRICKIT)
+   if (apple_runtime_available(0, APPLE_RUNTIME_VER(13, 0, 0), 0))
+      apple_rt_send_id(apple_rt_get_id(apple_rt_class("MXMetricManager"),
+               sel_registerName("sharedManager")),
+            sel_registerName("addSubscriber:"), self);
 #endif
 
 #ifdef HAVE_MFI
    extern void *apple_gamecontroller_joypad_init(void *data);
    apple_gamecontroller_joypad_init(NULL);
-   if (@available(macOS 11, iOS 14, tvOS 14, *))
    {
-      [[NSNotificationCenter defaultCenter] addObserverForName:GCMouseDidConnectNotification
-                                                        object:nil
-                                                         queue:[NSOperationQueue mainQueue]
-                                                    usingBlock:^(NSNotification *note)
-       {
-         GCMouse *mouse = note.object;
-         mouse.mouseInput.mouseMovedHandler = ^(GCMouseInput * _Nonnull mouse, float delta_x, float delta_y)
-         {
-            cocoa_input_data_t *apple = (cocoa_input_data_t*) input_state_get_ptr()->current_data;
-            if (!apple)
-               return;
-            apple->window_pos_x      += (int16_t)delta_x;
-            apple->window_pos_y      -= (int16_t)delta_y;
-         };
-         mouse.mouseInput.leftButton.pressedChangedHandler = ^(GCControllerButtonInput * _Nonnull button, float value, BOOL pressed)
-         {
-            cocoa_input_data_t *apple = (cocoa_input_data_t*) input_state_get_ptr()->current_data;
-            if (!apple)
-               return;
-            if (pressed)
-                apple->mouse_buttons |= (1 << 0);
-            else
-                apple->mouse_buttons &= ~(1 << 0);
-         };
-         mouse.mouseInput.rightButton.pressedChangedHandler = ^(GCControllerButtonInput * _Nonnull button, float value, BOOL pressed)
-         {
-            cocoa_input_data_t *apple = (cocoa_input_data_t*) input_state_get_ptr()->current_data;
-            if (!apple)
-               return;
-            if (pressed)
-                apple->mouse_buttons |= (1 << 1);
-            else
-                apple->mouse_buttons &= ~(1 << 1);
-         };
-      }];
+      /* GCMouse is macOS 11 / iOS 14: its notification is looked up by
+       * name, and the mouse is driven by selector; the buttons are plain
+       * GCControllerButtonInputs. */
+      void **mouse_note = apple_rt_constant_addr("GCMouseDidConnectNotification");
+      if (mouse_note && apple_runtime_available(APPLE_RUNTIME_VER(11, 0, 0), APPLE_RUNTIME_VER(14, 0, 0), APPLE_RUNTIME_VER(14, 0, 0)))
+      {
+         [[NSNotificationCenter defaultCenter] addObserverForName:apple_rt_obj_at(mouse_note)
+                                                           object:nil
+                                                            queue:[NSOperationQueue mainQueue]
+                                                       usingBlock:^(NSNotification *note)
+          {
+            id mouse_input = apple_rt_get_id(note.object, sel_registerName("mouseInput"));
+            /* GCMouseMoved: (GCMouseInput *, float, float) */
+            apple_rt_send_id(mouse_input, sel_registerName("setMouseMovedHandler:"),
+                  ^(id mouse, float delta_x, float delta_y)
+            {
+               cocoa_input_mouse_moved_by((int16_t)delta_x, -(int16_t)delta_y);
+            });
+            ((GCControllerButtonInput *)apple_rt_get_id(mouse_input,
+                  sel_registerName("leftButton"))).pressedChangedHandler =
+               ^(GCControllerButtonInput * _Nonnull button, float value, BOOL pressed)
+            {
+               cocoa_input_mouse_button(0, pressed, false);
+            };
+            ((GCControllerButtonInput *)apple_rt_get_id(mouse_input,
+                  sel_registerName("rightButton"))).pressedChangedHandler =
+               ^(GCControllerButtonInput * _Nonnull button, float value, BOOL pressed)
+            {
+               cocoa_input_mouse_button(1, pressed, false);
+            };
+         }];
+      }
    }
 #endif
 }
@@ -1114,12 +1289,7 @@ bool cocoa_audio_session_begin_record(unsigned preferred_rate,
 #endif
 
    /* Clear any stuck or stale touches when backgrounding */
-   cocoa_input_data_t *apple = (cocoa_input_data_t*)input_state_get_ptr()->current_data;
-   if (apple)
-   {
-      apple->touch_count = 0;
-      memset(apple->touches, 0, sizeof(apple->touches));
-   }
+   cocoa_input_touches_reset();
 }
 
 - (void)applicationDidReceiveMemoryWarning:(UIApplication *)application
@@ -1140,12 +1310,11 @@ bool cocoa_audio_session_begin_record(unsigned preferred_rate,
    rarch_stop_draw_observer();
 
    /* Clear any stuck or stale touches when losing focus */
-   cocoa_input_data_t *apple = (cocoa_input_data_t*)input_state_get_ptr()->current_data;
-   if (apple)
-   {
-      apple->touch_count = 0;
-      memset(apple->touches, 0, sizeof(apple->touches));
-   }
+   cocoa_input_touches_reset();
+
+   /* Hardware keyboard keys held while losing focus never get their
+    * release event; drop them like the macOS port does (ui_cocoa.m). */
+   apple_input_keyboard_reset();
 }
 
 - (void)applicationDidBecomeActive:(UIApplication *)application
@@ -1181,7 +1350,7 @@ bool cocoa_audio_session_begin_record(unsigned preferred_rate,
       if (   [[NSDate date] timeIntervalSinceDate:self.bgDate] > 60.0f
           && (   !(runloop_get_flags() & RUNLOOP_FLAG_CORE_RUNNING)
               || retroarch_ctl(RARCH_CTL_IS_DUMMY_CORE, NULL)))
-         task_push_cloud_sync();
+         task_push_cloud_sync(NULL, NULL);
       self.bgDate = nil;
    }
 #endif
@@ -1199,7 +1368,9 @@ bool cocoa_audio_session_begin_record(unsigned preferred_rate,
 #endif
 }
 
--(BOOL)openRetroArchURL:(NSURL *)url
+/* NSURLComponents' query items are iOS 8; the one caller checks the
+ * OS before it hands a URL here. */
+-(BOOL)openRetroArchURL:(NSURL *)url API_AVAILABLE(ios(8.0), tvos(9.0))
 {
    RARCH_LOG("RetroArch URL received: %s\n", [[url absoluteString] UTF8String]);
 
@@ -1290,7 +1461,14 @@ bool cocoa_audio_session_begin_record(unsigned preferred_rate,
       }
 
       RARCH_LOG("Returning game library to '%s'\n", [caller_scheme UTF8String]);
-      [[UIApplication sharedApplication] openURL:replyURL options:@{} completionHandler:nil];
+      /* -openURL:options:completionHandler: is iOS 10; -openURL: before it */
+      if (apple_runtime_available(0, APPLE_RUNTIME_VER(10, 0, 0), APPLE_RUNTIME_VER(10, 0, 0)))
+         ((void (*)(id, SEL, id, id, id))objc_msgSend)([UIApplication sharedApplication],
+               sel_registerName("openURL:options:completionHandler:"),
+               replyURL, [NSDictionary dictionary], nil);
+      else
+         ((BOOL (*)(id, SEL, id))objc_msgSend)([UIApplication sharedApplication],
+               sel_registerName("openURL:"), replyURL);
       return YES;
    }
 #endif
@@ -1299,9 +1477,12 @@ bool cocoa_audio_session_begin_record(unsigned preferred_rate,
    return NO;
 }
 
--(BOOL)application:(UIApplication *)app openURL:(NSURL *)url options:(NSDictionary<UIApplicationOpenURLOptionsKey, id> *)options {
+-(BOOL)application:(UIApplication *)app openURL:(NSURL *)url options:(NSDictionary *)options {
     if ([[url scheme] isEqualToString:@"retroarch"])
-        return [self openRetroArchURL:url];
+        return apple_runtime_available(0, APPLE_RUNTIME_VER(8, 0, 0), APPLE_RUNTIME_VER(9, 0, 0))
+           ? ((BOOL (*)(id, SEL, id))objc_msgSend)(self,
+                 @selector(openRetroArchURL:), url)
+           : NO;
 
    NSFileManager *manager = [NSFileManager defaultManager];
    NSString     *filename = (NSString*)url.path.lastPathComponent;
@@ -1312,20 +1493,21 @@ bool cocoa_audio_session_begin_record(unsigned preferred_rate,
    NSString  *destination = [NSString stringWithUTF8String:fullpath];
    /* Copy file to documents directory if it's not already
     * inside Documents directory */
-   if ([url startAccessingSecurityScopedResource])
+   /* Security-scoped access is iOS 8; before it the file is plain */
    {
-      if (![[url path] containsString: self.documentsDirectory])
-         if (![manager fileExistsAtPath:destination])
-            [manager copyItemAtPath:[url path] toPath:destination error:&error];
-      [url stopAccessingSecurityScopedResource];
+      bool scoped = apple_runtime_available(0, APPLE_RUNTIME_VER(8, 0, 0), APPLE_RUNTIME_VER(9, 0, 0));
+      if (!scoped || apple_rt_get_bool(url,
+               sel_registerName("startAccessingSecurityScopedResource")))
+      {
+         if ([[url path] rangeOfString:self.documentsDirectory].location == NSNotFound)
+            if (![manager fileExistsAtPath:destination])
+               [manager copyItemAtPath:[url path] toPath:destination error:&error];
+         if (scoped)
+            apple_rt_send_void(url,
+                  sel_registerName("stopAccessingSecurityScopedResource"));
+      }
    }
-   task_push_dbscan(
-      settings->paths.directory_playlist,
-      settings->paths.path_content_database,
-      fullpath,
-      false,
-      false,
-      NULL);
+   task_push_dbscan(fullpath, NULL);
    return true;
 }
 
@@ -1342,7 +1524,6 @@ bool cocoa_audio_session_begin_record(unsigned preferred_rate,
 
 #if TARGET_OS_IOS
    [self setToolbarHidden:true animated:NO];
-   [[UIApplication sharedApplication] setStatusBarHidden:true withAnimation:UIStatusBarAnimationNone];
    [[UIApplication sharedApplication] setIdleTimerDisabled:true];
 #endif
 
@@ -1363,9 +1544,13 @@ bool cocoa_audio_session_begin_record(unsigned preferred_rate,
       self.keyboardTextField.autocapitalizationType = UITextAutocapitalizationTypeNone;
       self.keyboardTextField.autocorrectionType = UITextAutocorrectionTypeNo;
       self.keyboardTextField.spellCheckingType = UITextSpellCheckingTypeNo;
-      self.keyboardTextField.smartQuotesType = UITextSmartQuotesTypeNo;
-      self.keyboardTextField.smartDashesType = UITextSmartDashesTypeNo;
-      self.keyboardTextField.smartInsertDeleteType = UITextSmartInsertDeleteTypeNo;
+      /* The smart-text traits are iOS 11; 1 is each type's ...No */
+      if (apple_runtime_available(0, APPLE_RUNTIME_VER(11, 0, 0), APPLE_RUNTIME_VER(11, 0, 0)))
+      {
+         apple_rt_send_long(self.keyboardTextField, sel_registerName("setSmartQuotesType:"), 1);
+         apple_rt_send_long(self.keyboardTextField, sel_registerName("setSmartDashesType:"), 1);
+         apple_rt_send_long(self.keyboardTextField, sel_registerName("setSmartInsertDeleteType:"), 1);
+      }
       self.keyboardTextField.returnKeyType = UIReturnKeyDone;
       [[CocoaView get].view addSubview:self.keyboardTextField];
    }
@@ -1377,7 +1562,7 @@ bool cocoa_audio_session_begin_record(unsigned preferred_rate,
 
 - (void)supportOtherAudioSessions { }
 
-#if TARGET_OS_IOS
+#if TARGET_OS_IOS && defined(RARCH_SDK_METRICKIT)
 - (void)didReceiveMetricPayloads:(NSArray<MXMetricPayload *> *)payloads API_AVAILABLE(ios(13.0))
 {
     for (MXMetricPayload *payload in payloads)
@@ -1404,12 +1589,12 @@ bool cocoa_audio_session_begin_record(unsigned preferred_rate,
     }
 }
 
+#endif
+
+#if TARGET_OS_IOS && defined(RARCH_SDK_POINTER)
 - (UIPointerStyle *)pointerInteraction:(UIPointerInteraction *)interaction styleForRegion:(UIPointerRegion *)region API_AVAILABLE(ios(13.4))
 {
-   cocoa_input_data_t *apple = (cocoa_input_data_t*) input_state_get_ptr()->current_data;
-   if (!apple)
-      return nil;
-   if (apple->mouse_grabbed)
+   if (cocoa_input_mouse_grabbed())
       return [UIPointerStyle hiddenPointerStyle];
    return nil;
 }
@@ -1418,14 +1603,13 @@ bool cocoa_audio_session_begin_record(unsigned preferred_rate,
                        regionForRequest:(UIPointerRegionRequest *)request
                           defaultRegion:(UIPointerRegion *)defaultRegion API_AVAILABLE(ios(13.4))
 {
-   cocoa_input_data_t *apple = (cocoa_input_data_t*) input_state_get_ptr()->current_data;
-   if (!apple || apple->mouse_grabbed)
+   CGPoint location;
+   if (cocoa_input_mouse_grabbed())
       return nil;
-   CGPoint location = [apple_platform.renderView convertPoint:[request location] fromView:nil];
-   apple->touches[0].screen_x = (int16_t)(location.x * [[UIScreen mainScreen] scale]);
-   apple->touches[0].screen_y = (int16_t)(location.y * [[UIScreen mainScreen] scale]);
-   apple->window_pos_x = (int16_t)(location.x * [[UIScreen mainScreen] scale]);
-   apple->window_pos_y = (int16_t)(location.y * [[UIScreen mainScreen] scale]);
+   location = [apple_platform.renderView convertPoint:[request location] fromView:nil];
+   cocoa_input_pointer_at(
+         (int16_t)(location.x * [[UIScreen mainScreen] scale]),
+         (int16_t)(location.y * [[UIScreen mainScreen] scale]));
    return [UIPointerRegion regionWithRect:[apple_platform.renderView bounds] identifier:@"game view"];
 }
 #endif
@@ -1445,7 +1629,7 @@ bool cocoa_audio_session_begin_record(unsigned preferred_rate,
    if (utf8Text)
    {
       size_t newLen;
-      strlcpy(self.keyboardAllocatedBuffer, utf8Text, 512);
+      strlcpy(self.keyboardAllocatedBuffer, utf8Text, INPUT_NATIVE_KEYBOARD_BUFFER_SIZE);
       newLen = strlen(self.keyboardAllocatedBuffer);
       *self.keyboardSizePtr = newLen;
       /* Keep ptr in sync with size to prevent buffer overrun when appending */
@@ -1467,7 +1651,7 @@ bool cocoa_audio_session_begin_record(unsigned preferred_rate,
          if (finalText)
          {
             size_t finalLen;
-            strlcpy(self.keyboardAllocatedBuffer, finalText, 512);
+            strlcpy(self.keyboardAllocatedBuffer, finalText, INPUT_NATIVE_KEYBOARD_BUFFER_SIZE);
             finalLen = strlen(self.keyboardAllocatedBuffer);
             *self.keyboardSizePtr = finalLen;
             if (self.keyboardPtrPtr)
@@ -1555,6 +1739,7 @@ ui_companion_driver_t ui_companion_cocoatouch = {
    NULL, /* init */
    NULL, /* deinit */
    NULL, /* toggle */
+   NULL, /* iterate */
    ui_companion_cocoatouch_event_command,
    NULL, /* notify_refresh */
    NULL, /* msg_queue_push */
@@ -1583,15 +1768,17 @@ bool ios_keyboard_start(char **buffer_ptr, size_t *size_ptr, size_t *ptr_ptr,
       return false;
 
    /* Allocate a fixed-size buffer for keyboard input */
-   char *allocated_buffer = (char *)malloc(512);
+   char *allocated_buffer = (char *)malloc(INPUT_NATIVE_KEYBOARD_BUFFER_SIZE);
    if (!allocated_buffer)
       return false;
 
    /* Initialize buffer with existing content if any */
    if (*buffer_ptr && **buffer_ptr)
-      strlcpy(allocated_buffer, *buffer_ptr, 512);
+      strlcpy(allocated_buffer, *buffer_ptr, INPUT_NATIVE_KEYBOARD_BUFFER_SIZE);
    else
       allocated_buffer[0] = '\0';
+
+   free(*buffer_ptr);
 
    /* Update the keyboard_line buffer pointer to point to our allocated buffer */
    *buffer_ptr = allocated_buffer;
@@ -1616,22 +1803,18 @@ bool ios_keyboard_start(char **buffer_ptr, size_t *size_ptr, size_t *ptr_ptr,
 
    /* Store the completion callback */
    app.keyboardCompletionCallback = ^(const char *text) {
-      input_driver_state_t *input_st = input_state_get_ptr();
-
       if (callback)
          callback(userdata, text);
 
       /* Clean up RetroArch's keyboard state, mirroring what the built-in keyboard does */
-      if (input_st)
-      {
-         RARCH_LOG("[iOS KB] cleaning up input state\n");
-         input_keyboard_line_free(input_st);
-         input_st->flags &= ~INP_FLAG_KB_MAPPING_BLOCKED;
-      }
+      RARCH_LOG("[iOS KB] cleaning up input state\n");
+      input_driver_keyboard_line_end();
    };
 
    /* Show the keyboard */
    [app.keyboardTextField becomeFirstResponder];
+   if (len)
+      [app.keyboardTextField selectAll:nil];
    return true;
 }
 

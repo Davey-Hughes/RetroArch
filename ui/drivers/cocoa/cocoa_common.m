@@ -15,12 +15,21 @@
  */
 
 #import <AvailabilityMacros.h>
+#include "../../../apple_runtime.h"
+#import <objc/message.h>
 #include <sys/stat.h>
+#ifdef HAVE_COCOATOUCH
+/* Grand Central Dispatch is used by the iOS/tvOS code only; the macOS
+ * path stays on Foundation and CoreFoundation, which every target
+ * release has. */
 #include <dispatch/dispatch.h>
+#endif
 #include <CoreFoundation/CoreFoundation.h>
 
 #include <retro_atomic.h>
+#include <features/features_cpu.h>
 #include <rthreads/rthreads.h>
+#include <rthreads/retro_eventcount.h>
 #include <compat/apple_compat.h>
 #include <string/stdstring.h>
 #include <defines/cocoa_defines.h>
@@ -46,6 +55,7 @@
 #endif
 
 #include "../../configuration.h"
+#include "../../gfx/video_driver.h"
 #include "../../content.h"
 #include "../../core_info.h"
 #include "../../defaults.h"
@@ -85,11 +95,11 @@ extern bool RAIsVoiceOverRunning(void)
 extern bool RAIsVoiceOverRunning(void)
 {
 #if MAC_OS_X_VERSION_MAX_ALLOWED >= 101300
-   /* @available is clang-only (Xcode 7+).  GCC 4.0 rejects the
-    * '@' as a stray token.  isVoiceOverEnabled on NSWorkspace is
-    * 10.13+ anyway, so on older SDKs we skip this block entirely
-    * and fall through to the return below. */
-   if (@available(macOS 10.13, *))
+   /* The runtime check compiles on any toolchain, but the #if stays:
+    * isVoiceOverEnabled on NSWorkspace is only declared by 10.13+
+    * SDKs, so on older SDKs we skip this block entirely and fall
+    * through to the return below. */
+   if (apple_runtime_available(APPLE_RUNTIME_VER(10, 13, 0), 0, 0))
       return [[NSWorkspace sharedWorkspace] isVoiceOverEnabled];
 #endif
    return false;
@@ -112,11 +122,7 @@ extern bool RAIsVoiceOverRunning(void)
 #endif
 #endif /* OSX */
 
-#if defined(HAVE_COCOA_METAL) || defined(HAVE_COCOATOUCH)
 id<ApplePlatform> apple_platform;
-#else
-id apple_platform;
-#endif
 
 static CocoaView* g_instance;
 
@@ -124,12 +130,43 @@ static CocoaView* g_instance;
 void *glkitview_init(void);
 void cocoa_file_load_with_detect_core(const char *filename);
 
-@interface CocoaView()<GCDWebUploaderDelegate, GCDWebDAVServerDelegate, UIGestureRecognizerDelegate
+/* Not declared a UIDocumentPickerDelegate: SDKs before iOS 11 make
+ * -documentPicker:didPickDocumentAtURL: a required method, and the
+ * view gives itself that one at run time (see +initialize). The
+ * picker asks its delegate with -respondsToSelector:. */
+@interface CocoaView()<GCDWebUploaderDelegate, GCDWebDAVServerDelegate, UIGestureRecognizerDelegate>
 #if TARGET_OS_IOS
-,UIDocumentPickerDelegate
+- (void)importDocumentAtURL:(NSURL *)url;
 #endif
->
 @end
+#endif
+
+/* Methods a release before the deployment target's SDK still calls but
+ * the SDK marks deprecated or unavailable: +initialize installs each
+ * only on the releases that call it (apple_rt_add_method). */
+#if TARGET_OS_OSX
+/* NSView's own -layer:shouldInheritContentsScale:fromWindow: (10.7,
+ * asked when the view hosts a layer such as the Vulkan CAMetalLayer),
+ * deprecated in 11.0 for the NSViewLayerContentScaleDelegate method
+ * of the same name. */
+static BOOL cocoa_view_inherit_contents_scale(id self, SEL _cmd,
+      id layer, CGFloat scale, id window)
+{
+   return YES;
+}
+#elif TARGET_OS_IOS
+/* Before iOS 6 the only rotation question. */
+static BOOL cocoa_view_autorotate_to(id self, SEL _cmd, NSInteger orientation)
+{
+   return YES;
+}
+
+/* The iOS 8 - 10 document picker's answer; 11 sends the URL array. */
+static void cocoa_view_picked_document(id self, SEL _cmd,
+      id controller, NSURL *url)
+{
+   [(CocoaView*)self importDocumentAtURL:url];
+}
 #endif
 
 static CFRunLoopObserverRef iterate_observer;
@@ -137,13 +174,22 @@ static CFRunLoopObserverRef iterate_observer;
 static void rarch_draw_observer(CFRunLoopObserverRef observer,
     CFRunLoopActivity activity, void *info)
 {
-   int ret = runloop_iterate();
+   int ret;
 
-   if (ret == -1)
+   /* The desktop companion's per-frame hook: it lands the playlist
+    * parse, the browser's listing, decoded thumbnails and animation
+    * frames, and keeps its status current. Only the Qt-era rarch_main
+    * loop used to call it; this observer is the whole main loop on a
+    * non-Qt build, so without the call the Cocoa companion showed
+    * "Loading playlist..." for ever and nothing else. */
+   ui_companion_driver_wimp_iterate();
+
+   ret = runloop_iterate();
+
+   if (ret == -1 || ui_companion_driver_wimp_exiting())
    {
-#ifdef HAVE_QT
-      application->quit();
-#endif
+      ui_companion_driver_wimp_quit();
+      ui_companion_driver_wimp_deinit();
       main_exit(NULL);
       exit(0);
       return;
@@ -190,16 +236,88 @@ void rarch_stop_draw_observer(void)
 
 @implementation CocoaView
 
++ (void)initialize
+{
+   if (self != [CocoaView class])
+      return;
 #if TARGET_OS_OSX
-#ifdef HAVE_COCOA_METAL
-- (BOOL)layer:(CALayer *)layer shouldInheritContentsScale:(CGFloat)newScale fromWindow:(NSWindow *)window { return YES; }
+   if (apple_runtime_available(APPLE_RUNTIME_VER(10, 7, 0), 0, 0))
+   {
+      static char types[32];
+      snprintf(types, sizeof(types), "%s@:@%s@", @encode(BOOL), @encode(CGFloat));
+      apple_rt_add_method(self, "layer:shouldInheritContentsScale:fromWindow:",
+            cocoa_view_inherit_contents_scale, types);
+   }
+#elif TARGET_OS_IOS
+   if (!apple_runtime_available(0, APPLE_RUNTIME_VER(6, 0, 0), 0))
+   {
+      static char types[32];
+      snprintf(types, sizeof(types), "%s@:%s", @encode(BOOL), @encode(NSInteger));
+      apple_rt_add_method(self, "shouldAutorotateToInterfaceOrientation:",
+            cocoa_view_autorotate_to, types);
+   }
+   if (!apple_runtime_available(0, APPLE_RUNTIME_VER(11, 0, 0), 0))
+      apple_rt_add_method(self, "documentPicker:didPickDocumentAtURL:",
+            cocoa_view_picked_document, "v@:@@");
 #endif
+}
+
+#if TARGET_OS_OSX
 - (void)scrollWheel:(NSEvent *)theEvent { }
+#endif
+
+#if TARGET_OS_OSX
+/* The display's last vertical blank, on the clock
+ * cpu_features_get_time_usec() keeps; 0 while none is known.
+ *
+ * The threaded presenter lays its vblanks from the time a driver gives
+ * it for its last present, and paces the core to them. On macOS no
+ * driver had one to give: the OpenGL and Vulkan contexts had no such
+ * report, and Metal's comes from a drawable's presented time, which is
+ * not always there. Without it the presenter guesses - a period after
+ * the frame call returned - so the latency it shows is a period and
+ * more whatever the pacing does, and "Display" pacing has no display
+ * to go by.
+ *
+ * The view's display link (macOS 14 and later) is called for each
+ * vblank and carries its time. The time is the link's own, not when
+ * the call arrived: the main thread may be in a core, or asleep in the
+ * presenter's hold, when the vblank passes. */
+#ifdef RETRO_ATOMIC_HAS_64
+static retro_atomic_64_t cocoa_vblank_at;
+#endif
+
+retro_time_t cocoa_last_vblank_time(void)
+{
+#ifdef RETRO_ATOMIC_HAS_64
+   retro_time_t at = (retro_time_t)retro_atomic_load_acquire_64(&cocoa_vblank_at);
+   /* a link that has stopped - the window hidden, the display asleep -
+    * has nothing to say about the display now */
+   if (at > 0 && cpu_features_get_time_usec() - at < 250000)
+      return at;
+#endif
+   return 0;
+}
 #endif
 
 #if !TARGET_OS_OSX || __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
 -(void)step:(CADisplayLink*)target API_AVAILABLE(macos(14.0), ios(3.1), tvos(3.1))
 {
+#if TARGET_OS_OSX && defined(RETRO_ATOMIC_HAS_64)
+   /* host time to the frontend's clock by one paired read, as the Metal
+    * driver does for a drawable's presented time */
+   {
+      CFTimeInterval at = [target timestamp];
+      if (at > 0.0)
+      {
+         retro_time_t   now = cpu_features_get_time_usec();
+         CFTimeInterval age = CACurrentMediaTime() - at;
+         if (age >= 0.0 && age < 1.0)
+            retro_atomic_store_release_64(&cocoa_vblank_at,
+                  (int64_t)(now - (retro_time_t)(age * 1000000.0)));
+      }
+   }
+#endif
 #if TARGET_OS_IPHONE
    if ([[UIApplication sharedApplication] applicationState] != UIApplicationStateActive)
       return;
@@ -254,30 +372,29 @@ void rarch_stop_draw_observer(void)
 #if TARGET_OS_IPHONE
       view.displayLink = [CADisplayLink displayLinkWithTarget:view selector:@selector(step:)];
       {
-         float hz = (float)[UIScreen mainScreen].maximumFramesPerSecond;
-#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 150000 || __TV_OS_VERSION_MAX_ALLOWED >= 150000
-         if (@available(iOS 15.0, tvOS 15.0, *))
-            [view.displayLink setPreferredFrameRateRange:
-               CAFrameRateRangeMake(hz * 0.9, hz * 1.2, hz)];
-         else
-            view.displayLink.preferredFramesPerSecond = hz;
-#else
-         view.displayLink.preferredFramesPerSecond = hz;
-#endif
+         /* -[UIScreen maximumFramesPerSecond] is iOS 10.3 / tvOS 10.2;
+          * before it every screen is 60 Hz */
+         float hz = 60.0f;
+         if (apple_runtime_available(0, APPLE_RUNTIME_VER(10, 3, 0), APPLE_RUNTIME_VER(10, 2, 0)))
+            hz = (float)apple_rt_get_long([UIScreen mainScreen],
+                  sel_registerName("maximumFramesPerSecond"));
+         cocoa_display_link_set_rate(view.displayLink, hz);
       }
       [view.displayLink addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
 #elif TARGET_OS_OSX && __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
-      if (@available(macOS 14.0, *))
+      if (apple_runtime_available(APPLE_RUNTIME_VER(14, 0, 0), 0, 0))
       {
+         id link;
          CGDirectDisplayID did = CGMainDisplayID();
          CGDisplayModeRef mode = CGDisplayCopyDisplayMode(did);
          float hz = (float)CGDisplayModeGetRefreshRate(mode);
          CGDisplayModeRelease(mode);
          if (hz <= 0.0f)
             hz = 60.0f;
-         view.displayLink = [view displayLinkWithTarget:view selector:@selector(step:)];
-         view.displayLink.preferredFrameRateRange = CAFrameRateRangeMake(hz * 0.9, hz * 1.2, hz);
-         [view.displayLink addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
+         link = [view displayLinkWithTarget:view selector:@selector(step:)];
+         COCOA_VIEW_SET_DISPLAY_LINK(view, link);
+         COCOA_DISPLAY_LINK_SET_RATE(link, hz);
+         [link addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
       }
 #endif
    }
@@ -298,7 +415,7 @@ void rarch_stop_draw_observer(void)
 
 #if TARGET_OS_OSX
    [self setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
-   NSArray *array = [NSArray arrayWithObjects:NSColorPboardType, NSFilenamesPboardType, nil];
+   NSArray *array = [NSArray arrayWithObjects:RARCH_PBOARD_TYPE_COLOR, RARCH_PBOARD_TYPE_FILENAMES, nil];
    [self registerForDraggedTypes:array];
 
    video_driver_display_type_set(RARCH_DISPLAY_OSX);
@@ -348,8 +465,9 @@ void rarch_stop_draw_observer(void)
 - (bool)didMicroGamepadPress:(UIPressType)type
 {
     /* Are these presses that controllers send? */
-    if (@available(tvOS 14.3, *))
-        if (type == UIPressTypePageUp || type == UIPressTypePageDown)
+    if (apple_runtime_available(0, 0, APPLE_RUNTIME_VER(14, 3, 0)))
+        /* UIPressTypePageUp / UIPressTypePageDown (tvOS 14.3), by value */
+        if (type == (UIPressType)30 || type == (UIPressType)31)
             return true;
 
     NSArray<GCController*>* controllers = [GCController controllers];
@@ -410,36 +528,44 @@ void rarch_stop_draw_observer(void)
     return !nonSiriPress;
 }
 
+/* The remote's buttons, as a keyboard event.
+ *
+ * This built an NSDictionary of NSNumber keys to NSArrays of NSNumbers
+ * inside dispatch_once, and then hashed a boxed press type against it
+ * on every press. The mapping is seven compile-time constant pairs; a
+ * switch is the whole of it, with no dictionary to build, nothing to
+ * box per press, no once and no block.
+ *
+ * The two page keys were added under if (@available(tvOS 14.3, *)),
+ * which was guarding the wrong thing: the constants have to exist at
+ * compile time either way - they did, unconditionally, in the block -
+ * and a press type the running system never sends simply never
+ * arrives, so a case for it costs nothing. */
 - (void)sendKeyForPress:(UIPressType)type down:(bool)down
 {
-    static NSDictionary<NSNumber *,NSArray<NSNumber*>*> *map;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:@{
-            @(UIPressTypeUpArrow):    @[ @(RETROK_UP),       @( 0 ) ],
-            @(UIPressTypeDownArrow):  @[ @(RETROK_DOWN),     @( 0 ) ],
-            @(UIPressTypeLeftArrow):  @[ @(RETROK_LEFT),     @( 0 ) ],
-            @(UIPressTypeRightArrow): @[ @(RETROK_RIGHT),    @( 0 ) ],
+    unsigned keycode  = 0;
+    unsigned character = 0;
 
-            @(UIPressTypeSelect):     @[ @(RETROK_z),        @('z') ],
-            @(UIPressTypeMenu)     :  @[ @(RETROK_x),        @('x') ],
-            @(UIPressTypePlayPause):  @[ @(RETROK_s),        @('s') ],
-        }];
+    switch (type)
+    {
+        case UIPressTypeUpArrow:    keycode = RETROK_UP;    break;
+        case UIPressTypeDownArrow:  keycode = RETROK_DOWN;  break;
+        case UIPressTypeLeftArrow:  keycode = RETROK_LEFT;  break;
+        case UIPressTypeRightArrow: keycode = RETROK_RIGHT; break;
 
-        if (@available(tvOS 14.3, *))
-        {
-            [dict addEntriesFromDictionary:@{
-                @(UIPressTypePageUp):     @[ @(RETROK_PAGEUP),   @( 0 ) ],
-                @(UIPressTypePageDown):   @[ @(RETROK_PAGEDOWN), @( 0 ) ],
-            }];
-        }
-        map = dict;
-    });
-    NSArray<NSNumber*>* keyvals = map[@(type)];
-    if (!keyvals)
-        return;
-    apple_direct_input_keyboard_event(down, keyvals[0].intValue,
-                                      keyvals[1].intValue, 0, RETRO_DEVICE_KEYBOARD);
+        case UIPressTypeSelect:     keycode = RETROK_z; character = 'z'; break;
+        case UIPressTypeMenu:       keycode = RETROK_x; character = 'x'; break;
+        case UIPressTypePlayPause:  keycode = RETROK_s; character = 's'; break;
+
+        case UIPressTypePageUp:     keycode = RETROK_PAGEUP;   break;
+        case UIPressTypePageDown:   keycode = RETROK_PAGEDOWN; break;
+
+        default:
+            return;
+    }
+
+    apple_direct_input_keyboard_event(down, keycode, character, 0,
+                                      RETRO_DEVICE_KEYBOARD);
 }
 
 - (void)pressesBegan:(NSSet<UIPress *> *)presses
@@ -448,7 +574,7 @@ void rarch_stop_draw_observer(void)
     for (UIPress *press in presses)
     {
         bool has_key = false;
-        if (@available(tvOS 14, *))
+        if (apple_runtime_available(0, 0, APPLE_RUNTIME_VER(14, 0, 0)))
             has_key = !![press key];
         /* If we're at the top it doesn't matter who pressed it, we want to leave */
         if (press.type == UIPressTypeMenu && [self menuIsAtTop])
@@ -471,6 +597,14 @@ void rarch_stop_draw_observer(void)
                 [[CocoaView get] sendKeyForPress:press.type down:false];
                 });
     }
+}
+
+/* A cancelled press is the last thing UIKit delivers for that button -
+ * no pressesEnded: follows it - so it releases the key it mapped to
+ * exactly as an ended press does. */
+-(void)pressesCancelled:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event
+{
+    [self pressesEnded:presses withEvent:event];
 }
 
 -(void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
@@ -515,7 +649,17 @@ void rarch_stop_draw_observer(void)
 
 #pragma mark UIDocumentPickerViewController
 
--(void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentAtURL:(NSURL *)url
+/* The document picker is iOS 8: UIKit calls these only there, and
+ * ios_show_file_sheet() checks the OS before it asks for one. iOS 11
+ * answers with an array; 8 - 10 with the one URL, through the method
+ * +initialize installs there. */
+-(void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray *)urls API_AVAILABLE(ios(11.0))
+{
+   if ([urls count])
+      [self importDocumentAtURL:[urls objectAtIndex:0]];
+}
+
+-(void)importDocumentAtURL:(NSURL *)url
 {
    NSFileManager *manager = [NSFileManager defaultManager];
    NSString     *filename = (NSString*)url.path.lastPathComponent;
@@ -527,7 +671,7 @@ void rarch_stop_draw_observer(void)
    NSString *documentsDir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
    /* Copy file to documents directory if it's not already
     * inside Documents directory */
-   if (![[url path] containsString:documentsDir])
+   if ([[url path] rangeOfString:documentsDir].location == NSNotFound)
       if (![manager fileExistsAtPath:destination])
          [manager copyItemAtPath:[url path] toPath:destination error:&error];
    if (filebrowser_get_type() == FILEBROWSER_SCAN_FILE)
@@ -538,17 +682,25 @@ void rarch_stop_draw_observer(void)
    }
 }
 
--(void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller
+-(void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller API_AVAILABLE(ios(8.0))
 {
 }
 
--(void)showDocumentPicker
+-(void)showDocumentPicker API_AVAILABLE(ios(8.0))
 {
-   UIDocumentPickerViewController *documentPicker = [[UIDocumentPickerViewController alloc]
-                                                     initWithDocumentTypes:@[(NSString *)kUTTypeDirectory,
-                                                                             (NSString *)kUTTypeItem]
-                                                     inMode:UIDocumentPickerModeImport];
-   documentPicker.delegate = self;
+   /* -initWithDocumentTypes:inMode: and the kUTType names are
+    * deprecated (iOS 14 / 15) and still what reaches back to iOS 8;
+    * the call goes by selector and the type names by symbol. Mode 0 is
+    * UIDocumentPickerModeImport. */
+   void   **dir   = apple_rt_constant_addr("kUTTypeDirectory");
+   void   **item  = apple_rt_constant_addr("kUTTypeItem");
+   NSArray *types = [NSArray arrayWithObjects:
+         dir  ? apple_rt_obj_at(dir)  : @"public.directory",
+         item ? apple_rt_obj_at(item) : @"public.item", nil];
+   UIDocumentPickerViewController *documentPicker = apple_rt_init_id_long(
+         [UIDocumentPickerViewController alloc],
+         sel_registerName("initWithDocumentTypes:inMode:"), types, 0);
+   documentPicker.delegate = (id<UIDocumentPickerDelegate>)self;
    documentPicker.modalPresentationStyle = UIModalPresentationFormSheet;
    [self presentViewController:documentPicker animated:YES completion:nil];
 }
@@ -585,7 +737,7 @@ void rarch_stop_draw_observer(void)
     NSDragOperation sourceDragMask = [sender draggingSourceOperationMask];
     NSPasteboard           *pboard = [sender draggingPasteboard];
 
-    if ( [[pboard types] containsObject:NSFilenamesPboardType] )
+    if ( [[pboard types] containsObject:RARCH_PBOARD_TYPE_FILENAMES] )
     {
         if (sourceDragMask & NSDragOperationCopy)
             return NSDragOperationCopy;
@@ -596,16 +748,32 @@ void rarch_stop_draw_observer(void)
 
 - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender
 {
-#if 0
-    NSPasteboard *pboard = [sender draggingPasteboard];
+#ifdef HAVE_MENU
+    id files = [[sender draggingPasteboard]
+          propertyListForType:RARCH_PBOARD_TYPE_FILENAMES];
 
-    if ( [[pboard types] containsObject:NSURLPboardType])
+    if ([files isKindOfClass:[NSArray class]])
     {
-        NSURL *fileURL = [NSURL URLFromPasteboard:pboard];
-        NSString    *s = [fileURL path];
+        NSUInteger i;
+        union string_list_elem_attr attr;
+        struct string_list *list = string_list_new();
+        attr.i                   = 0;
+
+        for (i = 0; list && i < [files count]; i++)
+        {
+            id file = [files objectAtIndex:i];
+            if (     [file isKindOfClass:[NSString class]]
+                  && !string_list_append(list, [file UTF8String], attr))
+            {
+                string_list_free(list);
+                list = NULL;
+            }
+        }
+        if (list && menu_driver_drop(list))
+            return YES;
     }
 #endif
-    return YES;
+    return NO;
 }
 
 - (void)draggingExited:(id <NSDraggingInfo>)sender { [self setNeedsDisplay: YES]; }
@@ -624,10 +792,11 @@ void rarch_stop_draw_observer(void)
 }
 
 -(BOOL)prefersHomeIndicatorAutoHidden { return YES; }
--(void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator
+/* UIKit calls this from iOS 8 on, so the call up to super is as old */
+-(void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator API_AVAILABLE(ios(8.0))
 {
     [super viewWillTransitionToSize:size withTransitionCoordinator:coordinator];
-    if (@available(iOS 11, *))
+    if (apple_runtime_available(0, APPLE_RUNTIME_VER(11, 0, 0), 0))
     {
         [coordinator animateAlongsideTransition:^(id<UIViewControllerTransitionCoordinatorContext>  _Nonnull context) {
             [self adjustViewFrameForSafeArea];
@@ -642,7 +811,7 @@ void rarch_stop_draw_observer(void)
     * the notch in iPhone X phones. In multitasking mode,
     * we should only adjust within the current view bounds,
     * not force full screen dimensions. */
-   if (@available(iOS 11, *))
+   if (apple_runtime_available(0, APPLE_RUNTIME_VER(11, 0, 0), 0))
    {
       /* Early return if core systems aren't initialized yet */
       settings_t *settings = config_get_ptr();
@@ -679,8 +848,46 @@ void rarch_stop_draw_observer(void)
       if (!window)
          return;
 
-      UIEdgeInsets inset   = window.safeAreaInsets;
-      UIInterfaceOrientation orientation = [[UIApplication sharedApplication] statusBarOrientation];
+      /* -[UIView safeAreaInsets] (iOS 11); the struct is returned in
+       * memory everywhere but arm64 */
+      UIEdgeInsets inset   = apple_rt_get_large_struct(UIEdgeInsets, window,
+            sel_registerName("safeAreaInsets"));
+      /* UIWindowScene.effectiveGeometry is an iOS 16 API that older
+       * SDKs do not declare, so it is resolved entirely at runtime via
+       * objc_msgSend - same cost as a compiled property access.
+       * Capability is checked once per process (-1 = not yet checked). */
+      static SEL sel_window_scene        = NULL;
+      static SEL sel_effective_geometry  = NULL;
+      static SEL sel_iface_orientation   = NULL;
+      static int has_scene_geometry      = -1;
+      UIInterfaceOrientation orientation = (UIInterfaceOrientation)0;
+      if (has_scene_geometry == -1)
+      {
+         Class cls              = NSClassFromString(@"UIWindowScene");
+         sel_window_scene       = sel_registerName("windowScene");
+         sel_effective_geometry = sel_registerName("effectiveGeometry");
+         sel_iface_orientation  = sel_registerName("interfaceOrientation");
+         has_scene_geometry     = (cls && [cls instancesRespondToSelector:
+               sel_effective_geometry]) ? 1 : 0;
+      }
+      if (has_scene_geometry)
+      {
+         id scene = ((id (*)(id, SEL))objc_msgSend)(window, sel_window_scene);
+         if (scene)
+         {
+            id geometry = ((id (*)(id, SEL))objc_msgSend)(scene,
+                  sel_effective_geometry);
+            if (geometry)
+               orientation = (UIInterfaceOrientation)
+                     ((NSInteger (*)(id, SEL))objc_msgSend)(geometry,
+                           sel_iface_orientation);
+         }
+      }
+      /* 0 == unknown */
+      if (orientation == (UIInterfaceOrientation)0)
+         orientation = (UIInterfaceOrientation)apple_rt_get_long(
+               [UIApplication sharedApplication],
+               sel_registerName("statusBarOrientation"));
 
       switch (orientation)
       {
@@ -732,7 +939,7 @@ void rarch_stop_draw_observer(void)
 /* NOTE: This version runs on iOS6+. */
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations
 {
-  if (@available(iOS 16, *))
+  if (apple_runtime_available(0, APPLE_RUNTIME_VER(16, 0, 0), 0))
   {
     if (self.shouldLockCurrentInterfaceOrientation)
       return 1 << self.lockInterfaceOrientation;
@@ -748,32 +955,23 @@ void rarch_stop_draw_observer(void)
     return NO;
   return YES;
 }
-
-/* NOTE: This version runs on iOS2-iOS5, but not iOS6+. */
-- (BOOL)shouldAutorotateToInterfaceOrientation:(UIInterfaceOrientation)interfaceOrientation
-{
-   return YES;
-}
 #endif
 
 #ifdef HAVE_COCOATOUCH
 
+#if !TARGET_OS_TV
 -(BOOL) prefersPointerLocked API_AVAILABLE(ios(14.0))
 {
-   cocoa_input_data_t *apple = (cocoa_input_data_t*) input_state_get_ptr()->current_data;
-   if (!apple)
-      return NO;
-   return apple->mouse_grabbed;
+   return cocoa_input_mouse_grabbed() ? YES : NO;
 }
+#endif
 
 #pragma mark - UIViewController Lifecycle
 
 -(void)loadView {
-#if defined(HAVE_COCOA_METAL)
+   /* A plain container; -[RetroArch_iOS setViewType:] installs the
+    * render view the current video driver needs beneath it. */
    self.view       = [UIView new];
-#else
-   self.view       = (BRIDGE GLKView*)glkitview_init();
-#endif
 }
 
 -(void)viewDidLoad {
@@ -822,8 +1020,9 @@ void rarch_stop_draw_observer(void)
 - (void)viewDidAppear:(BOOL)animated
 {
 #if TARGET_OS_IOS
-    if (@available(iOS 11.0, *))
-        [self setNeedsUpdateOfHomeIndicatorAutoHidden];
+    if (apple_runtime_available(0, APPLE_RUNTIME_VER(11, 0, 0), 0))
+        apple_rt_send_void(self,
+              sel_registerName("setNeedsUpdateOfHomeIndicatorAutoHidden"));
 #endif
 }
 
@@ -853,8 +1052,14 @@ void rarch_stop_draw_observer(void)
     if (!settings->bools.gcdwebserver_alert)
         return;
 
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
+    /* Once per run. dispatch_once is the wrong shape for that even
+     * where it works: it is a barrier for publishing an initialisation
+     * to other threads, and this is UIKit on the main thread showing an
+     * alert. A flag says what is meant. The blocks below stay - they
+     * are UIAlertAction handlers, which the API requires, not GCD. */
+    static bool shown;
+    if (!shown)
+    {
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Welcome to RetroArch" message:[NSString stringWithFormat:@"To transfer files from your computer, go to one of these addresses on your web browser:\n\n%@",servers] preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction actionWithTitle:@"OK"
             style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
@@ -880,7 +1085,8 @@ void rarch_stop_draw_observer(void)
             struct menu_state *menu_st = menu_state_get_ptr();
             menu_st->flags |= MENU_ST_FLAG_BLOCK_ALL_INPUT;
         }];
-    });
+        shown = true;
+    }
 #endif
 }
 
@@ -900,7 +1106,8 @@ void rarch_stop_draw_observer(void)
 #if TARGET_OS_IOS
 void ios_show_file_sheet(void)
 {
-   [[CocoaView get] showDocumentPicker];
+   if (apple_runtime_available(0, APPLE_RUNTIME_VER(8, 0, 0), 0))
+      apple_rt_send_void([CocoaView get], @selector(showDocumentPicker));
 }
 #endif
 
@@ -936,7 +1143,7 @@ void *cocoa_screen_get_chosen(void)
  * it simply calls straight through, so the non-threaded path is
  * unchanged.
  *
- * The block is scheduled in BOTH kCFRunLoopCommonModes and a private
+ * The job is scheduled in BOTH kCFRunLoopCommonModes and a private
  * runloop mode:
  *  - common modes drain it whenever the main loop is running normally
  *    (e.g. show_mouse from the worker mid-session);
@@ -947,14 +1154,92 @@ void *cocoa_screen_get_chosen(void)
  *    from other modes (in particular the RetroArch draw observer) run
  *    reentrantly under the wait.
  * The mode string literal below must stay in sync with the one in
- * video_thread_wrapper.c. */
+ * video_thread_wrapper.c.
+ *
+ * Written without blocks or GCD: -performSelectorOnMainThread:
+ * withObject:waitUntilDone:modes: (Foundation, 10.0) carries the job
+ * over in exactly those modes, and the caller waits on the job's
+ * eventcount for its done flag, in bounded waits so the stall
+ * diagnostic keeps its cadence.  That makes the trampoline buildable
+ * by any Objective-C compiler and runnable on any release.
+ *
+ * The eventcount lives in the job, and Foundation holds the job until
+ * -run has returned: the notify after the done flag cannot outlive it,
+ * however soon the caller sees the flag and lets go of its reference. */
+@interface CocoaMainThreadJob : NSObject
+{
+   retro_eventcount_t _ec;
+   void (*_func)(void *userdata);
+   void  *_userdata;
+   retro_atomic_int_t _done;
+   bool _ec_ready;
+}
+- (id)initWithFunc:(void (*)(void *))func userdata:(void *)userdata;
+- (void)run;
+- (void)wait;
+@end
+
+@implementation CocoaMainThreadJob
+
+- (id)initWithFunc:(void (*)(void *))func userdata:(void *)userdata
+{
+   self = [super init];
+   if (!self)
+      return self;
+   if (!(_ec_ready = retro_eventcount_init(&_ec)))
+   {
+      RARCH_RELEASE(self);
+      return nil;
+   }
+   _func     = func;
+   _userdata = userdata;
+   retro_atomic_int_init(&_done, 0);
+   return self;
+}
+
+- (void)dealloc
+{
+   if (_ec_ready)
+      retro_eventcount_free(&_ec);
+   RARCH_SUPER_DEALLOC();
+}
+
+- (void)run
+{
+   _func(_userdata);
+   retro_atomic_store_release_int(&_done, 1);
+   retro_eventcount_notify(&_ec);
+}
+
+/* Waiting forever (with periodic diagnostics) is deliberate: running
+ * the function on this thread after a timeout would run it twice once
+ * the main thread drains the job, which is far worse than a loggable
+ * stall. */
+- (void)wait
+{
+   for (;;)
+   {
+      int key;
+      if (retro_atomic_load_acquire_int(&_done))
+         return;
+      key = retro_eventcount_prepare_wait(&_ec);
+      if (retro_atomic_load_acquire_int(&_done))
+      {
+         retro_eventcount_cancel_wait(&_ec);
+         return;
+      }
+      if (!retro_eventcount_commit_wait_timeout(&_ec, key, 5000000))
+         RARCH_ERR("[Cocoa]: Main-thread trampoline stalled; main runloop is not draining scheduled jobs.\n");
+   }
+}
+
+@end
+
 void cocoa_main_thread_sync(void (*func)(void *userdata), void *userdata);
 void cocoa_main_thread_sync(void (*func)(void *userdata), void *userdata)
 {
-   dispatch_semaphore_t done;
-   CFRunLoopRef main_loop;
-   CFArrayRef modes;
-   const void *mode_entries[2];
+   CocoaMainThreadJob *job;
+   NSArray *modes;
 
    if (sthread_is_main_thread())
    {
@@ -962,59 +1247,44 @@ void cocoa_main_thread_sync(void (*func)(void *userdata), void *userdata)
       return;
    }
 
-   done            = dispatch_semaphore_create(0);
-   main_loop       = CFRunLoopGetMain();
-   mode_entries[0] = kCFRunLoopCommonModes;
-   mode_entries[1] = CFSTR("com.libretro.RetroArch.MainThreadTrampoline");
-   modes           = CFArrayCreate(kCFAllocatorDefault, mode_entries, 2,
-         &kCFTypeArrayCallBacks);
+   if (!(job = [[CocoaMainThreadJob alloc] initWithFunc:func
+               userdata:userdata]))
+   {
+      RARCH_ERR("[Cocoa]: Main-thread trampoline could not be set up.\n");
+      return;
+   }
+   /* kCFRunLoopCommonModes is toll-free bridged to the NSString the
+    * Foundation call wants, and is the 10.0 spelling of the 10.5
+    * NSRunLoopCommonModes. */
+   modes = [[NSArray alloc] initWithObjects:
+         (BRIDGE NSString *)kCFRunLoopCommonModes,
+         @"com.libretro.RetroArch.MainThreadTrampoline", nil];
 
-   CFRunLoopPerformBlock(main_loop, modes, ^{
-      func(userdata);
-      dispatch_semaphore_signal(done);
-   });
-   CFRunLoopWakeUp(main_loop);
+   [job performSelectorOnMainThread:@selector(run) withObject:nil
+         waitUntilDone:NO modes:modes];
+   CFRunLoopWakeUp(CFRunLoopGetMain());
 
-   /* Wait for completion.  Waiting forever (with periodic diagnostics)
-    * is deliberate: falling back to running func() on this thread after
-    * a timeout would risk double-execution once the main thread finally
-    * drains the block, which is far worse than a loggable stall. */
-   while (dispatch_semaphore_wait(done,
-            dispatch_time(DISPATCH_TIME_NOW, (int64_t)5 * NSEC_PER_SEC)))
-      RARCH_ERR("[Cocoa]: Main-thread trampoline stalled; main runloop is not draining scheduled blocks.\n");
+   [job wait];
 
-   CFRelease(modes);
-#if OS_OBJECT_USE_OBJC
-   RARCH_RELEASE(done);
-#else
-   dispatch_release(done);
-#endif
+   RARCH_RELEASE(modes);
+   RARCH_RELEASE(job);
 }
 
-/* One condvar-wait iteration for a caller that may be the main thread and
- * must let the worker's cocoa_main_thread_sync() blocks drain.  On the main
- * thread: a bounded timed wait, pumping the private trampoline runloop mode
- * on timeout so those marshaled blocks run (otherwise the worker blocks
- * waiting for the main thread while the main thread blocks on the reply ->
- * deadlock).  Off the main thread: returns false so the caller performs a
- * plain blocking scond_wait().  Pumping ONLY the private mode keeps draw
- * observers, timers and input sources from running reentrantly under the
- * wait.  'lock' is held on entry and on return.  Shares the trampoline mode
- * string with cocoa_main_thread_sync() above -- single source of truth. */
-bool cocoa_main_thread_cond_wait_pump(scond_t *cond, slock_t *lock);
-bool cocoa_main_thread_cond_wait_pump(scond_t *cond, slock_t *lock)
+/* For a caller on the main thread that waits for the video thread and
+ * must let the worker's cocoa_main_thread_sync() blocks drain between
+ * tries (otherwise the worker blocks waiting for the main thread while
+ * the main thread blocks on it). Pumping ONLY the private trampoline
+ * mode keeps draw observers, timers and input sources from running
+ * reentrantly under the wait; the mode string is cocoa_main_thread_sync()'s.
+ * Off the main thread, nothing. */
+void cocoa_main_thread_pump(void);
+void cocoa_main_thread_pump(void)
 {
    if (!sthread_is_main_thread())
-      return false;
-   if (!scond_wait_timeout(cond, lock, 1000))
-   {
-      slock_unlock(lock);
-      CFRunLoopRunInMode(
-            CFSTR("com.libretro.RetroArch.MainThreadTrampoline"),
-            0.001, false);
-      slock_lock(lock);
-   }
-   return true;
+      return;
+   CFRunLoopRunInMode(
+         CFSTR("com.libretro.RetroArch.MainThreadTrampoline"),
+         0.001, false);
 }
 
 #if TARGET_OS_OSX
@@ -1026,6 +1296,20 @@ static void cocoa_show_mouse_mainthread_show(void *userdata)
 static void cocoa_show_mouse_mainthread_hide(void *userdata)
 {
    [NSCursor hide];
+}
+#endif
+
+#if !defined(HAVE_COCOATOUCH)
+/* 0 = never published (read as focused), 1 = not focused, 2 = focused.
+ * Written on the main thread - by cocoa_has_focus() when it is asked
+ * there, and by the application delegate's activation notifications,
+ * which is what keeps it current under threaded video, where nothing
+ * on the main thread asks and the worker reads this every frame. */
+static retro_atomic_size_t cocoa_focus_state;
+
+void cocoa_publish_focus(bool focused)
+{
+   retro_atomic_store_release_size(&cocoa_focus_state, focused ? 2 : 1);
 }
 #endif
 
@@ -1046,14 +1330,13 @@ bool cocoa_has_focus(void *data)
      * i.e. pause-on-focus-loss may not trigger.  Proper fix is
      * publishing from NSApplication did-become/resign-active
      * notifications; kept out of this validation patch. */
-    static retro_atomic_size_t focus_state;
     if (sthread_is_main_thread())
     {
        size_t v = [NSApp isActive] ? 2 : 1;
-       retro_atomic_store_release_size(&focus_state, v);
+       retro_atomic_store_release_size(&cocoa_focus_state, v);
        return (v == 2);
     }
-    return (retro_atomic_load_acquire_size(&focus_state) != 1);
+    return (retro_atomic_load_acquire_size(&cocoa_focus_state) != 1);
 #endif
 }
 
@@ -1151,29 +1434,27 @@ float cocoa_screen_get_native_scale(void)
  * still need a registered function.
  * --------------------------------------------------------------------- */
 
-float cocoa_get_refresh_rate(void)
-{
 #if TARGET_OS_OSX
+/* The refresh rate of one display's current mode, or 0 when it does not
+ * say - which most built-in LCDs do not. */
+static float cocoa_display_mode_refresh_rate(CGDirectDisplayID id)
+{
 #ifdef RARCH_HAS_CGDISPLAYMODE_API
    /* macOS 10.6+: CGDisplayMode API. */
-   CGDirectDisplayID main_id = CGMainDisplayID();
-   CGDisplayModeRef  mode    = CGDisplayCopyDisplayMode(main_id);
+   CGDisplayModeRef  mode    = CGDisplayCopyDisplayMode(id);
    float             rate    = 0.0f;
    if (mode)
    {
       rate = (float)CGDisplayModeGetRefreshRate(mode);
       CFRelease(mode);
    }
-   /* CGDisplayModeGetRefreshRate returns 0 on most built-in LCDs;
-    * hand the caller a sane fallback instead of 0 Hz. */
-   return (rate > 0.0f) ? rate : 60.0f;
+   return rate;
 #else
    /* macOS 10.5 Leopard: CGDisplayCopyDisplayMode doesn't exist.
     * CGDisplayCurrentMode returns a borrowed CFDictionaryRef
     * (do NOT CFRelease) carrying kCGDisplayRefreshRate.  Deprecated
     * in 10.6 but the only option on the 10.5 SDK. */
-   CGDirectDisplayID main_id = CGMainDisplayID();
-   CFDictionaryRef   mode    = CGDisplayCurrentMode(main_id);
+   CFDictionaryRef   mode    = CGDisplayCurrentMode(id);
    double            rate    = 0.0;
    if (mode)
    {
@@ -1182,8 +1463,52 @@ float cocoa_get_refresh_rate(void)
       if (n)
          CFNumberGetValue(n, kCFNumberDoubleType, &rate);
    }
-   return (rate > 0.0) ? (float)rate : 60.0f;
+   return (rate > 0.0) ? (float)rate : 0.0f;
 #endif
+}
+#endif
+
+#if TARGET_OS_IPHONE
+void cocoa_display_link_set_rate(id link, float hz)
+{
+   if (!link || hz <= 0.0f)
+      return;
+   if (apple_runtime_available(0, APPLE_RUNTIME_VER(15, 0, 0), APPLE_RUNTIME_VER(15, 0, 0)))
+      COCOA_DISPLAY_LINK_SET_RATE(link, hz);
+   else if (apple_runtime_available(0, APPLE_RUNTIME_VER(10, 0, 0), APPLE_RUNTIME_VER(10, 0, 0)))
+      apple_rt_send_long(link, sel_registerName("setPreferredFramesPerSecond:"),
+            (long)(hz + 0.5f));
+   else
+   {
+      /* Deprecated in iOS 10 and the only control before it */
+      long interval = (long)(60.0f / hz + 0.5f);
+      apple_rt_send_long(link, sel_registerName("setFrameInterval:"),
+            interval > 0 ? interval : 1);
+   }
+}
+
+float cocoa_display_link_get_rate(id link)
+{
+   long interval;
+   if (!link)
+      return 0.0f;
+   if (apple_runtime_available(0, APPLE_RUNTIME_VER(15, 0, 0), APPLE_RUNTIME_VER(15, 0, 0)))
+      return COCOA_DISPLAY_LINK_PREFERRED_RATE(link);
+   if (apple_runtime_available(0, APPLE_RUNTIME_VER(10, 0, 0), APPLE_RUNTIME_VER(10, 0, 0)))
+      return (float)apple_rt_get_long(link,
+            sel_registerName("preferredFramesPerSecond"));
+   interval = apple_rt_get_long(link, sel_registerName("frameInterval"));
+   return 60.0f / (float)(interval > 0 ? interval : 1);
+}
+#endif
+
+float cocoa_get_refresh_rate(void)
+{
+#if TARGET_OS_OSX
+   float rate = cocoa_display_mode_refresh_rate(CGMainDisplayID());
+   /* CGDisplayModeGetRefreshRate returns 0 on most built-in LCDs;
+    * hand the caller a sane fallback instead of 0 Hz. */
+   return (rate > 0.0f) ? rate : 60.0f;
 #else /* iOS / tvOS */
    /* Prefer the panel's own capability over the CADisplayLink's
     * preferred rate.
@@ -1205,62 +1530,134 @@ float cocoa_get_refresh_rate(void)
     * below stays reachable and unchanged: 10.0 - 10.2 still gets
     * preferredFramesPerSecond, pre-10.0 still gets frameInterval,
     * and a 0 answer here still falls through to them. */
-#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 100300 || __TV_OS_VERSION_MAX_ALLOWED >= 100200
-   if (@available(iOS 10.3, tvOS 10.2, *))
+   if (apple_runtime_available(0, APPLE_RUNTIME_VER(10, 3, 0), APPLE_RUNTIME_VER(10, 2, 0)))
    {
-      NSInteger max_fps = [[UIScreen mainScreen] maximumFramesPerSecond];
+      long max_fps = apple_rt_get_long([UIScreen mainScreen],
+            sel_registerName("maximumFramesPerSecond"));
       if (max_fps > 0)
          return (float)max_fps;
    }
-#endif
    {
       CADisplayLink *dl = [CocoaView get].displayLink;
       if (dl)
       {
-#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 150000 || __TV_OS_VERSION_MAX_ALLOWED >= 150000
-         if (@available(iOS 15.0, tvOS 15.0, *))
-            return dl.preferredFrameRateRange.preferred;
-#endif
-#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 100000 || __TV_OS_VERSION_MAX_ALLOWED >= 100000
-         if (@available(iOS 10.0, tvOS 10.0, *))
-            return dl.preferredFramesPerSecond;
-#endif
-         /* iOS 6 - 9 / tvOS < 10: only frameInterval exists.  It is
-          * the number of screen refreshes between callbacks, so
-          * convert to Hz assuming a 60 Hz panel (accurate for every
-          * pre-iOS-10 device - ProMotion is iPad Pro 2017+). */
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-         {
-            NSInteger fi = dl.frameInterval;
-            return 60.0f / (float)(fi > 0 ? fi : 1);
-         }
-#pragma clang diagnostic pop
+         /* Before iOS 10 this is frameInterval on a 60 Hz panel, which
+          * is every pre-iOS-10 device - ProMotion is iPad Pro 2017+. */
+         return cocoa_display_link_get_rate(dl);
       }
    }
-#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 100300 || __TV_OS_VERSION_MAX_ALLOWED >= 100200
-   if (@available(iOS 10.3, tvOS 10.2, *))
-      return [UIScreen mainScreen].maximumFramesPerSecond;
-#endif
+   if (apple_runtime_available(0, APPLE_RUNTIME_VER(10, 3, 0), APPLE_RUNTIME_VER(10, 2, 0)))
+      return (float)apple_rt_get_long([UIScreen mainScreen],
+            sel_registerName("maximumFramesPerSecond"));
    return 60.0f;
 #endif
 }
 
-void cocoa_get_video_output_size(unsigned *width, unsigned *height,
+/* The refresh rate of the screen the RetroArch window is on, which on a
+ * Mac with several displays, or an iPad driving an external one, is not
+ * necessarily the main screen; 0 when there is no window yet or the
+ * screen does not say. The view is read without +get, which would make
+ * one. */
+float cocoa_get_window_refresh_rate(void)
+{
+   CocoaView *view = (BRIDGE CocoaView*)nsview_get_ptr();
+#if TARGET_OS_OSX
+   NSWindow *window = view ? [view window] : nil;
+   NSScreen *screen = window ? [window screen] : nil;
+   NSNumber *number;
+   float     rate   = 0.0f;
+
+   if (!screen)
+      return 0.0f;
+   number = [[screen deviceDescription] objectForKey:@"NSScreenNumber"];
+   if (number)
+      rate = cocoa_display_mode_refresh_rate(
+            (CGDirectDisplayID)[number unsignedIntValue]);
+   if (rate > 0.0f)
+      return rate;
+   /* A built-in panel, whose mode carries no rate: the screen's own
+    * figure, which is its current rate on a fixed panel and its top
+    * rate on a ProMotion one */
+   if (apple_runtime_available(APPLE_RUNTIME_VER(12, 0, 0), 0, 0))
+   {
+      /* -[NSScreen maximumFramesPerSecond], macOS 12 */
+      long max_fps = apple_rt_get_long(screen,
+            sel_registerName("maximumFramesPerSecond"));
+      if (max_fps > 0)
+         return (float)max_fps;
+   }
+   return 0.0f;
+#else /* iOS / tvOS */
+   UIScreen *screen = (view && view.view.window) ? view.view.window.screen : nil;
+
+   if (!screen)
+      return 0.0f;
+   if (apple_runtime_available(0, APPLE_RUNTIME_VER(10, 3, 0), APPLE_RUNTIME_VER(10, 2, 0)))
+   {
+      long max_fps = apple_rt_get_long(screen,
+            sel_registerName("maximumFramesPerSecond"));
+      if (max_fps > 0)
+         return (float)max_fps;
+   }
+   return 0.0f;
+#endif
+}
+
+/* Tells the frontend when the window may be on another screen, or its
+ * screen has changed mode, so the next reading of its refresh rate is
+ * taken afresh (see video_driver_window_output_changed()). Posted on
+ * the main thread, which is the one that reads it. */
+@interface RAWindowOutputObserver : NSObject
+- (void)outputChanged:(NSNotification *)notification;
+@end
+
+@implementation RAWindowOutputObserver
+- (void)outputChanged:(NSNotification *)notification
+{
+   video_driver_window_output_changed();
+}
+@end
+
+void cocoa_watch_window_output(void)
+{
+   /* Process lifetime: never removed, so never released */
+   static RAWindowOutputObserver *observer = nil;
+   NSNotificationCenter *center;
+
+   if (observer)
+      return;
+   observer = [[RAWindowOutputObserver alloc] init];
+   center   = [NSNotificationCenter defaultCenter];
+#if TARGET_OS_OSX
+   [center addObserver:observer selector:@selector(outputChanged:)
+                  name:NSWindowDidChangeScreenNotification object:nil];
+   [center addObserver:observer selector:@selector(outputChanged:)
+                  name:NSApplicationDidChangeScreenParametersNotification object:nil];
+#else
+   [center addObserver:observer selector:@selector(outputChanged:)
+                  name:UIScreenModeDidChangeNotification object:nil];
+   [center addObserver:observer selector:@selector(outputChanged:)
+                  name:UIScreenDidConnectNotification object:nil];
+   [center addObserver:observer selector:@selector(outputChanged:)
+                  name:UIScreenDidDisconnectNotification object:nil];
+#endif
+}
+
+void cocoa_get_video_output_size(unsigned *dims,
       char *desc, size_t desc_len)
 {
 #if TARGET_OS_IPHONE
    UIScreen *screen = [UIScreen mainScreen];
-#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 80000 || __TV_OS_VERSION_MAX_ALLOWED >= 90000
-   if (@available(iOS 8.0, tvOS 9.0, *))
+   if (apple_runtime_available(0, APPLE_RUNTIME_VER(8, 0, 0), APPLE_RUNTIME_VER(9, 0, 0)))
    {
-      /* nativeBounds is physical pixels, orientation-independent. */
-      CGRect b = screen.nativeBounds;
-      *width   = (unsigned)b.size.width;
-      *height  = (unsigned)b.size.height;
+      /* nativeBounds (iOS 8) is physical pixels, orientation-independent;
+       * a CGRect is returned in memory everywhere but arm64. */
+      CGRect b = apple_rt_get_large_struct(CGRect, screen,
+            sel_registerName("nativeBounds"));
+      *dims    = VIDEO_SCALE_PACK((unsigned)b.size.width,
+            (unsigned)b.size.height);
    }
    else
-#endif
    {
       /* iOS 6/7: no nativeBounds.  UIScreen.bounds is in points and
        * fixed to portrait orientation pre-iOS-8.  Every iOS 6/7-era
@@ -1268,8 +1665,8 @@ void cocoa_get_video_output_size(unsigned *width, unsigned *height,
        * gives exact physical pixels. */
       CGRect  b = screen.bounds;
       CGFloat s = screen.scale; /* UIScreen.scale is iOS 4+ */
-      *width    = (unsigned)(b.size.width  * s);
-      *height   = (unsigned)(b.size.height * s);
+      *dims     = VIDEO_SCALE_PACK((unsigned)(b.size.width  * s),
+            (unsigned)(b.size.height * s));
    }
 
    if (desc && desc_len > 0)
@@ -1288,8 +1685,8 @@ void cocoa_get_video_output_size(unsigned *width, unsigned *height,
 #else
    /* macOS: CGDisplayPixelsWide/High is 10.0+, safe back to 10.5. */
    CGDirectDisplayID d = CGMainDisplayID();
-   *width  = (unsigned)CGDisplayPixelsWide(d);
-   *height = (unsigned)CGDisplayPixelsHigh(d);
+   *dims = VIDEO_SCALE_PACK((unsigned)CGDisplayPixelsWide(d),
+         (unsigned)CGDisplayPixelsHigh(d));
 
    if (desc && desc_len > 0)
    {
@@ -1341,14 +1738,7 @@ void nsview_set_ptr(CocoaView *p)
 
 CocoaView *cocoaview_get(void)
 {
-#if defined(HAVE_COCOA_METAL)
-    return (CocoaView*)apple_platform.renderView;
-#elif defined(HAVE_COCOA)
-    return g_instance;
-#else
-    /* TODO/FIXME - implement */
-    return NULL;
-#endif
+    return (CocoaView*)[apple_platform renderView];
 }
 
 #if TARGET_OS_OSX
@@ -1400,7 +1790,7 @@ bool cocoa_get_metrics(
    float   physical_width        = screen_rect.size.width  * scale;
    float   physical_height       = screen_rect.size.height * scale;
    float   dpi                   = 160                     * scale;
-   NSInteger idiom_type          = UI_USER_INTERFACE_IDIOM();
+   NSInteger idiom_type          = [[UIDevice currentDevice] userInterfaceIdiom];
 
    switch (idiom_type)
    {
@@ -1822,7 +2212,8 @@ static void topshelfProcessPending(NSArray *pending, NSDictionary *contentDict, 
       if (updated)
       {
          [ud setObject:contentDict forKey:@"topshelf"];
-         [TVTopShelfContentProvider topShelfContentDidChange];
+         apple_rt_send_void(apple_rt_class("TVTopShelfContentProvider"),
+               sel_registerName("topShelfContentDidChange"));
       }
       topshelfPruneCache(cacheDir, hashes);
       if (completion)
@@ -1832,7 +2223,7 @@ static void topshelfProcessPending(NSArray *pending, NSDictionary *contentDict, 
 
 void update_topshelf(void)
 {
-   if (@available(tvOS 13.0, *))
+   if (apple_runtime_available(0, 0, APPLE_RUNTIME_VER(13, 0, 0)))
    {
       NSUserDefaults *ud = [[NSUserDefaults alloc] initWithSuiteName:kRetroArchAppGroup];
       if (!ud)
@@ -1878,7 +2269,8 @@ void update_topshelf(void)
       free(thumbnail_path_data);
 
       [ud setObject:contentDict forKey:@"topshelf"];
-      [TVTopShelfContentProvider topShelfContentDidChange];
+      apple_rt_send_void(apple_rt_class("TVTopShelfContentProvider"),
+               sel_registerName("topShelfContentDidChange"));
 
       if ([pending count] && cacheDir)
       {

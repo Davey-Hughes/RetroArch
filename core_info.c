@@ -110,9 +110,8 @@ static core_info_state_t core_info_st = {
  *
  * The list is built, replaced and freed on the main thread, but it
  * is *read* from task threads - the content scanner calls
- * core_info_database_supports_content_path() and
- * core_info_database_match_archive_member() from
- * task_database_iterate_crc_lookup(). Closing content runs
+ * core_info_database_claim() once per database when a scan sizes
+ * its per-database state. Closing content runs
  * driver_uninit() -> core_info_deinit_list() on the main thread with
  * no regard for a scan that is still in flight, so without this lock
  * a worker walks a list that has just been freed.
@@ -925,42 +924,6 @@ end:
 }
 #endif
 
-/* Move a completed temporary over its destination.
- *
- * POSIX rename() replaces atomically, which is the whole point;
- * Windows' rename() refuses when the destination exists, so fall back
- * to moving the original aside first and putting it back if the second
- * move fails - never leaving nothing behind.
- *
- * (playlist.c carries the same helper for the same reason.  A third
- * caller would justify hoisting one copy into libretro-common.) */
-static bool core_info_replace_file(const char *from, const char *to)
-{
-   char saved[PATH_MAX_LENGTH];
-   size_t _len;
-
-   if (filestream_rename(from, to) == 0)
-      return true;
-
-   _len = strlcpy(saved, to, sizeof(saved));
-   if (_len + STRLEN_CONST(".old") >= sizeof(saved))
-      return false;
-   strlcpy_lit(saved + _len, ".old", sizeof(saved) - _len);
-
-   filestream_delete(saved);          /* a leftover from a previous run */
-   if (filestream_rename(to, saved) != 0)
-      return false;                   /* original untouched; give up   */
-
-   if (filestream_rename(from, to) == 0)
-   {
-      filestream_delete(saved);
-      return true;
-   }
-
-   filestream_rename(saved, to);      /* put the original back */
-   return false;
-}
-
 static bool core_info_cache_write(core_info_cache_list_t *list, const char *info_dir)
 {
    intfstream_t *file    = NULL;
@@ -1296,7 +1259,7 @@ static bool core_info_cache_write(core_info_cache_list_t *list, const char *info
    free(file);
    file    = NULL;
 
-   if (!core_info_replace_file(write_path, file_path))
+   if (filestream_rename(write_path, file_path) != 0)
    {
       filestream_delete(write_path);
       RARCH_ERR("[Core info] Failed to write core info cache file: \"%s\".\n",
@@ -2067,6 +2030,13 @@ static size_t core_info_list_resolve_all_extensions(
             if (!tok_end)
                tok_end = end;
             tok_len = tok_end - p;
+            /* "/" is one core's directory support, not a file
+             * extension every core list consumer should match */
+            if (tok_len == 1 && *p == '/')
+            {
+               p = tok_end + 1;
+               continue;
+            }
             CORE_INFO_EXT_INSERT(p, tok_len, scr->slots,
                   scr->token_buf, token_pos, _TOKEN_BUF,
                   unique_count, total_chars, _HASH_MASK);
@@ -2077,6 +2047,11 @@ static size_t core_info_list_resolve_all_extensions(
 
 #ifdef HAVE_7ZIP
    CORE_INFO_EXT_INSERT("7z", STRLEN_CONST("7z"), scr->slots,
+         scr->token_buf, token_pos, _TOKEN_BUF, unique_count,
+         total_chars, _HASH_MASK);
+#endif
+#ifdef HAVE_RRAR
+   CORE_INFO_EXT_INSERT("rar", STRLEN_CONST("rar"), scr->slots,
          scr->token_buf, token_pos, _TOKEN_BUF, unique_count,
          total_chars, _HASH_MASK);
 #endif
@@ -2806,59 +2781,23 @@ bool core_info_core_file_id_is_equal(const char *core_path_a,
    return !strcmp(core_file_id_a, core_file_id_b);
 }
 
-bool core_info_database_match_archive_member(const char *database_path)
+struct string_list *core_info_database_claim(
+      const char *database_path, bool *match_archive_member)
 {
-   char      *database           = NULL;
-   const char      *new_path     = path_basename_nocompression(
+   union string_list_elem_attr attr;
+   struct string_list *exts      = NULL;
+   char *database                = NULL;
+   const char *new_path          = path_basename_nocompression(
          database_path);
-   core_info_state_t *p_coreinfo = NULL;
+   core_info_state_t *p_coreinfo = &core_info_st;
+
+   *match_archive_member         = false;
    if (!new_path || !*new_path)
-      return false;
+      return NULL;
    if (!(database = strdup(new_path)))
-      return false;
+      return NULL;
    path_remove_extension(database);
-   p_coreinfo                     = &core_info_st;
-
-   /* Task thread reader - see the comment in
-    * core_info_database_supports_content_path(). */
-   CORE_INFO_LIST_LOCK();
-   if (p_coreinfo->curr_list)
-   {
-      size_t i;
-
-      for (i = 0; i < p_coreinfo->curr_list->count; i++)
-      {
-         const core_info_t *info = &p_coreinfo->curr_list->list[i];
-
-         if (!(info->flags & CORE_INFO_FLAG_DATABASE_MATCH_ARCHIVE_MEMBER))
-             continue;
-
-         if (!string_list_find_elem(info->databases_list, database))
-             continue;
-
-         CORE_INFO_LIST_UNLOCK();
-         free(database);
-         return true;
-      }
-   }
-   CORE_INFO_LIST_UNLOCK();
-
-   free(database);
-   return false;
-}
-
-bool core_info_database_supports_content_path(
-      const char *database_path, const char *path)
-{
-   char      *database           = NULL;
-   const char      *new_path     = path_basename(database_path);
-   core_info_state_t *p_coreinfo = NULL;
-   if (!new_path || !*new_path)
-      return false;
-   if (!(database = strdup(new_path)))
-      return false;
-   path_remove_extension(database);
-   p_coreinfo                    = &core_info_st;
+   attr.i                        = 0;
 
    /* Called from the content scanner on a task thread. The whole
     * walk has to be under the lock, not just the NULL check - the
@@ -2871,24 +2810,32 @@ bool core_info_database_supports_content_path(
 
       for (i = 0; i < p_coreinfo->curr_list->count; i++)
       {
+         size_t j;
          const core_info_t *info = &p_coreinfo->curr_list->list[i];
-
-         if (!string_list_find_elem(info->supported_extensions_list,
-                  path_get_extension(path)))
-            continue;
+         const struct string_list *core_exts =
+            info->supported_extensions_list;
 
          if (!string_list_find_elem(info->databases_list, database))
             continue;
 
-         CORE_INFO_LIST_UNLOCK();
-         free(database);
-         return true;
+         if (info->flags & CORE_INFO_FLAG_DATABASE_MATCH_ARCHIVE_MEMBER)
+            *match_archive_member = true;
+
+         if (!core_exts || !core_exts->size)
+            continue;
+
+         if (!exts && !(exts = string_list_new()))
+            break;
+
+         for (j = 0; j < core_exts->size; j++)
+            if (!string_list_find_elem(exts, core_exts->elems[j].data))
+               string_list_append(exts, core_exts->elems[j].data, attr);
       }
    }
    CORE_INFO_LIST_UNLOCK();
 
    free(database);
-   return false;
+   return exts;
 }
 
 size_t core_info_list_get_display_name(

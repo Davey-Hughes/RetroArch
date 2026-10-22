@@ -80,7 +80,23 @@ enum crt_switch_type
    CRT_SWITCH_15KHZ,
    CRT_SWITCH_31KHZ,
    CRT_SWITCH_32_120,
-   CRT_SWITCH_INI
+   CRT_SWITCH_INI,
+   CRT_SWITCH_EDID,
+   CRT_SWITCH_LCD
+};
+
+/* The rate the menu runs at while content is loaded */
+enum menu_frame_rate_mode
+{
+   MENU_FRAME_RATE_DISPLAY = 0,
+   MENU_FRAME_RATE_CONTENT
+};
+
+enum video_sdl_display_server_mode
+{
+   VIDEO_SDL_DISPLAY_SERVER_OFF = 0,
+   VIDEO_SDL_DISPLAY_SERVER_AUTO,
+   VIDEO_SDL_DISPLAY_SERVER_ALWAYS
 };
 
 enum override_type
@@ -141,6 +157,12 @@ typedef struct settings
       unsigned input_joypad_index[MAX_USERS];
       unsigned input_device[MAX_USERS];
       unsigned input_mouse_index[MAX_USERS];
+      /* The keyboard a port reads, where the input driver can tell
+       * keyboards apart: 0 for all of them as one (the default), N
+       * for the Nth the driver lists. */
+      unsigned input_keyboard_index[MAX_USERS];
+      /* 0 off, 1 the left stick, 2 the right: enum input_aim_stick */
+      unsigned input_aim_stick[MAX_USERS];
 
       unsigned input_libretro_device[MAX_USERS];
       unsigned input_analog_dpad_mode[MAX_USERS];
@@ -154,12 +176,21 @@ typedef struct settings
       unsigned led_map[MAX_LEDS];
 
       unsigned audio_output_sample_rate;
-      unsigned audio_block_frames;
+      unsigned audio_output_layout;
       unsigned audio_latency;
+      /* The floor applied to audio_latency before any driver sees it,
+       * in milliseconds. Eight by default, which is what it was fixed
+       * at; lower it and an exclusive-mode driver that can negotiate a
+       * shorter period with the device will. Never zero - zero is the
+       * value that reached the drivers before this floor existed, and
+       * each did something different with it. */
+      unsigned audio_latency_floor;
       unsigned audio_format_negotiation;
 
 #ifdef HAVE_WASAPI
       unsigned audio_wasapi_sh_buffer_length;
+#endif
+#ifdef HAVE_ASIO
       unsigned audio_asio_output_channel;
 #endif
 
@@ -197,6 +228,10 @@ typedef struct settings
       unsigned input_menu_toggle_gamepad_combo;
       unsigned input_keyboard_gamepad_mapping_type;
       unsigned input_poll_type_behavior;
+      unsigned input_assign_ports_keyboard;
+      unsigned input_rotation;
+      unsigned input_socd_horizontal;
+      unsigned input_socd_vertical;
       unsigned input_rumble_gain;
       unsigned input_auto_game_focus;
       unsigned input_max_users;
@@ -210,6 +245,7 @@ typedef struct settings
       unsigned netplay_input_latency_frames_range;
       unsigned netplay_share_digital;
       unsigned netplay_share_analog;
+      unsigned tls_verify_mode;
       unsigned bundle_assets_extract_version_current;
       unsigned bundle_assets_extract_last_version;
       unsigned content_history_size;
@@ -222,13 +258,16 @@ typedef struct settings
       unsigned replay_checkpoint_interval;
       unsigned replay_max_keep;
       unsigned savestate_max_keep;
+      unsigned save_compression_codec;
       unsigned network_cmd_port;
+      unsigned mcp_server_port;
       unsigned network_remote_base_port;
       unsigned keymapper_port;
       unsigned cloud_sync_sync_mode;
       unsigned video_window_opacity;
       unsigned crt_switch_resolution;
       unsigned crt_switch_resolution_super;
+      unsigned video_sdl_display_server;
       unsigned screen_brightness;
       unsigned video_monitor_index;
       unsigned video_fullscreen_x;
@@ -237,13 +276,26 @@ typedef struct settings
       unsigned video_scale_integer_axis;
       unsigned video_scale_integer_scaling;
       unsigned video_max_swapchain_images;
+      unsigned video_filter_threads;
       unsigned video_swap_interval;
+      unsigned video_driver_pacing;
       unsigned video_hard_sync_frames;
       unsigned video_frame_delay;
+      unsigned video_scanline_sync_offset;
       unsigned video_viwidth;
+      unsigned video_ps2_mode;
+      unsigned video_gamma;
+      unsigned video_flicker_filter;
       unsigned video_aspect_ratio_idx;
       unsigned video_rotation;
+      unsigned video_stereo_mode;
+      unsigned video_screen_layout;
+      unsigned video_openxr_refresh_rate;
+      unsigned video_openxr_controllers;
+      unsigned video_openxr_laser;
+      unsigned video_openxr_placement;
       unsigned video_fse_negotiation;
+      unsigned video_hw_decode;
       unsigned screen_orientation;
       unsigned video_msg_bgcolor_red;
       unsigned video_msg_bgcolor_green;
@@ -272,11 +324,13 @@ typedef struct settings
       unsigned accessibility_narrator_engine;
 
       unsigned menu_timedate_style;
+      unsigned menu_frame_rate;
       unsigned menu_timedate_date_separator;
       unsigned gfx_thumbnails;
       unsigned menu_left_thumbnails;
       unsigned menu_icon_thumbnails;
       unsigned gfx_thumbnail_upscale_threshold;
+      unsigned menu_thumbnail_preview_threads;
       unsigned menu_rgui_thumbnail_downscaler;
       unsigned menu_rgui_thumbnail_delay;
       unsigned menu_rgui_color_theme;
@@ -296,7 +350,6 @@ typedef struct settings
       unsigned menu_materialui_thumbnail_view_portrait;
       unsigned menu_materialui_thumbnail_view_landscape;
       unsigned menu_materialui_landscape_layout_optimization;
-      unsigned menu_ozone_color_theme;
       unsigned menu_ozone_header_icon;
       unsigned menu_ozone_header_separator;
       unsigned menu_ozone_font_scale;
@@ -309,6 +362,22 @@ typedef struct settings
       unsigned menu_rgui_particle_effect;
       unsigned menu_ticker_type;
       unsigned menu_scroll_delay;
+      unsigned desktop_menu_view_type;
+      unsigned desktop_menu_thumbnail_type;
+      unsigned desktop_menu_last_tab;
+      unsigned desktop_menu_thumbnail_cache_limit;
+      unsigned desktop_menu_thumbnail_max_size;
+      unsigned desktop_menu_thumbnail_quality;
+      unsigned desktop_menu_icon_view_zoom;
+      unsigned desktop_menu_all_playlists_list_max_count;
+      unsigned desktop_menu_all_playlists_grid_max_count;
+      unsigned desktop_menu_theme;
+      /* Window geometry, two packed words (was a Qt QByteArray blob).
+       * 0 = unset. Both writers clamp the origin at zero, so it fits
+       * VIDEO_POS_PACK's range without ever going negative, and the
+       * setting rows bound every axis to 32767. */
+      unsigned desktop_menu_window_pos;
+      unsigned desktop_menu_window_dims;
       unsigned menu_content_show_add_entry;
       unsigned menu_content_show_contentless_cores;
       unsigned menu_content_show_netplay;
@@ -316,6 +385,7 @@ typedef struct settings
       unsigned menu_screensaver_animation;
       unsigned menu_remember_selection;
       unsigned menu_startup_page;
+      unsigned menu_file_browser_extension_display;
 
       unsigned playlist_entry_remove_enable;
       unsigned playlist_show_inline_core_name;
@@ -323,8 +393,9 @@ typedef struct settings
       unsigned playlist_sublabel_runtime_type;
       unsigned playlist_sublabel_last_played_style;
 
-      unsigned camera_width;
-      unsigned camera_height;
+      /* In VIDEO_SCALE_PACK's layout. Runtime only: no config key and
+       * no menu row binds either axis. */
+      unsigned camera_dims;
 
 #ifdef HAVE_OVERLAY
       unsigned input_overlay_show_inputs;
@@ -346,14 +417,19 @@ typedef struct settings
       unsigned midi_volume;
       unsigned streaming_mode;
 
-      unsigned window_position_x;
-      unsigned window_position_y;
-      unsigned window_position_width;
-      unsigned window_position_height;
-      unsigned window_auto_width_max;
-      unsigned window_auto_height_max;
+      /* Where the window sits, in VIDEO_POS_PACK's layout: a
+       * display left of or above the primary one puts an axis
+       * negative, so both halves sign-extend on the way back out. */
+      unsigned window_position_pos;
+      /* The windowed-mode size, and the ceiling auto-resize honours,
+       * each a pair in VIDEO_SCALE_PACK's layout. The config file
+       * keeps a key per axis and the menu a row per axis; both carry
+       * which half they are. */
+      unsigned window_position_dims;
+      unsigned window_auto_dims_max;
 
       unsigned video_record_threads;
+      unsigned video_record_fifo_frames;
 
       unsigned libnx_overclock;
       unsigned ai_service_mode;
@@ -377,6 +453,10 @@ typedef struct settings
       unsigned cpu_min_freq;
       unsigned cpu_max_freq;
 #endif
+#ifdef HAVE_LAKKA_SWITCH
+      /* enum r2p_payload_kind; paired with reboot_payload_name */
+      unsigned reboot_payload_kind;
+#endif
 
 #ifdef HAVE_MIST
       unsigned steam_rich_presence_format;
@@ -389,8 +469,20 @@ typedef struct settings
       unsigned smb_client_auth_mode;
       unsigned smb_client_num_contexts;
       unsigned smb_client_timeout;
+      unsigned smb_client_readahead;
+#endif
+#ifdef HAVE_NFSCLIENT
+      unsigned nfs_timeout;
+      unsigned nfs_num_contexts;
+      unsigned nfs_port;
+      unsigned nfs_mount_port;
+      unsigned nfs_version;
+      unsigned nfs_readahead;
 #endif
       unsigned input_sensor_orientation;
+#ifdef ANDROID
+      unsigned input_stylus_pressure_sensitivity;
+#endif
    } uints;
 
    struct
@@ -399,7 +491,7 @@ typedef struct settings
       size_t rewind_buffer_size;
    } sizes;
 
-   video_viewport_t video_vp_custom; /* int alignment */
+   video_viewport_settings_t video_vp_custom; /* int alignment */
 
    struct
    {
@@ -415,6 +507,9 @@ typedef struct settings
       int video_max_frame_latency;
 #ifdef HAVE_VULKAN
       int vulkan_gpu_index;
+#endif
+#ifdef HAVE_EGL
+      int gl_gpu_index;
 #endif
 #ifdef HAVE_D3D10
       int d3d10_gpu_index;
@@ -472,6 +567,8 @@ typedef struct settings
       float video_hdr_menu_nits;
       float video_hdr_paper_white_nits;
       float video_hdr_max_nits;
+      float video_openxr_distance;
+      float video_openxr_width;
 
       float menu_scale_factor;
       float menu_widget_scale_factor;
@@ -524,6 +621,10 @@ typedef struct settings
       float slowmotion_ratio;
       float fastforward_ratio;
       float input_analog_deadzone;
+      float input_analog_trigger_deadzone;
+      float input_analog_outer_deadzone;
+      float input_analog_anti_deadzone;
+      float input_analog_response_curve;
       float input_axis_threshold;
       float input_analog_sensitivity;
       float input_sensor_accelerometer_sensitivity;
@@ -545,6 +646,7 @@ typedef struct settings
       /* Video */
       bool video_fullscreen;
       bool video_windowed_fullscreen;
+      bool video_dxgi_present;
       bool video_vsync;
       bool video_adaptive_vsync;
       bool video_gl_direct_spirv;
@@ -552,11 +654,17 @@ typedef struct settings
       bool video_hard_sync;
       bool video_waitable_swapchains;
       bool video_vfilter;
+      bool video_soft_filter;
+      bool video_pal60_enable;
       bool video_smooth;
+      bool video_stereo_swap_eyes;
+      bool video_openxr_enable;
+      bool video_openxr_perf_boost;
       bool video_ctx_scaling;
       bool video_force_aspect;
       bool video_frame_delay_auto;
       bool video_frame_time_sample_gated;
+      bool video_frame_time_sample_from_display;
       bool video_crop_overscan;
       bool video_aspect_ratio_auto;
       bool video_dingux_ipu_keep_aspect;
@@ -568,16 +676,24 @@ typedef struct settings
       bool video_shader_preset_save_reference_enable;
       bool video_scan_subframes;
       bool video_threaded;
+      bool video_threaded_present_repeat;
+      bool video_threaded_display_pacing;
+      bool video_d3d9ex_present;
+      bool video_present_timing_from_display;
       bool video_font_enable;
       bool video_disable_composition;
       bool video_post_filter_record;
       bool video_gpu_record;
+      bool video_record_allow_frame_drop;
+      bool video_record_game_only;
+      bool video_record_hw_encoder;
       bool video_gpu_screenshot;
       bool video_allow_rotate;
       bool video_shared_context;
       bool video_force_srgb_disable;
       bool video_fps_show;
       bool video_statistics_show;
+      bool video_statistics_hide_in_menu;
       bool video_framecount_show;
       bool video_memory_show;
       bool video_msg_bgcolor_enable;
@@ -588,6 +704,8 @@ typedef struct settings
       bool video_wiiu_prefer_drc;
       bool video_notch_write_over_enable;
       bool video_hdr_scanlines;
+      bool video_hdr_use_display_peak;
+      bool video_hdr_send_luminance;
       bool video_use_metal_arg_buffers;
 
       /* Accessibility */
@@ -602,13 +720,17 @@ typedef struct settings
       bool audio_enable_menu_bgm;
       bool audio_enable_menu_scroll;
       bool audio_sync;
+      bool audio_headphone_virtual_surround;
       bool audio_sink_rate_estimation;
       bool audio_threaded_pipeline;
+      bool audio_pipeline_fill_cap;
       bool audio_thread_priority;
       bool audio_rate_control;
       bool audio_fastforward_mute;
       bool audio_fastforward_speedup;
+      bool audio_fastforward_callback;
       bool audio_fastpath_s16;
+      bool audio_resampler_hq_oversampling;
       bool audio_rewind_mute;
 #if TARGET_OS_IPHONE
       bool audio_respect_silent_mode;
@@ -616,6 +738,7 @@ typedef struct settings
 
 #ifdef HAVE_WASAPI
       bool audio_wasapi_exclusive_mode;
+      bool audio_wasapi_mmcss;
 #endif
 
 #ifdef HAVE_MICROPHONE
@@ -630,9 +753,12 @@ typedef struct settings
       /* Input */
       bool input_remap_binds_enable;
       bool input_remap_sort_by_controller_enable;
+      bool input_assign_ports_on_button_press;
+      bool input_trigger_full_range;
       bool input_autodetect_enable;
       bool input_sensors_enable;
       bool input_android_system_keyboard;
+      bool input_sdl3_system_keyboard;
       bool input_overlay_enable;
       bool input_overlay_enable_autopreferred;
       bool input_overlay_behind_menu;
@@ -659,12 +785,16 @@ typedef struct settings
       bool input_small_keyboard_enable;
       bool input_keyboard_gamepad_enable;
       bool input_auto_mouse_grab;
+      bool input_joypad_background;
+      bool input_keyboard_background;
       bool input_turbo_enable;
       bool input_turbo_allow_dpad;
       bool input_hotkey_device_merge;
       bool input_hotkey_follows_player1;
 #if defined(HAVE_DINPUT) || defined(HAVE_WINRAWINPUT)
       bool input_nowinkey_enable;
+      bool input_winraw_xinput_enable;
+      bool input_winraw_player_lights;
 #endif
 #ifdef UDEV_TOUCH_SUPPORT
       bool input_touch_vmouse_pointer;
@@ -734,7 +864,6 @@ typedef struct settings
 #endif
       bool menu_show_information;
       bool menu_show_configurations;
-      bool menu_show_help;
       bool menu_show_quit_retroarch;
       bool menu_show_restart_retroarch;
       bool menu_show_reboot;
@@ -871,6 +1000,7 @@ typedef struct settings
       bool network_buildbot_show_experimental_cores;
       bool network_on_demand_thumbnails;
       bool core_updater_auto_backup;
+      bool core_updater_auto_backup_compress;
 
       /* UI */
       bool ui_menubar_enable;
@@ -879,6 +1009,12 @@ typedef struct settings
       bool ui_companion_enable;
       bool ui_companion_toggle;
       bool desktop_menu_enable;
+      bool desktop_menu_suggest_loaded_core_first;
+      bool desktop_menu_save_last_tab;
+      bool desktop_menu_save_geometry;
+      bool desktop_menu_save_dock_positions;
+      bool desktop_menu_show_welcome_screen;
+      bool desktop_menu_scan_finish_confirm;
 
       /* Cheevos */
       bool cheevos_enable;
@@ -942,6 +1078,8 @@ typedef struct settings
       bool discord_enable;
       bool threaded_data_runloop_enable;
       bool thread_prefer_fast_cores;
+      bool video_thread_priority;
+      bool main_thread_priority;
       bool set_supports_no_game_enable;
       bool auto_screenshot_filename;
       bool history_list_enable;
@@ -949,7 +1087,6 @@ typedef struct settings
       bool rewind_enable;
       bool fastforward_frameskip;
       bool vrr_runloop_enable;
-      bool menu_throttle_framerate;
       bool apply_cheats_after_toggle;
       bool apply_cheats_after_load;
       bool run_ahead_enabled;
@@ -967,10 +1104,12 @@ typedef struct settings
       bool save_file_compression;
       bool savestate_file_compression;
       bool network_cmd_enable;
+      bool mcp_server_enable;
       bool stdin_cmd_enable;
       bool keymapper_enable;
       bool network_remote_enable;
       bool network_remote_enable_user[MAX_USERS];
+      bool network_remote_first_sender;
       bool load_dummy_on_core_shutdown;
       bool core_option_category_enable;
       bool core_info_cache_enable;
@@ -1008,6 +1147,10 @@ typedef struct settings
       bool switch_oc;
       bool switch_cec;
       bool bluetooth_ertm_disable;
+      /* When an update is staged, reboot back into the running
+       * Lakka entry instead of the selected payload so the
+       * initramfs installs it. */
+      bool reboot_force_self_on_update;
 #endif
 #ifdef HAVE_LAKKA
       bool ssh_enable;
@@ -1058,6 +1201,8 @@ typedef struct settings
       bool ai_service_pause;
 
       bool gamemode_enable;
+      bool win32_power_plan;
+      bool win32_power_plan_idle_disable;
 #ifdef HAVE_BSV_MOVIE
       bool replay_checkpoint_deserialize;
 #endif
@@ -1069,6 +1214,9 @@ typedef struct settings
 
 #ifdef ANDROID
       bool android_input_disconnect_workaround;
+      bool input_stylus_enable;
+      bool input_stylus_require_contact_for_click;
+      bool input_stylus_hover_moves_pointer;
 #endif
 
 #if defined(HAVE_COCOATOUCH)
@@ -1085,6 +1233,8 @@ typedef struct settings
 #ifdef HAVE_SMBCLIENT
       bool smb_client_enable;
 #endif
+      bool audio_time_stretch;
+      bool audio_time_stretch_lowpass;
    } bools;
 
    struct
@@ -1100,6 +1250,7 @@ typedef struct settings
       char location_driver[32];
       char cloud_sync_driver[32];
       char menu_driver[32];
+      char menu_ozone_color_theme[32];
       char cheevos_username[32];
       char cheevos_token[32];
       char cheevos_leaderboards_enable[32];
@@ -1109,12 +1260,18 @@ typedef struct settings
       char input_driver[32];
       char input_joypad_driver[32];
       char midi_driver[32];
+      char ui_companion_driver[32];
+      char desktop_menu_hidden_playlists[PATH_MAX_LENGTH]; /* comma-separated .lpl names */
+      char desktop_menu_highlight_color[32];              /* "#rrggbb" */
       char midi_input[32];
       char midi_output[32];
       char ai_service_backend[32];
 #ifdef HAVE_LAKKA
       char cpu_main_gov[32];
       char cpu_menu_gov[32];
+#endif
+#ifdef HAVE_LAKKA_SWITCH
+      char reboot_payload_name[64]; /* R2P_NAME_MAXLEN */
 #endif
 #ifdef HAVE_MICROPHONE
       char microphone_driver[32];
@@ -1135,7 +1292,29 @@ typedef struct settings
       char input_android_physical_keyboard[NAME_MAX_LENGTH];
 #endif
       char audio_device[NAME_MAX_LENGTH];
+      /* Desktop companion dock layout, one plain row per dock:
+       * "<area>,<shown>,<width>,<height>,<tabbed_with>,<raised>" - see
+       * ui/drivers/ui_qt.cpp qt_dock_state_*. Toolkit-neutral so the
+       * native companions can honour the same rows. */
+      char desktop_menu_dock_search[64];
+      char desktop_menu_dock_playlists[64];
+      char desktop_menu_dock_core[64];
+      char desktop_menu_dock_boxart[64];
+      char desktop_menu_dock_title[64];
+      char desktop_menu_dock_screenshot[64];
+      char desktop_menu_dock_logo[64];
+      char desktop_menu_dock_core_info[64];
+      char desktop_menu_dock_log[64];
+      /* The companion's View Options window: "x,y,w,h", honoured when
+       * desktop_menu_save_geometry is on. */
+      char desktop_menu_options_window[48];
       char camera_device[NAME_MAX_LENGTH];
+      /* Address the network command interface binds to. Empty means
+       * every interface (the historical behaviour); 127.0.0.1 limits
+       * it to this machine. */
+      char network_cmd_bind_address[NAME_MAX_LENGTH];
+      char mcp_server_bind_address[NAME_MAX_LENGTH];
+      char mcp_server_token[NAME_MAX_LENGTH];
       char netplay_mitm_server[NAME_MAX_LENGTH];
 #ifdef HAVE_NETWORKING
 #ifdef HAVE_CLOUDSYNC
@@ -1153,11 +1332,25 @@ typedef struct settings
 
       char crt_switch_timings[NAME_MAX_LENGTH];
       char input_reserved_devices[MAX_USERS][NAME_MAX_LENGTH];
+      /* the keyboard a port is given, by what it is: see
+       * input/common/input_device_pins.h */
+      char input_keyboard_device[MAX_USERS][64];
+      /* and the mouse */
+      char input_mouse_device[MAX_USERS][64];
 
       char youtube_stream_key[PATH_MAX_LENGTH];
       char twitch_stream_key[PATH_MAX_LENGTH];
       char facebook_stream_key[PATH_MAX_LENGTH];
       char kick_stream_key[PATH_MAX_LENGTH];
+      /* The device each GPU index named when it was chosen, so a list
+       * that has changed order since is noticed rather than silently
+       * selecting another GPU. */
+      char video_gpu_name_vulkan[NAME_MAX_LENGTH];
+      char video_gpu_name_gl[NAME_MAX_LENGTH];
+      char video_gpu_name_d3d10[NAME_MAX_LENGTH];
+      char video_gpu_name_d3d11[NAME_MAX_LENGTH];
+      char video_gpu_name_d3d12[NAME_MAX_LENGTH];
+      char video_gpu_name_metal[NAME_MAX_LENGTH];
       char discord_app_id[PATH_MAX_LENGTH];
       char ai_service_url[PATH_MAX_LENGTH];
 
@@ -1169,6 +1362,16 @@ typedef struct settings
       char smb_client_username[128];
       char smb_client_password[128];
       char smb_client_workgroup[64];
+      char smb_client_realm[128];
+      char smb_client_kdc[256];
+#endif
+#ifdef HAVE_NFSCLIENT
+      char nfs_server[256];
+      char nfs_export[PATH_MAX_LENGTH];
+      char nfs_subdir[PATH_MAX_LENGTH];
+#ifdef HAVE_CLOUDSYNC
+      char cloud_sync_nfs_subdir[PATH_MAX_LENGTH];
+#endif
 #endif
 } arrays;
 
@@ -1239,6 +1442,8 @@ typedef struct settings
       char path_softfilter_plugin[PATH_MAX_LENGTH];
       char path_core_options[PATH_MAX_LENGTH];
       char path_content_favorites[PATH_MAX_LENGTH];
+      char desktop_menu_initial_playlist[PATH_MAX_LENGTH];
+      char desktop_menu_custom_theme[PATH_MAX_LENGTH];
       char path_content_history[PATH_MAX_LENGTH];
       char path_content_image_history[PATH_MAX_LENGTH];
       char path_content_music_history[PATH_MAX_LENGTH];
@@ -1423,8 +1628,9 @@ void config_get_autoconf_profile_filename(
 /**
  * config_save_autoconf_profile:
  * @device_name       : Input device name
- * @user              : Controller number to save
- * Writes a controller autoconf file to disk.
+ * @user              : Port whose binds are saved
+ * Writes a controller autoconf file to disk for the
+ * device assigned to @user.
  **/
 bool config_save_autoconf_profile(const char *device_name, unsigned user);
 
@@ -1437,6 +1643,12 @@ bool config_save_autoconf_profile(const char *device_name, unsigned user);
  * Returns: true (1) on success, otherwise returns false (0).
  **/
 bool config_save_file(const char *path);
+
+#if defined(HAVE_KEYCHAIN) && defined(HAVE_CRYPTO) && defined(HAVE_CONFIGFILE)
+/* After a keychain unlock: open the credentials sealed on another
+ * machine and put them into the running settings. Returns how many. */
+unsigned config_keychain_reapply(void);
+#endif
 
 /**
  * config_save_overrides:
@@ -1461,9 +1673,9 @@ bool config_overlay_enable_default(void);
 bool config_metal_arg_buffers_default(void);
 #endif
 
-void config_set_defaults(void *data);
+void config_set_defaults(settings_t *target);
 
-void config_load(void *data);
+void config_load(void);
 
 #if !defined(HAVE_DYNAMIC)
 /* Salamander config file contains a single

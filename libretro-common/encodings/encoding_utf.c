@@ -20,6 +20,8 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#include <retro_posix_source.h>
+
 #include <stdint.h>
 #include <stdlib.h>
 #include <stddef.h>
@@ -348,7 +350,7 @@ size_t utf8cpy(char *s, size_t len, const char *in, size_t chars)
    if (!in || !len)
       return 0;
 
-   while (*sb && chars-- > 0)
+   while ((size_t)(sb - sb_org) < len - 1 && *sb && chars-- > 0)
    {
       /* Stepping over continuation bytes stops at the terminator by
        * itself, so a truncated sequence cannot overrun the buffer. */

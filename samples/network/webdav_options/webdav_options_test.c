@@ -55,14 +55,21 @@ typedef struct
 static void run_probe(const char **hdrs, size_t n, probe_result_t *out)
 {
    http_transfer_data_t data;
-   struct string_list  *list = string_list_new();
-   size_t i;
+   static char block[4096];
+   size_t i, off = 0;
 
+   /* The header block net_http_headers_take() returns: each line
+    * NUL-terminated, an empty line at the end. */
    for (i = 0; i < n; i++)
-      string_list_append(list, hdrs[i], (union string_list_elem_attr){0});
+   {
+      size_t l = strlen(hdrs[i]) + 1;
+      memcpy(block + off, hdrs[i], l);
+      off += l;
+   }
+   block[off] = '\0';
 
    data.data    = NULL;
-   data.headers = list;
+   data.headers = block;
    data.len     = 0;
    data.status  = 200;
 
@@ -76,8 +83,6 @@ static void run_probe(const char **hdrs, size_t n, probe_result_t *out)
    /* Mirrors the decision in webdav_stat_cb(). */
    out->verified = out->dav || out->allow_dav_method;
    out->fatal    = (!out->verified && out->allow_seen);
-
-   string_list_free(list);
 }
 
 /* --- real-world header sets ------------------------------------------ */
@@ -175,6 +180,64 @@ static void check_token_matching(void)
 
 /* --------------------------------------------------------------------- */
 
+
+/* --- the probe has to run at all ------------------------------------- */
+
+extern unsigned webdav_stub_stat_calls;
+extern bool     webdav_stub_stat_auth;
+extern void     webdav_stub_reset(void);
+
+static unsigned begin_completions;
+
+static void begin_cb(void *user_data, const char *path, bool success,
+      RFILE *file)
+{
+   (void)user_data; (void)path; (void)success; (void)file;
+   begin_completions++;
+}
+
+/* webdav_sync_begin() must open every sync with OPTIONS, credentials or
+ * not. dav_verified is set from that response alone, and MKCOL answers
+ * 405 on a collection that already exists (RFC 4918 9.3.1) - a 405 that
+ * is only forgiven once the endpoint has been verified. An endpoint
+ * reached without a username would otherwise fail every upload into a
+ * directory it had already created. */
+static void test_begin_probes_regardless_of_credentials(void)
+{
+   settings_t *settings = config_get_ptr();
+
+   strlcpy(settings->arrays.webdav_url, "http://example.invalid/dav/",
+         sizeof(settings->arrays.webdav_url));
+
+   /* With credentials. */
+   strlcpy(settings->arrays.webdav_username, "user",
+         sizeof(settings->arrays.webdav_username));
+   strlcpy(settings->arrays.webdav_password, "pass",
+         sizeof(settings->arrays.webdav_password));
+   webdav_stub_reset();
+   begin_completions = 0;
+   CHECK(webdav_sync_begin(begin_cb, NULL), "begin refused with credentials");
+   CHECK(webdav_stub_stat_calls == 1, "authenticated begin did not probe once (%u)",
+         webdav_stub_stat_calls);
+   CHECK(webdav_stub_stat_auth, "authenticated begin sent no Authorization header");
+   CHECK(begin_completions == 0, "begin completed without waiting for the probe");
+
+   /* Without. */
+   settings->arrays.webdav_username[0] = '\0';
+   settings->arrays.webdav_password[0] = '\0';
+   webdav_stub_reset();
+   begin_completions = 0;
+   CHECK(webdav_sync_begin(begin_cb, NULL), "begin refused without credentials");
+   CHECK(webdav_stub_stat_calls == 1,
+         "anonymous begin skipped the probe (%u calls); MKCOL 405 would then be fatal",
+         webdav_stub_stat_calls);
+   CHECK(!webdav_stub_stat_auth, "anonymous begin sent an Authorization header");
+   CHECK(begin_completions == 0,
+         "anonymous begin reported success before the probe answered");
+
+   webdav_sync_end(begin_cb, NULL);
+}
+
 int main(void)
 {
    probe_result_t r;
@@ -226,14 +289,16 @@ int main(void)
       data.len     = 0;
       data.status  = 200;
       webdav_check_options(&data, &dav, &seen, &method);
-      CHECK(!dav && !seen && !method, "NULL header list: probe invented a result");
+      CHECK(!dav && !seen && !method, "NULL header block: probe invented a result");
    }
+
+   test_begin_probes_regardless_of_credentials();
 
    if (failures)
    {
       printf("%u failure(s)\n", failures);
       return 1;
    }
-   printf("webdav_check_options: all header sets classified correctly\n");
+   printf("webdav probe: header sets classified and the probe always runs\n");
    return 0;
 }

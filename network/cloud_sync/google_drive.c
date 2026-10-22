@@ -70,6 +70,9 @@ static const char *gdrive_client_secret(void)
 #define GDRIVE_SCOPE         "https://www.googleapis.com/auth/drive.file"
 #define GDRIVE_FOLDER_NAME   "RetroArch"
 #define GDRIVE_TOKEN_URL     "https://oauth2.googleapis.com/token"
+/* Watchdog for the OAuth task while a poll is in flight; the poll's
+ * callback wakes it on an outcome. */
+#define GDRIVE_OAUTH_PENDING_PARK_USEC 1000000
 #define GDRIVE_DEVICE_URL    "https://oauth2.googleapis.com/device/code"
 #define GDRIVE_API_BASE      "https://www.googleapis.com/drive/v3"
 #define GDRIVE_UPLOAD_BASE   "https://www.googleapis.com/upload/drive/v3"
@@ -140,12 +143,16 @@ typedef struct
 typedef struct
 {
    char device_code[512];
-   retro_task_t *task;
    int interval;
    int polls;
    int max_polls;
-   bool poll_pending;
-   bool auth_done;
+   /* The polling task's ident, for the poll callback's wake. */
+   uint32_t task_ident;
+   /* Set by the task when it posts a poll, cleared by the poll's
+    * callback on the main thread - after interval, auth_success and
+    * auth_done, which the task reads once it sees the clear. */
+   retro_atomic_int_t poll_pending;
+   retro_atomic_int_t auth_done;
    bool auth_success;
    cloud_sync_complete_handler_t cb;
    void *user_data;
@@ -153,7 +160,7 @@ typedef struct
 
 /* ========== State ========== */
 
-static gdrive_state_t gdrive_st = {0};
+static gdrive_state_t gdrive_st;
 
 /* ========== Completion Helpers ========== */
 
@@ -197,12 +204,13 @@ static char *gdrive_get_headers(const char *extra)
 static void gdrive_log_http_failure(const char *context,
       http_transfer_data_t *data)
 {
-   size_t i;
+   const char *h;
    RARCH_WARN(GDPFX "Failed: %s: HTTP %d\n", context,
          data ? data->status : -1);
-   if (data && data->headers)
-      for (i = 0; i < data->headers->size; i++)
-         RARCH_WARN("%s\n", data->headers->elems[i].data);
+   if (data)
+      for (h = net_http_header_next(data->headers, NULL); h;
+            h = net_http_header_next(data->headers, h))
+         RARCH_WARN("%s\n", h);
    /* See webdav.c: data->data is sized exactly to data->len.
     * data->data[data->len] = 0 is a one-byte heap overflow. */
    if (data && data->data)
@@ -974,38 +982,29 @@ static void gdrive_poll_cb(retro_task_t *task, void *task_data,
    char error_str[256];
    char access_token[2048];
    char refresh_token[2048];
-
-   ctx->poll_pending = false;
+   bool done                  = true;
 
    if (!data)
-   {
       RARCH_WARN(GDPFX "OAuth poll failed (no data)\n");
-      ctx->auth_done = true;
-      return;
-   }
-
    /* Check for error responses (still polling) */
-   if (gdrive_json_string(data->data, data->len,
+   else if (gdrive_json_string(data->data, data->len,
             "error", error_str, sizeof(error_str)))
    {
+      /* authorization_pending: the task polls again after interval */
       if (string_is_equal(error_str, "authorization_pending"))
-         return; /* handler will poll again after interval */
-
-      if (string_is_equal(error_str, "slow_down"))
+         done = false;
+      else if (string_is_equal(error_str, "slow_down"))
       {
          ctx->interval += 5;
          RARCH_LOG(GDPFX "Slowing down poll interval to %d seconds\n",
                ctx->interval);
-         return;
+         done = false;
       }
-
-      RARCH_WARN(GDPFX "OAuth error: %s\n", error_str);
-      ctx->auth_done = true;
-      return;
+      else
+         RARCH_WARN(GDPFX "OAuth error: %s\n", error_str);
    }
-
    /* Success - extract tokens */
-   if (   gdrive_json_string(data->data, data->len,
+   else if (gdrive_json_string(data->data, data->len,
             "access_token", access_token, sizeof(access_token))
        && gdrive_json_string(data->data, data->len,
             "refresh_token", refresh_token, sizeof(refresh_token)))
@@ -1017,15 +1016,19 @@ static void gdrive_poll_cb(retro_task_t *task, void *task_data,
             refresh_token,
             sizeof(settings->arrays.google_drive_refresh_token));
       RARCH_LOG(GDPFX "OAuth authorization successful\n");
-      ctx->auth_done    = true;
       ctx->auth_success = true;
-      /* Wake the handler immediately */
-      ctx->task->when   = cpu_features_get_time_usec();
-      return;
    }
+   else
+      RARCH_WARN(GDPFX "OAuth response missing tokens\n");
 
-   RARCH_WARN(GDPFX "OAuth response missing tokens\n");
-   ctx->auth_done = true;
+   /* The task waits for this clear before it reads anything above or
+    * frees ctx, and an outcome wakes it at once; a pending reply
+    * leaves it to its poll interval. */
+   if (done)
+      retro_atomic_store_release_int(&ctx->auth_done, 1);
+   retro_atomic_store_release_int(&ctx->poll_pending, 0);
+   if (done)
+      task_queue_wake(ctx->task_ident);
 }
 
 /*
@@ -1038,7 +1041,15 @@ static void gdrive_oauth_task_handler(retro_task_t *task)
    gdrive_oauth_ctx_t *ctx = (gdrive_oauth_ctx_t *)task->user_data;
    char post_data[2048];
 
-   if (ctx->auth_done)
+   /* A poll in flight: its callback writes into ctx, which cleanup
+    * frees, so nothing ends the task before it lands. */
+   if (retro_atomic_load_acquire_int(&ctx->poll_pending))
+   {
+      task_queue_park(task, GDRIVE_OAUTH_PENDING_PARK_USEC);
+      return;
+   }
+
+   if (retro_atomic_load_acquire_int(&ctx->auth_done))
    {
       if (ctx->auth_success)
          gdrive_begin_with_token(ctx->cb, ctx->user_data);
@@ -1048,22 +1059,17 @@ static void gdrive_oauth_task_handler(retro_task_t *task)
       return;
    }
 
-   if (ctx->poll_pending)
+   if (     (task_get_flags(task) & RETRO_TASK_FLG_CANCELLED)
+         || ++ctx->polls > ctx->max_polls)
    {
-      /* Still waiting for HTTP response, check again in 1s */
-      task->when = cpu_features_get_time_usec() + 1000000;
-      return;
-   }
-
-   if (++ctx->polls > ctx->max_polls)
-   {
-      RARCH_WARN(GDPFX "OAuth polling timed out\n");
+      if (!(task_get_flags(task) & RETRO_TASK_FLG_CANCELLED))
+         RARCH_WARN(GDPFX "OAuth polling timed out\n");
       ctx->cb(ctx->user_data, NULL, false, NULL);
       task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
       return;
    }
 
-   ctx->poll_pending = true;
+   retro_atomic_store_release_int(&ctx->poll_pending, 1);
 
    snprintf(post_data, sizeof(post_data),
          "client_id=%s&client_secret=%s"
@@ -1077,10 +1083,10 @@ static void gdrive_oauth_task_handler(retro_task_t *task)
          gdrive_poll_cb, ctx))
    {
       RARCH_WARN(GDPFX "Could not poll for authorization\n");
-      ctx->poll_pending = false;
+      retro_atomic_store_release_int(&ctx->poll_pending, 0);
    }
 
-   /* Schedule next handler invocation after interval */
+   /* The next poll after interval; an outcome wakes the task sooner. */
    task->when = cpu_features_get_time_usec()
               + (retro_time_t)ctx->interval * 1000000;
 }
@@ -1157,7 +1163,9 @@ static void gdrive_device_code_cb(retro_task_t *task, void *task_data,
    poll_task->progress = -1;
    poll_task->when     = cpu_features_get_time_usec()
                        + (retro_time_t)ctx->interval * 1000000;
-   ctx->task           = poll_task;
+   ctx->task_ident     = poll_task->ident;
+   retro_atomic_int_init(&ctx->poll_pending, 0);
+   retro_atomic_int_init(&ctx->auth_done, 0);
    task_queue_push(poll_task);
 }
 
@@ -1168,6 +1176,11 @@ static void gdrive_begin_with_token(cloud_sync_complete_handler_t cb,
 {
    gdrive_begin_ctx_t *ctx =
       (gdrive_begin_ctx_t *)calloc(1, sizeof(*ctx));
+   if (!ctx)
+   {
+      cb(user_data, NULL, false, NULL);
+      return;
+   }
    ctx->cb        = cb;
    ctx->user_data = user_data;
    gdrive_find_folder(ctx);
@@ -1296,15 +1309,37 @@ static void gdrive_read_download_cb(retro_task_t *task, void *task_data,
    if (!success && data)
       gdrive_log_http_failure(cb_st->path, data);
 
-   if (success && data->data)
+   /* A body delimited only by the connection closing may have been
+    * cut off; do not let it replace the local file. */
+   if (success && !net_http_body_is_framed(data->headers))
+   {
+      RARCH_WARN(GDPFX "%s: response body has no Content-Length or "
+            "chunked framing; treating as failure.\n", cb_st->path);
+      success = false;
+   }
+
+   /* As in webdav.c: a downloaded file, even an empty one, is always
+    * handed back open, and one that cannot be written locally is a
+    * failure, so success with no file only ever means "not on the
+    * server" (gdrive_read_search_cb()). */
+   if (success)
    {
       file = filestream_open(cb_st->file,
             RETRO_VFS_FILE_ACCESS_READ_WRITE,
             RETRO_VFS_FILE_ACCESS_HINT_NONE);
-      if (file)
+      if (   file
+          && data->data && data->len
+          && filestream_write(file, data->data, data->len) != (int64_t)data->len)
       {
-         filestream_write(file, data->data, data->len);
+         filestream_close(file);
+         file = NULL;
+      }
+      if (file)
          filestream_seek(file, 0, SEEK_SET);
+      else
+      {
+         RARCH_WARN(GDPFX "Could not write \"%s\".\n", cb_st->file);
+         success = false;
       }
    }
 
@@ -1391,6 +1426,7 @@ static bool gdrive_read(const char *path, const char *file,
 /* ========== Update ========== */
 
 static void gdrive_do_update(gdrive_cb_state_t *cb_st);
+static void gdrive_do_patch(gdrive_cb_state_t *cb_st);
 
 static void gdrive_upload_cb(retro_task_t *task, void *task_data,
       void *user_data, const char *err)
@@ -1404,10 +1440,13 @@ static void gdrive_upload_cb(retro_task_t *task, void *task_data,
 
    success = (data && data->status >= 200 && data->status < 300);
 
+   /* The file ID is known by now, and any backup already taken, so the
+    * retry repeats only the PATCH: going back through the search would
+    * take the backup a second time. */
    if (data && data->status == 401 && !cb_st->retried)
    {
       cb_st->retried = true;
-      gdrive_refresh_then_retry(gdrive_do_update, cb_st);
+      gdrive_refresh_then_retry(gdrive_do_patch, cb_st);
       return;
    }
 
@@ -1506,6 +1545,83 @@ static void gdrive_create_cb(retro_task_t *task, void *task_data,
    gdrive_do_patch(cb_st);
 }
 
+/* With destructive sync off, a delete keeps the server's copy - renamed
+ * in place to <name>-<yymmdd-hhmmss> - but an upload replaced its
+ * content outright.  Before the PATCH, copy the file (files.copy, done
+ * by Drive itself) to that name in the same folder, so an upload keeps
+ * the copy a delete would have.  The server manifest is rewritten every
+ * sync and is not backed up. */
+static bool gdrive_wants_backup(const char *path)
+{
+   settings_t *settings = config_get_ptr();
+   return settings
+       && !settings->bools.cloud_sync_destructive
+       && !string_is_equal(path, CLOUD_SYNC_SERVER_MANIFEST);
+}
+
+static void gdrive_backup_copy_cb(retro_task_t *task, void *task_data,
+      void *user_data, const char *err)
+{
+   gdrive_cb_state_t    *cb_st = (gdrive_cb_state_t *)user_data;
+   http_transfer_data_t *data  = (http_transfer_data_t *)task_data;
+
+   if (!cb_st)
+      return;
+
+   if (data && data->status == 401 && !cb_st->retried)
+   {
+      cb_st->retried = true;
+      gdrive_refresh_then_retry(gdrive_do_update, cb_st);
+      return;
+   }
+
+   if (!data || data->status < 200 || data->status >= 300)
+   {
+      if (data)
+         gdrive_log_http_failure(cb_st->path, data);
+      RARCH_WARN(GDPFX "Not replacing %s: the copy on the server could not be backed up\n",
+            cb_st->path);
+      gdrive_cb_state_finish(cb_st, false);
+      return;
+   }
+
+   /* The PATCH is a request of its own. */
+   cb_st->retried = false;
+   gdrive_do_patch(cb_st);
+}
+
+static void gdrive_backup_then_patch(gdrive_cb_state_t *cb_st)
+{
+   char url[2048];
+   char json[PATH_MAX_LENGTH + 512];
+   char escaped_name[PATH_MAX_LENGTH];
+   char timestamp[32];
+   char *headers;
+   struct tm tm_;
+   time_t cur_time = time(NULL);
+
+   rtime_localtime(&cur_time, &tm_);
+   strftime(timestamp, sizeof(timestamp), "-%y%m%d-%H%M%S", &tm_);
+   gdrive_json_escape(escaped_name, sizeof(escaped_name),
+         path_basename(cb_st->path));
+   snprintf(json, sizeof(json),
+         "{\"name\":\"%s%s\",\"parents\":[\"%s\"]}",
+         escaped_name, timestamp, cb_st->parent_id);
+   snprintf(url, sizeof(url),
+         GDRIVE_API_BASE "/files/%s/copy", cb_st->file_id);
+
+   headers = gdrive_get_headers("Content-Type: application/json\r\n");
+
+   RARCH_DBG(GDPFX "Copy (backup) %s\n", cb_st->path);
+   if (!task_push_http_post_transfer_with_headers(url, json, true, NULL,
+         headers, gdrive_backup_copy_cb, cb_st))
+   {
+      RARCH_WARN(GDPFX "Could not back up %s\n", cb_st->path);
+      gdrive_cb_state_finish(cb_st, false);
+   }
+   free(headers);
+}
+
 static void gdrive_update_search_cb(retro_task_t *task, void *task_data,
       void *user_data, const char *err)
 {
@@ -1530,7 +1646,10 @@ static void gdrive_update_search_cb(retro_task_t *task, void *task_data,
 
    if (cb_st->file_id[0])
    {
-      gdrive_do_patch(cb_st);
+      if (gdrive_wants_backup(cb_st->path))
+         gdrive_backup_then_patch(cb_st);
+      else
+         gdrive_do_patch(cb_st);
    }
    else
    {
@@ -1745,5 +1864,6 @@ cloud_sync_driver_t cloud_sync_google_drive = {
    gdrive_read,
    gdrive_update,
    gdrive_delete,
-   "google_drive"
+   "google_drive",
+   0
 };
