@@ -1851,7 +1851,8 @@ static bool menu_input_key_bind_poll_find_hold(
 
       for (i = 0; i < MAX_USERS; i++)
       {
-         if (     (i < max_users || ((new_state->listen >> i) & 1))
+         if (     (i < max_users || i == new_state->port
+                  || ((new_state->listen >> i) & 1))
                && menu_input_key_bind_poll_find_hold_pad(new_state, output, i))
          {
             new_state->from = i;
@@ -2012,7 +2013,8 @@ static bool menu_input_key_bind_poll_find_trigger(
 
       for (i = 0; i < MAX_USERS; i++)
       {
-         if (     (i < max_users || ((new_state->listen >> i) & 1))
+         if (     (i < max_users || i == new_state->port
+                  || ((new_state->listen >> i) & 1))
                && menu_input_key_bind_poll_find_trigger_pad(
                   state, new_state, output, i))
          {
