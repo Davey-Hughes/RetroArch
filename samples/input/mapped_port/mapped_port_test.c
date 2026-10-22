@@ -871,6 +871,41 @@ static void test_join_poll(void)
          "the join outlived the sharer's entry");
 }
 
+/* A controller port 1's reservation names shares with a Player 1
+ * controller there, in either connect order: both feed core port 1. */
+static void test_join_reserved(void)
+{
+   unsigned order;
+   for (order = 0; order < 2; order++)
+   {
+      t_reset();
+      settings.uints.input_device_reservation_type[0] =
+         INPUT_DEVICE_RESERVATION_PREFERRED;
+      strlcpy(settings.arrays.input_reserved_devices[0], "0005:0005 Res",
+            sizeof(settings.arrays.input_reserved_devices[0]));
+      t_entries(
+            "input_plays_as_device_1 = \"0002:0002 B\"\n"
+            "input_plays_as_player_1 = \"1\"\n");
+      if (order)
+      {
+         t_connect(0, "B", 2, 2);
+         t_connect(1, "Res", 5, 5);
+      }
+      else
+      {
+         t_connect(0, "Res", 5, 5);
+         t_connect(1, "B", 2, 2);
+      }
+      input_driver_poll();
+      t_buttons[0] = T_A;
+      t_buttons[1] = T_B;
+      CHECK(t_read(0) == (T_A | T_B) && t_read(3) == 0,
+            order ? "Player 1 first: the reserved controller does not "
+                    "feed core port 1"
+                  : "reserved first: Player 1 does not feed core port 1");
+   }
+}
+
 /* Player 1's rumble reaches the sharer; core port 4's does not. */
 static void test_rumble_join(void)
 {
@@ -1928,6 +1963,7 @@ int main(void)
    test_join_port_map();
    test_join_follows_mapped_port();
    test_join_poll();
+   test_join_reserved();
    test_rumble_join();
    test_first_press_group();
    test_remap_join();
