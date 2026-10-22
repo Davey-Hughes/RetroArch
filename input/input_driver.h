@@ -1960,6 +1960,15 @@ void input_config_plays_as_max_users_changed(uint8_t *again);
 void input_config_plays_as_release(unsigned slot);
 /* The lowest user below Max Users reading @slot, or MAX_USERS. */
 unsigned input_config_slot_user(unsigned slot);
+/* The controller in @slot's own button and axis for hotkey @id,
+ * NO_BTN and AXIS_NONE where it has none; set, taking an entry for it
+ * at its player if it has none (false when none is free); and hotkey
+ * @id taken from every entry. */
+void input_config_plays_as_hotkey(unsigned slot, unsigned id,
+      uint16_t *joykey, uint32_t *joyaxis);
+bool input_config_plays_as_set_hotkey(unsigned slot, unsigned id,
+      uint16_t joykey, uint32_t joyaxis);
+void input_config_plays_as_clear_hotkey(unsigned id);
 
 unsigned *input_config_get_device_ptr(unsigned port);
 
@@ -2158,6 +2167,15 @@ size_t input_config_get_bind_string_joykey(
       char *s, const char *prefix,
       const struct retro_keybind *bind,
       const struct input_bind_label *label, size_t len);
+
+/* A bind's button and axis as the config file has them: "8", "h0up";
+ * "+1", "-2"; "nul" for none. Read into @joykey or @joyaxis (false,
+ * nothing changed, for a value that is none of these), or written
+ * into @s. */
+bool input_config_parse_joykey(const char *s, uint16_t *joykey);
+bool input_config_parse_joyaxis(const char *s, uint32_t *joyaxis);
+void input_config_format_joykey(char *s, size_t len, uint16_t joykey);
+void input_config_format_joyaxis(char *s, size_t len, uint32_t joyaxis);
 
 bool input_key_pressed(int key, bool keyboard_pressed);
 
@@ -2470,9 +2488,10 @@ size_t input_entry_spec(unsigned number, char *s, size_t len);
 /* The entries and macros written into a configuration to be saved. */
 void input_entries_write(void *conf);
 
-/* input_plays_as_device_N and input_plays_as_player_N, N from 1: the
- * file's entries in place of the ones there are, and the ones there
- * are written, keys an entry has no value for taken out. */
+/* input_plays_as_device_N, input_plays_as_player_N and the entries'
+ * own hotkeys, input_plays_as_<hotkey>_btn_N and _axis_N, N from 1:
+ * the file's entries in place of the ones there are, and the ones
+ * there are written, keys an entry has no value for taken out. */
 void input_plays_as_read(void *conf);
 void input_plays_as_write(void *conf);
 /* A copy of the entries and the claims on them, put back after a load
