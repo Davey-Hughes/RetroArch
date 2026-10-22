@@ -12115,6 +12115,99 @@ static unsigned input_pad_buttons_other_sources(
    return held;
 }
 
+/* User @user's controller, read with another user's binds. */
+static void input_user_joypad_info(rarch_joypad_info_t *info,
+      unsigned user, float axis_threshold)
+{
+   info->axis_threshold = axis_threshold;
+   info->joy_idx        = config_get_ptr()->uints.input_joypad_index[user];
+   if (info->joy_idx >= MAX_USERS)
+      info->joy_idx     = 0;
+   info->auto_binds     = input_autoconf_binds[info->joy_idx];
+}
+
+/* A hotkey's button and axis on a controller sharing the hotkeys' core
+ * port, by user: its profile's, never the set's. Made when a bind
+ * changes. */
+typedef struct
+{
+   unsigned gen;                      /* the change count + 1 it was made at */
+   const struct retro_keybind *autob; /* the sharer's profile it was made for */
+   uint32_t has_pad[(RARCH_BIND_LIST_END + 31) / 32];
+   uint32_t axis[RARCH_BIND_LIST_END - RARCH_FIRST_META_KEY];
+   uint16_t key[RARCH_BIND_LIST_END - RARCH_FIRST_META_KEY];
+} input_share_hot_t;
+
+static input_share_hot_t input_share_hot[MAX_USERS];
+
+INPUT_NOINLINE static void input_share_hot_make(unsigned user,
+      const struct retro_keybind *autob, unsigned gen)
+{
+   unsigned i;
+   input_share_hot_t *t = &input_share_hot[user];
+
+   memset(t->has_pad, 0, sizeof(t->has_pad));
+   for (i = RARCH_FIRST_META_KEY; i < RARCH_BIND_LIST_END; i++)
+   {
+      uint16_t key  = NO_BTN;
+      uint32_t axis = AXIS_NONE;
+      if (RETRO_KEYBIND_VALID(&input_config_binds[0][i]))
+      {
+         key  = autob[i].joykey;
+         axis = autob[i].joyaxis;
+      }
+      t->key[i - RARCH_FIRST_META_KEY]  = key;
+      t->axis[i - RARCH_FIRST_META_KEY] = axis;
+      if (key != NO_BTN || axis != AXIS_NONE)
+         t->has_pad[i >> 5] |= (1u << (i & 31));
+   }
+   t->autob = autob;
+   t->gen   = gen;
+}
+
+/* User @user's, read by its profile @autob. */
+static INLINE const input_share_hot_t *input_share_hot_get(unsigned user,
+      const struct retro_keybind *autob)
+{
+   input_share_hot_t *t = &input_share_hot[user];
+   if (!t->gen || t->autob != autob)
+   {
+      unsigned gen = input_config_binds_generation() + 1;
+      input_share_hot_make(user, autob, gen);
+      if (input_config_binds_generation() + 1 != gen)
+         t->gen = 0;
+   }
+   return t;
+}
+
+/* Hotkey @id on user @user's controller (@info): its button and axis
+ * there; Hotkey Enable also on hotkey port @port's keys and mouse. The
+ * other keys and mouse buttons are the hotkey port's alone. */
+static bool input_hotkey_share_read(input_driver_state_t *input_st,
+      const input_device_driver_t *joypad, rarch_joypad_info_t *info,
+      const retro_keybind_set *binds, bool kb_blocked, unsigned port,
+      unsigned user, unsigned id)
+{
+   const input_share_hot_t *t = input_share_hot_get(user,
+         info->auto_binds);
+   uint16_t key               = t->key[id - RARCH_FIRST_META_KEY];
+   uint32_t axis              = t->axis[id - RARCH_FIRST_META_KEY];
+
+   if (joypad)
+   {
+      if (key != NO_BTN && joypad->button(info->joy_idx, key))
+         return true;
+      if (     axis != AXIS_NONE
+            && ((float)abs(joypad->axis(info->joy_idx, axis)) * INV_0x8000)
+               > info->axis_threshold)
+         return true;
+   }
+   return id == RARCH_ENABLE_HOTKEY
+      && input_state_wrap(input_st->current_driver,
+         input_st->current_data, NULL, info, binds, kb_blocked,
+         port, RETRO_DEVICE_JOYPAD, 0, id) != 0;
+}
+
 /* By bind: what something could be holding this frame. A bind is in it
  * if its key is down, if a mouse button or a pad may be behind it, or
  * if the overlay holds it; a bind that is not is held by nothing, and
@@ -12123,7 +12216,8 @@ static unsigned input_pad_buttons_other_sources(
  * frontend's to know (a driver that does not give it its keys) or a
  * command interface is open, whose presses are not kept as bits. */
 static void input_hotkeys_maybe_held(input_driver_state_t *input_st,
-      unsigned port, const rarch_joypad_info_t *joypad_info, uint32_t *maybe)
+      unsigned port, const rarch_joypad_info_t *joypad_info, uint32_t share,
+      uint32_t *maybe)
 {
    unsigned w;
    const unsigned words          = (RARCH_BIND_LIST_END + 31) / 32;
@@ -12166,6 +12260,17 @@ static void input_hotkeys_maybe_held(input_driver_state_t *input_st,
       if (input_st->overlay_ptr)
          maybe[w] |= input_st->overlay_ptr->overlay_state.buttons.data[w];
 #endif
+   }
+   /* what the controllers sharing the port have behind them */
+   for (; share; share &= share - 1)
+   {
+      rarch_joypad_info_t info;
+      const input_share_hot_t *t;
+      unsigned user = (unsigned)compat_ctz(share);
+      input_user_joypad_info(&info, user, 0.0f);
+      t             = input_share_hot_get(user, info.auto_binds);
+      for (w = 0; w < words; w++)
+         maybe[w] |= t->has_pad[w];
    }
    maybe[RARCH_MENU_TOGGLE >> 5] |= (1u << (RARCH_MENU_TOGGLE & 31));
 #ifdef HAVE_OPENXR
@@ -12217,6 +12322,7 @@ typedef struct
    const input_device_driver_t *joypad;
    rarch_joypad_info_t *joypad_info;
    unsigned port;
+   unsigned user;             /* a sharer's controller; MAX_USERS: the port's */
    uint8_t mode;              /* 0: none blocked, 1: all, 2: one by one */
    int8_t  enable_blocked;    /* the enabler's own answer; -1 not asked yet */
    bool    libretro_hotkey_set;
@@ -12267,6 +12373,18 @@ static bool input_hotkey_uses_enable(input_hotkey_block_t *b,
                b->binds, false, b->port, RETRO_DEVICE_MOUSE, 0, mbutton))
       return false;
    return true;
+}
+
+/* Hotkey @i, read on @b's controller. */
+static bool input_hotkey_block_pad(const input_hotkey_block_t *b,
+      bool kb_blocked, unsigned i)
+{
+   if (b->user < MAX_USERS)
+      return input_hotkey_share_read(b->input_st, b->joypad,
+            b->joypad_info, b->binds, kb_blocked, b->port, b->user, i);
+   return input_state_wrap(b->input_st->current_driver,
+         b->input_st->current_data, b->joypad, b->joypad_info, b->binds,
+         kb_blocked, b->port, RETRO_DEVICE_JOYPAD, 0, i) != 0;
 }
 
 /* Whether hotkey @i is blocked, for one that is pressed.
@@ -12324,15 +12442,8 @@ static bool input_hotkey_blocked(input_hotkey_block_t *b, unsigned i)
             }
 
             /* Deny blocking if joypad hotkey is pressed */
-            if (input_state_wrap(
-                  b->input_st->current_driver,
-                  b->input_st->current_data,
-                  joypad,
-                  joypad_info,
-                  binds,
-                  !!(b->input_st->flags & INP_FLAG_KB_MAPPING_BLOCKED),
-                  port, RETRO_DEVICE_JOYPAD, 0,
-                  i))
+            if (input_hotkey_block_pad(b,
+                  !!(b->input_st->flags & INP_FLAG_KB_MAPPING_BLOCKED), i))
             {
                libretro_hotkey_pressed = true;
 
@@ -12367,15 +12478,8 @@ static bool input_hotkey_blocked(input_hotkey_block_t *b, unsigned i)
             }
 
             /* Allow blocking if joypad hotkey is pressed */
-            if (input_state_wrap(
-                  b->input_st->current_driver,
-                  b->input_st->current_data,
-                  joypad,
-                  joypad_info,
-                  binds,
-                  !!(b->input_st->flags & INP_FLAG_KB_MAPPING_BLOCKED),
-                  port, RETRO_DEVICE_JOYPAD, 0,
-                  i))
+            if (input_hotkey_block_pad(b,
+                  !!(b->input_st->flags & INP_FLAG_KB_MAPPING_BLOCKED), i))
             {
                /* Only block if keyboard is not pressed */
                if (!keyboard_hotkey_pressed)
@@ -12397,15 +12501,7 @@ static bool input_hotkey_blocked(input_hotkey_block_t *b, unsigned i)
             enabler_open = !b->enable_blocked;
          }
          if (     enabler_open
-               && input_state_wrap(
-                  b->input_st->current_driver,
-                  b->input_st->current_data,
-                  joypad,
-                  joypad_info,
-                  binds,
-                  true,
-                  port, RETRO_DEVICE_JOYPAD, 0,
-                  i))
+               && input_hotkey_block_pad(b, true, i))
             blocked = false;
       }
    }
@@ -12417,6 +12513,68 @@ static bool input_hotkey_blocked(input_hotkey_block_t *b, unsigned i)
       blocked = false;
 
    return blocked;
+}
+
+/* Of the users in @share, those whose controller holds hotkey @id
+ * (Hotkey Enable: or hotkey port @port's keys or mouse do). */
+static uint32_t input_hotkey_shared_held(input_driver_state_t *input_st,
+      const input_device_driver_t *joypad, const retro_keybind_set *binds,
+      float axis_threshold, unsigned port, uint32_t share, unsigned id,
+      bool kb_blocked)
+{
+   uint32_t held = 0;
+   for (; share; share &= share - 1)
+   {
+      rarch_joypad_info_t info;
+      unsigned user = (unsigned)compat_ctz(share);
+      input_user_joypad_info(&info, user, axis_threshold);
+      if (input_hotkey_share_read(input_st, joypad, &info, binds,
+               kb_blocked, port, user, id))
+         held |= 1U << user;
+   }
+   return held;
+}
+
+/* Of @users, those whose own RetroPad holds nothing. */
+static uint32_t input_users_pad_idle(input_driver_state_t *input_st,
+      const input_device_driver_t *joypad, const retro_keybind_set *binds,
+      float axis_threshold, uint32_t users, bool kb_blocked)
+{
+   uint32_t idle = users;
+   for (; users; users &= users - 1)
+   {
+      rarch_joypad_info_t info;
+      unsigned user = (unsigned)compat_ctz(users);
+      input_user_joypad_info(&info, user, axis_threshold);
+      if (input_state_wrap(input_st->current_driver,
+               input_st->current_data, joypad, &info, binds, kb_blocked,
+               user, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK)
+            & 0xffff)
+         idle &= ~(1U << user);
+   }
+   return idle;
+}
+
+/* Whether hotkey @i, pressed on the controllers in @pressed, gets past
+ * any of their own Hotkey Enables: @open holds those it does not block,
+ * the rest go by @mode. */
+static bool input_hotkey_shared_passes(const input_hotkey_block_t *blk,
+      uint32_t pressed, uint32_t open, uint8_t mode, unsigned i)
+{
+   for (; pressed; pressed &= pressed - 1)
+   {
+      rarch_joypad_info_t info;
+      input_hotkey_block_t b = *blk;
+      unsigned user          = (unsigned)compat_ctz(pressed);
+      input_user_joypad_info(&info, user, blk->joypad_info->axis_threshold);
+      b.joypad_info          = &info;
+      b.user                 = user;
+      b.enable_blocked       = -1;
+      b.mode                 = (open & (1U << user)) ? 0 : mode;
+      if (!input_hotkey_blocked(&b, i))
+         return true;
+   }
+   return false;
 }
 
 /**
@@ -12532,6 +12690,7 @@ void input_binds_kept_invalidate(void)
    {
       input_port_pads[port].gen     = 0;
       input_port_hotkeys[port].gen  = 0;
+      input_share_hot[port].gen     = 0;
    }
 }
 
@@ -13768,6 +13927,7 @@ static void input_keys_pressed(
       const retro_keybind_set *binds,
       const input_device_driver_t *joypad,
       rarch_joypad_info_t *joypad_info,
+      uint32_t share,
       bool input_hotkey_device_merge)
 {
    uint32_t maybe_held[(RARCH_BIND_LIST_END + 31) / 32];
@@ -13779,6 +13939,11 @@ static void input_keys_pressed(
    uint16_t held_now              = 0;
    input_hotkey_block_t blk;
    bool enable_hotkey_pressed     = false;
+   bool own_enabled               = false;
+   /* of @share, those holding Hotkey Enable, and those it lets through */
+   uint32_t share_enabled         = 0;
+   uint32_t share_open            = 0;
+   uint8_t block_mode;
    bool any_pressed               = false;
    /* what the tables say of this port's hotkeys, as of the last
     * change to a bind (input_port_hotkeys_t) */
@@ -13805,7 +13970,7 @@ static void input_keys_pressed(
    if (     (port == hotkey_port)
          && (hk->flags & INPUT_HK_ENABLER))
    {
-      if (input_state_wrap(
+      own_enabled      = input_state_wrap(
             input_st->current_driver,
             input_st->current_data,
             joypad,
@@ -13813,7 +13978,12 @@ static void input_keys_pressed(
             binds,
             kb_blocked,
             port, RETRO_DEVICE_JOYPAD, 0,
-            RARCH_ENABLE_HOTKEY))
+            RARCH_ENABLE_HOTKEY) != 0;
+      if (share)
+         share_enabled = input_hotkey_shared_held(input_st, joypad, binds,
+               joypad_info->axis_threshold, port, share,
+               RARCH_ENABLE_HOTKEY, kb_blocked);
+      if (own_enabled || share_enabled)
       {
          enable_hotkey_pressed = true;
          if (input_st->input_hotkey_block_counter < input_hotkey_block_delay)
@@ -13916,6 +14086,22 @@ static void input_keys_pressed(
                      !!(input_st->flags & INP_FLAG_KB_MAPPING_BLOCKED),
                      port, RETRO_DEVICE_JOYPAD, 0, i);
 
+         /* Bypass only from an idle pad: with another pad's Hotkey
+          * Enable held, the hotkey user's buttons were not read for
+          * any_pressed. */
+         if (bit_pressed && share_enabled && !own_enabled)
+            bit_pressed = input_users_pad_idle(input_st, joypad, binds,
+                  joypad_info->axis_threshold, 1U << port, kb_blocked) != 0;
+         if (     !bit_pressed
+               && share
+               && (hk->flags & INPUT_HK_MENU_VALID))
+            bit_pressed = input_users_pad_idle(input_st, joypad, binds,
+                  joypad_info->axis_threshold,
+                  input_hotkey_shared_held(input_st, joypad, binds,
+                     joypad_info->axis_threshold, port, share, i,
+                     kb_blocked),
+                  kb_blocked) != 0;
+
          if (     bit_pressed
                || (i == RARCH_MENU_TOGGLE && input_st->platform_menu_button)
                || input_keys_pressed_other_sources(input_st, i, p_new_state))
@@ -13978,17 +14164,24 @@ static void input_keys_pressed(
    blk.joypad              = joypad;
    blk.joypad_info         = joypad_info;
    blk.port                = port;
+   blk.user                = MAX_USERS;
    blk.enable_blocked      = -1;
    blk.libretro_hotkey_set = libretro_hotkey_set;
    blk.keyboard_hotkey_set = keyboard_hotkey_set;
    blk.is_menu             = is_menu;
+   block_mode              = (libretro_hotkey_set && keyboard_hotkey_set) ? 1 : 2;
    blk.mode                = !(input_st->flags & INP_FLAG_BLOCK_HOTKEY) ? 0
-      : (libretro_hotkey_set && keyboard_hotkey_set) ? 1 : 2;
+      : block_mode;
+   /* each controller's hotkeys go by its own Hotkey Enable */
+   if (!blk.mode && enable_hotkey_pressed && !own_enabled)
+      blk.mode             = block_mode;
+   if (!(input_st->flags & INP_FLAG_BLOCK_HOTKEY))
+      share_open           = enable_hotkey_pressed ? share_enabled : share;
 
    /* Which hotkeys anything could be holding: all that is gone through
     * below. The rest have nothing to do here - but for the menu toggle,
     * which acts on being let go and is always among them. */
-   input_hotkeys_maybe_held(input_st, port, joypad_info, maybe_held);
+   input_hotkeys_maybe_held(input_st, port, joypad_info, share, maybe_held);
 
    /* Only the hotkeys in it are gone through, lowest first as before:
     * a word of it at a time, a set bit at a time. Going through all
@@ -14008,6 +14201,7 @@ static void input_keys_pressed(
       {
          bool other_pressed;
          bool bit_pressed;
+         uint32_t shared_pressed;
 
          i = (hot_word << 5) + (unsigned)compat_ctz(hot);
 
@@ -14022,8 +14216,14 @@ static void input_keys_pressed(
                      kb_blocked,
                      port, RETRO_DEVICE_JOYPAD, 0,
                      i);
+         shared_pressed = (share && INPUT_HOT_BIT(input_hotkey_set.valid, i))
+               ? input_hotkey_shared_held(input_st, joypad, binds,
+                     joypad_info->axis_threshold, port, share, i,
+                     kb_blocked)
+               : 0;
 
          if (     bit_pressed
+               || shared_pressed
                || other_pressed
                || (i == RARCH_MENU_TOGGLE && input_st->platform_menu_button))
          {
@@ -14050,7 +14250,11 @@ static void input_keys_pressed(
             if (libretro_hotkey_set || keyboard_hotkey_set)
             {
                /* Do not block "other source" (input overlay) presses */
-               if (!other_pressed && input_hotkey_blocked(&blk, i))
+               if (     !other_pressed
+                     && (   (shared_pressed && !bit_pressed)
+                         || input_hotkey_blocked(&blk, i))
+                     && !input_hotkey_shared_passes(&blk, shared_pressed,
+                           share_open, block_mode, i))
                   continue;
             }
 
@@ -17164,6 +17368,27 @@ void input_remapping_update_port_map(void)
    input_st->first_press_live = unmapped && input_st->first_press_on;
 }
 
+/* The users on @user's core port, as bits, @user among them; @user
+ * alone on None, but for user 1, with core port 1's users. */
+static uint32_t input_port_sharers(const settings_t *settings,
+      unsigned user)
+{
+   unsigned port;
+   uint32_t first = 0;
+   for (port = 0; port < MAX_USERS; port++)
+   {
+      const unsigned *u = settings->uints.input_remap_port_map[port];
+      uint32_t users    = 0;
+      for (; *u < MAX_USERS; u++)
+         users |= 1U << *u;
+      if (users & (1U << user))
+         return users;
+      if (!port && !user)
+         first = users;
+   }
+   return first | (1U << user);
+}
+
 void input_remapping_deinit(bool save_remap)
 {
    runloop_state_t *runloop_st  = runloop_state_get_ptr();
@@ -17291,7 +17516,9 @@ void input_driver_collect_system_input(input_driver_state_t *input_st,
          : (uint8_t)settings->uints.input_max_users;
    uint8_t port                        = 0;
    uint8_t hotkey_port                 = 0;
+   uint32_t hotkey_share;
 #ifdef HAVE_MENU
+   uint32_t menu_users                 = 0;
    bool all_users_control_menu         = settings->bools.input_all_users_control_menu;
    bool display_kb                     = menu_input_dialog_get_display_kb();
    bool menu_is_alive                  = (menu_state_get_ptr()->flags &
@@ -17341,8 +17568,25 @@ void input_driver_collect_system_input(input_driver_state_t *input_st,
       }
    }
 
+   /* the other users on the hotkey user's core port fire their
+    * controllers' hotkeys */
+   hotkey_share = input_port_sharers(settings, hotkey_port)
+      & ~(1U << hotkey_port) & ((1U << max_users) - 1);
+#ifdef HAVE_MENU
+   if (menu_is_alive && !all_users_control_menu)
+      menu_users = input_port_sharers(settings, 0);
+#endif
+
    for (port = 0; port < (int)max_users; port++)
    {
+#ifdef HAVE_MENU
+      /* the menu is user 1's and its core port's, unless every user
+       * controls it */
+      if (     menu_is_alive
+            && !all_users_control_menu
+            && !(menu_users & (1U << port)))
+         continue;
+#endif
       joypad_info.joy_idx                    = settings->uints.input_joypad_index[port];
       /* input_autoconf_binds is [MAX_USERS] and joy_idx comes from the
        * config file, so it can point past the end - the same bound the
@@ -17447,15 +17691,8 @@ void input_driver_collect_system_input(input_driver_state_t *input_st,
             (const retro_keybind_set *)input_config_binds,
             joypad,
             &joypad_info,
+            (port == hotkey_port) ? hotkey_share : 0,
             settings->bools.input_hotkey_device_merge);
-
-#ifdef HAVE_MENU
-      if (menu_is_alive)
-      {
-         if (!all_users_control_menu)
-            break;
-      }
-#endif /* HAVE_MENU */
    }
 
 #ifdef HAVE_MENU
