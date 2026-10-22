@@ -2710,6 +2710,30 @@ static void test_headset_first_press_and_hotkey(void)
    t_buttons[3] = 0;
 }
 
+/* The headset's player as input_openxr.c looks it up by its name:
+ * player 1 with no entry, then the entry's, the generation moving with
+ * each change; also when a profile gives it another display name. */
+static void test_headset_named(void)
+{
+   unsigned gen;
+   t_reset();
+   t_headset(3, INPUT_OPENXR_JOYPAD_COMBINED);
+   input_config_set_device_display_name(3, "Quest");
+   gen = input_config_plays_as_generation();
+   CHECK(input_config_plays_as_named(INPUT_OPENXR_JOYPAD_COMBINED) == 1,
+         "with no entry the headset is not player 1");
+   CHECK(input_config_plays_as_set(3, 0)
+         && input_config_plays_as_player(3) == 0
+         && input_config_plays_as_named(INPUT_OPENXR_JOYPAD_COMBINED) == 0
+         && input_config_plays_as_generation() != gen,
+         "the headset shown by another name was not set to Auto");
+   gen = input_config_plays_as_generation();
+   CHECK(input_config_plays_as_set(3, 1)
+         && input_config_plays_as_named(INPUT_OPENXR_JOYPAD_COMBINED) == 1
+         && input_config_plays_as_generation() != gen,
+         "the headset set back to player 1 is not");
+}
+
 /* The headset's player 1 puts Plays As in effect with no entry; set
  * to Auto, or gone, it does not. */
 static void test_headset_in_effect(void)
@@ -2800,6 +2824,7 @@ int main(void)
    test_headset_separate_auto();
    test_headset_first_press_and_hotkey();
    test_headset_in_effect();
+   test_headset_named();
 #endif
    test_hotkey_enable_own_delay();
    test_hotkey_enable_own_game_focus();

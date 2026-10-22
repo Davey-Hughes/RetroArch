@@ -10704,9 +10704,11 @@ static int input_plays_as_new(unsigned slot)
       return -1;
    /* no config read yet leaves it zeroed: button 0 for every hotkey */
    input_plays_as_drop((unsigned)e);
+   /* by the name its default goes by, should a profile show another */
    snprintf(input_plays_as[e].device, sizeof(input_plays_as[e].device),
          "%04x:%04x %s", d->vid, d->pid,
-         *d->display_name ? d->display_name : d->name);
+         (*d->display_name && !input_plays_as_default(d->name))
+         ? d->display_name : d->name);
    input_plays_as[e].player   = player;
    input_plays_as_claim[slot] = (uint8_t)(e + 1);
    return e;
