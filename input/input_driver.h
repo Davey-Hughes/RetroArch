@@ -1979,7 +1979,7 @@ bool input_config_plays_as_set_hotkey(unsigned slot, unsigned id,
       uint16_t joykey, uint32_t joyaxis);
 void input_config_plays_as_clear_hotkey(unsigned id);
 /* Hotkey @id's own buttons on the connected controllers that have one,
- * " · name: button" each, into @s; the untruncated length. */
+ * " · name: button" each, into @s; the length written. */
 size_t input_config_plays_as_hotkey_string(unsigned id, char *s,
       size_t len);
 /* The slots of the controllers sharing user 1's core port, but user

@@ -10792,7 +10792,7 @@ size_t input_config_plays_as_hotkey_string(unsigned id, char *s,
 
    if (len)
       *s = '\0';
-   for (slot = 0; slot < MAX_INPUT_DEVICES && _len < len; slot++)
+   for (slot = 0; slot < MAX_INPUT_DEVICES && _len + 1 < len; slot++)
    {
       char bind[64];
       struct retro_keybind own;
@@ -10818,8 +10818,8 @@ size_t input_config_plays_as_hotkey_string(unsigned id, char *s,
       else
          input_config_get_bind_string_joyaxis(show, bind, "", &own, label,
                sizeof(bind));
-      _len += snprintf(s + _len, len - _len,
-            msg_hash_to_str(MSG_INPUT_PLAYS_AS_OWN_BIND), name, bind);
+      _len = BIND_STR_CLAMP(_len + snprintf(s + _len, len - _len,
+            msg_hash_to_str(MSG_INPUT_PLAYS_AS_OWN_BIND), name, bind), len);
    }
    return _len;
 }

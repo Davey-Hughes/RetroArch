@@ -2596,6 +2596,7 @@ static void test_hotkey_enable_own_menu_tap(void)
 static void test_hotkey_own_binding(void)
 {
    char row[128];
+   size_t n;
    t_reset();
    CHECK(input_config_hotkey_listen_slots() == 0,
          "the identity map: binding a hotkey listens to another player");
@@ -2613,6 +2614,10 @@ static void test_hotkey_own_binding(void)
          sizeof(row));
    CHECK(!strcmp(row, " | A: Axis -2 | B: Button 24"),
          "the row does not show each controller's own hotkey");
+   n = input_config_plays_as_hotkey_string(RARCH_FAST_FORWARD_KEY, row,
+         16);
+   CHECK(n == strlen(row) && n < 16,
+         "a row cut short gives a length past its buffer");
    t_disconnect(1);
    input_config_plays_as_hotkey_string(RARCH_FAST_FORWARD_KEY, row,
          sizeof(row));
