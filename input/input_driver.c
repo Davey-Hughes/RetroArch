@@ -9003,6 +9003,8 @@ const struct input_registry *input_driver_get_registry(void)
    return &input_registry;
 }
 
+static void input_plays_as_hold(void);
+
 /* Ports put back after a driver restart are a runtime matter. The
  * setting they are written to, input_joypad_index, is also what the
  * config file saves, and a saved exchange would outlive the session
@@ -9049,7 +9051,9 @@ void input_driver_registry_restart(void)
    input_player_lights_tick           = 0;
    input_player_lights_told           = false;
    /* pads can come back in other slots with no disconnect between:
-    * each takes its entry afresh, not by the slot it had */
+    * each takes its entry afresh, not by the slot it had, but for one
+    * known by where it is plugged in */
+   input_plays_as_hold();
    for (i = 0; i < MAX_INPUT_DEVICES; i++)
       input_config_plays_as_release(i);
    /* runtime moves the setting no longer holds are over: the next
@@ -10557,11 +10561,35 @@ int input_config_plays_as_entry(unsigned slot)
    return input_plays_as_claim[slot] - 1;
 }
 
+/* by registry record: the entry its controller had when the joypad
+ * driver last restarted, and one; 0 for none */
+static uint8_t input_plays_as_held[INPUT_REGISTRY_RECORDS];
+
+/* The joypad driver restarts: a controller known by where it is
+ * plugged in keeps its entry for when it is reported there again. */
+static void input_plays_as_hold(void)
+{
+   unsigned i;
+   for (i = 0; i < INPUT_REGISTRY_RECORDS; i++)
+   {
+      const input_device_record_t *rec = &input_registry.records[i];
+      if (rec->present)
+         input_plays_as_held[i] = (*rec->phys
+               && rec->slot < MAX_INPUT_DEVICES)
+            ? input_plays_as_claim[rec->slot] : 0;
+      else if (!rec->expected)
+         input_plays_as_held[i] = 0;
+   }
+}
+
 /* The controller in @slot takes the first entry naming it that no
- * other connected controller has taken. */
+ * other connected controller has taken. During a joypad driver
+ * restart, one reported again where it was plugged in takes back the
+ * entry it had, and those not reported yet keep theirs. */
 static void input_plays_as_take(unsigned slot)
 {
    unsigned e, s;
+   int held                      = -1;
    uint32_t taken                = 0;
    const input_device_info_t *d  = &input_driver_st.input_device_info[slot];
 
@@ -10574,6 +10602,29 @@ static void input_plays_as_take(unsigned slot)
       if (t >= 0)
          taken |= 1U << t;
    }
+   if (     input_registry.restarting
+         && cpu_features_get_time_usec() - input_registry_restart_time
+               <= INPUT_REGISTRY_RESTART_USEC)
+      for (s = 0; s < INPUT_REGISTRY_RECORDS; s++)
+      {
+         const input_device_record_t *rec = &input_registry.records[s];
+         unsigned h                       = input_plays_as_held[s];
+         if (!h || !rec->expected)
+            continue;
+         if (*d->phys && string_is_equal(rec->phys, d->phys))
+            held = (int)h - 1;
+         else
+            taken |= 1U << (h - 1);
+      }
+   if (     held >= 0
+         && !(taken & (1U << held))
+         && *input_plays_as[held].device
+         && input_plays_as_names(input_plays_as[held].device, true,
+               d->name, d->display_name, d->vid, d->pid))
+   {
+      input_plays_as_claim[slot] = (uint8_t)(held + 1);
+      return;
+   }
    for (e = 0; e < MAX_USERS; e++)
       if (     *input_plays_as[e].device
             && !(taken & (1U << e))
@@ -10585,14 +10636,29 @@ static void input_plays_as_take(unsigned slot)
       }
 }
 
-/* Every connected controller takes its entry again, lowest slot
- * first: the entries have changed under them. */
+/* Every connected controller takes its entry again, the entries
+ * having changed under them: the one it had where that still names
+ * it, so two of a model keep theirs; else as on connect, lowest slot
+ * first. */
 static void input_plays_as_reclaim(void)
 {
    unsigned s;
+   uint8_t had[MAX_INPUT_DEVICES];
+   memcpy(had, input_plays_as_claim, sizeof(had));
    memset(input_plays_as_claim, 0, sizeof(input_plays_as_claim));
    for (s = 0; s < MAX_INPUT_DEVICES; s++)
-      input_plays_as_take(s);
+   {
+      const input_device_info_t *d = &input_driver_st.input_device_info[s];
+      if (     had[s]
+            && *d->name
+            && *input_plays_as[had[s] - 1].device
+            && input_plays_as_names(input_plays_as[had[s] - 1].device,
+                  true, d->name, d->display_name, d->vid, d->pid))
+         input_plays_as_claim[s] = had[s];
+   }
+   for (s = 0; s < MAX_INPUT_DEVICES; s++)
+      if (!input_plays_as_claim[s])
+         input_plays_as_take(s);
 }
 
 /* Entry @e free, and no controller's. */
@@ -11083,10 +11149,14 @@ void input_plays_as_read(void *data)
 {
    unsigned e;
    char key[48];
+   uint8_t had[MAX_INPUT_DEVICES];
    config_file_t *conf = (config_file_t*)data;
 
+   memcpy(had, input_plays_as_claim, sizeof(had));
    for (e = 0; e < MAX_USERS; e++)
       input_plays_as_drop(e);
+   /* for input_plays_as_reclaim() to keep those still named */
+   memcpy(input_plays_as_claim, had, sizeof(had));
    for (e = 0; conf && e < MAX_USERS; e++)
    {
       unsigned player = 0;

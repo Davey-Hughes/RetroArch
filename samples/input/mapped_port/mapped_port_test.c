@@ -1351,6 +1351,58 @@ static void test_place_restart(void)
    input_driver_registry_disconnect(1);
 }
 
+/* One of two identical pads, plugged in at @phys, connects in @slot. */
+static void t_plug_twin(unsigned slot, const char *phys)
+{
+   t_dev(slot, "Pad", 1, 1);
+   input_config_set_device_phys(slot, phys);
+   input_config_plays_as_place(slot);
+   input_driver_registry_connect(slot, "x", "Pad", phys, 1, 1);
+}
+
+/* Two identical pads, the second set to Player 2: a config reload and
+ * a driver restart leave it its entry and port 2, whichever slots the
+ * pads come back in; the first never takes it by slot order. */
+static void test_place_restart_twins(void)
+{
+   unsigned s;
+   static const char *p2 =
+         "input_plays_as_device_1 = \"0001:0001 Pad\"\n"
+         "input_plays_as_player_1 = \"2\"\n";
+
+   t_reset();
+   t_plug_twin(0, "usb-1");
+   t_plug_twin(1, "usb-2");
+   CHECK(input_config_plays_as_set(1, 2), "Player 2 was refused");
+   input_config_plays_as_place(1);
+   t_entries(p2);
+   CHECK(input_config_plays_as_entry(0) == -1
+         && input_config_plays_as_entry(1) == 0,
+         "a reload gave the Player 2 twin's entry to the first");
+
+   input_driver_registry_restart();
+   t_plug_twin(0, "usb-1");
+   t_plug_twin(1, "usb-2");
+   CHECK(input_config_plays_as_entry(0) == -1
+         && input_config_plays_as_entry(1) == 0
+         && t_user_of(1) == 1 && t_user_of(0) == 0,
+         "after a restart the first twin took the Player 2 twin's entry");
+
+   input_driver_registry_restart();
+   t_plug_twin(0, "usb-2");
+   t_plug_twin(1, "usb-1");
+   CHECK(input_config_plays_as_entry(0) == 0
+         && input_config_plays_as_entry(1) == -1
+         && t_user_of(0) == 1 && t_user_of(1) == 0,
+         "the Player 2 twin, back in the other slot, lost its entry");
+
+   for (s = 0; s < 2; s++)
+   {
+      input_driver_registry_disconnect(s);
+      input_config_set_device_phys(s, "");
+   }
+}
+
 /* The reservations writing the ports after a Plays As move, as
  * reallocate_port_if_needed() hands them on: the config file still
  * gets the ports the user set. */
@@ -2805,6 +2857,7 @@ int main(void)
    test_slot_user();
    test_place_no_player();
    test_place_restart();
+   test_place_restart_twins();
    test_place_saved_ports();
    test_place_reload_kept();
    test_plays_as_copy();
