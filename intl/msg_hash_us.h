@@ -33373,6 +33373,14 @@ MSG_HASH(
    "Controller list full: set a disconnected controller to Auto"
    )
 MSG_HASH(
+   MSG_INPUT_PLAYS_AS_OWN_BIND,
+   " · %s: %s"
+   )
+MSG_HASH(
+   MSG_INPUT_BIND_LISTENING_PLAYER,
+   "Listening to Player %u's controllers"
+   )
+MSG_HASH(
    MSG_DEVICE_DISCONNECTED_FROM_PORT_NR,
    "%s disconnected from port %u"
    )
