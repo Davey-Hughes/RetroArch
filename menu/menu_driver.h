@@ -496,8 +496,8 @@ typedef struct
 
    /* The Content Downloader directory the user last stepped into. */
    char core_content_dir[NAME_MAX_LENGTH];
-   /* The Controllers row whose player was just set, and one; 0 for
-    * none. */
+   /* The Controllers row whose player was just set, and one, or the
+    * Layout row's value; 0 for none. */
    unsigned plays_as_row;
 } menu_handle_t;
 

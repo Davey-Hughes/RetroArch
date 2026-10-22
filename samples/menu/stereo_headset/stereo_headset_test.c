@@ -272,6 +272,7 @@ static void lane_controller_layout(void)
 {
    file_list_t *buf;
    int r;
+   struct menu_state *menu_st = menu_state_get_ptr();
 
    set_driver(HEADSET_DRIVER);
    open_stereo_list();
@@ -285,6 +286,28 @@ static void lane_controller_layout(void)
    CHECK(buf && r >= 0 && (size_t)r == buf->size - 1,
          "the controller layout is not the last row of Controllers "
          "(row %d)", r);
+
+   /* A controller connecting puts a row above the layout, as Separate
+    * does; the list made again as on a hotplug keeps the cursor on
+    * the layout, not at its index. */
+   menu_st->selection_ptr = (r > 0) ? (size_t)r : 0;
+   input_config_set_device_name(0, "Test Pad");
+   menu_st->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH
+                   | MENU_ST_FLAG_PREVENT_POPULATE;
+   run_frame();
+   r = row(MENU_ENUM_LABEL_VIDEO_OPENXR_CONTROLLERS_STR);
+   CHECK(r == 1 && menu_st->selection_ptr == 1,
+         "a row added above the controller layout took the cursor "
+         "(cursor %u, layout row %d)", (unsigned)menu_st->selection_ptr, r);
+
+   input_config_clear_device_name(0);
+   menu_st->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH
+                   | MENU_ST_FLAG_PREVENT_POPULATE;
+   run_frame();
+   r = row(MENU_ENUM_LABEL_VIDEO_OPENXR_CONTROLLERS_STR);
+   CHECK(r == 0 && menu_st->selection_ptr == 0,
+         "the cursor left the controller layout when the row above went "
+         "(cursor %u, layout row %d)", (unsigned)menu_st->selection_ptr, r);
 }
 
 /* Fixed in Room by default; each value shows its own name. */
