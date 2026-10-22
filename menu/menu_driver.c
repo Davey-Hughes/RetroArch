@@ -5302,6 +5302,11 @@ void menu_input_plays_as_change(unsigned row, unsigned player)
       menu_st->flags |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
       return;
    }
+   /* the same player: nothing is placed again */
+   if (player == (slot
+         ? input_config_plays_as_player(row)
+         : input_config_plays_as_entry_player(row - MAX_INPUT_DEVICES)))
+      return;
 
    if (slot)
    {
