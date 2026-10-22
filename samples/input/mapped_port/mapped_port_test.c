@@ -82,6 +82,10 @@ void fill_pathname_resolve_relative(char *s, const char *ref,
 size_t fill_pathname_abbreviated_or_relative(char *s, const char *ref,
       const char *in, size_t len)
 { (void)ref; return strlcpy(s, in, len); }
+/* file_path.c's, for a bind's label and its suffix */
+size_t fill_pathname_join_delim(char *s, const char *dir,
+      const char *path, const char delim, size_t len)
+{ return (size_t)snprintf(s, len, "%s%c%s", dir, delim, path); }
 /* configuration.c's bind names, for the hotkeys the tests name */
 bool input_config_bind_map_get_valid(unsigned i)
 { return i < RARCH_BIND_LIST_END; }
@@ -120,8 +124,9 @@ void menu_entry_get(menu_entry_t *entry, size_t stack_idx,
       size_t i, void *userdata, bool use_representation)
 { (void)entry; (void)stack_idx; (void)i; (void)userdata;
   (void)use_representation; }
+/* the own hotkeys' row text, to read it back */
 const char *msg_hash_to_str(enum msg_hash_enums msg)
-{ (void)msg; return ""; }
+{ return (msg == MSG_INPUT_PLAYS_AS_OWN_BIND) ? " | %s: %s" : ""; }
 void runloop_msg_queue_push(const char *msg, size_t len,
       unsigned prio, unsigned duration, bool flush, char *title,
       enum message_queue_icon icon, enum message_queue_category category)
@@ -2410,6 +2415,36 @@ static void test_hotkey_enable_own_menu_tap(void)
    settings.uints.input_hotkey_block_delay = 0;
 }
 
+/* Binding a hotkey listens to the controllers sharing user 1's core
+ * port, not to other players'; its row shows each connected
+ * controller's own. */
+static void test_hotkey_own_binding(void)
+{
+   char row[128];
+   t_reset();
+   CHECK(input_config_hotkey_listen_slots() == 0,
+         "the identity map: binding a hotkey listens to another player");
+   t_two_player_1();
+   t_connect(2, "C", 3, 3);
+   input_driver_poll();
+   CHECK(input_config_hotkey_listen_slots() == (1u << 1),
+         "binding a hotkey does not listen to the sharer alone");
+
+   input_config_plays_as_set_hotkey(1, RARCH_FAST_FORWARD_KEY, T_OWN_KEY,
+         AXIS_NONE);
+   input_config_plays_as_set_hotkey(0, RARCH_FAST_FORWARD_KEY, NO_BTN,
+         AXIS_NEG(2));
+   input_config_plays_as_hotkey_string(RARCH_FAST_FORWARD_KEY, row,
+         sizeof(row));
+   CHECK(!strcmp(row, " | A: Axis -2 | B: Button 24"),
+         "the row does not show each controller's own hotkey");
+   t_disconnect(1);
+   input_config_plays_as_hotkey_string(RARCH_FAST_FORWARD_KEY, row,
+         sizeof(row));
+   CHECK(!strcmp(row, " | A: Axis -2"),
+         "the row shows a controller that is gone");
+}
+
 int main(void)
 {
    test_identity();
@@ -2468,6 +2503,7 @@ int main(void)
    test_hotkey_own_lookup();
    test_hotkey_own_storage();
    test_hotkey_enable_own();
+   test_hotkey_own_binding();
    test_hotkey_enable_own_delay();
    test_hotkey_enable_own_game_focus();
    test_hotkey_enable_own_menu_tap();

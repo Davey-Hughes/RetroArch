@@ -1849,10 +1849,14 @@ static bool menu_input_key_bind_poll_find_hold(
    {
       unsigned i;
 
-      for (i = 0; i < max_users; i++)
+      for (i = 0; i < MAX_USERS; i++)
       {
-         if (menu_input_key_bind_poll_find_hold_pad(new_state, output, i))
+         if (     (i < max_users || ((new_state->listen >> i) & 1))
+               && menu_input_key_bind_poll_find_hold_pad(new_state, output, i))
+         {
+            new_state->from = i;
             return true;
+         }
       }
    }
 
@@ -2006,11 +2010,15 @@ static bool menu_input_key_bind_poll_find_trigger(
    {
       unsigned i;
 
-      for (i = 0; i < max_users; i++)
+      for (i = 0; i < MAX_USERS; i++)
       {
-         if (menu_input_key_bind_poll_find_trigger_pad(
+         if (     (i < max_users || ((new_state->listen >> i) & 1))
+               && menu_input_key_bind_poll_find_trigger_pad(
                   state, new_state, output, i))
+         {
+            new_state->from = i;
             return true;
+         }
       }
    }
 
@@ -2023,10 +2031,15 @@ static bool menu_input_key_bind_poll_find_trigger(
 static void menu_input_key_bind_poll_bind_get_rested_axes(
       struct menu_bind_state *state)
 {
+   unsigned s;
    input_driver_capture_pad(state->port, false,
          NULL, 0,
          state->axis_state[state->port].rested_axes, MENU_MAX_AXES,
          NULL, 0);
+   for (s = 0; s < MAX_USERS; s++)
+      if ((state->listen >> s) & 1)
+         input_driver_capture_pad(s, false, NULL, 0,
+               state->axis_state[s].rested_axes, MENU_MAX_AXES, NULL, 0);
 }
 
 MENU_NOINLINE static void input_event_osk_iterate(void *osk_grid, enum osk_type osk_idx)
@@ -3839,6 +3852,13 @@ static void menu_input_key_bind_poll_bind_state(
          state->state[port].buttons, MENU_MAX_BUTTONS,
          state->state[port].axes,    MENU_MAX_AXES,
          state->state[port].hats,    MENU_MAX_HATS);
+   /* and for a hotkey, the controllers sharing its core port */
+   for (b = 0; b < MAX_USERS; b++)
+      if (b != port && ((state->listen >> b) & 1))
+         input_driver_capture_pad(b, false,
+               state->state[b].buttons, MENU_MAX_BUTTONS,
+               state->state[b].axes,    MENU_MAX_AXES,
+               state->state[b].hats,    MENU_MAX_HATS);
 }
 
 MENU_NOINLINE static int menu_dialog_iterate(
@@ -5325,6 +5345,11 @@ bool menu_input_key_bind_set_mode(
    index_offset                        = setting->index_offset;
    binds->port                         = settings->uints.input_joypad_index[
       index_offset];
+   /* a hotkey is bound from user 1's pad or a controller sharing its
+    * core port, which keeps the press as its own */
+   binds->listen                       = (binds->out_id >= RARCH_FIRST_META_KEY)
+      ? input_config_hotkey_listen_slots() : 0;
+   binds->from                         = binds->port;
 
    menu_input_key_bind_poll_bind_get_rested_axes(binds);
    menu_input_key_bind_poll_bind_state(
@@ -5421,6 +5446,7 @@ MENU_NOINLINE static bool menu_input_key_bind_iterate(
 
       input_driver_set_keyboard_mapping_blocked(false);
 
+      new_binds.from = new_binds.port;
       menu_input_key_bind_poll_bind_state(
             settings->uints.input_joypad_index[new_binds.port],
             &new_binds, timed_out);
@@ -5526,7 +5552,24 @@ MENU_NOINLINE static bool menu_input_key_bind_iterate(
           * here: the write is counted as a change when it is made,
           * and no address is carried from the frame the capture
           * began in */
-         *input_config_bind_edit(new_binds.out_user, new_binds.out_id)
+         if (new_binds.from != new_binds.port)
+         {
+            /* a sharing controller's: its own; refused with it still
+             * connected only when the list is full */
+            if (     !input_config_plays_as_set_hotkey(new_binds.from,
+                        new_binds.out_id, new_binds.buffer.joykey,
+                        new_binds.buffer.joyaxis)
+                  && input_config_get_device_name(new_binds.from))
+            {
+               const char *msg = msg_hash_to_str(MSG_INPUT_PLAYS_AS_FULL);
+               runloop_msg_queue_push(msg, strlen(msg), 1, 180, true, NULL,
+                     MESSAGE_QUEUE_ICON_DEFAULT,
+                     MESSAGE_QUEUE_CATEGORY_WARNING);
+            }
+            settings->flags |= SETTINGS_FLG_MODIFIED;
+         }
+         else
+            *input_config_bind_edit(new_binds.out_user, new_binds.out_id)
                                              = new_binds.buffer;
 
          /* Update keyboard mapping bits */
