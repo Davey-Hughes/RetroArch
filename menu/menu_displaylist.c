@@ -7796,25 +7796,9 @@ static bool menu_displaylist_refresh(struct menu_state *menu_st, file_list_t *li
 /* plays_as_row for the OpenXR Controller Layout row */
 #define PLAYS_AS_ROW_LAYOUT (MAX_INPUT_DEVICES + MAX_USERS + 1)
 
-/* A layout change reconnects the headset's controllers, and the list
- * made again keeps the cursor's index, not its row. */
-static void menu_displaylist_keep_layout_row(
-      struct menu_state *menu_st, file_list_t *list)
-{
-   menu_handle_t *menu = menu_st->driver_data;
-   size_t sel          = menu_st->selection_ptr;
-
-   if (     menu
-         && sel < list->size
-         && string_is_equal(list->list[sel].label,
-               MENU_ENUM_LABEL_VIDEO_OPENXR_CONTROLLERS_STR))
-      menu->plays_as_row = PLAYS_AS_ROW_LAYOUT;
-}
-
-/* Put the cursor back on the Controllers row whose player was just
- * set, or on the Layout row: the rows go in port order. Once the list
- * is made it is forgotten, so a row that is gone leaves the cursor
- * where it is. */
+/* Put the cursor back on the Controllers row in plays_as_row: the rows
+ * go in port order, so its index moves. Once the list is made it is
+ * forgotten, so a row that is gone leaves the cursor at its index. */
 static void menu_displaylist_restore_plays_as_row(
       struct menu_state *menu_st, file_list_t *list)
 {
@@ -7844,8 +7828,9 @@ static void menu_displaylist_restore_plays_as_row(
    menu->plays_as_row = 0;
 }
 
-/* A hotplug makes the list again with the cursor at its index: note the
- * controller it is on, for the pass above to put it back. */
+/* A hotplug, or a layout change reconnecting the headset's controllers,
+ * makes the list again with the cursor at its index: note the row it is
+ * on, for the pass above to put it back. */
 static void menu_displaylist_keep_plays_as_row(
       struct menu_state *menu_st, file_list_t *list)
 {
@@ -7859,6 +7844,9 @@ static void menu_displaylist_keep_plays_as_row(
    if (     type >= MENU_SETTINGS_INPUT_PLAYS_AS_BEGIN
          && type <  MENU_SETTINGS_INPUT_PLAYS_AS_END)
       menu->plays_as_row = type - MENU_SETTINGS_INPUT_PLAYS_AS_BEGIN + 1;
+   else if (string_is_equal(list->list[sel].label,
+            MENU_ENUM_LABEL_VIDEO_OPENXR_CONTROLLERS_STR))
+      menu->plays_as_row = PLAYS_AS_ROW_LAYOUT;
 }
 
 #ifdef HAVE_NETWORKING
@@ -17272,8 +17260,6 @@ static bool menu_displaylist_ctl_internal(
          case DISPLAYLIST_OPTIONS_NFS_CLIENT:
 #endif
          case DISPLAYLIST_OPTIONS_OVERRIDES:
-            if (type == DISPLAYLIST_INPUT_CONTROLLERS_LIST)
-               menu_displaylist_keep_layout_row(menu_st, info->list);
             menu_entries_clear(info->list);
             count = menu_displaylist_build_list(info->list,
                   settings, type, false);

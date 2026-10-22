@@ -496,8 +496,9 @@ typedef struct
 
    /* The Content Downloader directory the user last stepped into. */
    char core_content_dir[NAME_MAX_LENGTH];
-   /* The Controllers row whose player was just set, and one, or the
-    * Layout row's value; 0 for none. */
+   /* The Controllers row to put the cursor back on: a controller's
+    * row type less MENU_SETTINGS_INPUT_PLAYS_AS_BEGIN, and one, or
+    * PLAYS_AS_ROW_LAYOUT (menu_displaylist.c); 0 for none. */
    unsigned plays_as_row;
 } menu_handle_t;
 

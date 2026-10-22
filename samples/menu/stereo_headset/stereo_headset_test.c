@@ -311,18 +311,14 @@ static void lane_controller_layout(void)
     * the layout, not at its index. */
    menu_st->selection_ptr = (r > 0) ? (size_t)r : 0;
    input_config_set_device_name(0, "Test Pad");
-   menu_st->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH
-                   | MENU_ST_FLAG_PREVENT_POPULATE;
-   run_frame();
+   rebuild_as_hotplug();
    r = row(MENU_ENUM_LABEL_VIDEO_OPENXR_CONTROLLERS_STR);
    CHECK(r == 1 && menu_st->selection_ptr == 1,
          "a row added above the controller layout took the cursor "
          "(cursor %u, layout row %d)", (unsigned)menu_st->selection_ptr, r);
 
    input_config_clear_device_name(0);
-   menu_st->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH
-                   | MENU_ST_FLAG_PREVENT_POPULATE;
-   run_frame();
+   rebuild_as_hotplug();
    r = row(MENU_ENUM_LABEL_VIDEO_OPENXR_CONTROLLERS_STR);
    CHECK(r == 0 && menu_st->selection_ptr == 0,
          "the cursor left the controller layout when the row above went "
