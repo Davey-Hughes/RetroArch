@@ -206,6 +206,8 @@ static void t_reset(void)
 
    memset(&st->mapper, 0, sizeof(st->mapper));
    st->remap_worked = 0;
+   /* a test that ends with Hotkey Enable held leaves input held back */
+   st->flags       &= ~(INP_FLAG_BLOCK_LIBRETRO_INPUT | INP_FLAG_BLOCK_HOTKEY);
    t_rumble_refused = 0;
    t_inits          = 0;
    runloop_st.system.ports.data = t_core_ports;
@@ -2237,6 +2239,53 @@ static void test_hotkey_own_storage(void)
    config_file_free(conf);
 }
 
+/* A sharer's own Hotkey Enable: its hotkeys need it held, though user
+ * 1's pad has none; held, it holds game input back; it does not hold
+ * back user 1's pad's hotkeys, set or profile ones. */
+static void test_hotkey_enable_own(void)
+{
+   input_bits_t bits;
+   input_driver_state_t *st = input_state_get_ptr();
+
+   t_reset();
+   t_two_player_1();
+   input_driver_poll();
+   t_bind(RARCH_FAST_FORWARD_KEY, T_FF);
+   input_config_plays_as_set_hotkey(1, RARCH_ENABLE_HOTKEY, T_ENABLE,
+         AXIS_NONE);
+
+   t_buttons[1] = T_BIT(T_FF);
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "a sharer's hotkey fired without its own Hotkey Enable");
+   t_buttons[1] = T_BIT(T_ENABLE) | T_BIT(T_FF);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "a sharer's hotkey with its own Hotkey Enable held did not fire");
+   CHECK(st->flags & INP_FLAG_BLOCK_LIBRETRO_INPUT,
+         "a sharer's own Hotkey Enable does not hold game input back");
+
+   t_buttons[1] = 0;
+   t_buttons[0] = T_BIT(T_FF);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "user 1's pad, with no Hotkey Enable, lost its hotkey");
+   t_buttons[1] = T_BIT(T_ENABLE);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "the sharer's Hotkey Enable held back user 1's pad's hotkey");
+
+   /* user 1's pad's hotkey from its profile */
+   t_bind(RARCH_FAST_FORWARD_KEY, NO_BTN);
+   input_autoconf_binds[0] = t_auto_own;
+   t_buttons[0] = T_BIT(T_OWN_FF);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "the sharer's Hotkey Enable held back user 1's profile hotkey");
+   t_buttons[0] = 0;
+   t_buttons[1] = 0;
+}
+
 int main(void)
 {
    test_identity();
@@ -2294,6 +2343,7 @@ int main(void)
    test_bind_value_strings();
    test_hotkey_own_lookup();
    test_hotkey_own_storage();
+   test_hotkey_enable_own();
    if (failures)
    {
       printf("%d failure(s)\n", failures);
