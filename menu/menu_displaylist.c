@@ -7793,6 +7793,30 @@ static bool menu_displaylist_refresh(struct menu_state *menu_st, file_list_t *li
    return true;
 }
 
+/* Put the cursor back on the Controllers row whose player was just
+ * set: the rows go in port order. Once the list is made it is
+ * forgotten, so a row that is gone leaves the cursor where it is. */
+static void menu_displaylist_restore_plays_as_row(
+      struct menu_state *menu_st, file_list_t *list)
+{
+   size_t i;
+   menu_handle_t *menu = menu_st->driver_data;
+
+   if (!menu || !menu->plays_as_row)
+      return;
+
+   for (i = 0; i < list->size; i++)
+   {
+      if (list->list[i].type
+            != MENU_SETTINGS_INPUT_PLAYS_AS_BEGIN + menu->plays_as_row - 1)
+         continue;
+
+      menu_st->selection_ptr = i;
+      break;
+   }
+   menu->plays_as_row = 0;
+}
+
 #ifdef HAVE_NETWORKING
 /* Put the cursor back on the Content Downloader directory the user
  * just backed out of.  Called for both the stack push and the rebuild
@@ -17287,6 +17311,9 @@ static bool menu_displaylist_ctl_internal(
                case DISPLAYLIST_EJECT_DISC:
 #endif
                   info->flags       |= MD_FLAG_NEED_CLEAR;
+                  break;
+               case DISPLAYLIST_INPUT_CONTROLLERS_LIST:
+                  menu_displaylist_restore_plays_as_row(menu_st, info->list);
                   break;
                default:
                   break;

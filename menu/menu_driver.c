@@ -5284,7 +5284,10 @@ void menu_input_plays_as_change(unsigned row, unsigned player)
    else
       input_config_plays_as_set_entry(row - MAX_INPUT_DEVICES, player);
    settings->flags |= SETTINGS_FLG_MODIFIED;
-   /* the rows follow the controllers: the list is made again */
+   /* the rows follow the controllers: the list is made again, with
+    * the cursor kept on this one */
+   if (menu_st->driver_data)
+      menu_st->driver_data->plays_as_row = row + 1;
    menu_st->flags  &= ~MENU_ST_FLAG_PREVENT_POPULATE;
    menu_st->flags  |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
 }
