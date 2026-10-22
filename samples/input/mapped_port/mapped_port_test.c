@@ -58,18 +58,37 @@ void runloop_msg_queue_push(const char *msg, size_t len,
 { (void)msg; (void)len; (void)prio; (void)duration; (void)flush;
   (void)title; (void)icon; (void)category; }
 
-/* Slot n holds t_buttons[n]; every slot's profile has the RetroPad's
- * ids as its buttons. */
+/* Slot n holds t_buttons[n] and pushes axis t_axis_held[n] all the
+ * way; every slot's profile has the RetroPad's ids as its buttons and
+ * L2 and R2 as axes 4 and 5, unless a test gives it another. */
 static uint32_t t_buttons[MAX_USERS];
+static uint32_t t_axis_held[MAX_USERS];
+/* the button reads of each slot, apart from its RetroPad's */
+static unsigned t_button_reads[MAX_USERS];
 static unsigned t_rumbled[MAX_USERS];
 /* bit n: slot n's motors answer false */
 static unsigned t_rumble_refused;
 static struct retro_keybind t_auto[RARCH_BIND_LIST_END];
+/* An xpad's numbering: Back 6 is Select, Guide 8 none of the RetroPad's
+ * buttons, LT axis 2 as well as button 15. */
+static struct retro_keybind t_xpad[RARCH_BIND_LIST_END];
+/* the xpad's, with A and B the other way round */
+static struct retro_keybind t_xpad_ab[RARCH_BIND_LIST_END];
+/* the RetroPad's ids, as t_auto, with hotkeys of its own */
+static struct retro_keybind t_auto_own[RARCH_BIND_LIST_END];
+#define T_OWN_MENU 20
+#define T_OWN_FF   23
 static bool t_query(unsigned pad) { return pad < MAX_USERS; }
-static int32_t t_button(unsigned port, uint16_t joykey)
+static bool t_held(unsigned port, uint16_t joykey)
 {
    return port < MAX_USERS && joykey < 32
       && ((t_buttons[port] >> joykey) & 1);
+}
+static int32_t t_button(unsigned port, uint16_t joykey)
+{
+   if (port < MAX_USERS)
+      t_button_reads[port]++;
+   return t_held(port, joykey);
 }
 static int16_t t_state(rarch_joypad_info_t *joypad_info,
       const uint16_t *joykeys, const uint32_t *joyaxes, unsigned port)
@@ -79,12 +98,15 @@ static int16_t t_state(rarch_joypad_info_t *joypad_info,
    (void)joyaxes;
    (void)port;
    for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
-      if (joykeys[i] != NO_BTN && t_button(joypad_info->joy_idx, joykeys[i]))
+      if (joykeys[i] != NO_BTN && t_held(joypad_info->joy_idx, joykeys[i]))
          ret |= (int16_t)(1 << i);
    return ret;
 }
 static int16_t t_axis(unsigned port, uint32_t joyaxis)
-{ (void)port; (void)joyaxis; return 0; }
+{
+   return (port < MAX_USERS && joyaxis != AXIS_NONE
+         && t_axis_held[port] == joyaxis) ? 0x7fff : 0;
+}
 static void t_poll(void) { }
 static bool t_rumble(unsigned pad, enum retro_rumble_effect effect,
       uint16_t strength)
@@ -107,6 +129,8 @@ static input_device_driver_t t_joypad = {
  * their own; nothing held. */
 static void t_reset(void)
 {
+   static const uint16_t xpad[RARCH_FIRST_CUSTOM_BIND] = {
+      1, 3, 6, 7, 11, 12, 13, 14, 0, 2, 4, 5, 15, 16, 9, 10 };
    unsigned u, i;
    input_driver_state_t *st = input_state_get_ptr();
 
@@ -118,6 +142,30 @@ static void t_reset(void)
       t_auto[i].joyaxis = AXIS_NONE;
       t_auto[i].attr    = RETRO_KEYBIND_ATTR(RETROK_UNKNOWN, NO_BTN,
             i < RARCH_FIRST_CUSTOM_BIND);
+   }
+   t_auto[RETRO_DEVICE_ID_JOYPAD_L2].joyaxis = AXIS_POS(4);
+   t_auto[RETRO_DEVICE_ID_JOYPAD_R2].joyaxis = AXIS_POS(5);
+   for (i = 0; i < RARCH_BIND_LIST_END; i++)
+   {
+      t_xpad[i]         = t_auto[i];
+      t_xpad[i].joykey  = (i < RARCH_FIRST_CUSTOM_BIND) ? xpad[i] : NO_BTN;
+      t_xpad[i].joyaxis = AXIS_NONE;
+      t_auto_own[i]     = t_auto[i];
+   }
+   t_xpad[RETRO_DEVICE_ID_JOYPAD_L2].joyaxis = AXIS_POS(2);
+   for (i = 0; i < RARCH_BIND_LIST_END; i++)
+      t_xpad_ab[i] = t_xpad[i];
+   t_xpad_ab[RETRO_DEVICE_ID_JOYPAD_A].joykey = 1;
+   t_xpad_ab[RETRO_DEVICE_ID_JOYPAD_B].joykey = 0;
+   t_auto_own[RARCH_MENU_TOGGLE].joykey      = T_OWN_MENU;
+   t_auto_own[RARCH_FAST_FORWARD_KEY].joykey = T_OWN_FF;
+   for (u = 0; u < MAX_USERS; u++)
+   {
+      input_config_clear_device_name(u);
+      input_config_set_device_vid(u, 0);
+      input_config_set_device_pid(u, 0);
+      t_axis_held[u]    = AXIS_NONE;
+      t_button_reads[u] = 0;
    }
    for (u = 0; u < MAX_USERS; u++)
    {
@@ -137,8 +185,12 @@ static void t_reset(void)
    }
    settings.uints.input_max_users                 = 4;
    settings.uints.input_rumble_gain               = 100;
+   settings.uints.input_menu_toggle_gamepad_combo = INPUT_COMBO_NONE;
    settings.floats.input_axis_threshold           = 0.5f;
+   settings.bools.input_hotkey_follows_player1    = false;
+   settings.bools.input_all_users_control_menu    = false;
    st->primary_joypad                             = &t_joypad;
+   t_menu_st.flags                               &= ~MENU_ST_FLAG_ALIVE;
    input_remapping_update_port_map();
 }
 
@@ -255,6 +307,750 @@ static void test_port_2_users(void)
          "core port 3's rumble reached user 3, on None");
 }
 
+#define T_ENABLE 20
+#define T_FF     21
+#define T_MENU   22
+#define T_Y      T_BIT(RETRO_DEVICE_ID_JOYPAD_Y)
+
+/* A frame's system input, the block flags cleared first as the run
+ * loop clears them. */
+static void t_collect(input_bits_t *bits)
+{
+   input_driver_state_t *st = input_state_get_ptr();
+   st->flags &= ~(INP_FLAG_BLOCK_LIBRETRO_INPUT | INP_FLAG_BLOCK_HOTKEY);
+   memset(bits, 0, sizeof(*bits));
+   input_driver_collect_system_input(st, &settings, bits);
+}
+
+/* User 1's hotkey @id on button @joykey of any controller that reads
+ * it; counted as a change, as the menu's bind settings count it. */
+static void t_bind(unsigned id, uint16_t joykey)
+{
+   input_config_binds[0][id].joykey = joykey;
+   input_config_binds[0][id].attr   =
+      RETRO_KEYBIND_ATTR(RETROK_UNKNOWN, NO_BTN, true);
+   input_config_binds_changed();
+}
+
+/* With the menu up: user 1 wherever it is mapped, and the users on
+ * its core port; never a user on None. */
+static void test_menu_shared(void)
+{
+   input_bits_t bits;
+   t_reset();
+   t_menu_st.flags |= MENU_ST_FLAG_ALIVE;
+   t_buttons[1] = T_B;
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RETRO_DEVICE_ID_JOYPAD_B),
+         "the identity map: user 2 drives the menu");
+
+   t_map(1, 0);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RETRO_DEVICE_ID_JOYPAD_B),
+         "user 2 on core port 1 does not drive the menu");
+   t_buttons[1] = 0;
+   t_buttons[0] = T_A;
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RETRO_DEVICE_ID_JOYPAD_A),
+         "user 1 no longer drives the menu");
+   t_buttons[0] = 0;
+   t_buttons[2] = T_Y;
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RETRO_DEVICE_ID_JOYPAD_Y),
+         "user 3, on its own core port, drives the menu");
+
+   /* swapped: user 1 on core port 2, user 2 on core port 1 */
+   t_map(0, 1);
+   t_buttons[2] = 0;
+   t_buttons[0] = T_A;
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RETRO_DEVICE_ID_JOYPAD_A),
+         "swapped: user 1 no longer drives the menu");
+   t_buttons[0] = 0;
+   t_buttons[1] = T_B;
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RETRO_DEVICE_ID_JOYPAD_B),
+         "swapped: user 2, on core port 1, drives the menu");
+
+   /* both on None: nothing is shared */
+   t_map(0, MAX_USERS);
+   t_map(1, MAX_USERS);
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RETRO_DEVICE_ID_JOYPAD_B),
+         "user 2 on None drives the menu with user 1 on None");
+   t_buttons[1] = 0;
+   t_buttons[0] = T_A;
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RETRO_DEVICE_ID_JOYPAD_A),
+         "user 1 on None no longer drives the menu");
+   t_menu_st.flags &= ~MENU_ST_FLAG_ALIVE;
+}
+
+/* The users on user 1's core port fire user 1's hotkeys; no other user
+ * does, and a user on None shares nothing. */
+static void test_hotkeys_shared(void)
+{
+   input_bits_t bits;
+   t_reset();
+   t_bind(RARCH_FAST_FORWARD_KEY, T_FF);
+   t_buttons[1] = T_BIT(T_FF);
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "the identity map: user 2 fires user 1's hotkeys");
+
+   t_map(1, 0);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "user 2 on core port 1 does not fire user 1's hotkeys");
+   t_buttons[1] = 0;
+   t_buttons[0] = T_BIT(T_FF);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "user 1's pad lost its hotkeys to a shared core port");
+   t_buttons[0] = 0;
+   t_buttons[2] = T_BIT(T_FF);
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "user 3, on its own core port, fires user 1's hotkeys");
+
+   t_map(0, 1);
+   t_buttons[2] = 0;
+   t_buttons[1] = T_BIT(T_FF);
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "swapped: user 2 fires user 1's hotkeys");
+
+   t_map(0, MAX_USERS);
+   t_map(1, MAX_USERS);
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "user 2 on None fires user 1's hotkeys with user 1 on None");
+}
+
+/* Hotkey Enable goes with the hotkeys of the controller it is held on;
+ * held on any of them, it holds game input back. */
+static void test_hotkey_enable_shared(void)
+{
+   input_bits_t bits;
+   input_driver_state_t *st = input_state_get_ptr();
+
+   t_reset();
+   t_bind(RARCH_ENABLE_HOTKEY, T_ENABLE);
+   t_bind(RARCH_FAST_FORWARD_KEY, T_FF);
+   t_buttons[3] = T_BIT(T_ENABLE) | T_BIT(T_FF);
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RARCH_FAST_FORWARD_KEY)
+         && !(st->flags & INP_FLAG_BLOCK_LIBRETRO_INPUT),
+         "the identity map: user 4's pad has user 1's hotkeys");
+
+   t_map(1, 0);
+   t_buttons[3] = 0;
+   t_buttons[1] = T_BIT(T_ENABLE) | T_BIT(T_FF);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "Hotkey Enable and a hotkey on user 2's pad do not fire it");
+   CHECK(st->flags & INP_FLAG_BLOCK_LIBRETRO_INPUT,
+         "Hotkey Enable on user 2's pad does not hold game input back");
+
+   t_buttons[1] = T_BIT(T_FF);
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "a hotkey on user 2's pad fires without Hotkey Enable");
+
+   t_buttons[1] = 0;
+   t_buttons[0] = T_BIT(T_ENABLE) | T_BIT(T_FF);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "Hotkey Enable and a hotkey on user 1's pad do not fire it");
+   t_buttons[0] = T_BIT(T_FF);
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "a hotkey on user 1's pad fires without Hotkey Enable");
+
+   t_buttons[0] = T_BIT(T_ENABLE);
+   t_buttons[1] = T_BIT(T_FF);
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "Hotkey Enable on user 1's pad fires user 2's hotkey");
+
+   t_buttons[0] = T_BIT(T_FF);
+   t_buttons[1] = T_BIT(T_ENABLE);
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "Hotkey Enable on user 2's pad fires user 1's hotkey");
+}
+
+/* The menu toggle's button, which acts on being let go, and its
+ * controller combination work from either pad on core port 1. */
+static void test_menu_toggle_shared(void)
+{
+   input_bits_t bits;
+   t_reset();
+   t_bind(RARCH_MENU_TOGGLE, T_MENU);
+   settings.uints.input_menu_toggle_gamepad_combo = INPUT_COMBO_START_SELECT;
+   t_map(1, 0);
+
+   t_buttons[1] = T_BIT(T_MENU);
+   t_collect(&bits);
+   t_buttons[1] = 0;
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_MENU_TOGGLE),
+         "user 2's menu toggle button does not open the menu");
+   t_buttons[0] = T_BIT(T_MENU);
+   t_collect(&bits);
+   t_buttons[0] = 0;
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_MENU_TOGGLE),
+         "user 1's menu toggle button does not open the menu");
+
+   /* a button no RetroPad button shares needs no Hotkey Enable */
+   t_bind(RARCH_ENABLE_HOTKEY, T_ENABLE);
+   t_buttons[1] = T_BIT(T_MENU);
+   t_collect(&bits);
+   t_buttons[1] = 0;
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_MENU_TOGGLE),
+         "user 2's menu toggle button waits for Hotkey Enable");
+
+   t_menu_st.flags |= MENU_ST_FLAG_ALIVE;
+   t_buttons[1] = T_BIT(RETRO_DEVICE_ID_JOYPAD_START)
+      | T_BIT(RETRO_DEVICE_ID_JOYPAD_SELECT);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_MENU_TOGGLE),
+         "the menu toggle combination on user 2's pad does not close the menu");
+   t_buttons[1] = 0;
+   t_buttons[0] = T_BIT(RETRO_DEVICE_ID_JOYPAD_START)
+      | T_BIT(RETRO_DEVICE_ID_JOYPAD_SELECT);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_MENU_TOGGLE),
+         "the menu toggle combination on user 1's pad does not close the menu");
+   t_menu_st.flags &= ~MENU_ST_FLAG_ALIVE;
+}
+
+/* Hotkeys Follow Player 1: the hotkeys are core port 1's users',
+ * wherever user 1 is. */
+static void test_hotkeys_follow(void)
+{
+   input_bits_t bits;
+   t_reset();
+   settings.bools.input_hotkey_follows_player1 = true;
+   t_bind(RARCH_FAST_FORWARD_KEY, T_FF);
+   t_map(1, 0);
+
+   t_buttons[1] = T_BIT(T_FF);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "Follow Player 1: user 2 on core port 1 does not fire the hotkeys");
+   t_buttons[1] = 0;
+   t_buttons[0] = T_BIT(T_FF);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "Follow Player 1: user 1's pad does not fire the hotkeys");
+
+   /* user 1 moves to core port 3 */
+   t_map(0, 2);
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "Follow Player 1: user 1's pad on core port 3 fires the hotkeys");
+   t_buttons[0] = 0;
+   t_buttons[1] = T_BIT(T_FF);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "Follow Player 1: user 2 alone on core port 1 does not fire them");
+}
+
+/* User 1 on None: core port 1's users drive the menu and fire user 1's
+ * hotkeys, each by its own Hotkey Enable, and user 1 keeps both. */
+static void test_none_player1(void)
+{
+   input_bits_t bits;
+   t_reset();
+   t_bind(RARCH_ENABLE_HOTKEY, T_ENABLE);
+   t_bind(RARCH_FAST_FORWARD_KEY, T_FF);
+   t_map(0, MAX_USERS);
+   t_map(1, 0);
+
+   t_menu_st.flags |= MENU_ST_FLAG_ALIVE;
+   t_buttons[1] = T_B;
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RETRO_DEVICE_ID_JOYPAD_B),
+         "user 1 on None: user 2 on core port 1 does not drive the menu");
+   t_buttons[1] = 0;
+   t_buttons[2] = T_Y;
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RETRO_DEVICE_ID_JOYPAD_Y),
+         "user 1 on None: user 3, on its own core port, drives the menu");
+   t_buttons[2] = 0;
+   t_buttons[0] = T_A;
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RETRO_DEVICE_ID_JOYPAD_A),
+         "user 1 on None no longer drives the menu");
+   t_buttons[0] = 0;
+   t_menu_st.flags &= ~MENU_ST_FLAG_ALIVE;
+
+   t_buttons[1] = T_BIT(T_ENABLE) | T_BIT(T_FF);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "user 1 on None: Hotkey Enable and a hotkey on user 2's pad do "
+         "not fire it");
+   t_buttons[1] = T_BIT(T_FF);
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "user 1 on None: a hotkey on user 2's pad fires without Hotkey "
+         "Enable");
+   t_buttons[1] = 0;
+   t_buttons[2] = T_BIT(T_ENABLE) | T_BIT(T_FF);
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "user 1 on None: user 3, on its own core port, fires user 1's "
+         "hotkeys");
+   t_buttons[2] = 0;
+   t_buttons[0] = T_BIT(T_ENABLE) | T_BIT(T_FF);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "user 1 on None lost its hotkeys");
+}
+
+#define T_X      T_BIT(RETRO_DEVICE_ID_JOYPAD_X)
+#define T_SELECT T_BIT(RETRO_DEVICE_ID_JOYPAD_SELECT)
+#define T_START  T_BIT(RETRO_DEVICE_ID_JOYPAD_START)
+
+/* A frame with the buttons as set, then one with all let go: whether
+ * the menu toggles as they are let go. */
+static bool t_menu_tap(void)
+{
+   input_bits_t bits;
+   unsigned u;
+   t_collect(&bits);
+   for (u = 0; u < MAX_USERS; u++)
+      t_buttons[u] = 0;
+   t_collect(&bits);
+   return BIT256_GET(bits, RARCH_MENU_TOGGLE) != 0;
+}
+
+/* Menu toggle on RetroPad X, Hotkey Enable on Select: X is a game
+ * button, and opens the menu only with Select on the same pad. */
+static void test_menu_toggle_game_button(void)
+{
+   t_reset();
+   t_bind(RARCH_ENABLE_HOTKEY, RETRO_DEVICE_ID_JOYPAD_SELECT);
+   t_bind(RARCH_MENU_TOGGLE, RETRO_DEVICE_ID_JOYPAD_X);
+   t_buttons[0] = T_X;
+   CHECK(!t_menu_tap(), "the identity map: X on user 1's pad opens the menu");
+   t_buttons[0] = T_SELECT | T_X;
+   CHECK(t_menu_tap(),
+         "the identity map: Select+X on user 1's pad does not open the menu");
+
+   t_map(1, 0);
+   t_buttons[1] = T_X;
+   CHECK(!t_menu_tap(), "X on user 2's pad opens the menu");
+   t_buttons[1] = T_SELECT | T_X;
+   CHECK(t_menu_tap(), "Select+X on user 2's pad does not open the menu");
+   t_buttons[0] = T_X;
+   CHECK(!t_menu_tap(), "X on user 1's pad opens the menu, user 2 sharing");
+   t_buttons[0] = T_SELECT | T_X;
+   CHECK(t_menu_tap(),
+         "Select+X on user 1's pad does not open the menu, user 2 sharing");
+   t_buttons[0] = T_SELECT;
+   t_buttons[1] = T_X;
+   CHECK(!t_menu_tap(), "Select on user 1's pad and X on user 2's open the menu");
+   t_buttons[0] = T_X;
+   t_buttons[1] = T_SELECT;
+   CHECK(!t_menu_tap(), "Select on user 2's pad and X on user 1's open the menu");
+}
+
+/* The menu toggle combination may be held across the pads on core
+ * port 1. */
+static void test_menu_combo_split(void)
+{
+   input_bits_t bits;
+   t_reset();
+   settings.uints.input_menu_toggle_gamepad_combo = INPUT_COMBO_START_SELECT;
+   t_map(1, 0);
+   t_buttons[0] = T_START;
+   t_buttons[1] = T_SELECT;
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_MENU_TOGGLE),
+         "Start on user 1's pad and Select on user 2's do not open the menu");
+   t_buttons[0] = 0;
+   t_buttons[1] = 0;
+   t_collect(&bits);
+}
+
+/* A user sharing core port 1 fires user 1's hotkeys with the menu up. */
+static void test_hotkeys_shared_menu(void)
+{
+   input_bits_t bits;
+   t_reset();
+   t_bind(RARCH_FAST_FORWARD_KEY, T_FF);
+   t_map(1, 0);
+   t_menu_st.flags |= MENU_ST_FLAG_ALIVE;
+   t_buttons[1] = T_BIT(T_FF);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "with the menu up, user 2 on core port 1 does not fire user 1's hotkeys");
+   t_menu_st.flags &= ~MENU_ST_FLAG_ALIVE;
+}
+
+/* the key held on the keyboard, or 0 */
+static unsigned t_key;
+/* A keyboard driver asked for each bind; @binds is input_config_binds,
+ * its pointers cast. */
+static int16_t t_kb_state(void *data, const input_device_driver_t *joypad,
+      rarch_joypad_info_t *joypad_info, const retro_keybind_set *binds,
+      unsigned port, unsigned device, unsigned idx, unsigned id)
+{
+   (void)data;
+   (void)joypad;
+   (void)joypad_info;
+   (void)binds;
+   (void)idx;
+   if (!t_key || port >= MAX_USERS)
+      return 0;
+   if (device == RETRO_DEVICE_KEYBOARD)
+      return id == t_key;
+   return device == RETRO_DEVICE_JOYPAD && id < RARCH_BIND_LIST_END
+      && RETRO_KEYBIND_KEY(&input_config_binds[port][id]) == t_key;
+}
+static input_driver_t t_kb;
+
+/* Hotkey Enable on the keyboard and on the pads: held on the keyboard,
+ * it opens the hotkeys of every pad on core port 1. */
+static void test_hotkey_enable_keyboard(void)
+{
+   input_bits_t bits;
+   input_driver_state_t *st = input_state_get_ptr();
+   t_reset();
+   t_kb.input_state   = t_kb_state;
+   st->current_driver = &t_kb;
+   t_bind(RARCH_ENABLE_HOTKEY, T_ENABLE);
+   input_config_binds[0][RARCH_ENABLE_HOTKEY].attr =
+      RETRO_KEYBIND_ATTR(RETROK_TAB, NO_BTN, true);
+   t_bind(RARCH_FAST_FORWARD_KEY, T_FF);
+   t_map(1, 0);
+
+   t_buttons[1] = T_BIT(T_FF);
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "a hotkey on user 2's pad fires with no Hotkey Enable held");
+   t_key = RETROK_TAB;
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "Hotkey Enable on the keyboard does not open user 2's hotkeys");
+   t_key              = 0;
+   st->current_driver = NULL;
+}
+
+#define T_XPAD_SELECT 6
+#define T_XPAD_X      2
+#define T_XPAD_Y      3
+#define T_GUIDE       8
+
+/* Slot @slot's controller: its profile and its name, counted as a
+ * change, as a connect is. */
+static void t_pad(unsigned slot, struct retro_keybind *profile,
+      const char *name)
+{
+   input_autoconf_binds[slot] = profile;
+   input_config_set_device_name(slot, name);
+   input_config_binds_changed();
+}
+
+/* User 1's hand-set Hotkey Enable and hotkeys are its xpad's buttons.
+ * On user 2's pad of another numbering they are the RetroPad buttons
+ * they are on the xpad: Back is user 2's Select, not its button 6. */
+static void test_hotkeys_other_model(void)
+{
+   input_bits_t bits;
+   input_driver_state_t *st = input_state_get_ptr();
+
+   t_reset();
+   t_pad(0, t_xpad, "Xpad");
+   t_pad(1, t_auto, "Headset");
+   t_bind(RARCH_ENABLE_HOTKEY, T_XPAD_SELECT);
+   t_bind(RARCH_FAST_FORWARD_KEY, T_XPAD_X);
+
+   /* the identity map: nobody else's controller read for the hotkeys */
+   t_buttons[1] = T_SELECT | T_X;
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RARCH_FAST_FORWARD_KEY)
+         && !(st->flags & INP_FLAG_BLOCK_LIBRETRO_INPUT),
+         "the identity map: user 2's pad has user 1's hotkeys");
+   CHECK(!t_button_reads[1],
+         "the identity map: user 2's pad read for user 1's hotkeys");
+   t_buttons[1] = 0;
+   t_buttons[0] = T_BIT(T_XPAD_SELECT) | T_BIT(T_XPAD_X);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "the identity map: user 1's Back and X do not fire it");
+   t_buttons[0] = 0;
+
+   t_map(1, 0);
+   t_buttons[1] = T_BIT(T_XPAD_SELECT);
+   t_collect(&bits);
+   CHECK(!(st->flags & INP_FLAG_BLOCK_LIBRETRO_INPUT),
+         "user 2's button 6, its D-Pad Left, holds game input back");
+   t_buttons[1] = T_BIT(T_XPAD_SELECT) | T_BIT(T_XPAD_X);
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "user 2's buttons 6 and 2 fire fast-forward");
+   t_buttons[1] = T_SELECT;
+   t_collect(&bits);
+   CHECK(st->flags & INP_FLAG_BLOCK_LIBRETRO_INPUT,
+         "user 2's Select is not its Hotkey Enable");
+   t_buttons[1] = T_SELECT | T_X;
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "user 2's Select and X do not fire fast-forward");
+   t_buttons[1] = T_X;
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "user 2's X fires fast-forward without Hotkey Enable");
+   t_buttons[1] = 0;
+   t_buttons[0] = T_BIT(T_XPAD_SELECT) | T_BIT(T_XPAD_X);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "user 2 sharing: user 1's Back and X do not fire it");
+   t_buttons[0] = 0;
+
+   /* a bind changed: Hotkey Enable on the xpad's Y */
+   t_bind(RARCH_ENABLE_HOTKEY, T_XPAD_Y);
+   t_buttons[1] = T_Y | T_X;
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "Hotkey Enable moved to Y: user 2's Y and X do not fire it");
+   t_buttons[1] = T_SELECT | T_X;
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "Hotkey Enable moved to Y: user 2's Select still enables");
+
+   /* user 2's pad made an xpad: the binds as they are */
+   t_pad(1, t_xpad, "Xpad");
+   t_buttons[1] = T_BIT(T_XPAD_Y) | T_BIT(T_XPAD_X);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "user 2 now an xpad: its Y and X do not fire it");
+   t_buttons[1] = 0;
+}
+
+/* Game Focus, which lets a held Hotkey Enable through: user 2's is
+ * its Select, not its button 6. */
+static void test_hotkey_game_focus_other_model(void)
+{
+   input_bits_t bits;
+   input_driver_state_t *st = input_state_get_ptr();
+
+   t_reset();
+   t_pad(0, t_xpad, "Xpad");
+   t_pad(1, t_auto, "Headset");
+   t_bind(RARCH_ENABLE_HOTKEY, T_XPAD_SELECT);
+   t_bind(RARCH_FAST_FORWARD_KEY, T_XPAD_Y);
+   t_map(1, 0);
+   st->flags |= INP_FLAG_KB_MAPPING_BLOCKED;
+
+   t_buttons[1] = T_BIT(T_XPAD_SELECT) | T_BIT(T_XPAD_Y) | T_Y;
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "Game Focus: user 2's button 6 lets its Y fire fast-forward");
+   t_buttons[1] = T_SELECT | T_Y;
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "Game Focus: user 2's Select and Y do not fire fast-forward");
+   t_buttons[1] = 0;
+   st->flags   &= ~INP_FLAG_KB_MAPPING_BLOCKED;
+}
+
+/* A hand-set axis: the xpad's LT is user 2's L2, not its axis 2. */
+static void test_hotkey_axis_other_model(void)
+{
+   input_bits_t bits;
+   t_reset();
+   t_pad(0, t_xpad, "Xpad");
+   t_pad(1, t_auto, "Headset");
+   t_bind(RARCH_ENABLE_HOTKEY, T_XPAD_SELECT);
+   input_config_binds[0][RARCH_FAST_FORWARD_KEY].joyaxis = AXIS_POS(2);
+   input_config_binds[0][RARCH_FAST_FORWARD_KEY].attr    =
+      RETRO_KEYBIND_ATTR(RETROK_UNKNOWN, NO_BTN, true);
+   input_config_binds_changed();
+   t_map(1, 0);
+
+   t_buttons[1]   = T_SELECT | T_BIT(T_XPAD_SELECT);
+   t_axis_held[1] = AXIS_POS(2);
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "user 2's axis 2 fires the hotkey on the xpad's LT");
+   t_buttons[1]   = T_SELECT;
+   t_axis_held[1] = AXIS_POS(4);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "user 2's L2 axis does not fire the hotkey on the xpad's LT");
+   t_axis_held[1] = AXIS_NONE;
+   t_buttons[1]   = T_SELECT | T_BIT(RETRO_DEVICE_ID_JOYPAD_L2);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "user 2's L2 button does not fire the hotkey on the xpad's LT");
+   t_buttons[1] = 0;
+
+   /* user 2's profile has a fast-forward button of its own: kept */
+   t_pad(1, t_auto_own, "Headset");
+   t_buttons[1] = T_SELECT | T_BIT(T_OWN_FF);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "a hand-set axis took user 2's own fast-forward button");
+   t_buttons[1]   = T_SELECT;
+   t_axis_held[1] = AXIS_POS(4);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "with its own button, user 2's L2 axis does not fire the hotkey "
+         "on the xpad's LT");
+   t_axis_held[1] = AXIS_NONE;
+   t_buttons[1]   = 0;
+}
+
+/* A hand-set menu toggle on Guide, which is no RetroPad button: user
+ * 2's pad of another numbering has it where its own profile puts it. */
+static void test_menu_toggle_other_model(void)
+{
+   t_reset();
+   t_pad(0, t_xpad, "Xpad");
+   t_pad(1, t_auto, "Headset");
+   t_bind(RARCH_MENU_TOGGLE, T_GUIDE);
+   t_map(1, 0);
+
+   t_buttons[1] = T_BIT(T_GUIDE);
+   CHECK(!t_menu_tap(), "user 2's button 8, its A, opens the menu");
+   t_buttons[0] = T_BIT(T_GUIDE);
+   CHECK(t_menu_tap(), "user 1's Guide does not open the menu");
+
+   t_pad(1, t_auto_own, "Headset");
+   t_buttons[1] = T_BIT(T_OWN_MENU);
+   CHECK(t_menu_tap(),
+         "user 2's own profile's menu toggle does not open the menu");
+   t_buttons[1] = T_BIT(T_GUIDE);
+   CHECK(!t_menu_tap(),
+         "with a menu toggle of its own, user 2's button 8 opens the menu");
+}
+
+/* Two pads of one model: user 1's hand-set binds on user 2's as they
+ * are. */
+static void test_hotkeys_same_model(void)
+{
+   input_bits_t bits;
+   input_driver_state_t *st = input_state_get_ptr();
+
+   t_reset();
+   t_pad(0, t_xpad, "Xpad");
+   t_pad(1, t_xpad, "Xpad");
+   t_bind(RARCH_ENABLE_HOTKEY, T_XPAD_SELECT);
+   t_bind(RARCH_FAST_FORWARD_KEY, T_XPAD_X);
+   t_map(1, 0);
+
+   t_buttons[1] = T_BIT(T_XPAD_SELECT);
+   t_collect(&bits);
+   CHECK(st->flags & INP_FLAG_BLOCK_LIBRETRO_INPUT,
+         "same model: user 2's Back is not its Hotkey Enable");
+   t_buttons[1] = T_BIT(T_XPAD_SELECT) | T_BIT(T_XPAD_X);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "same model: user 2's Back and X do not fire it");
+   t_buttons[1] = 0;
+
+   t_reset();
+   t_pad(0, t_xpad, "Xpad");
+   t_pad(1, t_xpad, "Xpad");
+   t_bind(RARCH_MENU_TOGGLE, T_GUIDE);
+   t_map(1, 0);
+   t_buttons[1] = T_BIT(T_GUIDE);
+   CHECK(t_menu_tap(), "same model: user 2's Guide does not open the menu");
+}
+
+/* a driver that hands the frontend its keys: none down */
+static void t_keys_down(void *data, unsigned port, const uint16_t *keys,
+      const uint8_t *bind, unsigned count, uint32_t *down)
+{ (void)data; (void)port; (void)keys; (void)bind; (void)count; (void)down; }
+static int16_t t_kd_state(void *data, const input_device_driver_t *joypad,
+      rarch_joypad_info_t *joypad_info, const retro_keybind_set *binds,
+      unsigned port, unsigned device, unsigned idx, unsigned id)
+{
+   (void)data; (void)joypad; (void)joypad_info; (void)binds; (void)port;
+   (void)device; (void)idx; (void)id;
+   return 0;
+}
+static input_driver_t t_kd;
+
+/* With the keys the frontend's, only the hotkeys something may hold
+ * are gone through: one that only user 2's profile binds is among
+ * them while user 2 shares the port. */
+static void test_hotkey_sharer_profile(void)
+{
+   input_bits_t bits;
+   input_driver_state_t *st = input_state_get_ptr();
+
+   t_reset();
+   t_kd.input_state   = t_kd_state;
+   t_kd.keys_down     = t_keys_down;
+   st->current_driver = &t_kd;
+   t_pad(0, t_xpad, "Xpad");
+   t_pad(1, t_auto_own, "Headset");
+   input_config_binds[0][RARCH_FAST_FORWARD_KEY].attr =
+      RETRO_KEYBIND_ATTR(RETROK_UNKNOWN, NO_BTN, true);
+   input_config_binds_changed();
+   t_map(1, 0);
+
+   t_buttons[1] = T_BIT(T_OWN_FF);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "user 2's own profile's fast-forward is passed over");
+   t_buttons[1] = 0;
+   t_buttons[0] = T_BIT(T_OWN_FF);
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "user 2's profile's fast-forward fires on user 1's pad");
+   t_buttons[0]       = 0;
+   st->current_driver = NULL;
+}
+
+/* Pads of two names that number the RetroPad alike: the binds as they
+ * are, Guide included. Another numbering still translates. */
+static void test_hotkeys_same_layout(void)
+{
+   input_bits_t bits;
+
+   t_reset();
+   t_pad(0, t_xpad, "Xpad A");
+   t_pad(1, t_xpad, "Xpad B");
+   t_bind(RARCH_ENABLE_HOTKEY, T_GUIDE);
+   t_bind(RARCH_FAST_FORWARD_KEY, T_XPAD_X);
+   t_map(1, 0);
+
+   t_buttons[1] = T_BIT(T_GUIDE) | T_BIT(T_XPAD_X);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "one layout: user 2's Guide and X do not fire fast-forward");
+   t_buttons[1] = T_BIT(T_XPAD_X);
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "one layout: user 2's X fires fast-forward without Hotkey Enable");
+
+   /* A and B the other way round */
+   t_reset();
+   t_pad(0, t_xpad, "Xpad A");
+   t_pad(1, t_xpad_ab, "Xpad B");
+   t_bind(RARCH_ENABLE_HOTKEY, T_XPAD_SELECT);
+   t_bind(RARCH_FAST_FORWARD_KEY, 0);
+   t_map(1, 0);
+
+   t_buttons[1] = T_BIT(T_XPAD_SELECT) | T_BIT(1);
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "A and B swapped: user 2's Back and A do not fire fast-forward");
+   t_buttons[1] = T_BIT(T_XPAD_SELECT) | T_BIT(0);
+   t_collect(&bits);
+   CHECK(!BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "A and B swapped: user 2's Back and B fire fast-forward");
+   t_buttons[1] = 0;
+}
+
 int main(void)
 {
    test_identity();
@@ -262,6 +1058,23 @@ int main(void)
    test_swapped_ports();
    test_port_2_users();
    test_rumble_answer();
+   test_menu_shared();
+   test_hotkeys_shared();
+   test_hotkey_enable_shared();
+   test_menu_toggle_shared();
+   test_hotkeys_follow();
+   test_menu_toggle_game_button();
+   test_menu_combo_split();
+   test_hotkeys_shared_menu();
+   test_hotkey_enable_keyboard();
+   test_none_player1();
+   test_hotkeys_other_model();
+   test_hotkey_game_focus_other_model();
+   test_hotkey_axis_other_model();
+   test_menu_toggle_other_model();
+   test_hotkeys_same_model();
+   test_hotkeys_same_layout();
+   test_hotkey_sharer_profile();
    if (failures)
    {
       printf("%d failure(s)\n", failures);
