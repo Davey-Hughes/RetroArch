@@ -222,7 +222,6 @@ static void lane_headset_rows(void)
       MENU_ENUM_LABEL_VIDEO_OPENXR_DISTANCE_STR,
       MENU_ENUM_LABEL_VIDEO_OPENXR_WIDTH_STR,
       MENU_ENUM_LABEL_VIDEO_OPENXR_PLACEMENT_STR,
-      MENU_ENUM_LABEL_VIDEO_OPENXR_CONTROLLERS_STR,
       MENU_ENUM_LABEL_VIDEO_OPENXR_LASER_STR };
    unsigned i, d;
 
@@ -265,6 +264,27 @@ static void lane_headset_rows(void)
       CHECK(row(rows[i]) < 0, "%s is listed under " NO_PATH_DRIVER,
             rows[i]);
    set_driver(HEADSET_DRIVER);
+}
+
+/* The headset's controller layout is the last row of Settings > Input
+ * > Controllers, and is not among the headset's rows. */
+static void lane_controller_layout(void)
+{
+   file_list_t *buf;
+   int r;
+
+   set_driver(HEADSET_DRIVER);
+   open_stereo_list();
+   CHECK(row(MENU_ENUM_LABEL_VIDEO_OPENXR_CONTROLLERS_STR) < 0,
+         "the controller layout is listed with the headset's rows");
+   generic_action_ok_displaylist_push("", NULL, "", 0, 0, 0,
+         ACTION_OK_DL_INPUT_CONTROLLERS_LIST);
+   run_frame();
+   buf = selection_buf();
+   r   = row(MENU_ENUM_LABEL_VIDEO_OPENXR_CONTROLLERS_STR);
+   CHECK(buf && r >= 0 && (size_t)r == buf->size - 1,
+         "the controller layout is not the last row of Controllers "
+         "(row %d)", r);
 }
 
 /* Fixed in Room by default; each value shows its own name. */
@@ -519,6 +539,7 @@ int main(int argc, char *argv[])
    }
    lane_on_other_driver();
    lane_headset_rows();
+   lane_controller_layout();
    lane_placement();
    lane_refresh_rate();
 

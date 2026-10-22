@@ -9005,6 +9005,12 @@ static unsigned menu_displaylist_parse_input_controllers(
                0, 0, NULL))
          count++;
    }
+#ifdef HAVE_OPENXR
+   if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+            MENU_ENUM_LABEL_VIDEO_OPENXR_CONTROLLERS,
+            PARSE_ONLY_UINT, false) == 0)
+      count++;
+#endif
    return count;
 }
 
@@ -12567,10 +12573,6 @@ unsigned menu_displaylist_build_list(
                count++;
             if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
                      MENU_ENUM_LABEL_VIDEO_OPENXR_PLACEMENT,
-                     PARSE_ONLY_UINT, false) == 0)
-               count++;
-            if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
-                     MENU_ENUM_LABEL_VIDEO_OPENXR_CONTROLLERS,
                      PARSE_ONLY_UINT, false) == 0)
                count++;
             if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
