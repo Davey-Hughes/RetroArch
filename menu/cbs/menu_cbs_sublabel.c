@@ -1562,26 +1562,58 @@ size_t menu_cbs_sublabel_for_enum(enum msg_hash_enums enum_idx,
    return strlen(s);
 }
 
-/* Settings > Input > Controllers: where the controller is now. */
+/* Settings > Input > Controllers and Port N Controls: the player it
+ * plays as, and where. */
 static int action_bind_sublabel_input_plays_as(
       file_list_t *list,
       unsigned type, unsigned i,
       const char *label, const char *path,
       char *s, size_t len)
 {
-   unsigned user, with;
-   unsigned row = type - MENU_SETTINGS_INPUT_PLAYS_AS_BEGIN;
+   unsigned player, port;
+   unsigned row  = type - MENU_SETTINGS_INPUT_PLAYS_AS_BEGIN;
+   /* Port N Controls' rows carry N */
+   size_t page   = (list && i < list->size) ? list->list[i].entry_idx : 0;
+   enum input_plays_as_where where = input_config_plays_as_where(row,
+         &player, &port);
 
-   if (row >= MAX_INPUT_DEVICES)
-      strlcpy(s, msg_hash_to_str(MENU_ENUM_SUBLABEL_INPUT_PLAYS_AS_GONE), len);
-   else if ((user = input_config_slot_user(row)) >= MAX_USERS)
-      strlcpy(s, msg_hash_to_str(MENU_ENUM_SUBLABEL_INPUT_PLAYS_AS_NO_PORT), len);
-   else if ((with = input_remapping_join_user(user)) < MAX_USERS)
-      snprintf(s, len, msg_hash_to_str(MENU_ENUM_SUBLABEL_INPUT_PLAYS_AS_SHARING),
-            with + 1, user + 1);
-   else
-      snprintf(s, len, msg_hash_to_str(MENU_ENUM_SUBLABEL_INPUT_PLAYS_AS_PLAYER),
-            user + 1);
+   if (page && port)
+   {
+      if (port == page)
+         strlcpy(s, msg_hash_to_str(MENU_ENUM_SUBLABEL_INPUT_PLAYS_AS_THIS_PORT),
+               len);
+      else
+         snprintf(s, len,
+               msg_hash_to_str(MENU_ENUM_SUBLABEL_INPUT_PLAYS_AS_SHARED_BINDS),
+               port);
+      return 0;
+   }
+   switch (where)
+   {
+      case INPUT_PLAYS_AS_NO_PORT:
+         strlcpy(s, msg_hash_to_str(MENU_ENUM_SUBLABEL_INPUT_PLAYS_AS_NO_PORT),
+               len);
+         break;
+      case INPUT_PLAYS_AS_ABOVE_MAX_USERS:
+         snprintf(s, len,
+               msg_hash_to_str(MENU_ENUM_SUBLABEL_INPUT_PLAYS_AS_ABOVE_MAX_USERS),
+               player);
+         break;
+      case INPUT_PLAYS_AS_SHARING:
+         snprintf(s, len,
+               msg_hash_to_str(MENU_ENUM_SUBLABEL_INPUT_PLAYS_AS_SHARING),
+               player, port);
+         break;
+      case INPUT_PLAYS_AS_OWN_PORT:
+         snprintf(s, len,
+               msg_hash_to_str(MENU_ENUM_SUBLABEL_INPUT_PLAYS_AS_PLAYER),
+               player);
+         break;
+      default:
+         strlcpy(s, msg_hash_to_str(MENU_ENUM_SUBLABEL_INPUT_PLAYS_AS_GONE),
+               len);
+         break;
+   }
    return 0;
 }
 

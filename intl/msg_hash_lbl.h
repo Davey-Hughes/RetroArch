@@ -681,6 +681,14 @@ MSG_HASH(
    MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_SELECT_RESERVED_DEVICE,
    "deferred_dropdown_box_list_input_select_reserved_device"
    )
+MSG_HASH(
+   MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_PLAYS_AS,
+   "deferred_dropdown_box_list_input_plays_as"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_PLAYS_AS_ADD,
+   "deferred_dropdown_box_list_input_plays_as_add"
+   )
 #ifdef ANDROID
 MSG_HASH(
    MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_SELECT_PHYSICAL_KEYBOARD,
@@ -1486,6 +1494,10 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_LABEL_INPUT_PLAYS_AS,
    "input_plays_as"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_INPUT_PLAYS_AS_ADD,
+   "input_plays_as_add"
    )
 MSG_HASH(
    MENU_ENUM_LABEL_INPUT_MOUSE_INDEX,
