@@ -9681,6 +9681,8 @@ bool config_save_file(const char *path)
 
    /* the entries and macros, as they are now */
    input_entries_write(conf);
+   /* and the controllers' own players */
+   input_plays_as_write(conf);
 
    /* Remove unused "quit_press_twice" after migrating to "confirm_quit" */
    {

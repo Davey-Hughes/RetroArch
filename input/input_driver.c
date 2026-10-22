@@ -10399,6 +10399,265 @@ void input_config_follow_shared_ports(const uint8_t *leader)
          idx[i] = idx[leader[i]];
 }
 
+/* Plays As: a controller's own player, kept by the controller as a
+ * reservation names one, "vid:pid name". A connected controller takes
+ * the first entry naming it that no other connected controller has
+ * taken; one with none plays Auto. */
+typedef struct
+{
+   char device[NAME_MAX_LENGTH]; /* "" for a free entry */
+   unsigned player;              /* 0 Auto, else 1 and up */
+} input_plays_as_entry_t;
+
+static input_plays_as_entry_t input_plays_as[MAX_USERS];
+/* by slot: the entry its controller took, and one; 0 for none */
+static uint8_t input_plays_as_claim[MAX_INPUT_DEVICES];
+
+bool input_config_parse_vid_pid(const char *s, unsigned long *vid,
+      unsigned long *pid, const char **name)
+{
+   char *end;
+   unsigned long p;
+   const char *colon = strchr(s, ':');
+   unsigned long v   = strtoul(s, &end, 16);
+
+   if (!colon || end != colon)
+      return false;
+   p = strtoul(colon + 1, &end, 16);
+   if (end == colon + 1 || (*end != ' ' && *end != '\0'))
+      return false;
+   *vid = v;
+   *pid = p;
+   if (name)
+      *name = (*end == ' ') ? end + 1 : end;
+   return true;
+}
+
+/* Whether @entry names the controller called @name or @display with
+ * @vid and @pid: by vid:pid where it starts with one, by name where it
+ * starts with none. @zero_by_name: a 0000:0000, which every unnumbered
+ * controller has, names by the name after it (Plays As), not every
+ * such controller (a reservation). */
+static bool input_plays_as_names(const char *entry, bool zero_by_name,
+      const char *name, const char *display, uint16_t vid, uint16_t pid)
+{
+   unsigned long v;
+   unsigned long p;
+   const char *n = entry;
+
+   if (     input_config_parse_vid_pid(entry, &v, &p, &n)
+         && (v || p || !zero_by_name))
+      return v == vid && p == pid;
+   return (name && *name && string_is_equal(name, n))
+      || (display && *display && string_is_equal(display, n));
+}
+
+int input_config_plays_as_entry(unsigned slot)
+{
+   if (     slot >= MAX_INPUT_DEVICES
+         || !input_plays_as_claim[slot]
+         || !*input_driver_st.input_device_info[slot].name)
+      return -1;
+   return input_plays_as_claim[slot] - 1;
+}
+
+/* The controller in @slot takes the first entry naming it that no
+ * other connected controller has taken. */
+static void input_plays_as_take(unsigned slot)
+{
+   unsigned e, s;
+   uint32_t taken                = 0;
+   const input_device_info_t *d  = &input_driver_st.input_device_info[slot];
+
+   input_plays_as_claim[slot]    = 0;
+   if (!*d->name)
+      return;
+   for (s = 0; s < MAX_INPUT_DEVICES; s++)
+   {
+      int t = input_config_plays_as_entry(s);
+      if (t >= 0)
+         taken |= 1U << t;
+   }
+   for (e = 0; e < MAX_USERS; e++)
+      if (     *input_plays_as[e].device
+            && !(taken & (1U << e))
+            && input_plays_as_names(input_plays_as[e].device, true,
+                  d->name, d->display_name, d->vid, d->pid))
+      {
+         input_plays_as_claim[slot] = (uint8_t)(e + 1);
+         return;
+      }
+}
+
+/* Every connected controller takes its entry again, lowest slot
+ * first: the entries have changed under them. */
+static void input_plays_as_reclaim(void)
+{
+   unsigned s;
+   memset(input_plays_as_claim, 0, sizeof(input_plays_as_claim));
+   for (s = 0; s < MAX_INPUT_DEVICES; s++)
+      input_plays_as_take(s);
+}
+
+/* Entry @e free, and no controller's. */
+static void input_plays_as_drop(unsigned e)
+{
+   unsigned s;
+   input_plays_as[e].device[0] = '\0';
+   input_plays_as[e].player    = 0;
+   for (s = 0; s < MAX_INPUT_DEVICES; s++)
+      if (input_plays_as_claim[s] == e + 1)
+         input_plays_as_claim[s] = 0;
+}
+
+/* Entry @e is let go once it holds nothing a controller would not
+ * have without it. */
+static void input_plays_as_tidy(unsigned e)
+{
+   if (!input_plays_as[e].player)
+      input_plays_as_drop(e);
+}
+
+bool input_config_plays_as_active(void)
+{
+   unsigned e;
+   for (e = 0; e < MAX_USERS; e++)
+      if (*input_plays_as[e].device)
+         return true;
+   return false;
+}
+
+unsigned input_config_plays_as_player(unsigned slot)
+{
+   int e = input_config_plays_as_entry(slot);
+   return (e >= 0) ? input_plays_as[e].player : 0;
+}
+
+/* A free entry naming the controller in @slot, at its player, which
+ * the controller takes; -1 with none free. */
+static int input_plays_as_new(unsigned slot)
+{
+   int e;
+   unsigned player              = input_config_plays_as_player(slot);
+   const input_device_info_t *d = &input_driver_st.input_device_info[slot];
+
+   for (e = 0; e < MAX_USERS && *input_plays_as[e].device; e++) { }
+   if (e >= MAX_USERS)
+      return -1;
+   snprintf(input_plays_as[e].device, sizeof(input_plays_as[e].device),
+         "%04x:%04x %s", d->vid, d->pid,
+         *d->display_name ? d->display_name : d->name);
+   input_plays_as[e].player   = player;
+   input_plays_as_claim[slot] = (uint8_t)(e + 1);
+   return e;
+}
+
+bool input_config_plays_as_set(unsigned slot, unsigned player)
+{
+   int e;
+
+   if (     slot >= MAX_INPUT_DEVICES
+         || !*input_driver_st.input_device_info[slot].name)
+      return false;
+   if ((e = input_config_plays_as_entry(slot)) < 0)
+   {
+      if (player == input_config_plays_as_player(slot))
+         return true;
+      if ((e = input_plays_as_new(slot)) < 0)
+         return false;
+   }
+   input_plays_as[e].player = player;
+   input_plays_as_tidy((unsigned)e);
+   return true;
+}
+
+const char *input_config_plays_as_entry_name(unsigned e)
+{
+   const char *dev;
+   if (e >= MAX_USERS || !*input_plays_as[e].device)
+      return NULL;
+   dev = input_plays_as[e].device;
+   /* "vid:pid name" shows its name */
+   if (     strlen(dev) > 10
+         && dev[4] == ':' && dev[9] == ' ')
+      return dev + 10;
+   return dev;
+}
+
+unsigned input_config_plays_as_entry_player(unsigned e)
+{
+   return (e < MAX_USERS) ? input_plays_as[e].player : 0;
+}
+
+bool input_config_plays_as_entry_taken(unsigned e)
+{
+   unsigned s;
+   for (s = 0; s < MAX_INPUT_DEVICES; s++)
+      if (input_config_plays_as_entry(s) == (int)e)
+         return true;
+   return false;
+}
+
+void input_config_plays_as_set_entry(unsigned e, unsigned player)
+{
+   if (e >= MAX_USERS || !*input_plays_as[e].device)
+      return;
+   input_plays_as[e].player = player;
+   input_plays_as_tidy(e);
+}
+
+void input_config_plays_as_release(unsigned slot)
+{
+   if (slot < MAX_INPUT_DEVICES)
+      input_plays_as_claim[slot] = 0;
+}
+
+void input_plays_as_read(void *data)
+{
+   unsigned e;
+   char key[48];
+   config_file_t *conf = (config_file_t*)data;
+
+   for (e = 0; e < MAX_USERS; e++)
+      input_plays_as_drop(e);
+   for (e = 0; conf && e < MAX_USERS; e++)
+   {
+      unsigned player = 0;
+      snprintf(key, sizeof(key), "input_plays_as_device_%u", e + 1);
+      if (!config_get_array(conf, key, input_plays_as[e].device,
+               sizeof(input_plays_as[e].device)))
+         continue;
+      snprintf(key, sizeof(key), "input_plays_as_player_%u", e + 1);
+      if (config_get_uint(conf, key, &player) && player <= MAX_USERS)
+         input_plays_as[e].player = player;
+   }
+   input_plays_as_reclaim();
+}
+
+void input_plays_as_write(void *data)
+{
+   unsigned e;
+   char key[48];
+   config_file_t *conf = (config_file_t*)data;
+
+   if (!conf)
+      return;
+   for (e = 0; e < MAX_USERS; e++)
+   {
+      bool used = *input_plays_as[e].device != '\0';
+      snprintf(key, sizeof(key), "input_plays_as_device_%u", e + 1);
+      if (used)
+         config_set_string(conf, key, input_plays_as[e].device);
+      else
+         config_unset(conf, key);
+      snprintf(key, sizeof(key), "input_plays_as_player_%u", e + 1);
+      if (used)
+         config_set_uint(conf, key, input_plays_as[e].player);
+      else
+         config_unset(conf, key);
+   }
+}
+
 /* Adds an index to devices with the same name,
  * so they can be uniquely identified in the
  * frontend */
@@ -10955,6 +11214,8 @@ void config_read_keybinds_conf(void *data)
 
    /* and the entries, input_combo_1 and up */
    input_entries_read(conf);
+   /* and the controllers' own players */
+   input_plays_as_read(conf);
 }
 
 #ifdef HAVE_COMMAND
