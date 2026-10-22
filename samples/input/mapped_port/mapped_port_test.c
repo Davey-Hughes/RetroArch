@@ -2656,6 +2656,60 @@ static void test_hotkey_enable_own_menu_tap(void)
    settings.uints.input_hotkey_block_delay = 0;
 }
 
+/* A pad's press on @slot, binding @id for user @user, written where
+ * the bind capture (menu_input_key_bind_iterate()) writes it. */
+static void t_bind_press(unsigned user, unsigned slot, unsigned id,
+      uint16_t joykey)
+{
+   if (input_config_hotkey_bind_own(slot, id))
+      input_config_plays_as_set_hotkey(slot, id, joykey, AXIS_NONE);
+   else
+   {
+      input_config_binds[user][id].joykey  = joykey;
+      input_config_binds[user][id].joyaxis = AXIS_NONE;
+   }
+}
+
+/* Binding with a pad: a RetroPad bind is its user's, in the set, from
+ * user 1's pad or any other; a hotkey goes to the pressing
+ * controller's own bind when it is a sharer's or that controller has
+ * one already, else to the set. */
+static void test_bind_press_routing(void)
+{
+   uint16_t k;
+   uint32_t a;
+   const unsigned b  = RETRO_DEVICE_ID_JOYPAD_B;
+   const unsigned ff = RARCH_FAST_FORWARD_KEY;
+
+   t_reset();
+   t_dev(0, "A", 1, 1);
+   t_dev(1, "B", 2, 2);
+   t_dev(2, "C", 3, 3);
+   t_map(2, 0);
+   t_bind_press(0, 0, b, 5);
+   t_bind_press(1, 1, b, 6);
+   CHECK(input_config_binds[0][b].joykey == 5
+         && input_config_binds[1][b].joykey == 6
+         && input_config_plays_as_entry(0) == -1
+         && input_config_plays_as_entry(1) == -1,
+         "a RetroPad bind from a pad was not written to its user's set");
+
+   t_bind_press(0, 0, ff, 7);
+   input_config_plays_as_hotkey(0, ff, &k, &a);
+   CHECK(input_config_binds[0][ff].joykey == 7 && k == NO_BTN
+         && input_config_plays_as_entry(0) == -1,
+         "user 1's pad with no own bind did not bind the set");
+   t_bind_press(0, 2, ff, 9);
+   input_config_plays_as_hotkey(2, ff, &k, &a);
+   CHECK(k == 9 && input_config_binds[0][ff].joykey == 7,
+         "a sharer's press did not bind its own");
+   input_config_plays_as_set_hotkey(0, ff, T_OWN_KEY, AXIS_NONE);
+   t_bind_press(0, 0, ff, 10);
+   input_config_plays_as_hotkey(0, ff, &k, &a);
+   CHECK(k == 10 && input_config_binds[0][ff].joykey == 7,
+         "user 1's pad with its own bind bound the set");
+}
+
 /* With Hotkeys Follow Player 1 on and user 1 mapped off core port 1,
  * binding a hotkey listens to who fires them: the first user on core
  * port 1 and the users sharing it, not user 1's core port. */
@@ -2927,6 +2981,7 @@ int main(void)
    test_hotkey_own_lookup();
    test_hotkey_own_storage();
    test_hotkey_enable_own();
+   test_bind_press_routing();
    test_hotkey_listen_follows();
    test_hotkey_own_binding();
 #ifdef HAVE_OPENXR

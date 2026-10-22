@@ -18344,6 +18344,9 @@ bool input_config_hotkey_bind_own(unsigned slot, unsigned id)
    uint32_t joyaxis;
    const settings_t *settings = config_get_ptr();
 
+   /* a RetroPad bind is always its user's, in the set */
+   if (id < RARCH_FIRST_META_KEY || id >= RARCH_BIND_LIST_END)
+      return false;
    input_config_plays_as_hotkey(slot, id, &joykey, &joyaxis);
    if (joykey != NO_BTN || joyaxis != AXIS_NONE)
       return true;
