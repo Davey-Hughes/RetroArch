@@ -1944,7 +1944,7 @@ const char *input_config_plays_as_entry_name(unsigned e);
 unsigned input_config_plays_as_entry_player(unsigned e);
 bool input_config_plays_as_entry_taken(unsigned e);
 void input_config_plays_as_set_entry(unsigned e, unsigned player);
-/* Whether any entry is in use. */
+/* Whether any entry gives a player, within Max Users or past it. */
 bool input_config_plays_as_active(void);
 /* Whether any entry gives a player within Max Users. */
 bool input_config_plays_as_any_player(void);

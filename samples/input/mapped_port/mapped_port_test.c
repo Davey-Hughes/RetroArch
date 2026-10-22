@@ -2206,6 +2206,8 @@ static void test_hotkey_own_storage(void)
    CHECK(input_config_plays_as_entry(0) == 0
          && input_config_plays_as_player(0) == 0,
          "the entry was not made at the controller's player");
+   CHECK(!input_config_plays_as_active(),
+         "an entry kept only for its own hotkeys has Max Users place again");
 
    conf = config_file_new_alloc();
    input_plays_as_write(conf);

@@ -10581,7 +10581,7 @@ bool input_config_plays_as_active(void)
 {
    unsigned e;
    for (e = 0; e < MAX_USERS; e++)
-      if (*input_plays_as[e].device)
+      if (input_plays_as[e].player)
          return true;
    return false;
 }
