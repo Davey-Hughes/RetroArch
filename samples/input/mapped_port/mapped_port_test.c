@@ -2363,6 +2363,53 @@ static void test_hotkey_enable_own_game_focus(void)
    st->flags   &= ~INP_FLAG_KB_MAPPING_BLOCKED;
 }
 
+/* Hotkey Enable and the menu toggle on a sharer, let go together, open
+ * the menu when held past the delay and not when tapped within it:
+ * with the set's Hotkey Enable, and with only the sharer's own. */
+static void test_hotkey_enable_own_menu_tap(void)
+{
+   unsigned own, f;
+   input_bits_t bits;
+
+   for (own = 0; own < 2; own++)
+   {
+      t_reset();
+      settings.uints.input_hotkey_block_delay = 5;
+      t_two_player_1();
+      input_driver_poll();
+      if (own)
+         input_config_plays_as_set_hotkey(1, RARCH_ENABLE_HOTKEY,
+               T_ENABLE, AXIS_NONE);
+      else
+         t_bind(RARCH_ENABLE_HOTKEY, T_ENABLE);
+      /* a key only: a button would let it bypass Hotkey Enable */
+      input_config_binds[0][RARCH_MENU_TOGGLE].attr =
+         RETRO_KEYBIND_ATTR(RETROK_F1, NO_BTN, true);
+      input_config_binds_changed();
+      input_config_plays_as_set_hotkey(1, RARCH_MENU_TOGGLE, T_MENU,
+            AXIS_NONE);
+
+      t_buttons[1] = T_BIT(T_ENABLE) | T_BIT(T_MENU);
+      for (f = 0; f < 10; f++)
+         t_collect(&bits);
+      t_buttons[1] = 0;
+      t_collect(&bits);
+      CHECK(BIT256_GET(bits, RARCH_MENU_TOGGLE), own
+            ? "a sharer's own Hotkey Enable and menu toggle, held, did not open the menu"
+            : "the set's Hotkey Enable and menu toggle, held, did not open the menu");
+
+      t_buttons[1] = T_BIT(T_ENABLE) | T_BIT(T_MENU);
+      for (f = 0; f < 2; f++)
+         t_collect(&bits);
+      t_buttons[1] = 0;
+      t_collect(&bits);
+      CHECK(!BIT256_GET(bits, RARCH_MENU_TOGGLE), own
+            ? "a short tap of a sharer's own Hotkey Enable and menu toggle opened the menu"
+            : "a short tap of the set's Hotkey Enable and menu toggle opened the menu");
+   }
+   settings.uints.input_hotkey_block_delay = 0;
+}
+
 int main(void)
 {
    test_identity();
@@ -2423,6 +2470,7 @@ int main(void)
    test_hotkey_enable_own();
    test_hotkey_enable_own_delay();
    test_hotkey_enable_own_game_focus();
+   test_hotkey_enable_own_menu_tap();
    if (failures)
    {
       printf("%d failure(s)\n", failures);
