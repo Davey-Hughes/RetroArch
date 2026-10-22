@@ -1545,6 +1545,11 @@ static int action_bind_sublabel_input_plays_as(
       strlcpy(s, msg_hash_to_str(MENU_ENUM_SUBLABEL_INPUT_PLAYS_AS_GONE), len);
    else if ((user = input_config_slot_user(row)) >= MAX_USERS)
       strlcpy(s, msg_hash_to_str(MENU_ENUM_SUBLABEL_INPUT_PLAYS_AS_NO_PORT), len);
+   else if (input_config_plays_as_player(row)
+         > config_get_ptr()->uints.input_max_users)
+      snprintf(s, len,
+            msg_hash_to_str(MENU_ENUM_SUBLABEL_INPUT_PLAYS_AS_ABOVE_MAX_USERS),
+            user + 1);
    else if ((with = input_remapping_join_user(user)) < MAX_USERS)
       snprintf(s, len, msg_hash_to_str(MENU_ENUM_SUBLABEL_INPUT_PLAYS_AS_SHARING),
             user + 1, with + 1);

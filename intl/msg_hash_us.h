@@ -12514,6 +12514,10 @@ MSG_HASH(
    "No port: past Max Users"
    )
 MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_PLAYS_AS_ABOVE_MAX_USERS,
+   "Above Max Users: plays as Auto, Port %u"
+   )
+MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_PLAYS_AS_GONE,
    "Not connected"
    )
