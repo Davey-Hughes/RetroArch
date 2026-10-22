@@ -10716,9 +10716,9 @@ static bool input_plays_as_plays(const settings_t *settings,
             false, d->name, d->display_name, d->vid, d->pid);
 }
 
-/* The user whose reservation first names the controller in @slot, if
- * that user's controller plays as its player by its own; else
- * MAX_USERS. Placed second, either one shares. */
+/* The user whose reservation names the controller in @slot, chosen as
+ * the reservation code chooses, if that user's controller plays as its
+ * player by its own; else MAX_USERS. Placed second, either one shares. */
 static unsigned input_plays_as_reserved_held(const settings_t *settings,
       unsigned slot, unsigned max_users)
 {
@@ -10726,16 +10726,24 @@ static unsigned input_plays_as_reserved_held(const settings_t *settings,
    const input_device_info_t *d = &input_driver_st.input_device_info[slot];
    for (u = 0; u < MAX_USERS; u++)
    {
-      unsigned held = settings->uints.input_joypad_index[u];
+      const char *res = settings->arrays.input_reserved_devices[u];
+      unsigned held   = settings->uints.input_joypad_index[u];
+      const input_device_info_t *h;
       if (     settings->uints.input_device_reservation_type[u]
                == INPUT_DEVICE_RESERVATION_NONE
-            || !input_plays_as_names(settings->arrays.input_reserved_devices[u],
-               false, d->name, d->display_name, d->vid, d->pid))
+            || !input_plays_as_names(res, false,
+               d->name, d->display_name, d->vid, d->pid))
          continue;
-      if (     held != slot
-            && held < MAX_INPUT_DEVICES
-            && *input_driver_st.input_device_info[held].name
-            && input_plays_as_now(held, max_users) == u + 1)
+      if (held == slot || held >= MAX_INPUT_DEVICES)
+         break;
+      h = &input_driver_st.input_device_info[held];
+      if (!*h->name)
+         break;
+      /* a twin it also names has this port: the reservations look on */
+      if (input_plays_as_names(res, false,
+               h->name, h->display_name, h->vid, h->pid))
+         continue;
+      if (input_plays_as_now(held, max_users) == u + 1)
          return u;
       break;
    }

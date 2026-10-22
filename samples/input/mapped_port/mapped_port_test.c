@@ -681,6 +681,26 @@ static void test_place_reservation_order(void)
    CHECK(input_config_plays_as_place(1)
          && t_user_of(0) == 0 && t_user_of(1) == 3,
          "Player 1 first: the reserved controller did not share");
+
+   /* twins reserved for ports 1 and 2, one set to Player 1: the other
+    * goes to port 2 as the reservations give it */
+   t_reset();
+   settings.uints.input_device_reservation_type[0] =
+      INPUT_DEVICE_RESERVATION_PREFERRED;
+   settings.uints.input_device_reservation_type[1] =
+      INPUT_DEVICE_RESERVATION_PREFERRED;
+   strlcpy(settings.arrays.input_reserved_devices[0], "0005:0005 Res",
+         sizeof(settings.arrays.input_reserved_devices[0]));
+   strlcpy(settings.arrays.input_reserved_devices[1], "0005:0005 Res",
+         sizeof(settings.arrays.input_reserved_devices[1]));
+   t_entries(
+         "input_plays_as_device_1 = \"0005:0005 Res\"\n"
+         "input_plays_as_player_1 = \"1\"\n");
+   t_connect(0, "Res", 5, 5);
+   t_dev(1, "Res", 5, 5);
+   CHECK(!input_config_plays_as_place(1)
+         && t_user_of(0) == 0 && t_user_of(1) == 1,
+         "a twin reserved for port 2 shared Player 1");
 }
 
 /* The controller on port N leaving: its sharers stay; the next Auto
