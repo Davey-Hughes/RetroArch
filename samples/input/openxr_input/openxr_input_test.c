@@ -528,6 +528,18 @@ bool input_config_get_device_autoconfigured(unsigned port)
 {
    return port < MAX_USERS && t_dev_auto[port];
 }
+/* The headset's controllers' player (Plays As): 0, Auto, for the
+ * cases that place them as a pad is placed; its default is 1. A new
+ * value is a change of the entries; the lookups are counted. */
+static unsigned t_plays_as;
+static unsigned t_named_calls;
+unsigned input_config_plays_as_named(const char *name)
+{
+   (void)name;
+   t_named_calls++;
+   return t_plays_as;
+}
+unsigned input_config_plays_as_generation(void) { return t_plays_as; }
 /* Port n reads slot t_index[n]. */
 static unsigned t_index[MAX_USERS];
 static unsigned t_exchanges;
@@ -720,10 +732,11 @@ static void t_forget_devices(void)
 /* Unless a case holds them, the tasks a poll queues have run by the
  * next. */
 static bool t_hold_tasks;
+static unsigned t_max_users = 4;
 
 static void t_poll(unsigned controllers, unsigned laser)
 {
-   input_openxr_poll(4, controllers, laser, 0.5f);
+   input_openxr_poll(t_max_users, controllers, laser, 0.5f);
    if (!t_hold_tasks)
       t_land();
 }
@@ -1668,6 +1681,183 @@ static void test_device_taken(void)
    t_forget_devices();
 }
 
+/* Playing as a player (the headset's default, Player 1), the device
+ * takes the highest free slot below Max Users, so pads keep the low
+ * ones, both hands in Separate; past a pad that takes it, the next
+ * highest, the pad keeping its port; with none free below Max Users,
+ * the lowest past it. */
+static void test_plays_as_slot(void)
+{
+   unsigned n, x;
+   t_let_go();
+   t_forget_devices();
+   t_land();
+   t_plays_as = 1;
+   t_pad_lands(0, "Pad");
+   t_fresh_session();
+   n = t_num_ops;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   CHECK(t_num_ops == n + 1
+         && t_op_is(n, true, 3, INPUT_OPENXR_JOYPAD_COMBINED),
+         "Player 1: device in slot %d, want 3", t_slot(0));
+
+   t_pad_lands(1, "Pad 2");
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   CHECK(t_slot(0) == 3, "a second pad moved the device to %d", t_slot(0));
+
+   /* a pad takes slot 3: the device goes to 2, the pad keeps port 4 */
+   x = t_exchanges;
+   t_pad_lands(3, "Pad 4");
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   CHECK(t_slot(0) == 2 && t_exchanges == x
+         && t_index[2] == 2 && t_index[3] == 3,
+         "moved to slot %d, %u exchanges, ports 3 and 4 read %u and %u",
+         t_slot(0), t_exchanges - x, t_index[2], t_index[3]);
+   t_hooks.session_destroying(t_hooks.user);
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+
+   /* Separate: each hand a player's, the highest two free */
+   t_forget_devices();
+   t_pad_lands(0, "Pad");
+   t_fresh_session();
+   t_poll(VIDEO_OPENXR_CONTROLLERS_SEPARATE, VIDEO_OPENXR_LASER_OFF);
+   CHECK(t_slot(0) == 3 && t_slot(1) == 2,
+         "Separate: hands in slots %d and %d, want 3 and 2",
+         t_slot(0), t_slot(1));
+   t_hooks.session_destroying(t_hooks.user);
+   t_poll(VIDEO_OPENXR_CONTROLLERS_SEPARATE, VIDEO_OPENXR_LASER_OFF);
+
+   /* pads in 0-2, the device in 3: a 4th pad there stays port 4, and
+    * the device goes past Max Users */
+   t_forget_devices();
+   t_pad_lands(0, "Pad");
+   t_pad_lands(1, "Pad 2");
+   t_pad_lands(2, "Pad 3");
+   t_fresh_session();
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   x = t_exchanges;
+   t_reset_log();
+   t_pad_lands(3, "Pad 4");
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   CHECK(t_slot(0) == 4 && t_exchanges == x && t_index[3] == 3
+         && t_logged("past Max Users"),
+         "a 4th pad in slot 3: device in %d, %u exchanges, port 4 reads %u",
+         t_slot(0), t_exchanges - x, t_index[3]);
+   t_hooks.session_destroying(t_hooks.user);
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+
+   /* pads in every slot below Max Users: the lowest past it, warned */
+   t_forget_devices();
+   t_pad_lands(0, "Pad");
+   t_pad_lands(1, "Pad 2");
+   t_pad_lands(2, "Pad 3");
+   t_pad_lands(3, "Pad 4");
+   t_fresh_session();
+   t_reset_log();
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   CHECK(t_slot(0) == 4 && t_logged("past Max Users"),
+         "with slots 0-3 taken: slot %d", t_slot(0));
+
+   t_hooks.session_destroying(t_hooks.user);
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   t_plays_as = 0;
+   t_let_go();
+   t_forget_devices();
+}
+
+/* Set to Auto or back to a player, the device is placed again once its
+ * connect has landed, as it plays now; so is a player's lowered past
+ * Max Users with a slot below free. Steady polls place nothing and
+ * look nothing up. */
+static void test_plays_as_replace(void)
+{
+   unsigned n, c;
+   t_let_go();
+   t_forget_devices();
+   t_land();
+   t_plays_as = 1;
+   t_pad_lands(0, "Pad");
+   t_fresh_session();
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   n = t_num_ops;
+   c = t_named_calls;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   CHECK(t_slot(0) == 3 && t_num_ops == n && t_named_calls == c,
+         "Player 1, steady: slot %d, %u ops, %u lookups", t_slot(0),
+         t_num_ops - n, t_named_calls - c);
+
+   /* to Auto: out of slot 3, then into the lowest free */
+   t_plays_as = 0;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   CHECK(t_num_ops == n + 1
+         && t_op_is(n, false, 3, INPUT_OPENXR_JOYPAD_COMBINED),
+         "to Auto: %u ops, want slot 3 let go", t_num_ops - n);
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   CHECK(t_num_ops == n + 2
+         && t_op_is(n + 1, true, 1, INPUT_OPENXR_JOYPAD_COMBINED)
+         && t_slot(0) == 1,
+         "Auto: slot %d, %u ops, want slot 1", t_slot(0), t_num_ops - n);
+   n = t_num_ops;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   CHECK(t_slot(0) == 1 && t_num_ops == n,
+         "Auto, steady: slot %d, %u ops", t_slot(0), t_num_ops - n);
+
+   /* back to Player 1: the highest free slot */
+   t_plays_as = 1;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   CHECK(t_num_ops == n + 2
+         && t_op_is(n, false, 1, INPUT_OPENXR_JOYPAD_COMBINED)
+         && t_op_is(n + 1, true, 3, INPUT_OPENXR_JOYPAD_COMBINED)
+         && t_slot(0) == 3,
+         "to Player 1: slot %d, %u ops, want 3", t_slot(0), t_num_ops - n);
+
+   /* Max Users 2: into slot 1 */
+   n           = t_num_ops;
+   t_max_users = 2;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   CHECK(t_num_ops == n + 2
+         && t_op_is(n, false, 3, INPUT_OPENXR_JOYPAD_COMBINED)
+         && t_op_is(n + 1, true, 1, INPUT_OPENXR_JOYPAD_COMBINED)
+         && t_slot(0) == 1,
+         "Max Users 2: slot %d, %u ops, want 1", t_slot(0), t_num_ops - n);
+
+   /* Max Users 1, the pad in slot 0: nowhere lower, so it stays */
+   n           = t_num_ops;
+   t_max_users = 1;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   CHECK(t_slot(0) == 1 && t_num_ops == n,
+         "Max Users 1: slot %d, %u ops, want it kept", t_slot(0),
+         t_num_ops - n);
+
+   /* set to Auto while its connect is landing: moved once it has */
+   t_max_users = 4;
+   t_plays_as  = 0;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   t_hold_tasks = true;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   t_plays_as = 1;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   CHECK(t_slot(0) == 1,
+         "to Player 1 while landing: slot %d, want 1", t_slot(0));
+   t_hold_tasks = false;
+   t_land();
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   CHECK(t_slot(0) == 3,
+         "landed, then Player 1: slot %d, want 3", t_slot(0));
+
+   t_hooks.session_destroying(t_hooks.user);
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+   t_plays_as = 0;
+   t_let_go();
+   t_forget_devices();
+}
+
 /* The joypad driver readers get: the device's slot answered from its
  * pad with the RetroPad's ids as buttons and sticks, L2 and R2 as axes
  * 0 to 5; every other slot from the driver under it. */
@@ -1816,6 +2006,8 @@ int main(void)
    test_palm();
    test_devices();
    test_device_taken();
+   test_plays_as_slot();
+   test_plays_as_replace();
    test_joypad_wrapped();
    test_joints();
    test_session_restart_trigger();
