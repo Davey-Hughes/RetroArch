@@ -1021,7 +1021,8 @@ typedef struct
    unsigned core_gyro_rate;  /* >0 means core wants gyro at this rate */
    /* First-press port assignment, see input_first_press_apply():
     * buttons seen released on a user with no core port, the users to
-    * map at the next frame boundary, and whether any of it is live. */
+    * map (or a change in who shares a player, to announce) at the
+    * next frame boundary, and whether any of it is live. */
    uint32_t first_press_released[MAX_USERS];
    uint32_t first_press_pending;
    /* users whose core port a press gave them, not the user */
