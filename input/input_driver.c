@@ -10849,15 +10849,16 @@ static const struct retro_keybind *input_hotkey_bind_own(unsigned i)
 
 const char *input_config_plays_as_entry_name(unsigned e)
 {
-   const char *dev;
+   unsigned long vid, pid;
+   const char *name;
    if (e >= MAX_USERS || !*input_plays_as[e].device)
       return NULL;
-   dev = input_plays_as[e].device;
    /* "vid:pid name" shows its name */
-   if (     strlen(dev) > 10
-         && dev[4] == ':' && dev[9] == ' ')
-      return dev + 10;
-   return dev;
+   if (     input_config_parse_vid_pid(input_plays_as[e].device,
+               &vid, &pid, &name)
+         && *name)
+      return name;
+   return input_plays_as[e].device;
 }
 
 unsigned input_config_plays_as_entry_player(unsigned e)

@@ -531,6 +531,26 @@ static void test_plays_as_match(void)
          "one entry was taken by two controllers");
 }
 
+/* An entry's name is what follows its vid:pid, however that is
+ * written; a name alone is all name. */
+static void test_plays_as_entry_name(void)
+{
+   t_reset();
+   t_entries(
+         "input_plays_as_device_1 = \"45e:28e Pad\"\n"
+         "input_plays_as_device_2 = \"Pads:Mini Pro\"\n"
+         "input_plays_as_device_3 = \"0000:0000\"\n");
+   CHECK(input_config_plays_as_entry_name(0)
+         && !strcmp(input_config_plays_as_entry_name(0), "Pad"),
+         "a short vid:pid is shown with the name");
+   CHECK(input_config_plays_as_entry_name(1)
+         && !strcmp(input_config_plays_as_entry_name(1), "Pads:Mini Pro"),
+         "a name alone was cut");
+   CHECK(input_config_plays_as_entry_name(2)
+         && !strcmp(input_config_plays_as_entry_name(2), "0000:0000"),
+         "a vid:pid with no name is not shown");
+}
+
 /* The entries are written and read back; a free entry's keys go. */
 static void test_plays_as_round_trip(void)
 {
@@ -2722,6 +2742,7 @@ int main(void)
    test_rumble_answer();
    test_vid_pid_parse();
    test_plays_as_match();
+   test_plays_as_entry_name();
    test_plays_as_round_trip();
    test_plays_as_entry_life();
    test_place_auto();
