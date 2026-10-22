@@ -1401,6 +1401,20 @@ static void test_place_restart_twins(void)
       input_driver_registry_disconnect(s);
       input_config_set_device_phys(s, "");
    }
+
+   /* a place longer than the registry keeps (a serial behind a hub) */
+   t_reset();
+   t_plug_twin(0, "usb-0000:00:14.0-1.4.1/input0"
+         "0123456789abcdef0123456789abcdef0123456789");
+   CHECK(input_config_plays_as_set(0, 2), "Player 2 was refused");
+   input_config_plays_as_place(0);
+   input_driver_registry_restart();
+   t_plug_twin(0, "usb-0000:00:14.0-1.4.1/input0"
+         "0123456789abcdef0123456789abcdef0123456789");
+   CHECK(input_config_plays_as_entry(0) == 0 && t_user_of(0) == 1,
+         "a pad with a long place lost its entry after a restart");
+   input_driver_registry_disconnect(0);
+   input_config_set_device_phys(0, "");
 }
 
 /* The reservations writing the ports after a Plays As move, as

@@ -10611,7 +10611,9 @@ static void input_plays_as_take(unsigned slot)
          unsigned h                       = input_plays_as_held[s];
          if (!h || !rec->expected)
             continue;
-         if (*d->phys && string_is_equal(rec->phys, d->phys))
+         /* as the registry matches: by as much as it keeps */
+         if (     *d->phys
+               && !strncmp(rec->phys, d->phys, sizeof(rec->phys) - 1))
             held = (int)h - 1;
          else
             taken |= 1U << (h - 1);
