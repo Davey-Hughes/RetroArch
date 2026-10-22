@@ -1426,8 +1426,10 @@ void input_autoconfigure_reallocate_ports(unsigned slot)
             name,
             input_config_get_device_display_name(s));
    }
-   /* the ports may have changed controllers: their deadzones with them */
+   /* the ports may have changed controllers: their deadzones with them,
+    * and the hotkeys a sharer reads by the hotkey port's controller */
    input_driver_deadzones_refresh();
+   input_config_binds_changed();
 }
 
 #ifdef HAVE_MENU

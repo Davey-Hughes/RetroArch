@@ -848,6 +848,7 @@ static void t_place_again(unsigned slot)
    for (s = 0; s < MAX_USERS; s++)
       if (again[s] && input_config_get_device_name(s))
          input_config_plays_as_place(s);
+   input_config_binds_changed();
 }
 
 /* Placed again, a steady arrangement stays; a Player change and a
@@ -1930,6 +1931,35 @@ static void t_pad(unsigned slot, struct retro_keybind *profile,
    input_config_binds_changed();
 }
 
+/* A controller set to Player 1 takes port 1 from an Auto pad of
+ * another model: a user sharing port 1's core port then fires the
+ * hand-set hotkeys by the new controller's buttons. */
+static void test_place_again_share_hotkeys(void)
+{
+   input_bits_t bits;
+
+   t_reset();
+   input_autoconf_binds[0] = t_xpad;
+   t_connect(0, "X", 1, 1);
+   t_connect(1, "S", 3, 3);
+   t_connect(2, "P", 2, 2);
+   t_map(1, 0);
+   t_bind(RARCH_FAST_FORWARD_KEY, T_XPAD_X);
+   t_buttons[1] = T_X;
+   t_collect(&bits);
+   CHECK(BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "the sharer's X does not fire the xpad's X");
+   t_buttons[1] = 0;
+
+   CHECK(input_config_plays_as_set(2, 1), "Player 1 was refused");
+   t_place_again(2);
+   t_buttons[1] = T_BIT(T_XPAD_X);
+   t_collect(&bits);
+   CHECK(t_user_of(2) == 0 && BIT256_GET(bits, RARCH_FAST_FORWARD_KEY),
+         "after a re-place the sharer still reads the xpad's hotkeys");
+   t_buttons[1] = 0;
+}
+
 /* User 1's hand-set Hotkey Enable and hotkeys are its xpad's buttons.
  * On user 2's pad of another numbering they are the RetroPad buttons
  * they are on the xpad: Back is user 2's Select, not its button 6. */
@@ -2732,6 +2762,7 @@ int main(void)
    test_hotkey_enable_keyboard();
    test_none_player1();
    test_hotkeys_other_model();
+   test_place_again_share_hotkeys();
    test_hotkey_game_focus_other_model();
    test_hotkey_axis_other_model();
    test_menu_toggle_other_model();
