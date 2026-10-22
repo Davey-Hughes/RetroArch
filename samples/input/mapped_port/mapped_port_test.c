@@ -35,6 +35,12 @@ static int               failures;
 settings_t *config_get_ptr(void) { return &settings; }
 runloop_state_t *runloop_state_get_ptr(void) { return &runloop_st; }
 void RARCH_LOG(const char *fmt, ...) { (void)fmt; }
+void RARCH_DBG(const char *fmt, ...) { (void)fmt; }
+#if defined(__linux) && !defined(ANDROID)
+/* joypad_drivers[]'s, which no test starts */
+input_device_driver_t linuxraw_joypad;
+#endif
+void RARCH_WARN(const char *fmt, ...) { (void)fmt; }
 bool command_event(enum event_command cmd, void *data)
 { (void)cmd; (void)data; return false; }
 bool retroarch_ctl(enum rarch_ctl_state state, void *data)
@@ -518,6 +524,488 @@ static void test_plays_as_entry_life(void)
    input_config_plays_as_set_entry(15, 0);
    CHECK(!input_config_plays_as_entry_name(15),
          "a gone controller's entry set to Auto was kept");
+}
+
+/* A controller in slot @slot, connected as the frontend connects one:
+ * named, then placed. */
+static void t_connect(unsigned slot, const char *name, uint16_t vid,
+      uint16_t pid)
+{
+   t_dev(slot, name, vid, pid);
+   input_config_plays_as_place(slot);
+}
+
+/* The user reading @slot below Max Users, or MAX_USERS. */
+static unsigned t_user_of(unsigned slot)
+{
+   unsigned u;
+   for (u = 0; u < settings.uints.input_max_users; u++)
+      if (settings.uints.input_joypad_index[u] == slot)
+         return u;
+   return MAX_USERS;
+}
+
+/* Auto: with no entries the reservations place it; with entries, the
+ * first free port. */
+static void test_place_auto(void)
+{
+   t_reset();
+   t_dev(2, "Pad", 1, 1);
+   CHECK(!input_config_plays_as_place(2) && t_user_of(2) == 2,
+         "with no entries Plays As placed an Auto controller");
+   t_entries(
+         "input_plays_as_device_1 = \"Away\"\n"
+         "input_plays_as_player_1 = \"4\"\n");
+   CHECK(input_config_plays_as_place(2) && t_user_of(2) == 0,
+         "an Auto controller is not on the first free port");
+}
+
+/* Player N: a free port N is its; an Auto controller there moves to
+ * the first free port; another of player N's makes it share, from the
+ * highest free port below Max Users. */
+static void test_place_player(void)
+{
+   t_reset();
+   t_entries(
+         "input_plays_as_device_1 = \"0001:0001 A\"\n"
+         "input_plays_as_player_1 = \"2\"\n");
+   t_connect(0, "A", 1, 1);
+   CHECK(t_user_of(0) == 1, "Player 2 did not take a free port 2");
+
+   t_reset();
+   t_entries(
+         "input_plays_as_device_1 = \"0002:0002 B\"\n"
+         "input_plays_as_player_1 = \"1\"\n");
+   t_connect(0, "Auto", 9, 9);
+   CHECK(t_user_of(0) == 0, "the Auto controller is not on port 1");
+   t_connect(1, "B", 2, 2);
+   CHECK(t_user_of(1) == 0 && t_user_of(0) == 1,
+         "Player 1 did not take port 1 from an Auto controller");
+
+   t_reset();
+   t_entries(
+         "input_plays_as_device_1 = \"0001:0001 A\"\n"
+         "input_plays_as_player_1 = \"1\"\n"
+         "input_plays_as_device_2 = \"0002:0002 B\"\n"
+         "input_plays_as_player_2 = \"1\"\n");
+   t_connect(0, "A", 1, 1);
+   t_connect(1, "B", 2, 2);
+   CHECK(t_user_of(0) == 0 && t_user_of(1) == 3,
+         "a second Player 1 does not share from the highest free port");
+   CHECK(settings.uints.input_joypad_index[1] == 3,
+         "the port the sharer left does not read the slot it came from");
+}
+
+/* A controller a reservation put on port N is player N's; an explicit
+ * player above Max Users plays Auto; with no free port a sharer gets
+ * none. */
+static void test_place_limits(void)
+{
+   t_reset();
+   settings.uints.input_device_reservation_type[0] =
+      INPUT_DEVICE_RESERVATION_PREFERRED;
+   strlcpy(settings.arrays.input_reserved_devices[0], "0005:0005 Res",
+         sizeof(settings.arrays.input_reserved_devices[0]));
+   t_entries(
+         "input_plays_as_device_1 = \"0002:0002 B\"\n"
+         "input_plays_as_player_1 = \"1\"\n");
+   t_dev(0, "Res", 5, 5);
+   CHECK(!input_config_plays_as_place(0),
+         "an Auto controller was placed with a reservation set");
+   t_connect(1, "B", 2, 2);
+   CHECK(t_user_of(0) == 0 && t_user_of(1) == 3,
+         "Player 1 did not share with the reserved controller on port 1");
+
+   t_reset();
+   t_entries(
+         "input_plays_as_device_1 = \"0002:0002 B\"\n"
+         "input_plays_as_player_1 = \"5\"\n");
+   t_connect(0, "A", 1, 1);
+   t_connect(1, "B", 2, 2);
+   CHECK(t_user_of(0) == 0 && t_user_of(1) == 1,
+         "Player 5 with Max Users 4 did not play Auto");
+
+   t_reset();
+   settings.uints.input_max_users = 2;
+   t_entries(
+         "input_plays_as_device_1 = \"0001:0001 A\"\n"
+         "input_plays_as_player_1 = \"1\"\n"
+         "input_plays_as_device_2 = \"0002:0002 B\"\n"
+         "input_plays_as_player_2 = \"1\"\n");
+   t_connect(0, "A", 1, 1);
+   t_connect(1, "C", 3, 3);
+   t_connect(2, "B", 2, 2);
+   CHECK(t_user_of(0) == 0 && t_user_of(1) == 1 && t_user_of(2) == MAX_USERS,
+         "a sharer with no free port took one");
+}
+
+/* An explicit player beats a reservation naming the controller; a
+ * reservation names as it places, a 0000:0000 one every controller
+ * with no vid:pid. */
+static void test_place_reservation(void)
+{
+   t_reset();
+   settings.uints.input_device_reservation_type[0] =
+      INPUT_DEVICE_RESERVATION_PREFERRED;
+   strlcpy(settings.arrays.input_reserved_devices[0], "0005:0005 Res",
+         sizeof(settings.arrays.input_reserved_devices[0]));
+   t_dev(0, "Res", 5, 5);
+   t_entries(
+         "input_plays_as_device_1 = \"0005:0005 Res\"\n"
+         "input_plays_as_player_1 = \"3\"\n"
+         "input_plays_as_device_2 = \"0002:0002 B\"\n"
+         "input_plays_as_player_2 = \"1\"\n");
+   t_connect(1, "B", 2, 2);
+   CHECK(t_user_of(1) == 0 && t_user_of(0) == 1,
+         "a Player 3 controller that port 1's reservation names kept "
+         "port 1 from Player 1");
+
+   t_reset();
+   settings.uints.input_device_reservation_type[0] =
+      INPUT_DEVICE_RESERVATION_PREFERRED;
+   strlcpy(settings.arrays.input_reserved_devices[0], "0000:0000 Res",
+         sizeof(settings.arrays.input_reserved_devices[0]));
+   t_entries(
+         "input_plays_as_device_1 = \"0002:0002 B\"\n"
+         "input_plays_as_player_1 = \"1\"\n");
+   t_dev(0, "Other", 0, 0);
+   t_connect(1, "B", 2, 2);
+   CHECK(t_user_of(0) == 0 && t_user_of(1) == 3,
+         "a 0000:0000 reservation did not name an unnumbered controller "
+         "it places");
+}
+
+/* Port 1 reserved for one controller, another set to Player 1: either
+ * order, the first has port 1 and the second shares. */
+static void test_place_reservation_order(void)
+{
+   t_reset();
+   settings.uints.input_device_reservation_type[0] =
+      INPUT_DEVICE_RESERVATION_PREFERRED;
+   strlcpy(settings.arrays.input_reserved_devices[0], "0005:0005 Res",
+         sizeof(settings.arrays.input_reserved_devices[0]));
+   t_entries(
+         "input_plays_as_device_1 = \"0002:0002 B\"\n"
+         "input_plays_as_player_1 = \"1\"\n");
+   t_dev(0, "Res", 5, 5);
+   CHECK(!input_config_plays_as_place(0), "the reservation did not place");
+   t_connect(1, "B", 2, 2);
+   CHECK(t_user_of(0) == 0 && t_user_of(1) == 3,
+         "reserved first: Player 1 did not share");
+
+   t_reset();
+   settings.uints.input_device_reservation_type[0] =
+      INPUT_DEVICE_RESERVATION_PREFERRED;
+   strlcpy(settings.arrays.input_reserved_devices[0], "0005:0005 Res",
+         sizeof(settings.arrays.input_reserved_devices[0]));
+   t_entries(
+         "input_plays_as_device_1 = \"0002:0002 B\"\n"
+         "input_plays_as_player_1 = \"1\"\n");
+   t_connect(0, "B", 2, 2);
+   t_dev(1, "Res", 5, 5);
+   CHECK(input_config_plays_as_place(1)
+         && t_user_of(0) == 0 && t_user_of(1) == 3,
+         "Player 1 first: the reserved controller did not share");
+
+   /* twins reserved for ports 1 and 2, one set to Player 1: the other
+    * goes to port 2 as the reservations give it */
+   t_reset();
+   settings.uints.input_device_reservation_type[0] =
+      INPUT_DEVICE_RESERVATION_PREFERRED;
+   settings.uints.input_device_reservation_type[1] =
+      INPUT_DEVICE_RESERVATION_PREFERRED;
+   strlcpy(settings.arrays.input_reserved_devices[0], "0005:0005 Res",
+         sizeof(settings.arrays.input_reserved_devices[0]));
+   strlcpy(settings.arrays.input_reserved_devices[1], "0005:0005 Res",
+         sizeof(settings.arrays.input_reserved_devices[1]));
+   t_entries(
+         "input_plays_as_device_1 = \"0005:0005 Res\"\n"
+         "input_plays_as_player_1 = \"1\"\n");
+   t_connect(0, "Res", 5, 5);
+   t_dev(1, "Res", 5, 5);
+   CHECK(!input_config_plays_as_place(1)
+         && t_user_of(0) == 0 && t_user_of(1) == 1,
+         "a twin reserved for port 2 shared Player 1");
+}
+
+/* The controller on port N leaving: its sharers stay; the next Auto
+ * controller takes port N. A player set and the controllers connected
+ * again place them by it. */
+static void test_place_leave_and_change(void)
+{
+   t_reset();
+   t_entries(
+         "input_plays_as_device_1 = \"0001:0001 A\"\n"
+         "input_plays_as_player_1 = \"1\"\n"
+         "input_plays_as_device_2 = \"0002:0002 B\"\n"
+         "input_plays_as_player_2 = \"1\"\n");
+   t_connect(0, "A", 1, 1);
+   t_connect(1, "B", 2, 2);
+   t_disconnect(0);
+   CHECK(t_user_of(1) == 3, "the sharer moved when port 1 emptied");
+   t_connect(0, "Auto", 9, 9);
+   CHECK(t_user_of(0) == 0, "an Auto controller did not take the empty port 1");
+
+   t_reset();
+   t_connect(0, "A", 1, 1);
+   t_connect(1, "B", 2, 2);
+   CHECK(input_config_plays_as_set(1, 1), "Player 1 took no entry");
+   input_config_plays_as_place(0);
+   input_config_plays_as_place(1);
+   CHECK(t_user_of(1) == 0 && t_user_of(0) == 1,
+         "connected again, the controller set to Player 1 is not on port 1");
+}
+
+/* Entries that give no player within Max Users: Auto controllers are
+ * placed as with no entries, a Device Index swap kept, and a driver
+ * restart still puts each controller back on its port. */
+static void test_place_no_player(void)
+{
+   t_reset();
+   settings.uints.input_joypad_index[0] = 1;
+   settings.uints.input_joypad_index[1] = 0;
+   t_entries(
+         "input_plays_as_device_1 = \"0009:0009 Away\"\n"
+         "input_plays_as_player_1 = \"0\"\n"
+         "input_plays_as_device_2 = \"0002:0002 B\"\n"
+         "input_plays_as_player_2 = \"5\"\n");
+   CHECK(input_config_plays_as_active(), "the entries are not in use");
+   t_dev(0, "A", 1, 1);
+   CHECK(!input_config_plays_as_place(0) && t_user_of(0) == 1,
+         "an entry with no player undid a Device Index swap");
+   t_dev(2, "C", 3, 3);
+   CHECK(!input_config_plays_as_place(2) && t_user_of(2) == 2,
+         "an entry with no player moved an Auto controller");
+   t_connect(1, "B", 2, 2);
+   CHECK(t_user_of(1) == 0 && t_user_of(0) == 1,
+         "Player 5 with Max Users 4 was placed");
+
+   t_reset();
+   t_entries(
+         "input_plays_as_device_1 = \"0001:0001 A\"\n"
+         "input_plays_as_player_1 = \"0\"\n");
+   input_driver_registry_connect(0, "x", "A", "", 1, 1);
+   input_driver_registry_connect(1, "x", "B", "", 2, 2);
+   input_driver_registry_restart();
+   input_driver_registry_connect(0, "x", "B", "", 2, 2);
+   input_driver_registry_connect(1, "x", "A", "", 1, 1);
+   CHECK(settings.uints.input_joypad_index[0] == 1
+         && settings.uints.input_joypad_index[1] == 0,
+         "an entry with no player kept a restart from restoring the ports");
+   input_driver_registry_disconnect(0);
+   input_driver_registry_disconnect(1);
+}
+
+/* t_connect, with the registry told as the connect callback tells it. */
+static void t_plug(unsigned slot, const char *name, uint16_t vid,
+      uint16_t pid)
+{
+   t_connect(slot, name, vid, pid);
+   input_driver_registry_connect(slot, "x", name, "", vid, pid);
+}
+
+/* A driver restart that reports the pads in other slots with no
+ * disconnects between: the Player 1 pad keeps its entry and port 1. */
+static void test_place_restart(void)
+{
+   t_reset();
+   t_entries(
+         "input_plays_as_device_1 = \"0002:0002 B\"\n"
+         "input_plays_as_player_1 = \"1\"\n");
+   t_plug(0, "A", 1, 1);
+   t_plug(1, "B", 2, 2);
+   input_driver_registry_restart();
+   t_plug(0, "B", 2, 2);
+   t_plug(1, "A", 1, 1);
+   CHECK(t_user_of(0) == 0 && input_config_plays_as_player(0) == 1
+         && t_user_of(1) == 1,
+         "after a restart the Player 1 pad lost its entry or port 1");
+   input_driver_registry_disconnect(0);
+   input_driver_registry_disconnect(1);
+}
+
+/* One of two identical pads, plugged in at @phys, connects in @slot. */
+static void t_plug_twin(unsigned slot, const char *phys)
+{
+   t_dev(slot, "Pad", 1, 1);
+   input_config_set_device_phys(slot, phys);
+   input_config_plays_as_place(slot);
+   input_driver_registry_connect(slot, "x", "Pad", phys, 1, 1);
+}
+
+/* Two identical pads, the second set to Player 2: a config reload and
+ * a driver restart leave it its entry and port 2, whichever slots the
+ * pads come back in; the first never takes it by slot order. */
+static void test_place_restart_twins(void)
+{
+   unsigned s;
+   static const char *p2 =
+         "input_plays_as_device_1 = \"0001:0001 Pad\"\n"
+         "input_plays_as_player_1 = \"2\"\n";
+
+   t_reset();
+   t_plug_twin(0, "usb-1");
+   t_plug_twin(1, "usb-2");
+   CHECK(input_config_plays_as_set(1, 2), "Player 2 was refused");
+   input_config_plays_as_place(1);
+   t_entries(p2);
+   CHECK(input_config_plays_as_entry(0) == -1
+         && input_config_plays_as_entry(1) == 0,
+         "a reload gave the Player 2 twin's entry to the first");
+
+   input_driver_registry_restart();
+   t_plug_twin(0, "usb-1");
+   t_plug_twin(1, "usb-2");
+   CHECK(input_config_plays_as_entry(0) == -1
+         && input_config_plays_as_entry(1) == 0
+         && t_user_of(1) == 1 && t_user_of(0) == 0,
+         "after a restart the first twin took the Player 2 twin's entry");
+
+   input_driver_registry_restart();
+   t_plug_twin(0, "usb-2");
+   t_plug_twin(1, "usb-1");
+   CHECK(input_config_plays_as_entry(0) == 0
+         && input_config_plays_as_entry(1) == -1
+         && t_user_of(0) == 1 && t_user_of(1) == 0,
+         "the Player 2 twin, back in the other slot, lost its entry");
+
+   for (s = 0; s < 2; s++)
+   {
+      input_driver_registry_disconnect(s);
+      input_config_set_device_phys(s, "");
+   }
+
+   /* a place longer than the registry keeps (a serial behind a hub) */
+   t_reset();
+   t_plug_twin(0, "usb-0000:00:14.0-1.4.1/input0"
+         "0123456789abcdef0123456789abcdef0123456789");
+   CHECK(input_config_plays_as_set(0, 2), "Player 2 was refused");
+   input_config_plays_as_place(0);
+   input_driver_registry_restart();
+   t_plug_twin(0, "usb-0000:00:14.0-1.4.1/input0"
+         "0123456789abcdef0123456789abcdef0123456789");
+   CHECK(input_config_plays_as_entry(0) == 0 && t_user_of(0) == 1,
+         "a pad with a long place lost its entry after a restart");
+   input_driver_registry_disconnect(0);
+   input_config_set_device_phys(0, "");
+}
+
+/* The reservations writing the ports after a Plays As move, as
+ * reallocate_port_if_needed() hands them on: the config file still
+ * gets the ports the user set. */
+static void test_place_saved_ports(void)
+{
+   unsigned u;
+   bool runtime;
+   bool configured = true;
+   t_reset();
+   t_entries(
+         "input_plays_as_device_1 = \"0002:0002 B\"\n"
+         "input_plays_as_player_1 = \"2\"\n");
+   t_connect(0, "B", 2, 2);
+   runtime = input_driver_ports_runtime();
+   settings.uints.input_joypad_index[2] = 3;
+   settings.uints.input_joypad_index[3] = 2;
+   if (runtime)
+      input_driver_ports_runtime_moved();
+   for (u = 0; u < MAX_USERS; u++)
+      if (input_config_get_saved_joypad_index(u) != u)
+         configured = false;
+   CHECK(runtime && t_user_of(0) == 1 && configured,
+         "a reservation's write saved the ports Plays As moved");
+}
+
+/* An input driver and a joypad driver that can be left running
+ * across a video driver restart. */
+static bool t_kv_survives(void *data) { (void)data; return true; }
+static bool t_kv_pad_survives(void) { return true; }
+static input_driver_t        t_kv;
+static input_device_driver_t t_kv_joypad;
+
+/* They start, under the settings and entries as they are. */
+static void t_kv_start(void)
+{
+   input_driver_state_t *st = input_state_get_ptr();
+   t_kv.ident                 = "kv";
+   t_kv.survives_video        = t_kv_survives;
+   t_kv_joypad                = t_joypad;
+   t_kv_joypad.survives_video = t_kv_pad_survives;
+   strlcpy(settings.arrays.input_driver, "kv",
+         sizeof(settings.arrays.input_driver));
+   strlcpy(settings.arrays.input_joypad_driver, "kvpad",
+         sizeof(settings.arrays.input_joypad_driver));
+   st->current_driver = &t_kv;
+   st->current_data   = &t_kv;
+   st->primary_joypad = NULL;
+   input_driver_init_joypads();
+   st->primary_joypad = &t_kv_joypad;
+}
+
+/* Whether the input driver is kept across a video driver restart, as
+ * the drivers' teardown asks. */
+static bool t_kv_kept(void)
+{
+   input_driver_state_t *st = input_state_get_ptr();
+   bool kept;
+   input_driver_keep_for_video_restart(true, NULL);
+   kept            = st->kept_driver != NULL;
+   st->kept_driver = NULL;
+   st->kept_data   = NULL;
+   return kept;
+}
+
+/* A config reload, as an override comes or goes, with the input
+ * driver left running: the configured ports read again undo the
+ * Plays As moves, and an override's entries change who goes where.
+ * Either way the driver starts again, to place the controllers. */
+static void test_place_reload_kept(void)
+{
+   unsigned u;
+   static const char *p2 =
+         "input_plays_as_device_1 = \"0001:0001 P\"\n"
+         "input_plays_as_player_1 = \"2\"\n";
+   input_driver_state_t *st = input_state_get_ptr();
+
+   t_reset();
+   t_entries(p2);
+   t_kv_start();
+   t_connect(0, "P", 1, 1);
+   t_connect(1, "A", 9, 9);
+   CHECK(t_user_of(0) == 1 && t_user_of(1) == 0 && t_kv_kept(),
+         "placed by Plays As, the input driver was not kept");
+   for (u = 0; u < MAX_USERS; u++)
+      settings.uints.input_joypad_index[u] = u;
+   t_entries(p2);
+   CHECK(!t_kv_kept(),
+         "a reload undid the Plays As moves and the driver was kept");
+   t_kv_start();
+   t_connect(0, "P", 1, 1);
+   t_connect(1, "A", 9, 9);
+   CHECK(t_user_of(0) == 1 && t_user_of(1) == 0 && t_kv_kept(),
+         "started again, the controllers were not placed as before");
+
+   /* moves undone by a reload that also took the entry away: once
+    * started again with nothing to move, the driver is kept again */
+   for (u = 0; u < MAX_USERS; u++)
+      settings.uints.input_joypad_index[u] = u;
+   input_plays_as_read(NULL);
+   CHECK(!t_kv_kept(),
+         "a reload took the entry away and the driver was kept");
+   t_kv_start();
+   t_connect(0, "P", 1, 1);
+   t_connect(1, "A", 9, 9);
+   CHECK(t_user_of(0) == 0 && t_kv_kept(),
+         "started again with nothing moved, the driver was not kept");
+
+   t_reset();
+   t_kv_start();
+   t_connect(0, "P", 1, 1);
+   CHECK(t_kv_kept(), "with no entries the input driver was not kept");
+   t_entries(p2);
+   CHECK(!t_kv_kept(),
+         "an override set a player and the driver was kept");
+   st->current_driver = NULL;
+   st->current_data   = NULL;
 }
 
 /* A load made only to compare against, as saving an override makes
@@ -1181,6 +1669,17 @@ int main(void)
    test_plays_as_entry_name();
    test_plays_as_round_trip();
    test_plays_as_entry_life();
+   test_place_auto();
+   test_place_player();
+   test_place_limits();
+   test_place_reservation();
+   test_place_reservation_order();
+   test_place_leave_and_change();
+   test_place_no_player();
+   test_place_restart();
+   test_place_restart_twins();
+   test_place_saved_ports();
+   test_place_reload_kept();
    test_plays_as_copy();
    test_menu_shared();
    test_hotkeys_shared();

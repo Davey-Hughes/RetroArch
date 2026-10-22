@@ -1945,6 +1945,11 @@ bool input_config_plays_as_entry_taken(unsigned e);
 void input_config_plays_as_set_entry(unsigned e, unsigned player);
 /* Whether any entry is in use. */
 bool input_config_plays_as_active(void);
+/* Whether any entry gives a player within Max Users. */
+bool input_config_plays_as_any_player(void);
+/* The controller just connected in @slot takes its entry and its port:
+ * true when it was placed, false for one the reservations place. */
+bool input_config_plays_as_place(unsigned slot);
 /* The controller in @slot is gone. */
 void input_config_plays_as_release(unsigned slot);
 
@@ -2033,11 +2038,14 @@ size_t input_config_get_device_name_size(unsigned port);
 
 unsigned input_driver_lightgun_id_convert(unsigned id);
 
-#ifdef HAVE_OPENXR
 /* The ports that read slot @a read slot @b, and the other way round,
  * for this run only: the config file keeps what the user set. */
 void input_driver_exchange_ports(unsigned a, unsigned b);
-#endif
+/* Whether the ports are as runtime moves left them; and, written
+ * directly since (a reserved device's placement), that they still are,
+ * so the config file keeps what the user set. */
+bool input_driver_ports_runtime(void);
+void input_driver_ports_runtime_moved(void);
 
 bool input_driver_pointer_is_offscreen(int16_t x, int16_t y);
 
