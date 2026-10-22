@@ -1,9 +1,15 @@
 /* Mapped Port in input/input_driver.c: the users mapped to a core port
- * feed it and get its rumble. The real input_driver.c, with the rest
- * of the frontend stood in for. */
+ * feed it and get its rumble. Plays As: a controller's own player
+ * places it, and one playing as another user's player feeds that
+ * user's core port; the remap ports stay as they were. The real
+ * input_driver.c, with the rest of the frontend stood in for. */
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+
+#include <compat/strl.h>
+#include <file/config_file.h>
+#include <file/file_path.h>
 
 #include "../../../configuration.h"
 #include "../../../command.h"
@@ -33,6 +39,16 @@ bool command_event(enum event_command cmd, void *data)
 { (void)cmd; (void)data; return false; }
 bool retroarch_ctl(enum rarch_ctl_state state, void *data)
 { (void)state; (void)data; return false; }
+/* config_file.c's #include and #reference, which no test reaches */
+void path_linked_list_free(struct path_linked_list *l) { (void)l; }
+void path_linked_list_add_path(struct path_linked_list *l, char *path)
+{ (void)l; (void)path; }
+void fill_pathname_resolve_relative(char *s, const char *ref,
+      const char *in, size_t len)
+{ (void)ref; strlcpy(s, in, len); }
+size_t fill_pathname_abbreviated_or_relative(char *s, const char *ref,
+      const char *in, size_t len)
+{ (void)ref; return strlcpy(s, in, len); }
 bool video_driver_has_focus(void) { return true; }
 #if defined(_WIN32)
 void win32_text_entry(bool active) { (void)active; }
@@ -127,7 +143,7 @@ static input_device_driver_t t_joypad = {
 #define T_B       T_BIT(RETRO_DEVICE_ID_JOYPAD_B)
 
 /* Four users, user n reading slot n into core port n; no binds of
- * their own; nothing held. */
+ * their own; no reservations or Plays As entries; nothing held. */
 static void t_reset(void)
 {
    static const uint16_t xpad[RARCH_FIRST_CUSTOM_BIND] = {
@@ -162,8 +178,13 @@ static void t_reset(void)
    for (u = 0; u < MAX_USERS; u++)
    {
       input_config_clear_device_name(u);
+      input_config_clear_device_display_name(u);
+      input_config_plays_as_release(u);
       input_config_set_device_vid(u, 0);
       input_config_set_device_pid(u, 0);
+      settings.uints.input_device_reservation_type[u] =
+         INPUT_DEVICE_RESERVATION_NONE;
+      settings.arrays.input_reserved_devices[u][0]    = '\0';
       t_axis_held[u]    = AXIS_NONE;
       t_button_reads[u] = 0;
    }
@@ -191,6 +212,7 @@ static void t_reset(void)
    settings.bools.input_all_users_control_menu    = false;
    st->primary_joypad                             = &t_joypad;
    t_menu_st.flags                               &= ~MENU_ST_FLAG_ALIVE;
+   input_plays_as_read(NULL);
    input_remapping_update_port_map();
 }
 
@@ -305,6 +327,228 @@ static void test_port_2_users(void)
          "core port 2's rumble did not reach users 2 and 4 alone");
    CHECK(t_rumble_port(2, 1031) == 0,
          "core port 3's rumble reached user 3, on None");
+}
+
+/* Slot @slot holds a controller called @name with @vid and @pid. */
+static void t_dev(unsigned slot, const char *name, uint16_t vid,
+      uint16_t pid)
+{
+   input_config_set_device_name(slot, name);
+   input_config_set_device_display_name(slot, name);
+   input_config_set_device_vid(slot, vid);
+   input_config_set_device_pid(slot, pid);
+}
+
+/* Slot @slot's controller gone, as the frontend lets one go. */
+static void t_disconnect(unsigned slot)
+{
+   input_config_clear_device_name(slot);
+   input_config_clear_device_display_name(slot);
+   input_config_set_device_vid(slot, 0);
+   input_config_set_device_pid(slot, 0);
+   input_config_plays_as_release(slot);
+}
+
+/* The Plays As entries a configuration's @text gives. */
+static void t_entries(const char *text)
+{
+   char buf[1024];
+   config_file_t *conf;
+   strlcpy(buf, text, sizeof(buf));
+   conf = config_file_new_from_string(buf, NULL);
+   input_plays_as_read(conf);
+   config_file_free(conf);
+}
+
+/* Whether @conf has @key, and as @value where that is not NULL. */
+static bool t_conf_is(config_file_t *conf, const char *key,
+      const char *value)
+{
+   char got[256];
+   if (!config_get_array(conf, key, got, sizeof(got)))
+      return false;
+   return !value || !strcmp(got, value);
+}
+
+/* A reservation's vid:pid, as the reservations have always read it:
+ * hex, a colon, hex, then a space or the end; anything else is a
+ * name. */
+static void test_vid_pid_parse(void)
+{
+   unsigned long v = 7;
+   unsigned long p = 7;
+   const char *n   = NULL;
+   CHECK(input_config_parse_vid_pid("045e:028e Pad", &v, &p, &n)
+         && v == 0x045e && p == 0x028e && n && !strcmp(n, "Pad"),
+         "vid:pid name was not read as one");
+   CHECK(input_config_parse_vid_pid("0000:0000", &v, &p, &n)
+         && v == 0 && p == 0 && n && !*n,
+         "a bare 0000:0000 was not read as one");
+   v = 7;
+   CHECK(!input_config_parse_vid_pid("Pad", &v, &p, NULL)
+         && !input_config_parse_vid_pid("045e:Pad", &v, &p, NULL)
+         && !input_config_parse_vid_pid("045e:028eX", &v, &p, NULL)
+         && !input_config_parse_vid_pid("Pad 2: Turbo", &v, &p, NULL)
+         && v == 7,
+         "a name was read as a vid:pid");
+}
+
+/* An entry names its controller by vid:pid, or by name where it has
+ * 0000:0000 or none; an entry is one controller's. */
+static void test_plays_as_match(void)
+{
+   t_reset();
+   t_dev(0, "Other Name", 0x045e, 0x028e);
+   t_dev(1, "Headset", 0, 0);
+   t_dev(2, "Other", 0, 0);
+   t_dev(3, "Stick", 0x1234, 0x5678);
+   t_entries(
+         "input_plays_as_device_1 = \"045e:028e Pad\"\n"
+         "input_plays_as_player_1 = \"2\"\n"
+         "input_plays_as_device_2 = \"0000:0000 Headset\"\n"
+         "input_plays_as_player_2 = \"1\"\n"
+         "input_plays_as_device_3 = \"Stick\"\n"
+         "input_plays_as_player_3 = \"3\"\n");
+   CHECK(input_config_plays_as_entry(0) == 0,
+         "vid:pid does not name its controller");
+   CHECK(input_config_plays_as_entry(1) == 1,
+         "0000:0000 does not name its controller by name");
+   CHECK(input_config_plays_as_entry(2) == -1,
+         "0000:0000 names every controller with no vid:pid");
+   CHECK(input_config_plays_as_entry(3) == 2
+         && input_config_plays_as_player(3) == 3,
+         "a name alone does not name its controller");
+
+   /* two of one model, one entry: the second plays Auto */
+   t_reset();
+   t_dev(0, "Pad", 0x045e, 0x028e);
+   t_dev(1, "Pad", 0x045e, 0x028e);
+   t_entries(
+         "input_plays_as_device_1 = \"045e:028e Pad\"\n"
+         "input_plays_as_player_1 = \"2\"\n");
+   CHECK(input_config_plays_as_entry(0) == 0
+         && input_config_plays_as_entry(1) == -1,
+         "one entry was taken by two controllers");
+}
+
+/* An entry's name is what follows its vid:pid, however that is
+ * written; a name alone is all name. */
+static void test_plays_as_entry_name(void)
+{
+   t_reset();
+   t_entries(
+         "input_plays_as_device_1 = \"45e:28e Pad\"\n"
+         "input_plays_as_device_2 = \"Pads:Mini Pro\"\n"
+         "input_plays_as_device_3 = \"0000:0000\"\n");
+   CHECK(input_config_plays_as_entry_name(0)
+         && !strcmp(input_config_plays_as_entry_name(0), "Pad"),
+         "a short vid:pid is shown with the name");
+   CHECK(input_config_plays_as_entry_name(1)
+         && !strcmp(input_config_plays_as_entry_name(1), "Pads:Mini Pro"),
+         "a name alone was cut");
+   CHECK(input_config_plays_as_entry_name(2)
+         && !strcmp(input_config_plays_as_entry_name(2), "0000:0000"),
+         "a vid:pid with no name is not shown");
+}
+
+/* The entries are written and read back; a free entry's keys go. */
+static void test_plays_as_round_trip(void)
+{
+   config_file_t *conf;
+   t_reset();
+   t_dev(0, "Pad", 0x045e, 0x028e);
+   CHECK(input_config_plays_as_set(0, 2), "Player 2 took no entry");
+   conf = config_file_new_alloc();
+   config_set_string(conf, "input_plays_as_device_5", "045e:0000 Gone");
+   config_set_string(conf, "input_plays_as_player_5", "3");
+   input_plays_as_write(conf);
+   CHECK(t_conf_is(conf, "input_plays_as_device_1", "045e:028e Pad")
+         && t_conf_is(conf, "input_plays_as_player_1", "2"),
+         "the entry was not written as vid:pid name and player");
+   CHECK(!t_conf_is(conf, "input_plays_as_device_5", NULL)
+         && !t_conf_is(conf, "input_plays_as_player_5", NULL),
+         "a free entry's keys were kept");
+   CHECK(!t_conf_is(conf, "input_plays_as_device_2", NULL),
+         "a free entry was written");
+
+   input_plays_as_read(NULL);
+   CHECK(input_config_plays_as_player(0) == 0, "the entries outlived a read");
+   input_plays_as_read(conf);
+   CHECK(input_config_plays_as_entry(0) == 0
+         && input_config_plays_as_player(0) == 2,
+         "the entry did not come back");
+   config_file_free(conf);
+}
+
+/* An entry is made for a player and let go on Auto; with all sixteen
+ * held by controllers that are gone, another is not made. */
+static void test_plays_as_entry_life(void)
+{
+   unsigned e;
+   char name[32];
+   t_reset();
+   t_dev(0, "Pad", 1, 1);
+   CHECK(input_config_plays_as_set(0, 0)
+         && input_config_plays_as_entry(0) < 0,
+         "Auto took an entry");
+   CHECK(input_config_plays_as_set(0, 2)
+         && input_config_plays_as_entry(0) == 0
+         && input_config_plays_as_active(),
+         "Player 2 took no entry");
+   CHECK(input_config_plays_as_set(0, 0)
+         && input_config_plays_as_entry(0) < 0
+         && !input_config_plays_as_active(),
+         "an entry set back to Auto was kept");
+
+   for (e = 0; e < MAX_USERS; e++)
+   {
+      snprintf(name, sizeof(name), "Gone %u", e);
+      t_dev(1, name, (uint16_t)(e + 2), 1);
+      input_config_plays_as_set(1, 1);
+      t_disconnect(1);
+   }
+   CHECK(!input_config_plays_as_set(0, 3)
+         && input_config_plays_as_entry(0) < 0,
+         "a seventeenth entry was made");
+   CHECK(input_config_plays_as_set(0, 0), "Auto needed an entry");
+   CHECK(input_config_plays_as_entry_name(15)
+         && !strcmp(input_config_plays_as_entry_name(15), "Gone 15")
+         && !input_config_plays_as_entry_taken(15),
+         "an entry of a controller that is gone is not listed by name");
+   input_config_plays_as_set_entry(15, 0);
+   CHECK(!input_config_plays_as_entry_name(15),
+         "a gone controller's entry set to Auto was kept");
+}
+
+/* A load made only to compare against, as saving an override makes
+ * one: putting back the copy taken before it restores the entries and
+ * claims. */
+static void test_plays_as_copy(void)
+{
+   input_plays_as_copy_t *copy;
+   t_reset();
+   t_dev(0, "Pad", 0x045e, 0x028e);
+   t_dev(1, "Stick", 0x1234, 0x5678);
+   CHECK(input_config_plays_as_set(1, 3), "Player 3 took no entry");
+   copy = input_plays_as_copy_new();
+   CHECK(copy, "no copy of the entries");
+   if (!copy)
+      return;
+   t_entries(
+         "input_plays_as_device_1 = \"045e:028e Pad\"\n"
+         "input_plays_as_player_1 = \"2\"\n");
+   CHECK(input_config_plays_as_entry(0) == 0
+         && input_config_plays_as_entry(1) == -1,
+         "the load did not read the file's entries");
+   input_plays_as_copy_restore(copy);
+   input_plays_as_copy_free(copy);
+   CHECK(input_config_plays_as_entry(0) == -1
+         && input_config_plays_as_entry(1) == 0
+         && input_config_plays_as_player(1) == 3
+         && input_config_plays_as_entry_name(0)
+         && !strcmp(input_config_plays_as_entry_name(0), "Stick")
+         && !input_config_plays_as_entry_name(1),
+         "the entries read to compare against outlived the copy");
 }
 
 #define T_ENABLE 20
@@ -932,6 +1176,12 @@ int main(void)
    test_swapped_ports();
    test_port_2_users();
    test_rumble_answer();
+   test_vid_pid_parse();
+   test_plays_as_match();
+   test_plays_as_entry_name();
+   test_plays_as_round_trip();
+   test_plays_as_entry_life();
+   test_plays_as_copy();
    test_menu_shared();
    test_hotkeys_shared();
    test_hotkey_enable_shared();

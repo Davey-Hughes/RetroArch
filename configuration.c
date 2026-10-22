@@ -9681,6 +9681,8 @@ bool config_save_file(const char *path)
 
    /* the entries and macros, as they are now */
    input_entries_write(conf);
+   /* and the controllers' own players */
+   input_plays_as_write(conf);
 
    /* Remove unused "quit_press_twice" after migrating to "confirm_quit" */
    {
@@ -9760,6 +9762,7 @@ int8_t config_save_overrides(enum override_type type,
    unsigned i                                  = 0;
    int8_t ret                                  = 0;
    input_config_binds_copy_t *input_override_binds = NULL;
+   input_plays_as_copy_t *input_override_plays_as  = NULL;
    config_file_t *conf                         = NULL;
    settings_t *settings                        = NULL;
    struct config_bool_setting *bool_settings   = NULL;
@@ -9808,11 +9811,12 @@ int8_t config_save_overrides(enum override_type type,
 
    settings = (settings_t*)calloc(1, sizeof(settings_t));
    conf     = config_file_new_alloc();
-   /* A copy of the binds is kept off the stack (this function is
-    * reachable on small-stack platforms such as the 3DS). Made here so
-    * it shares the OOM bail below and is freed at the function-end
-    * cleanup. */
-   input_override_binds = input_config_binds_copy_new();
+   /* A copy of the binds, and one of the Plays As entries, is kept off
+    * the stack (this function is reachable on small-stack platforms
+    * such as the 3DS). Made here so it shares the OOM bail below and is
+    * freed at the function-end cleanup. */
+   input_override_binds    = input_config_binds_copy_new();
+   input_override_plays_as = input_plays_as_copy_new();
 
    /* NULL-check: both calloc and config_file_new_alloc can
     * return NULL on OOM.  config_load_file at line ~6552
@@ -9826,13 +9830,15 @@ int8_t config_save_overrides(enum override_type type,
     * Return -1 to signal hard failure (as distinct from
     * 'override was not needed' = false/0 at line 6529).
     * int8_t return value accommodates -1. */
-   if (!settings || !conf || !input_override_binds)
+   if (!settings || !conf || !input_override_binds || !input_override_plays_as)
    {
       if (conf)
          config_file_free(conf);
       free(settings);
       if (input_override_binds)
          input_config_binds_copy_free(input_override_binds);
+      if (input_override_plays_as)
+         input_plays_as_copy_free(input_override_plays_as);
       return -1;
    }
 
@@ -10227,6 +10233,8 @@ int8_t config_save_overrides(enum override_type type,
 
    /* Since config_load_file resets binds, restore overrides back to current binds */
    input_config_binds_copy_restore(input_override_binds);
+   /* and the Plays As entries it replaced */
+   input_plays_as_copy_restore(input_override_plays_as);
 
    if (bool_settings)
       free(bool_settings);
@@ -10258,6 +10266,7 @@ int8_t config_save_overrides(enum override_type type,
       free(size_overrides);
    free(settings);
    input_config_binds_copy_free(input_override_binds);
+   input_plays_as_copy_free(input_override_plays_as);
 
    return ret;
 }
