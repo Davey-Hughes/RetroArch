@@ -199,6 +199,8 @@ struct menu_bind_state
    unsigned from;
 
    bool skip;
+   /* the press was a key's or a mouse button's, not the pad's */
+   bool from_keys;
 };
 
 enum menu_inp_ptr_hwst_flags

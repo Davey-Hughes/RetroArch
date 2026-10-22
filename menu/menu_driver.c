@@ -1749,6 +1749,7 @@ static bool menu_input_key_bind_poll_find_hold_pad(
          continue;
 
       RETRO_KEYBIND_SET_KEY(output, (enum retro_key)b);
+      new_state->from_keys = true;
       return true;
    }
 
@@ -1771,6 +1772,7 @@ static bool menu_input_key_bind_poll_find_hold_pad(
          case RETRO_DEVICE_ID_MOUSE_HORIZ_WHEELUP:
          case RETRO_DEVICE_ID_MOUSE_HORIZ_WHEELDOWN:
             RETRO_KEYBIND_SET_MBUTTON(output, b);
+            new_state->from_keys = true;
             return true;
       }
    }
@@ -1884,6 +1886,7 @@ static bool menu_input_key_bind_poll_find_trigger_pad(
          continue;
 
       RETRO_KEYBIND_SET_KEY(output, (enum retro_key)b);
+      new_state->from_keys = true;
       return true;
    }
 
@@ -1906,6 +1909,7 @@ static bool menu_input_key_bind_poll_find_trigger_pad(
          case RETRO_DEVICE_ID_MOUSE_HORIZ_WHEELUP:
          case RETRO_DEVICE_ID_MOUSE_HORIZ_WHEELDOWN:
             RETRO_KEYBIND_SET_MBUTTON(output, b);
+            new_state->from_keys = true;
             return true;
       }
    }
@@ -5361,6 +5365,7 @@ bool menu_input_key_bind_set_mode(
    binds->listen                       = (binds->out_id >= RARCH_FIRST_META_KEY)
       ? input_config_hotkey_listen_slots() : 0;
    binds->from                         = binds->port;
+   binds->from_keys                    = false;
 
    menu_input_key_bind_poll_bind_get_rested_axes(binds);
    menu_input_key_bind_poll_bind_state(
@@ -5457,7 +5462,8 @@ MENU_NOINLINE static bool menu_input_key_bind_iterate(
 
       input_driver_set_keyboard_mapping_blocked(false);
 
-      new_binds.from = new_binds.port;
+      new_binds.from      = new_binds.port;
+      new_binds.from_keys = false;
       menu_input_key_bind_poll_bind_state(
             settings->uints.input_joypad_index[new_binds.port],
             &new_binds, timed_out);
@@ -5557,16 +5563,27 @@ MENU_NOINLINE static bool menu_input_key_bind_iterate(
       {
          /* Always stop binding when not binding all */
          bool stop_binding                   = new_binds.order == 0 && new_binds.begin == new_binds.last;
+         uint16_t own_key;
+         uint32_t own_axis;
 
+         input_config_plays_as_hotkey(new_binds.from, new_binds.out_id,
+               &own_key, &own_axis);
          /* Update bind */
+         /* a sharing controller's press goes to its own bind, and user
+          * 1's pad's does where it has its own for the hotkey; keys,
+          * mouse buttons and the rest go to the set */
          /* written where the bind is kept now, which is asked for
           * here: the write is counted as a change when it is made,
           * and no address is carried from the frame the capture
           * began in */
-         if (new_binds.from != new_binds.port)
+         if (     !new_binds.skip
+               && !new_binds.from_keys
+               && (     new_binds.from != new_binds.port
+                     || own_key  != NO_BTN
+                     || own_axis != AXIS_NONE))
          {
-            /* a sharing controller's: its own; refused with it still
-             * connected only when the list is full */
+            /* refused with the controller still connected only when
+             * the list is full */
             if (     !input_config_plays_as_set_hotkey(new_binds.from,
                         new_binds.out_id, new_binds.buffer.joykey,
                         new_binds.buffer.joyaxis)
