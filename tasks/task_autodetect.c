@@ -1265,8 +1265,6 @@ static void reallocate_leading_ports(
 
       if (*settings_value)
       {
-         char *endptr;
-         char *colon;
          unsigned long parsed_vid;
          unsigned long parsed_pid;
 
@@ -1276,27 +1274,13 @@ static void reallocate_leading_ports(
                    settings->uints.input_device_reservation_type[player],
                    settings_value, vendor_id, product_id);
 
-         colon      = strchr(settings_value, ':');
-         parsed_vid = strtoul(settings_value, &endptr, 16);
-
-         if (colon && endptr == colon)
+         if (input_config_parse_vid_pid(settings_value,
+                  &parsed_vid, &parsed_pid, NULL))
          {
-            parsed_pid = strtoul(colon + 1, &endptr, 16);
-            if (endptr != colon + 1 && (*endptr == ' ' || *endptr == '\0'))
-            {
-               settings_value_vendor_id  = (unsigned int)parsed_vid;
-               settings_value_product_id = (unsigned int)parsed_pid;
-               device_has_reserved_slot  = (  vendor_id  == settings_value_vendor_id
-                                           && product_id == settings_value_product_id);
-            }
-            else
-            {
-               strlcpy(settings_value_device_name, settings_value,
-                       sizeof(settings_value_device_name));
-               device_has_reserved_slot =
-                     string_is_equal(device_name, settings_value_device_name)
-                  || string_is_equal(device_display_name, settings_value_device_name);
-            }
+            settings_value_vendor_id  = (unsigned int)parsed_vid;
+            settings_value_product_id = (unsigned int)parsed_pid;
+            device_has_reserved_slot  = (  vendor_id  == settings_value_vendor_id
+                                        && product_id == settings_value_product_id);
          }
          else
          {
