@@ -871,6 +871,18 @@ static void test_join_poll(void)
          "the join outlived the sharer's entry");
 }
 
+/* Port 1's reservation names Res; B is Player 1. */
+static void t_reserve_1(void)
+{
+   settings.uints.input_device_reservation_type[0] =
+      INPUT_DEVICE_RESERVATION_PREFERRED;
+   strlcpy(settings.arrays.input_reserved_devices[0], "0005:0005 Res",
+         sizeof(settings.arrays.input_reserved_devices[0]));
+   t_entries(
+         "input_plays_as_device_1 = \"0002:0002 B\"\n"
+         "input_plays_as_player_1 = \"1\"\n");
+}
+
 /* A controller port 1's reservation names shares with a Player 1
  * controller there, in either connect order: both feed core port 1. */
 static void test_join_reserved(void)
@@ -879,13 +891,7 @@ static void test_join_reserved(void)
    for (order = 0; order < 2; order++)
    {
       t_reset();
-      settings.uints.input_device_reservation_type[0] =
-         INPUT_DEVICE_RESERVATION_PREFERRED;
-      strlcpy(settings.arrays.input_reserved_devices[0], "0005:0005 Res",
-            sizeof(settings.arrays.input_reserved_devices[0]));
-      t_entries(
-            "input_plays_as_device_1 = \"0002:0002 B\"\n"
-            "input_plays_as_player_1 = \"1\"\n");
+      t_reserve_1();
       if (order)
       {
          t_connect(0, "B", 2, 2);
@@ -904,6 +910,31 @@ static void test_join_reserved(void)
                     "feed core port 1"
                   : "reserved first: Player 1 does not feed core port 1");
    }
+}
+
+/* The Player 1 controller leaving: the reserved controller sharing
+ * with it stays and feeds core port 1, and the next Auto controller
+ * takes port 1 beside it. */
+static void test_join_reserved_stays(void)
+{
+   t_reset();
+   t_reserve_1();
+   t_connect(0, "B", 2, 2);
+   t_connect(1, "Res", 5, 5);
+   input_driver_poll();
+   t_disconnect(0);
+   input_driver_poll();
+   t_buttons[1] = T_B;
+   CHECK(t_read(0) == T_B && t_read(3) == 0
+         && input_remapping_join_user(3) == 0,
+         "the reserved controller stopped sharing when Player 1 left");
+
+   t_connect(0, "Auto", 9, 9);
+   input_driver_poll();
+   t_buttons[0] = T_A;
+   CHECK(t_user_of(0) == 0 && t_read(0) == (T_A | T_B),
+         "the next Auto controller is not on port 1 beside the reserved "
+         "controller");
 }
 
 /* Player 1's rumble reaches the sharer; core port 4's does not. */
@@ -1964,6 +1995,7 @@ int main(void)
    test_join_follows_mapped_port();
    test_join_poll();
    test_join_reserved();
+   test_join_reserved_stays();
    test_rumble_join();
    test_first_press_group();
    test_remap_join();

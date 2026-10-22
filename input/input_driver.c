@@ -10436,6 +10436,10 @@ typedef struct
 static input_plays_as_entry_t input_plays_as[MAX_USERS];
 /* by slot: the entry its controller took, and one; 0 for none */
 static uint8_t input_plays_as_claim[MAX_INPUT_DEVICES];
+/* by slot: for an Auto controller placed to share with the user whose
+ * reservation names it, that user and one, kept while it stays
+ * connected; 0 for none */
+static uint8_t input_plays_as_shares[MAX_INPUT_DEVICES];
 
 bool input_config_parse_vid_pid(const char *s, unsigned long *vid,
       unsigned long *pid, const char **name)
@@ -10644,7 +10648,10 @@ void input_config_plays_as_set_entry(unsigned e, unsigned player)
 void input_config_plays_as_release(unsigned slot)
 {
    if (slot < MAX_INPUT_DEVICES)
-      input_plays_as_claim[slot] = 0;
+   {
+      input_plays_as_claim[slot]  = 0;
+      input_plays_as_shares[slot] = 0;
+   }
 }
 
 void input_plays_as_read(void *data)
@@ -10791,6 +10798,7 @@ bool input_config_plays_as_place(unsigned slot)
    if (max_users > MAX_USERS)
       max_users = MAX_USERS;
    input_plays_as_take(slot);
+   input_plays_as_shares[slot] = 0;
 
    if (!(player = input_plays_as_now(slot, max_users)))
    {
@@ -10802,6 +10810,7 @@ bool input_config_plays_as_place(unsigned slot)
          input_plays_as_move(settings,
                input_plays_as_free(settings, max_users, slot, t, true),
                slot);
+         input_plays_as_shares[slot] = (uint8_t)(t + 1);
          return true;
       }
       for (u = 0; u < MAX_USERS; u++)
@@ -10852,34 +10861,20 @@ static uint8_t input_join_to[MAX_USERS];
 static void input_join_make(const settings_t *settings, uint8_t *join)
 {
    unsigned u;
-   bool reserved      = false;
    unsigned max_users = settings->uints.input_max_users;
 
    if (max_users > MAX_USERS)
       max_users = MAX_USERS;
    memset(join, 0, MAX_USERS);
-   /* an Auto controller a reservation names shares with its user when
-    * that user's controller plays as its player by its own; checked
-    * first, so the poll matches no names otherwise */
-   for (u = 0; u < max_users && !reserved; u++)
-      reserved = settings->uints.input_device_reservation_type[u]
-            != INPUT_DEVICE_RESERVATION_NONE
-         && input_plays_as_now(settings->uints.input_joypad_index[u],
-               max_users) == u + 1;
    for (u = 0; u < max_users; u++)
    {
       unsigned slot   = settings->uints.input_joypad_index[u];
       unsigned player = input_plays_as_now(slot, max_users);
       if (     !player
-            && reserved
             && slot < MAX_INPUT_DEVICES
-            && *input_driver_st.input_device_info[slot].name)
-      {
-         unsigned t = input_plays_as_reserved_held(settings, slot,
-               max_users);
-         if (t < MAX_USERS)
-            player = t + 1;
-      }
+            && *input_driver_st.input_device_info[slot].name
+            && input_plays_as_shares[slot] <= max_users)
+         player = input_plays_as_shares[slot];
       if (player && player != u + 1)
          join[u] = (uint8_t)player;
    }
