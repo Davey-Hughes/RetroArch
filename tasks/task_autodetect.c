@@ -1380,14 +1380,22 @@ static void reallocate_port_if_needed(
       const char *device_display_name)
 {
    uint8_t leader[MAX_USERS];
+   bool runtime;
 
    if (detected_port >= MAX_USERS)
       return;
    input_config_sanitize_joypad_indices();
+   /* placed by Plays As, else as the reservations place it */
+   if (input_config_plays_as_place(detected_port))
+      return;
+   runtime = input_driver_ports_runtime();
    input_config_shared_ports(leader);
    reallocate_leading_ports(leader, detected_port, vendor_id, product_id,
          device_name, device_display_name);
    input_config_follow_shared_ports(leader);
+   /* placed over runtime moves, the reservation's are runtime too */
+   if (runtime)
+      input_driver_ports_runtime_moved();
 }
 
 /*************************/
@@ -2030,6 +2038,7 @@ static void cb_input_autoconfigure_disconnect(
    input_config_set_device_pid(port, 0);
    input_config_set_device_autoconfigured(port, false);
    input_config_reset_autoconfig_binds(port);
+   input_config_plays_as_release(port);
 
    input_driver_registry_disconnect(port);
 }
