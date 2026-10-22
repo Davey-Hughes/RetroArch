@@ -861,7 +861,7 @@ static size_t menu_action_setting_disp_set_label_input_plays_as(
       const char *path,
       char *s2, size_t len2)
 {
-   unsigned user, with, player;
+   unsigned player, port;
    unsigned row = type - MENU_SETTINGS_INPUT_PLAYS_AS_BEGIN;
 
    *w = 19;
@@ -872,13 +872,15 @@ static size_t menu_action_setting_disp_set_label_input_plays_as(
       : input_config_plays_as_entry_player(row - MAX_INPUT_DEVICES);
    if (player)
       return snprintf(s, len, "%u", player);
-   if (     row < MAX_INPUT_DEVICES
-         && (user = input_config_slot_user(row)) < MAX_USERS)
+   switch (input_config_plays_as_where(row, &player, &port))
    {
-      with = input_remapping_join_user(user);
-      return snprintf(s, len,
-            msg_hash_to_str(MENU_ENUM_LABEL_VALUE_INPUT_PLAYS_AS_AUTO_PLAYER),
-            ((with < MAX_USERS) ? with : user) + 1);
+      case INPUT_PLAYS_AS_SHARING:
+      case INPUT_PLAYS_AS_OWN_PORT:
+         return snprintf(s, len,
+               msg_hash_to_str(MENU_ENUM_LABEL_VALUE_INPUT_PLAYS_AS_AUTO_PLAYER),
+               player);
+      default:
+         break;
    }
    return strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_AUTO), len);
 }
