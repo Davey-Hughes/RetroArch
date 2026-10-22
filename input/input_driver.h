@@ -2459,6 +2459,13 @@ void input_entries_write(void *conf);
  * are written, keys an entry has no value for taken out. */
 void input_plays_as_read(void *conf);
 void input_plays_as_write(void *conf);
+/* A copy of the entries and the claims on them, put back after a load
+ * made only to compare against, as the binds' copy is. NULL if there
+ * is no memory for it. */
+typedef struct input_plays_as_copy input_plays_as_copy_t;
+input_plays_as_copy_t *input_plays_as_copy_new(void);
+void input_plays_as_copy_restore(const input_plays_as_copy_t *copy);
+void input_plays_as_copy_free(input_plays_as_copy_t *copy);
 
 /* Macros: buttons of the RetroPad pressed for a user a step at a time,
  * a step lasting a number of the core's frames; read from the

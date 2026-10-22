@@ -500,6 +500,37 @@ static void test_plays_as_entry_life(void)
          "a gone controller's entry set to Auto was kept");
 }
 
+/* A load made only to compare against, as saving an override makes
+ * one, leaves the entries and claims as they were once the copy taken
+ * before it is put back. */
+static void test_plays_as_copy(void)
+{
+   input_plays_as_copy_t *copy;
+   t_reset();
+   t_dev(0, "Pad", 0x045e, 0x028e);
+   t_dev(1, "Stick", 0x1234, 0x5678);
+   CHECK(input_config_plays_as_set(1, 3), "Player 3 took no entry");
+   copy = input_plays_as_copy_new();
+   CHECK(copy, "no copy of the entries");
+   if (!copy)
+      return;
+   t_entries(
+         "input_plays_as_device_1 = \"045e:028e Pad\"\n"
+         "input_plays_as_player_1 = \"2\"\n");
+   CHECK(input_config_plays_as_entry(0) == 0
+         && input_config_plays_as_entry(1) == -1,
+         "the load did not read the file's entries");
+   input_plays_as_copy_restore(copy);
+   input_plays_as_copy_free(copy);
+   CHECK(input_config_plays_as_entry(0) == -1
+         && input_config_plays_as_entry(1) == 0
+         && input_config_plays_as_player(1) == 3
+         && input_config_plays_as_entry_name(0)
+         && !strcmp(input_config_plays_as_entry_name(0), "Stick")
+         && !input_config_plays_as_entry_name(1),
+         "the entries read to compare against outlived the copy");
+}
+
 #define T_ENABLE 20
 #define T_FF     21
 #define T_MENU   22
@@ -1255,6 +1286,7 @@ int main(void)
    test_plays_as_match();
    test_plays_as_round_trip();
    test_plays_as_entry_life();
+   test_plays_as_copy();
    test_menu_shared();
    test_hotkeys_shared();
    test_hotkey_enable_shared();

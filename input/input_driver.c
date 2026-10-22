@@ -10658,6 +10658,35 @@ void input_plays_as_write(void *data)
    }
 }
 
+struct input_plays_as_copy
+{
+   input_plays_as_entry_t entries[MAX_USERS];
+   uint8_t claim[MAX_INPUT_DEVICES];
+};
+
+input_plays_as_copy_t *input_plays_as_copy_new(void)
+{
+   input_plays_as_copy_t *copy =
+      (input_plays_as_copy_t*)malloc(sizeof(*copy));
+   if (copy)
+   {
+      memcpy(copy->entries, input_plays_as, sizeof(copy->entries));
+      memcpy(copy->claim, input_plays_as_claim, sizeof(copy->claim));
+   }
+   return copy;
+}
+
+void input_plays_as_copy_restore(const input_plays_as_copy_t *copy)
+{
+   memcpy(input_plays_as, copy->entries, sizeof(input_plays_as));
+   memcpy(input_plays_as_claim, copy->claim, sizeof(input_plays_as_claim));
+}
+
+void input_plays_as_copy_free(input_plays_as_copy_t *copy)
+{
+   free(copy);
+}
+
 /* Adds an index to devices with the same name,
  * so they can be uniquely identified in the
  * frontend */
