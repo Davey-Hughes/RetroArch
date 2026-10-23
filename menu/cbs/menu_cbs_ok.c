@@ -334,6 +334,8 @@ static enum msg_hash_enums action_ok_dl_to_enum(unsigned lbl)
          return MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_DESCRIPTION_KBD;
       case ACTION_OK_DL_DROPDOWN_BOX_LIST_INPUT_SELECT_RESERVED_DEVICE:
          return MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_SELECT_RESERVED_DEVICE;
+      case ACTION_OK_DL_DROPDOWN_BOX_LIST_INPUT_PLAYS_AS:
+         return MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_PLAYS_AS;
 #ifdef ANDROID
       case ACTION_OK_DL_DROPDOWN_BOX_LIST_INPUT_SELECT_PHYSICAL_KEYBOARD:
          return MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_SELECT_PHYSICAL_KEYBOARD;
@@ -520,6 +522,8 @@ static enum msg_hash_enums action_ok_dl_to_enum(unsigned lbl)
          return MENU_ENUM_LABEL_DEFERRED_AUDIO_MIXER_SETTINGS_LIST;
       case ACTION_OK_DL_INPUT_RETROPAD_BINDS_LIST:
          return MENU_ENUM_LABEL_DEFERRED_INPUT_RETROPAD_BINDS_LIST;
+      case ACTION_OK_DL_INPUT_CONTROLLERS_LIST:
+         return MENU_ENUM_LABEL_DEFERRED_INPUT_CONTROLLERS_LIST;
       case ACTION_OK_DL_INPUT_HOTKEY_BINDS_LIST:
          return MENU_ENUM_LABEL_DEFERRED_INPUT_HOTKEY_BINDS_LIST;
       case ACTION_OK_DL_RECORDING_SETTINGS_LIST:
@@ -980,6 +984,14 @@ int generic_action_ok_displaylist_push(
          info_path          = path;
          info_label         = MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_SELECT_RESERVED_DEVICE_STR;
          info.enum_idx      = MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_SELECT_RESERVED_DEVICE;
+         dl_type            = DISPLAYLIST_GENERIC;
+         break;
+      case ACTION_OK_DL_DROPDOWN_BOX_LIST_INPUT_PLAYS_AS:
+         info.type          = type;
+         info.directory_ptr = idx;
+         info_path          = path;
+         info_label         = MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_PLAYS_AS_STR;
+         info.enum_idx      = MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_PLAYS_AS;
          dl_type            = DISPLAYLIST_GENERIC;
          break;
 #ifdef ANDROID
@@ -1885,6 +1897,7 @@ int generic_action_ok_displaylist_push(
 #endif
       case ACTION_OK_DL_AUDIO_MIXER_SETTINGS_LIST:
       case ACTION_OK_DL_INPUT_RETROPAD_BINDS_LIST:
+      case ACTION_OK_DL_INPUT_CONTROLLERS_LIST:
       case ACTION_OK_DL_INPUT_HOTKEY_BINDS_LIST:
       case ACTION_OK_DL_RECORDING_SETTINGS_LIST:
       case ACTION_OK_DL_PLAYLIST_SETTINGS_LIST:
@@ -2017,6 +2030,7 @@ static const ok_dl_map_t ok_dl_map[] = {
    { MENU_ENUM_LABEL_PLAYLIST_MANAGER_LIST, ACTION_OK_DL_PLAYLIST_MANAGER_LIST },
    { MENU_ENUM_LABEL_RECORDING_SETTINGS, ACTION_OK_DL_RECORDING_SETTINGS_LIST },
    { MENU_ENUM_LABEL_INPUT_RETROPAD_BINDS, ACTION_OK_DL_INPUT_RETROPAD_BINDS_LIST },
+   { MENU_ENUM_LABEL_INPUT_CONTROLLERS, ACTION_OK_DL_INPUT_CONTROLLERS_LIST },
    { MENU_ENUM_LABEL_INPUT_HOTKEY_BINDS, ACTION_OK_DL_INPUT_HOTKEY_BINDS_LIST },
    { MENU_ENUM_LABEL_ACCOUNTS_YOUTUBE, ACTION_OK_DL_ACCOUNTS_YOUTUBE_LIST },
    { MENU_ENUM_LABEL_ACCOUNTS_TWITCH, ACTION_OK_DL_ACCOUNTS_TWITCH_LIST },
@@ -8426,6 +8440,19 @@ static int action_ok_push_dropdown_item_input_select_physical_keyboard(const cha
 
 #endif
 
+static int action_ok_push_dropdown_item_input_plays_as(const char *path,
+      const char *label, unsigned type, size_t idx, size_t entry_idx)
+{
+   unsigned row_type = string_to_unsigned(label);
+
+   if (     row_type < MENU_SETTINGS_INPUT_PLAYS_AS_BEGIN
+         || row_type > MENU_SETTINGS_INPUT_PLAYS_AS_END)
+      return -1;
+   menu_input_plays_as_change(row_type - MENU_SETTINGS_INPUT_PLAYS_AS_BEGIN,
+         (unsigned)entry_idx);
+   return action_cancel_pop_default(NULL, NULL, 0, 0);
+}
+
 static int action_ok_push_dropdown_item_input_description(const char *path,
       const char *label, unsigned type, size_t idx, size_t entry_idx)
 {
@@ -8900,6 +8927,16 @@ static int action_ok_input_description_dropdown_box_list(const char *path,
       label, type,
       idx, entry_idx,
       ACTION_OK_DL_DROPDOWN_BOX_LIST_INPUT_DESCRIPTION);
+}
+
+static int action_ok_input_plays_as_dropdown_box_list(const char *path,
+      const char *label, unsigned type, size_t idx, size_t entry_idx)
+{
+   return generic_action_ok_displaylist_push(
+      path, NULL,
+      label, type,
+      idx, entry_idx,
+      ACTION_OK_DL_DROPDOWN_BOX_LIST_INPUT_PLAYS_AS);
 }
 
 static int action_ok_input_description_kbd_dropdown_box_list(
@@ -10175,6 +10212,11 @@ static int menu_cbs_init_bind_ok_compare_type(menu_file_list_cbs_t *cbs,
    {
       BIND_ACTION_OK(cbs, action_ok_input_description_kbd_dropdown_box_list);
    }
+   else if (   (type >= MENU_SETTINGS_INPUT_PLAYS_AS_BEGIN)
+            && (type <= MENU_SETTINGS_INPUT_PLAYS_AS_END))
+   {
+      BIND_ACTION_OK(cbs, action_ok_input_plays_as_dropdown_box_list);
+   }
    else
    {
       switch (type)
@@ -10260,6 +10302,9 @@ static int menu_cbs_init_bind_ok_compare_type(menu_file_list_cbs_t *cbs,
           case MENU_SETTING_DROPDOWN_ITEM_INPUT_SELECT_RESERVED_DEVICE:
               BIND_ACTION_OK(cbs, action_ok_push_dropdown_item_input_select_reserved_device);
               break;
+         case MENU_SETTING_DROPDOWN_ITEM_INPUT_PLAYS_AS:
+            BIND_ACTION_OK(cbs, action_ok_push_dropdown_item_input_plays_as);
+            break;
 #ifdef ANDROID
           case MENU_SETTING_DROPDOWN_ITEM_INPUT_SELECT_PHYSICAL_KEYBOARD:
               BIND_ACTION_OK(cbs, action_ok_push_dropdown_item_input_select_physical_keyboard);

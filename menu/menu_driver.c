@@ -1749,6 +1749,7 @@ static bool menu_input_key_bind_poll_find_hold_pad(
          continue;
 
       RETRO_KEYBIND_SET_KEY(output, (enum retro_key)b);
+      new_state->from_keys = true;
       return true;
    }
 
@@ -1771,6 +1772,7 @@ static bool menu_input_key_bind_poll_find_hold_pad(
          case RETRO_DEVICE_ID_MOUSE_HORIZ_WHEELUP:
          case RETRO_DEVICE_ID_MOUSE_HORIZ_WHEELDOWN:
             RETRO_KEYBIND_SET_MBUTTON(output, b);
+            new_state->from_keys = true;
             return true;
       }
    }
@@ -1849,10 +1851,15 @@ static bool menu_input_key_bind_poll_find_hold(
    {
       unsigned i;
 
-      for (i = 0; i < max_users; i++)
+      for (i = 0; i < MAX_USERS; i++)
       {
-         if (menu_input_key_bind_poll_find_hold_pad(new_state, output, i))
+         if (     (i < max_users || i == new_state->port
+                  || ((new_state->listen >> i) & 1))
+               && menu_input_key_bind_poll_find_hold_pad(new_state, output, i))
+         {
+            new_state->from = i;
             return true;
+         }
       }
    }
 
@@ -1879,6 +1886,7 @@ static bool menu_input_key_bind_poll_find_trigger_pad(
          continue;
 
       RETRO_KEYBIND_SET_KEY(output, (enum retro_key)b);
+      new_state->from_keys = true;
       return true;
    }
 
@@ -1901,6 +1909,7 @@ static bool menu_input_key_bind_poll_find_trigger_pad(
          case RETRO_DEVICE_ID_MOUSE_HORIZ_WHEELUP:
          case RETRO_DEVICE_ID_MOUSE_HORIZ_WHEELDOWN:
             RETRO_KEYBIND_SET_MBUTTON(output, b);
+            new_state->from_keys = true;
             return true;
       }
    }
@@ -2006,11 +2015,16 @@ static bool menu_input_key_bind_poll_find_trigger(
    {
       unsigned i;
 
-      for (i = 0; i < max_users; i++)
+      for (i = 0; i < MAX_USERS; i++)
       {
-         if (menu_input_key_bind_poll_find_trigger_pad(
+         if (     (i < max_users || i == new_state->port
+                  || ((new_state->listen >> i) & 1))
+               && menu_input_key_bind_poll_find_trigger_pad(
                   state, new_state, output, i))
+         {
+            new_state->from = i;
             return true;
+         }
       }
    }
 
@@ -2023,10 +2037,15 @@ static bool menu_input_key_bind_poll_find_trigger(
 static void menu_input_key_bind_poll_bind_get_rested_axes(
       struct menu_bind_state *state)
 {
+   unsigned s;
    input_driver_capture_pad(state->port, false,
          NULL, 0,
          state->axis_state[state->port].rested_axes, MENU_MAX_AXES,
          NULL, 0);
+   for (s = 0; s < MAX_USERS; s++)
+      if ((state->listen >> s) & 1)
+         input_driver_capture_pad(s, false, NULL, 0,
+               state->axis_state[s].rested_axes, MENU_MAX_AXES, NULL, 0);
 }
 
 MENU_NOINLINE static void input_event_osk_iterate(void *osk_grid, enum osk_type osk_idx)
@@ -3839,6 +3858,13 @@ static void menu_input_key_bind_poll_bind_state(
          state->state[port].buttons, MENU_MAX_BUTTONS,
          state->state[port].axes,    MENU_MAX_AXES,
          state->state[port].hats,    MENU_MAX_HATS);
+   /* and for a hotkey, the controllers sharing its core port */
+   for (b = 0; b < MAX_USERS; b++)
+      if (b != port && ((state->listen >> b) & 1))
+         input_driver_capture_pad(b, false,
+               state->state[b].buttons, MENU_MAX_BUTTONS,
+               state->state[b].axes,    MENU_MAX_AXES,
+               state->state[b].hats,    MENU_MAX_HATS);
 }
 
 MENU_NOINLINE static int menu_dialog_iterate(
@@ -5265,6 +5291,49 @@ static bool menu_input_key_bind_custom_bind_keyboard_cb(
 }
 #endif
 
+void menu_input_plays_as_change(unsigned row, unsigned player)
+{
+   settings_t *settings       = config_get_ptr();
+   struct menu_state *menu_st = &menu_driver_state;
+   bool slot                  = row < MAX_INPUT_DEVICES;
+
+   /* gone, or back, since the list was made: the list is made again */
+   if (slot
+         ? !input_config_get_device_name(row)
+         : input_config_plays_as_entry_taken(row - MAX_INPUT_DEVICES))
+   {
+      menu_st->flags &= ~MENU_ST_FLAG_PREVENT_POPULATE;
+      menu_st->flags |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+      return;
+   }
+   /* the same player: nothing is placed again */
+   if (player == (slot
+         ? input_config_plays_as_player(row)
+         : input_config_plays_as_entry_player(row - MAX_INPUT_DEVICES)))
+      return;
+
+   if (slot)
+   {
+      if (!input_config_plays_as_set(row, player))
+      {
+         const char *msg = msg_hash_to_str(MSG_INPUT_PLAYS_AS_FULL);
+         runloop_msg_queue_push(msg, strlen(msg), 1, 180, true, NULL,
+               MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+         return;
+      }
+      input_autoconfigure_reallocate_ports(row);
+   }
+   else
+      input_config_plays_as_set_entry(row - MAX_INPUT_DEVICES, player);
+   settings->flags |= SETTINGS_FLG_MODIFIED;
+   /* the rows follow the controllers: the list is made again, with
+    * the cursor kept on this one */
+   if (menu_st->driver_data)
+      menu_st->driver_data->plays_as_row = row + 1;
+   menu_st->flags  &= ~MENU_ST_FLAG_PREVENT_POPULATE;
+   menu_st->flags  |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+}
+
 bool menu_input_key_bind_set_mode(
       enum menu_input_binds_ctl_state state, void *data)
 {
@@ -5291,6 +5360,12 @@ bool menu_input_key_bind_set_mode(
    index_offset                        = setting->index_offset;
    binds->port                         = settings->uints.input_joypad_index[
       index_offset];
+   /* a hotkey is bound from user 1's pad or a controller that fires
+    * the hotkeys, which keeps the press as its own */
+   binds->listen                       = (binds->out_id >= RARCH_FIRST_META_KEY)
+      ? input_config_hotkey_listen_slots() : 0;
+   binds->from                         = binds->port;
+   binds->from_keys                    = false;
 
    menu_input_key_bind_poll_bind_get_rested_axes(binds);
    menu_input_key_bind_poll_bind_state(
@@ -5387,6 +5462,8 @@ MENU_NOINLINE static bool menu_input_key_bind_iterate(
 
       input_driver_set_keyboard_mapping_blocked(false);
 
+      new_binds.from      = new_binds.port;
+      new_binds.from_keys = false;
       menu_input_key_bind_poll_bind_state(
             settings->uints.input_joypad_index[new_binds.port],
             &new_binds, timed_out);
@@ -5488,11 +5565,35 @@ MENU_NOINLINE static bool menu_input_key_bind_iterate(
          bool stop_binding                   = new_binds.order == 0 && new_binds.begin == new_binds.last;
 
          /* Update bind */
+         /* a sharing controller's press goes to its own bind, and that
+          * of user 1's pad or the hotkey user's does where it has its
+          * own for the hotkey; keys, mouse buttons and the rest go to
+          * the set */
          /* written where the bind is kept now, which is asked for
           * here: the write is counted as a change when it is made,
           * and no address is carried from the frame the capture
           * began in */
-         *input_config_bind_edit(new_binds.out_user, new_binds.out_id)
+         if (     !new_binds.skip
+               && !new_binds.from_keys
+               && input_config_hotkey_bind_own(new_binds.from,
+                     new_binds.out_id))
+         {
+            /* refused with the controller still connected only when
+             * the list is full */
+            if (     !input_config_plays_as_set_hotkey(new_binds.from,
+                        new_binds.out_id, new_binds.buffer.joykey,
+                        new_binds.buffer.joyaxis)
+                  && input_config_get_device_name(new_binds.from))
+            {
+               const char *msg = msg_hash_to_str(MSG_INPUT_PLAYS_AS_FULL);
+               runloop_msg_queue_push(msg, strlen(msg), 1, 180, true, NULL,
+                     MESSAGE_QUEUE_ICON_DEFAULT,
+                     MESSAGE_QUEUE_CATEGORY_WARNING);
+            }
+            settings->flags |= SETTINGS_FLG_MODIFIED;
+         }
+         else
+            *input_config_bind_edit(new_binds.out_user, new_binds.out_id)
                                              = new_binds.buffer;
 
          /* Update keyboard mapping bits */

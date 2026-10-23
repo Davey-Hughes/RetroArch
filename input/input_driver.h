@@ -987,7 +987,8 @@ typedef struct
    unsigned core_gyro_rate;  /* >0 means core wants gyro at this rate */
    /* First-press port assignment, see input_first_press_apply():
     * buttons seen released on a user with no core port, the users to
-    * map at the next frame boundary, and whether any of it is live. */
+    * map (or a change in who shares a player, to announce) at the
+    * next frame boundary, and whether any of it is live. */
    uint32_t first_press_released[MAX_USERS];
    uint32_t first_press_pending;
    /* users whose core port a press gave them, not the user */
@@ -1919,6 +1920,78 @@ bool input_config_sanitize_joypad_indices(void);
 unsigned input_config_shared_ports(uint8_t *leader);
 void input_config_follow_shared_ports(const uint8_t *leader);
 
+/* Whether @s, a device as reservations and Plays As name one, starts
+ * with a hex "vid:pid" and then a space or its end: then @vid, @pid
+ * and, where not NULL, @name (what follows the space) are set. */
+bool input_config_parse_vid_pid(const char *s, unsigned long *vid,
+      unsigned long *pid, const char **name);
+
+/* Plays As: a controller's own player. MAX_USERS entries, each naming
+ * a controller as a reservation does ("vid:pid name") with its player,
+ * 0 for Auto; a connected controller takes the first entry naming it
+ * that no other has taken. Main thread. */
+/* The entry the controller in @slot took, or -1. */
+int input_config_plays_as_entry(unsigned slot);
+/* The controller in @slot's player: 0 Auto, else 1 and up; with no
+ * entry, its default (the headset's is 1). */
+unsigned input_config_plays_as_player(unsigned slot);
+/* Gives the controller in @slot player @player (0 Auto), taking an
+ * entry for it if it has none. False, with nothing changed, when it
+ * needs one and every entry is taken. */
+bool input_config_plays_as_set(unsigned slot, unsigned player);
+/* Entry @e's controller name, or NULL for a free entry; its player;
+ * whether a connected controller has taken it; and its player set. */
+const char *input_config_plays_as_entry_name(unsigned e);
+unsigned input_config_plays_as_entry_player(unsigned e);
+bool input_config_plays_as_entry_taken(unsigned e);
+void input_config_plays_as_set_entry(unsigned e, unsigned player);
+/* Whether any entry gives a player, within Max Users or past it, or a
+ * connected controller has one with no entry (the headset's). */
+bool input_config_plays_as_active(void);
+/* Whether any entry, or a connected controller with none, gives a
+ * player within Max Users. */
+bool input_config_plays_as_any_player(void);
+/* The player of a controller called @name, which has no vid:pid: the
+ * first entry naming it, else its default. */
+unsigned input_config_plays_as_named(const char *name);
+/* Moves on whenever an entry's controller or player may have: a cache
+ * of input_config_plays_as_named() looks again when it does. */
+unsigned input_config_plays_as_generation(void);
+/* The controller just connected in @slot takes its entry and its port:
+ * true when it was placed, false for one the reservations place. */
+bool input_config_plays_as_place(unsigned slot);
+/* Max Users has changed: @again gets, for each of the MAX_USERS slots,
+ * whether its controller is placed again - one with no port below Max
+ * Users now, or one whose player was above Max Users when controllers
+ * were last placed and is within it now. */
+void input_config_plays_as_max_users_changed(uint8_t *again);
+/* The controller in @slot is gone. */
+void input_config_plays_as_release(unsigned slot);
+/* The lowest user below Max Users reading @slot, or MAX_USERS. */
+unsigned input_config_slot_user(unsigned slot);
+/* The controller in @slot's own button and axis for hotkey @id,
+ * NO_BTN and AXIS_NONE where it has none; set, taking an entry for it
+ * at its player if it has none (false when none is free); and hotkey
+ * @id taken from every entry. */
+void input_config_plays_as_hotkey(unsigned slot, unsigned id,
+      uint16_t *joykey, uint32_t *joyaxis);
+bool input_config_plays_as_set_hotkey(unsigned slot, unsigned id,
+      uint16_t joykey, uint32_t joyaxis);
+void input_config_plays_as_clear_hotkey(unsigned id);
+/* Hotkey @id's own buttons on the connected controllers that have one,
+ * " · name: button" each, into @s; the length written. */
+size_t input_config_plays_as_hotkey_string(unsigned id, char *s,
+      size_t len);
+/* The slots of the controllers that fire the hotkeys (on the hotkey
+ * port's core port), but user 1's own, as bits: a hotkey being bound
+ * listens to these too. */
+uint32_t input_config_hotkey_listen_slots(void);
+/* Whether a pad's press binding hotkey @id is kept as the own bind of
+ * the controller in @slot: it has one for @id already, or it fires
+ * the hotkeys as neither user 1's pad nor the hotkey user's. False for
+ * any id that is not a hotkey. */
+bool input_config_hotkey_bind_own(unsigned slot, unsigned id);
+
 unsigned *input_config_get_device_ptr(unsigned port);
 
 unsigned input_config_get_device(unsigned port);
@@ -2004,11 +2077,14 @@ size_t input_config_get_device_name_size(unsigned port);
 
 unsigned input_driver_lightgun_id_convert(unsigned id);
 
-#ifdef HAVE_OPENXR
 /* The ports that read slot @a read slot @b, and the other way round,
  * for this run only: the config file keeps what the user set. */
 void input_driver_exchange_ports(unsigned a, unsigned b);
-#endif
+/* Whether the ports are as runtime moves left them; and, written
+ * directly since (a reserved device's placement), that they still are,
+ * so the config file keeps what the user set. */
+bool input_driver_ports_runtime(void);
+void input_driver_ports_runtime_moved(void);
 
 bool input_driver_pointer_is_offscreen(int16_t x, int16_t y);
 
@@ -2113,6 +2189,15 @@ size_t input_config_get_bind_string_joykey(
       char *s, const char *prefix,
       const struct retro_keybind *bind,
       const struct input_bind_label *label, size_t len);
+
+/* A bind's button and axis as the config file has them: "8", "h0up";
+ * "+1", "-2"; "nul" for none. Read into @joykey or @joyaxis (false,
+ * nothing changed, for a value that is none of these), or written
+ * into @s. */
+bool input_config_parse_joykey(const char *s, uint16_t *joykey);
+bool input_config_parse_joyaxis(const char *s, uint32_t *joyaxis);
+void input_config_format_joykey(char *s, size_t len, uint16_t joykey);
+void input_config_format_joyaxis(char *s, size_t len, uint32_t joyaxis);
 
 bool input_key_pressed(int key, bool keyboard_pressed);
 
@@ -2424,6 +2509,20 @@ bool input_entry_set_depth(unsigned number, unsigned percent);
 size_t input_entry_spec(unsigned number, char *s, size_t len);
 /* The entries and macros written into a configuration to be saved. */
 void input_entries_write(void *conf);
+
+/* input_plays_as_device_N, input_plays_as_player_N and the entries'
+ * own hotkeys, input_plays_as_<hotkey>_btn_N and _axis_N, N from 1:
+ * the file's entries in place of the ones there are, and the ones
+ * there are written, keys an entry has no value for taken out. */
+void input_plays_as_read(void *conf);
+void input_plays_as_write(void *conf);
+/* A copy of the entries and the claims on them, put back after a load
+ * made only to compare against, as the binds' copy is. NULL if there
+ * is no memory for it. */
+typedef struct input_plays_as_copy input_plays_as_copy_t;
+input_plays_as_copy_t *input_plays_as_copy_new(void);
+void input_plays_as_copy_restore(const input_plays_as_copy_t *copy);
+void input_plays_as_copy_free(input_plays_as_copy_t *copy);
 
 /* Macros: buttons of the RetroPad pressed for a user a step at a time,
  * a step lasting a number of the core's frames; read from the

@@ -250,6 +250,7 @@ GENERIC_DEFERRED_PUSH(deferred_push_playlist_settings_list,         DISPLAYLIST_
 GENERIC_DEFERRED_PUSH(deferred_push_playlist_manager_list,          DISPLAYLIST_PLAYLIST_MANAGER_LIST)
 GENERIC_DEFERRED_PUSH(deferred_push_playlist_manager_settings,      DISPLAYLIST_PLAYLIST_MANAGER_SETTINGS)
 GENERIC_DEFERRED_PUSH(deferred_push_input_retropad_binds_list,        DISPLAYLIST_INPUT_RETROPAD_BINDS_LIST)
+GENERIC_DEFERRED_PUSH(deferred_push_input_controllers_list,           DISPLAYLIST_INPUT_CONTROLLERS_LIST)
 GENERIC_DEFERRED_PUSH(deferred_push_input_hotkey_binds_list,        DISPLAYLIST_INPUT_HOTKEY_BINDS_LIST)
 GENERIC_DEFERRED_PUSH(deferred_push_accounts_cheevos_list,          DISPLAYLIST_ACCOUNTS_CHEEVOS_LIST)
 GENERIC_DEFERRED_PUSH(deferred_push_accounts_twitch_list,           DISPLAYLIST_ACCOUNTS_TWITCH_LIST)
@@ -606,6 +607,7 @@ GENERIC_DEFERRED_PUSH_GENERAL(deferred_push_dropdown_box_list_input_device_type,
 GENERIC_DEFERRED_PUSH_GENERAL(deferred_push_dropdown_box_list_input_description, PUSH_DEFAULT, DISPLAYLIST_DROPDOWN_LIST_INPUT_DESCRIPTION)
 GENERIC_DEFERRED_PUSH_GENERAL(deferred_push_dropdown_box_list_input_description_kbd, PUSH_DEFAULT, DISPLAYLIST_DROPDOWN_LIST_INPUT_DESCRIPTION_KBD)
 GENERIC_DEFERRED_PUSH_GENERAL(deferred_push_dropdown_box_list_input_select_reserved_device, PUSH_DEFAULT, DISPLAYLIST_DROPDOWN_LIST_INPUT_SELECT_RESERVED_DEVICE)
+GENERIC_DEFERRED_PUSH_GENERAL(deferred_push_dropdown_box_list_input_plays_as, PUSH_DEFAULT, DISPLAYLIST_DROPDOWN_LIST_INPUT_PLAYS_AS)
 #ifdef ANDROID
 GENERIC_DEFERRED_PUSH_GENERAL(deferred_push_dropdown_box_list_input_select_physical_keyboard, PUSH_DEFAULT, DISPLAYLIST_DROPDOWN_LIST_INPUT_SELECT_PHYSICAL_KEYBOARD)
 #endif
@@ -658,6 +660,7 @@ static int menu_cbs_init_bind_deferred_push_compare_label(
       {MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_DESCRIPTION, deferred_push_dropdown_box_list_input_description},
       {MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_DESCRIPTION_KBD, deferred_push_dropdown_box_list_input_description_kbd},
       {MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_SELECT_RESERVED_DEVICE, deferred_push_dropdown_box_list_input_select_reserved_device},
+      {MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_PLAYS_AS, deferred_push_dropdown_box_list_input_plays_as},
 #ifdef ANDROID
       {MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_INPUT_SELECT_PHYSICAL_KEYBOARD, deferred_push_dropdown_box_list_input_select_physical_keyboard},
 #endif
@@ -788,6 +791,7 @@ static int menu_cbs_init_bind_deferred_push_compare_label(
       {MENU_ENUM_LABEL_SHADER_OPTIONS, deferred_push_shader_options},
       {MENU_ENUM_LABEL_DEFERRED_USER_BINDS_LIST, deferred_user_binds_list},
       {MENU_ENUM_LABEL_DEFERRED_INPUT_RETROPAD_BINDS_LIST, deferred_push_input_retropad_binds_list},
+      {MENU_ENUM_LABEL_DEFERRED_INPUT_CONTROLLERS_LIST, deferred_push_input_controllers_list},
       {MENU_ENUM_LABEL_DEFERRED_INPUT_HOTKEY_BINDS_LIST, deferred_push_input_hotkey_binds_list},
       {MENU_ENUM_LABEL_DEFERRED_QUICK_MENU_OVERRIDE_OPTIONS, deferred_push_quick_menu_override_options},
       {MENU_ENUM_LABEL_DEFERRED_ACCOUNTS_YOUTUBE_LIST, deferred_push_accounts_youtube_list},
@@ -904,6 +908,7 @@ static int menu_cbs_init_bind_deferred_push_compare_label(
          { MENU_ENUM_LABEL_DEFERRED_PLAYLIST_MANAGER_SETTINGS, deferred_push_playlist_manager_settings },
          { MENU_ENUM_LABEL_DEFERRED_RECORDING_SETTINGS_LIST, deferred_push_recording_settings_list },
          { MENU_ENUM_LABEL_DEFERRED_INPUT_RETROPAD_BINDS_LIST, deferred_push_input_retropad_binds_list },
+         { MENU_ENUM_LABEL_DEFERRED_INPUT_CONTROLLERS_LIST, deferred_push_input_controllers_list },
          { MENU_ENUM_LABEL_DEFERRED_INPUT_HOTKEY_BINDS_LIST, deferred_push_input_hotkey_binds_list },
          { MENU_ENUM_LABEL_DEFERRED_ACCOUNTS_CHEEVOS_LIST, deferred_push_accounts_cheevos_list },
          { MENU_ENUM_LABEL_DEFERRED_ACCOUNTS_YOUTUBE_LIST, deferred_push_accounts_youtube_list },
