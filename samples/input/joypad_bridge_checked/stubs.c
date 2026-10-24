@@ -14,6 +14,7 @@ void *config_get_ptr(void) { return no_settings; }
 /* and the settings a joypad driver asks for by name: nothing but
  * zeroes too, as they read from the block above */
 unsigned input_config_get_rumble_gain(void) { return 0; }
+int input_config_get_follow_steam_lists(void) { return 0; }
 unsigned input_config_get_joypad_index(unsigned port) { (void)port; return 0; }
 const char *input_config_get_autoconfig_dir(void) { return NULL; }
 int input_autoconfigure_connect(void) { return 0; }

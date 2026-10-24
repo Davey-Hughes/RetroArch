@@ -328,6 +328,52 @@ static void lane_controller_layout(void)
          "(cursor %u, layout row %d)", (unsigned)menu_st->selection_ptr, r);
 }
 
+#ifdef HAVE_UDEV
+/* Follow Steam's Controller Lists is on Controllers, above the
+ * controller layout, only while the joypad driver is udev, and keeps
+ * the cursor when the controllers it hides come or go. */
+static void lane_steam_lists_row(void)
+{
+   int r;
+   settings_t *settings       = config_get_ptr();
+   struct menu_state *menu_st = menu_state_get_ptr();
+
+   generic_action_ok_displaylist_push("", NULL, "", 0, 0, 0,
+         ACTION_OK_DL_INPUT_CONTROLLERS_LIST);
+   run_frame();
+   CHECK(row(MENU_ENUM_LABEL_INPUT_FOLLOW_STEAM_LISTS_STR) < 0,
+         "Follow Steam's Controller Lists is listed for the null joypad "
+         "driver");
+
+   strlcpy(settings->arrays.input_joypad_driver, "udev",
+         sizeof(settings->arrays.input_joypad_driver));
+   rebuild_as_hotplug();
+   r = row(MENU_ENUM_LABEL_INPUT_FOLLOW_STEAM_LISTS_STR);
+   CHECK(r == 0 && row(MENU_ENUM_LABEL_VIDEO_OPENXR_CONTROLLERS_STR) == 1,
+         "Follow Steam's Controller Lists is not the row above the "
+         "controller layout (row %d)", r);
+
+   /* the re-scan it asks for adds a controller row above it */
+   menu_st->selection_ptr = (r > 0) ? (size_t)r : 0;
+   input_config_set_device_name(0, "Test Pad");
+   rebuild_as_hotplug();
+   r = row(MENU_ENUM_LABEL_INPUT_FOLLOW_STEAM_LISTS_STR);
+   CHECK(r == 1 && menu_st->selection_ptr == 1,
+         "a row added above the Steam lists row took the cursor "
+         "(cursor %u, row %d)", (unsigned)menu_st->selection_ptr, r);
+
+   input_config_clear_device_name(0);
+   rebuild_as_hotplug();
+   r = row(MENU_ENUM_LABEL_INPUT_FOLLOW_STEAM_LISTS_STR);
+   CHECK(r == 0 && menu_st->selection_ptr == 0,
+         "the cursor left the Steam lists row when the row above went "
+         "(cursor %u, row %d)", (unsigned)menu_st->selection_ptr, r);
+
+   strlcpy(settings->arrays.input_joypad_driver, "null",
+         sizeof(settings->arrays.input_joypad_driver));
+}
+#endif
+
 /* Fixed in Room by default; each value shows its own name. */
 static void lane_placement(void)
 {
@@ -1226,6 +1272,9 @@ int main(int argc, char *argv[])
    lane_on_other_driver();
    lane_headset_rows();
    lane_controller_layout();
+#ifdef HAVE_UDEV
+   lane_steam_lists_row();
+#endif
    lane_placement();
    lane_refresh_rate();
    lane_controller_rows();

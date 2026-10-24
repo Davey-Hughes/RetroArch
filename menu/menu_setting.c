@@ -10684,6 +10684,13 @@ static void general_write_handler(rarch_setting_t *setting)
          if (input_config_plays_as_active())
             input_autoconfigure_reallocate_ports(MAX_USERS);
          break;
+#ifdef HAVE_UDEV
+      case MENU_ENUM_LABEL_INPUT_FOLLOW_STEAM_LISTS:
+         /* udev reads it per pad add: re-scan */
+         reinit_flags = DRIVER_VIDEO_AND_INPUT_MASK;
+         rarch_cmd    = CMD_EVENT_REINIT;
+         break;
+#endif
 #ifdef ANDROID
       case MENU_ENUM_LABEL_INPUT_SELECT_PHYSICAL_KEYBOARD:
          settings->flags |= SETTINGS_FLG_MODIFIED;

@@ -1193,6 +1193,7 @@ bool input_config_get_keyboard_background(void);
 bool input_config_get_winraw_xinput_enable(void);
 bool input_config_get_winraw_player_lights(void);
 bool input_config_get_sdl3_system_keyboard(void);
+bool input_config_get_follow_steam_lists(void);
 bool input_config_overlay_configured(void);
 unsigned input_config_get_split_joycon(unsigned port);
 bool input_config_get_backtouch_enable(void);

@@ -7831,8 +7831,10 @@ static bool menu_displaylist_refresh(struct menu_state *menu_st, file_list_t *li
    return true;
 }
 
-/* plays_as_row for the OpenXR Controller Layout row */
-#define PLAYS_AS_ROW_LAYOUT (MAX_INPUT_DEVICES + MAX_USERS + 1)
+/* plays_as_row for the OpenXR Controller Layout and Follow Steam's
+ * Controller Lists rows */
+#define PLAYS_AS_ROW_LAYOUT      (MAX_INPUT_DEVICES + MAX_USERS + 1)
+#define PLAYS_AS_ROW_STEAM_LISTS (MAX_INPUT_DEVICES + MAX_USERS + 2)
 
 /* Put the cursor back on the Controllers or Port N Controls (@page) row
  * in plays_as_row: the rows go in port order, so its index moves. Once
@@ -7862,6 +7864,12 @@ static void menu_displaylist_restore_plays_as_row(
                   MENU_ENUM_LABEL_VIDEO_OPENXR_CONTROLLERS_STR))
             continue;
       }
+      else if (menu->plays_as_row == PLAYS_AS_ROW_STEAM_LISTS)
+      {
+         if (!string_is_equal(list->list[i].label,
+                  MENU_ENUM_LABEL_INPUT_FOLLOW_STEAM_LISTS_STR))
+            continue;
+      }
       else if (list->list[i].type
             != MENU_SETTINGS_INPUT_PLAYS_AS_BEGIN + menu->plays_as_row - 1)
          continue;
@@ -7889,8 +7897,8 @@ static void menu_displaylist_restore_plays_as_row(
    menu->plays_as_rows = (unsigned)rows;
 }
 
-/* A hotplug, or a layout change reconnecting the headset's controllers,
- * makes the list again with the cursor at its index: note the row it is
+/* A hotplug, or a setting on the page reconnecting controllers, makes
+ * the list again with the cursor at its index: note the row it is
  * on, for the pass above to put it back. */
 static void menu_displaylist_keep_plays_as_row(
       struct menu_state *menu_st, file_list_t *list)
@@ -7908,6 +7916,9 @@ static void menu_displaylist_keep_plays_as_row(
    else if (string_is_equal(list->list[sel].label,
             MENU_ENUM_LABEL_VIDEO_OPENXR_CONTROLLERS_STR))
       menu->plays_as_row = PLAYS_AS_ROW_LAYOUT;
+   else if (string_is_equal(list->list[sel].label,
+            MENU_ENUM_LABEL_INPUT_FOLLOW_STEAM_LISTS_STR))
+      menu->plays_as_row = PLAYS_AS_ROW_STEAM_LISTS;
 }
 
 #ifdef HAVE_NETWORKING
@@ -9191,6 +9202,13 @@ static unsigned menu_displaylist_parse_input_controllers(
                MAX_INPUT_DEVICES + e, 0))
          count++;
    }
+#ifdef HAVE_UDEV
+   if (     string_is_equal(settings->arrays.input_joypad_driver, "udev")
+         && MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+               MENU_ENUM_LABEL_INPUT_FOLLOW_STEAM_LISTS,
+               PARSE_ONLY_BOOL, false) == 0)
+      count++;
+#endif
 #ifdef HAVE_OPENXR
    if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
             MENU_ENUM_LABEL_VIDEO_OPENXR_CONTROLLERS,

@@ -43,6 +43,7 @@
 
 #include "../input_driver.h"
 #include "../common/linux_not_joystick.h"
+#include "../common/steam_lists.h"
 #include "../common/output_writer.h"
 
 #include "../../configuration.h"
@@ -953,6 +954,7 @@ static int udev_add_pad(struct udev_device *dev, unsigned p, int fd, const char 
    unsigned long ffbit[NBITS(FF_MAX)]   = {0};
    const char *device_name              = input_config_get_device_name(p);
    size_t physlen                       = 0;
+   const char *steam_rule               = NULL;
 
    if (!device_name || !*device_name)
       pad->ident[0] = '\0';
@@ -978,6 +980,17 @@ static int udev_add_pad(struct udev_device *dev, unsigned p, int fd, const char 
       RARCH_LOG("[udev] Ignoring \"%s\" (%04x:%04x, %s): tagged as a"
             " joystick, but it is not one.\n",
             pad->ident, pad->vid, pad->pid, path);
+      pad->ident[0] = '\0';
+      pad->vid      = pad->pid = 0;
+      return -2;
+   }
+   /* Steam lists the controllers it mirrors for SDL to hide. */
+   if (     input_config_get_follow_steam_lists()
+         && (steam_rule = steam_lists_skip_env(
+               (uint16_t)pad->vid, (uint16_t)pad->pid)))
+   {
+      RARCH_LOG("[udev] Ignoring \"%s\" (%04x:%04x, %s): following %s.\n",
+            pad->ident, pad->vid, pad->pid, path, steam_rule);
       pad->ident[0] = '\0';
       pad->vid      = pad->pid = 0;
       return -2;
@@ -1128,7 +1141,8 @@ static void udev_check_device(struct udev_device *dev, const char *path)
       return;
 
    /* -1: could not be read. -2: read, and found not to be a
-    * controller. Neither keeps the descriptor. */
+    * controller or hidden by Steam's lists. Neither keeps the
+    * descriptor. */
    if ((ret = udev_add_pad(dev, pad, fd, path)) < 0)
    {
       if (ret == -1)

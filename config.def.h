@@ -1960,6 +1960,9 @@
  * On by default: one controller can drive several instances. */
 #define DEFAULT_INPUT_JOYPAD_BACKGROUND true
 
+/* Hide the controllers Steam asks SDL programs to hide (udev). */
+#define DEFAULT_INPUT_FOLLOW_STEAM_LISTS true
+
 #if TARGET_OS_IPHONE
 #define DEFAULT_INPUT_KEYBOARD_GAMEPAD_ENABLE false
 #else

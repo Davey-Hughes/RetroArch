@@ -15736,6 +15736,14 @@ bool input_config_get_sdl3_system_keyboard(void)
    return settings && settings->bools.input_sdl3_system_keyboard;
 }
 
+#ifdef HAVE_UDEV
+bool input_config_get_follow_steam_lists(void)
+{
+   settings_t *settings = config_get_ptr();
+   return !settings || settings->bools.input_follow_steam_lists;
+}
+#endif
+
 /* Sensors are allowed; and they are, until the settings say not. */
 bool input_config_get_sensors_enable(void)
 {

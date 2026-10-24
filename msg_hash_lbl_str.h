@@ -3942,6 +3942,11 @@ extern const struct msg_hash_us_lbl_blob_s msg_hash_us_lbl_blob;
 #else
 #define MENU_ENUM_LABEL_SETTINGS_SHOW_SMB_CLIENT_STR "settings_show_smb_client"
 #endif
+#if defined(HAVE_MENU) && (((defined(HAVE_UDEV))))
+#define MENU_ENUM_LABEL_INPUT_FOLLOW_STEAM_LISTS_STR (msg_hash_us_lbl_blob.m_MENU_ENUM_LABEL_INPUT_FOLLOW_STEAM_LISTS)
+#else
+#define MENU_ENUM_LABEL_INPUT_FOLLOW_STEAM_LISTS_STR "input_follow_steam_lists"
+#endif
 #if defined(HAVE_MENU) && (((defined(_WIN32) && defined(HAVE_WINRAWINPUT))))
 #define MENU_ENUM_LABEL_INPUT_KEYBOARD_BACKGROUND_STR (msg_hash_us_lbl_blob.m_MENU_ENUM_LABEL_INPUT_KEYBOARD_BACKGROUND)
 #else
