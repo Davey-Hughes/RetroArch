@@ -8900,9 +8900,9 @@ static const hid_driver_t *input_beside_source(void)
 
 void input_driver_beside_override(const hid_driver_t *drv)
 {
-   if (!drv && input_beside.drv && input_beside.drv == input_beside.override)
-      input_beside_stop();
    input_beside.override = drv;
+   if (input_beside.drv && input_beside.drv != input_beside_source())
+      input_beside_stop();
    if (!input_beside.drv)
       input_beside.tried = false;
 }
