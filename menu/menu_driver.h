@@ -526,6 +526,9 @@ struct menu_state
    retro_time_t action_press_time;
 
    struct menu_bind_state input_binds;     /* uint64_t alignment */
+   /* The bind capture's next state, compared against input_binds:
+    * too big for the stack. */
+   struct menu_bind_state input_binds_next; /* uint64_t alignment */
 
    gfx_thumbnail_path_data_t *thumbnail_path_data;
    menu_handle_t *driver_data;
