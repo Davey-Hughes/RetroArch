@@ -691,6 +691,26 @@ jobs:
           make clean
           echo "[pass] linux_not_joystick_test (ASan)"
 
+      - name: Build and run steam_lists_test (ASan + UBSan, mingw + Wine)
+        shell: bash
+        working-directory: samples/input/steam_lists
+        run: |
+          set -eu
+          # The controllers Steam asks SDL to hide, read as SDL reads
+          # them: the pads it mirrors on SDL_GAMECONTROLLER_IGNORE_DEVICES,
+          # an _EXCEPT list with an entry hiding all it does not name,
+          # "@path" values read from the file, and Steam's own pad kept
+          # only with SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD true.
+          # udev's joypad driver hides what these hide.
+          trap 'wineserver -k >/dev/null 2>&1 || true' EXIT
+          make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+             timeout 60 ./steam_lists_test
+          make clean
+          WINEDEBUG=-all timeout 300 make check CC=x86_64-w64-mingw32-gcc EXE=.exe RUNNER=wine
+          make clean
+          echo "[pass] steam_lists_test (ASan, mingw + Wine)"
+
       - name: Build and run overlay_textures_test (plain, ASan + UBSan, threaded)
         shell: bash
         working-directory: samples/input/overlay_textures
