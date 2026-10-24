@@ -5417,7 +5417,7 @@ MENU_NOINLINE static bool menu_input_key_bind_iterate(
       bool complete                         = false;
       struct menu_bind_state new_binds      = *_binds;
       unsigned bind_index                   = _binds->begin - MENU_SETTINGS_BIND_BEGIN;
-      const struct retro_keybind *old_binds = input_config_bind(new_binds.port, bind_index);
+      const struct retro_keybind *old_binds = input_config_bind(new_binds.out_user, bind_index);
       unsigned old_key                      = RETRO_KEYBIND_KEY(old_binds);
 
       input_driver_set_keyboard_mapping_blocked(false);
@@ -5557,7 +5557,7 @@ MENU_NOINLINE static bool menu_input_key_bind_iterate(
          input_driver_set_wait_input_release(true);
 
          /* Next bind */
-         new_binds.out_user                  = new_binds.port;
+         new_binds.out_user                  = new_binds.user;
          new_binds.out_id                    =
             input_config_bind_order[new_binds.order];
          new_binds.buffer = *input_config_bind(
