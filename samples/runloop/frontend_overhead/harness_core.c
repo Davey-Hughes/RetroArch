@@ -8,7 +8,10 @@
  * it times its own input_poll and a set number of input_state queries
  * spread over the joypad buttons of the ports it is told to read - the
  * frontend's input cost as a core sees it, from the core's side of the
- * libretro calls. */
+ * libretro calls.
+ *
+ * What the harness looks up is RETRO_API: a Windows DLL that exports
+ * the retro_ functions exports nothing else on its own. */
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
@@ -44,14 +47,15 @@ static int  in_b_last;
 
 /* Set while the core is inside input_poll / input_state, so the
  * harness can count heap calls in those alone. */
-volatile int harness_core_in_input;
+static volatile int in_input;
+RETRO_API volatile int *harness_core_in_input_flag(void) { return &in_input; }
 
 /* A probe the harness may set. While measuring, retro_run() calls it at
  * four points - 0 on entry, 1 after input_poll, 2 after the frame's
  * first input_state, 3 before it returns - so the harness can tell
  * where in the frame the frontend polled. Kept out of the timings. */
 static void (*in_probe)(int point);
-void harness_core_set_probe(void (*probe)(int point)) { in_probe = probe; }
+RETRO_API void harness_core_set_probe(void (*probe)(int point)) { in_probe = probe; }
 
 /* Trace: what the core sees of pad 1 each frame. @mode 1 reads the
  * sixteen buttons one by one, the way older cores do; 2 reads them as
@@ -61,14 +65,14 @@ static int      trace_analog;
 static unsigned trace_buttons;
 static int      trace_axes[4];
 
-void harness_core_trace(int mode, int analog)
+RETRO_API void harness_core_trace(int mode, int analog)
 {
    trace_mode   = mode;
    trace_analog = analog;
 }
 
 /* What the last frame saw. */
-void harness_core_trace_last(unsigned *buttons, int *axes)
+RETRO_API void harness_core_trace_last(unsigned *buttons, int *axes)
 {
    *buttons = trace_buttons;
    memcpy(axes, trace_axes, sizeof(trace_axes));
@@ -82,7 +86,7 @@ static unsigned      rumble_calls;
 static unsigned long rumble_made;
 static unsigned long rumble_true;
 
-void harness_core_rumble(unsigned calls)
+RETRO_API void harness_core_rumble(unsigned calls)
 {
    rumble_calls = calls;
    rumble_made  = 0;
@@ -91,7 +95,7 @@ void harness_core_rumble(unsigned calls)
 
 /* The calls made since harness_core_rumble(), and how many of them the
  * frontend answered true. */
-void harness_core_rumble_stats(unsigned long *made, unsigned long *answered_true)
+RETRO_API void harness_core_rumble_stats(unsigned long *made, unsigned long *answered_true)
 {
    *made          = rumble_made;
    *answered_true = rumble_true;
@@ -107,7 +111,7 @@ static unsigned long long now_ns(void)
 /* Start measuring: @queries input_state calls a frame over @ports
  * ports (0 queries goes back to the normal single read), counters
  * cleared. */
-void harness_core_input_measure(unsigned queries, unsigned ports)
+RETRO_API void harness_core_input_measure(unsigned queries, unsigned ports)
 {
    in_queries  = queries;
    in_ports    = ports ? ports : 1;
@@ -122,8 +126,8 @@ void harness_core_input_measure(unsigned queries, unsigned ports)
 
 /* The runs so far, and the runs in which pad 1's B changed since the
  * last harness_core_input_measure(). */
-long harness_core_runs(void) { return (long)runs; }
-void harness_core_input_edges(long *press_run, long *release_run)
+RETRO_API long harness_core_runs(void) { return (long)runs; }
+RETRO_API void harness_core_input_edges(long *press_run, long *release_run)
 {
    *press_run   = in_press_run;
    *release_run = in_release_run;
@@ -132,7 +136,7 @@ void harness_core_input_edges(long *press_run, long *release_run)
 /* What was measured since: frames, and nanoseconds in input_poll, in
  * each frame's first input_state call (which carries the poll when the
  * frontend polls late, its default), and in the other calls. */
-void harness_core_input_stats(unsigned long *frames,
+RETRO_API void harness_core_input_stats(unsigned long *frames,
       unsigned long long *poll_ns, unsigned long long *first_ns,
       unsigned long long *state_ns)
 {
@@ -219,7 +223,7 @@ void retro_set_controller_port_device(unsigned port, unsigned device)
       port_device_calls_in_run++;
 }
 
-void harness_core_port_device(unsigned port, unsigned *device,
+RETRO_API void harness_core_port_device(unsigned port, unsigned *device,
       long *calls, long *calls_in_run)
 {
    *device       = (port < 8) ? port_device[port] : 0;
@@ -274,7 +278,7 @@ void retro_run(void)
       unsigned long long first_ns;
       if (in_probe)
          in_probe(0);
-      harness_core_in_input = 1;
+      in_input = 1;
       t0 = now_ns();
       poll_cb();
       t1 = now_ns();
@@ -305,7 +309,7 @@ void retro_run(void)
          acc |= state_cb(q % in_ports, RETRO_DEVICE_JOYPAD, 0,
                (q / in_ports) % 16);
       t2 = now_ns();
-      harness_core_in_input = 0;
+      in_input = 0;
       in_sink      = acc;
       in_poll_ns  += t1 - t0;
       in_first_ns += first_ns;
