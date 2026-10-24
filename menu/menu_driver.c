@@ -3815,7 +3815,7 @@ static void menu_input_key_bind_poll_bind_state(
       /* Poll mouse (on the relevant port)
        *
        * Check if key was being pressed by
-       * user with mouse number 'port'
+       * the mouse of the user being bound
        *
        * NOTE: We start iterating on 2 (RETRO_DEVICE_ID_MOUSE_LEFT),
        * because we want to skip the axes
@@ -3825,7 +3825,7 @@ static void menu_input_key_bind_poll_bind_state(
          state->state[port].mouse_buttons[b] =
             input_driver_bind_capture_state(
                   joy_idx,
-                  port,
+                  state->user,
                   RETRO_DEVICE_MOUSE, 0, b);
       }
 
