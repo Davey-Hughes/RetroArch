@@ -82,12 +82,11 @@
 #include <string.h>
 #include <math.h>
 #include <unistd.h>
-#ifndef _WIN32
-#include <dlfcn.h>
-#endif
+#include <dynamic/dylib.h>
 #include <queues/task_queue.h>
 #include "../../../core.h"
 #include <file/file_path.h>
+#include <streams/file_stream.h>
 #include <string/stdstring.h>
 #include <boolean.h>
 #include <features/features_cpu.h>
@@ -194,7 +193,8 @@ extern void *__libc_realloc(void*, size_t);
 static unsigned long heap_calls;
 static bool          heap_counting;
 /* The input lanes count only while the core is inside input_poll or
- * input_state (the core's harness_core_in_input), not the whole loop. */
+ * input_state (the core's harness_core_in_input_flag()), not the
+ * whole loop. */
 static volatile int *heap_scope;
 #define HEAP_COUNTED() (heap_counting && (!heap_scope || *heap_scope))
 
@@ -363,25 +363,29 @@ static void lane_input_cost(void)
    unsigned long heap;
    void    *core;
 
-#if !defined(HAVE_TEST_DRIVERS) || defined(_WIN32)
+#ifndef HAVE_TEST_DRIVERS
    (void)had; (void)poll_us; (void)first_us; (void)q16; (void)q256; (void)q8;
    (void)heap; (void)core;
-   printf("[skip] input lanes: need the test drivers and dlopen\n");
+   printf("[skip] input lanes: need the test drivers\n");
 #else
-   if (   !(core = dlopen(core_path_g, RTLD_NOW))
+   if (   !(core = dylib_load(core_path_g))
        || !(core_input_measure = (void (*)(unsigned, unsigned))
-             dlsym(core, "harness_core_input_measure"))
+             dylib_proc(core, "harness_core_input_measure"))
        || !(core_input_stats = (void (*)(unsigned long*, unsigned long long*,
-             unsigned long long*, unsigned long long*))dlsym(core, "harness_core_input_stats"))
-       || !(core_runs = (long (*)(void))dlsym(core, "harness_core_runs"))
-       || !(core_input_edges = (void (*)(long*, long*))dlsym(core, "harness_core_input_edges")))
+             unsigned long long*, unsigned long long*))dylib_proc(core, "harness_core_input_stats"))
+       || !(core_runs = (long (*)(void))dylib_proc(core, "harness_core_runs"))
+       || !(core_input_edges = (void (*)(long*, long*))dylib_proc(core, "harness_core_input_edges")))
    {
       CHECK(false, "input lanes: the harness core's measuring entry points");
       return;
    }
 
 #ifdef HARNESS_COUNT_HEAP
-   heap_scope = (volatile int*)dlsym(core, "harness_core_in_input");
+   {
+      volatile int *(*in_input_flag)(void) = (volatile int *(*)(void))
+            dylib_proc(core, "harness_core_in_input_flag");
+      heap_scope = in_input_flag ? in_input_flag() : NULL;
+   }
    CHECK(heap_scope != NULL, "input lanes: the harness core's input-scope flag");
    if (!heap_scope)
       return;
@@ -482,7 +486,7 @@ static void lane_input_cost(void)
  * mode - no poll mode adds a frame between the device and the core. */
 static void lane_input_poll_modes(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    static const char *const name[3] = { "early", "normal", "late" };
    long     press_at[3], release_at[3];
    unsigned had = failures;
@@ -529,14 +533,14 @@ static void lane_input_poll_modes(void)
    if (failures == had)
       printf("[pass] early, normal and late polling see each edge in the same frame\n");
 #else
-   printf("[skip] poll-mode lane: need the test drivers and dlopen\n");
+   printf("[skip] poll-mode lane: need the test drivers\n");
 #endif
 }
 
 /* The registry mirrors what the joypad driver reports. */
 static void lane_device_registry(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    const input_registry_t *reg = input_driver_get_registry();
    input_device_handle_t handle7 = 0;
    uint32_t id7  = 0;
@@ -695,7 +699,7 @@ static void lane_device_registry(void)
  * ports on a pad together. */
 static void lane_shared_ports(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    settings_t *settings = config_get_ptr();
    unsigned *idx        = settings->uints.input_joypad_index;
    unsigned had         = failures;
@@ -824,7 +828,7 @@ static void lane_shared_ports(void)
 /* Where in a frame the frontend polls. The joypad driver's poll is
  * counted, and the count is read at four points of the core's
  * retro_run() and at both ends of the iterate. */
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
 enum
 {
    SITE_BEFORE_RUN = 0, /* before retro_run(): the early poll */
@@ -905,7 +909,7 @@ static void run_sited_frames(unsigned n)
 
 static void lane_input_poll_sites(const char *loaded_with)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    static const char *const name[3] = { "early", "normal", "late" };
    static const unsigned    home[3] = {
       SITE_BEFORE_RUN, SITE_INPUT_POLL, SITE_FIRST_STATE };
@@ -917,9 +921,9 @@ static void lane_input_poll_sites(const char *loaded_with)
    unsigned had = failures;
    unsigned m, s;
 
-   if (   !(core = dlopen(core_path_g, RTLD_NOW))
-       || !(set_probe = (void (*)(void (*)(int)))dlsym(core, "harness_core_set_probe"))
-       || !(measure = (void (*)(unsigned, unsigned))dlsym(core, "harness_core_input_measure"))
+   if (   !(core = dylib_load(core_path_g))
+       || !(set_probe = (void (*)(void (*)(int)))dylib_proc(core, "harness_core_set_probe"))
+       || !(measure = (void (*)(unsigned, unsigned))dylib_proc(core, "harness_core_input_measure"))
        || !input_st->primary_joypad
        || !input_st->primary_joypad->poll)
    {
@@ -1016,12 +1020,12 @@ static void lane_input_poll_sites(const char *loaded_with)
             loaded_with);
 #else
    (void)loaded_with;
-   printf("[skip] poll-site lane: need the test drivers and dlopen\n");
+   printf("[skip] poll-site lane: need the test drivers\n");
 #endif
 }
 
 /* A core's rumble calls: stored during retro_run(), written after it. */
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
 static unsigned long         rumble_writes;
 static unsigned long         rumble_mark;
 static unsigned long         rumble_in_run;
@@ -1053,7 +1057,7 @@ static void rumble_probe(int point)
 
 static void lane_output_store(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    input_driver_state_t *input_st = input_state_get_ptr();
    const input_device_driver_t *joypad_real;
    void (*set_probe)(void (*)(int));
@@ -1065,12 +1069,12 @@ static void lane_output_store(void)
    unsigned had = failures;
    unsigned i;
 
-   if (   !(core = dlopen(core_path_g, RTLD_NOW))
-       || !(set_probe = (void (*)(void (*)(int)))dlsym(core, "harness_core_set_probe"))
-       || !(measure = (void (*)(unsigned, unsigned))dlsym(core, "harness_core_input_measure"))
-       || !(rumble = (void (*)(unsigned))dlsym(core, "harness_core_rumble"))
+   if (   !(core = dylib_load(core_path_g))
+       || !(set_probe = (void (*)(void (*)(int)))dylib_proc(core, "harness_core_set_probe"))
+       || !(measure = (void (*)(unsigned, unsigned))dylib_proc(core, "harness_core_input_measure"))
+       || !(rumble = (void (*)(unsigned))dylib_proc(core, "harness_core_rumble"))
        || !(rumble_stats = (void (*)(unsigned long*, unsigned long*))
-             dlsym(core, "harness_core_rumble_stats"))
+             dylib_proc(core, "harness_core_rumble_stats"))
        || !input_st->primary_joypad)
    {
       CHECK(false, "output store: the harness core's rumble entry points or the joypad driver");
@@ -1139,12 +1143,12 @@ static void lane_output_store(void)
             " one per motor after it with the last strength\n",
             (unsigned)RUMBLE_CALLS + 1);
 #else
-   printf("[skip] output-store lane: need the test drivers and dlopen\n");
+   printf("[skip] output-store lane: need the test drivers\n");
 #endif
 }
 
 /* What a core sees of pad 1, frame by frame, from a synthetic pad. */
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
 #define VIEW_FRAMES 1200
 #define VIEW_SCENARIOS 11
 #define VIEW_REPLAY_SLACK 64
@@ -1336,7 +1340,7 @@ static uint32_t view_digest(const struct view_frame *v)
 
 static void lane_core_view(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    /* What the state path gives a core today, per scenario. A change
     * here is a change in what cores see: update it only on purpose. */
    static const struct { const char *name; uint32_t digest; } golden[VIEW_SCENARIOS] = {
@@ -1368,10 +1372,10 @@ static void lane_core_view(void)
    unsigned had = failures;
    unsigned sc, i, bridged;
 
-   if (   !(core = dlopen(core_path_g, RTLD_NOW))
-       || !(trace = (void (*)(int, int))dlsym(core, "harness_core_trace"))
-       || !(trace_last = (void (*)(unsigned*, int*))dlsym(core, "harness_core_trace_last"))
-       || !(runs = (long (*)(void))dlsym(core, "harness_core_runs"))
+   if (   !(core = dylib_load(core_path_g))
+       || !(trace = (void (*)(int, int))dylib_proc(core, "harness_core_trace"))
+       || !(trace_last = (void (*)(unsigned*, int*))dylib_proc(core, "harness_core_trace_last"))
+       || !(runs = (long (*)(void))dylib_proc(core, "harness_core_runs"))
        || !input_st->primary_joypad)
    {
       CHECK(false, "core view: the harness core's trace entry points or the joypad driver");
@@ -1769,7 +1773,7 @@ static void lane_core_view(void)
             " snapshot bridge's copy and lent to it, play back from a"
             " recording, and are the same under netplay\n");
 #else
-   printf("[skip] core-view lane: need the test drivers and dlopen\n");
+   printf("[skip] core-view lane: need the test drivers\n");
 #endif
 }
 
@@ -1785,7 +1789,7 @@ static void lane_core_view(void)
    } \
 } while (0)
 
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
 static input_driver_t        kept_wrap;
 static input_device_driver_t kept_joy_wrap;
 static void *(*kept_init_real)(const char *);
@@ -1847,7 +1851,7 @@ static void kept_wrap_joypad(input_driver_state_t *input_st)
 }
 #endif
 
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
 /* The first user's keys, as the input driver reports them: a RetroPad
  * mask the lane sets, standing in for a keyboard. */
 static uint32_t       fp_keys;
@@ -1870,7 +1874,7 @@ static int16_t fp_input_state(void *data,
 }
 #endif
 
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
 /* SOCD lane: holds the D-Pad directions in @dirs (RetroPad button
  * bits) on the scripted pad for a frame; returns what the core saw of
  * the D-Pad. */
@@ -1896,7 +1900,7 @@ static unsigned socd_frame(unsigned dirs, void (*trace_last)(unsigned*, int*))
  * together, per axis and per mode. */
 static void lane_socd(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    const unsigned U = 1u << RETRO_DEVICE_ID_JOYPAD_UP;
    const unsigned D = 1u << RETRO_DEVICE_ID_JOYPAD_DOWN;
    const unsigned L = 1u << RETRO_DEVICE_ID_JOYPAD_LEFT;
@@ -1910,9 +1914,9 @@ static void lane_socd(void)
    unsigned had = failures;
    unsigned mode, reading;
 
-   if (   !(core = dlopen(core_path_g, RTLD_NOW))
-       || !(trace = (void (*)(int, int))dlsym(core, "harness_core_trace"))
-       || !(trace_last = (void (*)(unsigned*, int*))dlsym(core, "harness_core_trace_last"))
+   if (   !(core = dylib_load(core_path_g))
+       || !(trace = (void (*)(int, int))dylib_proc(core, "harness_core_trace"))
+       || !(trace_last = (void (*)(unsigned*, int*))dylib_proc(core, "harness_core_trace_last"))
        || !input_st->primary_joypad)
    {
       CHECK(false, "SOCD: the harness core's trace entry points or the joypad driver");
@@ -1997,7 +2001,7 @@ static void lane_socd(void)
    fast_forward(false);
    run_loop_frames(5);
    input_st->primary_joypad = joypad_real;
-   dlclose(core);
+   dylib_close(core);
    if (failures == had)
       printf("[pass] SOCD: off, opposite directions both reach the core;"
             " neutral, last and first input priority, and up priority do"
@@ -2012,7 +2016,7 @@ static void lane_socd(void)
  * mapped to another still arrives as the other, one switched off does
  * not arrive, and taking the mapping away again leaves nothing of it
  * behind. */
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
 static unsigned remap_frame(unsigned id, void (*trace_last)(unsigned*, int*))
 {
    unsigned seen;
@@ -2027,7 +2031,7 @@ static unsigned remap_frame(unsigned id, void (*trace_last)(unsigned*, int*))
 
 static void lane_remap_idle(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    const unsigned B = RETRO_DEVICE_ID_JOYPAD_B;
    const unsigned A = RETRO_DEVICE_ID_JOYPAD_A;
    input_driver_state_t *input_st = input_state_get_ptr();
@@ -2039,9 +2043,9 @@ static void lane_remap_idle(void)
    unsigned had = failures;
    unsigned reading, was;
 
-   if (   !(core = dlopen(core_path_g, RTLD_NOW))
-       || !(trace = (void (*)(int, int))dlsym(core, "harness_core_trace"))
-       || !(trace_last = (void (*)(unsigned*, int*))dlsym(core, "harness_core_trace_last"))
+   if (   !(core = dylib_load(core_path_g))
+       || !(trace = (void (*)(int, int))dylib_proc(core, "harness_core_trace"))
+       || !(trace_last = (void (*)(unsigned*, int*))dylib_proc(core, "harness_core_trace_last"))
        || !input_st->primary_joypad)
    {
       CHECK(false, "remap idle: the harness core's trace entry points or the joypad driver");
@@ -2100,7 +2104,7 @@ static void lane_remap_idle(void)
    fast_forward(false);
    run_loop_frames(5);
    input_st->primary_joypad = joypad_real;
-   dlclose(core);
+   dylib_close(core);
    if (failures == had)
       printf("[pass] remap idle: a user with nothing mapped costs the poll no"
             " remap work; mapped, switched off and mapped back, the core sees"
@@ -2114,7 +2118,7 @@ static void lane_remap_idle(void)
  * quarter turns. */
 static void lane_input_rotation(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    const unsigned U = 1u << RETRO_DEVICE_ID_JOYPAD_UP;
    const unsigned D = 1u << RETRO_DEVICE_ID_JOYPAD_DOWN;
    const unsigned L = 1u << RETRO_DEVICE_ID_JOYPAD_LEFT;
@@ -2133,9 +2137,9 @@ static void lane_input_rotation(void)
    unsigned turns, reading, seen, i;
    int      axes[4];
 
-   if (   !(core = dlopen(core_path_g, RTLD_NOW))
-       || !(trace = (void (*)(int, int))dlsym(core, "harness_core_trace"))
-       || !(trace_last = (void (*)(unsigned*, int*))dlsym(core, "harness_core_trace_last"))
+   if (   !(core = dylib_load(core_path_g))
+       || !(trace = (void (*)(int, int))dylib_proc(core, "harness_core_trace"))
+       || !(trace_last = (void (*)(unsigned*, int*))dylib_proc(core, "harness_core_trace_last"))
        || !input_st->primary_joypad)
    {
       CHECK(false, "rotation: the harness core's trace entry points or the joypad driver");
@@ -2237,7 +2241,7 @@ static void lane_input_rotation(void)
    memcpy(&input_autoconf_binds[0][RARCH_ANALOG_LEFT_X_PLUS], saved_auto,
          sizeof(saved_auto));
    input_st->primary_joypad = joypad_real;
-   dlclose(core);
+   dylib_close(core);
    if (failures == had)
       printf("[pass] input rotation: the D-Pad and both sticks turn by"
             " quarter turns as set; 'Auto' follows Video Rotation; SOCD"
@@ -2247,7 +2251,7 @@ static void lane_input_rotation(void)
 #endif
 }
 
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
 /* Trigger lane: axes 2 and 3 of the scripted pad at @a2 and @a3 for a
  * frame; what the core saw of L2 and R2 as buttons, and L2's and R2's
  * analog values. */
@@ -2272,7 +2276,7 @@ static unsigned trig_frame(int a2, int a3, void (*trace_last)(unsigned*, int*),
 /* Full-range triggers: L2 and R2 on axes that rest at one end. */
 static void lane_triggers(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    const unsigned L2 = 1u << RETRO_DEVICE_ID_JOYPAD_L2;
    const unsigned R2 = 1u << RETRO_DEVICE_ID_JOYPAD_R2;
    input_driver_state_t *input_st = input_state_get_ptr();
@@ -2286,9 +2290,9 @@ static void lane_triggers(void)
    unsigned seen;
    int      l2, r2;
 
-   if (   !(core = dlopen(core_path_g, RTLD_NOW))
-       || !(trace = (void (*)(int, int))dlsym(core, "harness_core_trace"))
-       || !(trace_last = (void (*)(unsigned*, int*))dlsym(core, "harness_core_trace_last"))
+   if (   !(core = dylib_load(core_path_g))
+       || !(trace = (void (*)(int, int))dylib_proc(core, "harness_core_trace"))
+       || !(trace_last = (void (*)(unsigned*, int*))dylib_proc(core, "harness_core_trace_last"))
        || !input_st->primary_joypad)
    {
       CHECK(false, "triggers: the harness core's trace entry points or the joypad driver");
@@ -2374,7 +2378,7 @@ static void lane_triggers(void)
    run_loop_frames(5);
    input_driver_set_snapshot_bridge(false);
    input_st->primary_joypad = joypad_real;
-   dlclose(core);
+   dylib_close(core);
    if (failures == had)
       printf("[pass] triggers: off, only the second half of a pull counts,"
             " as before; on, a trigger that rests at one end is counted"
@@ -2385,7 +2389,7 @@ static void lane_triggers(void)
 #endif
 }
 
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
 /* Remapped pressure lane: the scripted pad's @buttons held and axes 2
  * and 3 at @a2 and @a3 for a frame; what the core saw of A and B as
  * buttons, and A's and B's analog values. */
@@ -2548,7 +2552,7 @@ static void lane_beside_source(void)
 /* A button remapped onto another carries its pressure with it. */
 static void lane_remap_pressure(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    const unsigned A = 1u << RETRO_DEVICE_ID_JOYPAD_A;
    const unsigned B = 1u << RETRO_DEVICE_ID_JOYPAD_B;
    input_driver_state_t *input_st = input_state_get_ptr();
@@ -2571,9 +2575,9 @@ static void lane_remap_pressure(void)
    int16_t  stick;
    int      a, b, x;
 
-   if (   !(core = dlopen(core_path_g, RTLD_NOW))
-       || !(trace = (void (*)(int, int))dlsym(core, "harness_core_trace"))
-       || !(trace_last = (void (*)(unsigned*, int*))dlsym(core, "harness_core_trace_last"))
+   if (   !(core = dylib_load(core_path_g))
+       || !(trace = (void (*)(int, int))dylib_proc(core, "harness_core_trace"))
+       || !(trace_last = (void (*)(unsigned*, int*))dylib_proc(core, "harness_core_trace_last"))
        || !input_st->primary_joypad
        || a_bind->joykey >= 32 || b_bind->joykey >= 32)
    {
@@ -2697,7 +2701,7 @@ static void lane_remap_pressure(void)
    input_driver_set_snapshot_bridge(false);
    input_st->primary_joypad      = joypad_real;
    input_st->analog_requested[0] = analog_requested;
-   dlclose(core);
+   dylib_close(core);
    if (failures == had)
       printf("[pass] remapped pressure: a button remapped onto another"
             " takes its pressure along, the harder of two presses wins,"
@@ -2707,11 +2711,10 @@ static void lane_remap_pressure(void)
 #endif
 }
 
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32) \
+#if defined(HAVE_TEST_DRIVERS) \
    && defined(HAVE_NETWORKING) && defined(HAVE_NETWORKGAMEPAD)
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
+#include <net/net_compat.h>
+#include <net/net_socket.h>
 
 /* Network RetroPad lane: one message to the first user's port. */
 static void np_send(int fd, const struct sockaddr_in *to,
@@ -2731,7 +2734,7 @@ static void np_send(int fd, const struct sockaddr_in *to,
 /* Network RetroPad: a controller sent over UDP by another RetroArch. */
 static void lane_network_retropad(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32) \
+#if defined(HAVE_TEST_DRIVERS) \
    && defined(HAVE_NETWORKING) && defined(HAVE_NETWORKGAMEPAD)
    const unsigned A = 1u << RETRO_DEVICE_ID_JOYPAD_A;
    const unsigned B = 1u << RETRO_DEVICE_ID_JOYPAD_B;
@@ -2749,9 +2752,9 @@ static void lane_network_retropad(void)
    unsigned seen, i;
    int      axes[4], fd;
 
-   if (   !(core = dlopen(core_path_g, RTLD_NOW))
-       || !(trace = (void (*)(int, int))dlsym(core, "harness_core_trace"))
-       || !(trace_last = (void (*)(unsigned*, int*))dlsym(core, "harness_core_trace_last")))
+   if (   !(core = dylib_load(core_path_g))
+       || !(trace = (void (*)(int, int))dylib_proc(core, "harness_core_trace"))
+       || !(trace_last = (void (*)(unsigned*, int*))dylib_proc(core, "harness_core_trace_last")))
    {
       CHECK(false, "network pad: the harness core's trace entry points");
       return;
@@ -2849,7 +2852,7 @@ static void lane_network_retropad(void)
       else
          printf("[skip] network pad: no second loopback address for First Sender Only\n");
       if (fd2 >= 0)
-         close(fd2);
+         socket_close(fd2);
    }
 
    /* with ports assigned on first press, a button of the network pad
@@ -2874,14 +2877,14 @@ static void lane_network_retropad(void)
    run_loop_frames(3);
 done:
    if (fd >= 0)
-      close(fd);
+      socket_close(fd);
    if (input_st->remote)
       input_remote_free(input_st->remote, max_users);
    input_st->remote = saved_remote;
    memset(&input_st->remote_st_ptr, 0, sizeof(input_st->remote_st_ptr));
    settings->uints.network_remote_base_port      = saved_port;
    settings->bools.network_remote_enable_user[0] = saved_user;
-   dlclose(core);
+   dylib_close(core);
    if (failures == had)
       printf("[pass] network pad: messages sent together arrive together;"
             " what is held stays held; a stray message changes nothing;"
@@ -2892,7 +2895,7 @@ done:
 #endif
 }
 
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
 /* Pointer capture lane: an input driver that notes what it is told. */
 static bool     cap_grabbed;
 static unsigned cap_calls;
@@ -2908,7 +2911,7 @@ static void cap_grab_mouse(void *data, bool state)
 /* Pointer capture: held for named reasons, by whoever wants it. */
 static void lane_pointer_capture(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    input_driver_state_t *input_st = input_state_get_ptr();
    settings_t *settings           = config_get_ptr();
    runloop_state_t *runloop_st    = runloop_state_get_ptr();
@@ -3025,7 +3028,7 @@ static void lane_pointer_capture(void)
 #endif
 }
 
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32) && defined(HAVE_OVERLAY)
+#if defined(HAVE_TEST_DRIVERS) && defined(HAVE_OVERLAY)
 /* Menu combination lane: whether L3 + R3 opens the menu, with the
  * scripted pad holding @pad and the overlay holding @overlay. */
 static bool combo_opens(unsigned pad, unsigned overlay)
@@ -3056,7 +3059,7 @@ static bool combo_opens(unsigned pad, unsigned overlay)
  * alone do not add up to it when the overlay has a menu button. */
 static void lane_menu_combo_gate(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32) && defined(HAVE_OVERLAY)
+#if defined(HAVE_TEST_DRIVERS) && defined(HAVE_OVERLAY)
    const unsigned L3 = 1u << RETRO_DEVICE_ID_JOYPAD_L3;
    const unsigned R3 = 1u << RETRO_DEVICE_ID_JOYPAD_R3;
    input_driver_state_t *input_st = input_state_get_ptr();
@@ -3228,7 +3231,7 @@ static void hf_press(uint32_t first, uint32_t then)
 
 static void lane_hotkey_facts(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    input_driver_state_t *input_st = input_state_get_ptr();
    settings_t *settings           = config_get_ptr();
    const input_device_driver_t *joypad_real = input_st->primary_joypad;
@@ -3242,8 +3245,8 @@ static void lane_hotkey_facts(void)
    unsigned had = failures;
    void *core;
 
-   if (   !(core = dlopen(core_path_g, RTLD_NOW))
-       || !(pm_runs = (long (*)(void))dlsym(core, "harness_core_runs"))
+   if (   !(core = dylib_load(core_path_g))
+       || !(pm_runs = (long (*)(void))dylib_proc(core, "harness_core_runs"))
        || !joypad_real)
    {
       CHECK(false, "hotkey facts: the harness core's entry point or the joypad driver");
@@ -3482,7 +3485,7 @@ static void gk_poll(void *data)
 
 static void lane_gun_buttons_kept_mice(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    input_driver_state_t *input_st = input_state_get_ptr();
    const input_device_driver_t *joypad_real = input_st->primary_joypad;
    input_driver_t *saved_input    = input_st->current_driver;
@@ -3646,7 +3649,7 @@ static bool pm_frames_saw_return(unsigned n)
 
 static void lane_menu_pause(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    input_driver_state_t *input_st = input_state_get_ptr();
    settings_t *settings           = config_get_ptr();
    const input_device_driver_t *joypad_real = input_st->primary_joypad;
@@ -3659,10 +3662,10 @@ static void lane_menu_pause(void)
    unsigned had = failures;
    unsigned s;
 
-   if (   !(core = dlopen(core_path_g, RTLD_NOW))
-       || !(pm_trace = (void (*)(int, int))dlsym(core, "harness_core_trace"))
-       || !(pm_trace_last = (void (*)(unsigned*, int*))dlsym(core, "harness_core_trace_last"))
-       || !(pm_runs = (long (*)(void))dlsym(core, "harness_core_runs"))
+   if (   !(core = dylib_load(core_path_g))
+       || !(pm_trace = (void (*)(int, int))dylib_proc(core, "harness_core_trace"))
+       || !(pm_trace_last = (void (*)(unsigned*, int*))dylib_proc(core, "harness_core_trace_last"))
+       || !(pm_runs = (long (*)(void))dylib_proc(core, "harness_core_runs"))
        || !joypad_real)
    {
       CHECK(false, "menu pause: the harness core's entry points or the joypad driver");
@@ -3902,7 +3905,7 @@ static void lane_menu_pause(void)
  * exactly one frame, and two presses before the next poll both do. */
 static void lane_ai_presses(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32) && defined(HAVE_TRANSLATE) && defined(HAVE_ACCESSIBILITY)
+#if defined(HAVE_TEST_DRIVERS) && defined(HAVE_TRANSLATE) && defined(HAVE_ACCESSIBILITY)
    const unsigned A = 1u << RETRO_DEVICE_ID_JOYPAD_A;
    const unsigned X = 1u << RETRO_DEVICE_ID_JOYPAD_X;
    settings_t *settings = config_get_ptr();
@@ -3915,10 +3918,10 @@ static void lane_ai_presses(void)
    unsigned i, frames_a = 0, frames_ax = 0, buttons;
    int axes[4];
 
-   if (   !(core = dlopen(core_path_g, RTLD_NOW))
-       || !(trace = (void (*)(int, int))dlsym(core, "harness_core_trace"))
-       || !(trace_last = (void (*)(unsigned*, int*))dlsym(core, "harness_core_trace_last"))
-       || !(runs = (long (*)(void))dlsym(core, "harness_core_runs")))
+   if (   !(core = dylib_load(core_path_g))
+       || !(trace = (void (*)(int, int))dylib_proc(core, "harness_core_trace"))
+       || !(trace_last = (void (*)(unsigned*, int*))dylib_proc(core, "harness_core_trace_last"))
+       || !(runs = (long (*)(void))dylib_proc(core, "harness_core_runs")))
    {
       CHECK(false, "AI presses: the harness core's trace entry points");
       return;
@@ -4110,7 +4113,7 @@ static void lane_menu_repeat_rates(void)
  * poll reads the stick afresh. */
 static void lane_dpad_sticks_once(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    settings_t *settings           = config_get_ptr();
    input_driver_state_t *input_st = input_state_get_ptr();
    const input_device_driver_t *joypad_real = input_st->primary_joypad;
@@ -4254,7 +4257,7 @@ static int dz_expect(double ax, double other, double dz)
 
 static void lane_deadzone_numbers(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    settings_t *settings           = config_get_ptr();
    input_driver_state_t *input_st = input_state_get_ptr();
    const input_device_driver_t *joypad_real = input_st->primary_joypad;
@@ -4463,7 +4466,7 @@ static void lane_deadzone_numbers(void)
 
 static void lane_sticks_read_once(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    settings_t *settings           = config_get_ptr();
    input_driver_state_t *input_st = input_state_get_ptr();
    const input_device_driver_t *joypad_real = input_st->primary_joypad;
@@ -4576,7 +4579,7 @@ static void lane_sticks_read_once(void)
 #endif
 }
 
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
 /* one frame with the stand-in pad's buttons @down: what the core saw */
 static unsigned map_frame(uint32_t down, void (*trace_last)(unsigned*, int*))
 {
@@ -4600,7 +4603,7 @@ static unsigned map_frame(uint32_t down, void (*trace_last)(unsigned*, int*))
  * frontend's per-poll copy as the desktop drivers' are. */
 static void lane_mapping_changes(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    enum { A = RETRO_DEVICE_ID_JOYPAD_A, B = RETRO_DEVICE_ID_JOYPAD_B };
    static const char *how[2]       = { "button by button", "as a mask" };
    input_driver_state_t *input_st  = input_state_get_ptr();
@@ -4616,9 +4619,9 @@ static void lane_mapping_changes(void)
    char     why[160];
 
    if (   !saved_user || !saved_auto
-       || !(core = dlopen(core_path_g, RTLD_NOW))
-       || !(trace = (void (*)(int, int))dlsym(core, "harness_core_trace"))
-       || !(trace_last = (void (*)(unsigned*, int*))dlsym(core, "harness_core_trace_last"))
+       || !(core = dylib_load(core_path_g))
+       || !(trace = (void (*)(int, int))dylib_proc(core, "harness_core_trace"))
+       || !(trace_last = (void (*)(unsigned*, int*))dylib_proc(core, "harness_core_trace_last"))
        || !input_st->primary_joypad)
    {
       CHECK(false, "mapping changes: the harness core's trace entry points or the joypad driver");
@@ -4751,7 +4754,7 @@ static void lane_mapping_changes(void)
    run_loop_frames(5);
    input_driver_set_snapshot_bridge(false);
    input_st->primary_joypad = joypad_real;
-   dlclose(core);
+   dylib_close(core);
    free(saved_user);
    free(saved_auto);
    if (failures == had)
@@ -4776,7 +4779,7 @@ static void lane_mapping_changes(void)
  * ran out, so four seconds of holding were two presses. */
 static void lane_quit_combo(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    input_driver_state_t *input_st  = input_state_get_ptr();
    settings_t *settings            = config_get_ptr();
    const input_device_driver_t *joypad_real;
@@ -5134,7 +5137,7 @@ static void lane_pointer_store(void)
  * changes. */
 static void lane_stick_sources(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    settings_t *settings           = config_get_ptr();
    input_driver_state_t *input_st = input_state_get_ptr();
    const input_device_driver_t *joypad_real = input_st->primary_joypad;
@@ -5277,7 +5280,7 @@ static void mb_keys_down(void *data, unsigned port,
 
 static void lane_mask_and_buttons(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    settings_t *settings           = config_get_ptr();
    input_driver_state_t *input_st = input_state_get_ptr();
    const input_device_driver_t *joypad_real = input_st->primary_joypad;
@@ -5757,7 +5760,7 @@ static void lane_hotkeys_one_set(void)
 static void lane_save_minimal_binds(void)
 {
    settings_t *settings      = config_get_ptr();
-   static const char path[]  = "/tmp/frontend_overhead_binds.cfg";
+   char path[512];
    struct retro_keybind *b   = &input_config_binds[0][RETRO_DEVICE_ID_JOYPAD_B];
    struct retro_keybind saved_b = *b;
    struct retro_keybind before_y = input_config_binds[0][RETRO_DEVICE_ID_JOYPAD_Y];
@@ -5772,6 +5775,7 @@ static void lane_save_minimal_binds(void)
    long  len                 = 0;
    FILE *f;
 
+   snprintf(path, sizeof(path), "%s/binds.cfg", harness_dir_g);
    RETRO_KEYBIND_SET_KEY(b, RETROK_F11);
    RETRO_KEYBIND_SET_VALID(b, true);
    /* and what else of the input a user has set that is not a bind: a
@@ -6161,7 +6165,7 @@ static void lane_bind_settings(void)
  * alone, and a key user 3 has bound keeps its mapping bit. */
 static void lane_bind_all_device_index(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32) && defined(HAVE_MENU)
+#if defined(HAVE_TEST_DRIVERS) && defined(HAVE_MENU)
    enum { ORDER = ARRAY_SIZE(input_config_bind_order) };
    struct retro_keybind saved1[ORDER], saved3[ORDER];
    unsigned k;
@@ -6260,7 +6264,7 @@ static void lane_bind_all_device_index(void)
 #endif
 }
 
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32) && defined(HAVE_MENU)
+#if defined(HAVE_TEST_DRIVERS) && defined(HAVE_MENU)
 /* a mouse per user: the button held on user 1's mouse and on user 3's,
  * 0 for none */
 static unsigned bm_held[2];
@@ -6288,7 +6292,7 @@ static int16_t bm_input_state(void *data,
  * is. */
 static void lane_bind_mouse_device_index(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32) && defined(HAVE_MENU)
+#if defined(HAVE_TEST_DRIVERS) && defined(HAVE_MENU)
    static input_driver_t bm_input;
    unsigned i;
    unsigned had                   = failures;
@@ -6808,9 +6812,9 @@ static void lane_macros(void)
    char     why[200];
    char     spec[400];
 
-   if (   !(core = dlopen(core_path_g, RTLD_NOW))
-       || !(trace = (void (*)(int, int))dlsym(core, "harness_core_trace"))
-       || !(trace_last = (void (*)(unsigned*, int*))dlsym(core, "harness_core_trace_last"))
+   if (   !(core = dylib_load(core_path_g))
+       || !(trace = (void (*)(int, int))dylib_proc(core, "harness_core_trace"))
+       || !(trace_last = (void (*)(unsigned*, int*))dylib_proc(core, "harness_core_trace_last"))
        || !joypad_real)
    {
       CHECK(false, "macros: the harness core's trace entry points or the joypad driver");
@@ -7070,9 +7074,9 @@ static void lane_macro_modes(void)
     * finding which one a later lane's failure follows */
    unsigned mm_parts = getenv("MM_PARTS") ? (unsigned)atoi(getenv("MM_PARTS")) : 15;
 
-   if (   !(core = dlopen(core_path_g, RTLD_NOW))
-       || !(trace = (void (*)(int, int))dlsym(core, "harness_core_trace"))
-       || !(trace_last = (void (*)(unsigned*, int*))dlsym(core, "harness_core_trace_last"))
+   if (   !(core = dylib_load(core_path_g))
+       || !(trace = (void (*)(int, int))dylib_proc(core, "harness_core_trace"))
+       || !(trace_last = (void (*)(unsigned*, int*))dylib_proc(core, "harness_core_trace_last"))
        || !joypad_real || !saved_input)
    {
       CHECK(false, "macro modes: the harness core's trace entry points or the drivers");
@@ -7294,7 +7298,7 @@ static bool mk_is(unsigned number, const char *want)
 
 static void lane_entries_kept(void)
 {
-   static const char path[] = "/tmp/frontend_overhead_entries.cfg";
+   char path[512];
    settings_t *settings     = config_get_ptr();
    bool saved_minimal       = settings->bools.config_save_minimal;
    unsigned had             = failures;
@@ -7305,6 +7309,7 @@ static void lane_entries_kept(void)
    FILE *f;
    config_file_t *conf;
 
+   snprintf(path, sizeof(path), "%s/entries.cfg", harness_dir_g);
    input_entries_clear();
    input_macros_clear();
 
@@ -8152,7 +8157,7 @@ static void lane_osk_chinese(void)
 
 static void lane_aim_stick(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    input_driver_state_t *input_st = input_state_get_ptr();
    settings_t *settings           = config_get_ptr();
    const input_device_driver_t *joypad_real = input_st->primary_joypad;
@@ -8465,7 +8470,7 @@ static void lane_hw_context_restart(void)
 /* A remap file with a disabled button, content closed from the menu,
  * the core started again from the menu, and closed again
  * (issue #19698). */
-#if !defined(_WIN32) && defined(HAVE_MENU)
+#ifdef HAVE_MENU
 static bool remap_has(const char *path, const char *want)
 {
    char line[256];
@@ -8483,12 +8488,12 @@ static bool remap_has(const char *path, const char *want)
 
 static void lane_remap_close(void)
 {
-#if !defined(_WIN32) && defined(HAVE_MENU)
+#ifdef HAVE_MENU
    runloop_state_t *runloop_st = runloop_state_get_ptr();
    settings_t *settings        = config_get_ptr();
    content_ctx_info_t info     = {0};
    const char *core_name       = runloop_st->system.info.library_name;
-   char dir[256], path[768], cmd[900];
+   char dir[512], core_dir[640], path[768];
    unsigned had = failures;
    unsigned i;
 
@@ -8497,8 +8502,9 @@ static void lane_remap_close(void)
       CHECK(false, "remap close: the core has no name");
       return;
    }
-   snprintf(dir, sizeof(dir), "/tmp/harness_remaps_%d", (int)getpid());
-   snprintf(path, sizeof(path), "%s/%s/%s.rmp", dir, core_name, core_name);
+   snprintf(dir, sizeof(dir), "%s/remaps", harness_dir_g);
+   snprintf(core_dir, sizeof(core_dir), "%s/%s", dir, core_name);
+   snprintf(path, sizeof(path), "%s/%s.rmp", core_dir, core_name);
    strlcpy(settings->paths.directory_input_remapping, dir,
          sizeof(settings->paths.directory_input_remapping));
 
@@ -8560,8 +8566,9 @@ static void lane_remap_close(void)
    /* the old core's descriptions do go, once it has closed */
    CHECK(!runloop_st->system.input_desc_btn[0][RETRO_DEVICE_ID_JOYPAD_L],
          "remap close: the closed core's button descriptions were kept");
-   snprintf(cmd, sizeof(cmd), "rm -rf '%s'", dir);
-   if (system(cmd)) { }
+   filestream_delete(path);
+   filestream_delete(core_dir);
+   filestream_delete(dir);
    if (failures == had)
       printf("[pass] remap close: a disabled button stays in the remap file"
             " through Close Content, with and without a configuration"
@@ -8575,7 +8582,7 @@ static void lane_remap_close(void)
  * port until a button is pressed on its controller. */
 static void lane_first_press(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    input_driver_state_t *input_st = input_state_get_ptr();
    settings_t *settings           = config_get_ptr();
    const input_device_driver_t *joypad_real;
@@ -8589,11 +8596,11 @@ static void lane_first_press(void)
    long     calls, calls0, in_run;
    uint32_t a_btn, b_btn;
 
-   if (   !(core = dlopen(core_path_g, RTLD_NOW))
-       || !(trace = (void (*)(int, int))dlsym(core, "harness_core_trace"))
-       || !(trace_last = (void (*)(unsigned*, int*))dlsym(core, "harness_core_trace_last"))
+   if (   !(core = dylib_load(core_path_g))
+       || !(trace = (void (*)(int, int))dylib_proc(core, "harness_core_trace"))
+       || !(trace_last = (void (*)(unsigned*, int*))dylib_proc(core, "harness_core_trace_last"))
        || !(port_device = (void (*)(unsigned, unsigned*, long*, long*))
-             dlsym(core, "harness_core_port_device"))
+             dylib_proc(core, "harness_core_port_device"))
        || !input_st->primary_joypad)
    {
       CHECK(false, "first press: the harness core's entry points or the joypad driver");
@@ -8746,7 +8753,7 @@ static void lane_first_press(void)
    /* a remap file saved now leaves out the port the press gave, and
     * has one the user set in the menu */
    {
-      static const char *rmp = "/tmp/frontend_overhead_first_press.rmp";
+      char rmp[512];
       runloop_state_t *runloop_st = runloop_state_get_ptr();
       char *was_file = runloop_st->name.remapfile;
       char text[8192];
@@ -8754,6 +8761,7 @@ static void lane_first_press(void)
       size_t n;
       bool by_press, by_hand;
 
+      snprintf(rmp, sizeof(rmp), "%s/first_press.rmp", harness_dir_g);
       runloop_st->name.remapfile = NULL;
       input_remapping_save_file(rmp);
       n = (f = fopen(rmp, "r")) ? fread(text, 1, sizeof(text) - 1, f) : 0;
@@ -8834,7 +8842,7 @@ static void lane_first_press(void)
    fast_forward(false);
    run_loop_frames(5);
    input_st->primary_joypad = joypad_real;
-   dlclose(core);
+   dylib_close(core);
    if (failures == had)
       printf("[pass] first press: no user has a core port until a button"
             " is pressed on it; a button held from the start and the d-pad"
@@ -8851,7 +8859,7 @@ static void lane_first_press(void)
 
 static void lane_input_kept(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    input_driver_state_t *input_st = input_state_get_ptr();
    settings_t *settings           = config_get_ptr();
    const input_registry_t *reg    = input_driver_get_registry();
@@ -9311,9 +9319,17 @@ static void lane_keys_let_go(void)
          "keys let go: the press did not reach the core");
 
    /* the input driver restarted with the video driver, not kept */
+#ifdef _WIN32
+   _putenv_s("RETROARCH_INPUT_KEEP", "0");
+#else
    setenv("RETROARCH_INPUT_KEEP", "0", 1);
+#endif
    command_event(CMD_EVENT_REINIT, &flags);
+#ifdef _WIN32
+   _putenv_s("RETROARCH_INPUT_KEEP", "");
+#else
    unsetenv("RETROARCH_INPUT_KEEP");
+#endif
    run_loop_frames(3);
    CHECK(keygone_up == 1,
          "keys let go: a key held when the input driver went stayed held");
@@ -9340,7 +9356,7 @@ static void lane_keys_let_go(void)
  * the driver. It waits for the poll now. This asks from a second
  * thread and looks at when, and on which thread, the driver is
  * destroyed. */
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
 static input_device_driver_t jr_wrap;
 static void (*jr_destroy_real)(void);
 static uintptr_t jr_main_thread;
@@ -9372,7 +9388,7 @@ static void jr_sender(void *data)
 
 static void lane_joypad_reinit(void)
 {
-#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+#ifdef HAVE_TEST_DRIVERS
    input_driver_state_t *input_st = input_state_get_ptr();
    settings_t *settings           = config_get_ptr();
    unsigned had                   = failures;
