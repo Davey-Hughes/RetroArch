@@ -122,6 +122,8 @@ bool input_autoconfigure_connect(const char *name, const char *display_name,
 bool input_autoconfigure_disconnect(unsigned port, const char *name)
 { (void)port; (void)name; return true; }
 const char *input_config_get_device_name(unsigned port) { (void)port; return NULL; }
+int64_t filestream_read_file(const char *path, void **buf, int64_t *len)
+{ (void)path; (void)buf; (void)len; return 0; }
 
 /* ---- the test ------------------------------------------------------- */
 

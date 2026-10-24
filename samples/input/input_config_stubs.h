@@ -38,6 +38,11 @@ bool input_config_get_winraw_player_lights(void)
 { return ((settings_t*)config_get_ptr())->bools.input_winraw_player_lights; }
 #endif
 
+#ifdef HAVE_UDEV
+bool input_config_get_follow_steam_lists(void)
+{ return ((settings_t*)config_get_ptr())->bools.input_follow_steam_lists; }
+#endif
+
 bool input_config_overlay_configured(void)
 {
    settings_t *settings = (settings_t*)config_get_ptr();

@@ -545,6 +545,44 @@ static void lane_input_restart_scope(void)
    CHECK(before_core == after_core, "surface recovery must retain core metadata");
 }
 
+#ifdef HAVE_UDEV
+/* udev reads Follow Steam's Controller Lists as it finds each
+ * controller: a press finds them again, video and input once, and
+ * leaves audio alone. */
+static void lane_steam_lists_restart_scope(void)
+{
+   static const unsigned actions[4]    = {
+      MENU_ACTION_OK, MENU_ACTION_RIGHT, MENU_ACTION_LEFT, MENU_ACTION_START
+   };
+   static const char *const pressed[4] = { "OK", "right", "left", "Start" };
+   unsigned i;
+   unsigned before_audio = audio_inits;
+   rarch_setting_t *s    = menu_setting_find_enum(
+         MENU_ENUM_LABEL_INPUT_FOLLOW_STEAM_LISTS);
+
+   config_get_ptr()->bools.audio_enable_menu = true;
+   CHECK(s != NULL, "Follow Steam's Controller Lists row must exist");
+   if (!s)
+      return;
+   CHECK(s->type == ST_BOOL && *s->value.target.boolean,
+         "Follow Steam's Controller Lists must be a boolean, on by default");
+   for (i = 0; i < 4; i++)
+   {
+      bool was        = *s->value.target.boolean;
+      unsigned before = inits;
+
+      menu_action_handle_setting(s, 0, actions[i], false);
+      CHECK(*s->value.target.boolean != was,
+            "Steam lists, press %u (%s): the setting did not change",
+            i + 1, pressed[i]);
+      CHECK(inits - before == 1,
+            "Steam lists, press %u (%s): video/input rebuilt %u times,"
+            " want 1", i + 1, pressed[i], inits - before);
+   }
+   CHECK(audio_inits == before_audio, "Steam lists must retain audio");
+}
+#endif
+
 static void lane_font_fallback(void)
 {
    rarch_setting_t *s = menu_setting_find_enum(MENU_ENUM_LABEL_VIDEO_FONT_SIZE);
@@ -867,6 +905,9 @@ int main(int argc, char *argv[])
 
    lane_hdr_restart_scope();
    lane_input_restart_scope();
+#ifdef HAVE_UDEV
+   lane_steam_lists_restart_scope();
+#endif
    lane_font_fallback();
    lane_minimum_audio_latency();
 

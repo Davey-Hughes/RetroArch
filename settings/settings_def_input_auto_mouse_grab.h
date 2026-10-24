@@ -1,5 +1,5 @@
-/* Single-source definitions: auto mouse grab and background
- * controller input settings.
+/* Single-source definitions: auto mouse grab, background
+ * controller input and Steam controller list settings.
  * Grammar identical to settings_def_video_sync.h plus S_FLOAT and
  * the _NS no-sublabel variants; the descriptor argument span
  * matches SDESC_<kind>_ROW; row order is menu display order;
@@ -15,6 +15,13 @@ S_BOOL(input_joypad_background, INPUT_JOYPAD_BACKGROUND,
       DEFAULT_INPUT_JOYPAD_BACKGROUND, SD_FLAG_NONE, 0, 0,
       "Background Controller Input",
       "Accept controller input while RetroArch is not the active window. When disabled, controllers are ignored while unfocused: the menu, hotkeys and running content do not react to them.")
+#ifdef HAVE_UDEV
+S_BOOL(input_follow_steam_lists, INPUT_FOLLOW_STEAM_LISTS,
+      "input_follow_steam_lists",
+      DEFAULT_INPUT_FOLLOW_STEAM_LISTS, SD_FLAG_NONE, 0, 0,
+      "Follow Steam's Controller Lists",
+      "Hide the controllers Steam mirrors, and Steam's own when it did not launch RetroArch.")
+#endif
 #if defined(_WIN32) && defined(HAVE_WINRAWINPUT)
 S_BOOL(input_keyboard_background, INPUT_KEYBOARD_BACKGROUND,
       "input_keyboard_background",

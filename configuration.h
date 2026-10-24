@@ -807,6 +807,9 @@ typedef struct settings
       bool input_auto_mouse_grab;
       bool input_joypad_background;
       bool input_keyboard_background;
+#ifdef HAVE_UDEV
+      bool input_follow_steam_lists;
+#endif
       bool input_turbo_enable;
       bool input_turbo_allow_dpad;
       bool input_hotkey_device_merge;

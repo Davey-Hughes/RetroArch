@@ -76,7 +76,7 @@ jobs:
     name: Build and run the menu navigation harness
     runs-on: ubuntu-latest
     env:
-      APT_PKGS: build-essential zlib1g-dev ccache
+      APT_PKGS: build-essential zlib1g-dev libudev-dev ccache
     timeout-minutes: 25
 
     steps:
