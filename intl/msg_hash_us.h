@@ -7886,7 +7886,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_VIDEO_WINDOWS_ENABLE_ANDROID,
-   "Show secondary screens on another display."
+   "Let screens and the menu use other displays. Off keeps everything in one window."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_WINDOW_MODE,
@@ -7903,6 +7903,34 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_SUBLABEL_VIDEO_SCREEN_WINDOW_MONITOR,
    "Where this screen goes when it is Separate. Auto picks a second display. The display RetroArch is on keeps the screen attached."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_DISPLAY,
+   "Screen %u Display"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_VIDEO_SCREEN_DISPLAY,
+   "The display this screen appears on. Auto picks one; Off leaves the screen out."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_MENU_DISPLAY,
+   "Menu Display"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_VIDEO_MENU_DISPLAY,
+   "The display the menu appears on. Auto uses Screen 1's Auto choice."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_MENU_FOLLOWS_SCREEN,
+   "Screen %u"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_NOTIFICATIONS_WITH_GAME,
+   "With the Game"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_NOTIFICATIONS_WITH_MENU,
+   "With the Menu"
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_OPENXR_CONTROLLERS_COMBINED,
