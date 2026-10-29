@@ -16,9 +16,24 @@
 
 #define NTHREADS 4
 #define ROUNDS   12
+#define FLIP_ROUNDS 25
 
 static char url_file[600], url_dir[600];
 static int  failures = 0;
+static int  rounds = ROUNDS;
+static int  flip_stop = 0;
+static const struct smb_settings *flip_cfg[2];
+
+/* Switches the settings between two connection keys while the workers
+ * run, as a settings edit does: each switch may replace the pool a
+ * worker is about to take from. */
+static void flipper(void *arg)
+{
+   unsigned n = 0;
+   (void)arg;
+   while (!__sync_fetch_and_add(&flip_stop, 0))
+      smb_init_cfg(flip_cfg[++n & 1]);
+}
 
 /* Each failure names its operation, thread and round, so a failure on
  * a CI runner says what went wrong rather than only how often. */
@@ -32,7 +47,7 @@ static void worker(void *arg)
    int i, bad = 0;
    int id = (int)(intptr_t)arg;
    uint8_t buf[64];
-   for (i = 0; i < ROUNDS; i++)
+   for (i = 0; i < rounds; i++)
    {
       RFILE *f = filestream_open(url_file, RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
       struct RDIR *d;
@@ -89,7 +104,9 @@ static void worker(void *arg)
 int main(int argc, char **argv)
 {
    struct smb_settings cfg;
+   struct smb_settings cfg2;
    sthread_t *t[NTHREADS];
+   sthread_t *ft;
    int i, phase;
 
    if (argc < 3)
@@ -283,12 +300,32 @@ int main(int argc, char **argv)
       }
       smb_shutdown();
    }
+   /* the key changing under the workers: the pool they took from must
+    * outlive them, and every operation still succeeds */
+   cfg.readahead = 1024;
+   cfg2          = cfg;
+   cfg2.timeout  = cfg.timeout + 1;
+   flip_cfg[0]   = &cfg;
+   flip_cfg[1]   = &cfg2;
+   rounds        = FLIP_ROUNDS;
+   smb_init_cfg(&cfg);
+   ft = sthread_create(flipper, NULL);
+   for (i = 0; i < NTHREADS; i++)
+      t[i] = sthread_create(worker, (void*)(intptr_t)i);
+   for (i = 0; i < NTHREADS; i++)
+      if (t[i])
+         sthread_join(t[i]);
+   __sync_fetch_and_add(&flip_stop, 1);
+   if (ft)
+      sthread_join(ft);
+   smb_init_cfg(&cfg);
+   smb_shutdown();
    if (failures)
    {
       fprintf(stderr, "FAIL: %d bad operations across %d threads\n", failures, NTHREADS);
       return 1;
    }
-   printf("ok: %d threads x %d rounds through the VFS, read-ahead off and on, reads past the windows\n",
-         NTHREADS, ROUNDS);
+   printf("ok: %d threads x %d rounds through the VFS, read-ahead off and on, reads past the windows; %d rounds with the settings switched under them\n",
+         NTHREADS, ROUNDS, FLIP_ROUNDS);
    return 0;
 }

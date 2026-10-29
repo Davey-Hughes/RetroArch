@@ -154,9 +154,11 @@ struct smb_pool
    retro_atomic_int_t  auth_mode;   /* resolved by the first connect */
    unsigned            count;
    struct smb_slot     slots[SMB_MAX_SLOTS];
+   struct smb_pool    *next;        /* in smb_pools_ptr */
 };
 
 static retro_atomic_ptr_t smb_pool_ptr;   /* struct smb_pool * */
+static retro_atomic_ptr_t smb_pools_ptr;  /* every pool built, freed at shutdown */
 static retro_atomic_ptr_t smb_cfg_ptr;    /* const struct smb_settings * */
 
 static const struct smb_settings *smb_cfg_get(void)
@@ -313,6 +315,27 @@ static int smb_pool_busy(const struct smb_pool *p)
    return 0;
 }
 
+/* A replaced pool's idle connections, closed. A slot is claimed
+ * through its busy flag first, so one still held, or taken by a thread
+ * that loaded the pool before the swap, is left to its holder. */
+static void smb_pool_close_idle(struct smb_pool *p)
+{
+   unsigned i;
+   for (i = 0; i < p->count; i++)
+   {
+      struct smb_slot *sl = &p->slots[i];
+      if (!retro_atomic_cas_int(&sl->busy, 0, 1))
+         continue;
+      if (sl->ctx)
+      {
+         smb2_disconnect_share(sl->ctx);
+         smb_ctx_free(sl->ctx);
+         sl->ctx = NULL;
+      }
+      retro_atomic_store_release_int(&sl->busy, 0);
+   }
+}
+
 bool smb_init_cfg(const struct smb_settings *new_cfg)
 {
    retro_atomic_store_release_ptr(&smb_cfg_ptr, (void*)new_cfg);
@@ -320,14 +343,16 @@ bool smb_init_cfg(const struct smb_settings *new_cfg)
 }
 
 /* The pool for @want_share: the published one when its key matches,
- * else a new one built here and published with a CAS (a losing
- * builder drops its copy). A pool whose slots are still held by open
+ * else the one kept for that key or a new one, published with a CAS.
+ * A pool is never freed before shutdown, since a thread that loaded
+ * it before a swap may still take from it; the one replaced has its
+ * idle connections closed. A pool whose slots are still held by open
  * handles is left in place; callers then connect privately until the
  * next call finds it idle and replaces it. */
 static struct smb_pool *smb_pool_for(const char *want_share)
 {
    struct smb_conn_key key;
-   struct smb_pool *cur, *fresh;
+   struct smb_pool *cur, *p;
 
    smb_conn_key_fill(&key, want_share);
    if (!*key.server_address)
@@ -339,18 +364,32 @@ static struct smb_pool *smb_pool_for(const char *want_share)
       return NULL;                       /* private connections meanwhile */
    if (!network_init())
       return NULL;
-   if (!(fresh = (struct smb_pool*)calloc(1, sizeof(*fresh))))
-      return NULL;
-   fresh->key   = key;
-   fresh->count = key.num_contexts > SMB_MAX_SLOTS ? SMB_MAX_SLOTS : key.num_contexts;
-   retro_atomic_store_release_int(&fresh->auth_mode, (int)key.auth_mode);
-   if (retro_atomic_cas_ptr(&smb_pool_ptr, cur, fresh))
+   for (p = (struct smb_pool*)retro_atomic_load_acquire_ptr(&smb_pools_ptr);
+         p; p = p->next)
+      if (memcmp(&p->key, &key, sizeof(key)) == 0)
+         break;
+   if (!p)
    {
-      smb_pool_free(cur);
-      return fresh;
+      if (!(p = (struct smb_pool*)calloc(1, sizeof(*p))))
+         return NULL;
+      p->key   = key;
+      p->count = key.num_contexts > SMB_MAX_SLOTS ? SMB_MAX_SLOTS : key.num_contexts;
+      retro_atomic_store_release_int(&p->auth_mode, (int)key.auth_mode);
+      do
+         p->next = (struct smb_pool*)retro_atomic_load_acquire_ptr(&smb_pools_ptr);
+      while (!retro_atomic_cas_ptr(&smb_pools_ptr, p->next, p));
    }
-   free(fresh);
-   return (struct smb_pool*)retro_atomic_load_acquire_ptr(&smb_pool_ptr);
+   if (retro_atomic_cas_ptr(&smb_pool_ptr, cur, p))
+   {
+      if (cur)
+         smb_pool_close_idle(cur);
+      return p;
+   }
+   /* lost to another builder: its pool only if the key is ours */
+   cur = (struct smb_pool*)retro_atomic_load_acquire_ptr(&smb_pool_ptr);
+   if (cur && memcmp(&cur->key, &key, sizeof(key)) == 0)
+      return cur;
+   return NULL;                          /* private connection */
 }
 
 /* A connection to @want_share for one caller. *slot is the pool slot
@@ -735,14 +774,25 @@ static bool smb_enum_shares(char ***out, unsigned *out_count)
 void smb_shutdown(void)
 {
    struct smb_pool *old = (struct smb_pool*)retro_atomic_load_acquire_ptr(&smb_pool_ptr);
+   struct smb_pool *head, *p;
    /* A slot still held is a connection still in use: an open stream
     * nobody closed, or a task the exit's drain left stuck on a dead
-    * share.  Unpublish the pool so nothing new takes from it, but do
-    * not free it under them - the process is on its way out. */
-   if (     old
-         && retro_atomic_cas_ptr(&smb_pool_ptr, old, NULL)
-         && !smb_pool_busy(old))
-      smb_pool_free(old);
+    * share.  Unpublish the pool so nothing new takes from it, but free
+    * no pool while one is held - the process is on its way out. */
+   if (old && !retro_atomic_cas_ptr(&smb_pool_ptr, old, NULL))
+      return;
+   head = (struct smb_pool*)retro_atomic_load_acquire_ptr(&smb_pools_ptr);
+   for (p = head; p; p = p->next)
+      if (smb_pool_busy(p))
+         return;
+   if (!retro_atomic_cas_ptr(&smb_pools_ptr, head, NULL))
+      return;
+   while (head)
+   {
+      p    = head;
+      head = head->next;
+      smb_pool_free(p);
+   }
 }
 
 /* Build full SMB path from settings */
