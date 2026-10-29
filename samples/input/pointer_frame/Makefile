@@ -14,7 +14,8 @@ endif
 
 all: $(TARGET)
 
-$(TARGET): pointer_frame_test.c $(REPO_ROOT)/input/input_pointer_frame.h
+$(TARGET): pointer_frame_test.c $(REPO_ROOT)/input/input_pointer_frame.h \
+           $(REPO_ROOT)/input/drivers/android_pointers.h
 	$(CC) $(CFLAGS) -o $@ pointer_frame_test.c $(LDFLAGS)
 
 check: all
