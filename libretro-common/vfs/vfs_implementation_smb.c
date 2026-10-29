@@ -131,6 +131,7 @@ struct smb_slot
 {
    struct smb2_context *ctx;
    retro_atomic_int_t   busy;
+   struct smb_pool     *pool;
 };
 
 struct smb_conn_key
@@ -353,6 +354,7 @@ static struct smb_pool *smb_pool_for(const char *want_share)
 {
    struct smb_conn_key key;
    struct smb_pool *cur, *p;
+   unsigned i;
 
    smb_conn_key_fill(&key, want_share);
    if (!*key.server_address)
@@ -374,6 +376,8 @@ static struct smb_pool *smb_pool_for(const char *want_share)
          return NULL;
       p->key   = key;
       p->count = key.num_contexts > SMB_MAX_SLOTS ? SMB_MAX_SLOTS : key.num_contexts;
+      for (i = 0; i < p->count; i++)
+         p->slots[i].pool = p;
       retro_atomic_store_release_int(&p->auth_mode, (int)key.auth_mode);
       do
          p->next = (struct smb_pool*)retro_atomic_load_acquire_ptr(&smb_pools_ptr);
@@ -451,12 +455,11 @@ static void smb_give(struct smb2_context *ctx, struct smb_slot *slot)
 static struct smb2_context *smb_heal(struct smb2_context *ctx, struct smb_slot *slot,
       const char *want_share)
 {
-   struct smb_pool *pool = (struct smb_pool*)retro_atomic_load_acquire_ptr(&smb_pool_ptr);
    struct smb2_context *fresh;
    if (smb2_echo(ctx) == 0)
       return NULL;
-   if (slot && pool)
-      fresh = smb_create_context(pool);
+   if (slot)
+      fresh = smb_create_context(slot->pool);
    else
    {
       struct smb_slot *dummy;
