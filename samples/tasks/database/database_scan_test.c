@@ -5573,10 +5573,12 @@ static void sevenzip_lane(const char *root, const char *pl_dir,
    started = run_scan(dir) && scan_completed;
    sprintf(what, "7z: a fingerprint is a hit where a core opens 7z %s", q);
    check(   started && file_contains(lpl, "7Z FP Set")
-         && file_contains(lpl, "7z_fp.7z"), what, "7z_fp.7z");
+         && file_contains(lpl, "7z_fp.7z")
+         && !file_contains(lpl, "7z_fp.7z#"), what, "7z_fp.7z");
    sprintf(what, "7z: a directory entry keeps the fingerprint %s", q);
    check(   started && file_contains(lpl, "7Z FP Dir Set")
-         && file_contains(lpl, "7z_fpdir.7z"), what, "7z_fpdir.7z");
+         && file_contains(lpl, "7z_fpdir.7z")
+         && !file_contains(lpl, "7z_fpdir.7z#"), what, "7z_fpdir.7z");
    return;
 
 fixture:
@@ -5586,9 +5588,9 @@ fixture:
 
 /* A set packed two ways: TorrentZip-like, and with other names, order
  * and a duplicate, as a zstd or 7z repack differs.  The record holds
- * the first's CRC and the fingerprint of its member CRCs, so the
- * second matches by fingerprint, from its one directory read, and is
- * written as the first would be.  So do repacks with a directory
+ * the first's CRC, the second's size and the fingerprint of its member
+ * CRCs, so the second matches by fingerprint, from its one directory
+ * read and not read whole, and is written as the first would be.  So do repacks with a directory
  * first, or a cue or gdi sheet or an empty member beside the ROMs; one
  * with a member that stores no CRC has no fingerprint.  Without the
  * key nothing matches. */
@@ -5598,7 +5600,8 @@ static void set_fp_lane(const char *root, const char *pl_dir,
    static const char cue[] = "FILE \"A.ROM\" BINARY\n";
    static const char gdi[] = "1\n1 0 4 2352 \"A.ROM\" 0\n";
    static uint8_t d[2][MF_MEMBER_LEN];
-   char           db[512], nofp[512], dir[512], p[1024], lpl[1024];
+   static char    p[1024], lpl[1024];
+   char           db[512], nofp[512], dir[512];
    char           what[64], detail[64], crc[16];
    uint8_t        be[8];
    db_rec_t       rec;
@@ -5645,6 +5648,7 @@ static void set_fp_lane(const char *root, const char *pl_dir,
    if (!write_zip_entries(p, e, 3))
       goto fixture;
    repack_bytes = zip_bytes(e, 3);
+   rec.size     = repack_bytes;
 
    /* A directory first. */
    e[0].name = "d/";
@@ -5789,7 +5793,8 @@ static void fp_one_lane(const char *root, const char *pl_dir,
       bool threaded)
 {
    static uint8_t d[MF_MEMBER_LEN];
-   char           db[512], dir[512], p[1024], lpl[1024];
+   static char    lpl[1024];
+   char           db[512], dir[512], p[1024];
    char           what[64], detail[64], crc[16];
    uint8_t        be[4];
    db_rec_t       rec;
@@ -5811,12 +5816,12 @@ static void fp_one_lane(const char *root, const char *pl_dir,
    e.len  = MF_MEMBER_LEN;
    e.crc  = 0x0CA70301u;
    sprintf(p, "%s/fp_one.zip", dir);
-   /* The record also holds the zip's own CRC and size, so a whole
-    * read would match it too. */
-   if (   !write_zip_entries(p, &e, 1)
-       || !set_whole_rec(&rec, "FP One", p))
+   if (!write_zip_entries(p, &e, 1))
       goto fixture;
    bytes = zip_bytes(&e, 1);
+   /* The zip's size, which lets it be read whole, but not its CRC. */
+   set_rec(&rec, "FP One", 0x0CA703FFu, bytes);
+   rec.rom_name = "fp_one.zip";
    for (k = 0; k < 4; k++)
       be[k] = (uint8_t)(0x0CA70301u >> (24 - 8 * k));
    rec.set_fp = crc_of(be, sizeof(be));
@@ -5891,8 +5896,8 @@ static void fp_cart_first_lane(const char *root, const char *pl_dir,
    bytes = zip_bytes(e, 2);
 
    set_rec(&cart, "FCF Cart", 0x0CA70201u, MF_MEMBER_LEN);
-   /* A zip record of another size: the size lets nothing read it. */
-   set_rec(&arc, "FCF Arcade", 0x0CA702FFu, bytes + 1);
+   /* The zip's size, which lets it be read whole, but not its CRC. */
+   set_rec(&arc, "FCF Arcade", 0x0CA702FFu, bytes);
    arc.rom_name = "fcf0.zip";
    for (k = 0; k < 4; k++)
    {
@@ -5937,6 +5942,66 @@ static void fp_cart_first_lane(const char *root, const char *pl_dir,
 
 fixture:
    check(0, "fixture", "could not write the fingerprint-first set");
+}
+
+/* A database matched by its members, as MAME's, never matches a set by
+ * its fingerprint. */
+static void fp_member_db_lane(const char *root, const char *pl_dir,
+      bool threaded)
+{
+   static uint8_t d[2][MF_MEMBER_LEN];
+   static char    lpl[1024];
+   char           db[512], dir[512], p[1024], what[64];
+   uint8_t        be[8];
+   db_rec_t       rec;
+   zip_entry_t    e[2];
+   bool           started;
+   unsigned       k;
+   const char    *q = threaded ? "(threaded)" : "(regular)";
+
+   sprintf(db,  "%s/fp_member_db", root);
+   sprintf(dir, "%s/fp_member",    root);
+   path_mkdir(db);
+   path_mkdir(dir);
+   fill_forced(d[0], MF_MEMBER_LEN, 173, 0x0CA70401u);
+   fill_forced(d[1], MF_MEMBER_LEN, 179, 0x0CA70402u);
+   memset(e, 0, sizeof(e));
+   e[0].name = "a.rd";
+   e[0].data = d[0];
+   e[0].len  = MF_MEMBER_LEN;
+   e[0].crc  = 0x0CA70401u;
+   e[1].name = "b.rd";
+   e[1].data = d[1];
+   e[1].len  = MF_MEMBER_LEN;
+   e[1].crc  = 0x0CA70402u;
+   sprintf(p, "%s/fp_member.zip", dir);
+   if (!write_zip_entries(p, e, 2))
+      goto fixture;
+
+   set_rec(&rec, "ES FP Set", 0x0CA704FFu, zip_bytes(e, 2));
+   rec.rom_name = "fp_member.zip";
+   for (k = 0; k < 4; k++)
+   {
+      be[k]     = (uint8_t)(0x0CA70401u >> (24 - 8 * k));
+      be[4 + k] = (uint8_t)(0x0CA70402u >> (24 - 8 * k));
+   }
+   rec.set_fp = crc_of(be, sizeof(be));
+   sprintf(p, "%s/Test ES Arcade.rdb", db);
+   if (!write_db_set(p, &rec, 1))
+      goto fixture;
+
+   sprintf(lpl, "%s/Test ES Arcade.lpl", pl_dir);
+   filestream_delete(lpl);
+   use_queue(threaded);
+   use_db(db);
+   started = run_scan(dir) && scan_completed;
+   sprintf(what, "a member database: no fingerprint match %s", q);
+   check(started && !file_contains(lpl, "ES FP Set"), what,
+         "fp_member.zip");
+   return;
+
+fixture:
+   check(0, "fixture", "could not write the member database set");
 }
 
 /* With "Scan Inside Archives" off nothing expands, so the member pass
@@ -9307,6 +9372,8 @@ int main(int argc, char **argv)
       fp_one_lane(root, pl_dir, false);
       fp_cart_first_lane(root, pl_dir, true);
       fp_cart_first_lane(root, pl_dir, false);
+      fp_member_db_lane(root, pl_dir, true);
+      fp_member_db_lane(root, pl_dir, false);
       every_member_lane(root, pl_dir, true);
       every_member_lane(root, pl_dir, false);
       loose_member_lane(root, pl_dir, true);

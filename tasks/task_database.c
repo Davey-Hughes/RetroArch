@@ -2039,7 +2039,8 @@ static void task_database_index_close(database_state_handle_t *db_state)
 /* Begins the current database's index build, or takes what it built.
  * False while it runs: the caller returns SCAN_VERDICT_CONTINUE, the
  * steps that follow run the build, and the caller comes back here for
- * it.  A build that cannot begin gives nothing, as a failed one. */
+ * it.  A build that cannot begin gives nothing, as a failed one.  In
+ * the set_fp pass, @crc is keyed on the set fingerprints instead. */
 static bool task_database_index_take(database_state_handle_t *db_state,
       database_info_crc_index_t **crc,
       database_info_serial_index_t **serial, bool *has_serial)
