@@ -1123,10 +1123,11 @@ typedef struct
    uint32_t    size;
    const char *rom_name;
    bool        unsized;
+   uint32_t    set_fp;
 } db_rec_t;
 
-/* One database holding @n records; a NULL serial or rom_name, or
- * unsized, leaves the key out. */
+/* One database holding @n records; a NULL serial or rom_name, a 0
+ * set_fp, or unsized leaves the key out. */
 static int write_db_set(const char *path, const db_rec_t *recs,
       unsigned n)
 {
@@ -1143,12 +1144,18 @@ static int write_db_set(const char *path, const db_rec_t *recs,
    for (r = 0; r < n; r++)
    {
       bfixmap(&body, 2 + (recs[r].serial ? 1 : 0)
-            + (recs[r].rom_name ? 1 : 0) + (recs[r].unsized ? 0 : 1));
+            + (recs[r].rom_name ? 1 : 0) + (recs[r].unsized ? 0 : 1)
+            + (recs[r].set_fp ? 1 : 0));
       bfixstr(&body, "name"); bfixstr(&body, recs[r].name);
       if (recs[r].rom_name)
       {
          bfixstr(&body, "rom_name");
          bfixstr(&body, recs[r].rom_name);
+      }
+      if (recs[r].set_fp)
+      {
+         bfixstr(&body, "set_fp1");
+         bbin4(&body, recs[r].set_fp);
       }
       if (recs[r].serial)
       {
@@ -3007,6 +3014,7 @@ static void set_rec(db_rec_t *rec, const char *name, uint32_t crc,
    rec->size   = size;
    rec->rom_name = NULL;
    rec->unsized  = false;
+   rec->set_fp   = 0;
 }
 
 #define MIX_BIG_ONE 70000
@@ -4519,13 +4527,15 @@ fixture:
  * record of its size. */
 static void rar_lane(const char *root, const char *pl_dir, bool threaded)
 {
-   static uint8_t d[4][MF_MEMBER_LEN];
-   static const uint32_t crc[4] = {
-      0x0BF80001u, 0x0BF80011u, 0x0BF80012u, 0x0BF80002u };
+   static uint8_t d[6][MF_MEMBER_LEN];
+   static const uint32_t crc[6] = {
+      0x0BF80001u, 0x0BF80011u, 0x0BF80012u, 0x0BF80002u, 0x0BF80021u,
+      0x0BF80022u };
    char           db[512], noclaim[512], dir[512], p[1024];
-   static char    cart_lpl[1024], member_lpl[1024];
+   static char    cart_lpl[1024], member_lpl[1024], nc_lpl[1024];
    char           what[64], detail[64];
-   db_rec_t       cart[3], held, nc;
+   uint8_t        be[8];
+   db_rec_t       cart[4], held, nc[2];
    zip_entry_t    e[2];
    uint32_t       cart_bytes, multi_bytes;
    int            cart_reads, multi_reads;
@@ -4539,7 +4549,7 @@ static void rar_lane(const char *root, const char *pl_dir, bool threaded)
    path_mkdir(db);
    path_mkdir(noclaim);
    path_mkdir(dir);
-   for (j = 0; j < 4; j++)
+   for (j = 0; j < 6; j++)
       fill_forced(d[j], MF_MEMBER_LEN, 101 + 2 * j, crc[j]);
    memset(e, 0, sizeof(e));
    e[0].len = MF_MEMBER_LEN;
@@ -4569,8 +4579,8 @@ static void rar_lane(const char *root, const char *pl_dir, bool threaded)
    cart[1].rom_name = "set.rar";
    set_rec(&held, "RAR Held", crc[2], MF_MEMBER_LEN);
    /* A rar record of that size whose core does not open rar. */
-   set_rec(&nc, "RAR NoClaim Sized", 0x0BF8FFFCu, multi_bytes);
-   nc.rom_name = "set.rar";
+   set_rec(&nc[1], "RAR NoClaim Sized", 0x0BF8FFFCu, multi_bytes);
+   nc[1].rom_name = "set.rar";
 
    /* A folder is no member: its one member's hit names it. */
    e[0].name = "d/";
@@ -4586,8 +4596,28 @@ static void rar_lane(const char *root, const char *pl_dir, bool threaded)
       goto fixture;
    set_rec(&cart[2], "RAR Folder", crc[3], MF_MEMBER_LEN);
 
+   /* A set whose fingerprint a database whose core opens rar holds. */
+   e[0].name = "A.ROM";
+   e[0].data = d[4];
+   e[0].len  = MF_MEMBER_LEN;
+   e[0].crc  = crc[4];
+   e[1].name = "B.ROM";
+   e[1].data = d[5];
+   e[1].crc  = crc[5];
+   sprintf(p, "%s/rar_fp.rar", dir);
+   if (!write_rar_entries(p, e, 2))
+      goto fixture;
+   set_rec(&cart[3], "RAR FP Set", 0x0BF8FFFFu, 2 * MF_MEMBER_LEN);
+   for (j = 0; j < 4; j++)
+   {
+      be[j]     = (uint8_t)(crc[4] >> (24 - 8 * j));
+      be[4 + j] = (uint8_t)(crc[5] >> (24 - 8 * j));
+   }
+   cart[3].set_fp = crc_of(be, sizeof(be));
+   nc[0]          = cart[3];
+
    sprintf(p, "%s/Test RAR Cart.rdb", db);
-   if (!write_db_set(p, cart, 3))
+   if (!write_db_set(p, cart, 4))
       goto fixture;
    sprintf(p, "%s/Test EM Member.rdb", db);
    if (!write_db_set(p, &held, 1))
@@ -4596,13 +4626,15 @@ static void rar_lane(const char *root, const char *pl_dir, bool threaded)
    if (!write_db_set(p, &held, 1))
       goto fixture;
    sprintf(p, "%s/Test EM Cart.rdb", noclaim);
-   if (!write_db_set(p, &nc, 1))
+   if (!write_db_set(p, nc, 2))
       goto fixture;
 
    sprintf(cart_lpl,   "%s/Test RAR Cart.lpl",  pl_dir);
    sprintf(member_lpl, "%s/Test EM Member.lpl", pl_dir);
+   sprintf(nc_lpl,     "%s/Test EM Cart.lpl",   pl_dir);
    filestream_delete(cart_lpl);
    filestream_delete(member_lpl);
+   filestream_delete(nc_lpl);
    use_queue(threaded);
 
    use_db(db);
@@ -4630,6 +4662,10 @@ static void rar_lane(const char *root, const char *pl_dir, bool threaded)
    sprintf(what, "rar: a later member's hit is held %s", q);
    check(started && file_contains(member_lpl, "rar_multi.rar#b.rd"),
          what, "rar_multi.rar#b.rd");
+   sprintf(what, "rar: a fingerprint is a hit where a core opens rar %s", q);
+   check(   started && file_contains(cart_lpl, "RAR FP Set")
+         && file_contains(cart_lpl, "rar_fp.rar")
+         && !file_contains(cart_lpl, "rar_fp.rar#"), what, "rar_fp.rar");
    if (!threaded)
    {
       sprintf(detail, "%d read steps", cart_reads);
@@ -4641,6 +4677,7 @@ static void rar_lane(const char *root, const char *pl_dir, bool threaded)
    }
 
    filestream_delete(member_lpl);
+   filestream_delete(nc_lpl);
    use_db(noclaim);
    retro_atomic_store_release_int(&reads_begun, 0);
    begun_size  = multi_bytes;
@@ -4650,6 +4687,9 @@ static void rar_lane(const char *root, const char *pl_dir, bool threaded)
    sprintf(what, "rar: no core opens rar: held %s", q);
    check(started && file_contains(member_lpl, "rar_multi.rar#b.rd"),
          what, "rar_multi.rar#b.rd");
+   sprintf(what, "rar: a fingerprint in rar writes nothing %s", q);
+   check(started && !file_contains(nc_lpl, "RAR FP Set"), what,
+         "rar_fp.rar");
    if (!threaded)
    {
       sprintf(detail, "%d whole reads", multi_reads);
@@ -5423,12 +5463,13 @@ fixture:
 }
 
 /* The first member in a database claimed only for it, the archive's
- * own CRC in one a core listing zip claims: held as archive#member
- * either way. */
+ * own CRC and fingerprint in one a core listing zip claims: held as
+ * archive#member either way. */
 static void dual_match_lane(const char *root, const char *pl_dir,
       bool threaded)
 {
    static const char *const pl[2] = { "Test Cart Gate", "Test Arc Gate" };
+   static const uint8_t     be[4] = { 0x0C, 0xA7, 0x00, 0x40 };
    char     db[512], dir[512], p[1024], crc[16];
    db_rec_t rec[2];
 
@@ -5441,6 +5482,7 @@ static void dual_match_lane(const char *root, const char *pl_dir,
             0x0CA70040u, &rec[0])
        || !set_whole_rec(&rec[1], "Gate DM0", p))
       goto fixture;
+   rec[1].set_fp = crc_of(be, sizeof(be));
    sprintf(p, "%s/%s.rdb", db, pl[0]);
    if (!write_db_set(p, &rec[0], 1))
       goto fixture;
@@ -5454,6 +5496,447 @@ static void dual_match_lane(const char *root, const char *pl_dir,
 
 fixture:
    check(0, "fixture", "could not write the dual match set");
+}
+
+#ifdef HAVE_7ZIP
+/* A 7z set's fingerprint is a hit where a core opens 7z, and stays one
+ * with a directory entry among the members. */
+static void sevenzip_lane(const char *root, const char *pl_dir,
+      bool threaded)
+{
+   static uint8_t d[4][MF_MEMBER_LEN];
+   static const uint32_t crc[4] = {
+      0x0BFB0001u, 0x0BFB0002u, 0x0BFB0011u, 0x0BFB0012u };
+   static char    lpl[1024];
+   char           db[512], dir[512], p[1024], what[64];
+   uint8_t        be[8];
+   db_rec_t       rec[2];
+   zip_entry_t    e[3];
+   bool           started;
+   unsigned       j, k;
+   const char    *q = threaded ? "(threaded)" : "(regular)";
+
+   sprintf(db,  "%s/7z_db", root);
+   sprintf(dir, "%s/7z",    root);
+   path_mkdir(db);
+   path_mkdir(dir);
+   for (j = 0; j < 4; j++)
+      fill_forced(d[j], MF_MEMBER_LEN, 131 + 2 * j, crc[j]);
+
+   memset(e, 0, sizeof(e));
+   e[0].name = "A.ROM";
+   e[0].data = d[0];
+   e[0].len  = MF_MEMBER_LEN;
+   e[0].crc  = crc[0];
+   e[1].name = "B.ROM";
+   e[1].data = d[1];
+   e[1].len  = MF_MEMBER_LEN;
+   e[1].crc  = crc[1];
+   sprintf(p, "%s/7z_fp.7z", dir);
+   if (!write_7z_entries(p, e, 2))
+      goto fixture;
+
+   e[0].name = "sub/";
+   e[0].data = NULL;
+   e[0].len  = 0;
+   e[0].crc  = 0;
+   e[1].name = "sub/C.ROM";
+   e[1].data = d[2];
+   e[1].crc  = crc[2];
+   e[2].name = "D.ROM";
+   e[2].data = d[3];
+   e[2].len  = MF_MEMBER_LEN;
+   e[2].crc  = crc[3];
+   sprintf(p, "%s/7z_fpdir.7z", dir);
+   if (!write_7z_entries(p, e, 3))
+      goto fixture;
+
+   set_rec(&rec[0], "7Z FP Set",     0x0BFBFFFFu, 2 * MF_MEMBER_LEN);
+   set_rec(&rec[1], "7Z FP Dir Set", 0x0BFBFFFEu, 2 * MF_MEMBER_LEN);
+   for (j = 0; j < 2; j++)
+   {
+      for (k = 0; k < 4; k++)
+      {
+         be[k]     = (uint8_t)(crc[2 * j]     >> (24 - 8 * k));
+         be[4 + k] = (uint8_t)(crc[2 * j + 1] >> (24 - 8 * k));
+      }
+      rec[j].set_fp = crc_of(be, sizeof(be));
+   }
+   sprintf(p, "%s/Test 7Z Cart.rdb", db);
+   if (!write_db_set(p, rec, 2))
+      goto fixture;
+
+   sprintf(lpl, "%s/Test 7Z Cart.lpl", pl_dir);
+   filestream_delete(lpl);
+   use_queue(threaded);
+   use_db(db);
+   started = run_scan(dir) && scan_completed;
+   sprintf(what, "7z: a fingerprint is a hit where a core opens 7z %s", q);
+   check(   started && file_contains(lpl, "7Z FP Set")
+         && file_contains(lpl, "7z_fp.7z"), what, "7z_fp.7z");
+   sprintf(what, "7z: a directory entry keeps the fingerprint %s", q);
+   check(   started && file_contains(lpl, "7Z FP Dir Set")
+         && file_contains(lpl, "7z_fpdir.7z"), what, "7z_fpdir.7z");
+   return;
+
+fixture:
+   check(0, "fixture", "could not write the 7z set");
+}
+#endif
+
+/* A set packed two ways: TorrentZip-like, and with other names, order
+ * and a duplicate, as a zstd or 7z repack differs.  The record holds
+ * the first's CRC and the fingerprint of its member CRCs, so the
+ * second matches by fingerprint, from its one directory read, and is
+ * written as the first would be.  So do repacks with a directory
+ * first, or a cue or gdi sheet or an empty member beside the ROMs; one
+ * with a member that stores no CRC has no fingerprint.  Without the
+ * key nothing matches. */
+static void set_fp_lane(const char *root, const char *pl_dir,
+      bool threaded)
+{
+   static const char cue[] = "FILE \"A.ROM\" BINARY\n";
+   static const char gdi[] = "1\n1 0 4 2352 \"A.ROM\" 0\n";
+   static uint8_t d[2][MF_MEMBER_LEN];
+   char           db[512], nofp[512], dir[512], p[1024], lpl[1024];
+   char           what[64], detail[64], crc[16];
+   uint8_t        be[8];
+   db_rec_t       rec;
+   zip_entry_t    e[3];
+   uint32_t       repack_bytes, dirfirst_bytes;
+   int            reads, stored, dir_reads;
+   bool           started;
+   const char    *q = threaded ? "(threaded)" : "(regular)";
+
+   sprintf(db,   "%s/set_fp_db",   root);
+   sprintf(nofp, "%s/set_fp_nofp", root);
+   sprintf(dir,  "%s/set_fp",      root);
+   path_mkdir(db);
+   path_mkdir(nofp);
+   path_mkdir(dir);
+
+   fill_forced(d[0], MF_MEMBER_LEN, 59, 0x5E7F0002u);
+   fill_forced(d[1], MF_MEMBER_LEN, 61, 0x5E7F0001u);
+
+   /* The packing the record's CRC was taken from: not scanned. */
+   memset(e, 0, sizeof(e));
+   e[0].name = "a.rd";
+   e[0].data = d[0];
+   e[0].len  = MF_MEMBER_LEN;
+   e[0].crc  = 0x5E7F0002u;
+   e[1].name = "b.rd";
+   e[1].data = d[1];
+   e[1].len  = MF_MEMBER_LEN;
+   e[1].crc  = 0x5E7F0001u;
+   sprintf(p, "%s/set_fp_tz.zip", root);
+   if (   !write_zip_entries(p, e, 2)
+       || !set_whole_rec(&rec, "FP Set", p))
+      goto fixture;
+
+   e[0].name = "B.ROM";
+   e[0].data = d[1];
+   e[0].crc  = 0x5E7F0001u;
+   e[1].name = "A.ROM";
+   e[1].data = d[0];
+   e[1].crc  = 0x5E7F0002u;
+   e[2]      = e[1];
+   e[2].name = "copy/A.ROM";
+   sprintf(p, "%s/fp_repack.zip", dir);
+   if (!write_zip_entries(p, e, 3))
+      goto fixture;
+   repack_bytes = zip_bytes(e, 3);
+
+   /* A directory first. */
+   e[0].name = "d/";
+   e[0].data = NULL;
+   e[0].len  = 0;
+   e[0].crc  = 0;
+   e[1].name = "d/A.ROM";
+   e[1].data = d[0];
+   e[1].len  = MF_MEMBER_LEN;
+   e[1].crc  = 0x5E7F0002u;
+   e[2].name = "d/B.ROM";
+   e[2].data = d[1];
+   e[2].len  = MF_MEMBER_LEN;
+   e[2].crc  = 0x5E7F0001u;
+   sprintf(p, "%s/fp_dirfirst.zip", dir);
+   if (!write_zip_entries(p, e, 3))
+      goto fixture;
+   dirfirst_bytes = zip_bytes(e, 3);
+
+   /* A cue sheet beside the ROMs. */
+   e[0].name = "A.ROM";
+   e[0].data = d[0];
+   e[0].len  = MF_MEMBER_LEN;
+   e[0].crc  = 0x5E7F0002u;
+   e[1].name = "B.ROM";
+   e[1].data = d[1];
+   e[1].crc  = 0x5E7F0001u;
+   e[2].name = "set.cue";
+   e[2].data = (const uint8_t*)cue;
+   e[2].len  = (uint32_t)(sizeof(cue) - 1);
+   e[2].crc  = crc_of((const uint8_t*)cue, sizeof(cue) - 1);
+   sprintf(p, "%s/fp_cue.zip", dir);
+   if (!write_zip_entries(p, e, 3))
+      goto fixture;
+
+   /* A member that stores no CRC. */
+   e[2].name = "C.ROM";
+   e[2].data = d[0];
+   e[2].len  = MF_MEMBER_LEN;
+   e[2].crc  = 0;
+   sprintf(p, "%s/fp_zero.zip", dir);
+   if (!write_zip_entries(p, e, 3))
+      goto fixture;
+
+   /* An empty member beside the ROMs: its stored CRC is 0, but it is
+    * no input. */
+   e[2].name = "E.ROM";
+   e[2].data = NULL;
+   e[2].len  = 0;
+   e[2].crc  = 0;
+   sprintf(p, "%s/fp_empty.zip", dir);
+   if (!write_zip_entries(p, e, 3))
+      goto fixture;
+
+   /* A gdi sheet beside the ROMs. */
+   e[2].name = "set.gdi";
+   e[2].data = (const uint8_t*)gdi;
+   e[2].len  = (uint32_t)(sizeof(gdi) - 1);
+   e[2].crc  = crc_of((const uint8_t*)gdi, sizeof(gdi) - 1);
+   sprintf(p, "%s/fp_gdi.zip", dir);
+   if (!write_zip_entries(p, e, 3))
+      goto fixture;
+
+   sprintf(p, "%s/Test FP Arcade.rdb", nofp);
+   if (!write_db_set(p, &rec, 1))
+      goto fixture;
+   be[0] = 0x5E; be[1] = 0x7F; be[2] = 0x00; be[3] = 0x01;
+   be[4] = 0x5E; be[5] = 0x7F; be[6] = 0x00; be[7] = 0x02;
+   rec.set_fp = crc_of(be, sizeof(be));
+   sprintf(p, "%s/Test FP Arcade.rdb", db);
+   if (!write_db_set(p, &rec, 1))
+      goto fixture;
+
+   sprintf(lpl, "%s/Test FP Arcade.lpl", pl_dir);
+   sprintf(crc, "%08X|crc", (unsigned)rec.crc);
+   use_queue(threaded);
+
+   filestream_delete(lpl);
+   use_db(db);
+   retro_atomic_store_release_int(&reads_begun, 0);
+   retro_atomic_store_release_int(&stored_reads, 0);
+   retro_atomic_store_release_int(&watch_scan, 0);
+   retro_atomic_store_release_int(&watch_reader, 0);
+   begun_size  = repack_bytes;
+   watch_size  = dirfirst_bytes;
+   stored_name = "fp_repack.zip";
+   started     = run_scan(dir) && scan_completed;
+   begun_size  = 0;
+   watch_size  = 0;
+   stored_name = NULL;
+   reads       = retro_atomic_load_acquire_int(&reads_begun);
+   stored      = retro_atomic_load_acquire_int(&stored_reads);
+   dir_reads   = retro_atomic_load_acquire_int(&watch_scan)
+      + retro_atomic_load_acquire_int(&watch_reader);
+   sprintf(what, "repacked set matched by fingerprint %s", q);
+   check(   started && file_contains(lpl, "FP Set")
+         && file_contains(lpl, crc)
+         && file_contains(lpl, "fp_repack.zip")
+         && !file_contains(lpl, "fp_repack.zip#"), what,
+         "fp_repack.zip, the record's CRC");
+   if (!threaded)
+   {
+      sprintf(detail, "%d whole reads", reads);
+      check(started && reads == 0,
+            "a fingerprint match reads no archive whole", detail);
+   }
+   sprintf(detail, "%d directory reads", stored);
+   sprintf(what, "fingerprint from the one directory read %s", q);
+   check(started && stored == 1, what, detail);
+   sprintf(what, "directory first: matched by fingerprint %s", q);
+   check(started && file_contains(lpl, "fp_dirfirst.zip"), what,
+         "fp_dirfirst.zip");
+   sprintf(detail, "%d whole reads", dir_reads);
+   sprintf(what, "directory first: not read whole %s", q);
+   check(started && dir_reads == 0, what, detail);
+   sprintf(what, "a cue sheet is left out of it %s", q);
+   check(started && file_contains(lpl, "fp_cue.zip"), what, "fp_cue.zip");
+   sprintf(what, "a gdi sheet is left out of it %s", q);
+   check(started && file_contains(lpl, "fp_gdi.zip"), what, "fp_gdi.zip");
+   sprintf(what, "an empty member is left out of it %s", q);
+   check(started && file_contains(lpl, "fp_empty.zip"), what,
+         "fp_empty.zip");
+   sprintf(what, "a member with no stored CRC: none %s", q);
+   check(started && !file_contains(lpl, "fp_zero.zip"), what,
+         "fp_zero.zip");
+
+   filestream_delete(lpl);
+   use_db(nofp);
+   started = run_scan(dir) && scan_completed;
+   sprintf(what, "no fingerprint key: no match %s", q);
+   check(started && !file_contains(lpl, "FP Set"), what,
+         "fp_repack.zip");
+   return;
+
+fixture:
+   check(0, "fixture", "could not write the set fingerprint set");
+}
+
+/* One member whose CRC no database holds: its fingerprint is looked up
+ * before its size lets it be read whole. */
+static void fp_one_lane(const char *root, const char *pl_dir,
+      bool threaded)
+{
+   static uint8_t d[MF_MEMBER_LEN];
+   char           db[512], dir[512], p[1024], lpl[1024];
+   char           what[64], detail[64], crc[16];
+   uint8_t        be[4];
+   db_rec_t       rec;
+   zip_entry_t    e;
+   uint32_t       bytes;
+   int            reads;
+   bool           started;
+   unsigned       k;
+   const char    *q = threaded ? "(threaded)" : "(regular)";
+
+   sprintf(db,  "%s/fp_one_db", root);
+   sprintf(dir, "%s/fp_one",    root);
+   path_mkdir(db);
+   path_mkdir(dir);
+   fill_forced(d, MF_MEMBER_LEN, 171, 0x0CA70301u);
+   memset(&e, 0, sizeof(e));
+   e.name = "solo.rd";
+   e.data = d;
+   e.len  = MF_MEMBER_LEN;
+   e.crc  = 0x0CA70301u;
+   sprintf(p, "%s/fp_one.zip", dir);
+   /* The record also holds the zip's own CRC and size, so a whole
+    * read would match it too. */
+   if (   !write_zip_entries(p, &e, 1)
+       || !set_whole_rec(&rec, "FP One", p))
+      goto fixture;
+   bytes = zip_bytes(&e, 1);
+   for (k = 0; k < 4; k++)
+      be[k] = (uint8_t)(0x0CA70301u >> (24 - 8 * k));
+   rec.set_fp = crc_of(be, sizeof(be));
+   sprintf(p, "%s/Test FP Arcade.rdb", db);
+   if (!write_db_set(p, &rec, 1))
+      goto fixture;
+
+   sprintf(lpl, "%s/Test FP Arcade.lpl", pl_dir);
+   sprintf(crc, "%08X|crc", (unsigned)rec.crc);
+   filestream_delete(lpl);
+   use_queue(threaded);
+   use_db(db);
+   retro_atomic_store_release_int(&reads_begun, 0);
+   begun_size = bytes;
+   started    = run_scan(dir) && scan_completed;
+   begun_size = 0;
+   reads      = retro_atomic_load_acquire_int(&reads_begun);
+   sprintf(what, "one member: matched by fingerprint %s", q);
+   check(   started && file_contains(lpl, "FP One")
+         && file_contains(lpl, crc)
+         && !file_contains(lpl, "fp_one.zip#"), what, "fp_one.zip");
+   if (!threaded)
+   {
+      sprintf(detail, "%d whole reads", reads);
+      check(started && reads == 0,
+            "one member: the fingerprint before the size", detail);
+   }
+   return;
+
+fixture:
+   check(0, "fixture", "could not write the one-member set");
+}
+
+/* Several members: a fingerprint in a database whose cores open zip
+ * wins over the first member's hit in one claimed only for its type,
+ * and the archive is not read whole. */
+static void fp_cart_first_lane(const char *root, const char *pl_dir,
+      bool threaded)
+{
+   static const char *const pl[2] = { "Test Cart Gate", "Test Arc Gate" };
+   static uint8_t d[2][MF_MEMBER_LEN];
+   static char    lpl[2][1024];
+   char           db[512], dir[512], p[1024];
+   char           what[64], detail[64], crc[16];
+   uint8_t        be[8];
+   db_rec_t       cart, arc;
+   zip_entry_t    e[2];
+   uint32_t       bytes;
+   int            reads;
+   bool           started;
+   unsigned       k;
+   const char    *q = threaded ? "(threaded)" : "(regular)";
+
+   sprintf(db,  "%s/fp_cart_first_db", root);
+   sprintf(dir, "%s/fp_cart_first",    root);
+   path_mkdir(db);
+   path_mkdir(dir);
+   fill_forced(d[0], MF_MEMBER_LEN, 163, 0x0CA70201u);
+   fill_forced(d[1], MF_MEMBER_LEN, 167, 0x0CA70202u);
+   memset(e, 0, sizeof(e));
+   e[0].name = "a.ct";
+   e[0].data = d[0];
+   e[0].len  = MF_MEMBER_LEN;
+   e[0].crc  = 0x0CA70201u;
+   e[1].name = "b.ct";
+   e[1].data = d[1];
+   e[1].len  = MF_MEMBER_LEN;
+   e[1].crc  = 0x0CA70202u;
+   sprintf(p, "%s/fcf0.zip", dir);
+   if (!write_zip_entries(p, e, 2))
+      goto fixture;
+   bytes = zip_bytes(e, 2);
+
+   set_rec(&cart, "FCF Cart", 0x0CA70201u, MF_MEMBER_LEN);
+   /* A zip record of another size: the size lets nothing read it. */
+   set_rec(&arc, "FCF Arcade", 0x0CA702FFu, bytes + 1);
+   arc.rom_name = "fcf0.zip";
+   for (k = 0; k < 4; k++)
+   {
+      be[k]     = (uint8_t)(0x0CA70201u >> (24 - 8 * k));
+      be[4 + k] = (uint8_t)(0x0CA70202u >> (24 - 8 * k));
+   }
+   arc.set_fp = crc_of(be, sizeof(be));
+   sprintf(p, "%s/%s.rdb", db, pl[0]);
+   if (!write_db_set(p, &cart, 1))
+      goto fixture;
+   sprintf(p, "%s/%s.rdb", db, pl[1]);
+   if (!write_db_set(p, &arc, 1))
+      goto fixture;
+
+   for (k = 0; k < 2; k++)
+   {
+      sprintf(lpl[k], "%s/%s.lpl", pl_dir, pl[k]);
+      filestream_delete(lpl[k]);
+   }
+   sprintf(crc, "%08X|crc", 0x0CA702FFu);
+   use_queue(threaded);
+   use_db(db);
+   retro_atomic_store_release_int(&reads_begun, 0);
+   begun_size = bytes;
+   started    = run_scan(dir) && scan_completed;
+   begun_size = 0;
+   reads      = retro_atomic_load_acquire_int(&reads_begun);
+   sprintf(what, "several members: the fingerprint record wins %s", q);
+   check(   started && file_contains(lpl[1], "FCF Arcade")
+         && file_contains(lpl[1], crc)
+         && !file_contains(lpl[1], "fcf0.zip#"), what, "fcf0.zip");
+   sprintf(what, "several members: no cartridge entry %s", q);
+   check(started && !file_contains(lpl[0], "fcf0.zip"), what,
+         "fcf0.zip#a.ct");
+   if (!threaded)
+   {
+      sprintf(detail, "%d whole reads", reads);
+      check(started && reads == 0,
+            "several members, a fingerprint hit: not read whole", detail);
+   }
+   return;
+
+fixture:
+   check(0, "fixture", "could not write the fingerprint-first set");
 }
 
 /* With "Scan Inside Archives" off nothing expands, so the member pass
@@ -6052,7 +6535,8 @@ fixture:
  * arcade zip by its own CRC, B the same 100 bytes longer, G an A whose
  * member is a cart gate ROM, H a zip whose member the gate database
  * holds and S a 7z of a gate ROM, by its own CRC in a database whose
- * core opens 7z. */
+ * core opens 7z.  P is a zip of two members, m.rd and n.rd, an arcade
+ * record holds by its set fingerprint alone. */
 #define AH_GATE_CRC 0x0CBFFFFFu
 #define AH_FILES   40
 #define AH_BIG     66000
@@ -6080,6 +6564,28 @@ static uint32_t ah_member_len(char role)
 static uint32_t ah_len(char role)
 {
    return 30 + 4 + ah_member_len(role) + 46 + 4 + 22;
+}
+
+/* A P's second member's CRC, and the fingerprint of both. */
+static uint32_t ah_p_crc(unsigned pos)
+{
+   return 0x0CBE0000u + pos;
+}
+
+static uint32_t ah_p_fp(unsigned pos)
+{
+   uint32_t c[2];
+   uint8_t  be[8];
+   unsigned k;
+
+   c[0] = 0x0CB00000u + pos;
+   c[1] = ah_p_crc(pos);
+   for (k = 0; k < 4; k++)
+   {
+      be[k]     = (uint8_t)(c[0] >> (24 - 8 * k));
+      be[4 + k] = (uint8_t)(c[1] >> (24 - 8 * k));
+   }
+   return crc_of(be, sizeof(be));
 }
 
 /* Writes wa_<k>.zip, or .7z for an S, as the file at @pos in
@@ -6113,11 +6619,23 @@ static bool write_ah_zip(const char *dir, unsigned k, unsigned pos,
    if (role == 'S')
       return write_7z(p, e.name, d, e.len, crc) != 0;
 #endif
+   if (role == 'P')
+   {
+      zip_entry_t pe[2];
+
+      fill_forced(d + 2048, ah_member_len(role), 89 + pos, ah_p_crc(pos));
+      pe[0]      = e;
+      pe[1]      = e;
+      pe[1].name = "n.rd";
+      pe[1].data = d + 2048;
+      pe[1].crc  = ah_p_crc(pos);
+      return write_zip_entries(p, pe, 2) != 0;
+   }
    return write_zip_entries(p, &e, 1) != 0;
 }
 
 /* Scans zips of @roles, in content-list order, on the threaded queue;
- * true when every K, F, A, B, G and W is in its playlist.  The first
+ * true when every K, F, A, B, G, P and W is in its playlist.  The first
  * zip's directory read waits for the others', so a reader has read
  * each directory by the scan's first verdict.  With @gate, the readers
  * instead wait in the F zips' (one each: the last), until all are in
@@ -6182,6 +6700,13 @@ static bool ah_scan(const char *root, const char *pl_dir, const char *tag,
             if (!set_whole_rec(&set7[ns], names[pos[i]], p))
                goto fail;
             set7[ns++].rom_name = "set.7z";
+         }
+         else if (role == 'P')
+         {
+            /* Neither its own CRC nor its size: only the fingerprint. */
+            set_rec(&arc[na], names[pos[i]], 0x0CBEFFFFu - pos[i], 0);
+            arc[na].unsized  = true;
+            arc[na++].set_fp = ah_p_fp(pos[i]);
          }
       }
       sprintf(p, "%s/Test MF Cart.rdb", db);
@@ -6350,6 +6875,37 @@ static void ahead_streak_lane(const char *root, const char *pl_dir)
    sprintf(detail, "%d reader reads", begun);
    check(   ok && !retro_atomic_load_acquire_int(&look_late)
          && begun == 2, "read ahead: a member hit ends the run", detail);
+}
+
+/* Match, fingerprint hit, match: a fingerprint hit ends the run as a
+ * member hit does, so the second match lets the readers read one zip
+ * whole ahead again, not two.  Test only: the P's lookup and the last
+ * K's wait for the reads granted before them. */
+static void ahead_fp_streak_lane(const char *root, const char *pl_dir)
+{
+   char detail[64];
+   bool ok;
+   int  begun;
+
+   if (!readers_expected())
+   {
+      check(1, "read ahead: a fingerprint hit ends the run",
+            "no readers");
+      return;
+   }
+   look_crc[0]  = ah_p_fp(2);
+   look_want[0] = 1;
+   look_crc[1]  = 0x0CB00004u;
+   look_want[1] = 2;
+   look_n       = 2;
+   ok           = ah_scan(root, pl_dir, "fpstreak", "KAPAKKKKKKKK", 0, 0,
+         0, 0);
+   look_n       = 0;
+   begun        = retro_atomic_load_acquire_int(&rd_wholes);
+   sprintf(detail, "%d reader reads", begun);
+   check(   ok && !retro_atomic_load_acquire_int(&look_late)
+         && begun == 2, "read ahead: a fingerprint hit ends the run",
+         detail);
 }
 
 /* @head, then an F for each reader: the last zips, which the readers
@@ -7778,7 +8334,7 @@ int main(int argc, char **argv)
             "corename = \"ReaderTest\"\n"
             "supported_extensions = \"rd|zip|cue|bin\"\n"
             "database = \"Test Reader|Test Order One|Test Order Two|Test Mix|Test Switch|"
-            "Test MF Cart|Test MF Arcade|Test FM One|Test FM Two|"
+            "Test MF Cart|Test MF Arcade|Test FM One|Test FM Two|Test FP Arcade|"
             "Test EM Cart|Test EM Arcade\"\n");
       fclose(f);
    }
@@ -7797,6 +8353,20 @@ int main(int argc, char **argv)
       fclose(f);
    }
    sprintf(p, "%s/archive_libretro.so", core_dir);
+   { FILE *f = fopen(p, "wb"); if (f) { fputs("\177ELF", f); fclose(f); } }
+   sprintf(p, "%s/sevenzip_libretro.info", info_dir);
+   {
+      FILE *f = fopen(p, "w");
+      if (!f)
+      { check(0, "fixture", "could not write core info"); return 1; }
+      fprintf(f,
+            "display_name = \"7z Cart Test\"\n"
+            "corename = \"SevenZipCartTest\"\n"
+            "supported_extensions = \"rd|7z\"\n"
+            "database = \"Test 7Z Cart\"\n");
+      fclose(f);
+   }
+   sprintf(p, "%s/sevenzip_libretro.so", core_dir);
    { FILE *f = fopen(p, "wb"); if (f) { fputs("\177ELF", f); fclose(f); } }
    /* Cartridge cores list their ROMs' extensions, most without zip;
     * arcade cores list zip. */
@@ -8727,6 +9297,16 @@ int main(int argc, char **argv)
       dual_match_lane(root, pl_dir, false);
       archives_off_lane(root, pl_dir, true);
       archives_off_lane(root, pl_dir, false);
+#ifdef HAVE_7ZIP
+      sevenzip_lane(root, pl_dir, true);
+      sevenzip_lane(root, pl_dir, false);
+#endif
+      set_fp_lane(root, pl_dir, true);
+      set_fp_lane(root, pl_dir, false);
+      fp_one_lane(root, pl_dir, true);
+      fp_one_lane(root, pl_dir, false);
+      fp_cart_first_lane(root, pl_dir, true);
+      fp_cart_first_lane(root, pl_dir, false);
       every_member_lane(root, pl_dir, true);
       every_member_lane(root, pl_dir, false);
       loose_member_lane(root, pl_dir, true);
@@ -8749,6 +9329,7 @@ int main(int argc, char **argv)
       ahead_lone_lane(root, pl_dir);
       ahead_double_lane(root, pl_dir);
       ahead_streak_lane(root, pl_dir);
+      ahead_fp_streak_lane(root, pl_dir);
       ahead_next_lane(root, pl_dir);
       ahead_hit_count_lane(root, pl_dir);
       ahead_arcade_lane(root, pl_dir);

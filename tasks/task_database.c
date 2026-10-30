@@ -180,7 +180,9 @@ enum db_state_flags_enum
    DB_STATE_FLAG_ARCHIVE_MEMBER           = (1 << 5),
    /* Its crc index build was refused.  The budget only shrinks, so a
     * retry would walk the database again to the same answer. */
-   DB_STATE_FLAG_NO_CRC_INDEX             = (1 << 6)
+   DB_STATE_FLAG_NO_CRC_INDEX             = (1 << 6),
+   /* Its set fingerprint index has been asked for. */
+   DB_STATE_FLAG_SETFP_CHECKED            = (1 << 7)
 };
 
 #ifdef HAVE_LIBRETRODB
@@ -276,6 +278,7 @@ typedef struct scan_members
    uint64_t       first_size;
    uint64_t       file_size;  /* the archive's, 0: unknown */
    uint32_t       first_crc;  /* the first member's */
+   uint32_t       set_fp;     /* 0: none */
    char           first_ext[16];
    bool           torrentzip; /* a zip TorrentZip wrote */
 } scan_members_t;
@@ -312,6 +315,9 @@ typedef struct database_state_handle
    database_info_crc_index_t **crc_index;
    /* Likewise for the serial lookup disc content uses. */
    database_info_serial_index_t **serial_index;
+   /* And for the arcade set fingerprints: NULL when the database
+    * carries none. */
+   database_info_crc_index_t **setfp_index;
    /* The extensions of the cores claiming each database, resolved
     * from core info when the scan starts, or NULL when no core
     * claims it. The per-file test is then one lookup in that list. */
@@ -368,7 +374,9 @@ enum db_crc_fail
  * by its member's CRC; if that misses, it is read whole only when a
  * database may hold it by its size.  An archive of several members is
  * read whole only when a database may hold it by its size, and each
- * database that opens its type takes either CRC.  Where neither
+ * database that opens its type takes either CRC.  A set fingerprint of
+ * its members' CRCs comes first, where a database carries one; one
+ * member's own CRC still comes before it.  Where none of these
  * matches, every member's stored CRC is looked up. */
 enum db_crc_pass
 {
@@ -377,7 +385,8 @@ enum db_crc_pass
    DB_CRC_PASS_EVERY,     /* each member's stored crc */
    DB_CRC_PASS_SIZE,      /* the archive's size, by archive records */
    DB_CRC_PASS_WHOLE,     /* archive_crc */
-   DB_CRC_PASS_BOTH       /* crc, or archive_crc once read */
+   DB_CRC_PASS_BOTH,      /* crc, or archive_crc once read */
+   DB_CRC_PASS_SETFP      /* set_fp */
 };
 
 /* None on Wii U: its newlib and libfat take no locks, and without
@@ -1154,6 +1163,57 @@ static void task_database_members_free(scan_members_t *m)
 }
 
 #ifdef HAVE_COMPRESSION
+static int task_database_crc_cmp(const void *a, const void *b)
+{
+   uint32_t x = *(const uint32_t*)a;
+   uint32_t y = *(const uint32_t*)b;
+   return (x < y) ? -1 : (x > y);
+}
+
+/* CRC-32 over the stored CRCs, de-duplicated and sorted, each as four
+ * big-endian bytes, so that any packing of the same ROMs gives the
+ * same value.  Empty members and cue or gdi sheets are left out; a
+ * member left in that stores no CRC means there is none. */
+static uint32_t task_database_members_fp(const scan_members_t *m)
+{
+   uint32_t  fp = 0;
+   uint32_t *crcs;
+   size_t    n  = 0;
+   size_t    i;
+
+   if (!m->count || !(crcs = (uint32_t*)malloc(m->count * sizeof(*crcs))))
+      return 0;
+   for (i = 0; i < m->count; i++)
+   {
+      enum msg_file_type type = extension_to_file_type(
+            path_get_extension(m->names + m->list[i].name));
+
+      if (!m->list[i].size || type == FILE_TYPE_CUE || type == FILE_TYPE_GDI)
+         continue;
+      if (!m->list[i].crc)
+      {
+         n = 0;
+         break;
+      }
+      crcs[n++] = m->list[i].crc;
+   }
+   if (n)
+      qsort(crcs, n, sizeof(*crcs), task_database_crc_cmp);
+   for (i = 0; i < n; i++)
+   {
+      uint8_t be[4];
+      if (i && crcs[i] == crcs[i - 1])
+         continue;
+      be[0] = (uint8_t)(crcs[i] >> 24);
+      be[1] = (uint8_t)(crcs[i] >> 16);
+      be[2] = (uint8_t)(crcs[i] >>  8);
+      be[3] = (uint8_t)(crcs[i]);
+      fp    = encoding_crc32(fp, be, sizeof(be));
+   }
+   free(crcs);
+   return fp;
+}
+
 /* The walk's transfer and userdata hold two paths each: too large for
  * a reader's frame. */
 typedef struct scan_members_walk
@@ -1163,7 +1223,8 @@ typedef struct scan_members_walk
 } scan_members_walk_t;
 #endif
 
-/* @path's directory; NULL when it cannot be read through. */
+/* @path's directory and its set fingerprint; NULL when the directory
+ * cannot be read through. */
 static scan_members_t *task_database_members_read(const char *path)
 {
 #ifdef HAVE_COMPRESSION
@@ -1266,6 +1327,7 @@ static scan_members_t *task_database_members_read(const char *path)
       task_database_members_free(m);
       return NULL;
    }
+   m->set_fp = task_database_members_fp(m);
    return m;
 #else
    (void)path;
@@ -1988,6 +2050,8 @@ static bool task_database_index_take(database_state_handle_t *db_state,
 
       if (crc)
          want |= DATABASE_INFO_INDEX_CRC;
+      if (crc && db_state->crc_pass == DB_CRC_PASS_SETFP)
+         want |= DATABASE_INFO_INDEX_SETFP;
       /* A database matched by members is never asked for its sizes,
        * and MAME's run to 100k records. */
       if (   crc
@@ -2020,6 +2084,27 @@ static enum scan_verdict task_database_index_step(
          return SCAN_VERDICT_CONTINUE;
    db_state->index_ready = true;
    return SCAN_VERDICT_CONTINUE;
+}
+
+/* Keeps database @i's fingerprint index, NULL when it carries no
+ * fingerprint or its build was refused, and charges it to the
+ * budget. */
+static void task_database_setfp_keep(database_state_handle_t *db_state,
+      size_t i, database_info_crc_index_t *fi)
+{
+   if (fi && !database_info_crc_index_count(fi))
+   {
+      database_info_crc_index_free(fi);
+      fi = NULL;
+   }
+   if (fi)
+   {
+      size_t used = database_info_crc_index_bytes(fi);
+      db_state->index_budget = (used < db_state->index_budget)
+         ? db_state->index_budget - used : 0;
+   }
+   db_state->setfp_index[i]  = fi;
+   db_state->flags[i]       |= DB_STATE_FLAG_SETFP_CHECKED;
 }
 
 static int task_database_iterate_playlist(
@@ -2412,6 +2497,8 @@ static enum scan_verdict task_database_matched(manual_scan_handle_t *_db,
       {
          database_info_crc_index_t    *ci =
             db_state->crc_index[db_state->list_index];
+         database_info_crc_index_t    *fi =
+            db_state->setfp_index[db_state->list_index];
          database_info_serial_index_t *si =
             db_state->serial_index[db_state->list_index];
          struct string_list           *ce =
@@ -2420,6 +2507,9 @@ static enum scan_verdict task_database_matched(manual_scan_handle_t *_db,
          memmove(&db_state->crc_index[1],
                  &db_state->crc_index[0],
                  sizeof(ci) * db_state->list_index);
+         memmove(&db_state->setfp_index[1],
+                 &db_state->setfp_index[0],
+                 sizeof(fi) * db_state->list_index);
          memmove(&db_state->serial_index[1],
                  &db_state->serial_index[0],
                  sizeof(si) * db_state->list_index);
@@ -2428,6 +2518,7 @@ static enum scan_verdict task_database_matched(manual_scan_handle_t *_db,
                  sizeof(ce) * db_state->list_index);
 
          db_state->crc_index[0]    = ci;
+         db_state->setfp_index[0]  = fi;
          db_state->serial_index[0] = si;
          db_state->claim_exts[0]   = ce;
       }
@@ -2510,6 +2601,8 @@ static bool task_database_state_alloc_arrays(
       calloc(count, sizeof(*db_state->crc_index));
    db_state->serial_index = (database_info_serial_index_t**)
       calloc(count, sizeof(*db_state->serial_index));
+   db_state->setfp_index = (database_info_crc_index_t**)
+      calloc(count, sizeof(*db_state->setfp_index));
    db_state->claim_exts = (struct string_list**)
       calloc(count, sizeof(*db_state->claim_exts));
    db_state->index_budget = task_database_index_budget();
@@ -2519,6 +2612,7 @@ static bool task_database_state_alloc_arrays(
        || !db_state->flags
        || !db_state->crc_index
        || !db_state->serial_index
+       || !db_state->setfp_index
        || !db_state->claim_exts)
       return false;
 
@@ -3032,6 +3126,73 @@ static bool task_database_whole_wanted(manual_scan_handle_t *_db,
    return false;
 }
 
+/* A database whose cores open the archive's type may match it by its
+ * fingerprint: its index is not asked for yet, or holds some. */
+static bool task_database_setfp_wanted(manual_scan_handle_t *_db,
+      database_state_handle_t *db_state, const char *name)
+{
+   size_t n = db_state->list->size;
+   size_t i;
+
+   if (   (_db->flags & DB_HANDLE_FLAG_USE_FIRST_MATCH_ONLY)
+       && n && (db_state->flags[0] & DB_STATE_FLAG_MATCHED))
+      n = 1;
+   for (i = 0; i < n; i++)
+      if (   task_database_opens_archive(_db, db_state, i, name)
+          && (   !(db_state->flags[i] & DB_STATE_FLAG_SETFP_CHECKED)
+              || db_state->setfp_index[i]))
+         return true;
+   return false;
+}
+
+/* One database's fingerprint lookup, where its cores open the
+ * archive's type.  A hit is written as a match on the archive's own
+ * CRC would be, so the entry is the record's. */
+static enum scan_verdict task_database_iterate_setfp(
+      manual_scan_handle_t *_db,
+      database_state_handle_t *db_state,
+      database_info_handle_t *db,
+      const char *name)
+{
+   size_t                     i = db_state->list_index;
+   database_info_crc_index_t *fi;
+   database_info_list_t      *hits;
+   size_t                     k;
+
+   if (!task_database_opens_archive(_db, db_state, i, name))
+      return database_info_list_iterate_next(db_state);
+   if (!(db_state->flags[i] & DB_STATE_FLAG_SETFP_CHECKED))
+   {
+      fi = NULL;
+      if (   db_state->index_budget
+          && !task_database_index_take(db_state, &fi, NULL, NULL))
+         return SCAN_VERDICT_CONTINUE;
+      task_database_setfp_keep(db_state, i, fi);
+   }
+
+   if (   !(fi = db_state->setfp_index[i])
+       || !(hits = database_info_list_new_crc(fi,
+            db_state->list->elems[i].data,
+            db_state->members->set_fp, 0, DB_EXTRACT_SCAN_FIELDS)))
+      return database_info_list_iterate_next(db_state);
+
+   for (k = 0; k < hits->count; k++)
+      if (hits->list[k].crc32)
+         break;
+   if (k == hits->count)
+   {
+      database_info_list_free(hits);
+      free(hits);
+      return database_info_list_iterate_next(db_state);
+   }
+
+   database_info_list_free(db_state->info);
+   free(db_state->info);
+   db_state->info        = hits;
+   db_state->entry_index = k;
+   return database_info_list_iterate_found_match(_db, db_state, db, NULL);
+}
+
 /* One database's say on reading the archive whole: one whose cores
  * open the type may hold it, unless the archive's size is outside its
  * size range, where the whole pass would skip it too, or its index
@@ -3062,13 +3223,14 @@ static enum scan_verdict task_database_iterate_size(
    return task_database_whole_pass(db_state, name);
 }
 
-/* The archive's next pass.  One member: a miss asks whether a database
- * may hold the archive by its size, which reads it whole; a held hit
- * goes straight to every member's.  Several members: the size pass,
- * then either CRC where the type is opened, the archive's own only if
- * the size let it be read.  Where none of that matches, every member's
- * stored CRC, whose lookups walk each database that claims a member's
- * type. */
+/* The archive's next pass.  One member: a miss asks for its set
+ * fingerprint, then whether a database may hold the archive by its
+ * size, which reads it whole; a held hit goes straight to every
+ * member's, the cartridge record being the archive's.  Several members:
+ * the fingerprint, the size pass, then either CRC where the type is
+ * opened, the archive's own only if the size let it be read.  Where
+ * none of that matches, every member's stored CRC, whose lookups walk
+ * each database that claims a member's type. */
 static enum scan_verdict task_database_archive_next(
       manual_scan_handle_t *_db, database_state_handle_t *db_state,
       database_info_handle_t *db, const char *name,
@@ -3077,6 +3239,12 @@ static enum scan_verdict task_database_archive_next(
    size_t first;
 
    if (   db_state->crc_pass == DB_CRC_PASS_MEMBER
+       && !db_state->member_hit
+       && db_state->members && db_state->members->set_fp
+       && task_database_setfp_wanted(_db, db_state, name))
+      return task_database_pass_begin(db_state, DB_CRC_PASS_SETFP);
+   if (   (   db_state->crc_pass == DB_CRC_PASS_MEMBER
+           || db_state->crc_pass == DB_CRC_PASS_SETFP)
        && !db_state->member_hit
        && task_database_whole_wanted(_db, db_state, name))
       return task_database_pass_begin(db_state, DB_CRC_PASS_SIZE);
@@ -3134,6 +3302,8 @@ static enum scan_verdict task_database_iterate_crc_lookup(
             path_contains_compressed_file);
    }
 
+   if (db_state->crc_pass == DB_CRC_PASS_SETFP)
+      return task_database_iterate_setfp(_db, db_state, db, name);
    if (db_state->crc_pass == DB_CRC_PASS_EVERY)
       return task_database_iterate_every(_db, db_state, name);
    if (db_state->crc_pass == DB_CRC_PASS_SIZE)
@@ -4272,6 +4442,14 @@ static void free_manual_content_scan_handle(manual_scan_handle_t *manual_scan)
                database_info_serial_index_free(dbstate->serial_index[si]);
             free(dbstate->serial_index);
             dbstate->serial_index = NULL;
+         }
+         if (dbstate->setfp_index)
+         {
+            size_t fi;
+            for (fi = 0; fi < db_count; fi++)
+               database_info_crc_index_free(dbstate->setfp_index[fi]);
+            free(dbstate->setfp_index);
+            dbstate->setfp_index = NULL;
          }
          if (dbstate->claim_exts)
          {
