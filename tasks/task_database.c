@@ -589,6 +589,12 @@ typedef struct manual_scan_handle
    database_state_handle_t state;
    uint8_t flags;
 #ifdef SCAN_HAVE_READERS
+   /* The fingerprint indexes built before the readers start: the build
+    * in flight, the next database, and whether one that opens zip may
+    * match a set by its fingerprint. */
+   database_info_index_job_t *setfp_job;
+   size_t setfp_next;
+   bool setfp_keyed;
    bool readers_tried;
 #endif
 #endif
@@ -1675,7 +1681,8 @@ static void scan_reader_handler(retro_task_t *task)
          }
          /* Only the directory unless a whole read is granted, or it is
           * a TorrentZip set of several members while a database opens
-          * zip: the scan reads it whole if its passes ask for that. */
+          * zip and none of those carries fingerprints: the scan reads
+          * it whole if its passes ask for that. */
          if (   m
              && !(m->torrentzip && m->count > 1 && blk->tz_free)
              && !scan_reader_credit(blk))
@@ -1707,19 +1714,41 @@ leave:
    task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
 }
 
-/* Some database opens zip: a TorrentZip set of several members is then
- * read whole with no grant, as its own CRC may be asked. */
+/* How many readers scan_readers_start() pushes: none below 2. */
+static unsigned scan_readers_wanted(void)
+{
+   unsigned n = cpu_features_get_core_amount();
+
+   if (n > SCAN_READERS_MAX)
+      n = SCAN_READERS_MAX;
+   if (n < 2 || !task_queue_is_threaded())
+      return 0;
+   return n;
+}
+
+/* The cores claiming database @i open zip. */
+static bool scan_readers_opens_zip(manual_scan_handle_t *manual_scan,
+      size_t i)
+{
+   database_state_handle_t *st = &manual_scan->state;
+
+   return (manual_scan->flags & DB_HANDLE_FLAG_SCAN_WITHOUT_CORE_MATCH)
+      || (   string_list_find_elem(st->claim_exts[i], "zip")
+          && !(st->flags[i] & DB_STATE_FLAG_ARCHIVE_MEMBER));
+}
+
+/* Some database opens zip and none of those may match a set by its
+ * fingerprint: a TorrentZip set of several members is then read whole
+ * with no grant, as its own CRC may be asked. */
 static bool scan_readers_tz_free(manual_scan_handle_t *manual_scan)
 {
    database_state_handle_t *st = &manual_scan->state;
    size_t                   i;
 
-   if (!st->list || !st->claim_exts)
+   if (!st->list || !st->claim_exts || manual_scan->setfp_keyed)
       return false;
    for (i = 0; i < st->list->size; i++)
-      if (   (manual_scan->flags & DB_HANDLE_FLAG_SCAN_WITHOUT_CORE_MATCH)
-          || (   string_list_find_elem(st->claim_exts[i], "zip")
-              && !(st->flags[i] & DB_STATE_FLAG_ARCHIVE_MEMBER)))
+      if (scan_readers_opens_zip(manual_scan, i))
          return true;
    return false;
 }
@@ -1731,13 +1760,11 @@ static void scan_readers_start(retro_task_t *task,
 {
    scan_readers_t *blk;
    size_t          i;
-   unsigned        n = cpu_features_get_core_amount();
+   unsigned        n = scan_readers_wanted();
    unsigned        r;
 
    manual_scan->readers_tried = true;
-   if (n > SCAN_READERS_MAX)
-      n = SCAN_READERS_MAX;
-   if (n < 2 || !task_queue_is_threaded())
+   if (!n)
       return;
    if (!(blk = (scan_readers_t*)calloc(1, sizeof(*blk))))
       return;
@@ -2107,6 +2134,50 @@ static void task_database_setfp_keep(database_state_handle_t *db_state,
    db_state->setfp_index[i]  = fi;
    db_state->flags[i]       |= DB_STATE_FLAG_SETFP_CHECKED;
 }
+
+#ifdef SCAN_HAVE_READERS
+/* Before the readers start, the fingerprint index of each database
+ * whose cores open zip, so that they know whether a TorrentZip set may
+ * match without its own CRC.  A refused build counts as keyed: that
+ * database can then match such a set only by its CRC.  False while a
+ * build runs. */
+static bool task_database_setfp_eager(manual_scan_handle_t *manual_scan,
+      nbio_budget_t *b)
+{
+   database_state_handle_t *st = &manual_scan->state;
+
+   if (!st->list || !st->claim_exts || !scan_readers_wanted())
+      return true;
+   for (; manual_scan->setfp_next < st->list->size;
+         manual_scan->setfp_next++)
+   {
+      size_t                     i  = manual_scan->setfp_next;
+      database_info_crc_index_t *fi = NULL;
+
+      if (   (st->flags[i] & DB_STATE_FLAG_SETFP_CHECKED)
+          || !scan_readers_opens_zip(manual_scan, i))
+         continue;
+      if (!manual_scan->setfp_job && st->index_budget)
+         manual_scan->setfp_job = database_info_index_job_new(
+               st->list->elems[i].data, st->index_budget,
+               DATABASE_INFO_INDEX_CRC | DATABASE_INFO_INDEX_SETFP);
+      if (manual_scan->setfp_job)
+      {
+         while (!database_info_index_job_step(manual_scan->setfp_job,
+                  SCAN_INDEX_RECORDS, SCAN_INDEX_ENTRIES))
+            if (!task_nbio_slice_within_budget(b, 0, 0))
+               return false;
+         database_info_index_job_finish(manual_scan->setfp_job, &fi,
+               NULL, NULL);
+         manual_scan->setfp_job = NULL;
+      }
+      if (!fi || database_info_crc_index_count(fi))
+         manual_scan->setfp_keyed = true;
+      task_database_setfp_keep(st, i, fi);
+   }
+   return true;
+}
+#endif
 
 static int task_database_iterate_playlist(
       manual_scan_handle_t *_db,
@@ -4413,6 +4484,10 @@ static void free_manual_content_scan_handle(manual_scan_handle_t *manual_scan)
          string_list_free(dbstate->member_exts);
          dbstate->member_exts = NULL;
          task_database_index_close(dbstate);
+#ifdef SCAN_HAVE_READERS
+         database_info_index_job_free(manual_scan->setfp_job);
+         manual_scan->setfp_job = NULL;
+#endif
          if (dbstate->list)
          {
             dir_list_free(dbstate->list);
@@ -5255,7 +5330,11 @@ static enum scan_step task_manual_scan_iterate_step(retro_task_t *task,
             if (   !manual_scan->readers_tried
                 && manual_scan->content_list->size
                    - manual_scan->content_list_index >= 2)
+            {
+               if (!task_database_setfp_eager(manual_scan, b))
+                  break;
                scan_readers_start(task, manual_scan);
+            }
 #endif
             /* Check if this is an M3U file and add to list for post-processing */
             if (rm3u_is_m3u_filestream(content_path))

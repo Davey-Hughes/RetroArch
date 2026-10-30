@@ -738,14 +738,25 @@ database_info_index_job_t *__real_database_info_index_job_new(
 /* When set, the most every index build may take: 1 refuses them all,
  * as a spent or too small budget does. */
 static size_t index_cap;
+/* When set, the most a fingerprint index build may take. */
+static size_t setfp_cap;
+/* Fingerprint index builds begun, refused ones too. */
+static unsigned setfp_builds;
 
 database_info_index_job_t *__wrap_database_info_index_job_new(
       const char *rdb_path, size_t max_bytes, unsigned want)
 {
-   database_info_index_job_t *job = __real_database_info_index_job_new(
-         rdb_path, index_cap ? index_cap : max_bytes, want);
+   size_t                     cap = index_cap ? index_cap : max_bytes;
+   database_info_index_job_t *job;
 
-   if (   job && walk_name && strstr(rdb_path, walk_name)
+   if (want & DATABASE_INFO_INDEX_SETFP)
+      setfp_builds++;
+   if (setfp_cap && (want & DATABASE_INFO_INDEX_SETFP))
+      cap = setfp_cap;
+   job = __real_database_info_index_job_new(rdb_path, cap, want);
+
+   if (   job && walk_name && !(want & DATABASE_INFO_INDEX_SETFP)
+       && strstr(rdb_path, walk_name)
        && __real_task_queue_is_threaded())
    {
       walk_hold(walk_want);
@@ -4119,18 +4130,21 @@ fixture:
 }
 
 /* TorrentZip sets of several members are read whole by the readers
- * with no grant while a database opens zip; a TorrentZip zip of one
- * member is not; plain ones only by the scan, once the size lets it;
- * neither while no database opens zip.  No record matches, so no
- * whole match grants a read ahead. */
+ * with no grant while a database opens zip and none of those carries
+ * set fingerprints; one whose fingerprint index was refused counts as
+ * carrying them.  A TorrentZip zip of one member is not read so; plain
+ * ones only by the scan, once the size lets it; neither while no
+ * database opens zip.  No record matches, so no whole match grants a
+ * read ahead. */
 static void tz_reader_lane(const char *root)
 {
    static uint8_t d[2][MF_MEMBER_LEN];
-   char           db[2][512], dir[2][512], p[1024], detail[64];
-   db_rec_t       arc[2], cart;
+   static char    p[1024];
+   char           db[3][512], dir[2][512], detail[64];
+   db_rec_t       arc[2], cart, fp[2];
    zip_entry_t    e[2];
    uint32_t       one_bytes;
-   unsigned       k, j;
+   unsigned       k, j, walks[5];
    int            scan, rdr, one;
    bool           started;
 
@@ -4141,6 +4155,7 @@ static void tz_reader_lane(const char *root)
    }
    sprintf(db[0],  "%s/tz_reader_db",    root);
    sprintf(db[1],  "%s/tz_reader_nozip", root);
+   sprintf(db[2],  "%s/tz_reader_fp",    root);
    sprintf(dir[0], "%s/tz_reader_tz",    root);
    sprintf(dir[1], "%s/tz_reader_plain", root);
    for (j = 0; j < 2; j++)
@@ -4148,6 +4163,7 @@ static void tz_reader_lane(const char *root)
       path_mkdir(db[j]);
       path_mkdir(dir[j]);
    }
+   path_mkdir(db[2]);
    memset(e, 0, sizeof(e));
    e[0].name = "a.ar";
    e[1].name = "b.ar";
@@ -4185,17 +4201,26 @@ static void tz_reader_lane(const char *root)
    sprintf(p, "%s/Test Arc Gate.rdb", db[0]);
    if (!write_db_set(p, arc, 2))
       goto fixture;
+   /* The same records, one keyed on a fingerprint no set has. */
+   fp[0]        = arc[0];
+   fp[1]        = arc[1];
+   fp[0].set_fp = 0x0CA701FEu;
+   sprintf(p, "%s/Test Arc Gate.rdb", db[2]);
+   if (!write_db_set(p, fp, 2))
+      goto fixture;
    set_rec(&cart, "TZR Cart", 0x0CA701F2u, MF_MEMBER_LEN);
    sprintf(p, "%s/Test Cart Gate.rdb", db[1]);
    if (!write_db_set(p, &cart, 1))
       goto fixture;
 
    use_queue(true);
-   for (j = 0; j < 3; j++)
+   for (j = 0; j < 5; j++)
    {
       bool tz = (j != 1);
 
-      use_db(db[j == 2]);
+      use_db(db[j == 2 ? 1 : (j > 2 ? 2 : 0)]);
+      setfp_cap  = (j == 4) ? 1 : 0;
+      setfp_builds = 0;
       retro_atomic_store_release_int(&reads_begun,  0);
       retro_atomic_store_release_int(&reader_begun, 0);
       retro_atomic_store_release_int(&watch_scan,   0);
@@ -4203,6 +4228,8 @@ static void tz_reader_lane(const char *root)
       begun_size = tz ? TZ_ZIP_LEN : ARC_ZIP_LEN;
       watch_size = one_bytes;
       started    = run_scan(dir[tz ? 0 : 1]) && scan_completed;
+      setfp_cap  = 0;
+      walks[j]   = setfp_builds;
       begun_size = 0;
       watch_size = 0;
       rdr        = retro_atomic_load_acquire_int(&reader_begun);
@@ -4221,14 +4248,30 @@ static void tz_reader_lane(const char *root)
       else if (j == 1)
          check(started && scan == GATE_ZIPS && rdr == 0,
                "plain sets: the scan reads them once sized", detail);
-      else
+      else if (j == 2)
          check(started && scan == 0 && rdr == 0,
                "TorrentZip sets: no zip database, no read", detail);
+      else if (j == 3)
+         check(started && scan == GATE_ZIPS && rdr == 0,
+               "TorrentZip sets: a zip database with fingerprints, "
+               "the scan reads them", detail);
+      else
+         check(started && scan == GATE_ZIPS && rdr == 0,
+               "TorrentZip sets: a refused fingerprint index counts "
+               "as keyed", detail);
    }
+   /* One walk for each database that opens zip, none for the other. */
+   sprintf(detail, "%u %u %u %u %u walks", walks[0], walks[1], walks[2],
+         walks[3], walks[4]);
+   check(   walks[0] == 1 && walks[1] == 1 && walks[2] == 0
+         && walks[3] == 1 && walks[4] == 1,
+         "TorrentZip sets: one fingerprint index walk per zip database",
+         detail);
    return;
 
 fixture:
    zip_comment = NULL;
+   setfp_cap   = 0;
    check(0, "fixture", "could not write the TorrentZip sets");
 }
 
