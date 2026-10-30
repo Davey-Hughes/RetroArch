@@ -798,6 +798,8 @@ bool __wrap_database_info_index_job_step(database_info_index_job_t *job,
          retro_sleep(WALK_IDLE_MS);
    }
    done = __real_database_info_index_job_step(job, records, entries);
+   if (done && job == setfp_job_live)
+      setfp_stepped = false;
    if (done && job == walk_job)
    {
       walk_to  = retro_atomic_load_acquire_int(&rd_wholes);
@@ -4197,7 +4199,8 @@ static void tz_reader_lane(const char *root)
 {
    static uint8_t d[2][MF_MEMBER_LEN];
    static char    p[1024];
-   char           db[3][512], dir[2][512], detail[64];
+   static char    db[4][512];
+   char           dir[2][512], detail[64];
    db_rec_t       arc[2], cart, fp[2];
    zip_entry_t    e[2];
    uint32_t       one_bytes;
@@ -4213,6 +4216,7 @@ static void tz_reader_lane(const char *root)
    sprintf(db[0],  "%s/tz_reader_db",    root);
    sprintf(db[1],  "%s/tz_reader_nozip", root);
    sprintf(db[2],  "%s/tz_reader_fp",    root);
+   sprintf(db[3],  "%s/tz_reader_nocm",  root);
    sprintf(dir[0], "%s/tz_reader_tz",    root);
    sprintf(dir[1], "%s/tz_reader_plain", root);
    for (j = 0; j < 2; j++)
@@ -4221,6 +4225,7 @@ static void tz_reader_lane(const char *root)
       path_mkdir(dir[j]);
    }
    path_mkdir(db[2]);
+   path_mkdir(db[3]);
    memset(e, 0, sizeof(e));
    e[0].name = "a.ar";
    e[1].name = "b.ar";
@@ -4325,19 +4330,34 @@ static void tz_reader_lane(const char *root)
          "TorrentZip sets: one fingerprint index walk per zip database",
          detail);
 
-   /* Without core match every database opens zip. */
-   sprintf(p, "%s/Test Arc Gate.rdb", db[1]);
+   /* Without core match every database opens zip: a keyed one whose
+    * cores open no zip keeps the readers off the TorrentZip sets. */
+   cart.set_fp = 0x0CA701FDu;
+   sprintf(p, "%s/Test Arc Gate.rdb", db[3]);
    if (!write_db_set(p, arc, 2))
       goto fixture;
-   use_db(db[1]);
+   sprintf(p, "%s/Test Cart Gate.rdb", db[3]);
+   if (!write_db_set(p, &cart, 1))
+      goto fixture;
+   use_db(db[3]);
    config_get_ptr()->bools.scan_without_core_match = true;
    setfp_builds = 0;
+   retro_atomic_store_release_int(&reads_begun,  0);
+   retro_atomic_store_release_int(&reader_begun, 0);
+   begun_size   = TZ_ZIP_LEN;
    started      = run_scan(dir[0]) && scan_completed;
+   begun_size   = 0;
    config_get_ptr()->bools.scan_without_core_match = false;
-   sprintf(detail, "%u walks for 2", setfp_builds);
+   rdr          = retro_atomic_load_acquire_int(&reader_begun);
+   scan         = retro_atomic_load_acquire_int(&reads_begun) - rdr;
+   sprintf(detail, "scan %d, readers %d, %u walks for 2", scan, rdr,
+         setfp_builds);
    check(started && setfp_builds == 2,
          "without core match: one fingerprint index walk per database",
          detail);
+   check(started && scan == GATE_ZIPS && rdr == 0,
+         "without core match: a keyed non-zip database, the scan "
+         "reads them", detail);
 
    use_db(db[2]);
    setfp_builds  = 0;
