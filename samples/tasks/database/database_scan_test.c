@@ -742,6 +742,14 @@ static size_t index_cap;
 static size_t setfp_cap;
 /* Fingerprint index builds begun, refused ones too. */
 static unsigned setfp_builds;
+/* When set, the budget checks after the fingerprint index build's
+ * steps fail: setfp_yield_n times, or with setfp_stall always, its
+ * steps then doing nothing.  setfp_yields counts those failures. */
+static unsigned                   setfp_yield_n;
+static bool                       setfp_stall;
+static bool                       setfp_stepped;
+static database_info_index_job_t *setfp_job_live;
+static retro_atomic_int_t         setfp_yields;
 
 database_info_index_job_t *__wrap_database_info_index_job_new(
       const char *rdb_path, size_t max_bytes, unsigned want)
@@ -754,6 +762,8 @@ database_info_index_job_t *__wrap_database_info_index_job_new(
    if (setfp_cap && (want & DATABASE_INFO_INDEX_SETFP))
       cap = setfp_cap;
    job = __real_database_info_index_job_new(rdb_path, cap, want);
+   if ((setfp_stall || setfp_yield_n) && (want & DATABASE_INFO_INDEX_SETFP))
+      setfp_job_live = job;
 
    if (   job && walk_name && !(want & DATABASE_INFO_INDEX_SETFP)
        && strstr(rdb_path, walk_name)
@@ -774,6 +784,12 @@ bool __wrap_database_info_index_job_step(database_info_index_job_t *job,
 {
    bool done;
 
+   if ((setfp_stall || setfp_yield_n) && job && job == setfp_job_live)
+   {
+      setfp_stepped = true;
+      if (setfp_stall)
+         return false;
+   }
    if (job == walk_job && !walk_steps++ && !walk_late)
    {
       if (walk_more)
@@ -797,6 +813,14 @@ bool __wrap_task_nbio_slice_within_budget(void *ud, size_t avail,
 {
    if (walk_job)
       return true;
+   if ((setfp_stall || setfp_yield_n) && setfp_stepped)
+   {
+      setfp_stepped = false;
+      if (setfp_yield_n)
+         setfp_yield_n--;
+      retro_atomic_fetch_add_int(&setfp_yields, 1);
+      return false;
+   }
    return __real_task_nbio_slice_within_budget(ud, avail, len);
 }
 
@@ -2384,6 +2408,38 @@ static retro_time_t run_scan_cancelled(const char *dir, bool on_stuck)
       retro_sleep(1);
    }
    return (scan_completed && cancelled) ? cb_usec - cancelled : -1;
+}
+
+/* As run_scan(), but cancels once the fingerprint index build has
+ * yielded.  True when the scan then ends. */
+static bool run_scan_cancel_setfp(const char *dir)
+{
+   task_finder_data_t finder;
+   bool               cancelled = false;
+   time_t             started;
+
+   loop_active    = true;
+   scan_completed = false;
+   if (!task_push_dbscan(dir, scan_cb))
+      return false;
+   finder.func     = find_scan;
+   finder.userdata = NULL;
+   started         = time(NULL);
+   while (loop_active)
+   {
+      if (   !cancelled
+          && retro_atomic_load_acquire_int(&setfp_yields) > 0
+          && task_queue_find(&finder))
+      {
+         task_queue_cancel_ident(lane_ident);
+         cancelled = true;
+      }
+      task_queue_check();
+      if (difftime(time(NULL), started) > SCAN_TIMEOUT_SECONDS)
+         return false;
+      retro_sleep(1);
+   }
+   return cancelled;
 }
 
 /* Reader tasks on the threaded queue's parallel workers.  The cancel
@@ -4131,11 +4187,12 @@ fixture:
 
 /* TorrentZip sets of several members are read whole by the readers
  * with no grant while a database opens zip and none of those carries
- * set fingerprints; one whose fingerprint index was refused counts as
- * carrying them.  A TorrentZip zip of one member is not read so; plain
- * ones only by the scan, once the size lets it; neither while no
- * database opens zip.  No record matches, so no whole match grants a
- * read ahead. */
+ * set fingerprints; a refused fingerprint index carries none.  A
+ * TorrentZip zip of one member is not read so; plain ones only by the
+ * scan, once the size lets it; neither while no database opens zip.
+ * No record matches, so no whole match grants a read ahead.  The
+ * fingerprint index build resumes after a yield and is freed when the
+ * scan is cancelled during it. */
 static void tz_reader_lane(const char *root)
 {
    static uint8_t d[2][MF_MEMBER_LEN];
@@ -4145,7 +4202,7 @@ static void tz_reader_lane(const char *root)
    zip_entry_t    e[2];
    uint32_t       one_bytes;
    unsigned       k, j, walks[5];
-   int            scan, rdr, one;
+   int            scan, rdr, one, yields;
    bool           started;
 
    if (!readers_expected())
@@ -4219,7 +4276,7 @@ static void tz_reader_lane(const char *root)
       bool tz = (j != 1);
 
       use_db(db[j == 2 ? 1 : (j > 2 ? 2 : 0)]);
-      setfp_cap  = (j == 4) ? 1 : 0;
+      setfp_cap    = (j == 4) ? 1 : 0;
       setfp_builds = 0;
       retro_atomic_store_release_int(&reads_begun,  0);
       retro_atomic_store_release_int(&reader_begun, 0);
@@ -4256,9 +4313,9 @@ static void tz_reader_lane(const char *root)
                "TorrentZip sets: a zip database with fingerprints, "
                "the scan reads them", detail);
       else
-         check(started && scan == GATE_ZIPS && rdr == 0,
+         check(started && scan == 0 && rdr == GATE_ZIPS,
                "TorrentZip sets: a refused fingerprint index counts "
-               "as keyed", detail);
+               "as none", detail);
    }
    /* One walk for each database that opens zip, none for the other. */
    sprintf(detail, "%u %u %u %u %u walks", walks[0], walks[1], walks[2],
@@ -4267,6 +4324,49 @@ static void tz_reader_lane(const char *root)
          && walks[3] == 1 && walks[4] == 1,
          "TorrentZip sets: one fingerprint index walk per zip database",
          detail);
+
+   /* Without core match every database opens zip. */
+   sprintf(p, "%s/Test Arc Gate.rdb", db[1]);
+   if (!write_db_set(p, arc, 2))
+      goto fixture;
+   use_db(db[1]);
+   config_get_ptr()->bools.scan_without_core_match = true;
+   setfp_builds = 0;
+   started      = run_scan(dir[0]) && scan_completed;
+   config_get_ptr()->bools.scan_without_core_match = false;
+   sprintf(detail, "%u walks for 2", setfp_builds);
+   check(started && setfp_builds == 2,
+         "without core match: one fingerprint index walk per database",
+         detail);
+
+   use_db(db[2]);
+   setfp_builds  = 0;
+   setfp_yield_n = 1;
+   retro_atomic_store_release_int(&setfp_yields, 0);
+   retro_atomic_store_release_int(&reads_begun,  0);
+   retro_atomic_store_release_int(&reader_begun, 0);
+   begun_size     = TZ_ZIP_LEN;
+   started        = run_scan(dir[0]) && scan_completed;
+   begun_size     = 0;
+   setfp_yield_n  = 0;
+   setfp_job_live = NULL;
+   rdr            = retro_atomic_load_acquire_int(&reader_begun);
+   scan           = retro_atomic_load_acquire_int(&reads_begun) - rdr;
+   yields         = retro_atomic_load_acquire_int(&setfp_yields);
+   sprintf(detail, "scan %d, readers %d, %u walks, %d yields", scan, rdr,
+         setfp_builds, yields);
+   check(   started && scan == GATE_ZIPS && rdr == 0
+         && setfp_builds == 1 && yields == 1,
+         "fingerprint index build: resumed after a yield", detail);
+
+   setfp_stall = true;
+   retro_atomic_store_release_int(&setfp_yields, 0);
+   started        = run_scan_cancel_setfp(dir[0]);
+   setfp_stall    = false;
+   setfp_job_live = NULL;
+   sprintf(detail, "%d yields", retro_atomic_load_acquire_int(&setfp_yields));
+   check(started, "fingerprint index build: a cancel during it ends the "
+         "scan", detail);
    return;
 
 fixture:
@@ -5633,10 +5733,10 @@ fixture:
  * and a duplicate, as a zstd or 7z repack differs.  The record holds
  * the first's CRC, the second's size and the fingerprint of its member
  * CRCs, so the second matches by fingerprint, from its one directory
- * read and not read whole, and is written as the first would be.  So do repacks with a directory
- * first, or a cue or gdi sheet or an empty member beside the ROMs; one
- * with a member that stores no CRC has no fingerprint.  Without the
- * key nothing matches. */
+ * read and not read whole, and is written as the first would be.  So
+ * do repacks with a directory first, or a cue or gdi sheet or an empty
+ * member beside the ROMs; one with a member that stores no CRC has no
+ * fingerprint.  Without the key nothing matches. */
 static void set_fp_lane(const char *root, const char *pl_dir,
       bool threaded)
 {

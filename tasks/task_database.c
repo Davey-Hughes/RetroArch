@@ -1726,15 +1726,15 @@ static unsigned scan_readers_wanted(void)
    return n;
 }
 
+static bool task_database_opens_archive(manual_scan_handle_t *_db,
+      database_state_handle_t *db_state, size_t i, const char *name);
+
 /* The cores claiming database @i open zip. */
 static bool scan_readers_opens_zip(manual_scan_handle_t *manual_scan,
       size_t i)
 {
-   database_state_handle_t *st = &manual_scan->state;
-
-   return (manual_scan->flags & DB_HANDLE_FLAG_SCAN_WITHOUT_CORE_MATCH)
-      || (   string_list_find_elem(st->claim_exts[i], "zip")
-          && !(st->flags[i] & DB_STATE_FLAG_ARCHIVE_MEMBER));
+   return task_database_opens_archive(manual_scan, &manual_scan->state,
+         i, "x.zip");
 }
 
 /* Some database opens zip and none of those may match a set by its
@@ -2138,9 +2138,9 @@ static void task_database_setfp_keep(database_state_handle_t *db_state,
 #ifdef SCAN_HAVE_READERS
 /* Before the readers start, the fingerprint index of each database
  * whose cores open zip, so that they know whether a TorrentZip set may
- * match without its own CRC.  A refused build counts as keyed: that
- * database can then match such a set only by its CRC.  False while a
- * build runs. */
+ * match without its own CRC.  A refused build counts as none: that
+ * database can match such a set only by its CRC, read whole.  False
+ * while a build runs. */
 static bool task_database_setfp_eager(manual_scan_handle_t *manual_scan,
       nbio_budget_t *b)
 {
@@ -2171,7 +2171,7 @@ static bool task_database_setfp_eager(manual_scan_handle_t *manual_scan,
                NULL, NULL);
          manual_scan->setfp_job = NULL;
       }
-      if (!fi || database_info_crc_index_count(fi))
+      if (fi && database_info_crc_index_count(fi))
          manual_scan->setfp_keyed = true;
       task_database_setfp_keep(st, i, fi);
    }
