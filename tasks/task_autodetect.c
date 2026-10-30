@@ -44,6 +44,7 @@
 
 #ifdef HAVE_MENU
 #include "../menu/menu_driver.h"
+#include "../msg_hash_lbl_str.h"
 #endif
 
 #include "../retroarch.h"
@@ -1265,8 +1266,6 @@ static void reallocate_leading_ports(
 
       if (*settings_value)
       {
-         char *endptr;
-         char *colon;
          unsigned long parsed_vid;
          unsigned long parsed_pid;
 
@@ -1276,27 +1275,13 @@ static void reallocate_leading_ports(
                    settings->uints.input_device_reservation_type[player],
                    settings_value, vendor_id, product_id);
 
-         colon      = strchr(settings_value, ':');
-         parsed_vid = strtoul(settings_value, &endptr, 16);
-
-         if (colon && endptr == colon)
+         if (input_config_parse_vid_pid(settings_value,
+                  &parsed_vid, &parsed_pid, NULL))
          {
-            parsed_pid = strtoul(colon + 1, &endptr, 16);
-            if (endptr != colon + 1 && (*endptr == ' ' || *endptr == '\0'))
-            {
-               settings_value_vendor_id  = (unsigned int)parsed_vid;
-               settings_value_product_id = (unsigned int)parsed_pid;
-               device_has_reserved_slot  = (  vendor_id  == settings_value_vendor_id
-                                           && product_id == settings_value_product_id);
-            }
-            else
-            {
-               strlcpy(settings_value_device_name, settings_value,
-                       sizeof(settings_value_device_name));
-               device_has_reserved_slot =
-                     string_is_equal(device_name, settings_value_device_name)
-                  || string_is_equal(device_display_name, settings_value_device_name);
-            }
+            settings_value_vendor_id  = (unsigned int)parsed_vid;
+            settings_value_product_id = (unsigned int)parsed_pid;
+            device_has_reserved_slot  = (  vendor_id  == settings_value_vendor_id
+                                        && product_id == settings_value_product_id);
          }
          else
          {
@@ -1396,15 +1381,72 @@ static void reallocate_port_if_needed(
       const char *device_display_name)
 {
    uint8_t leader[MAX_USERS];
+   bool runtime;
 
    if (detected_port >= MAX_USERS)
       return;
    input_config_sanitize_joypad_indices();
+   /* placed by Plays As, else as the reservations place it */
+   if (input_config_plays_as_place(detected_port))
+      return;
+   runtime = input_driver_ports_runtime();
    input_config_shared_ports(leader);
    reallocate_leading_ports(leader, detected_port, vendor_id, product_id,
          device_name, device_display_name);
    input_config_follow_shared_ports(leader);
+   /* placed over runtime moves, the reservation's are runtime too */
+   if (runtime)
+      input_driver_ports_runtime_moved();
 }
+
+/* Only what a Player or Max Users change moves is placed again, as its
+ * connect placed it: no other controller moves into a port emptied
+ * since. No driver restarts; the headset's hands follow on the next
+ * poll. */
+void input_autoconfigure_reallocate_ports(unsigned slot)
+{
+   unsigned s;
+   uint8_t again[MAX_USERS];
+
+   if (slot < MAX_USERS)
+   {
+      memset(again, 0, sizeof(again));
+      again[slot] = 1;
+   }
+   else
+      input_config_plays_as_max_users_changed(again);
+   for (s = 0; s < MAX_USERS; s++)
+   {
+      const char *name = input_config_get_device_name(s);
+      if (!again[s] || !name)
+         continue;
+      reallocate_port_if_needed(s,
+            input_config_get_device_vid(s),
+            input_config_get_device_pid(s),
+            name,
+            input_config_get_device_display_name(s));
+   }
+   /* the ports may have changed controllers: their deadzones with them,
+    * and the hotkeys a sharer reads by its controller */
+   input_driver_deadzones_refresh();
+   input_config_binds_changed();
+}
+
+#ifdef HAVE_MENU
+/* Settings > Input > Controllers and Port N Controls have a row per
+ * controller: if shown, the list is made again. */
+static void input_autoconfigure_refresh_controllers(void)
+{
+   const char *menu_label = NULL;
+   menu_entries_get_last_stack(NULL, &menu_label, NULL, NULL, NULL);
+   if (     string_is_equal(menu_label,
+               MENU_ENUM_LABEL_DEFERRED_INPUT_CONTROLLERS_LIST_STR)
+         || string_is_equal(menu_label,
+               MENU_ENUM_LABEL_DEFERRED_USER_BINDS_LIST_STR))
+      menu_state_get_ptr()->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH
+                                   | MENU_ST_FLAG_PREVENT_POPULATE;
+}
+#endif
 
 /*************************/
 /* Autoconfigure Connect */
@@ -1532,6 +1574,9 @@ static void cb_input_autoconfigure_connect(
          autoconfig_handle->device_info.phys,
          autoconfig_handle->device_info.vid,
          autoconfig_handle->device_info.pid);
+#ifdef HAVE_MENU
+   input_autoconfigure_refresh_controllers();
+#endif
 }
 
 static void input_autoconfigure_connect_handler(retro_task_t *task)
@@ -2176,8 +2221,12 @@ static void cb_input_autoconfigure_disconnect(
    input_config_set_device_pid(port, 0);
    input_config_set_device_autoconfigured(port, false);
    input_config_reset_autoconfig_binds(port);
+   input_config_plays_as_release(port);
 
    input_driver_registry_disconnect(port);
+#ifdef HAVE_MENU
+   input_autoconfigure_refresh_controllers();
+#endif
 }
 
 static void input_autoconfigure_disconnect_handler(retro_task_t *task)

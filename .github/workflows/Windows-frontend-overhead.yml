@@ -1,0 +1,72 @@
+name: CI Windows frontend overhead [frame-path harness]
+
+# The harness of Linux-frontend-overhead.yml, built with mingw-w64 and
+# run on Windows, where its lanes reach what no Linux build has:
+# WinUSB's source beside the joypad driver, Winsock under the network
+# pad. The heap lane counts by glibc interposition and skips here.
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  windows-frontend-overhead:
+    name: Release build, frame-path cost (UCRT64)
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+
+      - name: Install packages
+        run: |
+          # A mirror that stalls or rate-limits (HTTP 429) fails pacman's
+          # whole transaction; what it fetched stays in the cache, so a
+          # retry fetches only the rest, one file at a time after a
+          # growing wait so a shared runner's rate limit can clear.
+          p=$MINGW_PACKAGE_PREFIX
+          pkgs="base-devel $p-toolchain"
+          for i in 1 2 3 4 5; do
+            pacman -S --noconfirm --needed $pkgs && exit 0
+            [ $i = 5 ] && break
+            echo "package install failed (attempt $i); retrying in $((30 * i))s, serial downloads"
+            sed -i -e '/^#*ParallelDownloads/d' -e '/^\[options\]/a ParallelDownloads = 1' /etc/pacman.conf
+            sleep $((30 * i))
+          done
+          exit 1
+
+      - name: Configure
+        # Non-Qt, as the harness requires (with Qt, main() lives in
+        # ui_qt.o).
+        run: ./configure --disable-qt
+
+      - name: Build (release)
+        run: make -j"$(nproc)"
+
+      - name: Run the frontend-overhead harness
+        run: |
+          set -o pipefail
+          TMPDIR=$(cygpath -m "$RUNNER_TEMP") SAN=none make -C samples/runloop/frontend_overhead check
+          make -C samples/runloop/frontend_overhead clean
