@@ -119,6 +119,12 @@ void menu_setting_free(rarch_setting_t *setting);
  * name of the keyboard listed there. */
 size_t menu_setting_keyboard_index_name(unsigned idx, char *s, size_t len);
 
+#ifdef HAVE_VIDEO_WINDOWS
+/* Rebuilds the display rows' values: Auto, then each listed display's
+ * key. App thread; the list is built from it. */
+void menu_setting_video_screen_display_values(void);
+#endif
+
 RETRO_END_DECLS
 
 #endif

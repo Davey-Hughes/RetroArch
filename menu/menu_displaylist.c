@@ -12528,9 +12528,11 @@ unsigned menu_displaylist_build_list(
                      MENU_ENUM_LABEL_VIDEO_WINDOWS_ENABLE,
                      PARSE_ONLY_BOOL, false) == 0)
                count++;
+#ifdef ANDROID
+            /* Only Android places screens and the menu */
             if (settings->bools.video_windows_enable)
             {
-               /* Screen 2, and each further one the core has */
+               /* Screens 1 and 2, and each further one the core has */
                video_driver_state_t *video_st = video_state_get_ptr();
                unsigned screens               = 2;
                unsigned screen;
@@ -12539,20 +12541,31 @@ unsigned menu_displaylist_build_list(
                   screens = video_st->views_core.num_screens;
                if (screens > RETRO_VIDEO_VIEWS_MAX)
                   screens = RETRO_VIDEO_VIEWS_MAX;
-               for (screen = 1; screen < screens; screen++)
+               menu_setting_video_screen_display_values();
+               for (screen = 0; screen < screens; screen++)
                {
                   if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
                            (enum msg_hash_enums)
-                           (MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_MODE + screen),
-                           PARSE_ONLY_UINT, false) == 0)
-                     count++;
-                  if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
-                           (enum msg_hash_enums)
-                           (MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_MONITOR + screen),
-                           PARSE_ONLY_UINT, false) == 0)
+                           (MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY + screen),
+                           PARSE_ONLY_STRING_OPTIONS, false) == 0)
                      count++;
                }
+               if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                        MENU_ENUM_LABEL_VIDEO_MENU_FOLLOWS,
+                        PARSE_ONLY_UINT, false) == 0)
+                  count++;
+               if (     settings->uints.video_menu_follows
+                        == VIDEO_MENU_FOLLOWS_SEPARATE
+                     && MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                        MENU_ENUM_LABEL_VIDEO_MENU_DISPLAY,
+                        PARSE_ONLY_STRING_OPTIONS, false) == 0)
+                  count++;
+               if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                        MENU_ENUM_LABEL_VIDEO_NOTIFICATIONS_WINDOW,
+                        PARSE_ONLY_UINT, false) == 0)
+                  count++;
             }
+#endif
          }
 #endif
 #ifdef HAVE_OPENXR
