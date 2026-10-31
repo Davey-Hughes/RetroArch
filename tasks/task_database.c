@@ -30,6 +30,10 @@
 #include <encodings/crc32.h>
 #include <streams/interface_stream.h>
 #include <streams/file_stream.h>
+#if !defined(_WIN32) && !defined(ORBIS) \
+      && (defined(__unix__) || defined(__APPLE__))
+#include <unistd.h>
+#endif
 #ifdef HAVE_THREADS
 #include <retro_atomic.h>
 #include <features/features_cpu.h>
@@ -137,6 +141,16 @@ static bool scan_results_add(scan_results_t *sr,
 
    sr->count++;
    return true;
+}
+
+static scan_result_t *scan_results_find(scan_results_t *sr,
+      const char *entry_path)
+{
+   size_t i;
+   for (i = 0; i < sr->count; i++)
+      if (string_is_equal(sr->results[i].entry_path, entry_path))
+         return &sr->results[i];
+   return NULL;
 }
 
 static void scan_results_free(scan_results_t *sr)
@@ -592,6 +606,11 @@ typedef struct manual_scan_handle
     * this is how a task_push_dbscan caller learns the scan finished;
     * see cb_task_manual_content_scan. */
    retro_task_callback_t user_cb;
+   void *user_data;
+   /* The callback's task_data. */
+   task_dbscan_result_t result;
+   /* What a scan that could not start told the user. */
+   const char *fail_msg;
 } manual_scan_handle_t;
 
 enum scan_verdict
@@ -638,16 +657,43 @@ static const char *database_info_get_current_element_name(
    return handle->elems[ptr].data;
 }
 #endif
-static void task_database_scan_console_output(const char *label, const char *db_name, bool add)
+enum scan_console_mark
 {
-   char string[32];
-   const char *prefix   = (add) ? "++" : (db_name) ? "==" : "??";
-   const char *no_color = getenv("NO_COLOR");
-   bool color           = (no_color && no_color[0] != '0') ? false : true;
+   SCAN_CONSOLE_ADDED = 0,
+   SCAN_CONSOLE_DUPLICATE,
+   SCAN_CONSOLE_UNMATCHED,
+   SCAN_CONSOLE_ERROR
+};
 
-   /* Colorize prefix (add = green, dupe = yellow, not found = red) */
+/* Whether @stream is a terminal.  Where that cannot be told, say yes. */
+static bool task_database_scan_console_is_tty(FILE *stream)
+{
+#if defined(_WIN32) && !defined(_XBOX) && !defined(__WINRT__)
+   DWORD mode;
+   return GetConsoleMode(GetStdHandle((stream == stderr)
+         ? STD_ERROR_HANDLE : STD_OUTPUT_HANDLE), &mode) != 0;
+#elif (defined(__unix__) || defined(__APPLE__)) && !defined(ORBIS)
+   /* The PS4 toolchain defines __unix__ but has no isatty(). */
+   return isatty(fileno(stream)) != 0;
+#else
+   return true;
+#endif
+}
+
+static void task_database_scan_console_output(FILE *stream,
+      const char *label, const char *db_name, enum scan_console_mark mark)
+{
+   static const char *const prefixes[] = { "++", "==", "??", "!!" };
+   char string[32];
+   const char *prefix   = prefixes[mark];
+   const char *no_color = getenv("NO_COLOR");
+   bool color           = (no_color && no_color[0] != '0')
+         ? false : task_database_scan_console_is_tty(stream);
+
+   /* Colorize prefix (add = green, dupe = yellow, not found or error = red) */
 #ifdef _WIN32
-   HANDLE con      = GetStdHandle(STD_OUTPUT_HANDLE);
+   HANDLE con      = GetStdHandle((stream == stderr)
+         ? STD_ERROR_HANDLE : STD_OUTPUT_HANDLE);
    if (color && con != INVALID_HANDLE_VALUE)
    {
       unsigned red    = FOREGROUND_RED;
@@ -657,9 +703,11 @@ static void task_database_scan_console_output(const char *label, const char *db_
       size_t _len     = strlcpy_lit(string, " ", sizeof(string));
       _len += strlcpy(string + _len, prefix, sizeof(string) - _len);
       _len += strlcpy_lit(string + _len, " ",    sizeof(string) - _len);
-      SetConsoleTextAttribute(con, (add) ? green : (db_name) ? yellow : red);
+      SetConsoleTextAttribute(con, (mark == SCAN_CONSOLE_ADDED) ? green
+            : (mark == SCAN_CONSOLE_DUPLICATE) ? yellow : red);
       WriteConsole(con, string, _len, NULL, NULL);
       SetConsoleTextAttribute(con, reset);
+      string[0] = '\0';
    }
 #else
    if (color)
@@ -669,15 +717,16 @@ static void task_database_scan_console_output(const char *label, const char *db_
       const char *yellow = "\x1B[33m";
       const char *reset  = "\x1B[0m";
       size_t _len        = 0;
-      if (add)
+      if (mark == SCAN_CONSOLE_ADDED)
          _len += strlcpy(string + _len, green, sizeof(string) - _len);
       else
-         _len += strlcpy(string + _len, (db_name) ? yellow : red, sizeof(string) - _len);
+         _len += strlcpy(string + _len,
+               (mark == SCAN_CONSOLE_DUPLICATE) ? yellow : red,
+               sizeof(string) - _len);
       _len    += strlcpy_lit(string + _len, " ",    sizeof(string) - _len);
       _len    += strlcpy(string + _len, prefix, sizeof(string) - _len);
       _len    += strlcpy_lit(string + _len, " ",    sizeof(string) - _len);
       strlcpy(string + _len, reset,  sizeof(string) - _len);
-      fputs(string, stdout);
    }
 #endif
    else
@@ -685,13 +734,14 @@ static void task_database_scan_console_output(const char *label, const char *db_
       size_t _len     = strlcpy_lit(string, " ", sizeof(string));
       _len += strlcpy(string + _len, prefix, sizeof(string) - _len);
       strlcpy_lit(string + _len, " ", sizeof(string) - _len);
-      fputs(string, stdout);
    }
 
+   /* One call, so another thread's log line cannot split it.  The
+    * Win32 colour prefix is written apart, before it. */
    if (!db_name)
-      printf("\"%s\"\n", label);
+      fprintf(stream, "%s\"%s\"\n", string, label);
    else
-      printf("\"%s / %s\"\n", db_name, label);
+      fprintf(stream, "%s\"%s / %s\"\n", string, db_name, label);
 }
 #ifdef HAVE_LIBRETRODB
 static enum scan_verdict task_database_iterate_start(retro_task_t *task,
@@ -908,7 +958,7 @@ static void remove_disc_indicators(char *title, size_t len)
 
 static void task_database_iterate_m3u(
       manual_scan_handle_t *_db,
-      const char *m3u_path)
+      const char *m3u_path, bool counted)
 {
    size_t i, j;
    bool found_match = false;
@@ -916,6 +966,7 @@ static void task_database_iterate_m3u(
    char first_matched_crc[128];
    char collapsed_title[NAME_MAX_LENGTH];
    rm3u_t *m3u = NULL;
+   scan_result_t *own;
 
    first_matched_db[0] = '\0';
    first_matched_crc[0] = '\0';
@@ -925,6 +976,8 @@ static void task_database_iterate_m3u(
    if (!(m3u = rm3u_load_filestream(m3u_path)))
    {
       RARCH_ERR("[Scanner] Failed to open M3U file: \"%s\".\n", m3u_path);
+      if (!counted && !scan_results_find(&_db->scan_results, m3u_path))
+         _db->result.unmatched++;
       return;
    }
 
@@ -1013,9 +1066,19 @@ static void task_database_iterate_m3u(
 
    rm3u_free(m3u);
 
+   own = scan_results_find(&_db->scan_results, m3u_path);
+
    /* If we found at least one match, add M3U entry */
    if (found_match)
    {
+      /* The content pass's entry for the m3u itself would only be
+       * replaced by this one in the same playlist. */
+      if (own && (   *_db->task_config->playlist_file
+                  || string_is_equal(own->db_name, first_matched_db)))
+      {
+         free(own->entry_path);
+         own->entry_path = NULL;
+      }
       if (!scan_results_add(&_db->scan_results, m3u_path, collapsed_title,
                             first_matched_crc, first_matched_db, NULL))
       {
@@ -1027,6 +1090,8 @@ static void task_database_iterate_m3u(
                   collapsed_title, first_matched_db);
       }
    }
+   else if (!own && !counted)
+      _db->result.unmatched++;
 
    /* Compact scan_results to remove NULL entries */
    {
@@ -2211,7 +2276,8 @@ static enum scan_verdict database_info_list_iterate_end_no_match(
    /* Reached end of database list,
     * CRC match probably didn't succeed. */
    if (_db->task_config->cli_scan_output)
-      task_database_scan_console_output(path, NULL, false);
+      task_database_scan_console_output(stdout, path, NULL,
+            SCAN_CONSOLE_UNMATCHED);
 
    /* With its directory read, an archive's held hits were its
     * expansion.  It still expands where a member stores no CRC, and
@@ -4084,17 +4150,27 @@ static bool manual_scan_end_flush_tick(
           * playlist for the same answer. */
          playlist_push_unchecked(manual_scan->flush_playlist, &entry);
          manual_scan->flush_added++;
+         /* A present m3u is replaced, not added. */
+         if (entry_present)
+            manual_scan->result.duplicates++;
+         else
+            manual_scan->result.added++;
 
          RARCH_LOG("[Scanner] Add \"%s / %s\".\n", db_name_noext, result->entry_label);
 
          if (manual_scan->task_config->cli_scan_output)
-            task_database_scan_console_output(result->entry_label,
-                  db_name_noext, true);
+            task_database_scan_console_output(stdout,
+                  result->entry_label, db_name_noext, SCAN_CONSOLE_ADDED);
       }
       /* Entry already exists - output duplicate indicator for CLI scans */
-      else if (manual_scan->flush_playlist && manual_scan->task_config->cli_scan_output)
-         task_database_scan_console_output(result->entry_label,
-               db_name_noext, false);
+      else if (manual_scan->flush_playlist)
+      {
+         manual_scan->result.duplicates++;
+         if (manual_scan->task_config->cli_scan_output)
+            task_database_scan_console_output(stdout,
+                  result->entry_label, db_name_noext,
+                  SCAN_CONSOLE_DUPLICATE);
+      }
 
       manual_scan->flush_pos++;
    }
@@ -4128,10 +4204,11 @@ static bool manual_scan_end_flush_tick(
 }
 
 #ifdef HAVE_LIBRETRODB
-bool task_push_dbscan(const char *fullpath, retro_task_callback_t cb)
+bool task_push_dbscan(const char *fullpath, retro_task_callback_t cb,
+      void *user_data)
 {
    manual_content_scan_set_menu_content_dir(fullpath);
-   return task_push_manual_content_scan(false, cb);
+   return task_push_manual_content_scan(false, cb, user_data);
 }
 
 #endif
@@ -4393,7 +4470,12 @@ end:
     * documented as menu-only and the sample in samples/tasks/database
     * hangs on exactly this. */
    if (manual_scan && manual_scan->user_cb)
-      manual_scan->user_cb(task, task_data, user_data, err);
+   {
+      if (err)
+         manual_scan->result.failed = true;
+      manual_scan->user_cb(task, &manual_scan->result,
+            manual_scan->user_data, err);
+   }
 
 #if defined(HAVE_MENU)
    /* When creating playlists, the playlist tabs of
@@ -4579,6 +4661,11 @@ static bool manual_scan_begin_setup(retro_task_t *task,
             }
          }
 
+         /* A missing or unset folder holds no database, as an empty
+          * one does: the end step reports it. */
+         if (!dbstate->list && !(dbstate->list = string_list_new()))
+            return true;
+
          RARCH_LOG("[Scanner] %s\"%s\"...\n", msg_hash_to_str(MSG_MANUAL_CONTENT_SCAN_START), manual_scan->content_database_path);
          if (manual_scan->task_config->cli_scan_output)
             printf("%s\"%s\"...\n", msg_hash_to_str(MSG_MANUAL_CONTENT_SCAN_START), manual_scan->content_database_path);
@@ -4605,6 +4692,7 @@ static bool manual_scan_begin_setup(retro_task_t *task,
          const char *_msg = msg_hash_to_str(MSG_MANUAL_CONTENT_SCAN_INVALID_CONTENT);
          runloop_msg_queue_push(_msg, strlen(_msg), 1, 100, true, NULL,\
                MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+         manual_scan->fail_msg = _msg;
          return true;
       }
    }
@@ -4646,6 +4734,7 @@ static bool manual_scan_begin_dir_list(retro_task_t *task,
             const char *_msg = msg_hash_to_str(MSG_MANUAL_CONTENT_SCAN_INVALID_CONTENT);
             runloop_msg_queue_push(_msg, strlen(_msg), 1, 100, true, NULL,\
                   MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+            manual_scan->fail_msg = _msg;
          }
          return true;
       }
@@ -4664,6 +4753,7 @@ static bool manual_scan_begin_dir_list(retro_task_t *task,
             const char *_msg = msg_hash_to_str(MSG_MANUAL_CONTENT_SCAN_INVALID_CONTENT);
             runloop_msg_queue_push(_msg, strlen(_msg), 1, 100, true, NULL,
                   MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+            manual_scan->fail_msg = _msg;
             return true;
          }
 
@@ -4687,6 +4777,7 @@ static bool manual_scan_begin_dir_list(retro_task_t *task,
          const char *_msg = msg_hash_to_str(MSG_MANUAL_CONTENT_SCAN_INVALID_CONTENT);
          runloop_msg_queue_push(_msg, strlen(_msg), 1, 100, true, NULL,\
                MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+         manual_scan->fail_msg = _msg;
          return true;
       }
       dir_list_sort(manual_scan->content_list, true);
@@ -4828,6 +4919,7 @@ error_no_cleanup:
       const char *_msg = msg_hash_to_str(MSG_MANUAL_CONTENT_SCAN_DAT_FILE_LOAD_ERROR);
       runloop_msg_queue_push(_msg, strlen(_msg), 1, 100, true, NULL,
             MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+      manual_scan->fail_msg = _msg;
    }
    return true;
 }
@@ -5142,6 +5234,9 @@ static enum scan_step task_manual_scan_iterate_step(retro_task_t *task,
                      manual_scan->status = MANUAL_SCAN_ITERATE_CONTENT;
                   else
                   {
+                     /* An m3u is counted in the m3u pass. */
+                     if (!rm3u_is_m3u_filestream(content_path))
+                        manual_scan->result.unmatched++;
                      manual_scan->status = DATABASE_SCAN_ITERATE_NEXT;
                   }
                   break;
@@ -5154,6 +5249,18 @@ static enum scan_step task_manual_scan_iterate_step(retro_task_t *task,
                    * same failing step every tick.  Give up on this
                    * file and go to the next one. */
                   RARCH_ERR("[Scanner] Scanning of content unexpectedly failed for \"%s\"\n", content_path);
+                  /* Counted here, so not again in the m3u pass. */
+                  if (   manual_scan->m3u_list
+                      && manual_scan->m3u_list->size
+                      && string_is_equal(manual_scan->m3u_list->elems[
+                            manual_scan->m3u_list->size - 1].data,
+                            content_path))
+                     manual_scan->m3u_list->elems[
+                           manual_scan->m3u_list->size - 1].attr.i = 1;
+                  manual_scan->result.errors++;
+                  if (manual_scan->task_config->cli_scan_output)
+                     task_database_scan_console_output(stderr,
+                           content_path, NULL, SCAN_CONSOLE_ERROR);
 #ifdef SCAN_HAVE_READERS
                   if (dbstate->crc_pass != DB_CRC_PASS_FILE)
                      scan_readers_whole_ahead(manual_scan, 0);
@@ -5256,6 +5363,8 @@ static enum scan_step task_manual_scan_iterate_step(retro_task_t *task,
                            label, sizeof(label)))
                      {
                         label[0] = '\0';
+                        if (!rm3u_is_m3u_filestream(content_path))
+                           manual_scan->result.unmatched++;
 #ifdef DEBUG
                         RARCH_DBG("[Scanner] Rejecting item: %s\n",content_path);
 #endif
@@ -5416,7 +5525,18 @@ static void task_manual_content_scan_handler(retro_task_t *task)
       case MANUAL_SCAN_BEGIN_DAT_LOAD:
       case MANUAL_SCAN_BEGIN_PLAYLIST:
          if (task_manual_scan_begin_tick(task, manual_scan))
+         {
+            manual_scan->result.failed = true;
+            if (manual_scan->task_config->cli_scan_output)
+            {
+               fprintf(stderr, "%s: %s\n",
+                     manual_scan->task_config->content_dir,
+                     manual_scan->fail_msg ? manual_scan->fail_msg
+                     : msg_hash_to_str(MSG_MANUAL_CONTENT_SCAN_INVALID_CONFIG));
+               fflush(stdout);
+            }
             goto task_finished;
+         }
          break;
       case MANUAL_SCAN_ITERATE_M3U:
          {
@@ -5445,7 +5565,9 @@ static void task_manual_content_scan_handler(retro_task_t *task)
                task_set_progress(task, (manual_scan->m3u_index * 100) /
                      manual_scan->m3u_list->size);
 
-               task_database_iterate_m3u(manual_scan, m3u_path);
+               task_database_iterate_m3u(manual_scan, m3u_path,
+                     manual_scan->m3u_list->elems[
+                        manual_scan->m3u_index].attr.i != 0);
             }
 
             /* Increment M3U file index */
@@ -5456,7 +5578,8 @@ static void task_manual_content_scan_handler(retro_task_t *task)
          break;
       case MANUAL_SCAN_END:
          {
-            const char *msg = NULL;
+            const char *msg  = NULL;
+            bool no_database = false;
 
             /* Batch update all playlists with accumulated results,
              * spread across gathers under the shared window. */
@@ -5478,6 +5601,7 @@ static void task_manual_content_scan_handler(retro_task_t *task)
             {
                msg = msg_hash_to_str(MSG_SCANNING_NO_DATABASE);
                task_set_error(task, strdup(msg));
+               no_database = true;
             }
             else 
             {
@@ -5494,7 +5618,24 @@ static void task_manual_content_scan_handler(retro_task_t *task)
             task_set_progress(task, 100);
             RARCH_LOG("[Scanner] %s\n", msg);
             if (manual_scan->task_config->cli_scan_output)
-               printf("%s\n", msg);
+            {
+               if (no_database)
+                  fprintf(stderr, "%s: %s\n",
+                        manual_scan->task_config->content_dir, msg);
+               else
+               {
+                  printf("%s\n", msg);
+                  printf("%s: %u added, %u duplicates, %u unmatched, %u errors\n",
+                        manual_scan->task_config->content_dir,
+                        manual_scan->result.added,
+                        manual_scan->result.duplicates,
+                        manual_scan->result.unmatched,
+                        manual_scan->result.errors);
+               }
+               /* With --menu the process goes on: hand each scan's
+                * lines to a pipe or file as it ends. */
+               fflush(stdout);
+            }
 
             RARCH_DBG("[Scanner] Scan settings were:\n");
             RARCH_DBG("[Scanner]    Content dir:       \"%s\"\n",manual_scan->task_config->content_dir);
@@ -5543,6 +5684,10 @@ static bool task_manual_content_scan_finder(retro_task_t *task, void *user_data)
       return false;
    if (task->handler != task_manual_content_scan_handler)
       return false;
+   /* Still findable while its callback runs, which may push the
+    * next scan. */
+   if (task_get_flags(task) & RETRO_TASK_FLG_FINISHED)
+      return false;
    if (!(manual_scan = (manual_scan_handle_t*)task->state))
       return false;
    return string_is_equal(
@@ -5551,7 +5696,7 @@ static bool task_manual_content_scan_finder(retro_task_t *task, void *user_data)
 
 bool task_push_manual_content_scan(
       bool do_menu_refresh,
-      retro_task_callback_t user_cb)
+      retro_task_callback_t user_cb, void *user_data)
 {
    size_t _len;
    task_finder_data_t find_data;
@@ -5675,6 +5820,7 @@ bool task_push_manual_content_scan(
 #endif
 
    manual_scan->user_cb          = user_cb;
+   manual_scan->user_data        = user_data;
    task->callback                = cb_task_manual_content_scan;
    task->cleanup                 = task_manual_content_scan_free;
    task->flags                  |= RETRO_TASK_FLG_ALTERNATIVE_LOOK;
