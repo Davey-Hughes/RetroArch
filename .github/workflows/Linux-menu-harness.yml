@@ -37,6 +37,10 @@ on:
       - 'samples/menu/core_info_page/**'
       - 'samples/menu/load_content_filter/**'
       - 'samples/settings/packed_rows/**'
+      - 'save.c'
+      - 'save_items.c'
+      - 'save_items.h'
+      - 'samples/runloop/save_items/**'
       - 'setting_list.h'
       - 'gfx/video_defines.h'
       - '.github/workflows/Linux-menu-harness.yml'
@@ -62,6 +66,10 @@ on:
       - 'samples/menu/core_info_page/**'
       - 'samples/menu/load_content_filter/**'
       - 'samples/settings/packed_rows/**'
+      - 'save.c'
+      - 'save_items.c'
+      - 'save_items.h'
+      - 'samples/runloop/save_items/**'
       - 'setting_list.h'
       - 'gfx/video_defines.h'
       - '.github/workflows/Linux-menu-harness.yml'
@@ -184,6 +192,19 @@ jobs:
           samples/runloop/cloudsync_unload/build.sh
           ./samples/runloop/cloudsync_unload/cloudsync_unload_test
           make -C samples/runloop/cloudsync_unload clean
+
+      - name: Build and run the save_items harness
+        shell: bash
+        run: |
+          set -eu
+          # save_items.c's registry of a core's save items -
+          # negotiation, validation, matching by id, naming and file
+          # conflicts - under ASan and UBSan.  It builds on its own,
+          # not from the build above.
+          make -C samples/runloop/save_items clean
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
+            make -C samples/runloop/save_items SANITIZER=address,undefined check
+          make -C samples/runloop/save_items clean
 
       - name: Build and run menu_playlist_nav_test
         shell: bash

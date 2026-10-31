@@ -33565,6 +33565,18 @@ MSG_HASH(
    "Blocking SRAM Overwrite"
    )
 MSG_HASH(
+   MSG_SAVE_ITEMS_REFUSED,
+   "The core's save setup was refused; its saves may not be written."
+   )
+MSG_HASH(
+   MSG_SAVE_ITEM_LEFT_OUT,
+   "The core's save \"%s\" could not be set up and is not being saved."
+   )
+MSG_HASH(
+   MSG_SAVE_ITEMS_DETAILS_IN_LOG,
+   "Details are in the log."
+   )
+MSG_HASH(
    MSG_STARTING_MOVIE_PLAYBACK,
    "Starting movie playback."
    )

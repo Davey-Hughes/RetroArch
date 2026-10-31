@@ -214,6 +214,7 @@ bool android_get_vfs_authorized_locations(
 #include "defaults.h"
 #include "msg_hash.h"
 #include "paths.h"
+#include "save_items.h"
 #include "file_path_special.h"
 #include "ui/ui_companion_driver.h"
 #include "verbosity.h"
@@ -2045,6 +2046,75 @@ static void runloop_video_decode_close(void *decoder)
 }
 #endif
 
+/* GET_SYSTEM_DIRECTORY's answer; logs nothing. */
+static const char *runloop_system_dir(settings_t *settings)
+{
+   size_t _len;
+   char *tmp_path;
+   const char *fullpath;
+   const char *dir_system = settings->paths.directory_system;
+
+   if (     (dir_system && *dir_system)
+         && !settings->bools.systemfiles_in_content_dir)
+      return dir_system;
+
+   fullpath = path_get(RARCH_PATH_CONTENT);
+   /* If content path is empty, fall back to global system dir path */
+   if (     !fullpath || !*fullpath
+         || !(tmp_path = (char*)malloc(PATH_MAX_LENGTH)))
+      return dir_system;
+
+   _len = fill_pathname_basedir(tmp_path, fullpath, PATH_MAX_LENGTH);
+   /* Removes trailing slash (unless root dir) */
+   if (string_count_occurrences_single_character(tmp_path, PATH_DEFAULT_SLASH_C()) > 1
+         && tmp_path[_len - 1] == PATH_DEFAULT_SLASH_C())
+      tmp_path[_len - 1] = '\0';
+
+   dir_set(RARCH_DIR_SYSTEM, tmp_path);
+   free(tmp_path);
+   return dir_get_ptr(RARCH_DIR_SYSTEM);
+}
+
+/* What a save item's root names, as the core was told it. */
+static void runloop_save_items_paths(runloop_state_t *runloop_st,
+      struct save_items_paths *paths)
+{
+   paths->core                = runloop_st->system.info.library_name;
+   paths->subsystem           = path_is_empty(RARCH_PATH_SUBSYSTEM)
+      ? NULL : runloop_st->subsystem_fullpaths;
+   paths->savefile            = runloop_st->name.savefile;
+   paths->savefile_dir        = runloop_st->savefile_dir;
+   paths->system_dir          = runloop_system_dir(config_get_ptr());
+   paths->content             = path_get(RARCH_PATH_CONTENT);
+   paths->savestate           = runloop_st->name.savestate;
+   paths->replay              = runloop_st->name.replay;
+   paths->disk_index          = runloop_st->system.disk_control.record_enabled
+      ? runloop_st->system.disk_control.index_record.file_path : NULL;
+   paths->savefile_dir_is_dir = paths->subsystem
+      && path_is_directory(runloop_st->savefile_dir);
+}
+
+/* A refused registration, or the left-out item @name; the log has
+ * the details while logging is on. */
+static void runloop_save_items_notice(const char *name)
+{
+   char msg[512];
+   if (name)
+      snprintf(msg, sizeof(msg), msg_hash_to_str(MSG_SAVE_ITEM_LEFT_OUT),
+            name);
+   else
+      strlcpy(msg, msg_hash_to_str(MSG_SAVE_ITEMS_REFUSED), sizeof(msg));
+   if (verbosity_is_enabled())
+   {
+      strlcat(msg, " ", sizeof(msg));
+      strlcat(msg, msg_hash_to_str(MSG_SAVE_ITEMS_DETAILS_IN_LOG),
+            sizeof(msg));
+   }
+   RARCH_WARN("[SRAM] %s\n", msg);
+   runloop_msg_queue_push(msg, strlen(msg), 1, 180, false, NULL,
+         MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+}
+
 bool runloop_environment_cb(unsigned cmd, void *data)
 {
    unsigned p;
@@ -2670,44 +2740,17 @@ bool runloop_environment_cb(unsigned cmd, void *data)
 
       case RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY:
          {
-            const char *dir_system          = settings->paths.directory_system;
-            bool systemfiles_in_content_dir = settings->bools.systemfiles_in_content_dir;
+            const char *dir_system = settings->paths.directory_system;
+            const char *fullpath   = path_get(RARCH_PATH_CONTENT);
 
             if (     (!dir_system || !*dir_system)
-                  || systemfiles_in_content_dir)
-            {
-               const char *fullpath = path_get(RARCH_PATH_CONTENT);
+                  && (fullpath && *fullpath))
+               RARCH_WARN("[Environ] SYSTEM DIR is empty, assume CONTENT DIR \"%s\".\n",
+                          fullpath);
 
-               if (fullpath && *fullpath)
-               {
-                  size_t _len;
-                  char tmp_path[PATH_MAX_LENGTH];
-
-                  if (!dir_system || !*dir_system)
-                     RARCH_WARN("[Environ] SYSTEM DIR is empty, assume CONTENT DIR \"%s\".\n",
-                                fullpath);
-
-                  _len = fill_pathname_basedir(tmp_path, fullpath, sizeof(tmp_path));
-                  /* Removes trailing slash (unless root dir) */
-                  if (string_count_occurrences_single_character(tmp_path, PATH_DEFAULT_SLASH_C()) > 1
-                        && tmp_path[_len - 1] == PATH_DEFAULT_SLASH_C())
-                           tmp_path[_len - 1] = '\0';
-
-                  dir_set(RARCH_DIR_SYSTEM, tmp_path);
-                  *(const char**)data = dir_get_ptr(RARCH_DIR_SYSTEM);
-               }
-               else /* If content path is empty, fall back to global system dir path */
-                  *(const char**)data = dir_system;
-
-               RARCH_LOG("[Environ] GET_SYSTEM_DIRECTORY: \"%s\".\n",
-                     *(const char**)data);
-            }
-            else
-            {
-               *(const char**)data = dir_system;
-               RARCH_LOG("[Environ] GET_SYSTEM_DIRECTORY: \"%s\".\n",
-                         dir_system);
-            }
+            *(const char**)data = runloop_system_dir(settings);
+            RARCH_LOG("[Environ] GET_SYSTEM_DIRECTORY: \"%s\".\n",
+                  *(const char**)data);
          }
          break;
 
@@ -3822,6 +3865,30 @@ bool runloop_environment_cb(unsigned cmd, void *data)
             return true;
 #endif
          return false;
+      }
+
+      case RETRO_ENVIRONMENT_GET_SAVE_FRONTEND_INTERFACE:
+         return save_items_get_frontend_interface(
+               (struct retro_save_frontend_interface*)data,
+               RETRO_SAVE_INSTANCE_PRIMARY);
+
+      case RETRO_ENVIRONMENT_SET_SAVE_INTERFACE:
+      {
+         struct save_items_paths paths;
+         const char *left_out;
+         runloop_save_items_paths(runloop_st, &paths);
+         if (!save_items_register(
+                  (const struct retro_save_interface*)data, &paths))
+         {
+            if (save_items_take_refusal())
+               runloop_save_items_notice(NULL);
+            save_items_drop_previous();
+            return false;
+         }
+         while ((left_out = save_items_take_left_out()))
+            runloop_save_items_notice(left_out);
+         save_items_drop_previous();
+         break;
       }
 
       case RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS:
@@ -5491,6 +5558,8 @@ static bool core_unload_game(void)
       runloop_st->core_poll_type_override  = POLL_TYPE_OVERRIDE_DONTCARE;
       runloop_st->current_core.flags      &= ~RETRO_CORE_FLAG_GAME_LOADED;
    }
+
+   save_items_clear();
 
    /* A staged switch keeps the device running until its driver stage
     * sets it aside or closes it, so the menu's audio and its sounds
