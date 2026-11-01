@@ -52,6 +52,7 @@
 #include "gfx/video_driver.h"
 #include "paths.h"
 #include "runloop.h"
+#include "save_items.h"
 #include "verbosity.h"
 
 /* ===== BEGIN runahead dense input cache =====
@@ -947,6 +948,7 @@ static enum runahead_copy_status runahead_copy_poll(
 }
 /* ===== END runahead core-copy fragment ===== */
 
+/* ===== BEGIN runahead secondary environment hook ===== */
 /* What run-ahead's second instance may not register.  The frontend
  * holds one of each, keeps a pointer into the instance that declared
  * it - a callback, a table or string in its image, its RAM - and the
@@ -996,6 +998,23 @@ static bool runloop_environment_secondary_core_hook(
    if (filtered >= 0)
       return filtered != 0;
 
+   /* The copy's registration is checked, so it gets the primary's
+    * answer, and stored nowhere */
+   if (     (cmd & ~RETRO_ENVIRONMENT_EXPERIMENTAL)
+         == (RETRO_ENVIRONMENT_SET_SAVE_INTERFACE
+            & ~RETRO_ENVIRONMENT_EXPERIMENTAL))
+      return save_items_check((const struct retro_save_interface*)data,
+            runloop_st->system.info.library_name);
+
+   /* The copy is told it is the secondary instance: it persists
+    * nothing */
+   if (     (cmd & ~RETRO_ENVIRONMENT_EXPERIMENTAL)
+         == (RETRO_ENVIRONMENT_GET_SAVE_FRONTEND_INTERFACE
+            & ~RETRO_ENVIRONMENT_EXPERIMENTAL))
+      return save_items_get_frontend_interface(
+            (struct retro_save_frontend_interface*)data,
+            RETRO_SAVE_INSTANCE_SECONDARY);
+
    /* The running core keeps its keyboard callback; the copy's has a
     * slot of its own, emptied when the copy is closed */
    if (     (cmd & ~RETRO_ENVIRONMENT_EXPERIMENTAL)
@@ -1023,6 +1042,7 @@ static bool runloop_environment_secondary_core_hook(
    }
    return result;
 }
+/* ===== END runahead secondary environment hook ===== */
 
 void runahead_clear_controller_port_map(void *data)
 {

@@ -177,6 +177,12 @@ bool save_items_can_legacy_load(void);
  * caller tells the user. */
 bool save_items_take_refusal(void);
 
+/* The refusals the primary would meet for @iface, logged as for it;
+ * nothing is kept. True when it would be accepted. Run-ahead's second
+ * instance gets this answer. */
+bool save_items_check(const struct retro_save_interface *iface,
+      const char *core);
+
 /* The label, else the id, of a left-out item of the current set that
  * the frontend would write, not told of since the content loaded, once
  * each; NULL when none. */

@@ -506,14 +506,41 @@ static void save_items_check_root_folder(save_items_check_t *c, unsigned i,
       }
 }
 
-/* Checks item @i as the core gave it in @src; @it is the frontend's
- * copy, whose unknown descriptive values read as UNKNOWN. */
+/* Item @i's id against those of the items before it. */
+static void save_items_check_id(save_items_check_t *c,
+      const struct retro_save_interface *iface, unsigned i,
+      const struct retro_save_item *src)
+{
+   unsigned j;
+   if (!src->id)
+      save_items_find(c, i, src, RETRO_SAVE_FIELD_ID,
+            RETRO_SAVE_VERDICT_REFUSED, NULL,
+            "NULL: every item needs one");
+   for (j = 0; src->id && j < i; j++)
+   {
+      struct retro_save_item other;
+      save_items_read_item(&other, iface, j);
+      if (string_is_equal(other.id, src->id))
+         save_items_find(c, i, src, RETRO_SAVE_FIELD_ID,
+               RETRO_SAVE_VERDICT_REFUSED, NULL,
+               "\"%s\": item %u has it too, and a frontend matches items "
+               "by id", src->id, j);
+      else if (other.id && string_is_equal_noncase(other.id, src->id))
+         save_items_find(c, i, src, RETRO_SAVE_FIELD_ID,
+               RETRO_SAVE_VERDICT_IGNORED, NULL,
+               "\"%s\": item %u's \"%s\" differs only in case", src->id,
+               j, other.id);
+   }
+}
+
+/* Checks item @i as the core gave it in @src; the frontend's copy,
+ * in @set, reads unknown descriptive values as UNKNOWN. */
 static void save_items_check_item(save_items_check_t *c,
       const struct retro_save_interface *iface, save_items_set_t *set,
       unsigned i, const struct retro_save_item *src,
       const struct save_items_paths *paths)
 {
-   unsigned j, k;
+   unsigned k;
    struct retro_save_item *it = &set->items[i].item;
    uint64_t unknown           = src->flags & ~(uint64_t)SAVE_ITEMS_ITEM_FLAGS;
    bool buffer = src->storage == RETRO_SAVE_STORAGE_FRONTEND_BUFFER;
@@ -526,24 +553,7 @@ static void save_items_check_item(save_items_check_t *c,
    bool known  = src->storage <= RETRO_SAVE_STORAGE_NOT_PERSISTED;
 
    c->left = false;
-   if (!src->id)
-      save_items_find(c, i, src, RETRO_SAVE_FIELD_ID,
-            RETRO_SAVE_VERDICT_REFUSED, NULL,
-            "NULL: every item needs one");
-   for (j = 0; src->id && j < i; j++)
-   {
-      const char *other = set->items[j].item.id;
-      if (string_is_equal(other, src->id))
-         save_items_find(c, i, src, RETRO_SAVE_FIELD_ID,
-               RETRO_SAVE_VERDICT_REFUSED, NULL,
-               "\"%s\": item %u has it too, and a frontend matches items "
-               "by id", src->id, j);
-      else if (other && string_is_equal_noncase(other, src->id))
-         save_items_find(c, i, src, RETRO_SAVE_FIELD_ID,
-               RETRO_SAVE_VERDICT_IGNORED, NULL,
-               "\"%s\": item %u's \"%s\" differs only in case", src->id,
-               j, other);
-   }
+   save_items_check_id(c, iface, i, src);
    if (!src->label)
       save_items_find(c, i, src, RETRO_SAVE_FIELD_LABEL,
             RETRO_SAVE_VERDICT_IGNORED, NULL,
@@ -1440,7 +1450,7 @@ static unsigned RETRO_CALLCONV save_items_get_issues(
    return save_items_st.num_issues;
 }
 
-/* The secondary instance's registrations are not checked. */
+/* The secondary instance's findings are not listed. */
 static unsigned RETRO_CALLCONV save_items_get_no_issues(
       const struct retro_save_issue **issues)
 {
@@ -1764,6 +1774,26 @@ bool save_items_register(const struct retro_save_interface *iface,
    save_items_st.previous = cur;
    save_items_st.current  = set;
    return true;
+}
+
+bool save_items_check(const struct retro_save_interface *iface,
+      const char *core)
+{
+   unsigned i;
+   save_items_check_t c;
+   memset(&c, 0, sizeof(c));
+   c.core = core;
+   if (save_items_check_call(&c, iface))
+      for (i = 0; i < iface->num_items; i++)
+      {
+         struct retro_save_item src;
+         save_items_read_item(&src, iface, i);
+         save_items_check_id(&c, iface, i, &src);
+      }
+   for (i = 0; i < c.num_issues; i++)
+      free((char*)c.issues[i].text);
+   free(c.issues);
+   return !c.refused;
 }
 
 void save_items_drop_previous(void)
