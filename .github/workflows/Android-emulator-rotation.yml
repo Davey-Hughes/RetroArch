@@ -1,0 +1,224 @@
+name: Android emulator rotation (fork)
+
+# Davey's fork only, never upstream: the B-assign branch plus this
+# commit, pushed to ci-emu/*. The device harness's rotate and
+# rotate_reinit cases on an emulator with a second display.
+
+on:
+  push:
+    branches:
+      - 'ci-emu/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rotation:
+    name: rotate and rotate_reinit (threaded; gl, vulkan)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      APT_PKGS: imagemagick
+      # Pinned: 36.4.9 changed the default renderer. 37.1.11 and r9 are
+      # what the harness passes on locally.
+      EMU_BUILD: '15917651'
+      EMU_SHA256: 95771e0ae431897b2a4bd2d97fa095f29a8b0624a7b216baf529f9306161c266
+      IMG_ZIP: x86_64-35_r09.zip
+      IMG_SHA1: 0103e6dab21290c4b9d16550a3ce99476f884eef
+      NDK_VERSION: 29.0.14206865
+      RA_SERIAL: emulator-5580
+      RA_PKG: com.retroarch.aarch64
+      RA_AVD_DATA: 2G
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Paths
+        run: |
+          echo "ANDROID_AVD_HOME=$RUNNER_TEMP/avd" >> "$GITHUB_ENV"
+          echo "RA_DUAL_OUT=$RUNNER_TEMP/dual-out" >> "$GITHUB_ENV"
+          echo "RA_TREE=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          echo "CORE_OUT=$RUNNER_TEMP/cores" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/avd" "$RUNNER_TEMP/dual-out" "$RUNNER_TEMP/cores"
+
+      - name: Free disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: ImageMagick 6 as magick
+        run: |
+          if command -v magick > /dev/null; then exit 0; fi
+          mkdir -p "$RUNNER_TEMP/bin"
+          printf '%s\n' '#!/bin/sh' \
+            'if [ "$1" = identify ]; then shift; exec identify "$@"; fi' \
+            'exec convert "$@"' > "$RUNNER_TEMP/bin/magick"
+          chmod +x "$RUNNER_TEMP/bin/magick"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: NDK
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$NDK_VERSION" > /dev/null
+          echo "NDK_BIN=$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_ENV"
+
+      - name: APK (aarch64 debug; carries x86_64)
+        run: |
+          cd pkg/android/phoenix
+          set -o pipefail
+          for i in 1 2 3; do
+            ./gradlew assembleAarch64Debug \
+              -Dorg.gradle.internal.repository.max.tentatives=6 \
+              -Dorg.gradle.internal.repository.initial.backoff=2000 \
+              2>&1 | tee gradle.log && break
+            grep -qE 'Could not (resolve|GET|HEAD|download)' gradle.log \
+              && [ $i != 3 ] || exit 1
+            echo "dependency fetch failed (attempt $i); retrying in 30s"
+            sleep 30
+          done
+          apk="$PWD/build/outputs/apk/aarch64/debug/phoenix-aarch64-debug.apk"
+          ls -l "$apk"
+          echo "APK=$apk" >> "$GITHUB_ENV"
+
+      - name: Test core (x86_64)
+        run: |
+          make -s -C samples/cores/video_views CC="$NDK_BIN/x86_64-linux-android21-clang" \
+            TARGET="$CORE_OUT/video_views_libretro_android.so"
+          file "$CORE_OUT/video_views_libretro_android.so"
+
+      - name: Emulator and system image (pinned)
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o emu.zip "https://dl.google.com/android/repository/emulator-linux_x64-$EMU_BUILD.zip"
+          echo "$EMU_SHA256  emu.zip" | sha256sum -c -
+          rm -rf "${ANDROID_HOME:?}/emulator"
+          unzip -q emu.zip -d "$ANDROID_HOME"
+          rm -f emu.zip
+          grep Pkg.Revision "$ANDROID_HOME/emulator/source.properties"
+          curl -fsSL -o img.zip "https://dl.google.com/android/repository/sys-img/google_apis/$IMG_ZIP"
+          echo "$IMG_SHA1  img.zip" | sha1sum -c -
+          img="$ANDROID_HOME/system-images/android-35/google_apis"
+          rm -rf "${img:?}/x86_64"
+          mkdir -p "$img"
+          unzip -q img.zip -d "$img"
+          rm -f img.zip
+          test -f "$img/x86_64/system.img"
+          grep Pkg.Revision "$img/x86_64/source.properties"
+          df -h /
+
+      - name: AVD
+        run: |
+          python3 -I .github/ci-emu/avd.py
+          cat "$ANDROID_AVD_HOME/ra_dual.avd/config.ini"
+
+      - name: Boot (one retry, on a boot failure only)
+        id: boot
+        run: |
+          set -u
+          adb="$ANDROID_HOME/platform-tools/adb"
+          boot() {
+            env -u DISPLAY -u WAYLAND_DISPLAY QT_QPA_PLATFORM=offscreen \
+              setsid "$ANDROID_HOME/emulator/emulator" -avd ra_dual -port 5580 \
+              -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics \
+              -gpu swiftshader_indirect -cores 4 -memory 4096 "$@" \
+              > "$RA_DUAL_OUT/emulator-$try.log" 2>&1 < /dev/null &
+            timeout 180 "$adb" -s "$RA_SERIAL" wait-for-device &&
+              timeout 600 "$adb" -s "$RA_SERIAL" shell \
+                'while [ "$(getprop sys.boot_completed)" != 1 ]; do sleep 2; done'
+          }
+          try=1
+          if ! boot; then
+            echo "::warning::the emulator did not boot; one retry with wiped data"
+            tail -30 "$RA_DUAL_OUT/emulator-1.log"
+            "$adb" -s "$RA_SERIAL" emu kill || true
+            sleep 10
+            pkill -f "$ANDROID_HOME/emulator/qemu" || true
+            try=2
+            if ! boot -wipe-data; then
+              tail -30 "$RA_DUAL_OUT/emulator-2.log"
+              exit 1
+            fi
+          fi
+          echo "booted on try $try"
+          "$adb" -s "$RA_SERIAL" shell getprop ro.build.version.release
+
+      - name: Install and probe
+        id: probe
+        run: |
+          python3 -I .github/ci-emu/dual.py install "$APK" "$CORE_OUT/video_views_libretro_android.so"
+          python3 -I .github/ci-emu/dual.py probe
+          cat "$RA_DUAL_OUT/$RA_SERIAL/probe.json"
+
+      - name: gl
+        id: gl
+        run: |
+          set -o pipefail
+          python3 -I .github/ci-emu/dual.py run --driver gl --threaded 1 \
+            --cases rotate,rotate_reinit | tee "$RA_DUAL_OUT/gl.txt"
+          grep -qx 'cases: 2 pass, 0 fail, 0 skip' "$RA_DUAL_OUT/gl.txt"
+
+      - name: vulkan
+        if: ${{ !cancelled() && steps.probe.outcome == 'success' }}
+        run: |
+          set -o pipefail
+          python3 -I .github/ci-emu/dual.py run --driver vulkan --threaded 1 \
+            --cases rotate,rotate_reinit | tee "$RA_DUAL_OUT/vulkan.txt"
+          grep -qx 'cases: 2 pass, 0 fail, 0 skip' "$RA_DUAL_OUT/vulkan.txt"
+
+      - name: Stop the emulator
+        if: always()
+        run: |
+          "$ANDROID_HOME/platform-tools/adb" -s "$RA_SERIAL" emu kill || true
+
+      - name: Captures and logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rotation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dual-out
+          retention-days: 14
