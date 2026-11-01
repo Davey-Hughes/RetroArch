@@ -302,6 +302,7 @@ libretro-common/samples/**/*_test_*
 # committed as a built binary, which made any make clean in that
 # directory show up as a deletion.
 samples/audio/embedded_alsa/abi_check
+samples/runloop/save_items/save_items_fill_bench
 libretro-common/samples/rthreads/retro_eventcount_bench/retro_eventcount_bench
 libretro-common/samples/rthreads/retro_eventcount_bench/retro_eventcount_bench_*
 # The driver's text with its Windows includes swapped, produced by each

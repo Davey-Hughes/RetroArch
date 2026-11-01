@@ -54,9 +54,13 @@ typedef struct save_items_check
    const char *core;
    struct retro_save_issue *issues;
    unsigned num_issues;
+   /* Slots left after the findings. */
+   unsigned room;
    unsigned lines;
    unsigned more;
    bool refused;
+   /* The list may not move: findings only take the room left. */
+   bool fixed;
    /* A finding past the lines logged is not IGNORED. */
    bool more_err;
    /* The item being checked was left out. */
@@ -180,8 +184,10 @@ static void save_items_set_free(save_items_set_t *set)
       save_items_free_item(&set->items[i].item);
       free(set->items[i].path);
       save_items_strv_free((const char *const *)set->items[i].legacy);
+      free(set->items[i].tail);
    }
    free(set->items);
+   free(set->legacy_names);
    free(set);
 }
 
@@ -241,8 +247,9 @@ static void save_items_issues_free(void)
    for (i = 0; i < save_items_st.num_issues; i++)
       free((char*)save_items_st.issues[i].text);
    free(save_items_st.issues);
-   save_items_st.issues     = NULL;
-   save_items_st.num_issues = 0;
+   save_items_st.issues      = NULL;
+   save_items_st.num_issues  = 0;
+   save_items_st.issues_room = 0;
 }
 
 /* The frontend, not the core, writes an item of @storage; an unknown
@@ -307,15 +314,24 @@ static void save_items_find(save_items_check_t *c, unsigned i,
       c->refused = true;
    else if (verdict == RETRO_SAVE_VERDICT_LEFT_OUT)
       c->left    = true;
-   if ((grown = (struct retro_save_issue*)realloc(c->issues,
-         (c->num_issues + 1) * sizeof(*grown))))
+   if (     !c->room && !c->fixed
+         && (grown = (struct retro_save_issue*)realloc(c->issues,
+            (c->num_issues + 1) * sizeof(*grown))))
    {
       c->issues = grown;
-      grown[c->num_issues].item    = i;
-      grown[c->num_issues].field   = field;
-      grown[c->num_issues].verdict = verdict;
-      if ((grown[c->num_issues].text = strdup(line)))
+      c->room   = 1;
+   }
+   if (c->room)
+   {
+      struct retro_save_issue *issue = &c->issues[c->num_issues];
+      issue->item    = i;
+      issue->field   = field;
+      issue->verdict = verdict;
+      if ((issue->text = strdup(line)))
+      {
          c->num_issues++;
+         c->room--;
+      }
    }
    if (save_items_seen(&save_items_st.logged, &save_items_st.num_logged,
          line))
@@ -392,6 +408,25 @@ static void save_items_check_end(save_items_check_t *c)
    save_items_st.issues     = c->issues;
    save_items_st.num_issues = c->num_issues;
    c->issues                = NULL;
+}
+
+/* Room after the findings for those the first fill may add, one per
+ * item it may leave out, so the list never moves after the call. */
+static void save_items_issues_reserve(const save_items_set_t *set)
+{
+   unsigned i;
+   unsigned room = 0;
+   struct retro_save_issue *grown;
+   for (i = 0; i < set->num_items; i++)
+      if (!set->items[i].left_out && set->items[i].legacy_unreported)
+         room++;
+   if (     room
+         && (grown = (struct retro_save_issue*)realloc(save_items_st.issues,
+            (save_items_st.num_issues + room) * sizeof(*grown))))
+   {
+      save_items_st.issues      = grown;
+      save_items_st.issues_room = room;
+   }
 }
 
 /* False when the item array cannot be read: nothing after is checked. */
@@ -1034,22 +1069,26 @@ static bool save_items_match(const char *const *list, const char *name,
    return false;
 }
 
-/* Folder item @f holds @path: it is inside, matched by an include
- * pattern (no or an empty list: everything) and by no exclude one.
- * @buf as for save_items_match(); without it, inside is enough. */
-static bool save_items_holds(const save_item_t *f, const char *path,
+/* Folder item @f's patterns select @name, a path inside it: an include
+ * pattern (no or an empty list: everything) matches and no exclude one.
+ * @buf as for save_items_match(); without it, everything is selected. */
+static bool save_items_selects(const save_item_t *f, const char *name,
       char *buf)
 {
-   const char *name;
    bool include = f->item.include && f->item.include[0];
-   if (!f->path || !save_items_inside(path, f->path))
-      return false;
    if (!buf || (!include && !f->item.exclude))
       return true;
-   name = path + strlen(f->path) + 1;
    if (include && !save_items_match(f->item.include, name, buf))
       return false;
    return !f->item.exclude || !save_items_match(f->item.exclude, name, buf);
+}
+
+/* Folder item @f holds @path: it is inside, and selected. */
+static bool save_items_holds(const save_item_t *f, const char *path,
+      char *buf)
+{
+   return   f->path && save_items_inside(path, f->path)
+         && save_items_selects(f, path + strlen(f->path) + 1, buf);
 }
 
 /* The temps the frontend writes a file through, as save.c names them:
@@ -1185,25 +1224,111 @@ static void save_items_check_files(save_items_check_t *c,
    free(buf);
 }
 
+/* Where the frontend writes save RAM and RTC itself, in two
+ * PATH_MAX_LENGTH halves; NULL in a subsystem session, whose names
+ * are not known yet. */
+static char *save_items_legacy_names(const struct save_items_paths *paths)
+{
+   char *names;
+   if (     paths->subsystem || string_is_empty(paths->savefile)
+         || !(names = (char*)malloc(2 * PATH_MAX_LENGTH)))
+      return NULL;
+   strlcpy(names, paths->savefile, PATH_MAX_LENGTH);
+   fill_pathname(names + PATH_MAX_LENGTH, paths->savefile, ".rtc",
+         PATH_MAX_LENGTH);
+   save_items_tidy_path(names);
+   save_items_tidy_path(names + PATH_MAX_LENGTH);
+   return names;
+}
+
+/* A kept item of @set, or an earlier set, retired legacy memory @mem. */
+static bool save_items_memory_retired(const save_items_set_t *set,
+      unsigned mem)
+{
+   unsigned k;
+   for (k = 0; k < set->num_items; k++)
+      if (!set->items[k].left_out && set->items[k].item.legacy_memory == mem)
+         return true;
+   for (k = 0; k < save_items_st.num_retired; k++)
+      if (save_items_st.retired[k] == mem)
+         return true;
+   return false;
+}
+
+/* Leaves out item @i, at legacy memory @mem's file @name or a folder
+ * holding it, while the core reports that memory. */
+static void save_items_leave_legacy(save_items_check_t *c,
+      save_items_set_t *set, unsigned i, unsigned mem, const char *name)
+{
+   char value[32];
+   save_item_t *it   = &set->items[i];
+   const char *which = mem ? "RETRO_MEMORY_RTC" : "RETRO_MEMORY_SAVE_RAM";
+   if (it->item.storage == RETRO_SAVE_STORAGE_CORE_FOLDER)
+      save_items_find(c, i, &it->item, RETRO_SAVE_FIELD_PATH,
+            RETRO_SAVE_VERDICT_LEFT_OUT,
+            "SET_SAVE_INTERFACE, \"Ownership\"",
+            "\"%s\": the folder holds \"%s\", where the frontend "
+            "writes %s, which the core reports and no item replaces, "
+            "and a file has one writer; exclude it, or name that memory "
+            "in legacy_memory", it->item.path, name, which);
+   else
+   {
+      if (it->item.legacy_memory == RETRO_SAVE_NO_LEGACY_MEMORY)
+         strlcpy(value, "RETRO_SAVE_NO_LEGACY_MEMORY", sizeof(value));
+      else
+         snprintf(value, sizeof(value), "%u", it->item.legacy_memory);
+      save_items_find(c, i, &it->item, RETRO_SAVE_FIELD_LEGACY_MEMORY,
+            RETRO_SAVE_VERDICT_LEFT_OUT,
+            "SET_SAVE_INTERFACE, \"Ownership\"",
+            "%s: the file \"%s\" is where the frontend writes %s, "
+            "which the core reports and no item replaces, and a file "
+            "has one writer", value, name, which);
+   }
+   it->left_out = true;
+}
+
 /* The legacy memories the kept items retire: known ones, one item
  * each, and each written by its item. */
 static void save_items_check_legacy(save_items_check_t *c,
-      const save_items_set_t *set)
+      save_items_set_t *set, const struct save_items_paths *paths)
 {
    unsigned i, j;
+   char *names = save_items_legacy_names(paths);
+   for (i = 0; names && i < set->num_items; i++)
+   {
+      unsigned t;
+      save_item_t *it = &set->items[i];
+      if (it->left_out || !it->path)
+         continue;
+      for (t = 0; t < 2; t++)
+      {
+         unsigned mem     = t ? RETRO_MEMORY_RTC : RETRO_MEMORY_SAVE_RAM;
+         const char *name = names + t * PATH_MAX_LENGTH;
+         if (!string_is_equal(it->path, name))
+            continue;
+         if (it->item.storage == RETRO_SAVE_STORAGE_FRONTEND_BLOB)
+            save_items_find(c, i, &it->item, RETRO_SAVE_FIELD_PATH,
+                  RETRO_SAVE_VERDICT_IGNORED,
+                  "SET_SAVE_INTERFACE, \"Cross-core compatibility\"",
+                  "\"%s\": the frontend writes %s raw there, and a core "
+                  "never moves an existing raw file to a blob", name,
+                  t ? "RETRO_MEMORY_RTC" : "RETRO_MEMORY_SAVE_RAM");
+         if (     it->item.legacy_memory == mem
+               || save_items_memory_retired(set, mem))
+            continue;
+         /* Without that memory the frontend writes no file there. */
+         if (!paths->legacy_live[mem])
+            it->legacy_unreported |= 1 << mem;
+         else
+            save_items_leave_legacy(c, set, i, mem, name);
+      }
+   }
    for (i = 0; i < set->num_items; i++)
    {
       const save_item_t *it = &set->items[i];
       unsigned mem          = it->item.legacy_memory;
       if (it->left_out || mem == RETRO_SAVE_NO_LEGACY_MEMORY)
          continue;
-      if (     mem != RETRO_MEMORY_SAVE_RAM
-            && mem != RETRO_MEMORY_RTC
-            && mem < 0x100)
-         save_items_find(c, i, &it->item, RETRO_SAVE_FIELD_LEGACY_MEMORY,
-               RETRO_SAVE_VERDICT_IGNORED, NULL,
-               "%u: not RETRO_MEMORY_SAVE_RAM, RETRO_MEMORY_RTC or a "
-               "subsystem memory type", mem);
       for (j = 0; j < i; j++)
          if (     !set->items[j].left_out
                && set->items[j].item.legacy_memory == mem)
@@ -1218,6 +1343,33 @@ static void save_items_check_legacy(save_items_check_t *c,
                   ? "; 0 is RETRO_MEMORY_SAVE_RAM" : "");
             break;
          }
+      /* Its old file is read only through its own name or legacy_paths. */
+      if (     j == i && names && it->path
+            && (mem == RETRO_MEMORY_SAVE_RAM || mem == RETRO_MEMORY_RTC))
+      {
+         unsigned n;
+         const char *old = names
+            + (mem == RETRO_MEMORY_RTC ? PATH_MAX_LENGTH : 0);
+         bool listed     = string_is_equal(it->path, old);
+         for (n = 0; !listed && it->legacy && it->legacy[n]; n++)
+            listed = string_is_equal(it->legacy[n], old);
+         if (!listed)
+            save_items_find(c, i, &it->item, RETRO_SAVE_FIELD_LEGACY_PATHS,
+                  RETRO_SAVE_VERDICT_IGNORED,
+                  "SET_SAVE_INTERFACE, \"Cross-core compatibility\"",
+                  "%s: \"%s\", where the frontend saved this memory "
+                  "before, is not among them, so a save there is not "
+                  "loaded%s", it->legacy ? "set" : "NULL", old,
+                  mem == RETRO_MEMORY_SAVE_RAM
+                  ? "; 0 is RETRO_MEMORY_SAVE_RAM" : "");
+      }
+      if (     mem != RETRO_MEMORY_SAVE_RAM
+            && mem != RETRO_MEMORY_RTC
+            && mem < 0x100)
+         save_items_find(c, i, &it->item, RETRO_SAVE_FIELD_LEGACY_MEMORY,
+               RETRO_SAVE_VERDICT_IGNORED, NULL,
+               "%u: not RETRO_MEMORY_SAVE_RAM, RETRO_MEMORY_RTC or a "
+               "subsystem memory type", mem);
       if (     it->item.storage == RETRO_SAVE_STORAGE_EXTERNAL
             || it->item.storage == RETRO_SAVE_STORAGE_NOT_PERSISTED
             || (   (   it->item.storage == RETRO_SAVE_STORAGE_FRONTEND_BUFFER
@@ -1229,6 +1381,17 @@ static void save_items_check_legacy(save_items_check_t *c,
                "saved%s", mem, mem == RETRO_MEMORY_SAVE_RAM
                ? "; 0 is RETRO_MEMORY_SAVE_RAM" : "");
    }
+   free(names);
+}
+
+/* Whether folder item @f holds legacy file @name or its write temp:
+ * then @buf, of three PATH_MAX_LENGTH parts, names it. */
+static bool save_items_holds_legacy(const save_item_t *f, const char *name,
+      char *buf)
+{
+   static const char *const ends[] = { "", ".tmp", NULL };
+   return save_items_holds_ends(f, buf, strlcpy(buf, name, PATH_MAX_LENGTH),
+         ends, buf + PATH_MAX_LENGTH);
 }
 
 /* Whether folder item @f holds @base plus a slot and one of @ends:
@@ -1290,21 +1453,38 @@ static const char *save_items_holds_own(const save_item_t *f,
 }
 
 /* Leaves out a folder item that holds a file the frontend writes
- * itself, as that writer is not an item: this content's savestates,
- * thumbnails, entry states, replays and disk index, and the write
- * temps of these. */
+ * itself, as that writer is not an item: the live .srm and .rtc, this
+ * content's savestates, thumbnails, entry states, replays and disk
+ * index, and the write temps of these. */
 static void save_items_check_frontend_files(save_items_check_t *c,
       save_items_set_t *set, const struct save_items_paths *paths)
 {
-   unsigned i;
-   char *buf = (char*)malloc(3 * PATH_MAX_LENGTH);
+   unsigned i, t;
+   char *names = save_items_legacy_names(paths);
+   char *buf   = (char*)malloc(3 * PATH_MAX_LENGTH);
    for (i = 0; buf && i < set->num_items; i++)
    {
       const char *what;
       save_item_t *it = &set->items[i];
       if (     it->left_out || !it->path
-            || it->item.storage != RETRO_SAVE_STORAGE_CORE_FOLDER
-            || !(what = save_items_holds_own(it, paths, buf)))
+            || it->item.storage != RETRO_SAVE_STORAGE_CORE_FOLDER)
+         continue;
+      for (t = 0; names && t < 2; t++)
+      {
+         unsigned mem = t ? RETRO_MEMORY_RTC : RETRO_MEMORY_SAVE_RAM;
+         if (     save_items_memory_retired(set, mem)
+               || !save_items_holds_legacy(it,
+                  names + t * PATH_MAX_LENGTH, buf))
+            continue;
+         if (!paths->legacy_live[mem])
+            it->legacy_unreported |= 1 << mem;
+         else
+         {
+            save_items_leave_legacy(c, set, i, mem, buf);
+            break;
+         }
+      }
+      if (it->left_out || !(what = save_items_holds_own(it, paths, buf)))
          continue;
       save_items_find(c, i, &it->item, RETRO_SAVE_FIELD_PATH,
             RETRO_SAVE_VERDICT_LEFT_OUT,
@@ -1314,6 +1494,7 @@ static void save_items_check_frontend_files(save_items_check_t *c,
             what);
       it->left_out = true;
    }
+   free(names);
    free(buf);
 }
 
@@ -1472,7 +1653,10 @@ bool save_items_get_frontend_interface(
    fi->item_flags       &= SAVE_ITEMS_ITEM_FLAGS;
    fi->features         &= SAVE_ITEMS_FEATURES;
    if (instance == RETRO_SAVE_INSTANCE_PRIMARY)
+   {
       save_items_st.features = fi->features;
+      save_items_st.asked    = true;
+   }
    fi->get_path          = save_items_get_path;
    fi->notify            = save_items_notify;
    fi->get_issues        = instance == RETRO_SAVE_INSTANCE_PRIMARY
@@ -1521,17 +1705,38 @@ static void save_items_match_moves(save_items_set_t *set,
                && string_is_equal(cur->items[j].path, it->path)
                && save_items_same_type(&cur->items[j].item, &it->item))
          {
-            it->prev           = j;
-            cur->items[j].next = i;
+            it->prev                = j;
+            cur->items[j].next      = i;
+            it->tail                = cur->items[j].tail;
+            it->tail_size           = cur->items[j].tail_size;
+            cur->items[j].tail      = NULL;
+            cur->items[j].tail_size = 0;
             break;
          }
    }
 }
 
+/* Neither format tag is the other with "+<memory>" parts appended. */
+static bool save_items_tags_unrelated(const char *a, const char *b)
+{
+   size_t len;
+   if (!a || !b)
+      return false;
+   if (strlen(a) > strlen(b))
+   {
+      const char *t = a;
+      a             = b;
+      b             = t;
+   }
+   len = strlen(a);
+   return strncmp(a, b, len) || (b[len] && b[len] != '+');
+}
+
 /* Marks each frontend-owned item of @set, new or kept, whose file an
- * item of @cur other than its own kept another way. */
-static void save_items_mark_type_changes(save_items_set_t *set,
-      const save_items_set_t *cur)
+ * item of @cur other than its own kept another way, or whose own kept
+ * id there changed its format other than by appending or cutting. */
+static void save_items_mark_type_changes(save_items_check_t *c,
+      save_items_set_t *set, const save_items_set_t *cur)
 {
    unsigned i, j;
    for (i = 0; i < set->num_items; i++)
@@ -1539,6 +1744,19 @@ static void save_items_mark_type_changes(save_items_set_t *set,
       save_item_t *it = &set->items[i];
       if (!save_items_frontend_owned(it))
          continue;
+      if (     it->prev != SAVE_ITEMS_NONE
+            && string_is_equal(cur->items[it->prev].path, it->path)
+            && save_items_tags_unrelated(cur->items[it->prev].item.format,
+                  it->item.format))
+      {
+         it->type_changed = true;
+         save_items_find(c, i, &it->item, RETRO_SAVE_FIELD_FORMAT,
+               RETRO_SAVE_VERDICT_IGNORED,
+               "SET_SAVE_INTERFACE, \"Layout changes\"",
+               "\"%s\": it was \"%s\" at this file, and a layout changes "
+               "only by a trailing \"+<memory>\"; a copy of the file is "
+               "kept", it->item.format, cur->items[it->prev].item.format);
+      }
       for (j = 0; j < cur->num_items; j++)
          if (     j != it->prev
                && cur->items[j].path
@@ -1584,6 +1802,56 @@ static bool save_items_refuse(save_items_set_t *set)
    save_items_st.refused  = true;
    save_items_st.dropped  = cur != NULL;
    return false;
+}
+
+static size_t save_items_head_size(const struct retro_save_item *item)
+{
+   unsigned k;
+   size_t len = 0;
+   for (k = 0; k < item->num_segments; k++)
+      len += item->segments[k].size;
+   return len;
+}
+
+/* A re-registration that cuts a buffer keeps the cut bytes in front of
+ * its tail. @old's segments stand only during this SET call. False
+ * when there is no memory for them. */
+static bool save_items_keep_cut(save_item_t *it, const save_item_t *old)
+{
+   unsigned k;
+   unsigned char *tail;
+   size_t off = 0;
+   size_t own = save_items_head_size(&it->item);
+   size_t had = save_items_head_size(&old->item);
+
+   if (     it->item.storage  != RETRO_SAVE_STORAGE_FRONTEND_BUFFER
+         || old->item.storage != RETRO_SAVE_STORAGE_FRONTEND_BUFFER
+         || had <= own)
+      return true;
+   if (!(tail = (unsigned char*)malloc(had - own + it->tail_size)))
+   {
+      RARCH_ERR("[SRAM] No memory to keep what \"%s\" was cut by.\n",
+            it->item.id);
+      return false;
+   }
+   for (k = 0; k < old->item.num_segments; k++)
+   {
+      size_t end = off + old->item.segments[k].size;
+      if (end > own)
+      {
+         size_t from = off > own ? off : own;
+         memcpy(tail + (from - own),
+               (const unsigned char*)old->item.segments[k].data
+               + (from - off), end - from);
+      }
+      off = end;
+   }
+   if (it->tail_size)
+      memcpy(tail + (had - own), it->tail, it->tail_size);
+   free(it->tail);
+   it->tail       = tail;
+   it->tail_size += had - own;
+   return true;
 }
 
 static const char *save_items_storage_name(unsigned storage)
@@ -1679,6 +1947,12 @@ bool save_items_register(const struct retro_save_interface *iface,
    memset(&c, 0, sizeof(c));
    c.core                = paths->core;
    save_items_st.refused = false;
+   if (     !string_is_empty(paths->core)
+         && !string_is_equal(paths->core, save_items_st.core))
+   {
+      free(save_items_st.core);
+      save_items_st.core = strdup(paths->core);
+   }
    save_items_st.dropped = false;
    if (!save_items_check_call(&c, iface))
    {
@@ -1727,11 +2001,19 @@ bool save_items_register(const struct retro_save_interface *iface,
    save_items_resolve_set(set, paths);
    save_items_check_unnamed(&c, set, paths);
    save_items_check_files(&c, set, cur, paths);
-   save_items_check_legacy(&c, set);
+   save_items_check_legacy(&c, set, paths);
    save_items_check_frontend_files(&c, set, paths);
-   save_items_check_end(&c);
+   for (i = 0; i < set->num_items; i++)
+      if (!set->items[i].left_out && set->items[i].legacy_unreported)
+      {
+         set->legacy_names = save_items_legacy_names(paths);
+         break;
+      }
    if (c.refused)
+   {
+      save_items_check_end(&c);
       return save_items_refuse(set);
+   }
 
    /* Described only: no file, and it retires nothing. */
    for (i = 0; i < set->num_items; i++)
@@ -1760,19 +2042,91 @@ bool save_items_register(const struct retro_save_interface *iface,
                }
                set->items[i].prev = j;
                cur->items[j].next = i;
+               /* Only a buffer keeps a tail: a blob leaves it in the
+                * replaced item's last image. */
+               if (     string_is_equal(set->items[i].path,
+                           cur->items[j].path)
+                     && set->items[i].item.storage
+                        == RETRO_SAVE_STORAGE_FRONTEND_BUFFER)
+               {
+                  set->items[i].tail      = cur->items[j].tail;
+                  set->items[i].tail_size = cur->items[j].tail_size;
+                  cur->items[j].tail      = NULL;
+                  cur->items[j].tail_size = 0;
+                  /* Without memory for the cut bytes the end stays
+                   * with the replaced item: its last image is whole. */
+                  if (!save_items_keep_cut(&set->items[i],
+                           &cur->items[j]))
+                  {
+                     cur->items[j].tail      = set->items[i].tail;
+                     cur->items[j].tail_size = set->items[i].tail_size;
+                     set->items[i].tail      = NULL;
+                     set->items[i].tail_size = 0;
+                  }
+               }
                break;
             }
 
    if (cur)
    {
       save_items_match_moves(set, cur);
-      save_items_mark_type_changes(set, cur);
+      save_items_mark_type_changes(&c, set, cur);
    }
 
+   save_items_check_end(&c);
+   save_items_issues_reserve(set);
    save_items_summary(paths->core, set, cur);
    save_items_set_free(save_items_st.previous);
    save_items_st.previous = cur;
    save_items_st.current  = set;
+   return true;
+}
+
+bool save_items_check_reported(unsigned i, const bool *live)
+{
+   unsigned mem;
+   char *buf;
+   save_items_check_t c;
+   save_item_t *it;
+   save_items_set_t *set = save_items_st.current;
+   if (!set || i >= set->num_items)
+      return false;
+   it = &set->items[i];
+   if (it->left_out || !it->legacy_unreported || !set->legacy_names)
+   {
+      it->legacy_unreported = 0;
+      return false;
+   }
+   /* The finding takes room kept after the call's, so the list a core
+    * holds does not move. */
+   memset(&c, 0, sizeof(c));
+   c.core       = save_items_st.core;
+   c.issues     = save_items_st.issues;
+   c.num_issues = save_items_st.num_issues;
+   c.room       = save_items_st.issues_room;
+   c.fixed      = true;
+   buf          = (char*)malloc(3 * PATH_MAX_LENGTH);
+   for (mem = 0; mem < 2 && !it->left_out; mem++)
+      if (     (it->legacy_unreported & (1 << mem)) && live[mem]
+            && !save_items_memory_retired(set, mem))
+      {
+         const char *name = set->legacy_names + mem * PATH_MAX_LENGTH;
+         if (     it->item.storage == RETRO_SAVE_STORAGE_CORE_FOLDER && buf
+               && save_items_holds_legacy(it, name, buf))
+            name = buf;
+         save_items_leave_legacy(&c, set, i, mem, name);
+      }
+   free(buf);
+   it->legacy_unreported     = 0;
+   save_items_st.num_issues  = c.num_issues;
+   save_items_st.issues_room = c.room;
+   if (!it->left_out)
+      return false;
+   free(it->path);
+   it->path               = NULL;
+   save_items_strv_free((const char *const *)it->legacy);
+   it->legacy             = NULL;
+   it->item.legacy_memory = RETRO_SAVE_NO_LEGACY_MEMORY;
    return true;
 }
 
@@ -1840,6 +2194,41 @@ bool save_items_take_refusal(void)
    return true;
 }
 
+void save_items_check_caller(const char *core, bool other_thread)
+{
+   if (string_is_empty(core))
+      core = "Core";
+   if (!save_items_st.asked && !save_items_st.unasked_told)
+   {
+      save_items_st.unasked_told = true;
+      RARCH_WARN("[SRAM] %s: SET_SAVE_INTERFACE came before "
+            "GET_SAVE_FRONTEND_INTERFACE, which a core calls first to "
+            "learn what this frontend takes. See libretro.h, "
+            "GET_SAVE_FRONTEND_INTERFACE.\n", core);
+   }
+   if (other_thread && !save_items_st.thread_told)
+   {
+      save_items_st.thread_told = true;
+      RARCH_WARN("[SRAM] %s: SET_SAVE_INTERFACE came from a thread other "
+            "than the core's. See libretro.h, SET_SAVE_INTERFACE, "
+            "\"Threads\".\n", core);
+   }
+}
+
+void save_items_who(char *s, size_t len, const save_items_set_t *set,
+      unsigned i)
+{
+   const struct retro_save_item *item = &set->items[i].item;
+   const char *core = string_is_empty(save_items_st.core)
+      ? "Core" : save_items_st.core;
+   if (item->label)
+      snprintf(s, len, "%s: save item %u \"%s\" (\"%s\")", core, i,
+            save_items_id(item), item->label);
+   else
+      snprintf(s, len, "%s: save item %u \"%s\"", core, i,
+            save_items_id(item));
+}
+
 const char *save_items_take_left_out(void)
 {
    unsigned i;
@@ -1856,6 +2245,34 @@ const char *save_items_take_left_out(void)
    return NULL;
 }
 
+bool save_items_can_register(void)
+{
+   save_items_check_t c;
+   unsigned room;
+   struct retro_save_issue *grown;
+   if (!save_items_st.callback)
+      return true;
+   /* The set registered stays: so does the room its first fill may
+    * take. */
+   room   = save_items_st.issues_room;
+   memset(&c, 0, sizeof(c));
+   c.core = save_items_st.core;
+   save_items_find(&c, RETRO_SAVE_ISSUE_NO_ITEM, NULL,
+         RETRO_SAVE_FIELD_NONE, RETRO_SAVE_VERDICT_REFUSED,
+         "SET_SAVE_INTERFACE", "made from inside the core's %s(), which "
+         "reads the current set; a core makes it from retro_run()",
+         save_items_st.callback);
+   save_items_check_end(&c);
+   if (     room
+         && (grown = (struct retro_save_issue*)realloc(save_items_st.issues,
+            (save_items_st.num_issues + room) * sizeof(*grown))))
+   {
+      save_items_st.issues      = grown;
+      save_items_st.issues_room = room;
+   }
+   return false;
+}
+
 void save_items_clear(void)
 {
    save_items_drop_previous();
@@ -1868,7 +2285,280 @@ void save_items_clear(void)
    save_items_st.refused       = false;
    save_items_st.dropped       = false;
    save_items_st.refusal_shown = false;
+   save_items_st.asked         = false;
+   save_items_st.unasked_told  = false;
+   save_items_st.thread_told   = false;
+   free(save_items_st.core);
+   save_items_st.core          = NULL;
    save_items_issues_free();
    save_items_strs_free(&save_items_st.logged, &save_items_st.num_logged);
    save_items_strs_free(&save_items_st.told, &save_items_st.num_told);
+}
+
+size_t save_items_blob_size(const save_items_set_t *set, unsigned i)
+{
+   size_t len;
+   const char *was        = save_items_st.callback;
+   save_items_st.callback = "blob_size";
+   len                    = set->iface.blob_size(i);
+   save_items_st.callback = was;
+   return len;
+}
+
+static bool save_items_blob_save(const save_items_set_t *set, unsigned i,
+      void *buf, size_t len)
+{
+   bool ok;
+   const char *was        = save_items_st.callback;
+   save_items_st.callback = "blob_save";
+   ok                     = set->iface.blob_save(i, buf, len);
+   save_items_st.callback = was;
+   return ok;
+}
+
+uint64_t save_items_generation(const save_items_set_t *set, unsigned i)
+{
+   uint64_t gen;
+   const char *was;
+   if (!set->iface.get_generation)
+      return 0;
+   was                    = save_items_st.callback;
+   save_items_st.callback = "get_generation";
+   gen                    = set->iface.get_generation(i);
+   save_items_st.callback = was;
+   return gen;
+}
+
+bool save_items_can_snapshot(const save_items_set_t *set, unsigned i)
+{
+   bool ready;
+   const char *was;
+   if (!set->iface.can_snapshot)
+      return true;
+   was                    = save_items_st.callback;
+   save_items_st.callback = "can_snapshot";
+   ready                  = set->iface.can_snapshot(i);
+   save_items_st.callback = was;
+   return ready;
+}
+
+size_t save_items_size(const save_items_set_t *set, unsigned i)
+{
+   size_t len;
+   const save_item_t *it = &set->items[i];
+   if (it->item.storage == RETRO_SAVE_STORAGE_FRONTEND_BLOB)
+   {
+      len = save_items_blob_size(set, i);
+      return (it->item.max_size && len > it->item.max_size) ? 0 : len;
+   }
+   return save_items_head_size(&it->item) + it->tail_size;
+}
+
+bool save_items_copy_out_head(const save_items_set_t *set, unsigned i,
+      void *buf, size_t len)
+{
+   unsigned k;
+   size_t off                         = 0;
+   const struct retro_save_item *item = &set->items[i].item;
+   if (item->storage == RETRO_SAVE_STORAGE_FRONTEND_BLOB)
+      return save_items_blob_save(set, i, buf, len);
+   for (k = 0; k < item->num_segments; k++)
+   {
+      size_t n = item->segments[k].size;
+      if (n > len - off)
+         return false;
+      if (n)
+         memcpy((unsigned char*)buf + off, item->segments[k].data, n);
+      off += n;
+   }
+   return off == len;
+}
+
+bool save_items_copy_out(const save_items_set_t *set, unsigned i,
+      void *buf, size_t len)
+{
+   const save_item_t *it = &set->items[i];
+   if (it->item.storage == RETRO_SAVE_STORAGE_FRONTEND_BLOB)
+      return save_items_blob_save(set, i, buf, len);
+   if (     len < it->tail_size
+         || !save_items_copy_out_head(set, i, buf, len - it->tail_size))
+      return false;
+   if (it->tail_size)
+      memcpy((unsigned char*)buf + len - it->tail_size, it->tail,
+            it->tail_size);
+   return true;
+}
+
+bool save_items_copy_in(const save_items_set_t *set, unsigned i,
+      const void *buf, size_t len)
+{
+   unsigned k;
+   size_t off                         = 0;
+   const struct retro_save_item *item = &set->items[i].item;
+   if (item->storage == RETRO_SAVE_STORAGE_FRONTEND_BLOB)
+      return set->iface.blob_load(i, buf, len);
+   for (k = 0; k < item->num_segments && off < len; k++)
+   {
+      size_t n = item->segments[k].size;
+      if (n > len - off)
+         n = len - off;
+      if (n)
+         memcpy(item->segments[k].data,
+               (const unsigned char*)buf + off, n);
+      off += n;
+   }
+   return true;
+}
+
+void save_items_keep_tail(unsigned i, const void *buf, size_t len)
+{
+   size_t own;
+   save_item_t *it;
+   save_items_set_t *set = save_items_st.current;
+   if (!set || i >= set->num_items)
+      return;
+   it = &set->items[i];
+   save_items_drop_tail(i);
+   if (it->item.storage != RETRO_SAVE_STORAGE_FRONTEND_BUFFER)
+      return;
+   own = save_items_head_size(&it->item);
+   if (len <= own)
+      return;
+   if (!(it->tail = malloc(len - own)))
+   {
+      RARCH_ERR("[SRAM] No memory to keep the end of \"%s\".\n", it->path);
+      return;
+   }
+   memcpy(it->tail, (const unsigned char*)buf + own, len - own);
+   it->tail_size = len - own;
+}
+
+void save_items_drop_tail(unsigned i)
+{
+   save_items_set_t *set = save_items_st.current;
+   if (!set || i >= set->num_items)
+      return;
+   free(set->items[i].tail);
+   set->items[i].tail      = NULL;
+   set->items[i].tail_size = 0;
+}
+
+void save_items_cut_tail(unsigned i, size_t at, size_t len)
+{
+   save_item_t *it;
+   save_items_set_t *set = save_items_st.current;
+   if (!set || i >= set->num_items)
+      return;
+   it = &set->items[i];
+   if (at >= it->tail_size)
+      return;
+   if (len > it->tail_size - at)
+      len = it->tail_size - at;
+   memmove((unsigned char*)it->tail + at,
+         (const unsigned char*)it->tail + at + len,
+         it->tail_size - at - len);
+   if (!(it->tail_size -= len))
+      save_items_drop_tail(i);
+}
+
+size_t save_items_grow_from_tail(unsigned i, size_t from)
+{
+   unsigned k;
+   size_t n;
+   size_t off            = 0;
+   save_items_set_t *set = save_items_st.current;
+   save_item_t *it;
+   if (!set || i >= set->num_items || !set->items[i].tail_size)
+      return 0;
+   it = &set->items[i];
+   n  = save_items_head_size(&it->item);
+   if (n <= from)
+      return 0;
+   n -= from;
+   if (n > it->tail_size)
+      n = it->tail_size;
+   for (k = 0; k < it->item.num_segments; k++)
+   {
+      size_t end = off + it->item.segments[k].size;
+      size_t s   = off > from ? off : from;
+      size_t e   = end < from + n ? end : from + n;
+      if (s < e)
+         memcpy((unsigned char*)it->item.segments[k].data + (s - off),
+               (const unsigned char*)it->tail + (s - from), e - s);
+      off = end;
+   }
+   if (n == it->tail_size)
+      save_items_drop_tail(i);
+   else
+   {
+      memmove(it->tail, (const unsigned char*)it->tail + n,
+            it->tail_size - n);
+      it->tail_size -= n;
+   }
+   return n;
+}
+
+bool save_items_path_is_live(const char *path)
+{
+   unsigned i;
+   char *buf                   = NULL;
+   bool live                   = false;
+   const save_items_set_t *set = save_items_st.current;
+   if (!set || string_is_empty(path))
+      return false;
+   for (i = 0; !live && i < set->num_items; i++)
+   {
+      size_t len;
+      const save_item_t *it = &set->items[i];
+      if (!it->path)
+         continue;
+      switch (it->item.storage)
+      {
+         case RETRO_SAVE_STORAGE_FRONTEND_BUFFER:
+         case RETRO_SAVE_STORAGE_FRONTEND_BLOB:
+         case RETRO_SAVE_STORAGE_CORE_FILE:
+            live = string_is_equal_case_insensitive(it->path, path);
+            break;
+         case RETRO_SAVE_STORAGE_CORE_FOLDER:
+            /* The folder, and the files in it its patterns select;
+             * without memory to match, every file. */
+            len = strlen(it->path);
+            if (     !len
+                  || !string_starts_with_case_insensitive(path, it->path))
+               break;
+            if (!path[len])
+               live = true;
+            else if (PATH_CHAR_IS_SLASH(path[len]))
+            {
+               if (!buf)
+                  buf = (char*)malloc(2 * PATH_MAX_LENGTH);
+               live = save_items_selects(it, path + len + 1, buf);
+            }
+            else if (PATH_CHAR_IS_SLASH(it->path[len - 1]))
+            {
+               if (!buf)
+                  buf = (char*)malloc(2 * PATH_MAX_LENGTH);
+               live = save_items_selects(it, path + len, buf);
+            }
+            break;
+         default:
+            break;
+      }
+   }
+   free(buf);
+   return live;
+}
+
+size_t save_items_state_undo_dir(char *s, size_t len,
+      const char *core_assets, const char *library_name,
+      const char *content)
+{
+   if (     string_is_empty(core_assets)
+         || string_is_empty(library_name)
+         || string_is_empty(content)
+         || !*path_basename(content))
+      return 0;
+   fill_pathname_join_special(s, core_assets, "state_undo", len);
+   fill_pathname_join(s, s, library_name, len);
+   return fill_pathname_join(s, s, path_basename(content), len);
 }

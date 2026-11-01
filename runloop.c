@@ -2079,6 +2079,7 @@ static const char *runloop_system_dir(settings_t *settings)
 static void runloop_save_items_paths(runloop_state_t *runloop_st,
       struct save_items_paths *paths)
 {
+   unsigned i;
    paths->core                = runloop_st->system.info.library_name;
    paths->subsystem           = path_is_empty(RARCH_PATH_SUBSYSTEM)
       ? NULL : runloop_st->subsystem_fullpaths;
@@ -2092,11 +2093,19 @@ static void runloop_save_items_paths(runloop_state_t *runloop_st,
       ? runloop_st->system.disk_control.index_record.file_path : NULL;
    paths->savefile_dir_is_dir = paths->subsystem
       && path_is_directory(runloop_st->savefile_dir);
+   for (i = 0; i < 2; i++)
+   {
+      retro_ctx_memory_info_t mem;
+      mem.id                = i;
+      mem.data              = NULL;
+      mem.size              = 0;
+      paths->legacy_live[i] = core_get_memory(&mem) && mem.data && mem.size;
+   }
 }
 
 /* A refused registration, or the left-out item @name; the log has
  * the details while logging is on. */
-static void runloop_save_items_notice(const char *name)
+void runloop_save_items_notice(const char *name)
 {
    char msg[512];
    if (name)
@@ -3876,17 +3885,30 @@ bool runloop_environment_cb(unsigned cmd, void *data)
       {
          struct save_items_paths paths;
          const char *left_out;
+         if (!save_items_can_register())
+            return false;
+#ifdef HAVE_THREADS
+         save_items_check_caller(runloop_st->system.info.library_name,
+               runloop_msg_queue_off_main(runloop_st));
+#else
+         save_items_check_caller(runloop_st->system.info.library_name,
+               false);
+#endif
          runloop_save_items_paths(runloop_st, &paths);
          if (!save_items_register(
                   (const struct retro_save_interface*)data, &paths))
          {
             if (save_items_take_refusal())
                runloop_save_items_notice(NULL);
+            /* A refused set ended the one before: closed as replaced. */
+            if (save_items_state_get_ptr()->dropped)
+               event_save_items_registered();
             save_items_drop_previous();
             return false;
          }
          while ((left_out = save_items_take_left_out()))
             runloop_save_items_notice(left_out);
+         event_save_items_registered();
          save_items_drop_previous();
          break;
       }
@@ -5559,6 +5581,7 @@ static bool core_unload_game(void)
       runloop_st->current_core.flags      &= ~RETRO_CORE_FLAG_GAME_LOADED;
    }
 
+   event_save_items_deinit();
    save_items_clear();
 
    /* A staged switch keeps the device running until its driver stage
@@ -6043,6 +6066,18 @@ static bool event_init_content(
    command_event_set_replay_auto_index(settings);
 
    runloop_path_init_savefile(runloop_st);
+
+   /* Where this content's safety copies go. */
+   {
+      char *dir = (char*)malloc(PATH_MAX_LENGTH);
+      if (dir && !save_items_state_undo_dir(dir, PATH_MAX_LENGTH,
+               settings->paths.directory_core_assets,
+               runloop_st->system.info.library_name,
+               runloop_st->runtime_content_path_basename))
+         *dir = '\0';
+      event_save_items_set_undo_dir(dir);
+      free(dir);
+   }
 
    if (!event_load_save_files(runloop_st->flags & RUNLOOP_FLAG_IS_SRAM_LOAD_DISABLED))
       RARCH_LOG("[SRAM] %s\n", msg_hash_to_str(MSG_SKIPPING_SRAM_LOAD));
@@ -7640,7 +7675,10 @@ static bool display_menu_libretro(
          input_st->flags |= INP_FLAG_BLOCK_LIBRETRO_INPUT;
 
       video_driver_ff_frameskip_decide(current_time);
-      core_run();
+      event_save_items_fill(
+            (runloop_st->flags & RUNLOOP_FLAG_IS_SRAM_LOAD_DISABLED) != 0);
+      if (core_run())
+         event_save_items_ran(video_st->av_info.timing.fps);
       runloop_load_deferred_auto_state();
       runloop_st->core_runtime_usec       +=
          runloop_core_runtime_tick(runloop_st, slowmotion_ratio, current_time);
@@ -10145,6 +10183,11 @@ int runloop_iterate(void)
          break;
    }
 
+   /* Before any retro_run() of this frame: run-ahead and preemptive
+    * frames call it without core_run(). */
+   event_save_items_fill(
+         (runloop_st->flags & RUNLOOP_FLAG_IS_SRAM_LOAD_DISABLED) != 0);
+
 #ifdef HAVE_THREADS
    if (runloop_st->flags & RUNLOOP_FLAG_AUTOSAVE)
       autosave_lock();
@@ -10197,6 +10240,9 @@ int runloop_iterate(void)
 #endif
          frame_advanced = core_run();
    }
+
+   if (frame_advanced)
+      event_save_items_ran(video_st->av_info.timing.fps);
 
    runloop_load_deferred_auto_state();
 

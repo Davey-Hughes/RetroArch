@@ -119,6 +119,8 @@ static struct save_items_paths plain_paths(void)
    p.replay              = "/states/Game.v1.2.replay";
    p.disk_index          = "/saves/Game.v1.2.ldci";
    p.savefile_dir_is_dir = true;
+   p.legacy_live[RETRO_MEMORY_SAVE_RAM] = true;
+   p.legacy_live[RETRO_MEMORY_RTC]      = true;
    return p;
 }
 
@@ -129,6 +131,9 @@ static struct retro_save_item item_named(const char *id)
    it.id = id;
    return it;
 }
+
+/* The .srm of plain_paths(), as an earlier name. */
+static const char *const legacy_srm[] = { "srm", NULL };
 
 /* An item no check finds anything in. */
 static struct retro_save_item clean_item(const char *id)
@@ -498,6 +503,9 @@ static const char *path_of(unsigned root, const char *path,
    items[0].root          = root;
    items[0].path          = path;
    items[0].content_index = content_index;
+   /* At the .rtc name an item replaces RTC, or two would write it. */
+   if (path && !strcmp(path, "rtc"))
+      items[0].legacy_memory = RETRO_MEMORY_RTC;
    iface_of(&iface, items, 1);
    assert(save_items_register(&iface, p));
    save_items_drop_previous();
@@ -678,6 +686,7 @@ static void test_legacy(void)
 
    /* A subsystem memory type, and a core file retiring RTC. */
    items[0].legacy_memory = 0x101;
+   items[0].path          = "s101";
    items[1].legacy_memory = RETRO_MEMORY_RTC;
    iface_of(&iface, items, 2);
    assert(save_items_register(&iface, &p));
@@ -1160,6 +1169,7 @@ static void test_port_move(void)
  * kept the same way, it is not. */
 static void test_kept_move(void)
 {
+   unsigned i;
    struct retro_save_interface iface;
    struct retro_save_item items[2];
    struct save_items_paths p = plain_paths();
@@ -1197,12 +1207,33 @@ static void test_kept_move(void)
    assert(cur()->items[0].prev == 0 && cur()->items[1].prev == 1);
    assert(cur()->items[0].type_changed && cur()->items[1].type_changed);
 
-   /* Kept at their own files: not marked, whatever their type. */
-   items[0].format = "gb:rtc";
-   items[1].format = "gb:sram";
+   /* Kept at their own files, a format grown by "+<memory>": not
+    * marked. */
+   items[0].format = "gb:sram+rtc";
+   items[1].format = "gb:rtc";
    iface_of(&iface, items, 2);
    assert(save_items_register(&iface, &p));
    assert(!cur()->items[0].type_changed && !cur()->items[1].type_changed);
+
+   /* Any other format change there is a new layout: marked, and
+    * logged. */
+   items[0].format = "gb:rtc";
+   items[1].format = "gb:sram";
+   iface_of(&iface, items, 2);
+   logs_clear();
+   assert(save_items_register(&iface, &p));
+   assert(cur()->items[0].type_changed && cur()->items[1].type_changed);
+   assert(logged_once('W', "TestCore: save item 0 \"cart\" (\"Battery "
+         "RAM\"): format = \"gb:rtc\": it was \"gb:sram+rtc\" at this file, and a layout "
+         "changes only by a trailing \"+<memory>\"; a copy of the file is "
+         "kept. See libretro.h, SET_SAVE_INTERFACE, \"Layout changes\". "
+         "Ignored."));
+   for (i = 0; i < save_items_state_get_ptr()->num_issues; i++)
+      if (save_items_state_get_ptr()->issues[i].field
+            == RETRO_SAVE_FIELD_FORMAT)
+         break;
+   assert(i < save_items_state_get_ptr()->num_issues);
+   assert(save_items_state_get_ptr()->issues[i].item == 0);
 
    /* Swapping files kept the same way: not marked. */
    items[0].path   = "/abs/cart.sav";
@@ -1466,6 +1497,8 @@ static void test_rules(void)
    items[0] = clean_item("x");
    items[0].storage  = RETRO_SAVE_STORAGE_FRONTEND_BLOB;
    items[0].segments = NULL;
+   items[0].path     = "sav";
+   items[0].legacy_paths = legacy_srm;
    items[0].flags   |= RETRO_SAVE_FLAG_EXACT_SIZE;
    iface_of(&iface, items, 1);
    expect_finding(&iface, true, 0, RETRO_SAVE_FIELD_FLAGS,
@@ -1504,11 +1537,73 @@ static void test_rules(void)
          "legacy_memory. Ignored.");
    items[0] = clean_item("x");
    items[0].legacy_memory = 2;
+   items[0].path          = "sav";
    iface_of(&iface, items, 1);
    expect_finding(&iface, true, 0, RETRO_SAVE_FIELD_LEGACY_MEMORY,
          RETRO_SAVE_VERDICT_IGNORED, WHO "legacy_memory = 2: not "
          "RETRO_MEMORY_SAVE_RAM, RETRO_MEMORY_RTC or a subsystem memory "
          "type. See libretro.h, retro_save_item::legacy_memory. Ignored.");
+
+   /* At the .srm or .rtc name of a memory the core reports, an item
+    * replaces that memory, unless another item does: the legacy writer
+    * would write the file too. */
+   items[0] = clean_item("x");
+   items[0].legacy_memory = RETRO_SAVE_NO_LEGACY_MEMORY;
+   iface_of(&iface, items, 1);
+   expect_finding(&iface, true, 0, RETRO_SAVE_FIELD_LEGACY_MEMORY,
+         RETRO_SAVE_VERDICT_LEFT_OUT, WHO "legacy_memory = "
+         "RETRO_SAVE_NO_LEGACY_MEMORY: the file \"/saves/Game.v1.2.srm\" is "
+         "where the frontend writes RETRO_MEMORY_SAVE_RAM, which the core "
+         "reports and no item replaces, and a file has one writer. See "
+         "libretro.h, SET_SAVE_INTERFACE, \"Ownership\"." LEFT);
+   items[0].path = "rtc";
+   iface_of(&iface, items, 1);
+   expect_finding(&iface, true, 0, RETRO_SAVE_FIELD_LEGACY_MEMORY,
+         RETRO_SAVE_VERDICT_LEFT_OUT, WHO "legacy_memory = "
+         "RETRO_SAVE_NO_LEGACY_MEMORY: the file \"/saves/Game.v1.2.rtc\" is "
+         "where the frontend writes RETRO_MEMORY_RTC, which the core reports "
+         "and no item replaces, and a file has one writer. See libretro.h, "
+         "SET_SAVE_INTERFACE, \"Ownership\"." LEFT);
+   /* Nearest valid: the core reports no RTC, so the frontend writes no
+    * file there. */
+   p.legacy_live[RETRO_MEMORY_RTC] = false;
+   save_items_clear();
+   logs_clear();
+   assert(save_items_register(&iface, &p));
+   assert(save_items_state_get_ptr()->num_issues == 0);
+   assert(!cur()->items[0].left_out && cur()->items[0].path);
+   assert(logs_at('W') + logs_at('E') == 0);
+   p.legacy_live[RETRO_MEMORY_RTC] = true;
+   /* A blob at the raw .srm. */
+   items[0] = clean_item("x");
+   items[0].storage  = RETRO_SAVE_STORAGE_FRONTEND_BLOB;
+   items[0].segments  = NULL;
+   items[0].flags     = 0;
+   items[0].base_hash = NULL;
+   iface_of(&iface, items, 1);
+   expect_finding(&iface, true, 0, RETRO_SAVE_FIELD_PATH,
+         RETRO_SAVE_VERDICT_IGNORED, WHO "path = \"/saves/Game.v1.2.srm\": "
+         "the frontend writes RETRO_MEMORY_SAVE_RAM raw there, and a core "
+         "never moves an existing raw file to a blob. See libretro.h, "
+         "SET_SAVE_INTERFACE, \"Cross-core compatibility\". Ignored.");
+   /* An item replacing save RAM elsewhere lists the .srm. */
+   items[0] = clean_item("x");
+   items[0].path = "sav";
+   iface_of(&iface, items, 1);
+   expect_finding(&iface, true, 0, RETRO_SAVE_FIELD_LEGACY_PATHS,
+         RETRO_SAVE_VERDICT_IGNORED, WHO "legacy_paths = NULL: "
+         "\"/saves/Game.v1.2.srm\", where the frontend saved this memory "
+         "before, is not among them, so a save there is not loaded; 0 is "
+         "RETRO_MEMORY_SAVE_RAM. See libretro.h, SET_SAVE_INTERFACE, "
+         "\"Cross-core compatibility\". Ignored.");
+   /* Nearest valid: it does. */
+   items[0].legacy_paths = legacy_srm;
+   iface_of(&iface, items, 1);
+   save_items_clear();
+   logs_clear();
+   assert(save_items_register(&iface, &p));
+   assert(save_items_state_get_ptr()->num_issues == 0);
+   assert(logs_at('W') + logs_at('E') == 0);
 
    /* A zero-filled item retires nothing: it is left out. */
    memset(&items[0], 0, sizeof(items[0]));
@@ -1632,6 +1727,37 @@ static void test_findings(void)
    assert(logged_once('W', "TestCore: and 8 more save item findings."));
    save_items_clear();
    assert(save_items_state_get_ptr()->num_issues == 0);
+}
+
+/* A SET before GET_SAVE_FRONTEND_INTERFACE, or off the core's thread,
+ * is logged once per content load. */
+static void test_caller(void)
+{
+   struct retro_save_frontend_interface fi;
+   save_items_clear();
+   logs_clear();
+   save_items_check_caller("TestCore", false);
+   save_items_check_caller("TestCore", false);
+   assert(logged_once('W', "TestCore: SET_SAVE_INTERFACE came before "
+         "GET_SAVE_FRONTEND_INTERFACE, which a core calls first to learn "
+         "what this frontend takes. See libretro.h, "
+         "GET_SAVE_FRONTEND_INTERFACE."));
+   save_items_check_caller("TestCore", true);
+   save_items_check_caller("TestCore", true);
+   assert(logged_once('W', "TestCore: SET_SAVE_INTERFACE came from a "
+         "thread other than the core's. See libretro.h, SET_SAVE_INTERFACE, "
+         "\"Threads\"."));
+   assert(num_logs == 2);
+
+   /* Nearest valid: GET first, on the core's thread. */
+   save_items_clear();
+   logs_clear();
+   header_fill_frontend(&fi);
+   assert(save_items_get_frontend_interface(&fi,
+         RETRO_SAVE_INSTANCE_PRIMARY));
+   save_items_check_caller("TestCore", false);
+   assert(num_logs == 0);
+   save_items_clear();
 }
 
 /* What registered is logged for new and changed items only. */
@@ -2215,6 +2341,205 @@ static void test_folder_states(void)
    save_items_clear();
 }
 
+/* A folder that holds the frontend's live .srm or .rtc. */
+static void test_folder_legacy_files(void)
+{
+   static const char *const srm[]     = { "*.srm", NULL };
+   static const char *const rtc[]     = { "*.RTC", NULL };
+   static const char *const old_srm[] = { "Game.v1.2.srm", NULL };
+   static const char *const srm_tmp[] = { "*.srm.TMP", NULL };
+   const save_items_state_t *st = save_items_state_get_ptr();
+   struct retro_save_interface iface;
+   struct retro_save_item items[2];
+   struct save_items_paths p = plain_paths();
+
+   items[0] = folder_item("x", RETRO_SAVE_ROOT_SAVE_DIR, "");
+   items[0].include = srm;
+   iface_of(&iface, items, 1);
+   expect_finding(&iface, true, 0, RETRO_SAVE_FIELD_PATH,
+         RETRO_SAVE_VERDICT_LEFT_OUT, WHO "path = \"\": the folder holds "
+         "\"/saves/Game.v1.2.srm\", where the frontend writes "
+         "RETRO_MEMORY_SAVE_RAM, which the core reports and no item "
+         "replaces, and a file has one writer; exclude it, or name that "
+         "memory in legacy_memory. " OWNERSHIP LEFT_CORE);
+   assert(!save_items_take_left_out());
+
+   items[0].include = rtc;
+   register_counted(items, 1, &p, 1, 1);
+   assert(cur()->items[0].left_out);
+   assert(strstr(st->issues[0].text, "\"/saves/Game.v1.2.rtc\", where the "
+         "frontend writes RETRO_MEMORY_RTC"));
+   items[0].include = srm_tmp;
+   register_counted(items, 1, &p, 1, 1);
+   assert(cur()->items[0].left_out);
+   assert(strstr(st->issues[0].text, "holds \"/saves/Game.v1.2.srm.tmp\", "
+         "where the frontend writes RETRO_MEMORY_SAVE_RAM"));
+
+   /* Retired by an item: the frontend writes no .srm. */
+   items[0].include = srm;
+   items[1] = clean_item("y");
+   items[1].root         = RETRO_SAVE_ROOT_SAVE_DIR;
+   items[1].path         = "game.sav";
+   items[1].legacy_paths = old_srm;
+   register_counted(items, 2, &p, 0, 0);
+   assert(!cur()->items[0].left_out && !cur()->items[1].left_out);
+   assert(save_items_legacy_retired(RETRO_MEMORY_SAVE_RAM));
+
+   /* The core reports no save RAM. */
+   p.legacy_live[RETRO_MEMORY_SAVE_RAM] = false;
+   register_counted(items, 1, &p, 0, 0);
+   assert(!cur()->items[0].left_out);
+   save_items_clear();
+}
+
+/* Save RAM or RTC the core reports only after the call: checked again,
+ * once, with the finding the call would have made. */
+static void test_legacy_reported_late(void)
+{
+   static const char *const srm[] = { "*.srm", NULL };
+   static const char *const rtc[] = { "*.RTC", NULL };
+   static const char *const rtc_tmp[] = { "*.rtc.tmp", NULL };
+   static const bool ram[2]       = { true, false };
+   static const bool clock[2]     = { false, true };
+   static const bool none[2]      = { false, false };
+   const save_items_state_t *st = save_items_state_get_ptr();
+   struct retro_save_frontend_interface fi;
+   struct retro_save_item items[2];
+   struct save_items_paths p = plain_paths();
+   char text[1024];
+
+   p.legacy_live[RETRO_MEMORY_SAVE_RAM] = false;
+   p.legacy_live[RETRO_MEMORY_RTC]      = false;
+   memset(&fi, 0, sizeof(fi));
+   fi.interface_version = 1;
+   assert(save_items_get_frontend_interface(&fi,
+            RETRO_SAVE_INSTANCE_PRIMARY));
+
+   /* At the .srm, after a finding of item 1's: listed after it. */
+   items[0] = clean_item("x");
+   items[0].legacy_memory = RETRO_SAVE_NO_LEGACY_MEMORY;
+   items[1] = clean_item("y");
+   items[1].path          = "y.sav";
+   items[1].legacy_memory = 2;
+   register_counted(items, 2, &p, 1, 1);
+   assert(cur()->items[0].path && fi.get_path(0, NULL, 0));
+   logs_clear();
+   assert(save_items_check_reported(0, ram));
+   snprintf(text, sizeof(text), "TestCore: " WHO "legacy_memory = "
+         "RETRO_SAVE_NO_LEGACY_MEMORY: the file \"/saves/Game.v1.2.srm\" is "
+         "where the frontend writes RETRO_MEMORY_SAVE_RAM, which the core "
+         "reports and no item replaces, and a file has one writer. See "
+         "libretro.h, SET_SAVE_INTERFACE, \"Ownership\"." LEFT);
+   assert(st->num_issues == 2 && st->issues[1].item == 0);
+   assert(st->issues[1].field == RETRO_SAVE_FIELD_LEGACY_MEMORY);
+   assert(st->issues[1].verdict == RETRO_SAVE_VERDICT_LEFT_OUT);
+   assert(!strcmp(st->issues[1].text, text) && st->issues[0].item == 1);
+   assert(logged_once('E', text) && logs_at('W') + logs_at('E') == 1);
+   assert(cur()->items[0].left_out && !fi.get_path(0, NULL, 0));
+   assert(cur()->items[0].item.legacy_memory
+         == RETRO_SAVE_NO_LEGACY_MEMORY);
+   assert(!strcmp(save_items_take_left_out(), "Battery RAM"));
+   assert(!save_items_take_left_out());
+   /* Once. */
+   assert(!save_items_check_reported(0, ram));
+   assert(st->num_issues == 2 && logs_at('W') + logs_at('E') == 1);
+
+   /* Not reported at the fill either: kept, and not checked again. */
+   register_counted(items, 1, &p, 0, 0);
+   assert(!save_items_check_reported(0, none));
+   assert(!save_items_check_reported(0, ram));
+   assert(st->num_issues == 0 && logs_at('W') + logs_at('E') == 0);
+   assert(!cur()->items[0].left_out && fi.get_path(0, NULL, 0));
+
+   /* A folder holding the .rtc: left out, with no notice. */
+   items[0] = folder_item("x", RETRO_SAVE_ROOT_SAVE_DIR, "");
+   items[0].include = rtc;
+   register_counted(items, 1, &p, 0, 0);
+   assert(!save_items_check_reported(0, ram));
+   register_counted(items, 1, &p, 0, 0);
+   assert(save_items_check_reported(0, clock));
+   snprintf(text, sizeof(text), "TestCore: " WHO "path = \"\": the folder "
+         "holds \"/saves/Game.v1.2.rtc\", where the frontend writes "
+         "RETRO_MEMORY_RTC, which the core reports and no item replaces, "
+         "and a file has one writer; exclude it, or name that memory in "
+         "legacy_memory. " OWNERSHIP LEFT_CORE);
+   assert(st->num_issues == 1 && st->issues[0].field == RETRO_SAVE_FIELD_PATH);
+   assert(!strcmp(st->issues[0].text, text));
+   assert(logged_once('E', text) && logs_at('W') + logs_at('E') == 1);
+   assert(!fi.get_path(0, NULL, 0) && !save_items_take_left_out());
+
+   /* Only its write temp: named. */
+   items[0].include = rtc_tmp;
+   register_counted(items, 1, &p, 0, 0);
+   assert(save_items_check_reported(0, clock));
+   assert(st->num_issues == 1 && strstr(st->issues[0].text,
+         "holds \"/saves/Game.v1.2.rtc.tmp\", where the frontend writes "
+         "RETRO_MEMORY_RTC"));
+
+   /* Retired by another item at the call: never checked. */
+   items[0].include       = srm;
+   items[1]               = clean_item("y");
+   items[1].path          = "game.sav";
+   items[1].legacy_memory = RETRO_MEMORY_SAVE_RAM;
+   items[1].legacy_paths  = legacy_srm;
+   register_counted(items, 2, &p, 0, 0);
+   assert(!cur()->items[0].legacy_unreported);
+   assert(!save_items_check_reported(0, ram));
+   assert(st->num_issues == 0 && logs_at('W') + logs_at('E') == 0);
+   save_items_clear();
+}
+
+/* The first fill's findings take room kept at the call: the list
+ * does not move, and only the count grows. */
+static void test_issues_late_room(void)
+{
+   static const char *const rtc[] = { "*.rtc", NULL };
+   static const bool ram[2]       = { true, false };
+   static const bool both[2]      = { true, true };
+   struct retro_save_frontend_interface fi;
+   const struct retro_save_issue *before = NULL;
+   const struct retro_save_issue *after  = NULL;
+   struct retro_save_issue was;
+   struct retro_save_item items[3];
+   struct save_items_paths p = plain_paths();
+   char text[1024];
+
+   p.legacy_live[RETRO_MEMORY_SAVE_RAM] = false;
+   p.legacy_live[RETRO_MEMORY_RTC]      = false;
+   memset(&fi, 0, sizeof(fi));
+   fi.interface_version = 1;
+   assert(save_items_get_frontend_interface(&fi,
+            RETRO_SAVE_INSTANCE_PRIMARY));
+   items[0] = clean_item("x");
+   items[0].legacy_memory = RETRO_SAVE_NO_LEGACY_MEMORY;
+   items[1] = clean_item("y");
+   items[1].path          = "y.sav";
+   items[1].legacy_memory = 2;
+   items[2] = folder_item("z", RETRO_SAVE_ROOT_SAVE_DIR, "");
+   items[2].include       = rtc;
+   register_counted(items, 3, &p, 1, 1);
+   assert(fi.get_issues(&before) == 1 && before);
+   was = before[0];
+   strlcpy(text, before[0].text, sizeof(text));
+
+   assert(save_items_check_reported(0, ram));
+   assert(before[0].item == was.item && before[0].field == was.field);
+   assert(before[0].verdict == was.verdict && before[0].text == was.text);
+   assert(!strcmp(before[0].text, text));
+   assert(fi.get_issues(&after) == 2 && after == before);
+   assert(after[1].item == 0);
+   assert(after[1].verdict == RETRO_SAVE_VERDICT_LEFT_OUT);
+   assert(after[1].field == RETRO_SAVE_FIELD_LEGACY_MEMORY);
+
+   assert(save_items_check_reported(2, both));
+   assert(fi.get_issues(&after) == 3 && after == before);
+   assert(after[2].item == 2 && after[2].field == RETRO_SAVE_FIELD_PATH);
+   assert(!strcmp(before[0].text, text) && before[1].item == 0);
+   assert(strstr(before[1].text, "\"/saves/Game.v1.2.srm\""));
+   assert(logs_at('W') + logs_at('E') == 3);
+   save_items_clear();
+}
+
 int main(void)
 {
    segs[0].data = wram;
@@ -2238,6 +2563,7 @@ int main(void)
    test_kept_move();
    test_rules();
    test_findings();
+   test_caller();
    test_summary();
    test_left_out_reregister();
    test_left_out_many();
@@ -2246,6 +2572,9 @@ int main(void)
    test_folder_match_cost();
    test_folder_root();
    test_folder_states();
+   test_folder_legacy_files();
+   test_legacy_reported_late();
+   test_issues_late_room();
    printf("save_items_test: OK\n");
    return 0;
 }

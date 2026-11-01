@@ -943,6 +943,10 @@ void runloop_path_fill_names(void);
  **/
 bool runloop_environment_cb(unsigned cmd, void *data);
 
+/* Tells of a refused save registration (@name NULL), or of left-out
+ * save item @name. */
+void runloop_save_items_notice(const char *name);
+
 void runloop_msg_queue_push(const char *msg, size_t len,
       unsigned prio, unsigned duration,
       bool flush,
