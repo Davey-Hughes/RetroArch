@@ -6024,7 +6024,8 @@ enum dbscan_load_status
    DBSCAN_LOAD_NO_PLAYLIST,
    DBSCAN_LOAD_AMBIGUOUS,
    DBSCAN_LOAD_NO_SETTINGS,
-   DBSCAN_LOAD_FOLDER_MISSING
+   DBSCAN_LOAD_FOLDER_MISSING,
+   DBSCAN_LOAD_FOLDER_EMPTY
 };
 
 /* A prep task's state: the handler fills it, and the callback takes
@@ -6605,6 +6606,9 @@ static void dbscan_load_handler(retro_task_t *task)
          /* A single file's scan saves the file. */
          if (!path_is_valid(dir))
             prep->load = DBSCAN_LOAD_FOLDER_MISSING;
+         /* A mount point left behind with its drive unplugged */
+         else if (manual_scan_probe_dir(dir) == MANUAL_SCAN_DIR_EMPTY)
+            prep->load = DBSCAN_LOAD_FOLDER_EMPTY;
          free(dir);
       }
    }
@@ -6657,6 +6661,12 @@ static void dbscan_load_cb(retro_task_t *task, void *task_data,
       case DBSCAN_LOAD_FOLDER_MISSING:
          dbscan_chain_refresh_error(chain, prep->name,
                "skipped: content folder not found",
+               playlist_get_scan_content_dir(prep->playlist));
+         dbscan_chain_fold(chain, prep->name, TASK_DBSCAN_SKIPPED, NULL);
+         break;
+      case DBSCAN_LOAD_FOLDER_EMPTY:
+         dbscan_chain_refresh_error(chain, prep->name,
+               "skipped: content folder empty",
                playlist_get_scan_content_dir(prep->playlist));
          dbscan_chain_fold(chain, prep->name, TASK_DBSCAN_SKIPPED, NULL);
          break;
