@@ -2534,8 +2534,6 @@ static const struct
    char s_f387bafb[23];
    char s_2c868ae4[10];
    char s_9c535394[7];
-   char s_5c12d979[13];
-   char s_32cb293c[21];
    char s_3253994e[12];
    char s_c992346c[36];
    char s_a9c8430e[14];
@@ -2639,12 +2637,10 @@ static const struct
    char s_84c46931[21];
    char s_ebf10493[14];
    char s_d15bd14f[27];
-   char s_539d5393[11];
    char s_a64b3a0b[24];
    char s_83e8dc72[24];
    char s_7cf985f0[33];
    char s_0f5266ce[13];
-   char s_0f97fdc1[8];
    char s_ea2674d3[27];
    char s_ea2674d4[24];
    char s_2d8cb7ce[20];
@@ -4084,7 +4080,6 @@ static const struct
    char s_87ba81db[144];
    char s_58c80718[304];
    char s_dc6f9d69[62];
-   char s_1bcf70a7[134];
    char s_894ecb9a[336];
    char s_67d549fd[33];
    char s_afac733c[34];
@@ -7633,8 +7628,6 @@ static const struct
    "Rozlo\305\276enie obrazoviek",
    "Vodorovne",
    "Zvislo",
-   "Obrazovka %u",
-   "Displej obrazovky %u",
    "\305\240k\303\241lova\305\245",
    "Prep\303\255nanie re\305\276imov zobrazenia SDL",
    "Video shadery",
@@ -7738,12 +7731,10 @@ static const struct
    "Maximalizovan\303\251 okno",
    "Re\305\276im v okne",
    "Oddelen\303\251 okn\303\241 obrazoviek",
-   "Pripojen\303\251",
    "Maxim\303\241lna v\303\275\305\241ka okna",
    "Maxim\303\241lna \305\241\303\255rka okna",
    "Pou\305\276i\305\245 vlastn\303\272 ve\304\276kos\305\245 okna",
    "V\303\275\305\241ka okna",
-   "Skryt\303\251",
    "Vodorovn\303\275 posun obrazovky",
    "Zvisl\303\275 posun obrazovky",
    "Prieh\304\276adnos\305\245 okna",
@@ -10486,9 +10477,6 @@ static const struct
    "k rozdelen\303\255m obrazovky vertik\303\241lne a vykres\304\276ovan\303\255m ka\305\276dej \304"
    "\215asti obrazovky pod\304\276a po\304\215tu pod-sn\303\255mok.",
    "Ako usporiada\305\245 obrazovky syst\303\251mov s viacer\303\275mi obrazovkami.",
-   "Pripojen\303\251 ponech\303\241 t\303\272to obrazovku s ostatn\303\275mi. Oddelen\303\251 ju d"
-   "\303\241 do vlastn\303\251ho okna alebo na vlastn\303\275 displej. Skryt\303\251 ju vynech\303"
-   "\241.",
    "Umo\305\276n\303\255 oknu SDL prep\303\255na\305\245 medzi re\305\276imami zobrazenia, ktor\303"
    "\251 uv\303\241dza. 'Auto' ho pou\305\276ije len vtedy, ke\304\217 nat\303\255vny zobrazovac\303"
    "\255 server nevie prep\303\255na\305\245 re\305\276imy. 'V\305\276dy' prep\303\255\305\241e nat"
@@ -11454,7 +11442,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_sk_blob_check[
-      (sizeof(msg_hash_sk_blob) == (227223u
+      (sizeof(msg_hash_sk_blob) == (227036u
 #ifdef ANDROID
        + 389u
 #endif
@@ -14552,8 +14540,6 @@ static const msg_hash_id_t msg_hash_sk_ids[] =
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_LAYOUT,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_LAYOUT_HORIZONTAL,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_LAYOUT_VERTICAL,
-   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_WINDOW_MODE,
-   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_WINDOW_MONITOR,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_XR_SCALE,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_SDL_DISPLAY_SERVER,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_SHADERS_ENABLE,
@@ -14657,12 +14643,10 @@ static const msg_hash_id_t msg_hash_sk_ids[] =
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOWED_FULLSCREEN,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOWED_MODE_SETTINGS,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOWS_ENABLE,
-   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_ATTACHED,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_AUTO_HEIGHT_MAX,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_AUTO_WIDTH_MAX,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_CUSTOM_SIZE_ENABLE,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_HEIGHT,
-   (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_HIDDEN,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_OFFSET_X,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_OFFSET_Y,
    (msg_hash_id_t)MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_OPACITY,
@@ -16094,7 +16078,6 @@ static const msg_hash_id_t msg_hash_sk_ids[] =
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_VIDEO_SCANLINE_SYNC_OFFSET,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_VIDEO_SCAN_SUBFRAMES,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_VIDEO_SCREEN_LAYOUT,
-   (msg_hash_id_t)MENU_ENUM_SUBLABEL_VIDEO_SCREEN_WINDOW_MODE,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_VIDEO_SDL_DISPLAY_SERVER,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_VIDEO_SETTINGS,
    (msg_hash_id_t)MENU_ENUM_SUBLABEL_VIDEO_SHADERS_ENABLE,
