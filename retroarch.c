@@ -10121,6 +10121,7 @@ bool retroarch_main_deinit_begin(void)
    command_event(CMD_EVENT_RECORD_DEINIT, NULL);
 
    command_event(CMD_EVENT_SAVE_FILES, NULL);
+   event_save_items_join();
 
 #ifdef HAVE_REWIND
    command_event(CMD_EVENT_REWIND_DEINIT, NULL);

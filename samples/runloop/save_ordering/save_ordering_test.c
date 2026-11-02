@@ -679,6 +679,58 @@ static bool loaded_again(void)
 
 /* Another id at a file, a refused set, and a grow from inside
  * loaded(). */
+/* A core that stops registering the item in save RAM's place: save RAM
+ * is shorter, so the item's last image is copied, logged once; then
+ * save RAM is written at each save and at the close, as before the
+ * interface. */
+static void lane_depart(void)
+{
+   static char b[PATH_MAX_LENGTH];
+   static char c[PATH_MAX_LENGTH];
+   static char bin[PATH_MAX_LENGTH];
+   unsigned char want[SRM_SIZE];
+   unsigned char ram[32];
+   unsigned before = failures;
+   unsigned i;
+   size_t mark;
+
+   lane_file(b, "depart", "srm");
+   filestream_write_file(b, pattern, SRM_SIZE);
+   mode_start("depart", bin, &mark);
+   memcpy(want, pattern, SRM_SIZE);
+   want[1] = 0x44;
+   fill_pathname_join(c, dir,
+         "assets/state_undo/save_core/depart/depart.srm", sizeof(c));
+   for (i = 0; i < 600 && !file_holds(c, want, SRM_SIZE); i++)
+   {
+      runloop_iterate();
+      task_queue_check();
+   }
+   CHECK(file_holds(c, want, SRM_SIZE), "depart: no copy of the last image");
+   core_wram()[3] = 0x33;
+   for (i = 0; i < 600 && !file_holds(b, core_wram(), 32); i++)
+   {
+      command_event(CMD_EVENT_SAVE_FILES, NULL);
+      runloop_iterate();
+      task_queue_check();
+   }
+   CHECK(file_holds(b, core_wram(), 32), "depart: save RAM not saved");
+   core_wram()[2] = 0x77;
+   command_event(CMD_EVENT_SAVE_FILES, NULL);
+   CHECK(file_holds(b, core_wram(), 32), "depart: a later save not saved");
+   core_wram()[4] = 0x55;
+   memcpy(ram, core_wram(), sizeof(ram));
+   switch_to(idle_bin);
+   CHECK(file_holds(b, ram, sizeof(ram)), "depart: the close not saved");
+   CHECK(file_holds(c, want, SRM_SIZE), "depart: the copy changed");
+   CHECK(log_count("Kept a copy of") == 1, "depart: the copy not logged once");
+   CHECK(lane_files("depart", 1, 0), "depart: files");
+   filestream_delete(b);
+   filestream_delete(c);
+   filestream_delete(bin);
+   printf("[%s] depart\n", failures == before ? "ok" : "FAIL");
+}
+
 static void lane_layout2(void)
 {
    static char b[PATH_MAX_LENGTH];
@@ -864,10 +916,10 @@ static bool recovered(size_t *at, const unsigned char *data)
 }
 
 /* typewait whose copy can never be made (the assets folder is a
- * file): the file is never written over, the item's image goes to the
- * recovery file, each later write replacing it there, and the close
- * sends the taken image to one more under its own name; each is
- * named once. */
+ * file): the file is never written over, the failed copy sends the
+ * taken image to a recovery file of its own, and the item's image goes
+ * to another, each later write replacing it there; each is named
+ * once. */
 static void lane_typelost(void)
 {
    static char b[PATH_MAX_LENGTH];
@@ -900,12 +952,12 @@ static void lane_typelost(void)
          sizeof(settings->paths.directory_core_assets));
    CHECK(file_holds(b, pattern, SRM_SIZE), "typelost: written over");
    CHECK(lane_files("typelost", 0, 2), "typelost: files");
-   /* The item's file holds the final write's image; then the taken
-    * image's. */
+   /* The taken image's file first; then the item's, which holds the
+    * final write's image. */
    at = ra_log_mark;
    after_close(want, conv);
-   CHECK(recovered(&at, want), "typelost: the item's image");
    CHECK(recovered(&at, conv), "typelost: the taken image");
+   CHECK(recovered(&at, want), "typelost: the item's image");
    CHECK(log_count("this game's save went to") == 2,
          "typelost: not named twice");
    CHECK(log_count("The save type of") == 0, "typelost: not silent");
@@ -1336,6 +1388,7 @@ int main(int argc, char *argv[])
    lane_layout();
    lane_quiet();
    lane_layout2();
+   lane_depart();
    lane_typelost();
    lane_typeretire();
    lane_snapshot();

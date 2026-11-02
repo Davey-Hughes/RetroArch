@@ -36,6 +36,8 @@ static int late_after_rollback;
 static int late_rolled;
 static int in_set;
 static int ran;
+/* depart: the srm item has left the set. */
+static int departed;
 /* "mode:<word>" content: the layout lanes. */
 static char mode[16];
 static int rereg_legacy;
@@ -229,6 +231,8 @@ static void register_items(unsigned n)
       items[1].path         = moved ? "eep2" : "eep";
    }
    items[2]               = items[1];
+   if (departed)
+      items[0]            = items[1];
    items[2].id            = "card";
    items[2].path          = card_path;
    items[2].root          = RETRO_SAVE_ROOT_ABSOLUTE;
@@ -336,6 +340,12 @@ void retro_run(void)
          wram[1] = 0x44;
       moved = 1;
       register_items(2);
+   }
+   if (!ran && !strcmp(mode, "depart"))
+   {
+      wram[1]  = 0x44;
+      departed = 1;
+      register_items(1);
    }
    if (!ran && (!strcmp(mode, "dropset") || !strcmp(mode, "dropnow")))
    {
@@ -448,6 +458,7 @@ bool retro_load_game(const struct retro_game_info *game)
    ran         = 0;
    runs        = 0;
    busy        = 0;
+   departed    = 0;
    eep_ready   = 0;
    moved       = 0;
    grown       = 0;

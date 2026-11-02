@@ -33,14 +33,16 @@ BENCH_SOURCES := save_items_fill_bench.c $(COMMON) \
 CFLAGS += -std=gnu89 -Wall -g -O1 \
           -I$(ROOT) -I$(ROOT)/libretro-common/include
 IO_CFLAGS := -DHAVE_THREADS -DHAVE_COMPRESSION
-# The same without threads: only its own lane; most helpers go unused.
-IO_NT_CFLAGS := -DHAVE_COMPRESSION -Wno-unused
+# The same without threads: only its own lane.
+IO_NT_CFLAGS := -DHAVE_COMPRESSION
 # The header alone, held to the C89 the C89_BUILD lane uses.
 C89_CFLAGS := -std=c89 -pedantic -Werror=pedantic -Wall -Wextra -Werror \
               -Wno-long-long -I$(ROOT)/libretro-common/include
 # clang -std=c89 -pedantic flags the _Bool that stdbool.h gives libretro.h.
 ifneq ($(findstring clang,$(shell $(CC) --version 2>/dev/null)),)
 C89_CFLAGS += -Wno-c99-extensions
+# Counters the shared stubs set and only threaded lanes read.
+IO_NT_CFLAGS += -Wno-unknown-warning-option -Wno-unused-but-set-global
 endif
 ifeq ($(EXE),)
 IO_LDLIBS := -lpthread

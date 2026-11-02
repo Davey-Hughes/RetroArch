@@ -156,7 +156,7 @@ static void start_save(bool compress)
 {
    memset(ram, 0, SRAM_SIZE);
    current = autosave_new("unused.srm", ram, SRAM_SIZE, 0, compress);
-   assert(current);
+   assert(current && autosave_start(current));
    autosave_state.list = &current;
    autosave_state.num  = 1;
    wait_requested();

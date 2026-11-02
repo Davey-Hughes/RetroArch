@@ -459,6 +459,9 @@ void event_save_items_ran(double fps);
 
 void event_save_items_deinit(void);
 
+/* At the close, after its SAVE_FILES and before retro_unload_game(). */
+void event_save_items_join(void);
+
 /* After retro_unload_game(), before save_items_clear(). */
 void event_save_items_final(bool is_sram_used, bool compress_files);
 

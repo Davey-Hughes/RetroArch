@@ -57,22 +57,46 @@ static void *io_test_malloc(size_t len)
    return malloc(len);
 }
 
+/* Called before save.c's mallocs of main_malloc_hook_size bytes on the
+ * main thread. */
+static void (*main_malloc_hook)(void);
+static size_t main_malloc_hook_size;
+
 static void *io_test_main_malloc(size_t len)
 {
    int fail = retro_atomic_load_acquire_int(&fail_main_malloc_size);
+   if (     sthread_get_current_thread_id() == main_thread
+         && main_malloc_hook && len == main_malloc_hook_size)
+      main_malloc_hook();
    if (     fail && (size_t)fail == len
          && sthread_get_current_thread_id() == main_thread)
       return NULL;
    return malloc(len);
 }
 
+#ifdef HAVE_THREADS
+/* save.c's threads fail to start while this is set. */
+static retro_atomic_int_t fail_thread_starts;
+
+static sthread_t *io_test_sthread_create(void (*fn)(void*), void *userdata)
+{
+   if (retro_atomic_load_acquire_int(&fail_thread_starts))
+      return NULL;
+   return sthread_create(fn, userdata);
+}
+#endif
+
 #define realloc io_test_realloc
 #define calloc  io_test_calloc
 #define malloc  io_test_main_malloc
+#ifdef HAVE_THREADS
+#define sthread_create io_test_sthread_create
+#endif
 #include "../../../save.c"
 #undef realloc
 #undef calloc
 #undef malloc
+#undef sthread_create
 #define malloc  io_test_malloc
 #define realloc io_test_items_realloc
 #include "../../../save_items.c"
@@ -109,11 +133,22 @@ static unsigned worker_opens;
 static unsigned worker_rzip_opens;
 static unsigned worker_writes;
 static unsigned recovery_writes;
+/* Reads, and copies written, by the main thread; writes of /s/ files. */
+static unsigned main_reads;
+static unsigned main_undo_writes;
+static unsigned save_writes;
+/* Writes into /s/ made while copy_watch is not on disk. */
+static const char *copy_watch;
+static unsigned uncopied_writes;
+/* The close has begun: a held copy may go on. */
+static bool closing;
 static unsigned memory_asks[2];
 static bool hold_write;
 static bool fail_writes;
-/* Only the copies into /undo/ fail. */
+/* Only the copies into /undo/ fail; or the next fail_undo_left of
+ * them. */
 static bool fail_undo;
+static unsigned fail_undo_left;
 /* A new recovery file's write stops halfway, as a kill leaves it. */
 static bool cut_recovery;
 /* Reads of this file fail, as an I/O error or a lock fails them. */
@@ -125,13 +160,21 @@ static const char *app_dir;
 /* The core was called inside a registration. */
 static bool in_set;
 static unsigned core_calls_in_set;
+#ifdef HAVE_THREADS
 static bool retire_returned;
 static bool retire_timed_out;
-/* A worker is held after writing a temp, or before or after a rename's
- * move, while these are set; the main thread never is. */
+#endif
+/* A worker is held after writing a temp (in /s/ too), before or after
+ * a rename's move, after a move into /s/, before writing in /undo/, or
+ * before writing a recovery file, while these are set; the main thread
+ * never is. */
 static bool hold_temp;
+static bool hold_save_temp;
 static bool hold_rename;
 static bool hold_renamed;
+static bool hold_save_renamed;
+static bool hold_undo;
+static bool hold_recovery;
 static unsigned worker_holds;
 static unsigned failed_renames;
 static char renamed_from[96];
@@ -187,7 +230,9 @@ static size_t blob_short;
 static unsigned blob_sizes;
 static unsigned blob_saves;
 static unsigned char card[6];
+#ifdef HAVE_THREADS
 static struct retro_save_segment card_seg;
+#endif
 static uint64_t generation;
 static bool use_generation;
 /* can_snapshot()'s answer, and its calls. */
@@ -271,6 +316,8 @@ const char *msg_hash_to_str(enum msg_hash_enums msg)
 
 static unsigned osd_count;
 static char osd_last[256];
+/* Every message since start(), one per line. */
+static char osd_hist[1024];
 
 bool fill_pathname_application_data(char *s, size_t len)
 {
@@ -293,6 +340,8 @@ void runloop_msg_queue_push(const char *msg, size_t len, unsigned prio,
    (void)category;
    osd_count++;
    strlcpy(osd_last, msg, sizeof(osd_last));
+   strlcat(osd_hist, msg, sizeof(osd_hist));
+   strlcat(osd_hist, "\n", sizeof(osd_hist));
 }
 
 void runloop_save_items_notice(const char *name)
@@ -390,6 +439,8 @@ static bool disk_read(const char *path, void **buf, int64_t *len)
 {
    struct disk_file *f;
    slock_lock(disk_lock);
+   if (sthread_get_current_thread_id() == main_thread)
+      main_reads++;
    if (fail_read_path && !strcmp(path, fail_read_path))
       f = NULL;
    else if ((f = disk_find(path, false)))
@@ -452,11 +503,27 @@ static bool disk_write(const char *path, const void *data, size_t len,
    slock_lock(disk_lock);
    (*counter)++;
    if (!strncmp(path, "/undo/", 6))
+   {
       undo_writes++;
+      if (sthread_get_current_thread_id() == main_thread)
+         main_undo_writes++;
+      worker_hold(&hold_undo);
+   }
+   else if (!strncmp(path, "/s/", 3))
+   {
+      save_writes++;
+      if (copy_watch && !disk_find(copy_watch, false))
+         uncopied_writes++;
+   }
    scond_broadcast(disk_cond);
    while (hold_write)
       scond_wait(disk_cond, disk_lock);
-   if ((ok =    !fail_writes
+   if (fail_undo_left && !strncmp(path, "/undo/", 6))
+   {
+      fail_undo_left--;
+      ok = false;
+   }
+   else if ((ok =    !fail_writes
              && !(fail_undo && !strncmp(path, "/undo/", 6))
              && !(fail_save_writes && !strncmp(path, "/s/", 3))))
    {
@@ -464,7 +531,11 @@ static bool disk_write(const char *path, const void *data, size_t len,
       memcpy(f->data, data, len);
       f->size = len;
       if (is_temp(path))
+      {
          worker_hold(&hold_temp);
+         if (!strncmp(path, "/s/", 3))
+            worker_hold(&hold_save_temp);
+      }
    }
    slock_unlock(disk_lock);
    return ok;
@@ -488,6 +559,8 @@ static int disk_rename(const char *from, const char *to)
    src->exists = false;
    strlcpy(renamed_from, from, sizeof(renamed_from));
    worker_hold(&hold_renamed);
+   if (!strncmp(to, "/s/", 3))
+      worker_hold(&hold_save_renamed);
    slock_unlock(disk_lock);
    return 0;
 }
@@ -530,6 +603,12 @@ bool filestream_write_file_atomic(const char *path, const void *data,
    bool fresh =    app_dir && !strncmp(path, app_dir, strlen(app_dir))
                 && !disk_has(path);
    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+   if (fresh)
+   {
+      slock_lock(disk_lock);
+      worker_hold(&hold_recovery);
+      slock_unlock(disk_lock);
+   }
    if (fresh && recovery_cut(tmp, data, size))
       return false;
    if (!disk_write(tmp, data, (size_t)size,
@@ -547,7 +626,10 @@ bool filestream_write_file(const char *path, const void *data,
 {
    if (is_temp(path))
       return disk_write(path, data, (size_t)size, &raw_writes);
+   slock_lock(disk_lock);
    recovery_writes++;
+   worker_hold(&hold_recovery);
+   slock_unlock(disk_lock);
    if (recovery_cut(path, data, size))
       return false;
    disk_put(path, data, (size_t)size);
@@ -746,6 +828,7 @@ static struct retro_save_item buffer_item(const char *id, const char *path)
    return it;
 }
 
+#ifdef HAVE_THREADS
 /* Its own six bytes, to tell a fill of it from one of the others. */
 static struct retro_save_item card_item(const char *id, const char *path)
 {
@@ -766,6 +849,7 @@ static struct retro_save_item blob_item(const char *id, const char *path)
    it.legacy_memory = RETRO_SAVE_NO_LEGACY_MEMORY;
    return it;
 }
+#endif
 
 /* As runloop.c's SET_SAVE_INTERFACE case does it; false when refused
  * before anything changed. */
@@ -808,6 +892,7 @@ static void register_items(const struct retro_save_item *items, unsigned n)
    assert(set_items(items, n));
 }
 
+#ifdef HAVE_THREADS
 /* A refused registration, as runloop.c handles it. */
 static void register_refused(const struct retro_save_item *items,
       unsigned n)
@@ -825,6 +910,7 @@ static void register_refused(const struct retro_save_item *items,
       event_save_items_registered();
    save_items_drop_previous();
 }
+#endif
 
 /* wram then iram, as the file holds them. */
 static const unsigned char *image(void)
@@ -846,14 +932,23 @@ static void start(void)
    raw_writes = undo_writes = rzip_writes = rzip_reads = 0;
    worker_opens = worker_rzip_opens = worker_writes = 0;
    recovery_writes = 0;
+   main_reads = main_undo_writes = save_writes = 0;
+   copy_watch      = NULL;
+   uncopied_writes = 0;
+   closing      = false;
    fail_writes  = false;
    fail_undo    = false;
+   fail_undo_left = 0;
    cut_recovery = false;
    fail_save_writes = false;
    fail_read_path   = NULL;
    hold_temp    = false;
    hold_rename  = false;
    hold_renamed = false;
+   hold_save_renamed = false;
+   hold_undo    = false;
+   hold_save_temp = false;
+   hold_recovery  = false;
    worker_holds = failed_renames = 0;
    renamed_from[0] = '\0';
    disk_nocase  = false;
@@ -861,6 +956,7 @@ static void start(void)
    err_last[0]  = '\0';
    warn_hist[0] = '\0';
    copy_log[0]  = '\0';
+   copy_logs    = 0;
    slock_unlock(disk_lock);
    memset(memory_asks, 0, sizeof(memory_asks));
    memset(wram, 0, sizeof(wram));
@@ -900,6 +996,7 @@ static void start(void)
    app_dir        = NULL;
    osd_count      = 0;
    osd_last[0]    = '\0';
+   osd_hist[0]    = '\0';
    core_calls_in_set = 0;
    event_save_items_set_undo_dir("/undo");
 }
@@ -958,15 +1055,205 @@ static void test_given_back_saved(void)
 }
 
 #ifdef HAVE_THREADS
-/* Joins the retired handles' threads: they have written their last. */
-static void retired_join(void)
+static void copies_wait(bool reap);
+#endif
+
+/* The same with an item longer than save RAM: its last image is copied
+ * once, before save RAM's first write cuts the file. */
+static void test_given_back_shorter(void)
+{
+   unsigned char older[12];
+   unsigned char last[12];
+   struct retro_save_item items[1];
+
+   start();
+   app_dir = "/app";
+   path_init_savefile_rtc("/s/game.srm");
+   items[0]               = buffer_item("srm", "/s/game.srm");
+   items[0].legacy_memory = RETRO_MEMORY_SAVE_RAM;
+   register_items(items, 1);
+   event_load_save_files(false);
+   wram[0] = 1;
+   event_save_files(true, false, NULL);
+   memcpy(older, image(), sizeof(older));
+   assert(disk_holds("/s/game.srm", older, sizeof(older)));
+   wram[0] = 2;
+   memcpy(last, image(), sizeof(last));
+   register_items(NULL, 0);
+#ifdef HAVE_THREADS
+   copies_wait(false);
+#endif
+   /* Killed here. */
+   assert(files_on_disk() == 2);
+   assert(disk_holds("/s/game.srm", older, sizeof(older)));
+   assert(disk_holds("/undo/game.srm", last, sizeof(last)));
+#ifdef HAVE_THREADS
+   copies_wait(true);
+#endif
+   memset(legacy_ram, 9, sizeof(legacy_ram));
+   event_save_files(true, false, NULL);
+   assert(disk_holds("/s/game.srm", legacy_ram, sizeof(legacy_ram)));
+   assert(disk_holds("/undo/game.srm", last, sizeof(last)));
+   assert(files_on_disk() == 2);
+   legacy_ram[0] = 10;
+   event_save_files(true, false, NULL);
+   assert(disk_holds("/s/game.srm", legacy_ram, sizeof(legacy_ram)));
+   assert(files_on_disk() == 2);
+   assert(copy_logs == 1 && strstr(copy_log, "/undo/game.srm"));
+   assert(osd_count == 0 && err_count == 0);
+}
+
+#ifdef HAVE_THREADS
+static void retired_join(bool jobs);
+static autosave_t *start_autosave(bool compress);
+static void capture(autosave_t *h);
+static void wait_requested(autosave_t *h);
+#endif
+
+/* The same with save RAM reporting no size as the item leaves: the file
+ * is copied once, when save RAM reports a size again, before its first
+ * write cuts the file. Pass 1: save RAM's own autosave writes first. */
+static void test_given_back_unsized(void)
+{
+   unsigned char last[12];
+   struct retro_save_item items[1];
+   unsigned pass;
+
+#ifdef HAVE_THREADS
+   for (pass = 0; pass < 2; pass++)
+#else
+   for (pass = 0; pass < 1; pass++)
+#endif
+   {
+#ifdef HAVE_THREADS
+      autosave_t *h = NULL;
+#endif
+      start();
+      app_dir = "/app";
+      path_init_savefile_rtc("/s/game.srm");
+      items[0]               = buffer_item("srm", "/s/game.srm");
+      items[0].legacy_memory = RETRO_MEMORY_SAVE_RAM;
+      register_items(items, 1);
+      event_load_save_files(false);
+#ifdef HAVE_THREADS
+      if (pass)
+         h = start_autosave(false);
+#endif
+      wram[0] = 1;
+      event_save_files(true, false, NULL);
+      wram[0] = 2;
+      memcpy(last, image(), sizeof(last));
+      no_ram = true;
+      register_items(NULL, 0);
+#ifdef HAVE_THREADS
+      if (pass)
+         retired_join(false);
+      else
+#endif
+         event_save_files(true, false, NULL);
+      assert(disk_holds("/s/game.srm", last, sizeof(last)));
+      assert(files_on_disk() == 1);
+      no_ram     = false;
+      copy_watch = "/undo/game.srm";
+      memset(legacy_ram, 9, sizeof(legacy_ram));
+#ifdef HAVE_THREADS
+      if (pass)
+         autosave_check();
+      else
+         event_save_files(true, false, NULL);
+      copies_wait(false);
+      /* Killed here. */
+      assert(!pass || !autosave_state.list[0]);
+      assert(disk_holds("/s/game.srm", last, sizeof(last)));
+      assert(disk_holds("/undo/game.srm", last, sizeof(last)));
+      assert(files_on_disk() == 2);
+      copies_wait(true);
+      if (pass)
+      {
+         autosave_check();
+         assert((h = autosave_state.list[0]));
+         h->interval = 0;
+         wait_requested(h);
+         capture(h);
+      }
+      else
+#endif
+         event_save_files(true, false, NULL);
+      assert(uncopied_writes == 0);
+      assert(disk_holds("/s/game.srm", legacy_ram, sizeof(legacy_ram)));
+      assert(disk_holds("/undo/game.srm", last, sizeof(last)));
+      assert(files_on_disk() == 2);
+      legacy_ram[0] = 10;
+      event_save_files(true, false, NULL);
+      assert(disk_holds("/s/game.srm", legacy_ram, sizeof(legacy_ram)));
+      assert(files_on_disk() == 2);
+      assert(copy_logs == 1 && strstr(copy_log, "/undo/game.srm"));
+      assert(osd_count == 0 && err_count == 0);
+#ifdef HAVE_THREADS
+      autosave_deinit();
+#endif
+   }
+}
+
+#ifdef HAVE_THREADS
+/* Joins the retired handles' threads, copy jobs only when @jobs: they
+ * have written their last. */
+static void retired_join(bool jobs)
 {
    unsigned i;
    for (i = 0; i < autosave_state.num_retired; i++)
    {
-      sthread_join(autosave_state.retired[i]->thread);
-      autosave_state.retired[i]->thread = NULL;
+      autosave_t *h = autosave_state.retired[i];
+      if (jobs && !h->job)
+         continue;
+      sthread_join(h->thread);
+      h->thread = NULL;
    }
+}
+
+/* Until every copy job has written its last; with @reap, freed as the
+ * frame start does. */
+static void copies_wait(bool reap)
+{
+   retired_join(true);
+   if (reap)
+      autosave_reap(true);
+}
+
+/* SAVE_FILES once the copies started before it are done, and until an
+ * image handed to one is written, as a synchronous copy would. */
+static bool save_files(void)
+{
+   bool ret;
+   copies_wait(false);
+   ret = event_save_files(true, false, NULL);
+   copies_wait(true);
+   return ret;
+}
+
+/* save_files() up to the kill point: the copies it started are done,
+ * and none is reaped until frame_start_reap(). */
+static bool save_files_unreaped(void)
+{
+   bool ret;
+   copies_wait(false);
+   ret = event_save_files(true, false, NULL);
+   copies_wait(false);
+   return ret;
+}
+
+static void frame_start_reap(void)
+{
+   autosave_reap(true);
+}
+
+/* The load with no copy job started: a worker started next makes the
+ * copy the fill found owed. */
+static void load_for_worker(void)
+{
+   event_save_items_set_undo_dir(NULL);
+   event_load_save_files(false);
+   event_save_items_set_undo_dir("/undo");
 }
 
 static void wait_requested(autosave_t *h)
@@ -992,6 +1279,8 @@ static void capture(autosave_t *h)
 static autosave_t *start_autosave(bool compress)
 {
    autosave_t *h;
+   /* A worker starts once a copy job of its file is reaped. */
+   copies_wait(true);
    assert(autosave_init(compress, 1));
    assert((h = save_item_files.files[0].autosave));
    /* No rest between rounds. Set before the first snapshot, whose
@@ -1023,22 +1312,22 @@ static void test_write_on_difference(void)
    assert(!event_load_save_files(false));
 
    /* Untouched, with no file: nothing to write. */
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(!disk_has("/s/game.srm") && raw_writes == 0);
 
    wram[0] = 1;
    iram[3] = 2;
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(raw_writes == 1 && disk_holds("/s/game.srm", image(), 12));
 
    /* The file holds it already. */
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(raw_writes == 1);
 
    /* An erase back to the bytes it started with still reaches disk. */
    wram[0] = 0;
    iram[3] = 0;
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(raw_writes == 2 && disk_holds("/s/game.srm", image(), 12));
    ASSERT_FILES(0, 0, 0);
 }
@@ -1127,10 +1416,10 @@ static void test_blob(void)
    blob_len = 6;
    register_items(items, 1);
    assert(!event_load_save_files(false));
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(!disk_has("/s/game.flash"));
    blob_state[0] = 'z';
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/s/game.flash", "zbcdef", 6));
 
    start();
@@ -1160,12 +1449,12 @@ static void test_blob(void)
    event_load_save_files(false);
    blob_state[0] = 'T';
    sizes         = blob_sizes;
-   assert(!event_save_files(true, false, NULL));
+   assert(!save_files());
    assert(blob_sizes == sizes + 1);
    ASSERT_FILES(0, 0, 0);
    assert(err_count == 1);
-   assert(!event_save_files(true, false, NULL));
-   assert(!event_save_files(true, false, NULL));
+   assert(!save_files());
+   assert(!save_files());
    assert(!disk_has("/s/game.flash"));
    ASSERT_FILES(0, 0, 1);
    assert(err_count == 3);
@@ -1215,7 +1504,7 @@ static void test_legacy_retired(void)
 
    /* RTC has no memory here, so save RAM's half reports false. */
    wram[0] = 0x42;
-   event_save_files(true, false, NULL);
+   save_files();
    assert(memory_asks[RETRO_MEMORY_SAVE_RAM] == 1);
    assert(memory_asks[RETRO_MEMORY_RTC] == 2);
    assert(disk_holds("/s/game.srm", image(), 12));
@@ -1305,15 +1594,22 @@ static void test_reported_at_fill(void)
                RETRO_SAVE_INSTANCE_PRIMARY));
       assert(!fi.get_path(0, NULL, 0) && !st->current->items[0].path);
       assert(loaded_calls == (i == 2 ? 1u : 0u));
-      /* Killed here: the .srm as it was, alone, and loaded into save
-       * RAM. */
-      assert(disk_count_named("") == 1);
+      /* Killed here: the .srm as it was, loaded into save RAM; once
+       * made, the copy of what it held at the load. A folder registered
+       * after the load gives back no file read since. */
+#ifdef HAVE_THREADS
+      copies_wait(true);
+#endif
+      assert(disk_count_named("") == (i == 2 ? 1u : 2u));
       assert(disk_holds("/s/game.srm", on_disk, sizeof(on_disk)));
+      assert(i == 2 || disk_holds("/undo/game.srm", on_disk,
+               sizeof(on_disk)));
+      assert(copy_logs == (i == 2 ? 0u : 1u));
       assert(!memcmp(legacy_ram, on_disk, sizeof(on_disk)));
       /* Written as without the item (RTC, not reported, fails). */
       legacy_ram[0] = 9;
       event_save_files(true, false, NULL);
-      assert(disk_count_named("") == 1);
+      assert(disk_count_named("") == (i == 2 ? 1u : 2u));
       assert(disk_holds("/s/game.srm", later, sizeof(later)));
       assert(err_count == 1 && notices == (i ? 0u : 1u));
    }
@@ -1331,6 +1627,104 @@ static void test_reported_at_fill(void)
    event_save_items_fill(false);
    assert(st->num_issues == 0 && err_count == 0 && notices == 0);
    assert(st->current->items[0].path && loaded_calls == 1);
+}
+
+#ifdef HAVE_THREADS
+static void set_hold(bool *hold, bool on);
+static void wait_held(unsigned n);
+#endif
+
+/* An earlier session kept the item at the .srm; left out at its first
+ * fill now, the file goes back to save RAM's own handling, which reads
+ * it as save RAM: the bytes read are copied first, off the main thread.
+ * Pass 1 is killed while that copy is held; pass 2 is a first session,
+ * with no file. */
+static void test_left_late_copied(void)
+{
+   static const unsigned char srm[4]   = { 5, 6, 7, 8 };
+   static const unsigned char later[4] = { 1, 6, 7, 8 };
+   const save_items_state_t *st = save_items_state_get_ptr();
+   struct retro_save_segment seg;
+   struct retro_save_item items[1];
+   unsigned pass;
+
+   seg.data              = iram;
+   seg.size              = sizeof(iram);
+   items[0]              = buffer_item("srm", "/s/game.srm");
+   items[0].label        = "Battery";
+   items[0].segments     = &seg;
+   items[0].num_segments = 1;
+   for (pass = 0; pass < 3; pass++)
+   {
+      if (pass < 2)
+      {
+         start();
+         path_init_savefile_rtc("/s/game.srm");
+         set_savefile = "/s/game.srm";
+         no_ram       = true;
+         register_items(items, 1);
+         event_load_save_files(false);
+         assert(st->num_issues == 0 && st->current->items[0].path);
+         memcpy(iram, srm, sizeof(srm));
+         save_files();
+         assert(disk_count_named("") == 1);
+         assert(disk_holds("/s/game.srm", srm, sizeof(srm)));
+      }
+
+      start();
+      path_init_savefile_rtc("/s/game.srm");
+      set_savefile = "/s/game.srm";
+      if (pass < 2)
+         disk_put("/s/game.srm", srm, sizeof(srm));
+#ifdef HAVE_THREADS
+      if (pass == 1)
+         set_hold(&hold_undo, true);
+#endif
+      no_ram = true;
+      register_items(items, 1);
+      no_ram = false;
+      event_load_save_files(false);
+      assert(st->num_issues == 1 && !st->current->items[0].path);
+      assert(err_count == 1 && notices == 1);
+#ifdef HAVE_THREADS
+      if (pass == 1)
+      {
+         wait_held(1);
+         /* Killed here: the .srm as the item wrote it, alone. */
+         assert(disk_count_named("") == 1);
+         assert(disk_holds("/s/game.srm", srm, sizeof(srm)));
+         ASSERT_FILES(0, 0, 0);
+         set_hold(&hold_undo, false);
+      }
+      copies_wait(true);
+      assert(main_undo_writes == 0);
+#endif
+      if (pass == 2)
+      {
+         assert(disk_count_named("") == 0 && copy_logs == 0);
+         legacy_ram[0] = 1;
+         save_files();
+         assert(disk_count_named("") == 1);
+         assert(disk_holds("/s/game.srm", legacy_ram, sizeof(legacy_ram)));
+         ASSERT_FILES(0, 0, 0);
+         assert(err_count == 1 && notices == 1 && copy_logs == 0);
+         continue;
+      }
+      assert(!memcmp(legacy_ram, srm, sizeof(srm)));
+      assert(disk_count_named("") == 2);
+      assert(disk_holds("/s/game.srm", srm, sizeof(srm)));
+      assert(disk_holds("/undo/game.srm", srm, sizeof(srm)));
+      assert(copy_logs == 1 && strstr(copy_log, "/undo/game.srm"));
+      ASSERT_FILES(1, 0, 0);
+      /* Save RAM's own writer saves it as before the interface. */
+      legacy_ram[0] = 1;
+      save_files();
+      assert(disk_count_named("") == 2);
+      assert(disk_holds("/s/game.srm", later, sizeof(later)));
+      assert(disk_holds("/undo/game.srm", srm, sizeof(srm)));
+      ASSERT_FILES(1, 0, 0);
+      assert(err_count == 1 && notices == 1 && copy_logs == 1);
+   }
 }
 
 /* An item a later call leaves out, valid at its file again while the
@@ -1523,8 +1917,8 @@ static void test_blob_unsaved_logged(void)
    blob_len = 7;
    register_items(items, 1);
    event_load_save_files(false);
-   assert(!event_save_files(true, false, NULL));
-   assert(!event_save_files(true, false, NULL));
+   assert(!save_files());
+   assert(!save_files());
    event_save_items_final(true, false);
    assert(warned("\"flash\": blob_size = 7: over its max_size 4. See "
          "libretro.h, retro_save_item::max_size. \"/s/u.flash\" is not "
@@ -1537,7 +1931,7 @@ static void test_blob_unsaved_logged(void)
    register_items(items, 1);
    event_load_save_files(false);
    blob_fail_save = true;
-   assert(!event_save_files(true, false, NULL));
+   assert(!save_files());
    event_save_items_final(true, false);
    assert(warned("\"flash\": blob_save = false for 6 bytes. See "
          "libretro.h, retro_save_blob_save_t. \"/s/u.flash\" is not "
@@ -1549,7 +1943,7 @@ static void test_blob_unsaved_logged(void)
    blob_short = 2;
    register_items(items, 1);
    event_load_save_files(false);
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/s/u.flash", "ab\0\0\0\0", 6));
    assert(!warned("is not saved"));
 }
@@ -1609,7 +2003,7 @@ static void test_generation_stuck(void)
    wram[0] = 1;
    capture(h);
    assert(!disk_has("/s/stuck.srm"));
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/s/stuck.srm", image(), 12));
    assert(warned("Core: save item 0 \"srm\": get_generation = 0: it did "
          "not change while the bytes did. See libretro.h, "
@@ -1619,7 +2013,7 @@ static void test_generation_stuck(void)
    capture(h);
    capture(h);
    assert(disk_holds("/s/stuck.srm", image(), 12));
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(warned("did not change while the bytes did") == 1);
    autosave_deinit();
 
@@ -1630,7 +2024,7 @@ static void test_generation_stuck(void)
    event_load_save_files(false);
    h = start_autosave(false);
    capture(h);
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(!warned("did not change"));
    autosave_deinit();
 }
@@ -1984,7 +2378,7 @@ static void test_orphans(void)
    register_items(NULL, 0);
    assert(save_item_files.num_orphans == 1 && !disk_has("/s/a.srm"));
    wram[0] = 4;
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(save_item_files.num_orphans == 0);
    wram[0] = 3;
    assert(disk_holds("/s/a.srm", image(), 12));
@@ -2018,12 +2412,12 @@ static void test_late_fill(void)
    register_items(items, 2);
    assert(save_item_files.fill_pending && !save_item_files.files[1].taken_up);
    assert(!memcmp(card, blank, sizeof(card)));
-   event_save_files(true, false, NULL);
+   save_files();
    assert(raw_writes == 0 && disk_holds("/s/one.card", saved, 6));
    event_save_items_fill(false);
    assert(!save_item_files.fill_pending && save_item_files.files[1].taken_up);
    assert(!memcmp(card, saved, sizeof(card)));
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(raw_writes == 0);
 
    /* The same id moved to another file reads that file. */
@@ -2033,7 +2427,7 @@ static void test_late_fill(void)
    assert(save_item_files.fill_pending);
    event_save_items_fill(false);
    assert(!memcmp(card, other, sizeof(card)));
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(raw_writes == 0 && disk_holds("/s/one.card", saved, 6));
 
    /* No file: taken up as it is, written once it changes. */
@@ -2045,10 +2439,10 @@ static void test_late_fill(void)
    register_items(items, 2);
    event_save_items_fill(false);
    assert(save_item_files.files[1].taken_up);
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(!disk_has("/s/new.card"));
    card[0] = 'F';
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/s/new.card", card, sizeof(card)));
 
    /* Loading disabled: the file is not read. */
@@ -2149,7 +2543,7 @@ static void test_ownership(void)
    register_items(NULL, 0);
    assert(save_item_files.num_orphans == 1);
    assert(content_savefile_is_live("/S/GAME.SRM"));
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(!content_savefile_is_live("/s/Game.srm"));
 
    /* After a failed write its image is in a recovery file. */
@@ -2160,7 +2554,7 @@ static void test_ownership(void)
    wram[0] = 7;
    register_items(NULL, 0);
    set_fail_save_writes(true);
-   assert(!event_save_files(true, false, NULL));
+   assert(!save_files());
    set_fail_save_writes(false);
    assert(!content_savefile_is_live("/s/Game.srm"));
    assert(disk_named_holds("RetroArch-recovery-", image(), 12) == 1);
@@ -2208,6 +2602,29 @@ static unsigned disk_named_holds(const char *part, const void *data,
             && disk[i].size == len && !memcmp(disk[i].data, data, len))
          n++;
    slock_unlock(disk_lock);
+   return n;
+}
+
+/* How many messages since start() name, second, a file holding @data. */
+static unsigned told_holding(const void *data, size_t len)
+{
+   char name[96];
+   unsigned n      = 0;
+   const char *s   = osd_hist;
+   const char *bar;
+   while ((bar = strchr(s, '|')))
+   {
+      const char *end = strchr(bar, '\n');
+      size_t _len     = (size_t)(end - bar - 1);
+      if (_len < sizeof(name))
+      {
+         memcpy(name, bar + 1, _len);
+         name[_len] = '\0';
+         if (disk_holds(name, data, len))
+            n++;
+      }
+      s = end + 1;
+   }
    return n;
 }
 
@@ -2272,6 +2689,13 @@ static void set_fail_undo(bool fail)
    slock_unlock(disk_lock);
 }
 
+static void set_fail_undo_left(unsigned n)
+{
+   slock_lock(disk_lock);
+   fail_undo_left = n;
+   slock_unlock(disk_lock);
+}
+
 static void set_fail_save_writes(bool fail)
 {
    slock_lock(disk_lock);
@@ -2304,10 +2728,10 @@ static void test_tail_written_back(void)
    assert(save_items_state_get_ptr()->current->items[0].tail_size == 4);
 
    /* Head and tail match the file: nothing to write. */
-   assert(event_save_files(true, false, NULL) && raw_writes == 0);
+   assert(save_files() && raw_writes == 0);
    memcpy(want, file, sizeof(want));
    wram[0] = want[0] = 1;
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(raw_writes == 1 && disk_holds("/s/game.srm", want, 16));
 
    /* The worker copies the tail into its snapshot once. */
@@ -2324,7 +2748,7 @@ static void test_tail_written_back(void)
    wram[3] = want[3] = 4;
    items[0] = card_item("card", "/s/card.bin");
    register_items(items, 1);
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/s/game.srm", want, 16));
    ASSERT_FILES(0, 0, 0);
 }
@@ -2350,7 +2774,7 @@ static void test_port_move_tail(void)
    assert(save_item_files.files[0].taken_up);
    memcpy(want, file, sizeof(want));
    wram[0] = want[0] = 1;
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(raw_writes == 1 && disk_holds("/s/cart.sav", want, 16));
 }
 
@@ -2376,11 +2800,11 @@ static void test_storage_change_tail(void)
    assert(!save_items_state_get_ptr()->current->items[0].tail_size);
    event_save_items_fill(false);
    assert(blob_len == 16 && !memcmp(blob_state, file, 16));
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(raw_writes == 0 && disk_holds("/s/game.sav", file, 16));
    memcpy(blob_state, "abcdef", 6);
    blob_len = 6;
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/s/game.sav", "abcdef", 6));
 
    items[0] = buffer_item("sav", "/s/game.sav");
@@ -2388,7 +2812,7 @@ static void test_storage_change_tail(void)
    assert(!save_items_state_get_ptr()->current->items[0].tail_size);
    event_save_items_fill(true);
    wram[0] = 1;
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/s/game.sav", image(), 12));
 }
 
@@ -2431,11 +2855,11 @@ static void test_flag_change_tail(void)
       assert(save_item_files.num_orphans == 1);
       if (pass == 1)
          event_save_items_fill(false);
-      assert(event_save_files(true, false, NULL));
+      assert(save_files());
       assert(disk_holds("/s/game.srm", want, 16));
       event_save_items_fill(false);
       wram[1] = want[1] = 2;
-      assert(event_save_files(true, false, NULL));
+      assert(save_files());
       assert(disk_holds("/s/game.srm", want, 16));
    }
 }
@@ -2483,7 +2907,7 @@ static void test_flag_change_tail_worker(void)
       event_save_items_fill(false);
       memcpy(want, image(), 12);
       wram[1] = want[1] = 2;
-      assert(event_save_files(true, false, NULL));
+      assert(save_files());
       assert(disk_holds("/s/game.srm", want, 16));
       autosave_deinit();
    }
@@ -2511,7 +2935,7 @@ static void test_close_no_memory_tail(void)
    assert(!save_item_files.num_files && save_item_files.num_orphans == 1);
    /* Shown: what the core holds now is not written again. */
    assert(osd_count == 1 && err_count == 1);
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/s/game.srm", want, 16));
    assert(osd_count == 1 && !disk_named("/undo/"));
 }
@@ -2540,11 +2964,11 @@ static void test_cut_no_memory_tail(void)
    retro_atomic_store_release_int(&fail_malloc_size, 0);
    assert(err_count == 1 && strstr(err_last, "cut by"));
    assert(save_item_files.num_orphans == 1);
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/s/game.srm", want, 20));
    event_save_items_fill(false);
    wram[1] = want[1] = 2;
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/s/game.srm", want, 20));
 }
 
@@ -2575,6 +2999,8 @@ static void test_cut_no_memory_kept(void)
          h = start_autosave(false);
       wram[0]               = 1;
       items[0].num_segments = 1;
+      /* The copy starts at the cut. */
+      set_fail_undo((pass & 1) != 0);
       /* The 4 cut bytes and the end past the item. */
       retro_atomic_store_release_int(&fail_malloc_size, (int)size - 8);
       register_items(items, 1);
@@ -2584,11 +3010,10 @@ static void test_cut_no_memory_kept(void)
                && save_item_files.files[0].autosave == h
                && !save_item_files.num_orphans);
 
-      set_fail_undo((pass & 1) != 0);
       if (h)
          capture(h);
       else
-         assert(event_save_files(true, false, NULL) == !(pass & 1));
+         assert(save_files() == !(pass & 1));
       if (pass & 1)
       {
          assert(disk_holds("/s/game.srm", file, size));
@@ -2600,7 +3025,11 @@ static void test_cut_no_memory_kept(void)
          if (h)
             capture(h);
          else
-            assert(event_save_files(true, false, NULL));
+         {
+            /* Recovered again, the copy tried after it. */
+            assert(!save_files());
+            assert(save_files());
+         }
       }
       assert(disk_holds("/undo/game.srm", file, size));
       assert(disk_holds("/s/game.srm", image(), 8));
@@ -2628,18 +3057,18 @@ static void test_reshape(void)
    register_items(items, 1);
    it = &save_items_state_get_ptr()->current->items[0];
    assert(it->tail_size == 8 && !memcmp(it->tail, file + 8, 8));
-   assert(event_save_files(true, false, NULL) && raw_writes == 0);
+   assert(save_files() && raw_writes == 0);
 
    memset(iram, 0xee, sizeof(iram));
    items[0].num_segments = 2;
    register_items(items, 1);
    assert(iram[0] == 0xee && save_item_files.files[0].grow_from == 8);
-   assert(event_save_files(true, false, NULL) && raw_writes == 0);
+   assert(save_files() && raw_writes == 0);
    event_save_items_fill(false);
    it = &save_items_state_get_ptr()->current->items[0];
    assert(!memcmp(iram, file + 8, 4) && it->tail_size == 4);
    assert(!save_item_files.files[0].grow_from);
-   assert(event_save_files(true, false, NULL) && raw_writes == 0);
+   assert(save_files() && raw_writes == 0);
 }
 
 /* EXACT_SIZE: the file is copied, then cut to the item. */
@@ -2661,13 +3090,13 @@ static void test_exact_size_cut_after_copy(void)
    register_items(items, 1);
    assert(event_load_save_files(false));
    assert(save_item_files.files[0].guard.copy_first);
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/undo/game.srm", file, 16));
    assert(disk_holds("/s/game.srm", file, 12));
    assert(raw_writes == 2 && undo_writes == 1);
    assert(!save_item_files.files[0].guard.copy_first);
    assert(!save_items_state_get_ptr()->current->items[0].tail_size);
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(raw_writes == 2 && undo_writes == 1);
    ASSERT_FILES(1, 0, 0);
 
@@ -2679,7 +3108,7 @@ static void test_exact_size_cut_after_copy(void)
    register_items(items, 1);
    event_load_save_files(false);
    wram[0] = 0x55;
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(raw_writes == 1 && undo_writes == 0);
    assert(save_item_files.files[0].guard.copy_first);
    memcpy(want, image(), 12);
@@ -2687,7 +3116,7 @@ static void test_exact_size_cut_after_copy(void)
    assert(!disk_named("/undo/") && disk_holds("/s/game.srm", want, 16));
    ASSERT_FILES(0, 0, 0);
    event_save_items_set_undo_dir("/undo");
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/s/game.srm", image(), 12));
    assert(disk_has("/undo/game.srm"));
    ASSERT_FILES(1, 0, 0);
@@ -2696,7 +3125,7 @@ static void test_exact_size_cut_after_copy(void)
    start();
    disk_put("/s/game.srm", file, sizeof(file));
    register_items(items, 1);
-   event_load_save_files(false);
+   load_for_worker();
    h = start_autosave(false);
    wram[1] = 0x66;
    capture(h);
@@ -2718,7 +3147,7 @@ static void test_exact_size_cut_after_copy(void)
    items[0].num_segments = 1;
    register_items(items, 1);
    assert(save_item_files.files[0].guard.copy_first);
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/undo/game.srm", file, 12));
    assert(disk_holds("/s/game.srm", file, 8));
    ASSERT_FILES(1, 0, 0);
@@ -2729,7 +3158,7 @@ static void test_exact_size_cut_after_copy(void)
    disk_put("/s/game.srm", file, sizeof(file));
    items[0].num_segments = 2;
    register_items(items, 1);
-   event_load_save_files(false);
+   load_for_worker();
    start_autosave(false);
    logs     = copy_logs;
    items[1] = buffer_item("c", "/s/u.srm");
@@ -2752,7 +3181,7 @@ static void test_exact_size_cut_after_copy(void)
    start();
    disk_put("/s/game.srm", file, sizeof(file));
    register_items(items, 1);
-   event_load_save_files(false);
+   load_for_worker();
    h       = start_autosave(false);
    wram[1] = 0x66;
    capture(h);
@@ -2807,7 +3236,7 @@ static void test_refused(void)
    blob_refuse = false;
    memset(blob_state, 3, 4);
    blob_len    = 4;
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/undo/game.blob", old, 4));
    assert(disk_holds("/s/game.blob", blob_state, 4));
 
@@ -2821,17 +3250,17 @@ static void test_refused(void)
    blob_refuse = false;
    memset(blob_state, 3, 4);
    blob_len    = 4;
-   assert(!event_save_files(true, false, NULL));
+   assert(!save_files());
    assert(disk_holds("/s/game.blob", old, 4));
    assert(disk_named("RetroArch-recovery-") && osd_count == 2);
    assert(strstr(osd_last, "/s/game.blob|/app/RetroArch-recovery-"));
 
    /* Once per item: the same image is not recovered again, and a newer
     * one replaces it in the file the warning named. */
-   assert(!event_save_files(true, false, NULL));
+   assert(!save_files());
    assert(recovery_writes == 1 && osd_count == 2);
    blob_state[0] = 4;
-   assert(!event_save_files(true, false, NULL));
+   assert(!save_files());
    assert(recovery_writes == 1 && osd_count == 2);
    assert(disk_named_holds("RetroArch-recovery-", blob_state, 4));
    assert(disk_holds("/s/game.blob", old, 4));
@@ -2865,11 +3294,11 @@ static void test_recovery_same_second(void)
    blob_refuse = false;
    memset(blob_state, 3, 4);
    blob_len    = 4;
-   assert(!event_save_files(true, false, NULL));
+   assert(!save_files());
    assert(recovery_writes == 2);
    assert(disk_count_named("/app/RetroArch-recovery-") == 2);
    blob_state[0] = 4;
-   assert(!event_save_files(true, false, NULL));
+   assert(!save_files());
    assert(recovery_writes == 2);
    assert(disk_count_named("/app/RetroArch-recovery-") == 2);
    assert(disk_named_holds("/app/RetroArch-recovery-", blob_state, 4) == 2);
@@ -2889,7 +3318,7 @@ static void test_load_disabled_tail(void)
    register_items(items, 1);
    event_load_save_files(true);
    wram[0] = 1;
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/s/game.srm", image(), 12) && !disk_named("/undo/"));
 }
 
@@ -2910,7 +3339,7 @@ static void test_old_core_copy(void)
    event_load_save_files(false);
    assert(osd_count == 1);
    legacy_ram[0] = 9;
-   event_save_files(true, false, NULL);
+   save_files();
    assert(disk_holds("/s/old.srm", legacy_ram, 4));
    assert(disk_holds("/undo/old.srm", srm, 6));
    ASSERT_FILES(1, 0, 1);
@@ -2969,7 +3398,13 @@ static void test_unreadable_file(void)
    set_fail_read("/s/game.srm");
    assert(!event_load_save_files(false));
    wram[0] = 1;
-   event_save_files(true, false, NULL);
+   save_files_unreaped();
+   /* Killed here. */
+   assert(disk_holds("/s/game.srm", file, 12));
+   assert(disk_named_holds("RetroArch-recovery-", image(), 12) == 1);
+   ASSERT_FILES(0, 1, 1);
+   assert(err_count == 1);
+   frame_start_reap();
    assert(disk_holds("/s/game.srm", file, 12));
    assert(disk_named_holds("RetroArch-recovery-", image(), 12) == 1);
    ASSERT_FILES(0, 1, 1);
@@ -2977,13 +3412,13 @@ static void test_unreadable_file(void)
 
    set_fail_read(NULL);
    wram[0] = 2;
-   event_save_files(true, false, NULL);
+   save_files();
    assert(disk_holds("/undo/game.srm", file, 12));
    assert(   disk_holds("/s/game.srm", image(), 12)
           || disk_named_holds("RetroArch-recovery-", image(), 12) == 1);
    ASSERT_FILES(1, 1, 1);
    /* Written once the copy is made. */
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/s/game.srm", image(), 12));
    ASSERT_FILES(1, 1, 1);
 }
@@ -3012,7 +3447,7 @@ static void test_save_files_pending_grow(void)
    register_items(items, 1);
    assert(save_item_files.files[0].grow_from == 8);
    wram[0] = 0x99;
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/s/game.srm", want, 16));
    assert(!memcmp(iram, file + 8, sizeof(iram)));
    ASSERT_FILES(0, 0, 0);
@@ -3043,7 +3478,8 @@ static void test_tail_no_memory(void)
       assert(!save_items_state_get_ptr()->current->items[0].tail_size);
       assert(err_count == 1);
       wram[0] = 1;
-      event_save_files(true, false, NULL);
+      save_files_unreaped();
+      /* Killed here. */
       if (pass)
       {
          assert(disk_holds("/s/game.srm", file, 16));
@@ -3056,6 +3492,11 @@ static void test_tail_no_memory(void)
          assert(disk_holds("/s/game.srm", image(), 12));
          ASSERT_FILES(1, 0, 0);
       }
+      assert(err_count == 1);
+      frame_start_reap();
+      assert(disk_holds("/s/game.srm", pass ? file : image(), pass ? 16 : 12));
+      ASSERT_FILES(!pass, pass, pass);
+      assert(err_count == 1);
    }
 }
 
@@ -3097,9 +3538,9 @@ static void test_save_write_fails(void)
    assert(event_load_save_files(false));
    set_fail_save_writes(true);
    wram[0] = 1;
-   assert(!event_save_files(true, false, NULL));
+   assert(!save_files());
    wram[0] = 2;
-   assert(!event_save_files(true, false, NULL));
+   assert(!save_files());
    set_fail_save_writes(false);
    assert(disk_holds("/s/game.srm", file, 12));
    assert(disk_named_holds("RetroArch-recovery-", image(), 12) == 1);
@@ -3126,7 +3567,7 @@ static void test_recovery_cut(void)
    cut_recovery = true;
    slock_unlock(disk_lock);
    wram[0] = 1;
-   assert(!event_save_files(true, false, NULL));
+   assert(!save_files());
    assert(disk_count_named("RetroArch-recovery-") == 1);
    assert(disk_count_named(".tmp") == 1);
    assert(disk_holds("/s/game.srm", file, 12));
@@ -3149,10 +3590,10 @@ static void test_save_no_image(void)
    assert(event_load_save_files(false));
    wram[0] = 1;
    retro_atomic_store_release_int(&fail_main_malloc_size, 12);
-   assert(!event_save_files(true, false, NULL));
+   assert(!save_files());
    ASSERT_FILES(0, 0, 0);
    assert(err_count == 1);
-   assert(!event_save_files(true, false, NULL));
+   assert(!save_files());
    retro_atomic_store_release_int(&fail_main_malloc_size, 0);
    assert(disk_holds("/s/game.srm", file, 12));
    ASSERT_FILES(0, 0, 1);
@@ -3171,7 +3612,7 @@ static void test_save_no_image(void)
    assert(event_load_save_files(false));
    blob_state[0]  = 'z';
    blob_fail_save = true;
-   assert(!event_save_files(true, false, NULL));
+   assert(!save_files());
    blob_fail_save = false;
    assert(disk_holds("/s/game.flash", "abcd", 4));
    ASSERT_FILES(0, 0, 0);
@@ -3231,6 +3672,55 @@ static void test_worker_failed(void)
    ASSERT_FILES(0, 0, 2);
 }
 
+/* A worker's failed writes and SAVE_FILES's failures to save the same
+ * file are one streak, shown once whichever is shown first; a success
+ * ends it. */
+static void test_worker_and_main_failed(void)
+{
+   struct retro_save_item items[1];
+   autosave_t *h;
+   start();
+   items[0] = buffer_item("srm", "/s/auto.srm");
+   register_items(items, 1);
+   event_load_save_files(false);
+   h = start_autosave(false);
+   set_fail_writes(true);
+   wram[0] = 1;
+   capture(h);
+   capture(h);
+   event_save_items_fill(false);
+   assert(osd_count == 1 && err_count == 1);
+   retro_atomic_store_release_int(&fail_main_malloc_size, 12);
+   assert(!event_save_files(true, false, NULL));
+   assert(!event_save_files(true, false, NULL));
+   retro_atomic_store_release_int(&fail_main_malloc_size, 0);
+   assert(osd_count == 1 && err_count == 3);
+   set_fail_writes(false);
+   capture(h);
+   event_save_items_fill(false);
+   assert(event_save_files(true, false, NULL));
+   assert(disk_holds("/s/auto.srm", image(), 12));
+   assert(osd_count == 1 && err_count == 3);
+   /* SAVE_FILES first this time. */
+   wram[0] = 2;
+   retro_atomic_store_release_int(&fail_main_malloc_size, 12);
+   assert(!event_save_files(true, false, NULL));
+   assert(!event_save_files(true, false, NULL));
+   retro_atomic_store_release_int(&fail_main_malloc_size, 0);
+   assert(osd_count == 2 && err_count == 5);
+   set_fail_writes(true);
+   capture(h);
+   capture(h);
+   event_save_items_fill(false);
+   assert(osd_count == 2 && err_count == 6);
+   set_fail_writes(false);
+   assert(event_save_files(true, false, NULL));
+   assert(disk_holds("/s/auto.srm", image(), 12));
+   autosave_deinit();
+   ASSERT_FILES(0, 0, 2);
+   assert(err_count == 6);
+}
+
 /* An item closed before its fill writes nothing: removed, or ended
  * by a refused set. */
 static void test_close_unfilled(void)
@@ -3249,7 +3739,7 @@ static void test_close_unfilled(void)
    register_items(items, 2);
    register_items(items, 1);
    assert(save_item_files.num_orphans == 0);
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(raw_writes == 0 && disk_holds("/s/one.card", saved, 6));
 
    register_items(items, 2);
@@ -3257,7 +3747,7 @@ static void test_close_unfilled(void)
    twice[1] = card_item("a", "/s/y.srm");
    register_refused(twice, 2);
    assert(save_item_files.num_orphans == 1);
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(raw_writes == 0 && disk_holds("/s/one.card", saved, 6));
    ASSERT_FILES(0, 0, 0);
 }
@@ -3304,7 +3794,7 @@ static void test_close_pending_grow(void)
          assert(!autosave_state.num_retired);
          autosave_deinit();
       }
-      assert(event_save_files(true, false, NULL));
+      assert(save_files());
       /* EXACT_SIZE: copied, then cut to the item as its fill would
        * have left it. */
       if (i == 2)
@@ -3350,7 +3840,7 @@ static void test_reshapes_before_fill(void)
       register_items(items, 1);
       event_save_items_fill(false);
       assert(!save_item_files.files[0].grow_from);
-      assert(event_save_files(true, false, NULL));
+      assert(save_files());
       assert(raw_writes == 0 && disk_holds("/s/game.srm", file, 16));
       segs[0].size = sizeof(wram);
       segs[1].size = sizeof(iram);
@@ -3372,10 +3862,12 @@ static void test_copy_owed_again(void)
    items[0]       = buffer_item("srm", "/s/game.srm");
    items[0].flags = RETRO_SAVE_FLAG_EXACT_SIZE;
    register_items(items, 1);
-   event_load_save_files(false);
+   load_for_worker();
    h = start_autosave(false);
+   /* The copy the longer file owes is made at the start. */
+   assert(disk_holds("/undo/game.srm", file, 16));
 
-   /* The worker is held inside the copy the longer file owes. */
+   /* The worker is held inside a write when the cut owes a copy. */
    slock_lock(disk_lock);
    hold_write = true;
    slock_unlock(disk_lock);
@@ -3384,8 +3876,8 @@ static void test_copy_owed_again(void)
    autosave_lock();
    autosave_unlock();
    slock_lock(disk_lock);
-   disk_wait_count(&raw_writes, 1);
-   assert(raw_writes == 1);
+   disk_wait_count(&raw_writes, 2);
+   assert(raw_writes == 2);
    slock_unlock(disk_lock);
 
    items[0].num_segments = 1;
@@ -3395,16 +3887,13 @@ static void test_copy_owed_again(void)
    scond_broadcast(disk_cond);
    slock_unlock(disk_lock);
    wait_requested(h);
-   assert(disk_holds("/undo/game.srm", file, 16));
    assert(disk_holds("/s/game.srm", want, 12));
-   event_save_items_fill(false);
-   assert(save_item_files.files[0].guard.copy_first);
 
-   /* The next write copies the file holding the cut bytes first, next
-    * to the first copy. */
-   capture(h);
+   /* Once that write has landed, the file holding the cut bytes is
+    * copied next to the first copy, before the next write. */
    assert(disk_holds("/undo/game.srm", file, 16));
    assert(disk_holds("/undo/game-2.srm", want, 12));
+   capture(h);
    assert(disk_holds("/s/game.srm", want, 8));
    event_save_items_fill(false);
    assert(copy_logged("in \"/undo/game-2.srm\""));
@@ -3476,7 +3965,7 @@ static void test_copy_no_file(void)
       if (pass == 0)
       {
          wram[0] = 1;
-         assert(event_save_files(true, false, NULL));
+         assert(save_files());
       }
       else
       {
@@ -3520,7 +4009,7 @@ static void test_copy_numbered(void)
       register_items(items, 1);
       event_load_save_files(false);
       if (pass < 2)
-         assert(event_save_files(true, false, NULL));
+         assert(save_files());
       else
       {
          autosave_t *h = start_autosave(false);
@@ -3541,7 +4030,7 @@ static void test_copy_numbered(void)
       assert(copy_logged("in \"/undo/game.srm\""));
       items[0].num_segments = 1;
       register_items(items, 1);
-      assert(event_save_files(true, false, NULL));
+      assert(save_files());
       assert(disk_holds("/undo/game.srm", file, 16));
       assert(disk_holds("/undo/game-2.srm", file, 12));
       assert(disk_holds("/s/game.srm", file, 8));
@@ -3575,7 +4064,7 @@ static void test_copy_numbered_full(void)
    items[0].flags = RETRO_SAVE_FLAG_EXACT_SIZE;
    register_items(items, 1);
    event_load_save_files(false);
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/undo/game-99.srm", file, 16));
    fill_bytes(other, sizeof(other), 98);
    assert(disk_holds("/undo/game-98.srm", other, sizeof(other)));
@@ -3607,7 +4096,7 @@ static void test_copy_numbered_type_change(void)
       if (pass == 0)
       {
          wram[0] ^= 0xff;
-         assert(event_save_files(true, false, NULL));
+         assert(save_files());
       }
       else
       {
@@ -3625,9 +4114,9 @@ static void test_copy_numbered_type_change(void)
    }
 }
 
-/* SAVE_FILES while the item's own worker owes the copy: the newest
- * image goes to a recovery file no one is told of, gone once the path
- * holds it, named when the copy fails. */
+/* SAVE_FILES while the item's own worker makes the copy it owes:
+ * the newest image goes to a recovery file no one is told of, gone
+ * once the path holds it, named when the copy fails. */
 static void test_save_files_worker_copying(void)
 {
    unsigned char file[12];
@@ -3647,98 +4136,79 @@ static void test_save_files_worker_copying(void)
       event_load_save_files(false);
       items[0] = buffer_item("b", "/s/game.srm");
       register_items(items, 1);
+      event_save_items_set_undo_dir(NULL);
       event_save_items_fill(false);
+      event_save_items_set_undo_dir("/undo");
       assert(save_item_files.files[0].guard.keep_file);
-      h = start_autosave(false);
-      if (pass == 0)
-      {
-         /* Held in its copy. */
-         set_hold(&hold_temp, true);
-         wram[0] ^= 0xff;
-         autosave_lock();
-         autosave_unlock();
-         wait_held(1);
-      }
-      wram[0] ^= 0x0f;
+      set_hold(&hold_undo, true);
+      assert(autosave_init(false, 1));
+      assert((h = save_item_files.files[0].autosave));
+      h->interval = 0;
+      wait_held(1);
+      wram[0] ^= 0xff;
       memcpy(newest, image(), sizeof(newest));
-      assert(event_save_files(true, false, NULL));
+      assert(save_files_unreaped());
       /* Killed here. */
       assert(disk_holds("/s/game.srm", file, sizeof(file)));
       assert(disk_named_holds("RetroArch-recovery-", newest, 12) == 1);
-      /* Pass 0: the copy's temp. */
-      ASSERT_FILES(pass ? 0 : 1, 1, 0);
-      assert(disk_count_named(".auto.tmp") == (pass ? 0 : 1));
+      ASSERT_FILES(0, 1, 0);
+      assert(err_count == 0);
+      if (pass)
+         set_fail_undo(true);
+      set_hold(&hold_undo, false);
+      wait_requested(h);
+      /* Killed here. */
+      assert(disk_holds("/s/game.srm", file, sizeof(file)));
+      assert(disk_named_holds("RetroArch-recovery-", newest, 12) == 1);
+      /* Pass 1: the worker's dump of the old type's image too. */
+      ASSERT_FILES(pass ? 0 : 1, pass ? 2 : 1, 0);
       assert(err_count == 0);
       if (pass == 0)
       {
-         set_hold(&hold_temp, false);
-         wait_requested(h);
-         /* K2: the older snapshot is not written over the newer. */
-         assert(disk_holds("/s/game.srm", file, sizeof(file)));
          assert(disk_holds("/undo/game.srm", file, sizeof(file)));
-         assert(disk_named_holds("RetroArch-recovery-", newest, 12) == 1);
-         ASSERT_FILES(1, 1, 0);
          event_save_items_fill(false);
          capture(h);
+         /* Killed here. */
+         assert(disk_holds("/s/game.srm", newest, 12));
+         ASSERT_FILES(1, 0, 1);
          event_save_items_fill(false);
          assert(disk_holds("/s/game.srm", newest, 12));
          ASSERT_FILES(1, 0, 1);
          assert(strstr(osd_last, "/s/game.srm|/undo/game.srm"));
-         assert(err_count == 0);
       }
       else
       {
-         set_fail_undo(true);
-         capture(h);
-         /* Killed here. */
-         assert(disk_holds("/s/game.srm", file, sizeof(file)));
-         assert(disk_named_holds("RetroArch-recovery-", newest, 12) == 1);
-         ASSERT_FILES(0, 1, 0);
          event_save_items_fill(false);
-         ASSERT_FILES(0, 1, 1);
-         assert(strstr(osd_last, "RetroArch-recovery-"));
-         assert(err_count == 0);
-         /* The second failed write in a row is told too. */
+         ASSERT_FILES(0, 2, 2);
+         assert(told_holding(newest, 12) == 1);
+         assert(told_holding(file, sizeof(file)) == 1);
          capture(h);
          event_save_items_fill(false);
-         ASSERT_FILES(0, 1, 2);
-         assert(err_count == 1);
+         /* Still no copy: the image goes to the file named. */
+         assert(!save_files());
+         ASSERT_FILES(0, 2, 2);
          wram[0] ^= 0x0f;
-         assert(!event_save_files(true, false, NULL));
+         assert(!save_files());
          assert(disk_holds("/s/game.srm", file, sizeof(file)));
-         assert(disk_named_holds("RetroArch-recovery-", image(), 12) == 1);
-         ASSERT_FILES(0, 1, 2);
+         ASSERT_FILES(0, 2, 2);
+         assert(told_holding(image(), 12) == 1);
          set_fail_undo(false);
       }
+      assert(err_count == 0);
       autosave_deinit();
    }
 }
 
-/* How many copies in /undo/ are @size bytes and end in @end. */
-static unsigned undo_ends(const unsigned char *end, size_t len,
-      size_t size)
-{
-   unsigned i;
-   unsigned n = 0;
-   slock_lock(disk_lock);
-   for (i = 0; i < DISK_FILES; i++)
-      if (     disk[i].exists && !strncmp(disk[i].path, "/undo/", 6)
-            && disk[i].size == size
-            && !memcmp(disk[i].data + size - len, end, len))
-         n++;
-   slock_unlock(disk_lock);
-   return n;
-}
-
 /* An item closed while its worker owes the copy of its kept file: the
  * recovery file no one was told of keeps the newest image until the
- * worker's last write has landed it. Pass 1: that write fails, and the
- * image is recovered once. Pass 2: the content closes. */
+ * worker's last write lands it, then goes. Pass 1: that write fails,
+ * and the file is named once. Pass 2: the content closes. */
 static void test_close_worker_copying(void)
 {
    unsigned char file[12];
    unsigned char newest[12];
    struct retro_save_item items[1];
+   autosave_t *h;
    unsigned pass;
 
    fill_bytes(file, sizeof(file), 0x30);
@@ -3752,27 +4222,27 @@ static void test_close_worker_copying(void)
       event_load_save_files(false);
       items[0] = buffer_item("b", "/s/game.srm");
       register_items(items, 1);
+      event_save_items_set_undo_dir(NULL);
       event_save_items_fill(false);
+      event_save_items_set_undo_dir("/undo");
       assert(save_item_files.files[0].guard.keep_file);
-      start_autosave(false);
-      /* Held in its copy. */
-      set_hold(&hold_temp, true);
-      wram[0] ^= 0xff;
-      autosave_lock();
-      autosave_unlock();
+      set_hold(&hold_undo, true);
+      assert(autosave_init(false, 1));
+      assert((h = save_item_files.files[0].autosave));
+      h->interval = 0;
       wait_held(1);
-      wram[0] ^= 0x0f;
+      wram[0] ^= 0xff;
       memcpy(newest, image(), sizeof(newest));
-      assert(event_save_files(true, false, NULL));
+      assert(save_files_unreaped());
       register_items(NULL, 0);
-      /* Killed here: the copy's temp too. */
+      /* Killed here. */
       assert(disk_holds("/s/game.srm", file, sizeof(file)));
       assert(disk_named_holds("RetroArch-recovery-", newest, 12) == 1);
-      ASSERT_FILES(1, 1, 0);
+      ASSERT_FILES(0, 1, 0);
       assert(err_count == 0);
       if (pass == 1)
          set_fail_save_writes(true);
-      set_hold(&hold_temp, false);
+      set_hold(&hold_undo, false);
       if (pass == 2)
       {
          event_save_items_final(true, false);
@@ -3783,32 +4253,33 @@ static void test_close_worker_copying(void)
          autosave_deinit();
          continue;
       }
-      retired_join();
+      retired_join(false);
       set_fail_save_writes(false);
       /* Killed here. */
       assert(disk_holds("/undo/game.srm", file, sizeof(file)));
       assert(disk_holds("/s/game.srm", pass ? file : newest, 12));
-      assert(disk_named_holds("RetroArch-recovery-", newest, 12) == 1);
-      ASSERT_FILES(1, 1, 0);
+      assert(disk_named_holds("RetroArch-recovery-", newest, 12) == pass);
+      ASSERT_FILES(1, pass, 0);
       assert(err_count == 0);
-      autosave_reap();
+      autosave_reap(false);
       assert(!autosave_state.num_retired);
       assert(disk_holds("/s/game.srm", pass ? file : newest, 12));
-      assert(disk_named_holds("RetroArch-recovery-", newest, 12) == pass);
       ASSERT_FILES(1, pass, 1 + pass);
+      assert(told_holding(newest, 12) == pass);
       assert(err_count == 0);
       autosave_deinit();
    }
 }
 
 /* Two items of one name in two folders: each file gets its own copy,
- * one at a time. The one that waits writes keeping its end first. */
+ * one at a time. */
 static void test_copy_same_name(void)
 {
    unsigned char a[16];
    unsigned char b[10];
    struct retro_save_item items[2];
    autosave_t *h0, *h1;
+   unsigned i;
 
    start();
    app_dir = "/app";
@@ -3821,33 +4292,36 @@ static void test_copy_same_name(void)
    items[1]       = card_item("b", "/s/b/g.srm");
    items[1].flags = RETRO_SAVE_FLAG_EXACT_SIZE;
    register_items(items, 2);
-   event_load_save_files(false);
+   load_for_worker();
    assert(save_item_files.files[0].guard.copy_first);
    assert(save_item_files.files[1].guard.copy_first);
+   set_hold(&hold_undo, true);
    assert(autosave_init(false, 1));
    assert((h0 = save_item_files.files[0].autosave));
    assert((h1 = save_item_files.files[1].autosave));
    h0->interval = h1->interval = 0;
+   wait_held(1);
+   /* The other tries the same name meanwhile, then asks for a
+    * snapshot. */
+   for (i = 0; i < 5000; i++)
+   {
+      if (     retro_atomic_load_acquire_int(&h0->snapshot_requested)
+            || retro_atomic_load_acquire_int(&h1->snapshot_requested))
+         break;
+      retro_sleep(1);
+   }
+   assert(i < 5000);
+   set_hold(&hold_undo, false);
    wait_requested(h0);
    wait_requested(h1);
-   /* Both write at once, each held after its first temp. */
-   set_hold(&hold_temp, true);
    wram[0] = 1;
    card[0] = 1;
-   autosave_lock();
-   autosave_unlock();
-   wait_held(2);
-   set_hold(&hold_temp, false);
-   wait_requested(h0);
-   wait_requested(h1);
-   wram[0] = 2;
-   card[0] = 2;
    capture(h0);
    capture(h1);
    capture(h0);
    capture(h1);
-   assert(undo_ends(a + 12, 4, sizeof(a)) == 1);
-   assert(undo_ends(b + 6, 4, sizeof(b)) == 1);
+   assert(disk_named_holds("/undo/", a, sizeof(a)) == 1);
+   assert(disk_named_holds("/undo/", b, sizeof(b)) == 1);
    assert(!disk_named(".tmp"));
    ASSERT_FILES(2, 0, 0);
    assert(err_count == 0);
@@ -4068,7 +4542,7 @@ static void test_save_files_mid_write(void)
    wait_held(1);
    wram[0] = 2;
    memcpy(newer, image(), sizeof(newer));
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/s/game.srm", newer, 12));
    set_hold(&hold_temp, false);
    wait_requested(h);
@@ -4111,7 +4585,7 @@ static void test_save_files_at_rename(void)
       autosave_unlock();
       wait_held(1);
       wram[0] = 2;
-      assert(event_save_files(true, false, NULL));
+      assert(save_files());
       assert(disk_holds("/s/game.srm", image(), 12));
       set_hold(hold, false);
       wait_requested(h);
@@ -4167,7 +4641,7 @@ static void test_retired_then_new_item(void)
       assert(!save_item_files.files[0].autosave);
    }
    set_hold(&hold_temp, false);
-   retired_join();
+   retired_join(false);
    ASSERT_FILES(0, 0, 0);
    assert(err_count == 0);
    for (i = 0; !save_item_files.files[0].autosave && i < 5000; i++)
@@ -4200,9 +4674,9 @@ static void test_save_files_during_retired_write(void)
 
    retire_held(items, last);
    wram[0] = 2;
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    set_hold(&hold_temp, false);
-   retired_join();
+   retired_join(false);
    ASSERT_FILES(0, 0, 0);
    assert(err_count == 0);
    for (i = 0; autosave_state.num_retired && i < 5000; i++)
@@ -4286,7 +4760,7 @@ static void test_given_back_held(void)
    ASSERT_FILES(0, 0, 0);
    assert(err_count == 0);
    set_hold(&hold_temp, false);
-   retired_join();
+   retired_join(false);
    assert(disk_holds("/s/game.srm", last, sizeof(last)));
    /* The frame start reaps it. */
    autosave_check();
@@ -4318,7 +4792,7 @@ static void test_given_back_autosave(void)
    autosave_check();
    assert(!autosave_state.list[0]);
    set_hold(&hold_temp, false);
-   retired_join();
+   retired_join(false);
    autosave_check();
    assert(autosave_state.num_retired == 0);
    assert((r = autosave_state.list[0]));
@@ -4354,7 +4828,7 @@ static void test_given_back_autosave(void)
    assert(retro_atomic_load_acquire_int(&r->snapshot_requested));
    assert(disk_holds("/s/game.srm", was, sizeof(was)));
    set_hold(&hold_temp, false);
-   retired_join();
+   retired_join(false);
    assert(disk_holds("/s/game.srm", last, sizeof(last)));
    capture(r);
    assert(autosave_state.num_retired == 0);
@@ -4412,7 +4886,7 @@ static void test_given_back_reinit(void)
       }
       if (pass == 1)
       {
-         retired_join();
+         retired_join(false);
          autosave_check();
          assert((r = autosave_state.list[0]));
          wait_requested(r);
@@ -4490,7 +4964,7 @@ static void test_left_out_back_retired(void)
    assert(disk_holds("/s/game.srm", older, sizeof(older)));
    ASSERT_FILES(0, 0, 0);
    set_hold(&hold_temp, false);
-   retired_join();
+   retired_join(false);
    autosave_check();
    assert(autosave_state.num_retired == 0);
    assert(disk_count_named("") == 1);
@@ -4526,7 +5000,7 @@ static void test_retired_other_spelling(void)
    wait_held(1);
    event_save_items_fill(false);
    wram[0] = 2;
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    set_hold(&hold_temp, false);
    for (i = 0; autosave_state.num_retired && i < 5000; i++)
    {
@@ -4562,7 +5036,7 @@ static void test_legacy_load(void)
    assert(legacy_last_len == 16 && wram[0] == 0x33 && loaded_calls == 1);
    assert(!save_items_state_get_ptr()->current->items[0].tail_size);
    assert(save_item_files.files[0].initial);
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/s/game.srm", image(), 12));
    assert(disk_holds("/s/b.sav", old, 16));
 
@@ -4584,7 +5058,7 @@ static void test_legacy_load(void)
    assert(!event_load_save_files(false));
    assert(legacy_calls == 2 && wram[0] == 0 && loaded_calls == 1);
    assert(osd_count == 1 && strstr(osd_last, "/s/a.sav"));
-   assert(event_save_files(true, false, NULL) && !disk_has("/s/game.srm"));
+   assert(save_files() && !disk_has("/s/game.srm"));
    assert(disk_holds("/s/a.sav", old, 12));
 }
 
@@ -4605,7 +5079,7 @@ static void test_legacy_raw(void)
    register_items(items, 1);
    assert(event_load_save_files(false) && !memcmp(image(), old, 12));
    assert(osd_count == 1 && strstr(osd_last, "/s/a.sav"));
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/s/game.srm", old, 16));
 
    start();
@@ -4779,7 +5253,7 @@ static void test_final_write(void)
    event_load_save_files(false);
    wram[0] = 1;
    /* The close's SAVE_FILES, before the core unloads. */
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(raw_writes == 1);
 
    /* retro_unload_game() writes once more, an emulated power-off. */
@@ -4798,7 +5272,7 @@ static void test_final_write(void)
    register_items(items, 1);
    event_load_save_files(false);
    wram[0] = 1;
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    event_save_items_final(true, false);
    assert(raw_writes == 1);
 
@@ -4827,7 +5301,7 @@ static void test_final_write(void)
 static void snapshot_close(void)
 {
    autosave_deinit();
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    /* Killed here. */
    event_save_items_final(true, false);
 }
@@ -4856,11 +5330,11 @@ static void test_snapshot_close(void)
    memcpy(done, image(), sizeof(done));
    snapshot_ready = false;
    wram[0]        = 2;
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(raw_writes == 1 && disk_holds("/s/close.srm", done, 12));
    core_frames(1, 60.0);
    autosave_deinit();
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(raw_writes == 1 && disk_holds("/s/close.srm", done, 12));
    event_save_items_final(true, false);
    assert(raw_writes == 1 && disk_holds("/s/close.srm", done, 12));
@@ -4879,7 +5353,7 @@ static void test_snapshot_close(void)
    snapshot_ready = false;
    wram[0]        = 2;
    autosave_deinit();
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(raw_writes == 1);
    snapshot_ready = true;
    wram[1]        = 3;
@@ -4906,7 +5380,7 @@ static void test_snapshot_close(void)
    autosave_deinit();
    /* Killed here. */
    assert(raw_writes == 1 && disk_holds("/s/close.srm", done, 12));
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    event_save_items_final(true, false);
    assert(raw_writes == 1 && disk_holds("/s/close.srm", done, 12));
    assert(saving_logs == 1 && err_count == 0);
@@ -4967,7 +5441,7 @@ static void test_snapshot_close(void)
    event_save_items_fill(false);
    snapshot_ready = false;
    wram[0]        = 2;
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(raw_writes == 2 && disk_holds("/s/close.srm", image(), 12));
    event_save_items_final(true, false);
    assert(raw_writes == 2 && saving_logs == 0 && err_count == 0);
@@ -4981,7 +5455,7 @@ static void test_snapshot_close(void)
    register_items(items, 1);
    event_load_save_files(false);
    wram[0] = 1;
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    event_save_items_final(true, false);
    assert(raw_writes == 1 && disk_holds("/s/close.srm", image(), 12));
    assert(saving_logs == 0 && err_count == 0);
@@ -5032,7 +5506,7 @@ static void test_snapshot_close_owed(void)
       wram[0]        = 2;
       autosave_deinit();
       assert(save_item_files.files[0].guard.copy_first);
-      assert(event_save_files(true, false, NULL));
+      assert(save_files());
       /* Killed here. */
       memcpy(closed, image(), 12);
       assert(disk_holds("/s/owed.srm", closed, 12));
@@ -5080,7 +5554,7 @@ static void test_snapshot_close_superseded(void)
    snapshot_ready = false;
    wram[0]        = 3;
    memcpy(mid, image(), sizeof(mid));
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    set_hold(&hold_temp, false);
    wait_requested(h);
    /* Killed here. */
@@ -5090,7 +5564,7 @@ static void test_snapshot_close_superseded(void)
    autosave_deinit();
    /* Killed here: joined. */
    assert(disk_holds("/s/sup.srm", mid, 12));
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/s/sup.srm", mid, 12));
    /* Written while unloading. */
    wram[1] = 4;
@@ -5220,7 +5694,7 @@ static void test_legacy_paths(void)
 
    /* The next write goes to the item's own name; the old file stays. */
    wram[0] = 1;
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/s/game.srm", image(), 12));
    assert(disk_holds("/s/oldest.sav", old, sizeof(old)));
 
@@ -5326,7 +5800,7 @@ static void test_waiting_image(void)
    assert(!memcmp(image(), want, sizeof(want)));
    assert(save_item_files.num_orphans == 0);
    writes = raw_writes;
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(raw_writes == writes + 1);
    assert(disk_holds("/s/w.srm", want, sizeof(want)));
    ASSERT_FILES(0, 0, 0);
@@ -5344,7 +5818,7 @@ static void test_waiting_image(void)
    register_items(items, 1);
    event_save_items_fill(false);
    assert(save_item_files.files[0].initial);
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(!disk_has("/s/new.srm"));
    ASSERT_FILES(0, 0, 0);
    assert(err_count == 2);
@@ -5384,7 +5858,7 @@ static void test_waiting_image(void)
    hold_write = false;
    scond_broadcast(disk_cond);
    slock_unlock(disk_lock);
-   retired_join();
+   retired_join(false);
    ASSERT_FILES(0, 0, 0);
    assert(err_count == 2);
    for (i = 0; autosave_state.num_retired && i < 5000; i++)
@@ -5395,7 +5869,7 @@ static void test_waiting_image(void)
    assert(autosave_state.num_retired == 0);
    assert(disk_holds("/s/w.srm", want, sizeof(want)));
    autosave_deinit();
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/s/w.srm", want, sizeof(want)));
    ASSERT_FILES(0, 0, 0);
    assert(err_count == 2);
@@ -5450,7 +5924,7 @@ static void test_waiting_other_spelling(void)
       {
          unsigned i;
          set_hold(&hold_temp, false);
-         retired_join();
+         retired_join(false);
          ASSERT_FILES(0, 0, 0);
          assert(err_count == 0);
          for (i = 0; autosave_state.num_retired && i < 5000; i++)
@@ -5463,7 +5937,7 @@ static void test_waiting_other_spelling(void)
       }
 #endif
       assert(!save_item_files.num_orphans);
-      assert(event_save_files(true, false, NULL));
+      assert(save_files());
       assert(disk_holds("/s/w.srm", want, sizeof(want)));
       ASSERT_FILES(0, 0, 0);
       assert(err_count == 0);
@@ -5513,7 +5987,7 @@ static void test_waiting_refused(void)
       event_save_items_fill(false);
       assert(blob_len == 4 && !memcmp(blob_state, "keep", 4));
       blob_refuse = false;
-      assert(event_save_files(true, false, NULL));
+      assert(save_files());
       assert(disk_holds("/undo/t.srm", a, sizeof(a)));
       assert(disk_holds("/s/t.srm", "keep", 4));
       assert(!save_item_files.num_orphans);
@@ -5562,7 +6036,7 @@ static void test_port_move(void)
 #ifdef HAVE_THREADS
    autosave_deinit();
 #endif
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/s/cart.sav", want, sizeof(want)));
 }
 
@@ -5596,7 +6070,7 @@ static void test_type_change_waiting(void)
    assert(save_item_files.num_orphans == 0);
    assert(!memcmp(image(), want, sizeof(want)));
    wram[2] = 9;
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/undo/t.srm", want, sizeof(want)));
    assert(disk_holds("/s/t.srm", image(), 12));
    assert(strstr(osd_last, "/undo/t.srm"));
@@ -5605,11 +6079,10 @@ static void test_type_change_waiting(void)
 #ifdef HAVE_THREADS
    /* With workers the fill takes a copy of the retired worker's last
     * image, which that worker still writes. The new worker, started
-    * once the retired one is reaped, copies it before its first write;
-    * stopped before one, it hands it back for the final write; retired
-    * before one, it copies it at its last write, and the main thread
-    * tells that copy as a live worker's, from the reap (2) or at the
-    * close (3). */
+    * once the retired one is reaped, copies it as it starts, also when
+    * stopped (1) or retired (2, 3) before its first write, and the main
+    * thread tells that copy as a live worker's, from the reap (2) or at
+    * the close (3). */
    for (pass = 0; pass < 4; pass++)
    {
       start();
@@ -5669,10 +6142,8 @@ static void test_type_change_waiting(void)
          continue;
       }
       autosave_deinit();
-      /* Copied by the worker, or handed back. */
-      assert((save_item_files.files[0].guard.copy_image != NULL)
-            == (pass == 1));
-      assert(event_save_files(true, false, NULL));
+      assert(!save_item_files.files[0].guard.copy_image);
+      assert(save_files());
       assert(disk_holds("/undo/t.srm", want, sizeof(want)));
       assert(disk_holds("/s/t.srm", image(), 12));
    }
@@ -5735,9 +6206,12 @@ static void test_type_change_uncopied(void)
       memcpy(last, image(), sizeof(last));
       if (pass == 0)
       {
-         /* A failed copy stays owed until the close. */
-         assert(!event_save_files(true, false, NULL));
+         /* A failed copy stays owed until the close; the old type's
+          * image is in a recovery file of its own at once. */
+         assert(!save_files());
          assert(save_item_files.files[0].guard.copy_image);
+         assert(disk_named_holds("RetroArch-recovery-", want, 12) == 1);
+         assert(disk_count_named("RetroArch-recovery-") == 2);
       }
       if (pass == 1)
       {
@@ -5745,7 +6219,7 @@ static void test_type_change_uncopied(void)
          items[1] = buffer_item("c", "/s/u.srm");
          register_items(items + 1, 1);
          assert(save_item_files.num_orphans == 1);
-         assert(!event_save_files(true, false, NULL));
+         assert(!save_files());
          assert(!save_item_files.num_orphans);
       }
 #ifdef HAVE_THREADS
@@ -5787,14 +6261,18 @@ static void test_type_change_uncopied(void)
                || retro_atomic_load_acquire_int(&h->final_failed));
          if (pass != 4)
          {
-            /* The worker shows nothing. */
+            /* The worker recovers both images and shows nothing. */
             assert(osd_count == n);
+            assert(disk_count_named("RetroArch-recovery-") == 2);
+            assert(disk_named_holds("RetroArch-recovery-", last, 12));
+            assert(disk_named_holds("RetroArch-recovery-", want, 12));
             for (i = 0; autosave_state.num_retired && i < 5000; i++)
             {
                autosave_check();
                retro_sleep(1);
             }
             assert(!autosave_state.num_retired && osd_count == n + 2);
+            assert(disk_count_named("RetroArch-recovery-") == 2);
          }
       }
 #endif
@@ -5812,7 +6290,10 @@ static void test_type_change_uncopied(void)
             sizeof(old)));
       assert(disk_named_holds("RetroArch-recovery-", last, sizeof(last)));
       assert(strstr(osd_last, "/s/t.srm|/app/RetroArch-recovery-"));
-      assert(disk_holds(strchr(osd_last, '|') + 1, want, sizeof(want)));
+      /* Pass 5's item still holds that image. */
+      assert(told_holding(want, sizeof(want)) == 1 + (pass == 5));
+      assert(disk_named_holds("RetroArch-recovery-", want, 12)
+            == 1 + (pass == 5));
    }
 }
 
@@ -5858,7 +6339,7 @@ static void test_type_change_twice(void)
       wram[3]         = 0x66;
       if (!pass)
       {
-         assert(event_save_files(true, false, NULL));
+         assert(save_files());
          assert(disk_named_holds("/undo/", a, sizeof(a)) == 1);
          assert(disk_named_holds("/undo/", b, sizeof(b)) == 1);
          assert(disk_holds("/s/t.srm", image(), 12));
@@ -5866,7 +6347,7 @@ static void test_type_change_twice(void)
          assert(err_count == 0);
          continue;
       }
-      assert(!event_save_files(true, false, NULL));
+      assert(!save_files());
       event_save_items_final(true, false);
       assert(disk_holds("/s/t.srm", old, sizeof(old)));
       assert(disk_named_holds("RetroArch-recovery-", a, sizeof(a)) == 1);
@@ -5916,7 +6397,7 @@ static void test_type_change_blob_gone(void)
       blob_state[0] ^= 0xff;
       memcpy(b, blob_state, sizeof(b));
       register_items(NULL, 0);
-      event_save_files(true, false, NULL);
+      save_files();
       if (!pass)
       {
          assert(disk_holds("/s/t.srm", b, sizeof(b)));
@@ -5966,11 +6447,17 @@ static void test_waiting_refused_worker(void)
    event_save_items_fill(false);
    blob_refuse = false;
    assert(autosave_init(false, 1));
-   assert(event_save_files(true, false, NULL));
+   assert(save_files_unreaped());
+   /* Killed here. */
    assert(disk_holds("/undo/t.srm", a, sizeof(a)));
    assert(disk_holds("/s/t.srm", "keep", 4));
    ASSERT_FILES(1, 0, 1);
    assert(!err_count && !save_item_files.num_orphans);
+   frame_start_reap();
+   assert(disk_holds("/undo/t.srm", a, sizeof(a)));
+   assert(disk_holds("/s/t.srm", "keep", 4));
+   ASSERT_FILES(1, 0, 1);
+   assert(!err_count);
    autosave_check();
    event_save_items_fill(false);
    assert(save_item_files.files[0].autosave);
@@ -6004,13 +6491,28 @@ static void test_type_change_no_memory(void)
    event_save_items_fill(false);
    retro_atomic_store_release_int(&fail_main_malloc_size, 0);
    wram[2] = 9;
+#ifdef HAVE_THREADS
+   /* Its copy job is held until SAVE_FILES is done. */
+   set_hold(&hold_undo, true);
+#endif
    assert(event_save_files(true, false, NULL));
+#ifdef HAVE_THREADS
+   wait_held(1);
+   set_hold(&hold_undo, false);
+   copies_wait(false);
+#endif
+   /* Killed here. */
    assert(disk_holds("/undo/t.srm", want, sizeof(want)));
    assert(disk_holds("/s/t.srm", image(), 12));
    assert(image()[1] == 0x21);
+   ASSERT_FILES(1, 0, 0);
+   assert(!err_count && !save_item_files.num_orphans);
+   frame_start_reap();
+   assert(disk_holds("/undo/t.srm", want, sizeof(want)));
+   assert(disk_holds("/s/t.srm", image(), 12));
    ASSERT_FILES(1, 0, 1);
    assert(strstr(osd_last, "/s/t.srm|/undo/t.srm"));
-   assert(!err_count && !save_item_files.num_orphans);
+   assert(!err_count);
 }
 
 /* A blob that registers again from inside blob_load() and takes the
@@ -6040,7 +6542,7 @@ static void test_blob_reregister_taken(void)
       assert(event_load_save_files(false));
       assert(blob_len == 5 && !memcmp(blob_state, "other", 5));
       memcpy(blob_state, "newer", 5);
-      assert(event_save_files(true, false, NULL));
+      assert(save_files());
       assert(disk_holds("/s/game.flash", "newer", 5));
       ASSERT_FILES(0, 0, 0);
       assert(!err_count);
@@ -6125,17 +6627,17 @@ static void test_retired_copy_passes(void)
    /* SAVE_FILES before the reap: the copy the old worker owes comes
     * first and cannot be made, so the file is kept and the image goes
     * to the recovery file, once. */
-   assert(!event_save_files(true, false, NULL));
+   assert(!save_files());
    assert(disk_holds("/s/t.srm", old, sizeof(old)));
    assert(osd_count == n + 1);
-   ASSERT_FILES(0, 1, 1);
+   ASSERT_FILES(0, 3, 1);
    assert(err_count == 0);
    autosave_check();
    assert(!autosave_state.num_retired && osd_count == n + 2);
    assert(save_item_files.files[0].guard.copy_first);
    assert(save_item_files.files[0].guard.keep_file);
    assert(save_item_files.files[0].guard.type_changed);
-   assert(!event_save_files(true, false, NULL));
+   assert(!save_files());
    assert(disk_holds("/s/t.srm", old, sizeof(old)));
    assert(osd_count == n + 2);
    ASSERT_FILES(0, 2, 2);
@@ -6149,10 +6651,11 @@ static void test_retired_copy_passes(void)
 
 #ifdef HAVE_THREADS
 /* SAVE_FILES at a file whose retired worker has not made the copy it
- * owes makes that copy before the newer image lands. The copy is told
- * once, and kept once, though the worker makes it too. */
+ * owes hands the newer image to that worker, which writes it after its
+ * copy. The copy is told once. */
 static void test_save_files_retired_copy(void)
 {
+   unsigned char before[12];
    unsigned char want[12];
    struct retro_save_item items[1];
    unsigned i;
@@ -6165,13 +6668,19 @@ static void test_save_files_retired_copy(void)
    items[0].format = "core:a";
    register_items(items, 1);
    event_load_save_files(false);
+   memcpy(before, image(), sizeof(before));
    wram[1]         = 0x44;
    memcpy(want, image(), sizeof(want));
    items[0].id     = "b";
    items[0].format = "core:b";
    register_items(items, 1);
+   event_save_items_set_undo_dir(NULL);
    event_save_items_fill(false);
+   event_save_items_set_undo_dir("/undo");
+   /* Its copy at the start fails: still owed. */
+   set_fail_undo(true);
    start_autosave(false);
+   set_fail_undo(false);
    /* Ended before its first write: its last one copies first, and is
     * held once that copy's temp is written. */
    set_hold(&hold_temp, true);
@@ -6185,10 +6694,8 @@ static void test_save_files_retired_copy(void)
    assert(!save_item_files.files[0].guard.copy_first);
    wram[2] = 9;
    assert(event_save_files(true, false, NULL));
-   assert(disk_holds("/undo/t.srm", want, sizeof(want)));
-   assert(disk_holds("/s/t.srm", image(), 12));
-   assert(copy_logs == logs + 1 && osd_count == n + 1);
-   assert(strstr(osd_last, "/s/t.srm|/undo/t.srm"));
+   assert(!disk_has("/undo/t.srm") && disk_holds("/s/t.srm", before, 12));
+   assert(copy_logs == logs && osd_count == n);
    set_hold(&hold_temp, false);
    for (i = 0; autosave_state.num_retired && i < 5000; i++)
    {
@@ -6196,9 +6703,11 @@ static void test_save_files_retired_copy(void)
       retro_sleep(1);
    }
    assert(!autosave_state.num_retired);
-   assert(copy_logs == logs + 1 && osd_count == n + 1);
-   assert(!disk_has("/undo/t-2.srm"));
+   assert(disk_holds("/undo/t.srm", want, sizeof(want)));
    assert(disk_holds("/s/t.srm", image(), 12));
+   assert(copy_logs == logs + 1 && osd_count == n + 1);
+   assert(strstr(osd_last, "/s/t.srm|/undo/t.srm"));
+   assert(!disk_has("/undo/t-2.srm"));
    assert(failed_renames == 0 && !disk_named(".tmp"));
    ASSERT_FILES(1, 0, 1);
    assert(err_count == 0);
@@ -6352,7 +6861,7 @@ static void test_kept_move_type_change(void)
    assert(save_item_files.num_orphans == 1);
    assert(!memcmp(wram, want_card, sizeof(want_card)));
    wram[7] = 9;
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/undo/c.sav", want_card, sizeof(want_card)));
    assert(disk_holds("/s/c.sav", image(), 12));
    assert(osd_count == 1 && strstr(osd_last, "/undo/c.sav"));
@@ -6379,7 +6888,7 @@ static void test_kept_move_type_change(void)
    assert(save_item_files.files[1].guard.type_changed);
    event_save_items_fill(false);
    assert(save_item_files.num_orphans == 0);
-   assert(event_save_files(true, false, NULL));
+   assert(save_files());
    assert(disk_holds("/undo/c.sav", want_card, sizeof(want_card)));
    assert(disk_holds("/undo/a.srm", want, sizeof(want)));
    assert(osd_count == 2);
@@ -6400,6 +6909,1544 @@ static void test_kept_move_type_change(void)
    assert(save_item_files.files[0].guard.type_changed);
    assert(!save_item_files.files[1].guard.type_changed);
 }
+
+#ifdef HAVE_THREADS
+/* A refused blob at /s/game.blob, holding @old, with no worker: the
+ * fill owes its copy. */
+static void load_refused_blob(const unsigned char *old)
+{
+   struct retro_save_item items[1];
+   disk_put("/s/game.blob", old, 4);
+   items[0]              = buffer_item("blob", "/s/game.blob");
+   items[0].storage      = RETRO_SAVE_STORAGE_FRONTEND_BLOB;
+   items[0].segments     = NULL;
+   items[0].num_segments = 0;
+   blob_refuse           = true;
+   register_items(items, 1);
+   assert(!event_load_save_files(false));
+   blob_refuse           = false;
+   blob_len              = 4;
+}
+
+/* An owed copy with no worker is made off the main thread: SAVE_FILES
+ * reads nothing and writes no copy itself. Passes: a refused blob; a
+ * file longer than an EXACT_SIZE item. */
+static void test_copy_off_main(void)
+{
+   static const unsigned char old[4] = {7, 7, 7, 7};
+   unsigned char file[16];
+   struct retro_save_item items[1];
+
+   start();
+   load_refused_blob(old);
+   memset(blob_state, 3, 4);
+   main_reads = 0;
+   assert(save_files());
+   assert(main_reads == 0 && main_undo_writes == 0);
+   assert(disk_holds("/undo/game.blob", old, 4));
+   assert(disk_holds("/s/game.blob", blob_state, 4));
+   assert(copy_logs == 1);
+
+   start();
+   fill_bytes(file, sizeof(file), 0x30);
+   disk_put("/s/game.srm", file, sizeof(file));
+   items[0]       = buffer_item("srm", "/s/game.srm");
+   items[0].flags = RETRO_SAVE_FLAG_EXACT_SIZE;
+   register_items(items, 1);
+   assert(event_load_save_files(false));
+   main_reads = 0;
+   assert(save_files());
+   assert(main_reads == 0 && main_undo_writes == 0);
+   assert(disk_holds("/undo/game.srm", file, 16));
+   assert(disk_holds("/s/game.srm", file, 12));
+   assert(!save_item_files.files[0].guard.copy_first);
+}
+
+/* SAVE_FILES while the copy job runs hands it the image, which it
+ * writes after its copy: no recovery file, no notice. A second hand-off
+ * replaces the first, which is never written. */
+static void test_copy_job_handoff(void)
+{
+   static const unsigned char old[4] = {7, 7, 7, 7};
+   unsigned n;
+   unsigned logs;
+
+   start();
+   app_dir = "/app";
+   set_hold(&hold_temp, true);
+   load_refused_blob(old);
+   wait_held(1);
+   n    = osd_count;
+   logs = copy_logs;
+   memset(blob_state, 3, 4);
+   assert(event_save_files(true, false, NULL));
+   assert(disk_holds("/s/game.blob", old, 4) && save_writes == 0);
+   memset(blob_state, 5, 4);
+   assert(event_save_files(true, false, NULL));
+   assert(disk_holds("/s/game.blob", old, 4) && save_writes == 0);
+   assert(osd_count == n && !disk_named("RetroArch-recovery-"));
+   set_hold(&hold_temp, false);
+   copies_wait(false);
+   ASSERT_FILES(1, 0, 1);
+   assert(err_count == 0);
+   copies_wait(true);
+   assert(disk_holds("/undo/game.blob", old, 4));
+   assert(disk_holds("/s/game.blob", blob_state, 4) && save_writes == 1);
+   assert(osd_count == n && !disk_named("RetroArch-recovery-"));
+   assert(copy_logs == logs + 1 && main_undo_writes == 0);
+   assert(!save_item_files.files[0].guard.copy_first);
+   assert(failed_renames == 0 && !disk_named(".tmp"));
+   ASSERT_FILES(1, 0, 1);
+   assert(err_count == 0);
+}
+
+/* A copy job that has finished leaves SAVE_FILES its result: the main
+ * thread writes the image itself, or takes the failed-copy path (pass
+ * 1): the file kept, the image in the recovery file, named on screen. */
+static void test_copy_job_done(void)
+{
+   static const unsigned char old[4] = {7, 7, 7, 7};
+   unsigned pass;
+
+   for (pass = 0; pass < 2; pass++)
+   {
+      unsigned n;
+      start();
+      app_dir = "/app";
+      set_fail_undo(pass == 1);
+      load_refused_blob(old);
+      copies_wait(false);
+      assert(autosave_state.num_retired == 1);
+      n = osd_count;
+      memset(blob_state, 3, 4);
+      assert(event_save_files(true, false, NULL) == !pass);
+      assert(main_undo_writes == 0);
+      if (!pass)
+      {
+         assert(disk_holds("/undo/game.blob", old, 4));
+         assert(disk_holds("/s/game.blob", blob_state, 4));
+         assert(copy_logs == 1 && osd_count == n);
+         continue;
+      }
+      assert(disk_holds("/s/game.blob", old, 4));
+      assert(disk_named_holds("RetroArch-recovery-", blob_state, 4) == 1);
+      assert(osd_count == n + 1 && strstr(osd_last, "/app/RetroArch-"));
+      assert(save_item_files.files[0].guard.copy_first);
+   }
+}
+
+/* A copy owed to a worker resting its interval wakes it: the copy is
+ * made before its next write, though nothing changed. */
+static void test_worker_woken_for_copy(void)
+{
+   unsigned char file[12];
+   struct retro_save_item items[1];
+   autosave_t *h;
+
+   start();
+   fill_bytes(file, sizeof(file), 0x50);
+   disk_put("/s/game.srm", file, sizeof(file));
+   memcpy(wram, file, sizeof(wram));
+   memcpy(iram, file + 8, sizeof(iram));
+   items[0]       = buffer_item("srm", "/s/game.srm");
+   items[0].flags = RETRO_SAVE_FLAG_EXACT_SIZE;
+   register_items(items, 1);
+   assert(event_load_save_files(false));
+   h           = start_autosave(false);
+   h->interval = 100;
+   autosave_lock();
+   autosave_unlock();
+   set_hold(&hold_renamed, true);
+   items[0].num_segments = 1;
+   register_items(items, 1);
+   wait_held(1);
+   slock_lock(disk_lock);
+   assert(undo_writes == 1 && save_writes == 0);
+   slock_unlock(disk_lock);
+   assert(disk_holds("/undo/game.srm", file, 12));
+   set_hold(&hold_renamed, false);
+   /* Asked after the copy is told. */
+   wait_requested(h);
+   event_save_items_fill(false);
+   assert(copy_logs == 1);
+   autosave_deinit();
+}
+
+static void release_at_close(void *data)
+{
+   (void)data;
+   slock_lock(disk_lock);
+   while (!closing)
+      scond_wait(disk_cond, disk_lock);
+   hold_temp = false;
+   scond_broadcast(disk_cond);
+   slock_unlock(disk_lock);
+}
+
+/* The close joins a copy job still running: the final write is the
+ * normal one, with no notice. */
+static void test_close_joins_copy(void)
+{
+   static const unsigned char old[4] = {7, 7, 7, 7};
+   sthread_t *t;
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   set_hold(&hold_temp, true);
+   load_refused_blob(old);
+   wait_held(1);
+   n = osd_count;
+   memset(blob_state, 3, 4);
+   assert((t = sthread_create(release_at_close, NULL)));
+   slock_lock(disk_lock);
+   closing = true;
+   scond_broadcast(disk_cond);
+   slock_unlock(disk_lock);
+   event_save_items_final(true, false);
+   sthread_join(t);
+   assert(disk_holds("/undo/game.blob", old, 4));
+   assert(disk_holds("/s/game.blob", blob_state, 4));
+   assert(osd_count == n && !disk_named("RetroArch-recovery-"));
+   assert(copy_logs == 1 && main_undo_writes == 0);
+   assert(disk_count_named("/undo/") == 1);
+}
+
+/* A kept file whose copy failed: SAVE_FILES sends the image to the
+ * recovery file before it returns and tries the copy again without it.
+ * The recovery file is named once and kept current; once a copy is
+ * made, the image is written. */
+static void test_copy_failed_again(void)
+{
+   static const unsigned char old[4] = {7, 7, 7, 7};
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   set_fail_undo(true);
+   load_refused_blob(old);
+   copies_wait(true);
+   assert(save_item_files.files[0].guard.copy_failed);
+   n = osd_count;
+   memset(blob_state, 3, 4);
+   assert(!event_save_files(true, false, NULL));
+   assert(disk_named_holds("RetroArch-recovery-", blob_state, 4) == 1);
+   assert(osd_count == n + 1 && disk_holds("/s/game.blob", old, 4));
+   copies_wait(true);
+   memset(blob_state, 5, 4);
+   assert(!event_save_files(true, false, NULL));
+   assert(disk_named_holds("RetroArch-recovery-", blob_state, 4) == 1);
+   assert(disk_count_named("RetroArch-recovery-") == 1);
+   assert(osd_count == n + 1);
+   copies_wait(true);
+   set_fail_undo(false);
+   assert(!event_save_files(true, false, NULL));
+   copies_wait(true);
+   assert(disk_holds("/undo/game.blob", old, 4) && copy_logs == 1);
+   assert(save_files() && disk_holds("/s/game.blob", blob_state, 4));
+   assert(osd_count == n + 1 && disk_count_named("RetroArch-recovery-") == 1);
+}
+
+/* A copy job handed an image whose copy then fails writes the image to
+ * the recovery file itself before it exits; the reap names it, and the
+ * next SAVE_FILES keeps that file current. */
+static void test_copy_job_fails_handed(void)
+{
+   static const unsigned char old[4] = {7, 7, 7, 7};
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   set_hold(&hold_undo, true);
+   load_refused_blob(old);
+   wait_held(1);
+   n = osd_count;
+   memset(blob_state, 3, 4);
+   assert(event_save_files(true, false, NULL));
+   set_fail_undo(true);
+   set_hold(&hold_undo, false);
+   copies_wait(false);
+   assert(disk_named_holds("RetroArch-recovery-", blob_state, 4) == 1);
+   assert(osd_count == n);
+   autosave_reap(true);
+   assert(osd_count == n + 1 && strstr(osd_last, "/app/RetroArch-"));
+   assert(save_item_files.files[0].guard.recovered);
+   memset(blob_state, 5, 4);
+   assert(!event_save_files(true, false, NULL));
+   copies_wait(true);
+   assert(disk_named_holds("RetroArch-recovery-", blob_state, 4) == 1);
+   assert(disk_count_named("RetroArch-recovery-") == 1);
+   assert(osd_count == n + 1 && disk_holds("/s/game.blob", old, 4));
+}
+
+/* An orphan's image handed to a copy job whose copy of the old type's
+ * image fails: each of the two images reaches a recovery file. */
+static void test_orphan_job_fails_handed(void)
+{
+   unsigned char old[12];
+   unsigned char want[12];
+   unsigned char last[12];
+   struct retro_save_item items[2];
+
+   start();
+   app_dir = "/app";
+   memset(old, 0x21, sizeof(old));
+   disk_put("/s/t.srm", old, sizeof(old));
+   items[0]        = buffer_item("a", "/s/t.srm");
+   items[0].format = "core:a";
+   register_items(items, 1);
+   event_load_save_files(false);
+   wram[1] = 0x44;
+   memcpy(want, image(), sizeof(want));
+   set_hold(&hold_undo, true);
+   items[0].id     = "b";
+   items[0].format = "core:b";
+   register_items(items, 1);
+   event_save_items_fill(false);
+   wait_held(1);
+   wram[2] = 9;
+   memcpy(last, image(), sizeof(last));
+   items[1] = buffer_item("c", "/s/u.srm");
+   register_items(items + 1, 1);
+   assert(save_item_files.num_orphans == 1);
+   assert(save_item_files.orphans[0].guard.job);
+   assert(event_save_files(true, false, NULL));
+   set_fail_undo(true);
+   set_hold(&hold_undo, false);
+   copies_wait(false);
+   ASSERT_FILES(0, 2, 0);
+   assert(err_count == 0);
+   copies_wait(true);
+   assert(disk_named_holds("RetroArch-recovery-", last, 12) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", want, 12) == 1);
+   assert(disk_holds("/s/t.srm", old, 12));
+ASSERT_FILES(0, 2, 2);
+assert(err_count == 0);
+}
+
+/* An orphan's copy job that holds the only image of the old type and
+ * cannot copy it writes it to a recovery file before it exits; the
+ * reap names it once. Pass 0's orphan hands it an image too; pass 1's
+ * was taken by a second type change. */
+static void test_orphan_job_dumps_copy(void)
+{
+   unsigned char old[12];
+   unsigned char want[12];
+   unsigned char last[12];
+   struct retro_save_item items[2];
+   unsigned pass;
+   unsigned n;
+
+   for (pass = 0; pass < 2; pass++)
+   {
+      start();
+      app_dir = "/app";
+      memset(old, 0x21, sizeof(old));
+      disk_put("/s/t.srm", old, sizeof(old));
+      items[0]        = buffer_item("a", "/s/t.srm");
+      items[0].format = "core:a";
+      register_items(items, 1);
+      event_load_save_files(false);
+      wram[1] = 0x44;
+      memcpy(want, image(), sizeof(want));
+      set_hold(&hold_undo, true);
+      items[0].id     = "b";
+      items[0].format = "core:b";
+      register_items(items, 1);
+      event_save_items_fill(false);
+      wait_held(1);
+      wram[2] = 9;
+      memcpy(last, image(), sizeof(last));
+      if (pass == 0)
+      {
+         items[1] = buffer_item("c", "/s/u.srm");
+         register_items(items + 1, 1);
+      }
+      else
+      {
+         items[0].id     = "c";
+         items[0].format = "core:c";
+         register_items(items, 1);
+         event_save_items_fill(false);
+      }
+      assert(save_item_files.num_orphans == 1);
+      assert(save_item_files.orphans[0].guard.job);
+      assert(event_save_files(true, false, NULL) == (pass == 0));
+      n = osd_count;
+      set_fail_undo(true);
+      set_hold(&hold_undo, false);
+      copies_wait(false);
+      assert(disk_named_holds("RetroArch-recovery-", want, 12) == 1);
+      assert(osd_count == n);
+      autosave_reap(true);
+      assert(osd_count == n + (pass == 0 ? 2 : 1));
+      assert(disk_named_holds("RetroArch-recovery-", want, 12) == 1);
+      assert(disk_holds("/s/t.srm", old, 12));
+      set_fail_undo(false);
+   }
+}
+
+/* SAVE_FILES after a copy job's copy failed, before its reap: the image
+ * goes to the recovery file once, the old type's image the record
+ * still owes to one of its own, and the reap adds none. */
+static void test_failed_job_detached(void)
+{
+   unsigned char old[12];
+   unsigned char want[12];
+   unsigned char last[12];
+   struct retro_save_item items[1];
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   memset(old, 0x21, sizeof(old));
+   disk_put("/s/t.srm", old, sizeof(old));
+   items[0]        = buffer_item("a", "/s/t.srm");
+   items[0].format = "core:a";
+   register_items(items, 1);
+   event_load_save_files(false);
+   wram[1] = 0x44;
+   memcpy(want, image(), sizeof(want));
+   set_fail_undo(true);
+   items[0].id     = "b";
+   items[0].format = "core:b";
+   register_items(items, 1);
+   event_save_items_fill(false);
+   copies_wait(false);
+   /* Killed here: the job wrote the old type's image itself. */
+   assert(disk_named_holds("RetroArch-recovery-", want, 12) == 1);
+   assert(disk_count_named("RetroArch-recovery-") == 1);
+   assert(disk_holds("/s/t.srm", old, sizeof(old)));
+   n = osd_count;
+   wram[2] = 9;
+   memcpy(last, image(), sizeof(last));
+   assert(!event_save_files(true, false, NULL));
+   assert(disk_named_holds("RetroArch-recovery-", last, 12) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", want, 12) == 1);
+   assert(disk_count_named("RetroArch-recovery-") == 2);
+   assert(osd_count == n + 2);
+   copies_wait(true);
+   assert(osd_count == n + 2 && !err_count);
+   assert(disk_count_named("RetroArch-recovery-") == 2);
+   assert(!disk_named("/undo/"));
+   assert(save_item_files.files[0].guard.copy_image);
+}
+
+/* The replaced item's worker still owes its own copy when a type change
+ * owes another at its file: it makes both, its own first, then writes
+ * the image SAVE_FILES hands it. */
+static void test_retired_owes_and_type_change(void)
+{
+   unsigned char file[16];
+   unsigned char want[12];
+   struct retro_save_item items[1];
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   fill_bytes(file, sizeof(file), 0x30);
+   disk_put("/s/t.srm", file, sizeof(file));
+   items[0]        = buffer_item("a", "/s/t.srm");
+   items[0].format = "core:a";
+   items[0].flags  = RETRO_SAVE_FLAG_EXACT_SIZE;
+   register_items(items, 1);
+   load_for_worker();
+   set_hold(&hold_undo, true);
+   assert(autosave_init(false, 1));
+   wait_held(1);
+   wram[1] = 0x44;
+   memcpy(want, image(), sizeof(want));
+   items[0].id     = "b";
+   items[0].format = "core:b";
+   register_items(items, 1);
+   event_save_items_fill(false);
+   n = osd_count;
+   wram[2] = 9;
+   event_save_files(true, false, NULL);
+   assert(osd_count == n && !disk_named("RetroArch-recovery-"));
+   set_hold(&hold_undo, false);
+   retired_join(false);
+   autosave_check();
+   assert(!autosave_state.num_retired);
+   assert(disk_holds("/undo/t.srm", file, 16));
+   assert(disk_named_holds("/undo/", want, 12) == 1);
+   assert(disk_holds("/s/t.srm", image(), 12));
+   assert(!disk_named("RetroArch-recovery-"));
+   assert(!save_item_files.files[0].guard.copy_first);
+   ASSERT_FILES(2, 0, 1);
+   assert(err_count == 0);
+   autosave_deinit();
+}
+
+/* A cut after a copy job wrote a handed image: the next image is
+ * written only after a copy of the file that holds the cut bytes, by
+ * that job while it still runs (0) or by a new one once it has
+ * finished (1). */
+static void test_cut_after_handed(void)
+{
+   unsigned char file[16];
+   unsigned char first[12];
+   struct retro_save_item items[1];
+   unsigned pass;
+
+   for (pass = 0; pass < 2; pass++)
+   {
+      start();
+      app_dir = "/app";
+      fill_bytes(file, sizeof(file), 0x30);
+      disk_put("/s/game.srm", file, sizeof(file));
+      items[0]       = buffer_item("srm", "/s/game.srm");
+      items[0].flags = RETRO_SAVE_FLAG_EXACT_SIZE;
+      set_hold(&hold_temp, true);
+      register_items(items, 1);
+      assert(event_load_save_files(false));
+      wait_held(1);
+      wram[0] = 0x11;
+      memcpy(first, image(), sizeof(first));
+      assert(event_save_files(true, false, NULL));
+      set_hold(&hold_save_renamed, !pass);
+      set_hold(&hold_temp, false);
+      if (!pass)
+         wait_held(2);
+      else
+         copies_wait(false);
+      assert(disk_holds("/s/game.srm", first, 12));
+      items[0].num_segments = 1;
+      register_items(items, 1);
+      wram[1] = 0x22;
+      assert(event_save_files(true, false, NULL));
+      set_hold(&hold_save_renamed, false);
+      copies_wait(true);
+      assert(disk_holds("/undo/game.srm", file, 16));
+      assert(disk_named_holds("/undo/", first, 12) == 1);
+      assert(disk_holds("/s/game.srm", wram, 8));
+      assert(!save_item_files.files[0].guard.copy_first);
+   ASSERT_FILES(2, 0, 0);
+   assert(err_count == 0);
+   }
+}
+/* A type change's copy that fails sends the old type's image to a
+ * recovery file of its own at once, told once; the next write's image
+ * goes to the recovery file, and the copy made later is told without
+ * the type change's notice. */
+static void test_type_change_copy_fails(void)
+{
+   unsigned char old[12];
+   unsigned char want[12];
+   unsigned char last[12];
+   struct retro_save_item items[1];
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   memset(old, 0x21, sizeof(old));
+   disk_put("/s/t.srm", old, sizeof(old));
+   items[0]        = buffer_item("a", "/s/t.srm");
+   items[0].format = "core:a";
+   register_items(items, 1);
+   event_load_save_files(false);
+   wram[1] = 0x44;
+   memcpy(want, image(), sizeof(want));
+   set_fail_undo(true);
+   items[0].id     = "b";
+   items[0].format = "core:b";
+   register_items(items, 1);
+   n = osd_count;
+   event_save_items_fill(false);
+   /* Killed here: the job wrote the old type's image itself. */
+   copies_wait(false);
+   assert(disk_named_holds("RetroArch-recovery-", want, 12) == 1);
+   assert(disk_count_named("RetroArch-recovery-") == 1);
+   assert(disk_holds("/s/t.srm", old, sizeof(old)) && osd_count == n);
+   autosave_reap(true);
+   assert(disk_named_holds("RetroArch-recovery-", want, 12) == 1);
+   assert(disk_count_named("RetroArch-recovery-") == 1);
+   assert(osd_count == n + 1 && !disk_named("/undo/"));
+   assert(disk_holds("/s/t.srm", old, sizeof(old)));
+   set_fail_undo(false);
+   wram[2] = 9;
+   memcpy(last, image(), sizeof(last));
+   assert(!event_save_files(true, false, NULL));
+   assert(disk_named_holds("RetroArch-recovery-", last, 12) == 1);
+   assert(disk_count_named("RetroArch-recovery-") == 2);
+   assert(osd_count == n + 2);
+   copies_wait(true);
+   assert(disk_holds("/undo/t.srm", want, sizeof(want)));
+   assert(disk_count_named("/undo/") == 1 && copy_logs == 1);
+   assert(osd_count == n + 2);
+   assert(save_files() && disk_holds("/s/t.srm", last, 12));
+   assert(disk_count_named("RetroArch-recovery-") == 2);
+   assert(disk_count_named("/undo/") == 1);
+   assert(osd_count == n + 2 && !err_count);
+}
+
+/* Two SAVE_FILES while the replaced item's worker carries the type
+ * change's copy: the second image keeps the copy the first carried,
+ * and the worker's last image still lands first, held after its rename
+ * (0) or before (1). */
+static void test_carried_copy_handed_twice(void)
+{
+   unsigned char want[12];
+   struct retro_save_item items[1];
+   unsigned pass, n, logs;
+   bool *hold;
+
+   for (pass = 0; pass < 2; pass++)
+   {
+      hold = pass ? &hold_save_temp : &hold_save_renamed;
+      start();
+      app_dir = "/app";
+      disk_put("/s/t.srm", image(), 12);
+      items[0]        = buffer_item("a", "/s/t.srm");
+      items[0].format = "core:a";
+      register_items(items, 1);
+      event_load_save_files(false);
+      start_autosave(false);
+      wram[1] = 0x44;
+      memcpy(want, image(), sizeof(want));
+      set_hold(hold, true);
+      items[0].id     = "b";
+      items[0].format = "core:b";
+      register_items(items, 1);
+      wait_held(1);
+      event_save_items_fill(false);
+      assert(save_item_files.files[0].guard.copy_image);
+      n    = osd_count;
+      logs = copy_logs;
+      wram[2] = 9;
+      assert(event_save_files(true, false, NULL));
+      wram[3] = 0x55;
+      assert(event_save_files(true, false, NULL));
+      assert(osd_count == n && !disk_named("RetroArch-recovery-"));
+      set_hold(hold, false);
+      retired_join(false);
+      ASSERT_FILES(1, 0, 0);
+      assert(err_count == 0);
+      retired_join(false);
+      autosave_check();
+      assert(!autosave_state.num_retired);
+      assert(disk_holds("/undo/t.srm", want, sizeof(want)));
+      assert(disk_holds("/s/t.srm", image(), 12));
+      assert(disk_count_named("/undo/") == 1);
+      assert(!disk_named("RetroArch-recovery-"));
+      assert(osd_count == n + 1 && strstr(osd_last, "/s/t.srm|/undo/t.srm"));
+      assert(copy_logs == logs + 1 && !err_count);
+      assert(!save_item_files.files[0].guard.copy_first);
+      ASSERT_FILES(1, 0, 1);
+      assert(err_count == 0);
+      autosave_deinit();
+   }
+}
+
+/* Two SAVE_FILES after a cut while the copy job that wrote a handed
+ * image still runs: the second image keeps the copy the first carried,
+ * and the job's earlier image still lands first, held after its rename
+ * (0) or before (1). Each copy is told once. */
+static void test_cut_handed_twice(void)
+{
+   unsigned char file[16];
+   unsigned char first[12];
+   struct retro_save_item items[1];
+   unsigned pass, n;
+   bool *hold;
+
+   for (pass = 0; pass < 2; pass++)
+   {
+      hold = pass ? &hold_save_temp : &hold_save_renamed;
+      start();
+      fill_bytes(file, sizeof(file), 0x30);
+      disk_put("/s/game.srm", file, sizeof(file));
+      items[0]       = buffer_item("srm", "/s/game.srm");
+      items[0].flags = RETRO_SAVE_FLAG_EXACT_SIZE;
+      set_hold(&hold_temp, true);
+      register_items(items, 1);
+      assert(event_load_save_files(false));
+      wait_held(1);
+      n = osd_count;
+      wram[0] = 0x11;
+      memcpy(first, image(), sizeof(first));
+      assert(event_save_files(true, false, NULL));
+      set_hold(hold, true);
+      set_hold(&hold_temp, false);
+      wait_held(2);
+      items[0].num_segments = 1;
+      register_items(items, 1);
+      wram[1] = 0x22;
+      assert(event_save_files(true, false, NULL));
+      wram[2] = 0x33;
+      assert(event_save_files(true, false, NULL));
+      set_hold(hold, false);
+      copies_wait(true);
+      assert(disk_holds("/undo/game.srm", file, 16));
+      assert(disk_named_holds("/undo/", first, 12) == 1);
+      assert(disk_count_named("/undo/") == 2);
+      assert(disk_holds("/s/game.srm", wram, 8));
+      assert(!disk_named("RetroArch-recovery-"));
+      assert(osd_count == n && copy_logs == 2 && !err_count);
+      assert(!save_item_files.files[0].guard.copy_first);
+   }
+}
+
+/* No memory to hand an image to a copy job still copying: the job is
+ * kept, the image goes to the recovery file, and the copy it makes
+ * still counts. */
+static void test_hand_no_memory(void)
+{
+   static const unsigned char old[4] = {7, 7, 7, 7};
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   set_hold(&hold_undo, true);
+   load_refused_blob(old);
+   wait_held(1);
+   n = osd_count;
+   memset(blob_state, 3, 4);
+   retro_atomic_store_release_int(&fail_main_malloc_size,
+         (int)(sizeof(autosave_image_t) + 4));
+   assert(!event_save_files(true, false, NULL));
+   retro_atomic_store_release_int(&fail_main_malloc_size, 0);
+   assert(save_item_files.files[0].guard.job);
+   assert(disk_named_holds("RetroArch-recovery-", blob_state, 4) == 1);
+   assert(osd_count == n + 1);
+   set_hold(&hold_undo, false);
+   copies_wait(false);
+   ASSERT_FILES(1, 1, 2);
+   assert(err_count == 0);
+   copies_wait(true);
+   assert(!save_item_files.files[0].guard.copy_first);
+   assert(disk_holds("/undo/game.blob", old, 4) && copy_logs == 1);
+   memset(blob_state, 5, 4);
+   assert(save_files() && disk_holds("/s/game.blob", blob_state, 4));
+   assert(disk_count_named("RetroArch-recovery-") == 1);
+   assert(disk_count_named("/undo/") == 1);
+   assert(osd_count == n + 1 && !err_count);
+ASSERT_FILES(1, 1, 2);
+assert(err_count == 0);
+}
+
+/* No memory to hand the type change's image to the replaced item's
+ * worker still writing: SAVE_FILES returns, both images go to recovery
+ * files, and the copy is made by the next write. */
+static void test_carry_no_memory(void)
+{
+   unsigned char want[12];
+   unsigned char last[12];
+   struct retro_save_item items[1];
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   disk_put("/s/t.srm", image(), 12);
+   items[0]        = buffer_item("a", "/s/t.srm");
+   items[0].format = "core:a";
+   register_items(items, 1);
+   event_load_save_files(false);
+   start_autosave(false);
+   wram[1] = 0x44;
+   memcpy(want, image(), sizeof(want));
+   set_hold(&hold_save_renamed, true);
+   items[0].id     = "b";
+   items[0].format = "core:b";
+   register_items(items, 1);
+   wait_held(1);
+   event_save_items_fill(false);
+   n = osd_count;
+   wram[2] = 9;
+   memcpy(last, image(), sizeof(last));
+   retro_atomic_store_release_int(&fail_main_malloc_size,
+         (int)(sizeof(autosave_image_t) + 12));
+   assert(!event_save_files(true, false, NULL));
+   retro_atomic_store_release_int(&fail_main_malloc_size, 0);
+   assert(disk_named_holds("RetroArch-recovery-", last, 12) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", want, 12) == 1);
+   assert(disk_count_named("RetroArch-recovery-") == 2);
+   assert(osd_count == n + 2);
+   set_hold(&hold_save_renamed, false);
+   retired_join(false);
+   autosave_check();
+   assert(!autosave_state.num_retired);
+   assert(save_files());
+   assert(disk_holds("/undo/t.srm", want, sizeof(want)));
+   assert(disk_count_named("/undo/") == 1);
+   assert(disk_holds("/s/t.srm", last, 12));
+   assert(disk_count_named("RetroArch-recovery-") == 2);
+   assert(osd_count == n + 2 && !err_count);
+   autosave_deinit();
+}
+
+/* A copy that failed once, then made by the retry before its reap: a
+ * cut that loses the cut bytes later owes a copy its own job makes at
+ * once, with no recovery file. */
+static void test_copy_failed_then_made(void)
+{
+   unsigned char file[16];
+   struct retro_save_item items[1];
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   fill_bytes(file, sizeof(file), 0x30);
+   disk_put("/s/game.srm", file, sizeof(file));
+   items[0]       = buffer_item("srm", "/s/game.srm");
+   items[0].flags = RETRO_SAVE_FLAG_EXACT_SIZE;
+   set_fail_undo(true);
+   register_items(items, 1);
+   assert(event_load_save_files(false));
+   copies_wait(true);
+   assert(save_item_files.files[0].guard.copy_failed);
+   set_fail_undo(false);
+   n = osd_count;
+   wram[0] = 0x11;
+   assert(event_save_files(true, false, NULL));
+   copies_wait(false);
+   wram[0] = 0x12;
+   assert(event_save_files(true, false, NULL));
+   copies_wait(true);
+   assert(!save_item_files.files[0].guard.copy_failed);
+   assert(!save_item_files.files[0].guard.copy_first);
+   assert(disk_holds("/undo/game.srm", file, 16));
+   assert(disk_holds("/s/game.srm", image(), 12));
+   assert(disk_count_named("/undo/") == 1 && copy_logs == 1);
+   assert(!disk_named("RetroArch-recovery-"));
+   assert(osd_count == n && !err_count);
+}
+
+/* A replaced item's worker that still owes the copy of its own type
+ * change carries the next one's too: each copy is told once under its
+ * own name, and each type change's notice names its own copy. */
+static void test_carrier_tells_each_copy(void)
+{
+   unsigned char a0[12];
+   unsigned char a1[12];
+   struct retro_save_item items[1];
+   autosave_t *h;
+   unsigned i, n, logs;
+
+   start();
+   app_dir = "/app";
+   disk_put("/s/t.srm", image(), 12);
+   items[0]        = buffer_item("a", "/s/t.srm");
+   items[0].format = "core:a";
+   register_items(items, 1);
+   event_load_save_files(false);
+   start_autosave(false);
+   wram[1] = 0x44;
+   memcpy(a0, image(), sizeof(a0));
+   items[0].id     = "b";
+   items[0].format = "core:b";
+   register_items(items, 1);
+   event_save_items_fill(false);
+   set_hold(&hold_undo, true);
+   for (i = 0; !save_item_files.files[0].autosave && i < 5000; i++)
+   {
+      autosave_check();
+      event_save_items_fill(false);
+      retro_sleep(1);
+   }
+   assert((h = save_item_files.files[0].autosave) && h->copy_image);
+   wait_held(1);
+   wram[2] = 0x55;
+   memcpy(a1, image(), sizeof(a1));
+   items[0].id     = "c";
+   items[0].format = "core:c";
+   register_items(items, 1);
+   event_save_items_fill(false);
+   assert(save_item_files.files[0].guard.copy_image);
+   n    = osd_count;
+   logs = copy_logs;
+   wram[3] = 9;
+   assert(event_save_files(true, false, NULL));
+   assert(osd_count == n && !disk_named("RetroArch-recovery-"));
+   set_hold(&hold_undo, false);
+   retired_join(false);
+   autosave_check();
+   assert(!autosave_state.num_retired);
+   assert(disk_holds("/undo/t.srm", a0, 12));
+   assert(disk_holds("/undo/t-2.srm", a1, 12));
+   assert(disk_count_named("/undo/") == 2);
+   assert(disk_holds("/s/t.srm", image(), 12));
+   assert(!disk_named("RetroArch-recovery-"));
+   assert(copy_logs == logs + 2 && osd_count == n + 2 && !err_count);
+   assert(strstr(osd_hist, "/s/t.srm|/undo/t.srm\n"));
+   assert(strstr(osd_hist, "/s/t.srm|/undo/t-2.srm\n"));
+   autosave_deinit();
+}
+
+/* A copy job's worker that wrote a handed image it could not write to a
+ * recovery file it named, then wrote a newer one at its file: nobody
+ * was told of that file, which holds an older image, so it goes. */
+static void test_job_dump_then_written(void)
+{
+   static const unsigned char old[4] = {7, 7, 7, 7};
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   set_hold(&hold_undo, true);
+   load_refused_blob(old);
+   wait_held(1);
+   n = osd_count;
+   memset(blob_state, 3, 4);
+   assert(event_save_files(true, false, NULL));
+   set_fail_undo(true);
+   set_hold(&hold_recovery, true);
+   set_hold(&hold_undo, false);
+   wait_held(2);
+   memset(blob_state, 5, 4);
+   assert(event_save_files(true, false, NULL));
+   set_fail_undo(false);
+   set_hold(&hold_recovery, false);
+   copies_wait(true);
+   assert(disk_holds("/s/game.blob", blob_state, 4));
+   assert(disk_holds("/undo/game.blob", old, 4));
+   assert(disk_count_named("/undo/") == 1);
+   assert(!disk_named("RetroArch-recovery-"));
+   assert(osd_count == n && copy_logs == 1 && !err_count);
+}
+
+/* A type change's item leaves the set while the replaced item's worker
+ * carries its copy: that worker's last image is the old type's, so the
+ * orphan lets its own copy go; the worker copies the file, then writes
+ * the orphan's image. No recovery file. When that copy fails (pass 1)
+ * the old type's image is at the file when killed, and the reap sends
+ * it to a recovery file of its own; the orphan's image went to one. */
+static void test_carried_orphan(void)
+{
+   unsigned char want[12];
+   unsigned char last[12];
+   struct retro_save_item items[2];
+   unsigned pass, n, logs;
+
+   for (pass = 0; pass < 2; pass++)
+   {
+      start();
+      app_dir = "/app";
+      disk_put("/s/t.srm", image(), 12);
+      items[0]        = buffer_item("a", "/s/t.srm");
+      items[0].format = "core:a";
+      register_items(items, 1);
+      event_load_save_files(false);
+      start_autosave(false);
+      wram[1] = 0x44;
+      memcpy(want, image(), sizeof(want));
+      set_hold(&hold_save_renamed, true);
+      items[0].id     = "b";
+      items[0].format = "core:b";
+      register_items(items, 1);
+      wait_held(1);
+      event_save_items_fill(false);
+      n    = osd_count;
+      logs = copy_logs;
+      wram[2] = 9;
+      assert(event_save_files(true, false, NULL));
+      wram[3] = 0x55;
+      memcpy(last, image(), sizeof(last));
+      items[1] = buffer_item("c", "/s/u.srm");
+      register_items(items + 1, 1);
+      assert(save_item_files.num_orphans == 1);
+      assert(event_save_files(true, false, NULL));
+      assert(!save_item_files.num_orphans);
+      set_fail_undo(pass == 1);
+      set_hold(&hold_save_renamed, false);
+      retired_join(false);
+      if (pass == 1)
+      {
+         /* Killed here. */
+         assert(disk_holds("/s/t.srm", want, 12));
+         assert(disk_named_holds("RetroArch-recovery-", last, 12) == 1);
+         assert(disk_count_named("RetroArch-recovery-") == 1);
+         assert(osd_count == n && !disk_named("/undo/"));
+      }
+      autosave_check();
+      assert(!autosave_state.num_retired);
+      if (pass == 1)
+      {
+         assert(disk_holds("/s/t.srm", want, 12));
+         assert(disk_named_holds("RetroArch-recovery-", want, 12) == 1);
+         assert(disk_named_holds("RetroArch-recovery-", last, 12) == 1);
+         assert(disk_count_named("RetroArch-recovery-") == 2);
+         assert(!disk_named("/undo/"));
+         assert(copy_logs == logs && osd_count == n + 2 && !err_count);
+         autosave_deinit();
+         continue;
+      }
+      assert(disk_holds("/undo/t.srm", want, sizeof(want)));
+      assert(disk_count_named("/undo/") == 1);
+      assert(disk_holds("/s/t.srm", last, 12));
+      assert(!disk_named("RetroArch-recovery-"));
+      assert(copy_logs == logs + 1 && osd_count == n + 1 && !err_count);
+      autosave_deinit();
+   }
+}
+
+/* The replaced item's worker cannot make the copy it carries: the image
+ * it was handed goes to a recovery file named for that image's item,
+ * and the old type's image to another, named for the old item. */
+static void test_carried_dump_type(void)
+{
+   unsigned char want[12];
+   unsigned char last[12];
+   struct retro_save_item items[1];
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   disk_put("/s/t.srm", image(), 12);
+   items[0]        = buffer_item("a", "/s/t.srm");
+   items[0].format = "core:a";
+   register_items(items, 1);
+   event_load_save_files(false);
+   start_autosave(false);
+   wram[1] = 0x44;
+   memcpy(want, image(), sizeof(want));
+   set_hold(&hold_save_renamed, true);
+   items[0].id            = "b";
+   items[0].format        = "core:b";
+   items[0].legacy_memory = RETRO_MEMORY_RTC;
+   register_items(items, 1);
+   wait_held(1);
+   event_save_items_fill(false);
+   n = osd_count;
+   wram[2] = 9;
+   memcpy(last, image(), sizeof(last));
+   assert(event_save_files(true, false, NULL));
+   set_fail_undo(true);
+   set_hold(&hold_save_renamed, false);
+   retired_join(false);
+   /* Killed here. */
+   assert(disk_named_holds("RetroArch-recovery-1-", last, 12) == 1);
+   assert(disk_holds("/s/t.srm", want, 12) && osd_count == n);
+   autosave_check();
+   assert(!autosave_state.num_retired);
+   assert(disk_named_holds("RetroArch-recovery-", want, 12) == 1);
+   assert(!disk_named_holds("RetroArch-recovery-1-", want, 12));
+   assert(disk_count_named("RetroArch-recovery-") == 2);
+   assert(disk_holds("/s/t.srm", want, 12) && !disk_named("/undo/"));
+   assert(osd_count == n + 2 && !err_count);
+   autosave_deinit();
+}
+
+/* An item's worker whose type change's copy fails writes the old type's
+ * image to a recovery file itself, before any SAVE_FILES. SAVE_FILES
+ * names it and sends the image the worker may not write to the recovery
+ * file: one file each, told once. The copy made later is told without
+ * the type change's notice. */
+static void test_worker_copy_fails(void)
+{
+   unsigned char old[12];
+   unsigned char want[12];
+   unsigned char last[12];
+   struct retro_save_item items[1];
+   autosave_t *h;
+   unsigned n, logs;
+
+   start();
+   app_dir = "/app";
+   memset(old, 0x21, sizeof(old));
+   disk_put("/s/t.srm", old, sizeof(old));
+   items[0]        = buffer_item("a", "/s/t.srm");
+   items[0].format = "core:a";
+   register_items(items, 1);
+   event_load_save_files(false);
+   wram[1] = 0x44;
+   memcpy(want, image(), sizeof(want));
+   /* No copy job: the worker makes the copy. */
+   event_save_items_set_undo_dir(NULL);
+   items[0].id     = "b";
+   items[0].format = "core:b";
+   register_items(items, 1);
+   event_save_items_fill(false);
+   event_save_items_set_undo_dir("/undo");
+   set_fail_undo(true);
+   n    = osd_count;
+   logs = copy_logs;
+   h    = start_autosave(false);
+   assert(h->copy_image);
+   wram[2] = 9;
+   memcpy(last, image(), sizeof(last));
+   capture(h);
+   /* Killed here. */
+   assert(disk_holds("/s/t.srm", old, sizeof(old)));
+   assert(disk_named_holds("RetroArch-recovery-", want, 12) == 1);
+   assert(disk_count_named("RetroArch-recovery-") == 1);
+   assert(osd_count == n && !err_count);
+   assert(!event_save_files(true, false, NULL));
+   assert(disk_named_holds("RetroArch-recovery-", want, 12) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", last, 12) == 1);
+   assert(disk_count_named("RetroArch-recovery-") == 2);
+   assert(osd_count == n + 2 && !err_count);
+   wram[3] = 7;
+   memcpy(last, image(), sizeof(last));
+   assert(!event_save_files(true, false, NULL));
+   assert(disk_named_holds("RetroArch-recovery-", last, 12) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", want, 12) == 1);
+   assert(disk_count_named("RetroArch-recovery-") == 2);
+   assert(osd_count == n + 2 && disk_holds("/s/t.srm", old, 12));
+   set_fail_undo(false);
+   capture(h);
+   assert(event_save_files(true, false, NULL));
+   assert(disk_holds("/undo/t.srm", want, sizeof(want)));
+   assert(disk_count_named("/undo/") == 1 && copy_logs == logs + 1);
+   assert(disk_holds("/s/t.srm", last, 12));
+   assert(disk_count_named("RetroArch-recovery-") == 2);
+   assert(osd_count == n + 2 && !err_count);
+   assert(!save_item_files.files[0].guard.copy_first);
+   autosave_deinit();
+   assert(disk_count_named("RetroArch-recovery-") == 2);
+   assert(osd_count == n + 2 && !err_count);
+}
+
+/* The replaced item's worker fails both its last write and the copy it
+ * carries: the old type's image is in the recovery file of that last
+ * write only, told once. */
+static void test_carrier_final_and_copy_fail(void)
+{
+   unsigned char want[12];
+   unsigned char last[12];
+   unsigned char first[12];
+   struct retro_save_item items[1];
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   memcpy(first, image(), sizeof(first));
+   disk_put("/s/t.srm", first, 12);
+   items[0]        = buffer_item("a", "/s/t.srm");
+   items[0].format = "core:a";
+   register_items(items, 1);
+   event_load_save_files(false);
+   start_autosave(false);
+   wram[1] = 0x44;
+   memcpy(want, image(), sizeof(want));
+   set_hold(&hold_save_temp, true);
+   items[0].id     = "b";
+   items[0].format = "core:b";
+   register_items(items, 1);
+   wait_held(1);
+   event_save_items_fill(false);
+   n = osd_count;
+   wram[2] = 9;
+   memcpy(last, image(), sizeof(last));
+   assert(event_save_files(true, false, NULL));
+   /* Its last write's rename fails. */
+   filestream_delete("/s/t.srm.auto.tmp");
+   set_fail_undo(true);
+   set_hold(&hold_save_temp, false);
+   retired_join(false);
+   /* Killed here. */
+   assert(disk_holds("/s/t.srm", first, 12));
+   assert(disk_named_holds("RetroArch-recovery-", want, 12) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", last, 12) == 1);
+   assert(disk_count_named("RetroArch-recovery-") == 2);
+   assert(osd_count == n);
+   autosave_check();
+   assert(!autosave_state.num_retired);
+   assert(disk_named_holds("RetroArch-recovery-", want, 12) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", last, 12) == 1);
+   assert(disk_count_named("RetroArch-recovery-") == 2);
+   assert(osd_count == n + 2 && !err_count);
+   wram[3] = 7;
+   assert(!save_files());
+   assert(disk_named_holds("RetroArch-recovery-", image(), 12) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", want, 12) == 1);
+   assert(disk_count_named("RetroArch-recovery-") == 2);
+   assert(osd_count == n + 2 && !err_count && !disk_named("/undo/"));
+   autosave_deinit();
+}
+
+/* The old type's image recovered while its copy job still runs: the
+ * copy the job then makes is told without the type change's notice. */
+static void test_job_copy_after_recovery(void)
+{
+   unsigned char old[12];
+   unsigned char want[12];
+   unsigned char last[12];
+   struct retro_save_item items[1];
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   memset(old, 0x21, sizeof(old));
+   disk_put("/s/t.srm", old, sizeof(old));
+   items[0]        = buffer_item("a", "/s/t.srm");
+   items[0].format = "core:a";
+   register_items(items, 1);
+   event_load_save_files(false);
+   wram[1] = 0x44;
+   memcpy(want, image(), sizeof(want));
+   set_hold(&hold_undo, true);
+   items[0].id     = "b";
+   items[0].format = "core:b";
+   register_items(items, 1);
+   event_save_items_fill(false);
+   wait_held(1);
+   n = osd_count;
+   wram[2] = 9;
+   memcpy(last, image(), sizeof(last));
+   retro_atomic_store_release_int(&fail_main_malloc_size,
+         (int)(sizeof(autosave_image_t) + 12));
+   assert(!event_save_files(true, false, NULL));
+   retro_atomic_store_release_int(&fail_main_malloc_size, 0);
+   assert(save_item_files.files[0].guard.job);
+   assert(disk_named_holds("RetroArch-recovery-", want, 12) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", last, 12) == 1);
+   assert(osd_count == n + 2);
+   set_hold(&hold_undo, false);
+   copies_wait(true);
+   assert(disk_holds("/undo/t.srm", want, sizeof(want)));
+   assert(disk_count_named("/undo/") == 1 && copy_logs == 1);
+   assert(osd_count == n + 2);
+   assert(save_files() && disk_holds("/s/t.srm", last, 12));
+   assert(disk_count_named("RetroArch-recovery-") == 2);
+   assert(osd_count == n + 2 && !err_count);
+}
+
+/* A copy job holds an image of the old type when a type change's busy
+ * SAVE_FILES sends the new one to the recovery file the take gave the
+ * new item: the job's failed copy sends its image to a file of its
+ * own, never to that one. */
+static void test_job_dump_own_name(void)
+{
+   unsigned char file[12];
+   unsigned char b2[12];
+   unsigned char b3[12];
+   unsigned char c1[12];
+   struct retro_save_item items[1];
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   fill_bytes(file, sizeof(file), 0x40);
+   disk_put("/s/t.srm", file, sizeof(file));
+   items[0]        = buffer_item("b", "/s/t.srm");
+   items[0].format = "core:b";
+   register_items(items, 1);
+   set_fail_undo(true);
+   set_fail_read("/s/t.srm");
+   event_load_save_files(false);
+   set_fail_read(NULL);
+   assert(err_count == 1);
+   copies_wait(true);
+   assert(save_item_files.files[0].guard.copy_failed);
+   set_fail_undo(false);
+   set_hold(&hold_undo, true);
+   wram[0] = 1;
+   assert(!event_save_files(true, false, NULL));
+   assert(save_item_files.files[0].guard.recovered);
+   assert(save_item_files.files[0].guard.job);
+   wait_held(1);
+   wram[0] = 2;
+   memcpy(b2, image(), sizeof(b2));
+   assert(event_save_files(true, false, NULL));
+   wram[0] = 3;
+   memcpy(b3, image(), sizeof(b3));
+   items[0].id     = "c";
+   items[0].format = "core:c";
+   register_items(items, 1);
+   event_save_items_fill(false);
+   assert(!memcmp(image(), b3, sizeof(b3)));
+   assert(!save_item_files.num_orphans);
+   n       = osd_count;
+   wram[0] = 0xc;
+   memcpy(c1, image(), sizeof(c1));
+   assert(!event_save_files(true, false, NULL));
+   set_fail_undo(true);
+   set_hold(&hold_undo, false);
+   copies_wait(false);
+   assert(disk_holds("/s/t.srm", file, 12));
+   assert(disk_named_holds("RetroArch-recovery-", c1, 12) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", b3, 12) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", b2, 12) == 1);
+   ASSERT_FILES(0, 3, n + 1);
+   assert(err_count == 1);
+   autosave_reap(true);
+   ASSERT_FILES(0, 3, n + 2);
+   assert(err_count == 1);
+   assert(told_holding(b2, 12) == 1 && told_holding(c1, 12) == 1);
+   assert(disk_holds("/s/t.srm", file, 12));
+}
+
+/* A retired worker whose copy fails writes its last image to a
+ * recovery file it names; SAVE_FILES before the reap sends a newer one
+ * to the item's recovery file. The older goes at the reap: one file,
+ * named once. */
+static void test_retired_dump_superseded(void)
+{
+   unsigned char file[12];
+   unsigned char last[12];
+   struct retro_save_item items[1];
+   unsigned n, errs;
+
+   start();
+   app_dir = "/app";
+   fill_bytes(file, sizeof(file), 0x40);
+   disk_put("/s/game.srm", file, sizeof(file));
+   items[0] = buffer_item("srm", "/s/game.srm");
+   register_items(items, 1);
+   set_fail_undo(true);
+   set_fail_read("/s/game.srm");
+   event_load_save_files(false);
+   set_fail_read(NULL);
+   start_autosave(false);
+   wram[0] = 1;
+   memcpy(last, image(), sizeof(last));
+   register_items(NULL, 0);
+   register_items(items, 1);
+   event_save_items_fill(false);
+   retired_join(false);
+   n       = osd_count;
+   errs    = err_count;
+   wram[1] = 2;
+   assert(!event_save_files(true, false, NULL));
+   assert(disk_holds("/s/game.srm", file, 12));
+   assert(disk_named_holds("RetroArch-recovery-", image(), 12) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", last, 12) == 1);
+   ASSERT_FILES(0, 2, n + 1);
+   autosave_reap(false);
+   assert(!autosave_state.num_retired);
+   assert(disk_named_holds("RetroArch-recovery-", image(), 12) == 1);
+   assert(told_holding(image(), 12) == 1);
+   ASSERT_FILES(0, 1, n + 1);
+   assert(err_count == errs && disk_holds("/s/game.srm", file, 12));
+   autosave_deinit();
+}
+
+/* A replaced item's worker whose own copy is made only on the attempt
+ * for the copy it carries: that copy is its own, told without the next
+ * type change's notice, whose image went to a recovery file. */
+static void test_carrier_own_copy_late(void)
+{
+   unsigned char a0[12];
+   unsigned char a1[12];
+   struct retro_save_item items[1];
+   autosave_t *h;
+   unsigned i, n;
+
+   start();
+   app_dir = "/app";
+   disk_put("/s/t.srm", image(), 12);
+   items[0]        = buffer_item("a", "/s/t.srm");
+   items[0].format = "core:a";
+   register_items(items, 1);
+   event_load_save_files(false);
+   start_autosave(false);
+   wram[1] = 0x44;
+   memcpy(a0, image(), sizeof(a0));
+   items[0].id     = "b";
+   items[0].format = "core:b";
+   register_items(items, 1);
+   event_save_items_fill(false);
+   set_fail_undo_left(1);
+   for (i = 0; !save_item_files.files[0].autosave && i < 5000; i++)
+   {
+      autosave_check();
+      event_save_items_fill(false);
+      retro_sleep(1);
+   }
+   assert((h = save_item_files.files[0].autosave) && h->copy_image);
+   wait_requested(h);
+   set_hold(&hold_undo, true);
+   event_save_items_fill(false);
+   assert(disk_named_holds("RetroArch-recovery-", a0, 12) == 1);
+   assert(osd_count == 1 && told_holding(a0, 12) == 1);
+   n = osd_count;
+   wram[2] = 0x55;
+   memcpy(a1, image(), sizeof(a1));
+   items[0].id     = "c";
+   items[0].format = "core:c";
+   register_items(items, 1);
+   event_save_items_fill(false);
+   wait_held(1);
+   assert(save_item_files.files[0].guard.copy_image);
+   wram[3] = 9;
+   assert(event_save_files(true, false, NULL));
+   set_fail_undo_left(2);
+   set_hold(&hold_undo, false);
+   retired_join(false);
+   /* Killed here. */
+   assert(disk_holds("/undo/t.srm", a0, 12));
+   assert(disk_holds("/s/t.srm", image(), 12));
+   assert(disk_named_holds("RetroArch-recovery-", a1, 12) == 1);
+   ASSERT_FILES(1, 2, n);
+   assert(err_count == 0);
+   autosave_check();
+   assert(!autosave_state.num_retired);
+   assert(disk_holds("/undo/t.srm", a0, 12));
+   assert(disk_holds("/s/t.srm", image(), 12));
+   assert(disk_named_holds("RetroArch-recovery-", a1, 12) == 1);
+   ASSERT_FILES(1, 2, n + 1);
+   assert(!strstr(osd_hist, "|/undo/"));
+   assert(err_count == 0);
+   autosave_deinit();
+}
+
+/* A copy job's failed write of a handed image, cut by a kill while it
+ * goes to a new recovery file: no part of it is under a recovery name.
+ * The reap writes it whole. */
+static void test_job_dump_cut(void)
+{
+   static const unsigned char old[4] = {7, 7, 7, 7};
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   set_hold(&hold_undo, true);
+   load_refused_blob(old);
+   wait_held(1);
+   n = osd_count;
+   memset(blob_state, 3, 4);
+   assert(event_save_files(true, false, NULL));
+   set_fail_undo(true);
+   slock_lock(disk_lock);
+   cut_recovery = true;
+   slock_unlock(disk_lock);
+   set_hold(&hold_undo, false);
+   copies_wait(false);
+   assert(disk_count_named("RetroArch-recovery-") == 1);
+   assert(disk_count_named(".tmp") == 1);
+   assert(disk_holds("/s/game.blob", old, 4) && osd_count == n);
+   assert(err_count == 0);
+   slock_lock(disk_lock);
+   cut_recovery = false;
+   slock_unlock(disk_lock);
+   autosave_reap(true);
+   assert(disk_named_holds("RetroArch-recovery-", blob_state, 4) == 1);
+   assert(disk_count_named("RetroArch-recovery-") == 2);
+   assert(disk_count_named(".tmp") == 1);
+   assert(osd_count == n + 1 && told_holding(blob_state, 4) == 1);
+   assert(disk_holds("/s/game.blob", old, 4));
+   assert(err_count == 0);
+}
+
+/* SAVE_FILES while the worker owes the copy that a cut with no memory
+ * for its bytes made it keep the file for: the newest image is in an
+ * untold file until the worker writes it after the copy. */
+static void test_save_files_cut_copying(void)
+{
+   unsigned char file[20];
+   unsigned char newest[8];
+   struct retro_save_item items[1];
+   autosave_t *h;
+
+   start();
+   app_dir = "/app";
+   fill_bytes(file, sizeof(file), 0xd0);
+   disk_put("/s/game.srm", file, sizeof(file));
+   items[0] = buffer_item("srm", "/s/game.srm");
+   register_items(items, 1);
+   assert(event_load_save_files(false));
+   h       = start_autosave(false);
+   wram[0] = 1;
+   items[0].num_segments = 1;
+   retro_atomic_store_release_int(&fail_malloc_size, 12);
+   register_items(items, 1);
+   retro_atomic_store_release_int(&fail_malloc_size, 0);
+   assert(err_count == 1 && strstr(err_last, "cut by"));
+   assert(save_item_files.files[0].autosave == h);
+   assert(save_item_files.files[0].guard.keep_file);
+   memcpy(newest, image(), sizeof(newest));
+   /* The worker waits for a snapshot: its write makes the copy. */
+   assert(save_files_unreaped());
+   /* Killed here. */
+   assert(disk_holds("/s/game.srm", file, sizeof(file)));
+   assert(disk_named_holds("RetroArch-recovery-", newest, 8) == 1);
+   ASSERT_FILES(0, 1, 0);
+   capture(h);
+   /* Killed here: the untold file went as its image landed. */
+   assert(disk_holds("/s/game.srm", newest, 8));
+   ASSERT_FILES(1, 0, 0);
+   event_save_items_fill(false);
+   assert(disk_holds("/undo/game.srm", file, sizeof(file)));
+   assert(disk_holds("/s/game.srm", newest, 8));
+   ASSERT_FILES(1, 0, 0);
+   assert(err_count == 1);
+   autosave_deinit();
+}
+
+static void release_undo_at_close(void *data)
+{
+   (void)data;
+   slock_lock(disk_lock);
+   while (!closing)
+      scond_wait(disk_cond, disk_lock);
+   hold_undo = false;
+   scond_broadcast(disk_cond);
+   slock_unlock(disk_lock);
+}
+
+/* The close's SAVE_FILES hands its image to a copy job, joined before
+ * the core unloads: a crash in the unload loses nothing. */
+static void test_close_join_copies(void)
+{
+   static const unsigned char old[4] = {7, 7, 7, 7};
+   sthread_t *t;
+   unsigned e;
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   event_save_items_set_undo_dir(NULL);
+   load_refused_blob(old);
+   event_save_items_set_undo_dir("/undo");
+   n = osd_count;
+   e = err_count;
+   memset(blob_state, 3, 4);
+   set_hold(&hold_undo, true);
+   autosave_deinit();
+   assert(event_save_files(true, false, NULL));
+   assert(save_item_files.files[0].guard.job);
+   assert((t = sthread_create(release_undo_at_close, NULL)));
+   slock_lock(disk_lock);
+   closing = true;
+   scond_broadcast(disk_cond);
+   slock_unlock(disk_lock);
+   event_save_items_join();
+   /* Killed in the unload. */
+   assert(disk_holds("/s/game.blob", blob_state, 4));
+   assert(disk_holds("/undo/game.blob", old, 4));
+   ASSERT_FILES(1, 0, n);
+   sthread_join(t);
+   event_save_items_final(true, false);
+   assert(disk_holds("/s/game.blob", blob_state, 4));
+   ASSERT_FILES(1, 0, n);
+   assert(err_count == e);
+}
+
+/* The close's SAVE_FILES holds save RAM behind the last image of the
+ * item that gave it back: written after the join, before the unload. */
+static void test_given_back_close(void)
+{
+   unsigned char older[4];
+   unsigned char last[4];
+   struct retro_save_segment seg;
+   struct retro_save_item items[1];
+   sthread_t *t;
+
+   given_back_held(items, &seg, older, last);
+   event_save_files(true, false, NULL);
+   assert(save_item_files.ram_held);
+   assert(disk_holds("/s/game.srm", older, sizeof(older)));
+   assert((t = sthread_create(release_at_close, NULL)));
+   slock_lock(disk_lock);
+   closing = true;
+   scond_broadcast(disk_cond);
+   slock_unlock(disk_lock);
+   event_save_items_join();
+   /* Killed in the unload. */
+   assert(!save_item_files.ram_held);
+   assert(disk_holds("/s/game.srm", legacy_ram, sizeof(legacy_ram)));
+   assert(disk_count_named("") == 1);
+   ASSERT_FILES(0, 0, 0);
+   assert(err_count == 0);
+   sthread_join(t);
+   autosave_deinit();
+   event_save_items_final(true, false);
+   assert(disk_holds("/s/game.srm", legacy_ram, sizeof(legacy_ram)));
+   assert(disk_count_named("") == 1);
+   ASSERT_FILES(0, 0, 0);
+}
+#endif
 
 /* A registration from inside blob_size(), blob_save() or
  * get_generation() is refused with one error: the set they read stays,
@@ -6437,7 +8484,7 @@ static void test_reregister_in_callback(void)
       if (h)
          capture(h);
       else
-         assert(event_save_files(true, false, NULL));
+         assert(save_files_unreaped());
       /* Killed here. */
       assert(rereg_inside == 0 && rereg_refusals == 1);
       assert(err_count == 1 && strstr(err_last, names[pass]));
@@ -6463,7 +8510,7 @@ static void test_reregister_in_callback(void)
       if (h)
          capture(h);
       else
-         assert(event_save_files(true, false, NULL));
+         assert(save_files());
       assert(disk_holds("/s/game.flash", "ybcdef", 6));
       assert(err_count == 1);
       ASSERT_FILES(0, 0, 0);
@@ -6563,9 +8610,9 @@ static void test_blob_leaves(void)
       assert(core_calls_in_set == 2 && blob_saves == saves + 1);
       assert(save_items_state_get_ptr()->current->num_items == 0);
       if (pass == 2)
-         assert(event_save_files(true, false, NULL));
+         assert(save_files_unreaped());
       if (h)
-         retired_join();
+         retired_join(false);
       /* Killed here. */
       if (h)
          assert(disk_holds("/s/game.flash", "zbcdef", 6));
@@ -6577,7 +8624,11 @@ static void test_blob_leaves(void)
       assert(rereg_refusals == (pass == 3 ? 1 : 0));
       assert(err_count == (pass == 3 ? 1 : 0));
       ASSERT_FILES(0, 0, 0);
-      assert(event_save_files(true, false, NULL));
+      frame_start_reap();
+      assert(disk_holds("/s/game.flash", h ? "zbcdef" : "abcdef", 6));
+      assert(err_count == (pass == 3 ? 1 : 0));
+      ASSERT_FILES(0, 0, 0);
+      assert(save_files());
       assert(save_item_files.num_orphans == 0);
       assert(disk_holds("/s/game.flash", "zbcdef", 6));
       assert(!disk_has("/s/b.srm"));
@@ -6610,14 +8661,15 @@ static void test_blob_load_drops(void)
       rereg_n         = pass;
       register_items(items, 1);
       event_load_save_files(false);
+      copies_wait(false);
       /* Killed here. */
       assert(!blob_reregister);
       assert(save_item_files.num_orphans == 0);
       assert(disk_holds("/s/game.flash", "abcdef", 6));
       if (pass)
          assert(!memcmp(card, "abcdef", 6));
-      ASSERT_FILES(0, 0, 0);
-      assert(event_save_files(true, false, NULL));
+      ASSERT_FILES(pass, 0, 0);
+      assert(save_files());
       assert(disk_holds("/s/game.flash", "abcdef", 6));
       /* The new item's type change copies the file and tells it. */
       if (pass)
@@ -6625,6 +8677,45 @@ static void test_blob_load_drops(void)
       ASSERT_FILES(pass, 0, pass);
       assert(err_count == 0);
    }
+}
+
+/* A copy is named in the undo folder its copier had, when the folder
+ * changed while the copy was made. */
+static void test_copy_told_old_dir(void)
+{
+   unsigned char file[12];
+   struct retro_save_item items[1];
+   autosave_t *h;
+   fill_bytes(file, sizeof(file), 0x70);
+   start();
+   app_dir = "/app";
+   disk_put("/s/game.srm", file, sizeof(file));
+   items[0] = card_item("a", "/s/game.srm");
+   register_items(items, 1);
+   event_load_save_files(false);
+   items[0] = buffer_item("b", "/s/game.srm");
+   register_items(items, 1);
+   event_save_items_set_undo_dir(NULL);
+   event_save_items_fill(false);
+   event_save_items_set_undo_dir("/undo");
+   set_hold(&hold_undo, true);
+   assert(autosave_init(false, 1));
+   assert((h = save_item_files.files[0].autosave));
+   h->interval = 0;
+   wait_held(1);
+   event_save_items_set_undo_dir("/other");
+   set_hold(&hold_undo, false);
+   wait_requested(h);
+   /* Killed here. */
+   assert(disk_holds("/undo/game.srm", file, sizeof(file)));
+   assert(copy_logs == 0);
+   ASSERT_FILES(1, 0, 0);
+   event_save_items_fill(false);
+   assert(copy_logs == 1 && copy_logged("in \"/undo/game.srm\""));
+   assert(strstr(osd_last, "/s/game.srm|/undo/game.srm"));
+   ASSERT_FILES(1, 0, 1);
+   assert(err_count == 0);
+   autosave_deinit();
 }
 
 /* An old core's save RAM and RTC both cut their files at one load:
@@ -6781,12 +8872,259 @@ static void test_untold_write_fails(void)
 }
 #endif
 
+#ifdef HAVE_THREADS
+/* A retired worker of a kept file, still owing its copy, is handed an
+ * image it cannot write without that copy: it puts it in a recovery
+ * file no one is told of. A newer image then goes to the item's
+ * recovery file, and that older one goes at the reap. */
+static void test_retired_left_superseded(void)
+{
+   unsigned char before[12];
+   unsigned char want[12];
+   unsigned char y1[12];
+   unsigned char y2[12];
+   struct retro_save_item items[1];
+   autosave_t *h;
+   unsigned i;
+   unsigned n;
+
+   start();
+   app_dir         = "/app";
+   disk_put("/s/t.srm", image(), 12);
+   items[0]        = buffer_item("a", "/s/t.srm");
+   items[0].format = "core:a";
+   register_items(items, 1);
+   event_load_save_files(false);
+   memcpy(before, image(), sizeof(before));
+   wram[1]         = 0x44;
+   memcpy(want, image(), sizeof(want));
+   items[0].id     = "b";
+   items[0].format = "core:b";
+   register_items(items, 1);
+   event_save_items_set_undo_dir(NULL);
+   event_save_items_fill(false);
+   event_save_items_set_undo_dir("/undo");
+   set_fail_undo(true);
+   h = start_autosave(false);
+   /* Ended owing the copy: its last write tries it again, held first. */
+   set_hold(&hold_undo, true);
+   n = osd_count;
+   register_items(NULL, 0);
+   wait_held(1);
+   register_items(items, 1);
+   event_save_items_fill(false);
+   assert(!save_item_files.files[0].guard.copy_first);
+   wram[2] = 9;
+   memcpy(y1, image(), sizeof(y1));
+   assert(event_save_files(true, false, NULL));
+   set_hold(&hold_undo, false);
+   for (i = 0; i < 5000 && !retro_atomic_load_acquire_int(&h->exited); i++)
+      retro_sleep(1);
+   assert(retro_atomic_load_acquire_int(&h->exited));
+   retired_join(false);
+   /* Killed here: its last image and the old type's are recovered too. */
+   assert(disk_holds("/s/t.srm", before, 12));
+   assert(disk_named_holds("RetroArch-recovery-", want, 12) == 2);
+   assert(disk_named_holds("RetroArch-recovery-", y1, 12) == 1);
+   ASSERT_FILES(0, 3, n);
+   wram[3] = 7;
+   memcpy(y2, image(), sizeof(y2));
+   assert(!event_save_files(true, false, NULL));
+   /* Killed here. */
+   assert(disk_holds("/s/t.srm", before, 12));
+   assert(disk_named_holds("RetroArch-recovery-", y2, 12) == 1);
+   assert(told_holding(y2, 12) == 1);
+   ASSERT_FILES(0, 4, n + 1);
+   autosave_reap(false);
+   assert(!autosave_state.num_retired);
+   assert(disk_named_holds("RetroArch-recovery-", y2, 12) == 1);
+   assert(told_holding(want, 12) == 1);
+   ASSERT_FILES(0, 2, n + 2);
+   assert(err_count == 0);
+   set_fail_undo(false);
+   assert(save_files());
+   assert(disk_holds("/s/t.srm", image(), 12));
+   assert(disk_holds("/undo/t.srm", before, 12));
+   assert(strstr(osd_last, "/s/t.srm|/undo/t.srm"));
+   ASSERT_FILES(1, 2, n + 3);
+   assert(err_count == 0);
+   autosave_deinit();
+}
+
+/* test_retired_left_superseded for a cut file the item has no recovery
+ * file of: the newer image lands at the file, and the older one's
+ * recovery file goes at the reap untold. */
+static void test_retired_left_written(void)
+{
+   unsigned char file[16];
+   unsigned char y1[16];
+   unsigned char y2[16];
+   struct retro_save_item items[1];
+
+   start();
+   app_dir        = "/app";
+   fill_bytes(file, sizeof(file), 0x50);
+   disk_put("/s/t.srm", file, sizeof(file));
+   items[0]       = buffer_item("a", "/s/t.srm");
+   items[0].flags = RETRO_SAVE_FLAG_EXACT_SIZE;
+   register_items(items, 1);
+   load_for_worker();
+   assert(save_item_files.files[0].guard.copy_first);
+   assert(!save_item_files.files[0].guard.keep_file);
+   set_fail_undo(true);
+   start_autosave(false);
+   /* Ended owing the copy: its last write tries it again, held first. */
+   set_hold(&hold_undo, true);
+   register_items(NULL, 0);
+   wait_held(1);
+   /* Back without EXACT_SIZE: it owes nothing. */
+   items[0].flags = 0;
+   register_items(items, 1);
+   event_save_items_fill(false);
+   assert(!save_item_files.files[0].guard.copy_first);
+   wram[2] = 9;
+   memcpy(y1, image(), 12);
+   memcpy(y1 + 12, file + 12, 4);
+   assert(event_save_files(true, false, NULL));
+   /* Its last image lands; y1's write fails. */
+   set_hold(&hold_save_temp, true);
+   set_hold(&hold_undo, false);
+   wait_held(2);
+   set_fail_save_writes(true);
+   set_hold(&hold_save_temp, false);
+   retired_join(false);
+   set_fail_save_writes(false);
+   /* Killed here. */
+   assert(disk_holds("/s/t.srm", file, 16));
+   assert(disk_named_holds("RetroArch-recovery-", y1, 16) == 1);
+   ASSERT_FILES(0, 1, 0);
+   wram[3] = 7;
+   memcpy(y2, image(), 12);
+   memcpy(y2 + 12, file + 12, 4);
+   assert(event_save_files(true, false, NULL));
+   /* Killed here. */
+   assert(disk_holds("/s/t.srm", y2, 16));
+   assert(disk_named_holds("RetroArch-recovery-", y1, 16) == 1);
+   ASSERT_FILES(0, 1, 0);
+   autosave_reap(false);
+   assert(!autosave_state.num_retired);
+   assert(disk_holds("/s/t.srm", y2, 16));
+   ASSERT_FILES(0, 0, 0);
+   assert(err_count == 0);
+   set_fail_undo(false);
+   assert(save_files());
+   assert(disk_holds("/s/t.srm", y2, 16));
+   assert(disk_holds("/undo/t.srm", y2, 16));
+   ASSERT_FILES(1, 0, 0);
+   assert(err_count == 0);
+   autosave_deinit();
+}
+
+/* test_retired_left_written for the retired worker's own last write
+ * failing: the newer image lands at the file, and the last one's
+ * recovery file goes at the reap untold. */
+static void test_retired_final_written(void)
+{
+   unsigned char file[16];
+   unsigned char y1[16];
+   unsigned char y2[16];
+   struct retro_save_item items[1];
+
+   start();
+   app_dir        = "/app";
+   fill_bytes(file, sizeof(file), 0x50);
+   disk_put("/s/t.srm", file, sizeof(file));
+   items[0]       = buffer_item("a", "/s/t.srm");
+   items[0].flags = RETRO_SAVE_FLAG_EXACT_SIZE;
+   register_items(items, 1);
+   load_for_worker();
+   assert(save_item_files.files[0].guard.copy_first);
+   assert(!save_item_files.files[0].guard.keep_file);
+   set_fail_undo(true);
+   start_autosave(false);
+   wram[2] = 9;
+   memcpy(y1, image(), 12);
+   memcpy(y1 + 12, file + 12, 4);
+   set_fail_save_writes(true);
+   register_items(NULL, 0);
+   retired_join(false);
+   set_fail_save_writes(false);
+   /* Killed here. */
+   assert(disk_holds("/s/t.srm", file, 16));
+   assert(disk_named_holds("RetroArch-recovery-", y1, 16) == 1);
+   ASSERT_FILES(0, 1, 0);
+   /* Back without EXACT_SIZE: it owes nothing. */
+   items[0].flags = 0;
+   register_items(items, 1);
+   event_save_items_fill(false);
+   assert(!save_item_files.files[0].guard.copy_first);
+   assert(!memcmp(image(), y1, 12));
+   wram[3] = 7;
+   memcpy(y2, image(), 12);
+   memcpy(y2 + 12, file + 12, 4);
+   assert(event_save_files(true, false, NULL));
+   /* Killed here. */
+   assert(disk_holds("/s/t.srm", y2, 16));
+   assert(disk_named_holds("RetroArch-recovery-", y1, 16) == 1);
+   ASSERT_FILES(0, 1, 0);
+   autosave_reap(false);
+   assert(!autosave_state.num_retired);
+   assert(disk_holds("/s/t.srm", y2, 16));
+   ASSERT_FILES(0, 0, 0);
+   assert(err_count == 0);
+   set_fail_undo(false);
+   assert(save_files());
+   assert(disk_holds("/s/t.srm", y2, 16));
+   assert(disk_holds("/undo/t.srm", y2, 16));
+   ASSERT_FILES(1, 0, 0);
+   assert(err_count == 0);
+   autosave_deinit();
+}
+
+/* test_copy_failed_again, the job started again after the recovery
+ * write failing to start its thread: nothing leaks, the image is
+ * recovered once, and a later job makes the copy. */
+static void test_copy_job_start_fails(void)
+{
+   static const unsigned char old[4] = {7, 7, 7, 7};
+   unsigned n;
+   unsigned errs;
+
+   start();
+   app_dir = "/app";
+   set_fail_undo(true);
+   load_refused_blob(old);
+   copies_wait(true);
+   assert(save_item_files.files[0].guard.copy_failed);
+   n    = osd_count;
+   errs = err_count;
+   memset(blob_state, 3, 4);
+   retro_atomic_store_release_int(&fail_thread_starts, 1);
+   assert(!event_save_files(true, false, NULL));
+   retro_atomic_store_release_int(&fail_thread_starts, 0);
+   assert(!save_item_files.files[0].guard.job);
+   assert(disk_named_holds("RetroArch-recovery-", blob_state, 4) == 1);
+   assert(disk_holds("/s/game.blob", old, 4));
+   ASSERT_FILES(0, 1, n + 1);
+   assert(err_count == errs + 1);
+   set_fail_undo(false);
+   assert(!event_save_files(true, false, NULL));
+   copies_wait(true);
+   assert(disk_holds("/undo/game.blob", old, 4));
+   assert(save_files() && disk_holds("/s/game.blob", blob_state, 4));
+   ASSERT_FILES(1, 1, n + 1);
+   assert(err_count == errs + 1);
+}
+
+#endif
+
 int main(void)
 {
    retro_atomic_int_init(&fail_reallocs, 0);
    retro_atomic_int_init(&fail_callocs, 0);
    retro_atomic_int_init(&fail_main_malloc_size, 0);
    retro_atomic_int_init(&fail_malloc_size, 0);
+   retro_atomic_int_init(&fail_thread_starts, 0);
    main_thread  = sthread_get_current_thread_id();
    disk_lock    = slock_new();
    disk_cond    = scond_new();
@@ -6807,11 +9145,15 @@ int main(void)
    test_refused_before_fill();
    test_blob_leaves();
    test_blob_load_drops();
+   test_copy_told_old_dir();
    test_legacy_retired();
    test_reported_at_fill();
+   test_left_late_copied();
    test_left_out_back();
    test_left_out_back_retired();
    test_given_back_saved();
+   test_given_back_shorter();
+   test_given_back_unsized();
    test_told_no_memory();
    test_memory_size();
    test_old_file_unlisted();
@@ -6851,6 +9193,7 @@ int main(void)
    test_recovery_cut();
    test_save_no_image();
    test_worker_failed();
+   test_worker_and_main_failed();
    test_close_unfilled();
    test_close_pending_grow();
    test_reshapes_before_fill();
@@ -6875,6 +9218,7 @@ int main(void)
    test_given_back_held();
    test_given_back_autosave();
    test_given_back_reinit();
+   test_given_back_close();
    test_retired_other_spelling();
    test_undo_dir();
    test_loaded();
@@ -6909,8 +9253,43 @@ int main(void)
    test_save_files_retired_copy();
    test_reap_before_fill();
    test_retired_take_refused();
+   test_copy_off_main();
+   test_copy_job_handoff();
+   test_copy_job_done();
+   test_worker_woken_for_copy();
+   test_close_joins_copy();
+   test_copy_failed_again();
+   test_copy_job_fails_handed();
+   test_orphan_job_fails_handed();
+   test_orphan_job_dumps_copy();
+   test_failed_job_detached();
+   test_retired_owes_and_type_change();
+   test_cut_after_handed();
+   test_type_change_copy_fails();
+   test_carried_copy_handed_twice();
+   test_cut_handed_twice();
+   test_hand_no_memory();
+   test_carry_no_memory();
+   test_copy_failed_then_made();
+   test_carrier_tells_each_copy();
+   test_job_dump_then_written();
+   test_carried_orphan();
+   test_carried_dump_type();
+   test_worker_copy_fails();
+   test_carrier_final_and_copy_fail();
+   test_job_copy_after_recovery();
+   test_job_dump_own_name();
+   test_retired_dump_superseded();
+   test_carrier_own_copy_late();
+   test_job_dump_cut();
+   test_close_join_copies();
+   test_save_files_cut_copying();
    test_save_no_image_worker();
    test_untold_write_fails();
+   test_retired_left_superseded();
+   test_retired_left_written();
+   test_retired_final_written();
+   test_copy_job_start_fails();
 #endif
    test_kept_move_type_change();
    test_old_core_two_cuts();
@@ -6981,6 +9360,8 @@ int main(void)
 
    test_snapshot_close_unthreaded();
    test_given_back_saved();
+   test_given_back_shorter();
+   test_given_back_unsized();
 
    event_save_items_deinit();
    save_items_clear();
