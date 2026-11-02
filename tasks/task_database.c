@@ -6230,6 +6230,12 @@ typedef struct
    bool include_hidden;
    bool begun;
    bool failed;              /* LIST: out of memory */
+#ifdef HAVE_SMBCLIENT
+   const struct string_list *smb_down; /* LOAD: the chain's, read only */
+   char smb_share[256];      /* LOAD: the share it found down */
+   bool smb_up;              /* LOAD: the chain's, then what it found */
+   bool smb_root;            /* LOAD: a refresh-all's first load */
+#endif
 } dbscan_prep_t;
 
 /* What a refresh-all keeps of a playlist's first load to group it;
@@ -6258,6 +6264,12 @@ typedef struct
    size_t next;
    size_t all_next;
    task_dbscan_chain_result_t totals;
+#ifdef HAVE_SMBCLIENT
+   /* The shares found down, "" for all: a dead server costs two
+    * timeouts a share, not one a playlist. */
+   struct string_list *smb_down;
+   bool smb_up;                  /* a share's root answered */
+#endif
    bool all_running;
    bool all_counted; /* a playlist of the refresh-all had settings */
    bool all_loaded;  /* every playlist of the refresh-all loaded */
@@ -6309,6 +6321,9 @@ static void dbscan_chain_finish(dbscan_chain_t *chain)
       string_list_free(chain->rdb_list);
    if (chain->playlists)
       string_list_free(chain->playlists);
+#ifdef HAVE_SMBCLIENT
+   string_list_free(chain->smb_down);
+#endif
    free(chain->name);
    free(chain);
    dbscan_chain_running = NULL;
@@ -6357,9 +6372,36 @@ static char *dbscan_chain_expand(const char *in)
    return s;
 }
 
+#ifdef HAVE_SMBCLIENT
+/* True if the SMB share of @path is in @down. */
+static bool dbscan_smb_down(const struct string_list *down,
+      const char *path)
+{
+   const char *p;
+   size_t i;
+   size_t _len = 0;
+
+   if (   !down
+       || !string_starts_with_size(path, "smb://", STRLEN_CONST("smb://")))
+      return false;
+   /* The client talks to the configured server whatever the host. */
+   if ((p = strchr(path + STRLEN_CONST("smb://"), '/')))
+      _len = strcspn(++p, "/");
+   for (i = 0; i < down->size; i++)
+   {
+      const char *share = down->elems[i].data;
+      if (   !*share
+          || (_len && strlen(share) == _len && !strncmp(p, share, _len)))
+         return true;
+   }
+   return false;
+}
+#endif
+
 /* @in expanded; NULL, with the reason on stderr, if nothing is
  * there.  Free the result. */
-static char *dbscan_chain_resolve(const char *in)
+static char *dbscan_chain_resolve(const dbscan_chain_t *chain,
+      const char *in)
 {
    char *s = dbscan_chain_expand(in);
 
@@ -6368,7 +6410,11 @@ static char *dbscan_chain_resolve(const char *in)
       fprintf(stderr, "out of memory\n");
       return NULL;
    }
-   if (!*s || !path_is_valid(s))
+   if (   !*s
+#ifdef HAVE_SMBCLIENT
+       || dbscan_smb_down(chain->smb_down, s)
+#endif
+       || !path_is_valid(s))
    {
       fprintf(stderr, "%s: not found\n", in);
       free(s);
@@ -6482,7 +6528,7 @@ static bool dbscan_chain_push_path(dbscan_chain_t *chain,
 {
    enum manual_content_scan_override_status st;
    unsigned count = 0;
-   char *path     = dbscan_chain_resolve(item->arg);
+   char *path     = dbscan_chain_resolve(chain, item->arg);
 
    if (!path)
    {
@@ -6842,6 +6888,41 @@ static char *dbscan_refresh_key(const dbscan_prep_t *prep)
    return key;
 }
 
+#ifdef HAVE_SMBCLIENT
+/* path_is_valid() for the saved folder @dir (PATH_MAX_LENGTH), with no
+ * stat on a share found down.  In a refresh-all's first loads, until a
+ * share's root answers, an smb:// folder that is not there cuts @dir to
+ * its share, smb://host/share/, and stats that: a dead server fails it
+ * too. */
+static bool dbscan_load_dir_valid(dbscan_prep_t *prep, char *dir)
+{
+   char *s;
+   char *share;
+   size_t _len;
+
+   if (dbscan_smb_down(prep->smb_down, dir))
+      return false;
+   if (path_is_valid(dir))
+      return true;
+   if (   !prep->smb_root || prep->smb_up
+       || !string_starts_with_size(dir, "smb://", STRLEN_CONST("smb://"))
+       || !(share = strchr(dir + STRLEN_CONST("smb://"), '/')))
+      return false;
+   _len = (s = strchr(++share, '/')) ? (size_t)(s - share) : strlen(share);
+   if (!_len || _len >= sizeof(prep->smb_share))
+      return false;
+   if (s)
+      s[1] = '\0';
+   else
+      strlcat(dir, "/", PATH_MAX_LENGTH);
+   if (path_is_valid(dir))
+      prep->smb_up = true;
+   else
+      strlcpy(prep->smb_share, share, _len + 1);
+   return false;
+}
+#endif
+
 /* Loads one playlist and tells whether it can be refreshed: to the end
  * on a threaded queue's worker, else under the shared window. */
 static void dbscan_load_handler(retro_task_t *task)
@@ -6917,7 +6998,11 @@ static void dbscan_load_handler(retro_task_t *task)
                playlist_get_scan_content_dir(prep->playlist),
                PATH_MAX_LENGTH);
          /* A single file's scan saves the file. */
+#ifdef HAVE_SMBCLIENT
+         if (!dbscan_load_dir_valid(prep, dir))
+#else
          if (!path_is_valid(dir))
+#endif
             prep->load = DBSCAN_LOAD_FOLDER_MISSING;
          free(dir);
       }
@@ -7031,6 +7116,29 @@ static void dbscan_load_cb(retro_task_t *task, void *task_data,
       dbscan_chain_finish(chain);
       return;
    }
+#ifdef HAVE_SMBCLIENT
+   /* A root answered: the shares found down are checked again, so a
+    * waking NAS recovers and a missing share fails fast.  With a share
+    * set, a failed root lists "", after which none is tried. */
+   if (prep->smb_up && !chain->smb_up)
+   {
+      string_list_free(chain->smb_down);
+      chain->smb_down = NULL;
+   }
+   chain->smb_up = prep->smb_up;
+   if (*prep->smb_share)
+   {
+      union string_list_elem_attr attr;
+      attr.i = 0;
+      if (!chain->smb_down)
+         chain->smb_down = string_list_new();
+      /* With a share set, every smb:// path is on it. */
+      if (chain->smb_down)
+         string_list_append(chain->smb_down,
+                 *config_get_ptr()->arrays.smb_client_share
+               ? "" : prep->smb_share, attr);
+   }
+#endif
    if (prep->load != DBSCAN_LOAD_NO_SETTINGS)
       chain->all_counted = true;
    /* A refresh-all loads every playlist before it runs one. */
@@ -7172,6 +7280,11 @@ static bool dbscan_chain_push_load(dbscan_chain_t *chain,
          prep->rdb_list = chain->rdb_list;
          prep->ov       = chain->items[chain->next - 1].overrides;
       }
+#ifdef HAVE_SMBCLIENT
+      prep->smb_down = chain->smb_down;
+      prep->smb_up   = chain->smb_up;
+      prep->smb_root = chain->all_running && !chain->all_loaded;
+#endif
    }
    if (dbscan_chain_push_prep(chain, prep, dbscan_load_handler,
          dbscan_load_cb))
