@@ -459,6 +459,9 @@ void event_save_items_ran(double fps);
 
 void event_save_items_deinit(void);
 
+/* After retro_unload_game(), before save_items_clear(). */
+void event_save_items_final(bool is_sram_used, bool compress_files);
+
 /* Once per content load, before its save files are read: where the
  * safety copies go; NULL or empty for none. */
 void event_save_items_set_undo_dir(const char *dir);

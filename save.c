@@ -75,6 +75,10 @@ typedef struct save_item_guard
    int untold_mark;
    /* Bytes at the image's end dropped once the copy is made. */
    size_t drop_size;
+   /* A type change's copy is of this image, not of the file: the
+    * newest save of the old type, which a waiting write held. */
+   void *copy_image;
+   size_t copy_size;
    bool copy_first;
    /* Never written over without a copy: the core refused the file, or
     * a replaced item kept it another way. */
@@ -96,6 +100,8 @@ typedef struct save_item_file
    void *initial;
 #ifdef HAVE_THREADS
    autosave_t *autosave;
+   /* The retired worker whose last image the fill took. */
+   const autosave_t *took;
 #endif
    size_t initial_size;
    /* The segments' size before a re-registration grew the item over
@@ -113,6 +119,11 @@ typedef struct save_item_file
     * so. */
    bool cap_told;
 #endif
+   /* Since the last frame, the file holds an image taken while
+    * can_snapshot() said true, written here or by its stopped worker. */
+   bool settled;
+   /* Kept it since the last frame, and said so. */
+   bool kept_told;
    /* Its worker could not start, or the item was empty and has a
     * generation: tried again once that moves, at the next registration
     * or when the autosave settings change. */
@@ -121,6 +132,8 @@ typedef struct save_item_file
    bool taken_up;
    /* Checked again at its first fill (save_items_check_reported()). */
    bool checked;
+   /* loaded() is owed for the fill. */
+   bool tell;
    /* Why the blob was not copied, and the legacy memory's size, were
     * logged. */
    bool blob_told;
@@ -136,7 +149,8 @@ typedef struct save_item_file
 } save_item_file_t;
 
 /* The last image of an item that left the set, written at the next
- * save of the files. */
+ * save of the files. With no data, only the type change's copy it owed
+ * of guard.copy_image is left to make. */
 typedef struct save_item_orphan
 {
    char *path;
@@ -155,6 +169,11 @@ static struct save_item_files
    save_item_orphan_t *orphans;
    unsigned num_files;
    unsigned num_orphans;
+   /* The record of the blob whose fill runs: its file is still its
+    * save, so a registration that drops it keeps nothing of it. */
+   const save_item_file_t *filling;
+   /* Counts registrations: a core callback may register again. */
+   unsigned registrations;
    /* Bits of the legacy memories an item gave back: their file may hold
     * its image, so an autosave started later writes its first snapshot. */
    unsigned char given_back;
@@ -232,11 +251,13 @@ static bool save_ram_cut_bare[RETRO_MEMORY_RTC + 1];
 
 static void save_item_copy_done(const save_items_set_t *set, unsigned i);
 static bool save_item_write_pending(const char *path);
+static void save_item_recover(const char *path, const void *data,
+      size_t len, unsigned type, char **recovered);
 static bool dump_to_file_desperate(const void *data,
       size_t len, unsigned type, char *s, size_t s_len);
 
-/* What save_item_copy_file() did. Bits: a worker ORs in each result
- * until the main thread collects them. */
+/* What a safety copy did. Bits: a worker ORs in each result until the
+ * main thread collects them. */
 enum save_item_copy
 {
    SAVE_ITEM_COPY_FAILED = 0,
@@ -331,17 +352,16 @@ static unsigned save_item_copy_name(char *s, size_t size,
    return n;
 }
 
-/* Copies the file at @path into @dir before a write drops its end or
- * replaces it, through the writer's @suffix and a temp of the file's
- * own, as copy *@n (save_item_copy_name()): none is written when one
- * holds it already. With @turn, SAVE_ITEM_COPY_BUSY while a file of its
- * name is copied. Either thread; logs nothing. */
-static enum save_item_copy save_item_copy_file(const char *path,
-      const char *dir, const char *suffix, unsigned *n, bool turn)
+/* Writes @image into @dir as a copy of the file at @path, through the
+ * writer's @suffix and a temp of the file's own, as copy *@n
+ * (save_item_copy_name()): none is written when one holds it already.
+ * With @turn, SAVE_ITEM_COPY_BUSY while a file of its name is copied.
+ * Either thread; logs nothing. */
+static enum save_item_copy save_item_copy_image(const char *path,
+      const char *dir, const char *suffix, const void *image, size_t len,
+      unsigned *n, bool turn)
 {
    bool ok;
-   int64_t len = 0;
-   void *buf   = NULL;
    char *copy;
    char tmp[32];
 #ifdef HAVE_THREADS
@@ -350,8 +370,6 @@ static enum save_item_copy save_item_copy_file(const char *path,
 #endif
 
    *n = 1;
-   if (!path_is_valid(path))
-      return SAVE_ITEM_NO_FILE;
    if (string_is_empty(dir) || !(copy = (char*)malloc(PATH_MAX_LENGTH)))
       return SAVE_ITEM_COPY_FAILED;
 #ifdef HAVE_THREADS
@@ -364,22 +382,38 @@ static enum save_item_copy save_item_copy_file(const char *path,
    (void)turn;
 #endif
    snprintf(tmp, sizeof(tmp), ".%08x%s", save_name_hash(path), suffix);
-   if ((ok = filestream_read_file(path, &buf, &len) != 0))
-   {
-      *n = save_item_copy_name(copy, PATH_MAX_LENGTH, dir, path, 1, buf,
-            (size_t)len);
-      ok =     filestream_matches_buf(copy, buf, (size_t)len)
-            || (   path_mkdir(dir)
-                && save_item_write_file(copy, tmp, buf, (size_t)len,
-                      false));
-   }
+   *n = save_item_copy_name(copy, PATH_MAX_LENGTH, dir, path, 1, image,
+         len);
+   ok =     filestream_matches_buf(copy, image, len)
+         || (   path_mkdir(dir)
+             && save_item_write_file(copy, tmp, image, len, false));
 #ifdef HAVE_THREADS
    if (claimed)
       save_undo_release(bit);
 #endif
-   free(buf);
    free(copy);
    return ok ? SAVE_ITEM_COPY_MADE : SAVE_ITEM_COPY_FAILED;
+}
+
+/* Copies the file at @path into @dir before a write drops its end or
+ * replaces it, through the writer's @suffix, as copy *@n
+ * (save_item_copy_image()). Either thread; logs nothing. */
+static enum save_item_copy save_item_copy_file(const char *path,
+      const char *dir, const char *suffix, unsigned *n, bool turn)
+{
+   enum save_item_copy copy = SAVE_ITEM_COPY_FAILED;
+   int64_t len              = 0;
+   void *buf                = NULL;
+
+   *n = 1;
+   if (!path_is_valid(path))
+      return SAVE_ITEM_NO_FILE;
+   if (     !string_is_empty(dir)
+         && filestream_read_file(path, &buf, &len))
+      copy = save_item_copy_image(path, dir, suffix, buf, (size_t)len, n,
+            turn);
+   free(buf);
+   return copy;
 }
 
 /* Logs copy @n made in @dir, and the @dropped bytes it lets an
@@ -502,6 +536,8 @@ static void save_item_untold_drop(char **untold)
 /* @guard's copy was made: it owes none. */
 static void save_item_guard_met(save_item_guard_t *guard)
 {
+   free(guard->copy_image);
+   guard->copy_image   = NULL;
    guard->copy_first   = false;
    guard->keep_file    = false;
    guard->type_changed = false;
@@ -660,6 +696,9 @@ struct autosave
    char *path;
    /* The worker's own copy of save_undo_dir; NULL for none. */
    char *undo_dir;
+   /* The record's copy_image, until the worker has copied it; freed
+    * once the worker has exited. */
+   void *copy_image;
    sthread_t *thread;
    size_t bufsize;
    /* Bytes in snapshot, and room for them: an item's size can
@@ -667,10 +706,13 @@ struct autosave
    size_t snapshot_size;
    size_t snapshot_cap;
    size_t final_size;
+   size_t copy_size;
    /* What an EXACT_SIZE item drops from the end of the snapshot, and of
     * final, once its file is copied. */
    size_t drop_size;
    size_t final_drop;
+   /* Worker only: drop_size when its copy was made. */
+   size_t copy_drop;
    /* get_generation() when the snapshot was taken. */
    uint64_t generation;
    /* What the worker sleeps on: the copy it asked for, the end of its
@@ -679,6 +721,9 @@ struct autosave
    unsigned interval;
    /* The save item it writes; SAVE_ITEMS_NONE for save RAM. */
    unsigned item;
+   /* Main thread only: the retired item's legacy memory, which names
+    * its recovery file. */
+   unsigned type;
    /* Only the main thread reads live SRAM. The worker requests a copy
     * and waits until autosave_check() has made it and cleared this. */
    retro_atomic_int_t snapshot_requested;
@@ -687,6 +732,8 @@ struct autosave
    retro_atomic_int_t exited;
    /* The worker's last write failed. */
    retro_atomic_int_t failed;
+   /* Its write of final failed. Stored before exited. */
+   retro_atomic_int_t final_failed;
    /* Copy the file before the next write. The main thread adds one for
     * each copy owed; the worker clears only the value its copy began
     * under, then sets copied (enum save_item_copy bits) for the main
@@ -725,6 +772,20 @@ struct autosave
    bool refusing;
    /* The snapshot was taken while can_snapshot() said true. */
    bool settled;
+   /* Worker only until joined: its last snapshot is at the file. */
+   bool landed;
+   /* Worker only until joined: its last write was the main thread's
+    * image again (autosave_reissue()). */
+   bool reissued;
+   /* Worker only until joined: its last rename may have landed over a
+    * newer image of the main thread's that was not written again. */
+   bool over_newer;
+   /* Main thread only: superseded after its last write of the file,
+    * and whether can_snapshot() said true for that image. */
+   int wrote_mark;
+   bool wrote_settled;
+   /* Worker only: copy_image is copied; a later copy is of the file. */
+   bool image_copied;
    /* Worker only: the copy is made, so drop_size applies. */
    bool copy_made;
    /* Worker only: the file may hold another writer's image, so the
@@ -734,6 +795,10 @@ struct autosave
    bool held_back;
    /* Main thread only: the snapshot holds the item's current tail. */
    bool tail_kept;
+   /* Main thread only: the retired item owed a type change's copy. */
+   bool type_changed;
+   /* Main thread only: SAVE_FILES made its copy and told it. */
+   bool copy_told;
 };
 
 static struct autosave_st autosave_state;
@@ -812,7 +877,10 @@ static void autosave_reissue(autosave_t *save)
             free(tmp);
          }
          else if (save_item_rename_temp(tmp, save->path))
+         {
             retro_atomic_store_release_int(&save->written, mark);
+            save->reissued = true;
+         }
       }
       free(image);
    }
@@ -829,9 +897,12 @@ static bool autosave_write_item(autosave_t *save, const void *data,
    if (owed)
    {
       unsigned n;
-      enum save_item_copy copy = save_item_copy_file(save->path,
-            save->undo_dir, SAVE_ITEM_AUTO_TMP, &n,
-            !autosave_quitting(save));
+      enum save_item_copy copy = save->copy_image && !save->image_copied
+         ? save_item_copy_image(save->path, save->undo_dir,
+               SAVE_ITEM_AUTO_TMP, save->copy_image, save->copy_size, &n,
+               !autosave_quitting(save))
+         : save_item_copy_file(save->path, save->undo_dir,
+               SAVE_ITEM_AUTO_TMP, &n, !autosave_quitting(save));
       if (copy == SAVE_ITEM_COPY_BUSY)
       {
          /* Made at the next write. */
@@ -844,6 +915,8 @@ static bool autosave_write_item(autosave_t *save, const void *data,
       }
       else if ((save->copy_made = copy != SAVE_ITEM_COPY_FAILED))
       {
+         save->image_copied = save->copy_image != NULL;
+         save->copy_drop    = save->drop_size;
          retro_atomic_store_release_int(&save->keep_file, 0);
          /* A copy owed since this one began stays owed. */
          retro_atomic_cas_int(&save->copy_first, owed, 0);
@@ -868,10 +941,12 @@ static bool autosave_write_item(autosave_t *save, const void *data,
    if (!save_item_rename_temp(tmp, save->path))
       return false;
    retro_atomic_store_release_int(&save->written, save->fill_mark);
+   save->reissued = false;
    autosave_reissue(save);
    /* A newer write may have landed just before this one. */
    save->rewrite = retro_atomic_load_acquire_int(&save->superseded)
       != save->fill_mark;
+   save->over_newer = save->rewrite && !save->reissued;
    autosave_keep(save, data, len);
    return true;
 }
@@ -903,7 +978,11 @@ static void autosave_thread(void *data)
          retro_eventcount_commit_wait(&save->ec, key);
       }
 
-      if (autosave_quitting(save))
+      /* A settled snapshot taken before quit is the one a close
+       * keeps: written still. */
+      if (     autosave_quitting(save)
+            && (   retro_atomic_load_acquire_int(&save->snapshot_requested)
+                || !save->settled))
          break;
 
       /* The snapshot remains ours until the next request. Keep the
@@ -923,6 +1002,7 @@ static void autosave_thread(void *data)
          if (!save->held_back)
             retro_atomic_store_release_int(&save->failed, fails);
       }
+      save->landed = !retry_write && !save->rewrite;
 
       /* Rest an interval. Nothing but quit notifies while no copy is
        * asked for, so a wake before it runs out is quit's. */
@@ -944,13 +1024,17 @@ static void autosave_thread(void *data)
 
    save->drop_size = save->final_drop;
    save->fill_mark = save->final_mark;
+   /* Written while a copy is owed, changed or not. A failed last
+    * write is the main thread's to recover. */
    if (     save->final
          && retro_atomic_load_acquire_int(&save->superseded)
             == save->final_mark
-         && (   save->rewrite
+         && (   retro_atomic_load_acquire_int(&save->copy_first)
+             || save->rewrite
              || save->final_size != save->bufsize
-             || memcmp(save->buffer, save->final, save->bufsize) != 0))
-      save->write(save, save->final, save->final_size);
+             || memcmp(save->buffer, save->final, save->bufsize) != 0)
+         && !save->write(save, save->final, save->final_size))
+      retro_atomic_store_release_int(&save->final_failed, 1);
    retro_atomic_store_release_int(&save->exited, 1);
 }
 
@@ -960,13 +1044,20 @@ static void autosave_init_state(autosave_t *handle)
 {
    retro_atomic_int_init(&handle->exited, 0);
    retro_atomic_int_init(&handle->failed, 0);
+   retro_atomic_int_init(&handle->final_failed, 0);
    handle->write                 = autosave_write;
    handle->generation            = 0;
    handle->has_generation        = false;
    handle->refused_at            = 0;
    handle->refusing              = false;
    handle->settled               = false;
+   handle->landed                = false;
+   handle->reissued              = false;
+   handle->over_newer            = false;
+   handle->wrote_mark            = 0;
+   handle->wrote_settled         = false;
    handle->item                  = SAVE_ITEMS_NONE;
+   handle->type                  = 0;
    handle->final                 = NULL;
    handle->untold                = NULL;
    handle->final_size            = 0;
@@ -982,10 +1073,16 @@ static void autosave_init_state(autosave_t *handle)
    handle->undo_dir              = NULL;
    handle->drop_size             = 0;
    handle->final_drop            = 0;
+   handle->copy_drop             = 0;
+   handle->copy_image            = NULL;
+   handle->copy_size             = 0;
+   handle->image_copied          = false;
    handle->copy_made             = false;
    handle->rewrite               = false;
    handle->held_back             = false;
    handle->tail_kept             = false;
+   handle->type_changed          = false;
+   handle->copy_told             = false;
 }
 
 /**
@@ -1095,6 +1192,7 @@ static void autosave_free(autosave_t *handle)
    free(retro_atomic_load_acquire_ptr(&handle->reissue));
    free(handle->snapshot);
    free(handle->final);
+   free(handle->copy_image);
    free(handle->undo_dir);
    retro_eventcount_free(&handle->ec);
 
@@ -1259,11 +1357,16 @@ static autosave_t *autosave_new_item(const save_items_set_t *set,
    size_t len          = save_items_size(set, i);
    void *image         = len ? malloc(len) : NULL;
 
+   /* Until it has a file, the worker compares against what the item
+    * held before an earlier name filled it; the copy still shows that
+    * the item can be read. */
    if (image && save_items_copy_out(set, i, image, len))
    {
       f->copy_crc      = encoding_crc32(0, (const uint8_t*)image, len);
       f->copy_crc_size = len;
-      handle = autosave_new(set->items[i].path, image, len,
+      handle = autosave_new(set->items[i].path,
+            f->initial ? f->initial      : image,
+            f->initial ? f->initial_size : len,
             autosave_state.interval,
                autosave_state.compress
             && (set->items[i].item.flags
@@ -1273,7 +1376,7 @@ static autosave_t *autosave_new_item(const save_items_set_t *set,
    if (handle)
    {
       /* Read by the worker only after the first snapshot publishes. */
-      const save_item_guard_t *guard = &save_item_files.files[i].guard;
+      save_item_guard_t *guard = &save_item_files.files[i].guard;
       handle->write          = autosave_write_item;
       handle->retro_buffer   = NULL;
       handle->item           = i;
@@ -1281,6 +1384,9 @@ static autosave_t *autosave_new_item(const save_items_set_t *set,
       handle->has_generation =    set->iface.get_generation != NULL
                                && !f->generation_stuck;
       handle->undo_dir       = save_undo_dir ? strdup(save_undo_dir) : NULL;
+      handle->copy_image     = guard->copy_image;
+      handle->copy_size      = guard->copy_size;
+      guard->copy_image      = NULL;
       retro_atomic_store_release_int(&handle->keep_file, guard->keep_file);
       retro_atomic_store_release_int(&handle->copy_first,
             guard->copy_first);
@@ -1298,21 +1404,32 @@ static autosave_t *autosave_new_item(const save_items_set_t *set,
    return handle;
 }
 
-/* A retired worker still writes @path. */
+/* A retired handle of @path is not reaped yet: it may still write, or
+ * owe a copy the reap passes to the item at the file. */
 static bool autosave_retired_writes(const char *path)
 {
    unsigned i;
    for (i = 0; i < autosave_state.num_retired; i++)
-      if (     string_is_equal_noncase(autosave_state.retired[i]->path, path)
-            && !retro_atomic_load_acquire_int(
-               &autosave_state.retired[i]->exited))
+      if (string_is_equal_noncase(autosave_state.retired[i]->path, path))
+         return true;
+   return false;
+}
+
+/* An orphan's image is still to be written to @path. */
+static bool save_item_orphan_waits(const char *path)
+{
+   unsigned i;
+   for (i = 0; i < save_item_files.num_orphans; i++)
+      if (     save_item_files.orphans[i].data
+            && string_is_equal_noncase(save_item_files.orphans[i].path,
+               path))
          return true;
    return false;
 }
 
 /* Starts a handle for each frontend-owned item without one, once it
- * has been filled and no retired worker writes its file: one worker
- * per file. It calls the core: never inside a registration. */
+ * has been filled and no retired worker or orphan writes its file: one
+ * worker per file. It calls the core: never inside a registration. */
 static void autosave_items_start(void)
 {
    unsigned i;
@@ -1330,7 +1447,8 @@ static void autosave_items_start(void)
       if (     f->autosave
             || !f->taken_up
             || !save_items_frontend_owned(&set->items[i])
-            || autosave_retired_writes(set->items[i].path))
+            || autosave_retired_writes(set->items[i].path)
+            || save_item_orphan_waits(set->items[i].path))
          continue;
       if (     f->start_failed
             && (     !set->iface.get_generation
@@ -1371,10 +1489,14 @@ static void autosave_bump(autosave_t *h, const void *data, size_t len)
 }
 
 /* Stops an item handle without waiting for it. Its worker writes
- * @final if that differs from what it wrote last, then exits, and a
- * later autosave_check() frees it. Takes @final. */
+ * @final if that differs from what it wrote last or a copy is still
+ * owed, then exits, and a later autosave_check() frees it, telling a
+ * copy it made (the type change's notice too when @type_changed) and
+ * recovering @final as a @type save when that write failed. Takes
+ * @final. */
 static void autosave_retire(autosave_t *handle, void *final,
-      size_t final_size, size_t final_drop)
+      size_t final_size, size_t final_drop, unsigned type,
+      bool type_changed)
 {
    unsigned i;
 
@@ -1384,14 +1506,56 @@ static void autosave_retire(autosave_t *handle, void *final,
                handle->path))
          autosave_bump(autosave_state.retired[i], NULL, 0);
 
-   handle->final      = final;
-   handle->final_size = final_size;
-   handle->final_drop = final_drop;
+   handle->final        = final;
+   handle->final_size   = final_size;
+   handle->final_drop   = final_drop;
+   handle->type         = type;
+   handle->type_changed = type_changed;
    handle->final_mark = retro_atomic_load_acquire_int(&handle->superseded);
    retro_atomic_store_release_int(&handle->quit, 1);
    retro_eventcount_notify(&handle->ec);
    /* Its slot was kept when it started. */
    autosave_state.retired[autosave_state.num_retired++] = handle;
+}
+
+/* A retired worker of @path has not made the copy it owes yet: made
+ * here before a newer image lands, and told once whichever thread
+ * makes it (a slot that holds the bytes is not written again). False
+ * when it cannot be made and the file is kept. */
+static bool autosave_retired_copy(const char *path)
+{
+   unsigned i;
+   bool ok = true;
+   for (i = 0; i < autosave_state.num_retired; i++)
+   {
+      unsigned n;
+      enum save_item_copy copy;
+      autosave_t *h = autosave_state.retired[i];
+      int owed      = retro_atomic_load_acquire_int(&h->copy_first);
+      if (!owed || !string_is_equal_noncase(h->path, path))
+         continue;
+      copy = h->copy_image
+         ? save_item_copy_image(h->path, save_undo_dir, SAVE_ITEM_TMP,
+               h->copy_image, h->copy_size, &n, false)
+         : save_item_copy_file(h->path, save_undo_dir, SAVE_ITEM_TMP, &n,
+               false);
+      if (copy == SAVE_ITEM_COPY_FAILED)
+      {
+         if (retro_atomic_load_acquire_int(&h->keep_file))
+            ok = false;
+         continue;
+      }
+      retro_atomic_store_release_int(&h->keep_file, 0);
+      retro_atomic_cas_int(&h->copy_first, owed, 0);
+      if (copy == SAVE_ITEM_COPY_MADE && !h->copy_told)
+      {
+         h->copy_told = true;
+         save_item_log_copy(h->path, save_undo_dir, n, 0);
+         if (h->type_changed)
+            save_item_warn_type_changed(h->path, save_undo_dir, n);
+      }
+   }
+   return ok;
 }
 
 /* @path is to hold a newer image, written or already there: a worker's
@@ -1412,8 +1576,73 @@ static void autosave_supersede(const char *path, const void *data,
          autosave_bump(autosave_state.retired[i], data, len);
 }
 
-/* Frees the retired handles whose worker has exited. Their join
- * returns at once: the thread has nothing left to do. */
+/* A copy a retired worker made, told as save_item_file_collect() tells
+ * a live worker's, with the type change's notice when the item owed it.
+ * Main thread, once the worker has exited. */
+static void autosave_report_copy(autosave_t *handle)
+{
+   unsigned n;
+   if (     handle->copy_told
+         || !(   retro_atomic_load_acquire_int(&handle->copied)
+               & SAVE_ITEM_COPY_MADE))
+      return;
+   n = (unsigned)retro_atomic_load_acquire_int(&handle->copy_number);
+   save_item_log_copy(handle->path, handle->undo_dir, n,
+         handle->copy_drop);
+   if (handle->type_changed)
+      save_item_warn_type_changed(handle->path, handle->undo_dir, n);
+}
+
+/* What a retired worker that has exited left undone, on the main
+ * thread: a failed last write goes to the recovery file, and a type
+ * change's copy it still owed to a second one. A copy still owed
+ * passes to the item now at the file, which keeps the file as its own
+ * debt would; when its fill took that image, its recovery file starts
+ * as the one the image went to, so the image is recovered once. */
+static void autosave_settle(autosave_t *handle)
+{
+   unsigned i;
+   save_item_file_t *f         = NULL;
+   save_item_guard_t *guard    = NULL;
+   const save_items_set_t *set = save_items_state_get_ptr()->current;
+   bool owed = retro_atomic_load_acquire_int(&handle->copy_first) != 0;
+   bool took = false;
+
+   for (i = 0; set && !f && i < save_item_files.num_files; i++)
+      if (     string_is_equal_noncase(set->items[i].path, handle->path)
+            && save_items_frontend_owned(&set->items[i]))
+         f = &save_item_files.files[i];
+   if (f && f->took == handle)
+   {
+      f->took = NULL;
+      took    = true;
+   }
+   if (f && owed)
+      guard = &f->guard;
+   if (     retro_atomic_load_acquire_int(&handle->final_failed)
+         && !(   guard && guard->recovered
+              && filestream_matches_buf(guard->recovered, handle->final,
+                 handle->final_size)))
+      save_item_recover(handle->path, handle->final, handle->final_size,
+            handle->type,
+            guard && took && !guard->recovered ? &guard->recovered : NULL);
+   if (owed && handle->copy_image && !handle->image_copied)
+      save_item_recover(handle->path, handle->copy_image,
+            handle->copy_size, handle->type, NULL);
+   if (guard)
+   {
+      guard->copy_first = true;
+      if (retro_atomic_load_acquire_int(&handle->keep_file))
+         guard->keep_file = true;
+      if (handle->type_changed)
+         guard->type_changed = true;
+   }
+}
+
+/* Frees the retired handles whose worker has exited, telling a copy
+ * each made and settling what it left undone first. Their join returns
+ * at once: the thread has nothing left to do. A worker still writing
+ * waits for a later call. */
 static void autosave_reap(void)
 {
    unsigned i = 0;
@@ -1425,6 +1654,8 @@ static void autosave_reap(void)
          i++;
          continue;
       }
+      autosave_report_copy(handle);
+      autosave_settle(handle);
       autosave_free(handle);
       autosave_state.retired[i] =
          autosave_state.retired[--autosave_state.num_retired];
@@ -1497,13 +1728,39 @@ static void autosave_items_free(void)
       retro_eventcount_notify(&handle->ec);
       sthread_join(handle->thread);
       handle->thread = NULL;
+      /* The main thread's image is at the file when the worker's last
+       * was taken before it, or was that image again. */
+      if (handle->over_newer)
+         save_item_files.files[i].settled = false;
+      else if (handle->reissued
+            || !autosave_mark_reached(
+               retro_atomic_load_acquire_int(&handle->written),
+               handle->wrote_mark))
+         save_item_files.files[i].settled = handle->wrote_settled;
+      else
+         save_item_files.files[i].settled = handle->settled
+            && handle->landed;
       if (set)
          save_item_file_collect(set, i);
+      /* Not copied yet: the final write copies it. */
+      if (handle->copy_image && !handle->image_copied)
+      {
+         save_item_files.files[i].guard.copy_image = handle->copy_image;
+         save_item_files.files[i].guard.copy_size  = handle->copy_size;
+         handle->copy_image                        = NULL;
+      }
       autosave_free(handle);
       save_item_files.files[i].autosave = NULL;
    }
    for (i = 0; i < autosave_state.num_retired; i++)
-      autosave_free(autosave_state.retired[i]);
+   {
+      autosave_t *handle = autosave_state.retired[i];
+      sthread_join(handle->thread);
+      handle->thread = NULL;
+      autosave_report_copy(handle);
+      autosave_settle(handle);
+      autosave_free(handle);
+   }
    free(autosave_state.retired);
    autosave_state.retired     = NULL;
    autosave_state.num_retired = 0;
@@ -1972,43 +2229,361 @@ static void save_item_file_keep_tail(const save_items_set_t *set,
             "bytes.\n", path, (unsigned)rc);
 }
 
+/* An earlier name newer than the item's own file may hold a save
+ * another version of the core made since. */
+static void save_item_check_forks(const save_item_t *it)
+{
+   unsigned n;
+   int64_t own, old;
+   if (!it->legacy || !path_get_mtime(it->path, &own))
+      return;
+   for (n = 0; it->legacy[n]; n++)
+      if (path_get_mtime(it->legacy[n], &old) && old > own)
+      {
+         save_item_warn(MSG_SAVE_ITEM_LEGACY_NEWER, it->legacy[n], NULL);
+         return;
+      }
+}
+
+/* Earlier name @n of item @i, read whole into @buf: to legacy_load()
+ * when the core converts, else into the item as its own file would
+ * be, a buffer's tail following it to the new name. False
+ * when the core refused it. A callback may register again, so nothing
+ * of @set is read after one. */
+static bool content_load_item_legacy(const save_items_set_t *set,
+      unsigned i, unsigned n, const void *buf, size_t rc)
+{
+   size_t len;
+   const save_item_t *it = &set->items[i];
+   const char *path      = it->legacy[n];
+
+   if (save_items_can_legacy_load())
+   {
+      bool ok;
+      char *old = strdup(path);
+      char *own = strdup(it->path);
+      if ((ok = set->iface.legacy_load(i, n, NULL, buf, rc)) && old && own)
+         RARCH_LOG("[SRAM] Converted \"%s\" to \"%s\"; the old file is "
+               "kept.\n", old, own);
+      free(old);
+      free(own);
+      return ok;
+   }
+   if (it->item.storage == RETRO_SAVE_STORAGE_FRONTEND_BLOB)
+      return save_items_copy_in(set, i, buf, rc);
+   len = save_items_size(set, i);
+   save_items_copy_in(set, i, buf, rc);
+   save_item_file_keep_tail(set, i, path, buf, rc, len);
+   if (rc != len)
+      save_item_warn(MSG_SAVE_ITEM_LEGACY_SIZE, path, NULL);
+   return true;
+}
+
+#ifdef HAVE_THREADS
+/* @h's last image is the newest waiting for @path. final stays until
+ * autosave_reap() frees it on this thread; the worker only reads it. A
+ * newer image superseded it once superseded moves past final_mark. */
+static bool autosave_final_waits(autosave_t *h, const char *path)
+{
+   return   h->final
+         && h->final_size
+         &&    retro_atomic_load_acquire_int(&h->superseded)
+            == h->final_mark
+         && string_is_equal_case_insensitive(h->path, path);
+}
+#endif
+
+/* The newest image waiting for @path, left waiting until the fill has
+ * accepted it (save_item_take_waiting()): an orphan's, lent (@lent),
+ * as a registration adds orphans and frees none, else a copy of a
+ * retired worker's last one. NULL when nothing waits. */
+static void *save_item_find_waiting(const char *path, size_t *len,
+      save_item_file_t *f, bool *lent)
+{
+   unsigned i;
+   void *image         = NULL;
+   const void *initial = f->initial;
+   size_t initial_size = f->initial_size;
+
+   for (i = save_item_files.num_orphans; !image && i-- > 0; )
+   {
+      const save_item_orphan_t *o = &save_item_files.orphans[i];
+      if (!o->data || !string_is_equal_case_insensitive(o->path, path))
+         continue;
+      image        = o->data;
+      *len         = o->size;
+      *lent        = true;
+      initial      = o->initial;
+      initial_size = o->initial_size;
+   }
+#ifdef HAVE_THREADS
+   for (i = 0; !image && i < autosave_state.num_retired; i++)
+   {
+      autosave_t *h = autosave_state.retired[i];
+      if (     !autosave_final_waits(h, path)
+            || !(image = malloc(h->final_size)))
+         continue;
+      memcpy(image, h->final, h->final_size);
+      *len = h->final_size;
+   }
+#endif
+   /* Its own type change copies the image, not the file, whether the
+    * core takes it or not. Nothing of the old type was saved when there
+    * is no file and the image is still what the item was taken up
+    * with. */
+   if (     f->guard.type_changed && image
+         && (     path_is_valid(path)
+               || !initial
+               || initial_size != *len
+               || memcmp(initial, image, *len)))
+   {
+      /* Without it an orphan's image is not taken: its write comes
+       * first, and the copy is of the file it leaves. */
+      if (!(f->guard.copy_image = malloc(*len)))
+      {
+         if (!*lent)
+            return image;
+         *lent = false;
+         *len  = 0;
+         return NULL;
+      }
+      memcpy(f->guard.copy_image, image, *len);
+      f->guard.copy_size = *len;
+   }
+   return image;
+}
+
+/* The fill accepted the image save_item_find_waiting() found: an
+ * orphan's write is dropped with every older one and record @f takes
+ * over its debts; a retired worker still writes its own after the copy
+ * it owes, and @f shares its recovery file. */
+static void save_item_take_waiting(const char *path, save_item_file_t *f)
+{
+   unsigned i;
+   bool taken = false;
+   /* Its own type change copies the image it takes, not the file. */
+   bool own   = f->guard.type_changed;
+
+   for (i = save_item_files.num_orphans; i-- > 0; )
+   {
+      save_item_orphan_t *o = &save_item_files.orphans[i];
+      if (!o->data || !string_is_equal_case_insensitive(o->path, path))
+         continue;
+      if (!taken)
+      {
+         taken           = true;
+         free(f->initial);
+         f->initial      = o->initial;
+         f->initial_size = o->initial_size;
+         o->initial      = NULL;
+         if (o->guard.copy_first)
+            f->guard.copy_first   = true;
+         if (o->guard.keep_file)
+            f->guard.keep_file    = true;
+         if (o->guard.type_changed)
+            f->guard.type_changed = true;
+         /* The recovery file named for the kept file stays the one. */
+         if (!f->guard.recovered)
+         {
+            f->guard.recovered = o->guard.recovered;
+            o->guard.recovered = NULL;
+         }
+         if (!own)
+         {
+            f->guard.copy_image = o->guard.copy_image;
+            f->guard.copy_size  = o->guard.copy_size;
+            o->guard.copy_image = NULL;
+         }
+      }
+      free(o->data);
+      o->data = NULL;
+      free(o->initial);
+      o->initial = NULL;
+      /* The type change's copy it owes stays owed. */
+      if (o->guard.copy_image)
+         continue;
+      free(o->path);
+      free(o->guard.recovered);
+      save_item_files.num_orphans--;
+      memmove(o, o + 1, (save_item_files.num_orphans - i) * sizeof(*o));
+   }
+#ifdef HAVE_THREADS
+   for (i = 0; !taken && i < autosave_state.num_retired; i++)
+      if (autosave_final_waits(autosave_state.retired[i], path))
+      {
+         f->took = autosave_state.retired[i];
+         taken   = true;
+      }
+#endif
+}
+
+/* Blob item @i, of @id at @path, took its file: it owes no copy for
+ * it but a type change's. When blob_load() registered again since
+ * @seen, its record is the one carried: the same id at the same file. */
+static void save_item_blob_taken(const char *id, const char *path,
+      unsigned seen, unsigned i)
+{
+   save_item_file_t *f         = NULL;
+   const save_items_set_t *set = save_items_state_get_ptr()->current;
+   if (seen == save_item_files.registrations)
+      f = &save_item_files.files[i];
+   else
+      for (i = 0; set && !f && i < save_item_files.num_files; i++)
+         if (     string_is_equal(set->items[i].item.id, id)
+               && string_is_equal(set->items[i].path, path))
+            f = &save_item_files.files[i];
+   if (f && !f->guard.type_changed)
+   {
+      f->guard.copy_first = false;
+      f->guard.keep_file  = false;
+   }
+}
+
+/* Item @i starts empty: the file its legacy memory was saved to
+ * before, if it is there, is named in the log. */
+static void save_item_check_old_file(const save_items_set_t *set,
+      unsigned i)
+{
+   unsigned k, n;
+   char who[256];
+   const save_item_t *it = &set->items[i];
+   for (k = 0; task_save_files && k < task_save_files->size; k++)
+   {
+      const char *old = task_save_files->elems[k].data;
+      if (     (unsigned)task_save_files->elems[k].attr.i
+               != it->item.legacy_memory
+            || string_is_equal(old, it->path)
+            || !path_is_valid(old))
+         continue;
+      for (n = 0; it->legacy && it->legacy[n]; n++)
+         if (string_is_equal(it->legacy[n], old))
+            return;
+      save_items_who(who, sizeof(who), set, i);
+      RARCH_WARN("[SRAM] %s: legacy_paths = %s: \"%s\", where the "
+            "frontend saved this memory before, is not among them. See "
+            "libretro.h, SET_SAVE_INTERFACE, \"Cross-core compatibility\". "
+            "It was not loaded.\n", who, it->legacy ? "set" : "NULL", old);
+   }
+}
+
+/* content_load_item_file() for an item with no file of its own. */
+static bool content_load_item_legacy_names(const save_items_set_t *set,
+      unsigned i)
+{
+   unsigned n;
+   int64_t rc;
+   unsigned seen;
+   void *buf             = NULL;
+   char *refused         = NULL;
+   bool ok               = false;
+   unsigned regs         = save_item_files.registrations;
+   const save_item_t *it = &set->items[i];
+
+   /* The baseline is what the item held before an earlier name filled
+    * it, so the first write creates the item's own file. */
+   save_item_file_take_up(set, i);
+   for (n = 0; !ok && it->legacy && it->legacy[n]; n++)
+   {
+      char *name;
+      if (     !path_is_valid(it->legacy[n])
+            || !save_item_read_file(it->legacy[n], &buf, &rc)
+            || rc <= 0)
+      {
+         free(buf);
+         buf = NULL;
+         continue;
+      }
+      name = strdup(it->legacy[n]);
+      seen = save_item_files.registrations;
+      ok   = content_load_item_legacy(set, i, n, buf, (size_t)rc);
+      free(buf);
+      buf  = NULL;
+      if (!ok && !refused)
+         refused = name;
+      else
+         free(name);
+      /* Registered again: the record was carried as it stands. */
+      if (seen != save_item_files.registrations)
+         break;
+   }
+   if (!ok && refused)
+      save_item_warn(MSG_SAVE_ITEM_LEGACY_REFUSED, refused, NULL);
+   free(refused);
+   if (!ok && regs == save_item_files.registrations)
+      save_item_check_old_file(set, i);
+   return ok;
+}
+
+/* Fills item @i from its own file, or else from the first earlier name
+ * the core takes; the earlier names are never written again. */
 static bool content_load_item_file(const save_items_set_t *set,
       unsigned i)
 {
    int64_t rc;
-   bool got;
+   unsigned seen;
+   size_t waiting        = 0;
    void *buf             = NULL;
+   bool lent             = false;
    bool ok               = false;
    const save_item_t *it = &set->items[i];
    const char *path      = it->path;
    save_item_file_t *f   = &save_item_files.files[i];
 
-   if (!path_is_valid(path))
-      return false;
-
-   if ((got = save_item_read_file(path, &buf, &rc)) && rc > 0)
+   /* An image still waiting for the file is newer than the file. */
+   if ((buf = save_item_find_waiting(path, &waiting, f, &lent)))
+      rc = (int64_t)waiting;
+   if (buf || path_is_valid(path))
    {
-      size_t len = save_items_size(set, i);
-      if (!(ok = save_items_copy_in(set, i, buf, (size_t)rc)))
+      bool got;
+      save_item_check_forks(it);
+      if ((got = buf || save_item_read_file(path, &buf, &rc)) && rc > 0)
       {
-         /* Kept as it is until it has been copied. */
-         f->guard.copy_first = true;
-         f->guard.keep_file  = true;
-         save_item_warn(MSG_SAVE_ITEM_FILE_REFUSED, path, NULL);
+         size_t len = save_items_size(set, i);
+         seen       = save_item_files.registrations;
+         if (it->item.storage == RETRO_SAVE_STORAGE_FRONTEND_BLOB)
+         {
+            char *name          = strdup(path);
+            char *id            = strdup(it->item.id);
+            /* Kept as it is until it has been copied. */
+            f->guard.copy_first = true;
+            f->guard.keep_file  = true;
+            if ((ok = save_items_copy_in(set, i, buf, (size_t)rc)))
+            {
+               if (name && id)
+                  save_item_blob_taken(id, name, seen, i);
+            }
+            else if (name)
+               save_item_warn(MSG_SAVE_ITEM_FILE_REFUSED, name, NULL);
+            free(name);
+            free(id);
+         }
+         else
+         {
+            ok = save_items_copy_in(set, i, buf, (size_t)rc);
+            save_item_file_keep_tail(set, i, path, buf, (size_t)rc, len);
+         }
+         /* A refused image keeps its write; a registration from
+          * blob_load() carries the record without the take. */
+         if (waiting && ok && seen == save_item_files.registrations)
+            save_item_take_waiting(path, f);
       }
-      else if (it->item.storage == RETRO_SAVE_STORAGE_FRONTEND_BUFFER)
-         save_item_file_keep_tail(set, i, path, buf, (size_t)rc, len);
-   }
-   else if (!got)
-   {
-      /* Unread: kept until it has been copied. */
-      RARCH_ERR("[SRAM] Could not read \"%s\".\n", path);
-      f->guard.copy_first = true;
-      f->guard.keep_file  = true;
+      else
+      {
+         /* Unread: kept until it has been copied. */
+         if (!got)
+         {
+            RARCH_ERR("[SRAM] Could not read \"%s\".\n", path);
+            f->guard.copy_first = true;
+            f->guard.keep_file  = true;
+         }
+         save_item_file_take_up(set, i);
+      }
+      if (!lent)
+         free(buf);
+      return ok;
    }
 
-   free(buf);
-   return ok;
+   return content_load_item_legacy_names(set, i);
 }
 
 /* Fills the bytes a re-registration added to item @i from its tail's
@@ -2016,7 +2591,8 @@ static bool content_load_item_file(const save_items_set_t *set,
 static void save_item_fill_grow(unsigned i)
 {
    save_item_file_t *f = &save_item_files.files[i];
-   save_items_grow_from_tail(i, f->grow_from);
+   if (save_items_grow_from_tail(i, f->grow_from))
+      f->tell = true;
    f->grow_from = 0;
 #ifdef HAVE_THREADS
    if (f->autosave)
@@ -2093,33 +2669,76 @@ static void content_check_items_reported(void)
 static bool content_fill_items(bool is_sram_load_disabled)
 {
    unsigned i;
-   bool ret                    = false;
-   const save_items_set_t *set = save_items_state_get_ptr()->current;
+   unsigned seen;
+   bool ret = false;
+   const save_items_set_t *set;
 
    save_item_files.fill_pending = false;
    content_check_items_reported();
-   for (i = 0; set && i < save_item_files.num_files; i++)
+   /* legacy_load(), blob_load() and loaded() may register again: the
+    * set is read anew for each item, and a record carried across (same
+    * id, same file) is not filled twice. */
+   for (i = 0; (set = save_items_state_get_ptr()->current)
+         && i < save_item_files.num_files; i++)
    {
-      if (save_item_files.files[i].grow_from)
+      save_item_file_t *f = &save_item_files.files[i];
+      if (f->grow_from)
       {
          save_item_fill_grow(i);
          continue;
       }
-      if (     save_item_files.files[i].taken_up
-            || !save_items_frontend_owned(&set->items[i]))
+      if (f->taken_up || !save_items_frontend_owned(&set->items[i]))
          continue;
+      f->tell     = true;
+      f->taken_up = true;
       save_item_check_memory_size(set, i);
-      if (!is_sram_load_disabled && content_load_item_file(set, i))
-      {
-         save_item_files.files[i].taken_up = true;
-         ret                               = true;
-      }
-      else
+      if (is_sram_load_disabled)
          save_item_file_take_up(set, i);
+      else
+      {
+         if (set->items[i].item.storage == RETRO_SAVE_STORAGE_FRONTEND_BLOB)
+            save_item_files.filling = f;
+         if (content_load_item_file(set, i))
+            ret = true;
+         save_item_files.filling = NULL;
+      }
    }
+   /* Each is told, filled or not, before the core runs again. A core
+    * may register again from loaded(), so the set is read anew, and
+    * the pass starts over: an item not told yet may have moved to an
+    * index already passed. */
+   do
+   {
+      seen = save_item_files.registrations;
+      for (i = 0; seen == save_item_files.registrations
+            && i < save_item_files.num_files; i++)
+      {
+         /* A grow a callback registered is told once it is filled. */
+         if (     !save_item_files.files[i].tell
+               || save_item_files.files[i].grow_from)
+            continue;
+         save_item_files.files[i].tell = false;
+         set = save_items_state_get_ptr()->current;
+         if (set && i < set->num_items && set->iface.loaded)
+            set->iface.loaded(i);
+      }
+   } while (seen != save_item_files.registrations);
 #ifdef HAVE_THREADS
    autosave_items_start();
 #endif
+   return ret;
+}
+
+/* What legacy_load() or loaded() registered during a fill is filled
+ * and told once that callback has returned, before the core runs: a
+ * few passes here, the rest at the next frame start. */
+static bool content_fill_items_all(bool is_sram_load_disabled)
+{
+   unsigned n;
+   bool ret = content_fill_items(is_sram_load_disabled);
+   for (n = 0; n < 3 && save_item_files.fill_pending; n++)
+      if (content_fill_items(is_sram_load_disabled))
+         ret = true;
    return ret;
 }
 
@@ -2129,7 +2748,7 @@ static bool content_load_items(bool is_sram_load_disabled)
    if (save_item_files.loaded)
       return false;
    save_item_files.loaded = true;
-   return content_fill_items(is_sram_load_disabled);
+   return content_fill_items_all(is_sram_load_disabled);
 }
 
 /* After a frame in which the core's retro_run() ran. */
@@ -2143,15 +2762,20 @@ void event_save_items_ran(double fps)
 
 void event_save_items_fill(bool is_sram_load_disabled)
 {
-#ifdef HAVE_THREADS
    unsigned i;
    const save_items_set_t *set = save_items_state_get_ptr()->current;
    for (i = 0; set && i < save_item_files.num_files; i++)
+   {
+      save_item_files.files[i].kept_told = false;
+#ifdef HAVE_THREADS
       if (save_item_files.files[i].autosave)
          save_item_file_collect(set, i);
+      else
 #endif
+         save_item_files.files[i].settled = false;
+   }
    if (save_item_files.fill_pending)
-      content_fill_items(is_sram_load_disabled);
+      content_fill_items_all(is_sram_load_disabled);
 #ifdef HAVE_THREADS
    /* Again for an item empty when filled, or changed since its start
     * failed. */
@@ -2254,11 +2878,22 @@ static bool content_save_item_image(const char *path, const void *data,
       bool transform, unsigned type, save_item_guard_t *guard,
       char **recovered)
 {
+#ifdef HAVE_THREADS
+   /* A retired writer's owed copy comes before this newer image. */
+   if (guard && !autosave_retired_copy(path))
+   {
+      save_item_recover(path, data, len, type, &guard->recovered);
+      return false;
+   }
+#endif
    if (guard && guard->copy_first)
    {
       unsigned n;
-      enum save_item_copy copy = save_item_copy_file(path, save_undo_dir,
-            SAVE_ITEM_TMP, &n, false);
+      enum save_item_copy copy = guard->copy_image
+         ? save_item_copy_image(path, save_undo_dir, SAVE_ITEM_TMP,
+               guard->copy_image, guard->copy_size, &n, false)
+         : save_item_copy_file(path, save_undo_dir, SAVE_ITEM_TMP, &n,
+               false);
       if (copy != SAVE_ITEM_COPY_FAILED)
       {
          if (copy == SAVE_ITEM_COPY_MADE)
@@ -2284,6 +2919,18 @@ static bool content_save_item_image(const char *path, const void *data,
          transform, type, recovered);
 }
 
+/* @f's file, or its worker's next write, holds a snapshot taken while
+ * can_snapshot() said true, and owes nothing before a newer image. */
+static bool save_item_file_settled(const save_item_file_t *f)
+{
+#ifdef HAVE_THREADS
+   if (f->autosave)
+      return    f->autosave->settled
+             && !retro_atomic_load_acquire_int(&f->autosave->failed);
+#endif
+   return f->settled && !f->guard.untold && !f->guard.copy_first;
+}
+
 static bool content_save_item_file(const save_items_set_t *set,
       unsigned i, bool compress)
 {
@@ -2291,9 +2938,8 @@ static bool content_save_item_file(const save_items_set_t *set,
    void *data;
    bool ret                  = false;
    bool stuck                = false;
-#ifdef HAVE_THREADS
    bool untold               = false;
-#endif
+   bool ready                = false;
    const save_item_t *it     = &set->items[i];
    save_item_file_t *f       = &save_item_files.files[i];
    save_item_guard_t *guard  = &f->guard;
@@ -2322,6 +2968,18 @@ static bool content_save_item_file(const save_items_set_t *set,
       guard = NULL;
    }
 #endif
+   /* The game is still saving it: the file, or its worker's next
+    * write, holds the last snapshot taken while it said true. */
+   if (     !untold && !stuck
+         && !(ready = save_items_can_snapshot(set, i))
+         && save_item_file_settled(f))
+   {
+      if (!f->kept_told)
+         RARCH_LOG("[SRAM] Kept the last finished save of \"%s\": the "
+               "game was still saving it.\n", it->path);
+      f->kept_told = true;
+      return true;
+   }
    len  = blob ? save_items_blob_size(set, i) : save_items_size(set, i);
    /* A blob over its max_size is never written. */
    data = len && !(blob && it->item.max_size && len > it->item.max_size)
@@ -2383,6 +3041,14 @@ static bool content_save_item_file(const save_items_set_t *set,
             save_item_untold_tell(it->path, &f->guard.untold,
                   &f->guard.recovered);
       }
+#ifdef HAVE_THREADS
+      else
+      {
+         f->autosave->wrote_mark    = retro_atomic_load_acquire_int(
+               &f->autosave->superseded);
+         f->autosave->wrote_settled = ready && ret;
+      }
+#endif
    }
    else
    {
@@ -2390,6 +3056,9 @@ static bool content_save_item_file(const save_items_set_t *set,
       RARCH_ERR("[SRAM] %s \"%s\".\n",
             msg_hash_to_str(MSG_FAILED_TO_SAVE_SRAM), it->path);
    }
+   /* The file holds a settled image only if this one is. */
+   if (guard && ret)
+      f->settled = ready;
    if (ret)
       f->guard.save_fails = 0;
    free(data);
@@ -2406,15 +3075,37 @@ static bool content_save_items(bool compress)
 
    for (i = 0; i < save_item_files.num_orphans; i++)
    {
+      unsigned n;
       save_item_orphan_t *o = &save_item_files.orphans[i];
-      if (!content_save_item_image(o->path, o->data, o->size,
-               o->initial, o->initial_size, compress && o->transform,
-               o->type, &o->guard, &o->guard.recovered))
+      if (o->data)
+      {
+         if (!content_save_item_image(o->path, o->data, o->size,
+                  o->initial, o->initial_size, compress && o->transform,
+                  o->type, &o->guard, &o->guard.recovered))
+            ret = false;
+      }
+      else if (save_item_copy_image(o->path, save_undo_dir, SAVE_ITEM_TMP,
+               o->guard.copy_image, o->guard.copy_size, &n, false)
+            != SAVE_ITEM_COPY_FAILED)
+      {
+         save_item_log_copy(o->path, save_undo_dir, n, 0);
+         if (o->guard.type_changed)
+            save_item_warn_type_changed(o->path, save_undo_dir, n);
+         free(o->guard.copy_image);
+         o->guard.copy_image = NULL;
+      }
+      else
          ret = false;
+      /* Its last write: a type change's copy never made keeps its
+       * image in a second recovery file. */
+      if (o->guard.copy_image)
+         save_item_recover(o->path, o->guard.copy_image,
+               o->guard.copy_size, o->type, NULL);
       free(o->path);
       free(o->data);
       free(o->initial);
       free(o->guard.recovered);
+      free(o->guard.copy_image);
    }
    free(save_item_files.orphans);
    save_item_files.orphans     = NULL;
@@ -2571,17 +3262,22 @@ static bool save_item_same_file(const save_item_t *a,
             == (b->item.flags & RETRO_SAVE_FLAG_FRONTEND_MAY_TRANSFORM);
 }
 
-/* No memory to keep item file @f of @it that left the set: its image
- * goes to a recovery file now. Frees @image. */
+/* No memory to keep item file @f of @it that left the set: its images
+ * go to recovery files now. Frees @image. */
 static void save_item_orphan_lost(const save_item_t *it, void *image,
       size_t len, save_item_file_t *f)
 {
-   save_item_recover(it->path, image, len, it->item.legacy_memory,
-         &f->guard.recovered);
+   if (image)
+      save_item_recover(it->path, image, len, it->item.legacy_memory,
+            &f->guard.recovered);
+   if (f->guard.copy_image)
+      save_item_recover(it->path, f->guard.copy_image,
+            f->guard.copy_size, it->item.legacy_memory, NULL);
    free(image);
 }
 
-/* Takes @image and the record's initial bytes. */
+/* Takes @image, NULL for a copy owed only, and the record's initial
+ * bytes. */
 static void save_item_orphan_add(const save_item_t *it, void *image,
       size_t len, size_t drop, save_item_file_t *f)
 {
@@ -2613,13 +3309,15 @@ static void save_item_orphan_add(const save_item_t *it, void *image,
    o->guard.drop_size = drop;
    f->initial      = NULL;
    f->guard.recovered = NULL;
+   f->guard.copy_image = NULL;
    save_item_files.num_orphans++;
 }
 
 /* Item @i of @old left the set or its file changed. Its last image is
  * written later, by its worker when it has one, even when a new item
- * names that file. Nothing is written for an item not filled yet, or
- * for a file a core-owned item of @set now names.
+ * names that file. Nothing is written for an item not filled yet, a
+ * blob whose own fill runs, or a file a core-owned item of @set now
+ * names.
  * A buffer of @set at the same file that took its tail without its
  * record (save_items_register()) gives that tail back to the image. */
 static void save_item_file_close(const save_items_set_t *old,
@@ -2636,6 +3334,11 @@ static void save_item_file_close(const save_items_set_t *old,
    bool keep                  = f->taken_up
       && save_items_frontend_owned(it);
 
+   if (f == save_item_files.filling)
+   {
+      keep                    = false;
+      save_item_files.filling = NULL;
+   }
    for (k = 0; keep && set && k < set->num_items; k++)
       if (     string_is_equal(set->items[k].path, it->path)
             && !save_items_frontend_owned(&set->items[k]))
@@ -2698,17 +3401,20 @@ static void save_item_file_close(const save_items_set_t *old,
       save_item_files.given_back |= 1 << it->item.legacy_memory;
    if (f->autosave)
    {
-      autosave_retire(f->autosave, image, len, drop);
+      autosave_retire(f->autosave, image, len, drop,
+            it->item.legacy_memory, f->guard.type_changed);
       f->autosave = NULL;
       image       = NULL;
    }
 #endif
-   if (image)
+   if (image || f->guard.copy_image)
       save_item_orphan_add(it, image, len, drop, f);
    free(f->initial);
    f->initial = NULL;
    free(f->guard.recovered);
    f->guard.recovered = NULL;
+   free(f->guard.copy_image);
+   f->guard.copy_image = NULL;
 }
 
 /* Item @j of @old kept its file as item @i of @set. A cut put the cut
@@ -2774,6 +3480,7 @@ void event_save_items_registered(void)
    const save_items_set_t *old = st->previous;
    save_item_file_t *files     = NULL;
 
+   save_item_files.registrations++;
    if (     set
          && set->num_items
          && !(files = (save_item_file_t*)calloc(set->num_items,
@@ -2794,6 +3501,8 @@ void event_save_items_registered(void)
       {
          files[next]              = save_item_files.files[i];
          files[next].start_failed = false;
+         if (save_item_files.filling == &save_item_files.files[i])
+            save_item_files.filling = &files[next];
          save_item_file_reshape(old, i, set, next, &files[next]);
 #ifdef HAVE_THREADS
          if (files[next].autosave)
@@ -2829,6 +3538,31 @@ void event_save_items_registered(void)
          save_item_files.fill_pending = true;
 }
 
+/* After retro_unload_game() and before the set is cleared, so what the
+ * core writes while unloading reaches the files. The workers are
+ * stopped first: closing waits for them, as it does for save RAM. */
+void event_save_items_final(bool is_sram_used, bool compress_files)
+{
+   unsigned i;
+   const save_items_set_t *set = save_items_state_get_ptr()->current;
+#ifdef HAVE_THREADS
+   autosave_items_free();
+#endif
+   if (is_sram_used)
+   {
+      content_save_items(compress_files);
+      /* The last write: a type change's copy never made keeps its
+       * image in a second recovery file. */
+      for (i = 0; set && i < save_item_files.num_files; i++)
+         if (save_item_files.files[i].guard.copy_image)
+            save_item_recover(set->items[i].path,
+                  save_item_files.files[i].guard.copy_image,
+                  save_item_files.files[i].guard.copy_size,
+                  set->items[i].item.legacy_memory, NULL);
+   }
+   event_save_items_deinit();
+}
+
 void event_save_items_deinit(void)
 {
    unsigned i;
@@ -2840,6 +3574,7 @@ void event_save_items_deinit(void)
       free(save_item_files.files[i].initial);
       free(save_item_files.files[i].guard.recovered);
       free(save_item_files.files[i].guard.untold);
+      free(save_item_files.files[i].guard.copy_image);
    }
    free(save_item_files.files);
    for (i = 0; i < save_item_files.num_orphans; i++)
@@ -2848,6 +3583,7 @@ void event_save_items_deinit(void)
       free(save_item_files.orphans[i].data);
       free(save_item_files.orphans[i].initial);
       free(save_item_files.orphans[i].guard.recovered);
+      free(save_item_files.orphans[i].guard.copy_image);
    }
    free(save_item_files.orphans);
    memset(&save_item_files, 0, sizeof(save_item_files));

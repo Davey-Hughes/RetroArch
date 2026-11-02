@@ -40,6 +40,10 @@ on:
       - 'save.c'
       - 'save_items.c'
       - 'save_items.h'
+      - 'runahead.c'
+      - 'libretro-common/include/libretro.h'
+      - 'intl/msg_hash_us.h'
+      - 'samples/runloop/save_ordering/**'
       - 'samples/runloop/save_items/**'
       - 'setting_list.h'
       - 'gfx/video_defines.h'
@@ -69,6 +73,10 @@ on:
       - 'save.c'
       - 'save_items.c'
       - 'save_items.h'
+      - 'runahead.c'
+      - 'libretro-common/include/libretro.h'
+      - 'intl/msg_hash_us.h'
+      - 'samples/runloop/save_ordering/**'
       - 'samples/runloop/save_items/**'
       - 'setting_list.h'
       - 'gfx/video_defines.h'
@@ -192,6 +200,20 @@ jobs:
           samples/runloop/cloudsync_unload/build.sh
           ./samples/runloop/cloudsync_unload/cloudsync_unload_test
           make -C samples/runloop/cloudsync_unload clean
+
+      - name: Build and run save_ordering_test
+        shell: bash
+        run: |
+          set -eu
+          # A core's save items are filled before loaded() and the
+          # first retro_run(), and written after retro_unload_game()
+          # and before retro_deinit(), on a close and on a content
+          # switch.
+          #
+          # Shares the non-Qt build made above.
+          samples/runloop/save_ordering/build.sh
+          ./samples/runloop/save_ordering/save_ordering_test "$RUNNER_TEMP/save_ordering"
+          make -C samples/runloop/save_ordering clean
 
       - name: Build and run the save_items harness
         shell: bash

@@ -5581,7 +5581,14 @@ static bool core_unload_game(void)
       runloop_st->current_core.flags      &= ~RETRO_CORE_FLAG_GAME_LOADED;
    }
 
-   event_save_items_deinit();
+   event_save_items_final(
+         (runloop_st->flags & RUNLOOP_FLAG_USE_SRAM) != 0,
+#if defined(HAVE_COMPRESSION)
+         config_get_ptr()->bools.save_file_compression
+#else
+         false
+#endif
+         );
    save_items_clear();
 
    /* A staged switch keeps the device running until its driver stage

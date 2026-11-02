@@ -157,6 +157,30 @@ static struct retro_save_segment segs[2];
 static unsigned char blob_state[16];
 static size_t blob_len;
 static bool blob_refuse;
+static unsigned loaded_calls;
+static unsigned loaded_in_set;
+static bool loaded_saw_file;
+/* legacy_load(): offered, calls, what it was given, which names it
+ * refuses, and a registration from inside it or loaded(). */
+static bool use_legacy_load;
+static unsigned legacy_calls;
+static unsigned legacy_last_index;
+static size_t legacy_last_len;
+static unsigned legacy_refuse_below;
+static bool legacy_reregister;
+static bool loaded_reregister;
+static bool blob_reregister;
+static const struct retro_save_item *rereg_items;
+static unsigned rereg_n;
+/* The core registers rereg_items again from inside this callback, once. */
+#define REREG_SIZE       1
+#define REREG_SAVE       2
+#define REREG_GENERATION 3
+#define REREG_SNAPSHOT   4
+static unsigned rereg_inside;
+static unsigned rereg_refusals;
+/* The file path_get_mtime() calls newer. */
+static const char *newer_path;
 static bool blob_fail_save;
 /* blob_save() fills only this many bytes when nonzero. */
 static size_t blob_short;
@@ -172,18 +196,11 @@ static bool snapshot_ready;
 static unsigned snapshot_calls;
 /* Log lines that say the game was still saving. */
 static unsigned saving_logs;
-static const struct retro_save_item *rereg_items;
-static unsigned rereg_n;
-/* The core registers rereg_items again from inside this callback, once. */
-#define REREG_SIZE       1
-#define REREG_SAVE       2
-#define REREG_GENERATION 3
-#define REREG_SNAPSHOT   4
-static unsigned rereg_inside;
-static unsigned rereg_refusals;
 
-/* The last log line that names a file in /undo/. */
+/* The last log line that names a file in /undo/, and how many told a
+ * copy kept. */
 static char copy_log[256];
+static unsigned copy_logs;
 
 void RARCH_LOG(const char *fmt, ...)
 {
@@ -198,6 +215,8 @@ void RARCH_LOG(const char *fmt, ...)
    {
       slock_lock(disk_lock);
       strlcpy(copy_log, s, sizeof(copy_log));
+      if (strstr(s, "Kept a copy"))
+         copy_logs++;
       slock_unlock(disk_lock);
    }
 }
@@ -598,6 +617,8 @@ int intfstream_close(intfstream_t *file)
    return 0;
 }
 
+static void register_items(const struct retro_save_item *items,
+      unsigned n);
 static bool set_items(const struct retro_save_item *items, unsigned n);
 
 static void reregister_inside(unsigned which)
@@ -638,6 +659,11 @@ static bool RETRO_CALLCONV blob_load(unsigned item, const void *buf,
    (void)item;
    if (in_set)
       core_calls_in_set++;
+   if (blob_reregister)
+   {
+      blob_reregister = false;
+      register_items(rereg_items, rereg_n);
+   }
    if (blob_refuse || len > sizeof(blob_state))
       return false;
    memcpy(blob_state, buf, len);
@@ -660,6 +686,50 @@ static bool RETRO_CALLCONV item_can_snapshot(unsigned item)
    snapshot_calls++;
    reregister_inside(REREG_SNAPSHOT);
    return snapshot_ready;
+}
+
+/* What the core sees when told its buffer is filled. */
+static void RETRO_CALLCONV item_loaded(unsigned item)
+{
+   (void)item;
+   loaded_calls++;
+   if (in_set)
+      loaded_in_set++;
+   loaded_saw_file = wram[0] == 0x5a && iram[3] == 0xa5;
+   if (loaded_reregister)
+   {
+      loaded_reregister = false;
+      register_items(rereg_items, rereg_n);
+   }
+}
+
+/* Converts by filling wram with 0x33. */
+static bool RETRO_CALLCONV item_legacy_load(unsigned item, unsigned index,
+      const char *format, const void *buf, size_t len)
+{
+   (void)item;
+   (void)format;
+   (void)buf;
+   legacy_calls++;
+   legacy_last_index = index;
+   legacy_last_len   = len;
+   if (index < legacy_refuse_below)
+      return false;
+   memset(wram, 0x33, sizeof(wram));
+   if (legacy_reregister)
+   {
+      legacy_reregister = false;
+      register_items(rereg_items, rereg_n);
+   }
+   return true;
+}
+
+bool path_get_mtime(const char *path, int64_t *mtime)
+{
+   if (!disk_has(path))
+      return false;
+   *mtime = (newer_path && !strcmp(path, newer_path)) ? 2 : 1;
+   return true;
 }
 
 static struct retro_save_item buffer_item(const char *id, const char *path)
@@ -702,6 +772,7 @@ static struct retro_save_item blob_item(const char *id, const char *path)
 static bool set_items(const struct retro_save_item *items, unsigned n)
 {
    struct retro_save_interface iface;
+   struct retro_save_frontend_interface fi;
    struct save_items_paths paths;
    if (!save_items_can_register())
       return false;
@@ -717,6 +788,13 @@ static bool set_items(const struct retro_save_item *items, unsigned n)
    iface.blob_load         = blob_load;
    iface.get_generation    = use_generation ? item_generation : NULL;
    iface.can_snapshot      = use_can_snapshot ? item_can_snapshot : NULL;
+   iface.loaded            = item_loaded;
+   iface.legacy_load       = use_legacy_load ? item_legacy_load : NULL;
+   memset(&fi, 0, sizeof(fi));
+   fi.interface_version    = 1;
+   fi.features             = RETRO_SAVE_FEATURE_LEGACY_LOAD;
+   assert(save_items_get_frontend_interface(&fi,
+            RETRO_SAVE_INSTANCE_PRIMARY));
    in_set                  = true;
    assert(save_items_register(&iface, &paths));
    event_save_items_registered();
@@ -801,18 +879,28 @@ static void start(void)
    blob_short     = 0;
    blob_sizes     = 0;
    blob_saves     = 0;
-   generation     = 0;
-   use_generation = false;
-   use_can_snapshot = false;
-   snapshot_ready   = true;
-   snapshot_calls   = 0;
-   saving_logs      = 0;
+   generation          = 0;
+   use_generation      = false;
+   use_can_snapshot    = false;
+   snapshot_ready      = true;
+   snapshot_calls      = 0;
+   saving_logs         = 0;
+   loaded_calls        = 0;
+   loaded_in_set       = 0;
+   loaded_saw_file     = false;
+   use_legacy_load     = false;
+   legacy_calls        = 0;
+   legacy_refuse_below = 0;
+   legacy_reregister   = false;
+   loaded_reregister   = false;
+   blob_reregister     = false;
+   rereg_inside        = 0;
+   rereg_refusals      = 0;
+   newer_path          = NULL;
    app_dir        = NULL;
    osd_count      = 0;
    osd_last[0]    = '\0';
    core_calls_in_set = 0;
-   rereg_inside      = 0;
-   rereg_refusals    = 0;
    event_save_items_set_undo_dir("/undo");
 }
 
@@ -869,6 +957,7 @@ static void test_given_back_saved(void)
    assert(osd_count == 0 && err_count == 0);
 }
 
+#ifdef HAVE_THREADS
 /* Joins the retired handles' threads: they have written their last. */
 static void retired_join(void)
 {
@@ -1082,6 +1171,28 @@ static void test_blob(void)
    assert(err_count == 3);
 }
 
+/* blob_load() registers again and refuses: the refusal still names
+ * the file. */
+static void test_blob_reregister_refused(void)
+{
+   struct retro_save_item items[1];
+   start();
+   memset(&items[0], 0, sizeof(items[0]));
+   items[0].id            = "flash";
+   items[0].path          = "/s/game.flash";
+   items[0].storage       = RETRO_SAVE_STORAGE_FRONTEND_BLOB;
+   items[0].root          = RETRO_SAVE_ROOT_ABSOLUTE;
+   items[0].legacy_memory = RETRO_SAVE_NO_LEGACY_MEMORY;
+   disk_put("/s/game.flash", "other", 5);
+   blob_refuse     = true;
+   blob_reregister = true;
+   rereg_items     = items;
+   rereg_n         = 1;
+   register_items(items, 1);
+   assert(!event_load_save_files(false));
+   assert(osd_count == 1 && !strcmp(osd_last, "/s/game.flash|"));
+}
+
 static void test_legacy_retired(void)
 {
    static const unsigned char on_disk[12] = {1, 2, 3, 4, 5, 6, 7, 8,
@@ -1119,8 +1230,8 @@ static void test_legacy_retired(void)
 
 /* Save RAM the core reports only after it registered: an item at the
  * .srm, or a folder holding it, is left out at the first fill, before
- * it is read or written, and the frontend's own .srm handling keeps
- * the file. */
+ * it is read, told or written, and the frontend's own .srm handling
+ * keeps the file. */
 static void test_reported_at_fill(void)
 {
    static const unsigned char on_disk[4] = { 7, 7, 7, 7 };
@@ -1171,6 +1282,7 @@ static void test_reported_at_fill(void)
       {
          register_items(&items[1], 1);
          assert(event_load_save_files(false));
+         assert(loaded_calls == 1);
       }
       register_items(items, i == 2 ? 2 : 1);
       assert(st->num_issues == 0 && st->current->items[0].path);
@@ -1192,6 +1304,7 @@ static void test_reported_at_fill(void)
       assert(save_items_get_frontend_interface(&fi,
                RETRO_SAVE_INSTANCE_PRIMARY));
       assert(!fi.get_path(0, NULL, 0) && !st->current->items[0].path);
+      assert(loaded_calls == (i == 2 ? 1u : 0u));
       /* Killed here: the .srm as it was, alone, and loaded into save
        * RAM. */
       assert(disk_count_named("") == 1);
@@ -1217,7 +1330,54 @@ static void test_reported_at_fill(void)
    no_ram       = false;
    event_save_items_fill(false);
    assert(st->num_issues == 0 && err_count == 0 && notices == 0);
-   assert(st->current->items[0].path);
+   assert(st->current->items[0].path && loaded_calls == 1);
+}
+
+/* An item a later call leaves out, valid at its file again while the
+ * last image of the item that left still waits: the fill takes that
+ * image, and only that image is written, once. */
+static void test_left_out_back(void)
+{
+   const save_items_state_t *st = save_items_state_get_ptr();
+   struct retro_save_item items[1];
+   unsigned char older[12];
+   unsigned char newest[12];
+   start();
+   app_dir        = "/app";
+   items[0]       = buffer_item("srm", "/s/game.srm");
+   items[0].label = "Battery";
+   register_items(items, 1);
+   event_load_save_files(false);
+   wram[0] = 1;
+   event_save_files(true, false, NULL);
+   memcpy(older, image(), sizeof(older));
+   assert(disk_holds("/s/game.srm", older, sizeof(older)));
+   wram[0] = 2;
+   memcpy(newest, image(), sizeof(newest));
+   items[0].path = NULL;
+   register_items(items, 1);
+   assert(st->num_issues == 1);
+   assert(st->issues[0].verdict == RETRO_SAVE_VERDICT_LEFT_OUT);
+   assert(save_item_files.num_orphans == 1);
+   wram[0]       = 3;
+   items[0].path = "/s/game.srm";
+   register_items(items, 1);
+   assert(st->num_issues == 0);
+   event_save_items_fill(false);
+   assert(!memcmp(image(), newest, sizeof(newest)));
+   /* Killed here: the file as last written, alone. */
+   assert(disk_count_named("") == 1);
+   assert(disk_holds("/s/game.srm", older, sizeof(older)));
+   ASSERT_FILES(0, 0, 0);
+   event_save_files(true, false, NULL);
+   assert(save_item_files.num_orphans == 0);
+   assert(disk_count_named("") == 1);
+   assert(disk_holds("/s/game.srm", newest, sizeof(newest)));
+   ASSERT_FILES(0, 0, 0);
+   assert(err_count == 1);
+   event_save_files(true, false, NULL);
+   assert(disk_holds("/s/game.srm", newest, sizeof(newest)));
+   ASSERT_FILES(0, 0, 0);
 }
 
 static void test_autosave_item(void)
@@ -1310,6 +1470,88 @@ static void test_memory_size(void)
    register_items(items, 1);
    event_load_save_files(false);
    assert(!warned("that memory is"));
+}
+
+/* An item replacing save RAM at a new name starts empty; the old
+ * .srm it does not list is named in the log. Listed, it is loaded. */
+static void test_old_file_unlisted(void)
+{
+   static const char *const old[] = { "/s/game.srm", NULL };
+   static const unsigned char on_disk[12] = {9, 8, 7, 6, 5, 4, 3, 2, 1,
+      0, 1, 2};
+   struct retro_save_item items[1];
+   start();
+   path_init_savefile_rtc("/s/game.srm");
+   disk_put("/s/game.srm", on_disk, sizeof(on_disk));
+   items[0]               = buffer_item("srm", "/s/game.sav");
+   items[0].legacy_memory = RETRO_MEMORY_SAVE_RAM;
+   register_items(items, 1);
+   event_load_save_files(false);
+   assert(wram[0] == 0);
+   assert(warned("\"srm\": legacy_paths = NULL: \"/s/game.srm\", where "
+         "the frontend saved this memory before, is not among them. See "
+         "libretro.h, SET_SAVE_INTERFACE, \"Cross-core compatibility\". It "
+         "was not loaded.") == 1);
+
+   start();
+   path_init_savefile_rtc("/s/game.srm");
+   disk_put("/s/game.srm", on_disk, sizeof(on_disk));
+   items[0].legacy_paths  = old;
+   register_items(items, 1);
+   assert(event_load_save_files(false));
+   assert(!memcmp(image(), on_disk, 12));
+   assert(!warned("was not loaded"));
+}
+
+/* At a save of the files and the close: a blob over its
+ * max_size names the sizes, a false blob_save() says so, once each; a
+ * short blob_save() leaves zeros, not heap. */
+static void test_blob_unsaved_logged(void)
+{
+   struct retro_save_item items[1];
+   memset(&items[0], 0, sizeof(items[0]));
+   items[0].id            = "flash";
+   items[0].path          = "/s/u.flash";
+   items[0].storage       = RETRO_SAVE_STORAGE_FRONTEND_BLOB;
+   items[0].root          = RETRO_SAVE_ROOT_ABSOLUTE;
+   items[0].legacy_memory = RETRO_SAVE_NO_LEGACY_MEMORY;
+
+   start();
+   app_dir           = "/app";
+   items[0].max_size = 4;
+   memcpy(blob_state, "toolong", 7);
+   blob_len = 7;
+   register_items(items, 1);
+   event_load_save_files(false);
+   assert(!event_save_files(true, false, NULL));
+   assert(!event_save_files(true, false, NULL));
+   event_save_items_final(true, false);
+   assert(warned("\"flash\": blob_size = 7: over its max_size 4. See "
+         "libretro.h, retro_save_item::max_size. \"/s/u.flash\" is not "
+         "saved.") == 1);
+
+   start();
+   items[0].max_size = 0;
+   memcpy(blob_state, "abcdef", 6);
+   blob_len       = 6;
+   register_items(items, 1);
+   event_load_save_files(false);
+   blob_fail_save = true;
+   assert(!event_save_files(true, false, NULL));
+   event_save_items_final(true, false);
+   assert(warned("\"flash\": blob_save = false for 6 bytes. See "
+         "libretro.h, retro_save_blob_save_t. \"/s/u.flash\" is not "
+         "saved.") == 1);
+
+   start();
+   memcpy(blob_state, "abcdef", 6);
+   blob_len   = 6;
+   blob_short = 2;
+   register_items(items, 1);
+   event_load_save_files(false);
+   assert(event_save_files(true, false, NULL));
+   assert(disk_holds("/s/u.flash", "ab\0\0\0\0", 6));
+   assert(!warned("is not saved"));
 }
 
 static void test_generation(void)
@@ -1676,6 +1918,7 @@ static void test_retire_without_join(void)
    unsigned i;
 
    start();
+   app_dir = "/app";
    items[0] = buffer_item("srm", "/s/retire.srm");
    register_items(items, 1);
    event_load_save_files(false);
@@ -1711,6 +1954,10 @@ static void test_retire_without_join(void)
    scond_broadcast(disk_cond);
    slock_unlock(disk_lock);
    sthread_join(dog);
+   sthread_join(h->thread);
+   h->thread = NULL;
+   ASSERT_FILES(0, 0, 0);
+   assert(err_count == 0);
 
    /* A later frame frees it, once it has written the last image. */
    for (i = 0; autosave_state.num_retired && i < 5000; i++)
@@ -1720,6 +1967,8 @@ static void test_retire_without_join(void)
    }
    assert(autosave_state.num_retired == 0);
    assert(disk_holds("/s/retire.srm", last, sizeof(last)));
+   ASSERT_FILES(0, 0, 0);
+   assert(err_count == 0);
    autosave_deinit();
 }
 
@@ -2181,10 +2430,7 @@ static void test_flag_change_tail(void)
       register_items(items, 1);
       assert(save_item_files.num_orphans == 1);
       if (pass == 1)
-      {
          event_save_items_fill(false);
-         memcpy(want, file, sizeof(want));
-      }
       assert(event_save_files(true, false, NULL));
       assert(disk_holds("/s/game.srm", want, 16));
       event_save_items_fill(false);
@@ -2195,7 +2441,8 @@ static void test_flag_change_tail(void)
 }
 
 /* As above with a worker: its last image keeps the end, renamed
- * before the successor's fill reads the file (pass 0) or after. */
+ * before the successor's fill reads the file (pass 0), or taken by
+ * that fill while the worker still writes it (pass 1). */
 static void test_flag_change_tail_worker(void)
 {
    unsigned char file[16];
@@ -2223,7 +2470,7 @@ static void test_flag_change_tail_worker(void)
       {
          wait_held(1);
          event_save_items_fill(false);
-         assert(!memcmp(image(), file, 12));
+         assert(!memcmp(image(), want, 12));
          set_hold(&hold_temp, false);
       }
       for (i = 0; autosave_state.num_retired && i < 5000; i++)
@@ -2400,8 +2647,10 @@ static void test_exact_size_cut_after_copy(void)
 {
    unsigned char file[16];
    unsigned char want[16];
-   struct retro_save_item items[1];
+   struct retro_save_item items[2];
    autosave_t *h;
+   unsigned i;
+   unsigned logs;
 
    start();
    app_dir = "/app";
@@ -2473,6 +2722,55 @@ static void test_exact_size_cut_after_copy(void)
    assert(disk_holds("/undo/game.srm", file, 12));
    assert(disk_holds("/s/game.srm", file, 8));
    ASSERT_FILES(1, 0, 0);
+
+   /* A worker retired before its first write copies and cuts at its
+    * last one, and the reap tells the copy. */
+   start();
+   disk_put("/s/game.srm", file, sizeof(file));
+   items[0].num_segments = 2;
+   register_items(items, 1);
+   event_load_save_files(false);
+   start_autosave(false);
+   logs     = copy_logs;
+   items[1] = buffer_item("c", "/s/u.srm");
+   register_items(items + 1, 1);
+   for (i = 0; autosave_state.num_retired && i < 5000; i++)
+   {
+      autosave_check();
+      retro_sleep(1);
+   }
+   assert(!autosave_state.num_retired);
+   assert(disk_holds("/undo/game.srm", file, 16));
+   assert(disk_holds("/s/game.srm", file, 12));
+   assert(copy_logs == logs + 1);
+   assert(strstr(copy_log, "\"/s/game.srm\" in \"/undo/game.srm\"; "
+         "dropping its last 4 bytes"));
+   autosave_deinit();
+
+   /* A live write's copy not collected before the worker retires is
+    * told with what that write dropped, not what its last one drops. */
+   start();
+   disk_put("/s/game.srm", file, sizeof(file));
+   register_items(items, 1);
+   event_load_save_files(false);
+   h       = start_autosave(false);
+   wram[1] = 0x66;
+   capture(h);
+   assert(disk_holds("/undo/game.srm", file, 16));
+   logs           = copy_logs;
+   items[0].flags = 0;
+   register_items(items, 1);
+   assert(save_item_files.files[0].autosave == h);
+   register_items(items + 1, 1);
+   for (i = 0; autosave_state.num_retired && i < 5000; i++)
+   {
+      autosave_check();
+      retro_sleep(1);
+   }
+   assert(!autosave_state.num_retired);
+   assert(copy_logs == logs + 1);
+   assert(strstr(copy_log, "dropping its last 4 bytes"));
+   autosave_deinit();
 }
 
 /* Every read goes through rzip, which reads raw files too. */
@@ -3434,51 +3732,73 @@ static unsigned undo_ends(const unsigned char *end, size_t len,
 
 /* An item closed while its worker owes the copy of its kept file: the
  * recovery file no one was told of keeps the newest image until the
- * worker's last write has landed it. */
+ * worker's last write has landed it. Pass 1: that write fails, and the
+ * image is recovered once. Pass 2: the content closes. */
 static void test_close_worker_copying(void)
 {
    unsigned char file[12];
    unsigned char newest[12];
    struct retro_save_item items[1];
+   unsigned pass;
 
    fill_bytes(file, sizeof(file), 0x30);
-   start();
-   app_dir = "/app";
-   disk_put("/s/game.srm", file, sizeof(file));
-   items[0] = card_item("a", "/s/game.srm");
-   register_items(items, 1);
-   event_load_save_files(false);
-   items[0] = buffer_item("b", "/s/game.srm");
-   register_items(items, 1);
-   event_save_items_fill(false);
-   assert(save_item_files.files[0].guard.keep_file);
-   start_autosave(false);
-   /* Held in its copy. */
-   set_hold(&hold_temp, true);
-   wram[0] ^= 0xff;
-   autosave_lock();
-   autosave_unlock();
-   wait_held(1);
-   wram[0] ^= 0x0f;
-   memcpy(newest, image(), sizeof(newest));
-   assert(event_save_files(true, false, NULL));
-   register_items(NULL, 0);
-   /* Killed here: the copy's temp too. */
-   assert(disk_holds("/s/game.srm", file, sizeof(file)));
-   assert(disk_named_holds("RetroArch-recovery-", newest, 12) == 1);
-   ASSERT_FILES(1, 1, 0);
-   assert(err_count == 0);
-   set_hold(&hold_temp, false);
-   retired_join();
-   /* Killed here. */
-   assert(disk_holds("/s/game.srm", newest, 12));
-   assert(disk_holds("/undo/game.srm", file, sizeof(file)));
-   ASSERT_FILES(1, 1, 0);
-   autosave_reap();
-   assert(!autosave_state.num_retired);
-   ASSERT_FILES(1, 0, 0);
-   assert(err_count == 0);
-   autosave_deinit();
+   for (pass = 0; pass < 3; pass++)
+   {
+      start();
+      app_dir = "/app";
+      disk_put("/s/game.srm", file, sizeof(file));
+      items[0] = card_item("a", "/s/game.srm");
+      register_items(items, 1);
+      event_load_save_files(false);
+      items[0] = buffer_item("b", "/s/game.srm");
+      register_items(items, 1);
+      event_save_items_fill(false);
+      assert(save_item_files.files[0].guard.keep_file);
+      start_autosave(false);
+      /* Held in its copy. */
+      set_hold(&hold_temp, true);
+      wram[0] ^= 0xff;
+      autosave_lock();
+      autosave_unlock();
+      wait_held(1);
+      wram[0] ^= 0x0f;
+      memcpy(newest, image(), sizeof(newest));
+      assert(event_save_files(true, false, NULL));
+      register_items(NULL, 0);
+      /* Killed here: the copy's temp too. */
+      assert(disk_holds("/s/game.srm", file, sizeof(file)));
+      assert(disk_named_holds("RetroArch-recovery-", newest, 12) == 1);
+      ASSERT_FILES(1, 1, 0);
+      assert(err_count == 0);
+      if (pass == 1)
+         set_fail_save_writes(true);
+      set_hold(&hold_temp, false);
+      if (pass == 2)
+      {
+         event_save_items_final(true, false);
+         assert(disk_holds("/s/game.srm", newest, 12));
+         assert(disk_holds("/undo/game.srm", file, sizeof(file)));
+         ASSERT_FILES(1, 0, 1);
+         assert(err_count == 0);
+         autosave_deinit();
+         continue;
+      }
+      retired_join();
+      set_fail_save_writes(false);
+      /* Killed here. */
+      assert(disk_holds("/undo/game.srm", file, sizeof(file)));
+      assert(disk_holds("/s/game.srm", pass ? file : newest, 12));
+      assert(disk_named_holds("RetroArch-recovery-", newest, 12) == 1);
+      ASSERT_FILES(1, 1, 0);
+      assert(err_count == 0);
+      autosave_reap();
+      assert(!autosave_state.num_retired);
+      assert(disk_holds("/s/game.srm", pass ? file : newest, 12));
+      assert(disk_named_holds("RetroArch-recovery-", newest, 12) == pass);
+      ASSERT_FILES(1, pass, 1 + pass);
+      assert(err_count == 0);
+      autosave_deinit();
+   }
 }
 
 /* Two items of one name in two folders: each file gets its own copy,
@@ -3815,6 +4135,7 @@ static void retire_held(struct retro_save_item *items,
       unsigned char *last)
 {
    start();
+   app_dir = "/app";
    items[0] = buffer_item("srm", "/s/game.srm");
    register_items(items, 1);
    event_load_save_files(false);
@@ -3829,7 +4150,8 @@ static void retire_held(struct retro_save_item *items,
 }
 
 /* One worker per file: the new item's starts once the retired one has
- * exited. */
+ * exited. Its fill took the retired image, which that worker still
+ * writes. */
 static void test_retired_then_new_item(void)
 {
    unsigned char last[12];
@@ -3845,6 +4167,9 @@ static void test_retired_then_new_item(void)
       assert(!save_item_files.files[0].autosave);
    }
    set_hold(&hold_temp, false);
+   retired_join();
+   ASSERT_FILES(0, 0, 0);
+   assert(err_count == 0);
    for (i = 0; !save_item_files.files[0].autosave && i < 5000; i++)
    {
       autosave_check();
@@ -3853,12 +4178,15 @@ static void test_retired_then_new_item(void)
    }
    assert((h = save_item_files.files[0].autosave));
    assert(disk_holds("/s/game.srm", last, 12));
+   assert(!memcmp(image(), last, 12));
    h->interval = 0;
    wait_requested(h);
    wram[1] = 5;
    capture(h);
    assert(disk_holds("/s/game.srm", image(), 12));
    assert(failed_renames == 0 && !disk_named(".tmp"));
+   ASSERT_FILES(0, 0, 0);
+   assert(err_count == 0);
    autosave_deinit();
 }
 
@@ -3874,6 +4202,9 @@ static void test_save_files_during_retired_write(void)
    wram[0] = 2;
    assert(event_save_files(true, false, NULL));
    set_hold(&hold_temp, false);
+   retired_join();
+   ASSERT_FILES(0, 0, 0);
+   assert(err_count == 0);
    for (i = 0; autosave_state.num_retired && i < 5000; i++)
    {
       autosave_check();
@@ -3882,6 +4213,8 @@ static void test_save_files_during_retired_write(void)
    assert(autosave_state.num_retired == 0);
    assert(disk_holds("/s/game.srm", image(), 12));
    assert(failed_renames == 0 && !disk_named(".tmp"));
+   ASSERT_FILES(0, 0, 0);
+   assert(err_count == 0);
    autosave_deinit();
 }
 
@@ -4116,6 +4449,61 @@ static void test_given_back_reinit(void)
    }
 }
 
+/* As test_left_out_back(), the newest image held by the left-out
+ * item's retired worker rather than an orphan. */
+static void test_left_out_back_retired(void)
+{
+   const save_items_state_t *st = save_items_state_get_ptr();
+   struct retro_save_item items[1];
+   unsigned char older[12];
+   unsigned char newest[12];
+   autosave_t *h;
+   start();
+   app_dir        = "/app";
+   items[0]       = buffer_item("srm", "/s/game.srm");
+   items[0].label = "Battery";
+   register_items(items, 1);
+   event_load_save_files(false);
+   h       = start_autosave(false);
+   wram[0] = 1;
+   memcpy(older, image(), sizeof(older));
+   capture(h);
+   assert(disk_holds("/s/game.srm", older, sizeof(older)));
+   set_hold(&hold_temp, true);
+   wram[0] = 2;
+   memcpy(newest, image(), sizeof(newest));
+   items[0].path = NULL;
+   register_items(items, 1);
+   assert(st->num_issues == 1);
+   assert(st->issues[0].verdict == RETRO_SAVE_VERDICT_LEFT_OUT);
+   assert(save_item_files.num_orphans == 0);
+   assert(autosave_state.num_retired == 1);
+   wait_held(1);
+   wram[0]       = 3;
+   items[0].path = "/s/game.srm";
+   register_items(items, 1);
+   assert(st->num_issues == 0);
+   event_save_items_fill(false);
+   assert(!memcmp(image(), newest, sizeof(newest)));
+   /* Killed here: the file as last written, the newest in the temp. */
+   assert(disk_count_named("") == 2 && disk_count_named(".tmp") == 1);
+   assert(disk_holds("/s/game.srm", older, sizeof(older)));
+   ASSERT_FILES(0, 0, 0);
+   set_hold(&hold_temp, false);
+   retired_join();
+   autosave_check();
+   assert(autosave_state.num_retired == 0);
+   assert(disk_count_named("") == 1);
+   assert(disk_holds("/s/game.srm", newest, sizeof(newest)));
+   ASSERT_FILES(0, 0, 0);
+   assert(err_count == 1);
+   event_save_files(true, false, NULL);
+   assert(disk_count_named("") == 1);
+   assert(disk_holds("/s/game.srm", newest, sizeof(newest)));
+   ASSERT_FILES(0, 0, 0);
+   autosave_deinit();
+}
+
 /* Where case is ignored, SAVE_FILES at one spelling of a file drops a
  * retired worker's older image waiting at another. */
 static void test_retired_other_spelling(void)
@@ -4151,6 +4539,173 @@ static void test_retired_other_spelling(void)
    autosave_deinit();
 }
 
+/* An old-layout file goes whole to legacy_load(): no tail, the old
+ * file stays, the first write creates the new one, and the
+ * conversion is logged. A refusal moves to the next name; with every
+ * name refused the item is as the core left it, still told, and the
+ * warning names the first. */
+static void test_legacy_load(void)
+{
+   static const char *const legacy[] = {"/s/a.sav", "/s/b.sav", NULL};
+   unsigned char old[16];
+   struct retro_save_item items[1];
+
+   start();
+   fill_bytes(old, sizeof(old), 0x70);
+   disk_put("/s/b.sav", old, sizeof(old));
+   use_legacy_load       = true;
+   items[0]              = buffer_item("srm", "/s/game.srm");
+   items[0].legacy_paths = legacy;
+   register_items(items, 1);
+   assert(event_load_save_files(false));
+   assert(legacy_calls == 1 && legacy_last_index == 1);
+   assert(legacy_last_len == 16 && wram[0] == 0x33 && loaded_calls == 1);
+   assert(!save_items_state_get_ptr()->current->items[0].tail_size);
+   assert(save_item_files.files[0].initial);
+   assert(event_save_files(true, false, NULL));
+   assert(disk_holds("/s/game.srm", image(), 12));
+   assert(disk_holds("/s/b.sav", old, 16));
+
+   start();
+   disk_put("/s/a.sav", old, 12);
+   disk_put("/s/b.sav", old, 16);
+   use_legacy_load     = true;
+   legacy_refuse_below = 1;
+   register_items(items, 1);
+   assert(event_load_save_files(false));
+   assert(legacy_calls == 2 && legacy_last_index == 1 && osd_count == 0);
+
+   start();
+   disk_put("/s/a.sav", old, 12);
+   disk_put("/s/b.sav", old, 16);
+   use_legacy_load     = true;
+   legacy_refuse_below = 2;
+   register_items(items, 1);
+   assert(!event_load_save_files(false));
+   assert(legacy_calls == 2 && wram[0] == 0 && loaded_calls == 1);
+   assert(osd_count == 1 && strstr(osd_last, "/s/a.sav"));
+   assert(event_save_files(true, false, NULL) && !disk_has("/s/game.srm"));
+   assert(disk_holds("/s/a.sav", old, 12));
+}
+
+/* Without legacy_load() a buffer reads an earlier name raw, its tail
+ * following it to the new name, a size that differs shown;
+ * a blob gets it through blob_load(). */
+static void test_legacy_raw(void)
+{
+   static const char *const legacy[] = {"/s/a.sav", NULL};
+   unsigned char old[16];
+   struct retro_save_item items[1];
+
+   start();
+   fill_bytes(old, sizeof(old), 0x10);
+   disk_put("/s/a.sav", old, sizeof(old));
+   items[0]              = buffer_item("srm", "/s/game.srm");
+   items[0].legacy_paths = legacy;
+   register_items(items, 1);
+   assert(event_load_save_files(false) && !memcmp(image(), old, 12));
+   assert(osd_count == 1 && strstr(osd_last, "/s/a.sav"));
+   assert(event_save_files(true, false, NULL));
+   assert(disk_holds("/s/game.srm", old, 16));
+
+   start();
+   disk_put("/s/a.sav", old, 12);
+   register_items(items, 1);
+   assert(event_load_save_files(false) && osd_count == 0);
+
+   start();
+   disk_put("/s/a.sav", old, 4);
+   items[0].storage      = RETRO_SAVE_STORAGE_FRONTEND_BLOB;
+   items[0].segments     = NULL;
+   items[0].num_segments = 0;
+   register_items(items, 1);
+   assert(event_load_save_files(false) && blob_len == 4);
+   assert(!memcmp(blob_state, old, 4));
+}
+
+/* An earlier name newer than the own file is shown once. */
+static void test_legacy_newer(void)
+{
+   static const char *const legacy[] = {"/s/a.sav", NULL};
+   unsigned char file[12];
+   struct retro_save_item items[1];
+
+   start();
+   fill_bytes(file, sizeof(file), 1);
+   disk_put("/s/game.srm", file, sizeof(file));
+   disk_put("/s/a.sav", file, sizeof(file));
+   items[0]              = buffer_item("srm", "/s/game.srm");
+   items[0].legacy_paths = legacy;
+   register_items(items, 1);
+   assert(event_load_save_files(false) && osd_count == 0);
+
+   start();
+   disk_put("/s/game.srm", file, sizeof(file));
+   disk_put("/s/a.sav", file, sizeof(file));
+   newer_path = "/s/a.sav";
+   register_items(items, 1);
+   assert(event_load_save_files(false) && !memcmp(image(), file, 12));
+   assert(osd_count == 1 && strstr(osd_last, "/s/a.sav"));
+}
+
+/* The core registers again from inside legacy_load() and loaded(): no
+ * item is filled or told twice. */
+static void test_legacy_reregister(void)
+{
+   static const char *const legacy[] = {"/s/a.sav", NULL};
+   unsigned char old[12];
+   struct retro_save_item items[1];
+
+   start();
+   app_dir = "/app";
+   fill_bytes(old, sizeof(old), 0x50);
+   disk_put("/s/a.sav", old, sizeof(old));
+   use_legacy_load       = true;
+   legacy_reregister     = true;
+   items[0]              = buffer_item("srm", "/s/game.srm");
+   items[0].legacy_paths = legacy;
+   rereg_items           = items;
+   rereg_n               = 1;
+   register_items(items, 1);
+   assert(event_load_save_files(false));
+   assert(legacy_calls == 1 && loaded_calls == 1 && wram[0] == 0x33);
+   event_save_items_fill(false);
+   assert(legacy_calls == 1 && loaded_calls == 1);
+
+   start();
+   app_dir = "/app";
+   disk_put("/s/a.sav", old, sizeof(old));
+   use_legacy_load   = true;
+   loaded_reregister = true;
+   register_items(items, 1);
+   assert(event_load_save_files(false));
+   assert(legacy_calls == 1 && loaded_calls == 1);
+   event_save_items_fill(false);
+   assert(legacy_calls == 1 && loaded_calls == 1);
+ASSERT_FILES(0, 0, 0);
+assert(err_count == 0);
+}
+
+/* A grow over a kept tail is filled at the frame start, then told. */
+static void test_grow_told(void)
+{
+   unsigned char file[16];
+   struct retro_save_item items[1];
+
+   start();
+   fill_bytes(file, sizeof(file), 0x60);
+   disk_put("/s/game.srm", file, sizeof(file));
+   items[0]              = buffer_item("srm", "/s/game.srm");
+   items[0].num_segments = 1;
+   register_items(items, 1);
+   assert(event_load_save_files(false) && loaded_calls == 1);
+   items[0].num_segments = 2;
+   register_items(items, 1);
+   assert(loaded_calls == 1);
+   event_save_items_fill(false);
+   assert(loaded_calls == 2 && !memcmp(iram, file + 8, 4));
+}
+
 static void test_undo_dir(void)
 {
    char dir[256];
@@ -4167,6 +4722,1683 @@ static void test_undo_dir(void)
          "/roms/Game"));
    assert(!save_items_state_undo_dir(dir, sizeof(dir), "/assets", "core",
          "/roms/"));
+}
+
+static void test_loaded(void)
+{
+   static const char *const legacy[] = {"/s/old.srm", NULL};
+   unsigned char file[12];
+   struct retro_save_item items[2];
+   start();
+   memset(file, 0, sizeof(file));
+   file[0]  = 0x5a;
+   file[11] = 0xa5;
+   disk_put("/s/game.srm", file, sizeof(file));
+   items[0] = buffer_item("srm", "/s/game.srm");
+   memset(&items[1], 0, sizeof(items[1]));
+   items[1].id            = "core";
+   items[1].path          = "/s/core.dat";
+   items[1].storage       = RETRO_SAVE_STORAGE_CORE_FILE;
+   items[1].root          = RETRO_SAVE_ROOT_ABSOLUTE;
+   items[1].legacy_memory = RETRO_SAVE_NO_LEGACY_MEMORY;
+   register_items(items, 2);
+   assert(loaded_calls == 0);
+   assert(event_load_save_files(false));
+   /* Once, for the frontend's item only, after its bytes are in. */
+   assert(loaded_calls == 1 && loaded_saw_file);
+
+   /* Told even when there is nothing to read. */
+   start();
+   register_items(items, 1);
+   assert(!event_load_save_files(false));
+   assert(loaded_calls == 1 && !loaded_saw_file);
+
+   /* An empty file of its own: taken up as it is, no earlier name
+    * tried. */
+   start();
+   disk_put("/s/game.srm", file, 0);
+   disk_put("/s/old.srm", file, sizeof(file));
+   wram[0]               = 0x11;
+   items[0].legacy_paths = legacy;
+   register_items(items, 1);
+   assert(!event_load_save_files(false));
+   assert(loaded_calls == 1 && wram[0] == 0x11);
+   assert(save_item_files.files[0].initial);
+   assert(save_item_files.files[0].initial_size == 12);
+   assert(!memcmp(save_item_files.files[0].initial, image(), 12));
+}
+
+static void test_final_write(void)
+{
+   struct retro_save_item items[1];
+   unsigned char after[12];
+   start();
+   app_dir  = "/app";
+   items[0] = buffer_item("srm", "/s/final.srm");
+   register_items(items, 1);
+   event_load_save_files(false);
+   wram[0] = 1;
+   /* The close's SAVE_FILES, before the core unloads. */
+   assert(event_save_files(true, false, NULL));
+   assert(raw_writes == 1);
+
+   /* retro_unload_game() writes once more, an emulated power-off. */
+   wram[0] = 2;
+   iram[0] = 3;
+   memcpy(after, image(), sizeof(after));
+   event_save_items_final(true, false);
+   assert(raw_writes == 2 && disk_holds("/s/final.srm", after, 12));
+   assert(save_item_files.num_files == 0 && !save_item_files.loaded);
+   ASSERT_FILES(0, 0, 0);
+   /* The set stays until save_items_clear(). */
+   assert(save_items_state_get_ptr()->current);
+
+   /* Nothing changed during the unload: no second write. */
+   start();
+   register_items(items, 1);
+   event_load_save_files(false);
+   wram[0] = 1;
+   assert(event_save_files(true, false, NULL));
+   event_save_items_final(true, false);
+   assert(raw_writes == 1);
+
+   /* Save RAM not in use: nothing at all. */
+   start();
+   register_items(items, 1);
+   event_load_save_files(false);
+   wram[0] = 1;
+   event_save_items_final(false, false);
+   assert(raw_writes == 0);
+
+   /* The workers are stopped before it writes. */
+   start();
+   register_items(items, 1);
+   event_load_save_files(false);
+   start_autosave(false);
+   wram[0] = 4;
+   event_save_items_final(true, false);
+   assert(!autosave_state.num_retired);
+   assert(disk_holds("/s/final.srm", image(), 12));
+   autosave_deinit();
+}
+
+/* The close as runloop makes it: autosave stopped, SAVE_FILES, then the
+ * final write after retro_unload_game(). */
+static void snapshot_close(void)
+{
+   autosave_deinit();
+   assert(event_save_files(true, false, NULL));
+   /* Killed here. */
+   event_save_items_final(true, false);
+}
+
+/* can_snapshot() false at SAVE_FILES or the close: when autosave's last
+ * snapshot was taken on true, nothing new is written and the file holds
+ * that snapshot, logged once per item until a frame runs; otherwise the
+ * image now is written, as without it. */
+static void test_snapshot_close(void)
+{
+   struct retro_save_item items[1];
+   unsigned char done[12];
+   autosave_t *h;
+
+   /* Settled: nothing new while running, at the close, or after it. */
+   start();
+   app_dir          = "/app";
+   use_can_snapshot = true;
+   items[0] = buffer_item("srm", "/s/close.srm");
+   register_items(items, 1);
+   event_load_save_files(false);
+   h = start_autosave(false);
+   wram[0] = 1;
+   capture(h);
+   assert(raw_writes == 1);
+   memcpy(done, image(), sizeof(done));
+   snapshot_ready = false;
+   wram[0]        = 2;
+   assert(event_save_files(true, false, NULL));
+   assert(raw_writes == 1 && disk_holds("/s/close.srm", done, 12));
+   core_frames(1, 60.0);
+   autosave_deinit();
+   assert(event_save_files(true, false, NULL));
+   assert(raw_writes == 1 && disk_holds("/s/close.srm", done, 12));
+   event_save_items_final(true, false);
+   assert(raw_writes == 1 && disk_holds("/s/close.srm", done, 12));
+   assert(snapshot_calls == 5 && saving_logs == 2 && err_count == 0);
+   ASSERT_FILES(0, 0, 0);
+
+   /* True again by the final write: the image now. */
+   start();
+   app_dir          = "/app";
+   use_can_snapshot = true;
+   register_items(items, 1);
+   event_load_save_files(false);
+   h = start_autosave(false);
+   wram[0] = 1;
+   capture(h);
+   snapshot_ready = false;
+   wram[0]        = 2;
+   autosave_deinit();
+   assert(event_save_files(true, false, NULL));
+   assert(raw_writes == 1);
+   snapshot_ready = true;
+   wram[1]        = 3;
+   event_save_items_final(true, false);
+   assert(raw_writes == 2 && disk_holds("/s/close.srm", image(), 12));
+   assert(saving_logs == 1 && err_count == 0);
+   ASSERT_FILES(0, 0, 0);
+
+   /* The worker's write of a settled snapshot it had not started when
+    * the close stopped it lands at the join. */
+   start();
+   app_dir          = "/app";
+   use_can_snapshot = true;
+   register_items(items, 1);
+   event_load_save_files(false);
+   h = start_autosave(false);
+   wram[0] = 1;
+   assert(autosave_fill_item(h));
+   memcpy(done, image(), sizeof(done));
+   retro_atomic_store_release_int(&h->snapshot_requested, 0);
+   retro_atomic_store_release_int(&h->quit, 1);
+   snapshot_ready = false;
+   wram[0]        = 2;
+   autosave_deinit();
+   /* Killed here. */
+   assert(raw_writes == 1 && disk_holds("/s/close.srm", done, 12));
+   assert(event_save_files(true, false, NULL));
+   event_save_items_final(true, false);
+   assert(raw_writes == 1 && disk_holds("/s/close.srm", done, 12));
+   assert(saving_logs == 1 && err_count == 0);
+   ASSERT_FILES(0, 0, 0);
+
+   /* Its last snapshot was taken at the cap: the image now. */
+   start();
+   app_dir          = "/app";
+   use_can_snapshot = true;
+   snapshot_ready   = false;
+   register_items(items, 1);
+   event_load_save_files(false);
+   h = start_autosave(false);
+   wram[0] = 1;
+   autosave_check();
+   core_frames(600, 60.0);
+   capture(h);
+   assert(raw_writes == 1);
+   wram[0] = 2;
+   snapshot_close();
+   assert(raw_writes == 2 && disk_holds("/s/close.srm", image(), 12));
+   assert(saving_logs == 1 && err_count == 0);
+   ASSERT_FILES(0, 0, 0);
+
+   /* Its write of the settled snapshot failed: the image now. */
+   start();
+   app_dir          = "/app";
+   use_can_snapshot = true;
+   register_items(items, 1);
+   event_load_save_files(false);
+   h = start_autosave(false);
+   slock_lock(disk_lock);
+   fail_writes = true;
+   slock_unlock(disk_lock);
+   wram[0] = 1;
+   capture(h);
+   slock_lock(disk_lock);
+   fail_writes = false;
+   slock_unlock(disk_lock);
+   assert(!disk_has("/s/close.srm"));
+   snapshot_ready = false;
+   wram[0]        = 2;
+   snapshot_close();
+   assert(disk_holds("/s/close.srm", image(), 12));
+   assert(saving_logs == 0 && err_count == 0);
+   ASSERT_FILES(0, 0, 0);
+
+   /* Autosave stopped mid-game, then a frame ran: the image now. */
+   start();
+   app_dir          = "/app";
+   use_can_snapshot = true;
+   register_items(items, 1);
+   event_load_save_files(false);
+   h = start_autosave(false);
+   wram[0] = 1;
+   capture(h);
+   autosave_deinit();
+   event_save_items_fill(false);
+   snapshot_ready = false;
+   wram[0]        = 2;
+   assert(event_save_files(true, false, NULL));
+   assert(raw_writes == 2 && disk_holds("/s/close.srm", image(), 12));
+   event_save_items_final(true, false);
+   assert(raw_writes == 2 && saving_logs == 0 && err_count == 0);
+   ASSERT_FILES(0, 0, 0);
+
+   /* Autosave off: the image now. */
+   start();
+   app_dir          = "/app";
+   use_can_snapshot = true;
+   snapshot_ready   = false;
+   register_items(items, 1);
+   event_load_save_files(false);
+   wram[0] = 1;
+   assert(event_save_files(true, false, NULL));
+   event_save_items_final(true, false);
+   assert(raw_writes == 1 && disk_holds("/s/close.srm", image(), 12));
+   assert(saving_logs == 0 && err_count == 0);
+   ASSERT_FILES(0, 0, 0);
+}
+
+/* The close writes the image now because the file owes its copy: the
+ * final write keeps that image only if it was taken while the game said
+ * true. Pass 0: it was not, so what the core wrote while unloading is
+ * written. Pass 1: it was. */
+static void test_snapshot_close_owed(void)
+{
+   unsigned char file[16];
+   unsigned char cut[16];
+   unsigned char closed[12];
+   struct retro_save_item items[1];
+   autosave_t *h;
+   unsigned pass;
+   unsigned copies;
+
+   fill_bytes(file, sizeof(file), 0x60);
+   for (pass = 0; pass < 2; pass++)
+   {
+      start();
+      app_dir          = "/app";
+      use_can_snapshot = true;
+      disk_put("/s/owed.srm", file, sizeof(file));
+      items[0]       = buffer_item("srm", "/s/owed.srm");
+      items[0].flags = RETRO_SAVE_FLAG_EXACT_SIZE;
+      register_items(items, 1);
+      event_save_items_set_undo_dir(NULL);
+      event_load_save_files(false);
+      event_save_items_set_undo_dir("/undo");
+      assert(save_item_files.files[0].guard.copy_first);
+      set_fail_undo(true);
+      copies = copy_logs;
+      h = start_autosave(false);
+      wram[0] = 1;
+      capture(h);
+      /* Killed here: settled, written without the copy, the tail kept. */
+      memcpy(cut, image(), 12);
+      memcpy(cut + 12, file + 12, 4);
+      assert(disk_holds("/s/owed.srm", cut, 16));
+      ASSERT_FILES(0, 0, 0);
+      assert(saving_logs == 0 && err_count == 0);
+      set_fail_undo(false);
+      snapshot_ready = pass == 1;
+      wram[0]        = 2;
+      autosave_deinit();
+      assert(save_item_files.files[0].guard.copy_first);
+      assert(event_save_files(true, false, NULL));
+      /* Killed here. */
+      memcpy(closed, image(), 12);
+      assert(disk_holds("/s/owed.srm", closed, 12));
+      assert(disk_holds("/undo/owed.srm", cut, 16));
+      ASSERT_FILES(1, 0, 0);
+      assert(saving_logs == 0 && err_count == 0);
+      /* Written while unloading. */
+      snapshot_ready = false;
+      wram[1]        = 3;
+      event_save_items_final(true, false);
+      assert(disk_holds("/s/owed.srm", pass ? closed : image(), 12));
+      assert(disk_holds("/undo/owed.srm", cut, 16));
+      ASSERT_FILES(1, 0, 0);
+      assert(saving_logs == pass && err_count == 0
+            && copy_logs == copies + 1);
+   }
+}
+
+/* After a failed write, SAVE_FILES writes the image now while the game
+ * is still saving, under the worker's retry of a settled snapshot: the
+ * retry is dropped, so the close does not keep that image. */
+static void test_snapshot_close_superseded(void)
+{
+   unsigned char mid[12];
+   struct retro_save_item items[1];
+   autosave_t *h;
+
+   start();
+   app_dir          = "/app";
+   use_can_snapshot = true;
+   items[0] = buffer_item("srm", "/s/sup.srm");
+   register_items(items, 1);
+   event_load_save_files(false);
+   h = start_autosave(false);
+   set_fail_writes(true);
+   wram[0] = 1;
+   capture(h);
+   set_fail_writes(false);
+   assert(!disk_has("/s/sup.srm"));
+   set_hold(&hold_temp, true);
+   wram[0] = 2;
+   autosave_lock();
+   autosave_unlock();
+   wait_held(1);
+   snapshot_ready = false;
+   wram[0]        = 3;
+   memcpy(mid, image(), sizeof(mid));
+   assert(event_save_files(true, false, NULL));
+   set_hold(&hold_temp, false);
+   wait_requested(h);
+   /* Killed here. */
+   assert(disk_holds("/s/sup.srm", mid, 12));
+   ASSERT_FILES(0, 0, 0);
+   assert(saving_logs == 0 && err_count == 0);
+   autosave_deinit();
+   /* Killed here: joined. */
+   assert(disk_holds("/s/sup.srm", mid, 12));
+   assert(event_save_files(true, false, NULL));
+   assert(disk_holds("/s/sup.srm", mid, 12));
+   /* Written while unloading. */
+   wram[1] = 4;
+   event_save_items_final(true, false);
+   assert(disk_holds("/s/sup.srm", image(), 12));
+   ASSERT_FILES(0, 0, 0);
+   assert(saving_logs == 0 && err_count == 0 && snapshot_calls == 5);
+}
+
+/* SAVE_FILES writes a settled image while the worker writes an older
+ * settled snapshot: pass 0 drops that write, pass 1 renames it first
+ * and writes the newer again. The game then saves and the user quits:
+ * the close and the final write keep the settled image. */
+static void test_snapshot_close_main_settled(void)
+{
+   unsigned char settled[12];
+   struct retro_save_item items[1];
+   autosave_t *h;
+   unsigned pass;
+
+   for (pass = 0; pass < 2; pass++)
+   {
+      bool *hold = pass ? &hold_rename : &hold_temp;
+      start();
+      app_dir          = "/app";
+      use_can_snapshot = true;
+      items[0] = buffer_item("srm", "/s/main.srm");
+      register_items(items, 1);
+      event_load_save_files(false);
+      h = start_autosave(false);
+      wram[0] = 1;
+      capture(h);
+      set_hold(hold, true);
+      wram[0] = 2;
+      autosave_lock();
+      autosave_unlock();
+      wait_held(1);
+      wram[0] = 3;
+      memcpy(settled, image(), sizeof(settled));
+      assert(event_save_files(true, false, NULL));
+      set_hold(hold, false);
+      wait_requested(h);
+      /* Killed here. */
+      assert(disk_holds("/s/main.srm", settled, 12));
+      ASSERT_FILES(0, 0, 0);
+      assert(saving_logs == 0 && err_count == 0);
+      snapshot_ready = false;
+      wram[0]        = 4;
+      autosave_lock();
+      autosave_unlock();
+      autosave_deinit();
+      assert(event_save_files(true, false, NULL));
+      /* Killed here. */
+      assert(disk_holds("/s/main.srm", settled, 12));
+      /* Written while unloading. */
+      wram[1] = 5;
+      event_save_items_final(true, false);
+      assert(disk_holds("/s/main.srm", settled, 12));
+      ASSERT_FILES(0, 0, 0);
+      assert(saving_logs == 1 && err_count == 0 && snapshot_calls == 6);
+   }
+}
+
+/* The worker's older snapshot lands over a settled image SAVE_FILES
+ * wrote, and writing that image again fails: the file holds the older
+ * one, so the close writes the image now. */
+static void test_snapshot_close_reissue_failed(void)
+{
+   unsigned char older[12];
+   struct retro_save_item items[1];
+   autosave_t *h;
+
+   start();
+   app_dir          = "/app";
+   use_can_snapshot = true;
+   items[0] = buffer_item("srm", "/s/main.srm");
+   register_items(items, 1);
+   event_load_save_files(false);
+   h = start_autosave(false);
+   wram[0] = 1;
+   capture(h);
+   set_hold(&hold_rename, true);
+   wram[0] = 2;
+   memcpy(older, image(), sizeof(older));
+   autosave_lock();
+   autosave_unlock();
+   wait_held(1);
+   wram[0] = 3;
+   assert(event_save_files(true, false, NULL));
+   set_fail_writes(true);
+   set_hold(&hold_rename, false);
+   wait_requested(h);
+   set_fail_writes(false);
+   /* Killed here. */
+   assert(disk_holds("/s/main.srm", older, 12));
+   snapshot_ready = false;
+   wram[0]        = 4;
+   autosave_lock();
+   autosave_unlock();
+   autosave_deinit();
+   assert(event_save_files(true, false, NULL));
+   /* Killed here. */
+   assert(disk_holds("/s/main.srm", image(), 12));
+   /* Written while unloading. */
+   wram[1] = 5;
+   event_save_items_final(true, false);
+   assert(disk_holds("/s/main.srm", image(), 12));
+   ASSERT_FILES(0, 0, 0);
+   assert(saving_logs == 0 && err_count == 0);
+}
+
+static void test_legacy_paths(void)
+{
+   static const char *const legacy[] = {"/s/older.sav", "/s/oldest.sav",
+      NULL};
+   static const unsigned char old[12] = {7, 7, 7, 7, 7, 7, 7, 7,
+      7, 7, 7, 7};
+   struct retro_save_item items[1];
+   start();
+   app_dir = "/app";
+   disk_put("/s/oldest.sav", old, sizeof(old));
+   items[0]              = buffer_item("srm", "/s/game.srm");
+   items[0].legacy_paths = legacy;
+   register_items(items, 1);
+   assert(event_load_save_files(false));
+   assert(!memcmp(image(), old, 12));
+
+   /* The next write goes to the item's own name; the old file stays. */
+   wram[0] = 1;
+   assert(event_save_files(true, false, NULL));
+   assert(disk_holds("/s/game.srm", image(), 12));
+   assert(disk_holds("/s/oldest.sav", old, sizeof(old)));
+
+   /* The item's own name wins once it exists. */
+   start();
+   app_dir = "/app";
+   disk_put("/s/oldest.sav", old, sizeof(old));
+   disk_put("/s/game.srm", image(), 12);
+   register_items(items, 1);
+   assert(event_load_save_files(false));
+   assert(wram[0] == 0);
+ASSERT_FILES(0, 0, 0);
+assert(err_count == 0);
+}
+
+static void test_late_loaded(void)
+{
+   static const unsigned char saved[6] = {'S', 'A', 'V', 'E', 'D', '!'};
+   struct retro_save_item items[2];
+   start();
+   disk_put("/s/one.card", saved, sizeof(saved));
+   items[0] = buffer_item("srm", "/s/game.srm");
+   register_items(items, 1);
+   event_load_save_files(false);
+   assert(loaded_calls == 1);
+
+   /* Never from inside the call that registered it. */
+   items[1] = card_item("card", "/s/one.card");
+   register_items(items, 2);
+   assert(loaded_calls == 1);
+   event_save_items_fill(false);
+   assert(loaded_calls == 2 && loaded_in_set == 0);
+   assert(!memcmp(card, saved, sizeof(card)));
+
+   /* Once per fill. */
+   event_save_items_fill(false);
+   assert(loaded_calls == 2);
+
+   /* A kept id moved to another file is filled and told again. */
+   items[1].path = "/s/two.card";
+   register_items(items, 2);
+   assert(loaded_calls == 2);
+   event_save_items_fill(false);
+   assert(loaded_calls == 3 && loaded_in_set == 0);
+}
+
+/* loaded() registers again without the item it was told: the items
+ * left, moved to the indices already passed, are still told. */
+static void test_loaded_reregister_moves(void)
+{
+   struct retro_save_item items[3];
+   start();
+   app_dir = "/app";
+   memset(&items[0], 0, sizeof(items[0]));
+   items[0].id            = "flash";
+   items[0].path          = "/s/game.flash";
+   items[0].storage       = RETRO_SAVE_STORAGE_FRONTEND_BLOB;
+   items[0].root          = RETRO_SAVE_ROOT_ABSOLUTE;
+   items[0].legacy_memory = RETRO_SAVE_NO_LEGACY_MEMORY;
+   items[1]               = buffer_item("srm", "/s/game.srm");
+   items[2]               = card_item("card", "/s/one.card");
+   loaded_reregister      = true;
+   rereg_items            = items + 1;
+   rereg_n                = 2;
+   register_items(items, 3);
+   event_load_save_files(false);
+   assert(loaded_calls == 3);
+   event_save_items_fill(false);
+   assert(loaded_calls == 3);
+ASSERT_FILES(0, 0, 0);
+assert(err_count == 0);
+}
+
+/* A set registered right after a refusal fills from the ended set's
+ * image, not the older file. An orphan's write is dropped; a retired
+ * worker's still lands. */
+static void test_waiting_image(void)
+{
+   unsigned char want[12];
+   unsigned char file[12];
+   struct retro_save_item items[2];
+   unsigned writes;
+#ifdef HAVE_THREADS
+   autosave_t *h;
+   unsigned i;
+#endif
+
+   start();
+   app_dir = "/app";
+   disk_put("/s/w.srm", image(), 12);
+   items[0] = buffer_item("srm", "/s/w.srm");
+   items[1] = items[0];
+   register_items(items, 1);
+   event_load_save_files(false);
+   wram[1] = 0x44;
+   memcpy(want, image(), sizeof(want));
+   register_refused(items, 2);
+   assert(save_item_files.num_orphans == 1);
+   register_items(items, 1);
+   assert(save_item_files.num_orphans == 1);
+   event_save_items_fill(false);
+   assert(loaded_calls == 2);
+   assert(!memcmp(image(), want, sizeof(want)));
+   assert(save_item_files.num_orphans == 0);
+   writes = raw_writes;
+   assert(event_save_files(true, false, NULL));
+   assert(raw_writes == writes + 1);
+   assert(disk_holds("/s/w.srm", want, sizeof(want)));
+   ASSERT_FILES(0, 0, 0);
+   /* The refusal's two findings: the id, and the file. */
+   assert(err_count == 2);
+
+   /* A file not written yet: the orphan's baseline goes with it. */
+   start();
+   app_dir = "/app";
+   items[0] = buffer_item("srm", "/s/new.srm");
+   items[1] = items[0];
+   register_items(items, 1);
+   event_load_save_files(false);
+   register_refused(items, 2);
+   register_items(items, 1);
+   event_save_items_fill(false);
+   assert(save_item_files.files[0].initial);
+   assert(event_save_files(true, false, NULL));
+   assert(!disk_has("/s/new.srm"));
+   ASSERT_FILES(0, 0, 0);
+   assert(err_count == 2);
+
+#ifdef HAVE_THREADS
+   /* A retired worker held inside a write: the fill takes a copy of
+    * its last image, and the worker still writes both. */
+   start();
+   app_dir = "/app";
+   disk_put("/s/w.srm", image(), 12);
+   memcpy(file, image(), sizeof(file));
+   items[0] = buffer_item("srm", "/s/w.srm");
+   items[1] = items[0];
+   register_items(items, 1);
+   event_load_save_files(false);
+   h = start_autosave(false);
+   slock_lock(disk_lock);
+   hold_write = true;
+   slock_unlock(disk_lock);
+   wram[2] = 7;
+   autosave_lock();
+   autosave_unlock();
+   slock_lock(disk_lock);
+   disk_wait_count(&raw_writes, 1);
+   assert(raw_writes == 1);
+   slock_unlock(disk_lock);
+   wram[2] = 8;
+   memcpy(want, image(), sizeof(want));
+   register_refused(items, 2);
+   assert(autosave_state.num_retired == 1);
+   register_items(items, 1);
+   event_save_items_fill(false);
+   assert(!memcmp(image(), want, sizeof(want)));
+   assert(retro_atomic_load_acquire_int(&h->superseded) == h->final_mark);
+   assert(disk_holds("/s/w.srm", file, sizeof(file)));
+   slock_lock(disk_lock);
+   hold_write = false;
+   scond_broadcast(disk_cond);
+   slock_unlock(disk_lock);
+   retired_join();
+   ASSERT_FILES(0, 0, 0);
+   assert(err_count == 2);
+   for (i = 0; autosave_state.num_retired && i < 5000; i++)
+   {
+      autosave_check();
+      retro_sleep(1);
+   }
+   assert(autosave_state.num_retired == 0);
+   assert(disk_holds("/s/w.srm", want, sizeof(want)));
+   autosave_deinit();
+   assert(event_save_files(true, false, NULL));
+   assert(disk_holds("/s/w.srm", want, sizeof(want)));
+   ASSERT_FILES(0, 0, 0);
+   assert(err_count == 2);
+#else
+   (void)file;
+#endif
+}
+
+/* Where case is ignored, an item at one spelling of a file is filled
+ * from the image waiting at another: an orphan's (pass 0), or a
+ * retired worker's held in its last write (pass 1). */
+static void test_waiting_other_spelling(void)
+{
+   unsigned char want[12];
+   struct retro_save_item items[1];
+   unsigned pass;
+
+   for (pass = 0; pass < 2; pass++)
+   {
+#ifndef HAVE_THREADS
+      if (pass)
+         break;
+#endif
+      start();
+      app_dir = "/app";
+      slock_lock(disk_lock);
+      disk_nocase = true;
+      slock_unlock(disk_lock);
+      disk_put("/s/W.srm", image(), 12);
+      items[0] = buffer_item("srm", "/s/W.srm");
+      register_items(items, 1);
+      event_load_save_files(false);
+#ifdef HAVE_THREADS
+      if (pass)
+      {
+         start_autosave(false);
+         set_hold(&hold_temp, true);
+      }
+#endif
+      wram[1] = 0x44;
+      memcpy(want, image(), sizeof(want));
+      items[0].path = "/s/w.srm";
+      register_items(items, 1);
+#ifdef HAVE_THREADS
+      if (pass)
+         wait_held(1);
+#endif
+      event_save_items_fill(false);
+      assert(!memcmp(image(), want, sizeof(want)));
+#ifdef HAVE_THREADS
+      if (pass)
+      {
+         unsigned i;
+         set_hold(&hold_temp, false);
+         retired_join();
+         ASSERT_FILES(0, 0, 0);
+         assert(err_count == 0);
+         for (i = 0; autosave_state.num_retired && i < 5000; i++)
+         {
+            autosave_check();
+            retro_sleep(1);
+         }
+         assert(!autosave_state.num_retired);
+         autosave_deinit();
+      }
+#endif
+      assert(!save_item_files.num_orphans);
+      assert(event_save_files(true, false, NULL));
+      assert(disk_holds("/s/w.srm", want, sizeof(want)));
+      ASSERT_FILES(0, 0, 0);
+      assert(err_count == 0);
+   }
+}
+
+/* A blob at the file refuses an orphan's waiting image: the orphan
+ * keeps its write, so the image lands at the next SAVE_FILES and is
+ * copied before the blob's write. Pass 1 registers again from inside
+ * blob_load(). */
+static void test_waiting_refused(void)
+{
+   unsigned char old[12];
+   unsigned char a[12];
+   struct retro_save_item items[2];
+   unsigned pass;
+
+   memset(old, 0x21, sizeof(old));
+   for (pass = 0; pass < 2; pass++)
+   {
+      start();
+      app_dir = "/app";
+      disk_put("/s/t.srm", old, sizeof(old));
+      items[0] = buffer_item("a", "/s/t.srm");
+      register_items(items, 1);
+      event_load_save_files(false);
+      wram[1]  = 0x44;
+      memcpy(a, image(), sizeof(a));
+      register_items(NULL, 0);
+      assert(save_item_files.num_orphans == 1);
+      memset(&items[1], 0, sizeof(items[1]));
+      items[1].id            = "b";
+      items[1].path          = "/s/t.srm";
+      items[1].storage       = RETRO_SAVE_STORAGE_FRONTEND_BLOB;
+      items[1].root          = RETRO_SAVE_ROOT_ABSOLUTE;
+      items[1].legacy_memory = RETRO_SAVE_NO_LEGACY_MEMORY;
+      register_items(items + 1, 1);
+      memcpy(blob_state, "keep", 4);
+      blob_len    = 4;
+      blob_refuse = true;
+      if (pass)
+      {
+         blob_reregister = true;
+         rereg_items     = items + 1;
+         rereg_n         = 1;
+      }
+      event_save_items_fill(false);
+      assert(blob_len == 4 && !memcmp(blob_state, "keep", 4));
+      blob_refuse = false;
+      assert(event_save_files(true, false, NULL));
+      assert(disk_holds("/undo/t.srm", a, sizeof(a)));
+      assert(disk_holds("/s/t.srm", "keep", 4));
+      assert(!save_item_files.num_orphans);
+      ASSERT_FILES(1, 0, 1);
+      assert(err_count == 0);
+   }
+}
+
+/* A cart moving port: the same tag and size under another id takes
+ * the record over, so nothing is filled or told and the bytes written
+ * since the fill are kept. */
+static void test_port_move(void)
+{
+   unsigned char want[12];
+   struct retro_save_item items[1];
+#ifdef HAVE_THREADS
+   autosave_t *h;
+#endif
+
+   start();
+   disk_put("/s/cart.sav", image(), 12);
+   items[0]        = buffer_item("tpak1", "/s/cart.sav");
+   items[0].format = "gb:sram";
+   items[0].port   = 1;
+   register_items(items, 1);
+   event_load_save_files(false);
+#ifdef HAVE_THREADS
+   h = start_autosave(false);
+#endif
+   assert(loaded_calls == 1);
+   wram[1] = 0x44;
+   memcpy(want, image(), sizeof(want));
+   items[0].id   = "tpak2";
+   items[0].port = 2;
+   register_items(items, 1);
+   assert(save_item_files.files[0].taken_up);
+   assert(!save_item_files.fill_pending);
+   assert(save_item_files.num_orphans == 0);
+#ifdef HAVE_THREADS
+   assert(save_item_files.files[0].autosave == h);
+   assert(autosave_state.num_retired == 0);
+#endif
+   event_save_items_fill(false);
+   assert(loaded_calls == 1);
+   assert(!memcmp(image(), want, sizeof(want)));
+#ifdef HAVE_THREADS
+   autosave_deinit();
+#endif
+   assert(event_save_files(true, false, NULL));
+   assert(disk_holds("/s/cart.sav", want, sizeof(want)));
+}
+
+/* Another tag at a file whose last image still waits: the copy holds
+ * that image, the newest save of the old type, not the older file. */
+static void test_type_change_waiting(void)
+{
+   unsigned char want[12];
+   struct retro_save_item items[2];
+#ifdef HAVE_THREADS
+   autosave_t *h;
+   unsigned pass, i;
+   unsigned n;
+   unsigned logs;
+#endif
+
+   start();
+   disk_put("/s/t.srm", image(), 12);
+   items[0]        = buffer_item("a", "/s/t.srm");
+   items[0].format = "core:a";
+   register_items(items, 1);
+   event_load_save_files(false);
+   wram[1] = 0x44;
+   memcpy(want, image(), sizeof(want));
+   items[0].id     = "b";
+   items[0].format = "core:b";
+   register_items(items, 1);
+   assert(save_item_files.files[0].guard.type_changed);
+   assert(save_item_files.num_orphans == 1);
+   event_save_items_fill(false);
+   assert(save_item_files.num_orphans == 0);
+   assert(!memcmp(image(), want, sizeof(want)));
+   wram[2] = 9;
+   assert(event_save_files(true, false, NULL));
+   assert(disk_holds("/undo/t.srm", want, sizeof(want)));
+   assert(disk_holds("/s/t.srm", image(), 12));
+   assert(strstr(osd_last, "/undo/t.srm"));
+   assert(!save_item_files.files[0].guard.copy_image);
+
+#ifdef HAVE_THREADS
+   /* With workers the fill takes a copy of the retired worker's last
+    * image, which that worker still writes. The new worker, started
+    * once the retired one is reaped, copies it before its first write;
+    * stopped before one, it hands it back for the final write; retired
+    * before one, it copies it at its last write, and the main thread
+    * tells that copy as a live worker's, from the reap (2) or at the
+    * close (3). */
+   for (pass = 0; pass < 4; pass++)
+   {
+      start();
+      disk_put("/s/t.srm", image(), 12);
+      items[0].id     = "a";
+      items[0].format = "core:a";
+      register_items(items, 1);
+      event_load_save_files(false);
+      start_autosave(false);
+      wram[1] = 0x44;
+      items[0].id     = "b";
+      items[0].format = "core:b";
+      register_items(items, 1);
+      event_save_items_fill(false);
+      for (i = 0; !save_item_files.files[0].autosave && i < 5000; i++)
+      {
+         autosave_check();
+         event_save_items_fill(false);
+         retro_sleep(1);
+      }
+      assert((h = save_item_files.files[0].autosave) && h->copy_image);
+      assert(disk_holds("/s/t.srm", want, sizeof(want)));
+      h->interval = 0;
+      wram[2]     = 9;
+      if (!pass)
+      {
+         wait_requested(h);
+         capture(h);
+         assert(disk_holds("/undo/t.srm", want, sizeof(want)));
+         assert(disk_holds("/s/t.srm", image(), 12));
+      }
+      if (pass >= 2)
+      {
+         n        = osd_count;
+         logs     = copy_logs;
+         items[1] = buffer_item("c", "/s/u.srm");
+         register_items(items + 1, 1);
+         for (i = 0; pass == 2 && i < 5000
+               && !retro_atomic_load_acquire_int(&h->exited); i++)
+            retro_sleep(1);
+         assert(pass != 2 || retro_atomic_load_acquire_int(&h->exited));
+         /* The worker tells nothing. */
+         assert(osd_count == n && copy_logs == logs);
+         for (i = 0; pass == 2 && autosave_state.num_retired
+               && i < 5000; i++)
+         {
+            autosave_check();
+            retro_sleep(1);
+         }
+         assert(pass != 2 || (!autosave_state.num_retired
+               && copy_logs == logs + 1 && osd_count == n + 1));
+         autosave_deinit();
+         assert(copy_logs == logs + 1 && osd_count == n + 1);
+         assert(strstr(copy_log, "\"/s/t.srm\" in \"/undo/t.srm\""));
+         assert(strstr(osd_last, "/s/t.srm|/undo/t.srm"));
+         assert(disk_holds("/undo/t.srm", want, sizeof(want)));
+         continue;
+      }
+      autosave_deinit();
+      /* Copied by the worker, or handed back. */
+      assert((save_item_files.files[0].guard.copy_image != NULL)
+            == (pass == 1));
+      assert(event_save_files(true, false, NULL));
+      assert(disk_holds("/undo/t.srm", want, sizeof(want)));
+      assert(disk_holds("/s/t.srm", image(), 12));
+   }
+#endif
+}
+
+/* A type change's copy that can never be made: the file is never
+ * written over and the item's image goes to the recovery file; the
+ * last write that owes the copy sends the taken image to a second one
+ * under its own name, named on screen. Passes: the close; an orphan's
+ * write; a worker that hands the image back at the close; a retired
+ * worker's failed last write, recovered by the reap or at the close,
+ * also when the item has not changed since its fill. */
+static void test_type_change_uncopied(void)
+{
+   unsigned char old[12];
+   unsigned char want[12];
+   unsigned char last[12];
+   struct retro_save_item items[2];
+   unsigned pass;
+#ifdef HAVE_THREADS
+   autosave_t *h;
+   unsigned i;
+   unsigned n = 0;
+#endif
+
+   memset(old, 0x21, sizeof(old));
+#ifdef HAVE_THREADS
+   for (pass = 0; pass < 6; pass++)
+#else
+   for (pass = 0; pass < 2; pass++)
+#endif
+   {
+      start();
+      event_save_items_set_undo_dir(NULL);
+      app_dir         = "/app";
+      disk_put("/s/t.srm", old, sizeof(old));
+      items[0]        = buffer_item("a", "/s/t.srm");
+      items[0].format = "core:a";
+      register_items(items, 1);
+      event_load_save_files(false);
+#ifdef HAVE_THREADS
+      if (pass >= 2 && pass != 5)
+         start_autosave(false);
+#endif
+      wram[1]         = 0x44;
+      memcpy(want, image(), sizeof(want));
+      items[0].id     = "b";
+      items[0].format = "core:b";
+      register_items(items, 1);
+      event_save_items_fill(false);
+#ifdef HAVE_THREADS
+      /* Pass 5: the worker starts after the fill, which took the
+       * orphan's image, and the item stays as the fill left it. */
+      if (pass == 5)
+         start_autosave(false);
+#endif
+      if (pass != 5)
+         wram[2] = 9;
+      memcpy(last, image(), sizeof(last));
+      if (pass == 0)
+      {
+         /* A failed copy stays owed until the close. */
+         assert(!event_save_files(true, false, NULL));
+         assert(save_item_files.files[0].guard.copy_image);
+      }
+      if (pass == 1)
+      {
+         /* The item leaves the set: its orphan's write is its last. */
+         items[1] = buffer_item("c", "/s/u.srm");
+         register_items(items + 1, 1);
+         assert(save_item_files.num_orphans == 1);
+         assert(!event_save_files(true, false, NULL));
+         assert(!save_item_files.num_orphans);
+      }
+#ifdef HAVE_THREADS
+      if (pass >= 2)
+      {
+         /* Its worker, started once the retired one is reaped, cannot
+          * copy either; at the close it hands the image back (2). */
+         for (i = 0; !save_item_files.files[0].autosave && i < 5000; i++)
+         {
+            autosave_check();
+            event_save_items_fill(false);
+            retro_sleep(1);
+         }
+         assert((h = save_item_files.files[0].autosave) && h->copy_image);
+         h->interval = 0;
+         wait_requested(h);
+         capture(h);
+      }
+      if (pass >= 3)
+      {
+         /* Nor can its retired worker once the item leaves the set:
+          * the main thread recovers both images, from the reap (3, 5)
+          * or at the close (4). Passes 3 and 4 change it first. */
+         if (pass != 5)
+         {
+            wram[3] = 7;
+            memcpy(last, image(), sizeof(last));
+         }
+         n        = osd_count;
+         items[1] = buffer_item("c", "/s/u.srm");
+         register_items(items + 1, 1);
+         assert(!save_item_files.num_orphans);
+         for (i = 0; pass != 4 && i < 5000
+               && !retro_atomic_load_acquire_int(&h->exited); i++)
+            retro_sleep(1);
+         assert(pass == 4 || retro_atomic_load_acquire_int(&h->exited));
+         /* Unchanged, it still writes: it owes the copy. */
+         assert(pass != 5
+               || retro_atomic_load_acquire_int(&h->final_failed));
+         if (pass != 4)
+         {
+            /* The worker shows nothing. */
+            assert(osd_count == n);
+            for (i = 0; autosave_state.num_retired && i < 5000; i++)
+            {
+               autosave_check();
+               retro_sleep(1);
+            }
+            assert(!autosave_state.num_retired && osd_count == n + 2);
+         }
+      }
+#endif
+      if (pass != 1)
+         event_save_items_final(true, false);
+#ifdef HAVE_THREADS
+      if (pass == 4)
+         assert(osd_count == n + 2);
+      if (pass >= 2)
+         autosave_deinit();
+#endif
+      /* The retired worker wrote its last image, taken by the fill;
+       * pass 5's was an orphan's, whose write the take drops. */
+      assert(disk_holds("/s/t.srm", pass >= 2 && pass != 5 ? want : old,
+            sizeof(old)));
+      assert(disk_named_holds("RetroArch-recovery-", last, sizeof(last)));
+      assert(strstr(osd_last, "/s/t.srm|/app/RetroArch-recovery-"));
+      assert(disk_holds(strchr(osd_last, '|') + 1, want, sizeof(want)));
+   }
+}
+
+/* Two type changes at a file before a write, with no worker: the
+ * second's fill takes the first's image, whose own copy, of the image
+ * before it, is still made at the next save of the files, or recovered
+ * when no copy can be made (pass 1). */
+static void test_type_change_twice(void)
+{
+   unsigned char old[12];
+   unsigned char a[12];
+   unsigned char b[12];
+   struct retro_save_item items[1];
+   unsigned pass;
+
+   memset(old, 0x21, sizeof(old));
+   for (pass = 0; pass < 2; pass++)
+   {
+      start();
+      if (pass)
+      {
+         event_save_items_set_undo_dir(NULL);
+         app_dir = "/app";
+      }
+      disk_put("/s/t.srm", old, sizeof(old));
+      items[0]        = buffer_item("a", "/s/t.srm");
+      items[0].format = "core:a";
+      register_items(items, 1);
+      event_load_save_files(false);
+      wram[1]         = 0x44;
+      memcpy(a, image(), sizeof(a));
+      items[0].id     = "b";
+      items[0].format = "core:b";
+      register_items(items, 1);
+      event_save_items_fill(false);
+      wram[2]         = 0x55;
+      memcpy(b, image(), sizeof(b));
+      items[0].id     = "c";
+      items[0].format = "core:c";
+      register_items(items, 1);
+      event_save_items_fill(false);
+      assert(!memcmp(image(), b, sizeof(b)));
+      wram[3]         = 0x66;
+      if (!pass)
+      {
+         assert(event_save_files(true, false, NULL));
+         assert(disk_named_holds("/undo/", a, sizeof(a)) == 1);
+         assert(disk_named_holds("/undo/", b, sizeof(b)) == 1);
+         assert(disk_holds("/s/t.srm", image(), 12));
+         ASSERT_FILES(2, 0, 2);
+         assert(err_count == 0);
+         continue;
+      }
+      assert(!event_save_files(true, false, NULL));
+      event_save_items_final(true, false);
+      assert(disk_holds("/s/t.srm", old, sizeof(old)));
+      assert(disk_named_holds("RetroArch-recovery-", a, sizeof(a)) == 1);
+      assert(disk_named_holds("RetroArch-recovery-", b, sizeof(b)) == 1);
+      assert(disk_named_holds("RetroArch-recovery-", image(), 12) == 1);
+      ASSERT_FILES(0, 3, 3);
+      assert(err_count == 0);
+   }
+}
+
+/* A blob item that took the image waiting at a file kept another way
+ * changes and leaves before its first write: its copy of that image is
+ * still made at the next save of the files and its own image written,
+ * or both recovered (pass 1). */
+static void test_type_change_blob_gone(void)
+{
+   unsigned char old[12];
+   unsigned char a[12];
+   unsigned char b[12];
+   struct retro_save_item items[2];
+   unsigned pass;
+
+   memset(old, 0x21, sizeof(old));
+   for (pass = 0; pass < 2; pass++)
+   {
+      start();
+      if (pass)
+      {
+         event_save_items_set_undo_dir(NULL);
+         app_dir = "/app";
+      }
+      disk_put("/s/t.srm", old, sizeof(old));
+      items[0] = buffer_item("a", "/s/t.srm");
+      register_items(items, 1);
+      event_load_save_files(false);
+      wram[1]  = 0x44;
+      memcpy(a, image(), sizeof(a));
+      memset(&items[1], 0, sizeof(items[1]));
+      items[1].id            = "b";
+      items[1].path          = "/s/t.srm";
+      items[1].storage       = RETRO_SAVE_STORAGE_FRONTEND_BLOB;
+      items[1].root          = RETRO_SAVE_ROOT_ABSOLUTE;
+      items[1].legacy_memory = RETRO_SAVE_NO_LEGACY_MEMORY;
+      register_items(items + 1, 1);
+      event_save_items_fill(false);
+      assert(blob_len == sizeof(a) && !memcmp(blob_state, a, sizeof(a)));
+      blob_state[0] ^= 0xff;
+      memcpy(b, blob_state, sizeof(b));
+      register_items(NULL, 0);
+      event_save_files(true, false, NULL);
+      if (!pass)
+      {
+         assert(disk_holds("/s/t.srm", b, sizeof(b)));
+         assert(disk_holds("/undo/t.srm", a, sizeof(a)));
+      }
+      else
+      {
+         assert(disk_holds("/s/t.srm", old, sizeof(old)));
+         assert(disk_named_holds("RetroArch-recovery-", a, sizeof(a)) == 1);
+         assert(disk_named_holds("RetroArch-recovery-", b, sizeof(b)) == 1);
+      }
+      assert(!save_item_files.num_orphans);
+      ASSERT_FILES((pass ? 0 : 1), (pass ? 2 : 0), (pass ? 2 : 1));
+      assert(err_count == 0);
+   }
+}
+
+#ifdef HAVE_THREADS
+/* An orphan a blob at its file refused waits to be written: the blob's
+ * worker starts only once it is, so the copy holds it. */
+static void test_waiting_refused_worker(void)
+{
+   unsigned char old[12];
+   unsigned char a[12];
+   struct retro_save_item items[2];
+
+   start();
+   app_dir = "/app";
+   memset(old, 0x21, sizeof(old));
+   disk_put("/s/t.srm", old, sizeof(old));
+   items[0] = buffer_item("a", "/s/t.srm");
+   register_items(items, 1);
+   event_load_save_files(false);
+   wram[1]  = 0x44;
+   memcpy(a, image(), sizeof(a));
+   register_items(NULL, 0);
+   memset(&items[1], 0, sizeof(items[1]));
+   items[1].id            = "b";
+   items[1].path          = "/s/t.srm";
+   items[1].storage       = RETRO_SAVE_STORAGE_FRONTEND_BLOB;
+   items[1].root          = RETRO_SAVE_ROOT_ABSOLUTE;
+   items[1].legacy_memory = RETRO_SAVE_NO_LEGACY_MEMORY;
+   register_items(items + 1, 1);
+   memcpy(blob_state, "keep", 4);
+   blob_len    = 4;
+   blob_refuse = true;
+   event_save_items_fill(false);
+   blob_refuse = false;
+   assert(autosave_init(false, 1));
+   assert(event_save_files(true, false, NULL));
+   assert(disk_holds("/undo/t.srm", a, sizeof(a)));
+   assert(disk_holds("/s/t.srm", "keep", 4));
+   ASSERT_FILES(1, 0, 1);
+   assert(!err_count && !save_item_files.num_orphans);
+   autosave_check();
+   event_save_items_fill(false);
+   assert(save_item_files.files[0].autosave);
+   autosave_deinit();
+}
+#endif
+
+/* No memory to copy the waiting image a type change takes: the orphan
+ * keeps its write and the fill reads the file, so the copy is of the
+ * file once the orphan's image is there. */
+static void test_type_change_no_memory(void)
+{
+   unsigned char old[12];
+   unsigned char want[12];
+   struct retro_save_item items[1];
+
+   start();
+   app_dir = "/app";
+   memset(old, 0x21, sizeof(old));
+   disk_put("/s/t.srm", old, sizeof(old));
+   items[0]        = buffer_item("a", "/s/t.srm");
+   items[0].format = "core:a";
+   register_items(items, 1);
+   event_load_save_files(false);
+   wram[1] = 0x44;
+   memcpy(want, image(), sizeof(want));
+   items[0].id     = "b";
+   items[0].format = "core:b";
+   register_items(items, 1);
+   retro_atomic_store_release_int(&fail_main_malloc_size, 12);
+   event_save_items_fill(false);
+   retro_atomic_store_release_int(&fail_main_malloc_size, 0);
+   wram[2] = 9;
+   assert(event_save_files(true, false, NULL));
+   assert(disk_holds("/undo/t.srm", want, sizeof(want)));
+   assert(disk_holds("/s/t.srm", image(), 12));
+   assert(image()[1] == 0x21);
+   ASSERT_FILES(1, 0, 1);
+   assert(strstr(osd_last, "/s/t.srm|/undo/t.srm"));
+   assert(!err_count && !save_item_files.num_orphans);
+}
+
+/* A blob that registers again from inside blob_load() and takes the
+ * image: its file is not kept, so it is written with no copy, also
+ * when copies fail (pass 1). */
+static void test_blob_reregister_taken(void)
+{
+   struct retro_save_item items[1];
+   unsigned pass;
+
+   for (pass = 0; pass < 2; pass++)
+   {
+      start();
+      app_dir = "/app";
+      memset(&items[0], 0, sizeof(items[0]));
+      items[0].id            = "flash";
+      items[0].path          = "/s/game.flash";
+      items[0].storage       = RETRO_SAVE_STORAGE_FRONTEND_BLOB;
+      items[0].root          = RETRO_SAVE_ROOT_ABSOLUTE;
+      items[0].legacy_memory = RETRO_SAVE_NO_LEGACY_MEMORY;
+      disk_put("/s/game.flash", "other", 5);
+      blob_reregister = true;
+      rereg_items     = items;
+      rereg_n         = 1;
+      set_fail_undo(pass == 1);
+      register_items(items, 1);
+      assert(event_load_save_files(false));
+      assert(blob_len == 5 && !memcmp(blob_state, "other", 5));
+      memcpy(blob_state, "newer", 5);
+      assert(event_save_files(true, false, NULL));
+      assert(disk_holds("/s/game.flash", "newer", 5));
+      ASSERT_FILES(0, 0, 0);
+      assert(!err_count);
+   }
+}
+
+/* No memory to keep a type change's item that leaves: its image and
+ * the old type's image it owed a copy of each go to a recovery file. */
+static void test_orphan_no_memory_type_change(void)
+{
+   static const unsigned char zero[12];
+   unsigned char want[12];
+   struct retro_save_item items[1];
+
+   start();
+   app_dir = "/app";
+   event_save_items_set_undo_dir(NULL);
+   disk_put("/s/t.srm", image(), 12);
+   items[0]        = buffer_item("a", "/s/t.srm");
+   items[0].format = "core:a";
+   register_items(items, 1);
+   event_load_save_files(false);
+   wram[1] = 0x44;
+   memcpy(want, image(), sizeof(want));
+   items[0].id     = "b";
+   items[0].format = "core:b";
+   register_items(items, 1);
+   event_save_items_fill(false);
+   assert(save_item_files.files[0].guard.copy_image);
+   wram[2] = 9;
+   retro_atomic_store_release_int(&fail_reallocs, 1);
+   register_items(NULL, 0);
+   retro_atomic_store_release_int(&fail_reallocs, 0);
+   assert(!save_item_files.num_orphans);
+   assert(disk_named_holds("RetroArch-recovery-", image(), 12) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", want, 12) == 1);
+   ASSERT_FILES(0, 2, 2);
+   assert(err_count == 0);
+   assert(disk_holds("/s/t.srm", zero, 12));
+}
+
+#ifdef HAVE_THREADS
+/* A retired worker that exits owing a copy it could not make passes it
+ * to the item now at its file, which then keeps the file as its own
+ * debt would; that item's worker starts once the reap has done so. The
+ * image both hold is recovered once. */
+static void test_retired_copy_passes(void)
+{
+   unsigned char old[12];
+   struct retro_save_item items[1];
+   autosave_t *h;
+   unsigned i;
+   unsigned n;
+
+   start();
+   event_save_items_set_undo_dir(NULL);
+   app_dir         = "/app";
+   memset(old, 0x21, sizeof(old));
+   disk_put("/s/t.srm", old, sizeof(old));
+   items[0]        = buffer_item("a", "/s/t.srm");
+   items[0].format = "core:a";
+   register_items(items, 1);
+   event_load_save_files(false);
+   items[0].id     = "b";
+   items[0].format = "core:b";
+   register_items(items, 1);
+   event_save_items_fill(false);
+   h       = start_autosave(false);
+   wram[2] = 9;
+   capture(h);
+   n       = osd_count;
+   /* Ended owing the copy: its last write fails. */
+   register_items(NULL, 0);
+   for (i = 0; i < 5000 && !retro_atomic_load_acquire_int(&h->exited); i++)
+      retro_sleep(1);
+   assert(retro_atomic_load_acquire_int(&h->exited));
+   /* The same id again, not marked: its fill takes the image only. */
+   register_items(items, 1);
+   event_save_items_fill(false);
+   assert(!save_item_files.files[0].guard.copy_first);
+   assert(!save_item_files.files[0].autosave);
+   /* SAVE_FILES before the reap: the copy the old worker owes comes
+    * first and cannot be made, so the file is kept and the image goes
+    * to the recovery file, once. */
+   assert(!event_save_files(true, false, NULL));
+   assert(disk_holds("/s/t.srm", old, sizeof(old)));
+   assert(osd_count == n + 1);
+   ASSERT_FILES(0, 1, 1);
+   assert(err_count == 0);
+   autosave_check();
+   assert(!autosave_state.num_retired && osd_count == n + 2);
+   assert(save_item_files.files[0].guard.copy_first);
+   assert(save_item_files.files[0].guard.keep_file);
+   assert(save_item_files.files[0].guard.type_changed);
+   assert(!event_save_files(true, false, NULL));
+   assert(disk_holds("/s/t.srm", old, sizeof(old)));
+   assert(osd_count == n + 2);
+   ASSERT_FILES(0, 2, 2);
+   assert(err_count == 0);
+   event_save_items_fill(false);
+   assert((h = save_item_files.files[0].autosave));
+   assert(retro_atomic_load_acquire_int(&h->keep_file));
+   autosave_deinit();
+}
+#endif
+
+#ifdef HAVE_THREADS
+/* SAVE_FILES at a file whose retired worker has not made the copy it
+ * owes makes that copy before the newer image lands. The copy is told
+ * once, and kept once, though the worker makes it too. */
+static void test_save_files_retired_copy(void)
+{
+   unsigned char want[12];
+   struct retro_save_item items[1];
+   unsigned i;
+   unsigned n;
+   unsigned logs;
+
+   start();
+   disk_put("/s/t.srm", image(), 12);
+   items[0]        = buffer_item("a", "/s/t.srm");
+   items[0].format = "core:a";
+   register_items(items, 1);
+   event_load_save_files(false);
+   wram[1]         = 0x44;
+   memcpy(want, image(), sizeof(want));
+   items[0].id     = "b";
+   items[0].format = "core:b";
+   register_items(items, 1);
+   event_save_items_fill(false);
+   start_autosave(false);
+   /* Ended before its first write: its last one copies first, and is
+    * held once that copy's temp is written. */
+   set_hold(&hold_temp, true);
+   n    = osd_count;
+   logs = copy_logs;
+   register_items(NULL, 0);
+   wait_held(1);
+   /* The same id again, not marked: it owes nothing. */
+   register_items(items, 1);
+   event_save_items_fill(false);
+   assert(!save_item_files.files[0].guard.copy_first);
+   wram[2] = 9;
+   assert(event_save_files(true, false, NULL));
+   assert(disk_holds("/undo/t.srm", want, sizeof(want)));
+   assert(disk_holds("/s/t.srm", image(), 12));
+   assert(copy_logs == logs + 1 && osd_count == n + 1);
+   assert(strstr(osd_last, "/s/t.srm|/undo/t.srm"));
+   set_hold(&hold_temp, false);
+   for (i = 0; autosave_state.num_retired && i < 5000; i++)
+   {
+      autosave_check();
+      retro_sleep(1);
+   }
+   assert(!autosave_state.num_retired);
+   assert(copy_logs == logs + 1 && osd_count == n + 1);
+   assert(!disk_has("/undo/t-2.srm"));
+   assert(disk_holds("/s/t.srm", image(), 12));
+   assert(failed_renames == 0 && !disk_named(".tmp"));
+   ASSERT_FILES(1, 0, 1);
+   assert(err_count == 0);
+   autosave_deinit();
+}
+
+/* A registration from retro_run() is reaped before the next fill: the
+ * retired worker's failed last image goes to a recovery file the new
+ * item, which never took that image, does not write over. */
+static void test_reap_before_fill(void)
+{
+   unsigned char old[12];
+   unsigned char last[12];
+   struct retro_save_item items[1];
+   autosave_t *h;
+   unsigned i;
+
+   start();
+   event_save_items_set_undo_dir(NULL);
+   app_dir         = "/app";
+   memset(old, 0x21, sizeof(old));
+   disk_put("/s/t.srm", old, sizeof(old));
+   items[0]        = buffer_item("a", "/s/t.srm");
+   items[0].format = "core:a";
+   register_items(items, 1);
+   event_load_save_files(false);
+   items[0].id     = "b";
+   items[0].format = "core:b";
+   register_items(items, 1);
+   event_save_items_fill(false);
+   h       = start_autosave(false);
+   wram[2] = 9;
+   capture(h);
+   memcpy(last, image(), sizeof(last));
+   items[0].id     = "c";
+   items[0].format = "core:c";
+   register_items(items, 1);
+   for (i = 0; i < 5000 && !retro_atomic_load_acquire_int(&h->exited); i++)
+      retro_sleep(1);
+   assert(retro_atomic_load_acquire_int(&h->final_failed));
+   autosave_check();
+   assert(!autosave_state.num_retired);
+   event_save_items_fill(false);
+   assert(!memcmp(image(), old, sizeof(old)));
+   wram[3] = 7;
+   autosave_deinit();
+   event_save_items_final(true, false);
+   assert(disk_holds("/s/t.srm", old, sizeof(old)));
+   assert(disk_named_holds("RetroArch-recovery-", last, sizeof(last)) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", image(), 12) == 1);
+}
+
+/* A blob at the file refuses a retired worker's last image: it does
+ * not share that worker's recovery file, so its own failed write never
+ * replaces the image there. Pass 1 registers again from inside
+ * blob_load(). */
+static void test_retired_take_refused(void)
+{
+   unsigned char old[12];
+   unsigned char last[12];
+   struct retro_save_item items[2];
+   autosave_t *h;
+   unsigned i;
+   unsigned pass;
+
+   memset(old, 0x21, sizeof(old));
+   for (pass = 0; pass < 2; pass++)
+   {
+      start();
+      event_save_items_set_undo_dir(NULL);
+      app_dir         = "/app";
+      disk_put("/s/t.srm", old, sizeof(old));
+      items[0]        = buffer_item("a", "/s/t.srm");
+      items[0].format = "core:a";
+      register_items(items, 1);
+      event_load_save_files(false);
+      items[0].id     = "b";
+      items[0].format = "core:b";
+      register_items(items, 1);
+      event_save_items_fill(false);
+      h       = start_autosave(false);
+      wram[2] = 9;
+      capture(h);
+      memcpy(last, image(), sizeof(last));
+      /* Ended owing the copy: its last write fails. */
+      register_items(NULL, 0);
+      for (i = 0; i < 5000 && !retro_atomic_load_acquire_int(&h->exited);
+            i++)
+         retro_sleep(1);
+      assert(retro_atomic_load_acquire_int(&h->final_failed));
+      memset(&items[1], 0, sizeof(items[1]));
+      items[1].id            = "c";
+      items[1].path          = "/s/t.srm";
+      items[1].storage       = RETRO_SAVE_STORAGE_FRONTEND_BLOB;
+      items[1].root          = RETRO_SAVE_ROOT_ABSOLUTE;
+      items[1].legacy_memory = RETRO_SAVE_NO_LEGACY_MEMORY;
+      register_items(items + 1, 1);
+      memcpy(blob_state, "keep", 4);
+      blob_len    = 4;
+      blob_refuse = true;
+      if (pass)
+      {
+         blob_reregister = true;
+         rereg_items     = items + 1;
+         rereg_n         = 1;
+      }
+      event_save_items_fill(false);
+      assert(blob_len == 4 && !memcmp(blob_state, "keep", 4));
+      blob_refuse = false;
+      autosave_check();
+      assert(!autosave_state.num_retired);
+      autosave_deinit();
+      event_save_items_final(true, false);
+      assert(disk_holds("/s/t.srm", old, sizeof(old)));
+      assert(disk_named_holds("RetroArch-recovery-", last, sizeof(last))
+            == 1);
+      assert(disk_named_holds("RetroArch-recovery-", "keep", 4) == 1);
+   ASSERT_FILES(0, 3, 4);
+   assert(err_count == 0);
+   }
+}
+#endif
+
+/* A kept id moved onto the file of an item kept another way is
+ * guarded as a new id there is: filled from the image waiting for
+ * that file, which its copy holds. One kept at its own file is not
+ * guarded, whatever its tag. */
+static void test_kept_move_type_change(void)
+{
+   unsigned char want[12];
+   unsigned char want_card[6];
+   struct retro_save_item items[2];
+
+   /* The cart moves onto the file of the gone card. */
+   start();
+   disk_put("/s/a.srm", image(), 12);
+   disk_put("/s/c.sav", card, sizeof(card));
+   items[0]        = buffer_item("a", "/s/a.srm");
+   items[0].format = "core:a";
+   items[1]        = card_item("c", "/s/c.sav");
+   items[1].format = "core:c";
+   register_items(items, 2);
+   event_load_save_files(false);
+   card[1] = 0x44;
+   memcpy(want_card, card, sizeof(want_card));
+   items[0].path = "/s/c.sav";
+   register_items(items, 1);
+   assert(save_item_files.files[0].guard.type_changed);
+   assert(save_item_files.num_orphans == 2);
+   event_save_items_fill(false);
+   assert(save_item_files.num_orphans == 1);
+   assert(!memcmp(wram, want_card, sizeof(want_card)));
+   wram[7] = 9;
+   assert(event_save_files(true, false, NULL));
+   assert(disk_holds("/undo/c.sav", want_card, sizeof(want_card)));
+   assert(disk_holds("/s/c.sav", image(), 12));
+   assert(osd_count == 1 && strstr(osd_last, "/undo/c.sav"));
+
+   /* Two kept ids swap files of different tags: both guarded, and
+    * each copy holds the other's last image. */
+   start();
+   disk_put("/s/a.srm", image(), 12);
+   disk_put("/s/c.sav", card, sizeof(card));
+   items[0]        = buffer_item("a", "/s/a.srm");
+   items[0].format = "core:a";
+   items[1]        = card_item("c", "/s/c.sav");
+   items[1].format = "core:c";
+   register_items(items, 2);
+   event_load_save_files(false);
+   wram[1] = 0x55;
+   card[1] = 0x44;
+   memcpy(want, image(), sizeof(want));
+   memcpy(want_card, card, sizeof(want_card));
+   items[0].path = "/s/c.sav";
+   items[1].path = "/s/a.srm";
+   register_items(items, 2);
+   assert(save_item_files.files[0].guard.type_changed);
+   assert(save_item_files.files[1].guard.type_changed);
+   event_save_items_fill(false);
+   assert(save_item_files.num_orphans == 0);
+   assert(event_save_files(true, false, NULL));
+   assert(disk_holds("/undo/c.sav", want_card, sizeof(want_card)));
+   assert(disk_holds("/undo/a.srm", want, sizeof(want)));
+   assert(osd_count == 2);
+
+   /* Kept at their own files, a tag grown by "+<memory>": carried, no
+    * guard. */
+   items[0].format = "core:a+rtc";
+   items[1].format = "core:c+rtc";
+   register_items(items, 2);
+   assert(save_item_files.files[0].taken_up);
+   assert(save_item_files.files[1].taken_up);
+   assert(!save_item_files.files[0].guard.type_changed);
+   assert(!save_item_files.files[1].guard.type_changed);
+
+   /* Under another tag: a new layout, guarded. */
+   items[0].format = "core:b";
+   register_items(items, 2);
+   assert(save_item_files.files[0].guard.type_changed);
+   assert(!save_item_files.files[1].guard.type_changed);
 }
 
 /* A registration from inside blob_size(), blob_save() or
@@ -4356,6 +6588,45 @@ static void test_blob_leaves(void)
    }
 }
 
+/* A registration from inside a blob's own blob_load() that drops it
+ * leaves its file as it was: the blob is not saved during that SET.
+ * Passes: nothing takes the file; a new item does, filled from it. */
+static void test_blob_load_drops(void)
+{
+   struct retro_save_item items[1];
+   struct retro_save_item other[1];
+   unsigned pass;
+   for (pass = 0; pass < 2; pass++)
+   {
+      start();
+      app_dir  = "/app";
+      items[0] = blob_item("flash", "/s/game.flash");
+      other[0] = card_item("card", "/s/game.flash");
+      disk_put("/s/game.flash", "abcdef", 6);
+      memcpy(blob_state, "zzzzzz", 6);
+      blob_len        = 6;
+      blob_reregister = true;
+      rereg_items     = other;
+      rereg_n         = pass;
+      register_items(items, 1);
+      event_load_save_files(false);
+      /* Killed here. */
+      assert(!blob_reregister);
+      assert(save_item_files.num_orphans == 0);
+      assert(disk_holds("/s/game.flash", "abcdef", 6));
+      if (pass)
+         assert(!memcmp(card, "abcdef", 6));
+      ASSERT_FILES(0, 0, 0);
+      assert(event_save_files(true, false, NULL));
+      assert(disk_holds("/s/game.flash", "abcdef", 6));
+      /* The new item's type change copies the file and tells it. */
+      if (pass)
+         assert(disk_named_holds("/undo/", "abcdef", 6) == 1);
+      ASSERT_FILES(pass, 0, pass);
+      assert(err_count == 0);
+   }
+}
+
 /* An old core's save RAM and RTC both cut their files at one load:
  * copies in the undo folder are shown once (pass 0); each copy in a
  * recovery file is shown, naming it (pass 1), as is each cut with no
@@ -4417,6 +6688,7 @@ static void test_old_core_two_cuts(void)
    }
 }
 
+#ifdef HAVE_THREADS
 /* SAVE_FILES that cannot take the image of an item whose worker writes
  * fine: shown at the second failure in a row, not at each SAVE_FILES;
  * after a success the next streak is shown again. */
@@ -4507,6 +6779,7 @@ static void test_untold_write_fails(void)
    assert(err_count == 4);
    autosave_deinit();
 }
+#endif
 
 int main(void)
 {
@@ -4529,13 +6802,20 @@ int main(void)
    test_raw_by_default();
    test_load_prefix_and_cut();
    test_blob();
+   test_blob_reregister_refused();
    test_reregister_in_callback();
    test_refused_before_fill();
    test_blob_leaves();
+   test_blob_load_drops();
    test_legacy_retired();
    test_reported_at_fill();
+   test_left_out_back();
+   test_left_out_back_retired();
+   test_given_back_saved();
    test_told_no_memory();
    test_memory_size();
+   test_old_file_unlisted();
+   test_blob_unsaved_logged();
    test_autosave_item();
    test_generation();
    test_generation_stuck();
@@ -4595,11 +6875,44 @@ int main(void)
    test_given_back_held();
    test_given_back_autosave();
    test_given_back_reinit();
-   test_given_back_saved();
    test_retired_other_spelling();
    test_undo_dir();
+   test_loaded();
+   test_final_write();
+   test_snapshot_close();
+   test_snapshot_close_owed();
+   test_snapshot_close_superseded();
+   test_snapshot_close_main_settled();
+   test_snapshot_close_reissue_failed();
+   test_legacy_paths();
+   test_late_loaded();
+   test_loaded_reregister_moves();
+   test_legacy_load();
+   test_legacy_raw();
+   test_legacy_newer();
+   test_legacy_reregister();
+   test_grow_told();
+   test_waiting_image();
+   test_waiting_other_spelling();
+   test_waiting_refused();
+   test_port_move();
+   test_type_change_waiting();
+   test_type_change_uncopied();
+   test_type_change_twice();
+   test_type_change_blob_gone();
+   test_type_change_no_memory();
+   test_blob_reregister_taken();
+   test_orphan_no_memory_type_change();
+#ifdef HAVE_THREADS
+   test_waiting_refused_worker();
+   test_retired_copy_passes();
+   test_save_files_retired_copy();
+   test_reap_before_fill();
+   test_retired_take_refused();
    test_save_no_image_worker();
    test_untold_write_fails();
+#endif
+   test_kept_move_type_change();
    test_old_core_two_cuts();
 
    event_save_items_deinit();
@@ -4610,3 +6923,71 @@ int main(void)
    printf("save_items_io_test: OK\n");
    return 0;
 }
+#else
+/* No worker: the close's SAVE_FILES writes the image while
+ * can_snapshot() says true, and the final write, the game still saving
+ * it, keeps that image, logged once. Pass 1: a frame runs between them,
+ * so the final write writes the image now. */
+static void test_snapshot_close_unthreaded(void)
+{
+   unsigned char settled[12];
+   struct retro_save_item items[1];
+   unsigned pass;
+
+   for (pass = 0; pass < 2; pass++)
+   {
+      unsigned i;
+      unsigned files = 0;
+      start();
+      app_dir          = "/app";
+      use_can_snapshot = true;
+      items[0] = buffer_item("srm", "/s/close.srm");
+      register_items(items, 1);
+      event_load_save_files(false);
+      wram[0] = 1;
+      memcpy(settled, image(), sizeof(settled));
+      assert(event_save_files(true, false, NULL));
+      /* Killed here. */
+      assert(disk_holds("/s/close.srm", settled, 12));
+      if (pass)
+         event_save_items_fill(false);
+      snapshot_ready = false;
+      /* Written while unloading. */
+      wram[1] = 2;
+      event_save_items_final(true, false);
+      assert(disk_holds("/s/close.srm", pass ? image() : settled, 12));
+      for (i = 0; i < DISK_FILES; i++)
+         if (disk[i].exists)
+            files++;
+      assert(files == 1 && osd_count == 0 && err_count == 0);
+      assert(saving_logs == !pass && snapshot_calls == 2);
+   }
+}
+
+int main(void)
+{
+   retro_atomic_int_init(&fail_reallocs, 0);
+   retro_atomic_int_init(&fail_callocs, 0);
+   retro_atomic_int_init(&fail_main_malloc_size, 0);
+   retro_atomic_int_init(&fail_malloc_size, 0);
+   main_thread  = sthread_get_current_thread_id();
+   disk_lock    = slock_new();
+   disk_cond    = scond_new();
+   assert(disk_lock && disk_cond);
+   segs[0].data = wram;
+   segs[0].size = sizeof(wram);
+   segs[1].data = iram;
+   segs[1].size = sizeof(iram);
+
+   test_snapshot_close_unthreaded();
+   test_given_back_saved();
+
+   event_save_items_deinit();
+   save_items_clear();
+   path_deinit_savefile();
+   scond_free(disk_cond);
+   slock_free(disk_lock);
+   printf("save_items_io_test: OK\n");
+   return 0;
+}
+#endif

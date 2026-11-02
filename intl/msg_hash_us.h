@@ -33581,6 +33581,18 @@ MSG_HASH(
    "\"%s\" is longer than this core's save memory; a copy is kept in \"%s\"."
    )
 MSG_HASH(
+   MSG_SAVE_ITEM_LEGACY_SIZE,
+   "Loaded the older save \"%s\"; its size differs, so check the game's save."
+   )
+MSG_HASH(
+   MSG_SAVE_ITEM_LEGACY_NEWER,
+   "The older save \"%s\" is newer than this one."
+   )
+MSG_HASH(
+   MSG_SAVE_ITEM_LEGACY_REFUSED,
+   "The core could not convert \"%s\"; it is kept as it was."
+   )
+MSG_HASH(
    MSG_SAVE_ITEM_TYPE_CHANGED,
    "The save type of \"%s\" changed; a copy is kept in \"%s\"."
    )

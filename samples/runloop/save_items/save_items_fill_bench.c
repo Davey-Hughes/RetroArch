@@ -156,6 +156,67 @@ static double time_item(const char *path, bool cold)
    return (double)(cpu_features_get_time_usec() - t0) / 1000.0;
 }
 
+static bool RETRO_CALLCONV bench_legacy_load(unsigned item,
+      unsigned index, const char *format, const void *buf, size_t len)
+{
+   (void)item;
+   (void)index;
+   (void)format;
+   memcpy(ram, buf, len < ram_size ? len : ram_size);
+   return true;
+}
+
+/* An item whose own file is missing, filled at load from @path, its
+ * earlier name: raw, or converted by legacy_load(). */
+static double time_legacy(const char *path, bool cold, bool convert)
+{
+   static char own[PATH_MAX_LENGTH + 16];
+   retro_time_t t0;
+   const char *legacy[2];
+   struct retro_save_item item;
+   struct retro_save_interface iface;
+   struct retro_save_frontend_interface fi;
+   reset();
+   memset(&fi, 0, sizeof(fi));
+   fi.interface_version = 1;
+   fi.features          = RETRO_SAVE_FEATURE_LEGACY_LOAD;
+   save_items_get_frontend_interface(&fi, RETRO_SAVE_INSTANCE_PRIMARY);
+   snprintf(own, sizeof(own), "%s.missing", path);
+   legacy[0] = path;
+   legacy[1] = NULL;
+   memset(&iface, 0, sizeof(iface));
+   iface.interface_version = 1;
+   iface.item_size         = sizeof(item);
+   iface.legacy_load       = convert ? bench_legacy_load : NULL;
+   memset(&item, 0, sizeof(item));
+   item.id            = "srm";
+   item.path          = own;
+   item.storage       = RETRO_SAVE_STORAGE_FRONTEND_BUFFER;
+   item.root          = RETRO_SAVE_ROOT_ABSOLUTE;
+   item.segments      = &seg;
+   item.num_segments  = 1;
+   item.legacy_memory = RETRO_SAVE_NO_LEGACY_MEMORY;
+   item.legacy_paths  = legacy;
+   iface.num_items    = 1;
+   iface.items        = &item;
+   register_set(&iface);
+   if (cold)
+      drop_cache(path);
+   t0 = cpu_features_get_time_usec();
+   event_load_save_files(false);
+   return (double)(cpu_features_get_time_usec() - t0) / 1000.0;
+}
+
+static double time_legacy_raw(const char *path, bool cold)
+{
+   return time_legacy(path, cold, false);
+}
+
+static double time_legacy_convert(const char *path, bool cold)
+{
+   return time_legacy(path, cold, true);
+}
+
 /* SAVE_FILES on an unchanged item that holds half of @path: the
  * compare reads the head and the kept tail. */
 static double time_tail_compare(const char *path, bool cold)
@@ -315,6 +376,12 @@ int main(int argc, char *argv[])
       row(labels[s], "save RAM at load", path, true, rounds, time_save_ram);
       row(labels[s], "item while running", path, false, rounds, time_item);
       row(labels[s], "item while running", path, true, rounds, time_item);
+      row(labels[s], "old name, raw", path, false, rounds, time_legacy_raw);
+      row(labels[s], "old name, raw", path, true, rounds, time_legacy_raw);
+      row(labels[s], "old name, converted", path, false, rounds,
+            time_legacy_convert);
+      row(labels[s], "old name, converted", path, true, rounds,
+            time_legacy_convert);
       check_fill = false;
       row(labels[s], "tail at SAVE_FILES", path, false, rounds,
             time_tail_compare);
