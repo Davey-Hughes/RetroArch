@@ -371,16 +371,20 @@ void video_windows_place(video_windows_host_t *host,
       return;
    names    = video_windows_names_hash(in->displays, in->count);
    settings = video_windows_settings_hash(in);
-   refused  = video_windows_refusals(in);
    if (names != host->names)
    {
       host->names       = names;
       host->unable      = 0;
       host->refused     = 0;
+      host->ui_refused  = 0;
       host->moving      = 0;
       host->keep        = 0;
       event             = true;
    }
+   else
+      /* A UI failure heard as the names change was of the old list */
+      host->ui_refused |= in->ui_refused;
+   refused  = video_windows_refusals(in) | host->ui_refused;
    if (settings != host->settings)
    {
       host->settings    = settings;
@@ -455,7 +459,8 @@ void video_windows_place(video_windows_host_t *host,
          {
             /* A display RetroArch leaves that stays in use gets its
              * Presentation first */
-            video_windows_place_route(in, host->unable, d, out);
+            video_windows_place_route(in,
+                  host->unable | host->ui_refused, d, out);
             if (out->display == out->own)
             {
                host->make  = out->own;
@@ -491,7 +496,7 @@ void video_windows_place(video_windows_host_t *host,
          host->keep_frames--;
    }
    /* While a move is pending the main window shows what it will */
-   video_windows_place_route(in, host->unable,
+   video_windows_place_route(in, host->unable | host->ui_refused,
          (host->moving || host->make) ? host->host : out->own, out);
    if (host->keep)
    {

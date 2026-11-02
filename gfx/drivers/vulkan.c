@@ -11031,10 +11031,15 @@ static unsigned vulkan_window_ui_prepare(vk_t *vk,
       return 0;
    drawn = VIDEO_WINDOW_UI_DRAWN(layers, menu, msg,
          video_info->statistics_show, video_info->widgets_visible);
-   if (     !drawn
-         || !vulkan_vv_target_ensure(vk, &vk->windows.ui_target,
+   if (!drawn)
+      return layers;
+   if (!vulkan_vv_target_ensure(vk, &vk->windows.ui_target,
             &vk->windows.ui, dims))
-      return drawn ? 0 : layers;
+   {
+      /* Placement gives the UI back to the main window */
+      video_driver_window_ui_failed(f->display, f->restore);
+      return 0;
+   }
    /* vulkan_windows_draw() draws a prepared window with views or UI */
    ready = (vk->windows.win[w].flags & VK_WINDOW_FLAG_PREPARED)
       && (vk->views.active || f->window_ui[w]);

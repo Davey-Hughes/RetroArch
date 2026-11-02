@@ -2147,6 +2147,9 @@ typedef struct
     * frame */
    retro_atomic_int_t windows_failed;
    unsigned windows_forced_attached;
+   /* The display video_driver_window_ui_failed() named, for the next
+    * frame */
+   retro_atomic_int_t windows_ui_failed;
    unsigned windows_restore;
    /* A bit a window id: those the last snapshot wanted, 0 while
     * windows are off; main thread */

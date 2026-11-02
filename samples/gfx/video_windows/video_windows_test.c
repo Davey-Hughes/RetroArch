@@ -1201,6 +1201,68 @@ static void test_place_moves(void)
    CHECK(place_host.make == 1);
 }
 
+/* A display whose Presentation could not draw the UI is refused as if
+ * the platform had refused it */
+static void test_place_ui_refused(void)
+{
+   video_windows_route_t want;
+   video_windows_host_t want_host;
+   place_reset(1, 2);
+   place_in.menu_follows = 1;
+   place_game(2, false);
+   place_in.menu_open    = true;
+   place_at(0);
+   CHECK(place_r.display == 2);
+   place_d[1].refused = true;
+   place_at(16667);
+   want      = place_r;
+   want_host = place_host;
+   CHECK(want.display != 2);
+   place_reset(1, 2);
+   place_in.menu_follows = 1;
+   place_game(2, false);
+   place_in.menu_open    = true;
+   place_at(0);
+   place_in.ui_refused   = 1u << 1;
+   place_at(16667);
+   CHECK(placed(want.display, want.screens, want.main_screens, want.ui,
+            want.move));
+   CHECK(place_host.host == want_host.host
+         && place_host.make == want_host.make
+         && place_host.moving == want_host.moving);
+   /* A game without a map keeps the main window, so the Presentation
+    * stays off that display, heard once, until the list changes */
+   place_reset(1, 2);
+   place_in.menu_follows = VIDEO_MENU_FOLLOWS_SEPARATE;
+   strcpy(place_menu, "Screen-2");
+   place_game(1, true);
+   place_in.menu_open    = true;
+   place_at(0);
+   CHECK(placed(2, 0u, 1u, PLACE_MENU, 0));
+   place_in.ui_refused   = 1u << 1;
+   place_at(16667);
+   CHECK(placed(0, 0u, 1u, 0u, 0));
+   place_in.ui_refused   = 0;
+   place_at(33333);
+   CHECK(placed(0, 0u, 1u, 0u, 0));
+   place_in.count        = 3;
+   place_at(50000);
+   CHECK(placed(2, 0u, 1u, PLACE_MENU, 0));
+   /* Heard as the list changes: the old list's */
+   place_in.count        = 2;
+   place_in.ui_refused   = 1u << 1;
+   place_at(66667);
+   CHECK(placed(2, 0u, 1u, PLACE_MENU, 0));
+   /* Unplugged and back, heard as one list: the new id makes it a new
+    * list */
+   place_at(83333);
+   CHECK(placed(0, 0u, 1u, 0u, 0));
+   place_in.ui_refused   = 0;
+   place_d[1].id         = 7;
+   place_at(100000);
+   CHECK(placed(2, 0u, 1u, PLACE_MENU, 0) && !place_host.ui_refused);
+}
+
 static void test_selected_layout(void)
 {
    video_views_map_t map;
@@ -1688,6 +1750,7 @@ int main(void)
    test_place_where();
    test_place_external();
    test_place_moves();
+   test_place_ui_refused();
    test_selected_layout();
    test_second_output_touch();
    test_window_events();

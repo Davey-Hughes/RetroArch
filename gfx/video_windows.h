@@ -293,6 +293,9 @@ typedef struct video_windows_place_in
    /* The number of a move the platform could not start (a route's
     * move_seq), 0 for none */
    unsigned failed_move;
+   /* A bit an ordinal, bit 0 for 1: displays whose Presentation could
+    * not draw the UI, heard this frame */
+   unsigned ui_refused;
    retro_time_t now;
    bool mapless;
    bool menu_open;
@@ -348,6 +351,8 @@ typedef struct video_windows_host
    /* A bit an ordinal, bit 0 for 1: refusals since the names last
     * changed */
    unsigned refused;
+   /* Those of them whose Presentation could not draw the UI */
+   unsigned ui_refused;
    /* A bit an ordinal: displays that could not take RetroArch, until
     * the names change */
    unsigned unable;
@@ -476,6 +481,11 @@ void video_driver_window_layout_screens(const video_windows_frame_t *frame,
  * make or keep, in a frame of @restore (video_windows_frame_t's): one
  * laid out before the last restore is ignored. */
 void video_driver_attach_windows(unsigned screens, unsigned restore);
+
+/* Any thread: display @display's Presentation could not take the UI
+ * image, in a frame of @restore. Placement refuses the display until
+ * the display list changes. */
+void video_driver_window_ui_failed(unsigned display, unsigned restore);
 
 /* Window @window's layout as drawn on display @display (an ordinal, 0
  * where the native layer placed it), from the thread that runs the

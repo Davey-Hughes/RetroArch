@@ -2870,6 +2870,58 @@ static void test_window_ui_wait_moved(void)
    window_test_end();
 }
 
+/* A Presentation that could not draw the UI, a game without a map
+ * keeping the main window: its display is refused, past a restore,
+ * until the display list changes, so the menu is the main window's; a
+ * failure from before the last restore is not heard */
+static void test_window_ui_failed(void)
+{
+   video_window_display_t displays[3];
+   settings_t *settings           = config_get_ptr();
+   struct menu_state *menu_st     = menu_state_get_ptr();
+   uint16_t saved_menu            = menu_st->flags;
+   window_test_display(&displays[0], 1, VIDEO_WINDOW_CONNECTION_UNKNOWN,
+         true, "Built-in Screen");
+   window_test_display(&displays[1], 2, VIDEO_WINDOW_CONNECTION_UNKNOWN,
+         false, "Screen-2");
+   window_test_display(&displays[2], 3, VIDEO_WINDOW_CONNECTION_UNKNOWN,
+         false, "Screen-3");
+   displays[1].dims = VIDEO_SCALE_PACK(1240, 1080);
+   window_test_begin();
+   video_driver_publish_window_displays(displays, 2);
+   video_driver_clear_views();
+   settings->uints.video_menu_follows = 1;
+   menu_st->flags |= MENU_ST_FLAG_ALIVE;
+   window_test_run();
+   CHECK(window_test_seen.display == 2);
+   CHECK(video_driver_get_ui_layer_window(VIDEO_WINDOW_UI_MENU)
+         == VIDEO_WINDOWS_PRESENTATION);
+   video_driver_window_ui_failed(2, window_test_seen.restore);
+   window_test_run();
+   CHECK(window_test_seen.display == 0);
+   CHECK(video_driver_get_ui_layer_window(VIDEO_WINDOW_UI_MENU) == 0);
+   /* Its surface going restores the windows; the same list again */
+   video_driver_restore_windows();
+   window_test_run();
+   CHECK(window_test_seen.display == 0);
+   video_driver_publish_window_displays(displays, 2);
+   window_test_run();
+   CHECK(window_test_seen.display == 0);
+   CHECK(video_driver_get_ui_layer_window(VIDEO_WINDOW_UI_MENU) == 0);
+   video_driver_publish_window_displays(displays, 3);
+   window_test_run();
+   CHECK(window_test_seen.display == 2);
+   video_driver_window_ui_failed(2, window_test_seen.restore - 1);
+   window_test_run();
+   CHECK(window_test_seen.display == 2);
+   /* The list test_window_ui_targets() left for the later tests */
+   video_driver_publish_window_displays(displays, 2);
+   window_test_run();
+   settings->uints.video_menu_follows = 0;
+   menu_st->flags                     = saved_menu;
+   window_test_end();
+}
+
 static video_views_layout_t window_test_layouts[2];
 static video_views_map_t window_test_map;
 static unsigned window_test_generation;
@@ -4548,6 +4600,7 @@ int main(int argc, char **argv)
    test_window_shown_reinit();
    test_window_ui_targets();
    test_window_ui_wait_moved();
+   test_window_ui_failed();
    test_window_turned();
    test_window_turned_touch();
    test_window_turned_display();

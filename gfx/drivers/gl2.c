@@ -6776,10 +6776,15 @@ static unsigned gl2_window_ui_prepare(gl2_t *gl,
       return 0;
    drawn = VIDEO_WINDOW_UI_DRAWN(layers, menu, msg,
          video_info->statistics_show, video_info->widgets_visible);
-   if (     !drawn
-         || !gl2_vv_target_ensure(gl, &gl->windows.ui_target,
+   if (!drawn)
+      return layers;
+   if (!gl2_vv_target_ensure(gl, &gl->windows.ui_target,
             &gl->windows.ui, dims))
-      return drawn ? 0 : layers;
+   {
+      /* Placement gives the UI back to the main window */
+      video_driver_window_ui_failed(f->display, f->restore);
+      return 0;
+   }
    ready = gl2_window_ready(gl, f, w);
    for (l = 0; l < VIDEO_WINDOW_UI_LAYERS; l++)
       if (     (drawn & VIDEO_WINDOW_UI_BIT(l))

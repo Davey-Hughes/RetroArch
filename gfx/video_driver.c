@@ -1068,6 +1068,13 @@ void video_driver_attach_windows(unsigned screens, unsigned restore)
    } while (!retro_atomic_cas_int(word, was, now));
 }
 
+void video_driver_window_ui_failed(unsigned display, unsigned restore)
+{
+   if (display && display <= 32)
+      retro_atomic_store_release_int(&video_driver_st.windows_ui_failed,
+            VIDEO_WINDOWS_FAILED_TAG(restore) | (int)display);
+}
+
 void video_driver_publish_window_layout(unsigned window,
       unsigned generation, unsigned display,
       const video_views_layout_t *layout,
@@ -4485,8 +4492,8 @@ void video_driver_window_layout_screens(const video_windows_frame_t *frame,
 }
 
 /* App thread: placement's inputs from the settings, the content and the
- * menu, and RetroArch's move asked for. @in has the frame's shown, now
- * and menu_open. */
+ * menu, and RetroArch's move asked for. @in has the frame's shown, now,
+ * menu_open and ui_refused. */
 static void video_driver_windows_place(video_driver_state_t *video_st,
       settings_t *settings, const video_window_display_t *list,
       unsigned count, video_windows_place_in_t *in,
@@ -4717,9 +4724,16 @@ static VIDEO_NOINLINE const video_windows_frame_t *video_driver_windows_frame(
       {
          /* Not those of frames laid out before the last restore */
          int failed = retro_atomic_exchange_int(&video_st->windows_failed, 0);
+         int ui     = retro_atomic_exchange_int(
+               &video_st->windows_ui_failed, 0);
          if (     (failed & ~0xff)
                == VIDEO_WINDOWS_FAILED_TAG(video_st->windows_restore))
             video_st->windows_forced_attached |= (unsigned)failed & 0xffu;
+         in.ui_refused = 0;
+         if (     (ui & 0xff)
+               && (ui & ~0xff)
+                  == VIDEO_WINDOWS_FAILED_TAG(video_st->windows_restore))
+            in.ui_refused = 1u << ((ui & 0xff) - 1);
       }
       list   = video_driver_take_window_displays(video_st, &count);
       forced = video_st->windows_forced_attached;
