@@ -15545,8 +15545,10 @@ const input_pointer_view_t *input_driver_pointer_view(void)
    static input_pointer_view_t view;
    static unsigned             compiled;
 #ifdef HAVE_VIDEO_WINDOWS
-   /* the menu's window's touch: its last place */
+   /* the menu's window's touch, and the main window's mouse: their
+    * last places */
    static uint32_t             window_pos;
+   static uint32_t             mouse_pos;
    unsigned window;
    bool down;
 #endif
@@ -15603,7 +15605,7 @@ const input_pointer_view_t *input_driver_pointer_view(void)
    {
       uint32_t pos;
       view.flags    &= INPUT_PTR_VIEW_VALID | INPUT_PTR_VIEW_SCR_BACK;
-      view.mouse_pos = 0;
+      view.mouse_pos = mouse_pos;
       view.ptr_pos   = 0;
       if (input_driver_window_touch(window, 0, &pos, &down))
          window_pos  = pos;
@@ -15613,6 +15615,8 @@ const input_pointer_view_t *input_driver_pointer_view(void)
       if (down)
          view.flags |= INPUT_PTR_VIEW_SCR_PRESSED;
    }
+   else
+      mouse_pos      = view.mouse_pos;
 #endif
    return &view;
 }
