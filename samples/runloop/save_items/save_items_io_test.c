@@ -7271,18 +7271,33 @@ static void test_orphan_job_dumps_copy(void)
       }
       assert(save_item_files.num_orphans == 1);
       assert(save_item_files.orphans[0].guard.job);
-      assert(event_save_files(true, false, NULL) == (pass == 0));
+      assert(event_save_files(true, false, NULL));
       n = osd_count;
       set_fail_undo(true);
       set_hold(&hold_undo, false);
       copies_wait(false);
       assert(disk_named_holds("RetroArch-recovery-", want, 12) == 1);
       assert(osd_count == n);
+      /* Pass 1: c's image, the old type's too, in one untold file. */
+      if (pass)
+      {
+         assert(disk_named_holds("RetroArch-recovery-", last, 12) == 1);
+         ASSERT_FILES(0, 2, n);
+      }
       autosave_reap(true);
       assert(osd_count == n + (pass == 0 ? 2 : 1));
       assert(disk_named_holds("RetroArch-recovery-", want, 12) == 1);
       assert(disk_holds("/s/t.srm", old, 12));
       set_fail_undo(false);
+      if (pass)
+      {
+         assert(told_holding(last, 12) == 0);
+         assert(save_files());
+         assert(disk_holds("/s/t.srm", last, 12));
+         assert(disk_holds("/undo/t.srm", last, 12));
+         ASSERT_FILES(1, 1, n + 2);
+         assert(err_count == 0);
+      }
    }
 }
 
@@ -7330,6 +7345,52 @@ static void test_failed_job_detached(void)
    assert(disk_count_named("RetroArch-recovery-") == 2);
    assert(!disk_named("/undo/"));
    assert(save_item_files.files[0].guard.copy_image);
+}
+
+/* A type change while the replaced item's worker still writes its last
+ * image: that worker copies the file after its write, then writes the
+ * image SAVE_FILES hands it. No recovery file, and no notice but the
+ * type change's. */
+static void test_type_change_retired_busy(void)
+{
+   unsigned char want[12];
+   struct retro_save_item items[1];
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   disk_put("/s/t.srm", image(), 12);
+   items[0]        = buffer_item("a", "/s/t.srm");
+   items[0].format = "core:a";
+   register_items(items, 1);
+   event_load_save_files(false);
+   start_autosave(false);
+   wram[1] = 0x44;
+   memcpy(want, image(), sizeof(want));
+   set_hold(&hold_save_renamed, true);
+   items[0].id     = "b";
+   items[0].format = "core:b";
+   register_items(items, 1);
+   wait_held(1);
+   event_save_items_fill(false);
+   assert(save_item_files.files[0].guard.copy_image);
+   assert(!save_item_files.files[0].autosave);
+   n = osd_count;
+   wram[2] = 9;
+   event_save_files(true, false, NULL);
+   assert(osd_count == n && !disk_named("RetroArch-recovery-"));
+   set_hold(&hold_save_renamed, false);
+   retired_join(false);
+   autosave_check();
+   assert(!autosave_state.num_retired);
+   assert(disk_holds("/undo/t.srm", want, sizeof(want)));
+   assert(disk_holds("/s/t.srm", image(), 12));
+   assert(osd_count == n + 1 && strstr(osd_last, "/s/t.srm|/undo/t.srm"));
+   assert(!save_item_files.files[0].guard.copy_first);
+   assert(!save_item_files.files[0].guard.copy_image);
+   ASSERT_FILES(1, 0, 1);
+   assert(err_count == 0);
+   autosave_deinit();
 }
 
 /* The replaced item's worker still owes its own copy when a type change
@@ -8150,7 +8211,7 @@ static void test_job_dump_own_name(void)
    n       = osd_count;
    wram[0] = 0xc;
    memcpy(c1, image(), sizeof(c1));
-   assert(!event_save_files(true, false, NULL));
+   assert(event_save_files(true, false, NULL));
    set_fail_undo(true);
    set_hold(&hold_undo, false);
    copies_wait(false);
@@ -8158,13 +8219,23 @@ static void test_job_dump_own_name(void)
    assert(disk_named_holds("RetroArch-recovery-", c1, 12) == 1);
    assert(disk_named_holds("RetroArch-recovery-", b3, 12) == 1);
    assert(disk_named_holds("RetroArch-recovery-", b2, 12) == 1);
-   ASSERT_FILES(0, 3, n + 1);
+   ASSERT_FILES(0, 3, n);
    assert(err_count == 1);
    autosave_reap(true);
-   ASSERT_FILES(0, 3, n + 2);
+   ASSERT_FILES(0, 3, n + 1);
    assert(err_count == 1);
    assert(told_holding(b2, 12) == 1 && told_holding(c1, 12) == 1);
+   assert(told_holding(b3, 12) == 0);
    assert(disk_holds("/s/t.srm", file, 12));
+   /* C's own copy, tried again, fails: b3's file is named. The job may
+    * end before the hand-off, and SAVE_FILES then fails itself. */
+   save_files();
+   assert(disk_holds("/s/t.srm", file, 12));
+   assert(disk_named_holds("RetroArch-recovery-", c1, 12) == 1);
+   ASSERT_FILES(0, 3, n + 2);
+   assert(told_holding(b3, 12) == 1);
+   assert(err_count == 1);
+   set_fail_undo(false);
 }
 
 /* A retired worker whose copy fails writes its last image to a
@@ -8364,6 +8435,346 @@ static void test_save_files_cut_copying(void)
    autosave_deinit();
 }
 
+/* Chains type changes a -> b -> c at /s/t.srm, from a file of @old:
+ * b's copy job of a's image @want is held in its copy, and c took b's
+ * image @last, of which it owes a copy. */
+static void busy_chain(unsigned char *old, unsigned char *want,
+      unsigned char *last, struct retro_save_item *items)
+{
+   memset(old, 0x21, 12);
+   disk_put("/s/t.srm", old, 12);
+   items[0]        = buffer_item("a", "/s/t.srm");
+   items[0].format = "core:a";
+   register_items(items, 1);
+   event_load_save_files(false);
+   wram[1] = 0x44;
+   memcpy(want, image(), 12);
+   set_hold(&hold_undo, true);
+   items[0].id     = "b";
+   items[0].format = "core:b";
+   register_items(items, 1);
+   event_save_items_fill(false);
+   wait_held(1);
+   wram[2] = 9;
+   memcpy(last, image(), 12);
+   items[0].id     = "c";
+   items[0].format = "core:c";
+   register_items(items, 1);
+   event_save_items_fill(false);
+}
+
+/* A type change while the replaced item's copy job runs: SAVE_FILES
+ * writes the new image and the old type's silently. The next one makes
+ * the copy and both files go (pass 0); when that copy fails, each is
+ * named once (pass 1); when every write fails, the untold files are
+ * named, not lost (pass 2). */
+static void test_busy_job_type_change(void)
+{
+   unsigned char old[12];
+   unsigned char want[12];
+   unsigned char last[12];
+   unsigned char c1[12];
+   struct retro_save_item items[1];
+   unsigned pass;
+   unsigned n;
+
+   for (pass = 0; pass < 3; pass++)
+   {
+      start();
+      app_dir = "/app";
+      busy_chain(old, want, last, items);
+      wram[3] = 5;
+      memcpy(c1, image(), sizeof(c1));
+      n = osd_count;
+      assert(event_save_files(true, false, NULL));
+      set_hold(&hold_undo, false);
+      copies_wait(false);
+      /* Killed here. */
+      assert(disk_holds("/s/t.srm", old, 12));
+      assert(disk_holds("/undo/t.srm", want, 12));
+      assert(disk_named_holds("RetroArch-recovery-", c1, 12) == 1);
+      assert(disk_named_holds("RetroArch-recovery-", last, 12) == 1);
+      ASSERT_FILES(1, 2, n);
+      assert(err_count == 0);
+      if (pass == 1)
+         set_fail_undo(true);
+      if (pass == 2)
+         set_fail_writes(true);
+      /* A failed copy may end the job before the hand-off. */
+      assert(save_files() || pass);
+      set_fail_writes(false);
+      if (pass == 0)
+      {
+         assert(disk_holds("/s/t.srm", c1, 12));
+         assert(disk_named_holds("/undo/", last, 12) == 1);
+         ASSERT_FILES(2, 0, n + 2);
+      }
+      else
+      {
+         assert(disk_holds("/s/t.srm", old, 12));
+         assert(disk_named_holds("RetroArch-recovery-", c1, 12) == 1);
+         assert(disk_named_holds("RetroArch-recovery-", last, 12) == 1);
+         assert(told_holding(c1, 12) == 1 && told_holding(last, 12) == 1);
+         ASSERT_FILES(1, 2, n + 3);
+         set_fail_undo(false);
+      }
+      assert(err_count == 0);
+   }
+}
+
+/* An orphan whose file another copy job holds: its image and the old
+ * type's are written silently, and it stays until the next SAVE_FILES,
+ * which writes it once the job is done. */
+static void test_busy_orphan_image(void)
+{
+   unsigned char old[12];
+   unsigned char want[12];
+   unsigned char last[12];
+   unsigned char c1[12];
+   struct retro_save_item items[1];
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   busy_chain(old, want, last, items);
+   wram[3] = 5;
+   memcpy(c1, image(), sizeof(c1));
+   items[0] = card_item("u", "/s/u.srm");
+   register_items(items, 1);
+   event_save_items_fill(false);
+   assert(save_item_files.num_orphans == 2);
+   n = osd_count;
+   assert(event_save_files(true, false, NULL));
+   assert(save_item_files.num_orphans == 1);
+   set_hold(&hold_undo, false);
+   copies_wait(false);
+   /* Killed here. */
+   assert(disk_holds("/s/t.srm", old, 12));
+   assert(disk_holds("/undo/t.srm", want, 12));
+   assert(disk_named_holds("RetroArch-recovery-", c1, 12) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", last, 12) == 1);
+   ASSERT_FILES(1, 2, n);
+   assert(err_count == 0);
+   assert(save_files());
+   assert(!save_item_files.num_orphans);
+   assert(disk_holds("/s/t.srm", c1, 12));
+   assert(disk_named_holds("/undo/", last, 12) == 1);
+   ASSERT_FILES(2, 0, n + 2);
+   assert(err_count == 0);
+}
+
+/* Two type changes while the replaced item's worker still writes its
+ * last image, which the second does not carry: the copy-only orphan and
+ * the record write their images silently. The record's worker makes its
+ * copy, the orphan's job its own, and the files go. */
+static void test_busy_retired_no_carry(void)
+{
+   unsigned char old[12];
+   unsigned char a1[12];
+   unsigned char b1[12];
+   unsigned char c1[12];
+   struct retro_save_item items[1];
+   autosave_t *h;
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   memset(old, 0x21, sizeof(old));
+   disk_put("/s/t.srm", old, sizeof(old));
+   items[0]        = buffer_item("a", "/s/t.srm");
+   items[0].format = "core:a";
+   register_items(items, 1);
+   event_load_save_files(false);
+   start_autosave(false);
+   wram[1] = 0x44;
+   memcpy(a1, image(), sizeof(a1));
+   set_hold(&hold_save_renamed, true);
+   items[0].id     = "b";
+   items[0].format = "core:b";
+   register_items(items, 1);
+   wait_held(1);
+   event_save_items_fill(false);
+   assert(save_item_files.files[0].guard.copy_image);
+   wram[2] = 9;
+   memcpy(b1, image(), sizeof(b1));
+   items[0].id     = "c";
+   items[0].format = "core:c";
+   register_items(items, 1);
+   event_save_items_fill(false);
+   assert(save_item_files.num_orphans == 1);
+   assert(!save_item_files.orphans[0].data);
+   wram[3] = 5;
+   memcpy(c1, image(), sizeof(c1));
+   n = osd_count;
+   assert(event_save_files(true, false, NULL));
+   set_hold(&hold_save_renamed, false);
+   retired_join(false);
+   /* Killed here. */
+   assert(disk_holds("/s/t.srm", a1, 12));
+   assert(disk_named_holds("RetroArch-recovery-", a1, 12) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", b1, 12) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", c1, 12) == 1);
+   ASSERT_FILES(0, 3, n);
+   assert(err_count == 0);
+   autosave_check();
+   event_save_items_fill(false);
+   assert((h = save_item_files.files[0].autosave));
+   h->interval = 0;
+   wait_requested(h);
+   capture(h);
+   /* Killed here. */
+   assert(disk_holds("/s/t.srm", c1, 12));
+   assert(!disk_named_holds("RetroArch-recovery-", c1, 12));
+   ASSERT_FILES(1, 2, n);
+   assert(err_count == 0);
+   event_save_items_fill(false);
+   assert(disk_holds("/s/t.srm", c1, 12));
+   assert(save_files());
+   assert(!save_item_files.num_orphans);
+   assert(disk_named_holds("/undo/", a1, 12) == 1);
+   assert(disk_named_holds("/undo/", b1, 12) == 1);
+   ASSERT_FILES(2, 0, n + 2);
+   assert(err_count == 0);
+   autosave_deinit();
+}
+
+/* test_busy_retired_no_carry with no recovery folder: the copy-only
+ * orphan's image of the old type stays in memory, as the record's
+ * does; the file's failure is shown once, at the second SAVE_FILES in a
+ * row.
+ * The copies are made once the worker is done. */
+static void test_busy_orphan_untold_fails(void)
+{
+   unsigned char old[12];
+   unsigned char a1[12];
+   unsigned char b1[12];
+   unsigned char c1[12];
+   struct retro_save_item items[1];
+   autosave_t *h;
+   unsigned n;
+
+   start();
+   memset(old, 0x21, sizeof(old));
+   disk_put("/s/t.srm", old, sizeof(old));
+   items[0]        = buffer_item("a", "/s/t.srm");
+   items[0].format = "core:a";
+   register_items(items, 1);
+   event_load_save_files(false);
+   start_autosave(false);
+   wram[1] = 0x44;
+   memcpy(a1, image(), sizeof(a1));
+   set_hold(&hold_save_renamed, true);
+   items[0].id     = "b";
+   items[0].format = "core:b";
+   register_items(items, 1);
+   wait_held(1);
+   event_save_items_fill(false);
+   wram[2] = 9;
+   memcpy(b1, image(), sizeof(b1));
+   items[0].id     = "c";
+   items[0].format = "core:c";
+   register_items(items, 1);
+   event_save_items_fill(false);
+   assert(save_item_files.num_orphans == 1);
+   assert(!save_item_files.orphans[0].data);
+   wram[3] = 5;
+   memcpy(c1, image(), sizeof(c1));
+   n = osd_count;
+   assert(!event_save_files(true, false, NULL));
+   ASSERT_FILES(0, 0, n);
+   assert(err_count == 2);
+   assert(!event_save_files(true, false, NULL));
+   set_hold(&hold_save_renamed, false);
+   retired_join(false);
+   /* Killed here. */
+   assert(disk_holds("/s/t.srm", a1, 12));
+   assert(save_item_files.num_orphans == 1);
+   assert(save_item_files.orphans[0].guard.copy_image);
+   ASSERT_FILES(0, 0, n + 1);
+   assert(strstr(osd_last, "/s/t.srm"));
+   assert(err_count == 4);
+   autosave_check();
+   event_save_items_fill(false);
+   assert((h = save_item_files.files[0].autosave));
+   h->interval = 0;
+   wait_requested(h);
+   capture(h);
+   event_save_items_fill(false);
+   assert(disk_holds("/s/t.srm", c1, 12));
+   assert(save_files());
+   assert(!save_item_files.num_orphans);
+   assert(disk_named_holds("/undo/", a1, 12) == 1);
+   assert(disk_named_holds("/undo/", b1, 12) == 1);
+   ASSERT_FILES(2, 0, n + 3);
+   assert(err_count == 4);
+   autosave_deinit();
+}
+
+/* Releases the held copies once @data more recovery files are written. */
+static void release_after_recovery(void *data)
+{
+   unsigned until = *(const unsigned*)data;
+   slock_lock(disk_lock);
+   while (recovery_writes < until)
+      scond_wait(disk_cond, disk_lock);
+   hold_undo = false;
+   scond_broadcast(disk_cond);
+   slock_unlock(disk_lock);
+}
+
+/* The close with a copy-only orphan, whose job starts first, and a
+ * record owing a copy of the same file: the record's write waits for
+ * the job and lands after it, with no recovery file. */
+static void test_busy_close(void)
+{
+   unsigned char old[12];
+   unsigned char want[12];
+   unsigned char b1[12];
+   unsigned char c1[12];
+   struct retro_save_item items[1];
+   sthread_t *t;
+   unsigned until;
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   memset(old, 0x21, sizeof(old));
+   disk_put("/s/t.srm", old, sizeof(old));
+   items[0]        = buffer_item("a", "/s/t.srm");
+   items[0].format = "core:a";
+   register_items(items, 1);
+   event_load_save_files(false);
+   event_save_items_set_undo_dir(NULL);
+   wram[1] = 0x44;
+   memcpy(want, image(), sizeof(want));
+   items[0].id     = "b";
+   items[0].format = "core:b";
+   register_items(items, 1);
+   event_save_items_fill(false);
+   wram[2] = 9;
+   memcpy(b1, image(), sizeof(b1));
+   items[0].id     = "c";
+   items[0].format = "core:c";
+   register_items(items, 1);
+   event_save_items_fill(false);
+   event_save_items_set_undo_dir("/undo");
+   assert(save_item_files.num_orphans == 1);
+   assert(!save_item_files.orphans[0].guard.job);
+   wram[3] = 5;
+   memcpy(c1, image(), sizeof(c1));
+   n = osd_count;
+   set_hold(&hold_undo, true);
+   until = recovery_writes + 2;
+   assert((t = sthread_create(release_after_recovery, &until)));
+   event_save_items_final(true, false);
+   sthread_join(t);
+   assert(disk_holds("/s/t.srm", c1, 12));
+   assert(disk_named_holds("/undo/", want, 12) == 1);
+   assert(disk_named_holds("/undo/", b1, 12) == 1);
+   ASSERT_FILES(2, 0, n + 2);
+   assert(err_count == 0);
+}
+
 static void release_undo_at_close(void *data)
 {
    (void)data;
@@ -8446,6 +8857,1033 @@ static void test_given_back_close(void)
    assert(disk_count_named("") == 1);
    ASSERT_FILES(0, 0, 0);
 }
+/* Workers held since start(). */
+static unsigned held_count(void)
+{
+   unsigned n;
+   slock_lock(disk_lock);
+   n = worker_holds;
+   slock_unlock(disk_lock);
+   return n;
+}
+
+/* Until copier @h has exited, or a worker was held @holds times. */
+static void wait_tried(autosave_t *h, unsigned holds)
+{
+   unsigned i;
+   for (i = 0; i < 5000; i++)
+   {
+      if (     held_count() >= holds
+            || retro_atomic_load_acquire_int(&h->exited))
+         return;
+      retro_sleep(1);
+   }
+   assert(!"copier never tried");
+}
+
+/* Joins every copy job but @skip once it has exited without being
+ * held. */
+static void join_jobs_but(const autosave_t *skip)
+{
+   unsigned i;
+   for (i = 0; i < autosave_state.num_retired; i++)
+   {
+      autosave_t *h = autosave_state.retired[i];
+      if (h == skip || !h->job || !h->thread)
+         continue;
+      wait_tried(h, held_count() + 1);
+      assert(retro_atomic_load_acquire_int(&h->exited));
+      sthread_join(h->thread);
+      h->thread = NULL;
+   }
+}
+
+/* Item "x" at /s/b/g.srm, whose file @xfile is longer than it, and
+ * items[1] at /s/a/g.srm: x's copy job holds the undo name g.srm,
+ * held in its copy. Returns that job. */
+static autosave_t *busy_name_start(unsigned char *xfile,
+      struct retro_save_item *items)
+{
+   autosave_t *x;
+   fill_bytes(xfile, 16, 0x40);
+   disk_put("/s/b/g.srm", xfile, 16);
+   items[0]       = buffer_item("x", "/s/b/g.srm");
+   items[0].flags = RETRO_SAVE_FLAG_EXACT_SIZE;
+   register_items(items, 2);
+   set_hold(&hold_undo, true);
+   event_load_save_files(false);
+   wait_held(1);
+   assert((x = save_item_files.files[0].guard.job));
+   return x;
+}
+
+/* A copy job finds the undo name taken by a file of the same name in
+ * another folder: it copies nothing, writes the old type's image
+ * silently and hands its debt back to its record, which makes the copy
+ * once the name is free. */
+static void test_busy_name_job(void)
+{
+   unsigned char xfile[16];
+   unsigned char yold[6];
+   unsigned char ycur[6];
+   unsigned char ynew[6];
+   struct retro_save_item items[2];
+   autosave_t *h, *x;
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   memset(yold, 0x31, sizeof(yold));
+   disk_put("/s/a/g.srm", yold, sizeof(yold));
+   items[1]        = card_item("y", "/s/a/g.srm");
+   items[1].format = "core:y";
+   x = busy_name_start(xfile, items);
+   card[0] = 0x55;
+   memcpy(ycur, card, sizeof(ycur));
+   items[1].id     = "y2";
+   items[1].format = "core:y2";
+   register_items(items, 2);
+   event_save_items_fill(false);
+   assert((h = save_item_files.files[1].guard.job));
+   n = osd_count;
+   wait_tried(h, 2);
+   assert(held_count() == 1);
+   join_jobs_but(x);
+   /* Killed here. */
+   assert(disk_holds("/s/a/g.srm", yold, 6));
+   assert(disk_named_holds("RetroArch-recovery-", ycur, 6) == 1);
+   ASSERT_FILES(0, 1, n);
+   assert(err_count == 0);
+   card[1] = 0x66;
+   memcpy(ynew, card, sizeof(ynew));
+   assert(event_save_files(true, false, NULL));
+   join_jobs_but(x);
+   /* Killed here. */
+   assert(held_count() == 1);
+   assert(disk_holds("/s/a/g.srm", yold, 6));
+   assert(disk_named_holds("RetroArch-recovery-", ycur, 6) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", ynew, 6) == 1);
+   ASSERT_FILES(0, 2, n);
+   assert(err_count == 0);
+   set_hold(&hold_undo, false);
+   copies_wait(true);
+   assert(save_item_files.files[1].guard.busy);
+   ASSERT_FILES(1, 2, n);
+   assert(save_files());
+   assert(disk_holds("/s/a/g.srm", ynew, 6));
+   assert(disk_named_holds("/undo/", xfile, 16) == 1);
+   assert(disk_named_holds("/undo/", ycur, 6) == 1);
+   ASSERT_FILES(2, 0, n + 1);
+   assert(err_count == 0);
+}
+
+/* Save RAM's item leaves while its copy is busy, x's job holding the
+ * undo name: the close's SAVE_FILES keeps that copy owed and holds save
+ * RAM behind it. After the join the copy is made and save RAM written,
+ * before the unload. */
+static void test_given_back_busy_close(void)
+{
+   unsigned char xfile[16];
+   unsigned char last[12];
+   struct retro_save_item items[2];
+   autosave_t *x;
+   sthread_t *t;
+
+   start();
+   app_dir = "/app";
+   path_init_savefile_rtc("/s/a/g.srm");
+   items[1]               = buffer_item("y", "/s/a/g.srm");
+   items[1].legacy_memory = RETRO_MEMORY_SAVE_RAM;
+   x = busy_name_start(xfile, items);
+   wram[0] = 1;
+   memcpy(last, image(), sizeof(last));
+   register_items(items, 1);
+   join_jobs_but(x);
+   memset(legacy_ram, 9, sizeof(legacy_ram));
+   event_save_files(true, false, NULL);
+   /* Killed here. */
+   assert(save_item_files.ram_held);
+   assert(disk_holds("/s/a/g.srm", last, sizeof(last)));
+   assert(disk_named_holds("RetroArch-recovery-", last, sizeof(last)) == 1);
+   ASSERT_FILES(0, 1, 0);
+   assert((t = sthread_create(release_undo_at_close, NULL)));
+   slock_lock(disk_lock);
+   closing = true;
+   scond_broadcast(disk_cond);
+   slock_unlock(disk_lock);
+   event_save_items_join();
+   /* Killed in the unload. */
+   assert(!save_item_files.ram_held);
+   assert(save_item_files.num_orphans == 0);
+   assert(disk_holds("/s/a/g.srm", legacy_ram, sizeof(legacy_ram)));
+   assert(disk_named_holds("/undo/", last, sizeof(last)) == 1);
+   assert(disk_named_holds("/undo/", xfile, sizeof(xfile)) == 1);
+   ASSERT_FILES(2, 0, 0);
+   sthread_join(t);
+   event_save_items_final(true, false);
+   assert(disk_holds("/s/a/g.srm", legacy_ram, sizeof(legacy_ram)));
+   ASSERT_FILES(2, 0, 0);
+   assert(err_count == 0);
+}
+
+/* Fills @h's snapshot and hands it to its worker, as autosave_check()
+ * does, for @h alone. */
+static void fill_one(autosave_t *h)
+{
+   assert(autosave_fill_item(h));
+   retro_atomic_store_release_int(&h->snapshot_requested, 0);
+   retro_eventcount_notify(&h->ec);
+}
+
+/* Two items at /s/a/g.srm and /s/b/g.srm, both longer than the item:
+ * one worker holds the undo name g.srm in its copy, so the other's
+ * settled write lands and its copy stays owed. can_snapshot() says false
+ * at the close: that copy is made and the image now written, as without
+ * can_snapshot(), and the close returns; no recovery file is left. The
+ * close's image was not settled, so the final write writes the image
+ * now. */
+static void test_busy_name_close(void)
+{
+   unsigned char files[2][16];
+   unsigned char cut[16];
+   struct retro_save_item items[2];
+   autosave_t *h[2];
+   unsigned i;
+   unsigned b;
+
+   start();
+   app_dir          = "/app";
+   use_can_snapshot = true;
+   fill_bytes(files[0], 16, 0x40);
+   fill_bytes(files[1], 16, 0x31);
+   disk_put("/s/a/g.srm", files[0], 16);
+   disk_put("/s/b/g.srm", files[1], 16);
+   items[0]       = card_item("x", "/s/a/g.srm");
+   items[0].flags = RETRO_SAVE_FLAG_EXACT_SIZE;
+   items[1]       = card_item("y", "/s/b/g.srm");
+   items[1].flags = RETRO_SAVE_FLAG_EXACT_SIZE;
+   event_save_items_set_undo_dir(NULL);
+   register_items(items, 2);
+   event_load_save_files(false);
+   event_save_items_set_undo_dir("/undo");
+   set_hold(&hold_undo, true);
+   assert(autosave_init(false, 1));
+   for (i = 0; i < 2; i++)
+   {
+      assert((h[i] = save_item_files.files[i].autosave));
+      h[i]->interval = 0;
+   }
+   wait_held(1);
+   /* The worker not held found the name taken and asks for a
+    * snapshot. */
+   for (i = 0; i < 5000; i++)
+   {
+      if (     retro_atomic_load_acquire_int(&h[0]->snapshot_requested)
+            || retro_atomic_load_acquire_int(&h[1]->snapshot_requested))
+         break;
+      retro_sleep(1);
+   }
+   b = retro_atomic_load_acquire_int(&h[0]->snapshot_requested) ? 0 : 1;
+   assert(retro_atomic_load_acquire_int(&h[b]->snapshot_requested));
+   card[0] = 0x55;
+   memcpy(cut, card, 6);
+   memcpy(cut + 6, files[b] + 6, 10);
+   fill_one(h[b]);
+   wait_requested(h[b]);
+   /* Killed here: the tail stays until the copy is made. */
+   assert(disk_holds(items[b].path, cut, 16));
+   assert(held_count() == 1);
+   ASSERT_FILES(0, 0, 0);
+   snapshot_ready = false;
+   card[1]        = 0x66;
+   set_hold(&hold_undo, false);
+   wait_requested(h[!b]);
+   autosave_deinit();
+   assert(save_item_files.files[b].guard.busy);
+   assert(save_files());
+   /* Killed here. */
+   assert(disk_holds(items[b].path, card, 6));
+   assert(disk_holds(items[!b].path, card, 6));
+   assert(disk_named_holds("/undo/", cut, 16) == 1);
+   assert(disk_named_holds("/undo/", files[!b], 16) == 1);
+   ASSERT_FILES(2, 0, 0);
+   assert(saving_logs == 0 && err_count == 0);
+   /* Written while unloading. */
+   card[2] = 0x77;
+   event_save_items_final(true, false);
+   assert(disk_holds(items[b].path, card, 6));
+   assert(disk_holds(items[!b].path, card, 6));
+   assert(disk_named_holds("/undo/", cut, 16) == 1);
+   assert(disk_named_holds("/undo/", files[!b], 16) == 1);
+   ASSERT_FILES(2, 0, 0);
+   assert(saving_logs == 0 && err_count == 0);
+}
+
+/* Blob y at /s/a/g.srm, added after the load, refuses its file and
+ * owes its copy while x's copy job holds the undo name g.srm: its own
+ * job finds the name taken, so its file is busy at the final write,
+ * where the core has no
+ * image to give: pass 0 an empty blob, 1 one over max_size, 2 no
+ * memory, 3 blob_save() fails. The final write returns; the file keeps
+ * its save, the close's image of it is in a recovery file, and a failed
+ * write is logged once, as for an item that is not busy. */
+static void test_busy_close_stopped(void)
+{
+   unsigned char xfile[16];
+   unsigned char yfile[6];
+   unsigned char closed[6];
+   struct retro_save_item items[2];
+   autosave_t *x;
+   unsigned pass;
+
+   for (pass = 0; pass < 4; pass++)
+   {
+      start();
+      app_dir = "/app";
+      fill_bytes(yfile, 6, 0x31);
+      disk_put("/s/a/g.srm", yfile, 6);
+      fill_bytes(xfile, 16, 0x40);
+      disk_put("/s/b/g.srm", xfile, 16);
+      items[0]       = buffer_item("x", "/s/b/g.srm");
+      items[0].flags = RETRO_SAVE_FLAG_EXACT_SIZE;
+      register_items(items, 1);
+      set_hold(&hold_undo, true);
+      event_load_save_files(false);
+      wait_held(1);
+      assert((x = save_item_files.files[0].guard.job));
+      items[1]          = blob_item("y", "/s/a/g.srm");
+      items[1].max_size = 6;
+      register_items(items, 2);
+      blob_refuse = true;
+      event_save_items_fill(false);
+      blob_refuse   = false;
+      blob_len      = 6;
+      blob_state[0] = 0x55;
+      memcpy(closed, blob_state, sizeof(closed));
+      assert(event_save_files(true, false, NULL));
+      join_jobs_but(x);
+      set_hold(&hold_undo, false);
+      copies_wait(true);
+      assert(save_item_files.files[1].guard.busy);
+      /* Killed here. */
+      assert(disk_holds("/s/a/g.srm", yfile, 6));
+      assert(disk_named_holds("RetroArch-recovery-", closed, 6) == 1);
+      ASSERT_FILES(1, 1, 1);
+      assert(saving_logs == 0 && err_count == 0);
+      /* Unloaded. */
+      if (pass == 0)
+         blob_len = 0;
+      else if (pass == 1)
+         blob_len = 7;
+      else if (pass == 2)
+         retro_atomic_store_release_int(&fail_main_malloc_size, 6);
+      else
+         blob_fail_save = true;
+      event_save_items_final(true, false);
+      retro_atomic_store_release_int(&fail_main_malloc_size, 0);
+      assert(disk_holds("/s/a/g.srm", yfile, 6));
+      assert(disk_named_holds("/undo/", xfile, 16) == 1);
+      assert(disk_named_holds("RetroArch-recovery-", closed, 6) == 1);
+      ASSERT_FILES(1, 1, 2);
+      assert(saving_logs == 0 && err_count == (pass ? 1u : 0u));
+   }
+}
+
+/* Item y at /s/a/g.srm, a type change of z (old image *@zcur), with
+ * its worker held back by x's copy of the same name. Returns it. */
+static autosave_t *busy_name_worker(unsigned char *xfile,
+      unsigned char *zcur, struct retro_save_item *items, autosave_t **x)
+{
+   autosave_t *h;
+   unsigned char zold[6];
+   memset(zold, 0x31, sizeof(zold));
+   disk_put("/s/a/g.srm", zold, sizeof(zold));
+   items[1]        = card_item("z", "/s/a/g.srm");
+   items[1].format = "core:z";
+   *x = busy_name_start(xfile, items);
+   card[0] = 0x55;
+   memcpy(zcur, card, 6);
+   event_save_items_set_undo_dir(NULL);
+   items[1].id     = "y";
+   items[1].format = "core:y";
+   register_items(items, 2);
+   event_save_items_fill(false);
+   event_save_items_set_undo_dir("/undo");
+   assert(save_item_files.files[1].guard.copy_image);
+   assert(autosave_init(false, 1));
+   assert((h = save_item_files.files[1].autosave));
+   h->interval = 0;
+   wait_requested(h);
+   assert(held_count() == 1);
+   return h;
+}
+
+/* The retired one of @path that is not a copy job. */
+static autosave_t *retired_of(const char *path)
+{
+   unsigned i;
+   for (i = 0; i < autosave_state.num_retired; i++)
+      if (     !autosave_state.retired[i]->job
+            && string_is_equal_noncase(autosave_state.retired[i]->path,
+               path))
+         return autosave_state.retired[i];
+   return NULL;
+}
+
+/* A retired worker that owes a copy finds the undo name taken: its last
+ * image and the old type's go to files no one is told of, and the reap
+ * makes them an orphan, which the next SAVE_FILES writes after the
+ * copy. */
+static void test_busy_name_retired(void)
+{
+   unsigned char xfile[16];
+   unsigned char zcur[6];
+   unsigned char ycur[6];
+   struct retro_save_item items[2];
+   autosave_t *r, *x;
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   busy_name_worker(xfile, zcur, items, &x);
+   card[1] = 0x66;
+   memcpy(ycur, card, sizeof(ycur));
+   n = osd_count;
+   register_items(items, 1);
+   assert((r = retired_of("/s/a/g.srm")));
+   wait_tried(r, 2);
+   assert(held_count() == 1);
+   sthread_join(r->thread);
+   r->thread = NULL;
+   /* Killed here. */
+   assert(!disk_holds("/s/a/g.srm", ycur, 6));
+   assert(disk_named_holds("RetroArch-recovery-", ycur, 6) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", zcur, 6) == 1);
+   ASSERT_FILES(0, 2, n);
+   assert(err_count == 0);
+   set_hold(&hold_undo, false);
+   copies_wait(false);
+   autosave_reap(false);
+   assert(save_item_files.num_orphans == 1);
+   ASSERT_FILES(1, 2, n);
+   assert(save_files());
+   assert(!save_item_files.num_orphans);
+   assert(disk_holds("/s/a/g.srm", ycur, 6));
+   assert(disk_named_holds("/undo/", xfile, 16) == 1);
+   assert(disk_named_holds("/undo/", zcur, 6) == 1);
+   ASSERT_FILES(2, 0, n + 1);
+   assert(err_count == 0);
+   autosave_deinit();
+}
+
+/* A type change b of y while y's retired worker, held back by another
+ * file's copy of the same name, still writes: b's image goes to that
+ * worker after the copy it carries, which it cannot make either. b gets
+ * its image back; y's last image and the old type's become an orphan,
+ * written before b's newer image, never over it. */
+static void test_busy_name_carrier(void)
+{
+   unsigned char xfile[16];
+   unsigned char zcur[6];
+   unsigned char ycur[6];
+   unsigned char b1[6];
+   struct retro_save_item items[2];
+   autosave_t *r, *x;
+   unsigned held;
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   busy_name_worker(xfile, zcur, items, &x);
+   card[1] = 0x66;
+   memcpy(ycur, card, sizeof(ycur));
+   set_hold(&hold_recovery, true);
+   items[1].id     = "b";
+   items[1].format = "core:b";
+   register_items(items, 2);
+   assert((r = retired_of("/s/a/g.srm")));
+   wait_held(2);
+   event_save_items_fill(false);
+   assert(save_item_files.files[1].guard.copy_image);
+   card[2] = 0x77;
+   memcpy(b1, card, sizeof(b1));
+   n = osd_count;
+   assert(event_save_files(true, false, NULL));
+   assert(save_item_files.files[1].guard.job == r);
+   set_hold(&hold_recovery, false);
+   wait_tried(r, 99);
+   sthread_join(r->thread);
+   r->thread = NULL;
+   /* Killed here. */
+   assert(!disk_holds("/s/a/g.srm", ycur, 6));
+   assert(disk_named_holds("RetroArch-recovery-", zcur, 6) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", ycur, 6) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", b1, 6) == 1);
+   ASSERT_FILES(0, 3, n);
+   assert(err_count == 0);
+   set_hold(&hold_undo, false);
+   copies_wait(false);
+   autosave_deinit();
+   assert(save_item_files.num_orphans == 1);
+   assert(save_item_files.files[1].guard.busy);
+   ASSERT_FILES(1, 3, n);
+   /* The orphan's job copies; b waits for it. */
+   held = held_count();
+   set_hold(&hold_undo, true);
+   assert(event_save_files(true, false, NULL));
+   wait_held(held + 1);
+   assert(!save_item_files.num_orphans);
+   assert(save_item_files.files[1].guard.busy);
+   assert(!save_item_files.files[1].guard.job);
+   set_hold(&hold_undo, false);
+   copies_wait(true);
+   /* The orphan's image first, b's after. */
+   assert(disk_holds("/s/a/g.srm", ycur, 6));
+   assert(disk_named_holds("RetroArch-recovery-", b1, 6) == 1);
+   ASSERT_FILES(2, 1, n + 1);
+   assert(save_files());
+   assert(disk_holds("/s/a/g.srm", b1, 6));
+   assert(disk_named_holds("/undo/", xfile, 16) == 1);
+   assert(disk_named_holds("/undo/", zcur, 6) == 1);
+   assert(disk_named_holds("/undo/", ycur, 6) == 1);
+   ASSERT_FILES(3, 0, n + 2);
+   assert(err_count == 0);
+}
+
+/* test_busy_name_carrier with every write failing once the carrier
+ * holds b's image: what the reap takes back stays in memory, b's image
+ * with b and y's in an orphan, each failure logged. b's next write
+ * fails too and is shown; the orphan's job writes y's after its copy. */
+static void test_busy_name_untold_fails(void)
+{
+   unsigned char xfile[16];
+   unsigned char zcur[6];
+   unsigned char ycur[6];
+   unsigned char b1[6];
+   struct retro_save_item items[2];
+   autosave_t *r, *x;
+   unsigned held;
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   busy_name_worker(xfile, zcur, items, &x);
+   card[1] = 0x66;
+   memcpy(ycur, card, sizeof(ycur));
+   set_hold(&hold_recovery, true);
+   items[1].id     = "b";
+   items[1].format = "core:b";
+   register_items(items, 2);
+   assert((r = retired_of("/s/a/g.srm")));
+   wait_held(2);
+   event_save_items_fill(false);
+   card[2] = 0x77;
+   memcpy(b1, card, sizeof(b1));
+   n = osd_count;
+   assert(event_save_files(true, false, NULL));
+   assert(save_item_files.files[1].guard.job == r);
+   set_fail_writes(true);
+   set_hold(&hold_recovery, false);
+   wait_tried(r, 99);
+   sthread_join(r->thread);
+   r->thread = NULL;
+   /* Killed here. */
+   assert(!disk_holds("/s/a/g.srm", ycur, 6));
+   ASSERT_FILES(0, 0, n);
+   assert(err_count == 0);
+   autosave_reap(false);
+   assert(save_item_files.num_orphans == 1);
+   assert(save_item_files.orphans[0].data);
+   assert(save_item_files.files[1].guard.busy);
+   ASSERT_FILES(0, 0, n);
+   assert(err_count == 2);
+   /* y's job, started now, holds its image until writes work again. */
+   held = held_count();
+   set_hold(&hold_recovery, true);
+   assert(!event_save_files(true, false, NULL));
+   wait_held(held + 1);
+   assert(!save_item_files.num_orphans);
+   ASSERT_FILES(0, 0, n + 1);
+   assert(strstr(osd_last, "/s/a/g.srm"));
+   assert(err_count == 3);
+   set_fail_writes(false);
+   set_hold(&hold_recovery, false);
+   join_jobs_but(x);
+   set_hold(&hold_undo, false);
+   copies_wait(true);
+   assert(save_item_files.num_orphans == 1);
+   ASSERT_FILES(1, 2, n + 1);
+   assert(err_count == 3);
+   /* The orphan's job copies; b waits for it. */
+   held = held_count();
+   set_hold(&hold_undo, true);
+   assert(event_save_files(true, false, NULL));
+   wait_held(held + 1);
+   assert(!save_item_files.num_orphans);
+   assert(save_item_files.files[1].guard.busy);
+   set_hold(&hold_undo, false);
+   copies_wait(true);
+   assert(disk_holds("/s/a/g.srm", ycur, 6));
+   assert(disk_named_holds("RetroArch-recovery-", b1, 6) == 1);
+   ASSERT_FILES(2, 1, n + 2);
+   assert(save_files());
+   assert(disk_holds("/s/a/g.srm", b1, 6));
+   assert(disk_named_holds("/undo/", xfile, 16) == 1);
+   assert(disk_named_holds("/undo/", zcur, 6) == 1);
+   assert(disk_named_holds("/undo/", ycur, 6) == 1);
+   ASSERT_FILES(3, 0, n + 3);
+   assert(err_count == 3);
+   autosave_deinit();
+}
+
+/* The same, but the item comes back under another spelling of its path
+ * and hands its newer image to the retired worker without a copy: y's
+ * last image, older, never reaches the file, and its silent file goes. */
+static void test_busy_name_superseded(void)
+{
+   unsigned char xfile[16];
+   unsigned char zcur[6];
+   unsigned char ycur[6];
+   unsigned char b1[6];
+   unsigned char b2[6];
+   struct retro_save_item items[2];
+   autosave_t *r, *x;
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   slock_lock(disk_lock);
+   disk_nocase = true;
+   slock_unlock(disk_lock);
+   busy_name_worker(xfile, zcur, items, &x);
+   card[1] = 0x66;
+   memcpy(ycur, card, sizeof(ycur));
+   set_hold(&hold_recovery, true);
+   items[1].path = "/s/a/G.srm";
+   register_items(items, 2);
+   assert((r = retired_of("/s/a/g.srm")));
+   wait_held(2);
+   event_save_items_fill(false);
+   assert(!save_item_files.files[1].guard.copy_first);
+   card[2] = 0x77;
+   memcpy(b1, card, sizeof(b1));
+   n = osd_count;
+   assert(event_save_files(true, false, NULL));
+   set_hold(&hold_recovery, false);
+   wait_tried(r, 99);
+   sthread_join(r->thread);
+   r->thread = NULL;
+   /* Killed here. */
+   assert(disk_named_holds("RetroArch-recovery-", zcur, 6) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", b1, 6) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", ycur, 6) == 1);
+   ASSERT_FILES(0, 3, n);
+   assert(err_count == 0);
+   set_hold(&hold_undo, false);
+   copies_wait(false);
+   autosave_deinit();
+   assert(save_item_files.num_orphans == 1);
+   assert(!disk_named_holds("RetroArch-recovery-", ycur, 6));
+   ASSERT_FILES(1, 2, n);
+   card[3] = 0x78;
+   memcpy(b2, card, sizeof(b2));
+   assert(save_files());
+   assert(disk_holds("/s/a/g.srm", b2, 6));
+   assert(save_files());
+   assert(disk_holds("/s/a/g.srm", b2, 6));
+   assert(disk_named_holds("/undo/", xfile, 16) == 1);
+   assert(disk_named_holds("/undo/", zcur, 6) == 1);
+   assert(!disk_named_holds("/undo/", ycur, 6));
+   ASSERT_FILES(2, 0, n + 1);
+   assert(told_holding(ycur, 6) == 0);
+   assert(err_count == 0);
+}
+
+/* An orphan hands the image it wrote silently to a copy job: that file
+ * stays until the job has written the image. */
+static void test_busy_orphan_handed_kept(void)
+{
+   unsigned char old[12];
+   unsigned char want[12];
+   unsigned char last[12];
+   unsigned char c1[12];
+   struct retro_save_item items[1];
+   unsigned held;
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   busy_chain(old, want, last, items);
+   wram[3] = 5;
+   memcpy(c1, image(), sizeof(c1));
+   items[0] = card_item("u", "/s/u.srm");
+   register_items(items, 1);
+   event_save_items_fill(false);
+   assert(event_save_files(true, false, NULL));
+   set_hold(&hold_undo, false);
+   copies_wait(true);
+   assert(save_item_files.num_orphans == 1);
+   n    = osd_count;
+   held = held_count();
+   set_hold(&hold_undo, true);
+   assert(event_save_files(true, false, NULL));
+   wait_held(held + 1);
+   assert(!save_item_files.num_orphans);
+   /* Killed here: the job copies; c1 is still on disk. */
+   assert(disk_holds("/s/t.srm", old, 12));
+   assert(disk_named_holds("RetroArch-recovery-", c1, 12) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", last, 12) == 1);
+   ASSERT_FILES(1, 2, n);
+   set_hold(&hold_undo, false);
+   copies_wait(false);
+   /* Killed here. */
+   assert(disk_holds("/s/t.srm", c1, 12));
+   assert(disk_named_holds("/undo/", last, 12) == 1);
+   ASSERT_FILES(2, 0, n);
+   assert(err_count == 0);
+   frame_start_reap();
+   assert(disk_holds("/s/t.srm", c1, 12));
+   assert(disk_named_holds("/undo/", last, 12) == 1);
+   ASSERT_FILES(2, 0, n + 1);
+   assert(err_count == 0);
+}
+
+/* Blob y at /s/a/g.srm refused its file @yold; its worker, held back by
+ * x's copy of the same name, owes the copy of the file. y leaves and
+ * comes back: its new record takes the worker's last image @y1, which
+ * the worker could not write. Then the copy of x's file is made and the
+ * worker reaped: an orphan holds y1 and the copy. Returns the number of
+ * messages before the reap. */
+static unsigned busy_name_took(unsigned char *xfile,
+      const unsigned char *yold, const unsigned char *y1,
+      struct retro_save_item *items)
+{
+   autosave_t *h;
+   unsigned n;
+   fill_bytes(xfile, 16, 0x40);
+   disk_put("/s/b/g.srm", xfile, 16);
+   disk_put("/s/a/g.srm", yold, 4);
+   items[0]       = buffer_item("x", "/s/b/g.srm");
+   items[0].flags = RETRO_SAVE_FLAG_EXACT_SIZE;
+   register_items(items, 1);
+   set_hold(&hold_undo, true);
+   event_load_save_files(false);
+   wait_held(1);
+   items[1]    = blob_item("y", "/s/a/g.srm");
+   memcpy(blob_state, y1, 4);
+   blob_len    = 4;
+   blob_refuse = true;
+   event_save_items_set_undo_dir(NULL);
+   register_items(items, 2);
+   event_save_items_fill(false);
+   event_save_items_set_undo_dir("/undo");
+   blob_refuse = false;
+   assert(save_item_files.files[1].guard.keep_file);
+   assert(autosave_init(false, 1));
+   assert((h = save_item_files.files[1].autosave));
+   h->interval = 0;
+   wait_requested(h);
+   n = osd_count;
+   register_items(items, 1);
+   register_items(items, 2);
+   event_save_items_fill(false);
+   assert(!memcmp(blob_state, y1, 4));
+   wait_tried(h, 99);
+   sthread_join(h->thread);
+   h->thread = NULL;
+   /* Killed here. */
+   assert(held_count() == 1);
+   assert(disk_holds("/s/a/g.srm", yold, 4));
+   assert(disk_named_holds("RetroArch-recovery-", y1, 4) == 1);
+   ASSERT_FILES(0, 1, n);
+   assert(err_count == 0);
+   set_hold(&hold_undo, false);
+   copies_wait(false);
+   autosave_reap(false);
+   assert(save_item_files.num_orphans == 1);
+   ASSERT_FILES(1, 1, n);
+   return n;
+}
+
+/* The same record's newer image waits for the orphan's copy, in a file
+ * no one is told of, and then lands: the file is copied once, by the
+ * orphan. Each untold file goes as its image lands. Passes: SAVE_FILES
+ * writes y2; its worker does; the first again, the job's write of y1
+ * failing, so its untold file stays and is named at the reap; the
+ * second again, the worker's first write failing. */
+static void test_busy_name_took(void)
+{
+   static const unsigned char yold[4] = {0x31, 0x31, 0x31, 0x31};
+   static const unsigned char y1[4]   = {0x41, 0x41, 0x41, 0x41};
+   static const unsigned char y2[4]   = {0x42, 0x42, 0x42, 0x42};
+   unsigned char xfile[16];
+   struct retro_save_item items[2];
+   unsigned pass;
+
+   for (pass = 0; pass < 4; pass++)
+   {
+      unsigned held, n;
+      bool worker    = (pass & 1) != 0;
+      bool job_fails = pass == 2;
+      const unsigned char *at = job_fails ? yold : y1;
+      start();
+      app_dir = "/app";
+      n = busy_name_took(xfile, yold, y1, items);
+      memcpy(blob_state, y2, 4);
+      held = held_count();
+      set_hold(&hold_undo, true);
+      assert(event_save_files(true, false, NULL));
+      wait_held(held + 1);
+      assert(!save_item_files.num_orphans);
+      /* Killed here: the orphan's job copies; y2 waits. */
+      assert(disk_holds("/s/a/g.srm", yold, 4));
+      assert(disk_named_holds("RetroArch-recovery-", y1, 4) == 1);
+      assert(disk_named_holds("RetroArch-recovery-", y2, 4) == 1);
+      ASSERT_FILES(1, 2, n);
+      set_fail_save_writes(job_fails);
+      set_hold(&hold_undo, false);
+      copies_wait(false);
+      set_fail_save_writes(false);
+      /* Killed here. */
+      assert(disk_holds("/s/a/g.srm", at, 4));
+      assert(disk_named_holds("/undo/", yold, 4) == 1);
+      assert(disk_named_holds("RetroArch-recovery-", y1, 4) == job_fails);
+      assert(disk_named_holds("RetroArch-recovery-", y2, 4) == 1);
+      ASSERT_FILES(2, 1 + job_fails, n);
+      assert(err_count == 0);
+      frame_start_reap();
+      assert(disk_holds("/s/a/g.srm", at, 4));
+      assert(disk_named_holds("RetroArch-recovery-", y1, 4) == job_fails);
+      assert(told_holding(y1, 4) == job_fails);
+      assert(disk_named_holds("RetroArch-recovery-", y2, 4) == 1);
+      ASSERT_FILES(2, 1 + job_fails, n + job_fails);
+      assert(err_count == 0);
+      if (worker)
+      {
+         autosave_t *h;
+         event_save_items_fill(false);
+         assert((h = save_item_files.files[1].autosave));
+         h->interval = 0;
+         wait_requested(h);
+         if (pass == 3)
+         {
+            set_fail_save_writes(true);
+            capture(h);
+            set_fail_save_writes(false);
+            /* Killed here: y2's untold file is its only copy. */
+            assert(disk_holds("/s/a/g.srm", y1, 4));
+            assert(disk_named_holds("RetroArch-recovery-", y2, 4) == 1);
+            ASSERT_FILES(2, 1, n);
+            assert(err_count == 0);
+         }
+         capture(h);
+      }
+      else
+         assert(save_files_unreaped());
+      /* Killed here. */
+      assert(disk_holds("/s/a/g.srm", y2, 4));
+      assert(disk_named_holds("/undo/", xfile, 16) == 1);
+      assert(disk_named_holds("/undo/", yold, 4) == 1);
+      assert(!disk_named_holds("/undo/", y1, 4));
+      assert(!disk_named_holds("RetroArch-recovery-", y2, 4));
+      assert(told_holding(y1, 4) == job_fails);
+      ASSERT_FILES(2, job_fails, n + job_fails);
+      assert(err_count == 0);
+      if (worker)
+         event_save_items_fill(false);
+      else
+         frame_start_reap();
+      assert(disk_holds("/s/a/g.srm", y2, 4));
+      ASSERT_FILES(2, job_fails, n + job_fails);
+      assert(err_count == 0);
+      autosave_deinit();
+   }
+}
+
+/* SAVE_FILES's hand to the copy job of /s/a/g.srm finds it done. */
+static void job_done_first(void)
+{
+   unsigned i;
+   for (i = 0; i < autosave_state.num_retired; i++)
+      if (     autosave_state.retired[i]->job
+            && !strcmp(autosave_state.retired[i]->path, "/s/a/g.srm"))
+         wait_tried(autosave_state.retired[i], 99);
+}
+
+/* The same, but the orphan's copy fails: the file stays, y1 goes to a
+ * recovery file shown once, and the record's images follow into it
+ * until the copy is made. Passes: the job fails after SAVE_FILES hands
+ * it y1; before, so SAVE_FILES takes the failed copy itself; the first
+ * again, with the reap's write into the record's file failing. */
+static void test_busy_name_took_fails(void)
+{
+   static const unsigned char yold[4] = {0x31, 0x31, 0x31, 0x31};
+   static const unsigned char y1[4]   = {0x41, 0x41, 0x41, 0x41};
+   static const unsigned char y2[4]   = {0x42, 0x42, 0x42, 0x42};
+   unsigned char xfile[16];
+   struct retro_save_item items[2];
+   unsigned pass;
+
+   for (pass = 0; pass < 3; pass++)
+   {
+      unsigned n, held;
+      bool done_first = pass == 1;
+      start();
+      app_dir = "/app";
+      n = busy_name_took(xfile, yold, y1, items);
+      memcpy(blob_state, y2, 4);
+      set_fail_undo(true);
+      held = held_count();
+      if (done_first)
+      {
+         main_malloc_hook      = job_done_first;
+         main_malloc_hook_size = sizeof(autosave_image_t) + 4;
+      }
+      else
+         set_hold(&hold_undo, true);
+      event_save_files(true, false, NULL);
+      main_malloc_hook = NULL;
+      if (!done_first)
+      {
+         wait_held(held + 1);
+         set_hold(&hold_undo, false);
+      }
+      copies_wait(false);
+      /* Killed here. */
+      assert(disk_holds("/s/a/g.srm", yold, 4));
+      assert(disk_named_holds("RetroArch-recovery-", y2, 4) == 1);
+      assert(!done_first || !disk_named_holds("RetroArch-recovery-", y1, 4));
+      assert(done_first || disk_named_holds("RetroArch-recovery-", y1, 4));
+      assert(osd_count == n + done_first);
+      assert(err_count == 0);
+      autosave_reap(true);
+      assert(disk_holds("/s/a/g.srm", yold, 4));
+      assert(disk_named_holds("RetroArch-recovery-", y2, 4) == 1);
+      /* The told file holds y1 until the record's next write, which
+       * went there already when SAVE_FILES told it. */
+      assert(told_holding(done_first ? y2 : y1, 4) == 1);
+      ASSERT_FILES(1, 2 - done_first, n + 1);
+      held = held_count();
+      set_hold(&hold_undo, true);
+      event_save_files(true, false, NULL);
+      wait_held(held + 1);
+      set_hold(&hold_undo, false);
+      copies_wait(false);
+      /* Killed here: the record's file holds y2, so the job's failed
+       * copy leaves no file of its own. */
+      assert(disk_holds("/s/a/g.srm", yold, 4));
+      assert(disk_named_holds("RetroArch-recovery-", y2, 4) == 1);
+      assert(told_holding(done_first ? y2 : y1, 4) == 1);
+      ASSERT_FILES(1, 2 - done_first, n + 1);
+      assert(err_count == 0);
+      if (pass == 2)
+         set_fail_writes(true);
+      frame_start_reap();
+      set_fail_writes(false);
+      assert(disk_holds("/s/a/g.srm", yold, 4));
+      assert(disk_named_holds("RetroArch-recovery-", y2, 4) == 1);
+      assert(told_holding(y2, 4) == 1);
+      ASSERT_FILES(1, 1, n + 1);
+      assert(err_count == 0);
+      set_fail_undo(false);
+      save_files();
+      assert(disk_holds("/s/a/g.srm", yold, 4));
+      assert(disk_named_holds("/undo/", yold, 4) == 1);
+      assert(save_files());
+      assert(disk_holds("/s/a/g.srm", y2, 4));
+      assert(!disk_named_holds("/undo/", y1, 4));
+      ASSERT_FILES(2, 1, n + 1);
+      assert(err_count == 0);
+      autosave_deinit();
+   }
+}
+
+/* The same, but with no undo folder no copier starts: the orphan's
+ * image goes to a recovery file shown once, and the record's after it. */
+static void test_busy_name_took_no_undo(void)
+{
+   static const unsigned char yold[4] = {0x31, 0x31, 0x31, 0x31};
+   static const unsigned char y1[4]   = {0x41, 0x41, 0x41, 0x41};
+   static const unsigned char y2[4]   = {0x42, 0x42, 0x42, 0x42};
+   unsigned char xfile[16];
+   struct retro_save_item items[2];
+   unsigned n;
+
+   start();
+   app_dir = "/app";
+   n = busy_name_took(xfile, yold, y1, items);
+   memcpy(blob_state, y2, 4);
+   event_save_items_set_undo_dir(NULL);
+   save_files_unreaped();
+   /* Killed here. */
+   assert(disk_holds("/s/a/g.srm", yold, 4));
+   assert(disk_named_holds("RetroArch-recovery-", y2, 4) == 1);
+   assert(told_holding(y2, 4) == 1);
+   ASSERT_FILES(1, 1, n + 1);
+   assert(err_count == 0);
+   frame_start_reap();
+   assert(disk_holds("/s/a/g.srm", yold, 4));
+   assert(disk_named_holds("RetroArch-recovery-", y2, 4) == 1);
+   assert(told_holding(y2, 4) == 1);
+   ASSERT_FILES(1, 1, n + 1);
+   assert(err_count == 0);
+   event_save_items_set_undo_dir("/undo");
+   save_files();
+   assert(save_files());
+   assert(disk_holds("/s/a/g.srm", y2, 4));
+   assert(disk_named_holds("/undo/", yold, 4) == 1);
+   ASSERT_FILES(2, 1, n + 1);
+   assert(err_count == 0);
+   autosave_deinit();
+}
+
+/* The same record leaves while it waits: its last image, an orphan
+ * too, waits behind the first orphan's copy, and lands after it. */
+static void test_busy_name_took_leaves(void)
+{
+   static const unsigned char yold[4] = {0x31, 0x31, 0x31, 0x31};
+   static const unsigned char y1[4]   = {0x41, 0x41, 0x41, 0x41};
+   static const unsigned char y3[4]   = {0x43, 0x43, 0x43, 0x43};
+   unsigned char xfile[16];
+   struct retro_save_item items[2];
+   unsigned held, n;
+
+   start();
+   app_dir = "/app";
+   n = busy_name_took(xfile, yold, y1, items);
+   memcpy(blob_state, y3, 4);
+   register_items(items, 1);
+   assert(save_item_files.num_orphans == 2);
+   held = held_count();
+   set_hold(&hold_undo, true);
+   assert(event_save_files(true, false, NULL));
+   wait_held(held + 1);
+   assert(save_item_files.num_orphans == 1);
+   /* Killed here. */
+   assert(disk_holds("/s/a/g.srm", yold, 4));
+   assert(disk_named_holds("RetroArch-recovery-", y1, 4) == 1);
+   assert(disk_named_holds("RetroArch-recovery-", y3, 4) == 1);
+   ASSERT_FILES(1, 2, n);
+   set_hold(&hold_undo, false);
+   copies_wait(false);
+   /* Killed here. */
+   assert(disk_holds("/s/a/g.srm", y1, 4));
+   assert(!disk_named_holds("RetroArch-recovery-", y1, 4));
+   assert(disk_named_holds("RetroArch-recovery-", y3, 4) == 1);
+   ASSERT_FILES(2, 1, n);
+   assert(err_count == 0);
+   frame_start_reap();
+   assert(disk_holds("/s/a/g.srm", y1, 4));
+   assert(save_files());
+   assert(!save_item_files.num_orphans);
+   assert(disk_holds("/s/a/g.srm", y3, 4));
+   assert(disk_named_holds("/undo/", yold, 4) == 1);
+   assert(!disk_named_holds("/undo/", y1, 4));
+   ASSERT_FILES(2, 0, n);
+   assert(err_count == 0);
+   autosave_deinit();
+}
+
 #endif
 
 /* A registration from inside blob_size(), blob_save() or
@@ -9116,6 +10554,42 @@ static void test_copy_job_start_fails(void)
    assert(err_count == errs + 1);
 }
 
+/* test_busy_job_type_change with no recovery folder: the images the
+ * busy copier keeps from the file stay in memory only, shown at the
+ * second SAVE_FILES in a row; the next makes the copy and writes them. */
+static void test_busy_untold_fails(void)
+{
+   unsigned char old[12];
+   unsigned char want[12];
+   unsigned char last[12];
+   unsigned char c1[12];
+   struct retro_save_item items[1];
+   unsigned n;
+   unsigned errs;
+
+   start();
+   busy_chain(old, want, last, items);
+   wram[3] = 5;
+   memcpy(c1, image(), sizeof(c1));
+   n    = osd_count;
+   errs = err_count;
+   assert(!event_save_files(true, false, NULL));
+   assert(osd_count == n && err_count == errs + 1);
+   assert(!event_save_files(true, false, NULL));
+   set_hold(&hold_undo, false);
+   copies_wait(false);
+   /* Killed here. */
+   assert(disk_holds("/s/t.srm", old, 12));
+   assert(disk_holds("/undo/t.srm", want, 12));
+   ASSERT_FILES(1, 0, n + 1);
+   assert(strstr(osd_last, "/s/t.srm"));
+   assert(err_count == errs + 2);
+   assert(save_files());
+   assert(disk_holds("/s/t.srm", c1, 12));
+   assert(disk_named_holds("/undo/", last, 12) == 1);
+   ASSERT_FILES(2, 0, n + 3);
+   assert(err_count == errs + 2);
+}
 #endif
 
 int main(void)
@@ -9263,6 +10737,7 @@ int main(void)
    test_orphan_job_fails_handed();
    test_orphan_job_dumps_copy();
    test_failed_job_detached();
+   test_type_change_retired_busy();
    test_retired_owes_and_type_change();
    test_cut_after_handed();
    test_type_change_copy_fails();
@@ -9282,14 +10757,33 @@ int main(void)
    test_retired_dump_superseded();
    test_carrier_own_copy_late();
    test_job_dump_cut();
+   test_busy_job_type_change();
+   test_busy_orphan_image();
+   test_busy_retired_no_carry();
+   test_busy_orphan_untold_fails();
+   test_busy_close();
    test_close_join_copies();
    test_save_files_cut_copying();
+   test_busy_name_job();
+   test_given_back_busy_close();
+   test_busy_name_close();
+   test_busy_close_stopped();
+   test_busy_name_retired();
+   test_busy_name_carrier();
+   test_busy_name_untold_fails();
+   test_busy_name_superseded();
+   test_busy_orphan_handed_kept();
+   test_busy_name_took();
+   test_busy_name_took_fails();
+   test_busy_name_took_no_undo();
+   test_busy_name_took_leaves();
    test_save_no_image_worker();
    test_untold_write_fails();
    test_retired_left_superseded();
    test_retired_left_written();
    test_retired_final_written();
    test_copy_job_start_fails();
+   test_busy_untold_fails();
 #endif
    test_kept_move_type_change();
    test_old_core_two_cuts();
