@@ -150,9 +150,8 @@ typedef struct
    uint32_t uploads;
    uint32_t downloads;
    retro_time_t start_time;
-   /* Captured on the main thread when the task is pushed: the handler
-    * runs on the threaded task queue's worker, and a worker takes what
-    * it needs as arguments rather than reading the settings mid-sync. */
+   /* Captured when the task is pushed, so a sync keeps the settings it
+    * started with. */
    bool destructive;
    char dir_core_assets[DIR_MAX_LENGTH];
    /* The directory map for this sync, built at push. Per task rather
