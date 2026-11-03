@@ -30,6 +30,12 @@
  *    synced directory in one run, and lists what dir_list_new() listed:
  *    nested and hidden files, ignored names left out, two roots; a root
  *    that cannot be read still stops the sync;
+ *  - a core's save items, in the real registry, sync as save RAM does:
+ *    walked and uploaded from the save directory, their write temps
+ *    left out; a newer server copy or a server deletion of a file the
+ *    running core owns, or one an item that left still owes a write,
+ *    is deferred; an item in the system directory is walked only with
+ *    Sync: System Files on;
  *  - pushed on the task queue and run to its end, the sync releases
  *    everything it held (LeakSanitizer): the state used to be left
  *    behind by every sync, because it was freed from a callback that
@@ -46,6 +52,7 @@
 #include <retro_timers.h>
 
 #include "../../../tasks/task_cloudsync.c"
+#include "../../../save_items.h"
 
 /* The locked hand-over (TASK_CLOUDSYNC_FORCE_LOCK, or a backend with no
  * pointer atomics) appends under the lock task_push_cloud_sync() makes;
@@ -69,12 +76,27 @@ bool verbosity_is_enabled(void)       { return false; }
 /* NULL but for the follow-up lane, which pushes real syncs */
 static settings_t *test_settings;
 settings_t *config_get_ptr(void)      { return test_settings; }
-char *dir_get_ptr(enum rarch_dir_type type) { (void)type; return NULL; }
-/* The file a running core owns, if any. */
+/* The save and state directories a sync covers. */
+static char save_dir[96], state_dir[96];
+char *dir_get_ptr(enum rarch_dir_type type)
+{
+   if (type == RARCH_DIR_SAVEFILE)
+      return save_dir;
+   return type == RARCH_DIR_SAVESTATE ? state_dir : NULL;
+}
+/* As save.c answers: the save RAM of a running core, if any, the save
+ * items it registered (the real registry), and a path an item that left
+ * still owes its last image. */
 static char live_path[256];
+static char pending_path[256];
 bool content_savefile_is_live(const char *path)
 {
-   return *live_path && path && !strcmp(path, live_path);
+   if (!path)
+      return false;
+   if (     (*live_path    && !strcmp(path, live_path))
+         || (*pending_path && !strcmp(path, pending_path)))
+      return true;
+   return save_items_path_is_live(path);
 }
 void task_window_progress_cb(retro_task_t *task) { (void)task; }
 size_t fill_pathname_application_special(char *s, size_t len,
@@ -113,6 +135,17 @@ typedef struct
 
 static void write_file(const char *path, size_t size, unsigned seed);
 
+/* The keys a sync asked the driver to fetch ([0]) and to upload ([1]). */
+static char     asked[2][16][64];
+static unsigned num_asked[2];
+
+static void ask(unsigned what, const char *key)
+{
+   if (num_asked[what] < 16)
+      strlcpy(asked[what][num_asked[what]], key, sizeof(asked[0][0]));
+   num_asked[what]++;
+}
+
 /* Nonzero: a fetch writes half its bytes and then reports failure, as
  * a transfer cut off part-way. */
 static int fetch_fail;
@@ -141,6 +174,7 @@ bool cloud_sync_read(const char *path, const char *file,
 {
    fetch_job_t *job;
    sthread_t   *t;
+   ask(0, path);
    if (!fetch_size || !(job = (fetch_job_t*)calloc(1, sizeof(*job))))
    {
       transfers++;
@@ -160,7 +194,7 @@ bool cloud_sync_read(const char *path, const char *file,
 }
 bool cloud_sync_update(const char *path, RFILE *file,
       cloud_sync_complete_handler_t cb, void *user_data)
-{ (void)path; (void)file; (void)cb; (void)user_data; transfers++; return false; }
+{ (void)file; (void)cb; (void)user_data; ask(1, path); transfers++; return false; }
 bool cloud_sync_free(const char *path, cloud_sync_complete_handler_t cb,
       void *user_data)
 { (void)path; (void)cb; (void)user_data; transfers++; return false; }
@@ -636,6 +670,355 @@ static void walk_lane(void)
    if (system(cmd) != 0) { }
 }
 
+/* A game whose core registers save items: Game.eep beside its save RAM,
+ * card.mcd, the *.mcd files of the cards folder, and vmu.bin in the
+ * system directory. The write temps beside them never sync. */
+static char system_dir[96];
+static const char *const save_keys[] = {
+   "saves/Game.srm", "saves/Game.eep", "saves/card.mcd",
+   "saves/cards/a.mcd", "saves/cards/b.mcd", "saves/cards/notes.txt",
+   "saves/Other.srm", NULL };
+static const char *const temp_keys[] = {
+   "saves/Game.eep.tmp", "saves/Game.eep.auto.tmp", "saves/card.mcd.tmp",
+   NULL };
+static const char *const system_keys[] = {
+   "system/vmu.bin", "system/bios.bin", NULL };
+/* Server copies newer than the local files: of what the running core
+ * owns (cards/c.mcd is on the server only), of what it does not, and a
+ * file the server deleted. */
+static const char *const owned_keys[] = {
+   "saves/Game.srm", "saves/Game.eep", "saves/card.mcd",
+   "saves/cards/a.mcd", "saves/cards/c.mcd", NULL };
+static const char *const unowned_keys[] = {
+   "saves/cards/notes.txt", "saves/Other.srm", NULL };
+static const char *const deleted_keys[] = { "saves/cards/b.mcd", NULL };
+
+static unsigned char eep[64];
+static struct retro_save_segment eep_seg = { eep, sizeof(eep) };
+static const char *const mcd_files[] = { "*.mcd", NULL };
+
+static void key_path(char *s, size_t len, const char *key)
+{
+   if (!strncmp(key, "system/", 7))
+      snprintf(s, len, "%s/%s", system_dir, key + 7);
+   else
+      snprintf(s, len, "%s/%s", save_dir, key + 6);
+}
+
+static void write_keys(const char *const *keys)
+{
+   char path[256];
+   for (; *keys; keys++)
+   {
+      key_path(path, sizeof(path), *keys);
+      write_file(path, 64, (unsigned)strlen(*keys));
+   }
+}
+
+/* The files as each lane starts. */
+static void items_files(void)
+{
+   write_keys(save_keys);
+   write_keys(system_keys);
+}
+
+static void unlink_keys(const char *const *keys)
+{
+   char path[256];
+   for (; *keys; keys++)
+   {
+      key_path(path, sizeof(path), *keys);
+      unlink(path);
+   }
+}
+
+/* @keys into @list with the file's hash ('c'), a newer hash ('n'), or
+ * none, deleted on the server ('d'). */
+static void add_keys(file_list_t *list, const char *const *keys, char how)
+{
+   char path[256];
+   for (; *keys; keys++)
+   {
+      key_path(path, sizeof(path), *keys);
+      list_add(list, *keys, NULL, how == 'c' ? hash_of(path)
+            : how == 'n' ? strdup("0123456789abcdef0123456789abcdef")
+            : NULL);
+   }
+}
+
+/* The game starts and its core registers its items, or it closes. */
+static void items_running(bool running)
+{
+   struct retro_save_item      items[4];
+   struct retro_save_interface iface;
+   struct save_items_paths     paths;
+   unsigned i;
+
+   save_items_clear();
+   *live_path = '\0';
+   if (!running)
+      return;
+   memset(items, 0, sizeof(items));
+   for (i = 0; i < 4; i++)
+   {
+      items[i].storage       = RETRO_SAVE_STORAGE_CORE_FILE;
+      items[i].root          = RETRO_SAVE_ROOT_SAVE_DIR;
+      items[i].legacy_memory = RETRO_SAVE_NO_LEGACY_MEMORY;
+   }
+   items[0].id           = "eep";
+   items[0].path         = "eep";
+   items[0].storage      = RETRO_SAVE_STORAGE_FRONTEND_BUFFER;
+   items[0].root         = RETRO_SAVE_ROOT_FRONTEND;
+   items[0].segments     = &eep_seg;
+   items[0].num_segments = 1;
+   items[1].id           = "card";
+   items[1].path         = "card.mcd";
+   items[2].id           = "cards";
+   items[2].path         = "cards";
+   items[2].storage      = RETRO_SAVE_STORAGE_CORE_FOLDER;
+   items[2].include      = mcd_files;
+   items[3].id           = "vmu";
+   items[3].path         = "vmu.bin";
+   items[3].root         = RETRO_SAVE_ROOT_SYSTEM_DIR;
+   memset(&iface, 0, sizeof(iface));
+   iface.interface_version = 1;
+   iface.num_items         = 4;
+   iface.item_size         = sizeof(items[0]);
+   iface.items             = items;
+   key_path(live_path, sizeof(live_path), "saves/Game.srm");
+   memset(&paths, 0, sizeof(paths));
+   paths.core                = "Test";
+   paths.savefile            = live_path;
+   paths.savefile_dir        = save_dir;
+   paths.system_dir          = system_dir;
+   paths.savefile_dir_is_dir = true;
+   check("items: the core registers its save items",
+         save_items_register(&iface, &paths));
+   save_items_drop_previous();
+}
+
+/* A sync of the fixture with Sync: System Files @system_files, the last
+ * sync's record @local and the server's manifest @server, through the
+ * walk and the diff. */
+static task_cloud_sync_state_t *items_sync(retro_task_t *task,
+      bool system_files, file_list_t *local, file_list_t *server)
+{
+   task_cloud_sync_state_t *st       = (task_cloud_sync_state_t*)calloc(1, sizeof(*st));
+   settings_t              *settings = (settings_t*)calloc(1, sizeof(*settings));
+   unsigned i;
+
+   settings->bools.cloud_sync_sync_saves  = true;
+   settings->bools.cloud_sync_sync_system = system_files;
+   strlcpy(settings->paths.directory_system, system_dir,
+         sizeof(settings->paths.directory_system));
+   st->dirlist = task_cloud_sync_directory_map_new(settings);
+   free(settings);
+   file_list_sort_on_alt(local);
+   file_list_sort_on_alt(server);
+   st->local_manifest  = local;
+   st->server_manifest = server;
+   st->destructive     = true;
+   strlcpy(st->dir_core_assets, dir, sizeof(st->dir_core_assets));
+   retro_atomic_int_init(&st->waiting, 0);
+   retro_atomic_int_init(&st->phase, (int)CLOUD_SYNC_PHASE_BUILD_CURRENT_MANIFEST);
+   task_cloud_sync_task_setup(task, st, "Cloud Sync in progress");
+   grant        = 100;
+   num_asked[0] = num_asked[1] = 0;
+   for (i = 0; i < 100000
+         && (  task_cloud_sync_phase_get(st) == CLOUD_SYNC_PHASE_BUILD_CURRENT_MANIFEST
+            || task_cloud_sync_phase_get(st) == CLOUD_SYNC_PHASE_DIFF); i++)
+      task_cloud_sync_task_handler(task);
+   task_cloud_sync_fold_manifest_adds(st);
+   return st;
+}
+
+static void items_done(retro_task_t *task)
+{
+   task_cloud_sync_cleanup(task);
+   free(task->title);
+   free(task);
+}
+
+static bool asked_for(unsigned what, const char *key)
+{
+   unsigned i;
+   for (i = 0; i < num_asked[what] && i < 16; i++)
+      if (!strcmp(asked[what][i], key))
+         return true;
+   return false;
+}
+
+static unsigned asked_count(unsigned what, const char *const *keys)
+{
+   unsigned n = 0;
+   for (; *keys; keys++)
+      n += asked_for(what, *keys);
+   return n;
+}
+
+/* How many of @keys the walk listed. */
+static unsigned walked(const task_cloud_sync_state_t *st,
+      const char *const *keys)
+{
+   unsigned n = 0;
+   size_t   idx;
+   for (; *keys; keys++)
+      n += file_list_search(st->current_manifest, *keys, &idx);
+   return n;
+}
+
+/* How many of @keys the sync left alone: neither fetched nor removed,
+ * and the server's copy kept for the next sync. */
+static unsigned left_alone(const task_cloud_sync_state_t *st,
+      const char *const *keys)
+{
+   unsigned n = 0;
+   size_t   i, idx;
+   char     path[256];
+   for (; *keys; keys++)
+   {
+      const char *want;
+      if (     asked_for(0, *keys)
+            || !file_list_search(st->server_manifest, *keys, &idx))
+         continue;
+      if (!(want = CS_FILE_HASH(&st->server_manifest->list[idx])))
+      {
+         key_path(path, sizeof(path), *keys);
+         n += access(path, F_OK) == 0;
+         continue;
+      }
+      for (i = 0; i < st->updated_server_manifest->size; i++)
+         if (     !strcmp(st->updated_server_manifest->list[i].alt, *keys)
+               && st->updated_server_manifest->list[i].userdata
+               && !strcmp((const char*)st->updated_server_manifest->list[i].userdata, want))
+         {
+            n++;
+            break;
+         }
+   }
+   return n;
+}
+
+static file_list_t *new_list(void)
+{
+   return (file_list_t*)calloc(1, sizeof(file_list_t));
+}
+
+/* The newer server copies, over a record of the files as they are. */
+static task_cloud_sync_state_t *items_newer_sync(retro_task_t *task)
+{
+   file_list_t *local  = new_list();
+   file_list_t *server = new_list();
+   items_files();
+   add_keys(local,  save_keys,    'c');
+   add_keys(server, owned_keys,   'n');
+   add_keys(server, unowned_keys, 'n');
+   add_keys(server, deleted_keys, 'd');
+   return items_sync(task, false, local, server);
+}
+
+/* Newer server copies of the system directory's files. */
+static task_cloud_sync_state_t *items_system_sync(retro_task_t *task,
+      bool system_files)
+{
+   file_list_t *local  = new_list();
+   file_list_t *server = new_list();
+   items_files();
+   add_keys(local,  save_keys,   'c');
+   add_keys(local,  system_keys, 'c');
+   add_keys(server, save_keys,   'c');
+   add_keys(server, system_keys, 'n');
+   return items_sync(task, system_files, local, server);
+}
+
+static void items_lane(void)
+{
+   char path[256];
+   task_cloud_sync_state_t *st;
+   retro_task_t *task;
+
+   snprintf(save_dir,   sizeof(save_dir),   "%s/item_saves",  dir);
+   snprintf(state_dir,  sizeof(state_dir),  "%s/item_states", dir);
+   snprintf(system_dir, sizeof(system_dir), "%s/item_system", dir);
+   snprintf(path, sizeof(path), "%s/cards", save_dir);
+   path_mkdir(path);
+   path_mkdir(state_dir);
+   path_mkdir(system_dir);
+   items_files();
+   write_keys(temp_keys);
+
+   /* no core running: item files sync as save RAM does */
+   items_running(false);
+   task = task_init();
+   st   = items_sync(task, false, new_list(), new_list());
+   check("items: their files walked with the save RAM, 7 of 7",
+         st->current_manifest->size == 7 && walked(st, save_keys) == 7);
+   check("items: new files uploaded, 7 of 7, nothing fetched",
+         num_asked[1] == 7 && asked_count(1, save_keys) == 7
+         && num_asked[0] == 0);
+   check("items: write temps neither walked nor uploaded, 0 of 3",
+         walked(st, temp_keys) == 0 && asked_count(1, temp_keys) == 0);
+   items_done(task);
+
+   /* the game runs: what its core owns is deferred */
+   items_running(true);
+   task = task_init();
+   st   = items_newer_sync(task);
+   check("items: a running core's 5 files (one server-only) not fetched",
+         left_alone(st, owned_keys) == 5);
+   check("items: ... nor its file the server deleted removed, 1 of 1",
+         left_alone(st, deleted_keys) == 1);
+   check("items: the 2 files no core owns fetched, nothing else",
+         num_asked[0] == 2 && asked_count(0, unowned_keys) == 2
+         && num_asked[1] == 0);
+   items_done(task);
+
+   /* an item in the system directory */
+   task = task_init();
+   st   = items_system_sync(task, false);
+   check("items: System Files off, the system directory not walked",
+         st->dirlist->size == 2 && st->current_manifest->size == 7
+         && walked(st, system_keys) == 0);
+   check("items: ... nor its 2 newer server copies fetched",
+         num_asked[0] == 0 && num_asked[1] == 0 && st->server_skipped == 2);
+   items_done(task);
+   task = task_init();
+   st   = items_system_sync(task, true);
+   check("items: System Files on, the item there walked, 9 files",
+         st->dirlist->size == 3 && st->current_manifest->size == 9
+         && walked(st, system_keys) == 2);
+   check("items: ... deferred while the core runs, the BIOS fetched",
+         left_alone(st, system_keys) == 1
+         && num_asked[0] == 1 && asked_for(0, "system/bios.bin")
+         && num_asked[1] == 0);
+   items_done(task);
+
+   /* the game closed; Game.eep's last image is still being written */
+   items_running(false);
+   key_path(pending_path, sizeof(pending_path), "saves/Game.eep");
+   task = task_init();
+   st   = items_newer_sync(task);
+   check("items: a pending write deferred, the 6 other copies fetched",
+         left_alone(st, owned_keys) == 1 && !asked_for(0, "saves/Game.eep")
+         && num_asked[0] == 6);
+   key_path(path, sizeof(path), "saves/cards/b.mcd");
+   check("items: ... and the file the server deleted removed",
+         left_alone(st, deleted_keys) == 0 && access(path, F_OK) != 0);
+   items_done(task);
+   *pending_path = '\0';
+
+   unlink_keys(save_keys);
+   unlink_keys(owned_keys);
+   unlink_keys(temp_keys);
+   unlink_keys(system_keys);
+   snprintf(path, sizeof(path), "%s/cards", save_dir);
+   rmdir(path);
+   rmdir(save_dir);
+   rmdir(state_dir);
+   rmdir(system_dir);
+   *save_dir = *state_dir = '\0';
+}
+
 /* What a sync's pusher is told when it is done. */
 static unsigned done_calls;
 static int      done_failed;
@@ -809,6 +1192,7 @@ int main(void)
          "fetch: a download cut off part-way leaves the save as it was",
          "fetch: ... and is fetched again next sync");
    walk_lane();
+   items_lane();
    queue_lane();
    begin_lane();
    followup_lane();
