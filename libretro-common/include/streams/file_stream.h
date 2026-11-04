@@ -472,7 +472,8 @@ int filestream_flush(RFILE *stream);
 
 /**
  * Flushes pending writes and waits until the operating system has put
- * them on the storage device (fsync, fdatasync or FlushFileBuffers).
+ * them on the storage device (fsync, fdatasync, F_BARRIERFSYNC or
+ * FlushFileBuffers).
  * Does nothing where the platform has no such call, and for a file
  * opened through a frontend VFS (filestream_vfs_init()), whose
  * interface has none.

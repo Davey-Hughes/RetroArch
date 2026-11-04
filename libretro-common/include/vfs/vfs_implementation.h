@@ -62,7 +62,8 @@ int64_t retro_vfs_file_write_impl(libretro_vfs_implementation_file *stream, cons
 int retro_vfs_file_flush_impl(libretro_vfs_implementation_file *stream);
 
 /* Flushes @stream and asks the OS to put its data on the storage
- * device before returning: fdatasync() on Linux and Android, fsync()
+ * device before returning: fdatasync() on Linux and Android,
+ * fcntl(F_BARRIERFSYNC) on Apple (fsync() where that fails), fsync()
  * on other POSIX systems, FlushFileBuffers() on Windows. Returns 0, or
  * -1 on an error. Does nothing and returns 0 on the consoles, on
  * cdrom://, smb:// and nfs://, and for a file that cannot be synced

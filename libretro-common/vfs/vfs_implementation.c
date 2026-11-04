@@ -2051,6 +2051,11 @@ int retro_vfs_file_sync_impl(libretro_vfs_implementation_file *stream)
          return -1;
 #if defined(__linux__)
       ret = fdatasync(fd);
+#elif defined(F_BARRIERFSYNC)
+      /* Apple's fsync() lets the drive write the data after a later
+       * rename; the barrier keeps the order. */
+      if ((ret = fcntl(fd, F_BARRIERFSYNC)) != 0)
+         ret = fsync(fd);
 #else
       ret = fsync(fd);
 #endif
@@ -2076,7 +2081,12 @@ int retro_vfs_dir_sync_impl(const char *dir)
 #endif
    if ((fd = open(dir, O_RDONLY)) < 0)
       return -1;
+#if defined(F_BARRIERFSYNC)
+   if ((ret = fcntl(fd, F_BARRIERFSYNC)) != 0)
+      ret = fsync(fd);
+#else
    ret = fsync(fd);
+#endif
    if (ret != 0 && (errno == EINVAL || errno == EROFS))
       ret = 0;
    close(fd);
