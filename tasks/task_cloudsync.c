@@ -237,6 +237,7 @@ static INLINE enum task_cloud_sync_phase task_cloud_sync_phase_get(
 /* Forward declarations for conflict resolution */
 static void task_cloud_sync_upload_current_file(task_cloud_sync_state_t *sync_state);
 static void task_cloud_sync_fetch_server_file(task_cloud_sync_state_t *sync_state);
+static void task_cloud_sync_delete_server_file(task_cloud_sync_state_t *sync_state);
 /* Defined below task_cloud_sync_write_updated_manifest(), used above it
  * by the server-manifest upload callback. */
 static void task_cloud_sync_commit_local_manifest(task_cloud_sync_state_t *sync_state);
@@ -1560,15 +1561,19 @@ static void task_cloud_sync_fetch_server_file(task_cloud_sync_state_t *sync_stat
    }
 }
 
-static void task_cloud_sync_resolve_conflict(task_cloud_sync_state_t *sync_state)
+static void task_cloud_sync_resolve_conflict(task_cloud_sync_state_t *sync_state,
+      bool local_deleted)
 {
    struct item_file *server_file = &sync_state->server_manifest->list[sync_state->server_idx];
 
    if (sync_state->conflict_resolution == 1)
    {
-      /* Keep local: upload local file to server */
+      /* Keep local: upload local file to server, or delete it there */
       RARCH_LOG(CSPFX "Conflict on %s, keeping local.\n", CS_FILE_KEY(server_file));
-      task_cloud_sync_upload_current_file(sync_state);
+      if (local_deleted)
+         task_cloud_sync_delete_server_file(sync_state);
+      else
+         task_cloud_sync_upload_current_file(sync_state);
    }
    else if (sync_state->conflict_resolution == 2)
    {
@@ -1740,7 +1745,7 @@ static void task_cloud_sync_check_server_current(task_cloud_sync_state_t *sync_s
 
    if (!include_local)
    {
-      task_cloud_sync_resolve_conflict(sync_state);
+      task_cloud_sync_resolve_conflict(sync_state, false);
       return;
    }
 
@@ -1749,7 +1754,7 @@ static void task_cloud_sync_check_server_current(task_cloud_sync_state_t *sync_s
    current_changed = !string_is_equal(CS_FILE_HASH(local_file), CS_FILE_HASH(current_file));
 
    if (server_changed && current_changed)
-      task_cloud_sync_resolve_conflict(sync_state);
+      task_cloud_sync_resolve_conflict(sync_state, false);
    else if (current_changed)
       task_cloud_sync_upload_current_file(sync_state);
    else if (!string_is_empty(CS_FILE_HASH(server_file)))
@@ -1962,7 +1967,7 @@ static void task_cloud_sync_diff_next(task_cloud_sync_state_t *sync_state)
                task_cloud_sync_delete_server_file(sync_state);
             else
                /* the server changed and local deleted, that's a conflict */
-               task_cloud_sync_resolve_conflict(sync_state);
+               task_cloud_sync_resolve_conflict(sync_state, true);
          }
          else
          {

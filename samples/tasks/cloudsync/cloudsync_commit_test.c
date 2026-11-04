@@ -27,6 +27,9 @@ static char local_path[128], fetching_path[160];
 static retro_atomic_int_t off_main, ownership_checks;
 static int live, retired, failures, expect_old, expect_failure;
 static void *pending_fetch;
+static const char *deleted_key;
+static char sent[128];
+static int serve;
 
 #define CHECK(c) do { if (!(c)) { \
    fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #c); failures++; } } while (0)
@@ -60,9 +63,28 @@ bool cloud_sync_read(const char *path, const char *file,
 { (void)path; (void)file; (void)cb; pending_fetch = ud; return true; }
 bool cloud_sync_update(const char *path, RFILE *file,
       cloud_sync_complete_handler_t cb, void *ud)
-{ (void)path; (void)file; (void)cb; (void)ud; return false; }
+{
+   char buf[8];
+   int64_t n;
+   size_t len = strlen(sent);
+   if (!serve)
+      return false;
+   n = filestream_read(file, buf, sizeof(buf) - 1);
+   buf[n > 0 ? n : 0] = '\0';
+   if (strcmp(path, MANIFEST_FILENAME_SERVER))
+      snprintf(sent + len, sizeof(sent) - len, "%s=%s;", path, buf);
+   cb(ud, path, true, file);
+   return true;
+}
 bool cloud_sync_free(const char *path, cloud_sync_complete_handler_t cb, void *ud)
-{ (void)path; (void)cb; (void)ud; return false; }
+{
+   size_t len = strlen(sent);
+   if (!serve)
+      return false;
+   snprintf(sent + len, sizeof(sent) - len, "-%s;", path);
+   cb(ud, path, true, NULL);
+   return true;
+}
 void cloud_sync_poll(cloud_sync_poll_budget_t within, void *budget)
 { (void)within; (void)budget; }
 void task_nbio_slice_open(nbio_budget_t *b) { b->floor = 1; }
@@ -70,12 +92,18 @@ void task_nbio_slice_close(nbio_budget_t *b) { (void)b; }
 bool task_nbio_slice_within_budget(void *ud, size_t avail, size_t len)
 { (void)ud; (void)avail; (void)len; return true; }
 
-static void add(file_list_t *list, const char *path, const char *hash)
+static void put(file_list_t *list, const char *key, const char *path,
+      const char *hash)
 {
    size_t at = list->size;
    file_list_append(list, path, NULL, 0, 0, 0);
-   file_list_set_alt_at_offset(list, at, "saves/save.srm");
+   file_list_set_alt_at_offset(list, at, key);
    list->list[at].userdata = hash ? strdup(hash) : NULL;
+}
+
+static void add(file_list_t *list, const char *path, const char *hash)
+{
+   put(list, "saves/save.srm", path, hash);
 }
 
 static bool holds(const char *path, const char *text)
@@ -102,6 +130,13 @@ static void done(retro_task_t *task, void *data, void *ud, const char *error)
       CHECK(file_list_search(st->updated_local_manifest, "saves/save.srm", &at));
       if (file_list_search(st->updated_local_manifest, "saves/save.srm", &at))
          CHECK(string_is_equal(CS_FILE_HASH(&st->updated_local_manifest->list[at]), "old"));
+   }
+   if (deleted_key)
+   {
+      CHECK(file_list_search(st->updated_server_manifest, deleted_key, &at)
+            && !CS_FILE_HASH(&st->updated_server_manifest->list[at]));
+      CHECK(file_list_search(st->updated_local_manifest, deleted_key, &at)
+            && !CS_FILE_HASH(&st->updated_local_manifest->list[at]));
    }
    retired++;
 }
@@ -206,6 +241,79 @@ static void lane(bool threaded, bool deletion, bool owned, bool no_memory,
    filestream_delete(manifest);
 }
 
+/* Deleted here, changed on the server, "keep local": the delete goes to
+ * the server and nothing else is sent in its place. @last puts the
+ * deleted file after every file still on disk. */
+static void keep_local_lane(bool threaded, bool last)
+{
+   retro_task_t *task = task_init();
+   task_cloud_sync_state_t *st = (task_cloud_sync_state_t*)calloc(1, sizeof(*st));
+   const char *key = last ? "saves/c.srm" : "saves/a.srm";
+   unsigned i;
+   char other[160], gone[160], want[64], manifest[160];
+   union string_list_elem_attr attr;
+   retired = 0;
+   live = 0;
+   expect_old = 0;
+   expect_failure = 0;
+   deleted_key = key;
+   sent[0] = '\0';
+   serve = 1;
+   snprintf(other, sizeof(other), "%s/b.srm", directory);
+   snprintf(gone, sizeof(gone), "%s/%s", directory, key + STRLEN_CONST("saves/"));
+   snprintf(want, sizeof(want), "-%s;", key);
+   CHECK(filestream_write_file(other, "bbb", 3));
+   st->server_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->local_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->current_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->updated_server_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->updated_local_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->conflict_resolution = 1;
+   st->dirlist = string_list_new();
+   attr.i = 0;
+   string_list_append(st->dirlist, "saves", attr);
+   st->dirlist->elems[0].userdata = strdup(directory);
+   strlcpy(st->dir_core_assets, directory, sizeof(st->dir_core_assets));
+   if (!last)
+   {
+      put(st->server_manifest, key, NULL, "new");
+      put(st->local_manifest, key, NULL, "old");
+   }
+   put(st->server_manifest, "saves/b.srm", NULL, "bh");
+   put(st->local_manifest, "saves/b.srm", NULL, "bh");
+   put(st->current_manifest, "saves/b.srm", other, "bh");
+   if (last)
+   {
+      put(st->server_manifest, key, NULL, "new");
+      put(st->local_manifest, key, NULL, "old");
+   }
+   retro_atomic_int_init(&st->waiting, 0);
+   retro_atomic_int_init(&st->phase, CLOUD_SYNC_PHASE_DIFF);
+   st->cb = done;
+   task_cloud_sync_task_setup(task, st, "Cloud Sync");
+   task_queue_init(threaded, NULL);
+   task_queue_push(task);
+   for (i = 0; i < 2000 && !retired; i++)
+   {
+      task_queue_check();
+      retro_sleep(1);
+   }
+   CHECK(retired == 1);
+   CHECK(!strcmp(sent, want));
+   if (strcmp(sent, want))
+      fprintf(stderr, "  sent: %s\n", sent);
+   CHECK(holds(other, "bbb"));
+   CHECK(!path_is_valid(gone));
+   task_queue_deinit();
+   serve = 0;
+   deleted_key = NULL;
+   filestream_delete(other);
+   snprintf(manifest, sizeof(manifest), "%s/%s", directory, MANIFEST_FILENAME_LOCAL);
+   filestream_delete(manifest);
+   snprintf(manifest, sizeof(manifest), "%s/%s", directory, MANIFEST_FILENAME_SERVER);
+   filestream_delete(manifest);
+}
+
 int main(void)
 {
    unsigned t;
@@ -230,6 +338,8 @@ int main(void)
       lane(t != 0, false, false, true, false);
       lane(t != 0, true, true, false, false);
       lane(t != 0, true, false, false, false);
+      keep_local_lane(t != 0, false);
+      keep_local_lane(t != 0, true);
    }
    puts(failures ? "FAIL cloudsync_commit_test" : "PASS cloudsync_commit_test");
    return failures ? 1 : 0;
