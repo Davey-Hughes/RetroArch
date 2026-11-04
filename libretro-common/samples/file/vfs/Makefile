@@ -272,7 +272,7 @@ clean:
 	rm -f vfs_view_fixture.bin vfs_view_update.bin vfs_view_empty.bin
 	rm -f rename_replace.bin rename_replace.bin.old rename_replace.bin.tmp
 	rm -f close_result.bin close_result_w.bin
-	rm -f atomic.bin atomic.bin.old atomic.bin.*.old atomic.bin.tmp
+	rm -f atomic.bin atomic.bin.prev atomic.bin.*.prev atomic.bin.tmp
 	rm -f bulk_select.bin bulk_select_w.bin bulk_roundtrip.bin \
 		bulk_short.bin bulk_shrank.bin bulk_error.bin \
 		bulk_binary.bin bulk_threads.bin

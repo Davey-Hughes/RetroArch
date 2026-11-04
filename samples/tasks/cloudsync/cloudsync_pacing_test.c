@@ -574,8 +574,8 @@ static void walk_lane(void)
    snprintf(path, sizeof(path), "%s/.dot.srm", a);           write_file(path, 4, 1);
    snprintf(path, sizeof(path), "%s/core2/p.srm.rafetching", a); write_file(path, 4, 1);
    snprintf(path, sizeof(path), "%s/core2/p.srm.tmp", a);        write_file(path, 4, 1);
-   snprintf(path, sizeof(path), "%s/core2/p.srm.old", a);        write_file(path, 4, 1);
-   snprintf(path, sizeof(path), "%s/core2/p.srm.2.old", a);      write_file(path, 4, 1);
+   snprintf(path, sizeof(path), "%s/core2/p.srm.prev", a);       write_file(path, 4, 1);
+   snprintf(path, sizeof(path), "%s/core2/p.srm.2.prev", a);     write_file(path, 4, 1);
    snprintf(path, sizeof(path), "%s/.DS_Store", b);          write_file(path, 4, 1);
 
    nkeys = reference_keys(a, "saves", keys, 0);
@@ -600,7 +600,7 @@ static void walk_lane(void)
    check("walk: the same files dir_list_new() lists, hidden ones too", same);
    for (i = 0; same && i < nkeys; i++)
       if (     strstr(keys[i], ".rafetching") || strstr(keys[i], ".DS_Store")
-            || strstr(keys[i], ".tmp") || strstr(keys[i], ".old"))
+            || strstr(keys[i], ".tmp") || strstr(keys[i], ".prev"))
          same = 0;
    check("walk: ignored names left out", same);
    task_cloud_sync_cleanup(task);

@@ -511,7 +511,7 @@ static bool task_cloud_sync_should_ignore_file(const char *filename)
 
    /* the old file an atomic write moved aside, or left by one that
     * never finished (filestream_finish_atomic) */
-   if (string_ends_with(filename, ".old"))
+   if (string_ends_with(filename, ".prev"))
        return true;
 
    return false;

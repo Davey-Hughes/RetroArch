@@ -298,8 +298,8 @@ bool filestream_write_file(const char *path, const void *data, int64_t size);
  *
  * Under a frontend VFS whose rename refuses an existing destination,
  * the target is moved aside while the temporary file takes its place,
- * and put back if that fails.  The aside name is \c path with ".old"
- * appended, or ".2.old" up to ".99.old" when that is taken: an aside
+ * and put back if that fails.  The aside name is \c path with ".prev"
+ * appended, or ".2.prev" up to ".99.prev" when that is taken: an aside
  * file already there is never touched.  When all are taken, such a
  * write fails.
  *
@@ -307,8 +307,11 @@ bool filestream_write_file(const char *path, const void *data, int64_t size);
  * @param data The buffer to write to \c path.
  * @param size The size of \c data, in bytes.
  * @return \c true if the file was written successfully,
- * \c false if there was an error, in which case \c path is left as it
- * was and no temporary file remains.
+ * \c false if there was an error, in which case no temporary file
+ * remains and \c path is left as it was, unless the moved-aside copy
+ * could not be put back: then \c path is absent, its old contents are
+ * under the aside name and the new ones were deleted with the
+ * temporary file.
  */
 bool filestream_write_file_atomic(const char *path, const void *data, int64_t size);
 

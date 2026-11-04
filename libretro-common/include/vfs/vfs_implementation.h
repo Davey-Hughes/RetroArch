@@ -79,6 +79,16 @@ int retro_vfs_file_remove_impl(const char *path);
 
 int retro_vfs_file_rename_impl(const char *old_path, const char *new_path);
 
+/* Writes to @s, of @len bytes, aside name @n (1 to 99) of @path:
+ * "<path>.prev", then "<path>.2.prev" ... "<path>.99.prev". A file is
+ * moved aside to the first that does not exist: one already there may
+ * be all that is left of an interrupted write. Returns the name's
+ * length, or 0 when @n is out of range or the name does not fit;
+ * strlen(@path) + RETRO_VFS_ASIDE_SUFFIX_SIZE bytes always do. */
+#define RETRO_VFS_ASIDE_SUFFIX_SIZE sizeof(".99.prev")
+size_t retro_vfs_aside_name_impl(char *s, size_t len, const char *path,
+      unsigned n);
+
 const char *retro_vfs_file_get_path_impl(libretro_vfs_implementation_file *stream);
 
 /* Borrowed pointer to the whole file, when this stream is backed by a
