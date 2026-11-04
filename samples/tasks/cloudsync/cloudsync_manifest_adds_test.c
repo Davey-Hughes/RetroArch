@@ -50,6 +50,7 @@ void RARCH_ERR(const char *fmt, ...)  { (void)fmt; }
 bool verbosity_is_enabled(void)       { return false; }
 settings_t *config_get_ptr(void)      { return NULL; }
 char *dir_get_ptr(enum rarch_dir_type type) { (void)type; return NULL; }
+const char *path_get(enum rarch_path_type type) { (void)type; return NULL; }
 bool content_savefile_is_live(const char *path) { (void)path; return false; }
 void task_window_progress_cb(retro_task_t *task) { (void)task; }
 size_t fill_pathname_application_special(char *s, size_t len,
