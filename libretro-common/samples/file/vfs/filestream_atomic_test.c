@@ -419,15 +419,25 @@ static void lane_ios_eexist_moves_aside(void)
    CHECK(content_is(TARGET, "new"), "a failed reopen lost the file");
    CHECK(!exists(ASIDE), "a failed reopen left the aside copy");
 
-   eexist_left = 1;
+   /* a retry would take the second EEXIST */
+   eexist_left = 2;
    CHECK(!filestream_open(TARGET, RETRO_VFS_FILE_ACCESS_READ,
-         RETRO_VFS_FILE_ACCESS_HINT_NONE), "a read open was retried");
-   eexist_left = 1;
+         RETRO_VFS_FILE_ACCESS_HINT_NONE), "a read open after EEXIST worked");
+   CHECK(eexist_left == 1, "a read open was retried");
+   eexist_left = 2;
    CHECK(!open_write(RETRO_VFS_FILE_ACCESS_WRITE
          | RETRO_VFS_FILE_ACCESS_UPDATE_EXISTING, "x"),
-         "an update open was retried");
+         "an update open after EEXIST worked");
+   CHECK(eexist_left == 1, "an update open was retried");
    CHECK(content_is(TARGET, "new"), "a read or update open moved the file");
    CHECK(!exists(ASIDE), "a read or update open left an aside copy");
+
+   eexist_left = 1;
+   CHECK(open_write(RETRO_VFS_FILE_ACCESS_READ_WRITE, "rw"),
+         "the read-write reopen after EEXIST failed");
+   CHECK(content_is(TARGET, "rw"),
+         "the read-write reopened file has the wrong content");
+   CHECK(!exists(ASIDE), "the aside copy was left after a read-write reopen");
 
    eexist_left = 1;
    put(ASIDE, "stale");

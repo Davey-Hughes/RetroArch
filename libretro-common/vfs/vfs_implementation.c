@@ -707,32 +707,19 @@ int64_t retro_vfs_file_seek_internal(
    return retro_vfs_fd_seek64(stream->fd, offset, whence) == -1 ? -1 : 0;
 }
 
-/* The first of "<path>.old", "<path>.2.old" ... "<path>.99.old" that
- * does not exist: one already there may be all that is left of an
- * interrupted write.  NULL when all do, or on OOM. */
-static char *retro_vfs_aside_name(const char *path)
+/* The first aside name of @path (retro_vfs_aside_name_impl()) that
+ * does not exist.  NULL when all do, or on OOM. */
+static char *retro_vfs_free_aside_name(const char *path)
 {
    unsigned n;
-   size_t _len  = strlen(path);
-   char  *aside = (char*)malloc(_len + sizeof(".99.old"));
+   size_t _len  = strlen(path) + RETRO_VFS_ASIDE_SUFFIX_SIZE;
+   char  *aside = (char*)malloc(_len);
 
    if (!aside)
       return NULL;
-   memcpy(aside, path, _len);
-   for (n = 1; n <= 99; n++)
-   {
-      char *s = aside + _len;
-      if (n > 1)
-      {
-         *s++ = '.';
-         if (n > 9)
-            *s++ = (char)('0' + n / 10);
-         *s++ = (char)('0' + n % 10);
-      }
-      memcpy(s, ".old", sizeof(".old"));
+   for (n = 1; retro_vfs_aside_name_impl(aside, _len, path, n); n++)
       if (!retro_vfs_stat_impl(aside, NULL))
          return aside;
-   }
    free(aside);
    return NULL;
 }
@@ -744,7 +731,7 @@ static FILE *retro_vfs_file_reopen_aside(const char *path,
       const char *mode_str)
 {
    FILE *fp    = NULL;
-   char *aside = retro_vfs_aside_name(path);
+   char *aside = retro_vfs_free_aside_name(path);
 
    if (!aside)
       return NULL;
@@ -982,6 +969,7 @@ libretro_vfs_implementation_file *retro_vfs_file_open_impl(
 #endif
 
          default:
+            errno = 0;
             if (!(fp = (FILE*)fopen_utf8(path, mode_str)))
             {
                if (     errno == EEXIST
