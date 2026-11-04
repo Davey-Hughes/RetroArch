@@ -70,6 +70,7 @@ bool verbosity_is_enabled(void)       { return false; }
 static settings_t *test_settings;
 settings_t *config_get_ptr(void)      { return test_settings; }
 char *dir_get_ptr(enum rarch_dir_type type) { (void)type; return NULL; }
+const char *path_get(enum rarch_path_type type) { (void)type; return NULL; }
 /* The file a running core owns, if any. */
 static char live_path[256];
 bool content_savefile_is_live(const char *path)
@@ -490,8 +491,8 @@ static int key_cmp(const void *a, const void *b)
 
 /* The keys dir_list_new() gives for @root under @name, as the manifest
  * build made them before the walk. */
-static size_t reference_keys(const char *root, const char *name,
-      char **keys, size_t at)
+static size_t reference_keys(const task_cloud_sync_state_t *st,
+      const char *root, const char *name, char **keys, size_t at)
 {
    char slash[256], rel[256], alt[256];
    struct string_list *l;
@@ -504,7 +505,7 @@ static size_t reference_keys(const char *root, const char *name,
    {
       path_relative_to(rel, l->elems[i].data, slash, sizeof(rel));
       fill_pathname_join_special(alt, name, rel, sizeof(alt));
-      if (task_cloud_sync_should_ignore_file(alt))
+      if (task_cloud_sync_should_ignore_file(st, alt))
          continue;
       pathname_make_slashes_portable(alt);
       keys[at++] = strdup(alt);
@@ -576,11 +577,11 @@ static void walk_lane(void)
    snprintf(path, sizeof(path), "%s/core2/p.srm.tmp", a);        write_file(path, 4, 1);
    snprintf(path, sizeof(path), "%s/.DS_Store", b);          write_file(path, 4, 1);
 
-   nkeys = reference_keys(a, "saves", keys, 0);
-   nkeys = reference_keys(b, "states", keys, nkeys);
+   st   = walk_state(a, b);
+   nkeys = reference_keys(st, a, "saves", keys, 0);
+   nkeys = reference_keys(st, b, "states", keys, nkeys);
    qsort(keys, nkeys, sizeof(*keys), key_cmp);
 
-   st   = walk_state(a, b);
    task = task_init();
    grant = 20;
    r = walk_run(st, task);

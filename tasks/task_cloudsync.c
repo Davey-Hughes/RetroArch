@@ -159,6 +159,9 @@ typedef struct
     * than a process-wide cache: a fresh list per sync is a handful of
     * strdups, and it cannot go stale against the sync toggles. */
    struct string_list *dirlist;
+   /* The config this RetroArch loaded, as a path under the config
+    * root in manifest form; empty when it lies outside. */
+   char loaded_config[PATH_MAX_LENGTH];
    /* Whoever pushed the sync, told when it is done. */
    retro_task_callback_t cb;
    void *cb_data;
@@ -480,15 +483,36 @@ static void task_cloud_sync_read_local_manifest(task_cloud_sync_state_t *sync_st
    task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_BUILD_CURRENT_MANIFEST);
 }
 
+/* Paths compare as these platforms' usual file systems do. */
+#if defined(_WIN32) || defined(__APPLE__)
+#define TCS_PATH_EQUAL(a, b)       string_is_equal_case_insensitive(a, b)
+#define TCS_PATH_STARTS_WITH(a, b) string_starts_with_case_insensitive(a, b)
+#else
+#define TCS_PATH_EQUAL(a, b)       string_is_equal(a, b)
+#define TCS_PATH_STARTS_WITH(a, b) string_starts_with(a, b)
+#endif
+
 /* takes the filename in manifest format, e.g. "config/retroarch.cfg" */
-static bool task_cloud_sync_should_ignore_file(const char *filename)
+static bool task_cloud_sync_should_ignore_file(
+      const task_cloud_sync_state_t *sync_state, const char *filename)
 {
+   const char *name = path_basename_nocompression(filename);
+
+   /* this install's secrets, kept beside whichever config was loaded */
+   if (     string_is_equal_case_insensitive(name, "retroarch-keychain.cfg")
+         || string_is_equal_case_insensitive(name, "retroarch-keychain.key"))
+      return true;
+
    if (string_starts_with(filename, "config/"))
    {
       const char *path = filename + STRLEN_CONST("config/");
 
       /* need to exclude FILE_PATH_MAIN_CONFIG, those don't get sync'd */
       if (string_is_equal(path, FILE_PATH_MAIN_CONFIG))
+         return true;
+
+      /* nor the one this RetroArch loaded, whatever its name */
+      if (TCS_PATH_EQUAL(path, sync_state->loaded_config))
          return true;
 
       /* ignore playlist files */
@@ -613,7 +637,7 @@ static void task_cloud_sync_walk_step(task_cloud_sync_state_t *sync_state)
    fill_pathname_join_special(CS_WALK_ALT(sync_state),
          sync_state->dirlist->elems[sync_state->walk_root_idx].data,
          CS_WALK_REL(sync_state), PATH_MAX_LENGTH);
-   if (task_cloud_sync_should_ignore_file(CS_WALK_ALT(sync_state)))
+   if (task_cloud_sync_should_ignore_file(sync_state, CS_WALK_ALT(sync_state)))
       return;
 
    /* The "alt" refers to the relative path of whatever we're syncing relative to the retroarch folder
@@ -708,11 +732,43 @@ error:
    return NULL;
 }
 
-/* True when @key lies under one of the directories this sync covers. */
-static bool task_cloud_sync_key_in_scope(const struct string_list *dirlist,
-      const char *key)
+/* Fills @s with @config relative to the "config" root of @dirlist,
+ * in manifest form, or leaves it empty when @config lies outside. */
+static void task_cloud_sync_loaded_config(char *s, size_t len,
+      const struct string_list *dirlist, const char *config)
 {
+   char   root[DIR_MAX_LENGTH];
+   size_t _len;
+   int    i = string_list_find_elem(dirlist, "config");
+
+   *s = '\0';
+   if (!i || string_is_empty(config))
+      return;
+   strlcpy(root, (const char*)dirlist->elems[i - 1].userdata, sizeof(root));
+   strlcpy(s, config, len);
+   /* left as given where they cannot be resolved */
+   path_resolve_realpath(root, sizeof(root), false);
+   path_resolve_realpath(s, len, false);
+   _len = fill_pathname_slash(root, sizeof(root));
+   if (!TCS_PATH_STARTS_WITH(s, root))
+   {
+      *s = '\0';
+      return;
+   }
+   memmove(s, s + _len, strlen(s + _len) + 1);
+   pathname_make_slashes_portable(s);
+}
+
+/* True when @key lies under one of the directories this sync covers
+ * and is not ignored. The rest keep their records, never read as
+ * deletes on either side. */
+static bool task_cloud_sync_key_in_scope(
+      const task_cloud_sync_state_t *sync_state, const char *key)
+{
+   const struct string_list *dirlist = sync_state->dirlist;
    size_t i;
+   if (task_cloud_sync_should_ignore_file(sync_state, key))
+      return false;
    for (i = 0; i < dirlist->size; i++)
       if (string_starts_with(key, dirlist->elems[i].data))
          return true;
@@ -731,7 +787,7 @@ static size_t task_cloud_sync_count_out_of_scope(
       return 0;
 
    for (i = 0; i < server->size; i++)
-      if (!task_cloud_sync_key_in_scope(dirlist,
+      if (!task_cloud_sync_key_in_scope(sync_state,
                CS_FILE_KEY(&server->list[i])))
          count++;
 
@@ -1502,7 +1558,7 @@ static void task_cloud_sync_fetch_server_file(task_cloud_sync_state_t *sync_stat
     * successful. on error just add to the updated manifest without marking
     * need_manifest_uplaod. */
 
-   if (task_cloud_sync_should_ignore_file(key))
+   if (task_cloud_sync_should_ignore_file(sync_state, key))
    {
       /* don't fetch a file we're supposed to ignore, even if the server has it */
       RARCH_LOG(CSPFX "Ignoring %s.\n", key);
@@ -1641,7 +1697,7 @@ static void task_cloud_sync_upload_current_file(task_cloud_sync_state_t *sync_st
    const char       *filename = item->path;
    RFILE            *file;
 
-   if (task_cloud_sync_should_ignore_file(path))
+   if (task_cloud_sync_should_ignore_file(sync_state, path))
    {
       RARCH_LOG(CSPFX "Ignoring \"%s\", not uploading.\n", path);
       return;
@@ -1713,7 +1769,7 @@ static void task_cloud_sync_check_server_current(task_cloud_sync_state_t *sync_s
    const char       *filename     = current_file->path;
    RFILE            *file;
 
-   if (task_cloud_sync_should_ignore_file(CS_FILE_KEY(server_file)))
+   if (task_cloud_sync_should_ignore_file(sync_state, CS_FILE_KEY(server_file)))
    {
       RARCH_LOG(CSPFX "Ignoring \"%s\" (despite possible conflict).\n", CS_FILE_KEY(server_file));
       return;
@@ -1795,7 +1851,7 @@ static void task_cloud_sync_delete_server_file(task_cloud_sync_state_t *sync_sta
    struct item_file *server_file = &sync_state->server_manifest->list[sync_state->server_idx];
    const char       *key = CS_FILE_KEY(server_file);
 
-   if (task_cloud_sync_should_ignore_file(key))
+   if (task_cloud_sync_should_ignore_file(sync_state, key))
    {
       RARCH_LOG(CSPFX "Ignoring \"%s\", instead of removing from server.\n", key);
       return;
@@ -1833,7 +1889,7 @@ static void task_cloud_sync_maybe_ignore(task_cloud_sync_state_t *sync_state)
       {
          struct item_file *local_file  = &sync_state->local_manifest->list[sync_state->local_idx];
          const char *key = CS_FILE_KEY(local_file);
-         found = task_cloud_sync_key_in_scope(dirlist, key);
+         found = task_cloud_sync_key_in_scope(sync_state, key);
          /* we have a record of doing a sync for this file but now no longer
           * wish to sync it. keep the record? might as well, in case the option
           * gets turned back on later. */
@@ -1851,7 +1907,7 @@ static void task_cloud_sync_maybe_ignore(task_cloud_sync_state_t *sync_state)
       {
          struct item_file *server_file  = &sync_state->server_manifest->list[sync_state->server_idx];
          const char *key = CS_FILE_KEY(server_file);
-         found = task_cloud_sync_key_in_scope(dirlist, key);
+         found = task_cloud_sync_key_in_scope(sync_state, key);
          /* must keep the server's manifest complete */
          if (!found)
          {
@@ -2512,6 +2568,9 @@ static bool task_push_cloud_sync_with_mode(int conflict_resolution,
             settings->paths.directory_core_assets,
             sizeof(sync_state->dir_core_assets));
       sync_state->dirlist     = task_cloud_sync_directory_map_new(settings);
+      task_cloud_sync_loaded_config(sync_state->loaded_config,
+            sizeof(sync_state->loaded_config), sync_state->dirlist,
+            path_get(RARCH_PATH_CONFIG));
    }
    cloud_sync_capture();
    if (!sync_state->dirlist)
