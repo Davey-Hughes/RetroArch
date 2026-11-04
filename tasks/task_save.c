@@ -480,9 +480,11 @@ static void undo_save_state_cb(retro_task_t *task,
    state_tasks_release();
 }
 
-bool content_finish_tmp(const char *path, bool ok)
+bool content_finish_tmp(const char *path, bool ok, bool sync)
 {
-   int ret = filestream_finish_atomic(path, ok);
+   int ret = sync
+      ? filestream_finish_atomic_synced(path, ok)
+      : filestream_finish_atomic(path, ok);
    if (ret == 1 && path_is_valid(path))
    {
       char tmp_path[PATH_MAX_LENGTH];
@@ -539,7 +541,9 @@ static void task_save_handler_finished(retro_task_t *task,
             task_set_error(task, strdup(
                   msg_hash_to_str(MSG_FAILED_TO_SAVE_STATE_TO)));
       }
-      else if (!content_finish_tmp(state->path, !task_get_error(task))
+      /* Off the frame loop only on the threaded queue. */
+      else if (!content_finish_tmp(state->path, !task_get_error(task),
+                  task_queue_is_threaded())
             && !task_get_error(task))
          task_set_error(task, strdup(
                msg_hash_to_str(MSG_FAILED_TO_SAVE_STATE_TO)));
@@ -2087,7 +2091,7 @@ bool content_auto_save_state(const char *path)
    free(serial_data);
    free(file);
 
-   if (!content_finish_tmp(path, _close_ret == 0))
+   if (!content_finish_tmp(path, _close_ret == 0, false))
       return false;
 
 #ifdef HAVE_SCREENSHOTS
@@ -2622,7 +2626,7 @@ bool content_ram_state_to_file(const char *path)
          char tmp_path[PATH_MAX_LENGTH];
          if (filestream_atomic_temp_name(tmp_path, sizeof(tmp_path), path))
             written = content_finish_tmp(path, rzipstream_write_file(tmp_path,
-                  ram_buf.state_buf.data, ram_buf.state_buf.size));
+                  ram_buf.state_buf.data, ram_buf.state_buf.size), false);
       }
       else
 #endif

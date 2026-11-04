@@ -3905,6 +3905,7 @@ bool command_event(enum event_command cmd, void *data)
 #else
                false,
 #endif
+               data ? *(bool*)data : false,
 #ifdef HAVE_CHEATS
                settings->paths.path_cheat_database
 #else
@@ -6971,7 +6972,10 @@ void retroarch_save_for_suspend(void)
     * CMD_EVENT_SAVE_FILES exists to persist SRAM and game-specific
     * cheats, both of which require loaded content. */
    if (runloop_content_loaded())
-      command_event(CMD_EVENT_SAVE_FILES, NULL);
+   {
+      bool sync = true;
+      command_event(CMD_EVENT_SAVE_FILES, &sync);
+   }
 
    /* Core options: written unconditionally on core unload, so not
     * gated on config_save_on_exit here either. Without this, option
@@ -10512,7 +10516,11 @@ bool retroarch_main_deinit_begin(void)
 
    command_event(CMD_EVENT_RECORD_DEINIT, NULL);
 
-   command_event(CMD_EVENT_SAVE_FILES, NULL);
+   {
+      /* The session's last save write: worth waiting for the disk. */
+      bool sync = true;
+      command_event(CMD_EVENT_SAVE_FILES, &sync);
+   }
 
 #ifdef HAVE_REWIND
    command_event(CMD_EVENT_REWIND_DEINIT, NULL);

@@ -2018,6 +2018,86 @@ int retro_vfs_file_flush_impl(libretro_vfs_implementation_file *stream)
    return -1;
 }
 
+/* The consoles' SDKs are not relied on for an fsync(); there a sync
+ * does nothing. */
+#if !defined(_WIN32) && !defined(VITA) && !defined(PSP) && !defined(PS2) \
+      && !defined(ORBIS) && !defined(GEKKO) && !defined(_3DS) \
+      && !defined(WIIU) && !defined(SWITCH) && !defined(__PSL1GHT__) \
+      && !defined(__PS3__)
+#define VFS_HAVE_FSYNC
+#endif
+
+int retro_vfs_file_sync_impl(libretro_vfs_implementation_file *stream)
+{
+   if (!stream)
+      return -1;
+#ifdef HAVE_CDROM
+   if (stream->scheme == VFS_SCHEME_CDROM)
+      return 0;
+#endif
+#ifdef HAVE_SMBCLIENT
+   if (stream->scheme == VFS_SCHEME_SMB)
+      return 0;
+#endif
+#ifdef HAVE_NFSCLIENT
+   if (stream->scheme == VFS_SCHEME_NFS)
+      return 0;
+#endif
+   if (stream->fp && fflush(stream->fp) != 0)
+      return -1;
+#if defined(_WIN32) && !defined(_XBOX)
+   {
+      HANDLE h;
+      int fd = stream->fp ? _fileno(stream->fp) : stream->fd;
+      if (fd < 0)
+         return -1;
+      h = (HANDLE)_get_osfhandle(fd);
+      if (h == INVALID_HANDLE_VALUE || !FlushFileBuffers(h))
+         return -1;
+   }
+#elif defined(VFS_HAVE_FSYNC)
+   {
+      int ret;
+      int fd = stream->fp ? fileno(stream->fp) : stream->fd;
+      if (fd < 0)
+         return -1;
+#if defined(__linux__)
+      ret = fdatasync(fd);
+#else
+      ret = fsync(fd);
+#endif
+      /* EINVAL and EROFS: a pipe or the like, nothing to sync */
+      if (ret != 0 && errno != EINVAL && errno != EROFS)
+         return -1;
+   }
+#endif
+   return 0;
+}
+
+int retro_vfs_dir_sync_impl(const char *dir)
+{
+#if defined(VFS_HAVE_FSYNC)
+   int fd;
+   int ret;
+
+   if (!dir || !*dir)
+      return -1;
+#if defined(ANDROID) && defined(HAVE_SAF)
+   if (path_is_saf(dir))
+      return 0;
+#endif
+   if ((fd = open(dir, O_RDONLY)) < 0)
+      return -1;
+   ret = fsync(fd);
+   if (ret != 0 && (errno == EINVAL || errno == EROFS))
+      ret = 0;
+   close(fd);
+   return ret == 0 ? 0 : -1;
+#else
+   return 0;
+#endif
+}
+
 int retro_vfs_file_remove_impl(const char *path)
 {
    if (path && *path)

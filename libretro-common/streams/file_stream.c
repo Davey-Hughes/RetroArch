@@ -1633,6 +1633,22 @@ int filestream_flush(RFILE *stream)
    return output;
 }
 
+int filestream_sync(RFILE *stream)
+{
+   if (!stream)
+      return -1;
+   /* The VFS interface has no sync. */
+   if (filestream_open_cb)
+      return 0;
+   if (retro_vfs_file_sync_impl(
+            (libretro_vfs_implementation_file*)stream->hfile) != 0)
+   {
+      stream->err_flag = true;
+      return -1;
+   }
+   return 0;
+}
+
 int filestream_delete(const char *path)
 {
    if (filestream_remove_cb)
@@ -2349,16 +2365,23 @@ bool filestream_write_file(const char *path, const void *data, int64_t size)
    return filestream_close(file) == 0 && ret == size;
 }
 
-/* <path>.tmp, the sibling an atomic write goes through; NULL on OOM */
-static char *filestream_atomic_temp_path(const char *path)
+/* <path><suffix>, the sibling an atomic write goes through; NULL on OOM */
+static char *filestream_atomic_temp_path_suffix(const char *path,
+      const char *suffix)
 {
-   size_t path_len = strlen(path);
-   char *temp_path = (char*)malloc(path_len + sizeof(".tmp"));
+   size_t path_len   = strlen(path);
+   size_t suffix_len = strlen(suffix);
+   char *temp_path   = (char*)malloc(path_len + suffix_len + 1);
    if (!temp_path)
       return NULL;
    memcpy(temp_path, path, path_len);
-   memcpy(temp_path + path_len, ".tmp", sizeof(".tmp"));
+   memcpy(temp_path + path_len, suffix, suffix_len + 1);
    return temp_path;
+}
+
+static char *filestream_atomic_temp_path(const char *path)
+{
+   return filestream_atomic_temp_path_suffix(path, ".tmp");
 }
 
 RFILE *filestream_open_atomic(const char *path)
@@ -2389,6 +2412,23 @@ bool filestream_atomic_temp_name(char *s, size_t len, const char *path)
    memcpy(s, path, path_len);
    memcpy(s + path_len, ".tmp", sizeof(".tmp"));
    return true;
+}
+
+/* A rename is on the disk only once its folder is synced too. */
+static void filestream_sync_parent(const char *path)
+{
+   size_t _len;
+   char  *dir;
+
+   if (filestream_open_cb)
+      return;
+   _len = strlen(path);
+   if (!(dir = (char*)malloc(_len + 1)))
+      return;
+   memcpy(dir, path, _len + 1);
+   path_basedir(dir);
+   retro_vfs_dir_sync_impl(dir);
+   free(dir);
 }
 
 int filestream_commit_atomic(RFILE *file, const char *path, bool ok)
@@ -2434,11 +2474,13 @@ static char *filestream_aside_name(const char *path)
    return NULL;
 }
 
-int filestream_finish_atomic(const char *path, bool ok)
+static int filestream_finish_atomic_internal(const char *path,
+      const char *suffix, bool ok)
 {
    char *temp_path;
 
-   if (!path || !*path || !(temp_path = filestream_atomic_temp_path(path)))
+   if (     !path || !*path
+         || !(temp_path = filestream_atomic_temp_path_suffix(path, suffix)))
       return -1;
 
    if (!ok)
@@ -2487,17 +2529,68 @@ int filestream_finish_atomic(const char *path, bool ok)
    return 1;
 }
 
-bool filestream_write_file_atomic(const char *path,
-      const void *data, int64_t size)
+static int filestream_finish_atomic_synced_internal(const char *path,
+      const char *suffix, bool ok)
 {
    int ret;
+
+   if (ok && !filestream_open_cb)
+   {
+      RFILE *file;
+      char  *temp_path;
+
+      if (     !path || !*path
+            || !(temp_path = filestream_atomic_temp_path_suffix(path, suffix)))
+         return -1;
+      file = filestream_open(temp_path,
+            RETRO_VFS_FILE_ACCESS_WRITE | RETRO_VFS_FILE_ACCESS_UPDATE_EXISTING,
+            RETRO_VFS_FILE_ACCESS_HINT_NONE);
+      free(temp_path);
+      if (!file || filestream_sync(file) != 0)
+         ok = false;
+      if (file && filestream_close(file) != 0)
+         ok = false;
+   }
+
+   if ((ret = filestream_finish_atomic_internal(path, suffix, ok)) == 0)
+      filestream_sync_parent(path);
+   return ret;
+}
+
+int filestream_finish_atomic(const char *path, bool ok)
+{
+   return filestream_finish_atomic_internal(path, ".tmp", ok);
+}
+
+int filestream_finish_atomic_synced(const char *path, bool ok)
+{
+   return filestream_finish_atomic_synced_internal(path, ".tmp", ok);
+}
+
+int filestream_finish_atomic_suffix(const char *path, const char *suffix,
+      bool ok, bool sync)
+{
+   if (!suffix || !*suffix)
+      return -1;
+   return sync
+      ? filestream_finish_atomic_synced_internal(path, suffix, ok)
+      : filestream_finish_atomic_internal(path, suffix, ok);
+}
+
+static bool filestream_write_file_atomic_internal(const char *path,
+      const void *data, int64_t size, bool sync)
+{
+   int ret;
+   bool ok;
    RFILE *file = filestream_open_atomic(path);
 
    if (!file)
       return false;
 
-   ret = filestream_commit_atomic(file, path,
-         filestream_write(file, data, size) == size);
+   ok = filestream_write(file, data, size) == size;
+   if (ok && sync)
+      ok = filestream_sync(file) == 0;
+   ret = filestream_commit_atomic(file, path, ok);
 
    /* Written but not renamed into place */
    if (ret == 1)
@@ -2509,8 +2602,22 @@ bool filestream_write_file_atomic(const char *path,
          free(temp_path);
       }
    }
+   else if (ret == 0 && sync)
+      filestream_sync_parent(path);
 
    return ret == 0;
+}
+
+bool filestream_write_file_atomic(const char *path,
+      const void *data, int64_t size)
+{
+   return filestream_write_file_atomic_internal(path, data, size, false);
+}
+
+bool filestream_write_file_atomic_synced(const char *path,
+      const void *data, int64_t size)
+{
+   return filestream_write_file_atomic_internal(path, data, size, true);
 }
 
 char *filestream_getline(RFILE *stream)
