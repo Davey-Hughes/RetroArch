@@ -2514,6 +2514,23 @@ int filestream_commit_atomic(RFILE *file, const char *path, bool ok)
    return filestream_finish_atomic(path, ok);
 }
 
+/* The first aside name of @path (fill_pathname_aside()) that
+ * does not exist.  NULL when all do, or on OOM. */
+static char *filestream_aside_name(const char *path)
+{
+   unsigned n;
+   size_t aside_size = strlen(path) + PATH_ASIDE_SUFFIX_SIZE;
+   char  *aside      = (char*)malloc(aside_size);
+
+   if (!aside)
+      return NULL;
+   for (n = 1; fill_pathname_aside(aside, path, n, aside_size); n++)
+      if (!filestream_exists(aside))
+         return aside;
+   free(aside);
+   return NULL;
+}
+
 int filestream_finish_atomic(const char *path, bool ok)
 {
    char *temp_path;
@@ -2538,15 +2555,29 @@ int filestream_finish_atomic(const char *path, bool ok)
     * and puts it back when its replacement cannot be moved in, so a
     * failure there leaves the old file as it was.  A frontend's
     * rename may refuse an existing destination, as the libretro VFS
-    * API allows, so that one needs the target gone first. */
+    * API allows, so the destination is moved aside and put back if
+    * the temporary cannot take its place. */
    if (filestream_rename_cb)
    {
-      filestream_delete(path);
-      if (filestream_rename(temp_path, path) == 0)
+      char *aside = filestream_aside_name(path);
+      int   ret   = 1;
+
+      if (aside)
       {
-         free(temp_path);
-         return 0;
+         if (filestream_rename(path, aside) == 0)
+         {
+            if (filestream_rename(temp_path, path) == 0)
+            {
+               filestream_delete(aside);
+               ret = 0;
+            }
+            else
+               filestream_rename(aside, path);
+         }
+         free(aside);
       }
+      free(temp_path);
+      return ret;
    }
 
    free(temp_path);

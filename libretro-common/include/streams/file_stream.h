@@ -338,15 +338,21 @@ bool filestream_write_file(const char *path, const void *data, int64_t size);
  * an absent one.
  *
  * Under a frontend VFS whose rename refuses an existing destination,
- * the target is removed first and the rename retried, so there the
- * replacement is not atomic.
+ * the target is moved aside while the temporary file takes its place,
+ * and put back if that fails.  The aside name is \c path with ".prev"
+ * appended, or ".2.prev" up to ".99.prev" when that is taken: an aside
+ * file already there is never touched.  When all are taken, such a
+ * write fails.
  *
  * @param path Path to the file that will be written to.
  * @param data The buffer to write to \c path.
  * @param size The size of \c data, in bytes.
  * @return \c true if the file was written successfully,
- * \c false if there was an error, in which case \c path is left as it
- * was and no temporary file remains.
+ * \c false if there was an error, in which case no temporary file
+ * remains and \c path is left as it was, unless the moved-aside copy
+ * could not be put back: then \c path is absent, its old contents are
+ * under the aside name and the new ones were deleted with the
+ * temporary file.
  */
 bool filestream_write_file_atomic(const char *path, const void *data, int64_t size);
 
@@ -374,7 +380,10 @@ RFILE *filestream_open_atomic(const char *path);
  * close failed, in which case the temporary file is deleted and \c path
  * is left as it was; 1 if the contents are complete in the temporary
  * file but could not be renamed into place, in which case the temporary
- * file is left for the caller to copy or delete.
+ * file is left for the caller to copy or delete.  \c path is never
+ * removed: on 1 it keeps its old contents, which only a failure to put
+ * back the moved-aside copy (see filestream_write_file_atomic()) leaves
+ * under its aside name instead.
  */
 int filestream_commit_atomic(RFILE *file, const char *path, bool ok);
 

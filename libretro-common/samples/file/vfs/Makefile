@@ -17,6 +17,7 @@ TARGET_TEST13 := vfs_descriptor_rw_test
 TARGET_TEST14 := vfs_positional_test
 TARGET_TEST15 := vfs_positional_nommap_test
 TARGET_TEST16 := vfs_positional_off32_test
+TARGET_TEST17 := filestream_atomic_test
 
 LIBRETRO_COMM_DIR := ../../..
 
@@ -40,7 +41,8 @@ OBJS        := vfs_read_overflow_test.o vfs_mapped_ptr_test.o \
 	vfs_prefetch_test.o vfs_readahead_test.o vfs_view_test.o \
 	vfs_prefetch_offthread_test.o vfs_close_result_test.o \
 	vfs_descriptor_rw_test.o vfs_positional_test.o \
-	vfs_positional_off32_test.o $(COMMON_OBJS)
+	vfs_positional_off32_test.o \
+	filestream_atomic_test.o $(COMMON_OBJS)
 
 # vfs_view_test also hashes through sha1_calculate(), whose dispatch
 # asks features_cpu.c what the CPU has.
@@ -163,7 +165,8 @@ endif
 all: $(TARGET) $(TARGET_TEST) $(TARGET_TEST2) $(TARGET_TEST3) $(TARGET_TEST4) \
 	$(TARGET_TEST5) $(TARGET_TEST6) $(TARGET_TEST8) $(TARGET_TEST9) \
 	$(TARGET_TEST10) $(TARGET_TEST11) $(TARGET_TEST12) $(TARGET_TEST13) \
-	$(TARGET_TEST14) $(TARGET_TEST15) $(TARGET_TEST16) $(RENAME_TARGET)
+	$(TARGET_TEST14) $(TARGET_TEST15) $(TARGET_TEST16) \
+	$(TARGET_TEST17) $(RENAME_TARGET)
 
 %.o: %.c
 	$(CC) -c -o $@ $< $(CFLAGS)
@@ -291,12 +294,16 @@ $(CLOSE_VFS_OBJ): $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c close_hook.h
 $(TARGET_TEST12): vfs_close_result_test.o $(CLOSE_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
+$(TARGET_TEST17): filestream_atomic_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
 clean:
 	rm -rf $(SAMPLE_OBJDIR)
 	rm -f $(TARGET) $(TARGET_TEST) $(TARGET_TEST2) $(TARGET_TEST3) \
 		$(TARGET_TEST4) $(TARGET_TEST5) $(TARGET_TEST6) \
 		$(TARGET_TEST7) $(TARGET_TEST8) $(TARGET_TEST9) $(TARGET_TEST10) \
-		$(TARGET_TEST11) $(TARGET_TEST12) $(TARGET_TEST13) $(TARGET_TEST14) $(TARGET_TEST15) $(TARGET_TEST16) $(CLOSE_VFS_OBJ) \
+		$(TARGET_TEST11) $(TARGET_TEST12) $(TARGET_TEST13) $(TARGET_TEST14) $(TARGET_TEST15) $(TARGET_TEST16) \
+		$(TARGET_TEST17) $(CLOSE_VFS_OBJ) \
 		$(OBJS) $(FAULT_FS_OBJ) $(RENAME_VFS_OBJ) \
 		$(RA_VFS_OBJ) $(HOOK_VFS_OBJ) rthreads_ra.o retro_eventcount_ra.o \
 		$(NOMMAP_VFS_OBJ) vfs_positional_required.o $(OFF32_VFS_OBJ)
@@ -307,6 +314,7 @@ clean:
 	rm -f vfs_view_fixture.bin vfs_view_update.bin vfs_view_empty.bin
 	rm -f rename_replace.bin rename_replace.bin.old rename_replace.bin.old2 rename_replace.bin.tmp RENAME_REPLACE.BIN.OLD
 	rm -f close_result.bin close_result_w.bin
+	rm -f atomic.bin atomic.bin.prev atomic.bin.*.prev atomic.bin.tmp
 	rm -f bulk_select.bin bulk_select_w.bin bulk_roundtrip.bin \
 		bulk_short.bin bulk_shrank.bin bulk_error.bin \
 		bulk_binary.bin bulk_threads.bin
