@@ -710,6 +710,45 @@ int64_t retro_vfs_file_seek_internal(
    return retro_vfs_fd_seek64(stream->fd, offset, whence) == -1 ? -1 : 0;
 }
 
+/* The first aside name of @path (fill_pathname_aside()) that
+ * does not exist.  NULL when all do, or on OOM. */
+static char *retro_vfs_free_aside_name(const char *path)
+{
+   unsigned n;
+   size_t aside_size = strlen(path) + PATH_ASIDE_SUFFIX_SIZE;
+   char  *aside      = (char*)malloc(aside_size);
+
+   if (!aside)
+      return NULL;
+   for (n = 1; fill_pathname_aside(aside, path, n, aside_size); n++)
+      if (!retro_vfs_stat_impl(aside, NULL))
+         return aside;
+   free(aside);
+   return NULL;
+}
+
+/* iOS can refuse to open an existing file for writing with EEXIST.
+ * The file is moved aside for the reopen, removed once that succeeds
+ * and put back if it fails. */
+static FILE *retro_vfs_file_reopen_aside(const char *path,
+      const char *mode_str)
+{
+   FILE *fp    = NULL;
+   char *aside = retro_vfs_free_aside_name(path);
+
+   if (!aside)
+      return NULL;
+   if (retro_vfs_file_rename_impl(path, aside) == 0)
+   {
+      if ((fp = (FILE*)fopen_utf8(path, mode_str)))
+         retro_vfs_file_remove_impl(aside);
+      else
+         retro_vfs_file_rename_impl(aside, path);
+   }
+   free(aside);
+   return fp;
+}
+
 /**
  * retro_vfs_file_open_impl:
  * @path               : path to file
@@ -981,17 +1020,15 @@ libretro_vfs_implementation_file *retro_vfs_file_open_impl(
 #endif
 
          default:
+            errno = 0;
             if (!(fp = (FILE*)fopen_utf8(path, mode_str)))
             {
-#if TARGET_OS_IPHONE
-               if (errno == EEXIST)
-               {
-                  retro_vfs_file_remove_impl(path);
-                  fp = (FILE*)fopen_utf8(path, mode_str);
-               }
+               if (     errno == EEXIST
+                     && (mode & RETRO_VFS_FILE_ACCESS_WRITE)
+                     && !(mode & RETRO_VFS_FILE_ACCESS_UPDATE_EXISTING))
+                  fp = retro_vfs_file_reopen_aside(path, mode_str);
                if (!fp)
-#endif
-               goto error;
+                  goto error;
             }
             stream->fp  = fp;
             break;
