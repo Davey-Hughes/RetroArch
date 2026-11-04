@@ -203,8 +203,11 @@ public final class VfsImplementationSaf
       final String newName = getPathFileName(newPath);
       if (parentPath == null || newName == null || oldPath.equals(newPath) || !parentPath.equals(getPathParent(newPath)))
          return -1;
+      final SafStat target = new SafStat(content, tree, newPath, false);
+      if (target.getIsDirectory())
+         return -1;
       String asidePath = null;
-      if (new SafStat(content, tree, newPath, false).getIsOpen())
+      if (target.getIsOpen())
       {
          asidePath = getFreeAsidePath(content, tree, newPath);
          if (asidePath == null || !renameSafDocument(content, treeUri, newPath, getPathFileName(asidePath)))
@@ -213,7 +216,14 @@ public final class VfsImplementationSaf
       if (renameSafDocument(content, treeUri, oldPath, newName))
       {
          if (asidePath != null)
-            removeSafFile(content, tree, asidePath);
+         {
+            try
+            {
+               removeSafFile(content, tree, asidePath);
+            }
+            catch (RuntimeException e)
+            {}
+         }
          return 0;
       }
       if (asidePath != null)
@@ -247,10 +257,6 @@ public final class VfsImplementationSaf
     */
    private static boolean renameSafDocument(ContentResolver content, Uri treeUri, String path, String name)
    {
-      final String parentPath = getPathParent(path);
-      if (parentPath == null)
-         return false;
-      final Uri wanted = buildSafDocumentUri(treeUri, parentPath.length() == 1 ? "/" + name : parentPath + "/" + name);
       final Uri renamed;
       try
       {
@@ -262,7 +268,7 @@ public final class VfsImplementationSaf
       }
       if (renamed == null)
          return false;
-      if (DocumentsContract.getDocumentId(renamed).equals(DocumentsContract.getDocumentId(wanted)))
+      if (name.equals(getSafDisplayName(content, renamed)))
          return true;
       try
       {
@@ -271,6 +277,29 @@ public final class VfsImplementationSaf
       catch (FileNotFoundException | RuntimeException e)
       {}
       return false;
+   }
+
+   private static String getSafDisplayName(ContentResolver content, Uri uri)
+   {
+      final Cursor cursor;
+      try
+      {
+         cursor = content.query(uri, new String[] { Document.COLUMN_DISPLAY_NAME }, null, null, null);
+      }
+      catch (RuntimeException e)
+      {
+         return null;
+      }
+      if (cursor == null)
+         return null;
+      try
+      {
+         return cursor.moveToNext() ? cursor.getString(0) : null;
+      }
+      finally
+      {
+         cursor.close();
+      }
    }
 
    public static class SafStat

@@ -14,6 +14,12 @@ Lanes:
                            "<game>.srm.99.prev", taken, so the replace
                            cannot be made: the .srm keeps its old bytes
                            and the failed write is logged.
+  saf_root_tree            autosave off, in a tree picked at a volume root
+                           (--saf-root): the first close writes the .srm,
+                           the second replaces it, nothing is left beside
+                           it and no failed write is logged.  Skipped
+                           without --saf-root; not every device lets a
+                           volume root be picked.
 
 Run by hand, with the device owner's go-ahead: it starts and stops the
 package given.  It refuses to start while that package is running.
@@ -24,7 +30,7 @@ for this run (CONFIGFILE extra), and every run saves into a new
 Before the first run, in the build under test, pick the SAF folder once
 through Settings > Directory > Save Files (the system folder picker), so
 the package holds the grant, and copy the "saf://" value RetroArch
-wrote for it.
+wrote for it.  For saf_root_tree, do the same with a volume's root.
 """
 
 import argparse
@@ -90,6 +96,9 @@ def write_config(dev, args, cfg, saf_run, interval):
         'quit_press_twice = "false"',
         'confirm_quit = "false"',
         'config_save_on_exit = "false"',
+        'history_list_enable = "false"',
+        'content_runtime_log = "false"',
+        'content_runtime_log_aggregate = "false"',
         'audio_enable = "false"',
         'audio_driver = "null"',
         'pause_nonactive = "false"',
@@ -134,8 +143,16 @@ def main():
     ap.add_argument("--content", required=True,
                     help="content on the device whose battery save RAM "
                          "changes while it runs (a test ROM that counts)")
+    ap.add_argument("--saf-root",
+                    help='the "saf://" value of a volume root picked the '
+                         'same way, for saf_root_tree')
+    ap.add_argument("--fs-root",
+                    help="that root as a path adb can read, e.g. "
+                         "/storage/4A21-0000")
     ap.add_argument("--interval", type=int, default=2)
     args = ap.parse_args()
+    if (args.saf_root is None) != (args.fs_root is None):
+        ap.error("--saf-root and --fs-root go together")
 
     dev = Device(args.adb, args.serial)
     if running(dev, args.package):
@@ -151,6 +168,7 @@ def main():
     cfg = "/sdcard/Android/data/%s/files/save_e2e-%s.cfg" % (args.package,
                                                              stamp)
     failures = []
+    left = [fs_run]
 
     def check(name, ok):
         print("  %-60s %s" % (name, "ok" if ok else "FAIL"))
@@ -210,7 +228,30 @@ def main():
     check("no .tmp left in saves",
           not [n for n in listing(dev, saves) if n.endswith(".tmp")])
 
-    print("left on the device for inspection: %s and %s" % (fs_run, cfg))
+    if args.saf_root:
+        print("saf_root_tree")
+        root_saves = "%s/%s/saves" % (args.fs_root, stamp)
+        root_srm = "%s/%s.srm" % (root_saves, game)
+        write_config(dev, args, cfg, "%s/%s" % (args.saf_root, stamp), 0)
+        launch(dev, args, cfg)
+        time.sleep(5)
+        check("quit ends the process", quit_and_wait(dev, args.package))
+        first = md5(dev, root_srm)
+        check(".srm written", first is not None)
+        check("no failed save logged", log_count(dev, "Failed to save SRAM") == 0)
+        launch(dev, args, cfg)
+        time.sleep(5)
+        check("quit ends the process", quit_and_wait(dev, args.package))
+        check(".srm replaced", md5(dev, root_srm) not in (None, first))
+        check("no .tmp or .prev left in saves",
+              not [n for n in listing(dev, root_saves)
+                   if n.endswith((".tmp", ".prev"))])
+        check("no failed save logged", log_count(dev, "Failed to save SRAM") == 0)
+        left.append("%s/%s" % (args.fs_root, stamp))
+    else:
+        print("saf_root_tree: skipped (no --saf-root)")
+
+    print("left on the device for inspection: %s" % ", ".join(left + [cfg]))
     if failures:
         print("android_saf: %d FAIL" % len(failures))
         return 1
