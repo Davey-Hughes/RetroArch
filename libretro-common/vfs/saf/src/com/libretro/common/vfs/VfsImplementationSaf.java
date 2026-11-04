@@ -182,6 +182,97 @@ public final class VfsImplementationSaf
       return true;
    }
 
+   /**
+    * Rename a Storage Access Framework file within its directory, replacing a file already at the new name, returning 0 if it succeeded or -1 if not.
+    * A file being replaced is first renamed aside, to the first free name of "<name>.old", "<name>.2.old" ... "<name>.99.old", removed once the new one is in place and put back if that fails.
+    * @param content the content resolver returned by getContentResolver()
+    * @param tree the URI returned by the ACTION_OPEN_DOCUMENT_TREE intent action
+    * @param oldPath path of the file to rename, relative to the root directory of the tree
+    * @param newPath path to rename it to, in the same directory
+    */
+   public static int renameSafFile(ContentResolver content, String tree, String oldPath, String newPath)
+   {
+      if (Build.VERSION.SDK_INT < 21)
+         return -1;
+      final Uri treeUri = Uri.parse(tree);
+      if (isDocument(treeUri))
+         return -1;
+      oldPath = normalizePath(oldPath);
+      newPath = normalizePath(newPath);
+      final String parentPath = getPathParent(oldPath);
+      final String newName = getPathFileName(newPath);
+      if (parentPath == null || newName == null || oldPath.equals(newPath) || !parentPath.equals(getPathParent(newPath)))
+         return -1;
+      String asidePath = null;
+      if (new SafStat(content, tree, newPath, false).getIsOpen())
+      {
+         asidePath = getFreeAsidePath(content, tree, newPath);
+         if (asidePath == null || !renameSafDocument(content, treeUri, newPath, getPathFileName(asidePath)))
+            return -1;
+      }
+      if (renameSafDocument(content, treeUri, oldPath, newName))
+      {
+         if (asidePath != null)
+            removeSafFile(content, tree, asidePath);
+         return 0;
+      }
+      if (asidePath != null)
+         renameSafDocument(content, treeUri, asidePath, newName);
+      return -1;
+   }
+
+   /**
+    * The first of "<path>.old", "<path>.2.old" ... "<path>.99.old" that does not exist, or null if all do.
+    * One already there may be all that is left of an interrupted write, so it is never reused.
+    */
+   private static String getFreeAsidePath(ContentResolver content, String tree, String path)
+   {
+      for (int n = 1; n <= 99; n++)
+      {
+         final String aside = n == 1 ? path + ".old" : path + "." + n + ".old";
+         if (!new SafStat(content, tree, aside, false).getIsOpen())
+            return aside;
+      }
+      return null;
+   }
+
+   private static Uri buildSafDocumentUri(Uri treeUri, String path)
+   {
+      return DocumentsContract.buildDocumentUriUsingTree(treeUri, path.length() == 1 ? DocumentsContract.getTreeDocumentId(treeUri) : DocumentsContract.getTreeDocumentId(treeUri) + path);
+   }
+
+   /**
+    * Rename the document at a normalized path to a new name in the same directory, returning whether it now has that path.
+    * This class finds documents by path, so a rename the provider made to another name (a "name (1)" it picked to avoid a clash) is undone and counts as a failure.
+    */
+   private static boolean renameSafDocument(ContentResolver content, Uri treeUri, String path, String name)
+   {
+      final String parentPath = getPathParent(path);
+      if (parentPath == null)
+         return false;
+      final Uri wanted = buildSafDocumentUri(treeUri, parentPath.length() == 1 ? "/" + name : parentPath + "/" + name);
+      final Uri renamed;
+      try
+      {
+         renamed = DocumentsContract.renameDocument(content, buildSafDocumentUri(treeUri, path), name);
+      }
+      catch (FileNotFoundException | RuntimeException e)
+      {
+         return false;
+      }
+      if (renamed == null)
+         return false;
+      if (DocumentsContract.getDocumentId(renamed).equals(DocumentsContract.getDocumentId(wanted)))
+         return true;
+      try
+      {
+         DocumentsContract.renameDocument(content, renamed, getPathFileName(path));
+      }
+      catch (FileNotFoundException | RuntimeException e)
+      {}
+      return false;
+   }
+
    public static class SafStat
    {
       private static final String[] QUERY_ARGS_WITH_SIZE = {
