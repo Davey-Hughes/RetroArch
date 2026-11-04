@@ -299,6 +299,30 @@ int retro_vfs_file_flush_impl(libretro_vfs_implementation_file* stream)
     return -1;
 }
 
+int retro_vfs_file_sync_impl(libretro_vfs_implementation_file* stream)
+{
+    if (!stream)
+        return -1;
+
+#ifdef HAVE_SMBCLIENT
+    if (stream->scheme == VFS_SCHEME_SMB)
+        return 0;
+#endif
+
+    if (stream->fp && fflush(stream->fp) != 0)
+        return -1;
+    if (!stream->fh || stream->fh == INVALID_HANDLE_VALUE
+          || !FlushFileBuffers(stream->fh))
+        return -1;
+    return 0;
+}
+
+int retro_vfs_dir_sync_impl(const char *dir)
+{
+    (void)dir;
+    return 0;
+}
+
 int retro_vfs_file_remove_impl(const char *path)
 {
    BOOL ret;

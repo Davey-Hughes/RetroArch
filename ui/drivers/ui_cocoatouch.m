@@ -1306,7 +1306,10 @@ bool cocoa_audio_session_begin_record(unsigned preferred_rate,
    update_topshelf();
 #endif
    rarch_stop_draw_observer();
-   command_event(CMD_EVENT_SAVE_FILES, NULL);
+   {
+      bool sync = true;
+      command_event(CMD_EVENT_SAVE_FILES, &sync);
+   }
 
    /* -applicationWillTerminate: is not guaranteed: a suspended app that
     * the system reclaims, or one the user swipes out of the app switcher,

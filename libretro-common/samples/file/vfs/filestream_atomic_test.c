@@ -18,9 +18,15 @@
  *                           as iOS has been seen to do, moves the file
  *                           aside for the reopen and puts it back when
  *                           that fails too; other modes leave it alone.
+ *   atomic_synced_calls_sync - the synced atomic writes sync the file
+ *                           once and, on POSIX, its folder once after
+ *                           the rename; the plain one never does, nor
+ *                           does a write through a frontend VFS; a
+ *                           failed sync keeps the old file.
  *
  * vfs_implementation.c is compiled into this file so that its fopen
- * goes through a stand-in that can fail with EEXIST.
+ * goes through a stand-in that can fail with EEXIST, and its syncs
+ * through counting ones.
  */
 
 /* The *_impl functions and the VFS interface's callbacks share a
@@ -35,6 +41,19 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+BOOL WINAPI test_flush_file_buffers(HANDLE h);
+#define FlushFileBuffers test_flush_file_buffers
+#else
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+int test_fsync(int fd);
+#define fsync     test_fsync
+#define fdatasync test_fsync
+#if defined(F_BARRIERFSYNC)
+int test_fcntl(int fd, int cmd);
+#define fcntl     test_fcntl
+#endif
 #endif
 
 #include <compat/fopen_utf8.h>
@@ -43,6 +62,10 @@ void *test_fopen_utf8(const char *filename, const char *mode);
 #define fopen_utf8 test_fopen_utf8
 #include "../../../vfs/vfs_implementation.c"
 #undef fopen_utf8
+#undef FlushFileBuffers
+#undef fsync
+#undef fdatasync
+#undef fcntl
 
 #include <boolean.h>
 #include <file/file_path.h>
@@ -67,6 +90,44 @@ void *test_fopen_utf8(const char *filename, const char *mode)
 #endif
 }
 
+static unsigned file_syncs;
+static unsigned dir_syncs;
+static bool     fail_sync;
+
+#if defined(_WIN32)
+BOOL WINAPI test_flush_file_buffers(HANDLE h)
+{
+   if (fail_sync)
+      return FALSE;
+   file_syncs++;
+   return FlushFileBuffers(h);
+}
+#else
+int test_fsync(int fd)
+{
+   struct stat st;
+   if (fail_sync)
+   {
+      errno = EIO;
+      return -1;
+   }
+   if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode))
+      dir_syncs++;
+   else
+      file_syncs++;
+   return fsync(fd);
+}
+
+#if defined(F_BARRIERFSYNC)
+int test_fcntl(int fd, int cmd)
+{
+   if (cmd == F_BARRIERFSYNC)
+      return test_fsync(fd);
+   return fcntl(fd, cmd);
+}
+#endif
+#endif
+
 #define CHECK(cond, msg) \
    do { \
       if (!(cond)) \
@@ -80,6 +141,7 @@ void *test_fopen_utf8(const char *filename, const char *mode)
 #define ASIDE    TARGET ".prev"
 #define ASIDE2   TARGET ".2.prev"
 #define TEMP     TARGET ".tmp"
+#define OWN_TEMP TARGET ".auto.tmp"
 
 static void numbered_aside(char *s, size_t len, unsigned n)
 {
@@ -124,6 +186,7 @@ static void clean(void)
    remove(TARGET);
    remove(ASIDE);
    remove(TEMP);
+   remove(OWN_TEMP);
    for (n = 2; n <= 99; n++)
    {
       numbered_aside(name, sizeof(name), n);
@@ -142,7 +205,9 @@ static char aside_used[64];     /* where the target was last moved */
 static int RETRO_CALLCONV frontend_rename(const char *old_path,
       const char *new_path)
 {
-   if (exists(new_path) || (refuse_temp && !strcmp(old_path, TEMP)))
+   if (     exists(new_path)
+         || (refuse_temp && (!strcmp(old_path, TEMP)
+               || !strcmp(old_path, OWN_TEMP))))
       return -1;
    if (!strcmp(old_path, TARGET))
       snprintf(aside_used, sizeof(aside_used), "%s", new_path);
@@ -411,6 +476,116 @@ static void lane_ios_eexist_moves_aside(void)
    printf("[ios_eexist_moves_aside] done\n");
 }
 
+static void lane_atomic_synced_calls_sync(void)
+{
+#if defined(_WIN32)
+   const unsigned want_dir = 0;
+#else
+   const unsigned want_dir = 1;
+#endif
+
+   clean();
+   put(TARGET, "old");
+   file_syncs = dir_syncs = 0;
+   CHECK(filestream_write_file_atomic(TARGET, "new", 3), "plain write failed");
+   CHECK(file_syncs == 0 && dir_syncs == 0, "the plain write synced");
+
+   CHECK(filestream_write_file_atomic_synced(TARGET, "newer", 5),
+         "synced write failed");
+   CHECK(content_is(TARGET, "newer"), "synced write content wrong");
+   CHECK(file_syncs == 1 && dir_syncs == want_dir,
+         "synced write: not one file sync and one folder sync");
+
+   /* a temporary written and closed by other means, as rzip does */
+   file_syncs = dir_syncs = 0;
+   put(TEMP, "newest");
+   CHECK(filestream_finish_atomic_synced(TARGET, true) == 0,
+         "synced finish failed");
+   CHECK(content_is(TARGET, "newest") && !exists(TEMP),
+         "synced finish did not move the temporary in");
+   CHECK(file_syncs == 1 && dir_syncs == want_dir,
+         "synced finish: not one file sync and one folder sync");
+
+   fail_sync = true;
+   CHECK(!filestream_write_file_atomic_synced(TARGET, "lost", 4),
+         "a failed sync reported success");
+   put(TEMP, "lost");
+   CHECK(filestream_finish_atomic_synced(TARGET, true) == -1,
+         "a failed sync did not fail the finish");
+   fail_sync = false;
+   CHECK(content_is(TARGET, "newest"), "a failed sync cost the old file");
+   CHECK(!exists(TEMP), "a failed sync left the temporary");
+
+   use_frontend_vfs(true);
+   file_syncs = dir_syncs = 0;
+   CHECK(filestream_write_file_atomic_synced(TARGET, "front", 5),
+         "synced write through a frontend VFS failed");
+   CHECK(content_is(TARGET, "front"), "frontend synced write content wrong");
+   CHECK(file_syncs == 0 && dir_syncs == 0,
+         "a write through a frontend VFS synced");
+   use_frontend_vfs(false);
+
+   clean();
+   printf("[atomic_synced_calls_sync] done\n");
+}
+
+/* A temporary of the caller's own name: used instead of "<path>.tmp",
+ * under the same rules. */
+static void lane_atomic_suffix(void)
+{
+#if defined(_WIN32)
+   const unsigned want_dir = 0;
+#else
+   const unsigned want_dir = 1;
+#endif
+
+   clean();
+   put(TARGET, "old");
+   put(TEMP, "other");
+   put(OWN_TEMP, "new");
+   CHECK(filestream_finish_atomic_suffix(TARGET, ".auto.tmp", true, false) == 0,
+         "suffix finish failed");
+   CHECK(content_is(TARGET, "new") && !exists(OWN_TEMP),
+         "suffix finish did not move its temporary in");
+   CHECK(content_is(TEMP, "other"), "suffix finish used <path>.tmp");
+
+   file_syncs = dir_syncs = 0;
+   put(OWN_TEMP, "newer");
+   CHECK(filestream_finish_atomic_suffix(TARGET, ".auto.tmp", true, true) == 0,
+         "synced suffix finish failed");
+   CHECK(content_is(TARGET, "newer"), "synced suffix finish content wrong");
+   CHECK(file_syncs == 1 && dir_syncs == want_dir,
+         "synced suffix finish: not one file sync and one folder sync");
+
+   put(OWN_TEMP, "lost");
+   CHECK(filestream_finish_atomic_suffix(TARGET, ".auto.tmp", false, true) == -1,
+         "a failed write did not fail the suffix finish");
+   CHECK(content_is(TARGET, "newer") && !exists(OWN_TEMP),
+         "a failed suffix finish lost the file or kept its temporary");
+   CHECK(filestream_finish_atomic_suffix(TARGET, "", true, false) == -1,
+         "an empty suffix was taken");
+
+   /* a frontend rename that refuses an existing destination */
+   use_frontend_vfs(true);
+   put(OWN_TEMP, "front");
+   CHECK(filestream_finish_atomic_suffix(TARGET, ".auto.tmp", true, false) == 0,
+         "suffix finish through a frontend VFS failed");
+   CHECK(content_is(TARGET, "front") && !exists(ASIDE) && !exists(OWN_TEMP),
+         "suffix finish through a frontend VFS left a file behind");
+   refuse_temp = true;
+   put(OWN_TEMP, "refused");
+   CHECK(filestream_finish_atomic_suffix(TARGET, ".auto.tmp", true, false) == 1,
+         "a refused suffix temporary did not return 1");
+   refuse_temp = false;
+   CHECK(content_is(TARGET, "front"), "a refused rename lost the destination");
+   CHECK(!exists(ASIDE), "a refused rename left the aside copy");
+   CHECK(exists(OWN_TEMP), "the suffix finish removed the temporary it hands back");
+   use_frontend_vfs(false);
+
+   clean();
+   printf("[atomic_suffix] done\n");
+}
+
 int main(void)
 {
    lane_rename_cb_keeps_dest();
@@ -418,6 +593,8 @@ int main(void)
    lane_rename_cb_aside_name();
    lane_windows_locked_rename();
    lane_ios_eexist_moves_aside();
+   lane_atomic_synced_calls_sync();
+   lane_atomic_suffix();
 
    if (failures)
    {

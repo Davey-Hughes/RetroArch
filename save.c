@@ -512,12 +512,13 @@ static bool dump_to_file_desperate(const void *data,
  * content_save_ram_file:
  * @slot             : index into task_save_files
  * @compress         : whether to use rzip compression
+ * @sync             : whether to wait for the disk before replacing
  *
  * Save a RAM state from memory to disk.
  * Skips the write if the on-disk content already
  * matches memory (common when autosave has been active).
  */
-static bool content_save_ram_file(unsigned slot, bool compress)
+static bool content_save_ram_file(unsigned slot, bool compress, bool sync)
 {
    struct ram_type ram;
    retro_ctx_memory_info_t mem_info;
@@ -574,14 +575,17 @@ static bool content_save_ram_file(unsigned slot, bool compress)
       char tmp_path[PATH_MAX_LENGTH];
       if (     !filestream_atomic_temp_name(tmp_path, sizeof(tmp_path), ram.path)
             || !content_finish_tmp(ram.path, rzipstream_write_file(
-                  tmp_path, mem_info.data, mem_info.size)))
+                  tmp_path, mem_info.data, mem_info.size), sync))
          goto fail;
    }
    else
 #endif
    {
-      if (!filestream_write_file_atomic(
-            ram.path, mem_info.data, mem_info.size))
+      if (!(sync
+            ? filestream_write_file_atomic_synced(
+                  ram.path, mem_info.data, mem_info.size)
+            : filestream_write_file_atomic(
+                  ram.path, mem_info.data, mem_info.size)))
          goto fail;
    }
 
@@ -605,7 +609,7 @@ fail:
    return false;
 }
 
-bool event_save_files(bool is_sram_used, bool compress_files,
+bool event_save_files(bool is_sram_used, bool compress_files, bool sync,
       const char *path_cheat_database)
 {
    unsigned i;
@@ -616,7 +620,7 @@ bool event_save_files(bool is_sram_used, bool compress_files,
    if (!task_save_files || !is_sram_used)
       return false;
    for (i = 0; i < task_save_files->size; i++)
-      if (!content_save_ram_file(i, compress_files))
+      if (!content_save_ram_file(i, compress_files, sync))
          ret = false;
    return ret;
 }

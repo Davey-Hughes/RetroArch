@@ -357,6 +357,23 @@ bool filestream_write_file(const char *path, const void *data, int64_t size);
 bool filestream_write_file_atomic(const char *path, const void *data, int64_t size);
 
 /**
+ * As filestream_write_file_atomic(), and the new contents are on the
+ * storage device before they replace the old ones: the temporary file
+ * is synced (filestream_sync()) before the rename and, on POSIX, its
+ * folder after it, so a power loss leaves the old file or the new one.
+ * A failed sync fails the write and leaves \c path as it was.
+ *
+ * Blocks until the disk has the data: for worker threads and for
+ * writes outside the frame loop.
+ *
+ * @param path Path to the file that will be written to.
+ * @param data The buffer to write to \c path.
+ * @param size The size of \c data, in bytes.
+ * @return As filestream_write_file_atomic().
+ */
+bool filestream_write_file_atomic_synced(const char *path, const void *data, int64_t size);
+
+/**
  * Opens the sibling temporary file an atomic write of \c path goes
  * through (\c path with ".tmp" appended), for a writer that produces
  * the contents a piece at a time.  Finish with
@@ -408,6 +425,34 @@ bool filestream_atomic_temp_name(char *s, size_t len, const char *path);
  * @return As filestream_commit_atomic().
  */
 int filestream_finish_atomic(const char *path, bool ok);
+
+/**
+ * As filestream_finish_atomic(), syncing the temporary file before the
+ * rename and, on POSIX, its folder after it, as
+ * filestream_write_file_atomic_synced() does.  A failed sync is
+ * treated as \c ok being false.
+ *
+ * @param path Path of the file that will be replaced.
+ * @param ok Whether the temporary file holds everything it should.
+ * @return As filestream_commit_atomic().
+ */
+int filestream_finish_atomic_synced(const char *path, bool ok);
+
+/**
+ * As filestream_finish_atomic_synced() when \c sync is set, else as
+ * filestream_finish_atomic(), for a temporary file named \c path with
+ * \c suffix appended, so two writers of one file that may run at once
+ * each go through their own.
+ *
+ * @param path Path of the file that will be replaced.
+ * @param suffix What the temporary file's name adds to \c path,
+ * e.g. ".auto.tmp".
+ * @param ok Whether the temporary file holds everything it should.
+ * @param sync Whether to sync the temporary file before the rename.
+ * @return As filestream_commit_atomic().
+ */
+int filestream_finish_atomic_suffix(const char *path, const char *suffix,
+      bool ok, bool sync);
 
 /**
  * Writes a single character to the given file.
@@ -465,6 +510,20 @@ int filestream_error(RFILE *stream);
  * @see retro_vfs_flush_t
  */
 int filestream_flush(RFILE *stream);
+
+/**
+ * Flushes pending writes and waits until the operating system has put
+ * them on the storage device (fsync, fdatasync, F_BARRIERFSYNC or
+ * FlushFileBuffers).
+ * Does nothing where the platform has no such call, and for a file
+ * opened through a frontend VFS (filestream_vfs_init()), whose
+ * interface has none.
+ *
+ * @param stream The file to sync.
+ * @return 0 if the data is on the device or nothing could be done,
+ * -1 on an error.
+ */
+int filestream_sync(RFILE *stream);
 
 /**
  * Deletes the file at the given path.
