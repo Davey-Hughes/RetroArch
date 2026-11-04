@@ -731,32 +731,6 @@ int retro_vfs_file_rename_impl(const char* old_path, const char* new_path)
           std::filesystem::path(new_path), true);
 }
 
-size_t retro_vfs_aside_name_impl(char *s, size_t len, const char *path,
-      unsigned n)
-{
-    char   suffix[RETRO_VFS_ASIDE_SUFFIX_SIZE];
-    size_t suffix_len = 0;
-    size_t _len;
-
-    if (!s || !path || n < 1 || n > 99)
-        return 0;
-    if (n > 1)
-    {
-        suffix[suffix_len++] = '.';
-        if (n > 9)
-            suffix[suffix_len++] = (char)('0' + n / 10);
-        suffix[suffix_len++] = (char)('0' + n % 10);
-    }
-    memcpy(suffix + suffix_len, ".prev", sizeof(".prev"));
-    suffix_len += sizeof(".prev") - 1;
-    _len        = strlen(path);
-    if (_len + suffix_len >= len)
-        return 0;
-    memcpy(s, path, _len);
-    memcpy(s + _len, suffix, suffix_len + 1);
-    return _len + suffix_len;
-}
-
 const char *retro_vfs_file_get_path_impl(libretro_vfs_implementation_file *stream)
 {
    /* Should never happen, do something noisy so caller can be fixed */

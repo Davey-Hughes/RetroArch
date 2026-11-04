@@ -284,6 +284,26 @@ size_t fill_pathname(char *s, const char *in_path,
       const char *replace, size_t len);
 
 /**
+ * fill_pathname_aside:
+ * @s                  : output path
+ * @in_path            : input path
+ * @n                  : which aside name, 1 to 99
+ * @len                : size of output path
+ *
+ * Writes aside name @n of @in_path into @s: "<in_path>.prev", then
+ * "<in_path>.2.prev" ... "<in_path>.99.prev". A file is moved aside to
+ * the first that does not exist: one already there may be all that is
+ * left of an interrupted write. strlen(@in_path) +
+ * PATH_ASIDE_SUFFIX_SIZE bytes always hold the name.
+ *
+ * @return Length of the name, or 0 when @n is out of range or the name
+ * does not fit.
+ **/
+#define PATH_ASIDE_SUFFIX_SIZE sizeof(".99.prev")
+size_t fill_pathname_aside(char *s, const char *in_path, unsigned n,
+      size_t len);
+
+/**
  * fill_dated_filename:
  * @s                  : output filename
  * @ext                : extension of output filename

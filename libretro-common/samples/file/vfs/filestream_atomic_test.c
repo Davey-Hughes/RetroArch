@@ -359,10 +359,10 @@ static void lane_rename_cb_aside_name(void)
    CHECK(!strcmp(aside_used, name),
          "the target was not moved to <target>.10.prev");
 
-   CHECK(!retro_vfs_aside_name_impl(name, sizeof(name), TARGET, 0)
-         && !retro_vfs_aside_name_impl(name, sizeof(name), TARGET, 100),
+   CHECK(!fill_pathname_aside(name, TARGET, 0, sizeof(name))
+         && !fill_pathname_aside(name, TARGET, 100, sizeof(name)),
          "an aside name outside 1 to 99 was built");
-   CHECK(!retro_vfs_aside_name_impl(name, sizeof(ASIDE) - 1, TARGET, 1),
+   CHECK(!fill_pathname_aside(name, TARGET, 1, sizeof(ASIDE) - 1),
          "an aside name was built into a buffer too small for it");
 
    use_frontend_vfs(false);

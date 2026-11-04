@@ -2444,17 +2444,17 @@ int filestream_commit_atomic(RFILE *file, const char *path, bool ok)
    return filestream_finish_atomic(path, ok);
 }
 
-/* The first aside name of @path (retro_vfs_aside_name_impl()) that
+/* The first aside name of @path (fill_pathname_aside()) that
  * does not exist.  NULL when all do, or on OOM. */
 static char *filestream_aside_name(const char *path)
 {
    unsigned n;
-   size_t _len  = strlen(path) + RETRO_VFS_ASIDE_SUFFIX_SIZE;
-   char  *aside = (char*)malloc(_len);
+   size_t aside_size = strlen(path) + PATH_ASIDE_SUFFIX_SIZE;
+   char  *aside      = (char*)malloc(aside_size);
 
    if (!aside)
       return NULL;
-   for (n = 1; retro_vfs_aside_name_impl(aside, _len, path, n); n++)
+   for (n = 1; fill_pathname_aside(aside, path, n, aside_size); n++)
       if (!filestream_exists(aside))
          return aside;
    free(aside);
