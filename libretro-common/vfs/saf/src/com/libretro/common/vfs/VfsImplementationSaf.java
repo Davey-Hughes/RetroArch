@@ -184,7 +184,7 @@ public final class VfsImplementationSaf
 
    /**
     * Rename a Storage Access Framework file within its directory, replacing a file already at the new name, returning 0 if it succeeded or -1 if not.
-    * A file being replaced is first renamed aside, to the first free name of "<name>.old", "<name>.2.old" ... "<name>.99.old", removed once the new one is in place and put back if that fails.
+    * A file being replaced is first renamed aside, to the first free name of "<name>.prev", "<name>.2.prev" ... "<name>.99.prev", removed once the new one is in place and put back if that fails.
     * @param content the content resolver returned by getContentResolver()
     * @param tree the URI returned by the ACTION_OPEN_DOCUMENT_TREE intent action
     * @param oldPath path of the file to rename, relative to the root directory of the tree
@@ -222,14 +222,14 @@ public final class VfsImplementationSaf
    }
 
    /**
-    * The first of "<path>.old", "<path>.2.old" ... "<path>.99.old" that does not exist, or null if all do.
+    * The first of "<path>.prev", "<path>.2.prev" ... "<path>.99.prev" that does not exist, or null if all do.
     * One already there may be all that is left of an interrupted write, so it is never reused.
     */
    private static String getFreeAsidePath(ContentResolver content, String tree, String path)
    {
       for (int n = 1; n <= 99; n++)
       {
-         final String aside = n == 1 ? path + ".old" : path + "." + n + ".old";
+         final String aside = n == 1 ? path + ".prev" : path + "." + n + ".prev";
          if (!new SafStat(content, tree, aside, false).getIsOpen())
             return aside;
       }

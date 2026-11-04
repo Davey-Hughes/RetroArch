@@ -3,15 +3,15 @@
 
 Lanes:
   saf_rename               autosave on, a state save, a quit: the .srm is
-                           whole, no .tmp or .old is left, the state file
+                           whole, no .tmp or .prev is left, the state file
                            exists; then a force-stop mid-session leaves a
                            whole .srm.
-  saf_stale_aside          autosave off, a stale "<game>.srm.old" there:
+  saf_stale_aside          autosave off, a stale "<game>.srm.prev" there:
                            the close write replaces the .srm through
-                           "<game>.srm.2.old", the stale file keeps its
+                           "<game>.srm.2.prev", the stale file keeps its
                            bytes and no aside of the write is left.
-  saf_rename_replace_fail  every aside name, "<game>.srm.old" to
-                           "<game>.srm.99.old", taken, so the replace
+  saf_rename_replace_fail  every aside name, "<game>.srm.prev" to
+                           "<game>.srm.99.prev", taken, so the replace
                            cannot be made: the .srm keeps its old bytes
                            and the failed write is logged.
 
@@ -166,8 +166,8 @@ def main():
     check("quit ends the process", quit_and_wait(dev, args.package))
     names = listing(dev, saves)
     check(".srm written", game + ".srm" in names)
-    check("no .tmp or .old left in saves",
-          not [n for n in names if n.endswith((".tmp", ".old"))])
+    check("no .tmp or .prev left in saves",
+          not [n for n in names if n.endswith((".tmp", ".prev"))])
     snames = listing(dev, states)
     check("state file written", game + ".state" in snames)
     check("no .tmp left in states",
@@ -185,22 +185,22 @@ def main():
 
     print("saf_stale_aside")
     write_config(dev, args, cfg, saf_run, 0)
-    dev.push_text("stale aside\n", srm + ".old")
-    stale = md5(dev, srm + ".old")
+    dev.push_text("stale aside\n", srm + ".prev")
+    stale = md5(dev, srm + ".prev")
     before = md5(dev, srm)
     launch(dev, args, cfg)
     time.sleep(5)
     check("quit ends the process", quit_and_wait(dev, args.package))
     check(".srm replaced", before is not None and md5(dev, srm) not in (None, before))
-    check("the stale aside keeps its bytes", md5(dev, srm + ".old") == stale)
+    check("the stale aside keeps its bytes", md5(dev, srm + ".prev") == stale)
     names = listing(dev, saves)
     check("no aside of the write left",
-          not [n for n in names if n.endswith(".old") and n != game + ".srm.old"])
+          not [n for n in names if n.endswith(".prev") and n != game + ".srm.prev"])
     check("no failed save logged", log_count(dev, "Failed to save SRAM") == 0)
 
     print("saf_rename_replace_fail")
     before = md5(dev, srm)
-    dev.sh("for n in $(seq 2 99); do echo taken > '%s'.$n.old; done" % srm)
+    dev.sh("for n in $(seq 2 99); do echo taken > '%s'.$n.prev; done" % srm)
     launch(dev, args, cfg)
     time.sleep(5)
     check("quit ends the process", quit_and_wait(dev, args.package))
