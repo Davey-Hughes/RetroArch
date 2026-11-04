@@ -250,7 +250,12 @@ $(CLOSE_VFS_OBJ): $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c close_hook.h
 $(TARGET_TEST12): vfs_close_result_test.o $(CLOSE_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-$(TARGET_TEST13): filestream_atomic_test.o $(COMMON_OBJS)
+# filestream_atomic_test compiles vfs_implementation.c into itself, so
+# that one target links without the shared object.
+filestream_atomic_test.o: $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
+
+$(TARGET_TEST13): filestream_atomic_test.o \
+		$(filter-out %/vfs_implementation.o,$(COMMON_OBJS))
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 clean:

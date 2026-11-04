@@ -9,26 +9,57 @@
  *   windows_locked_rename - (Windows) a target held open without
  *                           FILE_SHARE_DELETE is kept and the temporary
  *                           removed.
+ *   ios_eexist_moves_aside - an open for writing that fails with EEXIST,
+ *                           as iOS has been seen to do, moves the file
+ *                           aside for the reopen and puts it back when
+ *                           that fails too; other modes leave it alone.
+ *
+ * vfs_implementation.c is compiled into this file so that its fopen
+ * goes through a stand-in that can fail with EEXIST.
  */
 
 /* The *_impl functions and the VFS interface's callbacks share a
  * handle type only under VFS_FRONTEND, as in file_stream.c. */
 #define VFS_FRONTEND
 
+#include <retro_posix_source.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 
 #if defined(_WIN32)
 #include <windows.h>
 #endif
 
+#include <compat/fopen_utf8.h>
+void *test_fopen_utf8(const char *filename, const char *mode);
+#undef fopen_utf8
+#define fopen_utf8 test_fopen_utf8
+#include "../../../vfs/vfs_implementation.c"
+#undef fopen_utf8
+
 #include <boolean.h>
 #include <libretro.h>
 #include <streams/file_stream.h>
-#include <vfs/vfs_implementation.h>
 
 static unsigned failures = 0;
+static unsigned eexist_left;     /* opens still to fail with EEXIST */
+
+void *test_fopen_utf8(const char *filename, const char *mode)
+{
+   if (eexist_left)
+   {
+      eexist_left--;
+      errno = EEXIST;
+      return NULL;
+   }
+#if defined(_WIN32)
+   return fopen_utf8(filename, mode);
+#else
+   return fopen(filename, mode);
+#endif
+}
 
 #define CHECK(cond, msg) \
    do { \
@@ -225,10 +256,68 @@ static void lane_windows_locked_rename(void)
 #endif
 }
 
+static bool open_write(unsigned mode, const char *text)
+{
+   RFILE *f = filestream_open(TARGET, mode, RETRO_VFS_FILE_ACCESS_HINT_NONE);
+   if (!f)
+      return false;
+   filestream_write(f, text, strlen(text));
+   return filestream_close(f) == 0;
+}
+
+static void lane_ios_eexist_moves_aside(void)
+{
+   clean();
+   put(TARGET, "old");
+
+   eexist_left = 1;
+   CHECK(open_write(RETRO_VFS_FILE_ACCESS_WRITE, "new"),
+         "the reopen after EEXIST failed");
+   CHECK(content_is(TARGET, "new"), "the reopened file has the wrong content");
+   CHECK(!exists(ASIDE), "the aside copy was left after a reopen");
+
+   eexist_left = 2;
+   CHECK(!open_write(RETRO_VFS_FILE_ACCESS_WRITE, "newer"),
+         "a failed reopen returned a file");
+   CHECK(content_is(TARGET, "new"), "a failed reopen lost the file");
+   CHECK(!exists(ASIDE), "a failed reopen left the aside copy");
+
+   eexist_left = 1;
+   CHECK(!filestream_open(TARGET, RETRO_VFS_FILE_ACCESS_READ,
+         RETRO_VFS_FILE_ACCESS_HINT_NONE), "a read open was retried");
+   eexist_left = 1;
+   CHECK(!open_write(RETRO_VFS_FILE_ACCESS_WRITE
+         | RETRO_VFS_FILE_ACCESS_UPDATE_EXISTING, "x"),
+         "an update open was retried");
+   CHECK(content_is(TARGET, "new"), "a read or update open moved the file");
+   CHECK(!exists(ASIDE), "a read or update open left an aside copy");
+
+   eexist_left = 1;
+   put(ASIDE, "stale");
+   CHECK(open_write(RETRO_VFS_FILE_ACCESS_WRITE, "newer"),
+         "a reopen with a stale aside copy there failed");
+   CHECK(content_is(TARGET, "newer"), "the reopened file has the wrong content");
+   CHECK(content_is(ASIDE, "stale"), "a stale aside copy was changed");
+   CHECK(!exists(ASIDE2), "the reopen left its own aside copy");
+
+   eexist_left = 2;
+   CHECK(!open_write(RETRO_VFS_FILE_ACCESS_WRITE, "lost"),
+         "a failed reopen returned a file");
+   CHECK(content_is(TARGET, "newer"),
+         "a failed reopen beside a stale aside lost the file");
+   CHECK(content_is(ASIDE, "stale"), "a stale aside copy was changed");
+   CHECK(!exists(ASIDE2), "a failed reopen left its own aside copy");
+
+   eexist_left = 0;
+   clean();
+   printf("[ios_eexist_moves_aside] done\n");
+}
+
 int main(void)
 {
    lane_rename_cb_keeps_dest();
    lane_windows_locked_rename();
+   lane_ios_eexist_moves_aside();
 
    if (failures)
    {

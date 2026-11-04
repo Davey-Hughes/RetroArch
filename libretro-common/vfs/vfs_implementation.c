@@ -707,6 +707,58 @@ int64_t retro_vfs_file_seek_internal(
    return retro_vfs_fd_seek64(stream->fd, offset, whence) == -1 ? -1 : 0;
 }
 
+/* The first of "<path>.old", "<path>.2.old" ... "<path>.99.old" that
+ * does not exist: one already there may be all that is left of an
+ * interrupted write.  NULL when all do, or on OOM. */
+static char *retro_vfs_aside_name(const char *path)
+{
+   unsigned n;
+   size_t _len  = strlen(path);
+   char  *aside = (char*)malloc(_len + sizeof(".99.old"));
+
+   if (!aside)
+      return NULL;
+   memcpy(aside, path, _len);
+   for (n = 1; n <= 99; n++)
+   {
+      char *s = aside + _len;
+      if (n > 1)
+      {
+         *s++ = '.';
+         if (n > 9)
+            *s++ = (char)('0' + n / 10);
+         *s++ = (char)('0' + n % 10);
+      }
+      memcpy(s, ".old", sizeof(".old"));
+      if (!retro_vfs_stat_impl(aside, NULL))
+         return aside;
+   }
+   free(aside);
+   return NULL;
+}
+
+/* iOS can refuse to open an existing file for writing with EEXIST.
+ * The file is moved aside for the reopen, removed once that succeeds
+ * and put back if it fails. */
+static FILE *retro_vfs_file_reopen_aside(const char *path,
+      const char *mode_str)
+{
+   FILE *fp    = NULL;
+   char *aside = retro_vfs_aside_name(path);
+
+   if (!aside)
+      return NULL;
+   if (retro_vfs_file_rename_impl(path, aside) == 0)
+   {
+      if ((fp = (FILE*)fopen_utf8(path, mode_str)))
+         retro_vfs_file_remove_impl(aside);
+      else
+         retro_vfs_file_rename_impl(aside, path);
+   }
+   free(aside);
+   return fp;
+}
+
 /**
  * retro_vfs_file_open_impl:
  * @path               : path to file
@@ -932,15 +984,12 @@ libretro_vfs_implementation_file *retro_vfs_file_open_impl(
          default:
             if (!(fp = (FILE*)fopen_utf8(path, mode_str)))
             {
-#if TARGET_OS_IPHONE
-               if (errno == EEXIST)
-               {
-                  retro_vfs_file_remove_impl(path);
-                  fp = (FILE*)fopen_utf8(path, mode_str);
-               }
+               if (     errno == EEXIST
+                     && (mode & RETRO_VFS_FILE_ACCESS_WRITE)
+                     && !(mode & RETRO_VFS_FILE_ACCESS_UPDATE_EXISTING))
+                  fp = retro_vfs_file_reopen_aside(path, mode_str);
                if (!fp)
-#endif
-               goto error;
+                  goto error;
             }
             stream->fp  = fp;
             break;
