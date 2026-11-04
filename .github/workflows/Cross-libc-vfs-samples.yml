@@ -102,6 +102,7 @@ jobs:
             ./vfs_v5_metadata_test
             ./vfs_readahead_test
             ./vfs_close_result_test
+            ./filestream_atomic_test
           }
           # Mapping on (what the platform actually ships), mapping off
           # with the descriptor path forced (what the consoles have),
@@ -206,6 +207,8 @@ jobs:
           ./vfs_prefetch_offthread_test.exe
           # The descriptor path's close() result, with PS2's semantics.
           ./vfs_close_result_test.exe
+          # Refused renames keep the old file, a locked target included.
+          ./filestream_atomic_test.exe
 
       # The Win64 fastjmp_set stores xmm6-xmm15 with movaps and faults
       # on a misaligned buffer. Linux has no such stores, so the Linux

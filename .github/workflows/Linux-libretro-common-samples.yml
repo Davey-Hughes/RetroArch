@@ -216,6 +216,7 @@ jobs:
             filestream_rbuf_fault_test
             vfs_rename_replace_test
             vfs_close_result_test
+            filestream_atomic_test
             cdrom_cuesheet_overflow_test
             rdvd_h262_test
             rdvd_lpcm_test
@@ -1362,7 +1363,7 @@ jobs:
           set -o pipefail
           . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           make clean MMAP=0
-          make CC=x86_64-w64-mingw32-gcc MMAP=0 vfs_readahead_test vfs_prefetch_offthread_test vfs_close_result_test
+          make CC=x86_64-w64-mingw32-gcc MMAP=0 vfs_readahead_test vfs_prefetch_offthread_test vfs_close_result_test filestream_atomic_test
           timeout 120 wine ./vfs_readahead_test.exe
           RETRO_VFS_PREFETCH=touch timeout 120 wine ./vfs_readahead_test.exe
           RETRO_VFS_PREFETCH=none timeout 120 wine ./vfs_readahead_test.exe
@@ -1371,6 +1372,8 @@ jobs:
           # A close() that reports the descriptor number on success, as
           # ps2sdk's does, is not a failure on the descriptor path.
           timeout 120 wine ./vfs_close_result_test.exe
+          # An atomic write's refused rename keeps the old file.
+          timeout 120 wine ./filestream_atomic_test.exe
           make clean MMAP=0
 
       - name: Build and run native DVD packets under Wine

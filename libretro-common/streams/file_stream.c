@@ -2404,6 +2404,36 @@ int filestream_commit_atomic(RFILE *file, const char *path, bool ok)
    return filestream_finish_atomic(path, ok);
 }
 
+/* The first of "<path>.old", "<path>.2.old" ... "<path>.99.old" that
+ * does not exist: one already there may be all that is left of an
+ * interrupted write.  NULL when all do, or on OOM. */
+static char *filestream_aside_name(const char *path)
+{
+   unsigned n;
+   size_t _len  = strlen(path);
+   char  *aside = (char*)malloc(_len + sizeof(".99.old"));
+
+   if (!aside)
+      return NULL;
+   memcpy(aside, path, _len);
+   for (n = 1; n <= 99; n++)
+   {
+      char *s = aside + _len;
+      if (n > 1)
+      {
+         *s++ = '.';
+         if (n > 9)
+            *s++ = (char)('0' + n / 10);
+         *s++ = (char)('0' + n % 10);
+      }
+      memcpy(s, ".old", sizeof(".old"));
+      if (!filestream_exists(aside))
+         return aside;
+   }
+   free(aside);
+   return NULL;
+}
+
 int filestream_finish_atomic(const char *path, bool ok)
 {
    char *temp_path;
@@ -2428,15 +2458,29 @@ int filestream_finish_atomic(const char *path, bool ok)
     * and puts it back when its replacement cannot be moved in, so a
     * failure there leaves the old file as it was.  A frontend's
     * rename may refuse an existing destination, as the libretro VFS
-    * API allows, so that one needs the target gone first. */
+    * API allows, so the destination is moved aside and put back if
+    * the temporary cannot take its place. */
    if (filestream_rename_cb)
    {
-      filestream_delete(path);
-      if (filestream_rename(temp_path, path) == 0)
+      char *aside = filestream_aside_name(path);
+      int   ret   = 1;
+
+      if (aside)
       {
-         free(temp_path);
-         return 0;
+         if (filestream_rename(path, aside) == 0)
+         {
+            if (filestream_rename(temp_path, path) == 0)
+            {
+               filestream_delete(aside);
+               ret = 0;
+            }
+            else
+               filestream_rename(aside, path);
+         }
+         free(aside);
       }
+      free(temp_path);
+      return ret;
    }
 
    free(temp_path);
