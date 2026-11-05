@@ -108,11 +108,18 @@ enum save_backup_result save_backups_copy_file(const char *path,
    return SAVE_BACKUP_FAILED;
 }
 
+const char *save_backups_reason_name(enum save_backup_reason reason)
+{
+   (void)reason;
+   return "";
+}
+
 const char *path_basename_nocompression(const char *path)
 {
    return path;
 }
 
+void RARCH_LOG(const char *fmt, ...) { (void)fmt; }
 void RARCH_WARN(const char *fmt, ...) { (void)fmt; }
 
 const char *msg_hash_to_str(enum msg_hash_enums msg)
