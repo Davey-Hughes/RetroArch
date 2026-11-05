@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Save lanes against a built retroarch binary (Linux).
+"""Save lanes against a built retroarch binary (Linux; the Windows
+lanes on Windows).
 
 Null drivers, no display, audio off, every folder RetroArch uses and
 XDG_CONFIG_HOME/HOME inside a fresh run folder per run.  Build the core
-and the shim first: make -C samples/runloop/save_e2e.
+and the shim first: make -C samples/runloop/save_e2e.  On Windows, the
+core only: make CC=x86_64-w64-mingw32-gcc save_e2e_core.dll.
 
   run.py --retroarch ./retroarch --run-dir <dir> [--lane L] [--runs N]
 """
 import argparse
 import os
-import resource
 import shutil
 import signal
 import socket
@@ -19,7 +20,13 @@ import threading
 import time
 from pathlib import Path
 
+try:
+    import resource
+except ImportError:
+    resource = None
+
 HERE = Path(__file__).resolve().parent
+WINDOWS = os.name == 'nt'
 SIZE = 8192
 DIRS = ('saves', 'states', 'system', 'assets', 'config', 'remaps',
         'playlists', 'cache', 'screenshots', 'thumbnails', 'logs', 'home',
@@ -132,9 +139,9 @@ class Run:
         return rc
 
     def kill(self):
-        """SIGKILL our own recorded pid, nothing else."""
+        """SIGKILL (TerminateProcess) our own process, nothing else."""
         if self.proc.poll() is None:
-            os.kill(self.proc.pid, signal.SIGKILL)
+            self.proc.kill()
         self.proc.wait()
 
     def temps(self):
@@ -187,6 +194,13 @@ def lane_autosave_full_disk(args, n):
           '.srm is %d bytes, not %d' % (len(data), SIZE))
     check(failures, data == old, '.srm bytes changed')
     check(failures, not r.temps(), 'temporaries left: %s' % r.temps())
+    # The whole process is out of room: no recovery file fits either.
+    log = r.log.read_text(errors='replace')
+    left = r.copies('unsaved') + r.copies('unsaved', r.dir / 'config'
+                                           / 'recovery')
+    check(failures, log.count("Couldn't save %s." % r.srm) == 1,
+          'not one write-failed notice at close')
+    check(failures, not left, 'recovery files left: %s' % left)
     return r, failures
 
 
@@ -386,6 +400,67 @@ def lane_cut_copy_old_core(args, n):
     return r, failures
 
 
+def lane_recovery_announced(args, n):
+    """A recovery file newer than the save is announced at load; after
+    the game wrote its save it is not."""
+    r = Run(args.run_dir, 'recovery_announced-%d' % n)
+    r.srm.write_bytes(pattern(71))
+    rec = r.saves / 'backups' / 'game - 2026-01-01 00-00-00 - save_e2e - unsaved.srm'
+    rec.parent.mkdir()
+    rec.write_bytes(pattern(72))
+    old = time.time() - 120
+    os.utime(r.srm, (old, old))
+    cfg = r.config()
+    notice = 'Unsaved progress for %s is in Save Backups.' % r.srm
+    failures = []
+    for i, seed in enumerate((73, 74)):
+        env = r.env(SAVE_E2E_TOUCH_FRAME=30, SAVE_E2E_SEED=seed,
+                    SAVE_E2E_FRAME_MS=10)
+        r.start(args, cfg, 100, env)
+        rc = r.wait(60)
+        log = r.log.read_text(errors='replace')
+        check(failures, rc == 0, 'run %d: retroarch exit %s' % (i, rc))
+        check(failures, log.count(notice) == (1, 0)[i],
+              'run %d: %d notices' % (i, log.count(notice)))
+        check(failures, r.srm.read_bytes() == pattern(seed),
+              'run %d: the save was not written' % i)
+    return r, failures
+
+
+def lane_windows_locked_close(args, n):
+    """A1-34 (Windows): a .srm held open without FILE_SHARE_DELETE at
+    close keeps its bytes; the image goes to one recovery file."""
+    r = Run(args.run_dir, 'windows_locked_close-%d' % n)
+    old, new = pattern(61), pattern(62)
+    r.srm.write_bytes(old)
+    # A Windows build may not log to a pipe; it logs to logs/ too.
+    cfg = r.config(log_to_file='true', log_to_file_timestamp='false')
+    env = r.env(SAVE_E2E_TOUCH_FRAME=30, SAVE_E2E_SEED=62,
+                SAVE_E2E_FRAME_MS=10)
+    # Python opens files sharing read and write, not delete.
+    held = open(r.srm, 'rb')
+    try:
+        r.start(args, cfg, 300, env)
+        rc = r.wait(120)
+    finally:
+        held.close()
+    logs = [r.log] + sorted((r.dir / 'logs').glob('*.log'))
+    log = max((p.read_text(errors='replace') for p in logs if p.exists()),
+              key=lambda t: t.count("Couldn't save"))
+    recs = r.copies('unsaved')
+    notices = [l for l in log.splitlines() if "Couldn't save" in l
+               and 'your progress is in Save Backups' in l]
+    failures = []
+    check(failures, (r.dir / 'touched').exists(), 'core never touched save RAM')
+    check(failures, rc == 0, 'retroarch exit %s' % rc)
+    check(failures, r.srm.read_bytes() == old, '.srm changed')
+    check(failures, len(recs) == 1, '%d recovery files' % len(recs))
+    check(failures, recs and recs[0].read_bytes() == new,
+          'the recovery file is not the image')
+    check(failures, len(notices) == 1, '%d recovery notices' % len(notices))
+    return r, failures
+
+
 LANES = {
     'autosave_full_disk': lane_autosave_full_disk,
     'autosave_kill_mid_write': lane_autosave_kill_mid_write,
@@ -395,14 +470,22 @@ LANES = {
     'noload_save_backed_up': lane_noload_save_backed_up,
     'explicit_save_copies': lane_explicit_save_copies,
     'cut_copy_old_core': lane_cut_copy_old_core,
+    'recovery_announced': lane_recovery_announced,
+    'windows_locked_close': lane_windows_locked_close,
 }
+# Lanes that need Windows, and the ones Windows cannot run.
+WINDOWS_LANES = {'windows_locked_close'}
+POSIX_LANES = {'autosave_full_disk', 'autosave_kill_mid_write',
+               'no_rewrite_at_launch', 'unreadable_backed_up',
+               'explicit_save_copies'}
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--retroarch', required=True, type=Path)
     p.add_argument('--run-dir', required=True, type=Path)
-    p.add_argument('--core', type=Path, default=HERE / 'save_e2e_core.so')
+    p.add_argument('--core', type=Path, default=HERE / (
+        'save_e2e_core.dll' if WINDOWS else 'save_e2e_core.so'))
     p.add_argument('--shim', type=Path, default=HERE / 'stall_shim.so')
     p.add_argument('--lane', action='append', choices=sorted(LANES))
     p.add_argument('--runs', type=int, default=1)
@@ -415,10 +498,14 @@ def main():
     args.core = args.core.resolve()
     args.shim = args.shim.resolve()
     args.run_dir = args.run_dir.resolve()
-    for f in (args.retroarch, args.core, args.shim):
+    lanes = [l for l in args.lane or sorted(LANES)
+             if l not in (POSIX_LANES if WINDOWS else WINDOWS_LANES)]
+    need = [args.retroarch, args.core]
+    if 'autosave_kill_mid_write' in lanes:
+        need.append(args.shim)
+    for f in need:
         if not f.exists():
             p.error('%s not found' % f)
-    lanes = args.lane or sorted(LANES)
     bad = 0
     for lane in lanes:
         for n in range(args.runs):
