@@ -10,7 +10,8 @@ workflow. Every other change runs everything, as before: the filter is
     '!libretro-common/samples/**'
     '!.github/workflows/*.yml'      ... and the other workflows,
     'samples/gfx/foo/**'            then the sample directories this
-    ...                             workflow's jobs name, and those
+    'samples/foo.c'                 workflow's jobs name (a file at most
+    ...                             two levels in as itself), and those
     '.github/workflows/<self>.yml'  name in turn, and itself.
 
 The sample directories are what tools/ci_local.py's coverage finds in
@@ -56,12 +57,18 @@ def code(text):
 
 
 def sample_dir(rel):
-    """The sample directory a path lies in, or None outside the trees."""
+    """The sample directory a path lies in, the path itself for a file at
+    most two levels in, or None outside the trees."""
     for t in TREES:
         if rel.startswith(t):
             parts = rel[len(t):].split('/')
             return t + '/'.join(parts[:2]) if len(parts) >= 2 else t + parts[0]
     return None
+
+
+def pattern(d):
+    """A sample_dir() result as a filter entry; '<file>/**' matches nothing."""
+    return d + '/**' if os.path.isdir(os.path.join(c.ROOT, d)) else d
 
 
 def read(rel):
@@ -163,8 +170,8 @@ def plan(wf):
     if not keep_workflows:
         paths += ['!.github/workflows/*.yml']
     if not keep_samples:
-        paths += [d + '/**' for d in sorted(dirs) if d.count('/') >= 2]
-        paths += [d + '/**' for d in sorted(dirs) if d.count('/') < 2]
+        paths += [pattern(d) for d in sorted(dirs) if d.count('/') >= 2]
+        paths += [pattern(d) for d in sorted(dirs) if d.count('/') < 2]
     if not keep_workflows:
         paths.append('.github/workflows/' + wf.file)
     if paths == ['**']:
