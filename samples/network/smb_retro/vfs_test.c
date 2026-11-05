@@ -7,6 +7,7 @@
 #include <retro_timers.h>
 #include <time.h>
 #include <net/net_compat.h>
+#include <file/file_path.h>
 #include <vfs/vfs.h>
 #include <vfs/vfs_implementation.h>
 #include "../../../libretro-common/vfs/vfs_implementation_smb.h"
@@ -217,6 +218,14 @@ int main(int argc, char **argv)
    if (mtime < (int64_t)now - 300 || mtime > (int64_t)now + 300)
    {
       fprintf(stderr, "FAIL: mtime %lld, now %lld\n",
+            (long long)mtime, (long long)now);
+      return 1;
+   }
+   mtime = 0;
+   if (     !path_get_mtime(url, &mtime)
+         || mtime < (int64_t)now - 300 || mtime > (int64_t)now + 300)
+   {
+      fprintf(stderr, "FAIL: path_get_mtime %lld, now %lld\n",
             (long long)mtime, (long long)now);
       return 1;
    }

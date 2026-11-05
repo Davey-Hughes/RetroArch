@@ -737,10 +737,10 @@ int retro_vfs_stat_saf(const char *tree, const char *path, int64_t *size, int64_
 
    if (mtime != NULL)
    {
-      /* milliseconds; 0 when the provider has none */
+      /* milliseconds; 0 when the provider has none, and 0 s is unknown */
       saf_stat_mtime = (*env)->CallLongMethod(env, saf_stat, vfs_saf_saf_stat_get_last_modified_method);
       if ((*env)->ExceptionOccurred(env)) goto error;
-      if (saf_stat_mtime > 0)
+      if (saf_stat_mtime >= 1000)
          *mtime = saf_stat_mtime / 1000;
    }
 

@@ -306,8 +306,8 @@ public final class VfsImplementationSaf
    {
       private static final String[] QUERY_ARGS_WITH_SIZE = {
          Document.COLUMN_MIME_TYPE,
-         Document.COLUMN_LAST_MODIFIED,
          Document.COLUMN_SIZE,
+         Document.COLUMN_LAST_MODIFIED,
       };
 
       private static final String[] QUERY_ARGS_WITHOUT_SIZE = {
@@ -354,8 +354,9 @@ public final class VfsImplementationSaf
             if (!cursor.moveToNext())
                return;
             isDirectory = cursor.getString(0).equals(Document.MIME_TYPE_DIR);
-            lastModified = cursor.isNull(1) ? 0 : cursor.getLong(1);
-            size = includeSize ? cursor.getLong(2) : 0;
+            size = includeSize ? cursor.getLong(1) : 0;
+            final int lastModifiedIndex = cursor.getColumnIndex(Document.COLUMN_LAST_MODIFIED);
+            lastModified = lastModifiedIndex < 0 || cursor.isNull(lastModifiedIndex) ? 0 : cursor.getLong(lastModifiedIndex);
             isOpen = true;
          }
          finally
