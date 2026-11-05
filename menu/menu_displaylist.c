@@ -6923,6 +6923,15 @@ static unsigned menu_displaylist_parse_disk_options(file_list_t *list)
    /* Check whether disk is currently ejected */
    disk_ejected = disk_control_get_eject_state(&sys_info->disk_control);
 
+   if (menu_displaylist_parse_settings_enum(list, PARSE_ONLY_BOOL, false,
+            menu_setting_find_enum(MENU_ENUM_LABEL_MENU_AUTO_INSERT_DISK),
+            MENU_ENUM_LABEL_MENU_AUTO_INSERT_DISK, true, true) == 0)
+      count++;
+   if (menu_displaylist_parse_settings_enum(list, PARSE_ONLY_BOOL, false,
+            menu_setting_find_enum(MENU_ENUM_LABEL_MENU_INSERT_DISK_RESUME),
+            MENU_ENUM_LABEL_MENU_INSERT_DISK_RESUME, true, true) == 0)
+      count++;
+
    if (menu_entries_append(list,
             msg_hash_to_str(MENU_ENUM_LABEL_VALUE_DISK_INDEX),
             MENU_ENUM_LABEL_DISK_INDEX_STR,
@@ -6930,7 +6939,16 @@ static unsigned menu_displaylist_parse_disk_options(file_list_t *list)
             MENU_SETTINGS_CORE_DISK_OPTIONS_DISK_INDEX, 0, 0, NULL))
       count++;
 
-   if (disk_ejected)
+   if (runloop_state_get_ptr()->pending_disk_control_insert)
+   {
+      if (menu_entries_append(list,
+               msg_hash_to_str(MENU_ENUM_LABEL_VALUE_DISK_INSERT_PENDING),
+               MENU_ENUM_LABEL_DISK_INSERT_PENDING_STR,
+               MENU_ENUM_LABEL_DISK_INSERT_PENDING,
+               MENU_SETTING_ACTION, 0, 0, NULL))
+         count++;
+   }
+   else if (disk_ejected)
    {
       if (menu_entries_append(list,
                msg_hash_to_str(MENU_ENUM_LABEL_VALUE_DISK_TRAY_INSERT),
