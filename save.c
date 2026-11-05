@@ -57,6 +57,10 @@ struct ram_type
 static struct string_list *task_save_files = NULL;
 
 #ifdef HAVE_THREADS
+/* The worker's own temporary: a SAVE_FILES on the main thread uses
+ * "<path>.tmp" and may run while the worker writes. */
+#define AUTOSAVE_TMP_SUFFIX ".auto.tmp"
+
 typedef struct autosave autosave_t;
 
 /* Autosave support. */
@@ -71,14 +75,17 @@ struct autosave
 {
    void *buffer;
    void *snapshot;
-   const void *retro_buffer;
    char *path;
+   char *tmp_path;
+   /* The retired handle this one replaced, joined with it */
+   autosave_t *prev;
    sthread_t *thread;
    size_t bufsize;
    /* What the worker sleeps on: the copy it asked for, the end of its
     * interval, or quit. */
    retro_eventcount_t ec;
    unsigned interval;
+   unsigned type;
    /* Only the main thread reads live SRAM. The worker requests a copy
     * and waits until autosave_check() has made it and cleared this. */
    retro_atomic_int_t snapshot_requested;
@@ -123,35 +130,43 @@ static void autosave_thread(void *data)
          break;
 
       /* The snapshot remains ours until the next request. Keep the
-       * last written image unchanged if opening or writing fails. */
+       * last written image unchanged if opening, writing, syncing or
+       * renaming fails; the file keeps its old contents. */
       if (retry_write ||
             memcmp(save->buffer, save->snapshot, save->bufsize) != 0)
       {
+         int ret;
          intfstream_t *file = NULL;
-         retry_write = true;
+         bool written       = false;
+         retry_write        = true;
 
          if (save->compress)
-            file = intfstream_open_rzip_file(save->path,
+            file = intfstream_open_rzip_file(save->tmp_path,
                   RETRO_VFS_FILE_ACCESS_WRITE);
          else
-            file = intfstream_open_file(save->path,
+            file = intfstream_open_file(save->tmp_path,
                   RETRO_VFS_FILE_ACCESS_WRITE, RETRO_VFS_FILE_ACCESS_HINT_NONE);
 
          if (file)
          {
-            bool written = intfstream_write(file, save->snapshot,
+            written = intfstream_write(file, save->snapshot,
                   save->bufsize) == (int64_t)save->bufsize;
             if (intfstream_flush(file) != 0)
                written = false;
             if (intfstream_close(file) != 0)
                written = false;
             free(file);
-            if (written)
-            {
-               memcpy(save->buffer, save->snapshot, save->bufsize);
-               retry_write = false;
-            }
          }
+
+         ret = filestream_finish_atomic_suffix(save->path,
+               AUTOSAVE_TMP_SUFFIX, written, true);
+         if (ret == 0)
+         {
+            memcpy(save->buffer, save->snapshot, save->bufsize);
+            retry_write = false;
+         }
+         else if (ret == 1)
+            filestream_delete(save->tmp_path);
       }
 
       /* Rest an interval. Nothing but quit notifies while no copy is
@@ -179,16 +194,19 @@ static void autosave_thread(void *data)
  * @data            : pointer to buffer
  * @len             : size of @data buffer
  * @interval        : interval at which saves should be performed.
+ * @type            : the RETRO_MEMORY_* id @data was read from
  *
- * Create and initialize autosave object.
+ * Create and initialize autosave object. Logs nothing: it is also
+ * called from autosave_check().
  *
  * @return Pointer to new autosave_t object if successful, otherwise
  * NULL.
  **/
 static autosave_t *autosave_new(const char *path,
       const void *data, size_t len,
-      unsigned interval, bool compress)
+      unsigned interval, bool compress, unsigned type)
 {
+   size_t      path_len;
    void       *buf               = NULL;
    autosave_t *handle            = (autosave_t*)malloc(sizeof(*handle));
    if (!handle)
@@ -200,11 +218,12 @@ static autosave_t *autosave_new(const char *path,
    retro_atomic_int_init(&handle->snapshot_requested, 0);
    handle->bufsize               = len;
    handle->interval              = interval;
+   handle->type                  = type;
    handle->buffer                = NULL;
    handle->snapshot              = NULL;
+   handle->prev                  = NULL;
    handle->thread                = NULL;
 
-   handle->retro_buffer          = data;
    /* Own the path string rather than borrowing it. The caller's
     * path comes from task_save_files->elems[i].data, freed by
     * path_deinit_savefile() during the deinit chain. The worker
@@ -218,8 +237,21 @@ static autosave_t *autosave_new(const char *path,
       return NULL;
    }
 
+   path_len                      = strlen(path);
+   if (!(handle->tmp_path = (char*)malloc(path_len
+               + sizeof(AUTOSAVE_TMP_SUFFIX))))
+   {
+      free(handle->path);
+      free(handle);
+      return NULL;
+   }
+   memcpy(handle->tmp_path, path, path_len);
+   memcpy(handle->tmp_path + path_len, AUTOSAVE_TMP_SUFFIX,
+         sizeof(AUTOSAVE_TMP_SUFFIX));
+
    if (!(buf = malloc(len)))
    {
+      free(handle->tmp_path);
       free(handle->path);
       free(handle);
       return NULL;
@@ -227,7 +259,7 @@ static autosave_t *autosave_new(const char *path,
 
    handle->buffer                = buf;
 
-   memcpy(handle->buffer, handle->retro_buffer, handle->bufsize);
+   memcpy(handle->buffer, data, handle->bufsize);
 
    handle->snapshot              = malloc(len);
    if (handle->snapshot)
@@ -235,10 +267,10 @@ static autosave_t *autosave_new(const char *path,
 
    if (!handle->snapshot || !handle->ec_inited)
    {
-      RARCH_ERR("[SRAM] Failed to initialize autosave synchronization primitives.\n");
       free(handle->snapshot);
       if (handle->ec_inited)
          retro_eventcount_free(&handle->ec);
+      free(handle->tmp_path);
       free(handle->path);
       free(handle->buffer);
       free(handle);
@@ -249,9 +281,9 @@ static autosave_t *autosave_new(const char *path,
 
    if (!handle->thread)
    {
-      RARCH_ERR("[SRAM] Failed to create autosave thread.\n");
       free(handle->snapshot);
       retro_eventcount_free(&handle->ec);
+      free(handle->tmp_path);
       free(handle->path);
       free(handle->buffer);
       free(handle);
@@ -283,8 +315,35 @@ static void autosave_free(autosave_t *handle)
    if (handle->path)
       free(handle->path);
    handle->path = NULL;
+   free(handle->tmp_path);
 
    free(handle);
+}
+
+/* A handle and the retired ones it replaced. */
+static void autosave_free_chain(autosave_t *handle)
+{
+   while (handle)
+   {
+      autosave_t *prev = handle->prev;
+      autosave_free(handle);
+      handle = prev;
+   }
+}
+
+/* A new handle for slot @i over memory of a new size or place; the
+ * retired one stays reachable from it until autosave_deinit(). */
+static void autosave_replace(unsigned i,
+      const retro_ctx_memory_info_t *mem_info)
+{
+   autosave_t *old    = autosave_state.list[i];
+   autosave_t *handle = autosave_new(old->path, mem_info->data,
+         mem_info->size, old->interval, old->compress, old->type);
+   if (handle)
+   {
+      handle->prev           = old;
+      autosave_state.list[i] = handle;
+   }
 }
 
 bool autosave_init(bool compress_files, unsigned autosave_interval)
@@ -321,7 +380,8 @@ bool autosave_init(bool compress_files, unsigned autosave_interval)
             mem_info.data,
             mem_info.size,
             autosave_interval,
-            compress_files)))
+            compress_files,
+            type)))
       {
          RARCH_WARN("[SRAM] %s\n", msg_hash_to_str(MSG_AUTOSAVE_FAILED));
          continue;
@@ -341,7 +401,7 @@ void autosave_deinit(void)
    {
       autosave_t *handle = autosave_state.list[i];
       if (handle)
-         autosave_free(handle);
+         autosave_free_chain(handle);
       autosave_state.list[i] = NULL;
    }
 
@@ -365,14 +425,36 @@ void autosave_check(void)
 
    for (i = 0; i < autosave_state.num; i++)
    {
+      retro_ctx_memory_info_t mem_info;
       autosave_t *handle = autosave_state.list[i];
       if (!handle)
          continue;
+      mem_info.id        = handle->type;
+      /* Retired: replaced once the core reports its memory again. */
+      if (autosave_quitting(handle))
+      {
+         core_get_memory(&mem_info);
+         if (mem_info.data && mem_info.size)
+            autosave_replace(i, &mem_info);
+         continue;
+      }
       /* The worker asked and is waiting: the snapshot is ours to fill
        * until the flag clears. */
       if (!retro_atomic_load_acquire_int(&handle->snapshot_requested))
          continue;
-      memcpy(handle->snapshot, handle->retro_buffer, handle->bufsize);
+      /* A core may move or resize its memory at any time. */
+      core_get_memory(&mem_info);
+      if (!mem_info.data || mem_info.size != handle->bufsize)
+      {
+         /* Its worker is idle, waiting for this copy: it ends without
+          * writing again and is joined at autosave_deinit(). */
+         retro_atomic_store_release_int(&handle->quit, 1);
+         retro_eventcount_notify(&handle->ec);
+         if (mem_info.data && mem_info.size)
+            autosave_replace(i, &mem_info);
+         continue;
+      }
+      memcpy(handle->snapshot, mem_info.data, handle->bufsize);
       retro_atomic_store_release_int(&handle->snapshot_requested, 0);
       retro_eventcount_notify(&handle->ec);
    }

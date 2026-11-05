@@ -19,11 +19,6 @@ static autosave_t *current;
 static unsigned char ram_storage[SRAM_SIZE + 1];
 static unsigned char *ram = ram_storage + 1;
 
-void RARCH_ERR(const char *fmt, ...)
-{
-   (void)fmt;
-}
-
 intfstream_t *intfstream_open_file(const char *path,
       unsigned mode, unsigned hints)
 {
@@ -82,6 +77,28 @@ int intfstream_close(intfstream_t *file)
    return result;
 }
 
+int filestream_finish_atomic_suffix(const char *path, const char *suffix,
+      bool ok, bool sync)
+{
+   (void)path;
+   (void)suffix;
+   (void)sync;
+   return ok ? 0 : -1;
+}
+
+int filestream_delete(const char *path)
+{
+   (void)path;
+   return 0;
+}
+
+bool core_get_memory(retro_ctx_memory_info_t *info)
+{
+   info->data = ram;
+   info->size = SRAM_SIZE;
+   return true;
+}
+
 static void wait_requested(void)
 {
    unsigned i;
@@ -104,7 +121,8 @@ static void capture_and_wait(void)
 static void start_save(bool compress)
 {
    memset(ram, 0, SRAM_SIZE);
-   current = autosave_new("unused.srm", ram, SRAM_SIZE, 0, compress);
+   current = autosave_new("unused.srm", ram, SRAM_SIZE, 0, compress,
+         RETRO_MEMORY_SAVE_RAM);
    assert(current);
    autosave_state.list = &current;
    autosave_state.num  = 1;
