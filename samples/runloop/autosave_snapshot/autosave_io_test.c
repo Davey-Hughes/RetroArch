@@ -168,13 +168,6 @@ runloop_state_t *runloop_state_get_ptr(void)
    return &runloop_st;
 }
 
-bool fill_pathname_application_data(char *s, size_t len)
-{
-   (void)s;
-   (void)len;
-   return false;
-}
-
 static unsigned synced_writes;
 
 bool content_finish_tmp(const char *path, bool ok, bool sync)
@@ -1663,8 +1656,8 @@ static void use_no_mtime(bool on)
    path_vfs_init(&info);
 }
 
-/* A save with no mtime: any recovery is announced, even one older than
- * the save. */
+/* A save with no mtime: any recovery with an mtime is announced, even
+ * one older than the save. */
 static void lane_recovery_no_mtime(void)
 {
    static unsigned char disk[BIG], ram[BIG];
