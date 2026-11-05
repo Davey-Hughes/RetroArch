@@ -197,11 +197,14 @@ struct smb_cfg_snap
 };
 static vfs_cfg_slot_t     smb_cfg_slot;
 static retro_atomic_int_t smb_cfg_gen;
-/* Last error for smb_get_last_error(), kept as nfs_get_last_error()
- * keeps it: each writer fills a ring slot of its own, claimed by an
- * atomic counter, then publishes its index for the reader. */
+/* A slot is reserved while either side copies its diagnostic. */
 #define SMB_ERR_SLOTS 8
-static char               smb_err_ring[SMB_ERR_SLOTS][256];
+struct smb_err_slot
+{
+   retro_atomic_int_t busy;
+   char               msg[256];
+};
+static struct smb_err_slot smb_err_ring[SMB_ERR_SLOTS];
 static retro_atomic_int_t smb_err_seq;
 static retro_atomic_int_t smb_err_latest;
 
@@ -220,21 +223,39 @@ static void smb_cfg_leave(vfs_cfg_hdr_t *h)
 /* "@what: @why", or @what alone when the client gave no reason. */
 static void smb_note_error(const char *what, const char *why)
 {
-   int slot = retro_atomic_fetch_add_int(&smb_err_seq, 1);
-   slot &= (SMB_ERR_SLOTS - 1);
-   strlcpy(smb_err_ring[slot], what, sizeof(smb_err_ring[slot]));
-   if (why && *why)
+   unsigned first = (unsigned)retro_atomic_fetch_add_int(&smb_err_seq, 1);
+   unsigned i;
+   for (i = 0; i < SMB_ERR_SLOTS; i++)
    {
-      strlcat(smb_err_ring[slot], ": ", sizeof(smb_err_ring[slot]));
-      strlcat(smb_err_ring[slot], why, sizeof(smb_err_ring[slot]));
+      unsigned slot = (first + i) & (SMB_ERR_SLOTS - 1);
+      struct smb_err_slot *sl = &smb_err_ring[slot];
+      if (!retro_atomic_cas_int(&sl->busy, 0, 1))
+         continue;
+      strlcpy(sl->msg, what, sizeof(sl->msg));
+      if (why && *why)
+      {
+         strlcat(sl->msg, ": ", sizeof(sl->msg));
+         strlcat(sl->msg, why, sizeof(sl->msg));
+      }
+      retro_atomic_store_release_int(&sl->busy, 0);
+      retro_atomic_store_release_int(&smb_err_latest, (int)slot);
+      return;
    }
-   retro_atomic_store_release_int(&smb_err_latest, slot);
 }
 
-const char *smb_get_last_error(void)
+const char *smb_get_last_error(char *buf, size_t len)
 {
-   int slot = retro_atomic_load_acquire_int(&smb_err_latest);
-   return smb_err_ring[slot & (SMB_ERR_SLOTS - 1)];
+   unsigned slot = (unsigned)retro_atomic_load_acquire_int(&smb_err_latest);
+   struct smb_err_slot *sl = &smb_err_ring[slot & (SMB_ERR_SLOTS - 1)];
+   if (!len)
+      return buf;
+   buf[0] = '\0';
+   if (retro_atomic_cas_int(&sl->busy, 0, 1))
+   {
+      strlcpy(buf, sl->msg, len);
+      retro_atomic_store_release_int(&sl->busy, 0);
+   }
+   return buf;
 }
 
 /* Extracts the first path component after the server from an smb:// URL.

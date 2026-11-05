@@ -25,7 +25,8 @@ static struct nfs_settings cfg;
 static int expect_fail(const char *what, const char *url, const char *want)
 {
    struct RDIR *d  = retro_opendir(url);
-   const char *err = nfs_get_last_error();
+   char err[128];
+   nfs_get_last_error(err, sizeof(err));
    if (d)
    {
       retro_closedir(d);
@@ -46,6 +47,7 @@ static int expect_fail(const char *what, const char *url, const char *want)
  * its handle means nothing on the new settings' connections. */
 static int expect_open_file_kept(const char *local)
 {
+   char error[128];
    static char got[16384], want[16384];
    const char *url = "nfs://127.0.0.1/sparse.img";
    int fails = 0;
@@ -57,7 +59,7 @@ static int expect_open_file_kept(const char *local)
    if (!f || !l)
    {
       fprintf(stderr, "FAIL: open %s and %s (%s)\n", url, local,
-            nfs_get_last_error());
+            nfs_get_last_error(error, sizeof(error)));
       fails++;
    }
    for (part = 0; part < 3 && !fails; part++)
@@ -79,7 +81,7 @@ static int expect_open_file_kept(const char *local)
             || memcmp(got, want, sizeof(got)) != 0)
       {
          fprintf(stderr, "FAIL: read %d of the open file, %s the change (%s)\n",
-               part, part ? "after" : "before", nfs_get_last_error());
+               part, part ? "after" : "before", nfs_get_last_error(error, sizeof(error)));
          fails++;
       }
    }
@@ -102,6 +104,7 @@ static int expect_open_file_kept(const char *local)
  * the file only on the export that connection settled on. */
 static int expect_private_open_keeps_export(const char *local)
 {
+   char error[128];
    static char got[16384], want[16384];
    const char *url = "nfs://127.0.0.1/export/sparse.img";
    unsigned window_kib = 0, direct_kib = 0;
@@ -120,7 +123,7 @@ static int expect_private_open_keeps_export(const char *local)
    if (!hold || !f || !l)
    {
       fprintf(stderr, "FAIL: open %s twice and %s (%s)\n", url, local,
-            nfs_get_last_error());
+            nfs_get_last_error(error, sizeof(error)));
       fails++;
    }
    else if (filestream_read(f, got, sizeof(got))  != (int64_t)sizeof(got)
@@ -128,7 +131,7 @@ static int expect_private_open_keeps_export(const char *local)
          || memcmp(got, want, sizeof(got)) != 0)
    {
       fprintf(stderr, "FAIL: read the file opened with every slot busy (%s)\n",
-            nfs_get_last_error());
+            nfs_get_last_error(error, sizeof(error)));
       fails++;
    }
    if (f)

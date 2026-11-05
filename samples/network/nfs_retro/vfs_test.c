@@ -13,6 +13,7 @@
 
 int main(int argc, char **argv)
 {
+   char error[128];
    struct nfs_settings cfg;
    RFILE *f;
    char url[600];
@@ -45,7 +46,7 @@ int main(int argc, char **argv)
    f = filestream_open(url, RETRO_VFS_FILE_ACCESS_WRITE, RETRO_VFS_FILE_ACCESS_HINT_NONE);
    if (!f)
    {
-      fprintf(stderr, "FAIL: open for write (%s)\n", nfs_get_last_error());
+      fprintf(stderr, "FAIL: open for write (%s)\n", nfs_get_last_error(error, sizeof(error)));
       return 1;
    }
    memset(buf, 0x5a, sizeof(buf));

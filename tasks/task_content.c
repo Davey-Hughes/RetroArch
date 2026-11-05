@@ -1622,7 +1622,8 @@ static bool content_file_load(
                      char msg[PATH_MAX_LENGTH];
 #ifdef HAVE_NFSCLIENT
                      if (content_path[0] == 'n')
-                        RARCH_ERR("[Content] NFS: %s\n", nfs_get_last_error());
+                        RARCH_ERR("[Content] NFS: %s\n",
+                              nfs_get_last_error(msg, sizeof(msg)));
 #endif
                      filestream_delete(part_path);
                      filestream_delete(stage_dir);

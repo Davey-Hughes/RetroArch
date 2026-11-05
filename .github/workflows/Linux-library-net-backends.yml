@@ -22,6 +22,7 @@ on:
       - 'samples/network/cheevos_login/**'
       - 'samples/network/smb_retro/**'
       - 'samples/network/tls_retro/**'
+      - 'samples/network/vfs_error/**'
       - '.github/workflows/Linux-library-net-backends.yml'
     # ci_paths: end
   pull_request:
@@ -36,6 +37,7 @@ on:
       - 'samples/network/cheevos_login/**'
       - 'samples/network/smb_retro/**'
       - 'samples/network/tls_retro/**'
+      - 'samples/network/vfs_error/**'
       - '.github/workflows/Linux-library-net-backends.yml'
     # ci_paths: end
   workflow_dispatch:

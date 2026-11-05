@@ -11,7 +11,7 @@ else
    # file mapping as the shipping build has it (Win32 maps without it)
    MMAP_FLAGS = -DHAVE_MMAP
 endif
-all: nfs_test nfs_sparse_test nfs_idle_test nfs_reply_bounds_test vfs_test vfs_threads_test nfs_error_test nfs_cfg_race_test
+all: nfs_test nfs_sparse_test nfs_idle_test nfs_reply_bounds_test vfs_test vfs_threads_test nfs_error_test nfs_cfg_race_test vfs_error_test
 
 nfs_test: $(SRC)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(SRC) $(LDLIBS) -o $@
@@ -39,9 +39,13 @@ nfs_error_test: $(ERR_SRC)
 RACE_SRC = nfs_cfg_race_test.c $(filter-out vfs_test.c,$(VFS_SRC)) $(COMMON)/rthreads/rthreads.c $(COMMON)/rthreads/retro_eventcount.c
 nfs_cfg_race_test: $(RACE_SRC) $(COMMON)/vfs/vfs_cfg_snapshot.h
 	$(CC) $(CPPFLAGS) -DHAVE_NFSCLIENT -DHAVE_THREADS -I$(ROOT) $(CFLAGS) $(RACE_SRC) $(LDLIBS) -lpthread -o $@
+ERROR_SRC = ../vfs_error/vfs_error_test.c $(filter-out nfs_cfg_race_test.c $(COMMON)/vfs/vfs_implementation_nfs.c,$(RACE_SRC))
+vfs_error_test: $(ERROR_SRC) $(COMMON)/vfs/vfs_implementation_nfs.c
+	$(CC) $(CPPFLAGS) -DHAVE_NFSCLIENT -DHAVE_THREADS -I$(ROOT) $(CFLAGS) $(ERROR_SRC) $(LDLIBS) -lpthread -o $@
+
 THR_SRC = vfs_threads_test.c $(filter-out vfs_test.c,$(VFS_SRC)) $(COMMON)/rthreads/rthreads.c $(COMMON)/rthreads/retro_eventcount.c
 vfs_threads_test: $(THR_SRC)
 	$(CC) $(CPPFLAGS) -DHAVE_NFSCLIENT -DHAVE_THREADS $(MMAP_FLAGS) -I$(ROOT) $(CFLAGS) $(THR_SRC) $(LDLIBS) -lpthread -o $@
 clean:
-	rm -f nfs_test nfs_test.exe nfs_sparse_test nfs_sparse_test.exe nfs_idle_test nfs_idle_test.exe nfs_reply_bounds_test nfs_reply_bounds_test.exe vfs_test vfs_test.exe vfs_threads_test vfs_threads_test.exe nfs_error_test nfs_error_test.exe nfs_cfg_race_test nfs_cfg_race_test.exe
+	rm -f nfs_test nfs_test.exe nfs_sparse_test nfs_sparse_test.exe nfs_idle_test nfs_idle_test.exe nfs_reply_bounds_test nfs_reply_bounds_test.exe vfs_test vfs_test.exe vfs_threads_test vfs_threads_test.exe nfs_error_test nfs_error_test.exe nfs_cfg_race_test nfs_cfg_race_test.exe vfs_error_test vfs_error_test.exe
 .PHONY: all clean

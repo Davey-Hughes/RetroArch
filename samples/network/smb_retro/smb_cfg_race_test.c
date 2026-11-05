@@ -70,6 +70,7 @@ static void fill(struct smb_settings *s, unsigned round)
 
 int main(void)
 {
+   char error[256];
    sthread_t *t[READERS];
    unsigned   i;
    int        failures = 0;
@@ -96,13 +97,13 @@ int main(void)
          fprintf(stderr, "FAIL: a stat with no server set succeeded\n");
          failures++;
       }
-      else if (!*smb_get_last_error())
+      else if (!*smb_get_last_error(error, sizeof(error)))
       {
          fprintf(stderr, "FAIL: a failed stat gave no reason\n");
          failures++;
       }
       else
-         printf("ok:   settings freed by the caller: %s\n", smb_get_last_error());
+         printf("ok:   settings freed by the caller: %s\n", smb_get_last_error(error, sizeof(error)));
    }
 
    /* one struct rewritten in place while readers resolve */

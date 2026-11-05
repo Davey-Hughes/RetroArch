@@ -87,16 +87,16 @@ struct nfs_cfg_snap
    char                export_path[512];
 };
 static vfs_cfg_slot_t nfs_cfg_slot;
-/* Last error for nfs_get_last_error(), used only for diagnostics off
- * the hot path. Writers may run on several pool threads at once, so
- * each publishes into its own ring slot (claimed by an atomic counter)
- * and then advances an atomic "latest" index; the reader loads that
- * index. Distinct slots per writer means no buffer is written by two
- * threads at once, and the only shared scalars are atomic. */
+/* A slot is reserved while either side copies its diagnostic. */
 #define NFS_ERR_SLOTS 8
-static char               nfs_err_ring[NFS_ERR_SLOTS][128];
-static retro_atomic_int_t nfs_err_seq;    /* next slot to hand out */
-static retro_atomic_int_t nfs_err_latest; /* slot last published, or -1 */
+struct nfs_err_slot
+{
+   retro_atomic_int_t busy;
+   char               msg[128];
+};
+static struct nfs_err_slot nfs_err_ring[NFS_ERR_SLOTS];
+static retro_atomic_int_t nfs_err_seq;
+static retro_atomic_int_t nfs_err_latest;
 
 static void nfs_note_error(const char *msg);
 
@@ -273,18 +273,34 @@ void nfs_shutdown(void)
 /* Record a diagnostic string from whichever thread hit the error. */
 static void nfs_note_error(const char *msg)
 {
-   int slot = retro_atomic_fetch_add_int(&nfs_err_seq, 1);
-   slot &= (NFS_ERR_SLOTS - 1);
-   strlcpy(nfs_err_ring[slot], msg, sizeof(nfs_err_ring[slot]));
-   retro_atomic_store_release_int(&nfs_err_latest, slot);
+   unsigned first = (unsigned)retro_atomic_fetch_add_int(&nfs_err_seq, 1);
+   unsigned i;
+   for (i = 0; i < NFS_ERR_SLOTS; i++)
+   {
+      unsigned slot = (first + i) & (NFS_ERR_SLOTS - 1);
+      struct nfs_err_slot *s = &nfs_err_ring[slot];
+      if (!retro_atomic_cas_int(&s->busy, 0, 1))
+         continue;
+      strlcpy(s->msg, msg, sizeof(s->msg));
+      retro_atomic_store_release_int(&s->busy, 0);
+      retro_atomic_store_release_int(&nfs_err_latest, (int)slot);
+      return;
+   }
 }
 
-const char *nfs_get_last_error(void)
+const char *nfs_get_last_error(char *buf, size_t len)
 {
-   int slot = retro_atomic_load_acquire_int(&nfs_err_latest);
-   if (slot < 0)
-      return "";
-   return nfs_err_ring[slot & (NFS_ERR_SLOTS - 1)];
+   unsigned slot = (unsigned)retro_atomic_load_acquire_int(&nfs_err_latest);
+   struct nfs_err_slot *s = &nfs_err_ring[slot & (NFS_ERR_SLOTS - 1)];
+   if (!len)
+      return buf;
+   buf[0] = '\0';
+   if (retro_atomic_cas_int(&s->busy, 0, 1))
+   {
+      strlcpy(buf, s->msg, len);
+      retro_atomic_store_release_int(&s->busy, 0);
+   }
+   return buf;
 }
 
 /* A connection to @server:@export made with @want for one caller: a

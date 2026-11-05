@@ -86,8 +86,9 @@ int retro_vfs_stat_smb(const char *path, int64_t *size);
 
 /* Errors */
 int retro_vfs_file_error_smb(libretro_vfs_implementation_file *stream);
-/* Why the last connect, share listing or opendir failed; "" if none has. */
-const char *smb_get_last_error(void);
+/* Copies why the last connect, share listing or opendir failed to @buf
+ * and returns @buf; "" if none has or its slot is busy. */
+const char *smb_get_last_error(char *buf, size_t len);
 
 /* Context management */
 void smb_shutdown(void);

@@ -51,6 +51,7 @@ static void worker(void *arg)
 
 int main(int argc, char **argv)
 {
+   char error[128];
    struct nfs_settings cfg;
    sthread_t *t[NTHREADS];
    int i, phase;
@@ -309,7 +310,7 @@ int main(int argc, char **argv)
       nfs_init_cfg(&cfg);
       if (!path_is_valid(url_file))
       {
-         fprintf(stderr, "FAIL: a stat with the ports set back (%s)\n", nfs_get_last_error());
+         fprintf(stderr, "FAIL: a stat with the ports set back (%s)\n", nfs_get_last_error(error, sizeof(error)));
          failures++;
       }
       nfs_shutdown();

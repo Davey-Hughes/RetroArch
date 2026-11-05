@@ -382,12 +382,12 @@ bool menu_displaylist_nfs_title_path(char *s, size_t len, const char *path)
 static void filebrowser_log_net_failure(const char *path)
 {
    settings_t *settings = config_get_ptr();
-   const char *why      = NULL;
+   char why[256];
 #ifdef HAVE_NFSCLIENT
    if (string_starts_with_size(path, "nfs://", STRLEN_CONST("nfs://")))
    {
       const char *export_p = settings->arrays.nfs_export;
-      why = nfs_get_last_error();
+      nfs_get_last_error(why, sizeof(why));
       RARCH_ERR("[NFS] Cannot list \"%s\" (version %u, port %u, export %s%s%s): %s.\n",
             path,
             settings->uints.nfs_version ? settings->uints.nfs_version : 3,
@@ -401,7 +401,7 @@ static void filebrowser_log_net_failure(const char *path)
    if (string_starts_with_size(path, "smb://", STRLEN_CONST("smb://")))
    {
       unsigned auth = settings->uints.smb_client_auth_mode;
-      why = smb_get_last_error();
+      smb_get_last_error(why, sizeof(why));
       RARCH_ERR("[SMB] Cannot list \"%s\" (server \"%s\", share \"%s\", auth %s): %s.\n",
             path,
             settings->arrays.smb_client_server_address,

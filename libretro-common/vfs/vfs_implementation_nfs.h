@@ -101,7 +101,9 @@ void nfs_shutdown(void);
  * Both are 0 while read-ahead is off. */
 void nfs_take_readahead_stats(unsigned *window_kib, unsigned *direct_kib);
 bool nfs_probe_connection(void);
-const char *nfs_get_last_error(void);
+/* Copies why the last connect, open or opendir failed to @buf and
+ * returns @buf; "" if none has or its slot is busy. */
+const char *nfs_get_last_error(char *buf, size_t len);
 
 RETRO_END_DECLS
 
