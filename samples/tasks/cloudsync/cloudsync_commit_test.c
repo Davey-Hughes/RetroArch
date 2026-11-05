@@ -216,6 +216,19 @@ static const char *walk_files[] = {
    "config/recovery/z - 2026-11-03 10-00-00 - Snes9x - unsaved.srm"
 };
 
+/* The folders those make, deepest first */
+static const char *walk_dirs[] = {
+   "saves/Snes9x/backups",
+   "saves/Snes9x",
+   "saves/backups",
+   "saves",
+   "states/Backups",
+   "states",
+   "config/remaps",
+   "config/recovery",
+   "config"
+};
+
 static bool walk_listed(const task_cloud_sync_state_t *st, const char *key)
 {
    size_t i;
@@ -278,6 +291,13 @@ static void walk_lane(void)
       snprintf(path, sizeof(path), "%s/walk/%s", directory, walk_files[i]);
       filestream_delete(path);
    }
+   for (i = 0; i < sizeof(walk_dirs) / sizeof(walk_dirs[0]); i++)
+   {
+      snprintf(path, sizeof(path), "%s/walk/%s", directory, walk_dirs[i]);
+      CHECK(path_rmdir(path));
+   }
+   snprintf(path, sizeof(path), "%s/walk", directory);
+   CHECK(path_rmdir(path));
 }
 
 int main(void)

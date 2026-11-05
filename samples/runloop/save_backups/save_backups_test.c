@@ -1,7 +1,7 @@
 /* save_backups.c: where safety copies go, how they are named and read
  * back, same-second numbers, the identical-copy skip, retention and
- * the recovery-file chain. Included with its clock and its two writes
- * set here. */
+ * the recovery-file chain. Included with its clock, its time format
+ * and its two writes set here. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +24,17 @@ static struct tm *test_localtime(const time_t *timep, struct tm *result)
    return result;
 }
 
+static bool strftime_fails;
+
+static size_t test_strftime(char *s, size_t max, const char *format,
+      const struct tm *tm)
+{
+   if (!strftime_fails)
+      return strftime(s, max, format, tm);
+   *s = '\0';
+   return 0;
+}
+
 static unsigned plain_writes, synced_writes;
 
 static bool test_write(const char *path, const void *data, int64_t len)
@@ -40,10 +51,12 @@ static bool test_write_synced(const char *path, const void *data,
 }
 
 #define rtime_localtime test_localtime
+#define strftime test_strftime
 #define filestream_write_file_atomic test_write
 #define filestream_write_file_atomic_synced test_write_synced
 #include "../../../save_backups.c"
 #undef rtime_localtime
+#undef strftime
 #undef filestream_write_file_atomic
 #undef filestream_write_file_atomic_synced
 
@@ -157,11 +170,26 @@ static void backup_folders(void)
    CHECK(same_path(s, ROOT "/roms/backups/system"));
 }
 
+/* A system file with no save folder: its copies stay beside it. */
+static void backup_system_fallback(void)
+{
+   save_backups_set_roots(NULL, ROOT "/fstates", NULL, ROOT "/fsystem",
+         NULL, NULL, "Snes9x");
+   set_time(18, 0, 0);
+   put(ROOT "/fsystem/pcsx2/Mcd001.ps2", "card");
+   CHECK(save_backups_copy_file(ROOT "/fsystem/pcsx2/Mcd001.ps2",
+         SAVE_BACKUP_CUT, true) == SAVE_BACKUP_MADE);
+   CHECK(holds(ROOT "/fsystem/pcsx2/backups/"
+         "Mcd001 - 2026-11-03 18-00-00 - Snes9x - cut.ps2", "card"));
+   CHECK(count_files(ROOT "/fsystem/pcsx2/backups") == 1);
+}
+
 static void backup_names(void)
 {
    size_t i, n;
    struct save_backup_name p;
-   char game[400], path[PATH_MAX_LENGTH], dir[PATH_MAX_LENGTH];
+   char game[400];
+   static char path[PATH_MAX_LENGTH], dir[PATH_MAX_LENGTH];
    struct string_list *l;
    roots();
    set_time(10, 0, 0);
@@ -272,6 +300,22 @@ static void backup_names(void)
    snprintf(dir, sizeof(dir), ROOT "/override/backups/%s"
          " - 2026-11-03 10-00-01 - Snes9x - cut.srm", game);
    CHECK(holds(dir, "i"));
+}
+
+/* Every character the core field changes. */
+static void backup_core_chars(void)
+{
+   set_time(17, 0, 0);
+   CHECK(save_backups_copy_to(ROOT "/chars", ROOT "/chars/Game.srm",
+         "a<b>c\"d/e\\f|g?h*i\001j\037k", SAVE_BACKUP_CUT, "1", 1, true)
+         == SAVE_BACKUP_MADE);
+   CHECK(holds(ROOT "/chars/"
+         "Game - 2026-11-03 17-00-00 - a_b_c_d_e_f_g_h_i_j_k - cut.srm", "1"));
+   CHECK(save_backups_copy_to(ROOT "/chars", ROOT "/chars/Game.srm",
+         "", SAVE_BACKUP_CUT, "2", 1, true) == SAVE_BACKUP_MADE);
+   CHECK(holds(ROOT "/chars/"
+         "Game - 2026-11-03 17-00-00-2 - unknown - cut.srm", "2"));
+   CHECK(count_files(ROOT "/chars") == 2);
 }
 
 static void backup_collisions(void)
@@ -394,6 +438,44 @@ static void backup_retention(void)
    CHECK(count_files(dir) == 10 + 10 + 3 + 8);
 }
 
+/* Two names cut to one: a copy may be either file's, so neither's are
+ * pruned. */
+static void backup_retention_cut(void)
+{
+   unsigned k;
+   char text[8], game[160], path[256], name[320];
+   save_backups_set_roots(ROOT "/cut", NULL, NULL, NULL, NULL, NULL, "Snes9x");
+   memset(game, 'x', 150);
+   strcpy(game + 150, "A.srm");
+   snprintf(path, sizeof(path), ROOT "/cut/%s", game);
+   for (k = 0; k < 3; k++)
+   {
+      set_time(16, 0, (int)k);
+      snprintf(text, sizeof(text), "a%u", k);
+      CHECK(save_backups_copy_image(path, SAVE_BACKUP_BEFORE_STATE_LOAD,
+            text, strlen(text), true) == SAVE_BACKUP_MADE);
+   }
+   game[150] = 'B';
+   snprintf(path, sizeof(path), ROOT "/cut/%s", game);
+   for (k = 0; k < 12; k++)
+   {
+      set_time(16, 1, (int)k);
+      snprintf(text, sizeof(text), "b%u", k);
+      CHECK(save_backups_copy_image(path, SAVE_BACKUP_BEFORE_STATE_LOAD,
+            text, strlen(text), true) == SAVE_BACKUP_MADE);
+   }
+   CHECK(count_files(ROOT "/cut/backups") == 3 + 12);
+   game[136] = '\0';
+   for (k = 0; k < 3; k++)
+   {
+      snprintf(name, sizeof(name), ROOT "/cut/backups/%s"
+            " - 2026-11-03 16-00-%02u - Snes9x - before-state-load.srm",
+            game, k);
+      snprintf(text, sizeof(text), "a%u", k);
+      CHECK(holds(name, text));
+   }
+}
+
 static void recovery_chain(void)
 {
    char s[PATH_MAX_LENGTH];
@@ -478,17 +560,39 @@ static void backup_sync(void)
    CHECK(synced_writes == 4 && plain_writes == 4);
 }
 
+/* No copy without its time in its name. */
+static void backup_no_time(void)
+{
+   char s[PATH_MAX_LENGTH];
+   save_backups_set_roots(ROOT "/notime", NULL, NULL, NULL,
+         ROOT "/notime_config", NULL, "Snes9x");
+   set_time(19, 0, 0);
+   strftime_fails = true;
+   CHECK(save_backups_copy_image(ROOT "/notime/Game.srm", SAVE_BACKUP_CUT,
+         "1", 1, true) == SAVE_BACKUP_FAILED);
+   CHECK(!save_backups_recover(s, sizeof(s), ROOT "/notime/Game.srm",
+         "r", 1, true));
+   CHECK(!*s);
+   strftime_fails = false;
+   CHECK(!path_is_valid(ROOT "/notime"));
+   CHECK(!path_is_valid(ROOT "/notime_config"));
+}
+
 int main(void)
 {
    rm_tree(ROOT);
    CHECK(path_mkdir(ROOT));
    backup_folders();
+   backup_system_fallback();
    backup_names();
+   backup_core_chars();
    backup_collisions();
    backup_identical_skip();
    backup_retention();
+   backup_retention_cut();
    recovery_chain();
    backup_sync();
+   backup_no_time();
    save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
    rm_tree(ROOT);
    puts(failures ? "FAIL save_backups_test" : "PASS save_backups_test");

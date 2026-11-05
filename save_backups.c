@@ -408,7 +408,8 @@ static enum save_backup_result save_backups_write_copy(char *s, size_t len,
    memset(&tm_, 0, sizeof(tm_));
    time(&now);
    rtime_localtime(&now, &tm_);
-   strftime(stamp, sizeof(stamp), "%Y-%m-%d %H-%M-%S", &tm_);
+   if (!strftime(stamp, sizeof(stamp), "%Y-%m-%d %H-%M-%S", &tm_))
+      goto end;
 
    if ((list = dir_list_new(dir, NULL, false, true, false, false))
          && list->size)
@@ -475,7 +476,9 @@ static enum save_backup_result save_backups_write_copy(char *s, size_t len,
    }
    result = SAVE_BACKUP_MADE;
 
+   /* A cut name may be another file's too */
    if (     names
+         && game_len == base_len
          && (  reason == SAVE_BACKUP_BEFORE_STATE_LOAD
             || reason == SAVE_BACKUP_CHANGED_ELSEWHERE))
       save_backups_retain(list, names, mine, reason);

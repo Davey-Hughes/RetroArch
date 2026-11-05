@@ -90,7 +90,8 @@ static void reserved_rom_folder(void)
    CHECK(!path_is_directory(ROOT "/saves/Records"));
    CHECK(!path_is_directory(ROOT "/states/backups"));
    CHECK(!path_is_directory(ROOT "/states/Records"));
-   CHECK(!path_is_directory(ROOT "/saves/Snes9x/BACKUPS"));
+   CHECK(!path_is_directory(ROOT "/saves/BACKUPS"));
+   CHECK(!path_is_directory(ROOT "/states/BACKUPS"));
 }
 
 int main(void)
