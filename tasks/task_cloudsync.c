@@ -33,6 +33,7 @@
 #include "../file_path_special.h"
 #include "../network/cloud_sync_driver.h"
 #include "../paths.h"
+#include "../save_backups.h"
 #include "../tasks/tasks_internal.h"
 #include "../verbosity.h"
 #include <compat/strl.h>
@@ -494,7 +495,18 @@ static bool task_cloud_sync_should_ignore_file(const char *filename)
       /* ignore playlist files */
       if (string_starts_with(path, "content_") && string_ends_with(path, FILE_PATH_LPL_EXTENSION))
          return true;
+
+      /* this device's recovery files (save_backups.c) */
+      if (string_starts_with(path, SAVE_BACKUPS_RECOVERY_DIR "/"))
+         return true;
    }
+
+   /* safety copies stay on the device that made them (save_backups.c) */
+   if (     string_starts_with_case_insensitive(filename,
+               "saves/" SAVE_BACKUPS_DIR "/")
+         || string_starts_with_case_insensitive(filename,
+               "states/" SAVE_BACKUPS_DIR "/"))
+      return true;
 
    if (string_ends_with(filename, "/.DS_Store"))
        return true;
@@ -609,6 +621,15 @@ static void task_cloud_sync_walk_step(task_cloud_sync_state_t *sync_state)
 #endif
    if (is_dir)
    {
+      /* a folder the sync ignores is not walked */
+      if (sync_state->walk_depth == 1)
+      {
+         snprintf(CS_WALK_ALT(sync_state), PATH_MAX_LENGTH, "%s/%s/",
+               sync_state->dirlist->elems[sync_state->walk_root_idx].data,
+               name);
+         if (task_cloud_sync_should_ignore_file(CS_WALK_ALT(sync_state)))
+            return;
+      }
       task_cloud_sync_walk_push(sync_state, len);
       return;
    }

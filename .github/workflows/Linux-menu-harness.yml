@@ -29,6 +29,10 @@ on:
       - 'samples/menu/ozone_sublabel_scroll/**'
       - 'gfx/gfx_display.c'
       - 'runloop.c'
+      - 'save_backups.c'
+      - 'save_backups.h'
+      - 'samples/runloop/save_backups/**'
+      - 'samples/runloop/save_paths/**'
       - 'samples/menu/network_settings/**'
       - 'intl/msg_hash_lbl.h'
       - 'msg_hash_lbl_str.h'
@@ -54,6 +58,10 @@ on:
       - 'samples/menu/ozone_sublabel_scroll/**'
       - 'gfx/gfx_display.c'
       - 'runloop.c'
+      - 'save_backups.c'
+      - 'save_backups.h'
+      - 'samples/runloop/save_backups/**'
+      - 'samples/runloop/save_paths/**'
       - 'samples/menu/network_settings/**'
       - 'intl/msg_hash_lbl.h'
       - 'msg_hash_lbl_str.h'
@@ -184,6 +192,28 @@ jobs:
           samples/runloop/cloudsync_unload/build.sh
           ./samples/runloop/cloudsync_unload/cloudsync_unload_test
           make -C samples/runloop/cloudsync_unload clean
+
+      - name: Build and run save_backups_test
+        shell: bash
+        run: |
+          set -eu
+          # save_backups.c: copy folders, names read back, same-second
+          # numbers, the identical-copy skip, retention and the
+          # recovery-file chain, with and without HAVE_THREADS.
+          make -C samples/runloop/save_backups clean check
+          make -C samples/runloop/save_backups clean check SANITIZER=address,undefined
+          make -C samples/runloop/save_backups clean
+
+      - name: Build and run save_paths_test
+        shell: bash
+        run: |
+          set -eu
+          # runloop_path_set_redirect() over a real folder: a ROM folder
+          # named backups or records is not made a folder of the save
+          # and state roots.
+          make -C samples/runloop/save_paths clean check
+          make -C samples/runloop/save_paths clean check SANITIZER=address,undefined
+          make -C samples/runloop/save_paths clean
 
       - name: Build and run menu_playlist_nav_test
         shell: bash
