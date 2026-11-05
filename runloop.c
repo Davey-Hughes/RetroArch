@@ -215,6 +215,7 @@ bool android_get_vfs_authorized_locations(
 #include "msg_hash.h"
 #include "paths.h"
 #include "file_path_special.h"
+#include "save_backups.h"
 #include "ui/ui_companion_driver.h"
 #include "verbosity.h"
 
@@ -11381,9 +11382,18 @@ void runloop_path_set_redirect(settings_t *settings,
     * saves/states are enabled */
    if (     (sort_savefiles_by_content || sort_savestates_by_content)
          && *runloop_st->runtime_content_path_basename)
+   {
       fill_pathname_parent_dir_name(content_dir_name,
             runloop_st->runtime_content_path_basename,
             sizeof(content_dir_name));
+      /* Folder names the save root keeps for itself */
+      if (     string_is_equal_noncase(content_dir_name, SAVE_BACKUPS_DIR)
+            || string_is_equal_noncase(content_dir_name,
+               SAVE_BACKUPS_RECORDS_DIR)
+            || string_is_equal_noncase(content_dir_name,
+               SAVE_BACKUPS_SYSTEM_DIR))
+         content_dir_name[0] = '\0';
+   }
 
    /* Set savefile directory if empty to content directory */
    if (     !*intermediate_savefile_dir
@@ -11427,7 +11437,7 @@ void runloop_path_set_redirect(settings_t *settings,
                && *new_savefile_dir)
          {
             /* Append content directory name to save location */
-            if (sort_savefiles_by_content)
+            if (sort_savefiles_by_content && *content_dir_name)
                fill_pathname_join_special(
                      new_savefile_dir,
                      intermediate_savefile_dir,
@@ -11461,7 +11471,7 @@ void runloop_path_set_redirect(settings_t *settings,
                && *new_savestate_dir)
          {
             /* Append content directory name to savestate location */
-            if (sort_savestates_by_content)
+            if (sort_savestates_by_content && *content_dir_name)
                fill_pathname_join_special(
                      new_savestate_dir,
                      intermediate_savestate_dir,

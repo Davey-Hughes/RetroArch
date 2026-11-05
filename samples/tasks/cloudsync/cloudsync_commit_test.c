@@ -1,6 +1,7 @@
 /* The real cloud-sync task, queued with threaded tasks on and off.
  * Downloads arrive on another thread. Save ownership and file commits
- * must stay on the content thread, including a failed hand-over. */
+ * must stay on the content thread, including a failed hand-over.
+ * The walk leaves out the safety copies and recovery files. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -219,6 +220,99 @@ static void lane(bool threaded, bool deletion, bool owned, bool no_memory,
    filestream_delete(manifest);
 }
 
+static const char *walk_files[] = {
+   "saves/ok.srm",
+   "saves/Snes9x/backups/y.srm",
+   "saves/backups/x.srm",
+   "states/Backups/s.state",
+   "config/remaps/r.rmp",
+   "config/recovery/z - 2026-11-03 10-00-00 - Snes9x - unsaved.srm"
+};
+
+/* The folders those make, deepest first */
+static const char *walk_dirs[] = {
+   "saves/Snes9x/backups",
+   "saves/Snes9x",
+   "saves/backups",
+   "saves",
+   "states/Backups",
+   "states",
+   "config/remaps",
+   "config/recovery",
+   "config"
+};
+
+static bool walk_listed(const task_cloud_sync_state_t *st, const char *key)
+{
+   size_t i;
+   for (i = 0; i < st->current_manifest->size; i++)
+      if (string_is_equal(st->current_manifest->list[i].alt, key))
+         return true;
+   return false;
+}
+
+static void walk_lane(void)
+{
+   static const char *roots[] = { "saves", "states", "config" };
+   retro_task_t *task = task_init();
+   task_cloud_sync_state_t *st = (task_cloud_sync_state_t*)calloc(1, sizeof(*st));
+   union string_list_elem_attr attr;
+   char path[256];
+   unsigned i;
+   attr.i = 0;
+   st->dirlist = string_list_new();
+   for (i = 0; i < 3; i++)
+   {
+      snprintf(path, sizeof(path), "%s/walk/%s", directory, roots[i]);
+      string_list_append(st->dirlist, roots[i], attr);
+      st->dirlist->elems[i].userdata = strdup(path);
+   }
+   for (i = 0; i < sizeof(walk_files) / sizeof(walk_files[0]); i++)
+   {
+      char dir[256];
+      snprintf(path, sizeof(path), "%s/walk/%s", directory, walk_files[i]);
+      fill_pathname_basedir(dir, path, sizeof(dir));
+      CHECK(path_mkdir(dir));
+      CHECK(filestream_write_file(path, "x", 1));
+   }
+   retro_atomic_int_init(&st->waiting, 0);
+   retro_atomic_int_init(&st->phase, CLOUD_SYNC_PHASE_BUILD_CURRENT_MANIFEST);
+   task_cloud_sync_task_setup(task, st, "Cloud Sync");
+   for (i = 0; i < 1000
+         && task_cloud_sync_phase_get(st) == CLOUD_SYNC_PHASE_BUILD_CURRENT_MANIFEST; i++)
+      task_cloud_sync_task_handler(task);
+   CHECK(task_cloud_sync_phase_get(st) == CLOUD_SYNC_PHASE_DIFF);
+   CHECK(st->current_manifest && st->current_manifest->size == 3);
+   if (st->current_manifest)
+   {
+      CHECK(walk_listed(st, "saves/ok.srm"));
+      CHECK(walk_listed(st, "saves/Snes9x/backups/y.srm"));
+      CHECK(walk_listed(st, "config/remaps/r.rmp"));
+   }
+   /* nor fetched, uploaded or deleted from the server */
+   CHECK(task_cloud_sync_should_ignore_file("saves/backups/x.srm"));
+   CHECK(task_cloud_sync_should_ignore_file("states/BACKUPS/s.state"));
+   CHECK(task_cloud_sync_should_ignore_file("config/recovery/z.srm"));
+   CHECK(!task_cloud_sync_should_ignore_file("saves/Snes9x/backups/y.srm"));
+   CHECK(!task_cloud_sync_should_ignore_file("saves/backupsx/a.srm"));
+   CHECK(!task_cloud_sync_should_ignore_file("system/backups/a.bin"));
+   task_cloud_sync_cleanup(task);
+   free(task->title);
+   free(task);
+   for (i = 0; i < sizeof(walk_files) / sizeof(walk_files[0]); i++)
+   {
+      snprintf(path, sizeof(path), "%s/walk/%s", directory, walk_files[i]);
+      filestream_delete(path);
+   }
+   for (i = 0; i < sizeof(walk_dirs) / sizeof(walk_dirs[0]); i++)
+   {
+      snprintf(path, sizeof(path), "%s/walk/%s", directory, walk_dirs[i]);
+      CHECK(path_rmdir(path));
+   }
+   snprintf(path, sizeof(path), "%s/walk", directory);
+   CHECK(path_rmdir(path));
+}
+
 int main(void)
 {
    unsigned t;
@@ -248,6 +342,7 @@ int main(void)
       lane(t != 0, true, false, false, false);
       across_volumes = 0;
    }
+   walk_lane();
    puts(failures ? "FAIL cloudsync_commit_test" : "PASS cloudsync_commit_test");
    return failures ? 1 : 0;
 }
