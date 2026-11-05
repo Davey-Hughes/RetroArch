@@ -11,6 +11,7 @@ on:
       - '!libretro-common/samples/**'
       - '!.github/workflows/*.yml'
       - 'libretro-common/samples/encodings/rbzip2/**'
+      - 'libretro-common/samples/sample_objdir.mk'
       - 'samples/menu/dirwalk/**'
       - 'samples/playlist/playlist_parity_test.c'
       - 'samples/tasks/autodetect_handoff/**'
@@ -45,6 +46,7 @@ on:
       - 'samples/tasks/watchdog/**'
       - 'samples/tasks/wifi_tasks/**'
       - 'samples/playlist/**'
+      - 'samples/sample_objdir.mk'
       - 'samples/ui_companion_log_stub.c'
       - '.github/workflows/Linux-samples-tasks.yml'
     # ci_paths: end
@@ -58,6 +60,7 @@ on:
       - '!libretro-common/samples/**'
       - '!.github/workflows/*.yml'
       - 'libretro-common/samples/encodings/rbzip2/**'
+      - 'libretro-common/samples/sample_objdir.mk'
       - 'samples/menu/dirwalk/**'
       - 'samples/playlist/playlist_parity_test.c'
       - 'samples/tasks/autodetect_handoff/**'
@@ -92,6 +95,7 @@ on:
       - 'samples/tasks/watchdog/**'
       - 'samples/tasks/wifi_tasks/**'
       - 'samples/playlist/**'
+      - 'samples/sample_objdir.mk'
       - 'samples/ui_companion_log_stub.c'
       - '.github/workflows/Linux-samples-tasks.yml'
     # ci_paths: end

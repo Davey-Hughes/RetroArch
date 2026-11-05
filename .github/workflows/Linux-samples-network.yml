@@ -19,6 +19,7 @@ on:
       - 'samples/network/webdav_backup/**'
       - 'samples/network/webdav_options/**'
       - 'samples/network/webdav_reauth/**'
+      - 'samples/sample_objdir.mk'
       - '.github/workflows/Linux-samples-network.yml'
     # ci_paths: end
   pull_request:
@@ -39,6 +40,7 @@ on:
       - 'samples/network/webdav_backup/**'
       - 'samples/network/webdav_options/**'
       - 'samples/network/webdav_reauth/**'
+      - 'samples/sample_objdir.mk'
       - '.github/workflows/Linux-samples-network.yml'
     # ci_paths: end
   workflow_dispatch:

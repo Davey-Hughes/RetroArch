@@ -1443,7 +1443,7 @@ def clean_copy():
 SRC_EXT = ('.c', '.cpp', '.cc', '.cxx', '.m', '.mm', '.h', '.hpp', '.S', '.s',
            '.glsl', '.slang', '.inc', '.def')
 _PATHISH = re.compile(r'[A-Za-z0-9_.$(){}/+-]*[A-Za-z0-9_]/[A-Za-z0-9_.$(){}/+-]*'
-                      r'|[A-Za-z0-9_+-]+\.(?:c|cpp|cc|m|mm|h|py|sh|mk|list|ref)\b')
+                      r'|(?:\.\.?/)*[A-Za-z0-9_+-]+\.(?:c|cpp|cc|m|mm|h|py|sh|mk|list|ref)\b')
 _TREE_BUILD = re.compile(r'(?:^|[\s;&|(])(?:\./configure|\./bootstrap'
                          r'|make\b[^\n]*-f\s*Makefile\.[\w.]+|griffin'
                          r'|msbuild|cmake\b|xcodebuild|qb/)', re.M)
