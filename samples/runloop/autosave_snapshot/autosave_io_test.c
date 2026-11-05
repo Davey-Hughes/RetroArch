@@ -66,8 +66,12 @@ bool fill_pathname_application_data(char *s, size_t len)
    return false;
 }
 
+static unsigned finish_synced;
+
 bool content_finish_tmp(const char *path, bool ok, bool sync)
 {
+   if (sync)
+      finish_synced++;
    return (sync
          ? filestream_finish_atomic_synced(path, ok)
          : filestream_finish_atomic(path, ok)) == 0;
@@ -325,6 +329,45 @@ static void lane_close_unchanged(void)
    clean();
 }
 
+/* Bytes an unsynced write left are written again by a synced request,
+ * then skipped; an unsynced request skips them. */
+static void lane_close_sync(void)
+{
+   static unsigned char disk[BIG], ram[BIG];
+   unsigned c, before, synced;
+
+   for (c = 0; c < 2; c++)
+   {
+      clean();
+      fill(disk, BIG, 8);
+      fill(ram, BIG, 9);
+      put(SAVE, disk, BIG);
+      core_data = ram;
+      core_size = BIG;
+      path_init_savefile_new();
+      path_init_savefile_rtc(SAVE);
+      use_test_vfs(true);
+      event_save_files(true, c != 0, false, NULL);
+      before = get_write_opens();
+      event_save_files(true, c != 0, false, NULL);
+      CHECK(get_write_opens() == before,
+            "close_sync: an unsynced request rewrote matching bytes");
+      synced = finish_synced;
+      event_save_files(true, c != 0, true, NULL);
+      CHECK(get_write_opens() > before,
+            "close_sync: a synced request skipped unsynced bytes");
+      CHECK(!c || finish_synced > synced,
+            "close_sync: the rewrite was not synced");
+      before = get_write_opens();
+      event_save_files(true, c != 0, true, NULL);
+      CHECK(get_write_opens() == before,
+            "close_sync: synced bytes were written again");
+      use_test_vfs(false);
+      path_deinit_savefile();
+   }
+   clean();
+}
+
 #ifdef HAVE_THREADS
 static unsigned joins;
 
@@ -545,6 +588,7 @@ int main(void)
 #endif
    lane_close_full_disk();
    lane_close_unchanged();
+   lane_close_sync();
 #ifdef HAVE_THREADS
    lane_autosave_full_disk();
    lane_no_rewrite_at_launch();

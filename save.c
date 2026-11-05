@@ -55,6 +55,9 @@ struct ram_type
 };
 
 static struct string_list *task_save_files = NULL;
+/* An unsynced write may have left bytes the disk does not hold yet: a
+ * synced request writes them again even when they match. */
+static bool save_files_unsynced = false;
 
 #ifdef HAVE_THREADS
 /* The worker's own temporary: a SAVE_FILES on the main thread uses
@@ -595,12 +598,14 @@ static bool dump_to_file_desperate(const void *data,
  * @slot             : index into task_save_files
  * @compress         : whether to use rzip compression
  * @sync             : whether to wait for the disk before replacing
+ * @rewrite          : write even if the file matches memory
  *
  * Save a RAM state from memory to disk.
  * Skips the write if the on-disk content already
  * matches memory (common when autosave has been active).
  */
-static bool content_save_ram_file(unsigned slot, bool compress, bool sync)
+static bool content_save_ram_file(unsigned slot, bool compress, bool sync,
+      bool rewrite)
 {
    struct ram_type ram;
    retro_ctx_memory_info_t mem_info;
@@ -612,6 +617,7 @@ static bool content_save_ram_file(unsigned slot, bool compress, bool sync)
     * current memory contents, skip the write entirely.
     * This is the common case when autosave has been running. */
    if (   ram.path && *ram.path
+       && !rewrite
        &&  path_is_valid(ram.path))
    {
       /* Compared in place rather than slurped, in both lanes.  The
@@ -642,6 +648,9 @@ static bool content_save_ram_file(unsigned slot, bool compress, bool sync)
          return true;
       }
    }
+
+   if (!sync)
+      save_files_unsynced = true;
 
    RARCH_LOG("[SRAM] %s #%u %s \"%s\".\n",
          msg_hash_to_str(MSG_SAVING_RAM_TYPE),
@@ -678,6 +687,8 @@ static bool content_save_ram_file(unsigned slot, bool compress, bool sync)
    return true;
 
 fail:
+   if (rewrite)
+      save_files_unsynced = true;
    RARCH_ERR("[SRAM] %s.\n",
          msg_hash_to_str(MSG_FAILED_TO_SAVE_SRAM));
    RARCH_WARN("[SRAM] Attempting to recover...\n");
@@ -695,14 +706,17 @@ bool event_save_files(bool is_sram_used, bool compress_files, bool sync,
       const char *path_cheat_database)
 {
    unsigned i;
-   bool ret = true;
+   bool ret     = true;
+   bool rewrite = sync && save_files_unsynced;
 #ifdef HAVE_CHEATS
    cheat_manager_save_game_specific_cheats(path_cheat_database);
 #endif
    if (!task_save_files || !is_sram_used)
       return false;
+   if (sync)
+      save_files_unsynced = false;
    for (i = 0; i < task_save_files->size; i++)
-      if (!content_save_ram_file(i, compress_files, sync))
+      if (!content_save_ram_file(i, compress_files, sync, rewrite))
          ret = false;
    return ret;
 }
