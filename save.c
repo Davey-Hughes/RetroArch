@@ -375,12 +375,12 @@ static void autosave_replace(unsigned i,
       const retro_ctx_memory_info_t *mem_info)
 {
    autosave_t *old    = autosave_state.list[i];
-   size_t      len    = old->bufsize < mem_info->size
-      ? old->bufsize : mem_info->size;
    /* The old worker waits for a copy or has ended: what it had not
-    * written goes to the new one. */
+    * written goes to the new one.  A new size is a change too: some
+    * cores report only the extent in use. */
    bool    unwritten  = old->unwritten
-      || memcmp(old->buffer, mem_info->data, len) != 0;
+      || old->bufsize != mem_info->size
+      || memcmp(old->buffer, mem_info->data, old->bufsize) != 0;
    autosave_t *handle = autosave_new(old->path, mem_info->data,
          mem_info->size, old->interval, old->compress, old->type,
          unwritten);

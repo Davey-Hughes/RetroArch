@@ -636,7 +636,7 @@ static void lane_pointer_requery(void)
    CHECK(joins == 0, "requery: autosave_check joined a thread");
    wait_requested();
    capture_and_wait();
-   CHECK(holds(SAVE, b, sizeof(b)), "requery: an unchanged resize was written");
+   CHECK(holds(SAVE, c, sizeof(c)), "requery: a resize was not written");
    memset(c, 4, sizeof(c));
    capture_and_wait();
    CHECK(holds(SAVE, c, sizeof(c)), "requery: the new size was not written");
@@ -708,6 +708,69 @@ static void lane_resize_unwritten(void)
    wait_requested();
    capture_and_wait();
    CHECK(holds(SAVE, e, sizeof(e)), "resize: a retry was dropped");
+
+   stop();
+   use_test_vfs(false);
+   clean();
+}
+
+/* A core that reports the extent in use grows it on an append and
+ * shrinks it on an erase, the bytes before it unchanged: both are
+ * written.  Memory back at its old size and bytes is not. */
+static void lane_resize_extent(void)
+{
+   static unsigned char ram[256];
+   unsigned before;
+
+   clean();
+   memset(ram, 0xFF, sizeof(ram));
+   fill(ram, 128, 8);
+   put(SAVE, ram, 128);
+   use_test_vfs(true);
+   start(ram, 128, false);
+
+   fill(ram + 128, 64, 9);
+   core_size = 192;
+   autosave_lock();
+   autosave_unlock();
+   wait_requested();
+   capture_and_wait();
+   CHECK(holds(SAVE, ram, 192), "extent: a grow was not written");
+
+   memset(ram + 64, 0xFF, 128);
+   core_size = 64;
+   autosave_lock();
+   autosave_unlock();
+   wait_requested();
+   capture_and_wait();
+   CHECK(holds(SAVE, ram, 64), "extent: a shrink was not written");
+
+   core_data = NULL;
+   core_size = 0;
+   autosave_lock();
+   autosave_unlock();
+   fill(ram + 64, 32, 10);
+   core_data = ram;
+   core_size = 96;
+   autosave_lock();
+   autosave_unlock();
+   wait_requested();
+   capture_and_wait();
+   CHECK(holds(SAVE, ram, 96), "extent: a new size after a gap was not written");
+
+   core_data = NULL;
+   core_size = 0;
+   autosave_lock();
+   autosave_unlock();
+   core_data = ram;
+   core_size = 96;
+   before    = get_write_opens();
+   autosave_lock();
+   autosave_unlock();
+   wait_requested();
+   capture_and_wait();
+   CHECK(get_write_opens() == before, "extent: an unchanged return was written");
+   CHECK(holds(SAVE, ram, 96), "extent: an unchanged return changed the save");
 
    stop();
    use_test_vfs(false);
@@ -869,6 +932,7 @@ int main(void)
    lane_no_rewrite_at_launch();
    lane_pointer_requery();
    lane_resize_unwritten();
+   lane_resize_extent();
    lane_retire_bounded();
    lane_no_join_running();
    lane_create_retry();
