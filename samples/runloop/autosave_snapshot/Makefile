@@ -37,7 +37,7 @@ BASE_CFLAGS := $(CFLAGS) -std=gnu89 -Wall -g -O1 \
           -ffunction-sections -fdata-sections \
           -I$(ROOT) -I$(ROOT)/libretro-common/include
 CFLAGS := $(BASE_CFLAGS) -Wextra -DHAVE_THREADS
-IO_CFLAGS := $(BASE_CFLAGS) -DHAVE_COMPRESSION
+IO_CFLAGS := $(BASE_CFLAGS) -Wextra -DHAVE_COMPRESSION
 LDFLAGS += -Wl,--gc-sections
 LDLIBS += -lpthread
 
