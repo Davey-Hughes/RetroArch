@@ -45,10 +45,15 @@ BOOL WINAPI test_flush_file_buffers(HANDLE h);
 #define FlushFileBuffers test_flush_file_buffers
 #else
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 int test_fsync(int fd);
 #define fsync     test_fsync
 #define fdatasync test_fsync
+#if defined(F_BARRIERFSYNC)
+int test_fcntl(int fd, int cmd);
+#define fcntl     test_fcntl
+#endif
 #endif
 
 #include <compat/fopen_utf8.h>
@@ -60,6 +65,7 @@ void *test_fopen_utf8(const char *filename, const char *mode);
 #undef FlushFileBuffers
 #undef fsync
 #undef fdatasync
+#undef fcntl
 
 #include <boolean.h>
 #include <libretro.h>
@@ -110,6 +116,15 @@ int test_fsync(int fd)
       file_syncs++;
    return fsync(fd);
 }
+
+#if defined(F_BARRIERFSYNC)
+int test_fcntl(int fd, int cmd)
+{
+   if (cmd == F_BARRIERFSYNC)
+      return test_fsync(fd);
+   return fcntl(fd, cmd);
+}
+#endif
 #endif
 
 #define CHECK(cond, msg) \
