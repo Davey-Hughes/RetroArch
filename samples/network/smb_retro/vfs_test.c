@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <retro_timers.h>
+#include <time.h>
 #include <net/net_compat.h>
 #include <vfs/vfs.h>
 #include <vfs/vfs_implementation.h>
@@ -31,7 +32,7 @@ static int expect_failure(struct smb_settings *cfg, const char *share,
    if (!smb_init_cfg(cfg))
       return 1;
    snprintf(url, sizeof(url), "smb://%s/%s", cfg->server_address, share);
-   if (retro_vfs_stat_smb(url, NULL) != 0)
+   if (retro_vfs_stat_smb(url, NULL, NULL) != 0)
    {
       fprintf(stderr, "FAIL: %s was reached\n", url);
       return 1;
@@ -48,13 +49,13 @@ static int expect_failure(struct smb_settings *cfg, const char *share,
       return 0;
    for (tries = atoi(getenv("SMB_WAIT_OK")) * 5; tries > 0; tries--)
    {
-      if (retro_vfs_stat_smb(url, NULL) != 0)
+      if (retro_vfs_stat_smb(url, NULL, NULL) != 0)
          break;
       retro_sleep(200);
    }
    snprintf(missing, sizeof(missing), "%s/rsmb_missing.bin", url);
    if (!tries || smb_url_failure(url) != SMB_FAILURE_CONNECTED
-         || retro_vfs_stat_smb(missing, NULL) != 0
+         || retro_vfs_stat_smb(missing, NULL, NULL) != 0
          || smb_url_failure(missing) != SMB_FAILURE_CONNECTED)
    {
       fprintf(stderr, "FAIL: %s: %s after the server came back, want connected\n",
@@ -173,7 +174,9 @@ int main(int argc, char **argv)
    struct smbc_dirent *ent;
    char url[512];
    uint8_t buf[4096];
-   int64_t size = 0;
+   int64_t size  = 0;
+   int64_t mtime = 0;
+   time_t now;
    int found = 0;
    int i;
 
@@ -205,9 +208,16 @@ int main(int argc, char **argv)
       fprintf(stderr, "FAIL: a code before any connect\n");
       return 1;
    }
-   if (retro_vfs_stat_smb(url, &size) == 0 || size != 200000)
+   now = time(NULL);
+   if (retro_vfs_stat_smb(url, &size, &mtime) == 0 || size != 200000)
    {
       fprintf(stderr, "FAIL: stat (%lld)\n", (long long)size);
+      return 1;
+   }
+   if (mtime < (int64_t)now - 300 || mtime > (int64_t)now + 300)
+   {
+      fprintf(stderr, "FAIL: mtime %lld, now %lld\n",
+            (long long)mtime, (long long)now);
       return 1;
    }
    if (smb_url_failure(url) != SMB_FAILURE_CONNECTED)
@@ -260,7 +270,7 @@ int main(int argc, char **argv)
       }
    snprintf(url, sizeof(url), "smb://%s/%s/rsmb_missing.bin", argv[1], argv[2]);
    memset(&stream, 0, sizeof(stream));
-   if (     retro_vfs_stat_smb(url, NULL) != 0
+   if (     retro_vfs_stat_smb(url, NULL, NULL) != 0
          || retro_vfs_file_open_smb(&stream, url, RETRO_VFS_FILE_ACCESS_READ, 0)
          || retro_vfs_opendir_smb(url, false))
    {

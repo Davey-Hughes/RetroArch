@@ -1302,8 +1302,7 @@ int retro_vfs_dirent_stat_impl(libretro_vfs_implementation_dir* rdir,
        if (!name)
           return 0;
        fill_pathname_join_special(full, rdir->orig_path, name, sizeof(full));
-       /* The SMB stat helper carries no mtime. */
-       return retro_vfs_stat_smb(full, size);
+       return retro_vfs_stat_smb(full, size, mtime);
     }
 #endif
     /* All of it is already in the find data: no I/O. */

@@ -37,6 +37,7 @@ static jmethodID vfs_saf_saf_stat_init_method;
 static jmethodID vfs_saf_saf_stat_get_is_open_method;
 static jmethodID vfs_saf_saf_stat_get_is_directory_method;
 static jmethodID vfs_saf_saf_stat_get_size_method;
+static jmethodID vfs_saf_saf_stat_get_last_modified_method;
 static jmethodID vfs_saf_mkdir_saf_method;
 static jclass vfs_saf_saf_directory_class;
 static jmethodID vfs_saf_saf_directory_init_method;
@@ -147,6 +148,9 @@ bool retro_vfs_init_saf(JNIEnv *(*get_jni_env)(void), jobject activity_object)
    if ((*env)->ExceptionOccurred(env)) goto error;
 
    vfs_saf_saf_stat_get_size_method = (*env)->GetMethodID(env, vfs_saf_saf_stat_class, "getSize", "()J");
+   if ((*env)->ExceptionOccurred(env)) goto error;
+
+   vfs_saf_saf_stat_get_last_modified_method = (*env)->GetMethodID(env, vfs_saf_saf_stat_class, "getLastModified", "()J");
    if ((*env)->ExceptionOccurred(env)) goto error;
 
    vfs_saf_mkdir_saf_method = (*env)->GetStaticMethodID(env, vfs_saf_vfs_implementation_saf_class, "mkdirSaf", "(Landroid/content/ContentResolver;Ljava/lang/String;Ljava/lang/String;)I");
@@ -674,13 +678,14 @@ error:
    return -1;
 }
 
-int retro_vfs_stat_saf(const char *tree, const char *path, int64_t *size)
+int retro_vfs_stat_saf(const char *tree, const char *path, int64_t *size, int64_t *mtime)
 {
    JNIEnv *env;
    jstring tree_object;
    jstring path_object;
    jobject saf_stat;
    int64_t saf_stat_size;
+   int64_t saf_stat_mtime;
    bool saf_stat_is_directory;
 
    if (vfs_saf_get_jni_env == NULL)
@@ -729,6 +734,15 @@ int retro_vfs_stat_saf(const char *tree, const char *path, int64_t *size)
 
    saf_stat_is_directory = (*env)->CallBooleanMethod(env, saf_stat, vfs_saf_saf_stat_get_is_directory_method);
    if ((*env)->ExceptionOccurred(env)) goto error;
+
+   if (mtime != NULL)
+   {
+      /* milliseconds; 0 when the provider has none */
+      saf_stat_mtime = (*env)->CallLongMethod(env, saf_stat, vfs_saf_saf_stat_get_last_modified_method);
+      if ((*env)->ExceptionOccurred(env)) goto error;
+      if (saf_stat_mtime > 0)
+         *mtime = saf_stat_mtime / 1000;
+   }
 
    if (size != NULL)
       *size = saf_stat_size > INT64_MAX ? INT64_MAX : (int64_t)saf_stat_size;

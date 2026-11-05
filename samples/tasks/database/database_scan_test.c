@@ -341,10 +341,11 @@ static bool               smb_stub_live;
 static retro_atomic_int_t smb_stub_stats_main;
 static retro_atomic_int_t smb_stats_at_push;
 
-int retro_vfs_stat_smb(const char *path, int64_t *size)
+int retro_vfs_stat_smb(const char *path, int64_t *size, int64_t *mtime)
 {
    size_t n = strlen(path);
 
+   (void)mtime;
    if (size)
       *size = 0;
    if (task_is_on_main_thread())
