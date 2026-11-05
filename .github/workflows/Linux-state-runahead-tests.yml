@@ -13,6 +13,8 @@ on:
       - state_manager.h
       - runahead.c
       - runahead.h
+      - save_items.c
+      - save_items.h
       - runloop.h
       - samples/state_rewind/**
       - samples/runahead/**
@@ -27,6 +29,8 @@ on:
       - state_manager.h
       - runahead.c
       - runahead.h
+      - save_items.c
+      - save_items.h
       - runloop.h
       - samples/state_rewind/**
       - samples/runahead/**

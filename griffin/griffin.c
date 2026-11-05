@@ -1830,6 +1830,7 @@ DATA RUNLOOP
 #endif
 #endif
 #include "../save.c"
+#include "../save_items.c"
 #include "../tasks/task_save.c"
 #if defined(HAVE_KEYCHAIN) && defined(HAVE_CRYPTO) && defined(HAVE_CONFIGFILE)
 #include "../tasks/task_keychain.c"

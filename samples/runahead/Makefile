@@ -46,7 +46,7 @@ endif
 
 OBJS := $(call sample_objs,$(SOURCES_C:.c=.o))
 
-all: $(TARGET) runahead_tmpdir_test
+all: $(TARGET) runahead_tmpdir_test runahead_secondary_env_test
 
 runahead_copy_fragment.c: $(CORE_DIR)/runahead.c
 	sed -n '/===== BEGIN runahead core-copy fragment =====/,/===== END runahead core-copy fragment =====/p' $< > $@
@@ -66,6 +66,20 @@ runahead_tmpdir_fragment.c: $(CORE_DIR)/runahead.c
 runahead_tmpdir_test: runahead_tmpdir_test.c runahead_tmpdir_fragment.c
 	$(CC) $(CFLAGS) $(flags) -o $@ runahead_tmpdir_test.c $(LDFLAGS)
 
+# The second instance's environment hook, against the real save_items.c
+runahead_secondary_env_fragment.c: $(CORE_DIR)/runahead.c
+	sed -n '/===== BEGIN runahead secondary environment hook =====/,/===== END runahead secondary environment hook =====/p' $< > $@
+SAVE_ITEMS_SOURCES := \
+	$(CORE_DIR)/save_items.c \
+	$(LIBRETRO_COMM_DIR)/file/file_path.c \
+	$(LIBRETRO_COMM_DIR)/lists/string_list.c \
+	$(LIBRETRO_COMM_DIR)/compat/compat_strl.c \
+	$(LIBRETRO_COMM_DIR)/compat/compat_posix_string.c \
+	$(LIBRETRO_COMM_DIR)/encodings/encoding_utf.c \
+	$(LIBRETRO_COMM_DIR)/time/rtime.c
+runahead_secondary_env_test: runahead_secondary_env_test.c runahead_secondary_env_fragment.c $(SAVE_ITEMS_SOURCES) $(CORE_DIR)/save_items.h
+	$(CC) $(INCDIRS) $(CFLAGS) $(flags) -o $@ runahead_secondary_env_test.c $(SAVE_ITEMS_SOURCES) $(LDFLAGS)
+
 preempt_slab_fragment.c: $(CORE_DIR)/runahead.c
 	sed -n '/===== BEGIN preempt slab =====/,/===== END preempt slab =====/p' $< > $@
 
@@ -81,13 +95,14 @@ $(SAMPLE_OBJDIR)/%.o: $$(call sample_src,$$*).c
 $(TARGET): $(OBJS)
 	$(CC) -o$@ $(OBJS) $(LDFLAGS)
 
-check: $(TARGET) runahead_tmpdir_test
+check: $(TARGET) runahead_tmpdir_test runahead_secondary_env_test
 	./$(TARGET)
 	./runahead_tmpdir_test
+	./runahead_secondary_env_test
 
 clean:
 	rm -rf $(SAMPLE_OBJDIR)
-	rm -f $(OBJS) runahead_copy_fragment.c preempt_mask_fragment.c dense_cache_fragment.c preempt_slab_fragment.c input_list_fragment.c runahead_tmpdir_fragment.c
-	rm -f $(TARGET) runahead_tmpdir_test
+	rm -f $(OBJS) runahead_copy_fragment.c preempt_mask_fragment.c dense_cache_fragment.c preempt_slab_fragment.c input_list_fragment.c runahead_tmpdir_fragment.c runahead_secondary_env_fragment.c
+	rm -f $(TARGET) runahead_tmpdir_test runahead_secondary_env_test
 
 .PHONY: clean all check

@@ -63,19 +63,33 @@
  * path_deinit_savefile() frees once save RAM has been written out. */
 static struct string_list *task_save_files = NULL;
 
+/* No core registers save items here. */
+static bool save_items_path_is_live(const char *path)
+{
+   (void)path;
+   return false;
+}
+
+static bool save_item_write_pending(const char *path)
+{
+   (void)path;
+   return false;
+}
+
 /* Verbatim copy of save.c::content_savefile_is_live(). */
 static bool content_savefile_is_live(const char *path)
 {
    size_t i;
 
-   if (!task_save_files || string_is_empty(path))
+   if (string_is_empty(path))
       return false;
 
-   for (i = 0; i < task_save_files->size; i++)
-      if (string_is_equal_noncase(task_save_files->elems[i].data, path))
-         return true;
+   if (task_save_files)
+      for (i = 0; i < task_save_files->size; i++)
+         if (string_is_equal_noncase(task_save_files->elems[i].data, path))
+            return true;
 
-   return false;
+   return save_items_path_is_live(path) || save_item_write_pending(path);
 }
 
 static int failures = 0;

@@ -33594,6 +33594,50 @@ MSG_HASH(
    "Blocking SRAM Overwrite"
    )
 MSG_HASH(
+   MSG_SAVE_ITEM_FILE_REFUSED,
+   "The core could not read \"%s\". It is kept as it is."
+   )
+MSG_HASH(
+   MSG_SAVE_ITEM_FILE_RECOVERED,
+   "\"%s\" was kept as it is; this game's save went to \"%s\"."
+   )
+MSG_HASH(
+   MSG_SAVE_RAM_CUT,
+   "\"%s\" is longer than this core's save memory; saving will cut it."
+   )
+MSG_HASH(
+   MSG_SAVE_RAM_CUT_COPIED,
+   "\"%s\" is longer than this core's save memory; a copy is kept in \"%s\"."
+   )
+MSG_HASH(
+   MSG_SAVE_ITEM_LEGACY_SIZE,
+   "Loaded the older save \"%s\"; its size differs, so check the game's save."
+   )
+MSG_HASH(
+   MSG_SAVE_ITEM_LEGACY_NEWER,
+   "The older save \"%s\" is newer than this one."
+   )
+MSG_HASH(
+   MSG_SAVE_ITEM_LEGACY_REFUSED,
+   "The core could not convert \"%s\"; it is kept as it was."
+   )
+MSG_HASH(
+   MSG_SAVE_ITEM_TYPE_CHANGED,
+   "The save type of \"%s\" changed; a copy is kept in \"%s\"."
+   )
+MSG_HASH(
+   MSG_SAVE_ITEMS_REFUSED,
+   "The core's save setup was refused; its saves may not be written."
+   )
+MSG_HASH(
+   MSG_SAVE_ITEM_LEFT_OUT,
+   "The core's save \"%s\" could not be set up and is not being saved."
+   )
+MSG_HASH(
+   MSG_SAVE_ITEMS_DETAILS_IN_LOG,
+   "Details are in the log."
+   )
+MSG_HASH(
    MSG_STARTING_MOVIE_PLAYBACK,
    "Starting movie playback."
    )

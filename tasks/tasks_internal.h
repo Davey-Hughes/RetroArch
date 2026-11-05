@@ -529,6 +529,30 @@ bool content_savefile_is_live(const char *path);
 bool event_save_files(bool sram_used, bool compress_files,
       const char *path_cheat_database);
 
+/* After a save_items_register() that registered a set or ended one,
+ * before save_items_drop_previous(). */
+void event_save_items_registered(void);
+
+/* Before the core runs again: fills the items a registration added or
+ * moved since the last fill. */
+void event_save_items_fill(bool is_sram_load_disabled);
+
+/* After a frame in which the core's retro_run() ran, at its frame
+ * rate. */
+void event_save_items_ran(double fps);
+
+void event_save_items_deinit(void);
+
+/* At the close, after its SAVE_FILES and before retro_unload_game(). */
+void event_save_items_join(void);
+
+/* After retro_unload_game(), before save_items_clear(). */
+void event_save_items_final(bool is_sram_used, bool compress_files);
+
+/* Once per content load, before its save files are read: where the
+ * safety copies go; NULL or empty for none. */
+void event_save_items_set_undo_dir(const char *dir);
+
 void path_init_savefile_rtc(const char *savefile_path);
 
 void *savefile_ptr_get(void);

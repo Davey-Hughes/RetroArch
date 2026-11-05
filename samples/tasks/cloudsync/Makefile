@@ -9,7 +9,8 @@
 #    (tasks/task_cloudsync.c, #included by the test).
 #  - cloudsync_pacing_test: the diff runs as much as the shared
 #    per-frame I/O window grants, hashing large files a chunk at a time
-#    (tasks/task_cloudsync.c, #included by the test).
+#    (tasks/task_cloudsync.c, #included by the test), and a core's save
+#    items sync through the walk and the diff (save_items.c).
 #  - cloudsync_async_test: a blocking driver's calls run on a worker
 #    and complete through cloud_sync_poll() on the caller's thread
 #    (network/cloud_sync_driver.c).
@@ -117,8 +118,8 @@ $(PATH_TARGET): $(PATH_OBJS)
 $(ADDS_TARGET): $(ADDS_SOURCES) $(CORE_DIR)/tasks/task_cloudsync.c
 	$(CC) -o $@ $(ADDS_SOURCES) $(filter-out -pedantic,$(CFLAGS)) $(ADDS_DEFS) $(LDFLAGS) -lpthread
 
-$(PACING_TARGET): cloudsync_pacing_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(CORE_DIR)/tasks/task_cloudsync.c
-	$(CC) -o $@ cloudsync_pacing_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(filter-out -pedantic,$(CFLAGS)) $(ADDS_DEFS) $(LDFLAGS) -lpthread
+$(PACING_TARGET): cloudsync_pacing_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(CORE_DIR)/tasks/task_cloudsync.c $(CORE_DIR)/save_items.c
+	$(CC) -o $@ cloudsync_pacing_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(CORE_DIR)/save_items.c $(filter-out -pedantic,$(CFLAGS)) $(ADDS_DEFS) $(LDFLAGS) -lpthread
 
 $(ASYNC_TARGET): $(ASYNC_SOURCES) $(CORE_DIR)/network/cloud_sync_driver.h
 	$(CC) -o $@ $(ASYNC_SOURCES) $(filter-out -pedantic,$(CFLAGS)) $(ASYNC_DEFS) $(LDFLAGS) -lpthread

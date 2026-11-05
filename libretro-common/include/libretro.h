@@ -3613,6 +3613,201 @@ struct retro_hw_render_upscaler_interface
    void (*set_inputs)(void *handle, const struct retro_hw_upscaler_inputs *inputs);
 };
 
+/**
+ * Fills a frontend-provided interface for save items and negotiates which
+ * storage kinds, item flags and features the frontend supports.
+ *
+ * A core that wants to declare its saves calls this first, with
+ * \c interface_version set to the lowest version it can use and the mask
+ * fields set to what it intends to use. The frontend writes back the version
+ * it provides and clears every mask bit it does not support. The core then
+ * registers only items whose storage kind survived, and keeps writing every
+ * other save exactly as it does today.
+ *
+ * A false return means the frontend does not implement this interface, or
+ * offers no version the core can use: the core changes nothing. Old cores
+ * never call it, so a frontend's \c RETRO_MEMORY_SAVE_RAM and
+ * \c RETRO_MEMORY_RTC handling is untouched for them.
+ *
+ * Should be called from \c retro_load_game, after the core knows its content.
+ *
+ * @param[in,out] data <tt>struct retro_save_frontend_interface *</tt>.
+ * May be \c NULL, which only probes availability.
+ * @return \c true if the interface is available (even when \c data is
+ * \c NULL), \c false if the core asked for a version newer than the frontend
+ * provides or the interface is unsupported.
+ * @see RETRO_ENVIRONMENT_SET_SAVE_INTERFACE
+ * @see retro_save_frontend_interface
+ */
+#define RETRO_ENVIRONMENT_GET_SAVE_FRONTEND_INTERFACE (104 | RETRO_ENVIRONMENT_EXPERIMENTAL)
+
+/**
+ * Registers the core's complete set of save items.
+ *
+ * The frontend deep-copies the interface, its items and every string, and
+ * matches items to earlier registrations by \c id. The call may be repeated
+ * at any time on the core's thread, with a different item count, when a
+ * buffer moves or changes size, an item appears or disappears, or an option
+ * changes a path or scope. An item missing from the new set is closed: the
+ * frontend snapshots a frontend-owned buffer during the call and writes it
+ * later, and never touches the old pointers again. It snapshots a blob the
+ * same way, through the previous set's \c blob_size and \c blob_save with
+ * the item's old index. A refused call registers nothing and closes every
+ * item of the previous set the same way: the frontend writes nothing more
+ * for them until a later call succeeds, and the legacy memories they
+ * retired stay retired. A call made from inside \c blob_size, \c blob_save,
+ * \c get_generation or \c can_snapshot returns \c false and registers
+ * nothing; \c get_issues says why. The core makes it from \c retro_run
+ * instead. A core treats a \c false return as it treats a frontend without
+ * this interface. A frontend may leave out an item it cannot keep; get_path
+ * then returns 0 for it, and the core saves it as it would without this
+ * interface. \c get_issues says why an item was left out.
+ *
+ * Rules every core and frontend must follow:
+ *
+ * - Ownership. Exactly one side writes each path. The frontend never writes
+ *   a path that a \c RETRO_SAVE_STORAGE_CORE_FILE or \c _CORE_FOLDER item
+ *   names, except to write back a copy it took of that item immediately
+ *   before requesting \c RETRO_SAVE_OP_RELOAD for it; a core never writes a
+ *   path the frontend owns. A \c CORE_FOLDER item's files are those in its
+ *   folder that its \c include and \c exclude patterns select. A frontend
+ *   leaves out a frontend-owned item that names another item's file, or
+ *   whose write temp is one, keeping the item that held the file at the
+ *   previous call or a core-written one, and an item that lists another
+ *   item's file in \c legacy_paths. It also leaves out an item at its own
+ *   \c .srm or \c .rtc name, or a \c CORE_FOLDER item holding that file
+ *   or its write temp, while the core reports that memory through
+ *   \c retro_get_memory_size at the call and no item names it in
+ *   \c legacy_memory, as the frontend writes that file too; and a
+ *   \c CORE_FOLDER item holding another of the frontend's files of the
+ *   content: its savestates and their thumbnails, entry states, replays,
+ *   the disk index, and the write temps of these. A write temp is the
+ *   file's name plus ".tmp" or ".auto.tmp". The core excludes such a file,
+ *   or names the memory in \c legacy_memory. A frontend checks that
+ *   memory again when it first fills the items after the call that added
+ *   the item (see Ordering at load), core-written or not, and leaves such
+ *   an item out then: from that point, before the next \c retro_run,
+ *   \c get_path returns 0 for it, \c get_issues lists why, and \c loaded is
+ *   not called for it. A folder at the root directory itself (\c path "")
+ *   names its own files in \c include, as that directory also holds files
+ *   the core does not write; a frontend leaves it out otherwise.
+ *   Registration retires the frontend's \c .srm / \c .rtc file handling
+ *   for every legacy memory an item names in \c legacy_memory;
+ *   \c retro_get_memory_data keeps working for its other users.
+ * - Pointer lifetime. A segment pointer and size are valid from the call
+ *   that registered them until the next \c SET_SAVE_INTERFACE call, refused
+ *   or not, the next \c retro_load_game, or \c retro_deinit, whichever comes
+ *   first. A core re-registers before it frees, replaces or clears a buffer.
+ * - Threads. Every callback in both directions runs on the core's thread. The
+ *   frontend calls the core's callbacks, and reads buffers, only between core
+ *   calls and never while one of its own calls into the core is in progress,
+ *   except the snapshot it takes during the core's own \c SET_SAVE_INTERFACE
+ *   call; so a core may mutate a buffer in place during \c retro_serialize.
+ *   A frontend's worker threads see copies only.
+ * - Copies. A frontend copies an item only while \c can_snapshot returns
+ *   true or is \c NULL, and asks again on a later frame when it returns
+ *   false. After a few seconds of frames it saves a frontend-owned item
+ *   anyway; it never keeps a backup taken while the answer was false. When
+ *   the answer is false after \c retro_unload_game, it keeps the last image
+ *   it took while the answer was true if that is its latest copy of the
+ *   item, and otherwise writes the current image. It writes the current
+ *   image anyway when it must, such as while a backup of the file is still
+ *   owed or an image it took has not reached the file. A copy of a
+ *   core-written item counts only if \c can_snapshot returned true before
+ *   and after it and \c get_generation did not change in between.
+ * - Ordering at load. The frontend fills frontend-owned buffers after
+ *   \c retro_load_game returns and calls \c loaded for each, before the first
+ *   \c retro_run. It calls \c loaded again after every reload or restore.
+ *   An item that a later registration adds, or moves to another file, is
+ *   filled and told the same way after that call returns, before the next
+ *   \c retro_run, and so is one that grows over bytes the frontend kept past
+ *   its end; for a call made from inside \c loaded or \c legacy_load, after
+ *   that callback returns, never from inside it. A file read from
+ *   \c legacy_paths goes whole to \c legacy_load when the core set it and
+ *   negotiated \c RETRO_SAVE_FEATURE_LEGACY_LOAD; otherwise it is loaded as
+ *   the item's own file would be. A \c false from \c legacy_load or
+ *   \c blob_load for a legacy name moves the frontend to the next one; for
+ *   the item's own file it leaves the item as it was. \c loaded is called
+ *   whether or not a file was read. A core may register again from inside
+ *   \c loaded or \c legacy_load; an item that keeps its \c id and file is
+ *   not filled again unless it grows over kept bytes.
+ * - Ordering at unload. The frontend writes frontend-owned items for the last
+ *   time after \c retro_unload_game returns, so writes a core makes while
+ *   unloading (an emulated power-off, a final export) reach the file. A core
+ *   therefore frees these buffers in \c retro_deinit, not in
+ *   \c retro_unload_game, and \c can_snapshot stays callable until then.
+ * - Save states. These rules apply to state loads the user asks for, never
+ *   to run-ahead, rewind or netplay rollback loads. A frontend restores every
+ *   frontend-owned buffer whose scope is \c RETRO_SAVE_SCOPE_SHARED,
+ *   \c _ACCESSORY, \c _CONSOLE or \c _OTHER_CONTENT after
+ *   \c retro_unserialize and calls \c loaded, because a state belongs to one
+ *   game and a shared container to many. Per-game and unstated buffers
+ *   follow the frontend's own setting. Before the load it copies
+ *   every core-written item marked \c RETRO_SAVE_STATE_LOAD_OVERWRITES or
+ *   \c _LOAD_WRITES_FILE, requesting \c RETRO_SAVE_OP_FLUSH first; such an
+ *   item whose \c write_timing is not \c RETRO_SAVE_WRITE_THROUGH needs
+ *   \c request. After the load, for each such item restored by the
+ *   same scope rule, it writes the copy back if the load rewrote the file and
+ *   requests \c RETRO_SAVE_OP_RELOAD. For an item whose core cannot reload,
+ *   the frontend warns before the load that the item will be rolled back.
+ * - Instances. A frontend that runs a second instance of the core (run-ahead)
+ *   answers that instance's \c GET_SAVE_FRONTEND_INTERFACE with
+ *   \c instance set to \c RETRO_SAVE_INSTANCE_SECONDARY and accepts its
+ *   registration without acting on it. A secondary instance persists nothing:
+ *   it never writes a core-written item, never runs an unload finalisation
+ *   that writes, and its buffers are never filled or written by the frontend.
+ *   Its \c legacy_load is never called; its state arrives through
+ *   \c retro_unserialize.
+ * - Netplay. A frontend may ask the core, through \c redirect, to write a
+ *   core-written item at another path for the rest of the session. The core
+ *   may refuse. A redirect ends at \c retro_unload_game and nothing written
+ *   there is copied back.
+ * - In content. A \c RETRO_SAVE_STORAGE_IN_CONTENT item is the content file
+ *   itself. The frontend may copy it but never writes it, and restores a copy
+ *   only while the content is closed. Content loaded from inside an archive
+ *   is described only.
+ * - Cross-core compatibility. Adopting this interface never changes the
+ *   bytes, size, layout or name of a file the core already writes, or that
+ *   the frontend already writes for it. Memory the core never persisted
+ *   before goes into a new item with its own file, except an append under
+ *   Layout changes. A core never moves an existing raw file to
+ *   \c RETRO_SAVE_STORAGE_FRONTEND_BLOB.
+ * - Layout changes. A \c RETRO_SAVE_STORAGE_FRONTEND_BUFFER item's layout
+ *   changes only by appending segments or cutting trailing ones: the item
+ *   keeps its \c id and path, and its \c format gains or loses a trailing
+ *   "+<memory>". Append only to match the layout the standalone emulator
+ *   uses. An item that replaces a legacy memory keeps the appended bytes in
+ *   that memory too, as \c retro_get_memory_data and
+ *   \c retro_get_memory_size report it, because frontends without this
+ *   interface and netplay's save sync read only that memory; they neither
+ *   save nor sync memory in an item of its own. Under a core version from
+ *   before the adoption, the frontend writes that memory at its old size and
+ *   cuts the rest. Any other change is a new \c id at a path no earlier
+ *   layout used: a frontend cannot tell a changed layout from a file of the
+ *   same size, so a reused path overwrites the user's only copy. A core
+ *   changes a blob's encoding in place only while its \c blob_load reads
+ *   every encoding it wrote.
+ * - Frontend-owned files. A frontend loads a shorter file into the leading
+ *   segments and leaves the rest untouched. It loads the leading bytes of a
+ *   longer one and writes the bytes past the item back unchanged, unless the
+ *   item carries \c RETRO_SAVE_FLAG_EXACT_SIZE. It never moves, renames or
+ *   transforms a file for compatibility. Before the first write that drops
+ *   bytes past an item, or replaces a file the core refused to read, it keeps
+ *   a copy of that file. It writes a file raw and whole unless the item
+ *   carries \c RETRO_SAVE_FLAG_FRONTEND_MAY_TRANSFORM, and only when the
+ *   bytes differ from the image it last loaded from or wrote to that file, so
+ *   no file appears for an untouched buffer and an in-game erase still
+ *   reaches disk.
+ *
+ * @param[in] data <tt>const struct retro_save_interface *</tt>.
+ * Behavior is undefined if \c NULL.
+ * @return \c true if the set was registered. \c false if it was refused:
+ * no set is registered, and the previous one is closed as described above.
+ * @see RETRO_ENVIRONMENT_GET_SAVE_FRONTEND_INTERFACE
+ * @see retro_save_interface
+ */
+#define RETRO_ENVIRONMENT_SET_SAVE_INTERFACE (105 | RETRO_ENVIRONMENT_EXPERIMENTAL)
+
 /* Speaker positions, as bits of a layout mask; a frame's channels are
  * interleaved in ascending bit order. The bits are those of the
  * WAVEFORMATEXTENSIBLE channel mask. */
@@ -7165,6 +7360,904 @@ struct retro_netpacket_callback
    retro_netpacket_disconnected_t disconnected; /* Optional - may be NULL */
    const char* protocol_version; /* Optional - if not NULL will be used instead of core version to decide if communication is compatible */
 };
+
+/* ---- Save items ------------------------------------------------------ */
+
+/** @defgroup RETRO_SAVE Save items
+ * @{
+ */
+
+/** Who writes an item's bytes. */
+enum retro_save_storage
+{
+   /** The core writes one file and only describes it here. */
+   RETRO_SAVE_STORAGE_CORE_FILE       = 0,
+
+   /** The core writes a folder and only describes it here. */
+   RETRO_SAVE_STORAGE_CORE_FOLDER     = 1,
+
+   /**
+    * The frontend loads and writes the item from \c segments, concatenated
+    * in order, as it does for \c RETRO_MEMORY_SAVE_RAM today. Every frontend
+    * that implements this interface supports this kind.
+    */
+   RETRO_SAVE_STORAGE_FRONTEND_BUFFER = 2,
+
+   /**
+    * The core encodes and decodes variable-length bytes through the blob
+    * callbacks; the frontend owns the file I/O.
+    */
+   RETRO_SAVE_STORAGE_FRONTEND_BLOB   = 3,
+
+   /** The save is written into the content file itself. */
+   RETRO_SAVE_STORAGE_IN_CONTENT      = 4,
+
+   /** A real device or another process holds the data. */
+   RETRO_SAVE_STORAGE_EXTERNAL        = 5,
+
+   /** Rebuilt on every load, or deliberately not persisted. */
+   RETRO_SAVE_STORAGE_NOT_PERSISTED   = 6,
+
+   RETRO_SAVE_STORAGE_DUMMY           = INT_MAX
+};
+
+/** Bit for a storage kind in \c retro_save_frontend_interface::storage_kinds. */
+#define RETRO_SAVE_STORAGE_BIT(s) ((uint64_t)1 << (s))
+
+/** How many games an item belongs to. */
+enum retro_save_scope
+{
+   /**
+    * Not stated. A frontend describes the item, never restores it from a
+    * backup, and treats it as per-game when a state loads.
+    */
+   RETRO_SAVE_SCOPE_UNKNOWN       = 0,
+
+   /** One loaded content, named by \c content_index. */
+   RETRO_SAVE_SCOPE_CONTENT       = 1,
+
+   /** One game across its discs and files, named by \c game_key. */
+   RETRO_SAVE_SCOPE_GAME          = 2,
+
+   /** Every game of this core, per \c scope_key. */
+   RETRO_SAVE_SCOPE_SHARED        = 3,
+
+   /** A peripheral shared by the games that use it, per \c scope_key. */
+   RETRO_SAVE_SCOPE_ACCESSORY     = 4,
+
+   /** The emulated machine itself: firmware, NVRAM, clock, per \c scope_key. */
+   RETRO_SAVE_SCOPE_CONSOLE       = 5,
+
+   /**
+    * Another game's save, named by \c game_key and \c port, written live by
+    * this core (a Transfer Pak, a GBA slot). Needs
+    * \c RETRO_SAVE_FEATURE_FOREIGN. Under \c RETRO_SAVE_ROOT_FRONTEND,
+    * \c game_key is "path:<that content's path>" and the frontend resolves
+    * it to that content's own save file, with the extension in \c path.
+    */
+   RETRO_SAVE_SCOPE_OTHER_CONTENT = 6,
+
+   RETRO_SAVE_SCOPE_DUMMY         = INT_MAX
+};
+
+/** Where \c retro_save_item::path is relative to. */
+enum retro_save_root
+{
+   /**
+    * The frontend names the file as it names \c .srm today, from the content
+    * at \c content_index and the extension in \c path, and reports the result
+    * through \c get_path.
+    */
+   RETRO_SAVE_ROOT_FRONTEND     = 0,
+
+   /** \c RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY. */
+   RETRO_SAVE_ROOT_SAVE_DIR     = 1,
+
+   /** \c RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY. */
+   RETRO_SAVE_ROOT_SYSTEM_DIR   = 2,
+
+   /** The directory of the content at \c content_index. */
+   RETRO_SAVE_ROOT_CONTENT_DIR  = 3,
+
+   /** The content file itself, for \c RETRO_SAVE_STORAGE_IN_CONTENT only;
+    * \c path is ignored. A frontend never writes it. */
+   RETRO_SAVE_ROOT_CONTENT_FILE = 4,
+
+   /** \c path is absolute, chosen by the core (an ini setting, for example). */
+   RETRO_SAVE_ROOT_ABSOLUTE     = 5,
+
+   RETRO_SAVE_ROOT_DUMMY        = INT_MAX
+};
+
+/** What an item holds, so a frontend can decide what to back up. */
+enum retro_save_role
+{
+   RETRO_SAVE_ROLE_UNKNOWN    = 0,
+
+   /** Battery saves, slots, cards. */
+   RETRO_SAVE_ROLE_PROGRESS   = 1,
+
+   /** Configuration the game or core keeps. Not backed up by default. */
+   RETRO_SAVE_ROLE_SETTINGS   = 2,
+
+   /** Progress mixed with settings, installs or caches. */
+   RETRO_SAVE_ROLE_MIXED      = 3,
+
+   RETRO_SAVE_ROLE_HISCORE    = 4,
+
+   /** A clock. Restore it together with its \c group. */
+   RETRO_SAVE_ROLE_CLOCK      = 5,
+
+   /** An SD card or hard disk image that may hold anything. */
+   RETRO_SAVE_ROLE_USER_DRIVE = 6,
+
+   /** Never backed up. */
+   RETRO_SAVE_ROLE_CACHE      = 7,
+
+   RETRO_SAVE_ROLE_DUMMY      = INT_MAX
+};
+
+/** What loading a save state does to an item. */
+enum retro_save_state_relation
+{
+   RETRO_SAVE_STATE_UNKNOWN          = 0,
+
+   /** The item is not in states; a load leaves it alone. */
+   RETRO_SAVE_STATE_NOT_IN_STATE     = 1,
+
+   /** A load replaces the bytes in memory; the file follows at the next write. */
+   RETRO_SAVE_STATE_LOAD_OVERWRITES  = 2,
+
+   /** A load rewrites the file during \c retro_unserialize. */
+   RETRO_SAVE_STATE_LOAD_WRITES_FILE = 3,
+
+   /** Saved in states but ignored when one is loaded. */
+   RETRO_SAVE_STATE_STORED_IGNORED   = 4,
+
+   RETRO_SAVE_STATE_DUMMY            = INT_MAX
+};
+
+/** When a core-written item reaches disk. */
+enum retro_save_write_timing
+{
+   RETRO_SAVE_WRITE_UNKNOWN   = 0,
+
+   /** On every game write. */
+   RETRO_SAVE_WRITE_THROUGH   = 1,
+
+   /** Some time after the last write, in host or emulated time. */
+   RETRO_SAVE_WRITE_DEBOUNCED = 2,
+
+   /** On a timer. */
+   RETRO_SAVE_WRITE_PERIODIC  = 3,
+
+   /** Only at unload; the file is stale while the game runs. */
+   RETRO_SAVE_WRITE_AT_UNLOAD = 4,
+
+   /** The frontend writes it (\c RETRO_SAVE_STORAGE_FRONTEND_*). */
+   RETRO_SAVE_WRITE_FRONTEND  = 5,
+
+   RETRO_SAVE_WRITE_DUMMY     = INT_MAX
+};
+
+/** Item flags. Negotiated: the frontend clears bits it does not understand,
+ * and a core must not depend on a cleared bit. */
+
+/** The file embeds the content (a flash image with the game in it). Never
+ * exported or uploaded. */
+#define RETRO_SAVE_FLAG_CONTAINS_CONTENT       ((uint64_t)1 << 0)
+
+/** The file is a patch against the content named by \c base_hash. */
+#define RETRO_SAVE_FLAG_DIFF_OF_CONTENT        ((uint64_t)1 << 1)
+
+/** A reload takes effect only at the next \c retro_reset. */
+#define RETRO_SAVE_FLAG_RELOAD_NEEDS_RESET     ((uint64_t)1 << 2)
+
+/** The core overwrites parts of the item from its options after a load, so
+ * a restore is not byte-exact. */
+#define RETRO_SAVE_FLAG_CORE_REWRITES          ((uint64_t)1 << 3)
+
+/** The authoritative copy lives elsewhere until unload; the file is stale. */
+#define RETRO_SAVE_FLAG_LIVE_ELSEWHERE         ((uint64_t)1 << 4)
+
+/** The clock inside is anchored to host time. */
+#define RETRO_SAVE_FLAG_HOST_CLOCK             ((uint64_t)1 << 5)
+
+/** Holds credentials or personal data. A frontend never uploads it. */
+#define RETRO_SAVE_FLAG_SENSITIVE              ((uint64_t)1 << 6)
+
+/** The frontend may store the file in another encoding (compressed). Without
+ * it, frontend-owned files are written raw. */
+#define RETRO_SAVE_FLAG_FRONTEND_MAY_TRANSFORM ((uint64_t)1 << 7)
+
+/** The hardware shares this memory more widely than it is stored (a console
+ * EEPROM stored per game). */
+#define RETRO_SAVE_FLAG_HARDWARE_SHARED        ((uint64_t)1 << 8)
+
+/** A \c RETRO_SAVE_STORAGE_FRONTEND_BUFFER file is exactly the item's size:
+ * a frontend drops the bytes of a longer file past the item, after keeping a
+ * copy. Without it they are written back. For saves whose type emulators
+ * tell from the file size. */
+#define RETRO_SAVE_FLAG_EXACT_SIZE             ((uint64_t)1 << 9)
+
+/** One memory block of a frontend-owned buffer. */
+struct retro_save_segment
+{
+   void *data;
+   size_t size;
+};
+
+/**
+ * One save item. \c retro_save_interface::item_size is the stride only:
+ * a member appended after version 1 is read only when
+ * \c interface_version says it exists. Members are appended only.
+ */
+struct retro_save_item
+{
+   /** \c RETRO_SAVE_FLAG_*. */
+   uint64_t flags;
+
+   /** Stable within this core. A new meaning gets a new id. Never derived
+    * from a file extension. */
+   const char *id;
+
+   /** Shown to the user. */
+   const char *label;
+
+   /** Items with the same group are restored together; may be \c NULL. */
+   const char *group;
+
+   /** Key for \c RETRO_SAVE_SCOPE_SHARED, \c _ACCESSORY and \c _CONSOLE: a
+    * region, a port, a size, a BIOS name; may be \c NULL. */
+   const char *scope_key;
+
+   /**
+    * The game this item belongs to when the content path does not say:
+    * "<scheme>:<value>", for example "serial:SLUS-00594", "title:Doom",
+    * "sha1:...". \c NULL means the content path.
+    */
+   const char *game_key;
+
+   /** Under \c RETRO_SAVE_ROOT_FRONTEND, the extension without a dot ("srm").
+    * Under other roots, a path relative to the root, or absolute. Ignored
+    * under \c RETRO_SAVE_ROOT_CONTENT_FILE. */
+   const char *path;
+
+   /**
+    * \c NULL-terminated earlier names under the same root, oldest last.
+    * A frontend reads the first that exists when \c path does not, the next
+    * when the core refuses one, and never writes, deletes or renames them.
+    * On a \c RETRO_SAVE_STORAGE_FRONTEND_BUFFER item, only names in a layout
+    * that loads raw, unless \c legacy_load converts them. Never another
+    * item's file. List a large file in the registration made from
+    * \c retro_load_game: a later registration's files are read between two
+    * frames. May be \c NULL.
+    */
+   const char *const *legacy_paths;
+
+   /**
+    * \c NULL-terminated patterns naming the files of a \c CORE_FOLDER item.
+    * A pattern is matched against a file's path relative to the folder,
+    * with '/' between directories on every platform and case ignored: '*'
+    * matches any run of characters, '/' included, '?' any one character,
+    * "[abc]" one of the characters listed (no ranges or negation), and a
+    * backslash makes the next character literal. \c NULL or an empty list
+    * means everything.
+    *
+    * A folder at the root directory itself (\c path "") must list its own
+    * files, as that directory also holds files the core does not write:
+    * other games' saves, the frontend's \c .srm, \c .rtc, savestates,
+    * replays and disk index and their write temps, BIOS files. A game
+    * that saves beside its data files uses \c RETRO_SAVE_ROOT_CONTENT_DIR,
+    * \c path "" and include { "*.sav", NULL }. A core that owns a whole
+    * directory names a subfolder instead.
+    */
+   const char *const *include;
+
+   /** \c NULL-terminated patterns, as for \c include, of files a
+    * \c CORE_FOLDER item leaves out; may be \c NULL. */
+   const char *const *exclude;
+
+   /**
+    * Cross-core identity of the bytes. \c NULL means unknown: the frontend
+    * then treats the item as it treats every save today, never as
+    * incompatible. Grammar:
+    *   "<system>:<memory>[+<memory>...]"  a raw hardware layout, segments in
+    *                                        the listed order ("nes:wram+n163");
+    *   "<core>:<name>[+<memory>...]"        a core-private layout, memories
+    *                                        appended after it.
+    * A tag is a prefix of itself with one or more "+<memory>" appended: a
+    * frontend loads a file of either tag into an item of the other. A
+    * changed layout is a new tag; a tag is reused only for exactly its own
+    * layout.
+    */
+   const char *format;
+
+   /** \c NULL-terminated tags this core can load into this item besides its
+    * own; may be \c NULL. On a \c RETRO_SAVE_STORAGE_FRONTEND_BUFFER item,
+    * only tags whose files load raw, unless \c legacy_load converts them. */
+   const char *const *accepts;
+
+   /** Content hash the patch applies to, "<algo>:<hex>", for
+    * \c RETRO_SAVE_FLAG_DIFF_OF_CONTENT; else \c NULL. */
+   const char *base_hash;
+
+   /** Memory blocks written concatenated, in file order. Required for
+    * \c RETRO_SAVE_STORAGE_FRONTEND_BUFFER; else \c NULL. */
+   const struct retro_save_segment *segments;
+
+   /** Upper bound of a \c RETRO_SAVE_STORAGE_FRONTEND_BLOB; 0 = unknown. */
+   size_t max_size;
+
+   /** \c enum retro_save_storage. */
+   unsigned storage;
+
+   /** \c enum retro_save_scope. */
+   unsigned scope;
+
+   /** Owning content in a multi-content session; 0 otherwise. */
+   unsigned content_index;
+
+   /** Instance of a per-port item (a Controller Pak); 0 when not per port. */
+   unsigned port;
+
+   /** \c enum retro_save_root. */
+   unsigned root;
+
+   /**
+    * The legacy memory this item replaces: \c RETRO_MEMORY_SAVE_RAM,
+    * \c RETRO_MEMORY_RTC, a subsystem memory type, or
+    * \c RETRO_SAVE_NO_LEGACY_MEMORY. Registration retires the frontend's
+    * file handling for that memory. One item per legacy memory: on the
+    * first load, the old file's bytes have one place to go. 0 is
+    * \c RETRO_MEMORY_SAVE_RAM: an item that replaces none sets
+    * \c RETRO_SAVE_NO_LEGACY_MEMORY.
+    */
+   unsigned legacy_memory;
+
+   /** The core's revision of the bytes under \c format, compared only
+    * between equal tags; 0 when none. A layout change is a new tag, not a
+    * revision. */
+   unsigned format_version;
+
+   /** \c enum retro_save_role. */
+   unsigned role;
+
+   /** \c enum retro_save_state_relation. */
+   unsigned state_relation;
+
+   /** \c enum retro_save_write_timing. */
+   unsigned write_timing;
+
+   unsigned num_segments;
+};
+
+/** \c retro_save_item::legacy_memory when no legacy memory is replaced. */
+#define RETRO_SAVE_NO_LEGACY_MEMORY 0xffffffffu
+
+/** Operations a frontend requests from a core. */
+enum retro_save_op
+{
+   /** Write one consistent image of a core-written item now, with nothing
+    * left in the core's own buffers or threads. */
+   RETRO_SAVE_OP_FLUSH  = 0,
+
+   /** Re-read a core-written item from disk, as a hardware re-insert would. */
+   RETRO_SAVE_OP_RELOAD = 1,
+
+   RETRO_SAVE_OP_DUMMY  = INT_MAX
+};
+
+/** Results of requests, redirects and entry transfers. */
+enum retro_save_result
+{
+   RETRO_SAVE_RESULT_DONE        = 0,
+
+   /** Started; poll \c get_result. */
+   RETRO_SAVE_RESULT_PENDING     = 1,
+
+   RETRO_SAVE_RESULT_FAILED      = 2,
+
+   /** Not safe now; the core declines. */
+   RETRO_SAVE_RESULT_REFUSED     = 3,
+
+   RETRO_SAVE_RESULT_NO_SPACE    = 4,
+   RETRO_SAVE_RESULT_NAME_EXISTS = 5,
+
+   /** The entry is copy- or move-protected. */
+   RETRO_SAVE_RESULT_PROTECTED   = 6,
+
+   RETRO_SAVE_RESULT_BAD_FORMAT  = 7,
+   RETRO_SAVE_RESULT_UNSUPPORTED = 8,
+
+   RETRO_SAVE_RESULT_DUMMY       = INT_MAX
+};
+
+/** Events a core reports through \c retro_save_frontend_interface::notify. */
+enum retro_save_event
+{
+   /** The bytes of a frontend-owned buffer changed outside a game write
+    * (a state load). */
+   RETRO_SAVE_EVENT_CONTENTS_CHANGED = 0,
+
+   /** The entry list of an item is stale. */
+   RETRO_SAVE_EVENT_ENTRIES_CHANGED  = 1,
+
+   RETRO_SAVE_EVENT_DUMMY            = INT_MAX
+};
+
+/** Which instance of the core the frontend is talking to. */
+enum retro_save_instance
+{
+   RETRO_SAVE_INSTANCE_PRIMARY   = 0,
+
+   /** A copy run for run-ahead. Persists nothing. */
+   RETRO_SAVE_INSTANCE_SECONDARY = 1,
+
+   RETRO_SAVE_INSTANCE_DUMMY     = INT_MAX
+};
+
+/** Features negotiated in \c retro_save_frontend_interface::features. */
+
+/** The frontend calls \c request and \c get_result. */
+#define RETRO_SAVE_FEATURE_REQUESTS    ((uint64_t)1 << 0)
+
+/** The frontend acts on \c notify. */
+#define RETRO_SAVE_FEATURE_EVENTS      ((uint64_t)1 << 1)
+
+/** The frontend uses \c retro_save_entry_interface. */
+#define RETRO_SAVE_FEATURE_ENTRIES     ((uint64_t)1 << 2)
+
+/** The frontend resolves \c RETRO_SAVE_SCOPE_OTHER_CONTENT items. */
+#define RETRO_SAVE_FEATURE_FOREIGN     ((uint64_t)1 << 3)
+
+/** The frontend hands files in an earlier layout to \c legacy_load. */
+#define RETRO_SAVE_FEATURE_LEGACY_LOAD ((uint64_t)1 << 4)
+
+/**
+ * Writes the resolved path of an item into \c buf.
+ * @param item Index into the most recently registered item array.
+ * @return The length the full path needs, excluding the terminator; 0 if
+ * the item has no path. The result is truncated when it does not fit.
+ */
+typedef size_t (RETRO_CALLCONV *retro_save_get_path_t)(unsigned item,
+      char *buf, size_t len);
+
+/** Reports a \c retro_save_event for an item. */
+typedef void (RETRO_CALLCONV *retro_save_notify_t)(unsigned event,
+      unsigned item);
+
+/** What a frontend did about a finding of \c get_issues. */
+enum retro_save_verdict
+{
+   /** The call was refused. */
+   RETRO_SAVE_VERDICT_REFUSED  = 0,
+
+   /** The item was left out: \c get_path returns 0 for it. */
+   RETRO_SAVE_VERDICT_LEFT_OUT = 1,
+
+   /** The field was ignored, or read as its \c UNKNOWN value. */
+   RETRO_SAVE_VERDICT_IGNORED  = 2,
+
+   RETRO_SAVE_VERDICT_DUMMY    = INT_MAX
+};
+
+/** The member of \c retro_save_interface or \c retro_save_item a finding
+ * is about. */
+enum retro_save_field
+{
+   /** The call as a whole. */
+   RETRO_SAVE_FIELD_NONE              = 0,
+
+   RETRO_SAVE_FIELD_INTERFACE_VERSION = 1,
+   RETRO_SAVE_FIELD_NUM_ITEMS         = 2,
+   RETRO_SAVE_FIELD_ITEM_SIZE         = 3,
+   RETRO_SAVE_FIELD_ITEMS             = 4,
+   RETRO_SAVE_FIELD_REQUEST           = 5,
+   RETRO_SAVE_FIELD_GET_RESULT        = 6,
+   RETRO_SAVE_FIELD_GET_GENERATION    = 7,
+   RETRO_SAVE_FIELD_CAN_SNAPSHOT      = 8,
+   RETRO_SAVE_FIELD_LOADED            = 9,
+   RETRO_SAVE_FIELD_LEGACY_LOAD       = 10,
+   RETRO_SAVE_FIELD_REDIRECT          = 11,
+   RETRO_SAVE_FIELD_BLOB_SIZE         = 12,
+   RETRO_SAVE_FIELD_BLOB_SAVE         = 13,
+   RETRO_SAVE_FIELD_BLOB_LOAD         = 14,
+   RETRO_SAVE_FIELD_ENTRIES           = 15,
+
+   RETRO_SAVE_FIELD_FLAGS             = 16,
+   RETRO_SAVE_FIELD_ID                = 17,
+   RETRO_SAVE_FIELD_LABEL             = 18,
+   RETRO_SAVE_FIELD_GROUP             = 19,
+   RETRO_SAVE_FIELD_SCOPE_KEY         = 20,
+   RETRO_SAVE_FIELD_GAME_KEY          = 21,
+   RETRO_SAVE_FIELD_PATH              = 22,
+   RETRO_SAVE_FIELD_LEGACY_PATHS      = 23,
+   RETRO_SAVE_FIELD_INCLUDE           = 24,
+   RETRO_SAVE_FIELD_EXCLUDE           = 25,
+   RETRO_SAVE_FIELD_FORMAT            = 26,
+   RETRO_SAVE_FIELD_ACCEPTS           = 27,
+   RETRO_SAVE_FIELD_BASE_HASH         = 28,
+   RETRO_SAVE_FIELD_SEGMENTS          = 29,
+   RETRO_SAVE_FIELD_MAX_SIZE          = 30,
+   RETRO_SAVE_FIELD_STORAGE           = 31,
+   RETRO_SAVE_FIELD_SCOPE             = 32,
+   RETRO_SAVE_FIELD_CONTENT_INDEX     = 33,
+   RETRO_SAVE_FIELD_PORT              = 34,
+   RETRO_SAVE_FIELD_ROOT              = 35,
+   RETRO_SAVE_FIELD_LEGACY_MEMORY     = 36,
+   RETRO_SAVE_FIELD_FORMAT_VERSION    = 37,
+   RETRO_SAVE_FIELD_ROLE              = 38,
+   RETRO_SAVE_FIELD_STATE_RELATION    = 39,
+   RETRO_SAVE_FIELD_WRITE_TIMING      = 40,
+   RETRO_SAVE_FIELD_NUM_SEGMENTS      = 41,
+
+   RETRO_SAVE_FIELD_DUMMY             = INT_MAX
+};
+
+/** \c retro_save_issue::item for a finding about the call as a whole. */
+#define RETRO_SAVE_ISSUE_NO_ITEM 0xffffffffu
+
+/** One finding of a \c SET_SAVE_INTERFACE call. */
+struct retro_save_issue
+{
+   /** Index into the item array, or \c RETRO_SAVE_ISSUE_NO_ITEM. */
+   unsigned item;
+
+   /** \c enum retro_save_field. */
+   unsigned field;
+
+   /** \c enum retro_save_verdict. */
+   unsigned verdict;
+
+   /** For people; differs between frontends and versions. */
+   const char *text;
+};
+
+/**
+ * The findings of the last \c SET_SAVE_INTERFACE call, refused or not, in
+ * item order. Points \c *issues at them, valid until the next call or
+ * until the content unloads, and returns how many. A finding of the
+ * check at the first fill (see \c SET_SAVE_INTERFACE, Ownership) follows
+ * them while the pointer stays valid: only the count grows. A frontend
+ * may return 0.
+ */
+typedef unsigned (RETRO_CALLCONV *retro_save_get_issues_t)(
+      const struct retro_save_issue **issues);
+
+/**
+ * Filled by the frontend. Callbacks are valid after a \c true return from
+ * \c RETRO_ENVIRONMENT_GET_SAVE_FRONTEND_INTERFACE.
+ */
+struct retro_save_frontend_interface
+{
+   /** In: the lowest version the core can use. Out: the version provided. */
+   unsigned interface_version;
+
+   /** Out: \c enum retro_save_instance. */
+   unsigned instance;
+
+   /** In: \c RETRO_SAVE_STORAGE_BIT of the kinds the core wants.
+    * Out: the kinds supported. */
+   uint64_t storage_kinds;
+
+   /** In: the \c RETRO_SAVE_FLAG_* bits the core uses. Out: those understood. */
+   uint64_t item_flags;
+
+   /** In/out: \c RETRO_SAVE_FEATURE_*. */
+   uint64_t features;
+
+   retro_save_get_path_t   get_path;
+   retro_save_notify_t     notify;
+   retro_save_get_issues_t get_issues;
+};
+
+/**
+ * Starts an operation. Returns \c RETRO_SAVE_RESULT_DONE, \c _PENDING,
+ * \c _FAILED, \c _REFUSED or \c _UNSUPPORTED.
+ */
+typedef unsigned (RETRO_CALLCONV *retro_save_request_t)(unsigned item,
+      unsigned op);
+
+/** Polls the last request of \c op on \c item. */
+typedef unsigned (RETRO_CALLCONV *retro_save_get_result_t)(unsigned item,
+      unsigned op);
+
+/** A counter that changes on every write to the item, including writes
+ * from the core's own threads. */
+typedef uint64_t (RETRO_CALLCONV *retro_save_get_generation_t)(unsigned item);
+
+/**
+ * Whether a copy of the item taken now holds a save the game finished.
+ * False while the game is partway through writing it: a card, flash or
+ * EEPROM write sequence, file system changes the game has not committed,
+ * or a write still running on another thread. A core that cannot see
+ * where the game's writes end may return false until the item has not
+ * changed for a short time, as standalone emulators wait before writing
+ * a card; it keeps that time short.
+ */
+typedef bool (RETRO_CALLCONV *retro_save_can_snapshot_t)(unsigned item);
+
+/** Called after the frontend filled a frontend-owned item, or found no file
+ * to fill it from. */
+typedef void (RETRO_CALLCONV *retro_save_loaded_t)(unsigned item);
+
+/**
+ * Converts a file in an earlier layout into the item: its segments for a
+ * buffer, its state for a blob. The file is \c legacy_paths[index], or, when
+ * \c index is \c RETRO_SAVE_LEGACY_NONE, a copy tagged \c format that the
+ * frontend restores. \c format is \c NULL when the tag is not known; \c buf
+ * holds the whole file and is valid during the call. Returns \c false,
+ * leaving the item unchanged, when it cannot; the frontend then tries the
+ * next name, if any. The frontend never writes the file it read.
+ */
+typedef bool (RETRO_CALLCONV *retro_save_legacy_load_t)(unsigned item,
+      unsigned index, const char *format, const void *buf, size_t len);
+
+/** \c index of a \c legacy_load call for a file not in \c legacy_paths. */
+#define RETRO_SAVE_LEGACY_NONE 0xffffffffu
+
+/**
+ * Asks the core to write a core-written item at \c path (a file for
+ * \c CORE_FILE, a directory for \c CORE_FOLDER) until \c retro_unload_game.
+ * Returns \c RETRO_SAVE_RESULT_DONE, \c _REFUSED or \c _FAILED.
+ */
+typedef unsigned (RETRO_CALLCONV *retro_save_redirect_t)(unsigned item,
+      const char *path);
+
+/** Size the next \c blob_save needs. */
+typedef size_t (RETRO_CALLCONV *retro_save_blob_size_t)(unsigned item);
+
+/** Encodes the item into \c buf, filling all \c len bytes, with the same
+ * bytes for the same contents: a frontend writes when the bytes change. */
+typedef bool (RETRO_CALLCONV *retro_save_blob_save_t)(unsigned item,
+      void *buf, size_t len);
+
+/** Decodes \c buf, a whole file, into the item. May refuse by returning
+ * \c false, leaving the item unchanged; for a \c legacy_paths name the
+ * frontend then tries the next. */
+typedef bool (RETRO_CALLCONV *retro_save_blob_load_t)(unsigned item,
+      const void *buf, size_t len);
+
+struct retro_save_entry_interface;
+
+/**
+ * Filled by the core. Optional callbacks may be \c NULL. Requests never
+ * block: a long operation returns \c RETRO_SAVE_RESULT_PENDING and the
+ * frontend polls \c get_result.
+ */
+struct retro_save_interface
+{
+   /** The version of this interface the core was written for. */
+   unsigned interface_version;
+
+   unsigned num_items;
+
+   /** \c sizeof(struct retro_save_item) in the core's build; the stride of
+    * \c items. */
+   size_t item_size;
+
+   const struct retro_save_item *items;
+
+   retro_save_request_t        request;        /* Optional - may be NULL */
+   retro_save_get_result_t     get_result;     /* Required with request */
+   retro_save_get_generation_t get_generation; /* Optional - may be NULL */
+   retro_save_can_snapshot_t   can_snapshot;   /* Optional - may be NULL */
+   retro_save_loaded_t         loaded;         /* Optional - may be NULL */
+   retro_save_legacy_load_t    legacy_load;    /* Optional - may be NULL */
+   retro_save_redirect_t       redirect;       /* Optional - may be NULL */
+
+   /* Required when any item is RETRO_SAVE_STORAGE_FRONTEND_BLOB. */
+   retro_save_blob_size_t      blob_size;
+   retro_save_blob_save_t      blob_save;
+   retro_save_blob_load_t      blob_load;
+
+   /** Entry listing for containers and folders; \c NULL when none. */
+   const struct retro_save_entry_interface *entries;
+};
+
+/* ---- Entries ---- */
+
+/** What kind of save an entry is. */
+enum retro_save_entry_kind
+{
+   RETRO_SAVE_ENTRY_KIND_UNKNOWN = 0,
+   RETRO_SAVE_ENTRY_KIND_MANUAL  = 1,
+   RETRO_SAVE_ENTRY_KIND_AUTO    = 2,
+   RETRO_SAVE_ENTRY_KIND_QUICK   = 3,
+
+   /** Console data every game needs; never offered for deletion. */
+   RETRO_SAVE_ENTRY_KIND_SYSTEM  = 4,
+
+   RETRO_SAVE_ENTRY_KIND_DUMMY   = INT_MAX
+};
+
+/** Whether the core could load an entry. */
+enum retro_save_entry_verdict
+{
+   RETRO_SAVE_ENTRY_VERDICT_UNKNOWN     = 0,
+   RETRO_SAVE_ENTRY_VERDICT_LOADABLE    = 1,
+
+   /** Content or data files the entry needs are missing. */
+   RETRO_SAVE_ENTRY_VERDICT_NEEDS_FILES = 2,
+
+   /** Written by a version the core no longer reads. */
+   RETRO_SAVE_ENTRY_VERDICT_TOO_OLD     = 3,
+
+   /** Belongs to other content. */
+   RETRO_SAVE_ENTRY_VERDICT_OTHER_GAME  = 4,
+
+   RETRO_SAVE_ENTRY_VERDICT_DUMMY       = INT_MAX
+};
+
+/** The core's answer to "does this entry belong to the loaded content". */
+#define RETRO_SAVE_ENTRY_CURRENT_CONTENT ((uint64_t)1 << 0)
+
+/** Copy- or move-protected on the emulated hardware. */
+#define RETRO_SAVE_ENTRY_PROTECTED       ((uint64_t)1 << 1)
+
+/** Inserted in a slot right now. */
+#define RETRO_SAVE_ENTRY_MOUNTED         ((uint64_t)1 << 2)
+
+/**
+ * One entry of a container or folder. Every member but \c handle and
+ * \c num_files may be \c NULL, 0 or -1 when unknown.
+ * \c retro_save_entry_interface::entry_size is the stride; a later member is
+ * read only if \c interface_version has it.
+ */
+struct retro_save_entry
+{
+   /** Bytes on the container. */
+   uint64_t size;
+
+   /** \c RETRO_SAVE_ENTRY_*. */
+   uint64_t flags;
+
+   /** Unix seconds; -1 when unknown. */
+   int64_t mtime;
+
+   /** Core-owned; valid until \c RETRO_SAVE_EVENT_ENTRIES_CHANGED. */
+   const char *handle;
+
+   const char *title;
+   const char *detail;
+
+   /** "<scheme>:<value>", as \c retro_save_item::game_key. */
+   const char *game_id;
+
+   /** The save format version the entry was written with. */
+   const char *version;
+
+   /** \c enum retro_save_entry_kind. */
+   unsigned kind;
+
+   /** \c enum retro_save_entry_verdict. */
+   unsigned verdict;
+
+   /** Files one export of this entry produces; at least 1. */
+   unsigned num_files;
+};
+
+/** An entry's icon, as the core renders it. */
+struct retro_save_icon
+{
+   /** XRGB8888, \c frames frames stacked vertically; core-owned until the
+    * next \c get_icon or \c RETRO_SAVE_EVENT_ENTRIES_CHANGED. */
+   const void *pixels;
+
+   unsigned width;
+   unsigned height;
+
+   /** At least 1. */
+   unsigned frames;
+
+   /** Milliseconds per frame; 0 when not animated. */
+   unsigned frame_ms;
+};
+
+/**
+ * Lists the entries of \c item. Returns a \c retro_save_result; on
+ * \c RETRO_SAVE_RESULT_DONE, \c entries and \c count describe a core-owned
+ * array valid until \c RETRO_SAVE_EVENT_ENTRIES_CHANGED.
+ */
+typedef unsigned (RETRO_CALLCONV *retro_save_entry_list_t)(unsigned item,
+      const struct retro_save_entry **entries, unsigned *count);
+
+/** Fills \c icon for \c handle. Returns \c false when there is none. */
+typedef bool (RETRO_CALLCONV *retro_save_entry_get_icon_t)(unsigned item,
+      const char *handle, struct retro_save_icon *icon);
+
+/**
+ * Starts exporting \c handle in the interchange \c format ("gci",
+ * "vms+vmi", "psu", ...). Returns an operation handle, or \c NULL with
+ * \c *result set to \c RETRO_SAVE_RESULT_REFUSED when the entry is in
+ * use, \c _UNSUPPORTED when the format is, or \c _PROTECTED when the
+ * entry may not be copied.
+ */
+typedef void *(RETRO_CALLCONV *retro_save_export_begin_t)(unsigned item,
+      const char *handle, const char *format, unsigned *result);
+
+/**
+ * Selects file \c file of the export and writes its suggested name into
+ * \c name. Returns \c false past the last file.
+ */
+typedef bool (RETRO_CALLCONV *retro_save_export_file_t)(void *op,
+      unsigned file, char *name, size_t name_len);
+
+/**
+ * Produces at most \c max_bytes of the selected file into \c buf and
+ * reports how many in \c written. Returns \c RETRO_SAVE_RESULT_PENDING
+ * while the file has more, \c _DONE after its last byte, else an error.
+ */
+typedef unsigned (RETRO_CALLCONV *retro_save_export_step_t)(void *op,
+      void *buf, size_t max_bytes, size_t *written);
+
+/**
+ * Starts importing an entry in \c format. The core picks the final name,
+ * using \c name_hint if it can. Returns an operation handle, or \c NULL
+ * with \c *result set to \c RETRO_SAVE_RESULT_REFUSED when the container
+ * is in use, \c _UNSUPPORTED when the format is, or \c _NO_SPACE.
+ */
+typedef void *(RETRO_CALLCONV *retro_save_import_begin_t)(unsigned item,
+      const char *format, const char *name_hint, unsigned *result);
+
+/**
+ * Starts file \c file of the import, named \c name. Returns
+ * \c RETRO_SAVE_RESULT_DONE or \c _PENDING once the file is started; its
+ * bytes follow through \c import_step either way. Any other result ends
+ * the import.
+ */
+typedef unsigned (RETRO_CALLCONV *retro_save_import_file_t)(void *op,
+      unsigned file, const char *name);
+
+/**
+ * Hands \c len bytes of the current file to the core; \c len 0 (\c buf
+ * may be \c NULL) says the frontend has no more. As with \c export_step,
+ * \c RETRO_SAVE_RESULT_PENDING means call again: the bytes were taken and
+ * the file is not complete yet. \c _DONE means the core has the whole
+ * file, at the latest in answer to \c len 0. Any other result ends the
+ * import.
+ */
+typedef unsigned (RETRO_CALLCONV *retro_save_import_step_t)(void *op,
+      const void *buf, size_t len);
+
+/**
+ * Ends a transfer. With \c commit the import is applied as one unit and a
+ * typed result says why it was not; without, nothing changes. The handle is
+ * freed either way.
+ */
+typedef unsigned (RETRO_CALLCONV *retro_save_transfer_end_t)(void *op,
+      bool commit);
+
+/** Deletes \c handle. */
+typedef unsigned (RETRO_CALLCONV *retro_save_entry_remove_t)(unsigned item,
+      const char *handle);
+
+/**
+ * Entry access for containers (memory cards, backup RAM), folders of slots
+ * and slot-mounted libraries. Export and import run in bounded steps so a
+ * frontend can pace them.
+ */
+struct retro_save_entry_interface
+{
+   unsigned interface_version;
+
+   /** \c sizeof(struct retro_save_entry) in the core's build. */
+   size_t entry_size;
+
+   retro_save_entry_list_t     list;
+   retro_save_entry_get_icon_t get_icon;     /* Optional - may be NULL */
+   retro_save_export_begin_t   export_begin; /* Optional - may be NULL */
+   retro_save_export_file_t    export_file;  /* Required with export_begin */
+   retro_save_export_step_t    export_step;  /* Required with export_begin */
+   retro_save_import_begin_t   import_begin; /* Optional - may be NULL */
+   retro_save_import_file_t    import_file;  /* Required with import_begin */
+   retro_save_import_step_t    import_step;  /* Required with import_begin */
+   retro_save_transfer_end_t   transfer_end; /* Required with either begin */
+   retro_save_entry_remove_t   remove;       /* Optional - may be NULL */
+};
+
+/** @} */
 
 /**
  * The pixel format used for rendering.

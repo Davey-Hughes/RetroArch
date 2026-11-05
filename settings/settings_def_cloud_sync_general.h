@@ -29,7 +29,7 @@ S_BOOL(cloud_sync_sync_saves, CLOUD_SYNC_SYNC_SAVES,
       "cloud_sync_sync_saves",
       true, SD_FLAG_NONE, 0, 0,
       "Sync: Saves/States",
-      "When enabled, saves/states will be synced to cloud.")
+      "When enabled, saves/states will be synced to cloud. Saves a core keeps in the system directory, such as some memory cards, sync only with Sync: System Files.")
 #endif
 /* Descriptor and configuration rows are #ifdef HAVE_CLOUDSYNC; the string
  * tables always carry this row via the strings pass. */
@@ -56,7 +56,7 @@ S_BOOL(cloud_sync_sync_system, CLOUD_SYNC_SYNC_SYSTEM,
       "cloud_sync_sync_system",
       false, SD_FLAG_NONE, 0, 0,
       "Sync: System Files",
-      "When enabled, system files will be synced to cloud. This can significantly increase the time it takes to sync; use with caution.")
+      "When enabled, system files will be synced to cloud, including saves some cores keep there, such as memory cards. This can significantly increase the time it takes to sync; use with caution.")
 #endif
 /* Descriptor and configuration rows are #ifdef HAVE_CLOUDSYNC; the string
  * tables always carry this row via the strings pass. */

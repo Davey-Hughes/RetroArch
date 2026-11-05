@@ -24,6 +24,57 @@ void RARCH_ERR(const char *fmt, ...)
    (void)fmt;
 }
 
+/* PE linkers keep save.c's external functions. */
+bool core_get_memory(retro_ctx_memory_info_t *info)
+{
+   info->data = NULL;
+   info->size = 0;
+   return false;
+}
+
+/* What a retired item's reap reaches; no items here. */
+void RARCH_LOG(const char *fmt, ...)
+{
+   (void)fmt;
+}
+
+void RARCH_WARN(const char *fmt, ...)
+{
+   (void)fmt;
+}
+
+const char *msg_hash_to_str(enum msg_hash_enums msg)
+{
+   (void)msg;
+   return "";
+}
+
+bool fill_pathname_application_data(char *s, size_t len)
+{
+   (void)s;
+   (void)len;
+   return false;
+}
+
+void runloop_save_items_notice(const char *name)
+{
+   (void)name;
+}
+
+void runloop_msg_queue_push(const char *msg, size_t len, unsigned prio,
+      unsigned duration, bool flush, char *title,
+      enum message_queue_icon icon, enum message_queue_category category)
+{
+   (void)msg;
+   (void)len;
+   (void)prio;
+   (void)duration;
+   (void)flush;
+   (void)title;
+   (void)icon;
+   (void)category;
+}
+
 intfstream_t *intfstream_open_file(const char *path,
       unsigned mode, unsigned hints)
 {
@@ -105,7 +156,7 @@ static void start_save(bool compress)
 {
    memset(ram, 0, SRAM_SIZE);
    current = autosave_new("unused.srm", ram, SRAM_SIZE, 0, compress);
-   assert(current);
+   assert(current && autosave_start(current));
    autosave_state.list = &current;
    autosave_state.num  = 1;
    wait_requested();

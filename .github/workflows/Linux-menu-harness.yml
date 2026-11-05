@@ -37,6 +37,14 @@ on:
       - 'samples/menu/core_info_page/**'
       - 'samples/menu/load_content_filter/**'
       - 'samples/settings/packed_rows/**'
+      - 'save.c'
+      - 'save_items.c'
+      - 'save_items.h'
+      - 'runahead.c'
+      - 'libretro-common/include/libretro.h'
+      - 'intl/msg_hash_us.h'
+      - 'samples/runloop/save_ordering/**'
+      - 'samples/runloop/save_items/**'
       - 'setting_list.h'
       - 'gfx/video_defines.h'
       - '.github/workflows/Linux-menu-harness.yml'
@@ -62,6 +70,14 @@ on:
       - 'samples/menu/core_info_page/**'
       - 'samples/menu/load_content_filter/**'
       - 'samples/settings/packed_rows/**'
+      - 'save.c'
+      - 'save_items.c'
+      - 'save_items.h'
+      - 'runahead.c'
+      - 'libretro-common/include/libretro.h'
+      - 'intl/msg_hash_us.h'
+      - 'samples/runloop/save_ordering/**'
+      - 'samples/runloop/save_items/**'
       - 'setting_list.h'
       - 'gfx/video_defines.h'
       - '.github/workflows/Linux-menu-harness.yml'
@@ -184,6 +200,33 @@ jobs:
           samples/runloop/cloudsync_unload/build.sh
           ./samples/runloop/cloudsync_unload/cloudsync_unload_test
           make -C samples/runloop/cloudsync_unload clean
+
+      - name: Build and run save_ordering_test
+        shell: bash
+        run: |
+          set -eu
+          # A core's save items are filled before loaded() and the
+          # first retro_run(), and written after retro_unload_game()
+          # and before retro_deinit(), on a close and on a content
+          # switch.
+          #
+          # Shares the non-Qt build made above.
+          samples/runloop/save_ordering/build.sh
+          ./samples/runloop/save_ordering/save_ordering_test "$RUNNER_TEMP/save_ordering"
+          make -C samples/runloop/save_ordering clean
+
+      - name: Build and run the save_items harness
+        shell: bash
+        run: |
+          set -eu
+          # save_items.c's registry of a core's save items, and
+          # save.c's load, autosave and write of them against a disk
+          # in memory, with its worker threads, under ASan and UBSan.
+          # It builds on its own, not from the build above.
+          make -C samples/runloop/save_items clean
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
+            make -C samples/runloop/save_items SANITIZER=address,undefined check
+          make -C samples/runloop/save_items clean
 
       - name: Build and run menu_playlist_nav_test
         shell: bash
