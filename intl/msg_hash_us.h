@@ -32978,6 +32978,18 @@ MSG_HASH(
    "Failed to load SRAM"
    )
 MSG_HASH(
+   MSG_SAVE_FILE_UNREADABLE,
+   "Couldn't read %s; it will be backed up before the game saves."
+   )
+MSG_HASH(
+   MSG_SAVE_BACKUP_FAILED,
+   "Couldn't back up %s; its changes are kept for now."
+   )
+MSG_HASH(
+   MSG_SAVE_WRITE_RECOVERED,
+   "Couldn't save %s; your progress is in Save Backups."
+   )
+MSG_HASH(
    MSG_FAILED_TO_SAVE_STATE_TO,
    "Failed to save state to"
    )

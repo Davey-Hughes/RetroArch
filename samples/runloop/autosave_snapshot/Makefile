@@ -10,7 +10,7 @@ SOURCES := autosave_snapshot_test.c $(ROOT)/libretro-common/rthreads/rthreads.c 
 # autosave_io_test: real files through file_stream, rzip and a test VFS.
 IO_TARGET := autosave_io_test
 IO_NOTHREADS_TARGET := autosave_io_test_nothreads
-IO_SOURCES := autosave_io_test.c \
+IO_SOURCES := autosave_io_test.c $(ROOT)/save_backups.c \
               $(LRC)/compat/compat_strl.c \
               $(LRC)/compat/fopen_utf8.c \
               $(LRC)/encodings/encoding_crc32.c \
@@ -19,6 +19,8 @@ IO_SOURCES := autosave_io_test.c \
               $(LRC)/features/features_cpu.c \
               $(LRC)/file/file_path.c \
               $(LRC)/file/file_path_io.c \
+              $(LRC)/file/retro_dirent.c \
+              $(LRC)/lists/dir_list.c \
               $(LRC)/lists/string_list.c \
               $(LRC)/streams/file_stream.c \
               $(LRC)/streams/interface_stream.c \
@@ -77,5 +79,6 @@ clean:
 	rm -f $(TARGET) $(TARGET).exe $(IO_TARGET) $(IO_TARGET).exe \
 	      $(IO_NOTHREADS_TARGET) $(IO_NOTHREADS_TARGET).exe
 	rm -f game.srm game.srm.tmp game.srm.auto.tmp
+	rm -rf backups blk cfg
 
 .PHONY: all check clean

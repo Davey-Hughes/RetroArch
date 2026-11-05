@@ -236,14 +236,21 @@ jobs:
           # The binary built above, null drivers, every folder in a run
           # folder: an autosave on a full disk (file size limit) keeps
           # the old save whole, and a launch with an unchanged save
-          # writes nothing to it (strace).  The kill-mid-write lane and
-          # its runs under load stay local.  The harness builds above
-          # removed the binary to read its link line.
+          # writes nothing to it (strace); a save that does not read at
+          # load, that a core reports late or that is not loaded on
+          # request is copied before the first write over it, also by
+          # the network command's unsynced SAVE_FILES, and one longer
+          # than the core's memory before the first shorter write.  The
+          # kill-mid-write lane and its runs under load stay local.  The
+          # harness builds above removed the binary to read its link line.
           make -j$(nproc)
           make -C samples/runloop/save_e2e
           python3 samples/runloop/save_e2e/run.py --retroarch ./retroarch \
              --run-dir "$RUNNER_TEMP/save_e2e" \
-             --lane autosave_full_disk --lane no_rewrite_at_launch
+             --lane autosave_full_disk --lane no_rewrite_at_launch \
+             --lane unreadable_backed_up --lane late_core_backed_up \
+             --lane noload_save_backed_up --lane explicit_save_copies \
+             --lane cut_copy_old_core
           make -C samples/runloop/save_e2e clean
 
       - name: Build and run save_paths_test

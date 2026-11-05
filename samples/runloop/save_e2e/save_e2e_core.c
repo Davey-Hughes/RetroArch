@@ -4,7 +4,8 @@
  * SAVE_E2E_TOUCH_FRAME=n: at frame n, fills save RAM with the bytes
  *    run.py expects (seed SAVE_E2E_SEED) and creates SAVE_E2E_MARK.
  * SAVE_E2E_FRAME_MS: sleeps that long each frame, so frames take time
- *    with the null drivers. */
+ *    with the null drivers.
+ * SAVE_E2E_LATE=n: reports no save RAM before frame n (A1-5). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,7 +18,7 @@ static retro_video_refresh_t video_cb;
 static retro_input_poll_t poll_cb;
 static unsigned char *sram;
 static size_t sram_size;
-static long frame, touch_frame = -1;
+static long frame, touch_frame = -1, late_frame;
 static unsigned frame_ms, seed;
 static unsigned fb[16 * 16];
 
@@ -129,6 +130,7 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
    touch_frame = env_long("SAVE_E2E_TOUCH_FRAME", -1);
    frame_ms    = (unsigned)env_long("SAVE_E2E_FRAME_MS", 0);
    seed        = (unsigned)env_long("SAVE_E2E_SEED", 1);
+   late_frame  = env_long("SAVE_E2E_LATE", 0);
    return (sram = (unsigned char*)calloc(1, sram_size)) != NULL;
 }
 
@@ -151,10 +153,10 @@ RETRO_API unsigned retro_get_region(void) { return RETRO_REGION_NTSC; }
 
 RETRO_API void *retro_get_memory_data(unsigned id)
 {
-   return id == RETRO_MEMORY_SAVE_RAM ? sram : NULL;
+   return id == RETRO_MEMORY_SAVE_RAM && frame >= late_frame ? sram : NULL;
 }
 
 RETRO_API size_t retro_get_memory_size(unsigned id)
 {
-   return id == RETRO_MEMORY_SAVE_RAM ? sram_size : 0;
+   return id == RETRO_MEMORY_SAVE_RAM && frame >= late_frame ? sram_size : 0;
 }

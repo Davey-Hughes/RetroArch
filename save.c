@@ -43,6 +43,7 @@
 #include "file_path_special.h"
 #include "msg_hash.h"
 #include "runloop.h"
+#include "save_backups.h"
 #include "verbosity.h"
 #ifdef HAVE_CHEATS
 #include "cheat_manager.h"
@@ -71,6 +72,138 @@ static void content_mark_sized(unsigned slot,
       task_save_files->elems[slot].userdata = malloc(1);
 }
 
+enum save_file_flags
+{
+   SAVE_FILE_LOADED_NONBLANK    = (1 << 0),
+   SAVE_FILE_BLANKED_SEEN       = (1 << 1),
+   SAVE_FILE_BACKUP_FAILED      = (1 << 2),
+   SAVE_FILE_BACKUP_NOTICED     = (1 << 3),
+   SAVE_FILE_UNREADABLE_NOTICED = (1 << 4),
+   SAVE_FILE_CUT_SEEN           = (1 << 5)
+};
+
+/* One per entry of task_save_files, for the session. Workers read and
+ * raise these; the main thread makes them, frees them and turns the
+ * raised flags into notices. */
+struct save_file
+{
+   retro_atomic_size_t loaded; /* bytes read at load */
+   retro_atomic_int_t owed;    /* 1 << enum save_backup_reason */
+   retro_atomic_int_t flags;   /* enum save_file_flags */
+};
+
+static struct save_file *save_files = NULL;
+static size_t save_files_num        = 0;
+
+/* Main thread: made at the first use after the list is built, kept
+ * until path_deinit_savefile(). */
+static struct save_file *save_file_get(unsigned slot)
+{
+   if (!save_files && task_save_files && task_save_files->size)
+   {
+      size_t i;
+      if (!(save_files = (struct save_file*)malloc(
+            task_save_files->size * sizeof(*save_files))))
+         return NULL;
+      save_files_num = task_save_files->size;
+      for (i = 0; i < save_files_num; i++)
+      {
+         retro_atomic_size_init(&save_files[i].loaded, 0);
+         retro_atomic_int_init(&save_files[i].owed, 0);
+         retro_atomic_int_init(&save_files[i].flags, 0);
+      }
+   }
+   return slot < save_files_num ? &save_files[slot] : NULL;
+}
+
+static void save_file_owe(struct save_file *f,
+      enum save_backup_reason reason)
+{
+   if (f)
+      retro_atomic_fetch_or_int(&f->owed, 1 << reason);
+}
+
+/* All 0x00 or all 0xFF */
+static bool save_image_blank(const void *data, size_t len)
+{
+   size_t i;
+   const unsigned char *p = (const unsigned char*)data;
+   if (!len || (p[0] != 0x00 && p[0] != 0xFF))
+      return false;
+   for (i = 1; i < len; i++)
+      if (p[i] != p[0])
+         return false;
+   return true;
+}
+
+/* Makes the copies @f owes before @path is written over with @data.
+ * False when one is owed and not made: the file must stay as it is.
+ * Without @copy (a write inside a frame) nothing is copied. */
+static bool save_file_pay(struct save_file *f, const char *path,
+      const void *data, size_t len, bool copy, bool sync)
+{
+   unsigned r;
+   int owed;
+   if (!f)
+      return true;
+   if (     save_image_blank(data, len)
+         && (retro_atomic_load_acquire_int(&f->flags)
+            & SAVE_FILE_LOADED_NONBLANK)
+         && !(retro_atomic_fetch_or_int(&f->flags, SAVE_FILE_BLANKED_SEEN)
+            & SAVE_FILE_BLANKED_SEEN))
+      save_file_owe(f, SAVE_BACKUP_BLANKED);
+   /* Shorter than the save as loaded: an old core's partial load, a
+    * shrink or an erase. */
+   if (     len < (size_t)retro_atomic_load_acquire_size(&f->loaded)
+         && !(retro_atomic_fetch_or_int(&f->flags, SAVE_FILE_CUT_SEEN)
+            & SAVE_FILE_CUT_SEEN))
+      save_file_owe(f, SAVE_BACKUP_CUT);
+   if (!(owed = retro_atomic_load_acquire_int(&f->owed)))
+      return true;
+   if (!copy)
+      return false;
+   for (r = 0; r < SAVE_BACKUP_REASON_LAST; r++)
+   {
+      if (!(owed & (1 << r)))
+         continue;
+      if (save_backups_copy_file(path, (enum save_backup_reason)r, sync)
+            == SAVE_BACKUP_FAILED)
+      {
+         retro_atomic_fetch_or_int(&f->flags, SAVE_FILE_BACKUP_FAILED);
+         return false;
+      }
+      retro_atomic_fetch_and_int(&f->owed, ~(1 << r));
+   }
+   return true;
+}
+
+/* On screen with the file's name; with @log, also in the log with
+ * its path (never from autosave_check()). */
+static void save_file_notice(enum msg_hash_enums msg, const char *path,
+      bool log)
+{
+   char s[256];
+   int _len = snprintf(s, sizeof(s), msg_hash_to_str(msg),
+         path_basename_nocompression(path));
+   if (_len < 0)
+      return;
+   if ((size_t)_len >= sizeof(s))
+      _len = (int)sizeof(s) - 1;
+   runloop_msg_queue_push(s, (size_t)_len, 1, 180, true, NULL,
+         MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+   if (log)
+   {
+      size_t len = PATH_MAX_LENGTH + sizeof(s);
+      char *full = (char*)malloc(len);
+      if (full)
+      {
+         snprintf(full, len, msg_hash_to_str(msg), path);
+         RARCH_WARN("[SRAM] %s\n", full);
+         free(full);
+      }
+   }
+}
+
 #ifdef HAVE_THREADS
 /* The worker's own temporary: a SAVE_FILES on the main thread uses
  * "<path>.tmp" and may run while the worker writes. */
@@ -92,6 +225,8 @@ struct autosave
    void *snapshot;
    char *path;
    char *tmp_path;
+   /* Its file's session state; outlives the handle */
+   struct save_file *file;
    /* Retired handles whose workers may not have ended yet */
    autosave_t *prev;
    sthread_t *thread;
@@ -125,6 +260,40 @@ static bool autosave_quitting(autosave_t *save)
    return retro_atomic_load_acquire_int(&save->quit) != 0;
 }
 
+/* Writes the snapshot through the worker's own temporary. False when
+ * opening, writing, syncing or renaming failed: the file keeps its old
+ * contents. */
+static bool autosave_write(autosave_t *save)
+{
+   int ret;
+   intfstream_t *file = NULL;
+   bool written       = false;
+
+   if (save->compress)
+      file = intfstream_open_rzip_file(save->tmp_path,
+            RETRO_VFS_FILE_ACCESS_WRITE);
+   else
+      file = intfstream_open_file(save->tmp_path,
+            RETRO_VFS_FILE_ACCESS_WRITE, RETRO_VFS_FILE_ACCESS_HINT_NONE);
+
+   if (file)
+   {
+      written = intfstream_write(file, save->snapshot,
+            save->bufsize) == (int64_t)save->bufsize;
+      if (intfstream_flush(file) != 0)
+         written = false;
+      if (intfstream_close(file) != 0)
+         written = false;
+      free(file);
+   }
+
+   ret = filestream_finish_atomic_suffix(save->path,
+         AUTOSAVE_TMP_SUFFIX, written, true);
+   if (ret == 1)
+      filestream_delete(save->tmp_path);
+   return ret == 0;
+}
+
 static void autosave_thread(void *data)
 {
    autosave_t *save = (autosave_t*)data;
@@ -153,47 +322,23 @@ static void autosave_thread(void *data)
          break;
 
       /* The snapshot remains ours until the next request. Keep the
-       * last written image unchanged if opening, writing, syncing or
-       * renaming fails; the file keeps its old contents.  Memory
-       * erased to 0 bytes empties a save, but makes none. */
+       * last written image unchanged if the owed copy or the write
+       * fails, so the next check tries again.  Memory erased to 0
+       * bytes empties a save, but makes none. */
       if (     save->unwritten && !save->bufsize
             && !path_is_valid(save->path))
          save->unwritten = false;
       else if (save->unwritten ||
             memcmp(save->buffer, save->snapshot, save->bufsize) != 0)
       {
-         int ret;
-         intfstream_t *file = NULL;
-         bool written       = false;
-         save->unwritten    = true;
-
-         if (save->compress)
-            file = intfstream_open_rzip_file(save->tmp_path,
-                  RETRO_VFS_FILE_ACCESS_WRITE);
-         else
-            file = intfstream_open_file(save->tmp_path,
-                  RETRO_VFS_FILE_ACCESS_WRITE, RETRO_VFS_FILE_ACCESS_HINT_NONE);
-
-         if (file)
-         {
-            written = intfstream_write(file, save->snapshot,
-                  save->bufsize) == (int64_t)save->bufsize;
-            if (intfstream_flush(file) != 0)
-               written = false;
-            if (intfstream_close(file) != 0)
-               written = false;
-            free(file);
-         }
-
-         ret = filestream_finish_atomic_suffix(save->path,
-               AUTOSAVE_TMP_SUFFIX, written, true);
-         if (ret == 0)
+         save->unwritten = true;
+         if (     save_file_pay(save->file, save->path, save->snapshot,
+                     save->bufsize, true, true)
+               && autosave_write(save))
          {
             memcpy(save->buffer, save->snapshot, save->bufsize);
             save->unwritten = false;
          }
-         else if (ret == 1)
-            filestream_delete(save->tmp_path);
       }
 
       /* Rest an interval. Nothing but quit notifies while no copy is
@@ -225,6 +370,7 @@ static void autosave_thread(void *data)
  * @interval        : interval at which saves should be performed.
  * @type            : the RETRO_MEMORY_* id @data was read from
  * @unwritten       : @data is not on disk yet
+ * @file            : its file's session state, or NULL
  *
  * Create and initialize autosave object. Logs nothing: it is also
  * called from autosave_check().
@@ -234,7 +380,8 @@ static void autosave_thread(void *data)
  **/
 static autosave_t *autosave_new(const char *path,
       const void *data, size_t len,
-      unsigned interval, bool compress, unsigned type, bool unwritten)
+      unsigned interval, bool compress, unsigned type, bool unwritten,
+      struct save_file *file)
 {
    size_t      path_len;
    void       *buf               = NULL;
@@ -251,6 +398,7 @@ static autosave_t *autosave_new(const char *path,
    handle->interval              = interval;
    handle->type                  = type;
    handle->unwritten             = unwritten;
+   handle->file                  = file;
    handle->retry_time            = 0;
    handle->buffer                = NULL;
    handle->snapshot              = NULL;
@@ -399,7 +547,7 @@ static void autosave_replace(unsigned i,
       || memcmp(old->buffer, mem_info->data, old->bufsize) != 0;
    autosave_t *handle = autosave_new(old->path, mem_info->data,
          mem_info->size, old->interval, old->compress, old->type,
-         unwritten);
+         unwritten, old->file);
    if (handle)
    {
       handle->prev           = old;
@@ -447,7 +595,8 @@ bool autosave_init(bool compress_files, unsigned autosave_interval)
             autosave_interval,
             compress_files,
             type,
-            false)))
+            false,
+            save_file_get(i))))
       {
          RARCH_WARN("[SRAM] %s\n", msg_hash_to_str(MSG_AUTOSAVE_FAILED));
          continue;
@@ -482,6 +631,22 @@ void autosave_lock(void)
    autosave_state.depth++;
 }
 
+/* The once-per-session notices for what the worker raised. */
+static void save_file_check_notices(struct save_file *f, const char *path)
+{
+   int flags;
+   if (     !f
+         || !(retro_atomic_load_acquire_int(&f->flags)
+            & SAVE_FILE_BACKUP_FAILED))
+      return;
+   flags = retro_atomic_fetch_and_int(&f->flags, ~SAVE_FILE_BACKUP_FAILED);
+   if (!(flags & SAVE_FILE_BACKUP_NOTICED))
+   {
+      retro_atomic_fetch_or_int(&f->flags, SAVE_FILE_BACKUP_NOTICED);
+      save_file_notice(MSG_SAVE_BACKUP_FAILED, path, false);
+   }
+}
+
 void autosave_check(void)
 {
    unsigned i;
@@ -495,6 +660,7 @@ void autosave_check(void)
       autosave_t *handle = autosave_state.list[i];
       if (!handle)
          continue;
+      save_file_check_notices(handle->file, handle->path);
       if (handle->prev)
          autosave_reap(handle);
       mem_info.id        = handle->type;
@@ -568,11 +734,10 @@ static bool content_load_ram_file(unsigned slot)
    int64_t rc;
    struct ram_type ram;
    retro_ctx_memory_info_t mem_info;
-   void *buf        = NULL;
-   bool success     = false;
-
-   if (!content_get_memory(&mem_info, &ram, slot))
-      return false;
+   void *buf           = NULL;
+   bool success        = false;
+   bool have_memory    = content_get_memory(&mem_info, &ram, slot);
+   struct save_file *f = save_file_get(slot);
 
    /* On first run of content, SRAM file will
     * not exist. This is a common enough occurrence
@@ -582,6 +747,17 @@ static bool content_load_ram_file(unsigned slot)
        || !path_is_valid(ram.path))
       return false;
 
+   /* Not read now, so copied before anything writes over it. */
+   if (!have_memory)
+   {
+      const char *core = runloop_state_get_ptr()->system.info.library_name;
+      save_file_owe(f, SAVE_BACKUP_NOT_LOADED);
+      RARCH_WARN("[SRAM] %s reported no memory for \"%s\" at load; "
+            "it will be backed up before it is written.\n",
+            core ? core : "", ram.path);
+      return false;
+   }
+
 #if defined(HAVE_COMPRESSION)
    /* Always use RZIP interface when reading SRAM
     * files - this will automatically handle uncompressed
@@ -590,10 +766,22 @@ static bool content_load_ram_file(unsigned slot)
 #else
    if (!filestream_read_file(ram.path, &buf, &rc))
 #endif
+   {
+      save_file_owe(f, SAVE_BACKUP_UNREADABLE);
+      if (     f
+            && !(retro_atomic_fetch_or_int(&f->flags,
+                  SAVE_FILE_UNREADABLE_NOTICED)
+               & SAVE_FILE_UNREADABLE_NOTICED))
+      {
+         save_file_notice(MSG_SAVE_FILE_UNREADABLE, ram.path, true);
+      }
       return false;
+   }
 
    if (rc > 0)
    {
+      if (f)
+         retro_atomic_store_release_size(&f->loaded, (size_t)rc);
       if (rc > (ssize_t)mem_info.size)
       {
          RARCH_WARN("[SRAM] SRAM is larger than implementation expects, "
@@ -606,6 +794,8 @@ static bool content_load_ram_file(unsigned slot)
       }
       memcpy(mem_info.data, buf, (size_t)rc);
       success = true;
+      if (f && !save_image_blank(buf, (size_t)rc))
+         retro_atomic_fetch_or_int(&f->flags, SAVE_FILE_LOADED_NONBLANK);
    }
 
    if (buf)
@@ -670,16 +860,19 @@ static bool dump_to_file_desperate(const void *data,
  * @compress         : whether to use rzip compression
  * @sync             : whether to wait for the disk before replacing
  * @rewrite          : write even if the file matches memory
+ * @copy             : whether the safety copies the file owes may be
+ *                     made here
  *
  * Save a RAM state from memory to disk.
  * Skips the write if the on-disk content already
  * matches memory (common when autosave has been active).
  */
 static bool content_save_ram_file(unsigned slot, bool compress, bool sync,
-      bool rewrite)
+      bool rewrite, bool copy)
 {
    struct ram_type ram;
    retro_ctx_memory_info_t mem_info;
+   struct save_file *f;
 
    /* Memory that had a size this session and reports 0 bytes, its
     * pointer kept, was erased: its save is emptied. */
@@ -688,6 +881,7 @@ static bool content_save_ram_file(unsigned slot, bool compress, bool sync,
                || !task_save_files->elems[slot].userdata
                || !path_is_valid(ram.path)))
       return false;
+   f = save_file_get(slot);
 
    /* Quick check: if the file already exists and matches
     * current memory contents, skip the write entirely.
@@ -723,6 +917,43 @@ static bool content_save_ram_file(unsigned slot, bool compress, bool sync,
                ram.path);
          return true;
       }
+   }
+
+   if (!save_file_pay(f, ram.path, mem_info.data, mem_info.size,
+            copy, sync))
+   {
+      char *rec = NULL;
+      if (rewrite)
+         save_files_unsynced = true;
+      if (!copy)
+      {
+         RARCH_LOG("[SRAM] \"%s\" is written once it is backed up.\n",
+               ram.path);
+         return false;
+      }
+      /* Inside a frame: no recovery file, the image stays in memory. */
+      if (!sync)
+      {
+         if (     f
+               && !(retro_atomic_fetch_or_int(&f->flags,
+                     SAVE_FILE_BACKUP_NOTICED)
+                  & SAVE_FILE_BACKUP_NOTICED))
+            save_file_notice(MSG_SAVE_BACKUP_FAILED, ram.path, true);
+         return false;
+      }
+      /* An erase leaves nothing to recover. */
+      if (     mem_info.size
+            && (rec = (char*)malloc(PATH_MAX_LENGTH))
+            && save_backups_recover(rec, PATH_MAX_LENGTH, ram.path,
+                  mem_info.data, mem_info.size, sync))
+      {
+         save_file_notice(MSG_SAVE_WRITE_RECOVERED, ram.path, true);
+         RARCH_WARN("[SRAM] Unsaved progress: \"%s\"\n", rec);
+      }
+      else
+         RARCH_ERR("[SRAM] Couldn't back up or keep \"%s\".\n", ram.path);
+      free(rec);
+      return false;
    }
 
    if (!sync)
@@ -779,7 +1010,7 @@ fail:
 }
 
 bool event_save_files(bool is_sram_used, bool compress_files, bool sync,
-      const char *path_cheat_database)
+      bool copy, const char *path_cheat_database)
 {
    unsigned i;
    bool ret     = true;
@@ -792,7 +1023,7 @@ bool event_save_files(bool is_sram_used, bool compress_files, bool sync,
    if (sync)
       save_files_unsynced = false;
    for (i = 0; i < task_save_files->size; i++)
-      if (!content_save_ram_file(i, compress_files, sync, rewrite))
+      if (!content_save_ram_file(i, compress_files, sync, rewrite, copy))
          ret = false;
    return ret;
 }
@@ -802,8 +1033,17 @@ bool event_load_save_files(bool is_sram_load_disabled)
    unsigned i;
    bool ret = false;
 
-   if (!task_save_files || is_sram_load_disabled)
+   if (!task_save_files)
       return false;
+
+   /* Not loaded on request: copied before anything writes over it. */
+   if (is_sram_load_disabled)
+   {
+      for (i = 0; i < task_save_files->size; i++)
+         if (path_is_valid(task_save_files->elems[i].data))
+            save_file_owe(save_file_get(i), SAVE_BACKUP_NOT_LOADED);
+      return false;
+   }
 
    /* Report a successful load operation if
     * any type of RAM file is found and
@@ -869,6 +1109,9 @@ void path_deinit_savefile(void)
    if (task_save_files)
       string_list_free(task_save_files);
    task_save_files = NULL;
+   free(save_files);
+   save_files      = NULL;
+   save_files_num  = 0;
 }
 
 void path_init_savefile_new(void)
