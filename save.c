@@ -25,6 +25,7 @@
 #include <streams/rzip_stream.h>
 #include <rthreads/rthreads.h>
 #ifdef HAVE_THREADS
+#include <features/features_cpu.h>
 #include <rthreads/retro_eventcount.h>
 #endif
 #include <retro_atomic.h>
@@ -80,10 +81,12 @@ struct autosave
    void *snapshot;
    char *path;
    char *tmp_path;
-   /* The retired handle this one replaced, joined with it */
+   /* Retired handles whose workers may not have ended yet */
    autosave_t *prev;
    sthread_t *thread;
    size_t bufsize;
+   /* Main thread only: retired, when to try a replacement again */
+   retro_time_t retry_time;
    /* What the worker sleeps on: the copy it asked for, the end of its
     * interval, or quit. */
    retro_eventcount_t ec;
@@ -93,6 +96,8 @@ struct autosave
     * and waits until autosave_check() has made it and cleared this. */
    retro_atomic_int_t snapshot_requested;
    retro_atomic_int_t quit;
+   /* The worker's last store: the handle is the main thread's after it */
+   retro_atomic_int_t exited;
    bool compress;
    bool ec_inited;
    /* buffer is not on disk: written at the next copy whatever it
@@ -192,6 +197,8 @@ static void autosave_thread(void *data)
                   );
       }
    }
+
+   retro_atomic_store_release_int(&save->exited, 1);
 }
 
 /**
@@ -222,11 +229,13 @@ static autosave_t *autosave_new(const char *path,
    handle->compress              = compress;
    handle->ec_inited             = false;
    retro_atomic_int_init(&handle->quit, 0);
+   retro_atomic_int_init(&handle->exited, 0);
    retro_atomic_int_init(&handle->snapshot_requested, 0);
    handle->bufsize               = len;
    handle->interval              = interval;
    handle->type                  = type;
    handle->unwritten             = unwritten;
+   handle->retry_time            = 0;
    handle->buffer                = NULL;
    handle->snapshot              = NULL;
    handle->prev                  = NULL;
@@ -339,8 +348,28 @@ static void autosave_free_chain(autosave_t *handle)
    }
 }
 
+/* Frees the retired handles behind @handle whose workers have ended.
+ * A join after the worker's last store waits for no more than its
+ * return. */
+static void autosave_reap(autosave_t *handle)
+{
+   autosave_t **link = &handle->prev;
+   while (*link)
+   {
+      autosave_t *old = *link;
+      if (retro_atomic_load_acquire_int(&old->exited))
+      {
+         *link     = old->prev;
+         old->prev = NULL;
+         autosave_free(old);
+      }
+      else
+         link = &old->prev;
+   }
+}
+
 /* A new handle for slot @i over memory of a new size or place; the
- * retired one stays reachable from it until autosave_deinit(). */
+ * retired one stays reachable from it until its worker has ended. */
 static void autosave_replace(unsigned i,
       const retro_ctx_memory_info_t *mem_info)
 {
@@ -359,6 +388,9 @@ static void autosave_replace(unsigned i,
       handle->prev           = old;
       autosave_state.list[i] = handle;
    }
+   else
+      old->retry_time = cpu_features_get_time_usec()
+         + (retro_time_t)old->interval * 1000000;
 }
 
 bool autosave_init(bool compress_files, unsigned autosave_interval)
@@ -445,10 +477,15 @@ void autosave_check(void)
       autosave_t *handle = autosave_state.list[i];
       if (!handle)
          continue;
+      if (handle->prev)
+         autosave_reap(handle);
       mem_info.id        = handle->type;
       /* Retired: replaced once the core reports its memory again. */
       if (autosave_quitting(handle))
       {
+         if (     handle->retry_time
+               && cpu_features_get_time_usec() < handle->retry_time)
+            continue;
          core_get_memory(&mem_info);
          if (mem_info.data && mem_info.size)
             autosave_replace(i, &mem_info);
@@ -463,7 +500,7 @@ void autosave_check(void)
       if (!mem_info.data || mem_info.size != handle->bufsize)
       {
          /* Its worker is idle, waiting for this copy: it ends without
-          * writing again and is joined at autosave_deinit(). */
+          * writing again and is joined once it has. */
          retro_atomic_store_release_int(&handle->quit, 1);
          retro_eventcount_notify(&handle->ec);
          if (mem_info.data && mem_info.size)

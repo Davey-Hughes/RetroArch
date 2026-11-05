@@ -13,11 +13,16 @@
 #include <vfs/vfs_implementation.h>
 
 #ifdef HAVE_THREADS
+#define sthread_create test_sthread_create
 #define sthread_join test_sthread_join
+#define cpu_features_get_time_usec test_time_usec
 #endif
 #include "../../../save.c"
 #ifdef HAVE_THREADS
+#undef sthread_create
 #undef sthread_join
+#undef cpu_features_get_time_usec
+sthread_t *sthread_create(void (*thread_func)(void*), void *userdata);
 void sthread_join(sthread_t *thread);
 #endif
 
@@ -370,11 +375,53 @@ static void lane_close_sync(void)
 
 #ifdef HAVE_THREADS
 static unsigned joins;
+static unsigned creates;
+static bool fail_create;
+static retro_time_t now_usec;
+
+/* Each worker's handle, so a join can tell whether the worker has
+ * ended; only stop() and autosave_deinit() join running ones. */
+#define MAX_WORKERS 64
+static sthread_t *worker_threads[MAX_WORKERS];
+static autosave_t *worker_handles[MAX_WORKERS];
+static bool joining_all;
+
+sthread_t *test_sthread_create(void (*thread_func)(void*), void *userdata)
+{
+   unsigned i;
+   sthread_t *t;
+   creates++;
+   if (fail_create)
+      return NULL;
+   t = sthread_create(thread_func, userdata);
+   for (i = 0; t && i < MAX_WORKERS; i++)
+      if (!worker_threads[i])
+      {
+         worker_threads[i] = t;
+         worker_handles[i] = (autosave_t*)userdata;
+         break;
+      }
+   return t;
+}
 
 void test_sthread_join(sthread_t *thread)
 {
+   unsigned i;
    joins++;
+   for (i = 0; i < MAX_WORKERS; i++)
+      if (worker_threads[i] == thread)
+      {
+         CHECK(joining_all
+               || retro_atomic_load_acquire_int(&worker_handles[i]->exited),
+               "a check joined a worker still running");
+         worker_threads[i] = NULL;
+      }
    sthread_join(thread);
+}
+
+retro_time_t test_time_usec(void)
+{
+   return now_usec;
 }
 
 static autosave_t *slots[1];
@@ -414,7 +461,9 @@ static void start(void *ram, size_t len, bool compress)
 
 static void stop(void)
 {
+   joining_all         = true;
    autosave_free_chain(slots[0]);
+   joining_all         = false;
    slots[0]            = NULL;
    autosave_state.list = NULL;
    autosave_state.num  = 0;
@@ -498,7 +547,9 @@ static void lane_no_rewrite_at_launch(void)
       ram[0] ^= 0xFF;
       capture_and_wait();
    }
+   joining_all = true;
    autosave_deinit();
+   joining_all = false;
    slots[0] = NULL;
    CHECK(reads_as(SAVE, ram, BIG), "no_rewrite: a change was not written");
    memset(head, 0, sizeof(head));
@@ -573,7 +624,6 @@ static void lane_pointer_requery(void)
    memset(c, 5, sizeof(c));
    capture_and_wait();
    CHECK(holds(SAVE, c, sizeof(c)), "requery: the returned memory was not written");
-   CHECK(joins == 0, "requery: autosave_check joined a thread");
 
    stop();
    CHECK(joins == 3, "requery: retired workers were not joined at the end");
@@ -625,6 +675,99 @@ static void lane_resize_unwritten(void)
    use_test_vfs(false);
    clean();
 }
+
+/* Resizes again and again leave no retired handles behind once their
+ * workers have ended. */
+static void lane_retire_bounded(void)
+{
+   static unsigned char a[64], c[128];
+   unsigned i, n;
+   autosave_t *h;
+
+   clean();
+   memset(a, 1, sizeof(a));
+   memset(c, 1, sizeof(c));
+   joins = 0;
+   start(a, sizeof(a), false);
+   for (i = 0; i < 20; i++)
+   {
+      core_data = (i & 1) ? a : c;
+      core_size = (i & 1) ? sizeof(a) : sizeof(c);
+      autosave_lock();
+      autosave_unlock();
+      /* Again at once, while the retired worker is likely still
+       * ending: it must not be joined yet. */
+      autosave_lock();
+      autosave_unlock();
+      wait_requested();
+   }
+   for (i = 0; i < 5000 && slots[0]->prev; i++)
+   {
+      retro_sleep(1);
+      autosave_lock();
+      autosave_unlock();
+   }
+   for (n = 0, h = slots[0]->prev; h; h = h->prev)
+      n++;
+   CHECK(n == 0, "bounded: retired handles were kept");
+   CHECK(joins == 20, "bounded: retired workers were not joined");
+   stop();
+   CHECK(joins == 21, "bounded: a worker was not joined at the end");
+   clean();
+}
+
+/* A replacement whose worker cannot start is tried again once per
+ * interval, not at every check. */
+static void lane_create_retry(void)
+{
+   static unsigned char a[64], c[128];
+   unsigned i, before;
+
+   clean();
+   memset(a, 1, sizeof(a));
+   memset(c, 1, sizeof(c));
+   core_data = a;
+   core_size = sizeof(a);
+   now_usec  = 1000000;
+   slots[0]  = autosave_new(SAVE, a, sizeof(a), 1, false,
+         RETRO_MEMORY_SAVE_RAM, false);
+   CHECK(slots[0] != NULL, "create_retry: autosave_new failed");
+   autosave_state.list = slots;
+   autosave_state.num  = 1;
+   wait_requested();
+
+   core_data   = c;
+   core_size   = sizeof(c);
+   fail_create = true;
+   before      = creates;
+   for (i = 0; i < 10; i++)
+   {
+      autosave_lock();
+      autosave_unlock();
+   }
+   CHECK(creates == before + 1, "create_retry: tried again at every check");
+   now_usec += 999999;
+   autosave_lock();
+   autosave_unlock();
+   CHECK(creates == before + 1, "create_retry: tried again within the interval");
+   now_usec += 1;
+   for (i = 0; i < 10; i++)
+   {
+      autosave_lock();
+      autosave_unlock();
+   }
+   CHECK(creates == before + 2, "create_retry: not tried once per interval");
+
+   fail_create = false;
+   now_usec   += 1000000;
+   autosave_lock();
+   autosave_unlock();
+   CHECK(creates == before + 3 && slots[0] && !autosave_quitting(slots[0]),
+         "create_retry: no worker once it could start");
+   wait_requested();
+   stop();
+   clean();
+}
 #endif
 
 int main(void)
@@ -641,6 +784,8 @@ int main(void)
    lane_no_rewrite_at_launch();
    lane_pointer_requery();
    lane_resize_unwritten();
+   lane_retire_bounded();
+   lane_create_retry();
    slock_free(vfs_lock);
 #endif
    if (failures)
