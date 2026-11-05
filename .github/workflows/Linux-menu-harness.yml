@@ -221,10 +221,10 @@ jobs:
         run: |
           set -eu
           # save.c's autosave worker: snapshots taken on the main thread
-          # only, writes through a temporary of its own that a full disk
-          # or a refused rename leaves the old save behind, nothing
-          # written for an unchanged save, and memory a core moves or
-          # resizes followed; the close write without HAVE_THREADS.
+          # only; writes through a temporary of its own, so a full disk
+          # or a refused rename keeps the old save whole; nothing written
+          # for an unchanged save; memory a core moves or resizes
+          # followed.  The close write, with and without HAVE_THREADS.
           make -C samples/runloop/autosave_snapshot clean check
           make -C samples/runloop/autosave_snapshot clean check SANITIZER=address,undefined
           make -C samples/runloop/autosave_snapshot clean
