@@ -12,6 +12,7 @@ import os
 import resource
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -100,10 +101,11 @@ class Run:
         env.update({k: str(v) for k, v in extra.items()})
         return env
 
-    def start(self, args, cfg, frames, env, prefix=(), preexec=None):
+    def start(self, args, cfg, frames, env, prefix=(), preexec=None,
+              extra=()):
         cmd = list(prefix) + [str(args.retroarch), '--config', str(cfg),
                               '-L', str(args.core), str(self.content),
-                              '--max-frames=%d' % frames, '-v']
+                              '--max-frames=%d' % frames, '-v'] + list(extra)
         self.proc = subprocess.Popen(cmd, cwd=self.dir, env=env,
                                      stdin=subprocess.DEVNULL,
                                      stdout=subprocess.PIPE,
@@ -138,6 +140,22 @@ class Run:
     def temps(self):
         return sorted(p.name for p in self.saves.iterdir()
                       if p.name.endswith('.tmp'))
+
+    def copies(self, reason, folder=None):
+        """Safety copies or recovery files of game.srm with @reason."""
+        d = folder or self.saves / 'backups'
+        if not d.is_dir():
+            return []
+        return sorted(p for p in d.iterdir()
+                      if p.name.startswith('game - ')
+                      and p.name.endswith(' - %s.srm' % reason))
+
+    def wait_for(self, path, timeout=30):
+        deadline = time.time() + timeout
+        while not path.exists() and self.proc.poll() is None \
+                and time.time() < deadline:
+            time.sleep(0.01)
+        return path.exists()
 
 
 def check(failures, cond, what):
@@ -223,10 +241,160 @@ def lane_no_rewrite_at_launch(args, n):
     return r, failures
 
 
+def lane_unreadable_backed_up(args, n):
+    """A save that cannot be read at load is copied as it is
+    before the first write over it; one notice."""
+    r = Run(args.run_dir, 'unreadable_backed_up-%d' % n)
+    old, new = pattern(51), pattern(52)
+    r.srm.write_bytes(old)
+    os.chmod(r.srm, 0)
+    cfg = r.config()
+    env = r.env(SAVE_E2E_TOUCH_FRAME=30, SAVE_E2E_SEED=52,
+                SAVE_E2E_FRAME_MS=10)
+    r.start(args, cfg, 300, env)
+    # The read error passes once the game runs (a share back online).
+    touched = r.wait_for(r.dir / 'touched')
+    os.chmod(r.srm, 0o644)
+    rc = r.wait(60)
+    log = r.log.read_text(errors='replace')
+    copies = r.copies('unreadable')
+    failures = []
+    check(failures, touched, 'core never touched save RAM')
+    check(failures, rc == 0, 'retroarch exit %s' % rc)
+    check(failures, len(copies) == 1, '%d unreadable copies' % len(copies))
+    check(failures, copies and copies[0].read_bytes() == old,
+          'the copy is not the old save')
+    check(failures, r.srm.read_bytes() == new, '.srm not written')
+    check(failures, log.count("Couldn't read %s;" % r.srm) == 1,
+          'not one unreadable notice in the log')
+    return r, failures
+
+
+def lane_late_core_backed_up(args, n):
+    """A core that reports save RAM only after the load: the old
+    save is copied before the close writes over it; no notice."""
+    r = Run(args.run_dir, 'late_core_backed_up-%d' % n)
+    old, new = pattern(41), pattern(42)
+    r.srm.write_bytes(old)
+    cfg = r.config()
+    env = r.env(SAVE_E2E_LATE=5, SAVE_E2E_TOUCH_FRAME=30,
+                SAVE_E2E_SEED=42, SAVE_E2E_FRAME_MS=10)
+    r.start(args, cfg, 100, env)
+    rc = r.wait(60)
+    log = r.log.read_text(errors='replace')
+    copies = r.copies('not-loaded')
+    failures = []
+    check(failures, (r.dir / 'touched').exists(), 'core never touched save RAM')
+    check(failures, rc == 0, 'retroarch exit %s' % rc)
+    check(failures, len(copies) == 1, '%d not-loaded copies' % len(copies))
+    check(failures, copies and copies[0].read_bytes() == old,
+          'the copy is not the old save')
+    check(failures, 'save_e2e reported no memory for "%s"' % r.srm in log,
+          'the log does not name the core')
+    check(failures, "Couldn't read" not in log, 'a notice for a late core')
+    check(failures, log.count('Backed up "%s" (not-loaded)' % r.srm) == 1,
+          'the copy is not logged once')
+    check(failures, r.srm.read_bytes() == new, 'the close did not write')
+    return r, failures
+
+
+def lane_noload_save_backed_up(args, n):
+    """--sram-mode noload-save: the save is not loaded, so it is copied
+    before the first write over it."""
+    r = Run(args.run_dir, 'noload_save_backed_up-%d' % n)
+    old, new = pattern(81), pattern(82)
+    r.srm.write_bytes(old)
+    cfg = r.config()
+    env = r.env(SAVE_E2E_TOUCH_FRAME=30, SAVE_E2E_SEED=82,
+                SAVE_E2E_FRAME_MS=10)
+    r.start(args, cfg, 300, env, extra=('--sram-mode', 'noload-save'))
+    rc = r.wait(60)
+    copies = r.copies('not-loaded')
+    failures = []
+    check(failures, (r.dir / 'touched').exists(), 'core never touched save RAM')
+    check(failures, rc == 0, 'retroarch exit %s' % rc)
+    check(failures, len(copies) == 1, '%d not-loaded copies' % len(copies))
+    check(failures, copies and copies[0].read_bytes() == old,
+          'the copy is not the old save')
+    check(failures, r.srm.read_bytes() == new, '.srm not written')
+    return r, failures
+
+
+def lane_explicit_save_copies(args, n):
+    """The network command's SAVE_FILES on a save that owes a copy (it
+    did not read at load): the copy, then the write, neither synced
+    (the close writes those bytes again, synced). No autosave worker
+    runs."""
+    r = Run(args.run_dir, 'explicit_save_copies-%d' % n)
+    old, new = pattern(91), pattern(92)
+    r.srm.write_bytes(old)
+    os.chmod(r.srm, 0)
+    port = 55500 + n
+    cfg = r.config(autosave_interval='0', network_cmd_enable='true',
+                   network_cmd_port=str(port))
+    env = r.env(SAVE_E2E_TOUCH_FRAME=30, SAVE_E2E_SEED=92,
+                SAVE_E2E_FRAME_MS=10)
+    trace = r.dir / 'strace.log'
+    prefix = ['strace', '-f', '-qq', '-y', '-ttt', '-o', str(trace),
+              '-e', 'trace=fsync,fdatasync']
+    r.start(args, cfg, 600, env, prefix=prefix)
+    touched = r.wait_for(r.dir / 'touched')
+    os.chmod(r.srm, 0o644)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    deadline = time.time() + 20
+    while r.srm.read_bytes() != new and r.proc.poll() is None \
+            and time.time() < deadline:
+        sock.sendto(b'SAVE_FILES', ('127.0.0.1', port))
+        time.sleep(0.5)
+    written = time.time()
+    sock.close()
+    rc = r.wait(60)
+    copies = r.copies('unreadable')
+    syncs = [l for l in trace.read_text(errors='replace').splitlines()
+             if str(r.saves) in l and float(l.split()[1]) < written]
+    failures = []
+    check(failures, touched, 'core never touched save RAM')
+    check(failures, rc == 0, 'retroarch exit %s' % rc)
+    check(failures, len(copies) == 1, '%d unreadable copies' % len(copies))
+    check(failures, copies and copies[0].read_bytes() == old,
+          'the copy is not the old save')
+    check(failures, r.srm.read_bytes() == new, '.srm not written')
+    check(failures, not syncs, '%d syncs under saves/: %s' % (len(syncs),
+                                                             syncs[:2]))
+    return r, failures
+
+
+def lane_cut_copy_old_core(args, n):
+    """A save longer than the core's memory (an old core's partial
+    load) is copied before the first shorter write over it."""
+    r = Run(args.run_dir, 'cut_copy_old_core-%d' % n)
+    old, new = pattern(61), pattern(62, 2048)
+    r.srm.write_bytes(old)
+    cfg = r.config()
+    env = r.env(SAVE_E2E_SRAM=2048, SAVE_E2E_TOUCH_FRAME=30,
+                SAVE_E2E_SEED=62, SAVE_E2E_FRAME_MS=10)
+    r.start(args, cfg, 300, env)
+    rc = r.wait(60)
+    copies = r.copies('cut')
+    failures = []
+    check(failures, (r.dir / 'touched').exists(), 'core never touched save RAM')
+    check(failures, rc == 0, 'retroarch exit %s' % rc)
+    check(failures, len(copies) == 1, '%d cut copies' % len(copies))
+    check(failures, copies and copies[0].read_bytes() == old,
+          'the copy is not the old save')
+    check(failures, r.srm.read_bytes() == new, '.srm not written')
+    return r, failures
+
+
 LANES = {
     'autosave_full_disk': lane_autosave_full_disk,
     'autosave_kill_mid_write': lane_autosave_kill_mid_write,
     'no_rewrite_at_launch': lane_no_rewrite_at_launch,
+    'unreadable_backed_up': lane_unreadable_backed_up,
+    'late_core_backed_up': lane_late_core_backed_up,
+    'noload_save_backed_up': lane_noload_save_backed_up,
+    'explicit_save_copies': lane_explicit_save_copies,
+    'cut_copy_old_core': lane_cut_copy_old_core,
 }
 
 

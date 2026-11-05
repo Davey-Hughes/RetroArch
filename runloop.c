@@ -5967,6 +5967,35 @@ static void runloop_path_init_savefile(runloop_state_t *runloop_st)
             msg_hash_to_str(MSG_SRAM_WILL_NOT_BE_SAVED));
 }
 
+/* Where this content's safety copies and recovery files go. Set
+ * before the save load, while no autosave worker runs. */
+static void runloop_set_save_backup_roots(runloop_state_t *runloop_st,
+      settings_t *settings)
+{
+   char *content_dir = (char*)malloc(DIR_MAX_LENGTH);
+   char *config_dir  = (char*)malloc(DIR_MAX_LENGTH);
+   char *app_data    = (char*)malloc(DIR_MAX_LENGTH);
+   if (content_dir && config_dir && app_data)
+   {
+      const char *content = path_get(RARCH_PATH_CONTENT);
+      content_dir[0]      = '\0';
+      config_dir[0]       = '\0';
+      if (!string_is_empty(content))
+         fill_pathname_basedir(content_dir, content, DIR_MAX_LENGTH);
+      fill_pathname_application_special(config_dir, DIR_MAX_LENGTH,
+            APPLICATION_SPECIAL_DIRECTORY_CONFIG);
+      if (!fill_pathname_application_data(app_data, DIR_MAX_LENGTH))
+         app_data[0]      = '\0';
+      save_backups_set_roots(dir_get_ptr(RARCH_DIR_SAVEFILE),
+            dir_get_ptr(RARCH_DIR_SAVESTATE), content_dir,
+            settings->paths.directory_system, config_dir, app_data,
+            runloop_st->system.info.library_name);
+   }
+   free(content_dir);
+   free(config_dir);
+   free(app_data);
+}
+
 static bool event_init_content(
       runloop_state_t *runloop_st,
       settings_t *settings,
@@ -6019,6 +6048,7 @@ static bool event_init_content(
    command_event_set_replay_auto_index(settings);
 
    runloop_path_init_savefile(runloop_st);
+   runloop_set_save_backup_roots(runloop_st, settings);
 
    if (!event_load_save_files(runloop_st->flags & RUNLOOP_FLAG_IS_SRAM_LOAD_DISABLED))
       RARCH_LOG("[SRAM] %s\n", msg_hash_to_str(MSG_SKIPPING_SRAM_LOAD));

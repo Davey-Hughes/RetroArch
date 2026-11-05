@@ -98,6 +98,50 @@ bool path_is_valid(const char *path)
    return true;
 }
 
+/* No copy is ever owed here: the handles have no session state. */
+enum save_backup_result save_backups_copy_file(const char *path,
+      enum save_backup_reason reason, bool sync)
+{
+   (void)path;
+   (void)reason;
+   (void)sync;
+   return SAVE_BACKUP_FAILED;
+}
+
+const char *save_backups_reason_name(enum save_backup_reason reason)
+{
+   (void)reason;
+   return "";
+}
+
+const char *path_basename_nocompression(const char *path)
+{
+   return path;
+}
+
+void RARCH_LOG(const char *fmt, ...) { (void)fmt; }
+void RARCH_WARN(const char *fmt, ...) { (void)fmt; }
+
+const char *msg_hash_to_str(enum msg_hash_enums msg)
+{
+   (void)msg;
+   return "";
+}
+
+void runloop_msg_queue_push(const char *msg, size_t len,
+      unsigned prio, unsigned duration, bool flush, char *title,
+      enum message_queue_icon icon, enum message_queue_category category)
+{
+   (void)msg;
+   (void)len;
+   (void)prio;
+   (void)duration;
+   (void)flush;
+   (void)title;
+   (void)icon;
+   (void)category;
+}
+
 bool core_get_memory(retro_ctx_memory_info_t *info)
 {
    info->data = ram;
@@ -128,7 +172,7 @@ static void start_save(bool compress)
 {
    memset(ram, 0, SRAM_SIZE);
    current = autosave_new("unused.srm", ram, SRAM_SIZE, 0, compress,
-         RETRO_MEMORY_SAVE_RAM, false);
+         RETRO_MEMORY_SAVE_RAM, false, NULL);
    assert(current);
    autosave_state.list = &current;
    autosave_state.num  = 1;

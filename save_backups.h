@@ -89,6 +89,9 @@ size_t save_backups_dir(char *s, size_t len, const char *path);
 /* Reads a file name (no folder). False when it is not a copy's name. */
 bool save_backups_parse(const char *name, struct save_backup_name *out);
 
+/* @reason's word, as in a copy's name. */
+const char *save_backups_reason_name(enum save_backup_reason reason);
+
 /* Writes @data, or with NULL the file at @path as it is, into @dir as
  * a copy of @path, named with @core (NULL: the roots' core). Nothing
  * is written when the newest copy of @path there holds the same bytes.

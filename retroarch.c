@@ -3903,20 +3903,26 @@ bool command_event(enum event_command cmd, void *data)
 #endif
          return event_load_save_files(runloop_st->flags & RUNLOOP_FLAG_IS_SRAM_LOAD_DISABLED);
       case CMD_EVENT_SAVE_FILES:
-         return event_save_files(
-               runloop_st->flags & RUNLOOP_FLAG_USE_SRAM,
+         {
+            /* NULL is an explicit save request (network command, web
+             * export): not synced, but it makes the copies owed. */
+            bool sync = data ? *(bool*)data : false;
+            return event_save_files(
+                  runloop_st->flags & RUNLOOP_FLAG_USE_SRAM,
 #if defined(HAVE_COMPRESSION)
-               settings->bools.save_file_compression,
+                  settings->bools.save_file_compression,
 #else
-               false,
+                  false,
 #endif
-               data ? *(bool*)data : false,
+                  sync,
+                  sync || !data,
 #ifdef HAVE_CHEATS
-               settings->paths.path_cheat_database
+                  settings->paths.path_cheat_database
 #else
-               NULL
+                  NULL
 #endif
-         );
+            );
+         }
       case CMD_EVENT_OVERLAY_UNLOAD:
 #ifdef HAVE_OVERLAY
          input_overlay_unload();

@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <retro_timers.h>
+#include <lists/dir_list.h>
 #include <vfs/vfs_implementation.h>
 
 #define filestream_write_file_atomic_synced test_write_atomic_synced
@@ -60,17 +61,113 @@ bool core_get_memory(retro_ctx_memory_info_t *info)
    return true;
 }
 
-void RARCH_LOG(const char *fmt, ...) { (void)fmt; }
-void RARCH_WARN(const char *fmt, ...) { (void)fmt; }
-void RARCH_ERR(const char *fmt, ...) { (void)fmt; }
+/* Log lines, each led by its level: I, W or E.  Workers log too. */
+#define MAX_LOG 128
+static char log_lines[MAX_LOG][320];
+static unsigned log_num;
+#ifdef HAVE_THREADS
+static slock_t *log_lock;
+#define LOG_LOCK()   slock_lock(log_lock)
+#define LOG_UNLOCK() slock_unlock(log_lock)
+#else
+#define LOG_LOCK()
+#define LOG_UNLOCK()
+#endif
 
-const char *msg_hash_to_str(enum msg_hash_enums msg)
+static void log_line(char level, const char *fmt, va_list ap)
 {
-   (void)msg;
-   return "";
+   LOG_LOCK();
+   if (log_num < MAX_LOG)
+   {
+      log_lines[log_num][0] = level;
+      vsnprintf(log_lines[log_num] + 1, sizeof(log_lines[0]) - 1, fmt, ap);
+      log_num++;
+   }
+   LOG_UNLOCK();
 }
 
-/* No recovery file: those are A9's. */
+void RARCH_LOG(const char *fmt, ...)
+{
+   va_list ap;
+   va_start(ap, fmt);
+   log_line('I', fmt, ap);
+   va_end(ap);
+}
+
+void RARCH_WARN(const char *fmt, ...)
+{
+   va_list ap;
+   va_start(ap, fmt);
+   log_line('W', fmt, ap);
+   va_end(ap);
+}
+
+void RARCH_ERR(const char *fmt, ...)
+{
+   va_list ap;
+   va_start(ap, fmt);
+   log_line('E', fmt, ap);
+   va_end(ap);
+}
+
+/* Lines logged at @level that hold @text. */
+static unsigned logged(char level, const char *text)
+{
+   unsigned i, n = 0;
+   LOG_LOCK();
+   CHECK(log_num < MAX_LOG, "the log filled up");
+   for (i = 0; i < log_num; i++)
+      if (log_lines[i][0] == level && strstr(log_lines[i] + 1, text))
+         n++;
+   LOG_UNLOCK();
+   return n;
+}
+
+/* Each message is "msg<n> %s", so a notice tells which it was. */
+const char *msg_hash_to_str(enum msg_hash_enums msg)
+{
+   static char ring[8][32];
+   static unsigned next;
+   char *s = ring[next++ & 7];
+   snprintf(s, sizeof(ring[0]), "msg%d %%s", (int)msg);
+   return s;
+}
+
+#define MAX_NOTICES 32
+static int notice_ids[MAX_NOTICES];
+static unsigned notice_num;
+
+void runloop_msg_queue_push(const char *msg, size_t len,
+      unsigned prio, unsigned duration, bool flush, char *title,
+      enum message_queue_icon icon, enum message_queue_category category)
+{
+   (void)len;
+   (void)prio;
+   (void)duration;
+   (void)flush;
+   (void)title;
+   (void)icon;
+   (void)category;
+   if (notice_num < MAX_NOTICES)
+      notice_ids[notice_num++] = atoi(msg + 3);
+}
+
+static unsigned notices(enum msg_hash_enums msg)
+{
+   unsigned i, n = 0;
+   for (i = 0; i < notice_num; i++)
+      if (notice_ids[i] == (int)msg)
+         n++;
+   return n;
+}
+
+static runloop_state_t runloop_st;
+
+runloop_state_t *runloop_state_get_ptr(void)
+{
+   return &runloop_st;
+}
+
 bool fill_pathname_application_data(char *s, size_t len)
 {
    (void)s;
@@ -302,11 +399,105 @@ static bool emptied(const char *path)
          && !memcmp(buf + 12, zero, sizeof(zero)));
 }
 
+static void clear_dir(const char *dir)
+{
+   size_t i;
+   struct string_list *list = dir_list_new(dir, NULL, false, true,
+         false, false);
+   for (i = 0; list && i < list->size; i++)
+      filestream_delete(list->elems[i].data);
+   if (list)
+      string_list_free(list);
+}
+
 static void clean(void)
 {
    remove(SAVE);
    remove(WORKER_TEMP);
    remove(CLOSE_TEMP);
+   remove("game.rtc");
+   clear_dir("backups");
+   clear_dir("blk");
+   clear_dir("cfg/recovery");
+   save_backups_set_roots(NULL, NULL, NULL, NULL, "cfg", NULL, "as_core");
+   notice_num = 0;
+   LOG_LOCK();
+   log_num = 0;
+   LOG_UNLOCK();
+}
+
+/* Copies in @dir with @reason (or any, with SAVE_BACKUP_REASON_LAST);
+ * the newest one's path in @newest. */
+static unsigned copies(const char *dir, enum save_backup_reason reason,
+      char *newest, size_t len)
+{
+   size_t i;
+   unsigned n = 0;
+   struct save_backup_name best;
+   struct string_list *list = dir_list_new(dir, NULL, false, true,
+         false, false);
+   if (newest)
+      newest[0] = '\0';
+   for (i = 0; list && i < list->size; i++)
+   {
+      struct save_backup_name name;
+      if (     !save_backups_parse(path_basename(list->elems[i].data), &name)
+            || (reason != SAVE_BACKUP_REASON_LAST && name.reason != reason))
+         continue;
+      if (newest && (!n || memcmp(name.time, best.time, sizeof(best.time)) > 0
+               || (!memcmp(name.time, best.time, sizeof(best.time))
+                  && name.number > best.number)))
+      {
+         strlcpy(newest, list->elems[i].data, len);
+         best = name;
+      }
+      n++;
+   }
+   if (list)
+      string_list_free(list);
+   return n;
+}
+
+/* An rzip save of @data with its last 100 bytes cut off */
+static void put_cut_rzip(const char *path, const void *data, size_t len,
+      void *out, int64_t *out_len)
+{
+   void *buf = NULL;
+   int64_t n = 0;
+   rzipstream_write_file(path, data, (int64_t)len);
+   filestream_read_file(path, &buf, &n);
+   *out_len = n > 100 ? n - 100 : 0;
+   memcpy(out, buf, (size_t)*out_len);
+   free(buf);
+   put(path, out, (size_t)*out_len);
+}
+
+/* A core that reports no save RAM at load: the file is copied
+ * before the close writes over it; no notice. */
+static void lane_late_core(void)
+{
+   static unsigned char disk[BIG], ram[BIG];
+   char newest[PATH_MAX_LENGTH];
+
+   clean();
+   fill(disk, BIG, 20);
+   put(SAVE, disk, BIG);
+   core_data = NULL;
+   core_size = 0;
+   path_init_savefile_new();
+   path_init_savefile_rtc(SAVE);
+   CHECK(!event_load_save_files(false), "late_core: loaded without memory");
+   CHECK(notice_num == 0, "late_core: a notice for a late core");
+   fill(ram, BIG, 21);
+   core_data = ram;
+   core_size = BIG;
+   event_save_files(true, false, true, true, NULL);
+   CHECK(copies("backups", SAVE_BACKUP_NOT_LOADED, newest, sizeof(newest)) == 1,
+         "late_core: no not-loaded copy");
+   CHECK(holds(newest, disk, BIG), "late_core: the copy is not the old save");
+   CHECK(holds(SAVE, ram, BIG), "late_core: the close did not write");
+   path_deinit_savefile();
+   clean();
 }
 
 /* A full disk at close: the old file stays and no temporary is left. */
@@ -327,7 +518,7 @@ static void lane_close_full_disk(void)
       path_init_savefile_rtc(SAVE);
       use_test_vfs(true);
       set_vfs(4096, false);
-      event_save_files(true, c != 0, true, NULL);
+      event_save_files(true, c != 0, true, true, NULL);
       set_vfs(0, false);
       use_test_vfs(false);
       CHECK(holds(SAVE, disk, BIG), "close_full_disk: the save changed");
@@ -355,7 +546,7 @@ static void lane_close_unchanged(void)
    CHECK(event_load_save_files(false), "close_unchanged: no load");
    CHECK(!memcmp(ram, disk, BIG), "close_unchanged: load differs");
    before = get_write_opens();
-   event_save_files(true, true, true, NULL);
+   event_save_files(true, true, true, true, NULL);
    CHECK(get_write_opens() == before, "close_unchanged: the save was written");
    use_test_vfs(false);
    CHECK(holds(SAVE, disk, BIG), "close_unchanged: raw bytes changed");
@@ -381,18 +572,18 @@ static void lane_close_sync(void)
       path_init_savefile_new();
       path_init_savefile_rtc(SAVE);
       use_test_vfs(true);
-      event_save_files(true, c != 0, false, NULL);
+      event_save_files(true, c != 0, false, false, NULL);
       before = get_write_opens();
-      event_save_files(true, c != 0, false, NULL);
+      event_save_files(true, c != 0, false, false, NULL);
       CHECK(get_write_opens() == before,
             "close_sync: an unsynced request rewrote matching bytes");
       synced = synced_writes;
-      event_save_files(true, c != 0, true, NULL);
+      event_save_files(true, c != 0, true, true, NULL);
       CHECK(get_write_opens() > before,
             "close_sync: a synced request skipped unsynced bytes");
       CHECK(synced_writes > synced, "close_sync: the rewrite was not synced");
       before = get_write_opens();
-      event_save_files(true, c != 0, true, NULL);
+      event_save_files(true, c != 0, true, true, NULL);
       CHECK(get_write_opens() == before,
             "close_sync: synced bytes were written again");
       use_test_vfs(false);
@@ -422,7 +613,7 @@ static void close_at_zero(bool file, size_t load_size, bool pointer,
    event_load_save_files(false);
    core_data = pointer ? ram : NULL;
    core_size = 0;
-   event_save_files(true, compress, true, NULL);
+   event_save_files(true, compress, true, true, NULL);
    path_deinit_savefile();
 }
 
@@ -553,16 +744,24 @@ static void capture_and_wait(void)
    wait_requested();
 }
 
-static void start(void *ram, size_t len, bool compress)
+/* A worker for @path; it has slot 0's session state when the save
+ * file list is built. */
+static void start_at(const char *path, void *ram, size_t len,
+      bool compress)
 {
    core_data = ram;
    core_size = len;
-   slots[0]  = autosave_new(SAVE, ram, len, 0, compress,
-         RETRO_MEMORY_SAVE_RAM, false);
+   slots[0]  = autosave_new(path, ram, len, 0, compress,
+         RETRO_MEMORY_SAVE_RAM, false, save_file_get(0));
    CHECK(slots[0] != NULL, "autosave_new failed");
    autosave_state.list = slots;
    autosave_state.num  = 1;
    wait_requested();
+}
+
+static void start(void *ram, size_t len, bool compress)
+{
+   start_at(SAVE, ram, len, compress);
 }
 
 static void stop(void)
@@ -958,7 +1157,7 @@ static void lane_resize_erased(void)
    autosave_lock();
    autosave_unlock();
    autosave_deinit();
-   event_save_files(true, false, true, NULL);
+   event_save_files(true, false, true, true, NULL);
    CHECK(!exists(SAVE), "erased: memory with no size made a save");
    path_deinit_savefile();
    clean();
@@ -1066,7 +1265,7 @@ static void lane_create_retry(void)
    core_size = sizeof(a);
    now_usec  = 1000000;
    slots[0]  = autosave_new(SAVE, a, sizeof(a), 1, false,
-         RETRO_MEMORY_SAVE_RAM, false);
+         RETRO_MEMORY_SAVE_RAM, false, NULL);
    CHECK(slots[0] != NULL, "create_retry: autosave_new failed");
    autosave_state.list = slots;
    autosave_state.num  = 1;
@@ -1106,16 +1305,454 @@ static void lane_create_retry(void)
 }
 #endif
 
+/* A save that is there but does not read is copied as it is on
+ * disk before the first write over it; one notice at load. */
+static void lane_unreadable_backed_up(void)
+{
+   static unsigned char cut[BIG * 2], ram[BIG];
+   char newest[PATH_MAX_LENGTH];
+   int64_t cut_len = 0;
+
+   clean();
+   fill(ram, BIG, 22);
+   put_cut_rzip(SAVE, ram, BIG, cut, &cut_len);
+   memset(ram, 0, BIG);
+   core_data = ram;
+   core_size = BIG;
+   path_init_savefile_new();
+   path_init_savefile_rtc(SAVE);
+   CHECK(!event_load_save_files(false), "unreadable: a cut rzip loaded");
+   CHECK(notices(MSG_SAVE_FILE_UNREADABLE) == 1, "unreadable: no notice");
+   CHECK(copies("backups", SAVE_BACKUP_REASON_LAST, NULL, 0) == 0,
+         "unreadable: copied at load");
+#ifdef HAVE_THREADS
+   start(ram, BIG, false);
+   fill(ram, BIG, 23);
+   capture_and_wait();
+   stop();
+#else
+   fill(ram, BIG, 23);
+   event_save_files(true, false, true, true, NULL);
+#endif
+   CHECK(copies("backups", SAVE_BACKUP_UNREADABLE, newest, sizeof(newest)) == 1,
+         "unreadable: no unreadable copy");
+   CHECK(holds(newest, cut, (size_t)cut_len),
+         "unreadable: the copy is not the file's bytes");
+   CHECK(holds(SAVE, ram, BIG), "unreadable: not written after the copy");
+   CHECK(notices(MSG_SAVE_FILE_UNREADABLE) == 1, "unreadable: notices");
+   path_deinit_savefile();
+   clean();
+}
+
+/* One write of the current image: by the worker, or at close. */
+static void write_once(void *ram, size_t len)
+{
+#ifdef HAVE_THREADS
+   if (slots[0])
+   {
+      capture_and_wait();
+      return;
+   }
+#endif
+   (void)ram;
+   (void)len;
+   event_save_files(true, false, true, true, NULL);
+}
+
+/* A non-blank save written over with all 0xFF, then all 0x00: one
+ * blanked copy, before the first. */
+static void lane_blanked_backed_up(void)
+{
+   static unsigned char disk[BIG], ram[BIG], ones[BIG];
+   char newest[PATH_MAX_LENGTH];
+
+   clean();
+   fill(disk, BIG, 24);
+   put(SAVE, disk, BIG);
+   memset(ram, 0, BIG);
+   memset(ones, 0xFF, BIG);
+   core_data = ram;
+   core_size = BIG;
+   path_init_savefile_new();
+   path_init_savefile_rtc(SAVE);
+   CHECK(event_load_save_files(false), "blanked: no load");
+#ifdef HAVE_THREADS
+   start(ram, BIG, false);
+#endif
+   memset(ram, 0xFF, BIG);
+   write_once(ram, BIG);
+   CHECK(copies("backups", SAVE_BACKUP_BLANKED, newest, sizeof(newest)) == 1,
+         "blanked: no blanked copy");
+   CHECK(holds(newest, disk, BIG), "blanked: the copy is not the old save");
+   CHECK(holds(SAVE, ones, BIG), "blanked: 0xFF not written");
+   memset(ram, 0x00, BIG);
+   write_once(ram, BIG);
+   CHECK(copies("backups", SAVE_BACKUP_REASON_LAST, NULL, 0) == 1,
+         "blanked: a second copy in one session");
+   CHECK(holds(SAVE, ram, BIG), "blanked: 0x00 not written");
+#ifdef HAVE_THREADS
+   stop();
+#endif
+   path_deinit_savefile();
+   clean();
+}
+
+/* A copy that cannot be made (a file where its folder goes) keeps the
+ * save as it was all session, with one notice and a try at each
+ * check; at close the image goes to a recovery file. */
+static void lane_owed_copy_fails(void)
+{
+   static unsigned char cut[BIG * 2], ram[BIG];
+   char newest[PATH_MAX_LENGTH];
+   int64_t cut_len = 0;
+   const char *save = "blk/game.srm";
+
+   clean();
+   path_mkdir("blk");
+   put("blk/backups", "x", 1);
+   fill(ram, BIG, 25);
+   put_cut_rzip(save, ram, BIG, cut, &cut_len);
+   memset(ram, 0, BIG);
+   core_data = ram;
+   core_size = BIG;
+   path_init_savefile_new();
+   path_init_savefile_rtc(save);
+   CHECK(!event_load_save_files(false), "owed_fails: a cut rzip loaded");
+#ifdef HAVE_THREADS
+   {
+      unsigned i;
+      start_at(save, ram, BIG, false);
+      for (i = 0; i < 3; i++)
+      {
+         ram[0] = (unsigned char)(i + 1);
+         capture_and_wait();
+         CHECK(retro_atomic_load_acquire_int(&save_file_get(0)->flags)
+               & SAVE_FILE_BACKUP_FAILED, "owed_fails: no copy tried");
+         CHECK(holds(save, cut, (size_t)cut_len),
+               "owed_fails: written without its copy");
+      }
+      capture_and_wait();
+      CHECK(notices(MSG_SAVE_BACKUP_FAILED) == 1,
+            "owed_fails: not one backup notice");
+      stop();
+   }
+#endif
+   fill(ram, BIG, 26);
+   event_save_files(true, false, true, true, NULL);
+   CHECK(holds(save, cut, (size_t)cut_len), "owed_fails: written at close");
+   CHECK(copies("cfg/recovery", SAVE_BACKUP_UNSAVED, newest,
+            sizeof(newest)) == 1, "owed_fails: no recovery file");
+   CHECK(holds(newest, ram, BIG), "owed_fails: the recovery is not the image");
+   CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 1,
+         "owed_fails: not one recovery notice");
+   path_deinit_savefile();
+   clean();
+}
+
+/* --sram-mode noload-save: the save is not loaded, so it is copied
+ * before the first write over it. */
+static void lane_noload_save(void)
+{
+   static unsigned char disk[BIG], ram[BIG];
+   char newest[PATH_MAX_LENGTH];
+
+   clean();
+   fill(disk, BIG, 31);
+   put(SAVE, disk, BIG);
+   memset(ram, 0, BIG);
+   core_data = ram;
+   core_size = BIG;
+   path_init_savefile_new();
+   path_init_savefile_rtc(SAVE);
+   CHECK(!event_load_save_files(true), "noload_save: loaded");
+   CHECK(notice_num == 0, "noload_save: a notice");
+#ifdef HAVE_THREADS
+   start(ram, BIG, false);
+   fill(ram, BIG, 32);
+   capture_and_wait();
+   stop();
+#else
+   fill(ram, BIG, 32);
+   event_save_files(true, false, true, true, NULL);
+#endif
+   CHECK(copies("backups", SAVE_BACKUP_NOT_LOADED, newest, sizeof(newest)) == 1,
+         "noload_save: no not-loaded copy");
+   CHECK(holds(newest, disk, BIG), "noload_save: the copy is not the old save");
+   CHECK(holds(SAVE, ram, BIG), "noload_save: not written after the copy");
+   path_deinit_savefile();
+   clean();
+}
+
+/* A write inside a frame leaves a save that owes a copy; an explicit
+ * request (not synced) makes the copy, then writes. */
+static void lane_explicit_request(void)
+{
+   static unsigned char cut[BIG * 2], ram[BIG];
+   char newest[PATH_MAX_LENGTH];
+   int64_t cut_len = 0;
+
+   clean();
+   fill(ram, BIG, 33);
+   put_cut_rzip(SAVE, ram, BIG, cut, &cut_len);
+   memset(ram, 0, BIG);
+   core_data = ram;
+   core_size = BIG;
+   path_init_savefile_new();
+   path_init_savefile_rtc(SAVE);
+   CHECK(!event_load_save_files(false), "explicit: a cut rzip loaded");
+   fill(ram, BIG, 34);
+   CHECK(!content_save_ram_file(0, false, false, false, false),
+         "explicit: a frame's write went ahead");
+   CHECK(holds(SAVE, cut, (size_t)cut_len), "explicit: a frame's write wrote");
+   /* What CMD_EVENT_SAVE_FILES does for a NULL request */
+   CHECK(content_save_ram_file(0, false, false, false, true),
+         "explicit: the request failed");
+   CHECK(copies("backups", SAVE_BACKUP_REASON_LAST, newest, sizeof(newest)) == 1,
+         "explicit: not one copy");
+   CHECK(holds(newest, cut, (size_t)cut_len),
+         "explicit: the copy is not the file's bytes");
+   CHECK(holds(SAVE, ram, BIG), "explicit: not written after the copy");
+   path_deinit_savefile();
+   clean();
+}
+
+/* A write shorter than the save as loaded (an old core's partial
+ * load, an erase to 0 bytes) copies the save first, once a session. */
+static void lane_cut_copy_old_core(void)
+{
+   static unsigned char disk[BIG], ram[BIG];
+   char newest[PATH_MAX_LENGTH];
+   unsigned i;
+
+   clean();
+   fill(disk, BIG, 35);
+   put(SAVE, disk, BIG);
+   memset(ram, 0, BIG);
+   core_data = ram;
+   core_size = 2048;
+   path_init_savefile_new();
+   path_init_savefile_rtc(SAVE);
+   CHECK(event_load_save_files(false), "cut: no partial load");
+#ifdef HAVE_THREADS
+   start(ram, 2048, false);
+#endif
+   for (i = 0; i < 2; i++)
+   {
+      fill(ram, 2048, 36 + i);
+      write_once(ram, 2048);
+   }
+#ifdef HAVE_THREADS
+   stop();
+#endif
+   event_save_files(true, false, true, true, NULL);
+   CHECK(copies("backups", SAVE_BACKUP_CUT, newest, sizeof(newest)) == 1,
+         "cut: not one cut copy");
+   CHECK(holds(newest, disk, BIG), "cut: the copy is not the old save");
+   CHECK(copies("backups", SAVE_BACKUP_REASON_LAST, NULL, 0) == 1,
+         "cut: another copy");
+   CHECK(holds(SAVE, ram, 2048), "cut: not written after the copy");
+   path_deinit_savefile();
+
+   /* Erased to 0 bytes with the pointer kept (Genesis Plus GX) */
+   clean();
+   put(SAVE, disk, BIG);
+   fill(ram, BIG, 38);
+   core_size = BIG;
+   path_init_savefile_new();
+   path_init_savefile_rtc(SAVE);
+   CHECK(event_load_save_files(false), "cut: no load");
+#ifdef HAVE_THREADS
+   start(ram, BIG, false);
+   core_size = 0;
+   autosave_lock();
+   autosave_unlock();
+   wait_requested();
+   capture_and_wait();
+   CHECK(holds(SAVE, ram, 0), "cut: the worker did not empty the save");
+   stop();
+#endif
+   core_size = 0;
+   event_save_files(true, false, true, true, NULL);
+   CHECK(copies("backups", SAVE_BACKUP_CUT, newest, sizeof(newest)) == 1,
+         "cut: not one copy before the erase");
+   CHECK(holds(newest, disk, BIG), "cut: the erase's copy is not the old save");
+   CHECK(holds(SAVE, ram, 0), "cut: the erase did not empty the save");
+   path_deinit_savefile();
+   clean();
+}
+
+/* An erase whose cut copy cannot be made at close: the save stays,
+ * no recovery file, and the log does not call it lost. */
+static void lane_erase_copy_fails(void)
+{
+   static unsigned char disk[BIG], ram[BIG];
+   const char *save = "blk/game.srm";
+
+   clean();
+   path_mkdir("blk");
+   put("blk/backups", "x", 1);
+   fill(disk, BIG, 40);
+   put(save, disk, BIG);
+   core_data = ram;
+   core_size = BIG;
+   path_init_savefile_new();
+   path_init_savefile_rtc(save);
+   CHECK(event_load_save_files(false), "erase_fails: no load");
+   core_size = 0;
+   event_save_files(true, false, true, true, NULL);
+   CHECK(holds(save, disk, BIG), "erase_fails: the save changed");
+   CHECK(copies("cfg/recovery", SAVE_BACKUP_REASON_LAST, NULL, 0) == 0,
+         "erase_fails: a recovery file");
+   CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 0,
+         "erase_fails: a recovery notice");
+   CHECK(logged('W', "\"blk/game.srm\" not emptied: it could not be "
+            "backed up") == 1, "erase_fails: not one not-emptied line");
+   CHECK(logged('E', "Couldn't back up or keep") == 0,
+         "erase_fails: logged as lost");
+   path_deinit_savefile();
+   clean();
+}
+
+/* A synced request whose owed copy fails has not synced the earlier
+ * unsynced write: the next synced request writes it again, synced,
+ * though memory matches the disk. */
+static void lane_rewrite_after_failed_copy(void)
+{
+   static unsigned char disk[BIG], ram[BIG], image[BIG];
+   const char *save = "blk/game.srm";
+
+   clean();
+   path_mkdir("blk");
+   fill(disk, BIG, 41);
+   put(save, disk, BIG);
+   core_data = ram;
+   core_size = BIG;
+   path_init_savefile_new();
+   path_init_savefile_rtc(save);
+   CHECK(event_load_save_files(false), "rewrite: no load");
+   fill(image, BIG, 42);
+   memcpy(ram, image, BIG);
+   event_save_files(true, false, false, true, NULL);
+   CHECK(holds(save, image, BIG), "rewrite: the unsynced request did not write");
+   /* All 0x00 owes a blanked copy; it cannot be made. */
+   put("blk/backups", "x", 1);
+   memset(ram, 0, BIG);
+   event_save_files(true, false, true, true, NULL);
+   CHECK(holds(save, image, BIG), "rewrite: written without its copy");
+   remove("blk/backups");
+   memcpy(ram, image, BIG);
+   synced_writes = 0;
+   event_save_files(true, false, true, true, NULL);
+   CHECK(synced_writes == 1, "rewrite: the unsynced write was not synced");
+   CHECK(holds(save, image, BIG), "rewrite: the save changed");
+   clear_dir("blk/backups");
+   path_rmdir("blk/backups");
+   path_deinit_savefile();
+   clean();
+}
+
+/* An explicit request (not synced) whose owed copy fails, twice: the
+ * save stays, one notice on screen and in the log, no recovery file. */
+static void lane_explicit_copy_fails(void)
+{
+   static unsigned char cut[BIG * 2], ram[BIG];
+   char line[64];
+   int64_t cut_len = 0;
+   const char *save = "blk/game.srm";
+
+   clean();
+   path_mkdir("blk");
+   put("blk/backups", "x", 1);
+   fill(ram, BIG, 43);
+   put_cut_rzip(save, ram, BIG, cut, &cut_len);
+   memset(ram, 0, BIG);
+   core_data = ram;
+   core_size = BIG;
+   path_init_savefile_new();
+   path_init_savefile_rtc(save);
+   CHECK(!event_load_save_files(false), "explicit_fails: a cut rzip loaded");
+   fill(ram, BIG, 44);
+   event_save_files(true, false, false, true, NULL);
+   event_save_files(true, false, false, true, NULL);
+   CHECK(holds(save, cut, (size_t)cut_len),
+         "explicit_fails: written without its copy");
+   CHECK(notices(MSG_SAVE_BACKUP_FAILED) == 1,
+         "explicit_fails: not one notice");
+   snprintf(line, sizeof(line), "msg%d %s", (int)MSG_SAVE_BACKUP_FAILED,
+         save);
+   CHECK(logged('W', line) == 1, "explicit_fails: not logged once");
+   CHECK(copies("cfg/recovery", SAVE_BACKUP_REASON_LAST, NULL, 0) == 0,
+         "explicit_fails: a recovery file");
+   CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 0,
+         "explicit_fails: a recovery notice");
+   path_deinit_savefile();
+   clean();
+}
+
+/* A late core's copy is logged once with its reason; a slot whose
+ * memory is never reported is logged at load only. */
+static void lane_backup_logged(void)
+{
+   static unsigned char disk[BIG], ram[BIG];
+
+   clean();
+   fill(disk, BIG, 45);
+   put(SAVE, disk, BIG);
+   put("game.rtc", disk, 16);
+   core_data = NULL;
+   core_size = 0;
+   path_init_savefile_new();
+   path_init_savefile_rtc(SAVE);
+   CHECK(!event_load_save_files(false), "logged: loaded without memory");
+   CHECK(logged('I', "reported no memory for \"game.srm\" at load; "
+            "left unread.") == 1, "logged: no load line for the save");
+   CHECK(logged('I', "reported no memory for \"game.rtc\" at load; "
+            "left unread.") == 1, "logged: no load line for the rtc");
+   fill(ram, BIG, 46);
+#ifdef HAVE_THREADS
+   start(ram, BIG, false);
+   capture_and_wait();
+   fill(ram, BIG, 47);
+   capture_and_wait();
+   stop();
+#else
+   core_data = ram;
+   core_size = BIG;
+   event_save_files(true, false, true, true, NULL);
+   fill(ram, BIG, 47);
+#endif
+   event_save_files(true, false, true, true, NULL);
+   CHECK(holds(SAVE, ram, BIG), "logged: not written");
+   CHECK(logged('I', "Backed up \"game.srm\" (not-loaded) before "
+            "writing it.") == 1, "logged: the copy not logged once");
+   CHECK(logged('I', "Backed up \"game.rtc\"") == 0,
+         "logged: a copy of a slot never reported");
+   CHECK(holds("game.rtc", disk, 16), "logged: the rtc changed");
+   path_deinit_savefile();
+   clean();
+}
+
 int main(void)
 {
 #ifdef HAVE_THREADS
-   if (!(vfs_lock = slock_new()))
+   if (!(vfs_lock = slock_new()) || !(log_lock = slock_new()))
       return 2;
 #endif
    lane_close_full_disk();
    lane_close_unchanged();
    lane_close_sync();
    lane_close_erased();
+   lane_late_core();
+   lane_unreadable_backed_up();
+   lane_blanked_backed_up();
+   lane_owed_copy_fails();
+   lane_noload_save();
+   lane_explicit_request();
+   lane_cut_copy_old_core();
+   lane_erase_copy_fails();
+   lane_rewrite_after_failed_copy();
+   lane_explicit_copy_fails();
+   lane_backup_logged();
 #ifdef HAVE_THREADS
    lane_autosave_full_disk();
    lane_no_rewrite_at_launch();
@@ -1127,6 +1764,7 @@ int main(void)
    lane_no_join_running();
    lane_create_retry();
    slock_free(vfs_lock);
+   slock_free(log_lock);
 #endif
    if (failures)
    {
