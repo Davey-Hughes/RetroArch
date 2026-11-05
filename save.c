@@ -102,7 +102,8 @@ struct autosave
    bool ec_inited;
    /* buffer is not on disk: written at the next copy whatever it
     * holds. Set before the worker starts, then the worker's; the main
-    * thread reads it only while the worker waits for a copy. */
+    * thread reads it only while the worker waits for a copy or has
+    * ended. */
    bool unwritten;
 };
 

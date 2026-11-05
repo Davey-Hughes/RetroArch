@@ -12,18 +12,25 @@
 #include <retro_timers.h>
 #include <vfs/vfs_implementation.h>
 
+#define filestream_write_file_atomic_synced test_write_atomic_synced
 #ifdef HAVE_THREADS
 #define sthread_create test_sthread_create
 #define sthread_join test_sthread_join
 #define cpu_features_get_time_usec test_time_usec
+#define retro_eventcount_commit_wait test_commit_wait
 #endif
 #include "../../../save.c"
+#undef filestream_write_file_atomic_synced
+bool filestream_write_file_atomic_synced(const char *path, const void *data,
+      int64_t size);
 #ifdef HAVE_THREADS
 #undef sthread_create
 #undef sthread_join
 #undef cpu_features_get_time_usec
+#undef retro_eventcount_commit_wait
 sthread_t *sthread_create(void (*thread_func)(void*), void *userdata);
 void sthread_join(sthread_t *thread);
+void retro_eventcount_commit_wait(retro_eventcount_t *ec, int key);
 #endif
 
 #define SAVE        "game.srm"
@@ -71,15 +78,22 @@ bool fill_pathname_application_data(char *s, size_t len)
    return false;
 }
 
-static unsigned finish_synced;
+static unsigned synced_writes;
 
 bool content_finish_tmp(const char *path, bool ok, bool sync)
 {
    if (sync)
-      finish_synced++;
+      synced_writes++;
    return (sync
          ? filestream_finish_atomic_synced(path, ok)
          : filestream_finish_atomic(path, ok)) == 0;
+}
+
+bool test_write_atomic_synced(const char *path, const void *data,
+      int64_t size)
+{
+   synced_writes++;
+   return filestream_write_file_atomic_synced(path, data, size);
 }
 
 /* The test VFS: the built-in one, counting opens for writing and
@@ -357,12 +371,11 @@ static void lane_close_sync(void)
       event_save_files(true, c != 0, false, NULL);
       CHECK(get_write_opens() == before,
             "close_sync: an unsynced request rewrote matching bytes");
-      synced = finish_synced;
+      synced = synced_writes;
       event_save_files(true, c != 0, true, NULL);
       CHECK(get_write_opens() > before,
             "close_sync: a synced request skipped unsynced bytes");
-      CHECK(!c || finish_synced > synced,
-            "close_sync: the rewrite was not synced");
+      CHECK(synced_writes > synced, "close_sync: the rewrite was not synced");
       before = get_write_opens();
       event_save_files(true, c != 0, true, NULL);
       CHECK(get_write_opens() == before,
@@ -386,6 +399,13 @@ static sthread_t *worker_threads[MAX_WORKERS];
 static autosave_t *worker_handles[MAX_WORKERS];
 static bool joining_all;
 
+/* The next worker started is held after a wake from its wait for a
+ * copy until the gate opens.  gate_ec is set while no worker runs. */
+static bool gate_next;
+static retro_eventcount_t *gate_ec;
+static retro_atomic_int_t gate_parked;
+static retro_atomic_int_t gate_open;
+
 sthread_t *test_sthread_create(void (*thread_func)(void*), void *userdata)
 {
    unsigned i;
@@ -393,6 +413,11 @@ sthread_t *test_sthread_create(void (*thread_func)(void*), void *userdata)
    creates++;
    if (fail_create)
       return NULL;
+   if (gate_next)
+   {
+      gate_next = false;
+      gate_ec   = &((autosave_t*)userdata)->ec;
+   }
    t = sthread_create(thread_func, userdata);
    for (i = 0; t && i < MAX_WORKERS; i++)
       if (!worker_threads[i])
@@ -411,12 +436,25 @@ void test_sthread_join(sthread_t *thread)
    for (i = 0; i < MAX_WORKERS; i++)
       if (worker_threads[i] == thread)
       {
-         CHECK(joining_all
-               || retro_atomic_load_acquire_int(&worker_handles[i]->exited),
-               "a check joined a worker still running");
+         if (!retro_atomic_load_acquire_int(&worker_handles[i]->exited))
+         {
+            CHECK(joining_all, "a check joined a worker still running");
+            /* Or the join waits for a held worker forever. */
+            retro_atomic_store_release_int(&gate_open, 1);
+         }
          worker_threads[i] = NULL;
       }
    sthread_join(thread);
+}
+
+void test_commit_wait(retro_eventcount_t *ec, int key)
+{
+   bool held = ec == gate_ec;
+   if (held)
+      retro_atomic_store_release_int(&gate_parked, 1);
+   retro_eventcount_commit_wait(ec, key);
+   while (held && !retro_atomic_load_acquire_int(&gate_open))
+      retro_sleep(1);
 }
 
 retro_time_t test_time_usec(void)
@@ -716,6 +754,53 @@ static void lane_retire_bounded(void)
    clean();
 }
 
+/* A retired worker that has not ended is not joined: held after its
+ * wake, it stays on the chain until it ends, then is joined. */
+static void lane_no_join_running(void)
+{
+   static unsigned char a[64], c[128];
+   unsigned i, before;
+   autosave_t *held;
+
+   clean();
+   memset(a, 1, sizeof(a));
+   memset(c, 1, sizeof(c));
+   retro_atomic_int_init(&gate_parked, 0);
+   retro_atomic_int_init(&gate_open, 0);
+   gate_next = true;
+   start(a, sizeof(a), false);
+   held = slots[0];
+   for (i = 0; i < 5000 && !retro_atomic_load_acquire_int(&gate_parked); i++)
+      retro_sleep(1);
+   CHECK(retro_atomic_load_acquire_int(&gate_parked),
+         "running: the worker did not wait");
+
+   before    = joins;
+   core_data = c;
+   core_size = sizeof(c);
+   for (i = 0; i < 20; i++)
+   {
+      autosave_lock();
+      autosave_unlock();
+   }
+   CHECK(joins == before, "running: a worker still running was joined");
+   CHECK(slots[0] && slots[0]->prev == held && !slots[0]->prev->prev,
+         "running: the retired handle is not alone on the chain");
+
+   retro_atomic_store_release_int(&gate_open, 1);
+   for (i = 0; i < 5000 && slots[0] && slots[0]->prev; i++)
+   {
+      retro_sleep(1);
+      autosave_lock();
+      autosave_unlock();
+   }
+   CHECK(slots[0] && !slots[0]->prev, "running: the ended worker was kept");
+   CHECK(joins == before + 1, "running: the ended worker was not joined");
+   stop();
+   gate_ec = NULL;
+   clean();
+}
+
 /* A replacement whose worker cannot start is tried again once per
  * interval, not at every check. */
 static void lane_create_retry(void)
@@ -785,6 +870,7 @@ int main(void)
    lane_pointer_requery();
    lane_resize_unwritten();
    lane_retire_bounded();
+   lane_no_join_running();
    lane_create_retry();
    slock_free(vfs_lock);
 #endif
