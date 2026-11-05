@@ -110,8 +110,9 @@ enum save_backup_result save_backups_copy_file(const char *path,
       enum save_backup_reason reason, bool sync);
 
 /* Writes @data, meant for @path, as a new "unsaved" file: in the copy
- * folder, else <config>/recovery, else <app data>/recovery. Puts the
- * path written in @s and returns its length; 0 when none could be. */
+ * folder, else <config>/recovery, else <app data>/recovery. When the
+ * newest one, wherever it is, holds @data, that file serves instead.
+ * Puts the path in @s and returns its length; 0 when none could be. */
 size_t save_backups_recover(char *s, size_t len, const char *path,
       const void *data, size_t data_len, bool sync);
 

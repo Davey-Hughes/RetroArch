@@ -35,6 +35,7 @@ on:
       - 'samples/runloop/save_paths/**'
       - 'save.c'
       - 'autosave.h'
+      - 'tasks/task_save.c'
       - 'samples/runloop/autosave_snapshot/**'
       - 'samples/runloop/save_e2e/**'
       - 'libretro-common/streams/file_stream.c'
@@ -70,6 +71,7 @@ on:
       - 'samples/runloop/save_paths/**'
       - 'save.c'
       - 'autosave.h'
+      - 'tasks/task_save.c'
       - 'samples/runloop/autosave_snapshot/**'
       - 'samples/runloop/save_e2e/**'
       - 'libretro-common/streams/file_stream.c'
@@ -242,9 +244,10 @@ jobs:
           # the network command's unsynced SAVE_FILES, and one longer
           # than the core's memory before the first shorter write;
           # unsaved progress from a failed write is announced at the
-          # next load.  The kill-mid-write lane and its runs under load
-          # stay local.  The harness builds above removed the binary to
-          # read its link line.
+          # next load; the progress a state load rolls back is backed
+          # up.  The kill-mid-write lane and its runs under load stay
+          # local.  The harness builds above removed the binary to read
+          # its link line.
           make -j$(nproc)
           make -C samples/runloop/save_e2e
           python3 samples/runloop/save_e2e/run.py --retroarch ./retroarch \
@@ -252,7 +255,8 @@ jobs:
              --lane autosave_full_disk --lane no_rewrite_at_launch \
              --lane unreadable_backed_up --lane late_core_backed_up \
              --lane noload_save_backed_up --lane explicit_save_copies \
-             --lane cut_copy_old_core --lane recovery_announced
+             --lane cut_copy_old_core --lane recovery_announced \
+             --lane state_load_copy
           make -C samples/runloop/save_e2e clean
 
       - name: Build and run save_paths_test
