@@ -122,7 +122,7 @@ static void start_save(bool compress)
 {
    memset(ram, 0, SRAM_SIZE);
    current = autosave_new("unused.srm", ram, SRAM_SIZE, 0, compress,
-         RETRO_MEMORY_SAVE_RAM);
+         RETRO_MEMORY_SAVE_RAM, false);
    assert(current);
    autosave_state.list = &current;
    autosave_state.num  = 1;

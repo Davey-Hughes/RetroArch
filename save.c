@@ -95,6 +95,10 @@ struct autosave
    retro_atomic_int_t quit;
    bool compress;
    bool ec_inited;
+   /* buffer is not on disk: written at the next copy whatever it
+    * holds. Set before the worker starts, then the worker's; the main
+    * thread reads it only while the worker waits for a copy. */
+   bool unwritten;
 };
 
 static struct autosave_st autosave_state;
@@ -107,7 +111,6 @@ static bool autosave_quitting(autosave_t *save)
 static void autosave_thread(void *data)
 {
    autosave_t *save = (autosave_t*)data;
-   bool retry_write = false;
 
    while (!autosave_quitting(save))
    {
@@ -135,13 +138,13 @@ static void autosave_thread(void *data)
       /* The snapshot remains ours until the next request. Keep the
        * last written image unchanged if opening, writing, syncing or
        * renaming fails; the file keeps its old contents. */
-      if (retry_write ||
+      if (save->unwritten ||
             memcmp(save->buffer, save->snapshot, save->bufsize) != 0)
       {
          int ret;
          intfstream_t *file = NULL;
          bool written       = false;
-         retry_write        = true;
+         save->unwritten    = true;
 
          if (save->compress)
             file = intfstream_open_rzip_file(save->tmp_path,
@@ -166,7 +169,7 @@ static void autosave_thread(void *data)
          if (ret == 0)
          {
             memcpy(save->buffer, save->snapshot, save->bufsize);
-            retry_write = false;
+            save->unwritten = false;
          }
          else if (ret == 1)
             filestream_delete(save->tmp_path);
@@ -198,6 +201,7 @@ static void autosave_thread(void *data)
  * @len             : size of @data buffer
  * @interval        : interval at which saves should be performed.
  * @type            : the RETRO_MEMORY_* id @data was read from
+ * @unwritten       : @data is not on disk yet
  *
  * Create and initialize autosave object. Logs nothing: it is also
  * called from autosave_check().
@@ -207,7 +211,7 @@ static void autosave_thread(void *data)
  **/
 static autosave_t *autosave_new(const char *path,
       const void *data, size_t len,
-      unsigned interval, bool compress, unsigned type)
+      unsigned interval, bool compress, unsigned type, bool unwritten)
 {
    size_t      path_len;
    void       *buf               = NULL;
@@ -222,6 +226,7 @@ static autosave_t *autosave_new(const char *path,
    handle->bufsize               = len;
    handle->interval              = interval;
    handle->type                  = type;
+   handle->unwritten             = unwritten;
    handle->buffer                = NULL;
    handle->snapshot              = NULL;
    handle->prev                  = NULL;
@@ -340,8 +345,15 @@ static void autosave_replace(unsigned i,
       const retro_ctx_memory_info_t *mem_info)
 {
    autosave_t *old    = autosave_state.list[i];
+   size_t      len    = old->bufsize < mem_info->size
+      ? old->bufsize : mem_info->size;
+   /* The old worker waits for a copy or has ended: what it had not
+    * written goes to the new one. */
+   bool    unwritten  = old->unwritten
+      || memcmp(old->buffer, mem_info->data, len) != 0;
    autosave_t *handle = autosave_new(old->path, mem_info->data,
-         mem_info->size, old->interval, old->compress, old->type);
+         mem_info->size, old->interval, old->compress, old->type,
+         unwritten);
    if (handle)
    {
       handle->prev           = old;
@@ -384,7 +396,8 @@ bool autosave_init(bool compress_files, unsigned autosave_interval)
             mem_info.size,
             autosave_interval,
             compress_files,
-            type)))
+            type,
+            false)))
       {
          RARCH_WARN("[SRAM] %s\n", msg_hash_to_str(MSG_AUTOSAVE_FAILED));
          continue;

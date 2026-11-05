@@ -405,7 +405,7 @@ static void start(void *ram, size_t len, bool compress)
    core_data = ram;
    core_size = len;
    slots[0]  = autosave_new(SAVE, ram, len, 0, compress,
-         RETRO_MEMORY_SAVE_RAM);
+         RETRO_MEMORY_SAVE_RAM, false);
    CHECK(slots[0] != NULL, "autosave_new failed");
    autosave_state.list = slots;
    autosave_state.num  = 1;
@@ -537,6 +537,7 @@ static void lane_pointer_requery(void)
    CHECK(holds(SAVE, b, sizeof(b)), "requery: the moved buffer was not followed");
 
    memset(c, 3, sizeof(c));
+   memcpy(c, b, sizeof(b));
    core_data = c;
    core_size = sizeof(c);
    autosave_lock();
@@ -578,6 +579,52 @@ static void lane_pointer_requery(void)
    CHECK(joins == 3, "requery: retired workers were not joined at the end");
    clean();
 }
+
+/* Spec 5.5: what a retired worker had not written, a change or a
+ * refused write, is written by the new one. */
+static void lane_resize_unwritten(void)
+{
+   static unsigned char a[64], c[128], d[192], e[256];
+
+   clean();
+   memset(a, 1, sizeof(a));
+   put(SAVE, a, sizeof(a));
+   use_test_vfs(true);
+   start(a, sizeof(a), false);
+
+   memset(c, 6, sizeof(c));
+   core_data = c;
+   core_size = sizeof(c);
+   autosave_lock();
+   autosave_unlock();
+   wait_requested();
+   capture_and_wait();
+   CHECK(holds(SAVE, c, sizeof(c)), "resize: a pending change was not written");
+
+   set_vfs(0, true);
+   memset(d, 7, sizeof(d));
+   core_data = d;
+   core_size = sizeof(d);
+   autosave_lock();
+   autosave_unlock();
+   wait_requested();
+   capture_and_wait();
+   CHECK(holds(SAVE, c, sizeof(c)), "resize: a refused write changed the save");
+
+   memset(e, 7, sizeof(e));
+   core_data = e;
+   core_size = sizeof(e);
+   set_vfs(0, false);
+   autosave_lock();
+   autosave_unlock();
+   wait_requested();
+   capture_and_wait();
+   CHECK(holds(SAVE, e, sizeof(e)), "resize: a retry was dropped");
+
+   stop();
+   use_test_vfs(false);
+   clean();
+}
 #endif
 
 int main(void)
@@ -593,6 +640,7 @@ int main(void)
    lane_autosave_full_disk();
    lane_no_rewrite_at_launch();
    lane_pointer_requery();
+   lane_resize_unwritten();
    slock_free(vfs_lock);
 #endif
    if (failures)
