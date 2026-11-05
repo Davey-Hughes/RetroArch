@@ -321,24 +321,30 @@ static char *save_backups_core_field(const char *core)
    return s;
 }
 
-/* How much of @game a name keeps: cut at a UTF-8 boundary, without
- * trailing spaces and dots, so the whole name stays under the limit. */
-static size_t save_backups_game_len(const char *game, size_t game_len,
-      size_t core_len, size_t ext_len)
+/* The longest game a name with this core and extension keeps, so the
+ * whole name stays under the limit. */
+static size_t save_backups_game_max(size_t core_len, size_t ext_len)
 {
    size_t fixed = 3 + SAVE_BACKUPS_TIME_LEN + SAVE_BACKUPS_NUMBER_ROOM
       + 3 + core_len + 3 + SAVE_BACKUPS_REASON_ROOM + ext_len;
-   size_t max   = fixed + 2 < SAVE_BACKUPS_NAME_MAX
+   return fixed + 2 < SAVE_BACKUPS_NAME_MAX
       ? SAVE_BACKUPS_NAME_MAX - 1 - fixed : 1;
+}
+
+/* How much of @game a name keeps: a cut steps back at most 3 bytes
+ * from the limit, to a UTF-8 boundary, so a cut game is never more
+ * than 3 bytes under it. */
+static size_t save_backups_game_len(const char *game, size_t game_len,
+      size_t core_len, size_t ext_len)
+{
+   unsigned i;
+   size_t max = save_backups_game_max(core_len, ext_len);
    if (game_len <= max)
       return game_len;
-   game_len = max;
-   while (game_len && ((unsigned char)game[game_len] & 0xC0) == 0x80)
-      game_len--;
-   while (game_len
-         && (game[game_len - 1] == ' ' || game[game_len - 1] == '.'))
-      game_len--;
-   return game_len;
+   for (i = 0; i < 3 && max
+         && ((unsigned char)game[max] & 0xC0) == 0x80; i++)
+      max--;
+   return max;
 }
 
 static int save_backups_cmp(const struct save_backup_name *a,
@@ -354,13 +360,22 @@ static int save_backups_cmp(const struct save_backup_name *a,
  * SAVE_BACKUPS_KEEP counting the one just made, which is not in it. */
 static void save_backups_retain(struct string_list *list,
       struct save_backup_name *names, const bool *mine,
-      enum save_backup_reason reason)
+      enum save_backup_reason reason, size_t ext_len)
 {
    size_t i;
    size_t count = 0;
    for (i = 0; i < list->size; i++)
-      if (mine[i] && names[i].reason == reason)
+   {
+      if (!mine[i] || names[i].reason != reason)
+         continue;
+      /* Within 3 bytes of its limit, the game may be a longer name's
+       * cut: never pruned */
+      if (names[i].game_len + 3
+            < save_backups_game_max(names[i].core_len, ext_len))
          count++;
+      else
+         names[i].reason = SAVE_BACKUP_REASON_LAST;
+   }
    while (count + 1 > SAVE_BACKUPS_KEEP)
    {
       size_t oldest = list->size;
@@ -481,7 +496,7 @@ static enum save_backup_result save_backups_write_copy(char *s, size_t len,
          && game_len == base_len
          && (  reason == SAVE_BACKUP_BEFORE_STATE_LOAD
             || reason == SAVE_BACKUP_CHANGED_ELSEWHERE))
-      save_backups_retain(list, names, mine, reason);
+      save_backups_retain(list, names, mine, reason, strlen(ext));
 
 end:
    if (result != SAVE_BACKUP_MADE)

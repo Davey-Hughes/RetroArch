@@ -191,6 +191,8 @@ static void backup_names(void)
    char game[400];
    static char path[PATH_MAX_LENGTH], dir[PATH_MAX_LENGTH];
    struct string_list *l;
+   const char *zelda =
+         "Zelda - Part 2 - 2026-11-03 10-00-00 - Snes9x - core-changed.mcd";
    roots();
    set_time(10, 0, 0);
 
@@ -228,16 +230,12 @@ static void backup_names(void)
       CHECK(save_backups_parse(path_basename(l->elems[i].data), &p));
    if (l)
       string_list_free(l);
-   CHECK(save_backups_parse(
-         "Zelda - Part 2 - 2026-11-03 10-00-00 - Snes9x - core-changed.mcd", &p));
+   CHECK(save_backups_parse(zelda, &p));
    CHECK(p.game_len == 14 && p.number == 1);
    CHECK(!strcmp(p.time, "2026-11-03 10-00-00"));
-   CHECK(p.core_len == 6 && !strncmp(
-         "Zelda - Part 2 - 2026-11-03 10-00-00 - Snes9x - core-changed.mcd"
-         + p.core_off, "Snes9x", 6));
+   CHECK(p.core_len == 6 && !strncmp(zelda + p.core_off, "Snes9x", 6));
    CHECK(p.reason == SAVE_BACKUP_CORE_CHANGED);
-   CHECK(!strcmp("Zelda - Part 2 - 2026-11-03 10-00-00 - Snes9x - core-changed.mcd"
-         + p.ext_off, ".mcd"));
+   CHECK(!strcmp(zelda + p.ext_off, ".mcd"));
    CHECK(save_backups_parse(
          "Game - 2026-11-03 10-00-00-12 - Snes9x - deleted", &p));
    CHECK(p.number == 12 && p.reason == SAVE_BACKUP_DELETED && p.ext_off == 48);
@@ -288,7 +286,7 @@ static void backup_names(void)
    if (l)
       string_list_free(l);
 
-   /* the cut drops trailing spaces and dots */
+   /* the cut keeps trailing spaces and dots */
    memset(game, 'b', 134);
    memcpy(game + 134, " .", 2);
    memset(game + 136, 'c', 100);
@@ -296,10 +294,19 @@ static void backup_names(void)
    fill_pathname_join(path, ROOT "/override", game, sizeof(path));
    CHECK(save_backups_copy_image(path, SAVE_BACKUP_CUT, "i", 1, true)
          == SAVE_BACKUP_MADE);
-   memset(game + 134, 0, 2);
+   game[136] = '\0';
    snprintf(dir, sizeof(dir), ROOT "/override/backups/%s"
          " - 2026-11-03 10-00-01 - Snes9x - cut.srm", game);
    CHECK(holds(dir, "i"));
+
+   /* and steps back at most 3 bytes, so a cut game is within 3 bytes
+    * of its limit (136 here) */
+   memset(game, 'y', 132);
+   strcpy(game + 132, " \xF0\x9F\x98\x80 tail");
+   CHECK(save_backups_game_len(game, strlen(game), 6, 4) == 133);
+   memset(game, 'd', 130);
+   memset(game + 130, 0x80, 10);
+   CHECK(save_backups_game_len(game, 140, 6, 4) == 133);
 }
 
 /* Every character the core field changes. */
@@ -476,6 +483,86 @@ static void backup_retention_cut(void)
    }
 }
 
+/* How many files in @dir hold text starting with @tag. */
+static size_t count_tagged(const char *dir, char tag)
+{
+   size_t i, n = 0;
+   struct string_list *l = dir_list_new(dir, NULL, false, true, false, false);
+   for (i = 0; l && i < l->size; i++)
+   {
+      void *buf   = NULL;
+      int64_t len = 0;
+      if (     filestream_read_file(l->elems[i].data, &buf, &len)
+            && len && *(const char*)buf == tag)
+         n++;
+      free(buf);
+   }
+   if (l)
+      string_list_free(l);
+   return n;
+}
+
+/* @count before-state-load copies of @name into @dir, made at minute
+ * @min, holding "<tag><k>". */
+static void make_copies(const char *dir, const char *name, const char *core,
+      char tag, unsigned count, int min)
+{
+   unsigned k;
+   char text[16], path[256];
+   snprintf(path, sizeof(path), "%s/%s", dir, name);
+   for (k = 0; k < count; k++)
+   {
+      set_time(20, min, (int)k);
+      snprintf(text, sizeof(text), "%c%u", tag, k);
+      CHECK(save_backups_copy_to(dir, path, core,
+            SAVE_BACKUP_BEFORE_STATE_LOAD, text, strlen(text), true)
+            == SAVE_BACKUP_MADE);
+   }
+}
+
+/* A long file's copies are never pruned by a shorter file whose name
+ * its cut starts with; pruning needs a game more than 3 bytes under
+ * its copy's own limit. */
+static void backup_retention_long(void)
+{
+   char a[200], c[200], core[48];
+
+   strcpy(a, "Mario");
+   memset(a + 5, ' ', 140);
+   strcpy(a + 145, "x.srm");
+   make_copies(ROOT "/long1", a, "Snes9x", 'a', 3, 0);
+   make_copies(ROOT "/long1", "Mario.srm", "Snes9x", 'c', 12, 1);
+   CHECK(count_tagged(ROOT "/long1", 'a') == 3);
+   CHECK(count_tagged(ROOT "/long1", 'c') == 10);
+
+   memset(a, 'y', 132);
+   strcpy(a + 132, " \xF0\x9F\x98\x80 tail.srm");
+   memset(c, 'y', 132);
+   strcpy(c + 132, ".srm");
+   make_copies(ROOT "/long2", a, "Snes9x", 'a', 3, 0);
+   make_copies(ROOT "/long2", c, "Snes9x", 'c', 12, 1);
+   CHECK(count_tagged(ROOT "/long2", 'a') == 3);
+   CHECK(count_tagged(ROOT "/long2", 'c') == 10);
+
+   /* 133 bytes is what a cut can leave: never pruned */
+   memset(c, 'w', 133);
+   strcpy(c + 133, ".srm");
+   make_copies(ROOT "/long3", c, "Snes9x", 'c', 12, 1);
+   CHECK(count_tagged(ROOT "/long3", 'c') == 12);
+
+   /* a 40-byte core cuts at 102 */
+   memset(core, 'k', 40);
+   core[40] = '\0';
+   memset(a, 'v', 120);
+   strcpy(a + 120, ".srm");
+   memset(c, 'v', 102);
+   strcpy(c + 102, ".srm");
+   make_copies(ROOT "/long4", a, core, 'a', 3, 0);
+   make_copies(ROOT "/long4", c, "Snes9x", 'c', 12, 1);
+   CHECK(count_tagged(ROOT "/long4", 'a') == 3);
+   CHECK(count_tagged(ROOT "/long4", 'c') == 10);
+}
+
 static void recovery_chain(void)
 {
    char s[PATH_MAX_LENGTH];
@@ -590,6 +677,7 @@ int main(void)
    backup_identical_skip();
    backup_retention();
    backup_retention_cut();
+   backup_retention_long();
    recovery_chain();
    backup_sync();
    backup_no_time();
