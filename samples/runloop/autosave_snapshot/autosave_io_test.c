@@ -287,6 +287,21 @@ static bool reads_as(const char *path, const void *data, size_t len)
 }
 #endif
 
+/* The save holds no data: 0 raw bytes, or an rzip header for 0. */
+static bool emptied(const char *path)
+{
+   static const unsigned char zero[8];
+   unsigned char buf[32];
+   size_t got;
+   FILE *f = fopen(path, "rb");
+   if (!f)
+      return false;
+   got = fread(buf, 1, sizeof(buf), f);
+   fclose(f);
+   return got == 0 || (got == 20 && !memcmp(buf, "#RZIPv", 6)
+         && !memcmp(buf + 12, zero, sizeof(zero)));
+}
+
 static void clean(void)
 {
    remove(SAVE);
@@ -383,6 +398,59 @@ static void lane_close_sync(void)
       use_test_vfs(false);
       path_deinit_savefile();
    }
+   clean();
+}
+
+static unsigned char erased_disk[BIG];
+
+/* A save if @file, and save RAM that reports @load_size bytes at load
+ * and 0 at close, its pointer kept if @pointer. */
+static void close_at_zero(bool file, size_t load_size, bool pointer,
+      bool compress)
+{
+   static unsigned char ram[BIG];
+
+   clean();
+   fill(erased_disk, BIG, 11);
+   if (file)
+      put(SAVE, erased_disk, BIG);
+   memset(ram, 0, BIG);
+   core_data = ram;
+   core_size = load_size;
+   path_init_savefile_new();
+   path_init_savefile_rtc(SAVE);
+   event_load_save_files(false);
+   core_data = pointer ? ram : NULL;
+   core_size = 0;
+   event_save_files(true, compress, true, NULL);
+   path_deinit_savefile();
+}
+
+/* Save RAM erased to 0 bytes, its pointer kept: the close write
+ * empties the save and makes none.  Memory with no size all session,
+ * or no pointer, leaves the save alone. */
+static void lane_close_erased(void)
+{
+   unsigned c;
+
+   for (c = 0; c < 2; c++)
+   {
+      close_at_zero(true, BIG, true, c != 0);
+      CHECK(c ? emptied(SAVE) : holds(SAVE, erased_disk, 0),
+            "close_erased: the save was not emptied");
+      CHECK(!exists(CLOSE_TEMP), "close_erased: a temporary was left");
+      close_at_zero(false, BIG, true, c != 0);
+      CHECK(!exists(SAVE) && !exists(CLOSE_TEMP),
+            "close_erased: an erase made a save");
+   }
+   close_at_zero(true, 0, true, false);
+   CHECK(holds(SAVE, erased_disk, BIG),
+         "close_erased: memory with no size changed the save");
+   close_at_zero(false, 0, true, false);
+   CHECK(!exists(SAVE), "close_erased: memory with no size made a save");
+   close_at_zero(true, BIG, false, false);
+   CHECK(holds(SAVE, erased_disk, BIG),
+         "close_erased: vanished memory changed the save");
    clean();
 }
 
@@ -716,7 +784,8 @@ static void lane_resize_unwritten(void)
 
 /* A core that reports the extent in use grows it on an append and
  * shrinks it on an erase, the bytes before it unchanged: both are
- * written.  Memory back at its old size and bytes is not. */
+ * written.  Memory back at its old size and bytes is not, unless its
+ * last image was never written. */
 static void lane_resize_extent(void)
 {
    static unsigned char ram[256];
@@ -772,8 +841,126 @@ static void lane_resize_extent(void)
    CHECK(get_write_opens() == before, "extent: an unchanged return was written");
    CHECK(holds(SAVE, ram, 96), "extent: an unchanged return changed the save");
 
+   core_data = NULL;
+   core_size = 0;
+   autosave_lock();
+   autosave_unlock();
+   ram[10]  ^= 0x5A;
+   core_data = ram;
+   core_size = 96;
+   autosave_lock();
+   autosave_unlock();
+   wait_requested();
+   capture_and_wait();
+   CHECK(holds(SAVE, ram, 96), "extent: a change while gone was not written");
+
+   /* The new handle's first write is refused: its image is pending
+    * although it matches memory. */
+   set_vfs(0, true);
+   core_data = NULL;
+   core_size = 0;
+   autosave_lock();
+   autosave_unlock();
+   ram[20]  ^= 0x5A;
+   core_data = ram;
+   core_size = 96;
+   autosave_lock();
+   autosave_unlock();
+   wait_requested();
+   capture_and_wait();
+   core_data = NULL;
+   core_size = 0;
+   autosave_lock();
+   autosave_unlock();
+   set_vfs(0, false);
+   core_data = ram;
+   core_size = 96;
+   autosave_lock();
+   autosave_unlock();
+   wait_requested();
+   capture_and_wait();
+   CHECK(holds(SAVE, ram, 96), "extent: a refused write was dropped on return");
+
    stop();
    use_test_vfs(false);
+   clean();
+}
+
+/* Save RAM erased to 0 bytes, its pointer kept: the worker empties the
+ * save and makes none, and writes the size when it comes back.  Memory
+ * that vanishes writes nothing and its return is compared as before;
+ * memory with no size all session gets no worker and no save. */
+static void lane_resize_erased(void)
+{
+   static unsigned char ram[128];
+   unsigned c, before;
+
+   for (c = 0; c < 2; c++)
+   {
+      clean();
+      fill(ram, 128, 12);
+      put(SAVE, ram, 128);
+      start(ram, 128, c != 0);
+      core_size = 0;
+      autosave_lock();
+      autosave_unlock();
+      wait_requested();
+      capture_and_wait();
+      CHECK(c ? emptied(SAVE) : holds(SAVE, ram, 0),
+            "erased: the save was not emptied");
+      core_size = 128;
+      autosave_lock();
+      autosave_unlock();
+      wait_requested();
+      capture_and_wait();
+      CHECK(reads_as(SAVE, ram, 128), "erased: the returned size was not written");
+      stop();
+   }
+
+   clean();
+   start(ram, 128, false);
+   core_size = 0;
+   autosave_lock();
+   autosave_unlock();
+   wait_requested();
+   capture_and_wait();
+   CHECK(!exists(SAVE) && !exists(WORKER_TEMP), "erased: an erase made a save");
+   stop();
+
+   clean();
+   put(SAVE, ram, 128);
+   use_test_vfs(true);
+   start(ram, 128, false);
+   before    = get_write_opens();
+   core_data = NULL;
+   autosave_lock();
+   autosave_unlock();
+   autosave_lock();
+   autosave_unlock();
+   core_data = ram;
+   autosave_lock();
+   autosave_unlock();
+   wait_requested();
+   capture_and_wait();
+   CHECK(get_write_opens() == before, "erased: vanished memory was written");
+   CHECK(holds(SAVE, ram, 128), "erased: vanished memory changed the save");
+   stop();
+   use_test_vfs(false);
+
+   clean();
+   core_data = ram;
+   core_size = 0;
+   path_init_savefile_new();
+   path_init_savefile_rtc(SAVE);
+   event_load_save_files(false);
+   CHECK(autosave_init(false, 1), "erased: autosave_init failed");
+   CHECK(!autosave_state.list[0], "erased: memory with no size got a worker");
+   autosave_lock();
+   autosave_unlock();
+   autosave_deinit();
+   event_save_files(true, false, true, NULL);
+   CHECK(!exists(SAVE), "erased: memory with no size made a save");
+   path_deinit_savefile();
    clean();
 }
 
@@ -860,7 +1047,8 @@ static void lane_no_join_running(void)
    CHECK(slots[0] && !slots[0]->prev, "running: the ended worker was kept");
    CHECK(joins == before + 1, "running: the ended worker was not joined");
    stop();
-   gate_ec = NULL;
+   gate_next = false;
+   gate_ec   = NULL;
    clean();
 }
 
@@ -927,12 +1115,14 @@ int main(void)
    lane_close_full_disk();
    lane_close_unchanged();
    lane_close_sync();
+   lane_close_erased();
 #ifdef HAVE_THREADS
    lane_autosave_full_disk();
    lane_no_rewrite_at_launch();
    lane_pointer_requery();
    lane_resize_unwritten();
    lane_resize_extent();
+   lane_resize_erased();
    lane_retire_bounded();
    lane_no_join_running();
    lane_create_retry();

@@ -60,6 +60,17 @@ static struct string_list *task_save_files = NULL;
  * synced request writes them again even when they match. */
 static bool save_files_unsynced = false;
 
+/* Marks @slot's memory as having had a size this session: only then
+ * does a drop to 0 bytes empty its save at close. */
+static void content_mark_sized(unsigned slot,
+      const retro_ctx_memory_info_t *mem_info)
+{
+   if (     mem_info->data && mem_info->size
+         && task_save_files && slot < task_save_files->size
+         && !task_save_files->elems[slot].userdata)
+      task_save_files->elems[slot].userdata = malloc(1);
+}
+
 #ifdef HAVE_THREADS
 /* The worker's own temporary: a SAVE_FILES on the main thread uses
  * "<path>.tmp" and may run while the worker writes. */
@@ -143,8 +154,12 @@ static void autosave_thread(void *data)
 
       /* The snapshot remains ours until the next request. Keep the
        * last written image unchanged if opening, writing, syncing or
-       * renaming fails; the file keeps its old contents. */
-      if (save->unwritten ||
+       * renaming fails; the file keeps its old contents.  Memory
+       * erased to 0 bytes empties a save, but makes none. */
+      if (     save->unwritten && !save->bufsize
+            && !path_is_valid(save->path))
+         save->unwritten = false;
+      else if (save->unwritten ||
             memcmp(save->buffer, save->snapshot, save->bufsize) != 0)
       {
          int ret;
@@ -267,7 +282,8 @@ static autosave_t *autosave_new(const char *path,
    memcpy(handle->tmp_path + path_len, AUTOSAVE_TMP_SUFFIX,
          sizeof(AUTOSAVE_TMP_SUFFIX));
 
-   if (!(buf = malloc(len)))
+   /* At least a byte: malloc(0) may return NULL. */
+   if (!(buf = malloc(len ? len : 1)))
    {
       free(handle->tmp_path);
       free(handle->path);
@@ -279,7 +295,7 @@ static autosave_t *autosave_new(const char *path,
 
    memcpy(handle->buffer, data, handle->bufsize);
 
-   handle->snapshot              = malloc(len);
+   handle->snapshot              = malloc(len ? len : 1);
    if (handle->snapshot)
       handle->ec_inited          = retro_eventcount_init(&handle->ec);
 
@@ -420,6 +436,7 @@ bool autosave_init(bool compress_files, unsigned autosave_interval)
       mem_info.id         = type;
 
       core_get_memory(&mem_info);
+      content_mark_sized(i, &mem_info);
 
       if (mem_info.size == 0)
          continue;
@@ -488,7 +505,8 @@ void autosave_check(void)
                && cpu_features_get_time_usec() < handle->retry_time)
             continue;
          core_get_memory(&mem_info);
-         if (mem_info.data && mem_info.size)
+         content_mark_sized(i, &mem_info);
+         if (mem_info.data)
             autosave_replace(i, &mem_info);
          continue;
       }
@@ -498,13 +516,14 @@ void autosave_check(void)
          continue;
       /* A core may move or resize its memory at any time. */
       core_get_memory(&mem_info);
+      content_mark_sized(i, &mem_info);
       if (!mem_info.data || mem_info.size != handle->bufsize)
       {
          /* Its worker is idle, waiting for this copy: it ends without
           * writing again and is joined once it has. */
          retro_atomic_store_release_int(&handle->quit, 1);
          retro_eventcount_notify(&handle->ec);
-         if (mem_info.data && mem_info.size)
+         if (mem_info.data)
             autosave_replace(i, &mem_info);
          continue;
       }
@@ -530,6 +549,7 @@ static bool content_get_memory(retro_ctx_memory_info_t *mem_info,
    mem_info->id  = ram->type;
 
    core_get_memory(mem_info);
+   content_mark_sized(slot, mem_info);
 
    if (!mem_info->data || mem_info->size == 0)
       return false;
@@ -661,7 +681,12 @@ static bool content_save_ram_file(unsigned slot, bool compress, bool sync,
    struct ram_type ram;
    retro_ctx_memory_info_t mem_info;
 
-   if (!content_get_memory(&mem_info, &ram, slot))
+   /* Memory that had a size this session and reports 0 bytes, its
+    * pointer kept, was erased: its save is emptied. */
+   if (     !content_get_memory(&mem_info, &ram, slot)
+         && (     !mem_info.data
+               || !task_save_files->elems[slot].userdata
+               || !path_is_valid(ram.path)))
       return false;
 
    /* Quick check: if the file already exists and matches

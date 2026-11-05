@@ -92,6 +92,12 @@ int filestream_delete(const char *path)
    return 0;
 }
 
+bool path_is_valid(const char *path)
+{
+   (void)path;
+   return true;
+}
+
 bool core_get_memory(retro_ctx_memory_info_t *info)
 {
    info->data = ram;
