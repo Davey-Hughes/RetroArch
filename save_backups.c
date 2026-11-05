@@ -36,6 +36,8 @@
  * the game is cut the same way for all of one file's copies. */
 #define SAVE_BACKUPS_REASON_ROOM 17
 #define SAVE_BACKUPS_NUMBER_ROOM 8
+/* Most a cut steps back from the limit, to a UTF-8 boundary. */
+#define SAVE_BACKUPS_CUT_ROOM    3
 #define SAVE_BACKUPS_TIME_LEN    19
 
 enum save_backups_root
@@ -156,7 +158,7 @@ size_t save_backups_dir(char *s, size_t len, const char *path)
    {
       fill_pathname_join(s, save_backups_roots[SAVE_BACKUPS_ROOT_SAVEFILE],
             SAVE_BACKUPS_DIR, len);
-      _len = fill_pathname_join(s, s, "system", len);
+      _len = fill_pathname_join(s, s, SAVE_BACKUPS_SYSTEM_DIR, len);
    }
    else
       _len = fill_pathname_join(s, save_backups_roots[which],
@@ -305,10 +307,11 @@ static char *save_backups_core_field(const char *core)
    for (i = 0; core[i]; i++)
    {
       unsigned char c = (unsigned char)core[i];
-      if (c == ' ' && core[i + 1] == '-' && core[i + 2] == ' ')
+      /* " - " becomes "-", checked on the output so none is left */
+      if (c == ' ' && n > 1 && s[n - 2] == ' ' && s[n - 1] == '-')
       {
-         s[n++] = '-';
-         i     += 2;
+         s[n - 2] = '-';
+         n--;
       }
       else if (c < 0x20 || strchr("<>:\"/\\|?*", c))
          s[n++] = '_';
@@ -331,9 +334,8 @@ static size_t save_backups_game_max(size_t core_len, size_t ext_len)
       ? SAVE_BACKUPS_NAME_MAX - 1 - fixed : 1;
 }
 
-/* How much of @game a name keeps: a cut steps back at most 3 bytes
- * from the limit, to a UTF-8 boundary, so a cut game is never more
- * than 3 bytes under it. */
+/* How much of @game a name keeps. A cut game is never more than
+ * SAVE_BACKUPS_CUT_ROOM bytes under the limit. */
 static size_t save_backups_game_len(const char *game, size_t game_len,
       size_t core_len, size_t ext_len)
 {
@@ -341,7 +343,7 @@ static size_t save_backups_game_len(const char *game, size_t game_len,
    size_t max = save_backups_game_max(core_len, ext_len);
    if (game_len <= max)
       return game_len;
-   for (i = 0; i < 3 && max
+   for (i = 0; i < SAVE_BACKUPS_CUT_ROOM && max
          && ((unsigned char)game[max] & 0xC0) == 0x80; i++)
       max--;
    return max;
@@ -368,9 +370,9 @@ static void save_backups_retain(struct string_list *list,
    {
       if (!mine[i] || names[i].reason != reason)
          continue;
-      /* Within 3 bytes of its limit, the game may be a longer name's
-       * cut: never pruned */
-      if (names[i].game_len + 3
+      /* Near its limit, the game may be a longer name's cut: never
+       * pruned */
+      if (names[i].game_len + SAVE_BACKUPS_CUT_ROOM
             < save_backups_game_max(names[i].core_len, ext_len))
          count++;
       else

@@ -312,6 +312,9 @@ static void backup_names(void)
 /* Every character the core field changes. */
 static void backup_core_chars(void)
 {
+   size_t i;
+   struct save_backup_name p;
+   struct string_list *l;
    set_time(17, 0, 0);
    CHECK(save_backups_copy_to(ROOT "/chars", ROOT "/chars/Game.srm",
          "a<b>c\"d/e\\f|g?h*i\001j\037k", SAVE_BACKUP_CUT, "1", 1, true)
@@ -322,7 +325,21 @@ static void backup_core_chars(void)
          "", SAVE_BACKUP_CUT, "2", 1, true) == SAVE_BACKUP_MADE);
    CHECK(holds(ROOT "/chars/"
          "Game - 2026-11-03 17-00-00-2 - unknown - cut.srm", "2"));
-   CHECK(count_files(ROOT "/chars") == 2);
+   /* no " - " left by the cleanup itself either */
+   CHECK(save_backups_copy_to(ROOT "/chars", ROOT "/chars/Game.srm",
+         "a  -  b", SAVE_BACKUP_CUT, "3", 1, true) == SAVE_BACKUP_MADE);
+   CHECK(holds(ROOT "/chars/"
+         "Game - 2026-11-03 17-00-00-3 - a-b - cut.srm", "3"));
+   CHECK(save_backups_copy_to(ROOT "/chars", ROOT "/chars/Game.srm",
+         "c   -   d", SAVE_BACKUP_CUT, "4", 1, true) == SAVE_BACKUP_MADE);
+   CHECK(holds(ROOT "/chars/"
+         "Game - 2026-11-03 17-00-00-4 - c-d - cut.srm", "4"));
+   l = dir_list_new(ROOT "/chars", NULL, false, true, false, false);
+   CHECK(l && l->size == 4);
+   for (i = 0; l && i < l->size; i++)
+      CHECK(save_backups_parse(path_basename(l->elems[i].data), &p));
+   if (l)
+      string_list_free(l);
 }
 
 static void backup_collisions(void)
@@ -560,6 +577,11 @@ static void backup_retention_long(void)
    make_copies(ROOT "/long4", a, core, 'a', 3, 0);
    make_copies(ROOT "/long4", c, "Snes9x", 'c', 12, 1);
    CHECK(count_tagged(ROOT "/long4", 'a') == 3);
+   CHECK(count_tagged(ROOT "/long4", 'c') == 10);
+   /* nor the other way: a cut file prunes nothing */
+   make_copies(ROOT "/long4", c, "Snes9x", 'c', 12, 2);
+   make_copies(ROOT "/long4", a, core, 'a', 1, 3);
+   CHECK(count_tagged(ROOT "/long4", 'a') == 4);
    CHECK(count_tagged(ROOT "/long4", 'c') == 10);
 }
 

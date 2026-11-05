@@ -1,9 +1,10 @@
 /* Where runloop_path_set_redirect() puts a game's saves and states.
  *
  * With sort-by-content on, the content folder's name becomes a folder
- * under the save and state roots, except "backups" and "records" in
- * any case, which the roots keep for safety copies and records: those
- * games use the root (and the core's folder when that is on).
+ * under the save and state roots, except "backups", "records" and
+ * "system" in any case, which the roots keep for safety copies, records
+ * and the system folder's copies: those games use the root (and the
+ * core's folder when that is on).
  *
  * The shipping function is included and run over a real folder. */
 #include "../../../runloop.c"
@@ -83,6 +84,14 @@ static void reserved_rom_folder(void)
    CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/Snes9x/Game.srm"));
    CHECK(same_path(runloop_state.name.savestate, ROOT "/states/Snes9x/Game.state"));
 
+   redirect("/roms/system/Game", false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/Game.srm"));
+   CHECK(same_path(runloop_state.name.savestate, ROOT "/states/Game.state"));
+
+   redirect("/roms/System/Game", true);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/Snes9x/Game.srm"));
+   CHECK(same_path(runloop_state.name.savestate, ROOT "/states/Snes9x/Game.state"));
+
    redirect("/roms/backups2/Game", false);
    CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/backups2/Game.srm"));
 
@@ -92,6 +101,10 @@ static void reserved_rom_folder(void)
    CHECK(!path_is_directory(ROOT "/states/Records"));
    CHECK(!path_is_directory(ROOT "/saves/BACKUPS"));
    CHECK(!path_is_directory(ROOT "/states/BACKUPS"));
+   CHECK(!path_is_directory(ROOT "/saves/system"));
+   CHECK(!path_is_directory(ROOT "/states/system"));
+   CHECK(!path_is_directory(ROOT "/saves/System"));
+   CHECK(!path_is_directory(ROOT "/states/System"));
 }
 
 int main(void)

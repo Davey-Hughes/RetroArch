@@ -11328,7 +11328,9 @@ void runloop_path_set_redirect(settings_t *settings,
       /* Folder names the save root keeps for itself */
       if (     string_is_equal_noncase(content_dir_name, SAVE_BACKUPS_DIR)
             || string_is_equal_noncase(content_dir_name,
-               SAVE_BACKUPS_RECORDS_DIR))
+               SAVE_BACKUPS_RECORDS_DIR)
+            || string_is_equal_noncase(content_dir_name,
+               SAVE_BACKUPS_SYSTEM_DIR))
          content_dir_name[0] = '\0';
    }
 

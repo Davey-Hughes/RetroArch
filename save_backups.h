@@ -31,6 +31,8 @@ RETRO_BEGIN_DECLS
 #define SAVE_BACKUPS_RECOVERY_DIR    "recovery"
 /* Kept free under the save root for save records. */
 #define SAVE_BACKUPS_RECORDS_DIR     "records"
+/* The system folder's copies go in <save root>/backups/system. */
+#define SAVE_BACKUPS_SYSTEM_DIR      "system"
 /* The core field of cloud sync's own backups. */
 #define SAVE_BACKUPS_CORE_CLOUD_SYNC "cloud-sync"
 /* Copies kept per file for each repeating reason. */
