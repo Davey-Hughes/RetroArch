@@ -470,15 +470,18 @@ public final class VfsImplementationSaf
       private static final String[] QUERY_ARGS_WITH_SIZE = {
          Document.COLUMN_MIME_TYPE,
          Document.COLUMN_SIZE,
+         Document.COLUMN_LAST_MODIFIED,
       };
 
       private static final String[] QUERY_ARGS_WITHOUT_SIZE = {
          Document.COLUMN_MIME_TYPE,
+         Document.COLUMN_LAST_MODIFIED,
       };
 
       private boolean isOpen = false;
       private boolean isDirectory = false;
       private long size = -1;
+      private long lastModified = 0;
 
       /**
        * Retrieves metadata about a Storage Access Framework file or directory.
@@ -515,6 +518,8 @@ public final class VfsImplementationSaf
                return;
             isDirectory = cursor.getString(0).equals(Document.MIME_TYPE_DIR);
             size = includeSize ? cursor.getLong(1) : 0;
+            final int lastModifiedIndex = cursor.getColumnIndex(Document.COLUMN_LAST_MODIFIED);
+            lastModified = lastModifiedIndex < 0 || cursor.isNull(lastModifiedIndex) ? 0 : cursor.getLong(lastModifiedIndex);
             isOpen = true;
          }
          finally
@@ -546,6 +551,14 @@ public final class VfsImplementationSaf
       public long getSize()
       {
          return isOpen ? size : -1;
+      }
+
+      /**
+       * Get the last modification time in milliseconds since 1970, or 0 if it is unknown or there was an error opening the file or directory.
+       */
+      public long getLastModified()
+      {
+         return isOpen ? lastModified : 0;
       }
    }
 

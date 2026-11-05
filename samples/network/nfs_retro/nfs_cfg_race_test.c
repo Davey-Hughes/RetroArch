@@ -36,7 +36,7 @@ static void reader(void *arg)
    {
       int64_t         size = 0;
       nfs_dir_handle *dh;
-      if (retro_vfs_stat_nfs("nfs://127.0.0.1/roms/a.bin", &size))
+      if (retro_vfs_stat_nfs("nfs://127.0.0.1/roms/a.bin", &size, NULL))
          retro_atomic_fetch_add_int(&answered, 1);
       if ((dh = retro_vfs_opendir_nfs("nfs://127.0.0.1/roms", false)))
       {
@@ -84,7 +84,7 @@ int main(void)
       }
       free(exp);
       free(heap);
-      if (retro_vfs_stat_nfs("nfs://127.0.0.1/a.bin", &size))
+      if (retro_vfs_stat_nfs("nfs://127.0.0.1/a.bin", &size, NULL))
       {
          fprintf(stderr, "FAIL: a stat with nothing listening succeeded\n");
          failures++;

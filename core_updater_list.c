@@ -243,8 +243,8 @@ static void core_updater_list_walk_installed(core_updater_list_t *core_list,
       st             = retro_dirent_stat(rdir, &size, &mtime);
       slot->size     = size;
       slot->mtime    = mtime;
-      /* Backends that report no mtime (SMB, SAF) leave it at 0: no
-       * usable cache key, so those cores are always hashed */
+      /* Backends that report no mtime leave it at 0: no usable cache
+       * key, so those cores are always hashed */
       slot->metadata = (st & RETRO_VFS_STAT_IS_VALID) && mtime > 0;
       core_list->num_installed++;
    }

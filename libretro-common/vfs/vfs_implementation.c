@@ -3295,9 +3295,7 @@ static int vfs_stat_win32_wide(const char *path,
 
 /* One platform ladder serves stat, stat_64, get_mtime and the POSIX
  * fallback of dirent_stat.  @mtime is filled (seconds since the Unix
- * epoch) where the platform reports one; the SMB and SAF backends do
- * not carry it through their stat helpers yet, so it is left untouched
- * there and callers treat -1 from get_mtime as "unavailable". */
+ * epoch) where the backend reports one, and left untouched otherwise. */
 static int retro_vfs_stat_full(const char *path, int64_t *size, int64_t *mtime)
 {
    int ret                   = RETRO_VFS_STAT_IS_VALID;
@@ -3307,11 +3305,11 @@ static int retro_vfs_stat_full(const char *path, int64_t *size, int64_t *mtime)
 
 #ifdef HAVE_SMBCLIENT
    if (path_is_smb(path))
-      return retro_vfs_stat_smb(path, size);
+      return retro_vfs_stat_smb(path, size, mtime);
 #endif
 #ifdef HAVE_NFSCLIENT
    if (path_is_nfs(path))
-      return retro_vfs_stat_nfs(path, size);
+      return retro_vfs_stat_nfs(path, size, mtime);
 #endif
 
 #if defined(ANDROID) && defined(HAVE_SAF)
@@ -3320,7 +3318,7 @@ static int retro_vfs_stat_full(const char *path, int64_t *size, int64_t *mtime)
       struct libretro_vfs_implementation_saf_path_split_result saf_split_result;
       if (!retro_vfs_path_split_saf(&saf_split_result, path))
          return 0;
-      ret = retro_vfs_stat_saf(saf_split_result.tree, saf_split_result.path, size);
+      ret = retro_vfs_stat_saf(saf_split_result.tree, saf_split_result.path, size, mtime);
       free(saf_split_result.path);
       free(saf_split_result.tree);
       return ret;
@@ -3498,9 +3496,8 @@ int retro_vfs_get_mtime_impl(const char *path, int64_t *mtime)
    if (!mtime)
       return -1;
 
-   /* The SMB/SAF stat helpers leave @mtime untouched; a sentinel that
-    * no real file system reports tells those cases apart from a genuine
-    * timestamp. */
+   /* A backend with no time for the file leaves @mtime untouched; a
+    * sentinel no real file system reports tells that apart. */
    t     = INT64_MIN;
    flags = retro_vfs_stat_full(path, NULL, &t);
    got_it = (flags != 0) && (t != INT64_MIN);

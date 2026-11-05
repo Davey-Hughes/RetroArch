@@ -346,11 +346,12 @@ static retro_atomic_int_t smb_stat_count;
 static char              *smb_stat_log;
 static const char *const *smb_stat_valid;
 
-int retro_vfs_stat_smb(const char *path, int64_t *size)
+int retro_vfs_stat_smb(const char *path, int64_t *size, int64_t *mtime)
 {
    const char *const *v;
    size_t n = strlen(path);
 
+   (void)mtime;
    if (size)
       *size = 0;
    retro_atomic_fetch_add_int(&smb_stat_count, 1);
