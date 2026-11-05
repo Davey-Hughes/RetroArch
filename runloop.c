@@ -5963,13 +5963,8 @@ static void runloop_path_init_savefile(runloop_state_t *runloop_st)
       runloop_st->flags &= ~RUNLOOP_FLAG_USE_SRAM;
 
    if (!(runloop_st->flags & RUNLOOP_FLAG_USE_SRAM))
-   {
       RARCH_LOG("[SRAM] %s\n",
             msg_hash_to_str(MSG_SRAM_WILL_NOT_BE_SAVED));
-      return;
-   }
-
-   command_event(CMD_EVENT_AUTOSAVE_INIT, NULL);
 }
 
 static bool event_init_content(
@@ -6027,6 +6022,11 @@ static bool event_init_content(
 
    if (!event_load_save_files(runloop_st->flags & RUNLOOP_FLAG_IS_SRAM_LOAD_DISABLED))
       RARCH_LOG("[SRAM] %s\n", msg_hash_to_str(MSG_SKIPPING_SRAM_LOAD));
+
+   /* After the load, so the workers start from the loaded image and
+    * an unchanged save is not written back. */
+   if (runloop_st->flags & RUNLOOP_FLAG_USE_SRAM)
+      command_event(CMD_EVENT_AUTOSAVE_INIT, NULL);
 
    /* Set entry slot from playlist entry if available */
    {

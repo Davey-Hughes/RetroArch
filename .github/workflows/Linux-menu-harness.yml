@@ -33,6 +33,10 @@ on:
       - 'save_backups.h'
       - 'samples/runloop/save_backups/**'
       - 'samples/runloop/save_paths/**'
+      - 'save.c'
+      - 'autosave.h'
+      - 'samples/runloop/autosave_snapshot/**'
+      - 'samples/runloop/save_e2e/**'
       - 'libretro-common/streams/file_stream.c'
       - 'libretro-common/vfs/vfs_implementation.c'
       - 'samples/menu/network_settings/**'
@@ -64,6 +68,10 @@ on:
       - 'save_backups.h'
       - 'samples/runloop/save_backups/**'
       - 'samples/runloop/save_paths/**'
+      - 'save.c'
+      - 'autosave.h'
+      - 'samples/runloop/autosave_snapshot/**'
+      - 'samples/runloop/save_e2e/**'
       - 'libretro-common/streams/file_stream.c'
       - 'libretro-common/vfs/vfs_implementation.c'
       - 'samples/menu/network_settings/**'
@@ -88,7 +96,7 @@ jobs:
     name: Build and run the menu navigation harness
     runs-on: ubuntu-latest
     env:
-      APT_PKGS: build-essential zlib1g-dev ccache
+      APT_PKGS: build-essential zlib1g-dev ccache strace
     timeout-minutes: 25
 
     steps:
@@ -207,6 +215,36 @@ jobs:
           make -C samples/runloop/save_backups clean check
           make -C samples/runloop/save_backups clean check SANITIZER=address,undefined
           make -C samples/runloop/save_backups clean
+
+      - name: Build and run the autosave tests
+        shell: bash
+        run: |
+          set -eu
+          # save.c's autosave worker: snapshots taken on the main thread
+          # only; writes through a temporary of its own, so a full disk
+          # or a refused rename keeps the old save whole; nothing written
+          # for an unchanged save; memory a core moves or resizes
+          # followed.  The close write, with and without HAVE_THREADS.
+          make -C samples/runloop/autosave_snapshot clean check
+          make -C samples/runloop/autosave_snapshot clean check SANITIZER=address,undefined
+          make -C samples/runloop/autosave_snapshot clean
+
+      - name: Run the save end-to-end lanes
+        shell: bash
+        run: |
+          set -eu
+          # The binary built above, null drivers, every folder in a run
+          # folder: an autosave on a full disk (file size limit) keeps
+          # the old save whole, and a launch with an unchanged save
+          # writes nothing to it (strace).  The kill-mid-write lane and
+          # its runs under load stay local.  The harness builds above
+          # removed the binary to read its link line.
+          make -j$(nproc)
+          make -C samples/runloop/save_e2e
+          python3 samples/runloop/save_e2e/run.py --retroarch ./retroarch \
+             --run-dir "$RUNNER_TEMP/save_e2e" \
+             --lane autosave_full_disk --lane no_rewrite_at_launch
+          make -C samples/runloop/save_e2e clean
 
       - name: Build and run save_paths_test
         shell: bash

@@ -74,6 +74,8 @@ samples/gfx/window_title_mailbox window_title_mailbox_test
 samples/input/android_kbd_mailbox android_kbd_mailbox_test
 samples/input/overlay_textures overlay_textures_test
 samples/runahead runahead_copy_test
+samples/runloop/autosave_snapshot autosave_snapshot_test
+samples/runloop/autosave_snapshot autosave_io_test
 samples/runloop/core_status_defer core_status_defer_test
 samples/state_rewind state_rewind_test
 samples/tasks/bsv_replay_init bsv_replay_init_test
