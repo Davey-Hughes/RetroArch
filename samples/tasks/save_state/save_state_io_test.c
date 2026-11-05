@@ -137,6 +137,7 @@
 #include "../../../runloop.h"
 #include "../../../core.h"
 #include "../../../msg_hash.h"
+#include "../../../save_backups.h"
 #include "../../../gfx/video_driver.h"
 
 /* Must match tasks/task_save.c.  Duplicated rather than exported: the
@@ -335,6 +336,17 @@ runloop_state_t *runloop_state_get_ptr(void) { return &stub_runloop; }
 video_driver_state_t *video_state_get_ptr(void) { return &stub_video; }
 bool video_driver_cached_frame_is_hw_render(void) { return false; }
 void *savefile_ptr_get(void) { return NULL; }
+
+/* The flushes asked for before state loads, and what they owed */
+static unsigned flushes;
+static int flushes_owed;
+void event_flush_save_files(bool sram_used, bool compress_files, int owed)
+{
+   (void)sram_used;
+   (void)compress_files;
+   flushes++;
+   flushes_owed |= owed;
+}
 bool audio_driver_jump_fade_begin(void) { return false; }
 void audio_driver_jump_fade_end(bool ramped) { (void)ramped; }
 
@@ -1429,6 +1441,53 @@ static void test_undo_save_restores_file(void)
 }
 #endif
 
+/* -----------------------------------------------------------------
+ * The user's state loads (a file: hotkey, menu, entry slot, auto-load,
+ * the network command; Undo Load; a load from RAM) ask for a flush
+ * that owes a before-state-load copy. The backup load of a slot about
+ * to be saved over, a failed read, and the direct unserialize run-ahead,
+ * rewind, netplay and replays use do not.
+ * ----------------------------------------------------------------- */
+static void test_state_load_kinds(void)
+{
+   const char *path = "sst_kinds.state";
+   size_t sz        = 4096;
+   void *buf        = NULL;
+   int64_t len      = 0;
+   const int bsl    = 1 << SAVE_BACKUP_BEFORE_STATE_LOAD;
+
+   frontend_reset();
+   core_fill(sz);
+   filestream_delete(path);
+   content_save_state(path, true);
+   pump(1000);
+   flushes      = 0;
+   flushes_owed = 0;
+
+   content_load_state(path, false, false);
+   pump(1000);
+   okf(flushes == 1 && flushes_owed == bsl,
+         "kinds: a load from a file asks one before-state-load flush");
+   content_load_state(path, false, true);
+   pump(1000);
+   okf(flushes == 2, "kinds: the auto-load and entry-slot form flushes");
+   okf(content_undo_load_state() && flushes == 3, "kinds: Undo Load flushes");
+   okf(content_save_state_to_ram() && content_load_state_from_ram()
+         && flushes == 4, "kinds: a load from RAM flushes");
+
+   content_save_state(path, true);
+   pump(1000);
+   okf(flushes == 4, "kinds: the backup load before a save flushed");
+   content_load_state("sst_kinds_missing.state", false, false);
+   pump(1000);
+   okf(flushes == 4, "kinds: a load that read nothing flushed");
+   okf(filestream_read_file(path, &buf, &len)
+         && content_deserialize_state(buf, (size_t)len) && flushes == 4,
+         "kinds: a direct unserialize flushed");
+   free(buf);
+   filestream_delete(path);
+}
+
 static int run_default_lane(void)
 {
    printf("== task_save.c I/O regression oracle ==\n");
@@ -1456,6 +1515,7 @@ static int run_default_lane(void)
    test_undo_allocates_nothing();
    test_notify_without_allocation();
    test_load_held_behind_save();
+   test_state_load_kinds();
 #ifdef HAVE_COMPRESSION
    test_undo_save_restores_file();
 #endif

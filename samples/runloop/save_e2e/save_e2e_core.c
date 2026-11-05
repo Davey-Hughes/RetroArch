@@ -21,6 +21,10 @@ static size_t sram_size;
 static long frame, touch_frame = -1, late_frame;
 static unsigned frame_ms, seed;
 static unsigned fb[16 * 16];
+/* SAVE_E2E_TOUCHES: "frame:seed,..."; each makes <mark>-<seed> */
+#define MAX_TOUCHES 8
+static long touches[MAX_TOUCHES][2];
+static unsigned touch_num;
 
 static long env_long(const char *name, long fallback)
 {
@@ -82,8 +86,29 @@ RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device)
 }
 RETRO_API void retro_reset(void) { }
 
+static void touch_list(void)
+{
+   unsigned i;
+   for (i = 0; i < touch_num; i++)
+   {
+      if (frame == touches[i][0])
+      {
+         char path[1024];
+         const char *mark = getenv("SAVE_E2E_MARK");
+         FILE *f;
+         fill(sram, sram_size, (unsigned)touches[i][1]);
+         if (!mark || !*mark)
+            continue;
+         snprintf(path, sizeof(path), "%s-%ld", mark, touches[i][1]);
+         if ((f = fopen(path, "wb")))
+            fclose(f);
+      }
+   }
+}
+
 RETRO_API void retro_run(void)
 {
+   touch_list();
    if (frame == touch_frame)
    {
       const char *mark = getenv("SAVE_E2E_MARK");
@@ -99,18 +124,21 @@ RETRO_API void retro_run(void)
       retro_sleep(frame_ms);
 }
 
-RETRO_API size_t retro_serialize_size(void) { return 0; }
+/* A state is save RAM alone, so a load rolls it back. */
+RETRO_API size_t retro_serialize_size(void) { return sram_size; }
 RETRO_API bool retro_serialize(void *data, size_t len)
 {
-   (void)data;
-   (void)len;
-   return false;
+   if (!sram || len < sram_size)
+      return false;
+   memcpy(data, sram, sram_size);
+   return true;
 }
 RETRO_API bool retro_unserialize(const void *data, size_t len)
 {
-   (void)data;
-   (void)len;
-   return false;
+   if (!sram || len < sram_size)
+      return false;
+   memcpy(sram, data, sram_size);
+   return true;
 }
 RETRO_API void retro_cheat_reset(void) { }
 RETRO_API void retro_cheat_set(unsigned i, bool on, const char *code)
@@ -131,6 +159,21 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
    frame_ms    = (unsigned)env_long("SAVE_E2E_FRAME_MS", 0);
    seed        = (unsigned)env_long("SAVE_E2E_SEED", 1);
    late_frame  = env_long("SAVE_E2E_LATE", 0);
+   {
+      const char *t = getenv("SAVE_E2E_TOUCHES");
+      char *end;
+      while (t && *t && touch_num < MAX_TOUCHES)
+      {
+         touches[touch_num][0] = strtol(t, &end, 10);
+         if (*end != ':')
+            break;
+         touches[touch_num][1] = strtol(end + 1, &end, 10);
+         touch_num++;
+         if (*end != ',')
+            break;
+         t = end + 1;
+      }
+   }
    return (sram = (unsigned char*)calloc(1, sram_size)) != NULL;
 }
 

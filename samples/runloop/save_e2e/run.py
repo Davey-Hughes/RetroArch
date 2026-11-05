@@ -404,6 +404,47 @@ def lane_cut_copy_old_core(args, n):
     return r, failures
 
 
+def lane_state_load_copy(args, n):
+    """A1-17: hotkey state loads (the network command) of an older
+    state.  The autosave rests 60 s, so only the flush before each load
+    writes the progress; the next write backs it up, once per load."""
+    r = Run(args.run_dir, 'state_load_copy-%d' % n)
+    port = 55600 + n
+    cfg = r.config(autosave_interval='60', network_cmd_enable='true',
+                   network_cmd_port=str(port),
+                   sort_savestates_enable='false',
+                   sort_savestates_by_content_enable='false')
+    env = r.env(SAVE_E2E_TOUCHES='30:61,300:62,700:63',
+                SAVE_E2E_FRAME_MS=10)
+    r.start(args, cfg, 1200, env)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    failures = []
+    state = r.dir / 'states' / 'game.state'
+    mark = r.dir / 'touched'
+    check(failures, r.wait_for(Path('%s-61' % mark)), 'no first touch')
+    sock.sendto(b'SAVE_STATE', ('127.0.0.1', port))
+    check(failures, r.wait_for(state, 10)
+          and not Path('%s-62' % mark).exists(),
+          'state not saved before the second touch')
+    for seed in (62, 63):
+        check(failures, r.wait_for(Path('%s-%d' % (mark, seed))),
+              'no touch %d' % seed)
+        sock.sendto(b'LOAD_STATE', ('127.0.0.1', port))
+        time.sleep(1.0)
+    sock.close()
+    rc = r.wait(60)
+    copies = r.copies('before-state-load')
+    check(failures, rc == 0, 'retroarch exit %s' % rc)
+    check(failures, len(copies) == 2,
+          '%d before-state-load copies' % len(copies))
+    check(failures, [c.read_bytes() for c in copies]
+          == [pattern(62), pattern(63)],
+          'the copies are not the progress before each load')
+    check(failures, r.srm.read_bytes() == pattern(61),
+          '.srm is not the loaded state')
+    return r, failures
+
+
 def lane_recovery_announced(args, n):
     """A recovery file newer than the save is announced at load; after
     the game wrote its save it is not."""
@@ -475,6 +516,7 @@ LANES = {
     'explicit_save_copies': lane_explicit_save_copies,
     'cut_copy_old_core': lane_cut_copy_old_core,
     'recovery_announced': lane_recovery_announced,
+    'state_load_copy': lane_state_load_copy,
     'windows_locked_close': lane_windows_locked_close,
 }
 # Lanes that need Windows, and the ones Windows cannot run.

@@ -48,6 +48,7 @@
 #include "../gfx/video_driver.h"
 #include "../msg_hash.h"
 #include "../runloop.h"
+#include "../save_backups.h"
 #include "../verbosity.h"
 #include "tasks_internal.h"
 
@@ -285,6 +286,22 @@ typedef struct rastate_size_info
 } rastate_size_info_t;
 
 
+/* A user's state load is about to change save RAM: the save files are
+ * written as they are now, and the next write over each save RAM file
+ * backs it up first. Run-ahead, rewind, netplay and replays load
+ * states without this. */
+static void content_flush_saves_before_load(void)
+{
+#if defined(HAVE_COMPRESSION)
+   bool compress = config_get_ptr()->bools.save_file_compression;
+#else
+   bool compress = false;
+#endif
+   event_flush_save_files(
+         (runloop_state_get_ptr()->flags & RUNLOOP_FLAG_USE_SRAM) != 0,
+         compress, 1 << SAVE_BACKUP_BEFORE_STATE_LOAD);
+}
+
 /**
  * undo_load_state:
  * Revert to the state before a state was loaded.
@@ -384,6 +401,8 @@ bool content_undo_load_state(void)
    undo_load_buf.data     = NULL;
    undo_load_buf.size     = 0;
    undo_load_buf.capacity = 0;
+
+   content_flush_saves_before_load();
 
    /* An undo jumps the game's state exactly as a load does. See
     * audio_driver_jump_fade_begin(). */
@@ -1603,6 +1622,8 @@ static void content_load_state_apply(retro_task_t *task,
       return;
    }
 
+   content_flush_saves_before_load();
+
    if (     savefile_list
          && savefile_list->size
          && config_get_ptr()->bools.block_sram_overwrite
@@ -2527,6 +2548,8 @@ bool content_load_state_from_ram(void)
          msg_hash_to_str(MSG_LOADING_STATE),
          (unsigned)ram_buf.state_buf.size,
          msg_hash_to_str(MSG_BYTES));
+
+   content_flush_saves_before_load();
 
    /* Same discontinuity as a load from disk, so the same bracket. See
     * audio_driver_jump_fade_begin(). */

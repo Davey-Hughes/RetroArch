@@ -203,6 +203,10 @@ static int64_t open_written[MAX_OPEN];
 static int64_t cut_at;
 static bool refuse_rename;
 static unsigned write_opens;
+#ifdef HAVE_THREADS
+static uintptr_t main_thread;
+static unsigned main_write_opens;
+#endif
 
 static bool save_own(const char *path)
 {
@@ -219,6 +223,10 @@ static struct retro_vfs_file_handle *RETRO_CALLCONV test_open(
       return h;
    VFS_LOCK();
    write_opens++;
+#ifdef HAVE_THREADS
+   if (sthread_get_current_thread_id() == main_thread)
+      main_write_opens++;
+#endif
    for (i = 0; i < MAX_OPEN; i++)
       if (!open_files[i])
       {
@@ -470,6 +478,63 @@ static void put_cut_rzip(const char *path, const void *data, size_t len,
    memcpy(out, buf, (size_t)*out_len);
    free(buf);
    put(path, out, (size_t)*out_len);
+}
+
+/* A1-17 with no worker: the flush before a state load writes the
+ * save here, after the copy it owes; the next write after the load
+ * backs up what the flush wrote, once per load. */
+static void lane_state_load_copy_sync(void)
+{
+   static unsigned char cut[BIG * 2], ram[BIG], p1[BIG], l1[BIG], p2[BIG];
+   char newest[PATH_MAX_LENGTH];
+   int64_t cut_len = 0;
+   unsigned opens;
+   const int bsl   = 1 << SAVE_BACKUP_BEFORE_STATE_LOAD;
+
+   clean();
+   fill(p1, BIG, 42);
+   fill(l1, BIG, 43);
+   fill(p2, BIG, 44);
+   put_cut_rzip(SAVE, l1, BIG, cut, &cut_len);
+   memset(ram, 0, BIG);
+   core_data = ram;
+   core_size = BIG;
+   path_init_savefile_new();
+   path_init_savefile_rtc(SAVE);
+   CHECK(!event_load_save_files(false), "state_load_sync: a cut rzip loaded");
+   use_test_vfs(true);
+
+   memcpy(ram, p1, BIG);
+   event_flush_save_files(true, false, bsl);
+   CHECK(copies("backups", SAVE_BACKUP_UNREADABLE, newest, sizeof(newest)) == 1
+         && holds(newest, cut, (size_t)cut_len),
+         "state_load_sync: the flush did not make the owed copy");
+   CHECK(holds(SAVE, p1, BIG), "state_load_sync: the flush did not write");
+   CHECK(!copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, NULL, 0),
+         "state_load_sync: a copy before the load");
+
+   memcpy(ram, l1, BIG);
+   event_save_files(true, false, true, true, NULL);
+   CHECK(copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, newest,
+            sizeof(newest)) == 1 && holds(newest, p1, BIG),
+         "state_load_sync: no copy of the pre-load save");
+   CHECK(holds(SAVE, l1, BIG), "state_load_sync: not written after the copy");
+
+   memcpy(ram, p2, BIG);
+   event_flush_save_files(true, false, bsl);
+   memcpy(ram, l1, BIG);
+   event_save_files(true, false, true, true, NULL);
+   CHECK(copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, newest,
+            sizeof(newest)) == 2 && holds(newest, p2, BIG),
+         "state_load_sync: no copy for the second load");
+
+   /* Unchanged: nothing written. */
+   opens = get_write_opens();
+   event_flush_save_files(true, false, 0);
+   CHECK(get_write_opens() == opens, "state_load_sync: unchanged, written");
+   use_test_vfs(false);
+   path_deinit_savefile();
+   clean();
 }
 
 /* A1-5: a core that reports no save RAM at load: the file is copied
@@ -794,6 +859,89 @@ static void stop(void)
    slots[0]            = NULL;
    autosave_state.list = NULL;
    autosave_state.num  = 0;
+}
+
+static bool wait_holds(const char *path, const void *data, size_t len)
+{
+   unsigned i;
+   for (i = 0; i < 5000; i++)
+   {
+      if (holds(path, data, len))
+         return true;
+      retro_sleep(1);
+   }
+   return false;
+}
+
+/* A1-17 with a worker resting a long interval: the flush before a
+ * state load wakes it and it writes the save; the main thread only
+ * copies. The next write after the load backs that up first. */
+static void lane_state_load_copy_worker(void)
+{
+   static unsigned char disk[BIG], ram[BIG], p1[BIG], l1[BIG], p2[BIG];
+   char newest[PATH_MAX_LENGTH];
+   unsigned opens;
+   const int bsl = 1 << SAVE_BACKUP_BEFORE_STATE_LOAD;
+
+   clean();
+   fill(disk, BIG, 41);
+   fill(p1, BIG, 42);
+   fill(l1, BIG, 43);
+   fill(p2, BIG, 44);
+   put(SAVE, disk, BIG);
+   memset(ram, 0, BIG);
+   core_data = ram;
+   core_size = BIG;
+   path_init_savefile_new();
+   path_init_savefile_rtc(SAVE);
+   CHECK(event_load_save_files(false), "state_load: no load");
+   use_test_vfs(true);
+   main_thread      = sthread_get_current_thread_id();
+   main_write_opens = 0;
+   slots[0] = autosave_new(SAVE, ram, BIG, 100, false,
+         RETRO_MEMORY_SAVE_RAM, false, save_file_get(0));
+   CHECK(slots[0] != NULL, "state_load: autosave_new failed");
+   autosave_state.list = slots;
+   autosave_state.num  = 1;
+   wait_requested();
+   /* Unchanged: it rests 100 s without writing. */
+   autosave_check();
+
+   memcpy(ram, p1, BIG);
+   event_flush_save_files(true, false, bsl);
+   CHECK(wait_holds(SAVE, p1, BIG), "state_load: the flush was not written");
+   CHECK(!copies("backups", SAVE_BACKUP_REASON_LAST, NULL, 0),
+         "state_load: a copy before the load");
+
+   memcpy(ram, l1, BIG);
+   wait_requested();
+   autosave_check();
+   CHECK(wait_holds(SAVE, l1, BIG), "state_load: the load not written");
+   CHECK(copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, newest,
+            sizeof(newest)) == 1 && holds(newest, p1, BIG),
+         "state_load: no copy of the pre-load save");
+
+   memcpy(ram, p2, BIG);
+   event_flush_save_files(true, false, bsl);
+   CHECK(wait_holds(SAVE, p2, BIG), "state_load: second flush not written");
+   memcpy(ram, l1, BIG);
+   wait_requested();
+   autosave_check();
+   CHECK(wait_holds(SAVE, l1, BIG), "state_load: second load not written");
+   CHECK(copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, newest,
+            sizeof(newest)) == 2 && holds(newest, p2, BIG),
+         "state_load: no copy for the second load");
+
+   /* Unchanged: the flush wakes it from its rest; nothing written. */
+   opens = get_write_opens();
+   event_flush_save_files(true, false, 0);
+   wait_requested();
+   CHECK(get_write_opens() == opens, "state_load: unchanged, written");
+   CHECK(main_write_opens == 0, "state_load: the main thread wrote");
+   stop();
+   use_test_vfs(false);
+   path_deinit_savefile();
+   clean();
 }
 
 /* A1-1: a full disk or a refused rename keeps the old save whole and
@@ -2000,7 +2148,9 @@ int main(void)
    lane_rewrite_after_failed_copy();
    lane_explicit_copy_fails();
    lane_backup_logged();
+   lane_state_load_copy_sync();
 #ifdef HAVE_THREADS
+   lane_state_load_copy_worker();
    lane_autosave_full_disk();
    lane_no_rewrite_at_launch();
    lane_pointer_requery();

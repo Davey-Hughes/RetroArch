@@ -534,6 +534,15 @@ bool content_savefile_is_live(const char *path);
 bool event_save_files(bool sram_used, bool compress_files, bool sync,
       bool copy, const char *path_cheat_database);
 
+/* Writes each save file whose memory changed since it was last
+ * written, ahead of anything that changes it: with an autosave worker
+ * the main thread only copies the memory and the worker writes it
+ * before any later image; without one it is written here, not synced,
+ * after the copies the file owes. Then each save RAM file owes @owed
+ * (1 << enum save_backup_reason each; 0 for none). Never waits. */
+void event_flush_save_files(bool sram_used, bool compress_files,
+      int owed);
+
 void path_init_savefile_rtc(const char *savefile_path);
 
 void *savefile_ptr_get(void);
