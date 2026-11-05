@@ -398,6 +398,17 @@ static void save_backups_retain(struct string_list *list,
    }
 }
 
+/* @name (a basename) is a copy of the file named @base, whose game
+ * field is its first @game_len bytes and whose extension is @ext. */
+static bool save_backups_of(const char *name, struct save_backup_name *out,
+      const char *base, size_t game_len, const char *ext)
+{
+   return save_backups_parse(name, out)
+      && out->game_len == game_len
+      && !memcmp(name, base, game_len)
+      && string_is_equal(name + out->ext_off, ext);
+}
+
 /* Writes @data as a copy of @path into @dir, its path in @s. With
  * @skip_same, nothing is written when the newest copy holds it. */
 static enum save_backup_result save_backups_write_copy(char *s, size_t len,
@@ -446,10 +457,7 @@ static enum save_backup_result save_backups_write_copy(char *s, size_t len,
    for (i = 0; names && i < list->size; i++)
    {
       const char *name = path_basename_nocompression(list->elems[i].data);
-      if (     !save_backups_parse(name, &names[i])
-            || names[i].game_len != game_len
-            || memcmp(name, base, game_len)
-            || !string_is_equal(name + names[i].ext_off, ext))
+      if (!save_backups_of(name, &names[i], base, game_len, ext))
          continue;
       mine[i] = true;
       if (newest == (size_t)-1
@@ -599,4 +607,64 @@ size_t save_backups_recover(char *s, size_t len, const char *path,
    }
    free(dir);
    return made ? strlen(s) : 0;
+}
+
+/* The newest recovery file of @base in @dir changed after *@newest. */
+static void save_backups_newest_unsaved(char *s, size_t len,
+      const char *dir, const char *base, size_t game_len, const char *ext,
+      int64_t *newest)
+{
+   size_t i;
+   struct string_list *list = dir_list_new(dir, NULL, false, true,
+         false, false);
+   for (i = 0; list && i < list->size; i++)
+   {
+      struct save_backup_name name;
+      int64_t t        = 0;
+      const char *file = list->elems[i].data;
+      if (     save_backups_of(path_basename_nocompression(file), &name,
+                  base, game_len, ext)
+            && name.reason == SAVE_BACKUP_UNSAVED
+            && path_get_mtime(file, &t)
+            && t > *newest)
+      {
+         *newest = t;
+         strlcpy(s, file, len);
+      }
+   }
+   if (list)
+      string_list_free(list);
+}
+
+size_t save_backups_find_recovery(char *s, size_t len, const char *path,
+      int64_t mtime)
+{
+   unsigned i;
+   size_t game_len;
+   char *dir        = (char*)malloc(PATH_MAX_LENGTH);
+   const char *base = path_basename_nocompression(path);
+   const char *ext  = save_backups_ext(base);
+   char *field      = save_backups_core_field(
+         save_backups_roots[SAVE_BACKUPS_ROOT_CORE]);
+   s[0]             = '\0';
+   if (dir && field)
+   {
+      game_len = save_backups_game_len(base, (size_t)(ext - base),
+            strlen(field), strlen(ext));
+      if (save_backups_dir(dir, PATH_MAX_LENGTH, path))
+         save_backups_newest_unsaved(s, len, dir, base, game_len, ext,
+               &mtime);
+      for (i = SAVE_BACKUPS_ROOT_CONFIG; i <= SAVE_BACKUPS_ROOT_APP_DATA; i++)
+      {
+         if (!save_backups_roots[i])
+            continue;
+         fill_pathname_join(dir, save_backups_roots[i],
+               SAVE_BACKUPS_RECOVERY_DIR, PATH_MAX_LENGTH);
+         save_backups_newest_unsaved(s, len, dir, base, game_len, ext,
+               &mtime);
+      }
+   }
+   free(dir);
+   free(field);
+   return strlen(s);
 }

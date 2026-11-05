@@ -168,13 +168,6 @@ runloop_state_t *runloop_state_get_ptr(void)
    return &runloop_st;
 }
 
-bool fill_pathname_application_data(char *s, size_t len)
-{
-   (void)s;
-   (void)len;
-   return false;
-}
-
 static unsigned synced_writes;
 
 bool content_finish_tmp(const char *path, bool ok, bool sync)
@@ -193,8 +186,9 @@ bool test_write_atomic_synced(const char *path, const void *data,
    return filestream_write_file_atomic_synced(path, data, size);
 }
 
-/* The test VFS: the built-in one, counting opens for writing and
- * cutting each written file at cut_at bytes, or refusing renames. */
+/* The test VFS: the built-in one, counting opens of the save's own
+ * files for writing and cutting each at cut_at bytes, or refusing
+ * their renames. Copies and recovery files are written as usual. */
 #define MAX_OPEN 8
 #ifdef HAVE_THREADS
 static slock_t *vfs_lock;
@@ -210,13 +204,18 @@ static int64_t cut_at;
 static bool refuse_rename;
 static unsigned write_opens;
 
+static bool save_own(const char *path)
+{
+   return !strncmp(path_basename(path), SAVE, strlen(SAVE));
+}
+
 static struct retro_vfs_file_handle *RETRO_CALLCONV test_open(
       const char *path, unsigned mode, unsigned hints)
 {
    unsigned i;
    struct retro_vfs_file_handle *h =
       retro_vfs_file_open_impl(path, mode, hints);
-   if (!h || !(mode & RETRO_VFS_FILE_ACCESS_WRITE))
+   if (!h || !(mode & RETRO_VFS_FILE_ACCESS_WRITE) || !save_own(path))
       return h;
    VFS_LOCK();
    write_opens++;
@@ -280,7 +279,8 @@ static int RETRO_CALLCONV test_rename(const char *old_path,
    VFS_LOCK();
    refuse = refuse_rename;
    VFS_UNLOCK();
-   return refuse ? -1 : retro_vfs_file_rename_impl(old_path, new_path);
+   return refuse && save_own(new_path)
+      ? -1 : retro_vfs_file_rename_impl(old_path, new_path);
 }
 
 static struct retro_vfs_interface test_iface;
@@ -500,10 +500,12 @@ static void lane_late_core(void)
    clean();
 }
 
-/* A full disk at close: the old file stays and no temporary is left. */
+/* A full disk at close: the old file stays, no temporary is left and
+ * the image goes to a recovery file. */
 static void lane_close_full_disk(void)
 {
    static unsigned char disk[BIG], ram[BIG];
+   char newest[PATH_MAX_LENGTH];
    unsigned c;
 
    for (c = 0; c < 2; c++)
@@ -523,6 +525,12 @@ static void lane_close_full_disk(void)
       use_test_vfs(false);
       CHECK(holds(SAVE, disk, BIG), "close_full_disk: the save changed");
       CHECK(!exists(CLOSE_TEMP), "close_full_disk: a temporary was left");
+      CHECK(copies("backups", SAVE_BACKUP_UNSAVED, newest,
+               sizeof(newest)) == 1, "close_full_disk: no recovery file");
+      CHECK(holds(newest, ram, BIG),
+            "close_full_disk: the recovery is not the image");
+      CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 1,
+            "close_full_disk: not one recovery notice");
       path_deinit_savefile();
    }
    clean();
@@ -642,6 +650,20 @@ static void lane_close_erased(void)
    close_at_zero(true, BIG, false, false);
    CHECK(holds(SAVE, erased_disk, BIG),
          "close_erased: vanished memory changed the save");
+   /* An erase whose write fails leaves nothing to recover. */
+   use_test_vfs(true);
+   set_vfs(0, true);
+   close_at_zero(true, BIG, true, false);
+   set_vfs(0, false);
+   use_test_vfs(false);
+   CHECK(holds(SAVE, erased_disk, BIG),
+         "close_erased: a failed erase changed the save");
+   CHECK(copies("backups", SAVE_BACKUP_UNSAVED, NULL, 0) == 0
+         && copies("cfg/recovery", SAVE_BACKUP_REASON_LAST, NULL, 0) == 0,
+         "close_erased: a recovery file for an erase");
+   CHECK(notices(MSG_SAVE_WRITE_FAILED) == 1
+         && notices(MSG_SAVE_WRITE_RECOVERED) == 0,
+         "close_erased: a failed erase not shown once");
    clean();
 }
 
@@ -1160,6 +1182,23 @@ static void lane_resize_erased(void)
    event_save_files(true, false, true, true, NULL);
    CHECK(!exists(SAVE), "erased: memory with no size made a save");
    path_deinit_savefile();
+
+   /* No size at load, a size mid-session, 0 at close: emptied. */
+   clean();
+   core_data = ram;
+   core_size = 0;
+   path_init_savefile_new();
+   path_init_savefile_rtc(SAVE);
+   event_load_save_files(false);
+   start(ram, 128, false);
+   fill(ram, 128, 13);
+   capture_and_wait();
+   CHECK(holds(SAVE, ram, 128), "erased: the mid-session size not written");
+   stop();
+   core_size = 0;
+   event_save_files(true, false, true, true, NULL);
+   CHECK(holds(SAVE, ram, 0), "erased: a size had mid-session not emptied");
+   path_deinit_savefile();
    clean();
 }
 
@@ -1449,6 +1488,208 @@ static void lane_owed_copy_fails(void)
    clean();
 }
 
+/* An autosave that keeps failing is shown once a session; each
+ * close or flush write that fails is shown. No recovery file can be
+ * made here (a file where its folder goes, no config folder). */
+static void lane_write_failed_notice(void)
+{
+   static unsigned char disk[BIG], ram[BIG];
+   const char *save = "blk/game.srm";
+   unsigned expect  = 0;
+
+   clean();
+   save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, "as_core");
+   path_mkdir("blk");
+   put("blk/backups", "x", 1);
+   fill(disk, BIG, 27);
+   put(save, disk, BIG);
+   memset(ram, 0, BIG);
+   core_data = ram;
+   core_size = BIG;
+   path_init_savefile_new();
+   path_init_savefile_rtc(save);
+   CHECK(event_load_save_files(false), "write_failed: no load");
+   use_test_vfs(true);
+   set_vfs(4096, false);
+#ifdef HAVE_THREADS
+   {
+      unsigned i;
+      char line[64];
+      start_at(save, ram, BIG, false);
+      for (i = 0; i < 3; i++)
+      {
+         ram[0] = (unsigned char)(i + 1);
+         capture_and_wait();
+      }
+      capture_and_wait();
+      CHECK(notices(MSG_SAVE_WRITE_FAILED) == 1,
+            "write_failed: not one autosave notice");
+      stop();
+      snprintf(line, sizeof(line), "msg%d %s", (int)MSG_SAVE_WRITE_FAILED,
+            save);
+      CHECK(logged('W', line) == 0,
+            "write_failed: the autosave notice logged");
+      expect = 1;
+   }
+#endif
+   fill(ram, BIG, 28);
+   event_save_files(true, false, true, true, NULL);
+   event_save_files(true, false, false, false, NULL);
+   CHECK(notices(MSG_SAVE_WRITE_FAILED) == expect + 2,
+         "write_failed: a close or flush failure not shown");
+   set_vfs(0, false);
+   use_test_vfs(false);
+   CHECK(holds(save, disk, BIG), "write_failed: the save changed");
+   path_deinit_savefile();
+   clean();
+}
+
+/* Unsaved progress newer than the save is announced once at load, also
+ * with noload-save, and not after the save was written again. */
+static void lane_recovery_announced(void)
+{
+   static unsigned char disk[BIG], ram[BIG];
+   char rec[PATH_MAX_LENGTH];
+   int64_t mtime = 0;
+
+   clean();
+   fill(disk, BIG, 29);
+   put(SAVE, disk, BIG);
+   CHECK(save_backups_recover(rec, sizeof(rec), SAVE, disk, BIG, false),
+         "recovery_announced: no recovery file made");
+   CHECK(path_get_mtime(SAVE, &mtime)
+         && path_set_mtime(SAVE, mtime - 60),
+         "recovery_announced: cannot age the save");
+   memset(ram, 0, BIG);
+   core_data = ram;
+   core_size = BIG;
+   path_init_savefile_new();
+   path_init_savefile_rtc(SAVE);
+   event_load_save_files(false);
+   CHECK(notices(MSG_SAVE_RECOVERY_NEWER) == 1,
+         "recovery_announced: not announced");
+   event_load_save_files(false);
+   CHECK(notices(MSG_SAVE_RECOVERY_NEWER) == 1,
+         "recovery_announced: twice in one session");
+   path_deinit_savefile();
+
+   path_init_savefile_new();
+   path_init_savefile_rtc(SAVE);
+   event_load_save_files(true);
+   CHECK(notices(MSG_SAVE_RECOVERY_NEWER) == 2,
+         "recovery_announced: not announced with noload-save");
+   fill(ram, BIG, 30);
+   event_save_files(true, false, true, true, NULL);
+   path_deinit_savefile();
+
+   path_init_savefile_new();
+   path_init_savefile_rtc(SAVE);
+   event_load_save_files(false);
+   CHECK(notices(MSG_SAVE_RECOVERY_NEWER) == 2,
+         "recovery_announced: announced after the save was written");
+   path_deinit_savefile();
+   clean();
+}
+
+/* A recovery that only <config>/recovery or <app data>/recovery could
+ * take is announced from there. */
+static void lane_recovery_elsewhere(void)
+{
+   static unsigned char disk[BIG], ram[BIG];
+   static const char *const dirs[] = { "cfg/recovery",
+      "cfg/appdata/recovery" };
+   const char *save = "blk/game.srm";
+   char rec[PATH_MAX_LENGTH];
+   int64_t mtime = 0;
+   unsigned i;
+
+   for (i = 0; i < 2; i++)
+   {
+      clean();
+      clear_dir(dirs[1]);
+      save_backups_set_roots(NULL, NULL, NULL, NULL, i ? NULL : "cfg",
+            "cfg/appdata", "as_core");
+      path_mkdir("blk");
+      put("blk/backups", "x", 1);
+      fill(disk, BIG, 33);
+      put(save, disk, BIG);
+      CHECK(save_backups_recover(rec, sizeof(rec), save, disk, BIG, false)
+            && copies(dirs[i], SAVE_BACKUP_UNSAVED, NULL, 0) == 1,
+            "recovery_elsewhere: not made in the shared folder");
+      remove("blk/backups");
+      CHECK(path_get_mtime(save, &mtime)
+            && path_set_mtime(save, mtime - 60),
+            "recovery_elsewhere: cannot age the save");
+      memset(ram, 0, BIG);
+      core_data = ram;
+      core_size = BIG;
+      path_init_savefile_new();
+      path_init_savefile_rtc(save);
+      event_load_save_files(false);
+      CHECK(notices(MSG_SAVE_RECOVERY_NEWER) == 1, i
+            ? "recovery_elsewhere: not announced from app data"
+            : "recovery_elsewhere: not announced from config");
+      path_deinit_savefile();
+   }
+   clear_dir(dirs[1]);
+   clean();
+}
+
+static int RETRO_CALLCONV test_get_mtime(const char *path, int64_t *mtime)
+{
+   return save_own(path) ? -1 : retro_vfs_get_mtime_impl(path, mtime);
+}
+
+/* Path calls through a backend with no mtime for the save's files. */
+static void use_no_mtime(bool on)
+{
+   static struct retro_vfs_interface iface;
+   struct retro_vfs_interface_info info;
+   iface.stat         = retro_vfs_stat_impl;
+   iface.mkdir        = retro_vfs_mkdir_impl;
+   iface.stat_64      = retro_vfs_stat_64_impl;
+   iface.set_readonly = retro_vfs_set_readonly_impl;
+   iface.get_mtime    = test_get_mtime;
+   iface.set_mtime    = retro_vfs_set_mtime_impl;
+   info.required_interface_version = METADATA_REQUIRED_VFS_VERSION;
+   info.iface                      = on ? &iface : NULL;
+   path_vfs_init(&info);
+}
+
+/* A save with no mtime: any recovery with an mtime is announced, even
+ * one older than the save. */
+static void lane_recovery_no_mtime(void)
+{
+   static unsigned char disk[BIG], ram[BIG];
+   char rec[PATH_MAX_LENGTH];
+   int64_t mtime = 0;
+   unsigned i;
+
+   clean();
+   fill(disk, BIG, 34);
+   put(SAVE, disk, BIG);
+   CHECK(save_backups_recover(rec, sizeof(rec), SAVE, disk, BIG, false)
+         && path_get_mtime(SAVE, &mtime)
+         && path_set_mtime(rec, mtime - 60),
+         "no_mtime: no older recovery file made");
+   memset(ram, 0, BIG);
+   core_data = ram;
+   core_size = BIG;
+   for (i = 0; i < 2; i++)
+   {
+      use_no_mtime(i == 1);
+      path_init_savefile_new();
+      path_init_savefile_rtc(SAVE);
+      event_load_save_files(false);
+      path_deinit_savefile();
+      use_no_mtime(false);
+      CHECK(notices(MSG_SAVE_RECOVERY_NEWER) == i, i
+            ? "no_mtime: not announced"
+            : "no_mtime: an older recovery announced");
+   }
+   clean();
+}
+
 /* --sram-mode noload-save: the save is not loaded, so it is copied
  * before the first write over it. */
 static void lane_noload_save(void)
@@ -1582,7 +1823,7 @@ static void lane_cut_copy_old_core(void)
 }
 
 /* An erase whose cut copy cannot be made at close: the save stays,
- * no recovery file, and the log does not call it lost. */
+ * no recovery file, and it is shown as not saved. */
 static void lane_erase_copy_fails(void)
 {
    static unsigned char disk[BIG], ram[BIG];
@@ -1605,6 +1846,8 @@ static void lane_erase_copy_fails(void)
          "erase_fails: a recovery file");
    CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 0,
          "erase_fails: a recovery notice");
+   CHECK(notices(MSG_SAVE_WRITE_FAILED) == 1,
+         "erase_fails: not one write-failed notice");
    CHECK(logged('W', "\"blk/game.srm\" not emptied: it could not be "
             "backed up") == 1, "erase_fails: not one not-emptied line");
    CHECK(logged('E', "Couldn't back up or keep") == 0,
@@ -1746,6 +1989,10 @@ int main(void)
    lane_unreadable_backed_up();
    lane_blanked_backed_up();
    lane_owed_copy_fails();
+   lane_write_failed_notice();
+   lane_recovery_announced();
+   lane_recovery_elsewhere();
+   lane_recovery_no_mtime();
    lane_noload_save();
    lane_explicit_request();
    lane_cut_copy_old_core();

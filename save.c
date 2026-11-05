@@ -17,7 +17,6 @@
 #include <stdlib.h>
 #include <sys/types.h>
 #include <string.h>
-#include <time.h>
 
 #include <lists/string_list.h>
 #include <streams/interface_stream.h>
@@ -31,7 +30,6 @@
 #include <retro_atomic.h>
 #include <file/file_path.h>
 #include <string/stdstring.h>
-#include <time/rtime.h>
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
@@ -40,7 +38,6 @@
 #include "content.h"
 #include "core.h"
 #include "core_info.h"
-#include "file_path_special.h"
 #include "msg_hash.h"
 #include "runloop.h"
 #include "save_backups.h"
@@ -79,7 +76,10 @@ enum save_file_flags
    SAVE_FILE_BACKUP_FAILED      = (1 << 2),
    SAVE_FILE_BACKUP_NOTICED     = (1 << 3),
    SAVE_FILE_UNREADABLE_NOTICED = (1 << 4),
-   SAVE_FILE_CUT_SEEN           = (1 << 5)
+   SAVE_FILE_CUT_SEEN           = (1 << 5),
+   SAVE_FILE_WRITE_FAILED       = (1 << 6),
+   SAVE_FILE_WRITE_NOTICED      = (1 << 7),
+   SAVE_FILE_RECOVERY_NOTICED   = (1 << 8)
 };
 
 /* One per entry of task_save_files, for the session. Workers read and
@@ -337,12 +337,17 @@ static void autosave_thread(void *data)
             memcmp(save->buffer, save->snapshot, save->bufsize) != 0)
       {
          save->unwritten = true;
-         if (     save_file_pay(save->file, save->path, save->snapshot,
-                     save->bufsize, true, true)
-               && autosave_write(save))
+         if (save_file_pay(save->file, save->path, save->snapshot,
+                  save->bufsize, true, true))
          {
-            memcpy(save->buffer, save->snapshot, save->bufsize);
-            save->unwritten = false;
+            if (autosave_write(save))
+            {
+               memcpy(save->buffer, save->snapshot, save->bufsize);
+               save->unwritten = false;
+            }
+            else if (save->file)
+               retro_atomic_fetch_or_int(&save->file->flags,
+                     SAVE_FILE_WRITE_FAILED);
          }
       }
 
@@ -642,13 +647,21 @@ static void save_file_check_notices(struct save_file *f, const char *path)
    int flags;
    if (     !f
          || !(retro_atomic_load_acquire_int(&f->flags)
-            & SAVE_FILE_BACKUP_FAILED))
+            & (SAVE_FILE_BACKUP_FAILED | SAVE_FILE_WRITE_FAILED)))
       return;
-   flags = retro_atomic_fetch_and_int(&f->flags, ~SAVE_FILE_BACKUP_FAILED);
-   if (!(flags & SAVE_FILE_BACKUP_NOTICED))
+   flags = retro_atomic_fetch_and_int(&f->flags,
+         ~(SAVE_FILE_BACKUP_FAILED | SAVE_FILE_WRITE_FAILED));
+   if (     (flags & SAVE_FILE_BACKUP_FAILED)
+         && !(flags & SAVE_FILE_BACKUP_NOTICED))
    {
       retro_atomic_fetch_or_int(&f->flags, SAVE_FILE_BACKUP_NOTICED);
       save_file_notice(MSG_SAVE_BACKUP_FAILED, path, false);
+   }
+   if (     (flags & SAVE_FILE_WRITE_FAILED)
+         && !(flags & SAVE_FILE_WRITE_NOTICED))
+   {
+      retro_atomic_fetch_or_int(&f->flags, SAVE_FILE_WRITE_NOTICED);
+      save_file_notice(MSG_SAVE_WRITE_FAILED, path, false);
    }
 }
 
@@ -808,54 +821,49 @@ static bool content_load_ram_file(unsigned slot)
    return success;
 }
 
-/**
- * dump_to_file_desperate:
- * @data         : pointer to data buffer.
- * @size         : size of @data.
- * @type         : type of file to be saved.
- *
- * Attempt to save valuable RAM data somewhere.
- **/
-static bool dump_to_file_desperate(const void *data,
-      size_t len, unsigned type)
+/* The image a close or flush write could not put in @path goes to a
+ * recovery file, uncompressed; either way the user is told. An erase
+ * leaves nothing to recover. */
+static void save_file_recover(const char *path, const void *data,
+      size_t len, bool sync)
 {
-   size_t _len;
-   char path[PATH_MAX_LENGTH + 256 + 32];
-   path[0] = '\0';
-   _len    = fill_pathname_application_data(path,
-            sizeof(path));
-
-   if (_len)
+   char *rec = NULL;
+   if (     len
+         && (rec = (char*)malloc(PATH_MAX_LENGTH))
+         && save_backups_recover(rec, PATH_MAX_LENGTH, path, data, len,
+               sync))
    {
-      time_t time_;
-      struct tm tm_;
-
-      /* rtime_localtime leaves tm_ unwritten when localtime() fails */
-      memset(&tm_, 0, sizeof(tm_));
-      time(&time_);
-      rtime_localtime(&time_, &tm_);
-      _len += strlcpy_lit(path  + _len, "/RetroArch-recovery-", sizeof(path) - _len);
-      _len += snprintf(path + _len, sizeof(path) - _len, "%u-", type);
-      strftime(path + _len, sizeof(path) - _len,
-            "%Y-%m-%d-%H-%M-%S", &tm_);
-
-      /* Fallback (emergency) saves are always
-       * uncompressed
-       * > If a regular save fails, then the host
-       *   system is experiencing serious technical
-       *   difficulties (most likely some kind of
-       *   hardware failure)
-       * > In this case, we don't want to further
-       *   complicate matters by introducing zlib
-       *   compression overheads */
-      if (filestream_write_file(path, data, len))
-      {
-         RARCH_WARN("[SRAM] Succeeded in saving RAM data to \"%s\".\n", path);
-         return true;
-      }
+      save_file_notice(MSG_SAVE_WRITE_RECOVERED, path, true);
+      RARCH_WARN("[SRAM] Unsaved progress: \"%s\"\n", rec);
    }
+   else
+      save_file_notice(MSG_SAVE_WRITE_FAILED, path, true);
+   free(rec);
+}
 
-   return false;
+/* Unsaved progress from an earlier session newer than the save, once a
+ * session. */
+static void save_file_check_recovery(unsigned slot)
+{
+   char *rec;
+   int64_t mtime       = INT64_MIN;
+   struct save_file *f = save_file_get(slot);
+   const char *path    = task_save_files->elems[slot].data;
+   if (     !f
+         || string_is_empty(path)
+         || (retro_atomic_load_acquire_int(&f->flags)
+            & SAVE_FILE_RECOVERY_NOTICED)
+         || !(rec = (char*)malloc(PATH_MAX_LENGTH)))
+      return;
+   if (!path_get_mtime(path, &mtime))
+      mtime = INT64_MIN;
+   if (save_backups_find_recovery(rec, PATH_MAX_LENGTH, path, mtime))
+   {
+      retro_atomic_fetch_or_int(&f->flags, SAVE_FILE_RECOVERY_NOTICED);
+      save_file_notice(MSG_SAVE_RECOVERY_NEWER, path, true);
+      RARCH_WARN("[SRAM] Unsaved progress: \"%s\"\n", rec);
+   }
+   free(rec);
 }
 
 /**
@@ -926,7 +934,6 @@ static bool content_save_ram_file(unsigned slot, bool compress, bool sync,
    if (!save_file_pay(f, ram.path, mem_info.data, mem_info.size,
             copy, sync))
    {
-      char *rec = NULL;
       if (rewrite)
          save_files_unsynced = true;
       if (!copy)
@@ -945,20 +952,10 @@ static bool content_save_ram_file(unsigned slot, bool compress, bool sync,
             save_file_notice(MSG_SAVE_BACKUP_FAILED, ram.path, true);
          return false;
       }
-      /* An erase leaves nothing to recover. */
       if (!mem_info.size)
          RARCH_WARN("[SRAM] \"%s\" not emptied: it could not be "
                "backed up.\n", ram.path);
-      else if (     (rec = (char*)malloc(PATH_MAX_LENGTH))
-                 && save_backups_recover(rec, PATH_MAX_LENGTH, ram.path,
-                       mem_info.data, mem_info.size, sync))
-      {
-         save_file_notice(MSG_SAVE_WRITE_RECOVERED, ram.path, true);
-         RARCH_WARN("[SRAM] Unsaved progress: \"%s\"\n", rec);
-      }
-      else
-         RARCH_ERR("[SRAM] Couldn't back up or keep \"%s\".\n", ram.path);
-      free(rec);
+      save_file_recover(ram.path, mem_info.data, mem_info.size, sync);
       return false;
    }
 
@@ -1004,14 +1001,7 @@ fail:
       save_files_unsynced = true;
    RARCH_ERR("[SRAM] %s.\n",
          msg_hash_to_str(MSG_FAILED_TO_SAVE_SRAM));
-   RARCH_WARN("[SRAM] Attempting to recover...\n");
-
-   /* In case the file could not be written to,
-    * the fallback function 'dump_to_file_desperate'
-    * will be called. */
-   if (!dump_to_file_desperate(
-            mem_info.data, mem_info.size, ram.type))
-      RARCH_WARN("[SRAM] Failed. Cannot recover save file.\n");
+   save_file_recover(ram.path, mem_info.data, mem_info.size, sync);
    return false;
 }
 
@@ -1046,8 +1036,11 @@ bool event_load_save_files(bool is_sram_load_disabled)
    if (is_sram_load_disabled)
    {
       for (i = 0; i < task_save_files->size; i++)
+      {
          if (path_is_valid(task_save_files->elems[i].data))
             save_file_owe(save_file_get(i), SAVE_BACKUP_NOT_LOADED);
+         save_file_check_recovery(i);
+      }
       return false;
    }
 
@@ -1055,7 +1048,10 @@ bool event_load_save_files(bool is_sram_load_disabled)
     * any type of RAM file is found and
     * processed correctly */
    for (i = 0; i < task_save_files->size; i++)
+   {
       ret |= content_load_ram_file(i);
+      save_file_check_recovery(i);
+   }
 
    return ret;
 }

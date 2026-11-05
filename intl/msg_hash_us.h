@@ -33130,6 +33130,14 @@ MSG_HASH(
    "Couldn't save %s; your progress is in Save Backups."
    )
 MSG_HASH(
+   MSG_SAVE_WRITE_FAILED,
+   "Couldn't save %s."
+   )
+MSG_HASH(
+   MSG_SAVE_RECOVERY_NEWER,
+   "Unsaved progress for %s is in Save Backups."
+   )
+MSG_HASH(
    MSG_FAILED_TO_SAVE_STATE_TO,
    "Failed to save state to"
    )

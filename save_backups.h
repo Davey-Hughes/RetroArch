@@ -115,6 +115,11 @@ enum save_backup_result save_backups_copy_file(const char *path,
 size_t save_backups_recover(char *s, size_t len, const char *path,
       const void *data, size_t data_len, bool sync);
 
+/* The newest "unsaved" file of @path changed after @mtime (INT64_MIN:
+ * any), from where save_backups_recover() writes; its length, or 0. */
+size_t save_backups_find_recovery(char *s, size_t len, const char *path,
+      int64_t mtime);
+
 RETRO_END_DECLS
 
 #endif
