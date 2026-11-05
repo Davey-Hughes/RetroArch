@@ -30,7 +30,8 @@ WINDOWS = os.name == 'nt'
 SIZE = 8192
 DIRS = ('saves', 'states', 'system', 'assets', 'config', 'remaps',
         'playlists', 'cache', 'screenshots', 'thumbnails', 'logs', 'home',
-        'xdg-config', 'xdg-data', 'xdg-cache', 'xdg-state')
+        'xdg-config', 'xdg-data', 'xdg-cache', 'xdg-state') + (
+            ('appdata', 'localappdata') if WINDOWS else ())
 
 
 def pattern(seed, size=SIZE):
@@ -105,6 +106,9 @@ class Run:
                    XDG_CACHE_HOME=str(d / 'xdg-cache'),
                    XDG_STATE_HOME=str(d / 'xdg-state'),
                    SAVE_E2E_MARK=str(d / 'touched'))
+        if WINDOWS:
+            env.update(APPDATA=str(d / 'appdata'),
+                       LOCALAPPDATA=str(d / 'localappdata'))
         env.update({k: str(v) for k, v in extra.items()})
         return env
 

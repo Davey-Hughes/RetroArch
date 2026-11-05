@@ -17,7 +17,6 @@
 #include <stdlib.h>
 #include <sys/types.h>
 #include <string.h>
-#include <time.h>
 
 #include <lists/string_list.h>
 #include <streams/interface_stream.h>
@@ -31,7 +30,6 @@
 #include <retro_atomic.h>
 #include <file/file_path.h>
 #include <string/stdstring.h>
-#include <time/rtime.h>
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
@@ -40,7 +38,6 @@
 #include "content.h"
 #include "core.h"
 #include "core_info.h"
-#include "file_path_special.h"
 #include "msg_hash.h"
 #include "runloop.h"
 #include "save_backups.h"
@@ -1039,8 +1036,11 @@ bool event_load_save_files(bool is_sram_load_disabled)
    if (is_sram_load_disabled)
    {
       for (i = 0; i < task_save_files->size; i++)
+      {
          if (path_is_valid(task_save_files->elems[i].data))
             save_file_owe(save_file_get(i), SAVE_BACKUP_NOT_LOADED);
+         save_file_check_recovery(i);
+      }
       return false;
    }
 

@@ -115,18 +115,8 @@ enum save_backup_result save_backups_copy_file(const char *path,
 size_t save_backups_recover(char *s, size_t len, const char *path,
       const void *data, size_t data_len, bool sync);
 
-/**
- * save_backups_find_recovery:
- * @s                : the recovery file found
- * @len              : size of @s
- * @path             : the save file
- * @mtime            : the save file's mtime, or INT64_MIN when it has none
- *
- * The newest recovery file of @path changed after @mtime, from the
- * places save_backups_recover() writes to.
- *
- * Returns: strlen(@s), or 0 when there is none.
- **/
+/* The newest "unsaved" file of @path changed after @mtime (INT64_MIN:
+ * any), from where save_backups_recover() writes; its length, or 0. */
 size_t save_backups_find_recovery(char *s, size_t len, const char *path,
       int64_t mtime);
 

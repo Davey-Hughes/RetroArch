@@ -1521,6 +1521,7 @@ static void lane_write_failed_notice(void)
 #ifdef HAVE_THREADS
    {
       unsigned i;
+      char line[64];
       start_at(save, ram, BIG, false);
       for (i = 0; i < 3; i++)
       {
@@ -1531,6 +1532,10 @@ static void lane_write_failed_notice(void)
       CHECK(notices(MSG_SAVE_WRITE_FAILED) == 1,
             "write_failed: not one autosave notice");
       stop();
+      snprintf(line, sizeof(line), "msg%d %s", (int)MSG_SAVE_WRITE_FAILED,
+            save);
+      CHECK(logged('W', line) == 0,
+            "write_failed: the autosave notice logged");
       expect = 1;
    }
 #endif
@@ -1546,8 +1551,8 @@ static void lane_write_failed_notice(void)
    clean();
 }
 
-/* Unsaved progress newer than the save is announced once at load, and
- * not after the save was written again. */
+/* Unsaved progress newer than the save is announced once at load, also
+ * with noload-save, and not after the save was written again. */
 static void lane_recovery_announced(void)
 {
    static unsigned char disk[BIG], ram[BIG];
@@ -1573,6 +1578,13 @@ static void lane_recovery_announced(void)
    event_load_save_files(false);
    CHECK(notices(MSG_SAVE_RECOVERY_NEWER) == 1,
          "recovery_announced: twice in one session");
+   path_deinit_savefile();
+
+   path_init_savefile_new();
+   path_init_savefile_rtc(SAVE);
+   event_load_save_files(true);
+   CHECK(notices(MSG_SAVE_RECOVERY_NEWER) == 2,
+         "recovery_announced: not announced with noload-save");
    fill(ram, BIG, 30);
    event_save_files(true, false, true, true, NULL);
    path_deinit_savefile();
@@ -1580,9 +1592,108 @@ static void lane_recovery_announced(void)
    path_init_savefile_new();
    path_init_savefile_rtc(SAVE);
    event_load_save_files(false);
-   CHECK(notices(MSG_SAVE_RECOVERY_NEWER) == 1,
+   CHECK(notices(MSG_SAVE_RECOVERY_NEWER) == 2,
          "recovery_announced: announced after the save was written");
    path_deinit_savefile();
+   clean();
+}
+
+/* A recovery that only <config>/recovery or <app data>/recovery could
+ * take is announced from there. */
+static void lane_recovery_elsewhere(void)
+{
+   static unsigned char disk[BIG], ram[BIG];
+   static const char *const dirs[] = { "cfg/recovery",
+      "cfg/appdata/recovery" };
+   const char *save = "blk/game.srm";
+   char rec[PATH_MAX_LENGTH];
+   int64_t mtime = 0;
+   unsigned i;
+
+   for (i = 0; i < 2; i++)
+   {
+      clean();
+      clear_dir(dirs[1]);
+      save_backups_set_roots(NULL, NULL, NULL, NULL, i ? NULL : "cfg",
+            "cfg/appdata", "as_core");
+      path_mkdir("blk");
+      put("blk/backups", "x", 1);
+      fill(disk, BIG, 33);
+      put(save, disk, BIG);
+      CHECK(save_backups_recover(rec, sizeof(rec), save, disk, BIG, false)
+            && copies(dirs[i], SAVE_BACKUP_UNSAVED, NULL, 0) == 1,
+            "recovery_elsewhere: not made in the shared folder");
+      remove("blk/backups");
+      CHECK(path_get_mtime(save, &mtime)
+            && path_set_mtime(save, mtime - 60),
+            "recovery_elsewhere: cannot age the save");
+      memset(ram, 0, BIG);
+      core_data = ram;
+      core_size = BIG;
+      path_init_savefile_new();
+      path_init_savefile_rtc(save);
+      event_load_save_files(false);
+      CHECK(notices(MSG_SAVE_RECOVERY_NEWER) == 1, i
+            ? "recovery_elsewhere: not announced from app data"
+            : "recovery_elsewhere: not announced from config");
+      path_deinit_savefile();
+   }
+   clear_dir(dirs[1]);
+   clean();
+}
+
+static int RETRO_CALLCONV test_get_mtime(const char *path, int64_t *mtime)
+{
+   return save_own(path) ? -1 : retro_vfs_get_mtime_impl(path, mtime);
+}
+
+/* Path calls through a backend with no mtime for the save's files. */
+static void use_no_mtime(bool on)
+{
+   static struct retro_vfs_interface iface;
+   struct retro_vfs_interface_info info;
+   iface.stat         = retro_vfs_stat_impl;
+   iface.mkdir        = retro_vfs_mkdir_impl;
+   iface.stat_64      = retro_vfs_stat_64_impl;
+   iface.set_readonly = retro_vfs_set_readonly_impl;
+   iface.get_mtime    = test_get_mtime;
+   iface.set_mtime    = retro_vfs_set_mtime_impl;
+   info.required_interface_version = METADATA_REQUIRED_VFS_VERSION;
+   info.iface                      = on ? &iface : NULL;
+   path_vfs_init(&info);
+}
+
+/* A save with no mtime: any recovery is announced, even one older than
+ * the save. */
+static void lane_recovery_no_mtime(void)
+{
+   static unsigned char disk[BIG], ram[BIG];
+   char rec[PATH_MAX_LENGTH];
+   int64_t mtime = 0;
+   unsigned i;
+
+   clean();
+   fill(disk, BIG, 34);
+   put(SAVE, disk, BIG);
+   CHECK(save_backups_recover(rec, sizeof(rec), SAVE, disk, BIG, false)
+         && path_get_mtime(SAVE, &mtime)
+         && path_set_mtime(rec, mtime - 60),
+         "no_mtime: no older recovery file made");
+   memset(ram, 0, BIG);
+   core_data = ram;
+   core_size = BIG;
+   for (i = 0; i < 2; i++)
+   {
+      use_no_mtime(i == 1);
+      path_init_savefile_new();
+      path_init_savefile_rtc(SAVE);
+      event_load_save_files(false);
+      path_deinit_savefile();
+      use_no_mtime(false);
+      CHECK(notices(MSG_SAVE_RECOVERY_NEWER) == i, i
+            ? "no_mtime: not announced"
+            : "no_mtime: an older recovery announced");
+   }
    clean();
 }
 
@@ -1887,6 +1998,8 @@ int main(void)
    lane_owed_copy_fails();
    lane_write_failed_notice();
    lane_recovery_announced();
+   lane_recovery_elsewhere();
+   lane_recovery_no_mtime();
    lane_noload_save();
    lane_explicit_request();
    lane_cut_copy_old_core();
