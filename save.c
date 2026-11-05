@@ -164,14 +164,19 @@ static bool save_file_pay(struct save_file *f, const char *path,
       return false;
    for (r = 0; r < SAVE_BACKUP_REASON_LAST; r++)
    {
+      enum save_backup_result res;
       if (!(owed & (1 << r)))
          continue;
-      if (save_backups_copy_file(path, (enum save_backup_reason)r, sync)
-            == SAVE_BACKUP_FAILED)
+      res = save_backups_copy_file(path, (enum save_backup_reason)r, sync);
+      if (res == SAVE_BACKUP_FAILED)
       {
          retro_atomic_fetch_or_int(&f->flags, SAVE_FILE_BACKUP_FAILED);
          return false;
       }
+      /* Once per reason a session, so a worker may log it. */
+      if (res == SAVE_BACKUP_MADE)
+         RARCH_LOG("[SRAM] Backed up \"%s\" (%s) before writing it.\n",
+               path, save_backups_reason_name((enum save_backup_reason)r));
       retro_atomic_fetch_and_int(&f->owed, ~(1 << r));
    }
    return true;
@@ -752,9 +757,8 @@ static bool content_load_ram_file(unsigned slot)
    {
       const char *core = runloop_state_get_ptr()->system.info.library_name;
       save_file_owe(f, SAVE_BACKUP_NOT_LOADED);
-      RARCH_WARN("[SRAM] %s reported no memory for \"%s\" at load; "
-            "it will be backed up before it is written.\n",
-            core ? core : "", ram.path);
+      RARCH_LOG("[SRAM] %s reported no memory for \"%s\" at load; "
+            "left unread.\n", core ? core : "", ram.path);
       return false;
    }
 
@@ -942,10 +946,12 @@ static bool content_save_ram_file(unsigned slot, bool compress, bool sync,
          return false;
       }
       /* An erase leaves nothing to recover. */
-      if (     mem_info.size
-            && (rec = (char*)malloc(PATH_MAX_LENGTH))
-            && save_backups_recover(rec, PATH_MAX_LENGTH, ram.path,
-                  mem_info.data, mem_info.size, sync))
+      if (!mem_info.size)
+         RARCH_WARN("[SRAM] \"%s\" not emptied: it could not be "
+               "backed up.\n", ram.path);
+      else if (     (rec = (char*)malloc(PATH_MAX_LENGTH))
+                 && save_backups_recover(rec, PATH_MAX_LENGTH, ram.path,
+                       mem_info.data, mem_info.size, sync))
       {
          save_file_notice(MSG_SAVE_WRITE_RECOVERED, ram.path, true);
          RARCH_WARN("[SRAM] Unsaved progress: \"%s\"\n", rec);

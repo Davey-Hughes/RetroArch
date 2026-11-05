@@ -292,6 +292,8 @@ def lane_late_core_backed_up(args, n):
     check(failures, 'save_e2e reported no memory for "%s"' % r.srm in log,
           'the log does not name the core')
     check(failures, "Couldn't read" not in log, 'a notice for a late core')
+    check(failures, log.count('Backed up "%s" (not-loaded)' % r.srm) == 1,
+          'the copy is not logged once')
     check(failures, r.srm.read_bytes() == new, 'the close did not write')
     return r, failures
 
@@ -382,6 +384,7 @@ def lane_cut_copy_old_core(args, n):
           'the copy is not the old save')
     check(failures, r.srm.read_bytes() == new, '.srm not written')
     return r, failures
+
 
 LANES = {
     'autosave_full_disk': lane_autosave_full_disk,

@@ -212,6 +212,12 @@ static const char *save_backups_sep(const char *name, const char *end)
    }
 }
 
+const char *save_backups_reason_name(enum save_backup_reason reason)
+{
+   return (unsigned)reason < SAVE_BACKUP_REASON_LAST
+      ? save_backups_reasons[reason] : "";
+}
+
 bool save_backups_parse(const char *name, struct save_backup_name *out)
 {
    unsigned i, reason;

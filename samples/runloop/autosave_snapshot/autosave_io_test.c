@@ -61,9 +61,67 @@ bool core_get_memory(retro_ctx_memory_info_t *info)
    return true;
 }
 
-void RARCH_LOG(const char *fmt, ...) { (void)fmt; }
-void RARCH_WARN(const char *fmt, ...) { (void)fmt; }
-void RARCH_ERR(const char *fmt, ...) { (void)fmt; }
+/* Log lines, each led by its level: I, W or E.  Workers log too. */
+#define MAX_LOG 128
+static char log_lines[MAX_LOG][320];
+static unsigned log_num;
+#ifdef HAVE_THREADS
+static slock_t *log_lock;
+#define LOG_LOCK()   slock_lock(log_lock)
+#define LOG_UNLOCK() slock_unlock(log_lock)
+#else
+#define LOG_LOCK()
+#define LOG_UNLOCK()
+#endif
+
+static void log_line(char level, const char *fmt, va_list ap)
+{
+   LOG_LOCK();
+   if (log_num < MAX_LOG)
+   {
+      log_lines[log_num][0] = level;
+      vsnprintf(log_lines[log_num] + 1, sizeof(log_lines[0]) - 1, fmt, ap);
+      log_num++;
+   }
+   LOG_UNLOCK();
+}
+
+void RARCH_LOG(const char *fmt, ...)
+{
+   va_list ap;
+   va_start(ap, fmt);
+   log_line('I', fmt, ap);
+   va_end(ap);
+}
+
+void RARCH_WARN(const char *fmt, ...)
+{
+   va_list ap;
+   va_start(ap, fmt);
+   log_line('W', fmt, ap);
+   va_end(ap);
+}
+
+void RARCH_ERR(const char *fmt, ...)
+{
+   va_list ap;
+   va_start(ap, fmt);
+   log_line('E', fmt, ap);
+   va_end(ap);
+}
+
+/* Lines logged at @level that hold @text. */
+static unsigned logged(char level, const char *text)
+{
+   unsigned i, n = 0;
+   LOG_LOCK();
+   CHECK(log_num < MAX_LOG, "the log filled up");
+   for (i = 0; i < log_num; i++)
+      if (log_lines[i][0] == level && strstr(log_lines[i] + 1, text))
+         n++;
+   LOG_UNLOCK();
+   return n;
+}
 
 /* Each message is "msg<n> %s", so a notice tells which it was. */
 const char *msg_hash_to_str(enum msg_hash_enums msg)
@@ -357,11 +415,15 @@ static void clean(void)
    remove(SAVE);
    remove(WORKER_TEMP);
    remove(CLOSE_TEMP);
+   remove("game.rtc");
    clear_dir("backups");
    clear_dir("blk");
    clear_dir("cfg/recovery");
    save_backups_set_roots(NULL, NULL, NULL, NULL, "cfg", NULL, "as_core");
    notice_num = 0;
+   LOG_LOCK();
+   log_num = 0;
+   LOG_UNLOCK();
 }
 
 /* Copies in @dir with @reason (or any, with SAVE_BACKUP_REASON_LAST);
@@ -1519,10 +1581,161 @@ static void lane_cut_copy_old_core(void)
    clean();
 }
 
+/* An erase whose cut copy cannot be made at close: the save stays,
+ * no recovery file, and the log does not call it lost. */
+static void lane_erase_copy_fails(void)
+{
+   static unsigned char disk[BIG], ram[BIG];
+   const char *save = "blk/game.srm";
+
+   clean();
+   path_mkdir("blk");
+   put("blk/backups", "x", 1);
+   fill(disk, BIG, 40);
+   put(save, disk, BIG);
+   core_data = ram;
+   core_size = BIG;
+   path_init_savefile_new();
+   path_init_savefile_rtc(save);
+   CHECK(event_load_save_files(false), "erase_fails: no load");
+   core_size = 0;
+   event_save_files(true, false, true, true, NULL);
+   CHECK(holds(save, disk, BIG), "erase_fails: the save changed");
+   CHECK(copies("cfg/recovery", SAVE_BACKUP_REASON_LAST, NULL, 0) == 0,
+         "erase_fails: a recovery file");
+   CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 0,
+         "erase_fails: a recovery notice");
+   CHECK(logged('W', "\"blk/game.srm\" not emptied: it could not be "
+            "backed up") == 1, "erase_fails: not one not-emptied line");
+   CHECK(logged('E', "Couldn't back up or keep") == 0,
+         "erase_fails: logged as lost");
+   path_deinit_savefile();
+   clean();
+}
+
+/* A synced request whose owed copy fails has not synced the earlier
+ * unsynced write: the next synced request writes it again, synced,
+ * though memory matches the disk. */
+static void lane_rewrite_after_failed_copy(void)
+{
+   static unsigned char disk[BIG], ram[BIG], image[BIG];
+   const char *save = "blk/game.srm";
+
+   clean();
+   path_mkdir("blk");
+   fill(disk, BIG, 41);
+   put(save, disk, BIG);
+   core_data = ram;
+   core_size = BIG;
+   path_init_savefile_new();
+   path_init_savefile_rtc(save);
+   CHECK(event_load_save_files(false), "rewrite: no load");
+   fill(image, BIG, 42);
+   memcpy(ram, image, BIG);
+   event_save_files(true, false, false, true, NULL);
+   CHECK(holds(save, image, BIG), "rewrite: the unsynced request did not write");
+   /* All 0x00 owes a blanked copy; it cannot be made. */
+   put("blk/backups", "x", 1);
+   memset(ram, 0, BIG);
+   event_save_files(true, false, true, true, NULL);
+   CHECK(holds(save, image, BIG), "rewrite: written without its copy");
+   remove("blk/backups");
+   memcpy(ram, image, BIG);
+   synced_writes = 0;
+   event_save_files(true, false, true, true, NULL);
+   CHECK(synced_writes == 1, "rewrite: the unsynced write was not synced");
+   CHECK(holds(save, image, BIG), "rewrite: the save changed");
+   clear_dir("blk/backups");
+   path_rmdir("blk/backups");
+   path_deinit_savefile();
+   clean();
+}
+
+/* An explicit request (not synced) whose owed copy fails, twice: the
+ * save stays, one notice on screen and in the log, no recovery file. */
+static void lane_explicit_copy_fails(void)
+{
+   static unsigned char cut[BIG * 2], ram[BIG];
+   char line[64];
+   int64_t cut_len = 0;
+   const char *save = "blk/game.srm";
+
+   clean();
+   path_mkdir("blk");
+   put("blk/backups", "x", 1);
+   fill(ram, BIG, 43);
+   put_cut_rzip(save, ram, BIG, cut, &cut_len);
+   memset(ram, 0, BIG);
+   core_data = ram;
+   core_size = BIG;
+   path_init_savefile_new();
+   path_init_savefile_rtc(save);
+   CHECK(!event_load_save_files(false), "explicit_fails: a cut rzip loaded");
+   fill(ram, BIG, 44);
+   event_save_files(true, false, false, true, NULL);
+   event_save_files(true, false, false, true, NULL);
+   CHECK(holds(save, cut, (size_t)cut_len),
+         "explicit_fails: written without its copy");
+   CHECK(notices(MSG_SAVE_BACKUP_FAILED) == 1,
+         "explicit_fails: not one notice");
+   snprintf(line, sizeof(line), "msg%d %s", (int)MSG_SAVE_BACKUP_FAILED,
+         save);
+   CHECK(logged('W', line) == 1, "explicit_fails: not logged once");
+   CHECK(copies("cfg/recovery", SAVE_BACKUP_REASON_LAST, NULL, 0) == 0,
+         "explicit_fails: a recovery file");
+   CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 0,
+         "explicit_fails: a recovery notice");
+   path_deinit_savefile();
+   clean();
+}
+
+/* A late core's copy is logged once with its reason; a slot whose
+ * memory is never reported is logged at load only. */
+static void lane_backup_logged(void)
+{
+   static unsigned char disk[BIG], ram[BIG];
+
+   clean();
+   fill(disk, BIG, 45);
+   put(SAVE, disk, BIG);
+   put("game.rtc", disk, 16);
+   core_data = NULL;
+   core_size = 0;
+   path_init_savefile_new();
+   path_init_savefile_rtc(SAVE);
+   CHECK(!event_load_save_files(false), "logged: loaded without memory");
+   CHECK(logged('I', "reported no memory for \"game.srm\" at load; "
+            "left unread.") == 1, "logged: no load line for the save");
+   CHECK(logged('I', "reported no memory for \"game.rtc\" at load; "
+            "left unread.") == 1, "logged: no load line for the rtc");
+   fill(ram, BIG, 46);
+#ifdef HAVE_THREADS
+   start(ram, BIG, false);
+   capture_and_wait();
+   fill(ram, BIG, 47);
+   capture_and_wait();
+   stop();
+#else
+   core_data = ram;
+   core_size = BIG;
+   event_save_files(true, false, true, true, NULL);
+   fill(ram, BIG, 47);
+#endif
+   event_save_files(true, false, true, true, NULL);
+   CHECK(holds(SAVE, ram, BIG), "logged: not written");
+   CHECK(logged('I', "Backed up \"game.srm\" (not-loaded) before "
+            "writing it.") == 1, "logged: the copy not logged once");
+   CHECK(logged('I', "Backed up \"game.rtc\"") == 0,
+         "logged: a copy of a slot never reported");
+   CHECK(holds("game.rtc", disk, 16), "logged: the rtc changed");
+   path_deinit_savefile();
+   clean();
+}
+
 int main(void)
 {
 #ifdef HAVE_THREADS
-   if (!(vfs_lock = slock_new()))
+   if (!(vfs_lock = slock_new()) || !(log_lock = slock_new()))
       return 2;
 #endif
    lane_close_full_disk();
@@ -1536,6 +1749,10 @@ int main(void)
    lane_noload_save();
    lane_explicit_request();
    lane_cut_copy_old_core();
+   lane_erase_copy_fails();
+   lane_rewrite_after_failed_copy();
+   lane_explicit_copy_fails();
+   lane_backup_logged();
 #ifdef HAVE_THREADS
    lane_autosave_full_disk();
    lane_no_rewrite_at_launch();
@@ -1547,6 +1764,7 @@ int main(void)
    lane_no_join_running();
    lane_create_retry();
    slock_free(vfs_lock);
+   slock_free(log_lock);
 #endif
    if (failures)
    {
