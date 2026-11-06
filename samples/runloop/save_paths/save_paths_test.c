@@ -6,6 +6,10 @@
  * and the system folder's copies: those games use the root (and the
  * core's folder when that is on).
  *
+ * A netplay client whose ".netplay" folder can't be made writes no
+ * saves for that content, says so once, and the next content saves
+ * again. The flags that gate the writes stand in for them here.
+ *
  * The shipping function is included and run over a real folder. */
 #include "../../../runloop.c"
 #include <stdio.h>
@@ -22,8 +26,36 @@ void RARCH_LOG(const char *fmt, ...) { (void)fmt; }
 void RARCH_WARN(const char *fmt, ...) { (void)fmt; }
 void RARCH_ERR(const char *fmt, ...) { (void)fmt; }
 bool verbosity_is_enabled(void) { return false; }
-const char *msg_hash_to_str(enum msg_hash_enums msg) { (void)msg; return ""; }
+const char *msg_hash_to_str(enum msg_hash_enums msg)
+{
+   return msg == MSG_NETPLAY_SAVES_OFF ? "saves off" : "";
+}
 void dir_set(enum rarch_dir_type type, const char *path) { (void)type; (void)path; }
+
+static bool netplay_client;
+bool netplay_driver_ctl(enum rarch_netplay_ctl_state state, void *data)
+{
+   (void)data;
+   switch (state)
+   {
+      case RARCH_NETPLAY_CTL_IS_ENABLED:
+         return netplay_client;
+      default:
+         break;
+   }
+   return false;
+}
+static int saves_off_notices;
+void ui_companion_driver_msg_queue_push(const char *msg, unsigned priority,
+      unsigned duration, bool flush)
+{
+   (void)priority; (void)duration; (void)flush;
+   if (string_is_equal(msg, "saves off"))
+      saves_off_notices++;
+}
+void path_deinit_savefile(void) { }
+void path_init_savefile_new(void) { }
+void path_init_savefile_rtc(const char *savefile_path) { (void)savefile_path; }
 
 /* Equal but for which slash separates folders. */
 static bool same_path(const char *a, const char *b)
@@ -107,12 +139,64 @@ static void reserved_rom_folder(void)
    CHECK(!path_is_directory(ROOT "/states/System"));
 }
 
+/* A content load: the paths, then the save list. */
+static void load(const char *content)
+{
+   runloop_path_set_redirect(&test_settings, ROOT "/saves", ROOT "/states");
+   runloop_state.flags |= RUNLOOP_FLAG_USE_SRAM;
+   strlcpy(runloop_state.runtime_content_path_basename, content,
+         sizeof(runloop_state.runtime_content_path_basename));
+   runloop_path_set_redirect(&test_settings, ROOT "/saves", ROOT "/states");
+   runloop_path_init_savefile(&runloop_state);
+}
+
+static void netplay_no_folder(void)
+{
+   CHECK(path_mkdir(ROOT "/saves/snes"));
+   CHECK(filestream_write_file(ROOT "/saves/snes/.netplay", "x", 1));
+
+   redirect("/roms/snes/Game", false);
+   netplay_client    = true;
+   saves_off_notices = 0;
+   load("/roms/snes/Game");
+   CHECK(runloop_state.flags & RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED);
+   CHECK(!(runloop_state.flags & RUNLOOP_FLAG_USE_SRAM));
+   CHECK(saves_off_notices == 1);
+
+   /* The next content, not under netplay, saves again. */
+   netplay_client = false;
+   load("/roms/snes/Game");
+   CHECK(!(runloop_state.flags & RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED));
+   CHECK(runloop_state.flags & RUNLOOP_FLAG_USE_SRAM);
+   CHECK(saves_off_notices == 1);
+
+   /* --sram-mode's own setting outlives the netplay session. */
+   runloop_state.flags |= RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED;
+   netplay_client       = true;
+   load("/roms/snes/Game");
+   netplay_client       = false;
+   load("/roms/snes/Game");
+   CHECK(runloop_state.flags & RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED);
+   CHECK(saves_off_notices == 1);
+
+   /* A folder that can be made: saves on. */
+   CHECK(filestream_delete(ROOT "/saves/snes/.netplay") == 0);
+   runloop_state.flags &= ~RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED;
+   netplay_client       = true;
+   load("/roms/snes/Game");
+   CHECK(path_is_directory(ROOT "/saves/snes/.netplay"));
+   CHECK(!(runloop_state.flags & RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED));
+   CHECK(saves_off_notices == 1);
+   netplay_client       = false;
+}
+
 int main(void)
 {
    rm_tree(ROOT);
    CHECK(path_mkdir(ROOT "/saves"));
    CHECK(path_mkdir(ROOT "/states"));
    reserved_rom_folder();
+   netplay_no_folder();
    rm_tree(ROOT);
    puts(failures ? "FAIL save_paths_test" : "PASS save_paths_test");
    return failures ? 1 : 0;

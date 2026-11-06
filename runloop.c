@@ -433,6 +433,11 @@ static void runloop_game_ai_think_cb(void *userdata,
 #endif
 
 static runloop_state_t runloop_state;
+#ifdef HAVE_NETWORKING
+/* RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED is set for this content by the
+ * netplay block of runloop_path_set_redirect(), not by --sram-mode. */
+static bool runloop_netplay_saves_off = false;
+#endif
 
 /* Defined here, before its first user: the SET_MESSAGE_EXT STATUS
  * path in the environment callback defers through this machinery,
@@ -5956,6 +5961,16 @@ static void runloop_path_init_savefile(runloop_state_t *runloop_st)
    bool    should_sram_be_used =
           (runloop_st->flags & RUNLOOP_FLAG_USE_SRAM)
       && !(runloop_st->flags & RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED);
+
+#ifdef HAVE_NETWORKING
+   if (runloop_netplay_saves_off)
+   {
+      const char *_msg = msg_hash_to_str(MSG_NETPLAY_SAVES_OFF);
+      RARCH_WARN("[SRAM] %s\n", _msg);
+      runloop_msg_queue_push(_msg, strlen(_msg), 1, 180, true, NULL,
+            MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+   }
+#endif
 
    if (should_sram_be_used)
       runloop_st->flags |=  RUNLOOP_FLAG_USE_SRAM;
@@ -11534,6 +11549,12 @@ void runloop_path_set_redirect(settings_t *settings,
 
 
 #ifdef HAVE_NETWORKING
+   if (runloop_netplay_saves_off)
+   {
+      runloop_netplay_saves_off  = false;
+      runloop_st->flags         &= ~RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED;
+   }
+
    /* Special save directory for netplay clients. */
    if (      netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_ENABLED, NULL)
          && !netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_SERVER, NULL)
@@ -11545,7 +11566,16 @@ void runloop_path_set_redirect(settings_t *settings,
 
       if (     !path_is_directory(new_savefile_dir)
             && !path_mkdir(new_savefile_dir))
+      {
          path_basedir(new_savefile_dir);
+         /* The client's saves would land on the user's own: none are
+          * written this session. */
+         if (!(runloop_st->flags & RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED))
+         {
+            runloop_netplay_saves_off  = true;
+            runloop_st->flags         |= RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED;
+         }
+      }
    }
 #endif
 

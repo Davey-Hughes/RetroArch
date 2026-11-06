@@ -11,11 +11,13 @@ SOURCES := save_paths_test.c \
            $(LIBRETRO_COMM_DIR)/file/retro_dirent.c \
            $(LIBRETRO_COMM_DIR)/lists/dir_list.c \
            $(LIBRETRO_COMM_DIR)/lists/string_list.c \
+           $(LIBRETRO_COMM_DIR)/queues/message_queue.c \
            $(LIBRETRO_COMM_DIR)/streams/file_stream.c \
            $(LIBRETRO_COMM_DIR)/string/stdstring.c \
            $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
 CFLAGS += -O2 -g1 -std=gnu89 -Wall -flto \
           -ffunction-sections -fdata-sections \
+          -DHAVE_NETWORKING \
           -I$(ROOT) -I$(ROOT)/menu -I$(LIBRETRO_COMM_DIR)/include $(EXTRA_CFLAGS)
 LDFLAGS += -flto -Wl,--gc-sections
 ifneq ($(SANITIZER),)

@@ -33142,6 +33142,10 @@ MSG_HASH(
    "%s changed outside RetroArch; that version is in Save Backups."
    )
 MSG_HASH(
+   MSG_NETPLAY_SAVES_OFF,
+   "No netplay save folder; saves are off for this session."
+   )
+MSG_HASH(
    MSG_FAILED_TO_SAVE_STATE_TO,
    "Failed to save state to"
    )
