@@ -2808,6 +2808,36 @@ static void lane_main_write_paid_out_fails(void)
    flush_lane_end();
 }
 
+/* An image backed up while the worker stats the save is dropped before
+ * its write: only the main thread's image lands, then again. */
+static void lane_main_write_paid_dropped(void)
+{
+   static unsigned char disk[BIG], ram[BIG], p1[BIG], l1[BIG];
+   char newest[PATH_MAX_LENGTH];
+
+   fill_id(disk, BIG, 116, 'D');
+   fill_id(p1, BIG, 117, 'P');
+   fill_id(l1, BIG, 118, 'L');
+   flush_lane_begin(disk, ram);
+   start(ram, BIG, false);
+   memcpy(ram, p1, BIG);
+   stall(1);
+   event_flush_save_files(true, false, 1 << SAVE_BACKUP_BEFORE_STATE_LOAD);
+   CHECK(wait_stalled(), "paid dropped: the worker did not stop in its "
+         "stat");
+   memcpy(ram, l1, BIG);
+   event_save_files(true, false, true, true, NULL);
+   stall(0);
+   wait_flushed();
+   wait_requested();
+   CHECK(holds(SAVE, l1, BIG) && written_in_order("LL"),
+         "paid dropped: a backed up image written after the main write");
+   CHECK(copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, newest,
+            sizeof(newest)) == 1 && holds(newest, p1, BIG),
+         "paid dropped: the copy is not the pre-load save");
+   flush_lane_end();
+}
+
 /* A1-1: a full disk or a refused rename keeps the old save whole and
  * leaves no temporary; the image is written at the next check. */
 static void lane_autosave_full_disk(void)
@@ -4176,6 +4206,7 @@ int main(void)
    lane_main_write_paid_taken();
    lane_main_write_replaces_paid();
    lane_main_write_paid_out_fails();
+   lane_main_write_paid_dropped();
    lane_autosave_full_disk();
    lane_no_rewrite_at_launch();
    lane_pointer_requery();
