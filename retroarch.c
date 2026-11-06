@@ -4925,8 +4925,9 @@ bool command_event(enum event_command cmd, void *data)
          break;
       case CMD_EVENT_AUTOSAVE_INIT:
 #ifdef HAVE_THREADS
-         if (runloop_st->flags & RUNLOOP_FLAG_USE_SRAM)
-            autosave_deinit();
+         if (!(runloop_st->flags & RUNLOOP_FLAG_USE_SRAM))
+            break;
+         autosave_deinit();
          {
 #ifdef HAVE_NETWORKING
             unsigned autosave_interval =
