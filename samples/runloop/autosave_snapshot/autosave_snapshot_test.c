@@ -108,6 +108,19 @@ enum save_backup_result save_backups_copy_file(const char *path,
    return SAVE_BACKUP_FAILED;
 }
 
+/* No flush runs here. */
+size_t save_backups_recover(char *s, size_t len, const char *path,
+      const void *data, size_t data_len, bool sync)
+{
+   (void)s;
+   (void)len;
+   (void)path;
+   (void)data;
+   (void)data_len;
+   (void)sync;
+   return 0;
+}
+
 const char *save_backups_reason_name(enum save_backup_reason reason)
 {
    (void)reason;

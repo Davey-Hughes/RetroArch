@@ -1488,6 +1488,43 @@ static void test_state_load_kinds(void)
    filestream_delete(path);
 }
 
+/* -----------------------------------------------------------------
+ * A load that puts save RAM back (block_sram_overwrite: from a file
+ * and Undo Load) rolls nothing back and owes no copy; a load from RAM
+ * does not put it back. Undo Load with nothing to undo flushes nothing.
+ * ----------------------------------------------------------------- */
+static void test_state_load_guards(void)
+{
+   const char *path = "sst_guards.state";
+   size_t sz        = 4096;
+   const int bsl    = 1 << SAVE_BACKUP_BEFORE_STATE_LOAD;
+
+   frontend_reset();
+   core_fill(sz);
+   filestream_delete(path);
+   content_reset_savestate_backups();
+   flushes = 0;
+   content_undo_load_state();
+   okf(flushes == 0, "guards: Undo Load with nothing to undo flushed");
+
+   content_save_state(path, true);
+   pump(1000);
+   stub_settings.bools.block_sram_overwrite = true;
+   flushes      = 0;
+   flushes_owed = 0;
+   content_load_state(path, false, false);
+   pump(1000);
+   okf(flushes == 1 && flushes_owed == 0,
+         "guards: a blocked load from a file owes nothing");
+   okf(content_undo_load_state() && flushes == 2 && flushes_owed == 0,
+         "guards: a blocked Undo Load owes nothing");
+   okf(content_save_state_to_ram() && content_load_state_from_ram()
+         && flushes == 3 && flushes_owed == bsl,
+         "guards: a load from RAM owes its copy, blocked or not");
+   stub_settings.bools.block_sram_overwrite = false;
+   filestream_delete(path);
+}
+
 static int run_default_lane(void)
 {
    printf("== task_save.c I/O regression oracle ==\n");
@@ -1516,6 +1553,7 @@ static int run_default_lane(void)
    test_notify_without_allocation();
    test_load_held_behind_save();
    test_state_load_kinds();
+   test_state_load_guards();
 #ifdef HAVE_COMPRESSION
    test_undo_save_restores_file();
 #endif

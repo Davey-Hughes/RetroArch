@@ -288,9 +288,9 @@ typedef struct rastate_size_info
 
 /* A user's state load is about to change save RAM: the save files are
  * written as they are now, and the next write over each save RAM file
- * backs it up first. Run-ahead, rewind, netplay and replays load
- * states without this. */
-static void content_flush_saves_before_load(void)
+ * backs it up first, unless the load will @keep_sram. Run-ahead, rewind,
+ * netplay and replays load states without this. */
+static void content_flush_saves_before_load(bool keep_sram)
 {
 #if defined(HAVE_COMPRESSION)
    bool compress = config_get_ptr()->bools.save_file_compression;
@@ -299,7 +299,7 @@ static void content_flush_saves_before_load(void)
 #endif
    event_flush_save_files(
          (runloop_state_get_ptr()->flags & RUNLOOP_FLAG_USE_SRAM) != 0,
-         compress, 1 << SAVE_BACKUP_BEFORE_STATE_LOAD);
+         compress, keep_sram ? 0 : 1 << SAVE_BACKUP_BEFORE_STATE_LOAD);
 }
 
 /**
@@ -402,7 +402,9 @@ bool content_undo_load_state(void)
    undo_load_buf.size     = 0;
    undo_load_buf.capacity = 0;
 
-   content_flush_saves_before_load();
+   if (restore_data)
+      content_flush_saves_before_load(
+            config_get_ptr()->bools.block_sram_overwrite);
 
    /* An undo jumps the game's state exactly as a load does. See
     * audio_driver_jump_fade_begin(). */
@@ -1622,7 +1624,8 @@ static void content_load_state_apply(retro_task_t *task,
       return;
    }
 
-   content_flush_saves_before_load();
+   content_flush_saves_before_load(
+         config_get_ptr()->bools.block_sram_overwrite);
 
    if (     savefile_list
          && savefile_list->size
@@ -2549,7 +2552,8 @@ bool content_load_state_from_ram(void)
          (unsigned)ram_buf.state_buf.size,
          msg_hash_to_str(MSG_BYTES));
 
-   content_flush_saves_before_load();
+   /* Without block_sram_overwrite's put-back here. */
+   content_flush_saves_before_load(false);
 
    /* Same discontinuity as a load from disk, so the same bracket. See
     * audio_driver_jump_fade_begin(). */
