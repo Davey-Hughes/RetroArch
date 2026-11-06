@@ -220,9 +220,9 @@ static unsigned put_num;
 static uintptr_t main_thread;
 static unsigned main_write_opens;
 
-/* The worker stops in its stat of the save (1) or in opening its
- * temporary (2) until stall_mode changes; the main thread never
- * stops. */
+/* The worker stops in its stat of the save (1), in opening its
+ * temporary (2) or after renaming it (3) until stall_mode changes; the
+ * main thread never stops. */
 static retro_atomic_int_t stall_mode;
 static retro_atomic_int_t stalled;
 
@@ -338,6 +338,10 @@ static int RETRO_CALLCONV test_rename(const char *old_path,
    if (!ret && first != EOF && put_num < sizeof(put_log) - 1)
       put_log[put_num++] = (char)first;
    VFS_UNLOCK();
+#ifdef HAVE_THREADS
+   if (string_is_equal(path_basename(old_path), WORKER_TEMP))
+      stall_here(3);
+#endif
    return ret;
 }
 
@@ -2537,6 +2541,125 @@ static void lane_flush_points_queue(void)
    flush_lane_end();
 }
 
+/* (Davey 11-06) A write on the main thread that finds a state load's
+ * image still queued backs it up itself, from the image: the copy
+ * holds the pre-load save whatever the worker does next. Here the
+ * image is the worker's last write, which it does not write again. */
+static void lane_main_write_pays_waiting(void)
+{
+   static unsigned char disk[BIG], ram[BIG], l1[BIG];
+   char newest[PATH_MAX_LENGTH];
+
+   fill_id(disk, BIG, 91, 'D');
+   fill_id(l1, BIG, 92, 'L');
+   flush_lane_begin(disk, ram);
+   start_parked(ram);
+   event_flush_save_files(true, false, 1 << SAVE_BACKUP_BEFORE_STATE_LOAD);
+   memcpy(ram, l1, BIG);
+   event_save_files(true, false, true, true, NULL);
+   CHECK(holds(SAVE, l1, BIG), "pays waiting: the write not made");
+   retro_atomic_store_release_int(&gate_open, 1);
+   wait_flushed();
+   wait_requested();
+   CHECK(holds(SAVE, l1, BIG), "pays waiting: the save is not the memory");
+   CHECK(copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, newest,
+            sizeof(newest)) == 1 && holds(newest, disk, BIG),
+         "pays waiting: the copy is not the pre-load save");
+   flush_lane_end();
+}
+
+/* The same, the image renamed into place but its copy not yet owed. */
+static void lane_main_write_pays_landed(void)
+{
+   static unsigned char disk[BIG], ram[BIG], p1[BIG], l1[BIG];
+   char newest[PATH_MAX_LENGTH];
+
+   fill_id(disk, BIG, 93, 'D');
+   fill_id(p1, BIG, 94, 'P');
+   fill_id(l1, BIG, 95, 'L');
+   flush_lane_begin(disk, ram);
+   start(ram, BIG, false);
+   memcpy(ram, p1, BIG);
+   stall(3);
+   event_flush_save_files(true, false, 1 << SAVE_BACKUP_BEFORE_STATE_LOAD);
+   CHECK(wait_stalled(), "pays landed: the worker did not stop after "
+         "its rename");
+   memcpy(ram, l1, BIG);
+   event_save_files(true, false, true, true, NULL);
+   stall(0);
+   wait_flushed();
+   wait_requested();
+   CHECK(holds(SAVE, l1, BIG), "pays landed: the save is not the memory");
+   CHECK(copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, newest,
+            sizeof(newest)) == 1 && holds(newest, p1, BIG),
+         "pays landed: the copy is not the pre-load save");
+   flush_lane_end();
+}
+
+/* Both slots hold a state load's image and no check follows the
+ * write, as on Android in the background: neither image lands over
+ * it, and each is backed up. */
+static void lane_main_write_pays_both(void)
+{
+   static unsigned char disk[BIG], ram[BIG], p1[BIG], p2[BIG], l1[BIG];
+   char newest[PATH_MAX_LENGTH];
+   const int bsl = 1 << SAVE_BACKUP_BEFORE_STATE_LOAD;
+
+   fill_id(disk, BIG, 96, 'D');
+   fill_id(p1, BIG, 97, 'P');
+   fill_id(p2, BIG, 98, 'Q');
+   fill_id(l1, BIG, 99, 'L');
+   flush_lane_begin(disk, ram);
+   start_parked(ram);
+   memcpy(ram, p1, BIG);
+   event_flush_save_files(true, false, bsl);
+   memcpy(ram, p2, BIG);
+   event_flush_save_files(true, false, bsl);
+   memcpy(ram, l1, BIG);
+   event_save_files(true, false, true, true, NULL);
+   retro_atomic_store_release_int(&gate_open, 1);
+   wait_flushed();
+   wait_requested();
+   CHECK(holds(SAVE, l1, BIG) && written_in_order("LL"),
+         "pays both: a state load's image written over the save");
+   CHECK(copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, newest,
+            sizeof(newest)) == 2 && holds(newest, p2, BIG),
+         "pays both: the pre-load images not both backed up");
+   flush_lane_end();
+}
+
+/* A copy dropped for the main thread's write is taken again at the
+ * next check, not after the worker's interval. */
+static void lane_main_write_no_rest(void)
+{
+   static unsigned char disk[BIG], ram[BIG], s1[BIG], m2[BIG], s3[BIG];
+
+   fill_id(disk, BIG, 100, 'D');
+   fill_id(s1, BIG, 101, 'A');
+   fill_id(m2, BIG, 102, 'B');
+   fill_id(s3, BIG, 103, 'C');
+   flush_lane_begin(disk, ram);
+   slots[0] = autosave_new(SAVE, ram, BIG, 100, false,
+         RETRO_MEMORY_SAVE_RAM, false, save_file_get(0));
+   CHECK(slots[0] != NULL, "no rest: autosave_new failed");
+   autosave_state.list = slots;
+   autosave_state.num  = 1;
+   wait_requested();
+   memcpy(ram, s1, BIG);
+   stall(1);
+   autosave_check();
+   CHECK(wait_stalled(), "no rest: the worker did not stop in its stat");
+   memcpy(ram, m2, BIG);
+   event_save_files(true, false, true, true, NULL);
+   memcpy(ram, s3, BIG);
+   stall(0);
+   wait_requested();
+   autosave_check();
+   CHECK(wait_puts(2) && holds(SAVE, s3, BIG) && written_in_order("BC"),
+         "no rest: the next copy waited out the interval");
+   flush_lane_end();
+}
+
 /* A1-1: a full disk or a refused rename keeps the old save whole and
  * leaves no temporary; the image is written at the next check. */
 static void lane_autosave_full_disk(void)
@@ -3897,6 +4020,10 @@ int main(void)
    lane_flush_points_worker();
    lane_suspend_race();
    lane_flush_points_queue();
+   lane_main_write_pays_waiting();
+   lane_main_write_pays_landed();
+   lane_main_write_pays_both();
+   lane_main_write_no_rest();
    lane_autosave_full_disk();
    lane_no_rewrite_at_launch();
    lane_pointer_requery();

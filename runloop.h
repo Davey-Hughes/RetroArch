@@ -401,6 +401,10 @@ struct runloop
     * cross-thread race.  Both are main-thread only. */
    bool content_closing;
    bool content_switching;
+   /* Main thread: the core is running a frame (core_run(), run-ahead).
+    * A platform callback reached from there, as 3DS's from the audio
+    * driver's wait, must not read core memory. */
+   bool in_core_frame;
    /* quit_pending: a quit from the frame loop is waiting for a state
     * task to finish writing (retroarch_main_quit_staged()).  The loop
     * presents the last frame and runs nothing else until it is through.

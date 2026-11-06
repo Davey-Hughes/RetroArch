@@ -45,6 +45,7 @@
 #include "../../defaults.h"
 #include "../../paths.h"
 #include "../../retroarch.h"
+#include "../../runloop.h"
 #include "../../verbosity.h"
 
 #include "os/ctr/ctr_debug.h"
@@ -159,10 +160,13 @@ u8* gfxBottomFramebuffers[2];
 
 #ifndef IS_SALAMANDER
 /* HOME, the power button or a closed lid: the console may not come
- * back to it. */
+ * back to it. Not inside the core's frame (aptMainLoop() in the audio
+ * driver's wait), where its memory is half a frame and the stack may
+ * be the core's: as on Android, only between frames. */
 static void ctr_save_hook(APT_HookType hook, void *param)
 {
-   if (hook == APTHOOK_ONSUSPEND || hook == APTHOOK_ONSLEEP)
+   if (     (hook == APTHOOK_ONSUSPEND || hook == APTHOOK_ONSLEEP)
+         && !runloop_state_get_ptr()->in_core_frame)
       retroarch_save_files_for_suspend();
 }
 #endif

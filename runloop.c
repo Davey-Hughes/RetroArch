@@ -7633,7 +7633,9 @@ static bool display_menu_libretro(
          input_st->flags |= INP_FLAG_BLOCK_LIBRETRO_INPUT;
 
       video_driver_ff_frameskip_decide(current_time);
+      runloop_st->in_core_frame = true;
       core_run();
+      runloop_st->in_core_frame = false;
       runloop_load_deferred_auto_state();
       runloop_st->core_runtime_usec       +=
          runloop_core_runtime_tick(runloop_st, slowmotion_ratio, current_time);
@@ -10164,6 +10166,7 @@ int runloop_iterate(void)
     * fast-forward drops */
    video_driver_ff_frameskip_decide(runloop_st->core_run_time);
 
+   runloop_st->in_core_frame = true;
    {
 #ifdef HAVE_RUNAHEAD
       bool run_ahead_enabled            = settings->bools.run_ahead_enabled;
@@ -10190,6 +10193,7 @@ int runloop_iterate(void)
 #endif
          frame_advanced = core_run();
    }
+   runloop_st->in_core_frame = false;
 
    runloop_load_deferred_auto_state();
 
