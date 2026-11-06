@@ -6915,6 +6915,35 @@ bool runloop_event_init_core(
    return true;
 }
 
+void runloop_flush_save_files(void)
+{
+   if (runloop_state.flags & RUNLOOP_FLAG_USE_SRAM)
+   {
+#if defined(HAVE_COMPRESSION)
+      settings_t *settings = config_get_ptr();
+      event_flush_kept_save_files(true,
+            settings->bools.save_file_compression);
+#else
+      event_flush_kept_save_files(true, false);
+#endif
+   }
+}
+
+static retro_atomic_int_t runloop_save_files_request
+   = RETRO_ATOMIC_INT_INITIALIZER(0);
+
+void runloop_request_save_files(void)
+{
+   retro_atomic_store_release_int(&runloop_save_files_request, 1);
+}
+
+/* Main thread, between frames */
+static void runloop_take_save_files_request(void)
+{
+   if (retro_atomic_fetch_and_int(&runloop_save_files_request, 0))
+      runloop_flush_save_files();
+}
+
 void runloop_pause_checks(void)
 {
 #ifdef HAVE_PRESENCE
@@ -6957,6 +6986,8 @@ void runloop_pause_checks(void)
       /* Same idea as the MIDI silence above, for the audio stream: end it on
        * a ramp rather than wherever the waveform happened to be. */
       audio_driver_pause_fade(true);
+
+      runloop_flush_save_files();
 
 #ifdef HAVE_PRESENCE
       userdata.status = PRESENCE_GAME_PAUSED;
@@ -7676,7 +7707,9 @@ static bool display_menu_libretro(
          input_st->flags |= INP_FLAG_BLOCK_LIBRETRO_INPUT;
 
       video_driver_ff_frameskip_decide(current_time);
+      runloop_st->in_core_frame = true;
       core_run();
+      runloop_st->in_core_frame = false;
       runloop_load_deferred_auto_state();
       runloop_st->core_runtime_usec       +=
          runloop_core_runtime_tick(runloop_st, slowmotion_ratio, current_time);
@@ -9915,6 +9948,9 @@ int runloop_iterate(void)
    android_input_flush_pending_haptics();
 #endif
 
+   /* A save asked for off the main thread or inside the core's frame */
+   runloop_take_save_files_request();
+
    /* Tick deferred shader compilation (one pass per frame) */
    video_driver_shader_deferred_tick();
 
@@ -10208,6 +10244,7 @@ int runloop_iterate(void)
     * fast-forward drops */
    video_driver_ff_frameskip_decide(runloop_st->core_run_time);
 
+   runloop_st->in_core_frame = true;
    {
 #ifdef HAVE_RUNAHEAD
       bool run_ahead_enabled            = settings->bools.run_ahead_enabled;
@@ -10234,6 +10271,7 @@ int runloop_iterate(void)
 #endif
          frame_advanced = core_run();
    }
+   runloop_st->in_core_frame = false;
 
    runloop_load_deferred_auto_state();
 

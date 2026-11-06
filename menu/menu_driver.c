@@ -7690,6 +7690,8 @@ void retroarch_menu_running(void)
 
    menu_event_starts_afresh = true;
 
+   runloop_flush_save_files();
+
    if (menu)
    {
 #ifdef HAVE_NETWORKING
