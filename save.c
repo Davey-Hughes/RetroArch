@@ -422,11 +422,11 @@ static void autosave_recover(autosave_t *save, const void *image)
 /* Writes @image, taken at main_gen @gen, unless it is the last one
  * written, making the copies the file owes first. On failure the last
  * written image stays as it was and unwritten stays set, so the next
- * check writes; a @flush image goes to a recovery file. Any other
- * image older than the main thread's last write of the file is
- * dropped, and so is a @flush image the main thread backed up for
- * that write. Memory erased to 0 bytes empties a save, but makes
- * none. */
+ * check writes; a @flush image the main thread has not backed up goes
+ * to a recovery file. Any other image older than the main thread's
+ * last write of the file is dropped, and so is a @flush image the main
+ * thread backed up for that write. Memory erased to 0 bytes empties a
+ * save, but makes none. */
 static void autosave_put(autosave_t *save, const void *image, int gen,
       bool flush)
 {
@@ -486,7 +486,8 @@ static void autosave_put(autosave_t *save, const void *image, int gen,
          retro_atomic_fetch_or_int(&save->file->flags,
                SAVE_FILE_WRITE_FAILED);
    }
-   if (flush)
+   if (flush && !(retro_atomic_load_acquire_int(
+               &save->flush[save->flush_take]) & AUTOSAVE_FLUSH_PAID))
       autosave_recover(save, image);
 }
 

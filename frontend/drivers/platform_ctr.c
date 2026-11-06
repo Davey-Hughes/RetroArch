@@ -163,7 +163,7 @@ u8* gfxBottomFramebuffers[2];
  * back to it. Written now only on the main thread (no libctru Thread)
  * between frames. aptMainLoop() also runs in the audio driver's wait,
  * on the audio thread or inside the core's frame, where memory is
- * half a frame: as on Android, the next frame writes it. */
+ * half a frame: the next frame writes it, after wake for a sleep. */
 static void ctr_save_hook(APT_HookType hook, void *param)
 {
    if (hook != APTHOOK_ONSUSPEND && hook != APTHOOK_ONSLEEP)

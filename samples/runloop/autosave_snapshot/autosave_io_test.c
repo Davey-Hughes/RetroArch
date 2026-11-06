@@ -2730,7 +2730,7 @@ static void lane_main_write_paid_taken(void)
    wait_requested();
    stop();
    CHECK(holds(SAVE, l1, BIG) && written_in_order("LL"),
-         "paid taken: a backed up image written over the save");
+         "paid taken: the main write's image not written again");
    CHECK(quiet(), "paid taken: a recovery file or notice");
    refuse_copies(false);
    flush_lane_end();
@@ -2768,6 +2768,43 @@ static void lane_main_write_replaces_paid(void)
    CHECK(copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, newest,
             sizeof(newest)) == 2 && holds(newest, p2, BIG),
          "replaces paid: the pre-load images not both backed up");
+   flush_lane_end();
+}
+
+/* An image backed up while the worker writes it: its failed write is
+ * the main thread's to replace, so no recovery file and no notice. */
+static void lane_main_write_paid_out_fails(void)
+{
+   static unsigned char disk[BIG], ram[BIG], p1[BIG], l1[BIG];
+   char newest[PATH_MAX_LENGTH];
+
+   fill_id(disk, BIG, 113, 'D');
+   fill_id(p1, BIG, 114, 'P');
+   fill_id(l1, BIG, 115, 'L');
+   flush_lane_begin(disk, ram);
+   start(ram, BIG, false);
+   memcpy(ram, p1, BIG);
+   stall(2);
+   event_flush_save_files(true, false, 1 << SAVE_BACKUP_BEFORE_STATE_LOAD);
+   CHECK(wait_stalled(), "paid out fails: the worker did not stop in "
+         "opening its temporary");
+   memcpy(ram, l1, BIG);
+   event_save_files(true, false, true, true, NULL);
+   set_vfs(0, true);
+   stall(1);
+   CHECK(wait_stalled(), "paid out fails: the worker did not stop in "
+         "its stat");
+   set_vfs(0, false);
+   stall(0);
+   wait_flushed();
+   wait_requested();
+   stop();
+   CHECK(holds(SAVE, l1, BIG) && written_in_order("LL"),
+         "paid out fails: the save is not the memory");
+   CHECK(copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, newest,
+            sizeof(newest)) == 1 && holds(newest, p1, BIG),
+         "paid out fails: the copy is not the pre-load save");
+   CHECK(quiet(), "paid out fails: a recovery file or notice");
    flush_lane_end();
 }
 
@@ -4138,6 +4175,7 @@ int main(void)
    lane_main_write_pays_failed();
    lane_main_write_paid_taken();
    lane_main_write_replaces_paid();
+   lane_main_write_paid_out_fails();
    lane_autosave_full_disk();
    lane_no_rewrite_at_launch();
    lane_pointer_requery();
