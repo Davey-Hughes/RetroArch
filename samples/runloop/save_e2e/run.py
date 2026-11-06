@@ -445,6 +445,55 @@ def lane_state_load_copy(args, n):
     return r, failures
 
 
+def lane_flush_points(args, n):
+    """A1-21: pausing and opening the menu write a changed save at once
+    (the autosave rests 60 s); pausing again unchanged writes nothing.
+    Each write is a rename, so a new inode counts one.  Network commands
+    are not read while the menu is open, so the menu comes last."""
+    r = Run(args.run_dir, 'flush_points-%d' % n)
+    port = 55900 + n
+    cfg = r.config(autosave_interval='60', network_cmd_enable='true',
+                   network_cmd_port=str(port))
+    env = r.env(SAVE_E2E_TOUCHES='30:81,300:82', SAVE_E2E_FRAME_MS=10)
+    # Ended by kill: the close's own write must not come first.
+    r.start(args, cfg, 20000, env)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    failures = []
+    mark = r.dir / 'touched'
+
+    def send(cmd, settle=0.0):
+        sock.sendto(cmd, ('127.0.0.1', port))
+        time.sleep(settle)
+
+    def written(image, timeout=10):
+        deadline = time.time() + timeout
+        while time.time() < deadline and r.proc.poll() is None:
+            if r.srm.exists() and r.srm.read_bytes() == image:
+                return True
+            time.sleep(0.02)
+        return False
+
+    def inode():
+        return r.srm.stat().st_ino if r.srm.exists() else None
+
+    check(failures, r.wait_for(Path('%s-81' % mark)), 'no first touch')
+    send(b'PAUSE_TOGGLE')
+    check(failures, written(pattern(81)), 'pause: the changed save not written')
+    send(b'PAUSE_TOGGLE', 0.5)
+    before = inode()
+    send(b'PAUSE_TOGGLE', 1.0)
+    check(failures, inode() == before, 'pause: an unchanged save written')
+    send(b'PAUSE_TOGGLE')
+    check(failures, r.wait_for(Path('%s-82' % mark)), 'no second touch')
+    send(b'MENU_TOGGLE')
+    check(failures, written(pattern(82)),
+          'menu open: the changed save not written')
+    sock.close()
+    r.kill()
+    r.drain.join()
+    return r, failures
+
+
 def lane_changed_elsewhere(args, n):
     """A1-18: a second RetroArch writes the save while the first runs.
     The first's next write (its worker, or its close without one) backs
@@ -616,6 +665,7 @@ LANES = {
     'recovery_announced': lane_recovery_announced,
     'state_load_copy': lane_state_load_copy,
     'changed_elsewhere': lane_changed_elsewhere,
+    'flush_points': lane_flush_points,
     'nosave_netplay_disconnect': lane_nosave_netplay_disconnect,
     'windows_locked_close': lane_windows_locked_close,
 }

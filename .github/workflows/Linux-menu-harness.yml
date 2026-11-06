@@ -246,9 +246,10 @@ jobs:
           # unsaved progress from a failed write is announced at the
           # next load; the progress a state load rolls back, and a save
           # another RetroArch wrote meanwhile, are backed up; with saves
-          # off, a netplay host stopped in the game writes nothing.  The
-          # kill-mid-write lane and its runs under load stay local.  The
-          # harness builds above removed the binary to read its link
+          # off, a netplay host stopped in the game writes nothing;
+          # pausing and opening the menu write a changed save at once.
+          # The kill-mid-write lane and its runs under load stay local.
+          # The harness builds above removed the binary to read its link
           # line.
           make -j$(nproc)
           make -C samples/runloop/save_e2e
@@ -259,7 +260,7 @@ jobs:
              --lane noload_save_backed_up --lane explicit_save_copies \
              --lane cut_copy_old_core --lane recovery_announced \
              --lane state_load_copy --lane changed_elsewhere \
-             --lane nosave_netplay_disconnect
+             --lane nosave_netplay_disconnect --lane flush_points
           make -C samples/runloop/save_e2e clean
 
       - name: Build and run save_paths_test

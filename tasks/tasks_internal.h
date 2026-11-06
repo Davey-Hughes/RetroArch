@@ -545,6 +545,12 @@ bool event_save_files(bool sram_used, bool compress_files, bool sync,
 void event_flush_save_files(bool sram_used, bool compress_files,
       int owed);
 
+/* As event_flush_save_files() with nothing owed, for memory that stays
+ * as it is (the game stopped running): an image that cannot be written
+ * is left to the next write rather than recovered, and with a worker a
+ * newer one replaces it if it has not been taken yet. */
+void event_flush_kept_save_files(bool sram_used, bool compress_files);
+
 void path_init_savefile_rtc(const char *savefile_path);
 
 void *savefile_ptr_get(void);

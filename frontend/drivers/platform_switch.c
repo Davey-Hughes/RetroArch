@@ -148,6 +148,8 @@ static void on_applet_hook(AppletHookType hook, void *param)
 
          if (!platform_switch_has_focus)
          {
+            /* HOME or sleep: the console may not come back to it. */
+            retroarch_save_files_for_suspend();
             if (hosversionBefore(8, 0, 0))
             {
                pcvSetClockRate(PcvModule_CpuBus, 1020000000);

@@ -162,14 +162,20 @@ static void save_file_keep_stat(struct save_file *f, const char *path)
 }
 
 /* Another program wrote @path since it was loaded or last written
- * here: it owes a copy. Not when it is gone: nothing to keep. */
-static bool save_file_changed(struct save_file *f, const char *path)
+ * here. Not when it is gone: nothing to keep. */
+static bool save_file_differs(struct save_file *f, const char *path)
 {
    int stat, now;
-   if (     !f
-         || !(stat = retro_atomic_load_acquire_int(&f->stat))
-         || (now = save_file_stat(path)) == stat
-         || now == 1)
+   return   f
+         && (stat = retro_atomic_load_acquire_int(&f->stat))
+         && (now = save_file_stat(path)) != stat
+         && now != 1;
+}
+
+/* As save_file_differs(), and then it owes a copy. */
+static bool save_file_changed(struct save_file *f, const char *path)
+{
+   if (!save_file_differs(f, path))
       return false;
    save_file_owe(f, SAVE_BACKUP_CHANGED_ELSEWHERE);
    return true;
@@ -268,8 +274,16 @@ static void save_file_notice(enum msg_hash_enums msg, const char *path,
 #define AUTOSAVE_TMP_SUFFIX ".auto.tmp"
 
 /* Set in a slot of autosave.flush while its flush waits or is being
- * written; the bits below it are owed once it is written. */
+ * written; the bits below KEPT are owed once it is written. */
 #define AUTOSAVE_FLUSH_FULL (1 << 30)
+/* The worker is writing the slot: its image is no longer replaced. */
+#define AUTOSAVE_FLUSH_OUT  (1 << 29)
+/* Memory that stays as it is: a newer flush may replace the image
+ * before the worker takes it, and a failed write is left to the next
+ * check, not recovered. */
+#define AUTOSAVE_FLUSH_KEPT (1 << 28)
+#define AUTOSAVE_FLUSH_BITS \
+   (AUTOSAVE_FLUSH_FULL | AUTOSAVE_FLUSH_OUT | AUTOSAVE_FLUSH_KEPT)
 
 typedef struct autosave autosave_t;
 
@@ -290,6 +304,11 @@ struct autosave
     * written. Slot i is the main thread's while flush[i] is 0. */
    void *flush_buf[2];
    int flush_owed[2];
+   /* main_gen when flush_buf[i] and the snapshot were filled */
+   int flush_gen[2];
+   int snapshot_gen;
+   /* Worker only: main_gen of the last image written here */
+   int put_gen;
    char *path;
    char *tmp_path;
    /* Its file's session state; outlives the handle */
@@ -313,6 +332,12 @@ struct autosave
    /* AUTOSAVE_FLUSH_FULL, plus what flushes that came while both were
     * set owe after it */
    retro_atomic_int_t flush[2];
+   /* Counts the main thread's own writes of the file: an image taken
+    * before the last one is older than the file. */
+   retro_atomic_int_t main_gen;
+   /* Set by the worker from its last check of main_gen until its
+    * write is done. */
+   retro_atomic_int_t committing;
    retro_atomic_int_t quit;
    /* The worker's last store: the handle is the main thread's after it */
    retro_atomic_int_t exited;
@@ -389,12 +414,14 @@ static void autosave_recover(autosave_t *save, const void *image)
             made ? SAVE_FILE_FLUSH_RECOVERED : SAVE_FILE_FLUSH_LOST);
 }
 
-/* Writes @image unless it is the last one written, making the copies
- * the file owes first. On failure the last written image stays as it
- * was and unwritten stays set, so the next check writes; a @flush
- * image goes to a recovery file.  Memory erased to 0 bytes empties a
- * save, but makes none. */
-static void autosave_put(autosave_t *save, const void *image, bool flush)
+/* Writes @image, taken at main_gen @gen, unless it is the last one
+ * written, making the copies the file owes first. On failure the last
+ * written image stays as it was and unwritten stays set, so the next
+ * check writes; a @flush image goes to a recovery file. Any other
+ * image older than the main thread's last write of the file is
+ * dropped. Memory erased to 0 bytes empties a save, but makes none. */
+static void autosave_put(autosave_t *save, const void *image, int gen,
+      bool flush)
 {
    bool changed;
    if (     save->unwritten && !save->bufsize
@@ -403,21 +430,46 @@ static void autosave_put(autosave_t *save, const void *image, bool flush)
       save->unwritten = false;
       return;
    }
+   /* The main thread wrote the file since: buffer is not what it holds. */
+   if (gen != save->put_gen)
+      save->unwritten = true;
    if (!save->unwritten && !memcmp(save->buffer, image, save->bufsize))
       return;
    save->unwritten = true;
-   changed         = save_file_changed(save->file, save->path);
+   changed         = save_file_differs(save->file, save->path);
+   /* After the stat: the main thread's own write may be the change. */
+   if (retro_atomic_load_acquire_int(&save->main_gen) != gen)
+   {
+      if (!flush)
+         return;
+      changed = false;
+   }
+   if (changed)
+      save_file_owe(save->file, SAVE_BACKUP_CHANGED_ELSEWHERE);
    if (save_file_pay(save->file, save->path, image, save->bufsize,
             true, true))
    {
+      bool dropped;
+      bool written = false;
       /* Told once its copy is made */
       if (changed)
          retro_atomic_fetch_or_int(&save->file->flags,
                SAVE_FILE_CHANGED_ELSEWHERE);
-      if (autosave_write(save, image))
+      /* Against autosave_main_write(): it sees this write under way,
+       * or this sees its count. */
+      retro_atomic_fetch_add_seq_cst_int(&save->committing, 1);
+      dropped = !flush
+         && retro_atomic_load_seq_cst_int(&save->main_gen) != gen;
+      if (!dropped)
+         written = autosave_write(save, image);
+      retro_atomic_store_release_int(&save->committing, 0);
+      if (dropped)
+         return;
+      if (written)
       {
          memcpy(save->buffer, image, save->bufsize);
          save->unwritten = false;
+         save->put_gen   = gen;
          save_file_keep_stat(save->file, save->path);
          return;
       }
@@ -433,15 +485,20 @@ static void autosave_put(autosave_t *save, const void *image, bool flush)
  * when none was waiting. */
 static bool autosave_take_flush(autosave_t *save)
 {
-   int late;
+   int w, late;
    unsigned slot = save->flush_take;
-   if (!(retro_atomic_load_acquire_int(&save->flush[slot])
-         & AUTOSAVE_FLUSH_FULL))
-      return false;
-   autosave_put(save, save->flush_buf[slot], true);
+   do
+   {
+      w = retro_atomic_load_acquire_int(&save->flush[slot]);
+      if (!(w & AUTOSAVE_FLUSH_FULL))
+         return false;
+   } while (!retro_atomic_cas_int(&save->flush[slot], w,
+            w | AUTOSAVE_FLUSH_OUT));
+   autosave_put(save, save->flush_buf[slot], save->flush_gen[slot],
+         !(w & AUTOSAVE_FLUSH_KEPT));
    save_file_owe_bits(save->file, save->flush_owed[slot]);
    late = retro_atomic_exchange_int(&save->flush[slot], 0);
-   save_file_owe_bits(save->file, late & ~AUTOSAVE_FLUSH_FULL);
+   save_file_owe_bits(save->file, late & ~AUTOSAVE_FLUSH_BITS);
    save->flush_take = !slot;
    return true;
 }
@@ -482,9 +539,12 @@ static void autosave_thread(void *data)
          continue;
       if (autosave_quitting(save))
          break;
+      /* Woken by a flush the main thread took back to replace. */
+      if (retro_atomic_load_acquire_int(&save->snapshot_requested))
+         continue;
 
       /* The snapshot remains ours until the next request. */
-      autosave_put(save, save->snapshot, false);
+      autosave_put(save, save->snapshot, save->snapshot_gen, false);
 
       /* Rest an interval; a flush or quit ends it early. */
       if (save->interval)
@@ -545,8 +605,14 @@ static autosave_t *autosave_new(const char *path,
    retro_atomic_int_init(&handle->snapshot_requested, 0);
    retro_atomic_int_init(&handle->flush[0], 0);
    retro_atomic_int_init(&handle->flush[1], 0);
+   retro_atomic_int_init(&handle->main_gen, 0);
+   retro_atomic_int_init(&handle->committing, 0);
    handle->flush_owed[0]         = 0;
    handle->flush_owed[1]         = 0;
+   handle->flush_gen[0]          = 0;
+   handle->flush_gen[1]          = 0;
+   handle->snapshot_gen          = 0;
+   handle->put_gen               = 0;
    handle->flush_fill            = 0;
    handle->flush_take            = 0;
    handle->bufsize               = len;
@@ -890,6 +956,7 @@ void autosave_check(void)
          continue;
       }
       memcpy(handle->snapshot, mem_info.data, handle->bufsize);
+      handle->snapshot_gen = retro_atomic_load_relaxed_int(&handle->main_gen);
       retro_atomic_store_release_int(&handle->snapshot_requested, 0);
       retro_eventcount_notify(&handle->ec);
    }
@@ -901,33 +968,91 @@ void autosave_unlock(void)
       autosave_check();
 }
 
+static void autosave_fill(autosave_t *handle, unsigned slot,
+      const void *data, int owed, bool kept)
+{
+   memcpy(handle->flush_buf[slot], data, handle->bufsize);
+   handle->flush_owed[slot] = owed;
+   handle->flush_gen[slot]  = retro_atomic_load_relaxed_int(
+         &handle->main_gen);
+   retro_atomic_store_release_int(&handle->flush[slot],
+         kept ? AUTOSAVE_FLUSH_FULL | AUTOSAVE_FLUSH_KEPT
+              : AUTOSAVE_FLUSH_FULL);
+}
+
 /* Hands @data to the worker of @handle to write after any flush out
- * and before any later image, then @owed. With both slots out, only
- * @owed is added, to the one filled last. Copies; never waits. */
-static void autosave_flush(autosave_t *handle, const void *data, int owed)
+ * and before any later image, then @owed. A @kept image is of memory
+ * that stays as it is. Either replaces a kept image the worker has not
+ * taken from the slot filled last. With both slots out otherwise,
+ * only @owed is added, to the one filled last; a kept image is left
+ * out, as the worker asks for a copy once they are written. Copies;
+ * never waits. */
+static void autosave_flush(autosave_t *handle, const void *data, int owed,
+      bool kept)
 {
    unsigned fill = handle->flush_fill;
    for (;;)
    {
-      int w;
+      int w = retro_atomic_load_acquire_int(&handle->flush[!fill]);
+      if (     (w & AUTOSAVE_FLUSH_KEPT) && !(w & AUTOSAVE_FLUSH_OUT)
+            && (w & AUTOSAVE_FLUSH_FULL))
+      {
+         /* Fails only when the worker has just taken it. */
+         if (!retro_atomic_cas_int(&handle->flush[!fill], w, 0))
+            continue;
+         autosave_fill(handle, !fill, data,
+               owed | handle->flush_owed[!fill]
+               | (w & ~AUTOSAVE_FLUSH_BITS), kept);
+         break;
+      }
       if (!(retro_atomic_load_acquire_int(&handle->flush[fill])
             & AUTOSAVE_FLUSH_FULL))
       {
-         memcpy(handle->flush_buf[fill], data, handle->bufsize);
-         handle->flush_owed[fill] = owed;
-         retro_atomic_store_release_int(&handle->flush[fill],
-               AUTOSAVE_FLUSH_FULL);
+         autosave_fill(handle, fill, data, owed, kept);
          handle->flush_fill = !fill;
          break;
       }
+      if (kept)
+         break;
       /* Fails only when the worker has just finished it, and it finished
        * the other first: the next turn fills. */
-      w = retro_atomic_load_acquire_int(&handle->flush[!fill]);
       if (     (w & AUTOSAVE_FLUSH_FULL)
             && retro_atomic_cas_int(&handle->flush[!fill], w, w | owed))
          break;
    }
    retro_eventcount_notify(&handle->ec);
+}
+
+/* Main thread, before it writes slot @i itself: an image the worker
+ * took before this is older than the file and is not written over it.
+ * The handle when one may still land after this write, else NULL. */
+static autosave_t *autosave_main_write(unsigned i)
+{
+   autosave_t *handle;
+   if (     i >= autosave_state.num
+         || !(handle = autosave_state.list[i])
+         || autosave_quitting(handle))
+      return NULL;
+   retro_atomic_fetch_add_seq_cst_int(&handle->main_gen, 1);
+   /* Under way, or a state load's image, which is never dropped */
+   if (     retro_atomic_load_seq_cst_int(&handle->committing)
+         || ((retro_atomic_load_acquire_int(&handle->flush[0])
+            & (AUTOSAVE_FLUSH_FULL | AUTOSAVE_FLUSH_KEPT))
+            == AUTOSAVE_FLUSH_FULL)
+         || ((retro_atomic_load_acquire_int(&handle->flush[1])
+            & (AUTOSAVE_FLUSH_FULL | AUTOSAVE_FLUSH_KEPT))
+            == AUTOSAVE_FLUSH_FULL))
+      return handle;
+   return NULL;
+}
+
+/* The file holds @mem_info's memory now: the worker writes it again
+ * after what may land later. */
+static void autosave_main_written(autosave_t *handle,
+      const retro_ctx_memory_info_t *mem_info)
+{
+   if (handle && mem_info->size == handle->bufsize)
+      autosave_flush(handle, mem_info->data, 0, true);
 }
 
 /* Slot @i's live worker, or NULL; its memory in @mem_info. */
@@ -1099,18 +1224,23 @@ static void save_file_check_recovery(unsigned slot)
  *                     made here
  * @flush            : a state load replaces the image next: if it cannot
  *                     be written, it goes to a recovery file
+ * @kept             : the image stays in memory: if it cannot be
+ *                     written, that is shown once a session
  *
  * Save a RAM state from memory to disk.
  * Skips the write if the on-disk content already
  * matches memory (common when autosave has been active).
  */
 static bool content_save_ram_file(unsigned slot, bool compress, bool sync,
-      bool rewrite, bool copy, bool flush)
+      bool rewrite, bool copy, bool flush, bool kept)
 {
    struct ram_type ram;
    retro_ctx_memory_info_t mem_info;
    struct save_file *f;
    bool changed;
+#ifdef HAVE_THREADS
+   autosave_t *handle;
+#endif
 
    /* Memory that had a size this session and reports 0 bytes, its
     * pointer kept, was erased: its save is emptied. */
@@ -1120,6 +1250,9 @@ static bool content_save_ram_file(unsigned slot, bool compress, bool sync,
                || !path_is_valid(ram.path)))
       return false;
    f = save_file_get(slot);
+#ifdef HAVE_THREADS
+   handle = autosave_main_write(slot);
+#endif
 
    /* Quick check: if the file already exists and matches
     * current memory contents, skip the write entirely.
@@ -1153,6 +1286,9 @@ static bool content_save_ram_file(unsigned slot, bool compress, bool sync,
          RARCH_LOG("[SRAM] %s \"%s\" (unchanged, skipping write).\n",
                msg_hash_to_str(MSG_SAVED_SUCCESSFULLY_TO),
                ram.path);
+#ifdef HAVE_THREADS
+         autosave_main_written(handle, &mem_info);
+#endif
          return true;
       }
    }
@@ -1223,6 +1359,9 @@ static bool content_save_ram_file(unsigned slot, bool compress, bool sync,
    }
 
    save_file_keep_stat(f, ram.path);
+#ifdef HAVE_THREADS
+   autosave_main_written(handle, &mem_info);
+#endif
    RARCH_LOG("[SRAM] %s \"%s\".\n",
          msg_hash_to_str(MSG_SAVED_SUCCESSFULLY_TO),
          ram.path);
@@ -1234,6 +1373,15 @@ fail:
       save_files_unsynced = true;
    RARCH_ERR("[SRAM] %s.\n",
          msg_hash_to_str(MSG_FAILED_TO_SAVE_SRAM));
+   if (kept)
+   {
+      if (     f
+            && !(retro_atomic_fetch_or_int(&f->flags,
+                  SAVE_FILE_WRITE_NOTICED)
+               & SAVE_FILE_WRITE_NOTICED))
+         save_file_notice(MSG_SAVE_WRITE_FAILED, ram.path, true);
+      return false;
+   }
    save_file_recover(ram.path, mem_info.data, mem_info.size, sync);
    return false;
 }
@@ -1253,13 +1401,13 @@ bool event_save_files(bool is_sram_used, bool compress_files, bool sync,
       save_files_unsynced = false;
    for (i = 0; i < task_save_files->size; i++)
       if (!content_save_ram_file(i, compress_files, sync, rewrite, copy,
-               false))
+               false, false))
          ret = false;
    return ret;
 }
 
-void event_flush_save_files(bool is_sram_used, bool compress_files,
-      int owed)
+static void save_files_flush(bool is_sram_used, bool compress_files,
+      int owed, bool kept)
 {
    unsigned i;
    if (!task_save_files || !is_sram_used)
@@ -1278,14 +1426,26 @@ void event_flush_save_files(bool is_sram_used, bool compress_files,
 #ifdef HAVE_THREADS
       if (handle)
       {
-         autosave_flush(handle, mem_info.data, bits);
+         autosave_flush(handle, mem_info.data, bits, kept);
          continue;
       }
 #endif
       /* No worker: written here, not synced, owed copies made first. */
-      content_save_ram_file(i, compress_files, false, false, true, true);
+      content_save_ram_file(i, compress_files, false, false, true, !kept,
+            kept);
       save_file_owe_bits(save_file_get(i), bits);
    }
+}
+
+void event_flush_save_files(bool is_sram_used, bool compress_files,
+      int owed)
+{
+   save_files_flush(is_sram_used, compress_files, owed, false);
+}
+
+void event_flush_kept_save_files(bool is_sram_used, bool compress_files)
+{
+   save_files_flush(is_sram_used, compress_files, 0, true);
 }
 
 bool event_load_save_files(bool is_sram_load_disabled)

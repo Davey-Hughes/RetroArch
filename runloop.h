@@ -1065,6 +1065,10 @@ bool runloop_event_init_core(
 
 void runloop_pause_checks(void);
 
+/* The game stopped running: its saves are written now if they changed,
+ * by the autosave worker where one runs. */
+void runloop_flush_save_files(void);
+
 /* The sources that held the loop on the last iteration, as the
  * statistics overlay names them - "VSync+Display", "Timer", "None" -
  * and, when a rate has been measured, " (59.9 fps)" after it. One

@@ -6856,6 +6856,20 @@ bool runloop_event_init_core(
    return true;
 }
 
+void runloop_flush_save_files(void)
+{
+   if (runloop_state.flags & RUNLOOP_FLAG_USE_SRAM)
+   {
+#if defined(HAVE_COMPRESSION)
+      settings_t *settings = config_get_ptr();
+      event_flush_kept_save_files(true,
+            settings->bools.save_file_compression);
+#else
+      event_flush_kept_save_files(true, false);
+#endif
+   }
+}
+
 void runloop_pause_checks(void)
 {
 #ifdef HAVE_PRESENCE
@@ -6898,6 +6912,8 @@ void runloop_pause_checks(void)
       /* Same idea as the MIDI silence above, for the audio stream: end it on
        * a ramp rather than wherever the waveform happened to be. */
       audio_driver_pause_fade(true);
+
+      runloop_flush_save_files();
 
 #ifdef HAVE_PRESENCE
       userdata.status = PRESENCE_GAME_PAUSED;

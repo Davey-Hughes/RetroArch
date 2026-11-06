@@ -6954,6 +6954,15 @@ static void sdl_exit(void)
 }
 #endif
 
+void retroarch_save_files_for_suspend(void)
+{
+   if (runloop_content_loaded())
+   {
+      bool sync = true;
+      command_event(CMD_EVENT_SAVE_FILES, &sync);
+   }
+}
+
 /* The platform is taking the application away and may not give it
  * back - Android, when the activity is paused. Everything that would
  * otherwise only be written by retroarch_main_quit() is written now:
@@ -6978,11 +6987,7 @@ void retroarch_save_for_suspend(void)
     * transient state. There is nothing to save in either case:
     * CMD_EVENT_SAVE_FILES exists to persist SRAM and game-specific
     * cheats, both of which require loaded content. */
-   if (runloop_content_loaded())
-   {
-      bool sync = true;
-      command_event(CMD_EVENT_SAVE_FILES, &sync);
-   }
+   retroarch_save_files_for_suspend();
 
    /* Core options: written unconditionally on core unload, so not
     * gated on config_save_on_exit here either. Without this, option
