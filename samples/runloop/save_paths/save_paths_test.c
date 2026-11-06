@@ -8,7 +8,8 @@
  *
  * A netplay client whose ".netplay" folder can't be made writes no
  * saves for that content, says so once, and the next content saves
- * again.
+ * again. The flags that gate the writes stand in for them here;
+ * save_e2e's nosave_netplay_disconnect lane counts the writes.
  *
  * The shipping function is included and run over a real folder. */
 #include "../../../runloop.c"
@@ -26,12 +27,9 @@ void RARCH_LOG(const char *fmt, ...) { (void)fmt; }
 void RARCH_WARN(const char *fmt, ...) { (void)fmt; }
 void RARCH_ERR(const char *fmt, ...) { (void)fmt; }
 bool verbosity_is_enabled(void) { return false; }
-static int saves_off_notices;
 const char *msg_hash_to_str(enum msg_hash_enums msg)
 {
-   if (msg == MSG_NETPLAY_SAVES_OFF)
-      saves_off_notices++;
-   return "";
+   return msg == MSG_NETPLAY_SAVES_OFF ? "saves off" : "";
 }
 void dir_set(enum rarch_dir_type type, const char *path) { (void)type; (void)path; }
 
@@ -48,9 +46,14 @@ bool netplay_driver_ctl(enum rarch_netplay_ctl_state state, void *data)
    }
    return false;
 }
+static int saves_off_notices;
 void ui_companion_driver_msg_queue_push(const char *msg, unsigned priority,
       unsigned duration, bool flush)
-{ (void)msg; (void)priority; (void)duration; (void)flush; }
+{
+   (void)priority; (void)duration; (void)flush;
+   if (string_is_equal(msg, "saves off"))
+      saves_off_notices++;
+}
 void path_deinit_savefile(void) { }
 void path_init_savefile_new(void) { }
 void path_init_savefile_rtc(const char *savefile_path) { (void)savefile_path; }
