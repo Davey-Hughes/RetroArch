@@ -788,7 +788,7 @@ static void backup_deep(void)
    CHECK(*s && same_path(s, t));
    /* a newer one beside it, whole: the cut's prefix and Q */
    strlcpy(u, s, sizeof(u));
-   q = strchr(u, '~');
+   q = strrchr(u, '~');
    r = strstr(u, " 21-00-00 ");
    CHECK(q && r);
    if (q && r)
