@@ -445,6 +445,52 @@ def lane_state_load_copy(args, n):
     return r, failures
 
 
+def lane_changed_elsewhere(args, n):
+    """A1-18: a second RetroArch writes the save while the first runs.
+    The first's next write (its worker, or its close without one) backs
+    up the second's save first; its own writes never do."""
+    r = Run(args.run_dir, 'changed_elsewhere-%d' % n)
+    other = Run(r.dir, 'other')
+    cfg = r.config()
+    cfg2 = other.config(savefile_directory=r.saves, autosave_interval='0')
+    r.start(args, cfg, 1500, r.env(SAVE_E2E_TOUCHES='30:71,150:72,1000:74',
+                                   SAVE_E2E_FRAME_MS=10))
+    failures = []
+    mark = r.dir / 'touched'
+    check(failures, r.wait_for(Path('%s-72' % mark)), 'no touch 72')
+    deadline = time.time() + 5
+    while not (r.srm.exists() and r.srm.read_bytes() == pattern(72)) \
+            and time.time() < deadline:
+        time.sleep(0.05)
+    worker = r.srm.exists() and r.srm.read_bytes() == pattern(72)
+    other.start(args, cfg2, 100, other.env(SAVE_E2E_TOUCHES='30:73',
+                                           SAVE_E2E_FRAME_MS=10))
+    rc2 = other.wait(60)
+    check(failures, r.srm.read_bytes() == pattern(73),
+          "the other's save not written")
+    check(failures, not Path('%s-74' % mark).exists(),
+          'touch 74 came before the other wrote')
+    rc = r.wait(60)
+    copies = r.copies('changed-elsewhere')
+    log = r.log.read_text(errors='replace')
+    check(failures, rc == 0 and rc2 == 0, 'exits %s %s' % (rc, rc2))
+    check(failures, len(copies) == 1,
+          '%d changed-elsewhere copies' % len(copies))
+    check(failures, copies and copies[0].read_bytes() == pattern(73),
+          "the copy is not the other's save")
+    backups = r.saves / 'backups'
+    extra = sorted(p.name for p in backups.iterdir()
+                   if p not in copies) if backups.is_dir() else []
+    check(failures, not extra, 'other copies or recovery files %s' % extra)
+    check(failures, r.srm.read_bytes() == pattern(74), '.srm not written')
+    check(failures, log.count('changed outside RetroArch') == (0 if worker
+                                                                else 1),
+          'changed-elsewhere log lines')
+    check(failures, 'changed outside RetroArch' not in
+          other.log.read_text(errors='replace'), 'the other told')
+    return r, failures
+
+
 def lane_recovery_announced(args, n):
     """A recovery file newer than the save is announced at load; after
     the game wrote its save it is not."""
@@ -517,6 +563,7 @@ LANES = {
     'cut_copy_old_core': lane_cut_copy_old_core,
     'recovery_announced': lane_recovery_announced,
     'state_load_copy': lane_state_load_copy,
+    'changed_elsewhere': lane_changed_elsewhere,
     'windows_locked_close': lane_windows_locked_close,
 }
 # Lanes that need Windows, and the ones Windows cannot run.

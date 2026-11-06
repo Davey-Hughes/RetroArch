@@ -98,6 +98,19 @@ bool path_is_valid(const char *path)
    return true;
 }
 
+int64_t path_get_size(const char *path)
+{
+   (void)path;
+   return -1;
+}
+
+bool path_get_mtime(const char *path, int64_t *mtime)
+{
+   (void)path;
+   (void)mtime;
+   return false;
+}
+
 /* No copy is ever owed here: the handles have no session state. */
 enum save_backup_result save_backups_copy_file(const char *path,
       enum save_backup_reason reason, bool sync)

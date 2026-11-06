@@ -81,7 +81,9 @@ enum save_file_flags
    SAVE_FILE_WRITE_NOTICED      = (1 << 7),
    SAVE_FILE_RECOVERY_NOTICED   = (1 << 8),
    SAVE_FILE_FLUSH_RECOVERED    = (1 << 9),
-   SAVE_FILE_FLUSH_LOST         = (1 << 10)
+   SAVE_FILE_FLUSH_LOST         = (1 << 10),
+   SAVE_FILE_CHANGED_ELSEWHERE  = (1 << 11),
+   SAVE_FILE_CHANGED_NOTICED    = (1 << 12)
 };
 
 /* One per entry of task_save_files, for the session. Workers read and
@@ -92,6 +94,7 @@ struct save_file
    retro_atomic_size_t loaded; /* bytes read at load */
    retro_atomic_int_t owed;    /* 1 << enum save_backup_reason */
    retro_atomic_int_t flags;   /* enum save_file_flags */
+   retro_atomic_int_t stat;    /* save_file_stat(), 0 until kept */
 };
 
 static struct save_file *save_files = NULL;
@@ -113,6 +116,7 @@ static struct save_file *save_file_get(unsigned slot)
          retro_atomic_size_init(&save_files[i].loaded, 0);
          retro_atomic_int_init(&save_files[i].owed, 0);
          retro_atomic_int_init(&save_files[i].flags, 0);
+         retro_atomic_int_init(&save_files[i].stat, 0);
       }
    }
    return slot < save_files_num ? &save_files[slot] : NULL;
@@ -130,6 +134,45 @@ static void save_file_owe_bits(struct save_file *f, int bits)
 {
    if (f && bits)
       retro_atomic_fetch_or_int(&f->owed, bits);
+}
+
+/* @path's size and mtime in one word, so either thread reads or keeps
+ * it at once: never 0, and 1 when @path is missing. An unknown mtime
+ * counts as 0. */
+static int save_file_stat(const char *path)
+{
+   int64_t mtime = 0;
+   int64_t size  = path_get_size(path);
+   uint32_t key;
+   if (size < 0)
+      return 1;
+   if (!path_get_mtime(path, &mtime))
+      mtime = 0;
+   key = ((uint32_t)size * 2654435761u ^ (uint32_t)mtime
+         ^ (uint32_t)((uint64_t)mtime >> 32) * 40503u) & 0x7FFFFFFFu;
+   return key > 1 ? (int)key : 2;
+}
+
+/* At load and after each own write: read back, not taken from the
+ * clock, so coarse mtimes (FAT: 2 s) never look like a change. */
+static void save_file_keep_stat(struct save_file *f, const char *path)
+{
+   if (f)
+      retro_atomic_store_release_int(&f->stat, save_file_stat(path));
+}
+
+/* Another program wrote @path since it was loaded or last written
+ * here: it owes a copy. Not when it is gone: nothing to keep. */
+static bool save_file_changed(struct save_file *f, const char *path)
+{
+   int stat, now;
+   if (     !f
+         || !(stat = retro_atomic_load_acquire_int(&f->stat))
+         || (now = save_file_stat(path)) == stat
+         || now == 1)
+      return false;
+   save_file_owe(f, SAVE_BACKUP_CHANGED_ELSEWHERE);
+   return true;
 }
 
 /* All 0x00 or all 0xFF */
@@ -352,6 +395,7 @@ static void autosave_recover(autosave_t *save, const void *image)
  * save, but makes none. */
 static void autosave_put(autosave_t *save, const void *image, bool flush)
 {
+   bool changed;
    if (     save->unwritten && !save->bufsize
          && !path_is_valid(save->path))
    {
@@ -361,13 +405,19 @@ static void autosave_put(autosave_t *save, const void *image, bool flush)
    if (!save->unwritten && !memcmp(save->buffer, image, save->bufsize))
       return;
    save->unwritten = true;
+   changed         = save_file_changed(save->file, save->path);
    if (save_file_pay(save->file, save->path, image, save->bufsize,
             true, true))
    {
+      /* Told once its copy is made */
+      if (changed)
+         retro_atomic_fetch_or_int(&save->file->flags,
+               SAVE_FILE_CHANGED_ELSEWHERE);
       if (autosave_write(save, image))
       {
          memcpy(save->buffer, image, save->bufsize);
          save->unwritten = false;
+         save_file_keep_stat(save->file, save->path);
          return;
       }
       if (!flush && save->file)
@@ -595,7 +645,8 @@ static void save_file_check_notices(struct save_file *f, const char *path,
 {
    int flags;
    const int raised = SAVE_FILE_BACKUP_FAILED | SAVE_FILE_WRITE_FAILED
-      | SAVE_FILE_FLUSH_RECOVERED | SAVE_FILE_FLUSH_LOST;
+      | SAVE_FILE_FLUSH_RECOVERED | SAVE_FILE_FLUSH_LOST
+      | SAVE_FILE_CHANGED_ELSEWHERE;
    if (     !f
          || !(retro_atomic_load_acquire_int(&f->flags) & raised))
       return;
@@ -611,6 +662,12 @@ static void save_file_check_notices(struct save_file *f, const char *path,
    {
       retro_atomic_fetch_or_int(&f->flags, SAVE_FILE_WRITE_NOTICED);
       save_file_notice(MSG_SAVE_WRITE_FAILED, path, false);
+   }
+   if (     (flags & SAVE_FILE_CHANGED_ELSEWHERE)
+         && !(flags & SAVE_FILE_CHANGED_NOTICED))
+   {
+      retro_atomic_fetch_or_int(&f->flags, SAVE_FILE_CHANGED_NOTICED);
+      save_file_notice(MSG_SAVE_CHANGED_ELSEWHERE, path, false);
    }
    if (flags & SAVE_FILE_FLUSH_RECOVERED)
       save_file_notice(MSG_SAVE_WRITE_RECOVERED, path, log);
@@ -1052,6 +1109,7 @@ static bool content_save_ram_file(unsigned slot, bool compress, bool sync,
    struct ram_type ram;
    retro_ctx_memory_info_t mem_info;
    struct save_file *f;
+   bool changed;
 
    /* Memory that had a size this session and reports 0 bytes, its
     * pointer kept, was erased: its save is emptied. */
@@ -1098,6 +1156,7 @@ static bool content_save_ram_file(unsigned slot, bool compress, bool sync,
       }
    }
 
+   changed = save_file_changed(f, ram.path);
    if (!save_file_pay(f, ram.path, mem_info.data, mem_info.size,
             copy, sync))
    {
@@ -1125,6 +1184,11 @@ static bool content_save_ram_file(unsigned slot, bool compress, bool sync,
       save_file_recover(ram.path, mem_info.data, mem_info.size, sync);
       return false;
    }
+
+   if (     changed
+         && !(retro_atomic_fetch_or_int(&f->flags, SAVE_FILE_CHANGED_NOTICED)
+            & SAVE_FILE_CHANGED_NOTICED))
+      save_file_notice(MSG_SAVE_CHANGED_ELSEWHERE, ram.path, true);
 
    if (!sync)
       save_files_unsynced = true;
@@ -1157,6 +1221,7 @@ static bool content_save_ram_file(unsigned slot, bool compress, bool sync,
          goto fail;
    }
 
+   save_file_keep_stat(f, ram.path);
    RARCH_LOG("[SRAM] %s \"%s\".\n",
          msg_hash_to_str(MSG_SAVED_SUCCESSFULLY_TO),
          ram.path);
@@ -1229,6 +1294,9 @@ bool event_load_save_files(bool is_sram_load_disabled)
 
    if (!task_save_files)
       return false;
+
+   for (i = 0; i < task_save_files->size; i++)
+      save_file_keep_stat(save_file_get(i), task_save_files->elems[i].data);
 
    /* Not loaded on request: copied before anything writes over it. */
    if (is_sram_load_disabled)

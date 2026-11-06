@@ -161,7 +161,6 @@ static unsigned notices(enum msg_hash_enums msg)
    return n;
 }
 
-#ifdef HAVE_THREADS
 /* Lines logged as a warning that are the notice @msg. */
 static unsigned logged_msg(enum msg_hash_enums msg)
 {
@@ -169,7 +168,6 @@ static unsigned logged_msg(enum msg_hash_enums msg)
    snprintf(text, sizeof(text), "msg%d ", (int)msg);
    return logged('W', text);
 }
-#endif
 
 static runloop_state_t runloop_st;
 
@@ -198,7 +196,8 @@ bool test_write_atomic_synced(const char *path, const void *data,
 
 /* The test VFS: the built-in one, counting opens of the save's own
  * files for writing and cutting each at cut_at bytes, or refusing
- * their renames. Copies and recovery files are written as usual. */
+ * their renames, and with fat_mtime reporting mtimes in 2 s steps as
+ * FAT does. Copies and recovery files are written as usual. */
 #define MAX_OPEN 8
 #ifdef HAVE_THREADS
 static slock_t *vfs_lock;
@@ -320,6 +319,16 @@ static int RETRO_CALLCONV test_rename(const char *old_path,
    return ret;
 }
 
+static bool fat_mtime;
+
+static int RETRO_CALLCONV fat_get_mtime(const char *path, int64_t *mtime)
+{
+   int ret = retro_vfs_get_mtime_impl(path, mtime);
+   if (!ret && fat_mtime)
+      *mtime &= ~(int64_t)1;
+   return ret;
+}
+
 static struct retro_vfs_interface test_iface;
 
 static void use_test_vfs(bool on)
@@ -338,9 +347,16 @@ static void use_test_vfs(bool on)
    test_iface.remove   = retro_vfs_file_remove_impl;
    test_iface.rename   = test_rename;
    test_iface.truncate = retro_vfs_file_truncate_impl;
-   info.required_interface_version = FILESTREAM_REQUIRED_VFS_VERSION;
+   test_iface.stat     = retro_vfs_stat_impl;
+   test_iface.mkdir    = retro_vfs_mkdir_impl;
+   test_iface.stat_64  = retro_vfs_stat_64_impl;
+   test_iface.set_readonly = retro_vfs_set_readonly_impl;
+   test_iface.get_mtime    = fat_get_mtime;
+   test_iface.set_mtime    = retro_vfs_set_mtime_impl;
+   info.required_interface_version = METADATA_REQUIRED_VFS_VERSION;
    info.iface                      = on ? &test_iface : NULL;
    filestream_vfs_init(&info);
+   path_vfs_init(&info);
 }
 
 static void set_vfs(int64_t cut, bool refuse)
@@ -522,6 +538,105 @@ static void put_cut_rzip(const char *path, const void *data, size_t len,
    memcpy(out, buf, (size_t)*out_len);
    free(buf);
    put(path, out, (size_t)*out_len);
+}
+
+/* Another program writes @len bytes of @data over @path, its mtime
+ * @ahead seconds after the file's. */
+static void put_elsewhere(const char *path, const void *data, size_t len,
+      int64_t ahead)
+{
+   int64_t mtime = 0;
+   path_get_mtime(path, &mtime);
+   put(path, data, len);
+   if (ahead)
+      path_set_mtime(path, mtime + ahead);
+}
+
+/* A1-18 with no worker and FAT mtimes: the close write backs up what
+ * another program wrote and says so once a session. Its own writes,
+ * a flush's included, never do, nor does a save removed meanwhile. */
+static void lane_changed_elsewhere_close(void)
+{
+   static unsigned char disk[BIG], ram[BIG], other[BIG];
+   char newest[PATH_MAX_LENGTH];
+   int64_t mtime = 0;
+   const enum save_backup_reason ce = SAVE_BACKUP_CHANGED_ELSEWHERE;
+
+   clean();
+   fill(disk, BIG, 51);
+   put(SAVE, disk, BIG);
+   /* Aged: an own write never stats as the load did, so only the stat
+    * each write keeps matches the next one. */
+   CHECK(path_get_mtime(SAVE, &mtime) && path_set_mtime(SAVE, mtime - 60),
+         "changed_close: cannot age the save");
+   memset(ram, 0, BIG);
+   core_data = ram;
+   core_size = BIG;
+   use_test_vfs(true);
+   fat_mtime = true;
+   path_init_savefile_new();
+   path_init_savefile_rtc(SAVE);
+   CHECK(event_load_save_files(false), "changed_close: no load");
+
+   fill(ram, BIG, 52);
+   event_save_files(true, false, true, true, NULL);
+   fill(ram, BIG, 53);
+   event_flush_save_files(true, false, 1 << SAVE_BACKUP_BEFORE_STATE_LOAD);
+   fill(ram, BIG, 57);
+   event_save_files(true, false, true, true, NULL);
+   CHECK(holds(SAVE, ram, BIG), "changed_close: an own write not written");
+   CHECK(copies("backups", SAVE_BACKUP_REASON_LAST, NULL, 0) == 1
+         && copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, NULL, 0) == 1,
+         "changed_close: an own write was backed up");
+   CHECK(!notice_num, "changed_close: an own write told");
+
+   remove(SAVE);
+   fill(ram, BIG, 58);
+   event_save_files(true, false, true, true, NULL);
+   CHECK(holds(SAVE, ram, BIG)
+         && copies("backups", SAVE_BACKUP_REASON_LAST, NULL, 0) == 1,
+         "changed_close: a removed save was backed up");
+   CHECK(!notice_num, "changed_close: a removed save told");
+
+   /* Same size, later mtime */
+   fill(other, BIG, 54);
+   put_elsewhere(SAVE, other, BIG, 4);
+   fill(ram, BIG, 55);
+   event_save_files(true, false, true, true, NULL);
+   CHECK(copies("backups", ce, newest, sizeof(newest)) == 1
+         && holds(newest, other, BIG),
+         "changed_close: no copy of the other program's save");
+   CHECK(copies("backups", SAVE_BACKUP_REASON_LAST, NULL, 0) == 2
+         && !copies("cfg/recovery", SAVE_BACKUP_REASON_LAST, NULL, 0),
+         "changed_close: another copy or recovery file");
+   CHECK(holds(SAVE, ram, BIG), "changed_close: not written after the copy");
+   CHECK(notices(MSG_SAVE_CHANGED_ELSEWHERE) == 1 && notice_num == 1,
+         "changed_close: not one notice");
+   CHECK(logged_msg(MSG_SAVE_CHANGED_ELSEWHERE) == 1,
+         "changed_close: not one log line");
+
+   /* Same mtime step, another size */
+   put_elsewhere(SAVE, other, BIG / 2, 0);
+   fill(ram, BIG, 56);
+   event_save_files(true, false, true, true, NULL);
+   CHECK(copies("backups", ce, newest, sizeof(newest)) == 2
+         && holds(newest, other, BIG / 2),
+         "changed_close: a size change was not backed up");
+   CHECK(holds(SAVE, ram, BIG), "changed_close: not written after a size change");
+   CHECK(notices(MSG_SAVE_CHANGED_ELSEWHERE) == 1 && notice_num == 1,
+         "changed_close: a second notice");
+
+   fill(ram, BIG, 59);
+   event_save_files(true, false, true, true, NULL);
+   CHECK(holds(SAVE, ram, BIG)
+         && copies("backups", SAVE_BACKUP_REASON_LAST, NULL, 0) == 3,
+         "changed_close: an own write after it was backed up");
+   CHECK(notice_num == 1 && logged_msg(MSG_SAVE_CHANGED_ELSEWHERE) == 1,
+         "changed_close: an own write after it told");
+   fat_mtime = false;
+   use_test_vfs(false);
+   path_deinit_savefile();
+   clean();
 }
 
 /* A1-17 with no worker: the flush before a state load writes the
@@ -1268,6 +1383,93 @@ static void start_parked_at(const char *path, void *ram)
 static void start_parked(void *ram)
 {
    start_parked_at(SAVE, ram);
+}
+
+/* A1-18 with a worker and FAT mtimes: the worker's stat after its own
+ * writes, two flushes back to back included, keeps them from looking
+ * like another program's; another program's write is backed up before
+ * the next one, with one notice, on screen only. */
+static void lane_changed_elsewhere_worker(void)
+{
+   static unsigned char disk[BIG], ram[BIG], other[BIG];
+   char newest[PATH_MAX_LENGTH];
+   int64_t mtime = 0;
+   unsigned i;
+   const enum save_backup_reason ce = SAVE_BACKUP_CHANGED_ELSEWHERE;
+
+   clean();
+   fill(disk, BIG, 61);
+   put(SAVE, disk, BIG);
+   CHECK(path_get_mtime(SAVE, &mtime) && path_set_mtime(SAVE, mtime - 60),
+         "changed_worker: cannot age the save");
+   memset(ram, 0, BIG);
+   core_data = ram;
+   core_size = BIG;
+   use_test_vfs(true);
+   fat_mtime = true;
+   path_init_savefile_new();
+   path_init_savefile_rtc(SAVE);
+   CHECK(event_load_save_files(false), "changed_worker: no load");
+   start_parked_at(SAVE, ram);
+   ram[0] = 1;
+   event_flush_save_files(true, false, 0);
+   ram[0] = 2;
+   event_flush_save_files(true, false, 0);
+   retro_atomic_store_release_int(&gate_open, 1);
+   wait_flushed();
+   wait_requested();
+   for (i = 0; i < 3; i++)
+   {
+      ram[0] = (unsigned char)(i + 3);
+      capture_and_wait();
+   }
+   capture_and_wait();
+   CHECK(holds(SAVE, ram, BIG), "changed_worker: an own write not written");
+   CHECK(!copies("backups", SAVE_BACKUP_REASON_LAST, NULL, 0),
+         "changed_worker: an own write was backed up");
+   CHECK(!notice_num, "changed_worker: an own write told");
+
+   fill(other, BIG, 62);
+   put_elsewhere(SAVE, other, BIG, 4);
+   ram[0] = 9;
+   capture_and_wait();
+   capture_and_wait();
+   CHECK(copies("backups", ce, newest, sizeof(newest)) == 1
+         && holds(newest, other, BIG),
+         "changed_worker: no copy of the other program's save");
+   CHECK(copies("backups", SAVE_BACKUP_REASON_LAST, NULL, 0) == 1
+         && !copies("cfg/recovery", SAVE_BACKUP_REASON_LAST, NULL, 0),
+         "changed_worker: another copy or recovery file");
+   CHECK(holds(SAVE, ram, BIG), "changed_worker: not written after the copy");
+   CHECK(notices(MSG_SAVE_CHANGED_ELSEWHERE) == 1 && notice_num == 1,
+         "changed_worker: not one notice");
+
+   put_elsewhere(SAVE, other, BIG / 2, 0);
+   ram[0] = 10;
+   capture_and_wait();
+   capture_and_wait();
+   CHECK(copies("backups", ce, newest, sizeof(newest)) == 2
+         && holds(newest, other, BIG / 2),
+         "changed_worker: a size change was not backed up");
+   CHECK(notices(MSG_SAVE_CHANGED_ELSEWHERE) == 1 && notice_num == 1,
+         "changed_worker: a second notice");
+
+   ram[0] = 11;
+   capture_and_wait();
+   capture_and_wait();
+   CHECK(holds(SAVE, ram, BIG)
+         && copies("backups", SAVE_BACKUP_REASON_LAST, NULL, 0) == 2,
+         "changed_worker: an own write after it was backed up");
+   CHECK(notice_num == 1, "changed_worker: an own write after it told");
+   stop();
+   gate_next = false;
+   gate_ec   = NULL;
+   CHECK(notice_num == 1 && !logged('W', "") && !logged('E', ""),
+         "changed_worker: logged or told at the end");
+   fat_mtime = false;
+   use_test_vfs(false);
+   path_deinit_savefile();
+   clean();
 }
 
 /* A flush and a filled snapshot pending together, whichever came
@@ -2547,6 +2749,92 @@ static void lane_create_retry(void)
 }
 #endif
 
+/* A1-18 when its copy cannot be made: the other program's save stays,
+ * and nothing says it is in Save Backups until it is. */
+static void lane_changed_elsewhere_copy_fails(void)
+{
+   static unsigned char disk[BIG], ram[BIG], other[BIG];
+   char newest[PATH_MAX_LENGTH];
+   const char *save = "blk/game.srm";
+   unsigned c;
+
+   for (c = 0; c < 2; c++)
+   {
+      bool worker = c == 1;
+#ifndef HAVE_THREADS
+      if (worker)
+         break;
+#endif
+      clean();
+      path_mkdir("blk");
+      fill(disk, BIG, 81);
+      put(save, disk, BIG);
+      memset(ram, 0, BIG);
+      core_data = ram;
+      core_size = BIG;
+      use_test_vfs(true);
+      fat_mtime = true;
+      path_init_savefile_new();
+      path_init_savefile_rtc(save);
+      CHECK(event_load_save_files(false), "changed_fails: no load");
+#ifdef HAVE_THREADS
+      if (worker)
+         start_at(save, ram, BIG, false);
+#endif
+      put("blk/backups", "x", 1);
+      fill(other, BIG, 82);
+      put_elsewhere(save, other, BIG, 4);
+      fill(ram, BIG, 83);
+#ifdef HAVE_THREADS
+      if (worker)
+      {
+         capture_and_wait();
+         capture_and_wait();
+      }
+      else
+#endif
+         event_save_files(true, false, true, true, NULL);
+      CHECK(holds(save, other, BIG),
+            "changed_fails: the other's save written over");
+      CHECK(copies("cfg/recovery", SAVE_BACKUP_UNSAVED, newest,
+               sizeof(newest)) == !worker
+            && (worker || holds(newest, ram, BIG)),
+            "changed_fails: not one recovery file of the close");
+      CHECK(!notices(MSG_SAVE_CHANGED_ELSEWHERE) && notice_num == 1
+            && !logged_msg(MSG_SAVE_CHANGED_ELSEWHERE),
+            "changed_fails: told it is in Save Backups");
+
+      filestream_delete("blk/backups");
+#ifdef HAVE_THREADS
+      if (worker)
+      {
+         capture_and_wait();
+         capture_and_wait();
+      }
+      else
+#endif
+         event_save_files(true, false, true, true, NULL);
+      CHECK(copies("blk/backups", SAVE_BACKUP_CHANGED_ELSEWHERE, newest,
+               sizeof(newest)) == 1 && holds(newest, other, BIG)
+            && copies("blk/backups", SAVE_BACKUP_REASON_LAST, NULL, 0) == 1,
+            "changed_fails: not backed up once it could be");
+      CHECK(holds(save, ram, BIG), "changed_fails: not written then");
+      CHECK(notices(MSG_SAVE_CHANGED_ELSEWHERE) == 1 && notice_num == 2
+            && logged_msg(MSG_SAVE_CHANGED_ELSEWHERE) == !worker,
+            "changed_fails: not told then");
+#ifdef HAVE_THREADS
+      if (worker)
+         stop();
+#endif
+      fat_mtime = false;
+      use_test_vfs(false);
+      path_deinit_savefile();
+      clear_dir("blk/backups");
+      path_rmdir("blk/backups");
+   }
+   clean();
+}
+
 /* A1-4: a save that is there but does not read is copied as it is on
  * disk before the first write over it; one notice at load. */
 static void lane_unreadable_backed_up(void)
@@ -2893,6 +3181,48 @@ static void lane_recovery_no_mtime(void)
    clean();
 }
 
+/* A save with no mtime: own writes are not changes, nor is the unknown
+ * time; another program's size change still is. */
+static void lane_changed_no_mtime(void)
+{
+   static unsigned char disk[BIG], ram[BIG], other[BIG];
+   char newest[PATH_MAX_LENGTH];
+
+   clean();
+   fill(disk, BIG, 91);
+   put(SAVE, disk, BIG);
+   memset(ram, 0, BIG);
+   core_data = ram;
+   core_size = BIG;
+   use_no_mtime(true);
+   path_init_savefile_new();
+   path_init_savefile_rtc(SAVE);
+   CHECK(event_load_save_files(false), "changed_no_mtime: no load");
+   fill(ram, BIG, 92);
+   event_save_files(true, false, true, true, NULL);
+   fill(ram, BIG, 93);
+   event_save_files(true, false, true, true, NULL);
+   CHECK(holds(SAVE, ram, BIG)
+         && !copies("backups", SAVE_BACKUP_REASON_LAST, NULL, 0)
+         && !notice_num,
+         "changed_no_mtime: an own write was backed up or told");
+
+   fill(other, BIG, 94);
+   put(SAVE, other, BIG / 2);
+   fill(ram, BIG, 95);
+   event_save_files(true, false, true, true, NULL);
+   CHECK(copies("backups", SAVE_BACKUP_CHANGED_ELSEWHERE, newest,
+            sizeof(newest)) == 1 && holds(newest, other, BIG / 2)
+         && copies("backups", SAVE_BACKUP_REASON_LAST, NULL, 0) == 1,
+         "changed_no_mtime: a size change was not backed up");
+   CHECK(holds(SAVE, ram, BIG) && notices(MSG_SAVE_CHANGED_ELSEWHERE) == 1
+         && notice_num == 1,
+         "changed_no_mtime: not written, or not told once");
+   use_no_mtime(false);
+   path_deinit_savefile();
+   clean();
+}
+
 /* --sram-mode noload-save: the save is not loaded, so it is copied
  * before the first write over it. */
 static void lane_noload_save(void)
@@ -3196,6 +3526,7 @@ int main(void)
    lane_recovery_announced();
    lane_recovery_elsewhere();
    lane_recovery_no_mtime();
+   lane_changed_no_mtime();
    lane_noload_save();
    lane_explicit_request();
    lane_cut_copy_old_core();
@@ -3207,10 +3538,13 @@ int main(void)
    lane_flush_copy_fails_sync();
    lane_flush_write_fails_sync();
    lane_flush_same_image_sync();
+   lane_changed_elsewhere_close();
+   lane_changed_elsewhere_copy_fails();
 #ifdef HAVE_THREADS
    retro_atomic_int_init(&wait_entries, 0);
    retro_atomic_int_init(&wait_leaves, 0);
    lane_state_load_copy_worker();
+   lane_changed_elsewhere_worker();
    lane_flush_with_snapshot();
    lane_flush_queue();
    lane_flush_retire_guard();

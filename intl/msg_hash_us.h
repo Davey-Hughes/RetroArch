@@ -32998,6 +32998,10 @@ MSG_HASH(
    "Unsaved progress for %s is in Save Backups."
    )
 MSG_HASH(
+   MSG_SAVE_CHANGED_ELSEWHERE,
+   "%s changed outside RetroArch; that version is in Save Backups."
+   )
+MSG_HASH(
    MSG_FAILED_TO_SAVE_STATE_TO,
    "Failed to save state to"
    )
