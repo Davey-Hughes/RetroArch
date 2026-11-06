@@ -39,7 +39,9 @@ BASE_CFLAGS := $(CFLAGS) -std=gnu89 -Wall -g -O1 \
           -ffunction-sections -fdata-sections \
           -I$(ROOT) -I$(ROOT)/libretro-common/include
 CFLAGS := $(BASE_CFLAGS) -Wextra -DHAVE_THREADS
-IO_CFLAGS := $(BASE_CFLAGS) -Wextra -Wno-unused-parameter -DHAVE_COMPRESSION
+# RARCH_INTERNAL, as the frontend builds it, for path_resolve_realpath()
+IO_CFLAGS := $(BASE_CFLAGS) -Wextra -Wno-unused-parameter -DHAVE_COMPRESSION \
+             -DRARCH_INTERNAL
 LDFLAGS += -Wl,--gc-sections
 LDLIBS += -lpthread
 

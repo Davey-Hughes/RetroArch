@@ -74,6 +74,15 @@ static int test_dir_sync(const char *dir)
 #define filestream_write_file_atomic_synced test_write_synced
 #define filestream_sync test_sync
 #define retro_vfs_dir_sync_impl test_dir_sync
+#if defined(SAVE_BACKUPS_PATH_MAX) && !defined(_WIN32)
+/* Win32's limit as from a run folder no deeper than RUN_UNITS: main()
+ * adds what this one has past that, so the lanes pass from any folder.
+ * Windows itself keeps the real limit. */
+#define RUN_UNITS 124
+static long path_max = SAVE_BACKUPS_PATH_MAX;
+#undef SAVE_BACKUPS_PATH_MAX
+#define SAVE_BACKUPS_PATH_MAX path_max
+#endif
 #include "../../../save_backups.c"
 #undef rtime_localtime
 #undef strftime
@@ -135,6 +144,63 @@ static size_t count_files(const char *dir)
    if (l)
       string_list_free(l);
    return n;
+}
+
+#ifdef SAVE_BACKUPS_PATH_MAX
+/* UTF-16 units in @s */
+static long units(const char *s)
+{
+   long n = 0;
+   for (; *s; s++)
+      if (((unsigned char)*s & 0xC0) != 0x80)
+         n += (unsigned char)*s >= 0xF0 ? 2 : 1;
+   return n;
+}
+
+/* UTF-16 units in @path's full path, the run folder's included */
+static long full_units(const char *path)
+{
+   static char s[PATH_MAX_LENGTH];
+   strlcpy(s, path, sizeof(s));
+   if (!path_is_absolute(s))
+      CHECK(path_resolve_realpath(s, sizeof(s), false));
+   return units(s);
+}
+#endif
+
+/* The most bytes of an ASCII game a copy into @dir keeps with this core
+ * and extension: the name's 199 less 53 for the separators, the time, a
+ * number and the longest reason, and where a copy's path has a limit,
+ * no more than is left after the folder and ".tmp"; below 0 when not
+ * even an empty game fits. */
+static long game_limit(const char *dir, const char *core, const char *ext)
+{
+   long fixed = 53 + (long)(strlen(core) + strlen(ext));
+   long n     = 199 - fixed;
+#ifdef SAVE_BACKUPS_PATH_MAX
+   long room  = SAVE_BACKUPS_PATH_MAX - 4 - (full_units(dir) + 1) - fixed;
+   if (room < n)
+      n = room;
+#endif
+   return n;
+}
+
+/* Whether a long ASCII game in @dir is cut by the path, so its cut
+ * ends with the mark. */
+static bool path_cuts(const char *dir, const char *core, const char *ext)
+{
+   return game_limit(dir, core, ext)
+      < 146 - (long)(strlen(core) + strlen(ext));
+}
+
+/* Ends long ASCII @game where a copy into @dir cuts it. */
+static void cut_game(char *game, const char *dir, const char *core,
+      const char *ext)
+{
+   long n = game_limit(dir, core, ext);
+   if (path_cuts(dir, core, ext))
+      game[n - 1] = '~';
+   game[n] = '\0';
 }
 
 static bool holds(const char *path, const char *text)
@@ -209,6 +275,8 @@ static void backup_system_fallback(void)
 static void backup_names(void)
 {
    size_t i, n;
+   long cut, keep;
+   bool mark;
    struct save_backup_name p;
    char game[400];
    static char path[PATH_MAX_LENGTH], dir[PATH_MAX_LENGTH];
@@ -289,8 +357,12 @@ static void backup_names(void)
    set_time(10, 0, 1);
    CHECK(save_backups_copy_image(path, SAVE_BACKUP_BEFORE_STATE_LOAD, "h", 1, true)
          == SAVE_BACKUP_MADE);
-   l = dir_list_new(ROOT "/saves/backups", NULL, false, true, false, false);
-   n = 0;
+   /* 'a' and 67 two-byte characters, or what fits beside the mark */
+   cut  = game_limit(ROOT "/saves/backups", "Snes9x", ".srm");
+   mark = cut < 68;
+   cut  = mark ? 2 * cut - 2 : 135;
+   l   = dir_list_new(ROOT "/saves/backups", NULL, false, true, false, false);
+   n   = 0;
    for (i = 0; l && i < l->size; i++)
    {
       const char *name = path_basename(l->elems[i].data);
@@ -299,24 +371,27 @@ static void backup_names(void)
       n++;
       CHECK(strlen(name) < 200);
       CHECK(save_backups_parse(name, &p));
-      CHECK(p.game_len == 135);
-      CHECK(!memcmp(name, game, p.game_len));
-      CHECK(((unsigned char)name[p.game_len - 1] & 0xC0) == 0x80);
+      CHECK(p.game_len == (size_t)cut);
+      CHECK(!memcmp(name, game, p.game_len - mark));
+      CHECK(!mark || name[p.game_len - 1] == '~');
+      CHECK(((unsigned char)name[p.game_len - 1 - mark] & 0xC0) == 0x80);
       CHECK(!strcmp(name + p.ext_off, ".srm"));
    }
    CHECK(n == 2);
    if (l)
       string_list_free(l);
 
-   /* the cut keeps trailing spaces and dots */
-   memset(game, 'b', 134);
-   memcpy(game + 134, " .", 2);
-   memset(game + 136, 'c', 100);
-   strcpy(game + 236, ".srm");
+   /* the cut keeps trailing spaces and dots, before any mark */
+   keep = game_limit(ROOT "/override/backups", "Snes9x", ".srm")
+      - path_cuts(ROOT "/override/backups", "Snes9x", ".srm");
+   memset(game, 'b', (size_t)keep - 2);
+   memcpy(game + keep - 2, " .", 2);
+   memset(game + keep, 'c', 100);
+   strcpy(game + keep + 100, ".srm");
    fill_pathname_join(path, ROOT "/override", game, sizeof(path));
    CHECK(save_backups_copy_image(path, SAVE_BACKUP_CUT, "i", 1, true)
          == SAVE_BACKUP_MADE);
-   game[136] = '\0';
+   cut_game(game, ROOT "/override/backups", "Snes9x", ".srm");
    snprintf(dir, sizeof(dir), ROOT "/override/backups/%s"
          " - 2026-11-03 10-00-01 - Snes9x - cut.srm", game);
    CHECK(holds(dir, "i"));
@@ -511,7 +586,7 @@ static void backup_retention_cut(void)
             text, strlen(text), true) == SAVE_BACKUP_MADE);
    }
    CHECK(count_files(ROOT "/cut/backups") == 3 + 12);
-   game[136] = '\0';
+   cut_game(game, ROOT "/cut/backups", "Snes9x", ".srm");
    for (k = 0; k < 3; k++)
    {
       snprintf(name, sizeof(name), ROOT "/cut/backups/%s"
@@ -565,6 +640,7 @@ static void make_copies(const char *dir, const char *name, const char *core,
 static void backup_retention_long(void)
 {
    char a[200], c[200], core[48];
+   long n;
 
    strcpy(a, "Mario");
    memset(a + 5, ' ', 140);
@@ -574,28 +650,33 @@ static void backup_retention_long(void)
    CHECK(count_tagged(ROOT "/long1", 'a') == 3);
    CHECK(count_tagged(ROOT "/long1", 'c') == 10);
 
-   memset(a, 'y', 132);
-   strcpy(a + 132, " \xF0\x9F\x98\x80 tail.srm");
-   memset(c, 'y', 132);
-   strcpy(c + 132, ".srm");
+   n = game_limit(ROOT "/long2", "Snes9x", ".srm");
+   memset(a, 'y', (size_t)n - 4);
+   strcpy(a + n - 4, " \xF0\x9F\x98\x80 tail.srm");
+   memset(c, 'y', (size_t)n - 4);
+   strcpy(c + n - 4, ".srm");
    make_copies(ROOT "/long2", a, "Snes9x", 'a', 3, 0);
    make_copies(ROOT "/long2", c, "Snes9x", 'c', 12, 1);
    CHECK(count_tagged(ROOT "/long2", 'a') == 3);
    CHECK(count_tagged(ROOT "/long2", 'c') == 10);
 
-   /* 133 bytes is what a cut can leave: never pruned */
-   memset(c, 'w', 133);
-   strcpy(c + 133, ".srm");
+   /* 3 under the name's limit is what a cut can leave: never pruned.
+    * Whole at the path's limit, it has no mark: pruned. */
+   n = game_limit(ROOT "/long3", "Snes9x", ".srm");
+   memset(c, 'w', (size_t)n - 3);
+   strcpy(c + n - 3, ".srm");
    make_copies(ROOT "/long3", c, "Snes9x", 'c', 12, 1);
-   CHECK(count_tagged(ROOT "/long3", 'c') == 12);
+   CHECK(count_tagged(ROOT "/long3", 'c')
+         == (path_cuts(ROOT "/long3", "Snes9x", ".srm") ? 10 : 12));
 
-   /* a 40-byte core cuts at 102 */
+   /* a 40-byte core cuts shorter (at 102 by the name's limit) */
    memset(core, 'k', 40);
    core[40] = '\0';
+   n = game_limit(ROOT "/long4", core, ".srm");
    memset(a, 'v', 120);
    strcpy(a + 120, ".srm");
-   memset(c, 'v', 102);
-   strcpy(c + 102, ".srm");
+   memset(c, 'v', (size_t)n);
+   strcpy(c + n, ".srm");
    make_copies(ROOT "/long4", a, core, 'a', 3, 0);
    make_copies(ROOT "/long4", c, "Snes9x", 'c', 12, 1);
    CHECK(count_tagged(ROOT "/long4", 'a') == 3);
@@ -606,6 +687,227 @@ static void backup_retention_long(void)
    CHECK(count_tagged(ROOT "/long4", 'a') == 4);
    CHECK(count_tagged(ROOT "/long4", 'c') == 10);
 }
+
+/* Copies cut to fit a folder elsewhere, then synced here: their marked
+ * game never counts, even for a file named exactly that. */
+static void backup_retention_mark(void)
+{
+   unsigned k;
+   char name[128];
+   for (k = 0; k < 12; k++)
+   {
+      snprintf(name, sizeof(name), ROOT "/mark/Mario~"
+            " - 2000-01-01 00-00-%02u - Snes9x - before-state-load.srm", k);
+      put(name, "a");
+   }
+   make_copies(ROOT "/mark", "Mario~.srm", "Snes9x", 'c', 12, 0);
+   CHECK(count_tagged(ROOT "/mark", 'a') == 12);
+   CHECK(count_tagged(ROOT "/mark", 'c') == 12);
+}
+
+#ifdef SAVE_BACKUPS_PATH_MAX
+/* ROOT "/<name>/dd..d", with the d that make the path of a file in it,
+ * up to its name, @len UTF-16 units long; false when the run folder is
+ * too long for that. */
+static bool deep_dir(char *dir, size_t size, const char *name, long len)
+{
+   long k;
+   size_t _len = (size_t)snprintf(dir, size, ROOT "/%s", name);
+   k           = len - full_units(dir) - 2;
+   if (k < 1 || _len + 1 + (size_t)k >= size)
+      return false;
+   dir[_len++] = '/';
+   memset(dir + _len, 'd', (size_t)k);
+   dir[_len + k] = '\0';
+   return true;
+}
+
+/* In a deep folder only the game is cut, at a character, to what fits
+ * beside the mark: the copy is made and reads back, and its recovery
+ * file is found. A file whose whole name is the cut's prefix and
+ * another character is not taken for it. */
+static void backup_deep(void)
+{
+   struct save_backup_name p;
+   char game[160];
+   char *q, *r;
+   static char dir[512], path[PATH_MAX_LENGTH];
+   static char s[PATH_MAX_LENGTH], t[PATH_MAX_LENGTH], u[PATH_MAX_LENGTH];
+   /* 24 units for the game */
+   CHECK(deep_dir(dir, sizeof(dir), "deep",
+         SAVE_BACKUPS_PATH_MAX - 4 - 63 - 24));
+   CHECK(game_limit(dir, "Snes9x", ".srm") == 24);
+   set_time(21, 0, 0);
+   memcpy(game, "Deep", 4);
+   memset(game + 4, 'x', 19);
+   strcpy(game + 23, "Q.srm");
+   fill_pathname_join(path, dir, game, sizeof(path));
+   CHECK(save_backups_copy_to(dir, path, "Snes9x", SAVE_BACKUP_CUT,
+         "d1", 2, true) == SAVE_BACKUP_MADE);
+   game[24] = '\0';
+   snprintf(s, sizeof(s), "%s/%s - 2026-11-03 21-00-00 - Snes9x - cut.srm",
+         dir, game);
+   CHECK(holds(s, "d1"));
+   memset(game + 4, 'x', 100);
+   strcpy(game + 104, ".srm");
+   fill_pathname_join(path, dir, game, sizeof(path));
+   CHECK(save_backups_copy_to(dir, path, "Snes9x", SAVE_BACKUP_CUT,
+         "d1", 2, true) == SAVE_BACKUP_MADE);
+   CHECK(save_backups_copy_to(dir, path, "Snes9x",
+         SAVE_BACKUP_BEFORE_STATE_LOAD, "d2", 2, true) == SAVE_BACKUP_MADE);
+   strcpy(game + 23, "~");
+   snprintf(s, sizeof(s), "%s/%s - 2026-11-03 21-00-00 - Snes9x - cut.srm",
+         dir, game);
+   CHECK(holds(s, "d1"));
+   snprintf(s, sizeof(s), "%s/%s - 2026-11-03 21-00-00-2 - Snes9x"
+         " - before-state-load.srm", dir, game);
+   CHECK(holds(s, "d2"));
+   CHECK(full_units(s) + 4 <= SAVE_BACKUPS_PATH_MAX);
+   CHECK(save_backups_parse(path_basename(s), &p));
+   CHECK(p.game_len == 24 && p.number == 2);
+   CHECK(p.reason == SAVE_BACKUP_BEFORE_STATE_LOAD);
+
+   /* a 4-byte character is 2 units */
+   memset(game, 'e', 22);
+   strcpy(game + 22, "\xF0\x9F\x98\x80 tail.srm");
+   fill_pathname_join(path, dir, game, sizeof(path));
+   CHECK(save_backups_copy_to(dir, path, "Snes9x", SAVE_BACKUP_CUT,
+         "d3", 2, true) == SAVE_BACKUP_MADE);
+   strcpy(game + 22, "~");
+   snprintf(s, sizeof(s), "%s/%s - 2026-11-03 21-00-00 - Snes9x - cut.srm",
+         dir, game);
+   CHECK(holds(s, "d3"));
+   memset(game, 'f', 22);
+   strcpy(game + 22, "\xF0\x9F\x98\x80.srm");
+   fill_pathname_join(path, dir, game, sizeof(path));
+   CHECK(save_backups_copy_to(dir, path, "Snes9x", SAVE_BACKUP_CUT,
+         "d4", 2, true) == SAVE_BACKUP_MADE);
+   game[26] = '\0';
+   snprintf(s, sizeof(s), "%s/%s - 2026-11-03 21-00-00 - Snes9x - cut.srm",
+         dir, game);
+   CHECK(holds(s, "d4"));
+
+   save_backups_set_roots(dir, NULL, NULL, NULL, NULL, NULL, "Snes9x");
+   memcpy(game, "Deep", 4);
+   memset(game + 4, 'r', 100);
+   strcpy(game + 104, ".srm");
+   fill_pathname_join(path, dir, game, sizeof(path));
+   CHECK(save_backups_recover(s, sizeof(s), path, "r1", 2, true));
+   CHECK(save_backups_find_recovery(t, sizeof(t), path, INT64_MIN));
+   CHECK(*s && same_path(s, t));
+   /* a newer one beside it, whole: the cut's prefix and Q */
+   strlcpy(u, s, sizeof(u));
+   q = strrchr(u, '~');
+   r = strstr(u, " 21-00-00 ");
+   CHECK(q && r);
+   if (q && r)
+   {
+      *q   = 'Q';
+      r[8] = '1';
+      put(u, "r1");
+      CHECK(save_backups_find_recovery(t, sizeof(t), path, INT64_MIN));
+      CHECK(*s && same_path(s, t));
+   }
+}
+
+/* The shortest cut game is the mark alone. A copy whose name does not
+ * fit even so is not made, and its save's copy stays owed. */
+static void backup_no_room(void)
+{
+   struct save_backup_name p;
+   static char dir[512], path[PATH_MAX_LENGTH];
+   static char s[PATH_MAX_LENGTH];
+   set_time(22, 0, 0);
+   CHECK(deep_dir(dir, sizeof(dir), "room0", SAVE_BACKUPS_PATH_MAX - 4 - 63));
+   CHECK(game_limit(dir, "Snes9x", ".srm") == 0);
+   fill_pathname_join(path, dir, "Game.srm", sizeof(path));
+   CHECK(save_backups_copy_to(dir, path, "Snes9x",
+         SAVE_BACKUP_BEFORE_STATE_LOAD, "n1", 2, true) == SAVE_BACKUP_MADE);
+   snprintf(s, sizeof(s),
+         "%s/~ - 2026-11-03 22-00-00 - Snes9x - before-state-load.srm", dir);
+   CHECK(holds(s, "n1"));
+   CHECK(save_backups_parse(path_basename(s), &p) && p.game_len == 1);
+
+   /* past the room kept for the longest reason, a shorter one fits */
+   CHECK(deep_dir(dir, sizeof(dir), "room10",
+         SAVE_BACKUPS_PATH_MAX - 4 - 63 + 10));
+   fill_pathname_join(path, dir, "Game.srm", sizeof(path));
+   CHECK(save_backups_copy_to(dir, path, "Snes9x", SAVE_BACKUP_CUT,
+         "n2", 2, true) == SAVE_BACKUP_MADE);
+   snprintf(s, sizeof(s), "%s/~ - 2026-11-03 22-00-00 - Snes9x - cut.srm", dir);
+   CHECK(holds(s, "n2"));
+   CHECK(save_backups_copy_to(dir, path, "Snes9x",
+         SAVE_BACKUP_BEFORE_STATE_LOAD, "n3", 2, true) == SAVE_BACKUP_FAILED);
+   CHECK(count_files(dir) == 1);
+
+   CHECK(deep_dir(dir, sizeof(dir), "noroom", SAVE_BACKUPS_PATH_MAX - 29));
+   fill_pathname_join(path, dir, "Game.srm", sizeof(path));
+   CHECK(save_backups_copy_to(dir, path, "Snes9x", SAVE_BACKUP_CUT,
+         "n4", 2, true) == SAVE_BACKUP_FAILED);
+   CHECK(count_files(dir) == 0);
+
+   /* a path and its ".tmp" fit in 259 units, not 260; that name is 42 */
+   CHECK(deep_dir(dir, sizeof(dir), "edge", SAVE_BACKUPS_PATH_MAX - 4 - 42));
+   fill_pathname_join(path, dir, "Game.srm", sizeof(path));
+   CHECK(save_backups_copy_to(dir, path, "Snes9x", SAVE_BACKUP_CUT,
+         "n5", 2, true) == SAVE_BACKUP_MADE);
+   snprintf(s, sizeof(s), "%s/~ - 2026-11-03 22-00-00 - Snes9x - cut.srm", dir);
+   CHECK(holds(s, "n5"));
+   CHECK(full_units(s) + 4 == SAVE_BACKUPS_PATH_MAX);
+   CHECK(deep_dir(dir, sizeof(dir), "edge1", SAVE_BACKUPS_PATH_MAX - 4 - 41));
+   fill_pathname_join(path, dir, "Game.srm", sizeof(path));
+   CHECK(save_backups_copy_to(dir, path, "Snes9x", SAVE_BACKUP_CUT,
+         "n6", 2, true) == SAVE_BACKUP_FAILED);
+   CHECK(count_files(dir) == 0);
+}
+
+/* Copies cut in a deep folder, the folder moved somewhere roomier: a
+ * file named exactly their cut game prunes none of them. */
+static void backup_moved(void)
+{
+   size_t _len = 0;
+   struct save_backup_name p;
+   char game[64];
+   static char dir[512];
+   struct string_list *l;
+   CHECK(deep_dir(dir, sizeof(dir), "moved",
+         SAVE_BACKUPS_PATH_MAX - 4 - 63 - 24));
+   memset(game, 'g', 40);
+   strcpy(game + 40, ".srm");
+   make_copies(dir, game, "Snes9x", 'a', 12, 0);
+   l = dir_list_new(dir, NULL, false, true, false, false);
+   if (     l && l->size
+         && save_backups_parse(path_basename(l->elems[0].data), &p)
+         && p.game_len < 40)
+   {
+      _len = p.game_len;
+      memcpy(game, path_basename(l->elems[0].data), _len);
+   }
+   CHECK(_len);
+   strcpy(game + _len, ".srm");
+   if (l)
+      string_list_free(l);
+   CHECK(!rename(dir, ROOT "/moved2"));
+   make_copies(ROOT "/moved2", game, "Snes9x", 'c', 12, 1);
+   CHECK(count_tagged(ROOT "/moved2", 'a') == 12);
+   CHECK(count_tagged(ROOT "/moved2", 'c') == 12);
+}
+
+/* A VFS URL has no path limit; on Windows "/dir" is on a drive. */
+static void backup_dir_units(void)
+{
+   CHECK(save_backups_dir_units("smb://host/share/saves") < 0);
+   CHECK(save_backups_dir_units("C://sbt") == 8);
+#ifdef _WIN32
+   {
+      static char s[PATH_MAX_LENGTH];
+      strlcpy(s, "/sbt", sizeof(s));
+      CHECK(path_resolve_realpath(s, sizeof(s), false));
+      CHECK(save_backups_dir_units("/sbt") == units(s) + 1);
+   }
+#endif
+}
+#endif
 
 static void recovery_chain(void)
 {
@@ -835,6 +1137,21 @@ static void backup_no_time(void)
 
 int main(void)
 {
+#ifdef SAVE_BACKUPS_PATH_MAX
+   char core[41];
+#ifdef RUN_UNITS
+   if (full_units(ROOT) > RUN_UNITS)
+      path_max += full_units(ROOT) - RUN_UNITS;
+#endif
+   memset(core, 'k', 40);
+   core[40] = '\0';
+   /* long4's game has the least room */
+   if (game_limit(ROOT "/long4", core, ".srm") < 4)
+   {
+      puts("FAIL save_backups_test: run folder too long");
+      return 1;
+   }
+#endif
    rm_tree(ROOT);
    CHECK(path_mkdir(ROOT));
    backup_folders();
@@ -846,6 +1163,13 @@ int main(void)
    backup_retention();
    backup_retention_cut();
    backup_retention_long();
+   backup_retention_mark();
+#ifdef SAVE_BACKUPS_PATH_MAX
+   backup_deep();
+   backup_no_room();
+   backup_moved();
+   backup_dir_units();
+#endif
    recovery_chain();
    recovery_newest_tie();
    backup_sync();

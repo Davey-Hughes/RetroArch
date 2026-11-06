@@ -4,6 +4,8 @@
 #   make check
 #   make check SANITIZER=address,undefined
 #   make CC=x86_64-w64-mingw32-gcc EXE=.exe LDFLAGS=-static
+#
+# _pathmax has the Windows path limit a copy's name fits to.
 
 ROOT              := ../../..
 LIBRETRO_COMM_DIR := $(ROOT)/libretro-common
@@ -32,7 +34,8 @@ THREAD_SOURCES := $(LIBRETRO_COMM_DIR)/rthreads/rthreads.c \
 	$(LIBRETRO_COMM_DIR)/rthreads/retro_eventcount.c \
 	$(LIBRETRO_COMM_DIR)/features/features_cpu.c
 
-CFLAGS += -std=gnu89 -Wall -g -O1 \
+# RARCH_INTERNAL, as the frontend builds it, for path_resolve_realpath()
+CFLAGS += -std=gnu89 -Wall -g -O1 -DRARCH_INTERNAL \
           -I$(ROOT) -I$(LIBRETRO_COMM_DIR)/include
 
 ifneq ($(SANITIZER),)
@@ -40,7 +43,7 @@ CFLAGS  += -fsanitize=$(SANITIZER) -fno-omit-frame-pointer
 LDFLAGS += -fsanitize=$(SANITIZER)
 endif
 
-all: $(TARGET)$(EXE) $(TARGET)_nothreads$(EXE)
+all: $(TARGET)$(EXE) $(TARGET)_nothreads$(EXE) $(TARGET)_pathmax$(EXE)
 
 $(TARGET)$(EXE): $(SOURCES) $(ROOT)/save_backups.c $(ROOT)/save_backups.h
 	$(CC) $(CFLAGS) -DHAVE_THREADS $(SOURCES) $(THREAD_SOURCES) $(LDFLAGS) -lpthread -o $@
@@ -48,12 +51,17 @@ $(TARGET)$(EXE): $(SOURCES) $(ROOT)/save_backups.c $(ROOT)/save_backups.h
 $(TARGET)_nothreads$(EXE): $(SOURCES) $(ROOT)/save_backups.c $(ROOT)/save_backups.h
 	$(CC) $(CFLAGS) $(SOURCES) $(LDFLAGS) -o $@
 
+$(TARGET)_pathmax$(EXE): $(SOURCES) $(ROOT)/save_backups.c $(ROOT)/save_backups.h
+	$(CC) $(CFLAGS) -DSAVE_BACKUPS_PATH_MAX=259 $(SOURCES) $(LDFLAGS) -o $@
+
 check: all
 	./$(TARGET)$(EXE)
 	./$(TARGET)_nothreads$(EXE)
+	./$(TARGET)_pathmax$(EXE)
 
 clean:
 	rm -f $(TARGET) $(TARGET).exe $(TARGET)_nothreads $(TARGET)_nothreads.exe
+	rm -f $(TARGET)_pathmax $(TARGET)_pathmax.exe
 	rm -rf save_backups_test_files
 
 .PHONY: all check clean
