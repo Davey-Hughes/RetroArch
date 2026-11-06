@@ -715,19 +715,30 @@ static bool deep_dir(char *dir, size_t size, const char *name, long len)
 
 /* In a deep folder only the game is cut, at a character, to what fits
  * beside the mark: the copy is made and reads back, and its recovery
- * file is found. */
+ * file is found. A file whose whole name is the cut's prefix and
+ * another character is not taken for it. */
 static void backup_deep(void)
 {
    struct save_backup_name p;
    char game[160];
+   char *q, *r;
    static char dir[512], path[PATH_MAX_LENGTH];
-   static char s[PATH_MAX_LENGTH], t[PATH_MAX_LENGTH];
+   static char s[PATH_MAX_LENGTH], t[PATH_MAX_LENGTH], u[PATH_MAX_LENGTH];
    /* 24 units for the game */
    CHECK(deep_dir(dir, sizeof(dir), "deep",
          SAVE_BACKUPS_PATH_MAX - 4 - 63 - 24));
    CHECK(game_limit(dir, "Snes9x", ".srm") == 24);
    set_time(21, 0, 0);
    memcpy(game, "Deep", 4);
+   memset(game + 4, 'x', 19);
+   strcpy(game + 23, "Q.srm");
+   fill_pathname_join(path, dir, game, sizeof(path));
+   CHECK(save_backups_copy_to(dir, path, "Snes9x", SAVE_BACKUP_CUT,
+         "d1", 2, true) == SAVE_BACKUP_MADE);
+   game[24] = '\0';
+   snprintf(s, sizeof(s), "%s/%s - 2026-11-03 21-00-00 - Snes9x - cut.srm",
+         dir, game);
+   CHECK(holds(s, "d1"));
    memset(game + 4, 'x', 100);
    strcpy(game + 104, ".srm");
    fill_pathname_join(path, dir, game, sizeof(path));
@@ -775,6 +786,19 @@ static void backup_deep(void)
    CHECK(save_backups_recover(s, sizeof(s), path, "r1", 2, true));
    CHECK(save_backups_find_recovery(t, sizeof(t), path, INT64_MIN));
    CHECK(*s && same_path(s, t));
+   /* a newer one beside it, whole: the cut's prefix and Q */
+   strlcpy(u, s, sizeof(u));
+   q = strchr(u, '~');
+   r = strstr(u, " 21-00-00 ");
+   CHECK(q && r);
+   if (q && r)
+   {
+      *q   = 'Q';
+      r[8] = '1';
+      put(u, "r1");
+      CHECK(save_backups_find_recovery(t, sizeof(t), path, INT64_MIN));
+      CHECK(*s && same_path(s, t));
+   }
 }
 
 /* The shortest cut game is the mark alone. A copy whose name does not
@@ -863,14 +887,14 @@ static void backup_moved(void)
 /* A VFS URL has no path limit; on Windows "/dir" is on a drive. */
 static void backup_dir_units(void)
 {
-   CHECK((long)save_backups_dir_units("smb://host/share/saves") < 0);
-   CHECK((long)save_backups_dir_units("C://sbt") == 8);
+   CHECK(save_backups_dir_units("smb://host/share/saves") < 0);
+   CHECK(save_backups_dir_units("C://sbt") == 8);
 #ifdef _WIN32
    {
       static char s[PATH_MAX_LENGTH];
       strlcpy(s, "/sbt", sizeof(s));
       CHECK(path_resolve_realpath(s, sizeof(s), false));
-      CHECK((long)save_backups_dir_units("/sbt") == units(s) + 1);
+      CHECK(save_backups_dir_units("/sbt") == units(s) + 1);
    }
 #endif
 }
