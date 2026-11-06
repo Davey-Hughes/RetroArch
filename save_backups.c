@@ -40,6 +40,16 @@
 /* Most a cut steps back from the limit, to a UTF-8 boundary. */
 #define SAVE_BACKUPS_CUT_ROOM    3
 #define SAVE_BACKUPS_TIME_LEN    19
+/* A copy is written through "<path>.tmp" */
+#define SAVE_BACKUPS_TEMP_LEN    4
+
+#ifndef SAVE_BACKUPS_PATH_MAX
+#if defined(_WIN32) && !defined(_XBOX) && !defined(__WINRT__)
+/* MAX_PATH less its NUL, in UTF-16 units: the Win32 file layer opens
+ * plain paths. */
+#define SAVE_BACKUPS_PATH_MAX    259
+#endif
+#endif
 
 enum save_backups_root
 {
@@ -356,6 +366,100 @@ static size_t save_backups_game_len(const char *game, size_t game_len,
    return max;
 }
 
+#ifdef SAVE_BACKUPS_PATH_MAX
+/* UTF-16 units in the first @len bytes of @s */
+static size_t save_backups_units(const char *s, size_t len)
+{
+   size_t i, n = 0;
+   for (i = 0; i < len; i++)
+   {
+      unsigned char c = (unsigned char)s[i];
+      if ((c & 0xC0) != 0x80)
+         n += c >= 0xF0 ? 2 : 1;
+   }
+   return n;
+}
+
+/* The most UTF-16 units a game keeps in a name with this core and
+ * extension, so the copy's temporary fits in a folder @dir_units long;
+ * below 0 when not even an empty game fits. */
+static long save_backups_game_room(size_t dir_units, const char *core,
+      size_t core_len, const char *ext)
+{
+   size_t fixed = dir_units + 3 + SAVE_BACKUPS_TIME_LEN
+      + SAVE_BACKUPS_NUMBER_ROOM + 3 + save_backups_units(core, core_len)
+      + 3 + SAVE_BACKUPS_REASON_ROOM + save_backups_units(ext, strlen(ext))
+      + SAVE_BACKUPS_TEMP_LEN;
+   return (long)SAVE_BACKUPS_PATH_MAX - (long)fixed;
+}
+#endif
+
+/* Where a copy's path has a limit, the UTF-16 units of @dir's full
+ * path and the slash before a copy's name; else 0. */
+static size_t save_backups_dir_units(const char *dir)
+{
+#ifdef SAVE_BACKUPS_PATH_MAX
+   size_t _len = strlen(dir);
+   size_t n    = _len && !PATH_CHAR_IS_SLASH(dir[_len - 1]);
+   char *full  = NULL;
+   if (     !path_is_absolute(dir)
+         && (full = (char*)malloc(PATH_MAX_LENGTH)))
+   {
+      strlcpy(full, dir, PATH_MAX_LENGTH);
+      if (path_resolve_realpath(full, PATH_MAX_LENGTH, false))
+      {
+         dir  = full;
+         _len = strlen(full);
+      }
+   }
+   n += save_backups_units(dir, _len);
+   free(full);
+   return n;
+#else
+   return 0;
+#endif
+}
+
+/* How much of @game a name keeps in a folder @dir_units long: as
+ * save_backups_game_len(), and no more than the room the path limit
+ * leaves, so possibly none. */
+static size_t save_backups_game_fit(size_t dir_units, const char *game,
+      size_t game_len, const char *core, const char *ext)
+{
+   size_t n = save_backups_game_len(game, game_len, strlen(core),
+         strlen(ext));
+#ifdef SAVE_BACKUPS_PATH_MAX
+   size_t i;
+   long room = save_backups_game_room(dir_units, core, strlen(core), ext);
+   for (i = 0; i < n; i++)
+   {
+      unsigned char c = (unsigned char)game[i];
+      if ((c & 0xC0) != 0x80 && (room -= c >= 0xF0 ? 2 : 1) < 0)
+         return i;
+   }
+#endif
+   return n;
+}
+
+/* Whether copy @name, read as @p, has a game more than
+ * SAVE_BACKUPS_CUT_ROOM under its own limits in a folder @dir_units
+ * long, so it cannot be a longer name's cut. */
+static bool save_backups_uncut(const char *name,
+      const struct save_backup_name *p, const char *ext, size_t dir_units)
+{
+   if (p->game_len + SAVE_BACKUPS_CUT_ROOM
+         >= save_backups_game_max(p->core_len, strlen(ext)))
+      return false;
+#ifdef SAVE_BACKUPS_PATH_MAX
+   if (     (long)(save_backups_units(name, p->game_len)
+               + SAVE_BACKUPS_CUT_ROOM)
+         >= save_backups_game_room(dir_units, name + p->core_off,
+               p->core_len, ext))
+      return false;
+#endif
+   return true;
+}
+
 static int save_backups_cmp(const struct save_backup_name *a,
       const struct save_backup_name *b)
 {
@@ -369,7 +473,7 @@ static int save_backups_cmp(const struct save_backup_name *a,
  * SAVE_BACKUPS_KEEP counting the one just made, which is not in it. */
 static void save_backups_retain(struct string_list *list,
       struct save_backup_name *names, const bool *mine,
-      enum save_backup_reason reason, size_t ext_len)
+      enum save_backup_reason reason, const char *ext, size_t dir_units)
 {
    size_t i;
    size_t count = 0;
@@ -379,8 +483,9 @@ static void save_backups_retain(struct string_list *list,
          continue;
       /* Near its limit, the game may be a longer name's cut: never
        * pruned */
-      if (names[i].game_len + SAVE_BACKUPS_CUT_ROOM
-            < save_backups_game_max(names[i].core_len, ext_len))
+      if (save_backups_uncut(
+               path_basename_nocompression(list->elems[i].data),
+               &names[i], ext, dir_units))
          count++;
       else
          names[i].reason = SAVE_BACKUP_REASON_LAST;
@@ -417,7 +522,7 @@ static enum save_backup_result save_backups_write_copy(char *s, size_t len,
       enum save_backup_reason reason, const void *data, size_t data_len,
       bool skip_same, bool sync)
 {
-   size_t i, _len, base_len, game_len;
+   size_t i, _len, base_len, game_len, dir_units, name_off;
    char stamp[SAVE_BACKUPS_TIME_LEN + 1];
    time_t now;
    struct tm tm_;
@@ -435,9 +540,9 @@ static enum save_backup_result save_backups_write_copy(char *s, size_t len,
    s[0] = '\0';
    if (!field || string_is_empty(dir))
       goto end;
-   base_len = (size_t)(ext - base);
-   game_len = save_backups_game_len(base, base_len, strlen(field),
-         strlen(ext));
+   base_len  = (size_t)(ext - base);
+   dir_units = save_backups_dir_units(dir);
+   game_len  = save_backups_game_fit(dir_units, base, base_len, field, ext);
 
    /* rtime_localtime leaves tm_ unwritten when localtime() fails */
    memset(&tm_, 0, sizeof(tm_));
@@ -480,11 +585,11 @@ static enum save_backup_result save_backups_write_copy(char *s, size_t len,
 
    if (!path_mkdir(dir))
       goto end;
-   _len = fill_pathname_join(s, dir, "", len);
-   if (_len + game_len >= len)
+   name_off = fill_pathname_join(s, dir, "", len);
+   if (name_off + game_len >= len)
       goto end;
-   memcpy(s + _len, base, game_len);
-   _len += game_len;
+   memcpy(s + name_off, base, game_len);
+   _len    = name_off + game_len;
    s[_len] = '\0';
    /* Never over another file, whatever its name's case. */
    for (;; number++)
@@ -497,6 +602,12 @@ static enum save_backup_result save_backups_write_copy(char *s, size_t len,
                field, save_backups_reasons[reason], ext);
       if (strlen(s) + 1 >= len)
          goto end;
+#ifdef SAVE_BACKUPS_PATH_MAX
+      if (     dir_units + SAVE_BACKUPS_TEMP_LEN
+            + save_backups_units(s + name_off, strlen(s + name_off))
+            > SAVE_BACKUPS_PATH_MAX)
+         goto end;
+#endif
       if (!path_is_valid(s))
          break;
    }
@@ -513,7 +624,7 @@ static enum save_backup_result save_backups_write_copy(char *s, size_t len,
          && game_len == base_len
          && (  reason == SAVE_BACKUP_BEFORE_STATE_LOAD
             || reason == SAVE_BACKUP_CHANGED_ELSEWHERE))
-      save_backups_retain(list, names, mine, reason, strlen(ext));
+      save_backups_retain(list, names, mine, reason, ext, dir_units);
 
 end:
    if (result != SAVE_BACKUP_MADE)
@@ -646,10 +757,12 @@ size_t save_backups_recover(char *s, size_t len, const char *path,
 /* The newest recovery file of @base in @dir changed after *@newest.
  * Times may be whole seconds: on a tie, the later name. */
 static void save_backups_newest_unsaved(char *s, size_t len,
-      const char *dir, const char *base, size_t game_len, const char *ext,
+      const char *dir, const char *base, const char *field, const char *ext,
       int64_t *newest)
 {
    size_t i;
+   size_t game_len          = save_backups_game_fit(
+         save_backups_dir_units(dir), base, (size_t)(ext - base), field, ext);
    struct string_list *list = dir_list_new(dir, NULL, false, true,
          false, false);
    for (i = 0; list && i < list->size; i++)
@@ -678,7 +791,6 @@ size_t save_backups_find_recovery(char *s, size_t len, const char *path,
       int64_t mtime)
 {
    unsigned i;
-   size_t game_len;
    char *dir        = (char*)malloc(PATH_MAX_LENGTH);
    const char *base = path_basename_nocompression(path);
    const char *ext  = save_backups_ext(base);
@@ -687,10 +799,8 @@ size_t save_backups_find_recovery(char *s, size_t len, const char *path,
    s[0]             = '\0';
    if (dir && field)
    {
-      game_len = save_backups_game_len(base, (size_t)(ext - base),
-            strlen(field), strlen(ext));
       if (save_backups_dir(dir, PATH_MAX_LENGTH, path))
-         save_backups_newest_unsaved(s, len, dir, base, game_len, ext,
+         save_backups_newest_unsaved(s, len, dir, base, field, ext,
                &mtime);
       for (i = SAVE_BACKUPS_ROOT_CONFIG; i <= SAVE_BACKUPS_ROOT_APP_DATA; i++)
       {
@@ -698,7 +808,7 @@ size_t save_backups_find_recovery(char *s, size_t len, const char *path,
             continue;
          fill_pathname_join(dir, save_backups_roots[i],
                SAVE_BACKUPS_RECOVERY_DIR, PATH_MAX_LENGTH);
-         save_backups_newest_unsaved(s, len, dir, base, game_len, ext,
+         save_backups_newest_unsaved(s, len, dir, base, field, ext,
                &mtime);
       }
    }
