@@ -589,8 +589,9 @@ static autosave_t *autosave_new(const char *path,
 }
 
 /* The notices for what the worker raised: autosave's once per session,
- * a flush's each time. */
-static void save_file_check_notices(struct save_file *f, const char *path)
+ * a flush's each time, and with @log in the log too. */
+static void save_file_check_notices(struct save_file *f, const char *path,
+      bool log)
 {
    int flags;
    const int raised = SAVE_FILE_BACKUP_FAILED | SAVE_FILE_WRITE_FAILED
@@ -612,25 +613,27 @@ static void save_file_check_notices(struct save_file *f, const char *path)
       save_file_notice(MSG_SAVE_WRITE_FAILED, path, false);
    }
    if (flags & SAVE_FILE_FLUSH_RECOVERED)
-      save_file_notice(MSG_SAVE_WRITE_RECOVERED, path, false);
+      save_file_notice(MSG_SAVE_WRITE_RECOVERED, path, log);
    if (flags & SAVE_FILE_FLUSH_LOST)
-      save_file_notice(MSG_SAVE_WRITE_FAILED, path, false);
+      save_file_notice(MSG_SAVE_WRITE_FAILED, path, log);
 }
 
 /**
  * autosave_free:
  * @handle          : pointer to autosave object
+ * @log             : its last flush's failure is logged as well as shown;
+ *                    not from autosave_check()
  *
  * Frees autosave object and all associated resources.
  **/
-static void autosave_free(autosave_t *handle)
+static void autosave_free(autosave_t *handle, bool log)
 {
    retro_atomic_store_release_int(&handle->quit, 1);
    retro_eventcount_notify(&handle->ec);
    sthread_join(handle->thread);
 
    /* No check runs after the worker's last flush. */
-   save_file_check_notices(handle->file, handle->path);
+   save_file_check_notices(handle->file, handle->path, log);
 
    free(handle->snapshot);
    free(handle->flush_buf[0]);
@@ -649,13 +652,14 @@ static void autosave_free(autosave_t *handle)
    free(handle);
 }
 
-/* A handle and the retired ones it replaced. */
+/* A handle and the retired ones it replaced, at the end of the session:
+ * its notices may never be seen, so they are logged. */
 static void autosave_free_chain(autosave_t *handle)
 {
    while (handle)
    {
       autosave_t *prev = handle->prev;
-      autosave_free(handle);
+      autosave_free(handle, true);
       handle = prev;
    }
 }
@@ -673,7 +677,7 @@ static void autosave_reap(autosave_t *handle)
       {
          *link     = old->prev;
          old->prev = NULL;
-         autosave_free(old);
+         autosave_free(old, false);
       }
       else
          link = &old->prev;
@@ -791,7 +795,7 @@ void autosave_check(void)
       autosave_t *handle = autosave_state.list[i];
       if (!handle)
          continue;
-      save_file_check_notices(handle->file, handle->path);
+      save_file_check_notices(handle->file, handle->path, false);
       if (handle->prev)
          autosave_reap(handle);
       mem_info.id        = handle->type;

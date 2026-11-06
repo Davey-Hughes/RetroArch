@@ -195,7 +195,7 @@ static void start_save(bool compress)
 static void stop_save(void)
 {
    /* No further frames: shutdown must wake a worker awaiting a copy. */
-   autosave_free(current);
+   autosave_free(current, false);
    current = NULL;
    autosave_state.list = NULL;
    autosave_state.num  = 0;

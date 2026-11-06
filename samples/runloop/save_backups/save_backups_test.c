@@ -50,15 +50,26 @@ static bool test_write_synced(const char *path, const void *data,
    return filestream_write_file_atomic_synced(path, data, len);
 }
 
+static unsigned file_syncs;
+static bool sync_fails;
+
+static int test_sync(RFILE *stream)
+{
+   file_syncs++;
+   return sync_fails ? -1 : filestream_sync(stream);
+}
+
 #define rtime_localtime test_localtime
 #define strftime test_strftime
 #define filestream_write_file_atomic test_write
 #define filestream_write_file_atomic_synced test_write_synced
+#define filestream_sync test_sync
 #include "../../../save_backups.c"
 #undef rtime_localtime
 #undef strftime
 #undef filestream_write_file_atomic
 #undef filestream_write_file_atomic_synced
+#undef filestream_sync
 
 #define ROOT "save_backups_test_files"
 
@@ -593,10 +604,31 @@ static void recovery_chain(void)
    set_time(14, 0, 0);
    CHECK(save_backups_recover(s, sizeof(s), ROOT "/rsaves/Game.srm", "r1", 2, true));
    CHECK(same_path(s, ROOT "/rsaves/backups/Game - 2026-11-03 14-00-00 - Snes9x - unsaved.srm"));
+   /* the same image: that file, nothing written */
+   plain_writes = synced_writes = 0;
    CHECK(save_backups_recover(s, sizeof(s), ROOT "/rsaves/Game.srm", "r1", 2, true));
+   CHECK(same_path(s, ROOT "/rsaves/backups/Game - 2026-11-03 14-00-00 - Snes9x - unsaved.srm"));
+   CHECK(!plain_writes && !synced_writes);
+   CHECK(count_files(ROOT "/rsaves/backups") == 1);
+   /* another */
+   CHECK(save_backups_recover(s, sizeof(s), ROOT "/rsaves/Game.srm", "r5", 2, true));
    CHECK(same_path(s, ROOT "/rsaves/backups/Game - 2026-11-03 14-00-00-2 - Snes9x - unsaved.srm"));
    CHECK(holds(ROOT "/rsaves/backups/Game - 2026-11-03 14-00-00 - Snes9x - unsaved.srm", "r1"));
    CHECK(count_files(ROOT "/rsaves/backups") == 2);
+   /* only the newest counts */
+   CHECK(save_backups_recover(s, sizeof(s), ROOT "/rsaves/Game.srm", "r1", 2, true));
+   CHECK(same_path(s, ROOT "/rsaves/backups/Game - 2026-11-03 14-00-00-3 - Snes9x - unsaved.srm"));
+   CHECK(count_files(ROOT "/rsaves/backups") == 3);
+   /* of the recovery files: a newer copy is not one */
+   CHECK(save_backups_copy_image(ROOT "/rsaves/Game.srm", SAVE_BACKUP_CUT,
+         "c9", 2, true) == SAVE_BACKUP_MADE);
+   CHECK(save_backups_recover(s, sizeof(s), ROOT "/rsaves/Game.srm", "r1", 2, true));
+   CHECK(same_path(s, ROOT "/rsaves/backups/Game - 2026-11-03 14-00-00-3 - Snes9x - unsaved.srm"));
+   CHECK(count_files(ROOT "/rsaves/backups") == 4);
+   /* nor does a newer copy with the bytes make one needless */
+   CHECK(save_backups_recover(s, sizeof(s), ROOT "/rsaves/Game.srm", "c9", 2, true));
+   CHECK(holds(s, "c9"));
+   CHECK(count_files(ROOT "/rsaves/backups") == 5);
 
    /* the save folder can't be written: a file where its folder goes */
    put(ROOT "/rsaves2/backups", "file");
@@ -608,6 +640,12 @@ static void recovery_chain(void)
    CHECK(save_backups_recover(s, sizeof(s), ROOT "/rsaves2/Game.srm", "r2", 2, true));
    CHECK(same_path(s, ROOT "/rconfig/recovery/Game - 2026-11-03 14-00-00 - Snes9x - unsaved.srm"));
    CHECK(holds(s, "r2"));
+   /* the same rule in the fallback */
+   plain_writes = synced_writes = 0;
+   CHECK(save_backups_recover(s, sizeof(s), ROOT "/rsaves2/Game.srm", "r2", 2, true));
+   CHECK(same_path(s, ROOT "/rconfig/recovery/Game - 2026-11-03 14-00-00 - Snes9x - unsaved.srm"));
+   CHECK(!plain_writes && !synced_writes);
+   CHECK(count_files(ROOT "/rconfig/recovery") == 1);
 
    /* nor the config folder */
    put(ROOT "/rconfig2/recovery", "file");
@@ -616,6 +654,9 @@ static void recovery_chain(void)
    CHECK(save_backups_recover(s, sizeof(s), ROOT "/rsaves2/Game.srm", "r3", 2, true));
    CHECK(same_path(s, ROOT "/rapp/recovery/Game - 2026-11-03 14-00-00 - Snes9x - unsaved.srm"));
    CHECK(holds(s, "r3"));
+   CHECK(save_backups_recover(s, sizeof(s), ROOT "/rsaves2/Game.srm", "r3", 2, true));
+   CHECK(same_path(s, ROOT "/rapp/recovery/Game - 2026-11-03 14-00-00 - Snes9x - unsaved.srm"));
+   CHECK(count_files(ROOT "/rapp/recovery") == 1);
 
    /* and no app data folder (consoles) */
    save_backups_set_roots(ROOT "/rsaves2", NULL, NULL, NULL,
@@ -625,6 +666,68 @@ static void recovery_chain(void)
    CHECK(count_files(ROOT "/rsaves2") == 1);
    CHECK(count_files(ROOT "/rconfig2") == 1);
    CHECK(count_files(ROOT "/rapp/recovery") == 1);
+
+   /* the save folder works again: the newest is still the fallback's */
+   put(ROOT "/rsaves3/backups", "file");
+   save_backups_set_roots(ROOT "/rsaves3", NULL, NULL, NULL,
+         ROOT "/rconfig3", NULL, "Snes9x");
+   CHECK(save_backups_recover(s, sizeof(s), ROOT "/rsaves3/Game.srm", "r6", 2, true));
+   CHECK(same_path(s, ROOT "/rconfig3/recovery/Game - 2026-11-03 14-00-00 - Snes9x - unsaved.srm"));
+   CHECK(filestream_delete(ROOT "/rsaves3/backups") == 0);
+   CHECK(save_backups_recover(s, sizeof(s), ROOT "/rsaves3/Game.srm", "r6", 2, true));
+   CHECK(same_path(s, ROOT "/rconfig3/recovery/Game - 2026-11-03 14-00-00 - Snes9x - unsaved.srm"));
+   CHECK(!path_is_valid(ROOT "/rsaves3/backups"));
+}
+
+/* Times in whole seconds tie: the numbers in the names decide. */
+static void recovery_newest_tie(void)
+{
+   static char made[8][PATH_MAX_LENGTH];
+   char s[PATH_MAX_LENGTH];
+   char name[PATH_MAX_LENGTH];
+   char image[2];
+   int64_t t = 0;
+   unsigned i;
+   save_backups_set_roots(ROOT "/tie", NULL, NULL, NULL, NULL, NULL, "Snes9x");
+   set_time(14, 30, 0);
+   image[1] = '\0';
+   for (i = 0; i < 8; i++)
+   {
+      image[0] = (char)('a' + i);
+      CHECK(save_backups_recover(s, sizeof(s), ROOT "/tie/Game.srm",
+            image, 1, false));
+      if (!i)
+         CHECK(path_get_mtime(s, &t));
+      CHECK(path_set_mtime(s, t));
+   }
+   for (i = 8; i-- > 1;)
+   {
+      CHECK(save_backups_find_recovery(s, sizeof(s), ROOT "/tie/Game.srm",
+            INT64_MIN));
+      snprintf(name, sizeof(name),
+            ROOT "/tie/backups/Game - 2026-11-03 14-30-00-%u - Snes9x - unsaved.srm",
+            i + 1);
+      CHECK(same_path(s, name));
+      CHECK(filestream_delete(s) == 0);
+   }
+   /* the times decide first, however the folder lists its files */
+   save_backups_set_roots(ROOT "/tie2", NULL, NULL, NULL, NULL, NULL, "Snes9x");
+   for (i = 0; i < 8; i++)
+   {
+      image[0] = (char)('a' + i);
+      CHECK(save_backups_recover(made[i], sizeof(made[i]),
+            ROOT "/tie2/Game.srm", image, 1, false));
+   }
+   for (i = 0; i < 8; i++)
+   {
+      CHECK(path_set_mtime(made[i], t + 100 + i));
+      CHECK(save_backups_find_recovery(s, sizeof(s), ROOT "/tie2/Game.srm",
+            INT64_MIN));
+      CHECK(same_path(s, made[i]));
+   }
+   /* not newer than @mtime on a tie */
+   CHECK(!save_backups_find_recovery(s, sizeof(s), ROOT "/tie2/Game.srm",
+         t + 107));
 }
 
 /* Each writer's sync flag reaches the write it asks for. */
@@ -661,12 +764,43 @@ static void backup_sync(void)
          "r", 1, true));
    CHECK(synced_writes == 4 && plain_writes == 3);
    CHECK(save_backups_recover(s, sizeof(s), ROOT "/sync/Game.srm",
-         "r", 1, false));
+         "s", 1, false));
    CHECK(synced_writes == 4 && plain_writes == 4);
    /* nothing written for a copy the newest one already holds */
    CHECK(save_backups_copy_image(ROOT "/sync/Game.srm", SAVE_BACKUP_CUT,
-         "r", 1, true) == SAVE_BACKUP_MADE);
+         "s", 1, true) == SAVE_BACKUP_MADE);
    CHECK(synced_writes == 4 && plain_writes == 4);
+}
+
+/* A held image may have been written without a sync: a caller that
+ * asks for one gets it, and a new file when it fails. */
+static void recovery_held_sync(void)
+{
+   char s[PATH_MAX_LENGTH];
+   char first[PATH_MAX_LENGTH];
+   save_backups_set_roots(ROOT "/held", NULL, NULL, NULL, NULL, NULL,
+         "Snes9x");
+   set_time(16, 0, 0);
+   plain_writes = synced_writes = file_syncs = 0;
+   CHECK(save_backups_recover(first, sizeof(first), ROOT "/held/Game.srm",
+         "h", 1, false));
+   CHECK(plain_writes == 1 && !synced_writes && !file_syncs);
+   CHECK(save_backups_recover(s, sizeof(s), ROOT "/held/Game.srm",
+         "h", 1, false));
+   CHECK(same_path(s, first));
+   CHECK(plain_writes == 1 && !synced_writes && !file_syncs);
+   CHECK(save_backups_recover(s, sizeof(s), ROOT "/held/Game.srm",
+         "h", 1, true));
+   CHECK(same_path(s, first));
+   CHECK(plain_writes == 1 && !synced_writes && file_syncs == 1);
+   CHECK(holds(first, "h"));
+   sync_fails = true;
+   CHECK(save_backups_recover(s, sizeof(s), ROOT "/held/Game.srm",
+         "h", 1, true));
+   sync_fails = false;
+   CHECK(!same_path(s, first));
+   CHECK(synced_writes == 1 && file_syncs == 2);
+   CHECK(count_files(ROOT "/held/backups") == 2);
 }
 
 /* No copy without its time in its name. */
@@ -701,7 +835,9 @@ int main(void)
    backup_retention_cut();
    backup_retention_long();
    recovery_chain();
+   recovery_newest_tie();
    backup_sync();
+   recovery_held_sync();
    backup_no_time();
    save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
    rm_tree(ROOT);

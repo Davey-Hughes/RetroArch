@@ -581,14 +581,38 @@ enum save_backup_result save_backups_copy_file(const char *path,
    return result;
 }
 
+/* Whether the newest recovery file of @path, its path in @s, holds
+ * @data. @sync: it may not have been synced when written, so it is now,
+ * and false if that fails. */
+static bool save_backups_recovered(char *s, size_t len, const char *path,
+      const void *data, size_t data_len, bool sync)
+{
+   bool ok;
+   RFILE *file;
+   if (     !save_backups_find_recovery(s, len, path, INT64_MIN)
+         || !filestream_matches_buf(s, data, data_len))
+      return false;
+   if (!sync)
+      return true;
+   file = filestream_open(s,
+         RETRO_VFS_FILE_ACCESS_WRITE | RETRO_VFS_FILE_ACCESS_UPDATE_EXISTING,
+         RETRO_VFS_FILE_ACCESS_HINT_NONE);
+   ok   = file && filestream_sync(file) == 0;
+   if (file && filestream_close(file) != 0)
+      ok = false;
+   return ok;
+}
+
 size_t save_backups_recover(char *s, size_t len, const char *path,
       const void *data, size_t data_len, bool sync)
 {
    unsigned i;
+   char *dir;
    bool made = false;
-   char *dir = (char*)malloc(PATH_MAX_LENGTH);
-   s[0]      = '\0';
-   if (!dir)
+   if (save_backups_recovered(s, len, path, data, data_len, sync))
+      return strlen(s);
+   s[0] = '\0';
+   if (!(dir = (char*)malloc(PATH_MAX_LENGTH)))
       return 0;
    if (save_backups_dir(dir, PATH_MAX_LENGTH, path))
       made = save_backups_write_copy(s, len, dir, path, NULL,
@@ -609,7 +633,8 @@ size_t save_backups_recover(char *s, size_t len, const char *path,
    return made ? strlen(s) : 0;
 }
 
-/* The newest recovery file of @base in @dir changed after *@newest. */
+/* The newest recovery file of @base in @dir changed after *@newest.
+ * Times may be whole seconds: on a tie, the later name. */
 static void save_backups_newest_unsaved(char *s, size_t len,
       const char *dir, const char *base, size_t game_len, const char *ext,
       int64_t *newest)
@@ -619,14 +644,17 @@ static void save_backups_newest_unsaved(char *s, size_t len,
          false, false);
    for (i = 0; list && i < list->size; i++)
    {
-      struct save_backup_name name;
+      struct save_backup_name name, best;
       int64_t t        = 0;
       const char *file = list->elems[i].data;
       if (     save_backups_of(path_basename_nocompression(file), &name,
                   base, game_len, ext)
             && name.reason == SAVE_BACKUP_UNSAVED
             && path_get_mtime(file, &t)
-            && t > *newest)
+            && (t > *newest
+               || (  t == *newest && *s
+                  && save_backups_parse(path_basename_nocompression(s), &best)
+                  && save_backups_cmp(&name, &best) > 0)))
       {
          *newest = t;
          strlcpy(s, file, len);

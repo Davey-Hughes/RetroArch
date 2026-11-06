@@ -1490,7 +1490,7 @@ static void test_state_load_kinds(void)
 
 /* -----------------------------------------------------------------
  * A load that puts save RAM back (block_sram_overwrite: from a file
- * and Undo Load) rolls nothing back and owes no copy; a load from RAM
+ * and Undo Load) rolls nothing back and does not flush; a load from RAM
  * does not put it back. Undo Load with nothing to undo flushes nothing.
  * ----------------------------------------------------------------- */
 static void test_state_load_guards(void)
@@ -1514,12 +1514,11 @@ static void test_state_load_guards(void)
    flushes_owed = 0;
    content_load_state(path, false, false);
    pump(1000);
-   okf(flushes == 1 && flushes_owed == 0,
-         "guards: a blocked load from a file owes nothing");
-   okf(content_undo_load_state() && flushes == 2 && flushes_owed == 0,
-         "guards: a blocked Undo Load owes nothing");
+   okf(flushes == 0, "guards: a blocked load from a file flushed");
+   okf(content_undo_load_state() && flushes == 0,
+         "guards: a blocked Undo Load flushed");
    okf(content_save_state_to_ram() && content_load_state_from_ram()
-         && flushes == 3 && flushes_owed == bsl,
+         && flushes == 1 && flushes_owed == bsl,
          "guards: a load from RAM owes its copy, blocked or not");
    stub_settings.bools.block_sram_overwrite = false;
    filestream_delete(path);

@@ -288,9 +288,9 @@ typedef struct rastate_size_info
 
 /* A user's state load is about to change save RAM: the save files are
  * written as they are now, and the next write over each save RAM file
- * backs it up first, unless the load will @keep_sram. Run-ahead, rewind,
- * netplay and replays load states without this. */
-static void content_flush_saves_before_load(bool keep_sram)
+ * backs it up first. A load that puts save RAM back changes nothing and
+ * skips this; so do run-ahead, rewind, netplay and replays. */
+static void content_flush_saves_before_load(void)
 {
 #if defined(HAVE_COMPRESSION)
    bool compress = config_get_ptr()->bools.save_file_compression;
@@ -299,7 +299,7 @@ static void content_flush_saves_before_load(bool keep_sram)
 #endif
    event_flush_save_files(
          (runloop_state_get_ptr()->flags & RUNLOOP_FLAG_USE_SRAM) != 0,
-         compress, keep_sram ? 0 : 1 << SAVE_BACKUP_BEFORE_STATE_LOAD);
+         compress, 1 << SAVE_BACKUP_BEFORE_STATE_LOAD);
 }
 
 /**
@@ -402,9 +402,8 @@ bool content_undo_load_state(void)
    undo_load_buf.size     = 0;
    undo_load_buf.capacity = 0;
 
-   if (restore_data)
-      content_flush_saves_before_load(
-            config_get_ptr()->bools.block_sram_overwrite);
+   if (restore_data && !config_get_ptr()->bools.block_sram_overwrite)
+      content_flush_saves_before_load();
 
    /* An undo jumps the game's state exactly as a load does. See
     * audio_driver_jump_fade_begin(). */
@@ -1624,8 +1623,8 @@ static void content_load_state_apply(retro_task_t *task,
       return;
    }
 
-   content_flush_saves_before_load(
-         config_get_ptr()->bools.block_sram_overwrite);
+   if (!config_get_ptr()->bools.block_sram_overwrite)
+      content_flush_saves_before_load();
 
    if (     savefile_list
          && savefile_list->size
@@ -2553,7 +2552,7 @@ bool content_load_state_from_ram(void)
          msg_hash_to_str(MSG_BYTES));
 
    /* Without block_sram_overwrite's put-back here. */
-   content_flush_saves_before_load(false);
+   content_flush_saves_before_load();
 
    /* Same discontinuity as a load from disk, so the same bracket. See
     * audio_driver_jump_fade_begin(). */

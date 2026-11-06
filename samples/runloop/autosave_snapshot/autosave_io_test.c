@@ -161,6 +161,16 @@ static unsigned notices(enum msg_hash_enums msg)
    return n;
 }
 
+#ifdef HAVE_THREADS
+/* Lines logged as a warning that are the notice @msg. */
+static unsigned logged_msg(enum msg_hash_enums msg)
+{
+   char text[32];
+   snprintf(text, sizeof(text), "msg%d ", (int)msg);
+   return logged('W', text);
+}
+#endif
+
 static runloop_state_t runloop_st;
 
 runloop_state_t *runloop_state_get_ptr(void)
@@ -287,6 +297,7 @@ static int RETRO_CALLCONV test_rename(const char *old_path,
       const char *new_path)
 {
    bool refuse;
+   int ret;
    int first = EOF;
    FILE *f   = NULL;
    VFS_LOCK();
@@ -301,11 +312,12 @@ static int RETRO_CALLCONV test_rename(const char *old_path,
       first = fgetc(f);
       fclose(f);
    }
+   ret = retro_vfs_file_rename_impl(old_path, new_path);
    VFS_LOCK();
-   if (first != EOF && put_num < sizeof(put_log) - 1)
+   if (!ret && first != EOF && put_num < sizeof(put_log) - 1)
       put_log[put_num++] = (char)first;
    VFS_UNLOCK();
-   return retro_vfs_file_rename_impl(old_path, new_path);
+   return ret;
 }
 
 static struct retro_vfs_interface test_iface;
@@ -348,6 +360,7 @@ static unsigned get_write_opens(void)
    return n;
 }
 
+#ifdef HAVE_THREADS
 static bool written_in_order(const char *order)
 {
    bool ok;
@@ -357,6 +370,7 @@ static bool written_in_order(const char *order)
    VFS_UNLOCK();
    return ok;
 }
+#endif
 
 static void fill(unsigned char *p, size_t len, unsigned seed)
 {
@@ -567,6 +581,7 @@ static void lane_state_load_copy_sync(void)
    clean();
 }
 
+#ifdef HAVE_THREADS
 /* An image for the put log: @id is its first byte. */
 static void fill_id(unsigned char *p, size_t len, unsigned seed, char id)
 {
@@ -582,6 +597,7 @@ static bool quiet(void)
          && !copies("backups", SAVE_BACKUP_UNSAVED, NULL, 0)
          && !logged('W', "") && !logged('E', "");
 }
+#endif
 
 /* With no worker, a flush whose owed copy cannot be made: the save
  * stays and the image, which the load replaces, goes to a recovery
@@ -642,6 +658,81 @@ static void lane_flush_copy_fails_sync(void)
    CHECK(logged('W', "Unsaved progress") == 3,
          "flush_copy_sync: not one log line each");
    path_deinit_savefile();
+   clean();
+}
+
+/* With no worker, the same memory flushed again into a failing save,
+ * and at the close: one recovery file, in whichever folder the chain
+ * reached, told and logged each time. Only the newest is compared. */
+static void lane_flush_same_image_sync(void)
+{
+   static unsigned char cut[BIG * 2], ram[BIG], p1[BIG], p2[BIG];
+   char newest[PATH_MAX_LENGTH];
+   int64_t cut_len = 0;
+   unsigned c;
+   const int bsl   = 1 << SAVE_BACKUP_BEFORE_STATE_LOAD;
+
+   fill(p1, BIG, 67);
+   fill(p2, BIG, 68);
+   for (c = 0; c < 2; c++)
+   {
+      const char *dir = c ? "cfg/recovery" : "backups";
+      clean();
+      fill(ram, BIG, 69);
+      if (c)
+      {
+         path_mkdir("blk");
+         put("blk/backups", "x", 1);
+         put_cut_rzip("blk/game.srm", ram, BIG, cut, &cut_len);
+      }
+      else
+         put(SAVE, ram, BIG);
+      core_data = ram;
+      core_size = BIG;
+      path_init_savefile_new();
+      path_init_savefile_rtc(c ? "blk/game.srm" : SAVE);
+      event_load_save_files(false);
+      notice_num = 0;
+      if (!c)
+      {
+         use_test_vfs(true);
+         set_vfs(4096, false);
+      }
+
+      memcpy(ram, p1, BIG);
+      event_flush_save_files(true, false, bsl);
+      event_flush_save_files(true, false, bsl);
+      CHECK(copies(dir, SAVE_BACKUP_UNSAVED, newest, sizeof(newest)) == 1
+            && holds(newest, p1, BIG),
+            "same_sync: the same image is not in one recovery file");
+      CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 2,
+            "same_sync: not told each time");
+      CHECK(logged('W', "Unsaved progress") == 2
+            && logged('W', path_basename(newest)) == 2,
+            "same_sync: its path not logged each time");
+
+      /* A close with the image held: that file again. */
+      event_save_files(true, false, true, true, NULL);
+      CHECK(copies(dir, SAVE_BACKUP_UNSAVED, newest, sizeof(newest)) == 1,
+            "same_sync: the close made another");
+      CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 3
+            && logged('W', path_basename(newest)) == 3,
+            "same_sync: the close not told and logged");
+
+      /* An older one holding it does not count. */
+      memcpy(ram, p2, BIG);
+      event_flush_save_files(true, false, bsl);
+      memcpy(ram, p1, BIG);
+      event_flush_save_files(true, false, bsl);
+      CHECK(copies(dir, SAVE_BACKUP_UNSAVED, newest, sizeof(newest)) == 3
+            && holds(newest, p1, BIG),
+            "same_sync: compared with more than the newest");
+      CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 5,
+            "same_sync: not one notice each");
+      set_vfs(0, false);
+      use_test_vfs(false);
+      path_deinit_savefile();
+   }
    clean();
 }
 
@@ -906,6 +997,9 @@ static bool gate_next;
 static retro_eventcount_t *gate_ec;
 static retro_atomic_int_t gate_parked;
 static retro_atomic_int_t gate_open;
+/* Entries to and returns from a worker's wait for a copy. */
+static retro_atomic_int_t wait_entries;
+static retro_atomic_int_t wait_leaves;
 
 sthread_t *test_sthread_create(void (*thread_func)(void*), void *userdata)
 {
@@ -951,9 +1045,11 @@ void test_sthread_join(sthread_t *thread)
 void test_commit_wait(retro_eventcount_t *ec, int key)
 {
    bool held = ec == gate_ec;
+   retro_atomic_fetch_add_int(&wait_entries, 1);
    if (held)
       retro_atomic_store_release_int(&gate_parked, 1);
    retro_eventcount_commit_wait(ec, key);
+   retro_atomic_fetch_add_int(&wait_leaves, 1);
    while (held && !retro_atomic_load_acquire_int(&gate_open))
       retro_sleep(1);
 }
@@ -1016,26 +1112,37 @@ static void stop(void)
    autosave_state.num  = 0;
 }
 
-static bool wait_holds(const char *path, const void *data, size_t len)
+/* @n images have reached the save. Polls no fopen of it, which can
+ * refuse the worker's rename on Windows. */
+static bool wait_puts(unsigned n)
 {
    unsigned i;
    for (i = 0; i < 5000; i++)
    {
-      if (holds(path, data, len))
+      unsigned done;
+      VFS_LOCK();
+      done = put_num;
+      VFS_UNLOCK();
+      if (done >= n)
          return true;
       retro_sleep(1);
    }
    return false;
 }
 
-/* A flush has been written, or failed, and given back. */
+/* The flushes out are written, or failed, and given back, and the
+ * worker has gone on to wait again: it owes and asks nothing more. */
 static void wait_flushed(void)
 {
    unsigned i;
    for (i = 0; i < 5000; i++)
    {
       if (!autosave_flush_waiting(slots[0]))
-         return;
+      {
+         int left = retro_atomic_load_acquire_int(&wait_leaves);
+         if (retro_atomic_load_acquire_int(&wait_entries) > left)
+            return;
+      }
       retro_sleep(1);
    }
    CHECK(0, "flush timed out");
@@ -1085,7 +1192,8 @@ static void lane_state_load_copy_worker(void)
    memcpy(ram, l1, BIG);
    wait_requested();
    autosave_check();
-   CHECK(wait_holds(SAVE, l1, BIG), "state_load: the load not written");
+   CHECK(wait_puts(2) && holds(SAVE, l1, BIG),
+         "state_load: the load not written");
    CHECK(copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, newest,
             sizeof(newest)) == 1 && holds(newest, p1, BIG),
          "state_load: no copy of the pre-load save");
@@ -1097,7 +1205,8 @@ static void lane_state_load_copy_worker(void)
    memcpy(ram, l1, BIG);
    wait_requested();
    autosave_check();
-   CHECK(wait_holds(SAVE, l1, BIG), "state_load: second load not written");
+   CHECK(wait_puts(4) && holds(SAVE, l1, BIG),
+         "state_load: second load not written");
    CHECK(copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, newest,
             sizeof(newest)) == 2 && holds(newest, p2, BIG),
          "state_load: no copy for the second load");
@@ -1143,17 +1252,22 @@ static void flush_lane_end(void)
 
 /* A worker parked in its wait for a copy; it writes nothing after its
  * next wake until the gate opens. */
-static void start_parked(void *ram)
+static void start_parked_at(const char *path, void *ram)
 {
    unsigned i;
    retro_atomic_int_init(&gate_parked, 0);
    retro_atomic_int_init(&gate_open, 0);
    gate_next = true;
-   start(ram, BIG, false);
+   start_at(path, ram, BIG, false);
    for (i = 0; i < 5000 && !retro_atomic_load_acquire_int(&gate_parked); i++)
       retro_sleep(1);
    CHECK(retro_atomic_load_acquire_int(&gate_parked),
          "parked: the worker did not wait");
+}
+
+static void start_parked(void *ram)
+{
+   start_parked_at(SAVE, ram);
 }
 
 /* A flush and a filled snapshot pending together, whichever came
@@ -1220,7 +1334,7 @@ static void lane_flush_with_snapshot(void)
 static void lane_flush_queue(void)
 {
    static unsigned char disk[BIG], ram[BIG], p1[BIG], p2[BIG], p3[BIG],
-                        l1[BIG], p4[BIG], p5[BIG];
+                        l1[BIG], p4[BIG], p5[BIG], p6[BIG];
    char newest[PATH_MAX_LENGTH];
    const int bsl = 1 << SAVE_BACKUP_BEFORE_STATE_LOAD;
 
@@ -1231,6 +1345,7 @@ static void lane_flush_queue(void)
    fill_id(l1, BIG, 78, 'L');
    fill_id(p4, BIG, 79, 'T');
    fill_id(p5, BIG, 80, 'U');
+   fill_id(p6, BIG, 73, 'V');
    flush_lane_begin(disk, ram);
    start_parked(ram);
 
@@ -1260,17 +1375,21 @@ static void lane_flush_queue(void)
             sizeof(newest)) == 2 && holds(newest, p2, BIG),
          "queue: the third load's copy was not made");
 
-   /* The slots come back, and in order. */
+   /* Slot 1 holds the older image now: it still goes first. */
    memcpy(ram, p4, BIG);
    event_flush_save_files(true, false, 0);
    wait_flushed();
    wait_requested();
+   retro_atomic_store_release_int(&gate_open, 0);
    memcpy(ram, p5, BIG);
    event_flush_save_files(true, false, 0);
+   memcpy(ram, p6, BIG);
+   event_flush_save_files(true, false, 0);
+   retro_atomic_store_release_int(&gate_open, 1);
    wait_flushed();
    wait_requested();
-   CHECK(written_in_order("PQLTU"), "queue: a later flush out of order");
-   CHECK(holds(SAVE, p5, BIG), "queue: a later flush not written");
+   CHECK(written_in_order("PQLTUV"), "queue: a later flush out of order");
+   CHECK(holds(SAVE, p6, BIG), "queue: a later flush not written");
    CHECK(copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, NULL, 0) == 2,
          "queue: a copy for a flush that owed none");
    CHECK(copies("backups", SAVE_BACKUP_REASON_LAST, NULL, 0) == 2,
@@ -1493,6 +1612,108 @@ static void lane_flush_write_fails(void)
    }
 }
 
+/* Flushes the image, which cannot be written, and shows it. */
+static void flush_failing(void *ram, const void *image)
+{
+   memcpy(ram, image, BIG);
+   event_flush_save_files(true, false, 1 << SAVE_BACKUP_BEFORE_STATE_LOAD);
+   wait_flushed();
+   capture_and_wait();
+}
+
+/* The same memory flushed again into a failing save: one recovery file,
+ * in whichever folder the chain reached, each flush told. Only the
+ * newest recovery file is compared, not a newer copy nor an older one. */
+static void lane_flush_same_image(void)
+{
+   static unsigned char cut[BIG * 2], disk[BIG], ram[BIG], p1[BIG], p2[BIG];
+   char newest[PATH_MAX_LENGTH];
+   int64_t cut_len = 0;
+   unsigned c;
+
+   fill_id(disk, BIG, 103, 'D');
+   fill_id(p1, BIG, 104, 'P');
+   fill_id(p2, BIG, 105, 'Q');
+   for (c = 0; c < 2; c++)
+   {
+      const char *save = c ? "blk/game.srm" : SAVE;
+      const char *dir  = c ? "cfg/recovery" : "backups";
+      clean();
+      if (c)
+      {
+         path_mkdir("blk");
+         put("blk/backups", "x", 1);
+         put_cut_rzip(save, disk, BIG, cut, &cut_len);
+      }
+      else
+         put(save, disk, BIG);
+      memset(ram, 0, BIG);
+      core_data = ram;
+      core_size = BIG;
+      path_init_savefile_new();
+      path_init_savefile_rtc(save);
+      event_load_save_files(false);
+      notice_num = 0;
+      LOG_LOCK();
+      log_num = 0;
+      LOG_UNLOCK();
+      use_test_vfs(true);
+      set_vfs(4096, false);
+      start_at(save, ram, BIG, false);
+
+      flush_failing(ram, p1);
+      CHECK(copies(dir, SAVE_BACKUP_UNSAVED, newest, sizeof(newest)) == 1
+            && holds(newest, p1, BIG),
+            "same: the image is not in one recovery file");
+      CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 1, "same: not told");
+      if (!c)
+         CHECK(copies(dir, SAVE_BACKUP_BEFORE_STATE_LOAD, NULL, 0) == 1,
+               "same: no newer copy to skip over");
+
+      flush_failing(ram, p1);
+      CHECK(copies(dir, SAVE_BACKUP_UNSAVED, newest, sizeof(newest)) == 1
+            && holds(newest, p1, BIG),
+            "same: the same image made another file");
+      CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 2,
+            "same: the same image not told");
+
+      flush_failing(ram, p2);
+      flush_failing(ram, p1);
+      CHECK(copies(dir, SAVE_BACKUP_UNSAVED, newest, sizeof(newest)) == 3
+            && holds(newest, p1, BIG),
+            "same: compared with more than the newest");
+      flush_failing(ram, p1);
+      CHECK(copies(dir, SAVE_BACKUP_UNSAVED, NULL, 0) == 3,
+            "same: the newest not compared");
+      CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 5,
+            "same: not one notice each");
+
+      /* The chain's first folder works again: the newest is still in
+       * the fallback, and is the file. */
+      if (c)
+      {
+         filestream_delete("blk/backups");
+         flush_failing(ram, p1);
+         CHECK(!copies("blk/backups", SAVE_BACKUP_UNSAVED, NULL, 0)
+               && copies(dir, SAVE_BACKUP_UNSAVED, NULL, 0) == 3,
+               "same: the newest in another folder not compared");
+         CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 6,
+               "same: the other folder's not told");
+      }
+      capture_and_wait();
+      CHECK(holds(save, c ? cut : disk, c ? (size_t)cut_len : BIG),
+            "same: the save changed");
+      CHECK(!logged('W', "") && !logged('E', ""), "same: the worker logged");
+      stop();
+      set_vfs(0, false);
+      use_test_vfs(false);
+      path_deinit_savefile();
+      clear_dir("blk/backups");
+      path_rmdir("blk/backups");
+   }
+   clean();
+}
+
 /* A flush whose owed copy cannot be made: the save stays and the image
  * goes to one recovery file; both notices, each once. Later checks
  * only retry; the close's image is a recovery file of its own. */
@@ -1561,7 +1782,7 @@ static void lane_flush_copy_fails(void)
 /* A flush with nowhere for its image: each is shown as not saved. */
 static void lane_flush_unrecoverable(void)
 {
-   static unsigned char disk[BIG], ram[BIG], p1[BIG], p2[BIG];
+   static unsigned char disk[BIG], ram[BIG], p1[BIG], p2[BIG], p3[BIG];
    const char *save = "blk/game.srm";
    const int bsl    = 1 << SAVE_BACKUP_BEFORE_STATE_LOAD;
 
@@ -1572,6 +1793,7 @@ static void lane_flush_unrecoverable(void)
    fill(disk, BIG, 97);
    fill(p1, BIG, 98);
    fill(p2, BIG, 99);
+   fill(p3, BIG, 106);
    put(save, disk, BIG);
    core_data = ram;
    core_size = BIG;
@@ -1602,7 +1824,14 @@ static void lane_flush_unrecoverable(void)
          "unrecoverable: a recovery file");
    CHECK(!logged('W', "Unsaved progress") && !logged('W', "msg"),
          "unrecoverable: the worker logged");
+
+   /* Lost at the exit: no later session can tell. */
+   memcpy(ram, p3, BIG);
+   event_flush_save_files(true, false, bsl);
    stop();
+   CHECK(notices(MSG_SAVE_WRITE_FAILED) == 3, "unrecoverable: not shown at exit");
+   CHECK(logged_msg(MSG_SAVE_WRITE_FAILED) == 1 && logged('W', "") == 1,
+         "unrecoverable: not one log line at exit");
    set_vfs(0, false);
    use_test_vfs(false);
    path_deinit_savefile();
@@ -1613,9 +1842,11 @@ static void lane_flush_unrecoverable(void)
  * in a recovery file and shown all the same. */
 static void lane_flush_fails_at_quit(void)
 {
-   static unsigned char disk[BIG], ram[BIG], p1[BIG], l1[BIG];
+   static unsigned char cut[BIG * 2], disk[BIG], ram[BIG], p1[BIG], l1[BIG];
    char newest[PATH_MAX_LENGTH];
-   const int bsl = 1 << SAVE_BACKUP_BEFORE_STATE_LOAD;
+   int64_t cut_len  = 0;
+   const char *save = "blk/game.srm";
+   const int bsl    = 1 << SAVE_BACKUP_BEFORE_STATE_LOAD;
 
    fill_id(disk, BIG, 100, 'D');
    fill_id(p1, BIG, 101, 'P');
@@ -1634,6 +1865,8 @@ static void lane_flush_fails_at_quit(void)
          "fails_at_quit: the image is not in one recovery file");
    CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 1 && notice_num == 1,
          "fails_at_quit: not one recovery notice");
+   CHECK(logged_msg(MSG_SAVE_WRITE_RECOVERED) == 1 && logged('W', "") == 1,
+         "fails_at_quit: not one log line");
 
    event_save_files(true, false, true, true, NULL);
    CHECK(holds(SAVE, l1, BIG), "fails_at_quit: the close did not write");
@@ -1643,11 +1876,124 @@ static void lane_flush_fails_at_quit(void)
    CHECK(copies("backups", SAVE_BACKUP_UNSAVED, NULL, 0) == 1
          && copies("backups", SAVE_BACKUP_REASON_LAST, NULL, 0) == 2,
          "fails_at_quit: another recovery file or copy");
+   CHECK(logged('W', "") == 1, "fails_at_quit: the close logged a warning");
    gate_next = false;
    gate_ec   = NULL;
    use_test_vfs(false);
    path_deinit_savefile();
    clean();
+
+   /* Its copy fails too: that notice is not logged here. */
+   path_mkdir("blk");
+   put("blk/backups", "x", 1);
+   fill_id(disk, BIG, 107, 'D');
+   put_cut_rzip(save, disk, BIG, cut, &cut_len);
+   memset(ram, 0, BIG);
+   core_data = ram;
+   core_size = BIG;
+   path_init_savefile_new();
+   path_init_savefile_rtc(save);
+   event_load_save_files(false);
+   notice_num = 0;
+   LOG_LOCK();
+   log_num = 0;
+   LOG_UNLOCK();
+   start_parked_at(save, ram);
+   memcpy(ram, p1, BIG);
+   event_flush_save_files(true, false, bsl);
+   stop();
+   CHECK(holds(save, cut, (size_t)cut_len),
+         "fails_at_quit: written without its copy");
+   CHECK(copies("cfg/recovery", SAVE_BACKUP_UNSAVED, newest,
+            sizeof(newest)) == 1 && holds(newest, p1, BIG),
+         "fails_at_quit: the image is not in one recovery file, copy failed");
+   CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 1
+         && notices(MSG_SAVE_BACKUP_FAILED) == 1 && notice_num == 2,
+         "fails_at_quit: not one notice each, copy failed");
+   CHECK(logged_msg(MSG_SAVE_WRITE_RECOVERED) == 1 && logged('W', "") == 1,
+         "fails_at_quit: not one log line, copy failed");
+   gate_next = false;
+   gate_ec   = NULL;
+   path_deinit_savefile();
+
+   /* Through autosave_deinit() itself. */
+   flush_lane_begin(disk, ram);
+   CHECK(autosave_init(false, 1), "fails_at_quit: autosave_init failed");
+   set_vfs(4096, false);
+   memcpy(ram, p1, BIG);
+   event_flush_save_files(true, false, bsl);
+   joining_all = true;
+   autosave_deinit();
+   joining_all = false;
+   CHECK(holds(SAVE, disk, BIG), "fails_at_quit: deinit, the save changed");
+   CHECK(copies("backups", SAVE_BACKUP_UNSAVED, newest, sizeof(newest)) == 1
+         && holds(newest, p1, BIG),
+         "fails_at_quit: deinit, the image is not in one recovery file");
+   CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 1 && notice_num == 1,
+         "fails_at_quit: deinit, not one recovery notice");
+   CHECK(logged_msg(MSG_SAVE_WRITE_RECOVERED) == 1 && logged('W', "") == 1,
+         "fails_at_quit: deinit, not one log line");
+   flush_lane_end();
+}
+
+/* A retired worker is reaped inside a check, which does not log: what
+ * it raised is only shown. */
+static void lane_flush_reap_no_log(void)
+{
+   static unsigned char disk[BIG], ram[BIG], big[BIG + 64];
+   unsigned i;
+   autosave_t *held;
+
+   fill_id(disk, BIG, 108, 'D');
+   fill_id(big, sizeof(big), 109, 'B');
+   flush_lane_begin(disk, ram);
+   start(ram, BIG, false);
+   held      = slots[0];
+   core_data = big;
+   core_size = sizeof(big);
+   autosave_check();
+   CHECK(slots[0] != held && slots[0]->prev == held,
+         "reap: not retired");
+   for (i = 0; i < 5000 && !retro_atomic_load_acquire_int(&held->exited); i++)
+      retro_sleep(1);
+   CHECK(retro_atomic_load_acquire_int(&held->exited),
+         "reap: the retired worker did not end");
+   retro_atomic_fetch_or_int(&held->file->flags, SAVE_FILE_FLUSH_RECOVERED);
+   autosave_reap(slots[0]);
+   CHECK(!slots[0]->prev, "reap: not joined");
+   CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 1 && notice_num == 1,
+         "reap: not shown");
+   CHECK(!logged('W', ""), "reap: logged inside a check");
+   flush_lane_end();
+}
+
+/* Erased memory's flush that fails leaves nothing to recover: told as
+ * not saved, and no empty recovery file. */
+static void lane_flush_zero_bytes(void)
+{
+   static unsigned char disk[BIG], ram[BIG];
+
+   fill_id(disk, BIG, 110, 'D');
+   flush_lane_begin(disk, ram);
+   core_size = 0;
+   slots[0]  = autosave_new(SAVE, ram, 0, 0, false, RETRO_MEMORY_SAVE_RAM,
+         true, save_file_get(0));
+   CHECK(slots[0] != NULL, "zero_bytes: autosave_new failed");
+   autosave_state.list = slots;
+   autosave_state.num  = 1;
+   wait_requested();
+   set_vfs(0, true);
+   event_flush_save_files(true, false, 0);
+   wait_flushed();
+   stop();
+   set_vfs(0, false);
+   CHECK(holds(SAVE, disk, BIG), "zero_bytes: the save changed");
+   CHECK(!copies("backups", SAVE_BACKUP_UNSAVED, NULL, 0)
+         && !copies("cfg/recovery", SAVE_BACKUP_REASON_LAST, NULL, 0),
+         "zero_bytes: an empty recovery file");
+   CHECK(notices(MSG_SAVE_WRITE_FAILED) == 1 && notice_num == 1,
+         "zero_bytes: not told as not saved");
+   flush_lane_end();
 }
 
 /* A1-1: a full disk or a refused rename keeps the old save whole and
@@ -2857,7 +3203,10 @@ int main(void)
    lane_state_load_copy_sync();
    lane_flush_copy_fails_sync();
    lane_flush_write_fails_sync();
+   lane_flush_same_image_sync();
 #ifdef HAVE_THREADS
+   retro_atomic_int_init(&wait_entries, 0);
+   retro_atomic_int_init(&wait_leaves, 0);
    lane_state_load_copy_worker();
    lane_flush_with_snapshot();
    lane_flush_queue();
@@ -2868,6 +3217,9 @@ int main(void)
    lane_flush_copy_fails();
    lane_flush_unrecoverable();
    lane_flush_fails_at_quit();
+   lane_flush_reap_no_log();
+   lane_flush_zero_bytes();
+   lane_flush_same_image();
    lane_autosave_full_disk();
    lane_no_rewrite_at_launch();
    lane_pointer_requery();
