@@ -6870,6 +6870,21 @@ void runloop_flush_save_files(void)
    }
 }
 
+static retro_atomic_int_t runloop_save_files_request
+   = RETRO_ATOMIC_INT_INITIALIZER(0);
+
+void runloop_request_save_files(void)
+{
+   retro_atomic_store_release_int(&runloop_save_files_request, 1);
+}
+
+/* Main thread, between frames */
+static void runloop_take_save_files_request(void)
+{
+   if (retro_atomic_fetch_and_int(&runloop_save_files_request, 0))
+      runloop_flush_save_files();
+}
+
 void runloop_pause_checks(void)
 {
 #ifdef HAVE_PRESENCE
@@ -9872,6 +9887,9 @@ int runloop_iterate(void)
     * stack, and a libco core reaches the poll on its own. */
    android_input_flush_pending_haptics();
 #endif
+
+   /* A save asked for off the main thread or inside the core's frame */
+   runloop_take_save_files_request();
 
    /* Tick deferred shader compilation (one pass per frame) */
    video_driver_shader_deferred_tick();

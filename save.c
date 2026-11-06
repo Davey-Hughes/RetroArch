@@ -503,8 +503,10 @@ static bool autosave_take_flush(autosave_t *save)
          return false;
    } while (!retro_atomic_cas_int(&save->flush[slot], w,
             w | AUTOSAVE_FLUSH_OUT));
-   autosave_put(save, save->flush_buf[slot], save->flush_gen[slot],
-         !(w & AUTOSAVE_FLUSH_KEPT));
+   /* Backed up already: the main thread writes the file itself. */
+   if (!(w & AUTOSAVE_FLUSH_PAID))
+      autosave_put(save, save->flush_buf[slot], save->flush_gen[slot],
+            !(w & AUTOSAVE_FLUSH_KEPT));
    /* Owed before the slot empties: a main write that finds it empty
     * makes them from the file. */
    if (!(retro_atomic_load_acquire_int(&save->flush[slot])
@@ -1000,10 +1002,9 @@ static void autosave_fill(autosave_t *handle, unsigned slot,
  * and before any later image, then @owed. A @kept image is of memory
  * that stays as it is. Either replaces a kept or backed up image the
  * worker has not taken from the slot filled last. With both slots out
- * otherwise,
- * only @owed is added, to the one filled last; a kept image is left
- * out, as the worker asks for a copy once they are written. Copies;
- * never waits. */
+ * otherwise, only @owed is added, to the one filled last; a kept image
+ * is left out, as the worker asks for a copy once they are written.
+ * Copies; never waits. */
 static void autosave_flush(autosave_t *handle, const void *data, int owed,
       bool kept)
 {

@@ -2660,6 +2660,117 @@ static void lane_main_write_no_rest(void)
    flush_lane_end();
 }
 
+/* The save's copies refused: a file where their folder goes. */
+static void refuse_copies(bool refuse)
+{
+   if (refuse)
+   {
+      clear_dir("backups");
+      path_rmdir("backups");
+      put("backups", "x", 1);
+   }
+   else
+      filestream_delete("backups");
+}
+
+/* A state load's image whose copy the main thread could not make is
+ * written over its write and backed up from the file, before that
+ * write lands again. The image is the worker's last write. */
+static void lane_main_write_pays_failed(void)
+{
+   static unsigned char disk[BIG], ram[BIG], l1[BIG];
+   char newest[PATH_MAX_LENGTH];
+
+   fill_id(disk, BIG, 104, 'D');
+   fill_id(l1, BIG, 105, 'L');
+   flush_lane_begin(disk, ram);
+   start_parked(ram);
+   refuse_copies(true);
+   event_flush_save_files(true, false, 1 << SAVE_BACKUP_BEFORE_STATE_LOAD);
+   memcpy(ram, l1, BIG);
+   event_save_files(true, false, true, true, NULL);
+   refuse_copies(false);
+   retro_atomic_store_release_int(&gate_open, 1);
+   wait_flushed();
+   wait_requested();
+   CHECK(holds(SAVE, l1, BIG) && written_in_order("LDL"),
+         "pays failed: the image not written before the write again");
+   CHECK(copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, newest,
+            sizeof(newest)) == 1 && holds(newest, disk, BIG),
+         "pays failed: the copy is not the pre-load save");
+   flush_lane_end();
+}
+
+/* An image backed up before the worker took it is not written, so a
+ * copy it would owe cannot fail: no recovery file and no notice. */
+static void lane_main_write_paid_taken(void)
+{
+   static unsigned char disk[BIG], ram[BIG], p1[BIG], p2[BIG], l1[BIG];
+   char newest[PATH_MAX_LENGTH];
+   const int bsl = 1 << SAVE_BACKUP_BEFORE_STATE_LOAD;
+
+   fill_id(disk, BIG, 106, 'D');
+   memset(p1, 0, BIG);
+   fill_id(p2, BIG, 107, 'Q');
+   fill_id(l1, BIG, 108, 'L');
+   flush_lane_begin(disk, ram);
+   start_parked(ram);
+   memcpy(ram, p1, BIG);
+   event_flush_save_files(true, false, bsl);
+   memcpy(ram, p2, BIG);
+   event_flush_save_files(true, false, bsl);
+   memcpy(ram, l1, BIG);
+   event_save_files(true, false, true, true, NULL);
+   CHECK(copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, newest,
+            sizeof(newest)) == 2 && holds(newest, p2, BIG),
+         "paid taken: the pre-load images not both backed up");
+   refuse_copies(true);
+   retro_atomic_store_release_int(&gate_open, 1);
+   wait_flushed();
+   wait_requested();
+   stop();
+   CHECK(holds(SAVE, l1, BIG) && written_in_order("LL"),
+         "paid taken: a backed up image written over the save");
+   CHECK(quiet(), "paid taken: a recovery file or notice");
+   refuse_copies(false);
+   flush_lane_end();
+}
+
+/* The older image is being written and lands after the main thread's
+ * write; the newer, backed up and not taken, is replaced by that
+ * write's image, which lands last with no check after. */
+static void lane_main_write_replaces_paid(void)
+{
+   static unsigned char disk[BIG], ram[BIG], p1[BIG], p2[BIG], l1[BIG];
+   char newest[PATH_MAX_LENGTH];
+   const int bsl = 1 << SAVE_BACKUP_BEFORE_STATE_LOAD;
+
+   fill_id(disk, BIG, 109, 'D');
+   fill_id(p1, BIG, 110, 'P');
+   fill_id(p2, BIG, 111, 'Q');
+   fill_id(l1, BIG, 112, 'L');
+   flush_lane_begin(disk, ram);
+   start(ram, BIG, false);
+   memcpy(ram, p1, BIG);
+   stall(2);
+   event_flush_save_files(true, false, bsl);
+   CHECK(wait_stalled(), "replaces paid: the worker did not stop in "
+         "opening its temporary");
+   memcpy(ram, p2, BIG);
+   event_flush_save_files(true, false, bsl);
+   memcpy(ram, l1, BIG);
+   event_save_files(true, false, true, true, NULL);
+   stall(0);
+   wait_flushed();
+   wait_requested();
+   CHECK(holds(SAVE, l1, BIG) && written_in_order("LPL"),
+         "replaces paid: the older image left over the save");
+   CHECK(copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, newest,
+            sizeof(newest)) == 2 && holds(newest, p2, BIG),
+         "replaces paid: the pre-load images not both backed up");
+   flush_lane_end();
+}
+
 /* A1-1: a full disk or a refused rename keeps the old save whole and
  * leaves no temporary; the image is written at the next check. */
 static void lane_autosave_full_disk(void)
@@ -4024,6 +4135,9 @@ int main(void)
    lane_main_write_pays_landed();
    lane_main_write_pays_both();
    lane_main_write_no_rest();
+   lane_main_write_pays_failed();
+   lane_main_write_paid_taken();
+   lane_main_write_replaces_paid();
    lane_autosave_full_disk();
    lane_no_rewrite_at_launch();
    lane_pointer_requery();

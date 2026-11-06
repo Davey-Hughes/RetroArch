@@ -402,8 +402,8 @@ struct runloop
    bool content_closing;
    bool content_switching;
    /* Main thread: the core is running a frame (core_run(), run-ahead).
-    * A platform callback reached from there, as 3DS's from the audio
-    * driver's wait, must not read core memory. */
+    * A platform callback reached from there must not read core memory;
+    * it asks with runloop_request_save_files(). */
    bool in_core_frame;
    /* quit_pending: a quit from the frame loop is waiting for a state
     * task to finish writing (retroarch_main_quit_staged()).  The loop
@@ -1072,6 +1072,10 @@ void runloop_pause_checks(void);
 /* The game stopped running: its saves are written now if they changed,
  * by the autosave worker where one runs. */
 void runloop_flush_save_files(void);
+
+/* Any thread: the main thread does runloop_flush_save_files() at its
+ * next frame. */
+void runloop_request_save_files(void);
 
 /* The sources that held the loop on the last iteration, as the
  * statistics overlay names them - "VSync+Display", "Timer", "None" -

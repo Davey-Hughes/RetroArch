@@ -11,9 +11,13 @@
  * again. The flags that gate the writes stand in for them here;
  * save_e2e's nosave_netplay_disconnect lane counts the writes.
  *
+ * A save asked for from another thread (3DS's suspend hook) is made
+ * once, at the main thread's next frame.
+ *
  * The shipping function is included and run over a real folder. */
 #include "../../../runloop.c"
 #include <stdio.h>
+#include <rthreads/rthreads.h>
 
 #define ROOT "save_paths_test_files"
 
@@ -191,6 +195,39 @@ static void netplay_no_folder(void)
    netplay_client       = false;
 }
 
+static unsigned kept_flushes;
+void event_flush_kept_save_files(bool sram_used, bool compress_files)
+{
+   (void)compress_files;
+   if (sram_used)
+      kept_flushes++;
+}
+
+static void request_save_files(void *data)
+{
+   (void)data;
+   runloop_request_save_files();
+}
+
+static void save_files_request(void)
+{
+   sthread_t *t;
+   memset(&runloop_state, 0, sizeof(runloop_state));
+   runloop_state.flags |= RUNLOOP_FLAG_USE_SRAM;
+   kept_flushes = 0;
+   runloop_take_save_files_request();
+   CHECK(kept_flushes == 0);
+   t = sthread_create(request_save_files, NULL);
+   CHECK(t != NULL);
+   if (t)
+      sthread_join(t);
+   CHECK(kept_flushes == 0);
+   runloop_take_save_files_request();
+   CHECK(kept_flushes == 1);
+   runloop_take_save_files_request();
+   CHECK(kept_flushes == 1);
+}
+
 int main(void)
 {
    rm_tree(ROOT);
@@ -198,6 +235,7 @@ int main(void)
    CHECK(path_mkdir(ROOT "/states"));
    reserved_rom_folder();
    netplay_no_folder();
+   save_files_request();
    rm_tree(ROOT);
    puts(failures ? "FAIL save_paths_test" : "PASS save_paths_test");
    return failures ? 1 : 0;

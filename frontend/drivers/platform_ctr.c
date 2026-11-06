@@ -160,14 +160,18 @@ u8* gfxBottomFramebuffers[2];
 
 #ifndef IS_SALAMANDER
 /* HOME, the power button or a closed lid: the console may not come
- * back to it. Not inside the core's frame (aptMainLoop() in the audio
- * driver's wait), where its memory is half a frame and the stack may
- * be the core's: as on Android, only between frames. */
+ * back to it. Written now only on the main thread (no libctru Thread)
+ * between frames. aptMainLoop() also runs in the audio driver's wait,
+ * on the audio thread or inside the core's frame, where memory is
+ * half a frame: as on Android, the next frame writes it. */
 static void ctr_save_hook(APT_HookType hook, void *param)
 {
-   if (     (hook == APTHOOK_ONSUSPEND || hook == APTHOOK_ONSLEEP)
-         && !runloop_state_get_ptr()->in_core_frame)
+   if (hook != APTHOOK_ONSUSPEND && hook != APTHOOK_ONSLEEP)
+      return;
+   if (!threadGetCurrent() && !runloop_state_get_ptr()->in_core_frame)
       retroarch_save_files_for_suspend();
+   else
+      runloop_request_save_files();
 }
 #endif
 
