@@ -35,6 +35,7 @@ on:
       - 'samples/runloop/save_paths/**'
       - 'save.c'
       - 'autosave.h'
+      - 'config.def.h'
       - 'tasks/task_save.c'
       - 'samples/runloop/autosave_snapshot/**'
       - 'samples/runloop/save_e2e/**'
@@ -71,6 +72,7 @@ on:
       - 'samples/runloop/save_paths/**'
       - 'save.c'
       - 'autosave.h'
+      - 'config.def.h'
       - 'tasks/task_save.c'
       - 'samples/runloop/autosave_snapshot/**'
       - 'samples/runloop/save_e2e/**'
@@ -227,6 +229,8 @@ jobs:
           # or a refused rename keeps the old save whole; nothing written
           # for an unchanged save; memory a core moves or resizes
           # followed.  The close write, with and without HAVE_THREADS.
+          # The cadence of a save that keeps changing, and config.def.h's
+          # default interval with and without threads.
           make -C samples/runloop/autosave_snapshot clean check
           make -C samples/runloop/autosave_snapshot clean check SANITIZER=address,undefined
           make -C samples/runloop/autosave_snapshot clean

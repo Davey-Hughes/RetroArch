@@ -3,6 +3,8 @@
 #include <assert.h>
 #include <stdio.h>
 #include <retro_timers.h>
+/* No busy cap: these lanes change save RAM at consecutive checks. */
+#define AUTOSAVE_BUSY_USEC 0
 #include "../../../save.c"
 
 #define SRAM_SIZE 17

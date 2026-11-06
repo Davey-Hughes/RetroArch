@@ -24,6 +24,7 @@
 #include <streams/rzip_stream.h>
 #include <rthreads/rthreads.h>
 #ifdef HAVE_THREADS
+#include <encodings/crc32.h>
 #include <features/features_cpu.h>
 #include <rthreads/retro_eventcount.h>
 #endif
@@ -290,6 +291,11 @@ static void save_file_notice(enum msg_hash_enums msg, const char *path,
    (AUTOSAVE_FLUSH_FULL | AUTOSAVE_FLUSH_OUT | AUTOSAVE_FLUSH_KEPT \
     | AUTOSAVE_FLUSH_PAID)
 
+/* A save that changes at every check is written at most this often. */
+#ifndef AUTOSAVE_BUSY_USEC
+#define AUTOSAVE_BUSY_USEC 60000000
+#endif
+
 typedef struct autosave autosave_t;
 
 /* Autosave support. */
@@ -324,6 +330,8 @@ struct autosave
    size_t bufsize;
    /* Main thread only: retired, when to try a replacement again */
    retro_time_t retry_time;
+   /* Worker only: when it last wrote the file */
+   retro_time_t last_write;
    /* What the worker sleeps on: the copy it asked for, the end of its
     * interval, or quit. */
    retro_eventcount_t ec;
@@ -477,8 +485,9 @@ static void autosave_put(autosave_t *save, const void *image, int gen,
       if (written)
       {
          memcpy(save->buffer, image, save->bufsize);
-         save->unwritten = false;
-         save->put_gen   = gen;
+         save->unwritten  = false;
+         save->put_gen    = gen;
+         save->last_write = cpu_features_get_time_usec();
          save_file_keep_stat(save->file, save->path);
          return;
       }
@@ -529,7 +538,14 @@ static bool autosave_woken(autosave_t *save)
 
 static void autosave_thread(void *data)
 {
-   autosave_t *save = (autosave_t*)data;
+   autosave_t *save  = (autosave_t*)data;
+   /* Cadence: the previous check's copy, as a CRC */
+   uint32_t prev_crc = encoding_crc32(0,
+         (const uint8_t*)save->buffer, save->bufsize);
+   bool prev_changed = false;
+   retro_time_t busy = (retro_time_t)save->interval * 1000000;
+   if (busy < AUTOSAVE_BUSY_USEC)
+      busy = AUTOSAVE_BUSY_USEC;
 
    while (!autosave_quitting(save))
    {
@@ -559,8 +575,20 @@ static void autosave_thread(void *data)
       if (retro_atomic_load_acquire_int(&save->snapshot_requested))
          continue;
 
-      /* The snapshot remains ours until the next request. */
-      autosave_put(save, save->snapshot, save->snapshot_gen, false);
+      /* The snapshot remains ours until the next request. Written at
+       * the first check after a quiet one, once it settles, or once
+       * per busy period while it keeps changing; one not yet on disk
+       * (a failed or dropped write) at once. */
+      {
+         uint32_t crc = encoding_crc32(0,
+               (const uint8_t*)save->snapshot, save->bufsize);
+         bool changed = crc != prev_crc;
+         if (     save->unwritten || !changed || !prev_changed
+               || cpu_features_get_time_usec() - save->last_write >= busy)
+            autosave_put(save, save->snapshot, save->snapshot_gen, false);
+         prev_crc     = crc;
+         prev_changed = changed;
+      }
       /* The main thread wrote since the copy: a newer one, not a rest */
       if (retro_atomic_load_acquire_int(&save->main_gen) != save->snapshot_gen)
          continue;
@@ -632,6 +660,7 @@ static autosave_t *autosave_new(const char *path,
    handle->flush_gen[1]          = 0;
    handle->snapshot_gen          = 0;
    handle->put_gen               = 0;
+   handle->last_write            = cpu_features_get_time_usec();
    handle->flush_fill            = 0;
    handle->flush_take            = 0;
    handle->bufsize               = len;

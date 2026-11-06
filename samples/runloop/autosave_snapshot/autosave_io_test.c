@@ -19,6 +19,11 @@
 #define sthread_join test_sthread_join
 #define cpu_features_get_time_usec test_time_usec
 #define retro_eventcount_commit_wait test_commit_wait
+/* The busy cap's 60 s, set per lane: 0 (writes whenever the image
+ * differs, as the lanes before the cadence expect) unless a lane sets
+ * it before it starts a worker. */
+static long long test_busy_usec = 0;
+#define AUTOSAVE_BUSY_USEC test_busy_usec
 #endif
 #include "../../../save.c"
 #undef filestream_write_file_atomic_synced
@@ -2905,6 +2910,117 @@ static void lane_main_write_paid_dropped(void)
    flush_lane_end();
 }
 
+/* A worker checking only when the lane makes a copy, resting
+ * @interval s after each, with a busy cap of @busy_usec. */
+static void cadence_start(unsigned char *ram, long long busy_usec,
+      unsigned interval)
+{
+   test_busy_usec = busy_usec;
+   core_data      = ram;
+   core_size      = BIG;
+   slots[0] = autosave_new(SAVE, ram, BIG, interval, false,
+         RETRO_MEMORY_SAVE_RAM, false, NULL);
+   CHECK(slots[0] != NULL, "cadence: autosave_new failed");
+   autosave_state.list = slots;
+   autosave_state.num  = 1;
+   wait_requested();
+}
+
+/* One check, save RAM changed first if @change: the writes it made. */
+static unsigned cadence_check(unsigned char *ram, bool change)
+{
+   static unsigned char next;
+   unsigned opens = get_write_opens();
+   if (change)
+      ram[next++] ^= 0xFF;
+   capture_and_wait();
+   return get_write_opens() - opens;
+}
+
+/* The autosave cadence, one check at a time: a change after a quiet
+ * check is written at that check; a save changing at every check is
+ * not written until the busy cap has passed since its last write; a
+ * settled image at the first quiet check. */
+static void lane_autosave_cadence(void)
+{
+   static unsigned char disk[BIG], ram[BIG];
+   unsigned i, w;
+
+   clean();
+   fill(disk, BIG, 81);
+   put(SAVE, disk, BIG);
+   memcpy(ram, disk, BIG);
+   use_test_vfs(true);
+
+   /* A cap that never passes here. */
+   cadence_start(ram, 3600000000LL, 0);
+   w  = cadence_check(ram, false);
+   w += cadence_check(ram, false);
+   CHECK(w == 0, "cadence: an unchanged save written");
+   w = cadence_check(ram, true);
+   CHECK(w == 1 && holds(SAVE, ram, BIG),
+         "cadence: a first change not written at the next check");
+   w = cadence_check(ram, false);
+   CHECK(w == 0, "cadence: a quiet check wrote");
+   w = cadence_check(ram, true);
+   CHECK(w == 1, "cadence: a change after a quiet check not written");
+   for (i = w = 0; i < 3; i++)
+      w += cadence_check(ram, true);
+   CHECK(w == 0, "cadence: a save changing at every check written");
+   w = cadence_check(ram, false);
+   CHECK(w == 1 && holds(SAVE, ram, BIG),
+         "cadence: a settled save not written at the first quiet check");
+   w = cadence_check(ram, false);
+   CHECK(w == 0, "cadence: a settled save written again");
+   stop();
+
+   /* A 1 s cap on the worker's clock, from its last write: still
+    * changing once it has passed, written. */
+   cadence_start(ram, 1000000, 0);
+   now_usec += test_busy_usec;
+   cadence_check(ram, true);
+   w = cadence_check(ram, true);
+   now_usec += test_busy_usec - 1;
+   w += cadence_check(ram, true);
+   CHECK(w == 0, "cadence: a save changing at every check written early");
+   now_usec += 1;
+   w = cadence_check(ram, true);
+   CHECK(w == 1 && holds(SAVE, ram, BIG),
+         "cadence: a save changing at every check not written after the cap");
+   stop();
+
+   /* An interval longer than the cap is the cap: still changing, not
+    * written once the cap has passed, written once the interval has. */
+   cadence_start(ram, 500000, 1);
+   cadence_check(ram, true);
+   now_usec += test_busy_usec;
+   w = cadence_check(ram, true);
+   CHECK(w == 0, "cadence: a save changing at every check written "
+         "before the interval");
+   now_usec += test_busy_usec;
+   w = cadence_check(ram, true);
+   CHECK(w == 1 && holds(SAVE, ram, BIG),
+         "cadence: a save changing at every check not written after "
+         "the interval");
+   stop();
+
+   /* A failed write is tried again at the next check, though the save
+    * still changes and the cap has not passed. */
+   cadence_start(ram, 3600000000LL, 0);
+   set_vfs(0, true);
+   w = cadence_check(ram, true);
+   CHECK(w == 1 && !holds(SAVE, ram, BIG), "cadence: a refused write");
+   set_vfs(0, false);
+   w = cadence_check(ram, true);
+   CHECK(w == 1 && holds(SAVE, ram, BIG),
+         "cadence: a failed write not tried again at the next check");
+   stop();
+
+   test_busy_usec = 0;
+   use_test_vfs(false);
+   clean();
+}
+
 /* A full disk or a refused rename keeps the old save whole and
  * leaves no temporary; the image is written at the next check. */
 static void lane_autosave_full_disk(void)
@@ -4308,6 +4424,7 @@ int main(void)
    lane_main_write_replaces_paid();
    lane_main_write_paid_out_fails();
    lane_main_write_paid_dropped();
+   lane_autosave_cadence();
    lane_autosave_full_disk();
    lane_no_rewrite_at_launch();
    lane_pointer_requery();

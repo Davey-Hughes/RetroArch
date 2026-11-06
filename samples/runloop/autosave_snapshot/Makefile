@@ -4,6 +4,7 @@ LRC := $(ROOT)/libretro-common
 TARGET := autosave_snapshot_test
 SOURCES := autosave_snapshot_test.c $(ROOT)/libretro-common/rthreads/rthreads.c \
            $(ROOT)/libretro-common/rthreads/retro_eventcount.c \
+           $(ROOT)/libretro-common/encodings/encoding_crc32.c \
            $(ROOT)/libretro-common/features/features_cpu.c \
            $(ROOT)/libretro-common/time/rtime.c
 
@@ -35,6 +36,10 @@ IO_SOURCES := autosave_io_test.c $(ROOT)/save_backups.c \
 IO_THREAD_SOURCES := $(LRC)/rthreads/rthreads.c \
                      $(LRC)/rthreads/retro_eventcount.c
 
+# autosave_default_test: config.def.h's default with and without threads.
+DEFAULT_TARGET := autosave_default_test
+DEFAULT_NOTHREADS_TARGET := autosave_default_test_nothreads
+
 BASE_CFLAGS := $(CFLAGS) -std=gnu89 -Wall -g -O1 \
           -ffunction-sections -fdata-sections \
           -I$(ROOT) -I$(ROOT)/libretro-common/include
@@ -61,7 +66,8 @@ IO_CFLAGS += -fsanitize=$(SANITIZER) -fno-omit-frame-pointer
 LDFLAGS += -fsanitize=$(SANITIZER)
 endif
 
-all: $(TARGET) $(IO_TARGET) $(IO_NOTHREADS_TARGET)
+all: $(TARGET) $(IO_TARGET) $(IO_NOTHREADS_TARGET) \
+     $(DEFAULT_TARGET) $(DEFAULT_NOTHREADS_TARGET)
 
 $(TARGET): $(SOURCES) $(ROOT)/save.c $(ROOT)/autosave.h
 	$(CC) $(CFLAGS) $(SOURCES) $(LDFLAGS) $(LDLIBS) -o $@
@@ -72,14 +78,24 @@ $(IO_TARGET): $(IO_SOURCES) $(IO_THREAD_SOURCES) $(ROOT)/save.c $(ROOT)/autosave
 $(IO_NOTHREADS_TARGET): $(IO_SOURCES) $(ROOT)/save.c $(ROOT)/autosave.h
 	$(CC) $(IO_CFLAGS) $(IO_SOURCES) $(LDFLAGS) -o $@
 
+$(DEFAULT_TARGET): autosave_default_test.c $(ROOT)/config.def.h
+	$(CC) $(BASE_CFLAGS) -DHAVE_THREADS autosave_default_test.c -o $@
+
+$(DEFAULT_NOTHREADS_TARGET): autosave_default_test.c $(ROOT)/config.def.h
+	$(CC) $(BASE_CFLAGS) autosave_default_test.c -o $@
+
 check: all
 	./$(TARGET)
 	./$(IO_TARGET)
 	./$(IO_NOTHREADS_TARGET)
+	./$(DEFAULT_TARGET)
+	./$(DEFAULT_NOTHREADS_TARGET)
 
 clean:
 	rm -f $(TARGET) $(TARGET).exe $(IO_TARGET) $(IO_TARGET).exe \
-	      $(IO_NOTHREADS_TARGET) $(IO_NOTHREADS_TARGET).exe
+	      $(IO_NOTHREADS_TARGET) $(IO_NOTHREADS_TARGET).exe \
+	      $(DEFAULT_TARGET) $(DEFAULT_TARGET).exe \
+	      $(DEFAULT_NOTHREADS_TARGET) $(DEFAULT_NOTHREADS_TARGET).exe
 	rm -f game.srm game.srm.tmp game.srm.auto.tmp
 	rm -rf backups blk cfg
 
