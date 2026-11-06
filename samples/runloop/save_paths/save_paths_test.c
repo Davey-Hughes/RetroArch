@@ -8,7 +8,8 @@
  *
  * A netplay client whose ".netplay" folder can't be made writes no
  * saves for that content, says so once, and the next content saves
- * again. The flags that gate the writes stand in for them here.
+ * again. The flags that gate the writes stand in for them here;
+ * save_e2e's nosave_netplay_disconnect lane counts the writes.
  *
  * The shipping function is included and run over a real folder. */
 #include "../../../runloop.c"

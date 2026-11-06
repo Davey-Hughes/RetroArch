@@ -518,6 +518,58 @@ def lane_recovery_announced(args, n):
     return r, failures
 
 
+def lane_nosave_netplay_disconnect(args, n):
+    """--sram-mode load-nosave: a netplay host stopped in the game (the
+    hotkey's network command) starts no autosave, so a later change in
+    save RAM never reaches the save."""
+    r = Run(args.run_dir, 'nosave_netplay_disconnect-%d' % n)
+    old = pattern(101)
+    r.srm.write_bytes(old)
+    then = time.time() - 120
+    os.utime(r.srm, (then, then))
+    mtime = r.srm.stat().st_mtime_ns
+    port, host_port = 55700 + n, 55800 + n
+    cfg = r.config(network_cmd_enable='true', network_cmd_port=str(port),
+                   netplay_public_announce='false',
+                   netplay_use_mitm_server='false',
+                   netplay_nat_traversal='false',
+                   core_info_savestate_bypass='true')
+    # Frame 30's touch writes the bytes already there: a mark only.
+    env = r.env(SAVE_E2E_TOUCHES='30:101,500:102', SAVE_E2E_FRAME_MS=10)
+    r.start(args, cfg, 800, env, extra=('--sram-mode', 'load-nosave',
+                                        '--host', '--port', str(host_port)))
+    failures = []
+    mark = r.dir / 'touched'
+    check(failures, r.wait_for(Path('%s-101' % mark)), 'no first touch')
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.sendto(b'NETPLAY_HOST_TOGGLE', ('127.0.0.1', port))
+    sock.close()
+    # Stopped once the host's port refuses a connection (Windows takes
+    # about a second to refuse).
+    stopped = False
+    deadline = time.time() + 10
+    while not stopped and r.proc.poll() is None and time.time() < deadline:
+        time.sleep(0.5)
+        try:
+            socket.create_connection(('127.0.0.1', host_port), 3).close()
+        except ConnectionRefusedError:
+            stopped = True
+        except OSError:
+            pass
+    check(failures, stopped and not Path('%s-102' % mark).exists(),
+          'the host did not stop before the second touch')
+    touched = r.wait_for(Path('%s-102' % mark))
+    rc = r.wait(60)
+    log = r.log.read_text(errors='replace')
+    check(failures, 'You have joined as player 1' in log, 'never hosted')
+    check(failures, touched, 'no second touch')
+    check(failures, rc == 0, 'retroarch exit %s' % rc)
+    check(failures, r.srm.read_bytes() == old, '.srm bytes changed')
+    check(failures, r.srm.stat().st_mtime_ns == mtime, '.srm mtime changed')
+    check(failures, not r.temps(), 'temporaries left: %s' % r.temps())
+    return r, failures
+
+
 def lane_windows_locked_close(args, n):
     """Windows: a .srm held open without FILE_SHARE_DELETE at
     close keeps its bytes; the image goes to one recovery file."""
@@ -564,6 +616,7 @@ LANES = {
     'recovery_announced': lane_recovery_announced,
     'state_load_copy': lane_state_load_copy,
     'changed_elsewhere': lane_changed_elsewhere,
+    'nosave_netplay_disconnect': lane_nosave_netplay_disconnect,
     'windows_locked_close': lane_windows_locked_close,
 }
 # Lanes that need Windows, and the ones Windows cannot run.
