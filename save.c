@@ -225,7 +225,8 @@ static bool save_file_pay(struct save_file *f, const char *path,
          retro_atomic_fetch_or_int(&f->flags, SAVE_FILE_BACKUP_FAILED);
          return false;
       }
-      /* At most once per reason a load, so a worker may log it. */
+      /* Once per reason a load, a state load or an outside change,
+       * so a worker may log it. */
       if (res == SAVE_BACKUP_MADE)
          RARCH_LOG("[SRAM] Backed up \"%s\" (%s) before writing it.\n",
                path, save_backups_reason_name((enum save_backup_reason)r));
