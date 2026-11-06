@@ -705,7 +705,7 @@ static void lane_flush_same_image_sync(void)
       CHECK(copies(dir, SAVE_BACKUP_UNSAVED, newest, sizeof(newest)) == 1
             && holds(newest, p1, BIG),
             "same_sync: the same image is not in one recovery file");
-      CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 2,
+      CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 2 && notice_num == 2,
             "same_sync: not told each time");
       CHECK(logged('W', "Unsaved progress") == 2
             && logged('W', path_basename(newest)) == 2,
@@ -715,7 +715,7 @@ static void lane_flush_same_image_sync(void)
       event_save_files(true, false, true, true, NULL);
       CHECK(copies(dir, SAVE_BACKUP_UNSAVED, newest, sizeof(newest)) == 1,
             "same_sync: the close made another");
-      CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 3
+      CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 3 && notice_num == 3
             && logged('W', path_basename(newest)) == 3,
             "same_sync: the close not told and logged");
 
@@ -727,7 +727,7 @@ static void lane_flush_same_image_sync(void)
       CHECK(copies(dir, SAVE_BACKUP_UNSAVED, newest, sizeof(newest)) == 3
             && holds(newest, p1, BIG),
             "same_sync: compared with more than the newest");
-      CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 5,
+      CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 5 && notice_num == 5,
             "same_sync: not one notice each");
       set_vfs(0, false);
       use_test_vfs(false);
@@ -1661,11 +1661,14 @@ static void lane_flush_same_image(void)
       set_vfs(4096, false);
       start_at(save, ram, BIG, false);
 
+      /* Besides one notice per flush: once a session, the copy that
+       * cannot be made, or else the autosave write that failed. */
       flush_failing(ram, p1);
       CHECK(copies(dir, SAVE_BACKUP_UNSAVED, newest, sizeof(newest)) == 1
             && holds(newest, p1, BIG),
             "same: the image is not in one recovery file");
-      CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 1, "same: not told");
+      CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 1
+            && notice_num == 1 + c, "same: not told");
       if (!c)
          CHECK(copies(dir, SAVE_BACKUP_BEFORE_STATE_LOAD, NULL, 0) == 1,
                "same: no newer copy to skip over");
@@ -1674,8 +1677,8 @@ static void lane_flush_same_image(void)
       CHECK(copies(dir, SAVE_BACKUP_UNSAVED, newest, sizeof(newest)) == 1
             && holds(newest, p1, BIG),
             "same: the same image made another file");
-      CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 2,
-            "same: the same image not told");
+      CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 2
+            && notice_num == 3, "same: the same image not told");
 
       flush_failing(ram, p2);
       flush_failing(ram, p1);
@@ -1685,8 +1688,8 @@ static void lane_flush_same_image(void)
       flush_failing(ram, p1);
       CHECK(copies(dir, SAVE_BACKUP_UNSAVED, NULL, 0) == 3,
             "same: the newest not compared");
-      CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 5,
-            "same: not one notice each");
+      CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 5
+            && notice_num == 6, "same: not one notice each");
 
       /* The chain's first folder works again: the newest is still in
        * the fallback, and is the file. */
@@ -1697,7 +1700,7 @@ static void lane_flush_same_image(void)
          CHECK(!copies("blk/backups", SAVE_BACKUP_UNSAVED, NULL, 0)
                && copies(dir, SAVE_BACKUP_UNSAVED, NULL, 0) == 3,
                "same: the newest in another folder not compared");
-         CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 6,
+         CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 6 && notice_num == 7,
                "same: the other folder's not told");
       }
       capture_and_wait();

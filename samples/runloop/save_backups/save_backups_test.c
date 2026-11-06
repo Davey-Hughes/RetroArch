@@ -14,6 +14,7 @@
 #include <streams/file_stream.h>
 #include <string/stdstring.h>
 #include <time/rtime.h>
+#include <vfs/vfs_implementation.h>
 
 static struct tm test_tm;
 
@@ -59,17 +60,27 @@ static int test_sync(RFILE *stream)
    return sync_fails ? -1 : filestream_sync(stream);
 }
 
+static unsigned dir_syncs;
+
+static int test_dir_sync(const char *dir)
+{
+   dir_syncs++;
+   return retro_vfs_dir_sync_impl(dir);
+}
+
 #define rtime_localtime test_localtime
 #define strftime test_strftime
 #define filestream_write_file_atomic test_write
 #define filestream_write_file_atomic_synced test_write_synced
 #define filestream_sync test_sync
+#define retro_vfs_dir_sync_impl test_dir_sync
 #include "../../../save_backups.c"
 #undef rtime_localtime
 #undef strftime
 #undef filestream_write_file_atomic
 #undef filestream_write_file_atomic_synced
 #undef filestream_sync
+#undef retro_vfs_dir_sync_impl
 
 #define ROOT "save_backups_test_files"
 
@@ -773,7 +784,7 @@ static void backup_sync(void)
 }
 
 /* A held image may have been written without a sync: a caller that
- * asks for one gets it, and a new file when it fails. */
+ * asks for one gets it, its folder too, and a new file when it fails. */
 static void recovery_held_sync(void)
 {
    char s[PATH_MAX_LENGTH];
@@ -781,25 +792,26 @@ static void recovery_held_sync(void)
    save_backups_set_roots(ROOT "/held", NULL, NULL, NULL, NULL, NULL,
          "Snes9x");
    set_time(16, 0, 0);
-   plain_writes = synced_writes = file_syncs = 0;
+   plain_writes = synced_writes = file_syncs = dir_syncs = 0;
    CHECK(save_backups_recover(first, sizeof(first), ROOT "/held/Game.srm",
          "h", 1, false));
-   CHECK(plain_writes == 1 && !synced_writes && !file_syncs);
+   CHECK(plain_writes == 1 && !synced_writes && !file_syncs && !dir_syncs);
    CHECK(save_backups_recover(s, sizeof(s), ROOT "/held/Game.srm",
          "h", 1, false));
    CHECK(same_path(s, first));
-   CHECK(plain_writes == 1 && !synced_writes && !file_syncs);
+   CHECK(plain_writes == 1 && !synced_writes && !file_syncs && !dir_syncs);
    CHECK(save_backups_recover(s, sizeof(s), ROOT "/held/Game.srm",
          "h", 1, true));
    CHECK(same_path(s, first));
    CHECK(plain_writes == 1 && !synced_writes && file_syncs == 1);
+   CHECK(dir_syncs == 1);
    CHECK(holds(first, "h"));
    sync_fails = true;
    CHECK(save_backups_recover(s, sizeof(s), ROOT "/held/Game.srm",
          "h", 1, true));
    sync_fails = false;
    CHECK(!same_path(s, first));
-   CHECK(synced_writes == 1 && file_syncs == 2);
+   CHECK(synced_writes == 1 && file_syncs == 2 && dir_syncs == 1);
    CHECK(count_files(ROOT "/held/backups") == 2);
 }
 

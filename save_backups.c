@@ -27,6 +27,7 @@
 #include <streams/file_stream.h>
 #include <string/stdstring.h>
 #include <time/rtime.h>
+#include <vfs/vfs_implementation.h>
 
 #include "save_backups.h"
 
@@ -588,6 +589,7 @@ static bool save_backups_recovered(char *s, size_t len, const char *path,
       const void *data, size_t data_len, bool sync)
 {
    bool ok;
+   char *dir;
    RFILE *file;
    if (     !save_backups_find_recovery(s, len, path, INT64_MIN)
          || !filestream_matches_buf(s, data, data_len))
@@ -600,6 +602,14 @@ static bool save_backups_recovered(char *s, size_t len, const char *path,
    ok   = file && filestream_sync(file) == 0;
    if (file && filestream_close(file) != 0)
       ok = false;
+   /* Its name too, as a synced write's rename */
+   if (ok && (dir = (char*)malloc(len)))
+   {
+      strlcpy(dir, s, len);
+      path_basedir(dir);
+      retro_vfs_dir_sync_impl(dir);
+      free(dir);
+   }
    return ok;
 }
 
