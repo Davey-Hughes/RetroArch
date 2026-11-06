@@ -2843,14 +2843,15 @@ static void lane_main_write_paid_dropped(void)
    flush_lane_end();
 }
 
-/* A worker checking only when the lane makes a copy, with a busy cap
- * of @busy_usec. */
-static void cadence_start(unsigned char *ram, long long busy_usec)
+/* A worker checking only when the lane makes a copy, resting
+ * @interval s after each, with a busy cap of @busy_usec. */
+static void cadence_start(unsigned char *ram, long long busy_usec,
+      unsigned interval)
 {
    test_busy_usec = busy_usec;
    core_data      = ram;
    core_size      = BIG;
-   slots[0] = autosave_new(SAVE, ram, BIG, 0, false,
+   slots[0] = autosave_new(SAVE, ram, BIG, interval, false,
          RETRO_MEMORY_SAVE_RAM, false, NULL);
    CHECK(slots[0] != NULL, "cadence: autosave_new failed");
    autosave_state.list = slots;
@@ -2885,7 +2886,7 @@ static void lane_autosave_cadence(void)
    use_test_vfs(true);
 
    /* A cap that never passes here. */
-   cadence_start(ram, 3600000000LL);
+   cadence_start(ram, 3600000000LL, 0);
    w  = cadence_check(ram, false);
    w += cadence_check(ram, false);
    CHECK(w == 0, "cadence: an unchanged save written");
@@ -2908,7 +2909,7 @@ static void lane_autosave_cadence(void)
 
    /* A 1 s cap on the worker's clock, from its last write: still
     * changing once it has passed, written. */
-   cadence_start(ram, 1000000);
+   cadence_start(ram, 1000000, 0);
    now_usec += test_busy_usec;
    cadence_check(ram, true);
    w = cadence_check(ram, true);
@@ -2921,9 +2922,24 @@ static void lane_autosave_cadence(void)
          "cadence: a save changing at every check not written after the cap");
    stop();
 
+   /* An interval longer than the cap is the cap: still changing, not
+    * written once the cap has passed, written once the interval has. */
+   cadence_start(ram, 500000, 1);
+   cadence_check(ram, true);
+   now_usec += test_busy_usec;
+   w = cadence_check(ram, true);
+   CHECK(w == 0, "cadence: a save changing at every check written "
+         "before the interval");
+   now_usec += test_busy_usec;
+   w = cadence_check(ram, true);
+   CHECK(w == 1 && holds(SAVE, ram, BIG),
+         "cadence: a save changing at every check not written after "
+         "the interval");
+   stop();
+
    /* A failed write is tried again at the next check, though the save
     * still changes and the cap has not passed. */
-   cadence_start(ram, 3600000000LL);
+   cadence_start(ram, 3600000000LL, 0);
    set_vfs(0, true);
    w = cadence_check(ram, true);
    CHECK(w == 1 && !holds(SAVE, ram, BIG), "cadence: a refused write");
