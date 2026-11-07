@@ -2,7 +2,8 @@
  * for the server, threaded tasks on and off: what the sync deletes on
  * the server when a folder under a root can't be read, when a folder
  * is unset, when a root moved, when most of a root's files are
- * missing, and which save folder it walks.
+ * missing, and when Keep Local resolves a file deleted here; and which
+ * save folder it walks.
  *
  *   ./cloudsync_roots_test [lane...]   (default: every lane) */
 #include <stdio.h>
@@ -56,6 +57,7 @@ static char srv[256], assets[256];
 static int failures;
 static unsigned deletes, uploads, fetches, notices, notice_count;
 static int sync_done, sync_failed;
+static int conflict_mode;
 
 #define CHECK(c) do { if (!(c)) { \
    fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #c); failures++; } } while (0)
@@ -328,6 +330,7 @@ static bool sync_list(bool threaded, struct string_list *dirlist)
    task_cloud_sync_state_t *st   = (task_cloud_sync_state_t*)calloc(1, sizeof(*st));
    unsigned i;
    st->dirlist = dirlist;
+   st->conflict_resolution = conflict_mode;
    strlcpy(st->dir_core_assets, assets, sizeof(st->dir_core_assets));
    retro_atomic_int_init(&st->waiting, 0);
    retro_atomic_int_init(&st->phase, CLOUD_SYNC_PHASE_BEGIN);
@@ -755,6 +758,405 @@ static void held_no_memory(bool threaded)
    CHECK(path_is_valid(srv_key("saves/f05.srm")));
 }
 
+/* In the manifest at @path: 0 when @key is absent, 1 when it is
+ * recorded deleted, 2 when it has a hash. */
+static int manifest_entry(const char *path, const char *key)
+{
+   char        want[PATH_MAX_LENGTH];
+   void       *buf = NULL;
+   int64_t     len = 0;
+   const char *at;
+   int         entry = 0;
+   if (!filestream_read_file(path, &buf, &len))
+      return 0;
+   snprintf(want, sizeof(want), "\"path\": \"%s\",", key);
+   if ((at = strstr((const char*)buf, want)))
+   {
+      at    = strstr(at, "\"hash\": ");
+      entry = at && !strncmp(at + 8, "\"\"", 2) ? 1 : 2;
+   }
+   free(buf);
+   return entry;
+}
+
+static int server_entry(const char *key)
+{
+   return manifest_entry(srv_key(MANIFEST_FILENAME_SERVER), key);
+}
+
+static int local_entry(const char *key)
+{
+   char path[PATH_MAX_LENGTH];
+   fill_pathname_join_special(path, assets, MANIFEST_FILENAME_LOCAL,
+         sizeof(path));
+   return manifest_entry(path, key);
+}
+
+/* Switches to a second device on the same server, with its own core
+ * assets folder, and back. */
+static void other_device(bool on)
+{
+   static char own[256];
+   if (on)
+   {
+      strlcpy(own, assets, sizeof(own));
+      strlcat(assets, "-b", sizeof(assets));
+      path_mkdir(assets);
+   }
+   else
+      strlcpy(assets, own, sizeof(assets));
+}
+
+/* Another device changes "a.srm" on the server, and this one has
+ * deleted it: Keep Local deletes it on the server as any delete here
+ * is, both manifests record the delete and nothing else is uploaded;
+ * Keep Server fetches it back. @other: a later file here. */
+static void keep_deleted_lane(bool threaded, int mode, bool other)
+{
+   char root[256], root_b[264], path[PATH_MAX_LENGTH];
+   bool ok;
+   lane_dirs(other ? "keep_other" : "keep", threaded, root, sizeof(root));
+   snprintf(root_b, sizeof(root_b), "%s-b", root);
+   CHECK(path_mkdir(root_b));
+   put(root, "a.srm", "1");
+   if (other)
+      put(root, "b.srm", "b");
+   CHECK(sync_saves(threaded, root));
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   put(root_b, "a.srm", "22");
+   CHECK(sync_saves(threaded, root_b));
+   CHECK(uploads == 1);
+   other_device(false);
+
+   drop(root, "a.srm");
+   conflict_mode = mode;
+   ok = sync_saves(threaded, root);
+   conflict_mode = 0;
+   CHECK(ok);
+   CHECK(uploads == 0);
+   if (other)
+   {
+      CHECK(holds(srv, "saves/b.srm", "b"));
+      CHECK(server_entry("saves/b.srm") == 2);
+      CHECK(local_entry("saves/b.srm") == 2);
+   }
+   if (mode == 2)
+   {
+      CHECK(deletes == 0);
+      CHECK(fetches == 1);
+      CHECK(holds(root, "a.srm", "22"));
+      CHECK(holds(srv, "saves/a.srm", "22"));
+      CHECK(server_entry("saves/a.srm") == 2);
+      CHECK(local_entry("saves/a.srm") == 2);
+      return;
+   }
+   CHECK(deletes == 1);
+   CHECK(fetches == 0);
+   CHECK(!path_is_valid(srv_key("saves/a.srm")));
+   CHECK(server_entry("saves/a.srm") == 1);
+   CHECK(local_entry("saves/a.srm") == 1);
+
+   /* settled: nothing more here, and the other device deletes it */
+   CHECK(sync_saves(threaded, root));
+   CHECK(deletes == 0);
+   CHECK(uploads == 0);
+   CHECK(fetches == 0);
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   CHECK(uploads == 0);
+   CHECK(!path_is_valid(srv_key("saves/a.srm")));
+   fill_pathname_join_special(path, root_b, "a.srm", sizeof(path));
+   CHECK(!path_is_valid(path));
+   other_device(false);
+}
+
+/* A Keep Local delete counts toward the mass-deletion hold: 12 of 22
+ * files gone here, one of them changed on the server, are held. */
+static void keep_local_held(bool threaded)
+{
+   char     root[256], root_b[264], name[32], key[48];
+   unsigned i;
+   bool     ok;
+   lane_dirs("keep_held", threaded, root, sizeof(root));
+   snprintf(root_b, sizeof(root_b), "%s-b", root);
+   CHECK(path_mkdir(root_b));
+   for (i = 0; i < 22; i++)
+   {
+      name_file(name, sizeof(name), i);
+      put(root, name, name);
+   }
+   CHECK(sync_saves(threaded, root));
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   put(root_b, "f00.srm", "changed");
+   CHECK(sync_saves(threaded, root_b));
+   other_device(false);
+   for (i = 0; i < 12; i++)
+   {
+      name_file(name, sizeof(name), i);
+      drop(root, name);
+   }
+   conflict_mode = 1;
+   ok = sync_saves(threaded, root);
+   conflict_mode = 0;
+   CHECK(ok);
+   CHECK(deletes == 0);
+   CHECK(uploads == 0);
+   CHECK(notices == 1);
+   CHECK(notice_count == 12);
+   CHECK(roots_name("saves/f00.srm"));
+   CHECK(holds(srv, "saves/f00.srm", "changed"));
+   for (i = 1; i < 12; i++)
+   {
+      snprintf(key, sizeof(key), "saves/f%02u.srm", i);
+      CHECK(path_is_valid(srv_key(key)));
+   }
+   CHECK(sync_saves(threaded, root));
+   CHECK(fetches == 12);
+   CHECK(holds(root, "f00.srm", "changed"));
+}
+
+/* A backup under @root's backups/cloud-sync holds @text. */
+static bool backup_holds(const char *root, const char *text)
+{
+   char                dir[PATH_MAX_LENGTH];
+   struct string_list *l;
+   bool                found = false;
+   size_t              i;
+   fill_pathname_join_special(dir, root, "backups/cloud-sync", sizeof(dir));
+   pathname_conform_slashes_to_os(dir);
+   if (!(l = dir_list_new(dir, NULL, false, true, false, true)))
+      return false;
+   for (i = 0; i < l->size && !found; i++)
+   {
+      void   *buf = NULL;
+      int64_t len = 0;
+      if (!filestream_read_file(l->elems[i].data, &buf, &len))
+         continue;
+      found = len == (int64_t)strlen(text) && !memcmp(buf, text, (size_t)len);
+      free(buf);
+   }
+   string_list_free(l);
+   return found;
+}
+
+/* The usual flow: @autos automatic syncs meet the conflict first and
+ * keep it, until the user picks @mode; the sync after that is quiet.
+ * @here_deleted: deleted here and changed on the other device, else
+ * changed here and deleted there. */
+static void keep_flow_lane(bool threaded, int mode, bool here_deleted,
+      unsigned autos)
+{
+   char     root[256], root_b[264], path[PATH_MAX_LENGTH];
+   unsigned i;
+   bool     ok;
+   lane_dirs(here_deleted ? "flow_del" : "flow_chg", threaded, root,
+         sizeof(root));
+   snprintf(root_b, sizeof(root_b), "%s-b", root);
+   fill_pathname_join_special(path, root, "a.srm", sizeof(path));
+   CHECK(path_mkdir(root_b));
+   put(root, "a.srm", "1");
+   put(root, "b.srm", "b");
+   CHECK(sync_saves(threaded, root));
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   if (here_deleted)
+      put(root_b, "a.srm", "22");
+   else
+      drop(root_b, "a.srm");
+   CHECK(sync_saves(threaded, root_b));
+   other_device(false);
+   if (here_deleted)
+      drop(root, "a.srm");
+   else
+      put(root, "a.srm", "33");
+
+   for (i = 0; i < autos; i++)
+   {
+      CHECK(!sync_saves(threaded, root));
+      CHECK(fetches == 0);
+      CHECK(uploads == 0);
+      CHECK(deletes == 0);
+      CHECK(here_deleted ? !path_is_valid(path) : holds(root, "a.srm", "33"));
+      CHECK(here_deleted ? holds(srv, "saves/a.srm", "22")
+            : !path_is_valid(srv_key("saves/a.srm")));
+   }
+
+   conflict_mode = mode;
+   ok = sync_saves(threaded, root);
+   conflict_mode = 0;
+   CHECK(ok);
+   CHECK(holds(srv, "saves/b.srm", "b"));
+   if (here_deleted && mode == 1)
+   {
+      CHECK(deletes == 1);
+      CHECK(fetches == 0);
+      CHECK(uploads == 0);
+      CHECK(!path_is_valid(srv_key("saves/a.srm")));
+      CHECK(server_entry("saves/a.srm") == 1);
+      CHECK(local_entry("saves/a.srm") == 1);
+   }
+   else if (here_deleted)
+   {
+      CHECK(deletes == 0);
+      CHECK(fetches == 1);
+      CHECK(uploads == 0);
+      CHECK(holds(root, "a.srm", "22"));
+      CHECK(server_entry("saves/a.srm") == 2);
+      CHECK(local_entry("saves/a.srm") == 2);
+   }
+   else if (mode == 1)
+   {
+      CHECK(uploads == 1);
+      CHECK(fetches == 0);
+      CHECK(holds(srv, "saves/a.srm", "33"));
+      CHECK(server_entry("saves/a.srm") == 2);
+      CHECK(local_entry("saves/a.srm") == 2);
+   }
+   else
+   {
+      CHECK(uploads == 0);
+      CHECK(fetches == 0);
+      CHECK(!path_is_valid(path));
+      CHECK(backup_holds(root, "33"));
+      CHECK(!path_is_valid(srv_key("saves/a.srm")));
+      CHECK(server_entry("saves/a.srm") == 1);
+      CHECK(local_entry("saves/a.srm") == 1);
+   }
+
+   CHECK(sync_saves(threaded, root));
+   CHECK(fetches == 0);
+   CHECK(uploads == 0);
+   CHECK(deletes == 0);
+}
+
+static void keep_local_flow(bool threaded)
+{
+   keep_flow_lane(threaded, 1, true, 2);
+   keep_flow_lane(threaded, 1, false, 2);
+   keep_flow_lane(threaded, 1, false, 0);
+}
+
+static void keep_server_flow(bool threaded)
+{
+   keep_flow_lane(threaded, 2, true, 2);
+   keep_flow_lane(threaded, 2, false, 2);
+   keep_flow_lane(threaded, 2, false, 0);
+}
+
+/* Files deleted on both sides are not counted toward the hold: 10 of
+ * 20 deleted here only, 2 more on both sides, are not held. */
+static void keep_local_both_deleted(bool threaded)
+{
+   char     root[256], root_b[264], name[32];
+   unsigned i;
+   bool     ok;
+   lane_dirs("keep_both", threaded, root, sizeof(root));
+   snprintf(root_b, sizeof(root_b), "%s-b", root);
+   CHECK(path_mkdir(root_b));
+   for (i = 0; i < 20; i++)
+   {
+      name_file(name, sizeof(name), i);
+      put(root, name, name);
+   }
+   CHECK(sync_saves(threaded, root));
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   drop(root_b, "f00.srm");
+   drop(root_b, "f01.srm");
+   CHECK(sync_saves(threaded, root_b));
+   CHECK(deletes == 2);
+   other_device(false);
+   for (i = 0; i < 12; i++)
+   {
+      name_file(name, sizeof(name), i);
+      drop(root, name);
+   }
+   conflict_mode = 1;
+   ok = sync_saves(threaded, root);
+   conflict_mode = 0;
+   CHECK(ok);
+   CHECK(deletes == 10);
+   CHECK(notices == 0);
+   CHECK(!path_is_valid(srv_key("saves/f02.srm")));
+}
+
+/* A file missing here counts toward the hold whether or not it changed
+ * on the server, in every mode: 12 of 22 gone here, 2 of them changed
+ * on the other device, are held. */
+static void held_conflicts_lane(bool threaded, int mode)
+{
+   char     root[256], root_b[264], name[32], key[48];
+   unsigned i;
+   bool     ok;
+   lane_dirs("held_conflicts", threaded, root, sizeof(root));
+   snprintf(root_b, sizeof(root_b), "%s-b", root);
+   CHECK(path_mkdir(root_b));
+   for (i = 0; i < 22; i++)
+   {
+      name_file(name, sizeof(name), i);
+      put(root, name, name);
+   }
+   CHECK(sync_saves(threaded, root));
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   put(root_b, "f00.srm", "changed");
+   put(root_b, "f01.srm", "changed");
+   CHECK(sync_saves(threaded, root_b));
+   CHECK(uploads == 2);
+   other_device(false);
+   for (i = 0; i < 12; i++)
+   {
+      name_file(name, sizeof(name), i);
+      drop(root, name);
+   }
+   conflict_mode = mode;
+   ok = sync_saves(threaded, root);
+   conflict_mode = 0;
+   /* unpicked conflicts fail the sync */
+   CHECK(ok == (mode != 0));
+   CHECK(deletes == 0);
+   CHECK(uploads == 0);
+   CHECK(fetches == (mode == 2 ? 2u : 0u));
+   CHECK(notices == 1);
+   CHECK(notice_count == (mode == 1 ? 12u : 10u));
+   for (i = 0; i < 12; i++)
+   {
+      snprintf(key, sizeof(key), "saves/f%02u.srm", i);
+      CHECK(path_is_valid(srv_key(key)));
+   }
+   CHECK(holds(srv, "saves/f00.srm", "changed"));
+   CHECK(holds(srv, "saves/f01.srm", "changed"));
+
+   ok = sync_saves(threaded, root);
+   CHECK(ok == (mode != 0));
+   CHECK(deletes == 0);
+   CHECK(fetches == (mode == 1 ? 12u : 10u));
+   for (i = 2; i < 12; i++)
+   {
+      name_file(name, sizeof(name), i);
+      CHECK(holds(root, name, name));
+   }
+   CHECK(holds(root, "f00.srm", "changed") == (mode != 0));
+}
+
+static void held_conflicts(bool threaded)
+{
+   held_conflicts_lane(threaded, 0);
+   held_conflicts_lane(threaded, 1);
+   held_conflicts_lane(threaded, 2);
+}
+
+static void keep_local_deleted(bool threaded) { keep_deleted_lane(threaded, 1, false); }
+static void keep_local_other(bool threaded)   { keep_deleted_lane(threaded, 1, true); }
+
+static void keep_server_deleted(bool threaded)
+{
+   keep_deleted_lane(threaded, 2, false);
+   keep_deleted_lane(threaded, 2, true);
+}
+
 struct lane
 {
    const char *name;
@@ -775,6 +1177,14 @@ static const struct lane lanes[] = {
    { "sync_main_folder_only",     main_folder_only },
    { "sync_mass_held",            mass_held },
    { "sync_held_no_memory",       held_no_memory },
+   { "sync_keep_local_deleted",   keep_local_deleted },
+   { "sync_keep_local_other",     keep_local_other },
+   { "sync_keep_local_held",      keep_local_held },
+   { "sync_keep_server_deleted",  keep_server_deleted },
+   { "sync_keep_local_flow",      keep_local_flow },
+   { "sync_keep_server_flow",     keep_server_flow },
+   { "sync_keep_local_both_deleted", keep_local_both_deleted },
+   { "sync_held_conflicts",       held_conflicts },
 };
 
 int main(int argc, char **argv)

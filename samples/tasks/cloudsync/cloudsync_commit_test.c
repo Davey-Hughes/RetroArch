@@ -256,9 +256,9 @@ static void complete_fetch(void *data)
 }
 
 /* After a save vanished during its copy. Found gone by the copy's own
- * thread, the server's change is a conflict at the next sync, the key
- * left out of the local record; the sync after that, or one keeping
- * the server's, fetches it. The inline move just took it. */
+ * thread, the server's change is a conflict at each sync, kept in both
+ * records, until one keeping the server's fetches it. The inline move
+ * just took it. */
 static void vanished_next_sync(void)
 {
 #if defined(TCS_MOVE_WORKER)
@@ -282,22 +282,25 @@ static void vanished_next_sync(void)
       st->dirlist->elems[0].userdata = strdup(directory);
       st->conflict_resolution = n == 2 ? 2 : 0;
       add(st->server_manifest, NULL, synced_server);
-      if (n != 1)
-         add(st->local_manifest, NULL, synced_local);
+      add(st->local_manifest, NULL, synced_local);
       retro_atomic_int_init(&st->waiting, 0);
       retro_atomic_int_init(&st->phase, CLOUD_SYNC_PHASE_DIFF);
       task_cloud_sync_task_setup(task, st, "Cloud Sync");
       pending_fetch = NULL;
       task_cloud_sync_diff_next(st);
       task_cloud_sync_fold_manifest_adds(st);
-      CHECK(st->conflicts == (n == 0));
-      CHECK((pending_fetch != NULL) == (n != 0));
-      CHECK(n || (file_list_search(st->updated_server_manifest,
+      CHECK(st->conflicts == (n != 2));
+      CHECK((pending_fetch != NULL) == (n == 2));
+      CHECK(n == 2 || (file_list_search(st->updated_server_manifest,
                   "saves/save.srm", &at)
             && string_is_equal(CS_FILE_HASH(
                   &st->updated_server_manifest->list[at]), "new")));
-      CHECK(!file_list_search(st->updated_local_manifest, "saves/save.srm",
-               &at));
+      CHECK(n == 2 || (file_list_search(st->updated_local_manifest,
+                  "saves/save.srm", &at)
+            && string_is_equal(CS_FILE_HASH(
+                  &st->updated_local_manifest->list[at]), "old")));
+      CHECK(n != 2 || !file_list_search(st->updated_local_manifest,
+               "saves/save.srm", &at));
       free(pending_fetch);
       pending_fetch = NULL;
       task_cloud_sync_cleanup(task);

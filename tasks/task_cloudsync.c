@@ -262,6 +262,7 @@ static INLINE enum task_cloud_sync_phase task_cloud_sync_phase_get(
 /* Forward declarations for conflict resolution */
 static void task_cloud_sync_upload_current_file(task_cloud_sync_state_t *sync_state);
 static void task_cloud_sync_fetch_server_file(task_cloud_sync_state_t *sync_state);
+static bool task_cloud_sync_delete_current_file(task_cloud_sync_state_t *sync_state);
 /* Defined below task_cloud_sync_write_updated_manifest(), used above it
  * by the server-manifest upload callback. */
 static void task_cloud_sync_commit_local_manifest(task_cloud_sync_state_t *sync_state);
@@ -1091,11 +1092,11 @@ static size_t task_cloud_sync_count_out_of_scope(
    return count;
 }
 
-/* Files deleted here and unchanged on the server, more than
- * CS_HOLD_MIN of them and more than half of a root's: more likely gone
- * missing (an unmounted card, an emptied folder) than deleted, so the
- * diff deletes none of them on the server. The lists are in
- * file_list_sort_on_alt() order. */
+/* Files missing here that the server still has, changed there or not,
+ * more than CS_HOLD_MIN of them and more than half of a root's: more
+ * likely gone missing (an unmounted card, an emptied folder) than
+ * deleted, so the diff deletes none of them on the server. The lists
+ * are in file_list_sort_on_alt() order. */
 static void task_cloud_sync_mark_held_roots(task_cloud_sync_state_t *sync_state)
 {
    struct string_list *dirlist = sync_state->dirlist;
@@ -1135,8 +1136,7 @@ static void task_cloud_sync_mark_held_roots(task_cloud_sync_state_t *sync_state)
                && (cmp = strcasecmp(server->list[s].alt, key)) < 0)
             s++;
          if (     s < server->size && !cmp
-               && string_is_equal(CS_FILE_HASH(&server->list[s]),
-                  CS_FILE_HASH(local_file)))
+               && !string_is_empty(CS_FILE_HASH(&server->list[s])))
             missing++;
       }
 
@@ -2371,9 +2371,13 @@ static void task_cloud_sync_resolve_conflict(task_cloud_sync_state_t *sync_state
    }
    else if (sync_state->conflict_resolution == 2)
    {
-      /* Keep server: download server file */
+      /* Keep server: download server file, or take its delete */
       RARCH_LOG(CSPFX "Conflict on %s, keeping server.\n", CS_FILE_KEY(server_file));
-      task_cloud_sync_fetch_server_file(sync_state);
+      if (!string_is_empty(CS_FILE_HASH(server_file)))
+         task_cloud_sync_fetch_server_file(sync_state);
+      else if (task_cloud_sync_delete_current_file(sync_state))
+         task_cloud_sync_add_to_updated_manifest(sync_state,
+               CS_FILE_KEY(server_file), CS_FILE_HASH(server_file), false);
    }
    else
    {
@@ -2807,11 +2811,13 @@ static void task_cloud_sync_diff_next(task_cloud_sync_state_t *sync_state)
             if (string_is_empty(CS_FILE_HASH(local_file)))
                /* previously saw the delete, now it's resurrected */
                task_cloud_sync_fetch_server_file(sync_state);
-            else if (string_is_equal(CS_FILE_HASH(server_file), CS_FILE_HASH(local_file)))
+            else if (   string_is_equal(CS_FILE_HASH(server_file), CS_FILE_HASH(local_file))
+                     || sync_state->conflict_resolution == 1)
             {
                int root = task_cloud_sync_key_root(sync_state->dirlist,
                      CS_FILE_KEY(server_file));
-               /* server didn't change, delete from the server */
+               /* server didn't change, or Keep Local keeps the
+                * delete: delete from the server */
                if (root >= 0 && (sync_state->dirlist->elems[root].attr.i
                         & CS_ROOT_HELD))
                   task_cloud_sync_hold_delete(sync_state);
@@ -2819,8 +2825,15 @@ static void task_cloud_sync_diff_next(task_cloud_sync_state_t *sync_state)
                   task_cloud_sync_delete_server_file(sync_state);
             }
             else
-               /* the server changed and local deleted, that's a conflict */
+            {
+               /* the server changed and local deleted, that's a conflict;
+                * unresolved, the local manifest keeps it too, so the
+                * next sync meets it again */
+               if (sync_state->conflict_resolution != 2)
+                  task_cloud_sync_add_to_updated_manifest(sync_state,
+                        CS_FILE_KEY(local_file), CS_FILE_HASH(local_file), false);
                task_cloud_sync_resolve_conflict(sync_state);
+            }
          }
          else
          {
