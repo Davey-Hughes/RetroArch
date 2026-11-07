@@ -1595,11 +1595,15 @@ bool event_load_save_files(bool is_sram_load_disabled)
  * costs nothing beyond leaving a file alone for one more round, while
  * a false negative is the data loss this exists to prevent.
  *
+ * The session's auto state (<state name>.auto) is owned in the same
+ * window: the auto save at unload writes over it.
+ *
  * Returns: true if a loaded core owns @path.
  **/
 bool content_savefile_is_live(const char *path)
 {
-   size_t i;
+   size_t i, _len;
+   const char *state;
 
    if (!task_save_files || string_is_empty(path))
       return false;
@@ -1608,7 +1612,11 @@ bool content_savefile_is_live(const char *path)
       if (string_is_equal_noncase(task_save_files->elems[i].data, path))
          return true;
 
-   return false;
+   state = runloop_state_get_ptr()->name.savestate;
+   _len  = strlen(state);
+   return   _len
+         && string_starts_with_case_insensitive(path, state)
+         && string_is_equal_noncase(path + _len, ".auto");
 }
 
 void path_init_savefile_rtc(const char *savefile_path)

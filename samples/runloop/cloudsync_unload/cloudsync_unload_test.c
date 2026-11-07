@@ -13,7 +13,7 @@
  * CMD_EVENT_UNLOAD_CORE, running frames until the close completes.
  * task_push_cloud_sync is wrapped (-Wl,--wrap): at each call the
  * harness records what the save file holds and whether a core still
- * owns it.  No server is contacted.
+ * owns it or the content's auto state.  No server is contacted.
  *
  * Lanes:
  *  startup   content from the command line: the startup sync runs to
@@ -66,6 +66,7 @@ static size_t   pattern_size;
 static unsigned n_syncs;
 static bool     last_on_disk;
 static bool     last_live;
+static bool     last_auto_live;
 
 static bool file_holds_pattern(void)
 {
@@ -81,9 +82,13 @@ static bool file_holds_pattern(void)
 
 bool __wrap_task_push_cloud_sync(retro_task_callback_t cb, void *cb_data)
 {
+   char state_auto[PATH_MAX_LENGTH + 8];
    n_syncs++;
-   last_on_disk = file_holds_pattern();
-   last_live    = content_savefile_is_live(srm_path);
+   last_on_disk   = file_holds_pattern();
+   last_live      = content_savefile_is_live(srm_path);
+   snprintf(state_auto, sizeof(state_auto), "%s.auto",
+         runloop_state_get_ptr()->name.savestate);
+   last_auto_live = content_savefile_is_live(state_auto);
    /* Done at once: a caller that waits for it goes on. */
    if (cb)
       cb(NULL, NULL, cb_data, NULL);
@@ -115,6 +120,7 @@ static void run_until_closed(void)
 
 static void lane_unload(const char *core_path)
 {
+   char     state_auto[PATH_MAX_LENGTH + 8];
    void    *core = dlopen(core_path, RTLD_NOW | RTLD_NOLOAD);
    uint8_t *(*get_sram)(void);
    uint8_t *sram;
@@ -137,6 +143,11 @@ static void lane_unload(const char *core_path)
 
    CHECK(content_savefile_is_live(srm_path),
          "the save file is not the running core's: %s", srm_path);
+   snprintf(state_auto, sizeof(state_auto), "%s.auto",
+         runloop_state_get_ptr()->name.savestate);
+   CHECK(runloop_state_get_ptr()->name.savestate[0], "the content has no state name");
+   CHECK(content_savefile_is_live(state_auto),
+         "the auto state is not the running core's: %s", state_auto);
 
    n_syncs = 0;
    command_event(CMD_EVENT_UNLOAD_CORE, NULL);
@@ -148,6 +159,8 @@ static void lane_unload(const char *core_path)
          "the sync was pushed before the save RAM reached disk");
    CHECK(!last_live,
          "the sync was pushed while a core still owned the save file");
+   CHECK(!last_auto_live,
+         "the sync was pushed while the auto state was still owned");
    printf("[%s] unload\n", failures ? "FAIL" : "ok");
 }
 
@@ -156,6 +169,8 @@ static void lane_startup(void)
    unsigned before = failures;
    CHECK(n_syncs == 1, "%u syncs before the content loaded, expected 1", n_syncs);
    CHECK(!last_live, "the startup sync was pushed after the core took the save file");
+   CHECK(!last_auto_live,
+         "the startup sync was pushed while the auto state was owned");
    CHECK(content_running(), "the content did not load after the startup sync");
    printf("[%s] startup\n", failures == before ? "ok" : "FAIL");
 }
