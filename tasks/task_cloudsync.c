@@ -1596,9 +1596,31 @@ static void task_cloud_sync_carry_manifests_forward(
 
    task_cloud_sync_add_to_updated_manifest(sync_state, key, server_hash, true);
 
-   if (file_list_search(sync_state->local_manifest, key, &idx))
+   if (     file_list_search(sync_state->local_manifest, key, &idx)
+         && string_is_equal_noncase(
+            CS_FILE_KEY(&sync_state->local_manifest->list[idx]), key))
       task_cloud_sync_add_to_updated_manifest(sync_state, key,
             CS_FILE_HASH(&sync_state->local_manifest->list[idx]), false);
+}
+
+/* Work on @key that did not happen: both manifests keep what the last
+ * sync left in them, so the next sync meets the same difference.
+ * file_list_search() also matches a longer key sharing @key's start. */
+static void task_cloud_sync_keep_records(task_cloud_sync_state_t *sync_state,
+      const char *key)
+{
+   size_t idx;
+
+   if (     file_list_search(sync_state->local_manifest, key, &idx)
+         && string_is_equal_noncase(
+            CS_FILE_KEY(&sync_state->local_manifest->list[idx]), key))
+      task_cloud_sync_add_to_updated_manifest(sync_state, key,
+            CS_FILE_HASH(&sync_state->local_manifest->list[idx]), false);
+   if (     file_list_search(sync_state->server_manifest, key, &idx)
+         && string_is_equal_noncase(
+            CS_FILE_KEY(&sync_state->server_manifest->list[idx]), key))
+      task_cloud_sync_add_to_updated_manifest(sync_state, key,
+            CS_FILE_HASH(&sync_state->server_manifest->list[idx]), true);
 }
 
 /**
@@ -1969,8 +1991,12 @@ static void task_cloud_sync_move_finish(task_cloud_sync_state_t *sync_state,
       sync_state->failures = true;
    }
    else if (!fetch_state)
+   {
+      task_cloud_sync_add_to_updated_manifest(sync_state, mv->key,
+            NULL, true);
       task_cloud_sync_add_to_updated_manifest(sync_state, mv->key,
             server_hash, false);
+   }
    else if (task_cloud_sync_fetch_place(fetch_state, mv->key, mv->fetching))
       task_cloud_sync_fetched(sync_state, fetch_state->server_file,
             mv->key, mv->hash);
@@ -2251,12 +2277,13 @@ static void task_cloud_sync_fetch_cb(void *user_data, const char *path, bool suc
    }
    else
    {
-      /* on failure, don't add it to local manifest, that will cause a fetch again next time */
+      /* the local file is untouched: both records stay, so the next
+       * sync fetches it again */
       RARCH_WARN(CSPFX "Failed to fetch \"%s\".\n", path);
       if (file)
          filestream_close(file);
       task_cloud_sync_fetch_discard(fetch_state);
-      task_cloud_sync_add_to_updated_manifest(sync_state, path, CS_FILE_HASH(server_file), true);
+      task_cloud_sync_keep_records(sync_state, path);
       sync_state->failures = true;
    }
 
@@ -2340,7 +2367,7 @@ static void task_cloud_sync_fetch_server_file(task_cloud_sync_state_t *sync_stat
    if (!fetch_state)
    {
       RARCH_WARN(CSPFX "Wanted to fetch %s but failed to malloc.\n", key);
-      task_cloud_sync_add_to_updated_manifest(sync_state, key, CS_FILE_HASH(server_file), true);
+      task_cloud_sync_keep_records(sync_state, key);
       sync_state->failures = true;
       return;
    }
@@ -2353,7 +2380,7 @@ static void task_cloud_sync_fetch_server_file(task_cloud_sync_state_t *sync_stat
    else
    {
       RARCH_WARN(CSPFX "Wanted to fetch %s but failed.\n", key);
-      task_cloud_sync_add_to_updated_manifest(sync_state, key, CS_FILE_HASH(server_file), true);
+      task_cloud_sync_keep_records(sync_state, key);
       sync_state->failures = true;
       free(fetch_state);
    }
@@ -2376,8 +2403,12 @@ static void task_cloud_sync_resolve_conflict(task_cloud_sync_state_t *sync_state
       if (!string_is_empty(CS_FILE_HASH(server_file)))
          task_cloud_sync_fetch_server_file(sync_state);
       else if (task_cloud_sync_delete_current_file(sync_state))
+      {
+         task_cloud_sync_add_to_updated_manifest(sync_state,
+               CS_FILE_KEY(server_file), NULL, true);
          task_cloud_sync_add_to_updated_manifest(sync_state,
                CS_FILE_KEY(server_file), CS_FILE_HASH(server_file), false);
+      }
    }
    else
    {
@@ -2415,12 +2446,7 @@ static void task_cloud_sync_upload_cb(void *user_data, const char *path, bool su
    }
    else
    {
-      /* if the upload fails, try to resurrect the hash from the last sync */
-      if (file_list_search(sync_state->local_manifest, path, &idx))
-      {
-         struct item_file *local_file = &sync_state->local_manifest->list[idx];
-         task_cloud_sync_add_to_updated_manifest(sync_state, path, CS_FILE_HASH(local_file), false);
-      }
+      task_cloud_sync_keep_records(sync_state, path);
       RARCH_WARN(CSPFX "Uploading \"%s\" failed.\n", path);
       sync_state->failures = true;
    }
@@ -2453,7 +2479,12 @@ static void task_cloud_sync_upload_current_file(task_cloud_sync_state_t *sync_st
    file = filestream_open(filename,
          RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_FREQUENT_ACCESS);
    if (!file)
+   {
+      task_cloud_sync_keep_records(sync_state, path);
+      RARCH_WARN(CSPFX "Could not read \"%s\".\n", filename);
+      sync_state->failures = true;
       return;
+   }
 
    RARCH_LOG(CSPFX "Uploading \"%s\".\n", path);
 
@@ -2464,13 +2495,7 @@ static void task_cloud_sync_upload_current_file(task_cloud_sync_state_t *sync_st
    task_cloud_sync_waiting_inc(sync_state);
    if (!cloud_sync_update(path, file, task_cloud_sync_upload_cb, sync_state))
    {
-      /* if the upload fails, try to resurrect the hash from the last sync */
-      size_t idx;
-      if (file_list_search(sync_state->local_manifest, path, &idx))
-      {
-         struct item_file *local_file = &sync_state->local_manifest->list[idx];
-         task_cloud_sync_add_to_updated_manifest(sync_state, path, CS_FILE_HASH(local_file), false);
-      }
+      task_cloud_sync_keep_records(sync_state, path);
       filestream_close(file);
       task_cloud_sync_waiting_dec(sync_state);
       sync_state->failures = true;
@@ -2549,7 +2574,12 @@ static void task_cloud_sync_check_server_current(task_cloud_sync_state_t *sync_s
       file = filestream_open(filename,
             RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_FREQUENT_ACCESS);
       if (!file)
+      {
+         task_cloud_sync_keep_records(sync_state, CS_FILE_KEY(server_file));
+         RARCH_WARN(CSPFX "Could not read \"%s\".\n", filename);
+         sync_state->failures = true;
          return;
+      }
       current_file->userdata = task_cloud_sync_md5_rfile(file);
       filestream_close(file);
    }
@@ -2579,7 +2609,10 @@ static void task_cloud_sync_check_server_current(task_cloud_sync_state_t *sync_s
    else if (!string_is_empty(CS_FILE_HASH(server_file)))
       task_cloud_sync_fetch_server_file(sync_state);
    else if (task_cloud_sync_delete_current_file(sync_state))
+   {
+      task_cloud_sync_add_to_updated_manifest(sync_state, CS_FILE_KEY(server_file), NULL, true);
       task_cloud_sync_add_to_updated_manifest(sync_state, CS_FILE_KEY(server_file), CS_FILE_HASH(server_file), false);
+   }
 }
 
 static void task_cloud_sync_delete_cb(void *user_data, const char *path, bool success, RFILE *file)
@@ -2591,13 +2624,8 @@ static void task_cloud_sync_delete_cb(void *user_data, const char *path, bool su
 
    if (!success)
    {
-      /* if the delete fails, resurrect the hash from the last sync */
-      size_t idx;
-      if (file_list_search(sync_state->local_manifest, path, &idx))
-      {
-         struct item_file *local_file = &sync_state->local_manifest->list[idx];
-         task_cloud_sync_add_to_updated_manifest(sync_state, path, CS_FILE_HASH(local_file), false);
-      }
+      /* the next sync tries it again */
+      task_cloud_sync_keep_records(sync_state, path);
       RARCH_WARN(CSPFX "Deleting \"%s\" failed.\n", path);
       sync_state->failures = true;
       task_cloud_sync_waiting_dec(sync_state);

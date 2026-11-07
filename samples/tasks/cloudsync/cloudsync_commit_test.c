@@ -58,6 +58,7 @@ static bool vanish;
 static retro_atomic_int_t vanishing;
 /* what the last sync recorded for the save */
 static char synced_server[33], synced_local[33];
+static bool synced_server_listed;
 
 #define CHECK(c) do { if (!(c)) { \
    fprintf(stderr, "FAIL line %d (hold %d): %s\n", __LINE__, hold_mode, #c); \
@@ -233,6 +234,8 @@ static void done(retro_task_t *task, void *data, void *ud, const char *error)
    CHECK(task_is_on_main_thread());
    CHECK((error != NULL) == expect_failure);
    task_cloud_sync_fold_manifest_adds(st);
+   synced_server_listed = file_list_search(st->updated_server_manifest,
+         "saves/save.srm", &at);
    synced_hash(st->updated_server_manifest, synced_server,
          sizeof(synced_server));
    synced_hash(st->updated_local_manifest, synced_local,
@@ -336,6 +339,7 @@ static void lane(bool threaded, bool deletion, bool owned, bool no_memory,
 #endif
    retired = 0;
    live = 0;
+   synced_server_listed = false;
    expect_old = owned || no_memory || keep || undone;
    expect_failure = no_memory || keep;
    retro_atomic_store_relaxed_int(&main_syncs, 0);
@@ -479,6 +483,9 @@ static void lane(bool threaded, bool deletion, bool owned, bool no_memory,
    }
    CHECK(retro_atomic_load_acquire_int(&vanishing) == (vanish ? 2 : 0));
    retro_atomic_store_relaxed_int(&vanishing, 0);
+   /* taken or not, the server's delete stays on its record */
+   CHECK(!deletion || !retired
+         || (synced_server_listed && string_is_empty(synced_server)));
    CHECK(retro_atomic_load_relaxed_int(&off_main) == 0);
    if (!no_memory)
       CHECK(retro_atomic_load_relaxed_int(&ownership_checks) > 0);

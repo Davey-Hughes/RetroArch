@@ -2,15 +2,19 @@
  * for the server, threaded tasks on and off: what the sync deletes on
  * the server when a folder under a root can't be read, when a folder
  * is unset, when a root moved, when most of a root's files are
- * missing, and when Keep Local resolves a file deleted here; and which
- * save folder it walks.
+ * missing, and when Keep Local resolves a file deleted here; what the
+ * manifests keep of a delete the server refuses, of one taken from it
+ * and of an upload or a download that does not happen; that a save
+ * which can't be read fails the sync; and which save folder it walks.
  *
  *   ./cloudsync_roots_test [lane...]   (default: every lane) */
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <retro_dirent.h>
 #include <retro_timers.h>
+#include <streams/file_stream.h>
 #include <queues/message_queue.h>
 #include <lists/string_list.h>
 #include "../../../msg_hash.h"
@@ -19,19 +23,30 @@ static struct RDIR *test_opendir(const char *name, bool include_hidden);
 static int test_readdir(struct RDIR *rdir);
 static bool test_dirent_error(struct RDIR *rdir);
 static char *test_strdup(const char *s);
+static RFILE *test_filestream_open(const char *path, unsigned mode,
+      unsigned hints);
 static bool test_string_list_append(struct string_list *list,
       const char *elem, union string_list_elem_attr attr);
+static void *test_malloc(size_t size);
+static int test_filestream_rename(const char *old_path,
+      const char *new_path);
 #define retro_opendir_include_hidden test_opendir
 #define retro_readdir test_readdir
 #define retro_dirent_error test_dirent_error
 #define strdup test_strdup
+#define filestream_open test_filestream_open
 #define string_list_append test_string_list_append
+#define malloc test_malloc
+#define filestream_rename test_filestream_rename
 #include "../../../tasks/task_cloudsync.c"
 #undef retro_opendir_include_hidden
 #undef retro_readdir
 #undef retro_dirent_error
 #undef strdup
+#undef filestream_open
 #undef string_list_append
+#undef malloc
+#undef filestream_rename
 
 /* A copy of this string runs out of memory */
 static const char *fail_strdup;
@@ -40,6 +55,44 @@ static char *test_strdup(const char *s)
    if (fail_strdup && !strcmp(s, fail_strdup))
       return NULL;
    return strdup(s);
+}
+
+/* The task's opens of a file whose path ends in this fail, after the
+ * first fail_fopen_after */
+static const char *fail_fopen;
+static unsigned fail_fopen_after;
+static RFILE *test_filestream_open(const char *path, unsigned mode,
+      unsigned hints)
+{
+   if (fail_fopen && string_ends_with(path, fail_fopen))
+   {
+      if (!fail_fopen_after)
+         return NULL;
+      fail_fopen_after--;
+   }
+   return filestream_open(path, mode, hints);
+}
+
+/* The task's next allocation of this size fails */
+static size_t fail_alloc;
+static void *test_malloc(size_t size)
+{
+   if (fail_alloc && size == fail_alloc)
+   {
+      fail_alloc = 0;
+      return NULL;
+   }
+   return malloc(size);
+}
+
+/* The task's renames onto a path ending in this fail */
+static const char *fail_rename;
+static int test_filestream_rename(const char *old_path,
+      const char *new_path)
+{
+   if (fail_rename && string_ends_with(new_path, fail_rename))
+      return -1;
+   return filestream_rename(old_path, new_path);
 }
 
 /* Adding this string to a list runs out of memory */
@@ -63,7 +116,21 @@ static int conflict_mode;
    fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #c); failures++; } } while (0)
 
 void RARCH_LOG(const char *fmt, ...) { (void)fmt; }
-void RARCH_WARN(const char *fmt, ...) { (void)fmt; }
+/* Warnings that name this */
+static const char *warn_about;
+static unsigned warned;
+void RARCH_WARN(const char *fmt, ...)
+{
+   char    s[512];
+   va_list ap;
+   if (!warn_about)
+      return;
+   va_start(ap, fmt);
+   vsnprintf(s, sizeof(s), fmt, ap);
+   va_end(ap);
+   if (strstr(s, warn_about))
+      warned++;
+}
 void RARCH_ERR(const char *fmt, ...) { (void)fmt; }
 bool verbosity_is_enabled(void) { return false; }
 settings_t *config_get_ptr(void) { return NULL; }
@@ -89,7 +156,10 @@ char *dir_get_ptr(enum rarch_dir_type type)
    }
    return unset;
 }
-bool content_savefile_is_live(const char *path) { (void)path; return false; }
+/* A save whose path ends in this belongs to the running core */
+static const char *live_save;
+bool content_savefile_is_live(const char *path)
+{ return live_save && string_ends_with(path, live_save); }
 unsigned content_savefile_lifetime(void) { return 0; }
 unsigned content_save_writes(void) { return 0; }
 bool content_save_state_in_progress(void *data) { (void)data; return false; }
@@ -200,11 +270,22 @@ bool cloud_sync_begin(cloud_sync_complete_handler_t cb, void *ud)
 bool cloud_sync_end(cloud_sync_complete_handler_t cb, void *ud)
 { cb(ud, NULL, true, NULL); return true; }
 
+/* Downloads of this key fail, at the call with fail_fetch_call */
+static const char *fail_fetch;
+static bool fail_fetch_call;
+
 bool cloud_sync_read(const char *path, const char *file,
       cloud_sync_complete_handler_t cb, void *ud)
 {
    char   s[PATH_MAX_LENGTH];
    RFILE *f = NULL;
+   if (fail_fetch && string_is_equal(path, fail_fetch))
+   {
+      if (fail_fetch_call)
+         return false;
+      cb(ud, path, false, NULL);
+      return true;
+   }
    srv_path(s, sizeof(s), path);
    if (!path_is_valid(s))
    {
@@ -220,11 +301,22 @@ bool cloud_sync_read(const char *path, const char *file,
    return true;
 }
 
+/* Uploads of this key fail, at the call with fail_update_call */
+static const char *fail_update;
+static bool fail_update_call;
+
 bool cloud_sync_update(const char *path, RFILE *file,
       cloud_sync_complete_handler_t cb, void *ud)
 {
    char s[PATH_MAX_LENGTH];
    bool ok;
+   if (fail_update && string_is_equal(path, fail_update))
+   {
+      if (fail_update_call)
+         return false;
+      cb(ud, path, false, file);
+      return true;
+   }
    srv_path(s, sizeof(s), path);
    ok = copy_file(filestream_get_path(file), s);
    if (ok && !string_is_equal(path, MANIFEST_FILENAME_SERVER))
@@ -233,12 +325,20 @@ bool cloud_sync_update(const char *path, RFILE *file,
    return true;
 }
 
+/* The server refuses to delete the keys starting with this */
+static const char *fail_free;
+
 bool cloud_sync_free(const char *path, cloud_sync_complete_handler_t cb,
       void *ud)
 {
    char s[PATH_MAX_LENGTH];
    srv_path(s, sizeof(s), path);
    deletes++;
+   if (fail_free && !strncmp(path, fail_free, strlen(fail_free)))
+   {
+      cb(ud, path, false, NULL);
+      return true;
+   }
    cb(ud, path, filestream_delete(s) == 0, NULL);
    return true;
 }
@@ -339,6 +439,7 @@ static bool sync_list(bool threaded, struct string_list *dirlist)
    sync_done   = 0;
    sync_failed = 0;
    deletes = uploads = fetches = notices = notice_count = outside_opens = 0;
+   warned  = 0;
    task_queue_init(threaded, NULL);
    task_queue_push(task);
    for (i = 0; i < 5000 && !sync_done; i++)
@@ -807,6 +908,20 @@ static void other_device(bool on)
       strlcpy(assets, own, sizeof(assets));
 }
 
+/* As other_device(), for a third device. */
+static void third_device(bool on)
+{
+   static char own[256];
+   if (on)
+   {
+      strlcpy(own, assets, sizeof(own));
+      strlcat(assets, "-c", sizeof(assets));
+      path_mkdir(assets);
+   }
+   else
+      strlcpy(assets, own, sizeof(assets));
+}
+
 /* Another device changes "a.srm" on the server, and this one has
  * deleted it: Keep Local deletes it on the server as any delete here
  * is, both manifests record the delete and nothing else is uploaded;
@@ -1148,6 +1263,497 @@ static void held_conflicts(bool threaded)
    held_conflicts_lane(threaded, 2);
 }
 
+/* A delete the server refuses, with a change sent in the same sync,
+ * stays in both manifests: the next sync deletes it again, and the
+ * other device takes the delete rather than uploading it again. */
+static void delete_failed(bool threaded)
+{
+   char root[256], root_b[264], path[PATH_MAX_LENGTH];
+   lane_dirs("delete_failed", threaded, root, sizeof(root));
+   snprintf(root_b, sizeof(root_b), "%s-b", root);
+   CHECK(path_mkdir(root_b));
+   put(root, "a.srm", "1");
+   put(root, "b.srm", "b");
+   CHECK(sync_saves(threaded, root));
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   other_device(false);
+
+   drop(root, "a.srm");
+   put(root, "b.srm", "bb");
+   fail_free = "saves/a.srm";
+   CHECK(!sync_saves(threaded, root));
+   fail_free = NULL;
+   CHECK(deletes == 1);
+   CHECK(uploads == 1);
+   CHECK(holds(srv, "saves/a.srm", "1"));
+   CHECK(server_entry("saves/a.srm") == 2);
+   CHECK(local_entry("saves/a.srm") == 2);
+
+   CHECK(sync_saves(threaded, root));
+   CHECK(deletes == 1);
+   CHECK(!path_is_valid(srv_key("saves/a.srm")));
+   CHECK(server_entry("saves/a.srm") == 1);
+   CHECK(local_entry("saves/a.srm") == 1);
+
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   CHECK(uploads == 0);
+   CHECK(fetches == 1);
+   fill_pathname_join_special(path, root_b, "a.srm", sizeof(path));
+   CHECK(!path_is_valid(path));
+   other_device(false);
+   CHECK(sync_saves(threaded, root));
+   CHECK(fetches == 0);
+   CHECK(!path_is_valid(srv_key("saves/a.srm")));
+}
+
+/* Deletes the server refused count toward the hold when tried again:
+ * of 22 files, 10 refused and 2 more gone here are held. */
+static void delete_failed_held(bool threaded)
+{
+   char     root[256], name[32], key[48];
+   unsigned i;
+   lane_dirs("delete_failed_held", threaded, root, sizeof(root));
+   for (i = 0; i < 22; i++)
+   {
+      name_file(name, sizeof(name), i);
+      put(root, name, name);
+   }
+   CHECK(sync_saves(threaded, root));
+   for (i = 0; i < 10; i++)
+   {
+      name_file(name, sizeof(name), i);
+      drop(root, name);
+   }
+   put(root, "f21.srm", "changed");
+   fail_free = "saves/f0";
+   CHECK(!sync_saves(threaded, root));
+   fail_free = NULL;
+   CHECK(deletes == 10);
+   CHECK(notices == 0);
+
+   drop(root, "f10.srm");
+   drop(root, "f11.srm");
+   CHECK(sync_saves(threaded, root));
+   CHECK(deletes == 0);
+   CHECK(notices == 1);
+   CHECK(notice_count == 12);
+   for (i = 0; i < 12; i++)
+   {
+      snprintf(key, sizeof(key), "saves/f%02u.srm", i);
+      CHECK(path_is_valid(srv_key(key)));
+   }
+}
+
+/* An upload that does not happen keeps both records. @how: 0 it
+ * fails, 1 it can't be sent, 2 the file can't be read, 3 it can't be
+ * read again to upload. "a.srm", deleted on the other device and
+ * changed here, is kept by Keep Local while "b.srm" goes up: the
+ * server keeps its delete, so a third device that still has "a.srm"
+ * takes it rather than uploading its copy again, and the next sync
+ * here uploads it. */
+static void upload_failed_lane(bool threaded, int how)
+{
+   char root[256], root_b[264], root_c[264], path[PATH_MAX_LENGTH];
+   char lane[32];
+   bool ok;
+   snprintf(lane, sizeof(lane), "upload_failed%d", how);
+   lane_dirs(lane, threaded, root, sizeof(root));
+   snprintf(root_b, sizeof(root_b), "%s-b", root);
+   snprintf(root_c, sizeof(root_c), "%s-c", root);
+   CHECK(path_mkdir(root_b));
+   CHECK(path_mkdir(root_c));
+   put(root, "a.srm", "1");
+   put(root, "b.srm", "b");
+   CHECK(sync_saves(threaded, root));
+   third_device(true);
+   CHECK(sync_saves(threaded, root_c));
+   third_device(false);
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   drop(root_b, "a.srm");
+   CHECK(sync_saves(threaded, root_b));
+   CHECK(deletes == 1);
+   other_device(false);
+
+   put(root, "a.srm", "33");
+   put(root, "b.srm", "bb");
+   if (how < 2)
+   {
+      fail_update      = "saves/a.srm";
+      fail_update_call = how == 1;
+   }
+   else
+   {
+      fail_fopen       = "a.srm";
+      fail_fopen_after = how == 3 ? 1 : 0;
+   }
+   conflict_mode = 1;
+   ok = sync_saves(threaded, root);
+   conflict_mode    = 0;
+   fail_update      = NULL;
+   fail_update_call = false;
+   fail_fopen       = NULL;
+   CHECK(!ok);
+   CHECK(uploads == 1);
+   CHECK(holds(root, "a.srm", "33"));
+   CHECK(!path_is_valid(srv_key("saves/a.srm")));
+   CHECK(server_entry("saves/a.srm") == 1);
+   CHECK(local_entry("saves/a.srm") == 2);
+
+   third_device(true);
+   CHECK(sync_saves(threaded, root_c));
+   CHECK(uploads == 0);
+   fill_pathname_join_special(path, root_c, "a.srm", sizeof(path));
+   CHECK(!path_is_valid(path));
+   third_device(false);
+
+   conflict_mode = 1;
+   ok = sync_saves(threaded, root);
+   conflict_mode = 0;
+   CHECK(ok);
+   CHECK(uploads == 1);
+   CHECK(holds(srv, "saves/a.srm", "33"));
+}
+
+static void upload_failed(bool threaded)
+{
+   int how;
+   for (how = 0; how < 4; how++)
+      upload_failed_lane(threaded, how);
+}
+
+/* A new file whose upload fails is recorded nowhere, not under the
+ * entry of a longer key sharing its start, and goes up next sync. */
+static void upload_failed_new(bool threaded)
+{
+   char root[256];
+   lane_dirs("upload_failed_new", threaded, root, sizeof(root));
+   put(root, "e.srm.x", "x");
+   CHECK(sync_saves(threaded, root));
+   put(root, "e.srm", "e");
+   put(root, "f.srm", "f");
+   fail_update = "saves/e.srm";
+   CHECK(!sync_saves(threaded, root));
+   fail_update = NULL;
+   CHECK(uploads == 1);
+   CHECK(server_entry("saves/e.srm") == 0);
+   CHECK(local_entry("saves/e.srm") == 0);
+   CHECK(sync_saves(threaded, root));
+   CHECK(uploads == 1);
+   CHECK(holds(srv, "saves/e.srm", "e"));
+}
+
+/* The other device changes "a.srm" and this one's download of it does
+ * not happen. @how: 0 it fails, 1 it can't be sent, 2 no memory. The
+ * copy here keeps its record, so the next sync fetches the change
+ * rather than meeting a conflict, and a Keep Local after that has
+ * nothing to put over it. */
+static void fetch_failed_lane(bool threaded, int how)
+{
+   char root[256], root_b[264], lane[32];
+   bool ok;
+   snprintf(lane, sizeof(lane), "fetch_failed%d", how);
+   lane_dirs(lane, threaded, root, sizeof(root));
+   snprintf(root_b, sizeof(root_b), "%s-b", root);
+   CHECK(path_mkdir(root_b));
+   put(root, "a.srm", "1");
+   CHECK(sync_saves(threaded, root));
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   put(root_b, "a.srm", "2");
+   CHECK(sync_saves(threaded, root_b));
+   CHECK(uploads == 1);
+   other_device(false);
+
+   if (how < 2)
+   {
+      fail_fetch      = "saves/a.srm";
+      fail_fetch_call = how == 1;
+   }
+   else
+      fail_alloc = sizeof(task_cloud_sync_fetch_state_t);
+   ok = sync_saves(threaded, root);
+   CHECK(!fail_alloc);
+   fail_fetch      = NULL;
+   fail_fetch_call = false;
+   fail_alloc      = 0;
+   CHECK(!ok);
+   CHECK(fetches == 0);
+   CHECK(holds(root, "a.srm", "1"));
+   CHECK(local_entry("saves/a.srm") == 2);
+
+   CHECK(sync_saves(threaded, root));
+   CHECK(fetches == 1);
+   CHECK(uploads == 0);
+   CHECK(holds(root, "a.srm", "2"));
+
+   conflict_mode = 1;
+   ok = sync_saves(threaded, root);
+   conflict_mode = 0;
+   CHECK(ok);
+   CHECK(uploads == 0);
+   CHECK(holds(srv, "saves/a.srm", "2"));
+}
+
+static void fetch_failed(bool threaded)
+{
+   int how;
+   for (how = 0; how < 3; how++)
+      fetch_failed_lane(threaded, how);
+}
+
+/* A save that can't be opened, to hash it or to upload it, fails the
+ * sync and is named in a warning. Its records stay as they were, and
+ * it goes up once it can be read. */
+static void save_unreadable(bool threaded)
+{
+   char root[256];
+   lane_dirs("save_unreadable", threaded, root, sizeof(root));
+   put(root, "a.srm", "1");
+   CHECK(sync_saves(threaded, root));
+
+   put(root, "a.srm", "11");
+   fail_fopen_after = 0;
+   fail_fopen = warn_about = "a.srm";
+   CHECK(!sync_saves(threaded, root));
+   CHECK(warned == 1);
+   CHECK(uploads == 0);
+   CHECK(holds(srv, "saves/a.srm", "1"));
+   CHECK(server_entry("saves/a.srm") == 2);
+   CHECK(local_entry("saves/a.srm") == 2);
+
+   put(root, "c.srm", "c");
+   fail_fopen = warn_about = "c.srm";
+   CHECK(!sync_saves(threaded, root));
+   CHECK(warned == 1);
+   CHECK(uploads == 1);
+   CHECK(holds(srv, "saves/a.srm", "11"));
+   CHECK(server_entry("saves/c.srm") == 0);
+   CHECK(local_entry("saves/c.srm") == 0);
+   fail_fopen = warn_about = NULL;
+
+   CHECK(sync_saves(threaded, root));
+   CHECK(uploads == 1);
+   CHECK(holds(srv, "saves/c.srm", "c"));
+   CHECK(deletes == 0);
+}
+
+/* Work skipped on a key the local manifest does not list records no
+ * local entry for it, not the entry of a longer key starting with it:
+ * the auto state's download, deferred while the core owns it, arrives
+ * at the next sync beside its thumbnail. */
+static void carry_exact_key(bool threaded)
+{
+   char root[256], root_b[264];
+   lane_dirs("carry_exact_key", threaded, root, sizeof(root));
+   snprintf(root_b, sizeof(root_b), "%s-b", root);
+   CHECK(path_mkdir(root_b));
+   put(root, "Game.state.auto.png", "png");
+   CHECK(sync_saves(threaded, root));
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   put(root_b, "Game.state.auto", "B");
+   CHECK(sync_saves(threaded, root_b));
+   CHECK(uploads == 1);
+   other_device(false);
+
+   live_save = "Game.state.auto";
+   CHECK(sync_saves(threaded, root));
+   live_save = NULL;
+   CHECK(fetches == 0);
+   CHECK(local_entry("saves/Game.state.auto") == 0);
+   CHECK(local_entry("saves/Game.state.auto.png") == 2);
+
+   CHECK(sync_saves(threaded, root));
+   CHECK(fetches == 1);
+   CHECK(holds(root, "Game.state.auto", "B"));
+
+   conflict_mode = 1;
+   CHECK(sync_saves(threaded, root));
+   conflict_mode = 0;
+   CHECK(deletes == 0);
+   CHECK(uploads == 0);
+   CHECK(holds(srv, "saves/Game.state.auto", "B"));
+}
+
+/* A download that can't be moved into place, after the old copy went
+ * to the backups, drops the local record: the next sync fetches it
+ * again, with no conflict. */
+static void rename_failed(bool threaded)
+{
+   char root[256], root_b[264];
+   lane_dirs("rename_failed", threaded, root, sizeof(root));
+   snprintf(root_b, sizeof(root_b), "%s-b", root);
+   CHECK(path_mkdir(root_b));
+   put(root, "a.srm", "1");
+   CHECK(sync_saves(threaded, root));
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   put(root_b, "a.srm", "2");
+   CHECK(sync_saves(threaded, root_b));
+   CHECK(uploads == 1);
+   other_device(false);
+
+   fail_rename = "a.srm";
+   CHECK(!sync_saves(threaded, root));
+   fail_rename = NULL;
+   CHECK(fetches == 1);
+   CHECK(!holds(root, "a.srm", "1"));
+   CHECK(local_entry("saves/a.srm") == 0);
+   CHECK(server_entry("saves/a.srm") == 2);
+
+   CHECK(sync_saves(threaded, root));
+   CHECK(fetches == 1);
+   CHECK(holds(root, "a.srm", "2"));
+
+   conflict_mode = 1;
+   CHECK(sync_saves(threaded, root));
+   conflict_mode = 0;
+   CHECK(uploads == 0);
+   CHECK(deletes == 0);
+   CHECK(holds(srv, "saves/a.srm", "2"));
+}
+
+/* A delete already in both records stays in the server's when this
+ * device sends a change: after it took the delete, and on a device
+ * that never had the file. A third device that still has it then
+ * takes the delete. */
+static void tombstone_kept(bool threaded)
+{
+   char root[256], root_b[264], root_c[264], path[PATH_MAX_LENGTH];
+   lane_dirs("tombstone_kept", threaded, root, sizeof(root));
+   snprintf(root_b, sizeof(root_b), "%s-b", root);
+   snprintf(root_c, sizeof(root_c), "%s-c", root);
+   CHECK(path_mkdir(root_b));
+   CHECK(path_mkdir(root_c));
+   put(root, "a.srm", "1");
+   put(root, "b.srm", "b");
+   CHECK(sync_saves(threaded, root));
+   third_device(true);
+   CHECK(sync_saves(threaded, root_c));
+   third_device(false);
+   drop(root, "a.srm");
+   CHECK(sync_saves(threaded, root));
+   CHECK(deletes == 1);
+
+   put(root, "b.srm", "bb");
+   CHECK(sync_saves(threaded, root));
+   CHECK(uploads == 1);
+   CHECK(server_entry("saves/a.srm") == 1);
+
+   other_device(true);
+   put(root_b, "d.srm", "d");
+   CHECK(sync_saves(threaded, root_b));
+   CHECK(uploads == 1);
+   CHECK(server_entry("saves/a.srm") == 1);
+   CHECK(local_entry("saves/a.srm") == 1);
+   other_device(false);
+
+   third_device(true);
+   CHECK(sync_saves(threaded, root_c));
+   CHECK(uploads == 0);
+   fill_pathname_join_special(path, root_c, "a.srm", sizeof(path));
+   CHECK(!path_is_valid(path));
+   third_device(false);
+}
+
+/* The other device deletes "a.srm"; this one takes the delete and
+ * sends a change of "b.srm" in the same sync. @conflict: "a.srm" was
+ * changed here too, and Keep Server takes the delete. A third device
+ * that still has "a.srm" takes the delete rather than uploading it
+ * again. */
+static void taken_delete_lane(bool threaded, bool conflict)
+{
+   char root[256], root_b[264], root_c[264], path[PATH_MAX_LENGTH];
+   bool ok;
+   lane_dirs(conflict ? "taken_conflict" : "taken", threaded, root,
+         sizeof(root));
+   snprintf(root_b, sizeof(root_b), "%s-b", root);
+   snprintf(root_c, sizeof(root_c), "%s-c", root);
+   fill_pathname_join_special(path, root, "a.srm", sizeof(path));
+   CHECK(path_mkdir(root_b));
+   CHECK(path_mkdir(root_c));
+   put(root, "a.srm", "1");
+   put(root, "b.srm", "b");
+   CHECK(sync_saves(threaded, root));
+   third_device(true);
+   CHECK(sync_saves(threaded, root_c));
+   CHECK(fetches == 2);
+   third_device(false);
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   drop(root_b, "a.srm");
+   CHECK(sync_saves(threaded, root_b));
+   CHECK(deletes == 1);
+   other_device(false);
+
+   if (conflict)
+      put(root, "a.srm", "33");
+   put(root, "b.srm", "bb");
+   conflict_mode = conflict ? 2 : 0;
+   ok = sync_saves(threaded, root);
+   conflict_mode = 0;
+   CHECK(ok);
+   CHECK(uploads == 1);
+   CHECK(!path_is_valid(path));
+   CHECK(backup_holds(root, conflict ? "33" : "1"));
+   CHECK(server_entry("saves/a.srm") == 1);
+   CHECK(local_entry("saves/a.srm") == 1);
+
+   third_device(true);
+   CHECK(sync_saves(threaded, root_c));
+   CHECK(uploads == 0);
+   CHECK(fetches == 1);
+   fill_pathname_join_special(path, root_c, "a.srm", sizeof(path));
+   CHECK(!path_is_valid(path));
+   third_device(false);
+   CHECK(!path_is_valid(srv_key("saves/a.srm")));
+   CHECK(sync_saves(threaded, root));
+   CHECK(fetches == 0);
+   CHECK(uploads == 0);
+}
+
+static void taken_delete(bool threaded)             { taken_delete_lane(threaded, false); }
+static void keep_server_taken_delete(bool threaded) { taken_delete_lane(threaded, true); }
+
+/* Files the server manifest no longer lists are not counted toward
+ * the hold: of 22 files, 11 the server lost and 1 deleted here, the
+ * one is deleted with no notice. */
+static void server_lost(bool threaded)
+{
+   char     root[256], root_b[264], name[32];
+   unsigned i;
+   lane_dirs("server_lost", threaded, root, sizeof(root));
+   snprintf(root_b, sizeof(root_b), "%s-b", root);
+   CHECK(path_mkdir(root_b));
+   for (i = 0; i < 22; i++)
+   {
+      name_file(name, sizeof(name), i);
+      put(root, name, name);
+      if (i >= 11)
+         put(root_b, name, name);
+   }
+   CHECK(sync_saves(threaded, root));
+   /* the server starts over, from another device's last 11 */
+   remove_tree(srv);
+   CHECK(path_mkdir(srv));
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   CHECK(uploads == 11);
+   other_device(false);
+   for (i = 0; i < 12; i++)
+   {
+      name_file(name, sizeof(name), i);
+      drop(root, name);
+   }
+   CHECK(sync_saves(threaded, root));
+   CHECK(deletes == 1);
+   CHECK(notices == 0);
+   CHECK(!path_is_valid(srv_key("saves/f11.srm")));
+}
+
 static void keep_local_deleted(bool threaded) { keep_deleted_lane(threaded, 1, false); }
 static void keep_local_other(bool threaded)   { keep_deleted_lane(threaded, 1, true); }
 
@@ -1185,6 +1791,18 @@ static const struct lane lanes[] = {
    { "sync_keep_server_flow",     keep_server_flow },
    { "sync_keep_local_both_deleted", keep_local_both_deleted },
    { "sync_held_conflicts",       held_conflicts },
+   { "sync_delete_failed",        delete_failed },
+   { "sync_delete_failed_held",   delete_failed_held },
+   { "sync_taken_delete",         taken_delete },
+   { "sync_keep_server_taken_delete", keep_server_taken_delete },
+   { "sync_server_lost",          server_lost },
+   { "sync_upload_failed",        upload_failed },
+   { "sync_upload_failed_new",    upload_failed_new },
+   { "sync_tombstone_kept",       tombstone_kept },
+   { "sync_fetch_failed",         fetch_failed },
+   { "sync_save_unreadable",      save_unreadable },
+   { "sync_carry_exact_key",      carry_exact_key },
+   { "sync_rename_failed",        rename_failed },
 };
 
 int main(int argc, char **argv)
