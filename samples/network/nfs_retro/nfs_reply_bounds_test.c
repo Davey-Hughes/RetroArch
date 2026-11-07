@@ -222,6 +222,98 @@ static void test_readdir_take(void)
    free(d.buf);
 }
 
+/* One READDIRPLUS entry list on @d as received, read from the start. */
+static void dir_page(struct rnfs_dir *d, struct reply *r)
+{
+   memset(d, 0, sizeof(*d));
+   d->buf     = r->mem;
+   d->buf_len = r->fill;
+}
+
+/* A READDIRPLUS entry named a.bin, without attributes or handle. */
+static void reply_entry(struct reply *r)
+{
+   reply_u32(r, 1);                     /* value_follows */
+   reply_u32(r, 0); reply_u32(r, 7);    /* fileid */
+   reply_u32(r, 5);
+   if (r->len - r->fill >= 8)
+   {
+      memcpy(r->mem + r->fill, "a.bin\0\0\0", 8);
+      r->fill += 8;
+   }
+   reply_u32(r, 0); reply_u32(r, 1);    /* cookie */
+   reply_u32(r, 0);                     /* no attributes */
+   reply_u32(r, 0);                     /* no handle */
+}
+
+/* The end of a listing against a page that fails to arrive or comes
+ * malformed: only the end is not a read error. The context was never
+ * connected, so asking it for the next page fails at once. */
+static void test_readdir_pages(void)
+{
+   struct rnfs_ctx *c = rnfs_new();
+   struct rnfs_dir  d;
+   struct reply     r;
+   const struct rnfs_dirent *e;
+   uint32_t         calls;
+   if (!c)
+   {
+      CHECK(0, "context");
+      return;
+   }
+
+   /* an entry, then the list's end with eof set */
+   reply_init(&r, 40 + 8);
+   reply_entry(&r);
+   reply_u32(&r, 0); reply_u32(&r, 1);
+   dir_page(&d, &r);
+   e = rnfs_readdir(c, &d);
+   CHECK(e && !strcmp(e->name, "a.bin"), "entry is read");
+   CHECK(rnfs_readdir(c, &d) == NULL && !rnfs_readdir_failed(&d),
+         "the end of the listing is not an error");
+   free(r.mem);
+
+   /* an entry, then eof clear and the next page fails */
+   reply_init(&r, 40 + 8);
+   reply_entry(&r);
+   reply_u32(&r, 0); reply_u32(&r, 0);
+   dir_page(&d, &r);
+   e = rnfs_readdir(c, &d);
+   CHECK(e && !strcmp(e->name, "a.bin"), "first page is read");
+   CHECK(rnfs_readdir(c, &d) == NULL, "listing stops at the failed page");
+   CHECK(rnfs_readdir_failed(&d), "a failed page is a read error");
+   free(r.mem);
+
+   /* an entry cut inside its fileid */
+   reply_init(&r, 8);
+   reply_u32(&r, 1); reply_u32(&r, 0);
+   dir_page(&d, &r);
+   CHECK(rnfs_readdir(c, &d) == NULL && rnfs_readdir_failed(&d),
+         "an entry cut short is a read error");
+   free(r.mem);
+
+   /* the list's end with its eof word missing: malformed, not a cue
+    * to fetch the next page */
+   reply_init(&r, 4);
+   reply_u32(&r, 0);
+   dir_page(&d, &r);
+   calls = rnfs_get_call_count(c);
+   CHECK(rnfs_readdir(c, &d) == NULL && rnfs_readdir_failed(&d),
+         "an end cut short is a read error");
+   CHECK(rnfs_get_call_count(c) == calls, "nothing is fetched after it");
+   free(r.mem);
+
+   /* a page cut inside its first value_follows */
+   reply_init(&r, 2);
+   reply_bytes(&r, 0, 2);
+   dir_page(&d, &r);
+   CHECK(rnfs_readdir(c, &d) == NULL && rnfs_readdir_failed(&d),
+         "a page cut short is a read error");
+   free(r.mem);
+
+   rnfs_free(c);
+}
+
 static void test_opaque_and_sequence(void)
 {
    static struct rnfs_ctx c;
@@ -255,6 +347,7 @@ int main(void)
    test_fattr();
    test_open_res();
    test_readdir_take();
+   test_readdir_pages();
    test_opaque_and_sequence();
    if (failures)
    {

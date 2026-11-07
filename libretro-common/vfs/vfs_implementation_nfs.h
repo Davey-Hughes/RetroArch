@@ -66,6 +66,7 @@ typedef struct
    void *ctx;                   /* struct rnfs_ctx, from the pool */
    void *dir;                   /* struct rnfs_dir */
    struct nfs_dirent ent;
+   bool error;                  /* the listing stopped on a read error */
 } nfs_dir_handle;
 
 /* Hands the client new settings: they are copied, strings included,

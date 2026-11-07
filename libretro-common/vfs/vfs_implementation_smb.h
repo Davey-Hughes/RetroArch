@@ -56,6 +56,7 @@ typedef struct {
    unsigned share_index;
    struct smbc_dirent ent;   /* the entry readdir returns; per handle, so
                               * listings on different threads never share it */
+   bool error;               /* the listing stopped on a read error */
 } smb_dir_handle;
 
 /* Hands the client new settings: they are copied, strings included,

@@ -236,6 +236,11 @@ static INLINE struct smb2dirent *smb2_readdir(struct smb2_context *ctx, struct s
    d->ent.st.smb2_mtime = e->st.mtime;
    return &d->ent;
 }
+/* Not in libsmb2, which reads a whole listing at opendir. */
+static INLINE int smb2_readdir_failed(struct smb2dir *d)
+{
+   return rsmb_readdir_failed(d->d);
+}
 static INLINE void smb2_closedir(struct smb2_context *ctx, struct smb2dir *d)
 {
    if (!d)

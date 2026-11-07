@@ -112,6 +112,9 @@ int rnfs_rename(struct rnfs_ctx *c, const char *from, const char *to);
 
 struct rnfs_dir *rnfs_opendir(struct rnfs_ctx *c, const char *path);
 const struct rnfs_dirent *rnfs_readdir(struct rnfs_ctx *c, struct rnfs_dir *d);
+/* Nonzero once rnfs_readdir() has returned NULL on a failed or
+ * malformed reply rather than at the end of the listing. */
+int rnfs_readdir_failed(const struct rnfs_dir *d);
 void rnfs_closedir(struct rnfs_ctx *c, struct rnfs_dir *d);
 
 /* NULL procedure round trip. */

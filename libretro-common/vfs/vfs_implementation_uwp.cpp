@@ -1286,7 +1286,10 @@ bool retro_vfs_readdir_impl(libretro_vfs_implementation_dir* rdir)
     {
         struct smbc_dirent *de = retro_vfs_readdir_smb(rdir->smb_handle);
         if (!de)
+        {
+            rdir->read_error = rdir->smb_handle->error;
             return false;
+        }
 
         strlcpy(rdir->smb_path, de->name, sizeof(rdir->smb_path));
         rdir->smb_is_dir = (de->type == RETRO_SMB_DIRENT_DIR);

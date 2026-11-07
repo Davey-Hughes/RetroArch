@@ -1863,6 +1863,7 @@ smb_dir_handle* retro_vfs_opendir_smb(const char *path, bool include_hidden)
       handle->shares      = shares;
       handle->share_count = count;
       handle->share_index = 0;
+      handle->error       = false;
       return handle;
    }
 
@@ -1912,6 +1913,7 @@ smb_dir_handle* retro_vfs_opendir_smb(const char *path, bool include_hidden)
    handle->shares      = NULL;
    handle->share_count = 0;
    handle->share_index = 0;
+   handle->error       = false;
    return handle;
 }
 
@@ -1938,12 +1940,22 @@ struct smbc_dirent* retro_vfs_readdir_smb(smb_dir_handle* dh)
       return result;
    }
 
+   /* a dead transport took the listing with it: not its end */
    if (!dh->ctx || !dh->dir || !smb_ctx_active(dh->ctx))
+   {
+      dh->error = true;
       return NULL;
+   }
 
    ent = smb2_readdir(dh->ctx, dh->dir);
    if (!ent)
+   {
+#ifdef HAVE_RETROSMB
+      if (smb2_readdir_failed(dh->dir))
+         dh->error = true;
+#endif
       return NULL;
+   }
 
    memset(result, 0, sizeof(*result));
    strlcpy(result->name, ent->name ? ent->name : "", sizeof(result->name));

@@ -49,7 +49,14 @@ static const struct rsmb_dirent *walk(struct rsmb_dir *d, struct page *p)
    d->buf_len = p->len;
    d->buf_off = 0;
    d->done    = 1;                   /* no further QUERY_DIRECTORY */
+   d->failed  = 0;
    return rsmb_readdir(NULL, d);
+}
+
+/* A malformed page is a read error, not the end of the listing. */
+static int refused(struct rsmb_dir *d, struct page *p)
+{
+   return walk(d, p) == NULL && rsmb_readdir_failed(d);
 }
 
 static void test_bad_entries(void)
@@ -61,37 +68,37 @@ static void test_bad_entries(void)
    /* a FileNameLength that wraps 64 + len in 32 bits */
    page_init(&p, 72);
    page_entry(&p, 0, 0xFFFFFFC0u, "ab", 0, 0, 72);
-   CHECK(walk(&d, &p) == NULL, "name length wrapping 32 bits is refused");
+   CHECK(refused(&d, &p), "name length wrapping 32 bits is refused");
    free(p.mem);
 
    /* a name one octet longer than the page */
    page_init(&p, 72);
    page_entry(&p, 0, 9, "ab", 0, 0, 72);
-   CHECK(walk(&d, &p) == NULL, "name past the page is refused");
+   CHECK(refused(&d, &p), "name past the page is refused");
    free(p.mem);
 
    /* next entry inside the current one */
    page_init(&p, 72 * 2);
    page_entry(&p, 1, ~0u, "ab", 0, 0, 72);
    page_entry(&p, 0, ~0u, "cd", 0, 0, 72);
-   CHECK(walk(&d, &p) == NULL, "next offset inside the entry is refused");
+   CHECK(refused(&d, &p), "next offset inside the entry is refused");
    free(p.mem);
 
    page_init(&p, 72 * 2);
    page_entry(&p, 67, ~0u, "ab", 0, 0, 72);
    page_entry(&p, 0, ~0u, "cd", 0, 0, 72);
-   CHECK(walk(&d, &p) == NULL, "next offset short of the name is refused");
+   CHECK(refused(&d, &p), "next offset short of the name is refused");
    free(p.mem);
 
    /* next entry past the page */
    page_init(&p, 72);
    page_entry(&p, 73, ~0u, "ab", 0, 0, 72);
-   CHECK(walk(&d, &p) == NULL, "next offset past the page is refused");
+   CHECK(refused(&d, &p), "next offset past the page is refused");
    free(p.mem);
 
    /* a page shorter than one entry header */
    page_init(&p, 63);
-   CHECK(walk(&d, &p) == NULL, "page shorter than an entry is refused");
+   CHECK(refused(&d, &p), "page shorter than an entry is refused");
    free(p.mem);
 }
 
@@ -112,7 +119,129 @@ static void test_good_page(void)
    e = rsmb_readdir(NULL, &d);
    CHECK(e && !strcmp(e->name, "dir") && e->st.is_dir, "last entry ends the page");
    CHECK(rsmb_readdir(NULL, &d) == NULL, "listing ends after the last entry");
+   CHECK(!rsmb_readdir_failed(&d), "the end of the listing is not an error");
    free(p.mem);
+}
+
+/* A page read, then the next QUERY_DIRECTORY fails: the listing stops
+ * there with a read error, so it is not taken for the whole folder. */
+static void test_failed_page(void)
+{
+   struct rsmb_ctx *c = rsmb_new();   /* never connected: calls fail */
+   struct rsmb_dir  d;
+   struct page      p;
+   const struct rsmb_dirent *e;
+   memset(&d, 0, sizeof(d));
+   page_init(&p, 80);
+   page_entry(&p, 0, ~0u, "a.bin", 0, 1234, 80);
+   d.buf     = p.mem;
+   d.buf_len = p.len;
+   e = c ? rsmb_readdir(c, &d) : NULL;
+   CHECK(e && !strcmp(e->name, "a.bin"), "first page is read");
+   CHECK(c && rsmb_readdir(c, &d) == NULL, "listing stops at the failed page");
+   CHECK(rsmb_readdir_failed(&d), "a failed page is a read error");
+   free(p.mem);
+   rsmb_free(c);
+}
+
+/* A connected loopback pair: fd[0] for the context, fd[1] to hand it
+ * canned replies. */
+static int loop_pair(int fd[2])
+{
+   struct sockaddr_in a;
+   socklen_t          len = sizeof(a);
+   int                l   = (int)socket(AF_INET, SOCK_STREAM, 0);
+   int                ok;
+   fd[0] = fd[1] = -1;
+   if (l < 0)
+      return -1;
+   memset(&a, 0, sizeof(a));
+   a.sin_family      = AF_INET;
+   a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+   ok =  !bind(l, (struct sockaddr*)&a, sizeof(a))
+      && !listen(l, 1)
+      && !getsockname(l, (struct sockaddr*)&a, &len)
+      && (fd[0] = (int)socket(AF_INET, SOCK_STREAM, 0)) >= 0
+      && !connect(fd[0], (struct sockaddr*)&a, sizeof(a))
+      && (fd[1] = (int)accept(l, NULL, NULL)) >= 0;
+   socket_close(l);
+   return ok ? 0 : -1;
+}
+
+/* The reply to message @mid: @status, and for a success @p as the
+ * QUERY_DIRECTORY output (none when NULL). */
+static void canned(int fd, uint64_t mid, uint32_t status,
+      const struct page *p)
+{
+   uint8_t m[4 + SMB2_HDR_SIZE + 8 + 128];
+   size_t  olen = p ? p->len : 0;
+   size_t  len  = SMB2_HDR_SIZE + 8 + olen;
+   memset(m, 0, sizeof(m));
+   m[1] = (uint8_t)(len >> 16);
+   m[2] = (uint8_t)(len >> 8);
+   m[3] = (uint8_t)len;
+   m[4] = 0xfe; m[5] = 'S'; m[6] = 'M'; m[7] = 'B';
+   smb_put16(m + 4 + 4, SMB2_HDR_SIZE);
+   smb_put32(m + 4 + 8, status);
+   smb_put16(m + 4 + 12, SMB2_QUERY_DIRECTORY);
+   smb_put32(m + 4 + 16, 1);                  /* a response */
+   smb_put64(m + 4 + 24, mid);
+   smb_put16(m + 4 + SMB2_HDR_SIZE, 9);
+   smb_put16(m + 4 + SMB2_HDR_SIZE + 2, SMB2_HDR_SIZE + 8);
+   smb_put32(m + 4 + SMB2_HDR_SIZE + 4, (uint32_t)olen);
+   if (olen)
+      memcpy(m + 4 + SMB2_HDR_SIZE + 8, p->mem, olen);
+   send(fd, (const char*)m, (int)(4 + len), 0);
+}
+
+static void dir_reset(struct rsmb_dir *d)
+{
+   uint8_t *buf = d->buf;
+   memset(d, 0, sizeof(*d));
+   d->buf = buf;
+}
+
+/* What QUERY_DIRECTORY replies end a listing: an empty folder may
+ * answer the first with STATUS_NO_SUCH_FILE; after a page that status
+ * cuts the listing short, as does a page with no entries. */
+static void test_query_replies(void)
+{
+   struct rsmb_ctx *c = rsmb_new();
+   struct rsmb_dir  d;
+   struct page      p;
+   int              fd[2];
+   if (!c || loop_pair(fd) != 0)
+   {
+      CHECK(0, "loopback pair");
+      rsmb_free(c);
+      return;
+   }
+   c->fd = fd[0];
+   page_init(&p, 80);
+   page_entry(&p, 0, ~0u, "a.bin", 0, 1234, 80);
+   memset(&d, 0, sizeof(d));
+   d.buf = (uint8_t*)malloc(SMB2_MAX_IO);
+
+   canned(fd[1], c->message_id, STATUS_NO_SUCH_FILE, NULL);
+   CHECK(rsmb_readdir(c, &d) == NULL && !rsmb_readdir_failed(&d),
+         "an empty folder's NO_SUCH_FILE ends its listing");
+
+   dir_reset(&d);
+   canned(fd[1], c->message_id, STATUS_SUCCESS, &p);
+   canned(fd[1], c->message_id + 1, STATUS_NO_SUCH_FILE, NULL);
+   CHECK(rsmb_readdir(c, &d) != NULL, "a page is read");
+   CHECK(rsmb_readdir(c, &d) == NULL && rsmb_readdir_failed(&d),
+         "NO_SUCH_FILE after a page is a read error");
+
+   dir_reset(&d);
+   canned(fd[1], c->message_id, STATUS_SUCCESS, NULL);
+   CHECK(rsmb_readdir(c, &d) == NULL && rsmb_readdir_failed(&d),
+         "a page with no entries is a read error");
+
+   free(d.buf);
+   free(p.mem);
+   socket_close(fd[1]);
+   rsmb_free(c);
 }
 
 static void test_utf16(void)
@@ -158,8 +287,11 @@ static void test_span(void)
 
 int main(void)
 {
+   network_init();
    test_bad_entries();
    test_good_page();
+   test_failed_page();
+   test_query_replies();
    test_utf16();
    test_span();
    if (failures)

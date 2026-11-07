@@ -952,11 +952,18 @@ struct nfs_dirent *retro_vfs_readdir_nfs(nfs_dir_handle *dh)
    struct rnfs_ctx *c;
    const struct rnfs_dirent *e;
    if (!ds || !(c = nfs_take(ds->server, ds->export_path, &ds->params, &slot)))
+   {
+      dh->error = true;
       return NULL;
+   }
    e = rnfs_readdir(c, ds->d);
    nfs_give(c, slot);
    if (!e)
+   {
+      if (rnfs_readdir_failed(ds->d))
+         dh->error = true;
       return NULL;
+   }
    strlcpy(dh->ent.name, e->name, sizeof(dh->ent.name));
    dh->ent.type = e->st.is_dir ? RETRO_NFS_DIRENT_DIR : RETRO_NFS_DIRENT_FILE;
    dh->ent.size = (int64_t)e->st.size;
