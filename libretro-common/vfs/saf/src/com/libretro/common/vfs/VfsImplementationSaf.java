@@ -182,20 +182,143 @@ public final class VfsImplementationSaf
       return true;
    }
 
+   /**
+    * Rename a Storage Access Framework file within its directory, replacing a file already at the new name, returning 0 if it succeeded or -1 if not.
+    * A file being replaced is first renamed aside, to the first free name of "<name>.prev", "<name>.2.prev" ... "<name>.99.prev", removed once the new one is in place and put back if that fails.
+    * @param content the content resolver returned by getContentResolver()
+    * @param tree the URI returned by the ACTION_OPEN_DOCUMENT_TREE intent action
+    * @param oldPath path of the file to rename, relative to the root directory of the tree
+    * @param newPath path to rename it to, in the same directory
+    */
+   public static int renameSafFile(ContentResolver content, String tree, String oldPath, String newPath)
+   {
+      if (Build.VERSION.SDK_INT < 21)
+         return -1;
+      final Uri treeUri = Uri.parse(tree);
+      if (isDocument(treeUri))
+         return -1;
+      oldPath = normalizePath(oldPath);
+      newPath = normalizePath(newPath);
+      final String parentPath = getPathParent(oldPath);
+      final String newName = getPathFileName(newPath);
+      if (parentPath == null || newName == null || oldPath.equals(newPath) || !parentPath.equals(getPathParent(newPath)))
+         return -1;
+      final SafStat target = new SafStat(content, tree, newPath, false);
+      if (target.getIsDirectory())
+         return -1;
+      String asidePath = null;
+      if (target.getIsOpen())
+      {
+         asidePath = getFreeAsidePath(content, tree, newPath);
+         if (asidePath == null || !renameSafDocument(content, treeUri, newPath, getPathFileName(asidePath)))
+            return -1;
+      }
+      if (renameSafDocument(content, treeUri, oldPath, newName))
+      {
+         if (asidePath != null)
+         {
+            try
+            {
+               removeSafFile(content, tree, asidePath);
+            }
+            catch (RuntimeException e)
+            {}
+         }
+         return 0;
+      }
+      if (asidePath != null)
+         renameSafDocument(content, treeUri, asidePath, newName);
+      return -1;
+   }
+
+   /**
+    * The first of "<path>.prev", "<path>.2.prev" ... "<path>.99.prev" that does not exist, or null if all do.
+    * One already there may be all that is left of an interrupted write, so it is never reused.
+    */
+   private static String getFreeAsidePath(ContentResolver content, String tree, String path)
+   {
+      for (int n = 1; n <= 99; n++)
+      {
+         final String aside = n == 1 ? path + ".prev" : path + "." + n + ".prev";
+         if (!new SafStat(content, tree, aside, false).getIsOpen())
+            return aside;
+      }
+      return null;
+   }
+
+   private static Uri buildSafDocumentUri(Uri treeUri, String path)
+   {
+      return DocumentsContract.buildDocumentUriUsingTree(treeUri, path.length() == 1 ? DocumentsContract.getTreeDocumentId(treeUri) : DocumentsContract.getTreeDocumentId(treeUri) + path);
+   }
+
+   /**
+    * Rename the document at a normalized path to a new name in the same directory, returning whether it now has that path.
+    * This class finds documents by path, so a rename the provider made to another name (a "name (1)" it picked to avoid a clash) is undone and counts as a failure.
+    */
+   private static boolean renameSafDocument(ContentResolver content, Uri treeUri, String path, String name)
+   {
+      final Uri renamed;
+      try
+      {
+         renamed = DocumentsContract.renameDocument(content, buildSafDocumentUri(treeUri, path), name);
+      }
+      catch (FileNotFoundException | RuntimeException e)
+      {
+         return false;
+      }
+      if (renamed == null)
+         return false;
+      if (name.equals(getSafDisplayName(content, renamed)))
+         return true;
+      try
+      {
+         DocumentsContract.renameDocument(content, renamed, getPathFileName(path));
+      }
+      catch (FileNotFoundException | RuntimeException e)
+      {}
+      return false;
+   }
+
+   private static String getSafDisplayName(ContentResolver content, Uri uri)
+   {
+      final Cursor cursor;
+      try
+      {
+         cursor = content.query(uri, new String[] { Document.COLUMN_DISPLAY_NAME }, null, null, null);
+      }
+      catch (RuntimeException e)
+      {
+         return null;
+      }
+      if (cursor == null)
+         return null;
+      try
+      {
+         return cursor.moveToNext() ? cursor.getString(0) : null;
+      }
+      finally
+      {
+         cursor.close();
+      }
+   }
+
    public static class SafStat
    {
       private static final String[] QUERY_ARGS_WITH_SIZE = {
          Document.COLUMN_MIME_TYPE,
          Document.COLUMN_SIZE,
+         Document.COLUMN_LAST_MODIFIED,
       };
 
       private static final String[] QUERY_ARGS_WITHOUT_SIZE = {
          Document.COLUMN_MIME_TYPE,
+         Document.COLUMN_LAST_MODIFIED,
       };
 
       private boolean isOpen = false;
       private boolean isDirectory = false;
       private long size = -1;
+      private long lastModified = 0;
 
       /**
        * Retrieves metadata about a Storage Access Framework file or directory.
@@ -232,6 +355,8 @@ public final class VfsImplementationSaf
                return;
             isDirectory = cursor.getString(0).equals(Document.MIME_TYPE_DIR);
             size = includeSize ? cursor.getLong(1) : 0;
+            final int lastModifiedIndex = cursor.getColumnIndex(Document.COLUMN_LAST_MODIFIED);
+            lastModified = lastModifiedIndex < 0 || cursor.isNull(lastModifiedIndex) ? 0 : cursor.getLong(lastModifiedIndex);
             isOpen = true;
          }
          finally
@@ -263,6 +388,14 @@ public final class VfsImplementationSaf
       public long getSize()
       {
          return isOpen ? size : -1;
+      }
+
+      /**
+       * Get the last modification time in milliseconds since 1970, or 0 if it is unknown or there was an error opening the file or directory.
+       */
+      public long getLastModified()
+      {
+         return isOpen ? lastModified : 0;
       }
    }
 

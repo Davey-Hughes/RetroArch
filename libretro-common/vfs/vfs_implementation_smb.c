@@ -1977,7 +1977,7 @@ int retro_vfs_closedir_smb(smb_dir_handle* dh)
    return 0;
 }
 
-int retro_vfs_stat_smb(const char *path, int64_t *size)
+int retro_vfs_stat_smb(const char *path, int64_t *size, int64_t *mtime)
 {
    char rel_path[PATH_MAX_LENGTH];
    char share[256];
@@ -2031,6 +2031,10 @@ int retro_vfs_stat_smb(const char *path, int64_t *size)
       *size = (st.smb2_size > (uint64_t)INT64_MAX)
          ? INT64_MAX
          : (int64_t)st.smb2_size;
+
+   /* 0: no time reported */
+   if (mtime && st.smb2_mtime > 0 && st.smb2_mtime <= (uint64_t)INT64_MAX)
+      *mtime = (int64_t)st.smb2_mtime;
 
    return RETRO_VFS_STAT_IS_VALID |
          (st.smb2_type == SMB2_TYPE_DIRECTORY ? RETRO_VFS_STAT_IS_DIRECTORY : 0);

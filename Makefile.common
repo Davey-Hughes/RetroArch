@@ -270,6 +270,7 @@ endif
 
 OBJ += \
        save.o \
+       save_backups.o \
        tasks/task_save.o \
        tasks/task_movie.o \
        tasks/task_file_transfer.o \

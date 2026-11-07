@@ -48,8 +48,9 @@ bool content_save_state_to_ram(void);
 
 /* Finishes a save written to filestream_atomic_temp_name(@path): moved
  * over @path if @ok, deleted otherwise. A temporary file that could not
- * be moved is kept only when it holds the one complete copy left. */
-bool content_finish_tmp(const char *path, bool ok);
+ * be moved is kept only when it holds the one complete copy left.
+ * @sync waits for the disk first (filestream_finish_atomic_synced). */
+bool content_finish_tmp(const char *path, bool ok, bool sync);
 
 /* Save a ram state from memory to disk. */
 bool content_ram_state_to_file(const char *path);

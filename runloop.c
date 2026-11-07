@@ -215,6 +215,7 @@ bool android_get_vfs_authorized_locations(
 #include "msg_hash.h"
 #include "paths.h"
 #include "file_path_special.h"
+#include "save_backups.h"
 #include "ui/ui_companion_driver.h"
 #include "verbosity.h"
 
@@ -432,6 +433,11 @@ static void runloop_game_ai_think_cb(void *userdata,
 #endif
 
 static runloop_state_t runloop_state;
+#ifdef HAVE_NETWORKING
+/* RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED is set for this content by the
+ * netplay block of runloop_path_set_redirect(), not by --sram-mode. */
+static bool runloop_netplay_saves_off = false;
+#endif
 
 /* Defined here, before its first user: the SET_MESSAGE_EXT STATUS
  * path in the environment callback defers through this machinery,
@@ -5897,19 +5903,53 @@ static void runloop_path_init_savefile(runloop_state_t *runloop_st)
           (runloop_st->flags & RUNLOOP_FLAG_USE_SRAM)
       && !(runloop_st->flags & RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED);
 
+#ifdef HAVE_NETWORKING
+   if (runloop_netplay_saves_off)
+   {
+      const char *_msg = msg_hash_to_str(MSG_NETPLAY_SAVES_OFF);
+      RARCH_WARN("[SRAM] %s\n", _msg);
+      runloop_msg_queue_push(_msg, strlen(_msg), 1, 180, true, NULL,
+            MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+   }
+#endif
+
    if (should_sram_be_used)
       runloop_st->flags |=  RUNLOOP_FLAG_USE_SRAM;
    else
       runloop_st->flags &= ~RUNLOOP_FLAG_USE_SRAM;
 
    if (!(runloop_st->flags & RUNLOOP_FLAG_USE_SRAM))
-   {
       RARCH_LOG("[SRAM] %s\n",
             msg_hash_to_str(MSG_SRAM_WILL_NOT_BE_SAVED));
-      return;
-   }
+}
 
-   command_event(CMD_EVENT_AUTOSAVE_INIT, NULL);
+/* Where this content's safety copies and recovery files go. Set
+ * before the save load, while no autosave worker runs. */
+static void runloop_set_save_backup_roots(runloop_state_t *runloop_st,
+      settings_t *settings)
+{
+   char *content_dir = (char*)malloc(DIR_MAX_LENGTH);
+   char *config_dir  = (char*)malloc(DIR_MAX_LENGTH);
+   char *app_data    = (char*)malloc(DIR_MAX_LENGTH);
+   if (content_dir && config_dir && app_data)
+   {
+      const char *content = path_get(RARCH_PATH_CONTENT);
+      content_dir[0]      = '\0';
+      config_dir[0]       = '\0';
+      if (!string_is_empty(content))
+         fill_pathname_basedir(content_dir, content, DIR_MAX_LENGTH);
+      fill_pathname_application_special(config_dir, DIR_MAX_LENGTH,
+            APPLICATION_SPECIAL_DIRECTORY_CONFIG);
+      if (!fill_pathname_application_data(app_data, DIR_MAX_LENGTH))
+         app_data[0]      = '\0';
+      save_backups_set_roots(dir_get_ptr(RARCH_DIR_SAVEFILE),
+            dir_get_ptr(RARCH_DIR_SAVESTATE), content_dir,
+            settings->paths.directory_system, config_dir, app_data,
+            runloop_st->system.info.library_name);
+   }
+   free(content_dir);
+   free(config_dir);
+   free(app_data);
 }
 
 static bool event_init_content(
@@ -5964,9 +6004,15 @@ static bool event_init_content(
    command_event_set_replay_auto_index(settings);
 
    runloop_path_init_savefile(runloop_st);
+   runloop_set_save_backup_roots(runloop_st, settings);
 
    if (!event_load_save_files(runloop_st->flags & RUNLOOP_FLAG_IS_SRAM_LOAD_DISABLED))
       RARCH_LOG("[SRAM] %s\n", msg_hash_to_str(MSG_SKIPPING_SRAM_LOAD));
+
+   /* After the load, so the workers start from the loaded image and
+    * an unchanged save is not written back. */
+   if (runloop_st->flags & RUNLOOP_FLAG_USE_SRAM)
+      command_event(CMD_EVENT_AUTOSAVE_INIT, NULL);
 
    /* Set entry slot from playlist entry if available */
    {
@@ -6810,6 +6856,35 @@ bool runloop_event_init_core(
    return true;
 }
 
+void runloop_flush_save_files(void)
+{
+   if (runloop_state.flags & RUNLOOP_FLAG_USE_SRAM)
+   {
+#if defined(HAVE_COMPRESSION)
+      settings_t *settings = config_get_ptr();
+      event_flush_kept_save_files(true,
+            settings->bools.save_file_compression);
+#else
+      event_flush_kept_save_files(true, false);
+#endif
+   }
+}
+
+static retro_atomic_int_t runloop_save_files_request
+   = RETRO_ATOMIC_INT_INITIALIZER(0);
+
+void runloop_request_save_files(void)
+{
+   retro_atomic_store_release_int(&runloop_save_files_request, 1);
+}
+
+/* Main thread, between frames */
+static void runloop_take_save_files_request(void)
+{
+   if (retro_atomic_fetch_and_int(&runloop_save_files_request, 0))
+      runloop_flush_save_files();
+}
+
 void runloop_pause_checks(void)
 {
 #ifdef HAVE_PRESENCE
@@ -6852,6 +6927,8 @@ void runloop_pause_checks(void)
       /* Same idea as the MIDI silence above, for the audio stream: end it on
        * a ramp rather than wherever the waveform happened to be. */
       audio_driver_pause_fade(true);
+
+      runloop_flush_save_files();
 
 #ifdef HAVE_PRESENCE
       userdata.status = PRESENCE_GAME_PAUSED;
@@ -7571,7 +7648,9 @@ static bool display_menu_libretro(
          input_st->flags |= INP_FLAG_BLOCK_LIBRETRO_INPUT;
 
       video_driver_ff_frameskip_decide(current_time);
+      runloop_st->in_core_frame = true;
       core_run();
+      runloop_st->in_core_frame = false;
       runloop_load_deferred_auto_state();
       runloop_st->core_runtime_usec       +=
          runloop_core_runtime_tick(runloop_st, slowmotion_ratio, current_time);
@@ -9809,6 +9888,9 @@ int runloop_iterate(void)
    android_input_flush_pending_haptics();
 #endif
 
+   /* A save asked for off the main thread or inside the core's frame */
+   runloop_take_save_files_request();
+
    /* Tick deferred shader compilation (one pass per frame) */
    video_driver_shader_deferred_tick();
 
@@ -10102,6 +10184,7 @@ int runloop_iterate(void)
     * fast-forward drops */
    video_driver_ff_frameskip_decide(runloop_st->core_run_time);
 
+   runloop_st->in_core_frame = true;
    {
 #ifdef HAVE_RUNAHEAD
       bool run_ahead_enabled            = settings->bools.run_ahead_enabled;
@@ -10128,6 +10211,7 @@ int runloop_iterate(void)
 #endif
          frame_advanced = core_run();
    }
+   runloop_st->in_core_frame = false;
 
    runloop_load_deferred_auto_state();
 
@@ -11320,9 +11404,18 @@ void runloop_path_set_redirect(settings_t *settings,
     * saves/states are enabled */
    if (     (sort_savefiles_by_content || sort_savestates_by_content)
          && *runloop_st->runtime_content_path_basename)
+   {
       fill_pathname_parent_dir_name(content_dir_name,
             runloop_st->runtime_content_path_basename,
             sizeof(content_dir_name));
+      /* Folder names the save root keeps for itself */
+      if (     string_is_equal_noncase(content_dir_name, SAVE_BACKUPS_DIR)
+            || string_is_equal_noncase(content_dir_name,
+               SAVE_BACKUPS_RECORDS_DIR)
+            || string_is_equal_noncase(content_dir_name,
+               SAVE_BACKUPS_SYSTEM_DIR))
+         content_dir_name[0] = '\0';
+   }
 
    /* Set savefile directory if empty to content directory */
    if (     !*intermediate_savefile_dir
@@ -11366,7 +11459,7 @@ void runloop_path_set_redirect(settings_t *settings,
                && *new_savefile_dir)
          {
             /* Append content directory name to save location */
-            if (sort_savefiles_by_content)
+            if (sort_savefiles_by_content && *content_dir_name)
                fill_pathname_join_special(
                      new_savefile_dir,
                      intermediate_savefile_dir,
@@ -11400,7 +11493,7 @@ void runloop_path_set_redirect(settings_t *settings,
                && *new_savestate_dir)
          {
             /* Append content directory name to savestate location */
-            if (sort_savestates_by_content)
+            if (sort_savestates_by_content && *content_dir_name)
                fill_pathname_join_special(
                      new_savestate_dir,
                      intermediate_savestate_dir,
@@ -11433,6 +11526,12 @@ void runloop_path_set_redirect(settings_t *settings,
 
 
 #ifdef HAVE_NETWORKING
+   if (runloop_netplay_saves_off)
+   {
+      runloop_netplay_saves_off  = false;
+      runloop_st->flags         &= ~RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED;
+   }
+
    /* Special save directory for netplay clients. */
    if (      netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_ENABLED, NULL)
          && !netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_SERVER, NULL)
@@ -11444,7 +11543,16 @@ void runloop_path_set_redirect(settings_t *settings,
 
       if (     !path_is_directory(new_savefile_dir)
             && !path_mkdir(new_savefile_dir))
+      {
          path_basedir(new_savefile_dir);
+         /* The client's saves would land on the user's own: none are
+          * written this session. */
+         if (!(runloop_st->flags & RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED))
+         {
+            runloop_netplay_saves_off  = true;
+            runloop_st->flags         |= RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED;
+         }
+      }
    }
 #endif
 

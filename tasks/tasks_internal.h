@@ -531,8 +531,25 @@ bool event_load_save_files(bool is_sram_load_disabled);
 
 bool content_savefile_is_live(const char *path);
 
-bool event_save_files(bool sram_used, bool compress_files,
-      const char *path_cheat_database);
+bool event_save_files(bool sram_used, bool compress_files, bool sync,
+      bool copy, const char *path_cheat_database);
+
+/* Writes each save file whose memory changed since it was last
+ * written, ahead of anything that changes it: with an autosave worker
+ * the main thread only copies the memory and the worker writes it
+ * before any later image; without one, or for memory that changed size
+ * under one, it is written here, not synced, after the copies the file
+ * owes. An image that cannot be written goes to a recovery file. Then
+ * each save RAM file owes @owed (1 << enum save_backup_reason each; 0
+ * for none). Never waits. */
+void event_flush_save_files(bool sram_used, bool compress_files,
+      int owed);
+
+/* As event_flush_save_files() with nothing owed, for memory that stays
+ * as it is (the game stopped running): an image that cannot be written
+ * is left to the next write rather than recovered, and with a worker a
+ * newer one replaces it if it has not been taken yet. */
+void event_flush_kept_save_files(bool sram_used, bool compress_files);
 
 void path_init_savefile_rtc(const char *savefile_path);
 

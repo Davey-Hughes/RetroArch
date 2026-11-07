@@ -1621,12 +1621,11 @@
 #define DEFAULT_PAUSE_ON_DISCONNECT false
 
 /* Saves non-volatile SRAM at a regular interval.
- * It is measured in seconds. A value of 0 disables autosave. */
-#if defined(__i386__) || defined(__i486__) || defined(__i686__) || defined(__x86_64__) || defined(_M_X64) || defined(_WIN32) || TARGET_OS_OSX || defined(ANDROID) || TARGET_OS_IPHONE || defined(DINGUX)
-/* Flush to file every 10 seconds on modern platforms by default */
+ * It is measured in seconds. A value of 0 disables autosave.
+ * The autosave worker needs threads. */
+#ifdef HAVE_THREADS
 #define DEFAULT_AUTOSAVE_INTERVAL 10
 #else
-/* Default to disabled on I/O-constrained platforms */
 #define DEFAULT_AUTOSAVE_INTERVAL 0
 #endif
 

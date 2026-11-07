@@ -3898,19 +3898,26 @@ bool command_event(enum event_command cmd, void *data)
 #endif
          return event_load_save_files(runloop_st->flags & RUNLOOP_FLAG_IS_SRAM_LOAD_DISABLED);
       case CMD_EVENT_SAVE_FILES:
-         return event_save_files(
-               runloop_st->flags & RUNLOOP_FLAG_USE_SRAM,
+         {
+            /* NULL is an explicit save request (network command, web
+             * export): not synced, but it makes the copies owed. */
+            bool sync = data ? *(bool*)data : false;
+            return event_save_files(
+                  runloop_st->flags & RUNLOOP_FLAG_USE_SRAM,
 #if defined(HAVE_COMPRESSION)
-               settings->bools.save_file_compression,
+                  settings->bools.save_file_compression,
 #else
-               false,
+                  false,
 #endif
+                  sync,
+                  sync || !data,
 #ifdef HAVE_CHEATS
-               settings->paths.path_cheat_database
+                  settings->paths.path_cheat_database
 #else
-               NULL
+                  NULL
 #endif
-         );
+            );
+         }
       case CMD_EVENT_OVERLAY_UNLOAD:
 #ifdef HAVE_OVERLAY
          input_overlay_unload();
@@ -4918,8 +4925,9 @@ bool command_event(enum event_command cmd, void *data)
          break;
       case CMD_EVENT_AUTOSAVE_INIT:
 #ifdef HAVE_THREADS
-         if (runloop_st->flags & RUNLOOP_FLAG_USE_SRAM)
-            autosave_deinit();
+         if (!(runloop_st->flags & RUNLOOP_FLAG_USE_SRAM))
+            break;
+         autosave_deinit();
          {
 #ifdef HAVE_NETWORKING
             unsigned autosave_interval =
@@ -6946,6 +6954,15 @@ static void sdl_exit(void)
 }
 #endif
 
+void retroarch_save_files_for_suspend(void)
+{
+   if (runloop_content_loaded())
+   {
+      bool sync = true;
+      command_event(CMD_EVENT_SAVE_FILES, &sync);
+   }
+}
+
 /* The platform is taking the application away and may not give it
  * back - Android, when the activity is paused. Everything that would
  * otherwise only be written by retroarch_main_quit() is written now:
@@ -6970,8 +6987,7 @@ void retroarch_save_for_suspend(void)
     * transient state. There is nothing to save in either case:
     * CMD_EVENT_SAVE_FILES exists to persist SRAM and game-specific
     * cheats, both of which require loaded content. */
-   if (runloop_content_loaded())
-      command_event(CMD_EVENT_SAVE_FILES, NULL);
+   retroarch_save_files_for_suspend();
 
    /* Core options: written unconditionally on core unload, so not
     * gated on config_save_on_exit here either. Without this, option
@@ -10512,7 +10528,11 @@ bool retroarch_main_deinit_begin(void)
 
    command_event(CMD_EVENT_RECORD_DEINIT, NULL);
 
-   command_event(CMD_EVENT_SAVE_FILES, NULL);
+   {
+      /* The session's last save write: worth waiting for the disk. */
+      bool sync = true;
+      command_event(CMD_EVENT_SAVE_FILES, &sync);
+   }
 
 #ifdef HAVE_REWIND
    command_event(CMD_EVENT_REWIND_DEINIT, NULL);

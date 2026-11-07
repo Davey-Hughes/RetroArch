@@ -707,6 +707,45 @@ int64_t retro_vfs_file_seek_internal(
    return retro_vfs_fd_seek64(stream->fd, offset, whence) == -1 ? -1 : 0;
 }
 
+/* The first aside name of @path (fill_pathname_aside()) that
+ * does not exist.  NULL when all do, or on OOM. */
+static char *retro_vfs_free_aside_name(const char *path)
+{
+   unsigned n;
+   size_t aside_size = strlen(path) + PATH_ASIDE_SUFFIX_SIZE;
+   char  *aside      = (char*)malloc(aside_size);
+
+   if (!aside)
+      return NULL;
+   for (n = 1; fill_pathname_aside(aside, path, n, aside_size); n++)
+      if (!retro_vfs_stat_impl(aside, NULL))
+         return aside;
+   free(aside);
+   return NULL;
+}
+
+/* iOS can refuse to open an existing file for writing with EEXIST.
+ * The file is moved aside for the reopen, removed once that succeeds
+ * and put back if it fails. */
+static FILE *retro_vfs_file_reopen_aside(const char *path,
+      const char *mode_str)
+{
+   FILE *fp    = NULL;
+   char *aside = retro_vfs_free_aside_name(path);
+
+   if (!aside)
+      return NULL;
+   if (retro_vfs_file_rename_impl(path, aside) == 0)
+   {
+      if ((fp = (FILE*)fopen_utf8(path, mode_str)))
+         retro_vfs_file_remove_impl(aside);
+      else
+         retro_vfs_file_rename_impl(aside, path);
+   }
+   free(aside);
+   return fp;
+}
+
 /**
  * retro_vfs_file_open_impl:
  * @path               : path to file
@@ -930,17 +969,15 @@ libretro_vfs_implementation_file *retro_vfs_file_open_impl(
 #endif
 
          default:
+            errno = 0;
             if (!(fp = (FILE*)fopen_utf8(path, mode_str)))
             {
-#if TARGET_OS_IPHONE
-               if (errno == EEXIST)
-               {
-                  retro_vfs_file_remove_impl(path);
-                  fp = (FILE*)fopen_utf8(path, mode_str);
-               }
+               if (     errno == EEXIST
+                     && (mode & RETRO_VFS_FILE_ACCESS_WRITE)
+                     && !(mode & RETRO_VFS_FILE_ACCESS_UPDATE_EXISTING))
+                  fp = retro_vfs_file_reopen_aside(path, mode_str);
                if (!fp)
-#endif
-               goto error;
+                  goto error;
             }
             stream->fp  = fp;
             break;
@@ -1969,6 +2006,96 @@ int retro_vfs_file_flush_impl(libretro_vfs_implementation_file *stream)
    return -1;
 }
 
+/* The consoles' SDKs are not relied on for an fsync(); there a sync
+ * does nothing. */
+#if !defined(_WIN32) && !defined(VITA) && !defined(PSP) && !defined(PS2) \
+      && !defined(ORBIS) && !defined(GEKKO) && !defined(_3DS) \
+      && !defined(WIIU) && !defined(SWITCH) && !defined(__PSL1GHT__) \
+      && !defined(__PS3__)
+#define VFS_HAVE_FSYNC
+#endif
+
+int retro_vfs_file_sync_impl(libretro_vfs_implementation_file *stream)
+{
+   if (!stream)
+      return -1;
+#ifdef HAVE_CDROM
+   if (stream->scheme == VFS_SCHEME_CDROM)
+      return 0;
+#endif
+#ifdef HAVE_SMBCLIENT
+   if (stream->scheme == VFS_SCHEME_SMB)
+      return 0;
+#endif
+#ifdef HAVE_NFSCLIENT
+   if (stream->scheme == VFS_SCHEME_NFS)
+      return 0;
+#endif
+   if (stream->fp && fflush(stream->fp) != 0)
+      return -1;
+#if defined(_WIN32) && !defined(_XBOX)
+   {
+      HANDLE h;
+      int fd = stream->fp ? _fileno(stream->fp) : stream->fd;
+      if (fd < 0)
+         return -1;
+      h = (HANDLE)_get_osfhandle(fd);
+      if (h == INVALID_HANDLE_VALUE || !FlushFileBuffers(h))
+         return -1;
+   }
+#elif defined(VFS_HAVE_FSYNC)
+   {
+      int ret;
+      int fd = stream->fp ? fileno(stream->fp) : stream->fd;
+      if (fd < 0)
+         return -1;
+#if defined(__linux__)
+      ret = fdatasync(fd);
+#elif defined(F_BARRIERFSYNC)
+      /* Apple's fsync() lets the drive write the data after a later
+       * rename; the barrier keeps the order. */
+      if ((ret = fcntl(fd, F_BARRIERFSYNC)) != 0)
+         ret = fsync(fd);
+#else
+      ret = fsync(fd);
+#endif
+      /* EINVAL and EROFS: a pipe or the like, nothing to sync */
+      if (ret != 0 && errno != EINVAL && errno != EROFS)
+         return -1;
+   }
+#endif
+   return 0;
+}
+
+int retro_vfs_dir_sync_impl(const char *dir)
+{
+#if defined(VFS_HAVE_FSYNC)
+   int fd;
+   int ret;
+
+   if (!dir || !*dir)
+      return -1;
+#if defined(ANDROID) && defined(HAVE_SAF)
+   if (path_is_saf(dir))
+      return 0;
+#endif
+   if ((fd = open(dir, O_RDONLY)) < 0)
+      return -1;
+#if defined(F_BARRIERFSYNC)
+   if ((ret = fcntl(fd, F_BARRIERFSYNC)) != 0)
+      ret = fsync(fd);
+#else
+   ret = fsync(fd);
+#endif
+   if (ret != 0 && (errno == EINVAL || errno == EROFS))
+      ret = 0;
+   close(fd);
+   return ret == 0 ? 0 : -1;
+#else
+   return 0;
+#endif
+}
+
 int retro_vfs_file_remove_impl(const char *path)
 {
    if (path && *path)
@@ -2772,9 +2899,7 @@ static int vfs_stat_win32_wide(const char *path,
 
 /* One platform ladder serves stat, stat_64, get_mtime and the POSIX
  * fallback of dirent_stat.  @mtime is filled (seconds since the Unix
- * epoch) where the platform reports one; the SMB and SAF backends do
- * not carry it through their stat helpers yet, so it is left untouched
- * there and callers treat -1 from get_mtime as "unavailable". */
+ * epoch) where the backend reports one, and left untouched otherwise. */
 static int retro_vfs_stat_full(const char *path, int64_t *size, int64_t *mtime)
 {
    int ret                   = RETRO_VFS_STAT_IS_VALID;
@@ -2784,11 +2909,11 @@ static int retro_vfs_stat_full(const char *path, int64_t *size, int64_t *mtime)
 
 #ifdef HAVE_SMBCLIENT
    if (path_is_smb(path))
-      return retro_vfs_stat_smb(path, size);
+      return retro_vfs_stat_smb(path, size, mtime);
 #endif
 #ifdef HAVE_NFSCLIENT
    if (path_is_nfs(path))
-      return retro_vfs_stat_nfs(path, size);
+      return retro_vfs_stat_nfs(path, size, mtime);
 #endif
 
 #if defined(ANDROID) && defined(HAVE_SAF)
@@ -2797,7 +2922,7 @@ static int retro_vfs_stat_full(const char *path, int64_t *size, int64_t *mtime)
       struct libretro_vfs_implementation_saf_path_split_result saf_split_result;
       if (!retro_vfs_path_split_saf(&saf_split_result, path))
          return 0;
-      ret = retro_vfs_stat_saf(saf_split_result.tree, saf_split_result.path, size);
+      ret = retro_vfs_stat_saf(saf_split_result.tree, saf_split_result.path, size, mtime);
       free(saf_split_result.path);
       free(saf_split_result.tree);
       return ret;
@@ -2975,9 +3100,8 @@ int retro_vfs_get_mtime_impl(const char *path, int64_t *mtime)
    if (!mtime)
       return -1;
 
-   /* The SMB/SAF stat helpers leave @mtime untouched; a sentinel that
-    * no real file system reports tells those cases apart from a genuine
-    * timestamp. */
+   /* A backend with no time for the file leaves @mtime untouched; a
+    * sentinel no real file system reports tells that apart. */
    t     = INT64_MIN;
    flags = retro_vfs_stat_full(path, NULL, &t);
    got_it = (flags != 0) && (t != INT64_MIN);

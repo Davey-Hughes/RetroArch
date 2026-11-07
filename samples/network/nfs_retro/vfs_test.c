@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <net/net_compat.h>
 #include <streams/file_stream.h>
 #include <file/file_path.h>
@@ -17,6 +18,8 @@ int main(int argc, char **argv)
    RFILE *f;
    char url[600];
    uint8_t buf[300];
+   int64_t mtime = 0;
+   time_t now;
    int found = 0;
    struct RDIR *d;
 
@@ -74,6 +77,14 @@ int main(int argc, char **argv)
    if (!path_is_valid(url) || path_is_directory(url))
    {
       fprintf(stderr, "FAIL: stat\n");
+      return 1;
+   }
+   now = time(NULL);
+   if (     !path_get_mtime(url, &mtime)
+         || mtime < (int64_t)now - 300 || mtime > (int64_t)now + 300)
+   {
+      fprintf(stderr, "FAIL: mtime %lld, now %lld\n",
+            (long long)mtime, (long long)now);
       return 1;
    }
 

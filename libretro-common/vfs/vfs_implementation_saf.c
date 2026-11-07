@@ -31,11 +31,13 @@ static jobject vfs_saf_content_resolver_object;
 static jclass vfs_saf_vfs_implementation_saf_class;
 static jmethodID vfs_saf_open_saf_file_method;
 static jmethodID vfs_saf_remove_saf_file_method;
+static jmethodID vfs_saf_rename_saf_file_method;
 static jclass vfs_saf_saf_stat_class;
 static jmethodID vfs_saf_saf_stat_init_method;
 static jmethodID vfs_saf_saf_stat_get_is_open_method;
 static jmethodID vfs_saf_saf_stat_get_is_directory_method;
 static jmethodID vfs_saf_saf_stat_get_size_method;
+static jmethodID vfs_saf_saf_stat_get_last_modified_method;
 static jmethodID vfs_saf_mkdir_saf_method;
 static jclass vfs_saf_saf_directory_class;
 static jmethodID vfs_saf_saf_directory_init_method;
@@ -133,6 +135,9 @@ bool retro_vfs_init_saf(JNIEnv *(*get_jni_env)(void), jobject activity_object)
    vfs_saf_remove_saf_file_method = (*env)->GetStaticMethodID(env, vfs_saf_vfs_implementation_saf_class, "removeSafFile", "(Landroid/content/ContentResolver;Ljava/lang/String;Ljava/lang/String;)Z");
    if ((*env)->ExceptionOccurred(env)) goto error;
 
+   vfs_saf_rename_saf_file_method = (*env)->GetStaticMethodID(env, vfs_saf_vfs_implementation_saf_class, "renameSafFile", "(Landroid/content/ContentResolver;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I");
+   if ((*env)->ExceptionOccurred(env)) goto error;
+
    vfs_saf_saf_stat_init_method = (*env)->GetMethodID(env, vfs_saf_saf_stat_class, "<init>", "(Landroid/content/ContentResolver;Ljava/lang/String;Ljava/lang/String;Z)V");
    if ((*env)->ExceptionOccurred(env)) goto error;
 
@@ -143,6 +148,9 @@ bool retro_vfs_init_saf(JNIEnv *(*get_jni_env)(void), jobject activity_object)
    if ((*env)->ExceptionOccurred(env)) goto error;
 
    vfs_saf_saf_stat_get_size_method = (*env)->GetMethodID(env, vfs_saf_saf_stat_class, "getSize", "()J");
+   if ((*env)->ExceptionOccurred(env)) goto error;
+
+   vfs_saf_saf_stat_get_last_modified_method = (*env)->GetMethodID(env, vfs_saf_saf_stat_class, "getLastModified", "()J");
    if ((*env)->ExceptionOccurred(env)) goto error;
 
    vfs_saf_mkdir_saf_method = (*env)->GetStaticMethodID(env, vfs_saf_vfs_implementation_saf_class, "mkdirSaf", "(Landroid/content/ContentResolver;Ljava/lang/String;Ljava/lang/String;)I");
@@ -625,16 +633,59 @@ error:
 
 int retro_vfs_file_rename_saf(const char *old_tree, const char *old_path, const char *new_tree, const char *new_path)
 {
+   JNIEnv *env;
+   jstring tree_object;
+   jstring old_path_object;
+   jstring new_path_object;
+   int ret;
+
+   /* Renames stay in one folder: a temporary sits beside its file. */
+   if (strcmp(old_tree, new_tree) != 0)
+      return -1;
+   if (vfs_saf_get_jni_env == NULL)
+      return -1;
+   env = vfs_saf_get_jni_env();
+   if (env == NULL)
+      return -1;
+
+   (*env)->PushLocalFrame(env, 3);
+   if ((*env)->ExceptionOccurred(env))
+   {
+      (*env)->ExceptionDescribe(env);
+      (*env)->ExceptionClear(env);
+      return -1;
+   }
+
+   tree_object = (*env)->NewStringUTF(env, old_tree);
+   if ((*env)->ExceptionOccurred(env)) goto error;
+
+   old_path_object = (*env)->NewStringUTF(env, old_path);
+   if ((*env)->ExceptionOccurred(env)) goto error;
+
+   new_path_object = (*env)->NewStringUTF(env, new_path);
+   if ((*env)->ExceptionOccurred(env)) goto error;
+
+   ret = (*env)->CallStaticIntMethod(env, vfs_saf_vfs_implementation_saf_class, vfs_saf_rename_saf_file_method, vfs_saf_content_resolver_object, tree_object, old_path_object, new_path_object);
+   if ((*env)->ExceptionOccurred(env)) goto error;
+
+   (*env)->PopLocalFrame(env, NULL);
+   return ret == 0 ? 0 : -1;
+
+error:
+   (*env)->ExceptionDescribe(env);
+   (*env)->ExceptionClear(env);
+   (*env)->PopLocalFrame(env, NULL);
    return -1;
 }
 
-int retro_vfs_stat_saf(const char *tree, const char *path, int64_t *size)
+int retro_vfs_stat_saf(const char *tree, const char *path, int64_t *size, int64_t *mtime)
 {
    JNIEnv *env;
    jstring tree_object;
    jstring path_object;
    jobject saf_stat;
    int64_t saf_stat_size;
+   int64_t saf_stat_mtime;
    bool saf_stat_is_directory;
 
    if (vfs_saf_get_jni_env == NULL)
@@ -683,6 +734,15 @@ int retro_vfs_stat_saf(const char *tree, const char *path, int64_t *size)
 
    saf_stat_is_directory = (*env)->CallBooleanMethod(env, saf_stat, vfs_saf_saf_stat_get_is_directory_method);
    if ((*env)->ExceptionOccurred(env)) goto error;
+
+   if (mtime != NULL)
+   {
+      /* milliseconds; 0 when the provider has none, and 0 s is unknown */
+      saf_stat_mtime = (*env)->CallLongMethod(env, saf_stat, vfs_saf_saf_stat_get_last_modified_method);
+      if ((*env)->ExceptionOccurred(env)) goto error;
+      if (saf_stat_mtime >= 1000)
+         *mtime = saf_stat_mtime / 1000;
+   }
 
    if (size != NULL)
       *size = saf_stat_size > INT64_MAX ? INT64_MAX : (int64_t)saf_stat_size;

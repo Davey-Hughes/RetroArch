@@ -48,6 +48,7 @@
 #include "../gfx/video_driver.h"
 #include "../msg_hash.h"
 #include "../runloop.h"
+#include "../save_backups.h"
 #include "../verbosity.h"
 #include "tasks_internal.h"
 
@@ -285,6 +286,22 @@ typedef struct rastate_size_info
 } rastate_size_info_t;
 
 
+/* A user's state load is about to change save RAM: the save files are
+ * written as they are now, and the next write over each save RAM file
+ * backs it up first. A load that puts save RAM back changes nothing and
+ * skips this; so do run-ahead, rewind, netplay and replays. */
+static void content_flush_saves_before_load(void)
+{
+#if defined(HAVE_COMPRESSION)
+   bool compress = config_get_ptr()->bools.save_file_compression;
+#else
+   bool compress = false;
+#endif
+   event_flush_save_files(
+         (runloop_state_get_ptr()->flags & RUNLOOP_FLAG_USE_SRAM) != 0,
+         compress, 1 << SAVE_BACKUP_BEFORE_STATE_LOAD);
+}
+
 /**
  * undo_load_state:
  * Revert to the state before a state was loaded.
@@ -385,6 +402,9 @@ bool content_undo_load_state(void)
    undo_load_buf.size     = 0;
    undo_load_buf.capacity = 0;
 
+   if (restore_data && !config_get_ptr()->bools.block_sram_overwrite)
+      content_flush_saves_before_load();
+
    /* An undo jumps the game's state exactly as a load does. See
     * audio_driver_jump_fade_begin(). */
    ramped                 = audio_driver_jump_fade_begin();
@@ -480,9 +500,11 @@ static void undo_save_state_cb(retro_task_t *task,
    state_tasks_release();
 }
 
-bool content_finish_tmp(const char *path, bool ok)
+bool content_finish_tmp(const char *path, bool ok, bool sync)
 {
-   int ret = filestream_finish_atomic(path, ok);
+   int ret = sync
+      ? filestream_finish_atomic_synced(path, ok)
+      : filestream_finish_atomic(path, ok);
    if (ret == 1 && path_is_valid(path))
    {
       char tmp_path[PATH_MAX_LENGTH];
@@ -539,7 +561,9 @@ static void task_save_handler_finished(retro_task_t *task,
             task_set_error(task, strdup(
                   msg_hash_to_str(MSG_FAILED_TO_SAVE_STATE_TO)));
       }
-      else if (!content_finish_tmp(state->path, !task_get_error(task))
+      /* Off the frame loop only on the threaded queue. */
+      else if (!content_finish_tmp(state->path, !task_get_error(task),
+                  task_queue_is_threaded())
             && !task_get_error(task))
          task_set_error(task, strdup(
                msg_hash_to_str(MSG_FAILED_TO_SAVE_STATE_TO)));
@@ -1599,6 +1623,9 @@ static void content_load_state_apply(retro_task_t *task,
       return;
    }
 
+   if (!config_get_ptr()->bools.block_sram_overwrite)
+      content_flush_saves_before_load();
+
    if (     savefile_list
          && savefile_list->size
          && config_get_ptr()->bools.block_sram_overwrite
@@ -2087,7 +2114,7 @@ bool content_auto_save_state(const char *path)
    free(serial_data);
    free(file);
 
-   if (!content_finish_tmp(path, _close_ret == 0))
+   if (!content_finish_tmp(path, _close_ret == 0, false))
       return false;
 
 #ifdef HAVE_SCREENSHOTS
@@ -2524,6 +2551,9 @@ bool content_load_state_from_ram(void)
          (unsigned)ram_buf.state_buf.size,
          msg_hash_to_str(MSG_BYTES));
 
+   /* Without block_sram_overwrite's put-back here. */
+   content_flush_saves_before_load();
+
    /* Same discontinuity as a load from disk, so the same bracket. See
     * audio_driver_jump_fade_begin(). */
    ramped = audio_driver_jump_fade_begin();
@@ -2622,7 +2652,7 @@ bool content_ram_state_to_file(const char *path)
          char tmp_path[PATH_MAX_LENGTH];
          if (filestream_atomic_temp_name(tmp_path, sizeof(tmp_path), path))
             written = content_finish_tmp(path, rzipstream_write_file(tmp_path,
-                  ram_buf.state_buf.data, ram_buf.state_buf.size));
+                  ram_buf.state_buf.data, ram_buf.state_buf.size), false);
       }
       else
 #endif

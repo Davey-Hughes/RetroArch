@@ -45,6 +45,7 @@
 #include "../../defaults.h"
 #include "../../paths.h"
 #include "../../retroarch.h"
+#include "../../runloop.h"
 #include "../../verbosity.h"
 
 #include "os/ctr/ctr_debug.h"
@@ -66,6 +67,9 @@
 #include <compat/strl.h>
 
 static enum frontend_fork ctr_fork_mode = FRONTEND_FORK_NONE;
+#ifndef IS_SALAMANDER
+static aptHookCookie ctr_save_hook_cookie;
+#endif
 static const char* elf_path_cst         = "sdmc:/retroarch/retroarch.3dsx";
 
 #ifdef IS_SALAMANDER
@@ -154,6 +158,23 @@ u8* gfxTopRightFramebuffers[2];
 u8* gfxBottomFramebuffers[2];
 #endif
 
+#ifndef IS_SALAMANDER
+/* HOME, the power button or a closed lid: the console may not come
+ * back to it. Written now only on the main thread (no libctru Thread)
+ * between frames. aptMainLoop() also runs in the audio driver's wait,
+ * on the audio thread or inside the core's frame, where memory is
+ * half a frame: the next frame writes it, after wake for a sleep. */
+static void ctr_save_hook(APT_HookType hook, void *param)
+{
+   if (hook != APTHOOK_ONSUSPEND && hook != APTHOOK_ONSLEEP)
+      return;
+   if (!threadGetCurrent() && !runloop_state_get_ptr()->in_core_frame)
+      retroarch_save_files_for_suspend();
+   else
+      runloop_request_save_files();
+}
+#endif
+
 static void frontend_ctr_deinit(void* data)
 {
    Handle lcd_handle;
@@ -164,6 +185,7 @@ static void frontend_ctr_deinit(void* data)
    (void)data;
 
 #ifndef IS_SALAMANDER
+   aptUnhook(&ctr_save_hook_cookie);
    CFGU_GetModelNintendo2DS(&not_2DS);
 
    if (not_2DS && srvGetServiceHandle(&lcd_handle, "gsp::Lcd") >= 0)
@@ -479,6 +501,7 @@ static void frontend_ctr_init(void* data)
    cfguInit();
    ptmuInit();
    mcuHwcInit();
+   aptHook(&ctr_save_hook_cookie, ctr_save_hook, NULL);
 #endif
 }
 
