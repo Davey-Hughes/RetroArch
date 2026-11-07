@@ -254,7 +254,8 @@ jobs:
           # pausing and opening the menu write a changed save at once;
           # a save folder missing at launch stays the configured one,
           # and the default stands in for one gone at a content load,
-          # with a game override loaded too.
+          # with a game override loaded too; an archive member sorted by
+          # content keeps the save in the folder it was sorted to before.
           # The kill-mid-write lane and its runs under load stay local.
           # The harness builds above removed the binary to read its link
           # line.
@@ -269,7 +270,7 @@ jobs:
              --lane state_load_copy --lane changed_elsewhere \
              --lane nosave_netplay_disconnect --lane flush_points \
              --lane config_keeps_folder --lane folder_check_each_load \
-             --lane folder_check_override
+             --lane folder_check_override --lane archive_member_old_folder
           make -C samples/runloop/save_e2e clean
 
       - name: Build and run save_paths_test
@@ -278,7 +279,9 @@ jobs:
           set -eu
           # runloop.c over a real folder: ROM folders named backups or
           # records, a netplay client with no folder, a save folder
-          # gone at a load, and a save asked for from another thread.
+          # gone at a load, an archive member named without its folders
+          # and the old save folders it keeps using, and a save asked
+          # for from another thread.
           make -C samples/runloop/save_paths clean check
           make -C samples/runloop/save_paths clean check SANITIZER=address,undefined
           make -C samples/runloop/save_paths clean

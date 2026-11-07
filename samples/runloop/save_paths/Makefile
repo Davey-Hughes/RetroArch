@@ -18,7 +18,7 @@ SOURCES := save_paths_test.c \
            $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
 CFLAGS += -O2 -g1 -std=gnu89 -Wall -flto \
           -ffunction-sections -fdata-sections \
-          -DHAVE_NETWORKING \
+          -DHAVE_NETWORKING -DHAVE_COMPRESSION \
           -I$(ROOT) -I$(ROOT)/menu -I$(LIBRETRO_COMM_DIR)/include $(EXTRA_CFLAGS)
 LDFLAGS += -flto -Wl,--gc-sections -lpthread
 ifneq ($(SANITIZER),)

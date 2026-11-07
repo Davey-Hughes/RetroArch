@@ -15,7 +15,28 @@
  * once, at the main thread's next frame.
  *
  * The shipping function is included and run over a real folder. */
+#include <string.h>
+#include <lists/dir_list.h>
+
+/* A folder named "roms" that can't be listed, as a flaky share's */
+static bool roms_unlistable;
+
+static struct string_list *test_dir_list_new(const char *dir,
+      const char *ext, bool include_dirs, bool include_hidden,
+      bool include_compressed, bool recursive)
+{
+   size_t n = strlen(dir);
+   while (n && (dir[n - 1] == '/' || dir[n - 1] == '\\'))
+      n--;
+   if (roms_unlistable && n >= 4 && !strncmp(dir + n - 4, "roms", 4))
+      return NULL;
+   return dir_list_new(dir, ext, include_dirs, include_hidden,
+         include_compressed, recursive);
+}
+
+#define dir_list_new test_dir_list_new
 #include "../../../runloop.c"
+#undef dir_list_new
 #include "../../../defaults.h"
 #include <stdio.h>
 #include <rthreads/rthreads.h>
@@ -84,6 +105,9 @@ char *dir_get_ptr(enum rarch_dir_type type)
    }
    return cfg_saves;
 }
+bool path_set(enum rarch_path_type type, const char *path)
+{ (void)type; (void)path; return true; }
+settings_t *config_get_ptr(void) { return &test_settings; }
 bool retroarch_override_setting_is_set(
       enum rarch_override_setting enum_idx, void *data)
 {
@@ -118,6 +142,29 @@ void ui_companion_driver_msg_queue_push(const char *msg, unsigned priority,
 void path_deinit_savefile(void) { }
 void path_init_savefile_new(void) { }
 void path_init_savefile_rtc(const char *savefile_path) { (void)savefile_path; }
+/* The members file_archive_get_file_list() lists: pack.7z's, and any
+ * other archive's. Each listing is counted. */
+static const char *archive_members[4];
+static const char *other_members[4];
+static bool archive_unreadable;
+static unsigned archive_lists;
+struct string_list *file_archive_get_file_list(const char *path,
+      const char *valid_exts)
+{
+   size_t i;
+   union string_list_elem_attr attr;
+   struct string_list *list;
+   const char **members = strstr(path, "pack.7z")
+      ? archive_members : other_members;
+   (void)valid_exts;
+   archive_lists++;
+   if (archive_unreadable || !(list = string_list_new()))
+      return NULL;
+   attr.i = 0;
+   for (i = 0; i < ARRAY_SIZE(archive_members) && members[i]; i++)
+      string_list_append(list, members[i], attr);
+   return list;
+}
 
 /* Equal but for which slash separates folders. */
 static bool same_path(const char *a, const char *b)
@@ -326,6 +373,472 @@ static void folder_check_each_load(void)
    g_defaults.dirs[DEFAULT_DIR_SAVESTATE][0] = '\0';
 }
 
+/* A member in a folder of an archive is named after the folder the
+ * archive is in, as a loose file there would be. */
+static void archive_member_folder(void)
+{
+   runloop_path_set_basename("/roms/snes/pack.7z#SNES/Game.sfc");
+   CHECK(same_path(runloop_state.runtime_content_path_basename,
+            "/roms/snes/Game"));
+   runloop_path_set_basename("/roms/snes/pack.7z#Game.sfc");
+   CHECK(same_path(runloop_state.runtime_content_path_basename,
+            "/roms/snes/Game"));
+
+   strlcpy(cfg_saves, ROOT "/saves", sizeof(cfg_saves));
+   strlcpy(cfg_states, ROOT "/states", sizeof(cfg_states));
+   memset(&test_settings, 0, sizeof(test_settings));
+   test_settings.bools.sort_savefiles_by_content_enable = true;
+   runloop_state.system.info.library_name = "Snes9x";
+   runloop_path_set_basename("/roms/snes/pack.7z#Disks/Game.sfc");
+   runloop_path_set_redirect(&test_settings, ROOT "/saves", ROOT "/states");
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/snes/Game.srm"));
+   CHECK(!path_is_directory(ROOT "/saves/Disks"));
+}
+
+/* The core's extensions, as runloop_event_init_core() passes them */
+static const char *member_exts = "sfc|smc";
+
+static void member_load(const char *content, bool per_core)
+{
+   memset(&runloop_state, 0, sizeof(runloop_state));
+   memset(&test_settings, 0, sizeof(test_settings));
+   test_settings.bools.sort_savefiles_by_content_enable  = true;
+   test_settings.bools.sort_savestates_by_content_enable = true;
+   test_settings.bools.sort_savefiles_enable             = per_core;
+   runloop_state.system.info.library_name = "Snes9x";
+   runloop_path_set_basename(content);
+   runloop_path_set_basename_kept(&runloop_state, content, member_exts);
+   runloop_path_set_redirect(&test_settings, ROOT "/saves", ROOT "/states");
+}
+
+/* Sorted by content, a member's saves were in the folder named after
+ * its folder inside the archive. That folder stays in use, for saves
+ * and states apart, while it has the game's and the new one has none. */
+static void archive_member_old_folder(void)
+{
+   const char *member = ROOT "/roms/snes/pack.7z#Disks/Game.sfc";
+   rm_tree(ROOT "/saves");
+   rm_tree(ROOT "/states");
+   CHECK(path_mkdir(ROOT "/saves/Disks/Snes9x"));
+   CHECK(path_mkdir(ROOT "/states/Disks"));
+   strlcpy(cfg_saves, ROOT "/saves", sizeof(cfg_saves));
+   strlcpy(cfg_states, ROOT "/states", sizeof(cfg_states));
+
+   CHECK(filestream_write_file(ROOT "/saves/Disks/Game.srm", "x", 1));
+   member_load(member, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/Disks/Game.srm"));
+   CHECK(!path_is_directory(ROOT "/saves/snes"));
+   CHECK(same_path(runloop_state.name.savestate,
+            ROOT "/states/snes/Game.state"));
+
+   CHECK(filestream_write_file(ROOT "/states/Disks/Game.state.auto", "x", 1));
+   member_load(member, false);
+   CHECK(same_path(runloop_state.name.savestate,
+            ROOT "/states/Disks/Game.state"));
+   CHECK(filestream_delete(ROOT "/states/Disks/Game.state.auto") == 0);
+   CHECK(filestream_write_file(ROOT "/states/Disks/Game.state12", "x", 1));
+   member_load(member, false);
+   CHECK(same_path(runloop_state.name.savestate,
+            ROOT "/states/Disks/Game.state"));
+   CHECK(filestream_delete(ROOT "/states/Disks/Game.state12") == 0);
+   CHECK(filestream_write_file(ROOT "/states/Disks/Game.state3.png", "x", 1));
+   CHECK(filestream_write_file(ROOT "/states/Disks/Game2.state", "x", 1));
+   member_load(member, false);
+   CHECK(same_path(runloop_state.name.savestate,
+            ROOT "/states/snes/Game.state"));
+
+   CHECK(filestream_write_file(ROOT "/saves/Disks/Snes9x/Game.srm", "x", 1));
+   member_load(member, true);
+   CHECK(same_path(runloop_state.name.savefile,
+            ROOT "/saves/Disks/Snes9x/Game.srm"));
+
+   CHECK(path_mkdir(ROOT "/saves/snes"));
+   CHECK(filestream_write_file(ROOT "/saves/snes/Game.srm", "x", 1));
+   CHECK(filestream_write_file(ROOT "/states/Disks/Game.state", "x", 1));
+   CHECK(filestream_write_file(ROOT "/states/snes/Game.state.auto", "x", 1));
+   member_load(member, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/snes/Game.srm"));
+   CHECK(same_path(runloop_state.name.savestate,
+            ROOT "/states/snes/Game.state"));
+
+   CHECK(filestream_delete(ROOT "/saves/snes/Game.srm") == 0);
+   CHECK(filestream_delete(ROOT "/saves/Disks/Game.srm") == 0);
+   member_load(member, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/snes/Game.srm"));
+
+   /* Loose content, and a member in a folder the roots keep */
+   CHECK(filestream_write_file(ROOT "/saves/Disks/Game.srm", "x", 1));
+   member_load(ROOT "/roms/snes/Game.sfc", false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/snes/Game.srm"));
+   CHECK(path_mkdir(ROOT "/saves/system"));
+   CHECK(filestream_write_file(ROOT "/saves/system/Game.srm", "x", 1));
+   member_load(ROOT "/roms/snes/pack.7z#system/Game.sfc", false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/snes/Game.srm"));
+
+   /* Two folders down: named after the inner one */
+   CHECK(path_mkdir(ROOT "/saves/B"));
+   CHECK(filestream_write_file(ROOT "/saves/B/Game.srm", "x", 1));
+   member_load(ROOT "/roms/snes/pack.7z#A/B/Game.sfc", false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/B/Game.srm"));
+
+   /* No content (a contentless start): nothing is looked for */
+   CHECK(filestream_write_file(ROOT "/saves/Disks/.srm", "x", 1));
+   member_load(member, false);
+   runloop_state.runtime_content_path_basename[0] = '\0';
+   runloop_path_set_redirect(&test_settings, ROOT "/saves", ROOT "/states");
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/Snes9x.srm"));
+
+   rm_tree(ROOT "/saves");
+   rm_tree(ROOT "/states");
+   CHECK(path_mkdir(ROOT "/saves"));
+   CHECK(path_mkdir(ROOT "/states"));
+}
+
+static void member_load_beside(const char *content, bool by_content,
+      bool per_core)
+{
+   memset(&runloop_state, 0, sizeof(runloop_state));
+   memset(&test_settings, 0, sizeof(test_settings));
+   test_settings.bools.savefiles_in_content_dir          = true;
+   test_settings.bools.savestates_in_content_dir         = true;
+   test_settings.bools.sort_savefiles_by_content_enable  = by_content;
+   test_settings.bools.sort_savestates_by_content_enable = by_content;
+   test_settings.bools.sort_savefiles_enable             = per_core;
+   test_settings.bools.sort_savestates_enable            = per_core;
+   runloop_state.system.info.library_name = "Snes9x";
+   runloop_path_set_basename(content);
+   runloop_path_set_basename_kept(&runloop_state, content, member_exts);
+   runloop_path_set_redirect(&test_settings, ROOT "/saves", ROOT "/states");
+}
+
+/* Beside the content, a member's folders were folders there too, with
+ * each sorting's folder under them. */
+static void archive_member_old_folder_beside(void)
+{
+   const char *member = ROOT "/roms/pack.7z#Disks/Game.sfc";
+   CHECK(path_mkdir(ROOT "/roms/Disks/Disks/Snes9x"));
+   CHECK(filestream_write_file(ROOT "/roms/Disks/Disks/Game.srm", "x", 1));
+   CHECK(filestream_write_file(ROOT "/roms/Disks/Disks/Game.state.auto",
+            "x", 1));
+   member_load_beside(member, true, false);
+   CHECK(same_path(runloop_state.name.savefile,
+            ROOT "/roms/Disks/Disks/Game.srm"));
+   CHECK(same_path(runloop_state.name.savestate,
+            ROOT "/roms/Disks/Disks/Game.state"));
+   CHECK(!path_is_directory(ROOT "/roms/roms"));
+   CHECK(filestream_write_file(ROOT "/roms/Disks/Disks/Snes9x/Game.srm",
+            "x", 1));
+   member_load_beside(member, true, true);
+   CHECK(same_path(runloop_state.name.savefile,
+            ROOT "/roms/Disks/Disks/Snes9x/Game.srm"));
+
+   CHECK(path_mkdir(ROOT "/roms/A/B/B"));
+   CHECK(filestream_write_file(ROOT "/roms/A/B/B/Game.srm", "x", 1));
+   member_load_beside(ROOT "/roms/pack.7z#A/B/Game.sfc", true, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/roms/A/B/B/Game.srm"));
+
+   /* Sorted by core only */
+   CHECK(path_mkdir(ROOT "/roms/Disks/Snes9x"));
+   CHECK(filestream_write_file(ROOT "/roms/Disks/Snes9x/Game.srm", "x", 1));
+   CHECK(filestream_write_file(ROOT "/roms/Disks/Snes9x/Game.state3",
+            "x", 1));
+   member_load_beside(member, false, true);
+   CHECK(same_path(runloop_state.name.savefile,
+            ROOT "/roms/Disks/Snes9x/Game.srm"));
+   CHECK(same_path(runloop_state.name.savestate,
+            ROOT "/roms/Disks/Snes9x/Game.state"));
+   CHECK(!path_is_directory(ROOT "/roms/Snes9x"));
+
+   /* Not sorted; the new folder wins once it has a save too */
+   CHECK(filestream_write_file(ROOT "/roms/Disks/Game.srm", "x", 1));
+   CHECK(filestream_write_file(ROOT "/roms/Disks/Game.state", "x", 1));
+   member_load_beside(member, false, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/roms/Disks/Game.srm"));
+   CHECK(same_path(runloop_state.name.savestate,
+            ROOT "/roms/Disks/Game.state"));
+   CHECK(filestream_write_file(ROOT "/roms/Game.srm", "x", 1));
+   member_load_beside(member, false, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/roms/Game.srm"));
+   CHECK(same_path(runloop_state.name.savestate,
+            ROOT "/roms/Disks/Game.state"));
+
+   rm_tree(ROOT "/roms");
+   rm_tree(ROOT "/saves");
+   rm_tree(ROOT "/states");
+   CHECK(path_mkdir(ROOT "/saves"));
+   CHECK(path_mkdir(ROOT "/states"));
+}
+
+/* Members of one archive with one name in different folders keep
+ * their folders, so their saves stay apart; the others don't. */
+static void archive_member_same_name(void)
+{
+   const char *usa = ROOT "/roms/snes/pack.7z#USA/Game.sfc";
+   archive_members[0] = "USA/Game.sfc";
+   archive_members[1] = "JPN/";
+   archive_members[2] = "JPN/game.smc";
+   member_load(usa, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/USA/Game.srm"));
+   CHECK(same_path(runloop_state.name.savestate,
+            ROOT "/states/USA/Game.state"));
+   member_load(ROOT "/roms/snes/pack.7z#JPN/game.smc", false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/JPN/game.srm"));
+
+   /* Beside the content, the folder is made */
+   CHECK(path_mkdir(ROOT "/roms"));
+   member_load_beside(ROOT "/roms/pack.7z#USA/Game.sfc", false, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/roms/USA/Game.srm"));
+   CHECK(same_path(runloop_state.name.savestate,
+            ROOT "/roms/USA/Game.state"));
+   CHECK(path_is_directory(ROOT "/roms/USA"));
+
+   /* One folder, another name, or a member with no folder */
+   archive_members[2] = "USA/Game.smc";
+   member_load(usa, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/snes/Game.srm"));
+   archive_members[2] = "JPN/Other.sfc";
+   member_load(usa, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/snes/Game.srm"));
+   archive_members[2] = "Game.sfc";
+   member_load(usa, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/USA/Game.srm"));
+   member_load(ROOT "/roms/snes/pack.7z#Game.sfc", false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/snes/Game.srm"));
+
+   archive_members[0] = archive_members[1] = archive_members[2] = NULL;
+   rm_tree(ROOT "/roms");
+   rm_tree(ROOT "/saves");
+   rm_tree(ROOT "/states");
+   CHECK(path_mkdir(ROOT "/saves"));
+   CHECK(path_mkdir(ROOT "/states"));
+}
+
+/* Beside the archive, a loose game of the name, or another archive's
+ * member of it, keeps the folder too; past 32 archives there none is
+ * listed and it is kept. The frontend's own files don't count, and an
+ * archive that can't be listed changes nothing unless the folder is
+ * there. */
+static void archive_member_name_beside(void)
+{
+   char arc[PATH_MAX_LENGTH];
+   unsigned i;
+   const char *usa = ROOT "/roms/pack.7z#USA/Game.sfc";
+   archive_members[0] = "USA/Game.sfc";
+   CHECK(path_mkdir(ROOT "/roms"));
+   CHECK(filestream_write_file(ROOT "/roms/Game.srm", "x", 1));
+   CHECK(filestream_write_file(ROOT "/roms/Game.state1", "x", 1));
+   member_load(usa, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/roms/Game.srm"));
+
+   /* Only content the core takes counts, or the member's own kind */
+   CHECK(filestream_write_file(ROOT "/roms/Game.bkr", "x", 1));
+   member_load(usa, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/roms/Game.srm"));
+   CHECK(filestream_write_file(ROOT "/roms/game.smc", "x", 1));
+   member_load(usa, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/USA/Game.srm"));
+   member_exts = NULL;
+   member_load(usa, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/roms/Game.srm"));
+   member_exts = "sfc|smc";
+   CHECK(filestream_delete(ROOT "/roms/game.smc") == 0);
+
+   CHECK(filestream_write_file(ROOT "/roms/other.zip", "x", 1));
+   other_members[0] = "JPN/GAME.sfc";
+   archive_lists = 0;
+   member_load(usa, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/USA/Game.srm"));
+   CHECK(archive_lists == 2);
+   other_members[0] = "Other.sfc";
+   member_load(usa, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/roms/Game.srm"));
+
+   for (i = 1; i < 32; i++)
+   {
+      snprintf(arc, sizeof(arc), ROOT "/roms/a%02u.zip", i);
+      CHECK(filestream_write_file(arc, "x", 1));
+   }
+   archive_lists = 0;
+   member_load(usa, false);
+   CHECK(archive_lists == 33);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/roms/Game.srm"));
+   /* Kept once a 33rd comes; a save made without the folder is left
+    * where it is */
+   CHECK(filestream_write_file(ROOT "/saves/roms/Game.srm", "x", 1));
+   CHECK(filestream_write_file(ROOT "/roms/a32.7z", "x", 1));
+   archive_lists = 0;
+   member_load(usa, false);
+   CHECK(archive_lists == 1);
+   CHECK(same_path(runloop_state.runtime_content_path_basename,
+            ROOT "/roms/USA/Game"));
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/USA/Game.srm"));
+   member_load_beside(usa, false, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/roms/USA/Game.srm"));
+   CHECK(same_path(runloop_state.name.savestate,
+            ROOT "/roms/USA/Game.state"));
+   CHECK(path_is_valid(ROOT "/saves/roms/Game.srm"));
+   CHECK(filestream_delete(ROOT "/saves/roms/Game.srm") == 0);
+
+   rm_tree(ROOT "/roms");
+   CHECK(path_mkdir(ROOT "/roms"));
+   archive_members[1] = "JPN/Game.sfc";
+   rm_tree(ROOT "/saves/USA");
+   archive_unreadable = true;
+   member_load(usa, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/roms/Game.srm"));
+   CHECK(path_mkdir(ROOT "/saves/USA"));
+   member_load(usa, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/USA/Game.srm"));
+   /* Its content folder gone too */
+   rm_tree(ROOT "/roms");
+   member_load(usa, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/USA/Game.srm"));
+   CHECK(path_mkdir(ROOT "/roms"));
+   archive_unreadable = false;
+
+#ifdef _WIN32
+   /* Its own archive, named in another case */
+   CHECK(filestream_write_file(ROOT "/roms/PACK.7z", "x", 1));
+   archive_members[1] = NULL;
+   other_members[0]   = "USA/Game.sfc";
+   member_load(usa, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/roms/Game.srm"));
+   CHECK(filestream_delete(ROOT "/roms/PACK.7z") == 0);
+   archive_members[1] = "JPN/Game.sfc";
+#endif
+
+   /* A kept folder that climbs out is not made; "Vol..2" is made */
+   archive_members[0] = "../up/Game.sfc";
+   member_load_beside(ROOT "/roms/pack.7z#../up/Game.sfc", false, false);
+   CHECK(same_path(runloop_state.runtime_content_path_basename,
+            ROOT "/roms/../up/Game"));
+   CHECK(!path_is_directory(ROOT "/up"));
+   archive_members[0] = "Vol..2/Game.sfc";
+   member_load_beside(ROOT "/roms/pack.7z#Vol..2/Game.sfc", false, false);
+   CHECK(path_is_directory(ROOT "/roms/Vol..2"));
+
+   archive_members[0] = archive_members[1] = other_members[0] = NULL;
+   rm_tree(ROOT "/roms");
+   rm_tree(ROOT "/saves");
+   rm_tree(ROOT "/states");
+   CHECK(path_mkdir(ROOT "/saves"));
+   CHECK(path_mkdir(ROOT "/states"));
+}
+
+/* A member kept apart from a game of its name never takes that game's
+ * saves where the name without its folders puts them: a loose game's,
+ * a root member's, or a sibling's from before this member was added.
+ * Its own start in its folder; theirs are left as they are. */
+static void archive_member_kept_apart(void)
+{
+   char arc[PATH_MAX_LENGTH];
+   unsigned i;
+   const char *usa = ROOT "/roms/pack.7z#USA/Game.sfc";
+   CHECK(path_mkdir(ROOT "/roms"));
+   CHECK(path_mkdir(ROOT "/saves/roms"));
+   CHECK(path_mkdir(ROOT "/states/roms"));
+   CHECK(filestream_write_file(ROOT "/saves/roms/Game.srm", "x", 1));
+   CHECK(filestream_write_file(ROOT "/states/roms/Game.state", "x", 1));
+   CHECK(filestream_write_file(ROOT "/roms/Game.srm", "x", 1));
+   CHECK(filestream_write_file(ROOT "/roms/Game.state", "x", 1));
+   archive_members[0] = "USA/Game.sfc";
+
+   CHECK(filestream_write_file(ROOT "/roms/Game.sfc", "x", 1));
+   member_load(usa, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/USA/Game.srm"));
+   CHECK(same_path(runloop_state.name.savestate,
+            ROOT "/states/USA/Game.state"));
+   member_load_beside(usa, false, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/roms/USA/Game.srm"));
+   CHECK(same_path(runloop_state.name.savestate,
+            ROOT "/roms/USA/Game.state"));
+   CHECK(filestream_delete(ROOT "/roms/Game.sfc") == 0);
+
+   archive_members[1] = "Game.sfc";
+   member_load(usa, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/USA/Game.srm"));
+   member_load_beside(usa, false, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/roms/USA/Game.srm"));
+
+   archive_members[1] = "JPN/Game.sfc";
+   member_load(ROOT "/roms/pack.7z#JPN/Game.sfc", false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/JPN/Game.srm"));
+   member_load(usa, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/USA/Game.srm"));
+   CHECK(path_is_valid(ROOT "/saves/roms/Game.srm"));
+
+   /* An archive of its name, not opened; with 32 more beside it */
+   archive_members[1] = NULL;
+   CHECK(filestream_write_file(ROOT "/roms/Game.zip", "x", 1));
+   archive_lists = 0;
+   member_load(usa, false);
+   CHECK(archive_lists == 1);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/USA/Game.srm"));
+   for (i = 1; i <= 32; i++)
+   {
+      snprintf(arc, sizeof(arc), ROOT "/roms/a%02u.zip", i);
+      CHECK(filestream_write_file(arc, "x", 1));
+   }
+   member_load(usa, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/USA/Game.srm"));
+   member_load_beside(usa, false, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/roms/USA/Game.srm"));
+
+   archive_members[0] = archive_members[1] = NULL;
+   rm_tree(ROOT "/roms");
+   rm_tree(ROOT "/saves");
+   rm_tree(ROOT "/states");
+   CHECK(path_mkdir(ROOT "/saves"));
+   CHECK(path_mkdir(ROOT "/states"));
+}
+
+/* With the archive's folder unlisted, a member uses the folder a kept
+ * name gives it only when that folder is there (a clash was seen),
+ * else goes without it as when nothing clashes. A loose game of its
+ * name keeps its own saves. */
+static void archive_member_unlisted(void)
+{
+   const char *usa = ROOT "/roms/pack.7z#USA/Game.sfc";
+   archive_members[0] = "USA/Game.sfc";
+   CHECK(path_mkdir(ROOT "/roms"));
+   CHECK(filestream_write_file(ROOT "/roms/Game.sfc", "x", 1));
+   CHECK(filestream_write_file(ROOT "/roms/Game.srm", "x", 1));
+   roms_unlistable = true;
+
+   member_load(usa, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/roms/Game.srm"));
+   CHECK(same_path(runloop_state.name.savestate,
+            ROOT "/states/roms/Game.state"));
+   member_load_beside(usa, false, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/roms/Game.srm"));
+   CHECK(!path_is_directory(ROOT "/roms/USA"));
+
+   CHECK(path_mkdir(ROOT "/saves/USA"));
+   CHECK(path_mkdir(ROOT "/states/USA"));
+   member_load(usa, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/USA/Game.srm"));
+   CHECK(same_path(runloop_state.name.savestate,
+            ROOT "/states/USA/Game.state"));
+
+   /* Beside the content: the loose game's save is not the member's */
+   CHECK(path_mkdir(ROOT "/roms/USA"));
+   member_load_beside(usa, false, false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/roms/USA/Game.srm"));
+   CHECK(same_path(runloop_state.name.savestate,
+            ROOT "/roms/USA/Game.state"));
+   roms_unlistable = false;
+   member_load_beside(usa, false, false);
+   CHECK(runloop_archive_kept);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/roms/USA/Game.srm"));
+
+   archive_members[0] = NULL;
+   rm_tree(ROOT "/roms");
+   rm_tree(ROOT "/saves");
+   rm_tree(ROOT "/states");
+   CHECK(path_mkdir(ROOT "/saves"));
+   CHECK(path_mkdir(ROOT "/states"));
+}
+
 /* Netplay's saves-off from the last load is undone before the folder
  * check, so a root gone at this load still turns saves off. One
  * redirect: load()'s second one would hide the order. */
@@ -458,6 +971,13 @@ int main(void)
    reserved_rom_folder();
    netplay_no_folder();
    folder_check_each_load();
+   archive_member_folder();
+   archive_member_old_folder();
+   archive_member_old_folder_beside();
+   archive_member_same_name();
+   archive_member_name_beside();
+   archive_member_kept_apart();
+   archive_member_unlisted();
    netplay_then_folder_gone();
    netplay_folder_gone();
    state_folder_notice();

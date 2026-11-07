@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import zipfile
 from pathlib import Path
 
 try:
@@ -741,6 +742,30 @@ def lane_folder_check_override(args, n):
     return lane_folder_check_each_load(args, n, override=True)
 
 
+def lane_archive_member_old_folder(args, n):
+    """Sorted by content, a member in a folder of an archive keeps
+    using the folder named after its folder inside the archive while
+    that folder has its save and the new one has none."""
+    r = Run(args.run_dir, 'archive_member_old_folder-%d' % n)
+    failures = []
+    pack = r.dir / 'pack.zip'
+    with zipfile.ZipFile(pack, 'w', zipfile.ZIP_STORED) as z:
+        z.writestr('Disks/game.bin', bytes(16))
+    r.content = '%s#Disks/game.bin' % pack
+    old = r.saves / 'Disks' / 'game.srm'
+    old.parent.mkdir()
+    old.write_bytes(pattern(31))
+    cfg = r.config(sort_savefiles_by_content_enable='true')
+    r.start(args, cfg, 60, r.env(SAVE_E2E_TOUCH_FRAME=5, SAVE_E2E_SEED=32))
+    rc = r.wait(60)
+    check(failures, rc == 0, 'retroarch exit %s' % rc)
+    check(failures, old.read_bytes() == pattern(32),
+          'save not written to %s' % old)
+    new = r.saves / r.dir.name
+    check(failures, not new.exists(), 'made %s' % new)
+    return r, failures
+
+
 LANES = {
     'autosave_full_disk': lane_autosave_full_disk,
     'autosave_kill_mid_write': lane_autosave_kill_mid_write,
@@ -759,6 +784,7 @@ LANES = {
     'config_keeps_folder': lane_config_keeps_folder,
     'folder_check_each_load': lane_folder_check_each_load,
     'folder_check_override': lane_folder_check_override,
+    'archive_member_old_folder': lane_archive_member_old_folder,
 }
 # Lanes that need Windows, and the ones Windows cannot run.
 WINDOWS_LANES = {'windows_locked_close'}

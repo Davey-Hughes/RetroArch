@@ -93,6 +93,9 @@
 #include <retro_assert.h>
 #include <queues/message_queue.h>
 #include <lists/dir_list.h>
+#ifdef HAVE_COMPRESSION
+#include <file/archive_file.h>
+#endif
 #ifdef __MACH__
 #include <TargetConditionals.h>
 #endif
@@ -442,6 +445,14 @@ static bool runloop_netplay_saves_off = false;
  * (runloop_path_set_redirect), and whether that turned saves off. */
 static enum runloop_save_root runloop_save_roots[2];
 static bool runloop_save_folder_off = false;
+/* The content's folders inside its archive ("" if none), which its
+ * kept name and the old-folder lookup use. */
+static char runloop_archive_dir[DIR_MAX_LENGTH];
+/* Kept in its name instead: its saves would be another game's
+ * without them */
+static bool runloop_archive_kept = false;
+/* Whether they would was not known: a listing failed */
+static bool runloop_archive_unlisted = false;
 
 /* Defined here, before its first user: the SET_MESSAGE_EXT STATUS
  * path in the environment callback defers through this machinery,
@@ -6721,6 +6732,9 @@ static void runloop_path_set_basename_to_archive(runloop_state_t *runloop_st)
       return;
    memcpy(runloop_st->runtime_content_path_basename, content, _len);
    runloop_st->runtime_content_path_basename[_len] = '\0';
+   runloop_archive_dir[0]  = '\0';
+   runloop_archive_kept    = false;
+   runloop_archive_unlisted = false;
    /* (without the archive's extension, as runloop_path_set_basename()
     * leaves a path) */
    if (     (dot = strrchr(runloop_st->runtime_content_path_basename, '.'))
@@ -6730,6 +6744,192 @@ static void runloop_path_set_basename_to_archive(runloop_state_t *runloop_st)
          && !strchr(dot, '\\')
 #endif
       )
+      *dot = '\0';
+   runloop_path_set_names();
+}
+#endif
+
+/* Whether @path has a ".." folder */
+static bool runloop_path_climbs(const char *path)
+{
+   const char *s = path;
+   while ((s = strstr(s, "..")))
+   {
+      if (     (s == path || PATH_CHAR_IS_SLASH(s[-1]))
+            && (!s[2] || PATH_CHAR_IS_SLASH(s[2])))
+         return true;
+      s += 2;
+   }
+   return false;
+}
+
+#ifdef HAVE_COMPRESSION
+/* Past this many archives beside a member's, none is listed */
+#define RUNLOOP_ARCHIVES_LISTED 32
+
+/* Whether @archive has a member named @name, extension and case aside,
+ * outside the first @dir_len bytes' folder of @member (if any).
+ * *@unlisted: @archive could not be listed. */
+static bool runloop_archive_has_name(const char *archive,
+      const char *name, const char *member, size_t dir_len, bool *unlisted)
+{
+   size_t i;
+   char other[NAME_MAX_LENGTH];
+   bool found               = false;
+   struct string_list *list = file_archive_get_file_list(archive, NULL);
+   if (!list)
+   {
+      if (unlisted)
+         *unlisted = true;
+      return false;
+   }
+   for (i = 0; i < list->size && !found; i++)
+   {
+      const char *entry = list->elems[i].data;
+      const char *ebase = path_basename_nocompression(entry);
+      if (     member
+            && (size_t)(ebase - entry) == dir_len
+            && !strncmp(entry, member, dir_len))
+         continue;
+      strlcpy(other, ebase, sizeof(other));
+      path_remove_extension(other);
+      found = string_is_equal_case_insensitive(name, other);
+   }
+   string_list_free(list);
+   return found;
+}
+
+/* Whether @ext is @own or one of @exts ("sfc|smc"), case aside */
+static bool runloop_ext_is_content(const char *ext, const char *own,
+      const char *exts)
+{
+   size_t _len = strlen(ext);
+   if (!_len)
+      return false;
+   if (string_is_equal_case_insensitive(ext, own))
+      return true;
+   while (exts && *exts)
+   {
+      size_t i        = 0;
+      const char *end = strchr(exts, '|');
+      size_t n        = end ? (size_t)(end - exts) : strlen(exts);
+      while (     i < n && i < _len
+            && tolower((unsigned char)exts[i])
+            == tolower((unsigned char)ext[i]))
+         i++;
+      if (i == n && n == _len)
+         return true;
+      exts = end ? end + 1 : NULL;
+   }
+   return false;
+}
+
+/* Whether @file is the member's own archive, named @arc */
+static bool runloop_archive_is_own(const char *file, const char *arc)
+{
+#ifdef _WIN32
+   return string_is_equal_case_insensitive(file, arc);
+#else
+   return string_is_equal(file, arc);
+#endif
+}
+
+/* Whether @path's member, named without its folders in the archive,
+ * would share its saves: with a member of its name in another folder
+ * there, a loose game of its name in @dir, the archive's folder (one
+ * the core takes, @exts, or of the member's extension), or a member of
+ * another archive there, or that archive's own name. Names are
+ * compared without extension, case aside. More than
+ * RUNLOOP_ARCHIVES_LISTED archives there are not listed: it would.
+ * *@unlisted: its own archive, or @dir while there, could not be
+ * listed. */
+static bool runloop_archive_name_shared(const char *path, const char *dir,
+      const char *exts, bool *unlisted)
+{
+   size_t i, dir_len;
+   char name[NAME_MAX_LENGTH];
+   char other[NAME_MAX_LENGTH];
+   char arc[NAME_MAX_LENGTH];
+   struct string_list *list;
+   unsigned archives  = 0;
+   bool shared        = false;
+   const char *delim  = path_get_archive_delim(path);
+   const char *base   = path_basename_nocompression(path);
+   const char *own    = path_get_extension(base);
+   const char *s      = path;
+   if (!delim || base <= delim)
+      return false;
+   for (i = 0; path + i < delim; i++)
+      if (PATH_CHAR_IS_SLASH(path[i]))
+         s = path + i + 1;
+   strlcpy(arc, s, MIN(sizeof(arc), (size_t)(delim - s) + 1));
+   dir_len = base - delim - 1;
+   strlcpy(name, base, sizeof(name));
+   path_remove_extension(name);
+   if (!*name)
+      return false;
+   if (runloop_archive_has_name(path, name, delim + 1, dir_len, unlisted))
+      return true;
+   if (!(list = dir_list_new(dir, NULL, false, false, false, false)))
+   {
+      if (path_is_directory(dir))
+         *unlisted = true;
+      return false;
+   }
+   for (i = 0; i < list->size && !shared; i++)
+   {
+      const char *entry = list->elems[i].data;
+      const char *ebase = path_basename_nocompression(entry);
+      if (path_is_compressed_file(entry))
+      {
+         archives++;
+         if (runloop_archive_is_own(ebase, arc))
+            continue;
+      }
+      else if (!runloop_ext_is_content(path_get_extension(entry), own, exts))
+         continue;
+      strlcpy(other, ebase, sizeof(other));
+      path_remove_extension(other);
+      shared = string_is_equal_case_insensitive(name, other);
+   }
+   if (archives > RUNLOOP_ARCHIVES_LISTED)
+      shared = true;
+   for (i = 0; i < list->size && !shared; i++)
+   {
+      const char *entry = list->elems[i].data;
+      if (     path_is_compressed_file(entry)
+            && !runloop_archive_is_own(path_basename_nocompression(entry), arc))
+         shared = runloop_archive_has_name(entry, name, NULL, 0, NULL);
+   }
+   string_list_free(list);
+   return shared;
+}
+
+/* Now that the core has said what content it takes: a member whose
+ * saves, named without its folders in the archive, would be another
+ * game's keeps them in its name, as before. */
+static void runloop_path_set_basename_kept(runloop_state_t *runloop_st,
+      const char *path, const char *exts)
+{
+   char dir[DIR_MAX_LENGTH];
+   char *dot;
+   if (     !*runloop_archive_dir
+         || runloop_archive_kept
+         || !path
+         || !path_get_archive_delim(path))
+      return;
+   fill_pathname_basedir(dir, runloop_st->runtime_content_path_basename,
+         sizeof(dir));
+   if (!runloop_archive_name_shared(path, dir, exts,
+            &runloop_archive_unlisted))
+      return;
+   runloop_archive_kept = true;
+   strlcpy(runloop_st->runtime_content_path_basename, dir,
+         sizeof(runloop_st->runtime_content_path_basename));
+   fill_pathname_dir(runloop_st->runtime_content_path_basename, path, "",
+         sizeof(runloop_st->runtime_content_path_basename));
+   if (     (dot = strrchr(runloop_st->runtime_content_path_basename, '.'))
+         && (dot - runloop_st->runtime_content_path_basename > 0))
       *dot = '\0';
    runloop_path_set_names();
 }
@@ -6847,6 +7047,9 @@ bool runloop_event_init_core(
    if (     sys_info->info.block_extract
          && path_is_empty(RARCH_PATH_SUBSYSTEM))
       runloop_path_set_basename_to_archive(runloop_st);
+   else if (path_is_empty(RARCH_PATH_SUBSYSTEM))
+      runloop_path_set_basename_kept(runloop_st,
+            path_get(RARCH_PATH_CONTENT), sys_info->info.valid_extensions);
 #endif
 
 #ifdef HAVE_CONFIGFILE
@@ -11444,9 +11647,20 @@ void runloop_path_set_basename(const char *path)
     *
     */
    path_basedir_wrapper(runloop_st->runtime_content_path_basename);
+   strlcpy(runloop_archive_dir, path_basename(path),
+         sizeof(runloop_archive_dir));
+   if ((dst = find_last_slash(runloop_archive_dir)))
+      *dst = '\0';
+   else
+      runloop_archive_dir[0] = '\0';
+   runloop_archive_kept    = false;
+   runloop_archive_unlisted = false;
+   /* A member's own folders in the archive are left out, unless its
+    * saves would then be another game's (runloop_event_init_core()) */
    if (*runloop_st->runtime_content_path_basename)
-      fill_pathname_dir(runloop_st->runtime_content_path_basename, path,
-            "", sizeof(runloop_st->runtime_content_path_basename));
+      fill_pathname_dir(runloop_st->runtime_content_path_basename,
+            path_basename_nocompression(path), "",
+            sizeof(runloop_st->runtime_content_path_basename));
 #endif
 
    /* Truncate path to last dot, but not when the path is
@@ -11519,6 +11733,91 @@ enum runloop_save_root runloop_save_root_check(char *s, size_t len,
    }
    strlcpy(s, dir, len);
    return RUNLOOP_SAVE_ROOT_NONE;
+}
+
+/* Folder names the save root keeps for itself */
+static bool runloop_save_dir_name_reserved(const char *name)
+{
+   return string_is_equal_noncase(name, SAVE_BACKUPS_DIR)
+       || string_is_equal_noncase(name, SAVE_BACKUPS_RECORDS_DIR)
+       || string_is_equal_noncase(name, SAVE_BACKUPS_SYSTEM_DIR);
+}
+
+/* Whether @dir has this content's save, or any of its states */
+static bool runloop_save_dir_has_saves(const char *dir, bool states)
+{
+   size_t i, _len;
+   bool found = false;
+   char path[PATH_MAX_LENGTH];
+   struct string_list *list;
+   const char *name = path_basename_nocompression(
+         runloop_state.runtime_content_path_basename);
+
+   _len = fill_pathname_join_special(path, dir, name, sizeof(path));
+   if (_len + STRLEN_CONST(".state.auto") >= sizeof(path))
+      return false;
+   if (!states)
+   {
+      strlcpy(path + _len, FILE_PATH_SRM_EXTENSION, sizeof(path) - _len);
+      return path_is_valid(path);
+   }
+   _len += strlcpy(path + _len, FILE_PATH_STATE_EXTENSION,
+         sizeof(path) - _len);
+   if (path_is_valid(path))
+      return true;
+   strlcpy(path + _len, ".auto", sizeof(path) - _len);
+   if (path_is_valid(path))
+      return true;
+
+   /* Numbered slots: listed, as command_scan_states() finds them */
+   if (!(list = dir_list_new(dir, NULL, false, true, false, false)))
+      return false;
+   path[_len] = '\0';
+   name       = path_basename_nocompression(path);
+   _len       = strlen(name);
+   for (i = 0; i < list->size && !found; i++)
+   {
+      const char *slot = path_basename_nocompression(list->elems[i].data);
+      if (strncmp(slot, name, _len) || !*(slot += _len))
+         continue;
+      while (*slot >= '0' && *slot <= '9')
+         slot++;
+      found = !*slot;
+   }
+   string_list_free(list);
+   return found;
+}
+
+/* An archive member's folders inside the archive were part of its
+ * name: folders beside the content, and the last one named the folder
+ * sorting by content made. @s, this root's folder now, becomes the
+ * folder that name gave while it has the game's saves and @s has none,
+ * or whenever it is there after a failed listing: it may be a kept
+ * name's. A name that keeps them has no other place: the name without
+ * them is another game's (or may be, past the archive cap). */
+static void runloop_save_dir_old(char *s, size_t len,
+      const char *root, bool in_content_dir, bool by_content,
+      const char *core, bool states)
+{
+   char dir[DIR_MAX_LENGTH];
+   const char *name = path_basename_nocompression(runloop_archive_dir);
+   if (     !*runloop_state.runtime_content_path_basename
+         || !*name
+         || runloop_archive_kept
+         || (!in_content_dir && !by_content)
+         || (by_content && runloop_save_dir_name_reserved(name)))
+      return;
+   fill_pathname_join_special_ext(dir, root,
+         in_content_dir ? runloop_archive_dir : "",
+         by_content ? name : "", "", sizeof(dir));
+   if (core)
+      fill_pathname_join(dir, dir, core, sizeof(dir));
+   if (     !string_is_equal(dir, s)
+         && path_is_directory(dir)
+         && (     runloop_archive_unlisted
+            || (   runloop_save_dir_has_saves(dir, states)
+               && !runloop_save_dir_has_saves(s, states))))
+      strlcpy(s, dir, len);
 }
 
 void runloop_path_set_redirect(settings_t *settings,
@@ -11602,12 +11901,7 @@ void runloop_path_set_redirect(settings_t *settings,
       fill_pathname_parent_dir_name(content_dir_name,
             runloop_st->runtime_content_path_basename,
             sizeof(content_dir_name));
-      /* Folder names the save root keeps for itself */
-      if (     string_is_equal_noncase(content_dir_name, SAVE_BACKUPS_DIR)
-            || string_is_equal_noncase(content_dir_name,
-               SAVE_BACKUPS_RECORDS_DIR)
-            || string_is_equal_noncase(content_dir_name,
-               SAVE_BACKUPS_SYSTEM_DIR))
+      if (runloop_save_dir_name_reserved(content_dir_name))
          content_dir_name[0] = '\0';
    }
 
@@ -11615,6 +11909,7 @@ void runloop_path_set_redirect(settings_t *settings,
    if (     !*intermediate_savefile_dir
          || savefiles_in_content_dir)
    {
+      savefiles_in_content_dir = true;
       fill_pathname_basedir(
             intermediate_savefile_dir,
             runloop_st->runtime_content_path_basename,
@@ -11628,12 +11923,23 @@ void runloop_path_set_redirect(settings_t *settings,
    if (     !*intermediate_savestate_dir
          || savestates_in_content_dir)
    {
+      savestates_in_content_dir = true;
       fill_pathname_basedir(intermediate_savestate_dir,
             runloop_st->runtime_content_path_basename,
             sizeof(intermediate_savestate_dir));
 
       if (!*intermediate_savestate_dir)
          RARCH_LOG("[Override] Cannot resolve save state file path.\n");
+   }
+
+   /* A member's folder kept in its name is made beside the archive,
+    * never outside it */
+   if (runloop_archive_kept && !runloop_path_climbs(runloop_archive_dir))
+   {
+      if (savefiles_in_content_dir)
+         path_mkdir(intermediate_savefile_dir);
+      if (savestates_in_content_dir)
+         path_mkdir(intermediate_savestate_dir);
    }
 
    strlcpy(new_savefile_dir, intermediate_savefile_dir,
@@ -11670,6 +11976,11 @@ void runloop_path_set_redirect(settings_t *settings,
                      sysinfo->library_name,
                      sizeof(new_savefile_dir));
 
+            runloop_save_dir_old(new_savefile_dir,
+                  sizeof(new_savefile_dir), intermediate_savefile_dir,
+                  savefiles_in_content_dir, sort_savefiles_by_content,
+                  sort_savefiles ? sysinfo->library_name : NULL, false);
+
             /* If path doesn't exist, try to create it,
              * if everything fails revert to the original path. */
             if (     !path_is_directory(new_savefile_dir)
@@ -11683,6 +11994,10 @@ void runloop_path_set_redirect(settings_t *settings,
                      sizeof(new_savefile_dir));
             }
          }
+         else if (!sort_savefiles && !sort_savefiles_by_content)
+            runloop_save_dir_old(new_savefile_dir,
+                  sizeof(new_savefile_dir), intermediate_savefile_dir,
+                  savefiles_in_content_dir, false, NULL, false);
 
          /* Per-core and/or per-content-directory savestates */
          if (     (sort_savestates || sort_savestates_by_content)
@@ -11705,6 +12020,11 @@ void runloop_path_set_redirect(settings_t *settings,
                      sysinfo->library_name,
                      sizeof(new_savestate_dir));
 
+            runloop_save_dir_old(new_savestate_dir,
+                  sizeof(new_savestate_dir), intermediate_savestate_dir,
+                  savestates_in_content_dir, sort_savestates_by_content,
+                  sort_savestates ? sysinfo->library_name : NULL, true);
+
             /* If path doesn't exist, try to create it.
              * If everything fails, revert to the original path. */
             if (     !path_is_directory(new_savestate_dir)
@@ -11718,6 +12038,10 @@ void runloop_path_set_redirect(settings_t *settings,
                      sizeof(new_savestate_dir));
             }
          }
+         else if (!sort_savestates && !sort_savestates_by_content)
+            runloop_save_dir_old(new_savestate_dir,
+                  sizeof(new_savestate_dir), intermediate_savestate_dir,
+                  savestates_in_content_dir, false, NULL, true);
       }
    }
 
