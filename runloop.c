@@ -5971,6 +5971,26 @@ static void runloop_path_init_savefile_internal(runloop_state_t *runloop_st)
       path_init_savefile_rtc(runloop_st->name.savefile);
 }
 
+#ifdef HAVE_CLOUDSYNC
+/* A main config folder was the one not found: cloud sync waits for it. */
+static bool runloop_save_base_replaced(void)
+{
+   size_t i;
+   for (i = 0; i < 2; i++)
+   {
+      const char *configured = dir_get_ptr(i
+            ? RARCH_DIR_SAVESTATE_CONFIGURED : RARCH_DIR_SAVEFILE_CONFIGURED);
+      if (     runloop_save_roots[i] != RUNLOOP_SAVE_ROOT_CONFIGURED
+            && string_is_equal(dir_get_ptr(i
+                  ? RARCH_DIR_SAVESTATE_BASE : RARCH_DIR_SAVEFILE_BASE),
+               *configured ? configured : g_defaults.dirs[i
+                  ? DEFAULT_DIR_SAVESTATE : DEFAULT_DIR_SRAM]))
+         return true;
+   }
+   return false;
+}
+#endif
+
 /* Once per content load, for the first root not found. */
 static void runloop_save_folder_notice(void)
 {
@@ -5998,7 +6018,8 @@ static void runloop_save_folder_notice(void)
       runloop_msg_queue_push(msg, strlen(msg), 1, 180, true, NULL,
             MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
 #ifdef HAVE_CLOUDSYNC
-      if (config_get_ptr()->bools.cloud_sync_enable)
+      if (     config_get_ptr()->bools.cloud_sync_enable
+            && runloop_save_base_replaced())
       {
          const char *_msg = msg_hash_to_str(MSG_CLOUD_SYNC_PAUSED_FALLBACK);
          runloop_msg_queue_push(_msg, strlen(_msg), 1, 180, false, NULL,
@@ -11717,6 +11738,35 @@ static bool runloop_save_root_usable(const char *dir)
    return *parent && path_is_directory(parent) && path_mkdir(dir);
 }
 
+#ifdef HAVE_CLOUDSYNC
+static const char *runloop_save_base_missing(void)
+{
+   const char *dir = dir_get_ptr(RARCH_DIR_SAVEFILE_BASE);
+   if (*dir && !path_is_directory(dir))
+      return dir;
+   dir = dir_get_ptr(RARCH_DIR_SAVESTATE_BASE);
+   if (*dir && !path_is_directory(dir))
+      return dir;
+   return NULL;
+}
+
+void runloop_save_base_check(void)
+{
+   /* Logged once per folder: a menu playlist redirects on each entry */
+   static char logged[DIR_MAX_LENGTH];
+   const char *missing = runloop_save_base_missing();
+   if (!missing)
+      *logged = '\0';
+   else if (!string_is_equal(missing, logged))
+   {
+      RARCH_WARN("[CloudSync] Paused: \"%s\" is not a directory.\n",
+            missing);
+      strlcpy(logged, missing, sizeof(logged));
+   }
+   task_cloud_sync_set_paused(missing != NULL);
+}
+#endif
+
 enum runloop_save_root runloop_save_root_check(char *s, size_t len,
       const char *configured, const char *def)
 {
@@ -11888,9 +11938,7 @@ void runloop_path_set_redirect(settings_t *settings,
       dir_set(RARCH_DIR_SAVESTATE, intermediate_savestate_dir);
    }
 #ifdef HAVE_CLOUDSYNC
-   task_cloud_sync_set_paused(
-            runloop_save_roots[0] != RUNLOOP_SAVE_ROOT_CONFIGURED
-         || runloop_save_roots[1] != RUNLOOP_SAVE_ROOT_CONFIGURED);
+   runloop_save_base_check();
 #endif
 
    /* Get content directory name, if per-content-directory

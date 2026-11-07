@@ -11101,6 +11101,17 @@ static void general_write_handler(rarch_setting_t *setting)
                dir_clear(configured);
             else
                dir_set(configured, dir);
+            /* an override's folder is not the main config's */
+            if (!(runloop_state_get_ptr()->flags
+                     & RUNLOOP_FLAG_OVERRIDES_ACTIVE))
+            {
+               dir_set(save
+                     ? RARCH_DIR_SAVEFILE_BASE
+                     : RARCH_DIR_SAVESTATE_BASE, dir);
+#ifdef HAVE_CLOUDSYNC
+               runloop_save_base_check();
+#endif
+            }
          }
          break;
       case MENU_ENUM_LABEL_VIDEO_GPU_INDEX:

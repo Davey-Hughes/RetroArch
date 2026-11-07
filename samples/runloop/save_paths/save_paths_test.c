@@ -14,6 +14,10 @@
  * A save asked for from another thread (3DS's suspend hook) is made
  * once, at the main thread's next frame.
  *
+ * Cloud sync, which walks the main config's folders only, waits while
+ * one of them is missing, and says so when it was the one replaced.
+ * The log line comes once for each folder it waits on.
+ *
  * The shipping function is included and run over a real folder. */
 #include <string.h>
 #include <lists/dir_list.h>
@@ -50,11 +54,17 @@ static settings_t test_settings;
    fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #c); failures++; } } while (0)
 
 void RARCH_LOG(const char *fmt, ...) { (void)fmt; }
-void RARCH_WARN(const char *fmt, ...) { (void)fmt; }
+static int pause_logs;
+void RARCH_WARN(const char *fmt, ...)
+{
+   if (strstr(fmt, "[CloudSync] Paused"))
+      pause_logs++;
+}
 void RARCH_ERR(const char *fmt, ...) { (void)fmt; }
 bool verbosity_is_enabled(void) { return false; }
 static int fallback_notices;
 static int missing_notices;
+static int sync_notices;
 const char *msg_hash_to_str(enum msg_hash_enums msg)
 {
    switch (msg)
@@ -71,6 +81,9 @@ const char *msg_hash_to_str(enum msg_hash_enums msg)
          return "state missing %s";
       case MSG_NETPLAY_SAVES_OFF:
          return "saves off";
+      case MSG_CLOUD_SYNC_PAUSED_FALLBACK:
+         sync_notices++;
+         return "sync paused";
       default:
          break;
    }
@@ -83,6 +96,9 @@ static char cfg_states[DIR_MAX_LENGTH];
 /* The roots in use, as the check sets them. */
 static char live_saves[DIR_MAX_LENGTH];
 static char live_states[DIR_MAX_LENGTH];
+/* The main config's roots, "default" resolved. */
+static char base_saves[DIR_MAX_LENGTH];
+static char base_states[DIR_MAX_LENGTH];
 void dir_set(enum rarch_dir_type type, const char *path)
 {
    if (type == RARCH_DIR_SAVEFILE)
@@ -100,6 +116,10 @@ char *dir_get_ptr(enum rarch_dir_type type)
          return live_saves;
       case RARCH_DIR_SAVESTATE:
          return live_states;
+      case RARCH_DIR_SAVEFILE_BASE:
+         return base_saves;
+      case RARCH_DIR_SAVESTATE_BASE:
+         return base_states;
       default:
          break;
    }
@@ -108,13 +128,16 @@ char *dir_get_ptr(enum rarch_dir_type type)
 bool path_set(enum rarch_path_type type, const char *path)
 { (void)type; (void)path; return true; }
 settings_t *config_get_ptr(void) { return &test_settings; }
+/* -s */
+static bool cli_save_path;
 bool retroarch_override_setting_is_set(
       enum rarch_override_setting enum_idx, void *data)
 {
-   (void)enum_idx;
    (void)data;
-   return false;
+   return cli_save_path && enum_idx == RARCH_OVERRIDE_SETTING_SAVE_PATH;
 }
+static bool sync_paused;
+void task_cloud_sync_set_paused(bool paused) { sync_paused = paused; }
 
 static bool netplay_client;
 bool netplay_driver_ctl(enum rarch_netplay_ctl_state state, void *data)
@@ -928,6 +951,121 @@ static void state_folder_notice(void)
    g_defaults.dirs[DEFAULT_DIR_SAVESTATE][0] = '\0';
 }
 
+/* Sync waits while a main config folder is missing, whichever folder
+ * the game uses: an override's or -s's, or the content's. Only a
+ * replaced main folder has the notice; a replaced override folder
+ * does not pause. */
+static void pause_follows_main_folder(void)
+{
+   rm_tree(ROOT "/card");
+   rm_tree(ROOT "/default");
+   CHECK(path_mkdir(ROOT "/card/saves"));
+   CHECK(path_mkdir(ROOT "/other/saves"));
+   CHECK(path_mkdir(ROOT "/default/saves"));
+   CHECK(path_mkdir(ROOT "/default/states"));
+   strlcpy(g_defaults.dirs[DEFAULT_DIR_SRAM], ROOT "/default/saves",
+         sizeof(g_defaults.dirs[DEFAULT_DIR_SRAM]));
+   strlcpy(g_defaults.dirs[DEFAULT_DIR_SAVESTATE], ROOT "/default/states",
+         sizeof(g_defaults.dirs[DEFAULT_DIR_SAVESTATE]));
+   strlcpy(base_saves, ROOT "/card/saves", sizeof(base_saves));
+   strlcpy(base_states, ROOT "/default/states", sizeof(base_states));
+   cfg_states[0] = '\0';
+   redirect("/roms/snes/Game", false);
+   test_settings.bools.cloud_sync_enable = true;
+   fallback_notices = sync_notices = 0;
+
+   /* An override's folder gone */
+   strlcpy(cfg_saves, ROOT "/gone/saves", sizeof(cfg_saves));
+   sync_paused = true;
+   load("/roms/snes/Game");
+   CHECK(same_path(live_saves, ROOT "/default/saves"));
+   CHECK(fallback_notices == 1);
+   CHECK(!sync_paused);
+   CHECK(sync_notices == 0);
+
+   /* The main folder gone, an override's in use */
+   rm_tree(ROOT "/card");
+   strlcpy(cfg_saves, ROOT "/other/saves", sizeof(cfg_saves));
+   load("/roms/snes/Game");
+   CHECK(same_path(live_saves, ROOT "/other/saves"));
+   CHECK(sync_paused);
+   CHECK(sync_notices == 0);
+
+   /* and in use */
+   strlcpy(cfg_saves, ROOT "/card/saves", sizeof(cfg_saves));
+   sync_paused = false;
+   load("/roms/snes/Game");
+   CHECK(same_path(live_saves, ROOT "/default/saves"));
+   CHECK(sync_paused);
+   CHECK(sync_notices == 1);
+
+   /* Saves beside the content, then -s */
+   test_settings.bools.savefiles_in_content_dir = true;
+   sync_paused = false;
+   load("/roms/snes/Game");
+   CHECK(sync_paused);
+   test_settings.bools.savefiles_in_content_dir = false;
+   cli_save_path = true;
+   sync_paused   = false;
+   load("/roms/snes/Game");
+   CHECK(sync_paused);
+   CHECK(sync_notices == 1);
+
+   CHECK(path_mkdir(ROOT "/card/saves"));
+   load("/roms/snes/Game");
+   CHECK(!sync_paused);
+   cli_save_path = false;
+
+   rm_tree(ROOT "/card");
+   rm_tree(ROOT "/other");
+   rm_tree(ROOT "/default");
+   cfg_saves[0] = cfg_states[0] = '\0';
+   base_saves[0] = base_states[0] = '\0';
+   g_defaults.dirs[DEFAULT_DIR_SRAM][0]      = '\0';
+   g_defaults.dirs[DEFAULT_DIR_SAVESTATE][0] = '\0';
+}
+
+/* Checked again where a main folder may have been made or set (Apple
+ * makes the default folders after the config load), the state folder
+ * as much as the save folder, and logged once for each folder the
+ * pause waits on: a playlist redirects for each entry. */
+static void pause_checked_again(void)
+{
+   rm_tree(ROOT "/main");
+   CHECK(path_mkdir(ROOT "/main/saves"));
+   strlcpy(base_saves, ROOT "/main/saves", sizeof(base_saves));
+   strlcpy(base_states, ROOT "/main/states", sizeof(base_states));
+   pause_logs  = 0;
+   sync_paused = false;
+
+   runloop_save_base_check();
+   CHECK(sync_paused);
+   CHECK(pause_logs == 1);
+   redirect("/roms/snes/Game", false);
+   redirect("/roms/snes/Other", false);
+   CHECK(sync_paused);
+   CHECK(pause_logs == 1);
+
+   CHECK(path_mkdir(ROOT "/main/states"));
+   runloop_save_base_check();
+   CHECK(!sync_paused);
+   CHECK(pause_logs == 1);
+
+   rm_tree(ROOT "/main/states");
+   runloop_save_base_check();
+   CHECK(sync_paused);
+   CHECK(pause_logs == 2);
+   strlcpy(base_states, ROOT "/main/other", sizeof(base_states));
+   runloop_save_base_check();
+   CHECK(sync_paused);
+   CHECK(pause_logs == 3);
+
+   rm_tree(ROOT "/main");
+   base_saves[0] = base_states[0] = '\0';
+   runloop_save_base_check();
+   CHECK(!sync_paused);
+}
+
 static unsigned kept_flushes;
 void event_flush_kept_save_files(bool sram_used, bool compress_files)
 {
@@ -981,6 +1119,8 @@ int main(void)
    netplay_then_folder_gone();
    netplay_folder_gone();
    state_folder_notice();
+   pause_follows_main_folder();
+   pause_checked_again();
    save_files_request();
    rm_tree(ROOT);
    puts(failures ? "FAIL save_paths_test" : "PASS save_paths_test");

@@ -1188,6 +1188,12 @@ enum runloop_save_root
 enum runloop_save_root runloop_save_root_check(char *s, size_t len,
       const char *configured, const char *def);
 
+#ifdef HAVE_CLOUDSYNC
+/* Cloud sync, which walks only the main config's save and state
+ * folders, is paused while one is set but is not a directory. */
+void runloop_save_base_check(void);
+#endif
+
 void runloop_path_set_special(char **argv, unsigned num_content);
 
 void runloop_path_deinit_subsystem(void);

@@ -666,7 +666,8 @@ void task_push_cloud_sync_update_driver(void);
  * Its error argument is non-NULL when the sync failed or finished with
  * failures or conflicts. Returns false if no sync was queued. */
 bool task_push_cloud_sync(retro_task_callback_t cb, void *user_data);
-/* No sync runs while set: a save or state root is a fallback. */
+/* No sync runs while set: a main config save or state folder is
+ * missing. */
 void task_cloud_sync_set_paused(bool paused);
 void task_push_cloud_sync_resolve_keep_local(void);
 void task_push_cloud_sync_resolve_keep_server(void);

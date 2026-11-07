@@ -6404,6 +6404,9 @@ void config_set_defaults(settings_t *target)
          dir_clear(RARCH_DIR_SAVESTATE);
       dir_clear(RARCH_DIR_SAVEFILE_CONFIGURED);
       dir_clear(RARCH_DIR_SAVESTATE_CONFIGURED);
+      dir_set(RARCH_DIR_SAVEFILE_BASE, g_defaults.dirs[DEFAULT_DIR_SRAM]);
+      dir_set(RARCH_DIR_SAVESTATE_BASE,
+            g_defaults.dirs[DEFAULT_DIR_SAVESTATE]);
    }
 
    *settings->paths.path_libretro_info = '\0';
@@ -7191,6 +7194,16 @@ static void config_set_save_dir_configured(enum rarch_dir_type type,
       dir_set(type, dir);
 }
 
+/* The main config's folder, the one cloud sync walks */
+static void config_set_save_dir_base(enum rarch_dir_type type,
+      const char *dir, const char *leaf, const char *def)
+{
+   if (!*dir || config_save_dir_is_default(dir, leaf))
+      dir_set(type, def);
+   else
+      dir_set(type, dir);
+}
+
 /**
  * config_load:
  * @path                : path to be read from.
@@ -7214,7 +7227,6 @@ static bool config_load_file(const char *path, settings_t *settings)
    char* libretro_video_shader_directory           = NULL;
    static bool first_load                          = true;
    bool without_overrides                          = false;
-   bool save_dir_missing                           = false;
    unsigned msg_color                              = 0;
    char override_username[PATH_MAX_LENGTH];
    bool override_username_set                      = false;
@@ -7384,6 +7396,17 @@ static bool config_load_file(const char *path, settings_t *settings)
    /* the controllers' own players, the main config's; each override's
     * go over them by controller as it is appended */
    input_plays_as_read(conf);
+
+   /* before any override goes in */
+   if (!without_overrides)
+   {
+      if (config_get_path(conf, "savefile_directory", tmp_str, sizeof(tmp_str)))
+         config_set_save_dir_base(RARCH_DIR_SAVEFILE_BASE, tmp_str,
+               "saves", g_defaults.dirs[DEFAULT_DIR_SRAM]);
+      if (config_get_path(conf, "savestate_directory", tmp_str, sizeof(tmp_str)))
+         config_set_save_dir_base(RARCH_DIR_SAVESTATE_BASE, tmp_str,
+               "states", g_defaults.dirs[DEFAULT_DIR_SAVESTATE]);
+   }
 
    if (!path_is_empty(RARCH_PATH_CONFIG_OVERRIDE) && !without_overrides)
    {
@@ -8154,10 +8177,7 @@ static bool config_load_file(const char *path, settings_t *settings)
                sizeof(runloop_st->name.savefile));
       }
       else
-      {
          RARCH_WARN("[Config] \"savefile_directory\" is not a directory, ignoring...\n");
-         save_dir_missing = true;
-      }
    }
 
    if (    !without_overrides
@@ -8184,15 +8204,12 @@ static bool config_load_file(const char *path, settings_t *settings)
                sizeof(runloop_st->name.replay));
       }
       else
-      {
          RARCH_WARN("[Config] \"savestate_directory\" is not a directory, ignoring...\n");
-         save_dir_missing = true;
-      }
    }
 #ifdef HAVE_CLOUDSYNC
    /* Until a content load checks the folders again */
    if (!without_overrides)
-      task_cloud_sync_set_paused(save_dir_missing);
+      runloop_save_base_check();
 #endif
 
    config_read_keybinds_conf(conf);

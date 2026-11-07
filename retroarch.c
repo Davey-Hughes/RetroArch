@@ -448,6 +448,8 @@ struct rarch_state
    char dir_savestate[DIR_MAX_LENGTH];
    char dir_savefile_configured[DIR_MAX_LENGTH];
    char dir_savestate_configured[DIR_MAX_LENGTH];
+   char dir_savefile_base[DIR_MAX_LENGTH];
+   char dir_savestate_base[DIR_MAX_LENGTH];
 };
 
 /* Forward declarations */
@@ -3418,6 +3420,10 @@ size_t dir_get_size(enum rarch_dir_type type)
          return sizeof(p_rarch->dir_savefile_configured);
       case RARCH_DIR_SAVESTATE_CONFIGURED:
          return sizeof(p_rarch->dir_savestate_configured);
+      case RARCH_DIR_SAVEFILE_BASE:
+         return sizeof(p_rarch->dir_savefile_base);
+      case RARCH_DIR_SAVESTATE_BASE:
+         return sizeof(p_rarch->dir_savestate_base);
       case RARCH_DIR_NONE:
          break;
    }
@@ -3449,6 +3455,12 @@ void dir_clear(enum rarch_dir_type type)
       case RARCH_DIR_SAVESTATE_CONFIGURED:
          *p_rarch->dir_savestate_configured = '\0';
          break;
+      case RARCH_DIR_SAVEFILE_BASE:
+         *p_rarch->dir_savefile_base = '\0';
+         break;
+      case RARCH_DIR_SAVESTATE_BASE:
+         *p_rarch->dir_savestate_base = '\0';
+         break;
       case RARCH_DIR_NONE:
          break;
       case RARCH_DIR_CURRENT_SAVEFILE:
@@ -3469,6 +3481,8 @@ static void dir_clear_all(void)
    dir_clear(RARCH_DIR_SAVESTATE);
    dir_clear(RARCH_DIR_SAVEFILE_CONFIGURED);
    dir_clear(RARCH_DIR_SAVESTATE_CONFIGURED);
+   dir_clear(RARCH_DIR_SAVEFILE_BASE);
+   dir_clear(RARCH_DIR_SAVESTATE_BASE);
 }
 
 /* get ptr functions */
@@ -3493,6 +3507,10 @@ char *dir_get_ptr(enum rarch_dir_type type)
          return p_rarch->dir_savefile_configured;
       case RARCH_DIR_SAVESTATE_CONFIGURED:
          return p_rarch->dir_savestate_configured;
+      case RARCH_DIR_SAVEFILE_BASE:
+         return p_rarch->dir_savefile_base;
+      case RARCH_DIR_SAVESTATE_BASE:
+         return p_rarch->dir_savestate_base;
       case RARCH_DIR_NONE:
          break;
    }
@@ -3526,6 +3544,14 @@ void dir_set(enum rarch_dir_type type, const char *path)
       case RARCH_DIR_SAVESTATE_CONFIGURED:
          strlcpy(p_rarch->dir_savestate_configured, path,
                sizeof(p_rarch->dir_savestate_configured));
+         break;
+      case RARCH_DIR_SAVEFILE_BASE:
+         strlcpy(p_rarch->dir_savefile_base, path,
+               sizeof(p_rarch->dir_savefile_base));
+         break;
+      case RARCH_DIR_SAVESTATE_BASE:
+         strlcpy(p_rarch->dir_savestate_base, path,
+               sizeof(p_rarch->dir_savestate_base));
          break;
       case RARCH_DIR_NONE:
          break;
@@ -9867,6 +9893,10 @@ bool retroarch_main_init_core(int argc, char *argv[],
     * want to do change the default directories.
     */
    dir_check_config();
+#ifdef HAVE_CLOUDSYNC
+   /* It may have made a folder the config load found missing */
+   runloop_save_base_check();
+#endif
 #endif
 
 #ifdef HAVE_ACCESSIBILITY

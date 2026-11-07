@@ -29,7 +29,7 @@ S_BOOL(cloud_sync_sync_saves, CLOUD_SYNC_SYNC_SAVES,
       "cloud_sync_sync_saves",
       true, SD_FLAG_NONE, 0, 0,
       "Sync: Saves/States",
-      "When enabled, saves/states will be synced to cloud.")
+      "When enabled, the save and state folders set in the main configuration are synced to cloud; folders set by an override or the command line are not.")
 #endif
 /* Descriptor and configuration rows are #ifdef HAVE_CLOUDSYNC; the string
  * tables always carry this row via the strings pass. */

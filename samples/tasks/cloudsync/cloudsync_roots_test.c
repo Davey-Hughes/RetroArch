@@ -1,7 +1,7 @@
 /* Whole syncs of the real cloud-sync task over a folder standing in
  * for the server, threaded tasks on and off: what the sync deletes on
  * the server when a folder under a root can't be read, when a folder
- * is unset, and when a root moved.
+ * is unset, when a root moved, and which save folder it walks.
  *
  *   ./cloudsync_roots_test [lane...]   (default: every lane) */
 #include <stdio.h>
@@ -49,13 +49,27 @@ void RARCH_WARN(const char *fmt, ...) { (void)fmt; }
 void RARCH_ERR(const char *fmt, ...) { (void)fmt; }
 bool verbosity_is_enabled(void) { return false; }
 settings_t *config_get_ptr(void) { return NULL; }
-/* The save folder for a lane that lists its folders as the frontend
- * does; the state folder is unset. */
-static char live_saves[256];
+/* For a lane that lists its folders as the frontend does: the main
+ * config's save and state folders and the ones in use. */
+static char main_saves[256], live_saves[256];
+static char main_states[256], live_states[256];
 char *dir_get_ptr(enum rarch_dir_type type)
 {
    static char unset[1];
-   return type == RARCH_DIR_SAVEFILE ? live_saves : unset;
+   switch (type)
+   {
+      case RARCH_DIR_SAVEFILE_BASE:
+         return main_saves;
+      case RARCH_DIR_SAVEFILE:
+         return live_saves;
+      case RARCH_DIR_SAVESTATE_BASE:
+         return main_states;
+      case RARCH_DIR_SAVESTATE:
+         return live_states;
+      default:
+         break;
+   }
+   return unset;
 }
 bool content_savefile_is_live(const char *path) { (void)path; return false; }
 void task_window_progress_cb(retro_task_t *task) { (void)task; }
@@ -377,7 +391,7 @@ static void empty_root_lane(bool threaded)
    settings_t *settings = (settings_t*)calloc(1, sizeof(*settings));
    lane_dirs("empty", threaded, root, sizeof(root));
    snprintf(sys, sizeof(sys), "%s/system-%d", base, threaded ? 1 : 0);
-   strlcpy(live_saves, root, sizeof(live_saves));
+   strlcpy(main_saves, root, sizeof(main_saves));
    put(root, "a.srm", "s");
    put(sys, "bios.bin", "b");
    settings->bools.cloud_sync_sync_saves  = true;
@@ -404,7 +418,7 @@ static void empty_root_lane(bool threaded)
    CHECK(sync_list(threaded, task_cloud_sync_directory_map_new(settings)));
    CHECK(deletes == 0);
    CHECK(fetches == 1);
-   live_saves[0] = '\0';
+   main_saves[0] = '\0';
    free(settings);
 }
 
@@ -481,7 +495,7 @@ static void unset_no_entry(bool threaded)
    settings_t *settings = (settings_t*)calloc(1, sizeof(*settings));
    lane_dirs("unset_no_entry", threaded, root, sizeof(root));
    snprintf(sys, sizeof(sys), "%s-system", root);
-   strlcpy(live_saves, root, sizeof(live_saves));
+   strlcpy(main_saves, root, sizeof(main_saves));
    put(root, "a.srm", "s");
    put(sys, "bios.bin", "b");
    settings->bools.cloud_sync_sync_saves  = true;
@@ -506,7 +520,7 @@ static void unset_no_entry(bool threaded)
    CHECK(deletes == 0);
    CHECK(fetches == 1);
    CHECK(holds(srv, "system/bios.bin", "b"));
-   live_saves[0] = '\0';
+   main_saves[0] = '\0';
    free(settings);
 }
 
@@ -530,6 +544,59 @@ static void roots_no_memory(bool threaded)
    CHECK(roots_name(root_a));
 }
 
+/* Sync walks the main config's save and state folders, not the ones
+ * in use (an override's or the command line's): other folders in use
+ * are no root change. */
+static void main_folder_only(bool threaded)
+{
+   char        root[256], live_a[264], live_b[264];
+   char        states[264], states_a[264], states_b[264];
+   settings_t *settings = (settings_t*)calloc(1, sizeof(*settings));
+   lane_dirs("main_only", threaded, root, sizeof(root));
+   snprintf(live_a, sizeof(live_a), "%s-a", root);
+   snprintf(live_b, sizeof(live_b), "%s-b", root);
+   snprintf(states, sizeof(states), "%s-st", root);
+   snprintf(states_a, sizeof(states_a), "%s-st-a", root);
+   snprintf(states_b, sizeof(states_b), "%s-st-b", root);
+   put(root, "a.srm", "1");
+   put(live_a, "o.srm", "2");
+   put(live_b, "p.srm", "3");
+   put(states, "a.state", "4");
+   put(states_a, "o.state", "5");
+   put(states_b, "p.state", "6");
+   strlcpy(main_saves, root, sizeof(main_saves));
+   strlcpy(live_saves, live_a, sizeof(live_saves));
+   strlcpy(main_states, states, sizeof(main_states));
+   strlcpy(live_states, states_a, sizeof(live_states));
+   settings->bools.cloud_sync_sync_saves = true;
+   CHECK(sync_list(threaded, task_cloud_sync_directory_map_new(settings)));
+   CHECK(uploads == 2);
+   CHECK(holds(srv, "saves/a.srm", "1"));
+   CHECK(!path_is_valid(srv_key("saves/o.srm")));
+   CHECK(holds(srv, "states/a.state", "4"));
+   CHECK(!path_is_valid(srv_key("states/o.state")));
+   CHECK(roots_name(root));
+   CHECK(!roots_name(live_a));
+   CHECK(roots_name(states));
+   CHECK(!roots_name(states_a));
+
+   strlcpy(live_saves, live_b, sizeof(live_saves));
+   strlcpy(live_states, states_b, sizeof(live_states));
+   CHECK(sync_list(threaded, task_cloud_sync_directory_map_new(settings)));
+   CHECK(uploads == 0);
+   CHECK(fetches == 0);
+   CHECK(deletes == 0);
+   CHECK(!path_is_valid(srv_key("saves/p.srm")));
+   CHECK(holds(live_b, "p.srm", "3"));
+   CHECK(!roots_name(live_b));
+   CHECK(!path_is_valid(srv_key("states/p.state")));
+   CHECK(holds(states_b, "p.state", "6"));
+   CHECK(!roots_name(states_b));
+   main_saves[0] = live_saves[0] = '\0';
+   main_states[0] = live_states[0] = '\0';
+   free(settings);
+}
+
 struct lane
 {
    const char *name;
@@ -547,6 +614,7 @@ static const struct lane lanes[] = {
    { "sync_no_roots_file",        no_roots_file },
    { "sync_unset_no_entry",       unset_no_entry },
    { "sync_roots_no_memory",      roots_no_memory },
+   { "sync_main_folder_only",     main_folder_only },
 };
 
 int main(int argc, char **argv)

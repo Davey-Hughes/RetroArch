@@ -993,13 +993,14 @@ static struct string_list *task_cloud_sync_directory_map_new(settings_t *setting
 
    if (settings->bools.cloud_sync_sync_saves)
    {
+      /* the main config's, not an override's or the command line's */
       if (!task_cloud_sync_directory_map_add(list,
                "saves", STRLEN_CONST("saves"),
-               dir_get_ptr(RARCH_DIR_SAVEFILE)))
+               dir_get_ptr(RARCH_DIR_SAVEFILE_BASE)))
          goto error;
       if (!task_cloud_sync_directory_map_add(list,
                "states", STRLEN_CONST("states"),
-               dir_get_ptr(RARCH_DIR_SAVESTATE)))
+               dir_get_ptr(RARCH_DIR_SAVESTATE_BASE)))
          goto error;
    }
 
@@ -2824,7 +2825,7 @@ static bool task_cloud_sync_task_finder(retro_task_t *task, void *user_data)
           && !(task_get_flags(task) & RETRO_TASK_FLG_FINISHED);
 }
 
-/* Set while a save or state root is a fallback (main thread) */
+/* Set while a main config save or state folder is missing (main thread) */
 static bool tcs_paused = false;
 
 void task_cloud_sync_set_paused(bool paused)
@@ -2846,7 +2847,7 @@ static bool task_push_cloud_sync_with_mode(int conflict_resolution,
 
    if (tcs_paused)
    {
-      RARCH_WARN(CSPFX "Paused: the save folder is a temporary one.\n");
+      RARCH_WARN(CSPFX "Paused: the save or state folder is missing.\n");
       return false;
    }
 

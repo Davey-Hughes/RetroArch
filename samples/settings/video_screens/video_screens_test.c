@@ -12,6 +12,7 @@
 #include <streams/file_stream.h>
 #include <time/rtime.h>
 #include <features/features_cpu.h>
+#include <queues/task_queue.h>
 #include <string/stdstring.h>
 
 #include "../../../configuration.h"
@@ -4938,6 +4939,124 @@ static void test_plays_as_override_unplugged(void)
    load_fixture("");
 }
 
+/* The main config's save folders, which cloud sync walks: an override's
+ * folder, a menu edit made while it is loaded and the command line's
+ * folder leave them as the config file has them. */
+static void test_save_dir_base(void)
+{
+   char dir[2048];
+   char a[2048];
+   char b[2048];
+   char c[2048];
+   char text[4200];
+
+   fill_pathname_basedir(dir, fixture_path, sizeof(dir));
+   fill_pathname_join(a, dir, "base_a", sizeof(a));
+   fill_pathname_join(b, dir, "base_b", sizeof(b));
+   fill_pathname_join(c, dir, "base_c", sizeof(c));
+   path_mkdir(a);
+   path_mkdir(b);
+   path_mkdir(c);
+   snprintf(text, sizeof(text), "savefile_directory = \"%s\"\n"
+         "savestate_directory = \"%s\"\n", a, a);
+   load_fixture(text);
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE), a));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVESTATE_BASE), a));
+
+   snprintf(text, sizeof(text), "savefile_directory = \"%s\"\n"
+         "savestate_directory = \"%s\"\n", b, b);
+   write_config(override_path, text);
+   CHECK(config_load_override_file(override_path));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE), b));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE), a));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVESTATE_BASE), a));
+   menu_set_dir("savefile_directory", c);
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE), c));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE), a));
+   CHECK(config_unload_override());
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE), a));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE), a));
+
+   /* With no override, a menu edit is the main config's */
+   menu_set_dir("savefile_directory", c);
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE), c));
+
+   /* -s */
+   retroarch_override_setting_set(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
+   dir_set(RARCH_DIR_SAVEFILE, b);
+   snprintf(text, sizeof(text), "savefile_directory = \"%s\"\n", a);
+   load_fixture(text);
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE), b));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE), a));
+   retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
+
+   strlcpy(g_defaults.dirs[DEFAULT_DIR_SRAM], b,
+         sizeof(g_defaults.dirs[DEFAULT_DIR_SRAM]));
+   strlcpy(g_defaults.dirs[DEFAULT_DIR_SAVESTATE], c,
+         sizeof(g_defaults.dirs[DEFAULT_DIR_SAVESTATE]));
+   load_fixture("savefile_directory = \"default\"\n"
+         "savestate_directory = \"default\"\n");
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE), b));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVESTATE_BASE), c));
+   load_fixture("savefile_directory = \"\"\n"
+         "savestate_directory = \"\"\n");
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE), b));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVESTATE_BASE), c));
+   *g_defaults.dirs[DEFAULT_DIR_SRAM]      = '\0';
+   *g_defaults.dirs[DEFAULT_DIR_SAVESTATE] = '\0';
+   load_fixture("");
+   CHECK(!*dir_get_ptr(RARCH_DIR_SAVEFILE_BASE));
+}
+
+#ifdef HAVE_CLOUDSYNC
+static void cloud_sync_done(retro_task_t *task, void *task_data,
+      void *user_data, const char *err)
+{
+   *(bool*)user_data = true;
+}
+
+/* With no driver, a sync that starts fails at once. */
+static bool cloud_sync_starts(void)
+{
+   bool done = false;
+   unsigned i;
+   config_get_ptr()->bools.cloud_sync_enable = true;
+   if (!task_push_cloud_sync(cloud_sync_done, &done))
+      return false;
+   for (i = 0; !done && i < 1000; i++)
+      task_queue_check();
+   CHECK(done);
+   return true;
+}
+
+/* Sync waits from the config load while a main config folder is
+ * missing, and a menu edit to a folder that exists ends the wait. */
+static void test_save_base_pause(void)
+{
+   char dir[2048];
+   char here[2048];
+   char gone[2048];
+   char text[4200];
+
+   fill_pathname_basedir(dir, fixture_path, sizeof(dir));
+   fill_pathname_join(here, dir, "pause_here", sizeof(here));
+   fill_pathname_join(gone, dir, "pause_gone", sizeof(gone));
+   path_mkdir(here);
+   task_queue_init(false, NULL);
+   snprintf(text, sizeof(text), "savefile_directory = \"%s\"\n"
+         "savestate_directory = \"%s\"\n", here, here);
+   load_fixture(text);
+   CHECK(cloud_sync_starts());
+   snprintf(text, sizeof(text), "savefile_directory = \"%s\"\n"
+         "savestate_directory = \"%s\"\n", gone, here);
+   load_fixture(text);
+   CHECK(!cloud_sync_starts());
+   menu_set_dir("savefile_directory", here);
+   CHECK(cloud_sync_starts());
+   task_queue_deinit();
+}
+#endif
+
 int main(int argc, char **argv)
 {
 #ifdef VIDEO_SCREENS_RUNTIME_TEST
@@ -4969,6 +5088,10 @@ int main(int argc, char **argv)
       test_save_dir_config();
       test_load_save_dir_args();
       test_override_flags_reset();
+      test_save_dir_base();
+#ifdef HAVE_CLOUDSYNC
+      test_save_base_pause();
+#endif
       test_xr_menu_place_config();
    }
    test_window_layout();
