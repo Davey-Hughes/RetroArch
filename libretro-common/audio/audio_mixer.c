@@ -626,27 +626,45 @@ static bool wav_to_float(const rwav_t* wav, const uint8_t* src,
    if (wav->format != RWAV_FORMAT_PCM && wav->format != RWAV_FORMAT_FLOAT)
    {
       rwav_t   h   = *wav;
-      int16_t *tmp = (int16_t*)malloc(wav->numsamples
-            * wav->numchannels * sizeof(int16_t));
+      int16_t *tmp;
       size_t   i, got;
       h.dataoffset = 0;
-      if (!tmp)
+      if (wav->numchannels <= 2)
+      {
+         /* Decoded into the tail of the output itself, no scratch:
+          * the s16 take a half (stereo) or a quarter (mono) of the
+          * buffer's bytes, at its end, and the forward pass writes
+          * each float at or before the bytes of every sample still
+          * to be read.  Those are read through memcpy, a byte access,
+          * so no float store can be ordered ahead of one. */
+         size_t         n = wav->numsamples * wav->numchannels;
+         const uint8_t *t = (const uint8_t*)(f + len) - n * sizeof(int16_t);
+         int16_t        v;
+         got = rwav_decode_s16(&h, src, 0, wav->numsamples,
+               (int16_t*)t);
+         if (wav->numchannels == 1)
+            for (i = 0; i < got; i++)
+            {
+               memcpy(&v, t + i * sizeof(v), sizeof(v));
+               f[2 * i]     = (float)v * (1.0f / 32768.0f);
+               f[2 * i + 1] = f[2 * i];
+            }
+         else
+            for (i = 0; i < got * 2; i++)
+            {
+               memcpy(&v, t + i * sizeof(v), sizeof(v));
+               f[i] = (float)v * (1.0f / 32768.0f);
+            }
+         return true;
+      }
+      if (!(tmp = (int16_t*)malloc(wav->numsamples
+            * wav->numchannels * sizeof(int16_t))))
       {
          memalign_free(f);
          *pcm = NULL;
          return false;
       }
       got = rwav_decode_s16(&h, src, 0, wav->numsamples, tmp);
-      if (wav->numchannels == 1)
-         for (i = 0; i < got; i++)
-         {
-            f[2 * i]     = (float)tmp[i] * (1.0f / 32768.0f);
-            f[2 * i + 1] = f[2 * i];
-         }
-      else if (wav->numchannels == 2)
-         for (i = 0; i < got * 2; i++)
-            f[i] = (float)tmp[i] * (1.0f / 32768.0f);
-      else
       {
          const int32_t (*co)[2] =
                audio_mixer_downmix_wav_q15[wav->numchannels];
@@ -963,26 +981,33 @@ static bool wav_to_s16(const rwav_t* wav, const uint8_t* src,
    if (wav->format != RWAV_FORMAT_PCM && wav->format != RWAV_FORMAT_FLOAT)
    {
       rwav_t   h   = *wav;
-      int16_t *tmp = (int16_t*)malloc(wav->numsamples
-            * wav->numchannels * sizeof(int16_t));
+      int16_t *tmp;
       size_t   i, got;
       h.dataoffset = 0;
-      if (!tmp)
+      if (wav->numchannels <= 2)
+      {
+         /* Decoded straight into the output, no scratch: stereo is
+          * already its layout, and mono lands in the first half and
+          * is spread out from the end, each pair written at or past
+          * the sample it is read from. */
+         got = rwav_decode_s16(&h, src, 0, wav->numsamples, s);
+         if (wav->numchannels == 1)
+            for (i = got; i-- > 0; )
+            {
+               int16_t v    = s[i];
+               s[2 * i]     = v;
+               s[2 * i + 1] = v;
+            }
+         return true;
+      }
+      if (!(tmp = (int16_t*)malloc(wav->numsamples
+            * wav->numchannels * sizeof(int16_t))))
       {
          memalign_free(s);
          *pcm = NULL;
          return false;
       }
       got = rwav_decode_s16(&h, src, 0, wav->numsamples, tmp);
-      if (wav->numchannels == 1)
-         for (i = 0; i < got; i++)
-         {
-            s[2 * i]     = tmp[i];
-            s[2 * i + 1] = tmp[i];
-         }
-      else if (wav->numchannels == 2)
-         memcpy(s, tmp, got * 2 * sizeof(int16_t));
-      else
       {
          const int32_t (*co)[2] =
                audio_mixer_downmix_wav_q15[wav->numchannels];
@@ -2003,6 +2028,19 @@ void audio_mixer_destroy(audio_mixer_sound_t* sound)
  * a mode flip with the sound still loaded (a core switch), and it now
  * builds from the source instead of from the other pipeline. */
 #ifdef HAVE_RWAV
+/* Whether a WAV's pipelines can be sized at all: two output samples a
+ * frame, padded to 16 and held as floats, a decode scratch of one s16
+ * a channel a frame where more than two are folded, and the frame
+ * count kept as an unsigned.  rwav bounds the count by the payload,
+ * but the pipelines expand it up to eightfold (8-bit mono to stereo
+ * float), which still wraps a 32-bit size_t on a large enough file. */
+static bool wav_pipeline_fits(const rwav_t *wav)
+{
+   size_t ch = (wav->numchannels > 2) ? (size_t)wav->numchannels : 2;
+   return     wav->numsamples <= (SIZE_MAX / sizeof(float) - 16) / ch
+          &&  (size_t)(unsigned)wav->numsamples == wav->numsamples;
+}
+
 static bool wav_build_float(audio_mixer_sound_t* sound,
       const char *resampler_ident, enum resampler_quality quality)
 {
@@ -2011,7 +2049,8 @@ static bool wav_build_float(audio_mixer_sound_t* sound,
 
    if (sound->types.wav.pcm)
       return true;
-   if (!sound->types.wav.src)
+   if (     !sound->types.wav.src
+         || !wav_pipeline_fits(&sound->types.wav.hdr))
       return false;
 
    samples = sound->types.wav.hdr.numsamples * 2;
@@ -2049,7 +2088,8 @@ static bool wav_build_s16(audio_mixer_sound_t* sound,
 
    if (sound->types.wav.pcm_s16)
       return true;
-   if (!sound->types.wav.src)
+   if (     !sound->types.wav.src
+         || !wav_pipeline_fits(&sound->types.wav.hdr))
       return false;
 
    samples = sound->types.wav.hdr.numsamples * 2;

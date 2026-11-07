@@ -2460,6 +2460,33 @@ void gfx_widgets_frame(void *data)
    gfx_display_flush_batch(disp_get_ptr());
 }
 
+void gfx_widgets_draw_idle_logo(void *data, uintptr_t texture)
+{
+   unsigned i, side;
+   float white[16];
+   video_frame_info_t *video_info = (video_frame_info_t*)data;
+   gfx_display_t *p_disp          = (gfx_display_t*)video_info->disp_userdata;
+   void *userdata                 = video_info->userdata;
+   unsigned width                 = VIDEO_SCALE_W(video_info->dims);
+   unsigned height                = VIDEO_SCALE_H(video_info->dims);
+
+   if (!texture || !p_disp || !p_disp->dispctx)
+      return;
+   side = ((width < height) ? width : height) / 4;
+   if (!side)
+      return;
+   for (i = 0; i < 16; i++)
+      white[i] = 1.0f;
+   gfx_display_blend_begin(p_disp->dispctx, userdata);
+   gfx_widgets_draw_icon(userdata, p_disp, video_info->dims,
+         VIDEO_SCALE_PACK(side, side), texture,
+         (float)(width - side) / 2.0f, (float)(height - side) / 2.0f,
+         0.0f, 1.0f, 0.0f, white);
+   gfx_display_blend_end(p_disp->dispctx, userdata);
+   /* Nothing gathered may still be waiting when the logo is done */
+   gfx_display_flush_batch(p_disp);
+}
+
 static void gfx_widgets_free(dispgfx_widget_t *p_dispwidget)
 {
    size_t i;
@@ -2854,18 +2881,9 @@ static void gfx_widgets_detach_tasks(dispgfx_widget_t *p_dispwidget)
 {
    size_t i;
 
-   /* Not displayed yet: discarded outright, with the updates nobody
-    * will apply. */
-   for (;;)
-   {
-      disp_widget_msg_t *msg_widget = gfx_widgets_pending_pop(p_dispwidget);
-
-      if (!msg_widget)
-         break;
-
-      gfx_widgets_msg_queue_free(p_dispwidget, msg_widget);
-      free(msg_widget);
-   }
+   /* Task updates not applied yet are discarded: nobody will apply
+    * them. The pending ring holds only plain messages, which wait for
+    * the next owner or for gfx_widgets_free(). */
    gfx_widgets_task_cmds_discard(p_dispwidget);
    gfx_widgets_task_pending_discard(p_dispwidget);
 
@@ -3065,9 +3083,9 @@ void gfx_widgets_worker_step(void *data,
    if (!retro_atomic_load_acquire_int(&p_dispwidget->worker))
       return;
 
-   /* Per-eye UI lays out at one eye's size. */
-   widget_dims = video_views_ui_dims(&video_info->views_layout,
-         video_info->dims);
+   /* At the notifications' window's size: one eye's for per-eye UI */
+   widget_dims = video_frame_ui_layer_dims(video_info,
+         VIDEO_WINDOW_UI_NOTIFICATIONS);
 
    if (gfx_widgets_update_layout(disp_get_ptr(),
             video_info->widget_scale_factor, widget_dims,

@@ -1017,6 +1017,35 @@ static void thread_update_driver_state(thread_video_t *thr)
    }
 }
 
+static void video_thread_views_apply(thread_video_t *thr, unsigned count)
+{
+   thr->views_count       = count;
+   thr->views_shrink_left = 0;
+   if (thr->driver_data && thr->poke && thr->poke->set_view_count)
+      thr->poke->set_view_count(thr->driver_data, count);
+}
+
+/* A frame queued before the count shrank draws with its own map's
+ * views, as it would unthreaded, so the driver takes a smaller count
+ * after the frames older than the command. The main thread pushes them
+ * and is waiting in the send: they are the one claimed and the ones
+ * pending. A grow parses the shader preset, which needs the main
+ * thread waiting, so it applies now. */
+static void video_thread_set_view_count(thread_video_t *thr,
+      unsigned count)
+{
+   int st         = video_thread_ring_load(thr);
+   unsigned older = VIDEO_THREAD_RING_BUSY_OF(st)
+      + VIDEO_THREAD_RING_PENDING_OF(st);
+   if (count < thr->views_count && older)
+   {
+      thr->views_shrink_to   = count;
+      thr->views_shrink_left = older;
+   }
+   else
+      video_thread_views_apply(thr, count);
+}
+
 /* returns true when video_thread_loop should quit */
 static bool video_thread_handle_packet(
       thread_video_t *thr,
@@ -1434,9 +1463,7 @@ static bool video_thread_handle_packet(
          break;
 
       case CMD_POKE_SET_VIEW_COUNT:
-         if (thr->driver_data && thr->poke && thr->poke->set_view_count)
-            thr->poke->set_view_count(thr->driver_data,
-                  (unsigned)pkt.data.i);
+         video_thread_set_view_count(thr, (unsigned)pkt.data.i);
          video_thread_reply(thr, &pkt);
          break;
 
@@ -2920,6 +2947,12 @@ static void video_thread_loop(void *data)
                 * value carried from the main thread is whatever it read
                 * when the frame was built and is superseded here. */
                video_info->swap_count = thr->video_st->swap_count;
+#ifdef HAVE_VIDEO_WINDOWS
+               /* The snapshot the driver's window layouts are drawn
+                * from */
+               if (video_info->windows)
+                  thr->video_st->windows_drawn = video_info->windows->serial;
+#endif
                /* Retain what this frame puts on screen when the setting
                 * is on and the driver can put it there again. Shader
                 * sub-frames opt out: each is a different shader output
@@ -3235,6 +3268,8 @@ static void video_thread_loop(void *data)
             retro_atomic_store_release_int(&thr->frame.mem[frame_mem].busy, 1);
          }
          video_thread_ring_complete(thr);
+         if (thr->views_shrink_left && !--thr->views_shrink_left)
+            video_thread_views_apply(thr, thr->views_shrink_to);
 
          if (tex_retire)
          {

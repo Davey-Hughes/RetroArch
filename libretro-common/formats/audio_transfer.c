@@ -1138,6 +1138,9 @@ struct audio_transfer_ac3
    size_t          pend_n;      /* frames in pend */
    size_t          pend_off;    /* frames of pend already handed out */
    bool            ended;
+   /* The map is the identity (mono, 2.0, 3.0, 5.1: the decoder's slot
+    * order is already WAV's): frames decode straight to where they go */
+   bool            identity;
 };
 
 static size_t audio_transfer_ac3_end(const struct audio_transfer_ac3 *a)
@@ -1148,11 +1151,20 @@ static size_t audio_transfer_ac3_end(const struct audio_transfer_ac3 *a)
 /* Decodes the frame at pos into pend, advances pos. Returns 1 on a
  * frame, 0 at the end of the buffer (or the frontier), -1 on a bad
  * frame. */
-static int audio_transfer_ac3_next(struct audio_transfer_ac3 *a)
+/* Decodes the frame at pos, in the mixer's channel shape, into @fdst
+ * as floats or else @sdst as s16, and advances pos.  Returns 1 with
+ * the frame count in @frames, 0 at the end of the buffer (or the
+ * frontier), -1 on a bad frame.  An identity map decodes straight
+ * into @fdst; any other map, and the s16 form, go through the
+ * decoder's own buffer once, with the map, gain and conversion in
+ * one pass on the way out. */
+static int audio_transfer_ac3_next_into(struct audio_transfer_ac3 *a,
+      float *fdst, int16_t *sdst, size_t *frames)
 {
    rac3_frame_info_t info;
    size_t end = audio_transfer_ac3_end(a);
    size_t got;
+   float *dec;
    enum rac3_status st;
    if (a->pos >= end)
       return 0;
@@ -1165,28 +1177,50 @@ static int audio_transfer_ac3_next(struct audio_transfer_ac3 *a)
       return 0;
    if (info.channels != a->dec_channels || info.sample_rate != a->rate)
       return -1;
-   got = rac3_decode_frame(a->dec, a->buf + a->pos, info.frame_bytes, a->raw, &info);
+   dec = (a->identity && fdst) ? fdst : a->raw;
+   got = rac3_decode_frame(a->dec, a->buf + a->pos, info.frame_bytes, dec, &info);
    if (!got)
       return -1;
+   if (dec != fdst)
    {
-      size_t f; unsigned c;
-      for (f = 0; f < got; f++)
-      {
-         const float *in = a->raw + f * a->dec_channels;
-         float *out      = a->pend + f * a->channels;
-         for (c = 0; c < a->channels; c++)
+      size_t f, i; unsigned c;
+      if (a->identity)
+         /* s16 of an identity map: the conversion alone */
+         for (i = 0; i < got * a->channels; i++)
+            sdst[i] = audio_transfer_unit_to_s16(a->raw[i]);
+      else
+         for (f = 0; f < got; f++)
          {
-            float v = in[a->map_a[c]];
-            if (a->map_b[c] >= 0)
-               v += in[a->map_b[c]];
-            out[c] = v * a->map_g[c];
+            const float *in = a->raw + f * a->dec_channels;
+            for (c = 0; c < a->channels; c++)
+            {
+               float v = in[a->map_a[c]];
+               if (a->map_b[c] >= 0)
+                  v += in[a->map_b[c]];
+               v *= a->map_g[c];
+               if (fdst)
+                  fdst[f * a->channels + c] = v;
+               else
+                  sdst[f * a->channels + c] = audio_transfer_unit_to_s16(v);
+            }
          }
-      }
    }
-   a->pos      += info.frame_bytes;
-   a->pend_n    = got;
-   a->pend_off  = 0;
+   a->pos += info.frame_bytes;
+   *frames = got;
    return 1;
+}
+
+/* Decodes the frame at pos into pend.  Same returns. */
+static int audio_transfer_ac3_next(struct audio_transfer_ac3 *a)
+{
+   size_t got = 0;
+   int    r   = audio_transfer_ac3_next_into(a, a->pend, NULL, &got);
+   if (r == 1)
+   {
+      a->pend_n   = got;
+      a->pend_off = 0;
+   }
+   return r;
 }
 
 /* The WAV-shaped channel set for an A/52 layout: the count the mixer
@@ -1229,6 +1263,11 @@ static void audio_transfer_ac3_map(struct audio_transfer_ac3 *a)
    }
 #undef AC3_OUT
    a->channels = out;
+   a->identity = (out == a->dec_channels);
+   for (i = 0; i < out; i++)
+      if (     a->map_a[i] != (int)i || a->map_b[i] >= 0
+            || a->map_g[i] != 1.0f)
+         a->identity = false;
    (void)lfe;
 }
 
@@ -1312,7 +1351,24 @@ static int audio_transfer_ac3_read(struct audio_transfer_ac3 *a,
          int r;
          if (a->ended)
             break;
-         r = audio_transfer_ac3_next(a);
+         /* Room for a whole frame (an A/52 frame is at most 1536):
+          * decode it straight into the caller's buffer */
+         if (frames - produced >= 1536)
+         {
+            size_t got = 0;
+            r = audio_transfer_ac3_next_into(a,
+                  out_f32 ? out_f32 + produced * a->channels : NULL,
+                  out_f32 ? NULL    : out_s16 + produced * a->channels,
+                  &got);
+            if (r == 1)
+            {
+               a->frame_pos += got;
+               produced     += got;
+               continue;
+            }
+         }
+         else
+            r = audio_transfer_ac3_next(a);
          if (r < 0)
          {
             if (frames_out) *frames_out = produced;
@@ -2794,10 +2850,12 @@ static int audio_transfer_flac_feed(struct audio_transfer_flac *fl)
 #endif
       )
    {
-      /* Buffer mode: one span, handed over once. */
+      /* Buffer mode: one span, handed over once, and it is the whole
+       * stream - which lets the decoder skip its rewind points. */
       if (fl->fed_hdr)
          return 0;
       rflac_set_in(fl->handle, (const uint8_t*)fl->data, fl->size);
+      rflac_set_eof(fl->handle);
       fl->fed_hdr = 1;
       return 1;
    }
@@ -2849,6 +2907,19 @@ static size_t audio_transfer_flac_pull(struct audio_transfer_flac *fl,
    return produced;
 }
 
+/* How many frames a decode-forward step may ask for into a scratch of
+ * @samples s16: the scratch holds frames times channels, and FLAC goes
+ * up to eight channels.  Before the header is read the count is not
+ * known, so the step assumes the most. */
+static size_t audio_transfer_flac_step_frames(
+      const struct audio_transfer_flac *fl, size_t samples)
+{
+   const rflac_format_t *ff = rflac_format(fl->handle);
+   unsigned ch = (ff && ff->channels && ff->channels <= 8)
+      ? ff->channels : 8;
+   return samples / ch;
+}
+
 /* Restarts the stream and decodes forward to @frame.  Returns 1 when
  * positioned. */
 static uint32_t audio_transfer_flac_seek_to(struct audio_transfer_flac *fl,
@@ -2880,6 +2951,7 @@ static uint32_t audio_transfer_flac_seek_to(struct audio_transfer_flac *fl,
          rflac_seek_resumed(fl->handle, 0);
          rflac_set_in(fl->handle, (const uint8_t*)fl->data + at,
                fl->size - (size_t)at);
+         rflac_set_eof(fl->handle);
          fl->fed_hdr = 1;
          fl->cursor  = (size_t)at;
          /* The table names the boundary, not the frame; close the
@@ -2889,9 +2961,11 @@ static uint32_t audio_transfer_flac_seek_to(struct audio_transfer_flac *fl,
          {
             int16_t skip[1024 * 2];
             size_t  want = (size_t)(frame - landed);
+            size_t  most = audio_transfer_flac_step_frames(fl,
+                  sizeof(skip) / sizeof(skip[0]));
             size_t  got;
-            if (want > 1024)
-               want = 1024;
+            if (want > most)
+               want = most;
             got = audio_transfer_flac_pull(fl, skip, want, 0);
             if (!got)
                break;
@@ -2920,9 +2994,11 @@ static uint32_t audio_transfer_flac_seek_to(struct audio_transfer_flac *fl,
    for (at = 0; at < frame; )
    {
       size_t want = (size_t)(frame - at);
+      size_t most = audio_transfer_flac_step_frames(fl,
+            sizeof(scratch) / sizeof(scratch[0]));
       size_t got;
-      if (want > 1024)
-         want = 1024;
+      if (want > most)
+         want = most;
       got = audio_transfer_flac_pull(fl, scratch, want, 0);
       if (!got)
          return 0;

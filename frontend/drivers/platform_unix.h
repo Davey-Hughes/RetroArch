@@ -77,6 +77,10 @@ struct android_app;
 #define ANDROID_DISPLAY_ON       (1 << 2)
 #define ANDROID_DISPLAY_PRIVATE  (1 << 3)
 #define ANDROID_DISPLAY_PHYSICAL (1 << 4)
+#define ANDROID_DISPLAY_REFUSED  (1 << 5)
+#define ANDROID_DISPLAY_DEFAULT  (1 << 6)
+#define ANDROID_DISPLAY_EXTERNAL (1 << 7)
+#define ANDROID_DISPLAY_INTERNAL (1 << 8)
 
 /* Fingers tracked on each display */
 #define MAX_TOUCH 16
@@ -85,8 +89,8 @@ struct android_app;
  * LTRIGGER, RTRIGGER, BRAKE, GAS */
 #define ANDROID_JOYSTICK_AXES 10
 
-/* What native input reads of a key or a joystick move, from the input
- * queue or from the second display's window */
+/* What native input reads of a key or a joystick move from the input
+ * queue */
 typedef struct android_input_fields
 {
    int64_t event_time; /* ns, AKeyEvent_getEventTime()'s clock */
@@ -173,11 +177,6 @@ struct android_input_reader
    retro_atomic_int_t quit;
 };
 
-/* The least number of keys and stick moves the second display's ring
- * holds; a down or a move leaves room for this many ups */
-#define ANDROID_SECOND_INPUTS    512
-#define ANDROID_SECOND_INPUT_UPS 32
-
 /* A touch on the second display, UI thread to the input poll */
 typedef struct android_second_touch
 {
@@ -202,9 +201,6 @@ struct android_second_display
 {
    /* android_second_touch_t records, UI thread to app thread */
    retro_spsc_t touches;
-   /* android_input_fields_t records: the keys and stick moves its
-    * window received, UI thread to app thread */
-   retro_spsc_t inputs;
    /* The newest surface not yet taken, struct android_second_surface *;
     * the taker owns it. UI thread in, video thread out. */
    retro_atomic_ptr_t surface;
@@ -221,6 +217,9 @@ struct android_second_display
    /* Video thread: a hide sent while no window held anything; the
     * surfaces made for earlier requests are given up, 0 none */
    retro_atomic_int_t released;
+   /* UI thread in, or the app thread when it could not ask; app thread
+    * out: the number of the last move Java could not start, 0 none */
+   retro_atomic_int_t move_failed;
 };
 
 /* Request number @a was sent before @b; wrap-safe */
@@ -285,8 +284,8 @@ struct android_app
    int destroy_from_framework;
 
    /*  Below are "private" implementation of RA code. */
-   /* Written by the app thread when the focus of its two windows
-    * changes (android_focus.h), read by the video thread in
+   /* Written by the app thread when the Activity's window gains or
+    * loses the focus (android_focus.h), read by the video thread in
     * dispserv_android.c. */
    retro_atomic_int_t unfocused;
    /* App thread only */
@@ -353,6 +352,7 @@ struct android_app
    jmethodID showKeyboard;
    jmethodID hideKeyboard;
    jmethodID setSecondDisplay;
+   jmethodID moveToDisplay;
 #ifdef HAVE_VULKAN_CUSTOM_DRIVER
    jmethodID addSafeStartShortcut;
 #endif
@@ -498,14 +498,7 @@ enum
     * surface or the display list changed, so the screens' windows get
     * another try.
     */
-   APP_CMD_SECOND_WINDOW_CHANGED,
-
-   /**
-    * Commands from the second display's controller, no ticket: its
-    * window gained focus, or lost it or went.
-    */
-   APP_CMD_SECOND_GAINED_FOCUS,
-   APP_CMD_SECOND_LOST_FOCUS
+   APP_CMD_SECOND_WINDOW_CHANGED
 };
 
 /* The JNI exception guard and call wrappers live in
@@ -572,6 +565,15 @@ extern struct android_app *g_android;
  * they arrive. */
 void android_second_display_request(unsigned ordinal, bool given_up);
 
+/* App thread: asks Java to move RetroArch's Activity onto the display
+ * whose id is @display_id; @move numbers the move. One-way: posts and
+ * returns. */
+void android_activity_move_request(int display_id, unsigned move);
+
+/* App thread: once, the number of the last move Java could not start;
+ * 0 for none. */
+unsigned android_activity_move_failed(void);
+
 /* Releases a surface's window and frees it. Any thread that owns it. */
 void android_second_surface_free(struct android_second_surface *node);
 
@@ -582,6 +584,11 @@ void frontend_android_get_manufacturer_model(char *s, size_t len);
 void frontend_android_get_version(int32_t *major, int32_t *minor, int32_t *rel);
 
 void frontend_android_get_version_sdk(int32_t *sdk);
+
+/* Resolves @path, symlinks included, into @s; true only when the
+ * result lies in one of the app's own core folders.  Open @s, not
+ * @path: the checked path is then the opened one. */
+bool android_core_path_resolve(const char *path, char *s, size_t len);
 
 bool is_screen_reader_enabled(void);
 

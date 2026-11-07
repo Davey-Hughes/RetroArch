@@ -2233,6 +2233,361 @@ end:
    free(p);
 }
 
+#define CISO_BLOCK 0x8000
+
+/* A CISO of one stored 32 KiB block, disc block @at, holding a disc
+ * header with @id and the system's @magic at @magic_at. */
+static int write_ciso(const char *path, unsigned at, const char *id,
+      const char *magic, unsigned magic_at)
+{
+   uint8_t *d = (uint8_t*)calloc(1, 2 * CISO_BLOCK);
+   int      ok;
+
+   if (!d)
+      return 0;
+   memcpy(d, "CISO", 4);
+   d[5]      = (uint8_t)(CISO_BLOCK >> 8);
+   d[8 + at] = 1;
+   memcpy(d + CISO_BLOCK, id, strlen(id));
+   memcpy(d + CISO_BLOCK + magic_at, magic, 4);
+   ok = write_bytes(path, d, 2 * CISO_BLOCK);
+   free(d);
+   return ok;
+}
+
+/* CISO files take the serial lookup through the disc image they stand
+ * for: a GameCube and a Wii image match by serial, and one whose disc
+ * starts with a block left out matches nothing, though its first
+ * stored block holds a header. */
+static void ciso_lane(const char *root, const char *pl_dir,
+      const char *db_dir)
+{
+   static const db_rec_t gc_recs[] = {
+      { "Cube The Game", "DL-DOL-GALE-USA", 0x3C150001u, 2 * CISO_BLOCK },
+      { "Gap The Game",  "DL-DOL-GAPE-USA", 0x3C150003u, 2 * CISO_BLOCK }
+   };
+   static const db_rec_t wii_recs[] = {
+      { "Wii The Game",  "RMCE01",          0x3C150002u, 2 * CISO_BLOCK }
+   };
+   char *ciso_db = (char*)malloc(512);
+   char *ciso_in = (char*)malloc(512);
+   char *p       = (char*)malloc(1024);
+   bool  started;
+
+   if (!ciso_db || !ciso_in || !p)
+   {
+      check(0, "ciso lane", "out of memory");
+      goto end;
+   }
+
+   sprintf(ciso_db, "%s/scan_db_ciso", root);
+   sprintf(ciso_in, "%s/scan_ciso",    root);
+   path_mkdir(ciso_db);
+   path_mkdir(ciso_in);
+
+   sprintf(p, "%s/Test GameCube.rdb", ciso_db);
+   if (!write_db_set(p, gc_recs, ARRAY_SIZE(gc_recs)))
+   { check(0, "fixture", "could not write database"); goto end; }
+   sprintf(p, "%s/Test Wii.rdb", ciso_db);
+   if (!write_db_set(p, wii_recs, ARRAY_SIZE(wii_recs)))
+   { check(0, "fixture", "could not write database"); goto end; }
+
+   sprintf(p, "%s/50_cube.ciso", ciso_in);
+   if (!write_ciso(p, 0, "GALE01", "\xc2\x33\x9f\x3d", 0x1c))
+   { check(0, "fixture", "could not write image"); goto end; }
+   sprintf(p, "%s/51_wii.ciso", ciso_in);
+   if (!write_ciso(p, 0, "RMCE01", "\x5d\x1c\x9e\xa3", 0x18))
+   { check(0, "fixture", "could not write image"); goto end; }
+   sprintf(p, "%s/52_gap.ciso", ciso_in);
+   if (!write_ciso(p, 1, "GAPE01", "\xc2\x33\x9f\x3d", 0x1c))
+   { check(0, "fixture", "could not write image"); goto end; }
+
+   strlcpy(config_get_ptr()->paths.path_content_database, ciso_db,
+         sizeof(config_get_ptr()->paths.path_content_database));
+   started = run_scan(ciso_in);
+   strlcpy(config_get_ptr()->paths.path_content_database, db_dir,
+         sizeof(config_get_ptr()->paths.path_content_database));
+   if (!started)
+   {
+      check(0, "ciso scan started", "task_push_dbscan refused");
+      goto end;
+   }
+
+   check(scan_completed, "ciso scan completed",
+         scan_completed ? "callback fired" : "timed out");
+   sprintf(p, "%s/Test GameCube.lpl", pl_dir);
+   check(   file_contains(p, "50_cube.ciso")
+         && file_contains(p, "Cube The Game"),
+         "GameCube CISO matches by serial", "50_cube.ciso");
+   check(!file_contains(p, "52_gap.ciso"),
+         "CISO read as its disc image", "52_gap.ciso unmatched");
+   sprintf(p, "%s/Test Wii.lpl", pl_dir);
+   check(   file_contains(p, "51_wii.ciso")
+         && file_contains(p, "Wii The Game"),
+         "Wii CISO matches by serial", "51_wii.ciso");
+
+end:
+   free(ciso_db);
+   free(ciso_in);
+   free(p);
+}
+
+#define XBOX_SECTOR 2048
+
+static void xbox_put_be32(uint8_t *p, uint32_t v)
+{
+   p[0] = (uint8_t)(v >> 24);
+   p[1] = (uint8_t)(v >> 16);
+   p[2] = (uint8_t)(v >> 8);
+   p[3] = (uint8_t)v;
+}
+
+/* An XEX's head: one optional header, the execution info, with
+ * @title, disc @disc of @discs */
+static void xbox_xex(uint8_t *x, uint32_t title, uint8_t disc,
+      uint8_t discs)
+{
+   memcpy(x, "XEX2", 4);
+   xbox_put_be32(x + 8, 0x60);
+   xbox_put_be32(x + 20, 1);
+   xbox_put_be32(x + 24, 0x00040006u);
+   xbox_put_be32(x + 28, 0x48);
+   xbox_put_be32(x + 0x48 + 12, title);
+   x[0x48 + 18] = disc;
+   x[0x48 + 19] = discs;
+}
+
+static void xbox_put32(uint8_t *p, uint32_t v)
+{
+   p[0] = (uint8_t)v;
+   p[1] = (uint8_t)(v >> 8);
+   p[2] = (uint8_t)(v >> 16);
+   p[3] = (uint8_t)(v >> 24);
+}
+
+/* An Xbox disc image of @size with its game partition at @base: the
+ * volume descriptor, a root holding default.xbe, and its title @title.
+ * With @ps2_spaces the field at 0x8008 holds what detect_system()
+ * takes for a PS2 DVD. Written sparsely: only the partition's head. */
+static int write_xbox_disc(const char *path, uint32_t base, uint32_t size,
+      uint32_t title, bool ps2_spaces, bool x360, uint8_t disc,
+      uint8_t discs)
+{
+   uint8_t *d = (uint8_t*)calloc(1, 40 * XBOX_SECTOR);
+   uint8_t *v = d + 32 * XBOX_SECTOR;
+   uint8_t *r = d + 33 * XBOX_SECTOR;
+   uint8_t *x = d + 34 * XBOX_SECTOR;
+   FILE    *f;
+   int      ok;
+
+   if (!d)
+      return 0;
+   memcpy(v, "MICROSOFT*XBOX*MEDIA", 20);
+   xbox_put32(v + 0x14, 33);
+   xbox_put32(v + 0x18, XBOX_SECTOR);
+   xbox_put32(r + 4, 34);
+   xbox_put32(r + 8, 4 * XBOX_SECTOR);
+   r[12] = 0x20;
+   r[13] = 11;
+   memcpy(r + 14, x360 ? "default.xex" : "default.xbe", 11);
+   if (x360)
+      xbox_xex(x, title, disc, discs);
+   else
+   {
+      memcpy(x, "XBEH", 4);
+      xbox_put32(x + 0x104, 0x10000);
+      xbox_put32(x + 0x118, 0x10000 + 0x178);
+      xbox_put32(x + 0x178 + 8, title);
+   }
+
+   if (!(f = fopen(path, "wb")))
+   {
+      free(d);
+      return 0;
+   }
+   ok = 1;
+   if (ps2_spaces)
+      ok = !fseek(f, 0x8008, SEEK_SET) && fwrite("           ", 1, 11, f) == 11;
+   ok = ok && !fseek(f, (long)base, SEEK_SET)
+           && fwrite(d, 1, 40 * XBOX_SECTOR, f) == 40 * XBOX_SECTOR
+           && !fseek(f, (long)size - 1, SEEK_SET)
+           && fputc(0, f) == 0;
+   ok = !fclose(f) && ok;
+   free(d);
+   return ok;
+}
+
+static int write_xbox(const char *path, uint32_t base, uint32_t size,
+      uint32_t title, bool ps2_spaces)
+{
+   return write_xbox_disc(path, base, size, title, ps2_spaces,
+         false, 0, 0);
+}
+
+/* Xbox discs take the serial lookup by their XBE's title: an XISO, a
+ * trimmed one named .iso, which the ISO size hint would rule out, and
+ * a whole XGD3 image whose video partition reads as a PS2 DVD to
+ * detect_system(). */
+static void xbox_lane(const char *root, const char *pl_dir,
+      const char *db_dir)
+{
+   /* sizes no trimmed image comes near, as Redump's do */
+   static const db_rec_t xbox_recs[] = {
+      { "Halo The Game",  "MS-004", 0x3B0E0001u, 0xF0000000u },
+      { "Trim The Game",  "MS-012", 0x3B0E0002u, 0xF0000000u },
+      { "Whole The Game", "EA-013", 0x3B0E0003u, 0xF0000000u }
+   };
+   char *xbox_db = (char*)malloc(512);
+   char *xbox_in = (char*)malloc(512);
+   char *p       = (char*)malloc(1024);
+   bool  started;
+
+   if (!xbox_db || !xbox_in || !p)
+   {
+      check(0, "xbox lane", "out of memory");
+      goto end;
+   }
+
+   sprintf(xbox_db, "%s/scan_db_xbox", root);
+   sprintf(xbox_in, "%s/scan_xbox",    root);
+   path_mkdir(xbox_db);
+   path_mkdir(xbox_in);
+
+   sprintf(p, "%s/Test Xbox.rdb", xbox_db);
+   if (!write_db_set(p, xbox_recs, ARRAY_SIZE(xbox_recs)))
+   { check(0, "fixture", "could not write database"); goto end; }
+
+   sprintf(p, "%s/60_halo.xiso", xbox_in);
+   if (!write_xbox(p, 0, 0x100000, 0x4D530004u, false))
+   { check(0, "fixture", "could not write image"); goto end; }
+   sprintf(p, "%s/61_trim.iso", xbox_in);
+   if (!write_xbox(p, 0, 0x100000, 0x4D53000Cu, false))
+   { check(0, "fixture", "could not write image"); goto end; }
+   sprintf(p, "%s/62_whole.iso", xbox_in);
+   if (!write_xbox(p, 0x2080000, 0x2080000 + 0x100000, 0x4541000Du, true))
+   { check(0, "fixture", "could not write image"); goto end; }
+
+   strlcpy(config_get_ptr()->paths.path_content_database, xbox_db,
+         sizeof(config_get_ptr()->paths.path_content_database));
+   started = run_scan(xbox_in);
+   strlcpy(config_get_ptr()->paths.path_content_database, db_dir,
+         sizeof(config_get_ptr()->paths.path_content_database));
+   if (!started)
+   {
+      check(0, "xbox scan started", "task_push_dbscan refused");
+      goto end;
+   }
+
+   check(scan_completed, "xbox scan completed",
+         scan_completed ? "callback fired" : "timed out");
+   sprintf(p, "%s/Test Xbox.lpl", pl_dir);
+   check(   file_contains(p, "60_halo.xiso")
+         && file_contains(p, "Halo The Game"),
+         "XISO matches by its XBE title", "60_halo.xiso");
+   check(   file_contains(p, "61_trim.iso")
+         && file_contains(p, "Trim The Game"),
+         "trimmed .iso not ruled out by size", "61_trim.iso");
+   check(   file_contains(p, "62_whole.iso")
+         && file_contains(p, "Whole The Game"),
+         "whole XGD3 image past the PS2 magic", "62_whole.iso");
+
+end:
+   free(xbox_db);
+   free(xbox_in);
+   free(p);
+}
+
+/* Xbox 360 content takes the serial lookup by its title: a whole XGD3
+ * disc, the second of a set, an XEX and an STFS package on their own;
+ * a .xex that is no Xbox 360 executable (an Atari 8-bit one) still
+ * matches its own database by CRC. */
+static void x360_lane(const char *root, const char *pl_dir,
+      const char *db_dir)
+{
+   static const db_rec_t x360_recs[] = {
+      { "Set The Game (Disc 1)", "FO-2046-0", 0x3B360001u, 0xF0000000u },
+      { "Set The Game (Disc 2)", "FO-2046-1", 0x3B360002u, 0xF0000000u },
+      { "Exe The Game",          "AV-2071",   0x3B360003u, 0xF0000000u },
+      { "Arcade The Game",       "XA-2209",   0x3B360004u, 0xF0000000u }
+   };
+   char    *x_db = (char*)malloc(512);
+   char    *x_in = (char*)malloc(512);
+   char    *p    = (char*)malloc(1024);
+   uint8_t *d    = (uint8_t*)calloc(1, 0x1000);
+   bool     started;
+
+   if (!x_db || !x_in || !p || !d)
+   {
+      check(0, "x360 lane", "out of memory");
+      goto end;
+   }
+
+   sprintf(x_db, "%s/scan_db_x360", root);
+   sprintf(x_in, "%s/scan_x360",    root);
+   path_mkdir(x_db);
+   path_mkdir(x_in);
+
+   sprintf(p, "%s/Test Xbox 360.rdb", x_db);
+   if (!write_db_set(p, x360_recs, ARRAY_SIZE(x360_recs)))
+   { check(0, "fixture", "could not write database"); goto end; }
+   sprintf(p, "%s/Test Atari.rdb", x_db);
+   if (!write_db(p, "Atari The Game", 0x3B360005u, 0x1000))
+   { check(0, "fixture", "could not write database"); goto end; }
+
+   sprintf(p, "%s/70_disc2.iso", x_in);
+   if (!write_xbox_disc(p, 0x2080000, 0x2080000 + 0x100000, 0x464F07FEu,
+         false, true, 2, 2))
+   { check(0, "fixture", "could not write image"); goto end; }
+   xbox_xex(d, 0x41560817u, 1, 1);
+   sprintf(p, "%s/71_game.xex", x_in);
+   if (!write_bytes(p, d, 0x1000))
+   { check(0, "fixture", "could not write executable"); goto end; }
+   memset(d, 0, 0x1000);
+   memcpy(d, "LIVE", 4);
+   xbox_put_be32(d + 0x360, 0x584108A1u);
+   sprintf(p, "%s/72_arcade.xcp", x_in);
+   if (!write_bytes(p, d, 0x1000))
+   { check(0, "fixture", "could not write package"); goto end; }
+   sprintf(p, "%s/73_atari.xex", x_in);
+   if (!write_content(p, 0x3B360005u, 0x1000))
+   { check(0, "fixture", "crc forcing failed"); goto end; }
+
+   strlcpy(config_get_ptr()->paths.path_content_database, x_db,
+         sizeof(config_get_ptr()->paths.path_content_database));
+   started = run_scan(x_in);
+   strlcpy(config_get_ptr()->paths.path_content_database, db_dir,
+         sizeof(config_get_ptr()->paths.path_content_database));
+   if (!started)
+   {
+      check(0, "x360 scan started", "task_push_dbscan refused");
+      goto end;
+   }
+
+   check(scan_completed, "x360 scan completed",
+         scan_completed ? "callback fired" : "timed out");
+   sprintf(p, "%s/Test Xbox 360.lpl", pl_dir);
+   check(   file_contains(p, "70_disc2.iso")
+         && file_contains(p, "Set The Game (Disc 2)")
+         && !file_contains(p, "Set The Game (Disc 1)"),
+         "360 disc matches its place in the set", "70_disc2.iso");
+   check(   file_contains(p, "71_game.xex")
+         && file_contains(p, "Exe The Game"),
+         "XEX matches by its title", "71_game.xex");
+   check(   file_contains(p, "72_arcade.xcp")
+         && file_contains(p, "Arcade The Game"),
+         "STFS package matches by its title", "72_arcade.xcp");
+   sprintf(p, "%s/Test Atari.lpl", pl_dir);
+   check(   file_contains(p, "73_atari.xex")
+         && file_contains(p, "Atari The Game"),
+         "other .xex still matches by CRC", "73_atari.xex");
+
+end:
+   free(x_db);
+   free(x_in);
+   free(p);
+   free(d);
+}
+
 /* The folder a playlist refreshes from, its default core and
  * whether it recurses.  False when the playlist holds no scan record. */
 static bool scan_record(const char *lpl, char *dir, char *core,
@@ -11207,6 +11562,62 @@ int main(int argc, char **argv)
    }
    sprintf(p, "%s/ctr_libretro.so", core_dir);
    { FILE *f = fopen(p, "wb"); if (f) { fputs("\177ELF", f); fclose(f); } }
+   sprintf(p, "%s/gcn_libretro.info", info_dir);
+   {
+      FILE *f = fopen(p, "w");
+      if (!f)
+      { check(0, "fixture", "could not write core info"); return 1; }
+      fprintf(f,
+            "display_name = \"GameCube Test\"\n"
+            "corename = \"GcnTest\"\n"
+            "supported_extensions = \"ciso\"\n"
+            "database = \"Test GameCube|Test Wii\"\n");
+      fclose(f);
+   }
+   sprintf(p, "%s/gcn_libretro.so", core_dir);
+   { FILE *f = fopen(p, "wb"); if (f) { fputs("\177ELF", f); fclose(f); } }
+   sprintf(p, "%s/xbox_libretro.info", info_dir);
+   {
+      FILE *f = fopen(p, "w");
+      if (!f)
+      { check(0, "fixture", "could not write core info"); return 1; }
+      fprintf(f,
+            "display_name = \"Xbox Test\"\n"
+            "corename = \"XboxTest\"\n"
+            "supported_extensions = \"iso|xiso\"\n"
+            "database = \"Test Xbox\"\n");
+      fclose(f);
+   }
+   sprintf(p, "%s/xbox_libretro.so", core_dir);
+   { FILE *f = fopen(p, "wb"); if (f) { fputs("\177ELF", f); fclose(f); } }
+   sprintf(p, "%s/x360_libretro.info", info_dir);
+   {
+      FILE *f = fopen(p, "w");
+      if (!f)
+      { check(0, "fixture", "could not write core info"); return 1; }
+      fprintf(f,
+            "display_name = \"Xbox 360 Test\"\n"
+            "corename = \"X360Test\"\n"
+            "supported_extensions = \"iso|xex|xcp\"\n"
+            "database = \"Test Xbox 360\"\n");
+      fclose(f);
+   }
+   sprintf(p, "%s/x360_libretro.so", core_dir);
+   { FILE *f = fopen(p, "wb"); if (f) { fputs("\177ELF", f); fclose(f); } }
+   sprintf(p, "%s/atari_libretro.info", info_dir);
+   {
+      FILE *f = fopen(p, "w");
+      if (!f)
+      { check(0, "fixture", "could not write core info"); return 1; }
+      fprintf(f,
+            "display_name = \"Atari Test\"\n"
+            "corename = \"AtariTest\"\n"
+            "supported_extensions = \"xex\"\n"
+            "database = \"Test Atari\"\n");
+      fclose(f);
+   }
+   sprintf(p, "%s/atari_libretro.so", core_dir);
+   { FILE *f = fopen(p, "wb"); if (f) { fputs("\177ELF", f); fclose(f); } }
    sprintf(p, "%s/reader_libretro.info", info_dir);
    {
       FILE *f = fopen(p, "w");
@@ -12111,6 +12522,9 @@ int main(int argc, char **argv)
    }
 
    walk_lane(root, pl_dir, db_dir);
+   ciso_lane(root, pl_dir, db_dir);
+   xbox_lane(root, pl_dir, db_dir);
+   x360_lane(root, pl_dir, db_dir);
    single_lane(root, pl_dir, crc_a, sz_a);
    counts_lane(root, pl_dir, crc_a, sz_a, crc_d, sz_d);
    failed_lane(root, pl_dir, db_dir, crc_a, sz_a);

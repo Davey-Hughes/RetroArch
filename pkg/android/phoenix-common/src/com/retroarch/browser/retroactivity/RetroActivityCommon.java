@@ -1846,11 +1846,6 @@ public class RetroActivityCommon extends NativeActivity
   private boolean  keyboardActive;
   private boolean  keyboardSuppressWatcher;
 
-  /* Read by SecondDisplayController on the UI thread */
-  boolean isKeyboardActive() {
-    return keyboardActive;
-  }
-
   /**
    * Raises the native system keyboard for menu text entry.
    *
@@ -1950,6 +1945,20 @@ public class RetroActivityCommon extends NativeActivity
   }
 
   /**
+   * Moves this Activity onto the display whose id is displayId; move
+   * numbers the move. Called from native code on any thread; posts to
+   * the UI thread and returns.
+   */
+  public void moveToDisplay(final int displayId, final int move) {
+    runOnUiThread(new Runnable() {
+      @Override public void run() {
+        if (secondDisplay != null)
+          secondDisplay.moveTo(displayId, move);
+      }
+    });
+  }
+
+  /**
    * Dismisses the system keyboard.
    *
    * Called from native code and after the user confirms or cancels.
@@ -1970,12 +1979,22 @@ public class RetroActivityCommon extends NativeActivity
     });
   }
 
-  /* On a one-focus system the IME refuses the field while the second
-   * display's window holds the focus; it serves the field again only
-   * after this returns */
+  @TargetApi(29)
+  @Override
+  public void onTopResumedActivityChanged(boolean top) {
+    super.onTopResumedActivityChanged(top);
+    if (secondDisplay != null)
+      secondDisplay.onTopResumedChanged(top);
+  }
+
+  /* On a one-focus system the IME refuses the field while another
+   * window holds the focus; it serves the field again only after this
+   * returns */
   @Override
   public void onWindowFocusChanged(boolean hasFocus) {
     super.onWindowFocusChanged(hasFocus);
+    if (secondDisplay != null)
+      secondDisplay.onFocusChanged(hasFocus);
     if (hasFocus && keyboardActive && keyboardEditText != null)
       keyboardEditText.post(new Runnable() {
         @Override public void run() {
