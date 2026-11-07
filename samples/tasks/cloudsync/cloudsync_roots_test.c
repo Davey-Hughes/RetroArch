@@ -5,7 +5,8 @@
  * missing, and when Keep Local resolves a file deleted here; what the
  * manifests keep of a delete the server refuses, of one taken from it
  * and of an upload or a download that does not happen; that a save
- * which can't be read fails the sync; and which save folder it walks.
+ * which can't be read or hashed fails the sync; and which save folder
+ * it walks.
  *
  *   ./cloudsync_roots_test [lane...]   (default: every lane) */
 #include <stdio.h>
@@ -30,6 +31,10 @@ static bool test_string_list_append(struct string_list *list,
 static void *test_malloc(size_t size);
 static int test_filestream_rename(const char *old_path,
       const char *new_path);
+static int64_t test_filestream_view(RFILE *stream, int64_t len,
+      const uint8_t **ptr);
+static int64_t test_filestream_read(RFILE *stream, void *data,
+      int64_t len);
 #define retro_opendir_include_hidden test_opendir
 #define retro_readdir test_readdir
 #define retro_dirent_error test_dirent_error
@@ -38,6 +43,8 @@ static int test_filestream_rename(const char *old_path,
 #define string_list_append test_string_list_append
 #define malloc test_malloc
 #define filestream_rename test_filestream_rename
+#define filestream_view test_filestream_view
+#define filestream_read test_filestream_read
 #include "../../../tasks/task_cloudsync.c"
 #undef retro_opendir_include_hidden
 #undef retro_readdir
@@ -47,6 +54,8 @@ static int test_filestream_rename(const char *old_path,
 #undef string_list_append
 #undef malloc
 #undef filestream_rename
+#undef filestream_view
+#undef filestream_read
 
 /* A copy of this string runs out of memory */
 static const char *fail_strdup;
@@ -73,16 +82,47 @@ static RFILE *test_filestream_open(const char *path, unsigned mode,
    return filestream_open(path, mode, hints);
 }
 
-/* The task's next allocation of this size fails */
+/* Faults the hooks below made */
+static unsigned faults;
+
+/* The task's next allocation of this size fails, and every one while
+ * fail_alloc_all */
 static size_t fail_alloc;
+static bool fail_alloc_all;
 static void *test_malloc(size_t size)
 {
    if (fail_alloc && size == fail_alloc)
    {
-      fail_alloc = 0;
+      if (!fail_alloc_all)
+         fail_alloc = 0;
+      faults++;
       return NULL;
    }
    return malloc(size);
+}
+
+/* With no_view the task's files can't be mapped, as on targets without
+ * mappings; its reads of a file whose path holds fail_fread fail */
+static bool no_view;
+static const char *fail_fread;
+static int64_t test_filestream_view(RFILE *stream, int64_t len,
+      const uint8_t **ptr)
+{
+   if (no_view)
+      return -1;
+   return filestream_view(stream, len, ptr);
+}
+
+static int64_t test_filestream_read(RFILE *stream, void *data,
+      int64_t len)
+{
+   const char *path = filestream_get_path(stream);
+   if (fail_fread && path && strstr(path, fail_fread))
+   {
+      faults++;
+      return -1;
+   }
+   return filestream_read(stream, data, len);
 }
 
 /* The task's renames onto a path ending in this fail */
@@ -1616,6 +1656,187 @@ static void rename_failed(bool threaded)
    CHECK(holds(srv, "saves/a.srm", "2"));
 }
 
+/* Hashing fails for the files named @file, on a read after a good open
+ * or (!@read_error) out of memory, on a target that can't map files. */
+static void hash_fault(bool read_error, const char *file)
+{
+   no_view    = true;
+   warn_about = file;
+   faults     = 0;
+   if (read_error)
+      fail_fread = file;
+   else
+   {
+      fail_alloc     = CS_HASH_CHUNK;
+      fail_alloc_all = true;
+   }
+}
+
+static void hash_fault_off(void)
+{
+   CHECK(faults);
+   no_view        = false;
+   fail_fread     = warn_about = NULL;
+   fail_alloc     = 0;
+   fail_alloc_all = false;
+}
+
+/* A save whose hash can't be made fails the sync and is named in a
+ * warning: nothing goes up or is placed, both records stay, and no
+ * device takes it for a deletion. Changed here, new on another device,
+ * changed on both, and new here. */
+static void hash_failed_lane(bool threaded, bool read_error)
+{
+   char root[256], root_b[264], lane[32];
+   snprintf(lane, sizeof(lane), "hash_failed%d", read_error ? 1 : 0);
+   lane_dirs(lane, threaded, root, sizeof(root));
+   snprintf(root_b, sizeof(root_b), "%s-b", root);
+   CHECK(path_mkdir(root_b));
+   put(root, "a.srm", "1");
+   put(root, "b.srm", "b");
+   CHECK(sync_saves(threaded, root));
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   other_device(false);
+
+   put(root, "a.srm", "11");
+   hash_fault(read_error, "a.srm");
+   CHECK(!sync_saves(threaded, root));
+   CHECK(warned == 1);
+   hash_fault_off();
+   CHECK(uploads == 0);
+   CHECK(holds(srv, "saves/a.srm", "1"));
+   CHECK(server_entry("saves/a.srm") == 2);
+   CHECK(local_entry("saves/a.srm") == 2);
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   CHECK(holds(root_b, "a.srm", "1"));
+   other_device(false);
+   put(root, "a.srm", "1");
+
+   other_device(true);
+   put(root_b, "e.srm", "e");
+   CHECK(sync_saves(threaded, root_b));
+   other_device(false);
+   hash_fault(read_error, "e.srm");
+   CHECK(!sync_saves(threaded, root));
+   CHECK(warned == 1);
+   hash_fault_off();
+   CHECK(fetches == 1);
+   CHECK(!holds(root, "e.srm", "e"));
+   CHECK(!holds(root, "e.srm" CS_FETCHING_SUFFIX, "e"));
+   CHECK(server_entry("saves/e.srm") == 2);
+   CHECK(local_entry("saves/e.srm") == 0);
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   CHECK(holds(root_b, "e.srm", "e"));
+   other_device(false);
+   CHECK(sync_saves(threaded, root));
+   CHECK(fetches == 1);
+   CHECK(holds(root, "e.srm", "e"));
+
+   other_device(true);
+   put(root_b, "b.srm", "b2");
+   CHECK(sync_saves(threaded, root_b));
+   other_device(false);
+   put(root, "b.srm", "bA");
+   hash_fault(read_error, "b.srm");
+   CHECK(!sync_saves(threaded, root));
+   CHECK(warned == 1);
+   hash_fault_off();
+   CHECK(uploads == 0);
+   CHECK(fetches == 0);
+   CHECK(holds(root, "b.srm", "bA"));
+   CHECK(server_entry("saves/b.srm") == 2);
+   CHECK(local_entry("saves/b.srm") == 2);
+
+   put(root, "c.srm", "c");
+   hash_fault(read_error, "c.srm");
+   CHECK(!sync_saves(threaded, root));
+   CHECK(warned == 1);
+   hash_fault_off();
+   CHECK(uploads == 0);
+   CHECK(server_entry("saves/c.srm") == 0);
+   CHECK(local_entry("saves/c.srm") == 0);
+
+   conflict_mode = 1;
+   CHECK(sync_saves(threaded, root));
+   conflict_mode = 0;
+   CHECK(uploads == 2);
+   CHECK(deletes == 0);
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   CHECK(fetches == 2);
+   CHECK(holds(root_b, "a.srm", "1"));
+   CHECK(holds(root_b, "b.srm", "bA"));
+   CHECK(holds(root_b, "c.srm", "c"));
+   CHECK(holds(root_b, "e.srm", "e"));
+   other_device(false);
+}
+
+static void hash_no_memory(bool threaded)  { hash_failed_lane(threaded, false); }
+static void hash_read_error(bool threaded) { hash_failed_lane(threaded, true); }
+
+/* A download of a save both devices hold whose hash fails keeps both
+ * records: the next sync fetches it, with no conflict. */
+static void fetch_hash_held(bool threaded)
+{
+   char root[256], root_b[264];
+   lane_dirs("fetch_hash_held", threaded, root, sizeof(root));
+   snprintf(root_b, sizeof(root_b), "%s-b", root);
+   CHECK(path_mkdir(root_b));
+   put(root, "a.srm", "1");
+   CHECK(sync_saves(threaded, root));
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   put(root_b, "a.srm", "2");
+   CHECK(sync_saves(threaded, root_b));
+   CHECK(uploads == 1);
+   other_device(false);
+
+   hash_fault(true, "a.srm");
+   fail_fread = "a.srm" CS_FETCHING_SUFFIX;
+   CHECK(!sync_saves(threaded, root));
+   CHECK(warned == 1);
+   hash_fault_off();
+   CHECK(fetches == 1);
+   CHECK(holds(root, "a.srm", "1"));
+   CHECK(local_entry("saves/a.srm") == 2);
+   CHECK(server_entry("saves/a.srm") == 2);
+
+   CHECK(sync_saves(threaded, root));
+   CHECK(fetches == 1);
+   CHECK(holds(root, "a.srm", "2"));
+
+   conflict_mode = 1;
+   CHECK(sync_saves(threaded, root));
+   conflict_mode = 0;
+   CHECK(uploads == 0);
+   CHECK(deletes == 0);
+   CHECK(holds(srv, "saves/a.srm", "2"));
+}
+
+/* A new save whose hash fails fails the sync on its own. */
+static void new_hash_fails(bool threaded)
+{
+   char root[256];
+   lane_dirs("new_hash_fails", threaded, root, sizeof(root));
+   put(root, "a.srm", "1");
+   CHECK(sync_saves(threaded, root));
+
+   put(root, "c.srm", "c");
+   hash_fault(true, "c.srm");
+   CHECK(!sync_saves(threaded, root));
+   CHECK(warned == 1);
+   hash_fault_off();
+   CHECK(uploads == 0);
+   CHECK(local_entry("saves/c.srm") == 0);
+
+   CHECK(sync_saves(threaded, root));
+   CHECK(uploads == 1);
+   CHECK(holds(srv, "saves/c.srm", "c"));
+}
+
 /* A delete already in both records stays in the server's when this
  * device sends a change: after it took the delete, and on a device
  * that never had the file. A third device that still has it then
@@ -1803,6 +2024,10 @@ static const struct lane lanes[] = {
    { "sync_save_unreadable",      save_unreadable },
    { "sync_carry_exact_key",      carry_exact_key },
    { "sync_rename_failed",        rename_failed },
+   { "sync_hash_no_memory",       hash_no_memory },
+   { "sync_hash_read_error",      hash_read_error },
+   { "sync_fetch_hash_held",      fetch_hash_held },
+   { "sync_new_hash_fails",       new_hash_fails },
 };
 
 int main(int argc, char **argv)

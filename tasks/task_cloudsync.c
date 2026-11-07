@@ -1422,10 +1422,15 @@ static char *task_cloud_sync_md5_rfile(RFILE *file)
             free(hash);
             return NULL;
          }
-         n   = filestream_read(file, buf, CS_HASH_CHUNK);
+         if ((n = filestream_read(file, buf, CS_HASH_CHUNK)) < 0)
+         {
+            free(buf);
+            free(hash);
+            return NULL;
+         }
          ptr = buf;
       }
-      if (n <= 0)
+      if (!n)
          break;
       MD5_Update(&md5, ptr, (unsigned long)n);
    }
@@ -1444,9 +1449,10 @@ static void task_cloud_sync_hash_begin(tcs_hash_t *h, RFILE *file)
 }
 
 /* Hashes @h's file a chunk at a time while @b allows. True once it is
- * done, with the digest in @hash (33 bytes); the stream is left to its
- * owner. False when the budget ran out first: the next call carries on.
- * Reads and hashes the same bytes as task_cloud_sync_md5_rfile(). */
+ * done, with the digest in @hash (33 bytes), or an empty @hash when a
+ * read failed; the stream is left to its owner. False when the budget
+ * ran out first: the next call carries on. Reads and hashes the same
+ * bytes as task_cloud_sync_md5_rfile(). */
 static bool task_cloud_sync_hash_step(tcs_hash_t *h, uint8_t *buf,
       nbio_budget_t *b, char *hash)
 {
@@ -1461,7 +1467,13 @@ static bool task_cloud_sync_hash_step(tcs_hash_t *h, uint8_t *buf,
          n   = filestream_read(h->file, buf, CS_HASH_CHUNK);
          ptr = buf;
       }
-      if (n <= 0)
+      if (n < 0)
+      {
+         hash[0] = '\0';
+         h->file = NULL;
+         return true;
+      }
+      if (!n)
          break;
       MD5_Update(&h->md5, ptr, (unsigned long)n);
    }
@@ -1474,8 +1486,8 @@ static bool task_cloud_sync_hash_step(tcs_hash_t *h, uint8_t *buf,
  * over several runs of the handler instead of holding up one - the
  * frame loop's, with Threaded Tasks off. True once the diff step can
  * run: the hash is in ->userdata, or there is no current file, or it
- * could not be opened and the step that needs it will find that out
- * itself. False when the budget ran out first. */
+ * could not be opened or read and the step that needs it will find that
+ * out itself. False when the budget ran out first. */
 static bool task_cloud_sync_hash_current(task_cloud_sync_state_t *sync_state,
       nbio_budget_t *b)
 {
@@ -1504,7 +1516,8 @@ static bool task_cloud_sync_hash_current(task_cloud_sync_state_t *sync_state,
             sync_state->hash_buf, b, hash))
       return false;
    filestream_close(file);
-   item->userdata = strdup(hash);
+   if (*hash)
+      item->userdata = strdup(hash);
    return true;
 }
 
@@ -2224,8 +2237,19 @@ static void task_cloud_sync_fetched_run(task_cloud_sync_state_t *sync_state,
          free(h);
       }
       filestream_close(rec->file);
-      commit = task_cloud_sync_fetch_commit(rec->fetch_state, rec->path,
-            hash);
+      if (!*hash)
+      {
+         /* the local file is untouched, as on a failed download */
+         RARCH_WARN(CSPFX "Could not hash the download of \"%s\".\n",
+               rec->path);
+         task_cloud_sync_fetch_discard(rec->fetch_state);
+         task_cloud_sync_keep_records(sync_state, rec->path);
+         sync_state->failures = true;
+         commit = TCS_COMMIT_LEFT;
+      }
+      else
+         commit = task_cloud_sync_fetch_commit(rec->fetch_state,
+               rec->path, hash);
       if (commit == TCS_COMMIT_PLACED)
          task_cloud_sync_fetched(sync_state, rec->fetch_state->server_file,
                rec->path, hash);
@@ -2486,10 +2510,16 @@ static void task_cloud_sync_upload_current_file(task_cloud_sync_state_t *sync_st
       return;
    }
 
-   RARCH_LOG(CSPFX "Uploading \"%s\".\n", path);
+   if (!item->userdata && !(item->userdata = task_cloud_sync_md5_rfile(file)))
+   {
+      task_cloud_sync_keep_records(sync_state, path);
+      filestream_close(file);
+      RARCH_WARN(CSPFX "Could not hash \"%s\".\n", filename);
+      sync_state->failures = true;
+      return;
+   }
 
-   if (!item->userdata)
-      item->userdata = task_cloud_sync_md5_rfile(file);
+   RARCH_LOG(CSPFX "Uploading \"%s\".\n", path);
 
    filestream_seek(file, 0, SEEK_SET);
    task_cloud_sync_waiting_inc(sync_state);
@@ -2582,6 +2612,13 @@ static void task_cloud_sync_check_server_current(task_cloud_sync_state_t *sync_s
       }
       current_file->userdata = task_cloud_sync_md5_rfile(file);
       filestream_close(file);
+      if (!current_file->userdata)
+      {
+         task_cloud_sync_keep_records(sync_state, CS_FILE_KEY(server_file));
+         RARCH_WARN(CSPFX "Could not hash \"%s\".\n", filename);
+         sync_state->failures = true;
+         return;
+      }
    }
 
    if (string_is_equal(CS_FILE_HASH(server_file), CS_FILE_HASH(current_file)))
