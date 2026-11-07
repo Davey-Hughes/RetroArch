@@ -59,6 +59,7 @@ settings_t *config_get_ptr(void)
 
 stub_request_t stub_pending;
 bool           stub_has_pending;
+const char    *stub_refuse;
 
 static void *stub_record(const char *method, const char *url,
       const char *dest, const char *headers,
@@ -67,12 +68,16 @@ static void *stub_record(const char *method, const char *url,
    /* The driver starts one request at a time and waits for its
     * answer, so one slot is enough; a second start before the answer
     * would be a driver bug the test reports. */
+   if (stub_refuse && !strcmp(method, stub_refuse))
+      return NULL;
    if (stub_has_pending)
       stub_pending.overlapped = true;
    stub_pending.method    = method;
    strlcpy(stub_pending.url, url ? url : "", sizeof(stub_pending.url));
    strlcpy(stub_pending.dest, dest ? dest : "", sizeof(stub_pending.dest));
    stub_pending.had_auth  = (headers != NULL);
+   stub_pending.had_digest = headers
+      && strstr(headers, "Authorization: Digest ") != NULL;
    stub_pending.cb        = cb;
    stub_pending.user_data = user_data;
    stub_has_pending       = true;
@@ -91,6 +96,13 @@ void *task_push_webdav_mkdir(const char *url, bool suppress,
 {
    (void)suppress;
    return stub_record("MKCOL", url, NULL, headers, cb, user_data);
+}
+
+void *task_push_webdav_propfind(const char *url, bool suppress,
+      const char *headers, retro_task_callback_t cb, void *user_data)
+{
+   (void)suppress;
+   return stub_record("PROPFIND", url, NULL, headers, cb, user_data);
 }
 
 void *task_push_webdav_put_stream(const char *url,

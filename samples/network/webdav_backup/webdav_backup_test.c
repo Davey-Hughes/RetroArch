@@ -20,6 +20,11 @@
  *   every sync, are not backed up;
  * - the COPY and the PUT each get their own Digest retry.
  *
+ * Deletes: a file already gone counts as deleted.  A DELETE or MOVE
+ * answered 404 is done; a MOVE refused otherwise (Go's x/net/webdav
+ * answers a missing source with 403) is done only if a PROPFIND of
+ * the source answers 404.
+ *
  * Includes the driver's translation unit so the paths are tested as
  * shipped rather than as a copy that can drift from them.
  */
@@ -53,12 +58,15 @@ static unsigned failures = 0;
       } \
    } while (0)
 
-/* What the scripted server answers.  copy[] and put[] are consumed in
- * order, one per request; everything else gets 201. */
+/* What the scripted server answers.  Each array is consumed in order,
+ * one per request of its method; everything else gets 201. */
 typedef struct
 {
    int copy[4];
    int put[4];
+   int move[4];
+   int propfind[4];
+   int del[4];
 } script_t;
 
 typedef struct
@@ -142,6 +150,59 @@ static void run_update(const char *path, bool destructive,
 
    CHECK(!stub_pending.overlapped, "%s: requests overlapped", path);
    filestream_close(rfile);
+}
+
+static void run_delete(const char *path, bool destructive,
+      const script_t *script, run_t *run)
+{
+   http_transfer_data_t resp;
+   webdav_state_t *webdav_st = webdav_state_get_ptr();
+   unsigned nmove = 0, nprop = 0, ndel = 0;
+
+   memset(run, 0, sizeof(*run));
+   config_get_ptr()->bools.cloud_sync_destructive = destructive;
+
+   webdav_cleanup_digest();
+   webdav_st->basic = true;
+
+   if (webdav_st->dirs)
+      string_list_free(webdav_st->dirs);
+   webdav_st->dirs = NULL;
+
+   stub_has_pending        = false;
+   stub_pending.overlapped = false;
+   webdav_delete(path, on_done, run);
+
+   while (stub_has_pending && run->steps < MAX_STEPS)
+   {
+      stub_request_t req = stub_pending;
+      int status         = 201;
+
+      stub_has_pending = false;
+      if (req.dest[0])
+         snprintf(run->trace[run->steps], sizeof(run->trace[0]),
+               "%s %s -> %s", req.method, rel(req.url), rel(req.dest));
+      else
+         snprintf(run->trace[run->steps], sizeof(run->trace[0]),
+               "%s %s%s", req.method, rel(req.url),
+               req.had_digest ? " (digest)" : "");
+      run->steps++;
+
+      if (!strcmp(req.method, "MOVE") && nmove < 4 && script->move[nmove])
+         status = script->move[nmove++];
+      else if (!strcmp(req.method, "PROPFIND") && nprop < 4
+            && script->propfind[nprop])
+         status = script->propfind[nprop++];
+      else if (!strcmp(req.method, "DELETE") && ndel < 4 && script->del[ndel])
+         status = script->del[ndel++];
+
+      memset(&resp, 0, sizeof(resp));
+      resp.status  = status;
+      resp.headers = (status == 401) ? challenge_headers : NULL;
+      req.cb(NULL, &resp, req.user_data, NULL);
+   }
+
+   CHECK(!stub_pending.overlapped, "%s: requests overlapped", path);
 }
 
 static int find_step(const run_t *run, const char *prefix, unsigned from)
@@ -274,6 +335,79 @@ static void test_each_request_reauths(const char *tmp)
          "one challenge each must still succeed, once");
 }
 
+typedef struct
+{
+   const char *name;
+   bool        destructive;
+   script_t    script;
+   bool        success;
+   unsigned    propfinds;
+} delete_case_t;
+
+static const delete_case_t delete_cases[] = {
+   { "DELETE 404",                   true,
+      {{0}, {0}, {0},   {0},        {404}}, true,  0 },
+   { "DELETE 500",                   true,
+      {{0}, {0}, {0},   {0},        {500}}, false, 0 },
+   { "MOVE 404",                     false,
+      {{0}, {0}, {404}, {0},        {0}},   true,  0 },
+   { "MOVE 403, PROPFIND 404",       false,
+      {{0}, {0}, {403}, {404},      {0}},   true,  1 },
+   { "MOVE 403, PROPFIND 207",       false,
+      {{0}, {0}, {403}, {207},      {0}},   false, 1 },
+   { "MOVE 409, PROPFIND 207",       false,
+      {{0}, {0}, {409}, {207},      {0}},   false, 1 },
+   { "MOVE 403, PROPFIND 401 + 404", false,
+      {{0}, {0}, {403}, {401, 404}, {0}},   true,  2 },
+   { "MOVE 403, PROPFIND -1",        false,
+      {{0}, {0}, {403}, {-1},       {0}},   false, 1 }
+};
+
+static void test_deletes(void)
+{
+   unsigned i;
+
+   for (i = 0; i < sizeof(delete_cases) / sizeof(delete_cases[0]); i++)
+   {
+      const delete_case_t *c = &delete_cases[i];
+      run_t run;
+
+      run_delete("saves/a.srm", c->destructive, &c->script, &run);
+      if (c->propfinds)
+         dump(c->name, &run);
+
+      CHECK(run.calls == 1 && run.success == c->success,
+            "%s: must report %s once", c->name,
+            c->success ? "success" : "failure");
+      CHECK(count_steps(&run, c->destructive
+               ? "DELETE saves/a.srm" : "MOVE saves/a.srm -> deleted/saves/a.srm-") == 1
+            && !count_steps(&run, c->destructive ? "MOVE" : "DELETE"),
+            "%s: must send one %s", c->name,
+            c->destructive ? "DELETE" : "MOVE into deleted/");
+      CHECK(count_steps(&run, "PROPFIND") == c->propfinds
+            && count_steps(&run, "PROPFIND saves/a.srm") == c->propfinds,
+            "%s: must send %u PROPFIND(s) on the source", c->name,
+            c->propfinds);
+      if (c->script.propfind[0] == 401)
+         CHECK(find_step(&run, "PROPFIND saves/a.srm (digest)", 0) >= 0,
+               "%s: the PROPFIND retry must carry Digest", c->name);
+   }
+}
+
+/* A PROPFIND that can't be started fails the delete: the sync is not
+ * left waiting on a callback that never comes. */
+static void test_propfind_refused(void)
+{
+   static const script_t script = {{0}, {0}, {403}, {0}, {0}};
+   run_t run;
+
+   stub_refuse = "PROPFIND";
+   run_delete("saves/a.srm", false, &script, &run);
+   stub_refuse = NULL;
+   CHECK(run.calls == 1 && !run.success,
+         "refused PROPFIND: must report failure once");
+}
+
 int main(void)
 {
    settings_t     *settings  = config_get_ptr();
@@ -302,6 +436,8 @@ int main(void)
    test_destructive(tmp);
    test_manifest(tmp);
    test_each_request_reauths(tmp);
+   test_deletes();
+   test_propfind_refused();
 
    if (webdav_st->dirs)
       string_list_free(webdav_st->dirs);
@@ -314,6 +450,6 @@ int main(void)
       printf("\n%u check(s) failed\n", failures);
       return 1;
    }
-   printf("\nall WebDAV upload backup checks passed\n");
+   printf("\nall WebDAV upload backup and delete checks passed\n");
    return 0;
 }

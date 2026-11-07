@@ -1351,7 +1351,10 @@ static void webdav_delete_cb(retro_task_t *task, void *task_data,
 {
    webdav_cb_state_t    *webdav_cb_st = (webdav_cb_state_t *)user_data;
    http_transfer_data_t *data         = (http_transfer_data_t*)task_data;
-   bool                  success      = (data != NULL && data->status >= 200 && data->status < 300);
+   /* 404: already gone, as the delete wants it. */
+   bool                  success      = (data != NULL
+                                      && (   (data->status >= 200 && data->status < 300)
+                                          || data->status == 404));
 
    if (!webdav_cb_st)
    {
@@ -1389,12 +1392,63 @@ static void webdav_delete_cb(retro_task_t *task, void *task_data,
 
 static void webdav_do_backup(bool success, webdav_cb_state_t *webdav_cb_st);
 
+static void webdav_backup_check_cb(retro_task_t *task, void *task_data,
+      void *user_data, const char *err);
+
+static void webdav_do_backup_check(webdav_cb_state_t *webdav_cb_st)
+{
+   char *auth_header;
+   char  url_encoded[PATH_MAX_LENGTH];
+
+   if (!webdav_url_for_path(url_encoded, sizeof(url_encoded), webdav_cb_st->path, NULL))
+   {
+      webdav_cb_st->cb(webdav_cb_st->user_data, webdav_cb_st->path, false, NULL);
+      free(webdav_cb_st);
+      return;
+   }
+
+   RARCH_DBG("[webdav] PROPFIND %s\n", url_encoded);
+   auth_header = webdav_get_auth_header("PROPFIND", url_encoded);
+   if (!task_push_webdav_propfind(url_encoded, true, auth_header,
+            webdav_backup_check_cb, webdav_cb_st))
+   {
+      webdav_cb_st->cb(webdav_cb_st->user_data, webdav_cb_st->path, false, NULL);
+      free(webdav_cb_st);
+   }
+   free(auth_header);
+}
+
+static void webdav_backup_check_cb(retro_task_t *task, void *task_data,
+      void *user_data, const char *err)
+{
+   webdav_cb_state_t    *webdav_cb_st = (webdav_cb_state_t *)user_data;
+   http_transfer_data_t *data         = (http_transfer_data_t*)task_data;
+   bool                  gone         = (data && data->status == 404);
+
+   if (!webdav_cb_st)
+      return;
+
+   if (webdav_retry_auth(data, &webdav_cb_st->reauthed))
+   {
+      webdav_do_backup_check(webdav_cb_st);
+      return;
+   }
+
+   if (gone)
+      RARCH_LOG("[webdav] %s is already gone from the server.\n", webdav_cb_st->path);
+   webdav_cb_st->cb(webdav_cb_st->user_data, webdav_cb_st->path, gone, NULL);
+   free(webdav_cb_st);
+}
+
 static void webdav_backup_cb(retro_task_t *task, void *task_data,
       void *user_data, const char *err)
 {
    webdav_cb_state_t    *webdav_cb_st = (webdav_cb_state_t *)user_data;
    http_transfer_data_t *data         = (http_transfer_data_t*)task_data;
-   bool                  success      = (data != NULL && data->status >= 200 && data->status < 300);
+   /* 404: the source is already gone, so there is nothing to keep. */
+   bool                  success      = (data != NULL
+                                      && (   (data->status >= 200 && data->status < 300)
+                                          || data->status == 404));
 
    if (!webdav_cb_st)
    {
@@ -1410,6 +1464,16 @@ static void webdav_backup_cb(retro_task_t *task, void *task_data,
    if (webdav_retry_auth(data, &webdav_cb_st->reauthed))
    {
       webdav_do_backup(true, webdav_cb_st);
+      return;
+   }
+
+   /* Go's x/net/webdav (rclone) answers a missing source with 403:
+    * ask whether the source is still there. */
+   if (!success && data && data->status != 401)
+   {
+      /* The PROPFIND is a request of its own. */
+      webdav_cb_st->reauthed = false;
+      webdav_do_backup_check(webdav_cb_st);
       return;
    }
 

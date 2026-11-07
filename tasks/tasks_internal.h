@@ -150,6 +150,8 @@ void *task_push_webdav_stat(const char *url, bool mute, const char *headers,
       retro_task_callback_t cb, void *userdata);
 void *task_push_webdav_mkdir(const char *url, bool mute, const char *headers,
       retro_task_callback_t cb, void *userdata);
+void *task_push_webdav_propfind(const char *url, bool mute, const char *headers,
+      retro_task_callback_t cb, void *userdata);
 /* PUT a body of @len bytes pulled from @source as the socket takes
  * them, holding one send buffer rather than the whole file. @rewind
  * restarts the body for a replay on a fresh connection; NULL means the
