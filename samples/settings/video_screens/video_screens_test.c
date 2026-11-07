@@ -412,9 +412,6 @@ static void test_save_dir_config(void)
    char text[4400];
    config_file_t *conf;
 
-   /* No command line here: clear what earlier overrides left set. */
-   retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
-   retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL);
    memset(&system_info, 0, sizeof(system_info));
    system_info.info.library_name = "save_dir_test";
    fill_pathname_basedir(dir, fixture_path, sizeof(dir));
@@ -507,6 +504,46 @@ static void test_load_save_dir_args(void)
    retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL);
    dir_clear(RARCH_DIR_SAVEFILE);
    dir_clear(RARCH_DIR_SAVESTATE);
+}
+
+/* Loading or unloading an override leaves the save and state path
+ * flags as the command line set them (here: not), so the next config
+ * load and the next game's names follow the config again. */
+static void test_override_flags_reset(void)
+{
+   char dir[2048];
+   char a[2048];
+   char b[2048];
+   char text[2200];
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+
+   fill_pathname_basedir(dir, fixture_path, sizeof(dir));
+   fill_pathname_join(a, dir, "saves_a", sizeof(a));
+   fill_pathname_join(b, dir, "saves_b", sizeof(b));
+   path_mkdir(a);
+   path_mkdir(b);
+   snprintf(text, sizeof(text), "savefile_directory = \"%s\"\n", a);
+   load_fixture(text);
+   snprintf(text, sizeof(text), "savefile_directory = \"%s\"\n", b);
+   write_config(override_path, text);
+   CHECK(config_load_override_file(override_path));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE), b));
+   CHECK(config_unload_override());
+   CHECK(!retroarch_override_setting_is_set(
+            RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL));
+   CHECK(!retroarch_override_setting_is_set(
+            RARCH_OVERRIDE_SETTING_STATE_PATH, NULL));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE), a));
+
+   runloop_path_set_basename("/roms/GameB.sfc");
+   runloop_path_set_names();
+   CHECK(string_is_equal(path_basename(runloop_st->name.savefile),
+            "GameB.srm"));
+
+   /* "Load Configuration": the other config's folder */
+   load_fixture(text);
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE), b));
+   path_clear(RARCH_PATH_CONTENT);
 }
 
 static void test_xr_config_invalid(void)
@@ -4931,6 +4968,7 @@ int main(int argc, char **argv)
       test_xr_config_invalid();
       test_save_dir_config();
       test_load_save_dir_args();
+      test_override_flags_reset();
       test_xr_menu_place_config();
    }
    test_window_layout();

@@ -688,14 +688,19 @@ def lane_config_keeps_folder(args, n):
     return r, failures
 
 
-def lane_folder_check_each_load(args, n):
+def lane_folder_check_each_load(args, n, override=False):
     """A save folder whose parent is missing at load: the default
     folder for that session, one notice, a note in save_folders.json,
     nothing made under the missing parent, and the config keeps the
     folder. Only the folder missing: made again and used."""
-    r = Run(args.run_dir, 'folder_check_each_load-%d' % n)
+    r = Run(args.run_dir, '%s-%d' % ('folder_check_override' if override
+                                     else 'folder_check_each_load', n))
     failures = []
     gone = r.dir / 'gone'
+    if override:
+        game_cfg = r.dir / 'config' / 'save_e2e' / 'game.cfg'
+        game_cfg.parent.mkdir()
+        game_cfg.write_text('video_smooth = "true"\n')
     cfg = r.config(savefile_directory=gone / 'saves',
                    config_save_on_exit='true')
     r.start(args, cfg, 60, r.env(SAVE_E2E_TOUCH_FRAME=5))
@@ -704,6 +709,9 @@ def lane_folder_check_each_load(args, n):
     default = r.dir / 'xdg-config' / 'retroarch' / 'saves'
     check(failures, (default / 'game.srm').is_file(), 'no save in default')
     log = r.log.read_text(errors='replace')
+    if override:
+        check(failures, 'Game-specific overrides found' in log,
+              'override not loaded')
     check(failures, log.count('not found; saving to') == 1,
           '%d fallback notices' % log.count('not found; saving to'))
     check(failures, 'Save folder %s not found; saving to %s for'
@@ -727,6 +735,12 @@ def lane_folder_check_each_load(args, n):
     return r, failures
 
 
+def lane_folder_check_override(args, n):
+    """The same with a game override, which must not skip the
+    check."""
+    return lane_folder_check_each_load(args, n, override=True)
+
+
 LANES = {
     'autosave_full_disk': lane_autosave_full_disk,
     'autosave_kill_mid_write': lane_autosave_kill_mid_write,
@@ -744,12 +758,14 @@ LANES = {
     'windows_locked_close': lane_windows_locked_close,
     'config_keeps_folder': lane_config_keeps_folder,
     'folder_check_each_load': lane_folder_check_each_load,
+    'folder_check_override': lane_folder_check_override,
 }
 # Lanes that need Windows, and the ones Windows cannot run.
 WINDOWS_LANES = {'windows_locked_close'}
 POSIX_LANES = {'autosave_full_disk', 'autosave_kill_mid_write',
                'no_rewrite_at_launch', 'unreadable_backed_up',
-               'explicit_save_copies', 'folder_check_each_load'}
+               'explicit_save_copies', 'folder_check_each_load',
+               'folder_check_override'}
 
 
 def main():

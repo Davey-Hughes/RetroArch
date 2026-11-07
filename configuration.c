@@ -8503,10 +8503,6 @@ bool config_load_override(void *data)
    /* Re-load the configuration with any overrides
     * that might have been found */
 
-   /* Toggle has_save_path to false so it resets */
-   retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL);
-   retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
-
    if (!config_load_file(path_get(RARCH_PATH_CONFIG), settings))
       return false;
 
@@ -8519,10 +8515,6 @@ bool config_load_override(void *data)
       runloop_msg_queue_push(msg, _len, 2, 100, false, NULL,
             MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
    }
-
-   /* Reset save paths. */
-   retroarch_override_setting_set(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL);
-   retroarch_override_setting_set(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
 
    a = path_get(RARCH_PATH_CONFIG_OVERRIDE);
    if (a && *a)
@@ -8550,10 +8542,6 @@ bool config_load_override_file(const char *config_path)
    /* Re-load the configuration with any overrides
     * that might have been found */
 
-   /* Toggle has_save_path to false so it resets */
-   retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL);
-   retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
-
    if (!config_load_file(path_get(RARCH_PATH_CONFIG), settings))
       return false;
 
@@ -8564,10 +8552,6 @@ bool config_load_override_file(const char *config_path)
       runloop_msg_queue_push(msg, _len, 2, 100, false, NULL,
             MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
    }
-
-   /* Reset save paths. */
-   retroarch_override_setting_set(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL);
-   retroarch_override_setting_set(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
 
    a = path_get(RARCH_PATH_CONFIG_OVERRIDE);
    if (a && *a)
@@ -8596,10 +8580,6 @@ bool config_unload_override(void)
 
    runloop_st->flags &= ~RUNLOOP_FLAG_OVERRIDES_ACTIVE;
    path_clear(RARCH_PATH_CONFIG_OVERRIDE);
-
-   /* Toggle has_save_path to false so it resets */
-   retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL);
-   retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
 
    /* When using minimal config, reset to defaults first.
     * This ensures settings not present in the config file
@@ -8633,10 +8613,6 @@ bool config_unload_override(void)
       config_load_remap(settings->paths.directory_input_remapping, &runloop_st->system);
 
    RARCH_LOG("[Override] Configuration overrides unloaded, original configuration restored.\n");
-
-   /* Reset save paths */
-   retroarch_override_setting_set(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL);
-   retroarch_override_setting_set(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
 
    /* each port's deadzones, from the settings put back */
    input_driver_deadzones_refresh();
