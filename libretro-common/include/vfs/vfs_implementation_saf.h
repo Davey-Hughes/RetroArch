@@ -50,6 +50,7 @@ typedef struct libretro_vfs_implementation_saf_dir
    int     batch_count;
    int     batch_pos;
    bool    exhausted;
+   bool    error;
 
    const char *dirent_name;
    bool dirent_is_dir;

@@ -3706,6 +3706,7 @@ struct libretro_vfs_implementation_dir
 #endif
 {
    char* orig_path;
+   bool read_error;
 #if defined(_WIN32)
 #if defined(LEGACY_WIN32_RUNTIME)
    /* Unlike every other site, the difference here is a type, not a
@@ -4653,34 +4654,69 @@ bool retro_vfs_readdir_impl(libretro_vfs_implementation_dir *rdir)
 #endif
 #if defined(ANDROID) && defined(HAVE_SAF)
    if (rdir->saf_directory != NULL)
-      return retro_vfs_readdir_saf(rdir->saf_directory);
+   {
+      if (retro_vfs_readdir_saf(rdir->saf_directory))
+         return true;
+      rdir->read_error = rdir->saf_directory->error;
+      return false;
+   }
 #endif
 
 #if defined(_WIN32)
    if (rdir->next)
-#if defined(LEGACY_WIN32_RUNTIME)
    {
+      BOOL found;
+#if defined(LEGACY_WIN32_RUNTIME)
       if (win32_needs_local_encoding())
-         return (FindNextFileA(rdir->directory, &rdir->entry.a) != 0);
-      return (FindNextFileW(rdir->directory, &rdir->entry.w) != 0);
-   }
+         found = FindNextFileA(rdir->directory, &rdir->entry.a);
+      else
+         found = FindNextFileW(rdir->directory, &rdir->entry.w);
 #elif defined(LEGACY_WIN32)
-      return (FindNextFile(rdir->directory, &rdir->entry) != 0);
+      found = FindNextFile(rdir->directory, &rdir->entry);
 #else
-      return (FindNextFileW(rdir->directory, &rdir->entry) != 0);
+      found = FindNextFileW(rdir->directory, &rdir->entry);
 #endif
+      if (!found && GetLastError() != ERROR_NO_MORE_FILES)
+         rdir->read_error = true;
+      return (found != 0);
+   }
 
    rdir->next = true;
    return (rdir->directory != INVALID_HANDLE_VALUE);
 #elif defined(VITA)
-   return (sceIoDread(rdir->directory, &rdir->entry) > 0);
+   {
+      int ret = sceIoDread(rdir->directory, &rdir->entry);
+      if (ret < 0)
+         rdir->read_error = true;
+      return (ret > 0);
+   }
 #elif defined(__PSL1GHT__) || defined(__PS3__)
    uint64_t nread;
    rdir->error = sysFsReaddir(rdir->directory, &rdir->entry, &nread);
+   if (rdir->error)
+   {
+      rdir->read_error = true;
+      return false;
+   }
    return (nread != 0);
 #else
-   return ((rdir->entry = readdir(rdir->directory)) != NULL);
+   errno = 0;
+   if ((rdir->entry = readdir(rdir->directory)))
+      return true;
+#if defined(_3DS) || defined(SWITCH) || defined(GEKKO) || defined(WIIU)
+   /* some libsysbase builds leave dirnext's ENOENT at the end */
+   if (errno == ENOENT)
+      return false;
 #endif
+   if (errno)
+      rdir->read_error = true;
+   return false;
+#endif
+}
+
+bool retro_vfs_dirent_error_impl(libretro_vfs_implementation_dir *rdir)
+{
+   return rdir && rdir->read_error;
 }
 
 #if defined(_WIN32)

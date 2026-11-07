@@ -189,6 +189,10 @@ libretro_vfs_implementation_dir *retro_vfs_opendir_impl(const char *dir, bool in
 
 bool retro_vfs_readdir_impl(libretro_vfs_implementation_dir *dirstream);
 
+/* True once a retro_vfs_readdir_impl() on @dirstream has failed with
+ * an error rather than at the end of the directory; it stays set. */
+bool retro_vfs_dirent_error_impl(libretro_vfs_implementation_dir *dirstream);
+
 const char *retro_vfs_dirent_get_name_impl(libretro_vfs_implementation_dir *dirstream);
 
 bool retro_vfs_dirent_is_dir_impl(libretro_vfs_implementation_dir *dirstream);

@@ -584,13 +584,26 @@ static bool task_cloud_sync_walk_push(task_cloud_sync_state_t *sync_state,
    return true;
 }
 
+/* Ends the sync when a synced folder can't be read to its end: its
+ * files would look deleted, and the diff would delete the server's
+ * copies of them. */
+static void task_cloud_sync_walk_abort(task_cloud_sync_state_t *sync_state,
+      const char *path)
+{
+   RARCH_ERR(CSPFX "Could not read \"%s\".\n", path);
+   RARCH_ERR(CSPFX "Not syncing, the current state of the disk could not be established.\n");
+   task_cloud_sync_walk_free(sync_state);
+   sync_state->failures = true;
+   task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_END);
+}
+
 /* One entry of the walk: the next name in the deepest open directory,
  * which adds a file to current_manifest or opens a subdirectory, or
  * the end of that directory. Lists what dir_list_new() lists for the
  * root, recursively, hidden entries included and directories left
- * out; a subdirectory that cannot be opened is skipped as it skips
- * one. */
-static void task_cloud_sync_walk_step(task_cloud_sync_state_t *sync_state)
+ * out. False when a subdirectory can't be opened or read, which ends
+ * the sync. */
+static bool task_cloud_sync_walk_step(task_cloud_sync_state_t *sync_state)
 {
    struct tcs_walk_dir *top  = &sync_state->walk[sync_state->walk_depth - 1];
    char                *path = CS_WALK_PATH(sync_state);
@@ -601,21 +614,27 @@ static void task_cloud_sync_walk_step(task_cloud_sync_state_t *sync_state)
 
    if (!retro_readdir(top->dir))
    {
+      if (retro_dirent_error(top->dir))
+      {
+         path[top->len] = '\0';
+         task_cloud_sync_walk_abort(sync_state, path);
+         return false;
+      }
       retro_closedir(top->dir);
       sync_state->walk_depth--;
-      return;
+      return true;
    }
    name = retro_dirent_get_name(top->dir);
    if (     (name[0] == '.' || name[0] == '$')
          && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')))
-      return;
+      return true;
 
    len = top->len;
    if (len && path[len - 1] != '/' && path[len - 1] != '\\')
       path[len++] = '/';
    len += strlcpy(path + len, name, PATH_MAX_LENGTH - len);
    if (len >= PATH_MAX_LENGTH)
-      return;
+      return true;
 
    is_dir = retro_dirent_is_dir(top->dir, NULL);
 #if TARGET_OS_IPHONE || TARGET_OS_OSX
@@ -632,10 +651,14 @@ static void task_cloud_sync_walk_step(task_cloud_sync_state_t *sync_state)
                sync_state->dirlist->elems[sync_state->walk_root_idx].data,
                name);
          if (task_cloud_sync_should_ignore_file(CS_WALK_ALT(sync_state)))
-            return;
+            return true;
       }
-      task_cloud_sync_walk_push(sync_state, len);
-      return;
+      if (!task_cloud_sync_walk_push(sync_state, len))
+      {
+         task_cloud_sync_walk_abort(sync_state, path);
+         return false;
+      }
+      return true;
    }
 
    path_relative_to(CS_WALK_REL(sync_state), path, CS_WALK_ROOT(sync_state),
@@ -644,7 +667,7 @@ static void task_cloud_sync_walk_step(task_cloud_sync_state_t *sync_state)
          sync_state->dirlist->elems[sync_state->walk_root_idx].data,
          CS_WALK_REL(sync_state), PATH_MAX_LENGTH);
    if (task_cloud_sync_should_ignore_file(CS_WALK_ALT(sync_state)))
-      return;
+      return true;
 
    /* The "alt" refers to the relative path of whatever we're syncing relative to the retroarch folder
     * whereas the full_path is the absolute disk path of the file. When building the manifest, adhere
@@ -655,6 +678,7 @@ static void task_cloud_sync_walk_step(task_cloud_sync_state_t *sync_state)
    file_list_append(sync_state->current_manifest, path, NULL, 0, 0, 0);
    file_list_set_alt_at_offset(sync_state->current_manifest, idx,
          CS_WALK_ALT(sync_state));
+   return true;
 }
 
 /**
@@ -673,8 +697,11 @@ static bool task_cloud_sync_directory_map_add(struct string_list *list,
       const char *name, size_t name_len, const char *dir)
 {
    union string_list_elem_attr attr = {0};
-   char *path = strdup(dir);
-   if (!path)
+   char *path;
+   /* an unset folder is left out: not walked, its server keys kept */
+   if (string_is_empty(dir))
+      return true;
+   if (!(path = strdup(dir)))
       return false;
    if (!string_list_append_n(list, name, name_len, attr))
    {
@@ -806,7 +833,8 @@ static void task_cloud_sync_build_current_manifest(
    {
       if (sync_state->walk_depth)
       {
-         task_cloud_sync_walk_step(sync_state);
+         if (!task_cloud_sync_walk_step(sync_state))
+            return;
          if (!sync_state->walk_depth)
             sync_state->walk_root_idx++;
          continue;
@@ -830,11 +858,7 @@ static void task_cloud_sync_build_current_manifest(
        * happened. */
       if (!task_cloud_sync_walk_push(sync_state, strlen(CS_WALK_PATH(sync_state))))
       {
-         RARCH_ERR(CSPFX "Could not read \"%s\".\n", CS_WALK_ROOT(sync_state));
-         RARCH_ERR(CSPFX "Not syncing, the current state of the disk could not be established.\n");
-         task_cloud_sync_walk_free(sync_state);
-         sync_state->failures = true;
-         task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_END);
+         task_cloud_sync_walk_abort(sync_state, CS_WALK_ROOT(sync_state));
          return;
       }
    }

@@ -841,6 +841,7 @@ libretro_vfs_implementation_saf_dir *retro_vfs_opendir_saf(const char *tree, con
    dirstream->batch_count   = 0;
    dirstream->batch_pos     = 0;
    dirstream->exhausted     = false;
+   dirstream->error         = false;
    dirstream->dirent_name   = NULL;
    dirstream->dirent_is_dir = false;
    (*env)->PopLocalFrame(env, NULL);
@@ -893,6 +894,7 @@ static bool saf_batch_fill(JNIEnv *env,
          (*env)->ExceptionDescribe(env);
          (*env)->ExceptionClear(env);
       }
+      dirstream->error = true;
       return false;
    }
 
@@ -949,6 +951,11 @@ static bool saf_batch_fill(JNIEnv *env,
             (flag_elems[i] != JNI_FALSE);
          dirstream->batch_count++;
       }
+      else
+      {
+         (*env)->DeleteLocalRef(env, jname);
+         break;
+      }
 
       (*env)->DeleteLocalRef(env, jname);
    }
@@ -959,9 +966,18 @@ static bool saf_batch_fill(JNIEnv *env,
    if (count < RETRO_VFS_SAF_DIRENT_BATCH)
       dirstream->exhausted = true;
 
+   /* An entry not copied ends the listing in an error, not short */
+   if (i < count)
+   {
+      dirstream->error     = true;
+      dirstream->exhausted = true;
+   }
+
    ok = (dirstream->batch_count > 0);
 
 done:
+   if (!ok)
+      dirstream->error = true;
    if ((*env)->ExceptionCheck(env))
    {
       (*env)->ExceptionDescribe(env);
@@ -975,11 +991,11 @@ bool retro_vfs_readdir_saf(libretro_vfs_implementation_saf_dir *dirstream)
 {
    JNIEnv *env;
 
-   if (vfs_saf_get_jni_env == NULL)
+   if (vfs_saf_get_jni_env == NULL || (env = vfs_saf_get_jni_env()) == NULL)
+   {
+      dirstream->error = true;
       return false;
-   env = vfs_saf_get_jni_env();
-   if (env == NULL)
-      return false;
+   }
 
    if (dirstream->batch_pos >= dirstream->batch_count)
    {

@@ -1205,6 +1205,7 @@ struct libretro_vfs_implementation_dir
     WIN32_FIND_DATAW entry;
     HANDLE directory;
     bool next;
+    bool read_error;
     char path[PATH_MAX_LENGTH];
 #ifdef HAVE_SMBCLIENT
     smb_dir_handle* smb_handle;
@@ -1299,10 +1300,20 @@ bool retro_vfs_readdir_impl(libretro_vfs_implementation_dir* rdir)
 #endif
 
     if (rdir->next)
-        return (FindNextFileW(rdir->directory, &rdir->entry) != 0);
+    {
+        BOOL found = FindNextFileW(rdir->directory, &rdir->entry);
+        if (!found && GetLastError() != ERROR_NO_MORE_FILES)
+            rdir->read_error = true;
+        return (found != 0);
+    }
 
     rdir->next = true;
     return (rdir->directory != INVALID_HANDLE_VALUE);
+}
+
+bool retro_vfs_dirent_error_impl(libretro_vfs_implementation_dir* rdir)
+{
+    return rdir && rdir->read_error;
 }
 
 const char* retro_vfs_dirent_get_name_impl(libretro_vfs_implementation_dir* rdir)

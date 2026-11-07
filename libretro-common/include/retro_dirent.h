@@ -120,9 +120,13 @@ struct RDIR *retro_opendir_include_hidden(const char *name, bool include_hidden)
 int retro_readdir(struct RDIR *rdir);
 
 /**
- * @deprecated Left for compatibility.
- * @param rdir Ignored.
- * @return \c false.
+ * Tells a read error from the end of the directory once
+ * retro_readdir() has returned \c false.
+ *
+ * @param rdir The directory being read.
+ * @return \c true once a retro_readdir() on this directory has failed
+ * with an error (it stays set); \c false otherwise, and always through
+ * a frontend's VFS interface, which reports no errors.
  */
 bool retro_dirent_error(struct RDIR *rdir);
 

@@ -621,6 +621,7 @@ public final class VfsImplementationSaf
 
       private int prefixLength;
       private Cursor cursor = null;
+      private boolean failed = false;
       private String direntName = null;
       private boolean direntIsDirectory = false;
       private boolean[] batchIsDir = new boolean[0];
@@ -638,7 +639,11 @@ public final class VfsImplementationSaf
          final Uri treeUri = Uri.parse(tree);
          path = normalizePath(path);
          if (isDocument(treeUri))
+         {
+            // a single document is not a folder to list
+            failed = true;
             return;
+         }
          path = path.length() == 1 ? DocumentsContract.getTreeDocumentId(treeUri) : DocumentsContract.getTreeDocumentId(treeUri) + path;
          prefixLength = path.length();
          final Uri childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, path);
@@ -648,6 +653,8 @@ public final class VfsImplementationSaf
          }
          catch (IllegalArgumentException e)
          {}
+         // a folder that can't be listed is not an empty one
+         failed = cursor == null;
       }
 
       @Override
@@ -698,7 +705,8 @@ public final class VfsImplementationSaf
        * Drain up to max children into arrays, so the native side can walk a
        * whole batch without a JNI round trip per entry. Returns the names;
        * getBatchIsDirectory() returns the parallel directory flags for the
-       * same batch. A zero-length result means the directory is exhausted.
+       * same batch. A zero-length result means the directory is exhausted;
+       * null means its children could not be queried.
        *
        * readdir()/getDirentName()/getDirentIsDirectory() remain for callers
        * that step one entry at a time.
@@ -707,6 +715,9 @@ public final class VfsImplementationSaf
       {
          int n = 0;
          String[] names;
+
+         if (failed)
+            return null;
 
          if (max <= 0)
             max = 1;

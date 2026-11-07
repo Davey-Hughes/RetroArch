@@ -92,8 +92,10 @@ struct RDIR *retro_opendir(const char *name)
 
 bool retro_dirent_error(struct RDIR *rdir)
 {
-   /* Left for compatibility */
-   return false;
+   /* a frontend's handle carries no error */
+   if (dirent_readdir_cb)
+      return false;
+   return retro_vfs_dirent_error_impl((struct retro_vfs_dir_handle *)rdir);
 }
 
 int retro_readdir(struct RDIR *rdir)
