@@ -1500,57 +1500,43 @@ static bool task_cloud_sync_hash_current(task_cloud_sync_state_t *sync_state,
 /* Returns false when the local file is still where it was, which leaves
  * the caller holding a file it must not replace or remove: non-destructive
  * mode promises a local copy of anything it displaces, and without the
- * backup there is nothing to fall back on. */
-static bool task_cloud_sync_backup_file(struct item_file *file,
-      const char *dir_core_assets)
+ * backup there is nothing to fall back on. The backup goes under the
+ * synced save folder's backups/cloud-sync, which no sync walks; without
+ * one, under <core assets>/cloud_backups. */
+static bool task_cloud_sync_backup_file(task_cloud_sync_state_t *sync_state,
+      struct item_file *file, enum save_backup_reason reason)
 {
-   struct tm   tm_;
-   size_t      len;
-   bool        ok                   = false;
-   /* one heap block for the three paths: the task runs on small stacks */
-   char       *new_dir              = (char*)malloc(2 * DIR_MAX_LENGTH + PATH_MAX_LENGTH);
-   char       *backup_dir           = new_dir + DIR_MAX_LENGTH;
-   char       *new_path             = backup_dir + DIR_MAX_LENGTH;
-   const char *path_dir_core_assets = dir_core_assets;
-   time_t      cur_time             = time(NULL);
+   size_t      i;
+   bool        ok       = false;
+   const char *saves    = NULL;
+   /* one heap block for the two paths: the task runs on small stacks */
+   char       *new_dir  = (char*)malloc(DIR_MAX_LENGTH + PATH_MAX_LENGTH);
+   char       *new_path = new_dir + DIR_MAX_LENGTH;
 
    if (!new_dir)
       return false;
-   rtime_localtime(&cur_time, &tm_);
 
-   fill_pathname_join_special(backup_dir,
-                              path_dir_core_assets,
-                              "cloud_backups",
-                              DIR_MAX_LENGTH);
-   len = fill_pathname_join_special(new_path,
-                                    backup_dir,
-                                    CS_FILE_KEY(file),
-                                    PATH_MAX_LENGTH);
-   if (len < PATH_MAX_LENGTH)
-      strftime(new_path + len, PATH_MAX_LENGTH - len, "-%y%m%d-%H%M%S", &tm_);
+   for (i = 0; i < sync_state->dirlist->size; i++)
+      if (string_is_equal(sync_state->dirlist->elems[i].data, "saves"))
+         saves = (const char*)sync_state->dirlist->elems[i].userdata;
+
+   if (!string_is_empty(saves))
+      fill_pathname_join_special(new_dir, saves,
+            SAVE_BACKUPS_DIR "/" SAVE_BACKUPS_CORE_CLOUD_SYNC, DIR_MAX_LENGTH);
+   else
+      fill_pathname_join_special(new_dir, sync_state->dir_core_assets,
+            "cloud_backups", DIR_MAX_LENGTH);
+   fill_pathname_join_special(new_path, new_dir, CS_FILE_KEY(file),
+         PATH_MAX_LENGTH);
    pathname_conform_slashes_to_os(new_path);
    fill_pathname_basedir(new_dir, new_path, DIR_MAX_LENGTH);
 
-   if (!path_mkdir(new_dir))
-      RARCH_ERR(CSPFX "Could not create backup directory \"%s\".\n", new_dir);
-   else if (filestream_rename(file->path, new_path) == 0)
+   if (save_backups_move_to(new_dir, file->path,
+            SAVE_BACKUPS_CORE_CLOUD_SYNC, reason) == SAVE_BACKUP_MADE)
       ok = true;
-   /* A rename cannot cross volumes, or leave a SAF tree on Android, and
-    * the backups live under the assets directory wherever saves are.
-    * This runs on the task thread, so a blocking copy holds up nothing. */
-   else if (filestream_copy(file->path, new_path) != 0)
-      RARCH_ERR(CSPFX "Could not back \"%s\" up to \"%s\".\n",
-            file->path, new_path);
-   /* The caller needs the local file gone; a backup of a file that is
-    * still there would only pile up. */
-   else if (filestream_delete(file->path) != 0)
-   {
-      filestream_delete(new_path);
-      RARCH_ERR(CSPFX "Could not remove \"%s\" after backing it up.\n",
-            file->path);
-   }
    else
-      ok = true;
+      RARCH_ERR(CSPFX "Could not back \"%s\" up to \"%s\".\n",
+            file->path, new_dir);
 
    free(new_dir);
    return ok;
@@ -1664,7 +1650,8 @@ static bool task_cloud_sync_fetch_commit(
       struct item_file local_file = {0};
       local_file.alt  = (char*)key;
       local_file.path = fetch_state->local;
-      if (!task_cloud_sync_backup_file(&local_file, sync_state->dir_core_assets))
+      if (!task_cloud_sync_backup_file(sync_state, &local_file,
+               SAVE_BACKUP_REPLACED))
       {
          filestream_delete(tmp);
          task_cloud_sync_carry_manifests_forward(sync_state, key, server_hash);
@@ -2126,7 +2113,8 @@ static bool task_cloud_sync_delete_current_file(task_cloud_sync_state_t *sync_st
 
    if (cloud_sync_destructive
          ? (filestream_delete(item->path) != 0)
-         : !task_cloud_sync_backup_file(item, sync_state->dir_core_assets))
+         : !task_cloud_sync_backup_file(sync_state, item,
+               SAVE_BACKUP_DELETED))
    {
       RARCH_ERR(CSPFX "Keeping \"%s\", the local file could not be removed.\n",
             CS_FILE_KEY(item));

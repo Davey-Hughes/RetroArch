@@ -1,10 +1,10 @@
 /* Where runloop_path_set_redirect() puts a game's saves and states.
  *
  * With sort-by-content on, the content folder's name becomes a folder
- * under the save and state roots, except "backups", "records" and
- * "system" in any case, which the roots keep for safety copies, records
- * and the system folder's copies: those games use the root (and the
- * core's folder when that is on).
+ * under the save and state roots, except "backups", "records",
+ * "system" and "cloud-sync" in any case, which the roots keep for safety
+ * copies, records, the system folder's copies and cloud sync's backups:
+ * those games use the root (and the core's folder when that is on).
  *
  * A netplay client whose ".netplay" folder can't be made writes no
  * saves for that content, says so once, and the next content saves
@@ -256,6 +256,14 @@ static void reserved_rom_folder(void)
    CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/Snes9x/Game.srm"));
    CHECK(same_path(runloop_state.name.savestate, ROOT "/states/Snes9x/Game.state"));
 
+   redirect("/roms/cloud-sync/Game", false);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/Game.srm"));
+   CHECK(same_path(runloop_state.name.savestate, ROOT "/states/Game.state"));
+
+   redirect("/roms/Cloud-Sync/Game", true);
+   CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/Snes9x/Game.srm"));
+   CHECK(same_path(runloop_state.name.savestate, ROOT "/states/Snes9x/Game.state"));
+
    redirect("/roms/backups2/Game", false);
    CHECK(same_path(runloop_state.name.savefile, ROOT "/saves/backups2/Game.srm"));
 
@@ -269,6 +277,10 @@ static void reserved_rom_folder(void)
    CHECK(!path_is_directory(ROOT "/states/system"));
    CHECK(!path_is_directory(ROOT "/saves/System"));
    CHECK(!path_is_directory(ROOT "/states/System"));
+   CHECK(!path_is_directory(ROOT "/saves/cloud-sync"));
+   CHECK(!path_is_directory(ROOT "/states/cloud-sync"));
+   CHECK(!path_is_directory(ROOT "/saves/Cloud-Sync"));
+   CHECK(!path_is_directory(ROOT "/states/Cloud-Sync"));
 }
 
 /* A content load: the paths, then the save list. */

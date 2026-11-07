@@ -93,6 +93,28 @@ static bool save_backups_write_file(const char *path,
    return filestream_write_file_atomic(path, data, len);
 }
 
+/* A rename, or where that fails (across drives) a copy, synced before
+ * the original is deleted. A delete that fails undoes the copy, unless
+ * the original went all the same (a network drive's lost reply). */
+static bool save_backups_move_file(const char *path, const char *to)
+{
+   void *buf   = NULL;
+   int64_t len = 0;
+   bool ok;
+   if (filestream_rename(path, to) == 0)
+      return true;
+   if (!filestream_read_file(path, &buf, &len))
+      return false;
+   ok = save_backups_write_file(to, buf, len, true);
+   free(buf);
+   if (ok && filestream_delete(path) != 0 && path_is_valid(path))
+   {
+      filestream_delete(to);
+      ok = false;
+   }
+   return ok;
+}
+
 void save_backups_set_roots(const char *savefile_dir,
       const char *savestate_dir, const char *content_dir,
       const char *system_dir, const char *config_dir,
@@ -525,12 +547,13 @@ static bool save_backups_of(const char *name, struct save_backup_name *out,
       && string_is_equal(name + out->ext_off, ext);
 }
 
-/* Writes @data as a copy of @path into @dir, its path in @s. With
- * @skip_same, nothing is written when the newest copy holds it. */
+/* Writes @data as a copy of @path into @dir, its path in @s; with
+ * @move, moves @path there instead. With @skip_same, nothing is written
+ * when the newest copy holds it. */
 static enum save_backup_result save_backups_write_copy(char *s, size_t len,
       const char *dir, const char *path, const char *core,
       enum save_backup_reason reason, const void *data, size_t data_len,
-      bool skip_same, bool sync)
+      bool move, bool skip_same, bool sync)
 {
    size_t i, _len, base_len, game_len, name_off;
    long dir_units;
@@ -628,7 +651,9 @@ static enum save_backup_result save_backups_write_copy(char *s, size_t len,
          break;
    }
 
-   if (!save_backups_write_file(s, data, (int64_t)data_len, sync))
+   if (move
+         ? !save_backups_move_file(path, s)
+         : !save_backups_write_file(s, data, (int64_t)data_len, sync))
    {
       s[0] = '\0';
       goto end;
@@ -679,8 +704,23 @@ enum save_backup_result save_backups_copy_to(const char *dir,
       len  = (size_t)n;
    }
    result = save_backups_write_copy(made, PATH_MAX_LENGTH, dir, path,
-         core, reason, data, len, true, sync);
+         core, reason, data, len, false, true, sync);
    free(buf);
+   free(made);
+   return result;
+}
+
+enum save_backup_result save_backups_move_to(const char *dir,
+      const char *path, const char *core, enum save_backup_reason reason)
+{
+   enum save_backup_result result;
+   char *made;
+   if (!path_is_valid(path))
+      return SAVE_BACKUP_NO_FILE;
+   if (!(made = (char*)malloc(PATH_MAX_LENGTH)))
+      return SAVE_BACKUP_FAILED;
+   result = save_backups_write_copy(made, PATH_MAX_LENGTH, dir, path,
+         core, reason, NULL, 0, true, false, false);
    free(made);
    return result;
 }
@@ -755,7 +795,7 @@ size_t save_backups_recover(char *s, size_t len, const char *path,
       return 0;
    if (save_backups_dir(dir, PATH_MAX_LENGTH, path))
       made = save_backups_write_copy(s, len, dir, path, NULL,
-            SAVE_BACKUP_UNSAVED, data, data_len, false, sync)
+            SAVE_BACKUP_UNSAVED, data, data_len, false, false, sync)
          == SAVE_BACKUP_MADE;
    for (i = SAVE_BACKUPS_ROOT_CONFIG;
          !made && i <= SAVE_BACKUPS_ROOT_APP_DATA; i++)
@@ -765,7 +805,7 @@ size_t save_backups_recover(char *s, size_t len, const char *path,
       fill_pathname_join(dir, save_backups_roots[i],
             SAVE_BACKUPS_RECOVERY_DIR, PATH_MAX_LENGTH);
       made = save_backups_write_copy(s, len, dir, path, NULL,
-            SAVE_BACKUP_UNSAVED, data, data_len, false, sync)
+            SAVE_BACKUP_UNSAVED, data, data_len, false, false, sync)
          == SAVE_BACKUP_MADE;
    }
    free(dir);

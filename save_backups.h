@@ -102,6 +102,13 @@ enum save_backup_result save_backups_copy_to(const char *dir,
       const char *path, const char *core, enum save_backup_reason reason,
       const void *data, size_t len, bool sync);
 
+/* Moves the file at @path into @dir under the name
+ * save_backups_copy_to() would give its copy: a rename, or across
+ * drives a synced copy and then the delete, undone when the original
+ * stays. */
+enum save_backup_result save_backups_move_to(const char *dir,
+      const char *path, const char *core, enum save_backup_reason reason);
+
 /* save_backups_copy_to() into save_backups_dir() of @path. */
 enum save_backup_result save_backups_copy_image(const char *path,
       enum save_backup_reason reason, const void *data, size_t len,

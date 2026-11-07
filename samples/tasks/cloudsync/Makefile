@@ -57,6 +57,7 @@ ADDS_TARGET  := cloudsync_manifest_adds_test
 ADDS_SOURCES := cloudsync_manifest_adds_test.c \
 	$(filter-out cloudsync_savefile_owner_test.c,$(SOURCES)) \
 	$(CORE_DIR)/tasks/task_cloudsync_path.c \
+	$(CORE_DIR)/save_backups.c \
 	$(LIBRETRO_COMM_DIR)/formats/json/rjson.c \
 	$(LIBRETRO_COMM_DIR)/utils/md5.c \
 	$(LIBRETRO_COMM_DIR)/queues/task_queue.c \
@@ -127,8 +128,10 @@ $(PACING_TARGET): cloudsync_pacing_test.c $(filter-out cloudsync_manifest_adds_t
 $(ASYNC_TARGET): $(ASYNC_SOURCES) $(CORE_DIR)/network/cloud_sync_driver.h
 	$(CC) -o $@ $(ASYNC_SOURCES) $(filter-out -pedantic,$(CFLAGS)) $(ASYNC_DEFS) $(LDFLAGS) -lpthread
 
+# The commit test refuses the move of a save into its backups at the
+# link boundary, as a move across drives fails, and counts the syncs.
 $(COMMIT_TARGET): cloudsync_commit_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(CORE_DIR)/tasks/task_cloudsync.c
-	$(CC) -o $@ cloudsync_commit_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(filter-out -pedantic,$(CFLAGS)) $(ADDS_DEFS) $(LDFLAGS) -lpthread
+	$(CC) -o $@ cloudsync_commit_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(filter-out -pedantic,$(CFLAGS)) $(ADDS_DEFS) $(LDFLAGS) -Wl,--wrap=filestream_rename -Wl,--wrap=filestream_delete -Wl,--wrap=retro_vfs_file_sync_impl -lpthread
 
 $(ROOTS_TARGET): cloudsync_roots_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(CORE_DIR)/tasks/task_cloudsync.c
 	$(CC) -o $@ cloudsync_roots_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(filter-out -pedantic,$(CFLAGS)) $(ADDS_DEFS) $(LDFLAGS) -lpthread
@@ -145,6 +148,6 @@ check: $(TARGET) $(PATH_TARGET) $(ADDS_TARGET) $(PACING_TARGET) $(ASYNC_TARGET) 
 clean:
 	rm -rf $(SAMPLE_OBJDIR)
 	rm -f $(TARGET) $(OBJS) $(PATH_TARGET) $(PATH_OBJS) $(ADDS_TARGET) $(PACING_TARGET) $(ASYNC_TARGET) $(COMMIT_TARGET) $(COMMIT_TARGET).exe $(ROOTS_TARGET) $(ROOTS_TARGET).exe
-	rm -rf cloudsync_roots_test_files
+	rm -rf cloudsync_roots_test_files cloudsync_commit_test_files
 
 .PHONY: all check clean

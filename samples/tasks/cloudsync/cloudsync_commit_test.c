@@ -7,6 +7,7 @@
 #include <string.h>
 #include <rthreads/rthreads.h>
 #include <retro_timers.h>
+#include <vfs/vfs_implementation.h>
 
 static int fail_alloc;
 static void *test_malloc(size_t size)
@@ -19,21 +20,8 @@ static void *test_malloc(size_t size)
    return malloc(size);
 }
 
-/* Whether a rename into the backup directory fails as one across
- * volumes does, or out of a SAF tree on Android. */
-static int across_volumes;
-#include <streams/file_stream.h>
-static int test_rename(const char *old_path, const char *new_path)
-{
-   if (across_volumes && strstr(new_path, "cloud_backups"))
-      return -1;
-   return filestream_rename(old_path, new_path);
-}
-
 #define malloc test_malloc
-#define filestream_rename test_rename
 #include "../../../tasks/task_cloudsync.c"
-#undef filestream_rename
 #undef malloc
 
 static const char *directory = "cloudsync_commit_test_files";
@@ -41,6 +29,12 @@ static char local_path[128], fetching_path[160];
 static retro_atomic_int_t off_main, ownership_checks;
 static int live, retired, failures, expect_old, expect_failure;
 static void *pending_fetch;
+/* 1: moving the save into its backups fails, as across drives;
+ * 2: deleting it fails too; 3: the delete removes it but reports a
+ * failure, as a network drive can */
+static retro_atomic_int_t refuse_move, refused;
+/* syncs of a backup, and how many came before the save was deleted */
+static retro_atomic_int_t backup_syncs, syncs_at_delete;
 
 #define CHECK(c) do { if (!(c)) { \
    fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #c); failures++; } } while (0)
@@ -59,6 +53,41 @@ void runloop_msg_queue_push(const char *msg, size_t len, unsigned prio,
 }
 settings_t *config_get_ptr(void) { return NULL; }
 char *dir_get_ptr(enum rarch_dir_type type) { (void)type; return NULL; }
+int __real_filestream_rename(const char *old_path, const char *new_path);
+int __wrap_filestream_rename(const char *old_path, const char *new_path)
+{
+   if (     retro_atomic_load_relaxed_int(&refuse_move)
+         && string_is_equal(old_path, local_path))
+   {
+      retro_atomic_inc_int(&refused);
+      return -1;
+   }
+   return __real_filestream_rename(old_path, new_path);
+}
+int __real_filestream_delete(const char *path);
+int __wrap_filestream_delete(const char *path)
+{
+   if (     string_is_equal(path, local_path)
+         && retro_atomic_load_relaxed_int(&syncs_at_delete) < 0)
+      retro_atomic_store_relaxed_int(&syncs_at_delete,
+            retro_atomic_load_relaxed_int(&backup_syncs));
+   if (     retro_atomic_load_relaxed_int(&refuse_move) >= 2
+         && string_is_equal(path, local_path))
+   {
+      if (retro_atomic_load_relaxed_int(&refuse_move) == 3)
+         __real_filestream_delete(path);
+      return -1;
+   }
+   return __real_filestream_delete(path);
+}
+int __real_retro_vfs_file_sync_impl(libretro_vfs_implementation_file *stream);
+int __wrap_retro_vfs_file_sync_impl(libretro_vfs_implementation_file *stream)
+{
+   if (     stream && stream->orig_path
+         && strstr(stream->orig_path, SAVE_BACKUPS_CORE_CLOUD_SYNC))
+      retro_atomic_inc_int(&backup_syncs);
+   return __real_retro_vfs_file_sync_impl(stream);
+}
 bool content_savefile_is_live(const char *path)
 {
    retro_atomic_inc_int(&ownership_checks);
@@ -146,12 +175,17 @@ static void lane(bool threaded, bool deletion, bool owned, bool no_memory,
    char manifest[160], backup_dir[160];
    struct string_list *backups;
    union string_list_elem_attr attr;
+   int mode = retro_atomic_load_relaxed_int(&refuse_move);
+   /* a save that can't be deleted is kept, its copy undone */
+   bool keep = mode == 2;
    retired = 0;
    live = 0;
-   expect_old = owned || no_memory;
-   expect_failure = no_memory;
+   expect_old = owned || no_memory || keep;
+   expect_failure = no_memory || keep;
    retro_atomic_store_relaxed_int(&off_main, 0);
    retro_atomic_store_relaxed_int(&ownership_checks, 0);
+   retro_atomic_store_relaxed_int(&backup_syncs, 0);
+   retro_atomic_store_relaxed_int(&syncs_at_delete, -1);
    CHECK(filestream_write_file(local_path, "old", 3));
    st->server_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
    st->local_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
@@ -163,7 +197,9 @@ static void lane(bool threaded, bool deletion, bool owned, bool no_memory,
    attr.i = 0;
    string_list_append(st->dirlist, "saves", attr);
    st->dirlist->elems[0].userdata = strdup(directory);
-   strlcpy(st->dir_core_assets, directory, sizeof(st->dir_core_assets));
+   snprintf(st->dir_core_assets, sizeof(st->dir_core_assets), "%s/assets",
+         directory);
+   CHECK(path_mkdir(st->dir_core_assets));
    add(st->server_manifest, NULL, deletion ? NULL : "new");
    add(st->local_manifest, NULL, "old");
    add(st->current_manifest, local_path, "old");
@@ -199,6 +235,11 @@ static void lane(bool threaded, bool deletion, bool owned, bool no_memory,
    CHECK(retro_atomic_load_relaxed_int(&off_main) == 0);
    if (!no_memory)
       CHECK(retro_atomic_load_relaxed_int(&ownership_checks) > 0);
+   /* a rename is not synced; a copy is, before the save goes */
+   if (!mode)
+      CHECK(retro_atomic_load_relaxed_int(&backup_syncs) == 0);
+   else
+      CHECK(retro_atomic_load_relaxed_int(&syncs_at_delete) > 0);
    if (expect_old)
       CHECK(holds(local_path, "old"));
    else if (!deletion)
@@ -206,28 +247,121 @@ static void lane(bool threaded, bool deletion, bool owned, bool no_memory,
    else
       CHECK(!path_is_valid(local_path));
    CHECK(!path_is_valid(fetching_path));
-   snprintf(backup_dir, sizeof(backup_dir), "%s/cloud_backups/saves", directory);
+   snprintf(backup_dir, sizeof(backup_dir), "%s/backups/cloud-sync/saves", directory);
    backups = dir_list_new(backup_dir, NULL, false, false, true, true);
    if (!destructive && !expect_old)
    {
       CHECK(backups && backups->size == 1);
       if (backups && backups->size)
+      {
+         struct save_backup_name name;
          CHECK(holds(backups->elems[0].data, "old"));
+         CHECK(save_backups_parse(path_basename(backups->elems[0].data), &name)
+               && name.reason == (deletion
+                  ? SAVE_BACKUP_DELETED : SAVE_BACKUP_REPLACED));
+      }
    }
    else
       CHECK(!backups || backups->size == 0);
+   snprintf(backup_dir, sizeof(backup_dir), "%s/assets/cloud_backups", directory);
+   CHECK(!path_is_valid(backup_dir));
    if (backups)
    {
-      for (i = 0; i < backups->size; i++)
-         filestream_delete(backups->elems[i].data);
+      /* left in place, copies would pile up over the mode's syncs */
+      if (!keep)
+         for (i = 0; i < backups->size; i++)
+            filestream_delete(backups->elems[i].data);
       string_list_free(backups);
    }
    task_queue_deinit();
    filestream_delete(local_path);
-   snprintf(manifest, sizeof(manifest), "%s/manifest.local", directory);
+   snprintf(manifest, sizeof(manifest), "%s/assets/manifest.local", directory);
    filestream_delete(manifest);
-   snprintf(manifest, sizeof(manifest), "%s/manifest.local.roots", directory);
+   snprintf(manifest, sizeof(manifest), "%s/assets/manifest.local.roots",
+         directory);
    filestream_delete(manifest);
+}
+
+/* Two backups of one key in one second are told apart by number; with
+ * no synced save folder they go under the core assets' cloud_backups. */
+static void backup_location_lane(void)
+{
+   task_cloud_sync_state_t *st = (task_cloud_sync_state_t*)calloc(1, sizeof(*st));
+   struct item_file item = {0};
+   union string_list_elem_attr attr;
+   struct string_list *list = NULL;
+   struct save_backup_name a, b;
+   char dir[256];
+   unsigned i, tries;
+   attr.i    = 0;
+   item.alt  = (char*)"saves/Snes9x/save.srm";
+   item.path = local_path;
+   st->dirlist = string_list_new();
+   string_list_append(st->dirlist, "saves", attr);
+   st->dirlist->elems[0].userdata = strdup(directory);
+   snprintf(st->dir_core_assets, sizeof(st->dir_core_assets), "%s/assets",
+         directory);
+   snprintf(dir, sizeof(dir), "%s/backups/cloud-sync/saves/Snes9x", directory);
+   for (tries = 0; tries < 3; tries++)
+   {
+      time_t start = time(NULL);
+      for (i = 0; i < 2; i++)
+      {
+         CHECK(filestream_write_file(local_path, i ? "two" : "one", 3));
+         CHECK(task_cloud_sync_backup_file(st, &item, SAVE_BACKUP_REPLACED));
+         CHECK(!path_is_valid(local_path));
+      }
+      list = dir_list_new(dir, NULL, false, false, false, false);
+      if (time(NULL) == start)
+         break;
+      /* the clock turned between the two: again */
+      for (i = 0; list && i < list->size; i++)
+         filestream_delete(list->elems[i].data);
+      string_list_free(list);
+      list = NULL;
+   }
+   CHECK(list && list->size == 2);
+   if (list && list->size == 2)
+   {
+      dir_list_sort(list, true);
+      CHECK(save_backups_parse(path_basename(list->elems[0].data), &a));
+      CHECK(save_backups_parse(path_basename(list->elems[1].data), &b));
+      CHECK(a.reason == SAVE_BACKUP_REPLACED && b.reason == SAVE_BACKUP_REPLACED);
+      CHECK(!memcmp(a.time, b.time, sizeof(a.time)));
+      CHECK(a.number == 1 && b.number == 2);
+      CHECK(!strncmp(path_basename(list->elems[0].data) + a.core_off,
+               "cloud-sync", a.core_len) && a.core_len == 10);
+      CHECK(holds(list->elems[0].data, "one"));
+      CHECK(holds(list->elems[1].data, "two"));
+   }
+   for (i = 0; list && i < list->size; i++)
+      filestream_delete(list->elems[i].data);
+   string_list_free(list);
+
+   string_list_free(st->dirlist);
+   st->dirlist = string_list_new();
+   CHECK(filestream_write_file(local_path, "three", 5));
+   CHECK(task_cloud_sync_backup_file(st, &item, SAVE_BACKUP_DELETED));
+   snprintf(dir, sizeof(dir), "%s/assets/cloud_backups/saves/Snes9x", directory);
+   list = dir_list_new(dir, NULL, false, false, false, false);
+   CHECK(list && list->size == 1);
+   if (list && list->size == 1)
+   {
+      CHECK(save_backups_parse(path_basename(list->elems[0].data), &a)
+            && a.reason == SAVE_BACKUP_DELETED);
+      CHECK(holds(list->elems[0].data, "three"));
+      filestream_delete(list->elems[0].data);
+   }
+   string_list_free(list);
+   path_rmdir(dir);
+   snprintf(dir, sizeof(dir), "%s/assets/cloud_backups/saves", directory);
+   path_rmdir(dir);
+   snprintf(dir, sizeof(dir), "%s/assets/cloud_backups", directory);
+   path_rmdir(dir);
+   snprintf(dir, sizeof(dir), "%s/assets", directory);
+   path_rmdir(dir);
+   string_list_free(st->dirlist);
+   free(st);
 }
 
 static const char *walk_files[] = {
@@ -326,6 +460,7 @@ static void walk_lane(void)
 int main(void)
 {
    unsigned t;
+   int m;
    retro_atomic_int_init(&off_main, 0);
    retro_atomic_int_init(&ownership_checks, 0);
 #if defined(HAVE_THREADS) && !defined(TCS_LOCK_FREE)
@@ -347,11 +482,20 @@ int main(void)
       lane(t != 0, false, false, true, false);
       lane(t != 0, true, true, false, false);
       lane(t != 0, true, false, false, false);
-      across_volumes = 1;
-      lane(t != 0, false, false, false, false);
-      lane(t != 0, true, false, false, false);
-      across_volumes = 0;
    }
+   /* across drives the move is a copy, then the delete */
+   for (m = 1; m <= 3; m++)
+   {
+      retro_atomic_store_relaxed_int(&refuse_move, m);
+      for (t = 0; t < 2; t++)
+      {
+         lane(t != 0, false, false, false, false);
+         lane(t != 0, true, false, false, false);
+      }
+   }
+   retro_atomic_store_relaxed_int(&refuse_move, 0);
+   CHECK(retro_atomic_load_relaxed_int(&refused) == 12);
+   backup_location_lane();
    walk_lane();
    puts(failures ? "FAIL cloudsync_commit_test" : "PASS cloudsync_commit_test");
    return failures ? 1 : 0;

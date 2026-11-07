@@ -11790,7 +11790,8 @@ static bool runloop_save_dir_name_reserved(const char *name)
 {
    return string_is_equal_noncase(name, SAVE_BACKUPS_DIR)
        || string_is_equal_noncase(name, SAVE_BACKUPS_RECORDS_DIR)
-       || string_is_equal_noncase(name, SAVE_BACKUPS_SYSTEM_DIR);
+       || string_is_equal_noncase(name, SAVE_BACKUPS_SYSTEM_DIR)
+       || string_is_equal_noncase(name, SAVE_BACKUPS_CORE_CLOUD_SYNC);
 }
 
 /* Whether @dir has this content's save, or any of its states */
