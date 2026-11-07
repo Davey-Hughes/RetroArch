@@ -52,6 +52,8 @@
 #define CSPFX "[CloudSync] "
 
 #define MANIFEST_FILENAME_LOCAL  "manifest.local"
+/* The folder each root was walked from, beside the local manifest */
+#define ROOTS_FILENAME_LOCAL     "manifest.local.roots"
 #define MANIFEST_FILENAME_SERVER CLOUD_SYNC_SERVER_MANIFEST
 
 #define CS_FILE_HASH(item_file) ((char*)((item_file) ? ((item_file)->userdata) : (NULL)))
@@ -158,8 +160,12 @@ typedef struct
    char dir_core_assets[DIR_MAX_LENGTH];
    /* The directory map for this sync, built at push. Per task rather
     * than a process-wide cache: a fresh list per sync is a handful of
-    * strdups, and it cannot go stale against the sync toggles. */
+    * strdups, and it cannot go stale against the sync toggles. An
+    * element's attr.i holds its CS_ROOT_* flags. */
    struct string_list *dirlist;
+   /* The roots file as the last sync left it: data is a root's name,
+    * userdata the folder it was walked from. NULL when there is none. */
+   struct string_list *roots;
    /* Whoever pushed the sync, told when it is done. */
    retro_task_callback_t cb;
    void *cb_data;
@@ -439,6 +445,250 @@ static void task_cloud_sync_fetch_server_manifest(task_cloud_sync_state_t *sync_
    }
 }
 
+/* A root walked from another folder than the last sync's */
+#define CS_ROOT_CHANGED 1
+
+static void task_cloud_sync_roots_filename(char *s, size_t len,
+      const char *dir_core_assets)
+{
+   fill_pathname_join_special(s, dir_core_assets, ROOTS_FILENAME_LOCAL, len);
+}
+
+/* The roots file in @out, NULL when there is none or it can't be
+ * read. False when out of memory. */
+static bool task_cloud_sync_read_roots(const char *dir_core_assets,
+      struct string_list **out)
+{
+   char                path[PATH_MAX_LENGTH];
+   void               *buf   = NULL;
+   int64_t             len   = 0;
+   char               *name  = NULL;
+   rjson_t            *json  = NULL;
+   struct string_list *roots = NULL;
+   bool                ok    = true;
+   enum rjson_type     type;
+
+   *out = NULL;
+   task_cloud_sync_roots_filename(path, sizeof(path), dir_core_assets);
+   if (!path_is_valid(path))
+      return true;
+   if (!filestream_read_file(path, &buf, &len))
+      goto error;
+   if (     !(json  = rjson_open_buffer(buf, (size_t)len))
+         || !(roots = string_list_new()))
+      goto oom;
+
+   /* the root members' strings; "held" is an array and skipped */
+   while ((type = rjson_next(json)) != RJSON_DONE)
+   {
+      const char *str;
+      if (type == RJSON_ERROR)
+         goto error;
+      if (     type != RJSON_STRING
+            || rjson_get_context_type(json) != RJSON_OBJECT)
+         continue;
+      str = rjson_get_string(json, NULL);
+      if (rjson_get_context_count(json) & 1)
+      {
+         free(name);
+         if (!(name = strdup(str)))
+            goto oom;
+      }
+      else if (name)
+      {
+         union string_list_elem_attr attr;
+         char *dir = strdup(str);
+         attr.i    = 0;
+         if (!dir || !string_list_append(roots, name, attr))
+         {
+            free(dir);
+            goto oom;
+         }
+         roots->elems[roots->size - 1].userdata = dir;
+      }
+   }
+
+   free(name);
+   rjson_free(json);
+   free(buf);
+   *out = roots;
+   return true;
+
+oom:
+   ok = false;
+error:
+   if (ok)
+      RARCH_WARN(CSPFX "Ignoring unreadable \"%s\".\n", path);
+   free(name);
+   if (json)
+      rjson_free(json);
+   string_list_free(roots);
+   free(buf);
+   return ok;
+}
+
+/* The two folders are the same, but for trailing separators */
+static bool task_cloud_sync_same_dir(const char *a, const char *b)
+{
+   size_t la = strlen(a);
+   size_t lb = strlen(b);
+   while (la > 1 && (a[la - 1] == '/' || a[la - 1] == '\\'))
+      la--;
+   while (lb > 1 && (b[lb - 1] == '/' || b[lb - 1] == '\\'))
+      lb--;
+   return la == lb && !memcmp(a, b, la);
+}
+
+/* The dirlist root @key lies under, or -1 */
+static int task_cloud_sync_key_root(const struct string_list *dirlist,
+      const char *key)
+{
+   size_t i;
+   for (i = 0; i < dirlist->size; i++)
+   {
+      size_t len = strlen(dirlist->elems[i].data);
+      if (!strncmp(key, dirlist->elems[i].data, len) && key[len] == '/')
+         return (int)i;
+   }
+   return -1;
+}
+
+/* A root walked from another folder than the last sync's leaves the
+ * local manifest, so the diff runs first-sync rules for its keys:
+ * fetch, upload or conflict, never a delete. False when out of
+ * memory. */
+static bool task_cloud_sync_drop_changed_roots(
+      task_cloud_sync_state_t *sync_state)
+{
+   struct string_list *dirlist = sync_state->dirlist;
+   file_list_t        *local   = sync_state->local_manifest;
+   file_list_t        *kept;
+   bool                changed = false;
+   size_t              i;
+
+   for (i = 0; i < dirlist->size; i++)
+   {
+      int at = string_list_find_elem(sync_state->roots,
+            dirlist->elems[i].data);
+      if (at && !task_cloud_sync_same_dir(
+               (const char*)sync_state->roots->elems[at - 1].userdata,
+               (const char*)dirlist->elems[i].userdata))
+      {
+         RARCH_WARN(CSPFX "\"%s\" is now \"%s\", was \"%s\": syncing it as a first sync.\n",
+               dirlist->elems[i].data,
+               (const char*)dirlist->elems[i].userdata,
+               (const char*)sync_state->roots->elems[at - 1].userdata);
+         dirlist->elems[i].attr.i |= CS_ROOT_CHANGED;
+         changed = true;
+      }
+   }
+   if (!changed || !local)
+      return true;
+
+   if (!(kept = (file_list_t*)calloc(1, sizeof(*kept))))
+      return false;
+   for (i = 0; i < local->size; i++)
+   {
+      const char *key = CS_FILE_KEY(&local->list[i]);
+      int         at  = task_cloud_sync_key_root(dirlist, key);
+      if (at >= 0 && (dirlist->elems[at].attr.i & CS_ROOT_CHANGED))
+         continue;
+      if (!file_list_append(kept, NULL, NULL, 0, 0, 0))
+      {
+         file_list_free(kept);
+         return false;
+      }
+      file_list_set_alt_at_offset(kept, kept->size - 1, key);
+      kept->list[kept->size - 1].userdata = local->list[i].userdata;
+      local->list[i].userdata             = NULL;
+   }
+   file_list_free(local);
+   sync_state->local_manifest = kept;
+   return true;
+}
+
+static void task_cloud_sync_write_root(rjsonwriter_t *writer,
+      const char *name, const char *dir, bool *first)
+{
+   if (!*first)
+      rjsonwriter_raw(writer, ",\n", 2);
+   *first = false;
+   rjsonwriter_add_spaces(writer, 2);
+   rjsonwriter_add_string(writer, name);
+   rjsonwriter_raw(writer, ": ", 2);
+   rjsonwriter_add_string(writer, dir);
+}
+
+/* A root with keys in the local manifest that this sync did not walk
+ * and no roots file named: its folder is unknown, so whichever folder
+ * it gets next is a change. */
+static void task_cloud_sync_write_unknown_roots(rjsonwriter_t *writer,
+      const task_cloud_sync_state_t *sync_state, bool *first)
+{
+   char               name[32];
+   char               last[32];
+   const file_list_t *local = sync_state->updated_local_manifest;
+   size_t             i;
+
+   last[0] = '\0';
+   for (i = 0; local && i < local->size; i++)
+   {
+      const char *key   = CS_FILE_KEY(&local->list[i]);
+      const char *slash = key ? strchr(key, '/') : NULL;
+      size_t      len   = slash ? (size_t)(slash - key) : 0;
+      if (!len || len >= sizeof(name))
+         continue;
+      memcpy(name, key, len);
+      name[len] = '\0';
+      /* sorted by key, so a root's keys are together */
+      if (string_is_equal(name, last))
+         continue;
+      strlcpy(last, name, sizeof(last));
+      if (     !string_list_find_elem(sync_state->dirlist, name)
+            && !string_list_find_elem(sync_state->roots, name))
+         task_cloud_sync_write_root(writer, name, "", first);
+   }
+}
+
+/* Written after the local manifest it describes: the folder each root
+ * was walked from, and the roots this sync did not cover as the last
+ * one left them. */
+static void task_cloud_sync_write_roots(task_cloud_sync_state_t *sync_state)
+{
+   char                path[PATH_MAX_LENGTH];
+   struct string_list *dirlist = sync_state->dirlist;
+   struct string_list *roots   = sync_state->roots;
+   rjsonwriter_t      *writer  = rjsonwriter_open_memory();
+   const char         *buf     = NULL;
+   bool                first   = true;
+   int                 len     = 0;
+   size_t              i;
+
+   task_cloud_sync_roots_filename(path, sizeof(path),
+         sync_state->dir_core_assets);
+   if (writer)
+   {
+      rjsonwriter_raw(writer, "{\n", 2);
+      for (i = 0; i < dirlist->size; i++)
+         task_cloud_sync_write_root(writer, dirlist->elems[i].data,
+               (const char*)dirlist->elems[i].userdata, &first);
+      for (i = 0; roots && i < roots->size; i++)
+         if (!string_list_find_elem(dirlist, roots->elems[i].data))
+            task_cloud_sync_write_root(writer, roots->elems[i].data,
+                  (const char*)roots->elems[i].userdata, &first);
+      task_cloud_sync_write_unknown_roots(writer, sync_state, &first);
+      rjsonwriter_raw(writer, "\n}\n", 3);
+      buf = rjsonwriter_get_memory_buffer(writer, &len);
+   }
+   if (!buf || !filestream_write_file_atomic(path, buf, len))
+   {
+      RARCH_ERR(CSPFX "Failed to write \"%s\".\n", path);
+      sync_state->failures = true;
+   }
+   if (writer)
+      rjsonwriter_free(writer);
+}
+
 static void task_cloud_sync_read_local_manifest(task_cloud_sync_state_t *sync_state)
 {
    char manifest_path[PATH_MAX_LENGTH];
@@ -476,6 +726,18 @@ static void task_cloud_sync_read_local_manifest(task_cloud_sync_state_t *sync_st
             filestream_delete(manifest_path);
          }
       }
+   }
+
+   /* A missing roots file, or a root it does not name, is unchanged */
+   if (     !task_cloud_sync_read_roots(sync_state->dir_core_assets,
+               &sync_state->roots)
+         || (    sync_state->roots
+             &&  sync_state->dirlist
+             && !task_cloud_sync_drop_changed_roots(sync_state)))
+   {
+      sync_state->failures = true;
+      task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_END);
+      return;
    }
 
    task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_BUILD_CURRENT_MANIFEST);
@@ -2244,6 +2506,7 @@ static void task_cloud_sync_commit_local_manifest(task_cloud_sync_state_t *sync_
       filestream_close(file);
       if (filestream_rename(tmp_path, manifest_path) == 0)
       {
+         task_cloud_sync_write_roots(sync_state);
          free(manifest_path);
          return;
       }
@@ -2517,6 +2780,7 @@ static void task_cloud_sync_cleanup(retro_task_t *task)
     * elems[i].data, so the strdup'd directories go with it. */
    if (sync_state->dirlist)
       string_list_free(sync_state->dirlist);
+   string_list_free(sync_state->roots);
    task_cloud_sync_walk_free(sync_state);
    if (sync_state->hash_cur.file)
       filestream_close(sync_state->hash_cur.file);

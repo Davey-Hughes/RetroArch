@@ -1,7 +1,7 @@
 /* Whole syncs of the real cloud-sync task over a folder standing in
  * for the server, threaded tasks on and off: what the sync deletes on
- * the server when a folder under a root can't be read, and when a
- * folder is unset.
+ * the server when a folder under a root can't be read, when a folder
+ * is unset, and when a root moved.
  *
  *   ./cloudsync_roots_test [lane...]   (default: every lane) */
 #include <stdio.h>
@@ -15,13 +15,25 @@
 static struct RDIR *test_opendir(const char *name, bool include_hidden);
 static int test_readdir(struct RDIR *rdir);
 static bool test_dirent_error(struct RDIR *rdir);
+static char *test_strdup(const char *s);
 #define retro_opendir_include_hidden test_opendir
 #define retro_readdir test_readdir
 #define retro_dirent_error test_dirent_error
+#define strdup test_strdup
 #include "../../../tasks/task_cloudsync.c"
 #undef retro_opendir_include_hidden
 #undef retro_readdir
 #undef retro_dirent_error
+#undef strdup
+
+/* A copy of this string runs out of memory */
+static const char *fail_strdup;
+static char *test_strdup(const char *s)
+{
+   if (fail_strdup && !strcmp(s, fail_strdup))
+      return NULL;
+   return strdup(s);
+}
 
 static const char *base = "cloudsync_roots_test_files";
 static char srv[256], assets[256];
@@ -121,6 +133,13 @@ static void srv_path(char *s, size_t len, const char *key)
    pathname_conform_slashes_to_os(s);
 }
 
+static const char *srv_key(const char *key)
+{
+   static char s[PATH_MAX_LENGTH];
+   srv_path(s, sizeof(s), key);
+   return s;
+}
+
 static bool copy_file(const char *from, const char *to)
 {
    char    dir[PATH_MAX_LENGTH];
@@ -215,6 +234,49 @@ static void put(const char *root, const char *rel, const char *text)
    fill_pathname_basedir(dir, path, sizeof(dir));
    path_mkdir(dir);
    CHECK(filestream_write_file(path, text, strlen(text)));
+}
+
+static void drop(const char *root, const char *rel)
+{
+   char path[PATH_MAX_LENGTH];
+   fill_pathname_join_special(path, root, rel, sizeof(path));
+   pathname_conform_slashes_to_os(path);
+   CHECK(filestream_delete(path) == 0);
+}
+
+static bool holds(const char *root, const char *rel, const char *text)
+{
+   char    path[PATH_MAX_LENGTH];
+   void   *buf = NULL;
+   int64_t len = 0;
+   bool    same;
+   fill_pathname_join_special(path, root, rel, sizeof(path));
+   pathname_conform_slashes_to_os(path);
+   if (!filestream_read_file(path, &buf, &len))
+      return false;
+   same = len == (int64_t)strlen(text) && !memcmp(buf, text, (size_t)len);
+   free(buf);
+   return same;
+}
+
+static void roots_path(char *s, size_t len)
+{
+   fill_pathname_join_special(s, assets, "manifest.local.roots", len);
+}
+
+/* The roots file a sync wrote names @root. */
+static bool roots_name(const char *root)
+{
+   char    path[PATH_MAX_LENGTH];
+   void   *buf = NULL;
+   int64_t len = 0;
+   bool    found;
+   roots_path(path, sizeof(path));
+   if (!filestream_read_file(path, &buf, &len))
+      return false;
+   found = strstr((const char*)buf, root) != NULL;
+   free(buf);
+   return found;
 }
 
 static void on_done(retro_task_t *task, void *data, void *ud,
@@ -333,8 +395,139 @@ static void empty_root_lane(bool threaded)
    CHECK(deletes == 0);
    srv_path(kept, sizeof(kept), "system/bios.bin");
    CHECK(path_is_valid(kept));
+
+   /* set again, to another folder: a first sync of it */
+   snprintf(sys, sizeof(sys), "%s/system-b-%d", base, threaded ? 1 : 0);
+   CHECK(path_mkdir(sys));
+   strlcpy(settings->paths.directory_system, sys,
+         sizeof(settings->paths.directory_system));
+   CHECK(sync_list(threaded, task_cloud_sync_directory_map_new(settings)));
+   CHECK(deletes == 0);
+   CHECK(fetches == 1);
    live_saves[0] = '\0';
    free(settings);
+}
+
+/* The save folder moved to an empty folder holding one
+ * different save. Nothing is deleted on the server; what it has comes
+ * down; the different save is a conflict. */
+static void root_changed(bool threaded)
+{
+   char root_a[256], root_b[264], roots[PATH_MAX_LENGTH], json[300];
+   lane_dirs("root_changed", threaded, root_a, sizeof(root_a));
+   snprintf(root_b, sizeof(root_b), "%s-b", root_a);
+   remove_tree(root_b);
+   CHECK(path_mkdir(root_b));
+   put(root_a, "a.srm", "1");
+   put(root_a, "b.srm", "2");
+   put(root_a, "c.srm", "3");
+   CHECK(sync_saves(threaded, root_a));
+   CHECK(uploads == 3);
+   CHECK(roots_name(root_a));
+   /* as a sync that walked A writes it */
+   roots_path(roots, sizeof(roots));
+   snprintf(json, sizeof(json), "{\"saves\": \"%s\"}\n", root_a);
+   CHECK(filestream_write_file(roots, json, strlen(json)));
+   put(root_b, "a.srm", "X");
+   CHECK(!sync_saves(threaded, root_b));
+   CHECK(deletes == 0);
+   CHECK(uploads == 0);
+   CHECK(fetches == 2);
+   CHECK(holds(root_b, "a.srm", "X"));
+   CHECK(holds(root_b, "b.srm", "2"));
+   CHECK(holds(root_b, "c.srm", "3"));
+   CHECK(holds(srv, "saves/a.srm", "1"));
+   CHECK(roots_name(root_b));
+   remove_tree(root_b);
+}
+
+/* A manifest from before the roots file: the sync runs as it always
+ * did, and writes the roots file, which the next sync reads. */
+static void no_roots_file(bool threaded)
+{
+   char root[256], root_b[264], roots[PATH_MAX_LENGTH];
+   lane_dirs("no_roots", threaded, root, sizeof(root));
+   put(root, "a.srm", "1");
+   put(root, "b.srm", "2");
+   put(root, "c.srm", "3");
+   put(root, "d.srm", "4");
+   CHECK(sync_saves(threaded, root));
+   roots_path(roots, sizeof(roots));
+   filestream_delete(roots);
+   drop(root, "a.srm");
+   put(root, "b.srm", "22");
+   CHECK(sync_saves(threaded, root));
+   CHECK(deletes == 1);
+   CHECK(uploads == 1);
+   CHECK(fetches == 0);
+   CHECK(!path_is_valid(srv_key("saves/a.srm")));
+   CHECK(holds(srv, "saves/b.srm", "22"));
+   CHECK(roots_name(root));
+   snprintf(root_b, sizeof(root_b), "%s-b", root);
+   remove_tree(root_b);
+   CHECK(path_mkdir(root_b));
+   CHECK(sync_saves(threaded, root_b));
+   CHECK(deletes == 0);
+   CHECK(fetches == 3);
+   remove_tree(root_b);
+}
+
+/* A folder unset at the first sync that writes the roots file has no
+ * entry to carry: set again, to another folder, it is a first sync of
+ * it. */
+static void unset_no_entry(bool threaded)
+{
+   char        root[256], sys[272], roots[PATH_MAX_LENGTH];
+   settings_t *settings = (settings_t*)calloc(1, sizeof(*settings));
+   lane_dirs("unset_no_entry", threaded, root, sizeof(root));
+   snprintf(sys, sizeof(sys), "%s-system", root);
+   strlcpy(live_saves, root, sizeof(live_saves));
+   put(root, "a.srm", "s");
+   put(sys, "bios.bin", "b");
+   settings->bools.cloud_sync_sync_saves  = true;
+   settings->bools.cloud_sync_sync_system = true;
+   strlcpy(settings->paths.directory_system, sys,
+         sizeof(settings->paths.directory_system));
+   CHECK(sync_list(threaded, task_cloud_sync_directory_map_new(settings)));
+   CHECK(uploads == 2);
+   /* as before the roots file */
+   roots_path(roots, sizeof(roots));
+   CHECK(filestream_delete(roots) == 0);
+
+   settings->paths.directory_system[0] = '\0';
+   CHECK(sync_list(threaded, task_cloud_sync_directory_map_new(settings)));
+   CHECK(deletes == 0);
+
+   snprintf(sys, sizeof(sys), "%s-system-b", root);
+   CHECK(path_mkdir(sys));
+   strlcpy(settings->paths.directory_system, sys,
+         sizeof(settings->paths.directory_system));
+   CHECK(sync_list(threaded, task_cloud_sync_directory_map_new(settings)));
+   CHECK(deletes == 0);
+   CHECK(fetches == 1);
+   CHECK(holds(srv, "system/bios.bin", "b"));
+   live_saves[0] = '\0';
+   free(settings);
+}
+
+/* Out of memory reading the roots file: the sync stops rather than
+ * take a moved folder as unchanged. */
+static void roots_no_memory(bool threaded)
+{
+   char root_a[256], root_b[264];
+   lane_dirs("roots_no_memory", threaded, root_a, sizeof(root_a));
+   snprintf(root_b, sizeof(root_b), "%s-b", root_a);
+   CHECK(path_mkdir(root_b));
+   put(root_a, "a.srm", "1");
+   put(root_a, "b.srm", "2");
+   CHECK(sync_saves(threaded, root_a));
+   fail_strdup = root_a;
+   CHECK(!sync_saves(threaded, root_b));
+   fail_strdup = NULL;
+   CHECK(deletes == 0);
+   CHECK(fetches == 0);
+   CHECK(holds(srv, "saves/a.srm", "1"));
+   CHECK(roots_name(root_a));
 }
 
 struct lane
@@ -350,6 +543,10 @@ static const struct lane lanes[] = {
    { "sync_unreadable_subfolder", unreadable_subfolder },
    { "sync_readdir_error",        readdir_error },
    { "sync_empty_root",           empty_root_lane },
+   { "sync_root_changed",         root_changed },
+   { "sync_no_roots_file",        no_roots_file },
+   { "sync_unset_no_entry",       unset_no_entry },
+   { "sync_roots_no_memory",      roots_no_memory },
 };
 
 int main(int argc, char **argv)

@@ -775,6 +775,7 @@ static void followup_lane(void)
 
 int main(void)
 {
+   char     path[96];
    unsigned r;
    int      ok;
 
@@ -815,6 +816,8 @@ int main(void)
    begin_lane();
    followup_lane();
 
+   snprintf(path, sizeof(path), "%s/manifest.local.roots", dir);
+   unlink(path);
    rmdir(dir);
    printf("cloudsync_pacing_test: %s\n", fails ? "FAIL" : "PASS");
    return fails ? 1 : 0;

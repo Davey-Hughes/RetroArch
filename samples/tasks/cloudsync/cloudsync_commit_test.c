@@ -218,6 +218,8 @@ static void lane(bool threaded, bool deletion, bool owned, bool no_memory,
    filestream_delete(local_path);
    snprintf(manifest, sizeof(manifest), "%s/manifest.local", directory);
    filestream_delete(manifest);
+   snprintf(manifest, sizeof(manifest), "%s/manifest.local.roots", directory);
+   filestream_delete(manifest);
 }
 
 static const char *walk_files[] = {
