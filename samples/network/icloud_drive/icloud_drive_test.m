@@ -33,10 +33,29 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 #include <streams/file_stream.h>
 
+#include "../../../configuration.h"
+
+/* The driver's clock: the real one unless a check fixes it, so that
+ * two keeps can fall in the same second. */
+static time_t fixed_now = 0;
+
+static time_t test_time(time_t *t)
+{
+   time_t now = fixed_now ? fixed_now : time(t);
+   if (t)
+      *t = now;
+   return now;
+}
+
+#define time(t) test_time(t)
 #include "../../../network/cloud_sync/icloud_drive.m"
+#undef time
 
 void RARCH_LOG(const char *fmt, ...)
 {
@@ -70,6 +89,12 @@ void RARCH_DBG(const char *fmt, ...)
    va_start(ap, fmt);
    vprintf(fmt, ap);
    va_end(ap);
+}
+
+settings_t *config_get_ptr(void)
+{
+   static settings_t settings;
+   return &settings;
 }
 
 static NSURL *test_container = nil;
@@ -276,6 +301,211 @@ static void test_delete(void)
    CHECK(access(cloud, F_OK) != 0, "delete: cloud file must be gone");
 }
 
+/* A copy of @file kept as <docs>/deleted/<dir>/<file>-<yymmdd-hhmmss>
+ * holds @text */
+static bool kept_holds(const char *dir, const char *file, const char *text)
+{
+   char           kept[320], path[640];
+   size_t         len   = strlen(file);
+   bool           found = false;
+   struct dirent *de;
+   DIR           *d;
+
+   snprintf(kept, sizeof(kept), "%s/deleted/%s", docs, dir);
+   if (!(d = opendir(kept)))
+      return false;
+   while (!found && (de = readdir(d)))
+      if (     !strncmp(de->d_name, file, len)
+            && de->d_name[len] == '-'
+            && strlen(de->d_name + len) == 14)
+      {
+         snprintf(path, sizeof(path), "%s/%s", kept, de->d_name);
+         found = file_is(path, text);
+      }
+   closedir(d);
+   return found;
+}
+
+/* With destructive sync off, the server's copy is kept before an upload
+ * replaces it or a delete removes it, where WebDAV keeps it; with it
+ * on, nothing is kept. */
+static void test_backup(void)
+{
+   report_t ru = {0}, rd = {0}, rx = {0};
+   char local[320], cloud[320];
+   RFILE *rfile;
+
+   config_get_ptr()->bools.cloud_sync_destructive = false;
+   path_in(local, sizeof(local), root, "keep.srm");
+   path_in(cloud, sizeof(cloud), docs, "saves/kb.srm");
+   write_file(cloud, "server-old");
+   write_file(local, "local-new");
+   rfile = filestream_open(local, RETRO_VFS_FILE_ACCESS_READ,
+         RETRO_VFS_FILE_ACCESS_HINT_NONE);
+   icloud_drive_update("saves/kb.srm", rfile, on_report, &ru);
+   wait_reports(&ru);
+   check_once("non-destructive update", &ru, true);
+   CHECK(file_is(cloud, "local-new"),
+         "non-destructive update must put the new data in place");
+   CHECK(kept_holds("saves", "kb.srm", "server-old"),
+         "non-destructive update must keep the old data as deleted/saves/kb.srm-<yymmdd-hhmmss>");
+   filestream_close(rfile);
+
+   path_in(cloud, sizeof(cloud), docs, "saves/kc.srm");
+   write_file(cloud, "server-c");
+   icloud_drive_delete("saves/kc.srm", on_report, &rd);
+   wait_reports(&rd);
+   check_once("non-destructive delete", &rd, true);
+   CHECK(access(cloud, F_OK) != 0,
+         "non-destructive delete: cloud file must be gone");
+   CHECK(kept_holds("saves", "kc.srm", "server-c"),
+         "non-destructive delete must keep the data as deleted/saves/kc.srm-<yymmdd-hhmmss>");
+
+   config_get_ptr()->bools.cloud_sync_destructive = true;
+   path_in(cloud, sizeof(cloud), docs, "saves/kd.srm");
+   write_file(cloud, "server-d");
+   icloud_drive_delete("saves/kd.srm", on_report, &rx);
+   wait_reports(&rx);
+   check_once("destructive delete", &rx, true);
+   CHECK(access(cloud, F_OK) != 0,
+         "destructive delete: cloud file must be gone");
+   CHECK(!kept_holds("saves", "kd.srm", "server-d"),
+         "destructive delete must keep nothing");
+   config_get_ptr()->bools.cloud_sync_destructive = false;
+}
+
+/* With destructive sync on, an upload keeps nothing; the server
+ * manifest is never kept. */
+static void test_backup_not_kept(void)
+{
+   report_t ru = {0}, rm = {0};
+   char local[320], cloud[320];
+   RFILE *rfile;
+
+   path_in(local, sizeof(local), root, "keep_f.srm");
+   write_file(local, "local-f");
+   rfile = filestream_open(local, RETRO_VFS_FILE_ACCESS_READ,
+         RETRO_VFS_FILE_ACCESS_HINT_NONE);
+
+   config_get_ptr()->bools.cloud_sync_destructive = true;
+   path_in(cloud, sizeof(cloud), docs, "saves/kf.srm");
+   write_file(cloud, "server-f");
+   icloud_drive_update("saves/kf.srm", rfile, on_report, &ru);
+   wait_reports(&ru);
+   check_once("destructive update", &ru, true);
+   CHECK(file_is(cloud, "local-f"),
+         "destructive update must put the new data in place");
+   CHECK(!kept_holds("saves", "kf.srm", "server-f"),
+         "destructive update must keep nothing");
+
+   config_get_ptr()->bools.cloud_sync_destructive = false;
+   path_in(cloud, sizeof(cloud), docs, CLOUD_SYNC_SERVER_MANIFEST);
+   write_file(cloud, "server-m");
+   icloud_drive_update(CLOUD_SYNC_SERVER_MANIFEST, rfile, on_report, &rm);
+   wait_reports(&rm);
+   check_once("manifest update", &rm, true);
+   CHECK(file_is(cloud, "local-f"),
+         "manifest update must put the new data in place");
+   CHECK(!kept_holds(".", CLOUD_SYNC_SERVER_MANIFEST, "server-m"),
+         "the server manifest must never be kept");
+   filestream_close(rfile);
+}
+
+/* A non-ASCII name is kept under that name, not one read in another
+ * encoding. */
+static void test_backup_utf8(void)
+{
+   static const char name[] = "\xe6\x97\xa5\xe6\x9c\xac.srm"; /* UTF-8 */
+   report_t r = {0};
+   char rel[64], cloud[320];
+
+   config_get_ptr()->bools.cloud_sync_destructive = false;
+   snprintf(rel, sizeof(rel), "saves/%s", name);
+   path_in(cloud, sizeof(cloud), docs, rel);
+   write_file(cloud, "server-j");
+   icloud_drive_delete(rel, on_report, &r);
+   wait_reports(&r);
+   check_once("non-destructive delete, UTF-8 name", &r, true);
+   CHECK(kept_holds("saves", name, "server-j"),
+         "a UTF-8 name must be kept under the same name in deleted/saves");
+}
+
+/* Two keeps of one file in the same second both succeed; each replaces
+ * the copy kept before it, as WebDAV's COPY does. */
+static void test_backup_same_second(void)
+{
+   report_t r1 = {0}, r2 = {0}, rd = {0};
+   char local[320], cloud[320];
+   RFILE *rfile;
+
+   config_get_ptr()->bools.cloud_sync_destructive = false;
+   fixed_now = time(NULL);
+   path_in(cloud, sizeof(cloud), docs, "saves/kg.srm");
+   write_file(cloud, "server-g");
+   path_in(local, sizeof(local), root, "keep_g.srm");
+   write_file(local, "local-g1");
+   rfile = filestream_open(local, RETRO_VFS_FILE_ACCESS_READ,
+         RETRO_VFS_FILE_ACCESS_HINT_NONE);
+   icloud_drive_update("saves/kg.srm", rfile, on_report, &r1);
+   wait_reports(&r1);
+   check_once("update, first keep in a second", &r1, true);
+
+   write_file(local, "local-g2");
+   icloud_drive_update("saves/kg.srm", rfile, on_report, &r2);
+   wait_reports(&r2);
+   check_once("update, second keep in the same second", &r2, true);
+   CHECK(file_is(cloud, "local-g2"),
+         "a second update in the same second must put the new data in place");
+   CHECK(    kept_holds("saves", "kg.srm", "local-g1")
+         && !kept_holds("saves", "kg.srm", "server-g"),
+         "a second update in the same second must replace the copy kept before it");
+   filestream_close(rfile);
+
+   icloud_drive_delete("saves/kg.srm", on_report, &rd);
+   wait_reports(&rd);
+   check_once("delete, third keep in the same second", &rd, true);
+   CHECK(access(cloud, F_OK) != 0,
+         "a delete in the same second: cloud file must be gone");
+   CHECK(kept_holds("saves", "kg.srm", "local-g2"),
+         "a delete in the same second must replace the copy kept before it");
+   fixed_now = 0;
+}
+
+/* A copy that cannot be kept stops the upload and the delete:
+ * deleted/sb is a file, so deleted/sb/ cannot be made. */
+static void test_backup_fails(void)
+{
+   report_t ru = {0}, rd = {0};
+   char local[320], cloud[320], dir[320];
+   RFILE *rfile;
+
+   config_get_ptr()->bools.cloud_sync_destructive = false;
+   path_in(dir, sizeof(dir), docs, "sb");
+   mkdir(dir, 0755);
+   path_in(dir, sizeof(dir), docs, "deleted");
+   mkdir(dir, 0755);
+   path_in(dir, sizeof(dir), docs, "deleted/sb");
+   write_file(dir, "not a folder");
+   path_in(cloud, sizeof(cloud), docs, "sb/ke.srm");
+   write_file(cloud, "server-e");
+   path_in(local, sizeof(local), root, "keep_e.srm");
+   write_file(local, "local-e");
+   rfile = filestream_open(local, RETRO_VFS_FILE_ACCESS_READ,
+         RETRO_VFS_FILE_ACCESS_HINT_NONE);
+   icloud_drive_update("sb/ke.srm", rfile, on_report, &ru);
+   wait_reports(&ru);
+   check_once("update, copy cannot be kept", &ru, false);
+   CHECK(file_is(cloud, "server-e"),
+         "an update whose copy cannot be kept must upload nothing");
+   filestream_close(rfile);
+
+   icloud_drive_delete("sb/ke.srm", on_report, &rd);
+   wait_reports(&rd);
+   check_once("delete, copy cannot be kept", &rd, false);
+   CHECK(file_is(cloud, "server-e"),
+         "a delete whose copy cannot be kept must leave the file");
+}
+
 static void test_no_container(void)
 {
    report_t rr = {0}, ru = {0}, rd = {0};
@@ -338,6 +568,11 @@ int main(void)
       test_update();
       test_update_unreadable_local();
       test_delete();
+      test_backup();
+      test_backup_not_kept();
+      test_backup_utf8();
+      test_backup_same_second();
+      test_backup_fails();
       test_no_container();
 
       system(cmd);

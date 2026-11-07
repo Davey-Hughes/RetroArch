@@ -1,4 +1,7 @@
+#include <time.h>
+
 #include "../cloud_sync_driver.h"
+#include "../../configuration.h"
 #include "../../verbosity.h"
 
 #define ICLOUD_CONTAINER_NAME @"iCloud.com.libretro.dist.RetroArch"
@@ -18,6 +21,62 @@ static NSURL *icloud_file_url(const char *path)
 
    NSString *relative_path = [NSString stringWithUTF8String:path];
    return [base URLByAppendingPathComponent:relative_path];
+}
+
+/* With destructive sync off, the server's copy of a file is kept, as
+ * the other drivers keep it, at deleted/<path>-<yymmdd-hhmmss>: a
+ * delete moves it there, and an upload that replaces it copies it there
+ * first.  The server manifest is rewritten every sync and is not kept. */
+static bool icloud_drive_wants_backup(const char *path)
+{
+   settings_t *settings = config_get_ptr();
+   return settings
+       && !settings->bools.cloud_sync_destructive
+       && strcmp(path, CLOUD_SYNC_SERVER_MANIFEST) != 0;
+}
+
+static NSURL *icloud_drive_backup_url(const char *path)
+{
+   char      ts[32];
+   time_t    now = time(NULL);
+   struct tm tm_;
+
+   localtime_r(&now, &tm_);
+   strftime(ts, sizeof(ts), "-%y%m%d-%H%M%S", &tm_);
+   return icloud_file_url([[NSString stringWithFormat:@"deleted/%@%s",
+         [NSString stringWithUTF8String:path], ts] UTF8String]);
+}
+
+/* Moves, or copies, the file at @url to deleted/@path-<yymmdd-hhmmss>,
+ * replacing a copy kept there in the same second, as WebDAV's COPY
+ * does; nothing there is nothing to keep.  Called off the main thread,
+ * as it looks up the container. */
+static bool icloud_drive_backup(NSURL *url, const char *path, bool copy)
+{
+   NSFileManager *fm    = [NSFileManager defaultManager];
+   NSError       *error = nil;
+   NSURL         *backup;
+
+   if (![fm fileExistsAtPath:url.path])
+      return true;
+   if (!(backup = icloud_drive_backup_url(path)))
+   {
+      RARCH_DBG("[iCloudDrive] iCloud is not available for %s\n", path);
+      return false;
+   }
+   if (     ![fm createDirectoryAtURL:[backup URLByDeletingLastPathComponent]
+               withIntermediateDirectories:YES attributes:nil error:&error]
+         || (     [fm fileExistsAtPath:backup.path]
+               && ![fm removeItemAtURL:backup error:&error])
+         || !(copy
+               ? [fm copyItemAtURL:url toURL:backup error:&error]
+               : [fm moveItemAtURL:url toURL:backup error:&error]))
+   {
+      RARCH_DBG("[iCloudDrive] Could not keep %s: %s\n",
+            [url.path UTF8String], [[error debugDescription] UTF8String]);
+      return false;
+   }
+   return true;
 }
 
 static bool icloud_drive_sync_begin(cloud_sync_complete_handler_t cb, void *user_data)
@@ -92,6 +151,7 @@ static bool icloud_drive_update(const char *p, RFILE *rfile, cloud_sync_complete
 {
     char     *path          = strdup(p);
     NSURL    *url           = icloud_file_url(path);
+    bool      keep          = icloud_drive_wants_backup(path);
     NSURL    *directory_url = [url URLByDeletingLastPathComponent];
     NSString *file_string   = [NSString stringWithUTF8String:filestream_get_path(rfile)];
     NSData   *local_data    = [NSData dataWithContentsOfFile:file_string];
@@ -110,7 +170,17 @@ static bool icloud_drive_update(const char *p, RFILE *rfile, cloud_sync_complete
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
         NSError *error = nil;
         NSError *directory_error = nil;
-        BOOL directory_is_present = [[NSFileManager defaultManager] fileExistsAtPath: directory_url.path];
+        BOOL directory_is_present;
+
+        if (keep && !icloud_drive_backup(url, path, true))
+        {
+            RARCH_DBG("[iCloudDrive] Not uploading %s: the copy on the server could not be kept\n", path);
+            cb(user_data, path, false, rfile);
+            free(path);
+            return;
+        }
+
+        directory_is_present = [[NSFileManager defaultManager] fileExistsAtPath: directory_url.path];
 
         if (!directory_is_present)
         {
@@ -140,6 +210,7 @@ static bool icloud_drive_delete(const char *p, cloud_sync_complete_handler_t cb,
 {
     char  *path = strdup(p);
     NSURL *url  = icloud_file_url(p);
+    bool   keep = icloud_drive_wants_backup(p);
 
     if (!url)
     {
@@ -151,7 +222,13 @@ static bool icloud_drive_delete(const char *p, cloud_sync_complete_handler_t cb,
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
         NSError *error = nil;
-        if ([[NSFileManager defaultManager] fileExistsAtPath:url.path])
+        bool     ok    = true;
+        if (keep)
+        {
+            ok = icloud_drive_backup(url, path, false);
+            RARCH_DBG("[iCloudDrive] delete %s (kept) %s\n", path, ok ? "succeeded" : "failed");
+        }
+        else if ([[NSFileManager defaultManager] fileExistsAtPath:url.path])
         {
             [[NSFileManager defaultManager] removeItemAtURL:url error:&error];
             RARCH_DBG("[iCloudDrive] delete %s %s\n", path, error == nil ? "succeeded" : "failed");
@@ -159,8 +236,9 @@ static bool icloud_drive_delete(const char *p, cloud_sync_complete_handler_t cb,
             {
                 RARCH_DBG("[iCloudDrive] error: %s\n", [[error debugDescription] UTF8String]);
             }
+            ok = error == nil;
         }
-        cb(user_data, path, error == nil, NULL);
+        cb(user_data, path, ok, NULL);
         free(path);
     });
     return true;
