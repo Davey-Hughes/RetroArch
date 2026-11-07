@@ -1,7 +1,8 @@
 /* Whole syncs of the real cloud-sync task over a folder standing in
  * for the server, threaded tasks on and off: what the sync deletes on
  * the server when a folder under a root can't be read, when a folder
- * is unset, when a root moved, and which save folder it walks.
+ * is unset, when a root moved, when most of a root's files are
+ * missing, and which save folder it walks.
  *
  *   ./cloudsync_roots_test [lane...]   (default: every lane) */
 #include <stdio.h>
@@ -10,21 +11,26 @@
 #include <retro_dirent.h>
 #include <retro_timers.h>
 #include <queues/message_queue.h>
+#include <lists/string_list.h>
 #include "../../../msg_hash.h"
 
 static struct RDIR *test_opendir(const char *name, bool include_hidden);
 static int test_readdir(struct RDIR *rdir);
 static bool test_dirent_error(struct RDIR *rdir);
 static char *test_strdup(const char *s);
+static bool test_string_list_append(struct string_list *list,
+      const char *elem, union string_list_elem_attr attr);
 #define retro_opendir_include_hidden test_opendir
 #define retro_readdir test_readdir
 #define retro_dirent_error test_dirent_error
 #define strdup test_strdup
+#define string_list_append test_string_list_append
 #include "../../../tasks/task_cloudsync.c"
 #undef retro_opendir_include_hidden
 #undef retro_readdir
 #undef retro_dirent_error
 #undef strdup
+#undef string_list_append
 
 /* A copy of this string runs out of memory */
 static const char *fail_strdup;
@@ -33,6 +39,16 @@ static char *test_strdup(const char *s)
    if (fail_strdup && !strcmp(s, fail_strdup))
       return NULL;
    return strdup(s);
+}
+
+/* Adding this string to a list runs out of memory */
+static const char *fail_append;
+static bool test_string_list_append(struct string_list *list,
+      const char *elem, union string_list_elem_attr attr)
+{
+   if (fail_append && !strcmp(elem, fail_append))
+      return false;
+   return string_list_append(list, elem, attr);
 }
 
 static const char *base = "cloudsync_roots_test_files";
@@ -597,6 +613,145 @@ static void main_folder_only(bool threaded)
    free(settings);
 }
 
+static void name_file(char *s, size_t len, unsigned i)
+{
+   snprintf(s, len, "f%02u.srm", i);
+}
+
+/* Of @n files under one root, @gone are missing at the next sync: more
+ * than 10 and more than half are held on the server, and come back
+ * down at the sync after. */
+static void mass_lane(bool threaded, unsigned n, unsigned gone, bool held)
+{
+   char     root[256], name[32], key[48];
+   unsigned i;
+   lane_dirs("mass", threaded, root, sizeof(root));
+   for (i = 0; i < n; i++)
+   {
+      name_file(name, sizeof(name), i);
+      put(root, name, name);
+   }
+   CHECK(sync_saves(threaded, root));
+   CHECK(uploads == n);
+   for (i = 0; i < gone; i++)
+   {
+      name_file(name, sizeof(name), i);
+      drop(root, name);
+   }
+   /* an upload rewrites the server manifest in the same sync */
+   put(root, "zz.srm", "zz");
+   CHECK(sync_saves(threaded, root));
+   if (!held)
+   {
+      CHECK(deletes == gone);
+      CHECK(notices == 0);
+      return;
+   }
+   CHECK(deletes == 0);
+   CHECK(notices == 1);
+   CHECK(notice_count == gone);
+   CHECK(roots_name("\"held\""));
+   CHECK(roots_name("saves/f00.srm"));
+   for (i = 0; i < gone; i++)
+   {
+      snprintf(key, sizeof(key), "saves/f%02u.srm", i);
+      CHECK(path_is_valid(srv_key(key)));
+   }
+   /* not applied: the next sync fetches them back */
+   CHECK(sync_saves(threaded, root));
+   CHECK(deletes == 0);
+   CHECK(fetches == gone);
+   CHECK(notices == 0);
+   CHECK(!roots_name("saves/f00.srm"));
+   for (i = 0; i < gone; i++)
+   {
+      name_file(name, sizeof(name), i);
+      CHECK(holds(root, name, name));
+   }
+}
+
+static bool sync_two(bool threaded, const char *saves, const char *states)
+{
+   struct string_list *l = string_list_new();
+   union string_list_elem_attr attr;
+   attr.i = 0;
+   string_list_append(l, "saves", attr);
+   l->elems[0].userdata = strdup(saves);
+   string_list_append(l, "states", attr);
+   l->elems[1].userdata = strdup(states);
+   return sync_list(threaded, l);
+}
+
+/* Counted per root: saves is held, states is not. */
+static void mass_two_roots(bool threaded)
+{
+   char     saves[256], states[256], name[32];
+   unsigned i;
+   lane_dirs("mass2", threaded, saves, sizeof(saves));
+   fill_pathname_basedir(states, saves, sizeof(states));
+   strlcat(states, "states", sizeof(states));
+   CHECK(path_mkdir(states));
+   for (i = 0; i < 30; i++)
+   {
+      name_file(name, sizeof(name), i);
+      put(saves, name, name);
+      if (i < 5)
+         put(states, name, name);
+   }
+   CHECK(sync_two(threaded, saves, states));
+   CHECK(uploads == 35);
+   for (i = 0; i < 20; i++)
+   {
+      name_file(name, sizeof(name), i);
+      drop(saves, name);
+      if (i < 3)
+         drop(states, name);
+   }
+   CHECK(sync_two(threaded, saves, states));
+   CHECK(deletes == 3);
+   CHECK(notices == 1);
+   CHECK(notice_count == 20);
+   CHECK(path_is_valid(srv_key("saves/f00.srm")));
+   CHECK(!path_is_valid(srv_key("states/f00.srm")));
+}
+
+static void mass_held(bool threaded)
+{
+   mass_lane(threaded, 30, 20, true);
+   mass_lane(threaded, 20, 11, true);
+   mass_lane(threaded, 30, 10, false);
+   mass_lane(threaded, 15, 10, false);
+   /* exactly half is not more than half */
+   mass_lane(threaded, 22, 11, false);
+   mass_two_roots(threaded);
+}
+
+/* Out of memory listing a held key: still held, still counted. */
+static void held_no_memory(bool threaded)
+{
+   char     root[256], name[32];
+   unsigned i;
+   lane_dirs("heldmem", threaded, root, sizeof(root));
+   for (i = 0; i < 30; i++)
+   {
+      name_file(name, sizeof(name), i);
+      put(root, name, name);
+   }
+   CHECK(sync_saves(threaded, root));
+   for (i = 0; i < 20; i++)
+   {
+      name_file(name, sizeof(name), i);
+      drop(root, name);
+   }
+   fail_append = "saves/f05.srm";
+   CHECK(!sync_saves(threaded, root));
+   fail_append = NULL;
+   CHECK(deletes == 0);
+   CHECK(notices == 1);
+   CHECK(notice_count == 20);
+   CHECK(path_is_valid(srv_key("saves/f05.srm")));
+}
+
 struct lane
 {
    const char *name;
@@ -615,6 +770,8 @@ static const struct lane lanes[] = {
    { "sync_unset_no_entry",       unset_no_entry },
    { "sync_roots_no_memory",      roots_no_memory },
    { "sync_main_folder_only",     main_folder_only },
+   { "sync_mass_held",            mass_held },
+   { "sync_held_no_memory",       held_no_memory },
 };
 
 int main(int argc, char **argv)

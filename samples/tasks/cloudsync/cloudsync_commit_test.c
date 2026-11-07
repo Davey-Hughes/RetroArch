@@ -49,6 +49,14 @@ void RARCH_LOG(const char *fmt, ...) { (void)fmt; }
 void RARCH_WARN(const char *fmt, ...) { (void)fmt; }
 void RARCH_ERR(const char *fmt, ...) { (void)fmt; }
 bool verbosity_is_enabled(void) { return false; }
+const char *msg_hash_to_str(enum msg_hash_enums msg) { (void)msg; return ""; }
+void runloop_msg_queue_push(const char *msg, size_t len, unsigned prio,
+      unsigned duration, bool flush, char *title,
+      enum message_queue_icon icon, enum message_queue_category category)
+{
+   (void)msg; (void)len; (void)prio; (void)duration; (void)flush;
+   (void)title; (void)icon; (void)category;
+}
 settings_t *config_get_ptr(void) { return NULL; }
 char *dir_get_ptr(enum rarch_dir_type type) { (void)type; return NULL; }
 bool content_savefile_is_live(const char *path)

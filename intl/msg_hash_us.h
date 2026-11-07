@@ -33166,6 +33166,10 @@ MSG_HASH(
    "Cloud sync paused: the save folder is a temporary one."
    )
 MSG_HASH(
+   MSG_CLOUD_SYNC_DELETIONS_HELD,
+   "Cloud sync kept %u files on the server that are missing here."
+   )
+MSG_HASH(
    MSG_FAILED_TO_SAVE_STATE_TO,
    "Failed to save state to"
    )

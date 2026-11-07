@@ -31,8 +31,10 @@
 
 #include "../configuration.h"
 #include "../file_path_special.h"
+#include "../msg_hash.h"
 #include "../network/cloud_sync_driver.h"
 #include "../paths.h"
+#include "../runloop.h"
 #include "../save_backups.h"
 #include "../tasks/tasks_internal.h"
 #include "../verbosity.h"
@@ -166,6 +168,10 @@ typedef struct
    /* The roots file as the last sync left it: data is a root's name,
     * userdata the folder it was walked from. NULL when there is none. */
    struct string_list *roots;
+   /* Keys this sync did not delete on the server (CS_ROOT_HELD), and
+    * how many: the list falls short when out of memory. */
+   struct string_list *held;
+   unsigned held_count;
    /* Whoever pushed the sync, told when it is done. */
    retro_task_callback_t cb;
    void *cb_data;
@@ -447,6 +453,10 @@ static void task_cloud_sync_fetch_server_manifest(task_cloud_sync_state_t *sync_
 
 /* A root walked from another folder than the last sync's */
 #define CS_ROOT_CHANGED 1
+/* A root whose missing files are not deleted on the server */
+#define CS_ROOT_HELD    2
+/* More missing files than this, and more than half of a root's */
+#define CS_HOLD_MIN     10
 
 static void task_cloud_sync_roots_filename(char *s, size_t len,
       const char *dir_core_assets)
@@ -677,7 +687,18 @@ static void task_cloud_sync_write_roots(task_cloud_sync_state_t *sync_state)
             task_cloud_sync_write_root(writer, roots->elems[i].data,
                   (const char*)roots->elems[i].userdata, &first);
       task_cloud_sync_write_unknown_roots(writer, sync_state, &first);
-      rjsonwriter_raw(writer, "\n}\n", 3);
+      if (!first)
+         rjsonwriter_raw(writer, ",\n", 2);
+      rjsonwriter_add_spaces(writer, 2);
+      rjsonwriter_add_string(writer, "held");
+      rjsonwriter_raw(writer, ": [", 3);
+      for (i = 0; sync_state->held && i < sync_state->held->size; i++)
+      {
+         if (i)
+            rjsonwriter_raw(writer, ", ", 2);
+         rjsonwriter_add_string(writer, sync_state->held->elems[i].data);
+      }
+      rjsonwriter_raw(writer, "]\n}\n", 4);
       buf = rjsonwriter_get_memory_buffer(writer, &len);
    }
    if (!buf || !filestream_write_file_atomic(path, buf, len))
@@ -1058,6 +1079,64 @@ static size_t task_cloud_sync_count_out_of_scope(
    return count;
 }
 
+/* Files deleted here and unchanged on the server, more than
+ * CS_HOLD_MIN of them and more than half of a root's: more likely gone
+ * missing (an unmounted card, an emptied folder) than deleted, so the
+ * diff deletes none of them on the server. The lists are in
+ * file_list_sort_on_alt() order. */
+static void task_cloud_sync_mark_held_roots(task_cloud_sync_state_t *sync_state)
+{
+   struct string_list *dirlist = sync_state->dirlist;
+   file_list_t        *local   = sync_state->local_manifest;
+   file_list_t        *current = sync_state->current_manifest;
+   file_list_t        *server  = sync_state->server_manifest;
+   size_t              r;
+
+   if (!local || !server)
+      return;
+
+   for (r = 0; r < dirlist->size; r++)
+   {
+      size_t total   = 0;
+      size_t missing = 0;
+      size_t c       = 0;
+      size_t s       = 0;
+      size_t i;
+
+      for (i = 0; i < local->size; i++)
+      {
+         struct item_file *local_file = &local->list[i];
+         const char       *key        = CS_FILE_KEY(local_file);
+         int               cmp        = 1;
+
+         if (     string_is_empty(CS_FILE_HASH(local_file))
+               || task_cloud_sync_key_root(dirlist, key) != (int)r)
+            continue;
+         total++;
+         while (c < current->size
+               && (cmp = strcasecmp(current->list[c].alt, key)) < 0)
+            c++;
+         if (c < current->size && !cmp)
+            continue;
+         cmp = 1;
+         while (s < server->size
+               && (cmp = strcasecmp(server->list[s].alt, key)) < 0)
+            s++;
+         if (     s < server->size && !cmp
+               && string_is_equal(CS_FILE_HASH(&server->list[s]),
+                  CS_FILE_HASH(local_file)))
+            missing++;
+      }
+
+      if (missing > CS_HOLD_MIN && missing * 2 > total)
+      {
+         RARCH_WARN(CSPFX "%u of %u files under \"%s\" are missing here, not deleting them on the server.\n",
+               (unsigned)missing, (unsigned)total, dirlist->elems[r].data);
+         dirlist->elems[r].attr.i |= CS_ROOT_HELD;
+      }
+   }
+}
+
 /**
  * task_cloud_sync_build_current_manifest:
  * @sync_state       : pointer to the current sync state
@@ -1132,6 +1211,7 @@ static void task_cloud_sync_build_current_manifest(
    file_list_sort_on_alt(sync_state->current_manifest);
    sync_state->server_out_of_scope =
       task_cloud_sync_count_out_of_scope(sync_state);
+   task_cloud_sync_mark_held_roots(sync_state);
    task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_DIFF);
    RARCH_LOG(CSPFX "Created in-memory manifest of current disk state with %d files.\n", sync_state->current_manifest->size);
 }
@@ -2218,6 +2298,34 @@ static void task_cloud_sync_maybe_ignore(task_cloud_sync_state_t *sync_state)
    }
 }
 
+/* Kept on the server and left out of the local manifest, so the next
+ * sync fetches it back. */
+static void task_cloud_sync_hold_delete(task_cloud_sync_state_t *sync_state)
+{
+   struct item_file *server_file = &sync_state->server_manifest->list[sync_state->server_idx];
+   union string_list_elem_attr attr;
+
+   attr.i = 0;
+   task_cloud_sync_add_to_updated_manifest(sync_state,
+         CS_FILE_KEY(server_file), CS_FILE_HASH(server_file), true);
+   sync_state->held_count++;
+   if (!sync_state->held)
+      sync_state->held = string_list_new();
+   if (     !sync_state->held
+         || !string_list_append(sync_state->held, CS_FILE_KEY(server_file), attr))
+      sync_state->failures = true;
+}
+
+static void task_cloud_sync_held_notice(task_cloud_sync_state_t *sync_state)
+{
+   char msg[128];
+   snprintf(msg, sizeof(msg), msg_hash_to_str(MSG_CLOUD_SYNC_DELETIONS_HELD),
+         sync_state->held_count);
+   RARCH_WARN(CSPFX "%s\n", msg);
+   runloop_msg_queue_push(msg, strlen(msg), 1, 180, false, NULL,
+         MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+}
+
 static void task_cloud_sync_diff_next(task_cloud_sync_state_t *sync_state)
 {
    int server_local_key_cmp;
@@ -2246,6 +2354,8 @@ static void task_cloud_sync_diff_next(task_cloud_sync_state_t *sync_state)
    if (!server_file && !local_file && !current_file)
    {
       RARCH_LOG(CSPFX "Finished processing manifests.\n");
+      if (sync_state->held_count)
+         task_cloud_sync_held_notice(sync_state);
       task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_UPDATE_MANIFESTS);
       return;
    }
@@ -2313,8 +2423,16 @@ static void task_cloud_sync_diff_next(task_cloud_sync_state_t *sync_state)
                /* previously saw the delete, now it's resurrected */
                task_cloud_sync_fetch_server_file(sync_state);
             else if (string_is_equal(CS_FILE_HASH(server_file), CS_FILE_HASH(local_file)))
+            {
+               int root = task_cloud_sync_key_root(sync_state->dirlist,
+                     CS_FILE_KEY(server_file));
                /* server didn't change, delete from the server */
-               task_cloud_sync_delete_server_file(sync_state);
+               if (root >= 0 && (sync_state->dirlist->elems[root].attr.i
+                        & CS_ROOT_HELD))
+                  task_cloud_sync_hold_delete(sync_state);
+               else
+                  task_cloud_sync_delete_server_file(sync_state);
+            }
             else
                /* the server changed and local deleted, that's a conflict */
                task_cloud_sync_resolve_conflict(sync_state);
@@ -2782,6 +2900,7 @@ static void task_cloud_sync_cleanup(retro_task_t *task)
    if (sync_state->dirlist)
       string_list_free(sync_state->dirlist);
    string_list_free(sync_state->roots);
+   string_list_free(sync_state->held);
    task_cloud_sync_walk_free(sync_state);
    if (sync_state->hash_cur.file)
       filestream_close(sync_state->hash_cur.file);
