@@ -446,6 +446,8 @@ struct rarch_state
    char dir_system[DIR_MAX_LENGTH];
    char dir_savefile[DIR_MAX_LENGTH];
    char dir_savestate[DIR_MAX_LENGTH];
+   char dir_savefile_configured[DIR_MAX_LENGTH];
+   char dir_savestate_configured[DIR_MAX_LENGTH];
 };
 
 /* Forward declarations */
@@ -3412,6 +3414,10 @@ size_t dir_get_size(enum rarch_dir_type type)
          return sizeof(p_rarch->dir_savefile);
       case RARCH_DIR_CURRENT_SAVEFILE:
          return sizeof(runloop_state_get_ptr()->savefile_dir);
+      case RARCH_DIR_SAVEFILE_CONFIGURED:
+         return sizeof(p_rarch->dir_savefile_configured);
+      case RARCH_DIR_SAVESTATE_CONFIGURED:
+         return sizeof(p_rarch->dir_savestate_configured);
       case RARCH_DIR_NONE:
          break;
    }
@@ -3437,6 +3443,12 @@ void dir_clear(enum rarch_dir_type type)
       case RARCH_DIR_SYSTEM:
          *p_rarch->dir_system = '\0';
          break;
+      case RARCH_DIR_SAVEFILE_CONFIGURED:
+         *p_rarch->dir_savefile_configured = '\0';
+         break;
+      case RARCH_DIR_SAVESTATE_CONFIGURED:
+         *p_rarch->dir_savestate_configured = '\0';
+         break;
       case RARCH_DIR_NONE:
          break;
       case RARCH_DIR_CURRENT_SAVEFILE:
@@ -3455,6 +3467,8 @@ static void dir_clear_all(void)
    dir_clear(RARCH_DIR_SYSTEM);
    dir_clear(RARCH_DIR_SAVEFILE);
    dir_clear(RARCH_DIR_SAVESTATE);
+   dir_clear(RARCH_DIR_SAVEFILE_CONFIGURED);
+   dir_clear(RARCH_DIR_SAVESTATE_CONFIGURED);
 }
 
 /* get ptr functions */
@@ -3475,6 +3489,10 @@ char *dir_get_ptr(enum rarch_dir_type type)
          return runloop_state_get_ptr()->savestate_dir;
       case RARCH_DIR_SYSTEM:
          return p_rarch->dir_system;
+      case RARCH_DIR_SAVEFILE_CONFIGURED:
+         return p_rarch->dir_savefile_configured;
+      case RARCH_DIR_SAVESTATE_CONFIGURED:
+         return p_rarch->dir_savestate_configured;
       case RARCH_DIR_NONE:
          break;
    }
@@ -3500,6 +3518,14 @@ void dir_set(enum rarch_dir_type type, const char *path)
       case RARCH_DIR_SYSTEM:
          strlcpy(p_rarch->dir_system, path,
                sizeof(p_rarch->dir_system));
+         break;
+      case RARCH_DIR_SAVEFILE_CONFIGURED:
+         strlcpy(p_rarch->dir_savefile_configured, path,
+               sizeof(p_rarch->dir_savefile_configured));
+         break;
+      case RARCH_DIR_SAVESTATE_CONFIGURED:
+         strlcpy(p_rarch->dir_savestate_configured, path,
+               sizeof(p_rarch->dir_savestate_configured));
          break;
       case RARCH_DIR_NONE:
          break;

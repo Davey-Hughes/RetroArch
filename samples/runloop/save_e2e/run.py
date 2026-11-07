@@ -174,6 +174,20 @@ def check(failures, cond, what):
         failures.append(what)
 
 
+def cfg_path(r, cfg, key, args):
+    """A path setting as RetroArch reads it back (':' is its own folder)."""
+    for line in cfg.read_text().splitlines():
+        k, _, v = line.partition(' = ')
+        if k == key:
+            v = v.strip('"')
+            if v.startswith(':'):
+                v = str(args.retroarch.parent) + v[1:]
+            elif v.startswith('~'):
+                v = str(r.dir / 'home') + v[1:]
+            return v
+    return None
+
+
 def no_core_writes_limit():
     # ulimit -f 4 with SIGXFSZ ignored: writes past 4096 bytes fail.
     signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
@@ -653,6 +667,27 @@ def lane_windows_locked_close(args, n):
     return r, failures
 
 
+def lane_config_keeps_folder(args, n):
+    """A save or state folder missing at launch stays in the
+    config saved on exit, and "default" stays "default"."""
+    r = Run(args.run_dir, 'config_keeps_folder-%d' % n)
+    gone = r.dir / 'gone'
+    failures = []
+    for saves, states in ((gone / 'saves', gone / 'states'),
+                          ('default', 'default')):
+        cfg = r.config(savefile_directory=saves, savestate_directory=states,
+                       config_save_on_exit='true')
+        r.start(args, cfg, 30, r.env())
+        rc = r.wait(60)
+        check(failures, rc == 0, 'retroarch exit %s' % rc)
+        for key, want in (('savefile_directory', saves),
+                          ('savestate_directory', states)):
+            got = cfg_path(r, cfg, key, args)
+            check(failures, got == str(want), '%s is %s' % (key, got))
+    check(failures, not gone.exists(), 'made %s' % gone)
+    return r, failures
+
+
 LANES = {
     'autosave_full_disk': lane_autosave_full_disk,
     'autosave_kill_mid_write': lane_autosave_kill_mid_write,
@@ -668,6 +703,7 @@ LANES = {
     'flush_points': lane_flush_points,
     'nosave_netplay_disconnect': lane_nosave_netplay_disconnect,
     'windows_locked_close': lane_windows_locked_close,
+    'config_keeps_folder': lane_config_keeps_folder,
 }
 # Lanes that need Windows, and the ones Windows cannot run.
 WINDOWS_LANES = {'windows_locked_close'}

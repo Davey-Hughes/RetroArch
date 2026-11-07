@@ -31,7 +31,10 @@ enum rarch_dir_type
    RARCH_DIR_SAVESTATE,
    RARCH_DIR_CURRENT_SAVEFILE,
    RARCH_DIR_CURRENT_SAVESTATE,
-   RARCH_DIR_SYSTEM
+   RARCH_DIR_SYSTEM,
+   /* As the config file has them ("" = default), even when missing */
+   RARCH_DIR_SAVEFILE_CONFIGURED,
+   RARCH_DIR_SAVESTATE_CONFIGURED
 };
 
 enum rarch_content_type

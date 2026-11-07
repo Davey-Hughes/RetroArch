@@ -3051,6 +3051,38 @@ static bool unix_find_packaged_dir(char *s, size_t len, const char *name)
 }
 #endif
 
+#ifdef ANDROID
+/* Whether @dir is @leaf in one of the parents frontend_unix_get_env()
+ * picks from by storage permission. */
+bool android_is_default_dir(const char *dir, const char *leaf)
+{
+   size_t i;
+   char path[DIR_MAX_LENGTH];
+   const char *parents[3];
+   parents[0] = internal_storage_path;
+   parents[1] = internal_storage_app_path;
+   parents[2] = app_dir;
+   for (i = 0; i < 3; i++)
+   {
+      if (!*parents[i])
+         continue;
+      if (i == 0)
+      {
+         fill_pathname_join(path, parents[i], "RetroArch", sizeof(path));
+         fill_pathname_join(path, path, leaf, sizeof(path));
+      }
+      else
+         fill_pathname_join(path, parents[i], leaf, sizeof(path));
+      if (string_is_equal(dir, path))
+         return true;
+      fill_pathname_slash(path, sizeof(path));
+      if (string_is_equal(dir, path))
+         return true;
+   }
+   return false;
+}
+#endif
+
 static void frontend_unix_get_env(int *argc,
       char *argv[], void *data, void *params_data)
 {
