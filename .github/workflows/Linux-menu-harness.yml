@@ -252,7 +252,8 @@ jobs:
           # another RetroArch wrote meanwhile, are backed up; with saves
           # off, a netplay host stopped in the game writes nothing;
           # pausing and opening the menu write a changed save at once;
-          # a save folder missing at launch stays the configured one.
+          # a save folder missing at launch stays the configured one,
+          # and the default stands in for one gone at a content load.
           # The kill-mid-write lane and its runs under load stay local.
           # The harness builds above removed the binary to read its link
           # line.
@@ -266,7 +267,7 @@ jobs:
              --lane cut_copy_old_core --lane recovery_announced \
              --lane state_load_copy --lane changed_elsewhere \
              --lane nosave_netplay_disconnect --lane flush_points \
-             --lane config_keeps_folder
+             --lane config_keeps_folder --lane folder_check_each_load
           make -C samples/runloop/save_e2e clean
 
       - name: Build and run save_paths_test
@@ -274,8 +275,8 @@ jobs:
         run: |
           set -eu
           # runloop.c over a real folder: ROM folders named backups or
-          # records, a netplay client with no folder, and a save asked
-          # for from another thread.
+          # records, a netplay client with no folder, a save folder
+          # gone at a load, and a save asked for from another thread.
           make -C samples/runloop/save_paths clean check
           make -C samples/runloop/save_paths clean check SANITIZER=address,undefined
           make -C samples/runloop/save_paths clean

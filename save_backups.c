@@ -21,6 +21,7 @@
 
 #include <compat/strl.h>
 #include <file/file_path.h>
+#include <formats/rjson.h>
 #include <lists/dir_list.h>
 #include <lists/string_list.h>
 #include <retro_miscellaneous.h>
@@ -834,4 +835,263 @@ size_t save_backups_find_recovery(char *s, size_t len, const char *path,
    free(dir);
    free(field);
    return strlen(s);
+}
+
+enum save_folders_key
+{
+   SAVE_FOLDERS_SAVES = 0,
+   SAVE_FOLDERS_STATES,
+   SAVE_FOLDERS_FIRST_SEEN,
+   SAVE_FOLDERS_LAST_SEEN,
+   SAVE_FOLDERS_CONFIGURED,
+   SAVE_FOLDERS_USED,
+   SAVE_FOLDERS_TIME,
+   SAVE_FOLDERS_KEY_LAST
+};
+
+static const char *const save_folders_keys[SAVE_FOLDERS_KEY_LAST] =
+{
+   "saves", "states", "first_seen", "last_seen", "configured", "used",
+   "time"
+};
+
+struct save_folders_entry
+{
+   char *v[SAVE_FOLDERS_KEY_LAST];
+};
+
+struct save_folders_list
+{
+   struct save_folders_entry *e;
+   size_t n;
+   size_t cap;
+};
+
+static struct save_folders_entry *save_folders_add(
+      struct save_folders_list *l)
+{
+   if (l->n == l->cap)
+   {
+      size_t cap = l->cap ? l->cap * 2 : 8;
+      struct save_folders_entry *e = (struct save_folders_entry*)
+         realloc(l->e, cap * sizeof(*e));
+      if (!e)
+         return NULL;
+      l->e   = e;
+      l->cap = cap;
+   }
+   memset(&l->e[l->n], 0, sizeof(l->e[l->n]));
+   return &l->e[l->n++];
+}
+
+/* False when @path is there but not read whole */
+static bool save_folders_read(struct save_folders_list *l,
+      const char *path)
+{
+   void *buf     = NULL;
+   int64_t len   = 0;
+   rjson_t *json = NULL;
+   int key       = -1;
+   bool whole    = true;
+   if (!filestream_read_file(path, &buf, &len))
+      return !path_is_valid(path);
+   if (!(json = rjson_open_buffer(buf, (size_t)len)))
+   {
+      free(buf);
+      return false;
+   }
+   for (;;)
+   {
+      size_t slen;
+      const char *str;
+      enum rjson_type t = rjson_next(json);
+      if (t == RJSON_DONE)
+         break;
+      if (t == RJSON_ERROR)
+      {
+         whole = false;
+         break;
+      }
+      if (rjson_get_context_depth(json) != 2)
+         continue;
+      if (t == RJSON_OBJECT)
+      {
+         if (!save_folders_add(l))
+         {
+            whole = false;
+            break;
+         }
+         continue;
+      }
+      if (t != RJSON_STRING || !l->n)
+         continue;
+      str = rjson_get_string(json, &slen);
+      if (rjson_get_context_count(json) & 1)
+      {
+         for (key = 0; key < SAVE_FOLDERS_KEY_LAST; key++)
+            if (string_is_equal(str, save_folders_keys[key]))
+               break;
+      }
+      else if (key >= 0 && key < SAVE_FOLDERS_KEY_LAST
+            && !l->e[l->n - 1].v[key]
+            && !(l->e[l->n - 1].v[key] = strdup(str)))
+         whole = false;
+   }
+   rjson_free(json);
+   free(buf);
+   return whole;
+}
+
+/* Moves @path to its first free aside name, put in @s */
+static bool save_folders_set_aside(char *s, size_t len, const char *path)
+{
+   unsigned n;
+   for (n = 1; fill_pathname_aside(s, path, n, len); n++)
+      if (!path_is_valid(s))
+         return filestream_rename(path, s) == 0;
+   return false;
+}
+
+static bool save_folders_write(const struct save_folders_list *l,
+      const char *path, bool sync)
+{
+   size_t i, k;
+   int len;
+   bool ok        = false;
+   char *buf      = NULL;
+   rjsonwriter_t *w = rjsonwriter_open_memory();
+   if (!w)
+      return false;
+   rjsonwriter_raw(w, "[", 1);
+   for (i = 0; i < l->n; i++)
+   {
+      bool first = true;
+      rjsonwriter_raw(w, i ? ",\n  {" : "\n  {", i ? 5 : 4);
+      for (k = 0; k < SAVE_FOLDERS_KEY_LAST; k++)
+      {
+         if (!l->e[i].v[k])
+            continue;
+         if (!first)
+            rjsonwriter_raw(w, ", ", 2);
+         rjsonwriter_add_string(w, save_folders_keys[k]);
+         rjsonwriter_raw(w, ": ", 2);
+         rjsonwriter_add_string(w, l->e[i].v[k]);
+         first = false;
+      }
+      rjsonwriter_raw(w, "}", 1);
+   }
+   rjsonwriter_raw(w, "\n]\n", 3);
+   if ((buf = rjsonwriter_get_memory_buffer(w, &len)))
+      ok = save_backups_write_file(path, buf, len, sync);
+   rjsonwriter_free(w);
+   return ok;
+}
+
+static bool save_folders_same(const char *a, const char *b)
+{
+   return string_is_equal(a ? a : "", b ? b : "");
+}
+
+bool save_backups_note_folders(const char *configured, const char *used,
+      bool sync)
+{
+   size_t i;
+   time_t now;
+   struct tm tm_;
+   char stamp[24];
+   struct save_folders_list l;
+   struct save_folders_entry *last = NULL;
+   struct save_folders_entry *e    = NULL;
+   bool changed                    = false;
+   bool ok                         = true;
+   bool whole;
+   const char *saves  = save_backups_roots[SAVE_BACKUPS_ROOT_SAVEFILE];
+   const char *states = save_backups_roots[SAVE_BACKUPS_ROOT_SAVESTATE];
+   char *path         = NULL;
+
+   if (     !save_backups_roots[SAVE_BACKUPS_ROOT_CONFIG]
+         || !(path = (char*)malloc(PATH_MAX_LENGTH)))
+      return false;
+   fill_pathname_join_special(path,
+         save_backups_roots[SAVE_BACKUPS_ROOT_CONFIG],
+         SAVE_BACKUPS_FOLDERS_FILE, PATH_MAX_LENGTH);
+
+   memset(&tm_, 0, sizeof(tm_));
+   time(&now);
+   rtime_localtime(&now, &tm_);
+   strftime(stamp, sizeof(stamp), "%Y-%m-%dT%H:%M:%S", &tm_);
+
+   memset(&l, 0, sizeof(l));
+   whole = save_folders_read(&l, path);
+   for (i = l.n; i-- > 0; )
+      if (l.e[i].v[SAVE_FOLDERS_SAVES] || l.e[i].v[SAVE_FOLDERS_STATES])
+      {
+         last = &l.e[i];
+         break;
+      }
+
+   if (     !last
+         || !save_folders_same(last->v[SAVE_FOLDERS_SAVES], saves)
+         || !save_folders_same(last->v[SAVE_FOLDERS_STATES], states))
+   {
+      if ((e = save_folders_add(&l)))
+      {
+         e->v[SAVE_FOLDERS_SAVES]      = strdup(saves ? saves : "");
+         e->v[SAVE_FOLDERS_STATES]     = strdup(states ? states : "");
+         e->v[SAVE_FOLDERS_FIRST_SEEN] = strdup(stamp);
+         e->v[SAVE_FOLDERS_LAST_SEEN]  = strdup(stamp);
+         changed = true;
+      }
+   }
+   /* A day is "YYYY-MM-DD", the first 10 bytes */
+   else if (!last->v[SAVE_FOLDERS_LAST_SEEN]
+         || strncmp(last->v[SAVE_FOLDERS_LAST_SEEN], stamp, 10))
+   {
+      free(last->v[SAVE_FOLDERS_LAST_SEEN]);
+      last->v[SAVE_FOLDERS_LAST_SEEN] = strdup(stamp);
+      changed = true;
+   }
+
+   if (configured)
+   {
+      /* The same note is kept once a day */
+      for (i = l.n; i-- > 0; )
+         if (l.e[i].v[SAVE_FOLDERS_CONFIGURED])
+            break;
+      if (     i == (size_t)-1
+            || !save_folders_same(l.e[i].v[SAVE_FOLDERS_CONFIGURED],
+               configured)
+            || !save_folders_same(l.e[i].v[SAVE_FOLDERS_USED], used)
+            || !l.e[i].v[SAVE_FOLDERS_TIME]
+            || strncmp(l.e[i].v[SAVE_FOLDERS_TIME], stamp, 10))
+      {
+         if ((e = save_folders_add(&l)))
+         {
+            e->v[SAVE_FOLDERS_CONFIGURED] = strdup(configured);
+            e->v[SAVE_FOLDERS_USED]       = strdup(used ? used : "");
+            e->v[SAVE_FOLDERS_TIME]       = strdup(stamp);
+            changed = true;
+         }
+      }
+   }
+
+   /* What was not read stays, aside; back in place when not written */
+   if (changed)
+   {
+      size_t size = strlen(path) + PATH_ASIDE_SUFFIX_SIZE;
+      char *aside = whole ? NULL : (char*)malloc(size);
+      ok = whole || (aside && save_folders_set_aside(aside, size, path));
+      if (ok && !(ok = save_folders_write(&l, path, sync)) && aside)
+         filestream_rename(aside, path);
+      free(aside);
+   }
+   for (i = 0; i < l.n; i++)
+   {
+      size_t k;
+      for (k = 0; k < SAVE_FOLDERS_KEY_LAST; k++)
+         free(l.e[i].v[k]);
+   }
+   free(l.e);
+   free(path);
+   return ok;
 }

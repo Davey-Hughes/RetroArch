@@ -499,6 +499,10 @@ static bool task_cloud_sync_should_ignore_file(const char *filename)
       /* this device's recovery files (save_backups.c) */
       if (string_starts_with(path, SAVE_BACKUPS_RECOVERY_DIR "/"))
          return true;
+
+      /* this device's save folders list (save_backups.c) */
+      if (string_is_equal(path, SAVE_BACKUPS_FOLDERS_FILE))
+         return true;
    }
 
    /* safety copies stay on the device that made them (save_backups.c) */
@@ -2532,6 +2536,14 @@ static bool task_cloud_sync_task_finder(retro_task_t *task, void *user_data)
           && !(task_get_flags(task) & RETRO_TASK_FLG_FINISHED);
 }
 
+/* Set while a save or state root is a fallback (main thread) */
+static bool tcs_paused = false;
+
+void task_cloud_sync_set_paused(bool paused)
+{
+   tcs_paused = paused;
+}
+
 static bool task_push_cloud_sync_with_mode(int conflict_resolution,
       retro_task_callback_t cb, void *cb_data)
 {
@@ -2543,6 +2555,12 @@ static bool task_push_cloud_sync_with_mode(int conflict_resolution,
 
    if (!cloud_sync_enable)
       return false;
+
+   if (tcs_paused)
+   {
+      RARCH_WARN(CSPFX "Paused: the save folder is a temporary one.\n");
+      return false;
+   }
 
 #if defined(HAVE_THREADS) && !defined(TCS_LOCK_FREE)
    if (!tcs_manifest_lock)

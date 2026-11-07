@@ -121,6 +121,15 @@ size_t save_backups_recover(char *s, size_t len, const char *path,
 size_t save_backups_find_recovery(char *s, size_t len, const char *path,
       int64_t mtime);
 
+#define SAVE_BACKUPS_FOLDERS_FILE "save_folders.json"
+
+/* <config>/save_folders.json: adds the save and state roots as an
+ * entry when they differ from the last one, else updates its last_seen
+ * once a day; with @configured, also a note that @used stood in for
+ * it. Rewritten only when something changed. */
+bool save_backups_note_folders(const char *configured, const char *used,
+      bool sync);
+
 RETRO_END_DECLS
 
 #endif

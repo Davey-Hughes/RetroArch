@@ -37,10 +37,13 @@ static size_t test_strftime(char *s, size_t max, const char *format,
 }
 
 static unsigned plain_writes, synced_writes;
+static bool write_fails;
 
 static bool test_write(const char *path, const void *data, int64_t len)
 {
    plain_writes++;
+   if (write_fails)
+      return false;
    return filestream_write_file_atomic(path, data, len);
 }
 
@@ -49,6 +52,20 @@ static bool test_write_synced(const char *path, const void *data,
 {
    synced_writes++;
    return filestream_write_file_atomic_synced(path, data, len);
+}
+
+static bool rename_fails, read_fails;
+
+static int test_rename(const char *old_path, const char *new_path)
+{
+   return rename_fails ? -1 : filestream_rename(old_path, new_path);
+}
+
+static int64_t test_read_file(const char *path, void **buf, int64_t *len)
+{
+   if (read_fails)
+      return 0;
+   return filestream_read_file(path, buf, len);
 }
 
 static unsigned file_syncs;
@@ -72,6 +89,8 @@ static int test_dir_sync(const char *dir)
 #define strftime test_strftime
 #define filestream_write_file_atomic test_write
 #define filestream_write_file_atomic_synced test_write_synced
+#define filestream_rename test_rename
+#define filestream_read_file test_read_file
 #define filestream_sync test_sync
 #define retro_vfs_dir_sync_impl test_dir_sync
 #if defined(SAVE_BACKUPS_PATH_MAX) && !defined(_WIN32)
@@ -88,6 +107,8 @@ static long path_max = SAVE_BACKUPS_PATH_MAX;
 #undef strftime
 #undef filestream_write_file_atomic
 #undef filestream_write_file_atomic_synced
+#undef filestream_rename
+#undef filestream_read_file
 #undef filestream_sync
 #undef retro_vfs_dir_sync_impl
 
@@ -1135,6 +1156,100 @@ static void backup_no_time(void)
    CHECK(!path_is_valid(ROOT "/notime_config"));
 }
 
+static unsigned count_of(const char *path, const char *text)
+{
+   void *buf    = NULL;
+   int64_t len  = 0;
+   unsigned n   = 0;
+   const char *p;
+   if (!filestream_read_file(path, &buf, &len))
+      return 0;
+   for (p = (const char*)buf; (p = strstr(p, text)); p++)
+      n++;
+   free(buf);
+   return n;
+}
+
+/* save_folders.json: one entry per set of roots, its last_seen moved
+ * once a day, a note for each fallback (once a day), and no write when
+ * nothing changed. */
+static void folders_list(void)
+{
+   const char *list = ROOT "/config/" SAVE_BACKUPS_FOLDERS_FILE;
+   CHECK(path_mkdir(ROOT "/config"));
+   roots();
+   set_time(10, 0, 0);
+   plain_writes = synced_writes = 0;
+   CHECK(save_backups_note_folders(NULL, NULL, false));
+   CHECK(plain_writes == 1);
+   CHECK(count_of(list, "\"saves\": ") == 1);
+   CHECK(count_of(list, "\"first_seen\": \"2026-11-03T10:00:00\"") == 1);
+
+   set_time(11, 0, 0);
+   CHECK(save_backups_note_folders(NULL, NULL, false));
+   CHECK(plain_writes == 1);
+
+   test_tm.tm_mday = 4;
+   CHECK(save_backups_note_folders(NULL, NULL, false));
+   CHECK(plain_writes == 2);
+   CHECK(count_of(list, "\"saves\": ") == 1);
+   CHECK(count_of(list, "\"first_seen\": \"2026-11-03T10:00:00\"") == 1);
+   CHECK(count_of(list, "\"last_seen\": \"2026-11-04T11:00:00\"") == 1);
+
+   save_backups_set_roots(ROOT "/default", ROOT "/states", ROOT "/roms",
+         ROOT "/system", ROOT "/config", ROOT "/appdata", "Snes9x");
+   CHECK(save_backups_note_folders("/card/saves", ROOT "/default", true));
+   CHECK(save_backups_note_folders("/card/saves", ROOT "/default", true));
+   CHECK(plain_writes == 2);
+   CHECK(synced_writes == 1);
+   CHECK(count_of(list, "\"saves\": ") == 2);
+   CHECK(count_of(list, "\"configured\": \"/card/saves\"") == 1);
+   CHECK(count_of(list, "\"used\": ") == 1);
+   roots();
+}
+
+/* A save_folders.json that does not read whole is moved aside, never
+ * written over: its entries stay, a second one beside the first. */
+static void save_folders_corrupt_kept(void)
+{
+   const char *list = ROOT "/config/" SAVE_BACKUPS_FOLDERS_FILE;
+   const char *bad  = "[\n  {\"saves\": \"/old/saves\", "
+         "\"states\": \"/old/states\"},\n  {\"saves\": ";
+   char aside[PATH_MAX_LENGTH], aside2[PATH_MAX_LENGTH];
+   fill_pathname_aside(aside, list, 1, sizeof(aside));
+   fill_pathname_aside(aside2, list, 2, sizeof(aside2));
+   roots();
+   set_time(10, 0, 0);
+   put(list, bad);
+   CHECK(save_backups_note_folders(NULL, NULL, false));
+   CHECK(holds(aside, bad));
+   CHECK(count_of(list, "\"saves\": \"/old/saves\"") == 1);
+   CHECK(count_of(list, "\"saves\": ") == 2);
+   put(list, bad);
+   CHECK(save_backups_note_folders(NULL, NULL, false));
+   CHECK(holds(aside, bad) && holds(aside2, bad));
+   CHECK(count_of(list, "\"saves\": ") == 2);
+   filestream_delete(aside);
+   filestream_delete(aside2);
+
+   /* not moved aside, nothing written; not written, put back */
+   put(list, bad);
+   rename_fails = true;
+   CHECK(!save_backups_note_folders(NULL, NULL, false));
+   rename_fails = false;
+   CHECK(holds(list, bad) && !path_is_valid(aside));
+   write_fails = true;
+   CHECK(!save_backups_note_folders(NULL, NULL, false));
+   write_fails = false;
+   CHECK(holds(list, bad) && !path_is_valid(aside));
+   /* there but not read: kept aside as well */
+   read_fails = true;
+   CHECK(save_backups_note_folders(NULL, NULL, false));
+   read_fails = false;
+   CHECK(holds(aside, bad) && count_of(list, "\"saves\": ") == 1);
+   filestream_delete(aside);
+}
+
 int main(void)
 {
 #ifdef SAVE_BACKUPS_PATH_MAX
@@ -1175,6 +1290,8 @@ int main(void)
    backup_sync();
    recovery_held_sync();
    backup_no_time();
+   folders_list();
+   save_folders_corrupt_kept();
    save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
    rm_tree(ROOT);
    puts(failures ? "FAIL save_backups_test" : "PASS save_backups_test");

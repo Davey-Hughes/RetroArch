@@ -475,6 +475,40 @@ static void test_save_dir_config(void)
    *g_defaults.dirs[DEFAULT_DIR_SAVESTATE] = '\0';
 }
 
+void menu_content_environment_get(int *argc, char *argv[],
+      void *args, void *params_data);
+
+/* A load from the menu passes the folders in use on as -s/-S only
+ * when they came from the command line: a configured one is checked
+ * again at the load. */
+static void test_load_save_dir_args(void)
+{
+   struct rarch_main_wrap wrap;
+   char dir[2048];
+
+   fill_pathname_basedir(dir, fixture_path, sizeof(dir));
+   dir_set(RARCH_DIR_SAVEFILE, dir);
+   dir_set(RARCH_DIR_SAVESTATE, dir);
+   retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
+   retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL);
+   memset(&wrap, 0, sizeof(wrap));
+   menu_content_environment_get(NULL, NULL, NULL, &wrap);
+   CHECK(!wrap.sram_path);
+   CHECK(!wrap.state_path);
+
+   retroarch_override_setting_set(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
+   retroarch_override_setting_set(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL);
+   memset(&wrap, 0, sizeof(wrap));
+   menu_content_environment_get(NULL, NULL, NULL, &wrap);
+   CHECK(wrap.sram_path && string_is_equal(wrap.sram_path, dir));
+   CHECK(wrap.state_path && string_is_equal(wrap.state_path, dir));
+
+   retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
+   retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL);
+   dir_clear(RARCH_DIR_SAVEFILE);
+   dir_clear(RARCH_DIR_SAVESTATE);
+}
+
 static void test_xr_config_invalid(void)
 {
    settings_t *settings = config_get_ptr();
@@ -4896,6 +4930,7 @@ int main(int argc, char **argv)
       test_xr_override_unload();
       test_xr_config_invalid();
       test_save_dir_config();
+      test_load_save_dir_args();
       test_xr_menu_place_config();
    }
    test_window_layout();

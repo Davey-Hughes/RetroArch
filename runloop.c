@@ -438,6 +438,10 @@ static runloop_state_t runloop_state;
  * netplay block of runloop_path_set_redirect(), not by --sram-mode. */
 static bool runloop_netplay_saves_off = false;
 #endif
+/* How this content's save and state roots were found
+ * (runloop_path_set_redirect), and whether that turned saves off. */
+static enum runloop_save_root runloop_save_roots[2];
+static bool runloop_save_folder_off = false;
 
 /* Defined here, before its first user: the SET_MESSAGE_EXT STATUS
  * path in the environment callback defers through this machinery,
@@ -5956,11 +5960,51 @@ static void runloop_path_init_savefile_internal(runloop_state_t *runloop_st)
       path_init_savefile_rtc(runloop_st->name.savefile);
 }
 
+/* Once per content load, for the first root not found. */
+static void runloop_save_folder_notice(void)
+{
+   char msg[DIR_MAX_LENGTH * 2 + 128];
+   size_t i;
+   for (i = 0; i < 2; i++)
+   {
+      const char *configured = dir_get_ptr(i
+            ? RARCH_DIR_SAVESTATE_CONFIGURED : RARCH_DIR_SAVEFILE_CONFIGURED);
+      if (runloop_save_roots[i] == RUNLOOP_SAVE_ROOT_CONFIGURED)
+         continue;
+      if (runloop_save_roots[i] == RUNLOOP_SAVE_ROOT_FALLBACK)
+         snprintf(msg, sizeof(msg),
+               msg_hash_to_str(i
+                  ? MSG_STATE_FOLDER_FALLBACK : MSG_SAVE_FOLDER_FALLBACK),
+               configured,
+               dir_get_ptr(i ? RARCH_DIR_SAVESTATE : RARCH_DIR_SAVEFILE));
+      else
+         snprintf(msg, sizeof(msg),
+               msg_hash_to_str(i
+                  ? MSG_STATE_FOLDER_MISSING : MSG_SAVE_FOLDER_MISSING),
+               *configured ? configured : dir_get_ptr(i
+                  ? RARCH_DIR_SAVESTATE : RARCH_DIR_SAVEFILE));
+      RARCH_WARN("[SRAM] %s\n", msg);
+      runloop_msg_queue_push(msg, strlen(msg), 1, 180, true, NULL,
+            MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+#ifdef HAVE_CLOUDSYNC
+      if (config_get_ptr()->bools.cloud_sync_enable)
+      {
+         const char *_msg = msg_hash_to_str(MSG_CLOUD_SYNC_PAUSED_FALLBACK);
+         runloop_msg_queue_push(_msg, strlen(_msg), 1, 180, false, NULL,
+               MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+      }
+#endif
+      break;
+   }
+}
+
 static void runloop_path_init_savefile(runloop_state_t *runloop_st)
 {
    bool    should_sram_be_used =
           (runloop_st->flags & RUNLOOP_FLAG_USE_SRAM)
       && !(runloop_st->flags & RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED);
+
+   runloop_save_folder_notice();
 
 #ifdef HAVE_NETWORKING
    if (runloop_netplay_saves_off)
@@ -6064,6 +6108,19 @@ static bool event_init_content(
 
    runloop_path_init_savefile(runloop_st);
    runloop_set_save_backup_roots(runloop_st, settings);
+   {
+      /* The folders list C2 reads; a fallback leaves a note there */
+      size_t i = runloop_save_roots[0] != RUNLOOP_SAVE_ROOT_CONFIGURED
+         ? 0 : 1;
+      if (runloop_save_roots[i] != RUNLOOP_SAVE_ROOT_CONFIGURED)
+         save_backups_note_folders(dir_get_ptr(i
+                  ? RARCH_DIR_SAVESTATE_CONFIGURED
+                  : RARCH_DIR_SAVEFILE_CONFIGURED),
+               dir_get_ptr(i ? RARCH_DIR_SAVESTATE : RARCH_DIR_SAVEFILE),
+               false);
+      else
+         save_backups_note_folders(NULL, NULL, false);
+   }
 
    if (!event_load_save_files(runloop_st->flags & RUNLOOP_FLAG_IS_SRAM_LOAD_DISABLED))
       RARCH_LOG("[SRAM] %s\n", msg_hash_to_str(MSG_SKIPPING_SRAM_LOAD));
@@ -11436,6 +11493,34 @@ void runloop_path_set_names(void)
 #endif
 }
 
+static bool runloop_save_root_usable(const char *dir)
+{
+   char parent[DIR_MAX_LENGTH];
+   if (path_is_directory(dir))
+      return true;
+   /* One level only: never a chain under a missing mount point */
+   fill_pathname_parent_dir(parent, dir, sizeof(parent));
+   return *parent && path_is_directory(parent) && path_mkdir(dir);
+}
+
+enum runloop_save_root runloop_save_root_check(char *s, size_t len,
+      const char *configured, const char *def)
+{
+   const char *dir = (configured && *configured) ? configured : def;
+   if (!dir || !*dir || runloop_save_root_usable(dir))
+   {
+      strlcpy(s, dir ? dir : "", len);
+      return RUNLOOP_SAVE_ROOT_CONFIGURED;
+   }
+   if (dir != def && def && *def && runloop_save_root_usable(def))
+   {
+      strlcpy(s, def, len);
+      return RUNLOOP_SAVE_ROOT_FALLBACK;
+   }
+   strlcpy(s, dir, len);
+   return RUNLOOP_SAVE_ROOT_NONE;
+}
+
 void runloop_path_set_redirect(settings_t *settings,
       const char *old_savefile_dir,
       const char *old_savestate_dir)
@@ -11460,6 +11545,54 @@ void runloop_path_set_redirect(settings_t *settings,
     * with the values from the config. */
    strlcpy(intermediate_savefile_dir, old_savefile_dir, sizeof(intermediate_savefile_dir));
    strlcpy(intermediate_savestate_dir, old_savestate_dir, sizeof(intermediate_savestate_dir));
+
+#ifdef HAVE_NETWORKING
+   if (runloop_netplay_saves_off)
+   {
+      runloop_netplay_saves_off  = false;
+      runloop_st->flags         &= ~RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED;
+   }
+#endif
+
+   /* The configured roots are checked again at each load */
+   if (runloop_save_folder_off)
+   {
+      runloop_save_folder_off  = false;
+      runloop_st->flags       &= ~RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED;
+   }
+   runloop_save_roots[0] = RUNLOOP_SAVE_ROOT_CONFIGURED;
+   runloop_save_roots[1] = RUNLOOP_SAVE_ROOT_CONFIGURED;
+   if (     !savefiles_in_content_dir
+         && !retroarch_override_setting_is_set(
+            RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL))
+   {
+      runloop_save_roots[0] = runloop_save_root_check(
+            intermediate_savefile_dir, sizeof(intermediate_savefile_dir),
+            dir_get_ptr(RARCH_DIR_SAVEFILE_CONFIGURED),
+            g_defaults.dirs[DEFAULT_DIR_SRAM]);
+      dir_set(RARCH_DIR_SAVEFILE, intermediate_savefile_dir);
+      if (     runloop_save_roots[0] == RUNLOOP_SAVE_ROOT_NONE
+            && !(runloop_st->flags & RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED))
+      {
+         runloop_save_folder_off  = true;
+         runloop_st->flags       |= RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED;
+      }
+   }
+   if (     !savestates_in_content_dir
+         && !retroarch_override_setting_is_set(
+            RARCH_OVERRIDE_SETTING_STATE_PATH, NULL))
+   {
+      runloop_save_roots[1] = runloop_save_root_check(
+            intermediate_savestate_dir, sizeof(intermediate_savestate_dir),
+            dir_get_ptr(RARCH_DIR_SAVESTATE_CONFIGURED),
+            g_defaults.dirs[DEFAULT_DIR_SAVESTATE]);
+      dir_set(RARCH_DIR_SAVESTATE, intermediate_savestate_dir);
+   }
+#ifdef HAVE_CLOUDSYNC
+   task_cloud_sync_set_paused(
+            runloop_save_roots[0] != RUNLOOP_SAVE_ROOT_CONFIGURED
+         || runloop_save_roots[1] != RUNLOOP_SAVE_ROOT_CONFIGURED);
+#endif
 
    /* Get content directory name, if per-content-directory
     * saves/states are enabled */
@@ -11515,9 +11648,11 @@ void runloop_path_set_redirect(settings_t *settings,
             msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NO_CORE)))
 #endif
       {
-         /* Per-core and/or per-content-directory saves */
+         /* Per-core and/or per-content-directory saves, only
+          * under a root that is there */
          if (     (sort_savefiles || sort_savefiles_by_content)
-               && *new_savefile_dir)
+               && *new_savefile_dir
+               && runloop_save_roots[0] != RUNLOOP_SAVE_ROOT_NONE)
          {
             /* Append content directory name to save location */
             if (sort_savefiles_by_content && *content_dir_name)
@@ -11551,7 +11686,8 @@ void runloop_path_set_redirect(settings_t *settings,
 
          /* Per-core and/or per-content-directory savestates */
          if (     (sort_savestates || sort_savestates_by_content)
-               && *new_savestate_dir)
+               && *new_savestate_dir
+               && runloop_save_roots[1] != RUNLOOP_SAVE_ROOT_NONE)
          {
             /* Append content directory name to savestate location */
             if (sort_savestates_by_content && *content_dir_name)
@@ -11587,14 +11723,9 @@ void runloop_path_set_redirect(settings_t *settings,
 
 
 #ifdef HAVE_NETWORKING
-   if (runloop_netplay_saves_off)
-   {
-      runloop_netplay_saves_off  = false;
-      runloop_st->flags         &= ~RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED;
-   }
-
    /* Special save directory for netplay clients. */
-   if (      netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_ENABLED, NULL)
+   if (      runloop_save_roots[0] != RUNLOOP_SAVE_ROOT_NONE
+         &&  netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_ENABLED, NULL)
          && !netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_SERVER, NULL)
          && !netplay_driver_ctl(RARCH_NETPLAY_CTL_USE_CORE_PACKET_INTERFACE, NULL))
    {
@@ -11621,6 +11752,12 @@ void runloop_path_set_redirect(settings_t *settings,
    {
       bool savefile_is_dir  = path_is_directory(new_savefile_dir);
       bool savestate_is_dir = path_is_directory(new_savestate_dir);
+      /* A root that can't be used keeps the names in it, so
+       * nothing lands beside the content instead */
+      if (runloop_save_roots[0] == RUNLOOP_SAVE_ROOT_NONE)
+         savefile_is_dir  = true;
+      if (runloop_save_roots[1] == RUNLOOP_SAVE_ROOT_NONE)
+         savestate_is_dir = true;
       if (savefile_is_dir)
          strlcpy(runloop_st->name.savefile, new_savefile_dir,
                  sizeof(runloop_st->name.savefile));

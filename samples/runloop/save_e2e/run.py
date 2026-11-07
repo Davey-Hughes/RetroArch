@@ -688,6 +688,45 @@ def lane_config_keeps_folder(args, n):
     return r, failures
 
 
+def lane_folder_check_each_load(args, n):
+    """A save folder whose parent is missing at load: the default
+    folder for that session, one notice, a note in save_folders.json,
+    nothing made under the missing parent, and the config keeps the
+    folder. Only the folder missing: made again and used."""
+    r = Run(args.run_dir, 'folder_check_each_load-%d' % n)
+    failures = []
+    gone = r.dir / 'gone'
+    cfg = r.config(savefile_directory=gone / 'saves',
+                   config_save_on_exit='true')
+    r.start(args, cfg, 60, r.env(SAVE_E2E_TOUCH_FRAME=5))
+    rc = r.wait(60)
+    check(failures, rc == 0, 'retroarch exit %s' % rc)
+    default = r.dir / 'xdg-config' / 'retroarch' / 'saves'
+    check(failures, (default / 'game.srm').is_file(), 'no save in default')
+    log = r.log.read_text(errors='replace')
+    check(failures, log.count('not found; saving to') == 1,
+          '%d fallback notices' % log.count('not found; saving to'))
+    check(failures, 'Save folder %s not found; saving to %s for'
+          % (gone / 'saves', default) in log, 'notice names other folders')
+    folders = r.dir / 'config' / 'save_folders.json'
+    text = folders.read_text() if folders.is_file() else ''
+    check(failures, '"configured": "%s"' % (gone / 'saves') in text,
+          'no fallback note')
+    check(failures, not gone.exists(), 'made %s' % gone)
+    check(failures, cfg_path(r, cfg, 'savefile_directory', args)
+          == str(gone / 'saves'), 'config lost the folder')
+
+    gone.mkdir()
+    r.start(args, cfg, 60, r.env(SAVE_E2E_TOUCH_FRAME=5))
+    rc = r.wait(60)
+    check(failures, rc == 0, 'retroarch exit %s' % rc)
+    check(failures, (gone / 'saves' / 'game.srm').is_file(),
+          'folder not made again')
+    log = r.log.read_text(errors='replace')
+    check(failures, 'not found;' not in log, 'notice with the folder there')
+    return r, failures
+
+
 LANES = {
     'autosave_full_disk': lane_autosave_full_disk,
     'autosave_kill_mid_write': lane_autosave_kill_mid_write,
@@ -704,12 +743,13 @@ LANES = {
     'nosave_netplay_disconnect': lane_nosave_netplay_disconnect,
     'windows_locked_close': lane_windows_locked_close,
     'config_keeps_folder': lane_config_keeps_folder,
+    'folder_check_each_load': lane_folder_check_each_load,
 }
 # Lanes that need Windows, and the ones Windows cannot run.
 WINDOWS_LANES = {'windows_locked_close'}
 POSIX_LANES = {'autosave_full_disk', 'autosave_kill_mid_write',
                'no_rewrite_at_launch', 'unreadable_backed_up',
-               'explicit_save_copies'}
+               'explicit_save_copies', 'folder_check_each_load'}
 
 
 def main():

@@ -7214,6 +7214,7 @@ static bool config_load_file(const char *path, settings_t *settings)
    char* libretro_video_shader_directory           = NULL;
    static bool first_load                          = true;
    bool without_overrides                          = false;
+   bool save_dir_missing                           = false;
    unsigned msg_color                              = 0;
    char override_username[PATH_MAX_LENGTH];
    bool override_username_set                      = false;
@@ -8153,7 +8154,10 @@ static bool config_load_file(const char *path, settings_t *settings)
                sizeof(runloop_st->name.savefile));
       }
       else
+      {
          RARCH_WARN("[Config] \"savefile_directory\" is not a directory, ignoring...\n");
+         save_dir_missing = true;
+      }
    }
 
    if (    !without_overrides
@@ -8180,8 +8184,16 @@ static bool config_load_file(const char *path, settings_t *settings)
                sizeof(runloop_st->name.replay));
       }
       else
+      {
          RARCH_WARN("[Config] \"savestate_directory\" is not a directory, ignoring...\n");
+         save_dir_missing = true;
+      }
    }
+#ifdef HAVE_CLOUDSYNC
+   /* Until a content load checks the folders again */
+   if (!without_overrides)
+      task_cloud_sync_set_paused(save_dir_missing);
+#endif
 
    config_read_keybinds_conf(conf);
    /* the binds, and the device settings read above */

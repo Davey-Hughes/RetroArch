@@ -1175,6 +1175,19 @@ void runloop_state_free(runloop_state_t *runloop_st);
 
 void runloop_path_set_redirect(settings_t *settings, const char *a, const char *b);
 
+enum runloop_save_root
+{
+   RUNLOOP_SAVE_ROOT_CONFIGURED = 0,
+   RUNLOOP_SAVE_ROOT_FALLBACK,
+   RUNLOOP_SAVE_ROOT_NONE
+};
+
+/* The folder to save in for a configured save or state root ("" is
+ * the default @def): the configured one, made when only it is missing;
+ * else @def for this session; NONE when neither can be used. */
+enum runloop_save_root runloop_save_root_check(char *s, size_t len,
+      const char *configured, const char *def);
+
 void runloop_path_set_special(char **argv, unsigned num_content);
 
 void runloop_path_deinit_subsystem(void);

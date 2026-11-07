@@ -33146,6 +33146,26 @@ MSG_HASH(
    "No netplay save folder; saves are off for this session."
    )
 MSG_HASH(
+   MSG_SAVE_FOLDER_FALLBACK,
+   "Save folder %s not found; saving to %s for this session."
+   )
+MSG_HASH(
+   MSG_SAVE_FOLDER_MISSING,
+   "Save folder %s not found; saving is off for this session."
+   )
+MSG_HASH(
+   MSG_STATE_FOLDER_FALLBACK,
+   "Savestate folder %s not found; savestates go to %s for this session."
+   )
+MSG_HASH(
+   MSG_STATE_FOLDER_MISSING,
+   "Savestate folder %s not found; savestates will fail until it is back."
+   )
+MSG_HASH(
+   MSG_CLOUD_SYNC_PAUSED_FALLBACK,
+   "Cloud sync paused: the save folder is a temporary one."
+   )
+MSG_HASH(
    MSG_FAILED_TO_SAVE_STATE_TO,
    "Failed to save state to"
    )

@@ -2576,11 +2576,15 @@ void menu_content_environment_get(int *argc, char *argv[],
 
    if (!path_is_empty(RARCH_PATH_CONFIG))
       wrap_args->config_path   = path_get(RARCH_PATH_CONFIG);
+   /* Only a command-line folder is passed on as one: a configured
+    * folder is checked again at each load */
    a = dir_get_ptr(RARCH_DIR_SAVEFILE);
-   if (a && *a)
+   if (a && *a && retroarch_override_setting_is_set(
+            RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL))
       wrap_args->sram_path     = dir_get_ptr(RARCH_DIR_SAVEFILE);
    a = dir_get_ptr(RARCH_DIR_SAVESTATE);
-   if (a && *a)
+   if (a && *a && retroarch_override_setting_is_set(
+            RARCH_OVERRIDE_SETTING_STATE_PATH, NULL))
       wrap_args->state_path    = dir_get_ptr(RARCH_DIR_SAVESTATE);
    if (!path_is_empty(RARCH_PATH_CONTENT))
       wrap_args->content_path  = path_get(RARCH_PATH_CONTENT);
