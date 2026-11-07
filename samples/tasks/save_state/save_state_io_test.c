@@ -347,6 +347,9 @@ void event_flush_save_files(bool sram_used, bool compress_files, int owed)
    flushes++;
    flushes_owed |= owed;
 }
+/* Save writes that have landed, for cloud sync's copies */
+static unsigned save_writes;
+void content_save_written(void) { save_writes++; }
 bool audio_driver_jump_fade_begin(void) { return false; }
 void audio_driver_jump_fade_end(bool ramped) { (void)ramped; }
 
@@ -443,12 +446,14 @@ static void test_budget_unlimited(void)
    core_fill(sz);
    filestream_delete(path);
    clock_step = 0;   /* clock never advances: budget never expires */
+   save_writes = 0;
 
    content_save_state(path, true);
    ticks = pump(1000);
 
    okf(ticks == 1,
        "unexpired budget writes a 64-quantum state in a single tick");
+   okf(save_writes == 1, "the state written counts as a save write");
    if (ticks != 1)
       printf("       (took %d ticks)\n", ticks);
 
@@ -1524,6 +1529,38 @@ static void test_state_load_guards(void)
    filestream_delete(path);
 }
 
+/* -----------------------------------------------------------------
+ * Undo Save State writing the slot back, and a RAM state written to
+ * its file, each count as one save write, as cloud sync's copies
+ * watch for.
+ * ----------------------------------------------------------------- */
+static void test_writes_counted(void)
+{
+   const char *path     = "sst_writes.state";
+   const char *ram_path = "sst_writes_ram.state";
+
+   frontend_reset();
+   core_fill(4096);
+   filestream_delete(path);
+   filestream_delete(ram_path);
+   content_save_state(path, true);
+   pump(1000);
+   memset(core_mem, 0x5A, core_len);
+   content_save_state(path, true);
+   pump(1000);
+   save_writes = 0;
+   okf(content_undo_save_state(), "writes: the undo of a save is pushed");
+   pump(1000);
+   okf(save_writes == 1, "writes: Undo Save State counts as a save write");
+
+   okf(content_save_state_to_ram(), "writes: a state is kept in RAM");
+   save_writes = 0;
+   okf(content_ram_state_to_file(ram_path) && save_writes == 1,
+         "writes: a RAM state written to file counts as a save write");
+   filestream_delete(path);
+   filestream_delete(ram_path);
+}
+
 static int run_default_lane(void)
 {
    printf("== task_save.c I/O regression oracle ==\n");
@@ -1553,6 +1590,7 @@ static int run_default_lane(void)
    test_load_held_behind_save();
    test_state_load_kinds();
    test_state_load_guards();
+   test_writes_counted();
 #ifdef HAVE_COMPRESSION
    test_undo_save_restores_file();
 #endif

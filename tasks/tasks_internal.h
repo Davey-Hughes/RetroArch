@@ -545,6 +545,10 @@ bool event_load_save_files(bool is_sram_load_disabled);
 
 bool content_savefile_is_live(const char *path);
 
+/* Changes whenever content is loaded or unloaded, so a check made
+ * across a gap can tell that ownership may have changed meanwhile. */
+unsigned content_savefile_lifetime(void);
+
 bool event_save_files(bool sram_used, bool compress_files, bool sync,
       bool copy, const char *path_cheat_database);
 

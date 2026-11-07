@@ -30,6 +30,7 @@
 #include <retro_inline.h>
 
 #include "../configuration.h"
+#include "../content.h"
 #include "../file_path_special.h"
 #include "../msg_hash.h"
 #include "../network/cloud_sync_driver.h"
@@ -49,6 +50,12 @@
  * the tests that cover it on hosts whose backends all have them. */
 #if defined(HAVE_THREADS) && defined(RETRO_ATOMIC_HAS_PTR) && !defined(TASK_CLOUDSYNC_FORCE_LOCK)
 #define TCS_LOCK_FREE 1
+#endif
+
+/* A backup copied across drives is copied on a thread of its own. Its
+ * hand-back needs a real exchange; without one the copy runs inline. */
+#if defined(HAVE_THREADS) && defined(RETRO_ATOMIC_LOCK_FREE)
+#define TCS_MOVE_WORKER 1
 #endif
 
 #define CSPFX "[CloudSync] "
@@ -81,6 +88,7 @@ typedef struct
 } tcs_hash_t;
 
 struct tcs_fetched;
+struct tcs_move;
 
 typedef struct
 {
@@ -136,6 +144,10 @@ typedef struct
    struct tcs_fetched *fetched_in;
 #endif
    struct tcs_fetched *fetched;
+#if defined(TCS_MOVE_WORKER)
+   /* Backups being copied across drives, oldest first */
+   struct tcs_move *moves;
+#endif
    /* The walk of the synced directories that builds current_manifest,
     * a few entries per run: the directories open from the root of
     * dirlist[walk_root_idx] down, each with the length of its path in
@@ -1496,50 +1508,71 @@ static bool task_cloud_sync_hash_current(task_cloud_sync_state_t *sync_state,
    return true;
 }
 
-/* don't pass a server/local item_file to this, only current has ->path set */
-/* Returns false when the local file is still where it was, which leaves
- * the caller holding a file it must not replace or remove: non-destructive
- * mode promises a local copy of anything it displaces, and without the
- * backup there is nothing to fall back on. The backup goes under the
- * synced save folder's backups/cloud-sync, which no sync walks; without
- * one, under <core assets>/cloud_backups. */
-static bool task_cloud_sync_backup_file(task_cloud_sync_state_t *sync_state,
-      struct item_file *file, enum save_backup_reason reason)
+/* Where this sync's backups go: under the synced save folder's
+ * backups/cloud-sync, which no sync walks; without one (false), under
+ * <core assets>/cloud_backups. */
+static bool task_cloud_sync_backup_root(task_cloud_sync_state_t *sync_state,
+      char *s, size_t len)
 {
    size_t      i;
-   bool        ok       = false;
-   const char *saves    = NULL;
-   /* one heap block for the two paths: the task runs on small stacks */
-   char       *new_dir  = (char*)malloc(DIR_MAX_LENGTH + PATH_MAX_LENGTH);
-   char       *new_path = new_dir + DIR_MAX_LENGTH;
+   const char *saves = NULL;
 
-   if (!new_dir)
-      return false;
-
-   for (i = 0; i < sync_state->dirlist->size; i++)
+   for (i = 0; sync_state->dirlist && i < sync_state->dirlist->size; i++)
       if (string_is_equal(sync_state->dirlist->elems[i].data, "saves"))
          saves = (const char*)sync_state->dirlist->elems[i].userdata;
 
-   if (!string_is_empty(saves))
-      fill_pathname_join_special(new_dir, saves,
-            SAVE_BACKUPS_DIR "/" SAVE_BACKUPS_CORE_CLOUD_SYNC, DIR_MAX_LENGTH);
-   else
-      fill_pathname_join_special(new_dir, sync_state->dir_core_assets,
-            "cloud_backups", DIR_MAX_LENGTH);
+   if (string_is_empty(saves))
+   {
+      fill_pathname_join_special(s, sync_state->dir_core_assets,
+            "cloud_backups", len);
+      return false;
+   }
+   fill_pathname_join_special(s, saves,
+         SAVE_BACKUPS_DIR "/" SAVE_BACKUPS_CORE_CLOUD_SYNC, len);
+   return true;
+}
+
+/* don't pass a server/local item_file to this, only current has ->path set */
+/* Anything but MADE leaves the caller holding a file it must not
+ * replace or remove: non-destructive mode promises a local copy of
+ * anything it displaces, and without the backup there is nothing to
+ * fall back on. With a move worker, COPY_OWED: the file is still in
+ * place and its copy is owed at *@owed (the caller frees it). */
+static enum save_backup_result task_cloud_sync_backup_file(
+      task_cloud_sync_state_t *sync_state, struct item_file *file,
+      enum save_backup_reason reason, char **owed)
+{
+   enum save_backup_result result = SAVE_BACKUP_FAILED;
+   /* one heap block for the two paths: the task runs on small stacks */
+   char *new_dir  = (char*)malloc(DIR_MAX_LENGTH + PATH_MAX_LENGTH);
+   char *new_path = new_dir + DIR_MAX_LENGTH;
+
+   *owed = NULL;
+   if (!new_dir)
+      return SAVE_BACKUP_FAILED;
+
+   task_cloud_sync_backup_root(sync_state, new_dir, DIR_MAX_LENGTH);
    fill_pathname_join_special(new_path, new_dir, CS_FILE_KEY(file),
          PATH_MAX_LENGTH);
    pathname_conform_slashes_to_os(new_path);
    fill_pathname_basedir(new_dir, new_path, DIR_MAX_LENGTH);
 
-   if (save_backups_move_to(new_dir, file->path,
-            SAVE_BACKUPS_CORE_CLOUD_SYNC, reason) == SAVE_BACKUP_MADE)
-      ok = true;
-   else
+#if defined(TCS_MOVE_WORKER)
+   result = save_backups_move_begin(new_dir, file->path,
+         SAVE_BACKUPS_CORE_CLOUD_SYNC, reason, new_path, PATH_MAX_LENGTH);
+   if (     result == SAVE_BACKUP_COPY_OWED
+         && !(*owed = strdup(new_path)))
+      result = SAVE_BACKUP_FAILED;
+#else
+   result = save_backups_move_to(new_dir, file->path,
+         SAVE_BACKUPS_CORE_CLOUD_SYNC, reason);
+#endif
+   if (result != SAVE_BACKUP_MADE && result != SAVE_BACKUP_COPY_OWED)
       RARCH_ERR(CSPFX "Could not back \"%s\" up to \"%s\".\n",
             file->path, new_dir);
 
    free(new_dir);
-   return ok;
+   return result;
 }
 
 /**
@@ -1626,48 +1659,92 @@ static bool task_cloud_sync_fetching_path(char *s, size_t len,
                < len - _len;
 }
 
-/* Moves a whole download into place. A core that has taken the file
- * since the fetch began keeps it, and the download goes, as at the
- * start of the fetch. False when the download did not land. */
-static bool task_cloud_sync_fetch_commit(
-      task_cloud_sync_fetch_state_t *fetch_state, const char *key)
+/* Moves @tmp, a whole download, into place. False when it did not
+ * land. */
+static bool task_cloud_sync_fetch_place(
+      task_cloud_sync_fetch_state_t *fetch_state, const char *key,
+      const char *tmp)
+{
+   task_cloud_sync_state_t *sync_state = fetch_state->sync_state;
+   if (filestream_rename(tmp, fetch_state->local) != 0)
+   {
+      RARCH_WARN(CSPFX "Could not move the download of \"%s\" into place.\n", key);
+      filestream_delete(tmp);
+      task_cloud_sync_add_to_updated_manifest(sync_state, key,
+            CS_FILE_HASH(fetch_state->server_file), true);
+      sync_state->failures = true;
+      return false;
+   }
+   return true;
+}
+
+enum tcs_commit
+{
+   TCS_COMMIT_LEFT = 0,
+   TCS_COMMIT_PLACED,
+   /* waits for its backup's copy, which then finishes the fetch */
+   TCS_COMMIT_OWED
+};
+
+#if defined(TCS_MOVE_WORKER)
+static bool task_cloud_sync_move_push(task_cloud_sync_state_t *sync_state,
+      task_cloud_sync_fetch_state_t *fetch_state,
+      struct item_file *server_file, const char *key, const char *path,
+      const char *to, const char *fetching, const char *hash);
+#endif
+
+/* Moves a whole download, of hash @hash, into place. A core that has
+ * taken the file since the fetch began keeps it, and the download goes,
+ * as at the start of the fetch. LEFT when the download did not land. */
+static enum tcs_commit task_cloud_sync_fetch_commit(
+      task_cloud_sync_fetch_state_t *fetch_state, const char *key,
+      const char *hash)
 {
    char tmp[PATH_MAX_LENGTH];
    task_cloud_sync_state_t *sync_state = fetch_state->sync_state;
    const char *server_hash = CS_FILE_HASH(fetch_state->server_file);
 
    if (!task_cloud_sync_fetching_path(tmp, sizeof(tmp), fetch_state->local))
-      return false;
+      return TCS_COMMIT_LEFT;
    if (content_savefile_is_live(fetch_state->local))
    {
       RARCH_LOG(CSPFX "Deferring \"%s\", the running core took it during the fetch.\n", key);
       filestream_delete(tmp);
       task_cloud_sync_carry_manifests_forward(sync_state, key, server_hash);
-      return false;
+      return TCS_COMMIT_LEFT;
    }
    if (!sync_state->destructive && path_is_valid(fetch_state->local))
    {
       struct item_file local_file = {0};
+      enum save_backup_result made;
+      char *owed      = NULL;
       local_file.alt  = (char*)key;
       local_file.path = fetch_state->local;
-      if (!task_cloud_sync_backup_file(sync_state, &local_file,
-               SAVE_BACKUP_REPLACED))
+      made = task_cloud_sync_backup_file(sync_state, &local_file,
+            SAVE_BACKUP_REPLACED, &owed);
+#if defined(TCS_MOVE_WORKER)
+      if (made == SAVE_BACKUP_COPY_OWED)
+      {
+         bool queued = task_cloud_sync_move_push(sync_state, fetch_state,
+               fetch_state->server_file, key, fetch_state->local, owed,
+               tmp, hash);
+         free(owed);
+         if (queued)
+            return TCS_COMMIT_OWED;
+      }
+#else
+      (void)hash;
+#endif
+      if (made != SAVE_BACKUP_MADE)
       {
          filestream_delete(tmp);
          task_cloud_sync_carry_manifests_forward(sync_state, key, server_hash);
          sync_state->failures = true;
-         return false;
+         return TCS_COMMIT_LEFT;
       }
    }
-   if (filestream_rename(tmp, fetch_state->local) != 0)
-   {
-      RARCH_WARN(CSPFX "Could not move the download of \"%s\" into place.\n", key);
-      filestream_delete(tmp);
-      task_cloud_sync_add_to_updated_manifest(sync_state, key, server_hash, true);
-      sync_state->failures = true;
-      return false;
-   }
-   return true;
+   return task_cloud_sync_fetch_place(fetch_state, key, tmp)
+      ? TCS_COMMIT_PLACED : TCS_COMMIT_LEFT;
 }
 
 /* What a fetch that never completed left beside its file. */
@@ -1699,6 +1776,300 @@ static void task_cloud_sync_fetched(task_cloud_sync_state_t *sync_state,
    if (!string_is_equal(hash, CS_FILE_HASH(server_file)))
       sync_state->need_manifest_uploaded = true;
    sync_state->downloads++;
+}
+
+/* A file's name ends in this while the atomic writer writes it. */
+#define CS_TEMP_SUFFIX ".tmp"
+
+#if defined(TCS_MOVE_WORKER)
+enum
+{
+   TCS_MOVE_QUEUED = 0,
+   TCS_MOVE_RUNNING,
+   TCS_MOVE_DONE,
+   TCS_MOVE_ABANDONED
+};
+
+/* A backup's copy across drives, on a detached thread. The task thread
+ * fills it before the thread starts; the thread then reads only path
+ * and to and writes only ok, and its exchange of state hands it back.
+ * A copy nobody polls for (ABANDONED) is the thread's to dispose of.
+ * Everything else is the task thread's. */
+typedef struct tcs_move
+{
+   struct tcs_move               *next;
+   retro_atomic_int_t             state;
+   bool                           ok;
+   unsigned                       lifetime;
+   unsigned                       writes;
+   int64_t                        size;
+   int64_t                        mtime;
+   char                          *path;
+   char                          *to;
+   char                          *key;
+   /* A fetch's download, placed once the file is moved; NULL for the
+    * server's deletion */
+   char                          *fetching;
+   task_cloud_sync_fetch_state_t *fetch_state;
+   struct item_file              *server_file;
+   char                           hash[33];
+} tcs_move_t;
+
+/* Copies in flight stay under both; a bigger copy runs alone. */
+#define TCS_MOVE_MAX     4
+#define TCS_MOVE_BUDGET  (16 * 1024 * 1024)
+
+static void task_cloud_sync_move_worker(void *data)
+{
+   tcs_move_t *mv = (tcs_move_t*)data;
+   mv->ok         = save_backups_copy_synced(mv->path, mv->to);
+   if (retro_atomic_exchange_int(&mv->state, TCS_MOVE_DONE)
+         == TCS_MOVE_ABANDONED)
+   {
+      /* nobody deletes the original now */
+      if (mv->ok)
+         filestream_delete(mv->to);
+      free(mv);
+   }
+}
+
+static void task_cloud_sync_move_start(tcs_move_t *mv)
+{
+   sthread_t *thread;
+   retro_atomic_store_release_int(&mv->state, TCS_MOVE_RUNNING);
+   if ((thread = sthread_create(task_cloud_sync_move_worker, mv)))
+   {
+      sthread_detach(thread);
+      return;
+   }
+   mv->ok = save_backups_copy_synced(mv->path, mv->to);
+   retro_atomic_store_release_int(&mv->state, TCS_MOVE_DONE);
+}
+
+/* Starts queued copies in order while the budget allows. */
+static void task_cloud_sync_moves_start(task_cloud_sync_state_t *sync_state)
+{
+   tcs_move_t *mv;
+   unsigned    running = 0;
+   int64_t     bytes   = 0;
+
+   for (mv = sync_state->moves; mv; mv = mv->next)
+   {
+      if (retro_atomic_load_acquire_int(&mv->state) == TCS_MOVE_QUEUED)
+      {
+         if (     running
+               && (   running + 1 >= TCS_MOVE_MAX
+                   || bytes + mv->size >= TCS_MOVE_BUDGET))
+            return;
+         task_cloud_sync_move_start(mv);
+      }
+      running++;
+      bytes += mv->size;
+   }
+}
+
+/* Queues the copy of @path to @to that its backup owes; until it is
+ * done the key is in flight (`waiting`). A fetch's own unit carries
+ * over. */
+static bool task_cloud_sync_move_push(task_cloud_sync_state_t *sync_state,
+      task_cloud_sync_fetch_state_t *fetch_state,
+      struct item_file *server_file, const char *key, const char *path,
+      const char *to, const char *fetching, const char *hash)
+{
+   tcs_move_t **tail;
+   size_t path_len     = strlen(path) + 1;
+   size_t to_len       = strlen(to) + 1;
+   size_t key_len      = strlen(key) + 1;
+   size_t fetching_len = fetching ? strlen(fetching) + 1 : 0;
+   tcs_move_t *mv      = (tcs_move_t*)calloc(1,
+         sizeof(*mv) + path_len + to_len + key_len + fetching_len);
+
+   if (!mv)
+      return false;
+   mv->path = (char*)(mv + 1);
+   memcpy(mv->path, path, path_len);
+   mv->to   = mv->path + path_len;
+   memcpy(mv->to, to, to_len);
+   mv->key  = mv->to + to_len;
+   memcpy(mv->key, key, key_len);
+   if (fetching)
+   {
+      mv->fetching = mv->key + key_len;
+      memcpy(mv->fetching, fetching, fetching_len);
+   }
+   if (hash)
+      strlcpy(mv->hash, hash, sizeof(mv->hash));
+   mv->fetch_state = fetch_state;
+   mv->server_file = server_file;
+   mv->lifetime    = content_savefile_lifetime();
+   mv->writes      = content_save_writes();
+   if ((mv->size = path_get_size(path)) < 0)
+      mv->size = TCS_MOVE_BUDGET;
+   if (!path_get_mtime(path, &mv->mtime))
+      mv->mtime = 0;
+   retro_atomic_int_init(&mv->state, TCS_MOVE_QUEUED);
+
+   for (tail = &sync_state->moves; *tail; tail = &(*tail)->next);
+   *tail = mv;
+   if (!fetch_state)
+      task_cloud_sync_waiting_inc(sync_state);
+   task_cloud_sync_moves_start(sync_state);
+   return true;
+}
+
+/* The file may have been written after the copy read it: by content
+ * loaded or closed meanwhile, by a save or state write of the frontend
+ * (one still in flight may land yet), or by the core itself, which only
+ * its size and mtime tell. */
+static bool task_cloud_sync_move_touched(const tcs_move_t *mv)
+{
+   int64_t mtime = 0;
+   if (     content_savefile_is_live(mv->path)
+         || content_savefile_lifetime() != mv->lifetime
+         || content_save_writes()       != mv->writes
+         || content_save_state_in_progress(NULL)
+         || path_get_size(mv->path)     != mv->size)
+      return true;
+   if (!path_get_mtime(mv->path, &mtime))
+      mtime = 0;
+   return mtime != mv->mtime;
+}
+
+/* The original goes once its copy is on the disk. A file written during
+ * the copy stays, and the copy goes, for the next sync to see; the copy
+ * of a file gone meanwhile stays. */
+static void task_cloud_sync_move_finish(task_cloud_sync_state_t *sync_state,
+      tcs_move_t *mv)
+{
+   task_cloud_sync_fetch_state_t *fetch_state = mv->fetch_state;
+   const char *server_hash = CS_FILE_HASH(mv->server_file);
+
+   if (task_cloud_sync_move_touched(mv))
+   {
+      RARCH_LOG(CSPFX "Deferring \"%s\", it may have been written during its backup.\n",
+            mv->key);
+      if (mv->ok && path_is_valid(mv->path))
+         filestream_delete(mv->to);
+      if (mv->fetching)
+         filestream_delete(mv->fetching);
+      task_cloud_sync_carry_manifests_forward(sync_state, mv->key,
+            server_hash);
+   }
+   else if (!mv->ok || !save_backups_move_finish(mv->path, mv->to))
+   {
+      RARCH_ERR(CSPFX "Could not back \"%s\" up to \"%s\".\n",
+            mv->path, mv->to);
+      if (mv->fetching)
+         filestream_delete(mv->fetching);
+      else
+         RARCH_ERR(CSPFX "Keeping \"%s\", the local file could not be removed.\n",
+               mv->key);
+      task_cloud_sync_carry_manifests_forward(sync_state, mv->key,
+            server_hash);
+      sync_state->failures = true;
+   }
+   else if (!fetch_state)
+      task_cloud_sync_add_to_updated_manifest(sync_state, mv->key,
+            server_hash, false);
+   else if (task_cloud_sync_fetch_place(fetch_state, mv->key, mv->fetching))
+      task_cloud_sync_fetched(sync_state, fetch_state->server_file,
+            mv->key, mv->hash);
+
+   free(fetch_state);
+   free(mv);
+   task_cloud_sync_waiting_dec(sync_state);
+}
+
+/* Finishes the copies that are done and starts what the budget then
+ * allows. Never waits. */
+static void task_cloud_sync_moves_run(task_cloud_sync_state_t *sync_state)
+{
+   tcs_move_t **link = &sync_state->moves;
+   while (*link)
+   {
+      tcs_move_t *mv = *link;
+      if (retro_atomic_load_acquire_int(&mv->state) != TCS_MOVE_DONE)
+      {
+         link = &mv->next;
+         continue;
+      }
+      *link = mv->next;
+      task_cloud_sync_move_finish(sync_state, mv);
+   }
+   task_cloud_sync_moves_start(sync_state);
+}
+
+/* A sync released with copies in flight: each copy is undone and its
+ * original kept, by whichever side lets go of it last. */
+static void task_cloud_sync_moves_abandon(task_cloud_sync_state_t *sync_state)
+{
+   while (sync_state->moves)
+   {
+      tcs_move_t *mv    = sync_state->moves;
+      sync_state->moves = mv->next;
+      if (mv->fetching)
+         filestream_delete(mv->fetching);
+      free(mv->fetch_state);
+      switch (retro_atomic_exchange_int(&mv->state, TCS_MOVE_ABANDONED))
+      {
+         case TCS_MOVE_RUNNING:
+            break;
+         case TCS_MOVE_DONE:
+            if (mv->ok)
+               filestream_delete(mv->to);
+            /* fall through */
+         default:
+            free(mv);
+            break;
+      }
+   }
+}
+#endif
+
+/* Deletes the temporary files of backup copies in backups/cloud-sync
+ * that never finished, as the atomic writer names them. Only at the
+ * first sync of a process: each is from a process that ended mid-copy,
+ * and none of this one's copies can be in flight before that sync's
+ * diff. */
+static void task_cloud_sync_sweep_temps(task_cloud_sync_state_t *sync_state)
+{
+   static bool swept = false;
+   size_t i;
+   struct string_list *list = NULL;
+   char *dir;
+
+   if (swept)
+      return;
+   swept = true;
+   if (!(dir = (char*)malloc(DIR_MAX_LENGTH)))
+      return;
+   if (task_cloud_sync_backup_root(sync_state, dir, DIR_MAX_LENGTH))
+      list = dir_list_new(dir, "tmp", false, true, false, true);
+   free(dir);
+   for (i = 0; list && i < list->size; i++)
+   {
+      struct save_backup_name parsed;
+      char        name[256];
+      const char *base = path_basename_nocompression(list->elems[i].data);
+      size_t      _len = strlen(base);
+
+      if (     _len <= STRLEN_CONST(CS_TEMP_SUFFIX)
+            || !string_is_equal(base + _len - STRLEN_CONST(CS_TEMP_SUFFIX),
+                  CS_TEMP_SUFFIX))
+         continue;
+      _len -= STRLEN_CONST(CS_TEMP_SUFFIX);
+      if (_len >= sizeof(name))
+         continue;
+      memcpy(name, base, _len);
+      name[_len] = '\0';
+      if (     !save_backups_parse(name, &parsed)
+            || parsed.core_len != STRLEN_CONST(SAVE_BACKUPS_CORE_CLOUD_SYNC)
+            || strncmp(name + parsed.core_off, SAVE_BACKUPS_CORE_CLOUD_SYNC,
+                  parsed.core_len))
+         continue;
+      filestream_delete(list->elems[i].data);
+   }
+   string_list_free(list);
 }
 
 /* Hands a download to the task thread to hash a chunk at a time. The
@@ -1800,8 +2171,9 @@ static void task_cloud_sync_fetched_run(task_cloud_sync_state_t *sync_state,
    task_cloud_sync_fetched_take(sync_state);
    while (sync_state->fetched)
    {
-      tcs_fetched_t *rec = sync_state->fetched;
-      char           hash[33];
+      tcs_fetched_t  *rec = sync_state->fetched;
+      enum tcs_commit commit;
+      char            hash[33];
 
       if (!sync_state->hash_fetched.file)
       {
@@ -1826,13 +2198,18 @@ static void task_cloud_sync_fetched_run(task_cloud_sync_state_t *sync_state,
          free(h);
       }
       filestream_close(rec->file);
-      if (task_cloud_sync_fetch_commit(rec->fetch_state, rec->path))
+      commit = task_cloud_sync_fetch_commit(rec->fetch_state, rec->path,
+            hash);
+      if (commit == TCS_COMMIT_PLACED)
          task_cloud_sync_fetched(sync_state, rec->fetch_state->server_file,
                rec->path, hash);
       sync_state->fetched = rec->next;
-      free(rec->fetch_state);
+      if (commit != TCS_COMMIT_OWED)
+      {
+         free(rec->fetch_state);
+         task_cloud_sync_waiting_dec(sync_state);
+      }
       free(rec);
-      task_cloud_sync_waiting_dec(sync_state);
    }
 }
 
@@ -2098,9 +2475,11 @@ static void task_cloud_sync_upload_current_file(task_cloud_sync_state_t *sync_st
 }
 
 /* Returns false when the local file was left in place, in which case the
- * caller must not record the delete as sync'd. */
+ * caller must not record the delete as sync'd, or when its backup's copy
+ * records it once done. */
 static bool task_cloud_sync_delete_current_file(task_cloud_sync_state_t *sync_state)
 {
+   bool removed;
    struct item_file *item        = &sync_state->current_manifest->list[sync_state->current_idx];
    struct item_file *server_file = &sync_state->server_manifest->list[sync_state->server_idx];
    bool cloud_sync_destructive   = sync_state->destructive;
@@ -2111,10 +2490,28 @@ static bool task_cloud_sync_delete_current_file(task_cloud_sync_state_t *sync_st
 
    RARCH_WARN(CSPFX "Server has deleted \"%s\", so shall we.\n", CS_FILE_KEY(item));
 
-   if (cloud_sync_destructive
-         ? (filestream_delete(item->path) != 0)
-         : !task_cloud_sync_backup_file(sync_state, item,
-               SAVE_BACKUP_DELETED))
+   if (cloud_sync_destructive)
+      removed = filestream_delete(item->path) == 0;
+   else
+   {
+      char *owed = NULL;
+      enum save_backup_result made = task_cloud_sync_backup_file(
+            sync_state, item, SAVE_BACKUP_DELETED, &owed);
+#if defined(TCS_MOVE_WORKER)
+      if (made == SAVE_BACKUP_COPY_OWED)
+      {
+         bool queued = task_cloud_sync_move_push(sync_state, NULL,
+               server_file, CS_FILE_KEY(server_file), item->path, owed,
+               NULL, NULL);
+         free(owed);
+         if (queued)
+            return false;
+      }
+#endif
+      removed = made == SAVE_BACKUP_MADE;
+   }
+
+   if (!removed)
    {
       RARCH_ERR(CSPFX "Keeping \"%s\", the local file could not be removed.\n",
             CS_FILE_KEY(item));
@@ -2742,6 +3139,7 @@ static void task_cloud_sync_task_step(retro_task_t *task,
    switch (task_cloud_sync_phase_get(sync_state))
    {
       case CLOUD_SYNC_PHASE_BEGIN:
+         task_cloud_sync_sweep_temps(sync_state);
          task_cloud_sync_waiting_set(sync_state, 1);
          if (!cloud_sync_begin(task_cloud_sync_begin_handler, task))
          {
@@ -2819,6 +3217,9 @@ static void task_cloud_sync_task_handler(retro_task_t *task)
    task_nbio_slice_open(&b);
    cloud_sync_poll(task_nbio_slice_within_budget, &b);
    task_cloud_sync_fetched_run(sync_state, &b);
+#if defined(TCS_MOVE_WORKER)
+   task_cloud_sync_moves_run(sync_state);
+#endif
    task_cloud_sync_task_step(task, sync_state, &b);
    task_nbio_slice_close(&b);
 }
@@ -2902,6 +3303,9 @@ static void task_cloud_sync_cleanup(retro_task_t *task)
       free(rec->fetch_state);
       free(rec);
    }
+#if defined(TCS_MOVE_WORKER)
+   task_cloud_sync_moves_abandon(sync_state);
+#endif
    free(sync_state->hash_buf);
 
    free(sync_state);

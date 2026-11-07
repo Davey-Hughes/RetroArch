@@ -485,6 +485,7 @@ static void undo_save_state_cb(retro_task_t *task,
 
    if (save_state_tasks_pending)
       save_state_tasks_pending--;
+   content_save_written();
 
    /* Wipe the save file buffer as it's intended to be one use only */
    undo_save_buf.path[0]  = '\0';
@@ -1759,6 +1760,7 @@ static void save_state_cb(retro_task_t *task,
    /* Out of the core whichever way this callback exits. */
    if (save_state_tasks_pending)
       save_state_tasks_pending--;
+   content_save_written();
    if (state->done_cb)
       state->done_cb(task, state->path, user_data, error);
 #ifdef HAVE_SCREENSHOTS
@@ -2116,6 +2118,7 @@ bool content_auto_save_state(const char *path)
 
    if (!content_finish_tmp(path, _close_ret == 0, false))
       return false;
+   content_save_written();
 
 #ifdef HAVE_SCREENSHOTS
    if (settings->bools.savestate_thumbnail_enable)
@@ -2667,6 +2670,7 @@ bool content_ram_state_to_file(const char *path)
 
 success:
    ram_buf.to_write_file = false;
+   content_save_written();
    return true;
 }
 

@@ -95,6 +95,11 @@ ADDS_DEFS    := -DHAVE_THREADS -DRARCH_INTERNAL -DHAVE_CLOUDSYNC \
 ifneq ($(FORCE_LOCK),)
    ADDS_DEFS += -DTASK_CLOUDSYNC_FORCE_LOCK
 endif
+# NOTHREADS=1: the task as a build without threads has it, where a
+# backup's copy runs inline
+ifneq ($(NOTHREADS),)
+   ADDS_DEFS := $(filter-out -DHAVE_THREADS,$(ADDS_DEFS))
+endif
 
 CFLAGS += -Wall -pedantic -std=gnu99 -g1 -O1 -fno-omit-frame-pointer \
           -I$(LIBRETRO_COMM_DIR)/include -I$(CORE_DIR)
@@ -129,9 +134,11 @@ $(ASYNC_TARGET): $(ASYNC_SOURCES) $(CORE_DIR)/network/cloud_sync_driver.h
 	$(CC) -o $@ $(ASYNC_SOURCES) $(filter-out -pedantic,$(CFLAGS)) $(ASYNC_DEFS) $(LDFLAGS) -lpthread
 
 # The commit test refuses the move of a save into its backups at the
-# link boundary, as a move across drives fails, and counts the syncs.
+# link boundary, as a move across drives fails, counts the syncs and
+# holds the copy at its sync, sees how much a copy reads at once, and
+# deletes the save once its copy has read it.
 $(COMMIT_TARGET): cloudsync_commit_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(CORE_DIR)/tasks/task_cloudsync.c
-	$(CC) -o $@ cloudsync_commit_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(filter-out -pedantic,$(CFLAGS)) $(ADDS_DEFS) $(LDFLAGS) -Wl,--wrap=filestream_rename -Wl,--wrap=filestream_delete -Wl,--wrap=retro_vfs_file_sync_impl -lpthread
+	$(CC) -o $@ cloudsync_commit_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(filter-out -pedantic,$(CFLAGS)) $(ADDS_DEFS) $(LDFLAGS) -Wl,--wrap=filestream_rename -Wl,--wrap=filestream_delete -Wl,--wrap=retro_vfs_file_sync_impl -Wl,--wrap=filestream_read -Wl,--wrap=filestream_close -lpthread
 
 $(ROOTS_TARGET): cloudsync_roots_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(CORE_DIR)/tasks/task_cloudsync.c
 	$(CC) -o $@ cloudsync_roots_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(filter-out -pedantic,$(CFLAGS)) $(ADDS_DEFS) $(LDFLAGS) -lpthread

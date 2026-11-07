@@ -42,7 +42,9 @@ enum save_backup_result
 {
    SAVE_BACKUP_MADE = 0,
    SAVE_BACKUP_NO_FILE,
-   SAVE_BACKUP_FAILED
+   SAVE_BACKUP_FAILED,
+   /* save_backups_move_begin(): the rename failed, the copy is owed */
+   SAVE_BACKUP_COPY_OWED
 };
 
 /* The reason word in a copy's name. Fixed English, never translated. */
@@ -108,6 +110,23 @@ enum save_backup_result save_backups_copy_to(const char *dir,
  * stays. */
 enum save_backup_result save_backups_move_to(const char *dir,
       const char *path, const char *core, enum save_backup_reason reason);
+
+/* save_backups_move_to() up to the copy: renames @path into @dir, or
+ * when that fails returns COPY_OWED with the copy's path in @s and
+ * nothing written. */
+enum save_backup_result save_backups_move_begin(const char *dir,
+      const char *path, const char *core, enum save_backup_reason reason,
+      char *s, size_t len);
+
+/* Copies @path to @to a piece at a time, synced and renamed into place
+ * as an atomic synced write is. Reads no roots: safe off the main
+ * thread. */
+bool save_backups_copy_synced(const char *path, const char *to);
+
+/* Deletes @path once its copy at @to is made. A delete that fails
+ * deletes the copy and returns false, unless the original went all the
+ * same (a network drive's lost reply). */
+bool save_backups_move_finish(const char *path, const char *to);
 
 /* save_backups_copy_to() into save_backups_dir() of @path. */
 enum save_backup_result save_backups_copy_image(const char *path,

@@ -84,6 +84,9 @@ bool content_savefile_is_live(const char *path)
 {
    return *live_path && path && !strcmp(path, live_path);
 }
+unsigned content_savefile_lifetime(void) { return 0; }
+unsigned content_save_writes(void) { return 0; }
+bool content_save_state_in_progress(void *data) { (void)data; return false; }
 void task_window_progress_cb(retro_task_t *task) { (void)task; }
 size_t fill_pathname_application_special(char *s, size_t len,
       enum application_special_type type)

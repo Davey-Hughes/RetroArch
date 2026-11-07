@@ -1452,6 +1452,7 @@ static bool content_save_ram_file(unsigned slot, bool compress, bool sync,
    }
 
    save_file_keep_stat(f, ram.path);
+   content_save_written();
 #ifdef HAVE_THREADS
    autosave_main_written(handle, &mem_info);
 #endif
@@ -1520,6 +1521,7 @@ static void save_files_flush(bool is_sram_used, bool compress_files,
       if (handle)
       {
          autosave_flush(handle, mem_info.data, bits, kept);
+         content_save_written();
          continue;
       }
 #endif
@@ -1635,6 +1637,10 @@ void path_init_savefile_rtc(const char *savefile_path)
    string_list_append(task_save_files, savefile_name_rtc, attr);
 }
 
+/* Changes at every content load and unload. Main thread only. */
+static unsigned content_savefile_lifetimes = 0;
+static unsigned content_save_write_count   = 0;
+
 void path_deinit_savefile(void)
 {
    if (task_save_files)
@@ -1643,11 +1649,28 @@ void path_deinit_savefile(void)
    free(save_files);
    save_files      = NULL;
    save_files_num  = 0;
+   content_savefile_lifetimes++;
 }
 
 void path_init_savefile_new(void)
 {
    task_save_files = string_list_new();
+   content_savefile_lifetimes++;
+}
+
+unsigned content_savefile_lifetime(void)
+{
+   return content_savefile_lifetimes;
+}
+
+void content_save_written(void)
+{
+   content_save_write_count++;
+}
+
+unsigned content_save_writes(void)
+{
+   return content_save_write_count;
 }
 
 void *savefile_ptr_get(void)

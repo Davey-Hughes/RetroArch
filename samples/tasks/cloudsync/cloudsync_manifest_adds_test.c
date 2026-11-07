@@ -59,6 +59,9 @@ void runloop_msg_queue_push(const char *msg, size_t len, unsigned prio,
 settings_t *config_get_ptr(void)      { return NULL; }
 char *dir_get_ptr(enum rarch_dir_type type) { (void)type; return NULL; }
 bool content_savefile_is_live(const char *path) { (void)path; return false; }
+unsigned content_savefile_lifetime(void) { return 0; }
+unsigned content_save_writes(void) { return 0; }
+bool content_save_state_in_progress(void *data) { (void)data; return false; }
 void task_window_progress_cb(retro_task_t *task) { (void)task; }
 size_t fill_pathname_application_special(char *s, size_t len,
       enum application_special_type type)

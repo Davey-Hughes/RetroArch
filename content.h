@@ -97,6 +97,12 @@ bool content_deserialize_state(const void* serialized_data, size_t serialized_si
  * content_wait_for_save_state_task() would block. */
 bool content_save_state_in_progress(void* data);
 
+/* Changes as each save or state file the frontend writes lands, so a
+ * check made across a gap can tell one may have been written meanwhile.
+ * Main thread only. */
+unsigned content_save_writes(void);
+void content_save_written(void);
+
 /* Waits for any in-progress save state tasks to finish */
 void content_wait_for_save_state_task(void);
 /* Waits for any in-progress load state tasks to finish */
