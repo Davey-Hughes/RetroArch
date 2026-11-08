@@ -2773,6 +2773,27 @@ static void task_cloud_sync_hold_delete(task_cloud_sync_state_t *sync_state)
       sync_state->failures = true;
 }
 
+/* Whether @key's file is here after all. A save renames a state aside
+ * and back, and the walk can land in between: the file is back by now,
+ * still held (save_backups_held()), or in its temp. */
+static bool task_cloud_sync_still_here(
+      const task_cloud_sync_state_t *sync_state, int root, const char *key)
+{
+   char        local[PATH_MAX_LENGTH];
+   const char *path = cloud_sync_manifest_key_path(key);
+
+   if (root < 0 || !path)
+      return false;
+   fill_pathname_join_special(local,
+         (const char*)sync_state->dirlist->elems[root].userdata,
+         path, sizeof(local));
+   pathname_conform_slashes_to_os(local);
+   if (path_is_valid(local) || save_backups_held(local))
+      return true;
+   return    strlcat(local, ".tmp", sizeof(local)) < sizeof(local)
+          && path_is_valid(local);
+}
+
 static void task_cloud_sync_held_notice(task_cloud_sync_state_t *sync_state)
 {
    char msg[128];
@@ -2829,7 +2850,17 @@ static void task_cloud_sync_diff_next(task_cloud_sync_state_t *sync_state)
       {
          /* the server has a file we don't have, we check the hash */
          if (!string_is_empty(CS_FILE_HASH(server_file)))
-            task_cloud_sync_fetch_server_file(sync_state);
+         {
+            /* not over a file the walk missed: a conflict next time */
+            if (task_cloud_sync_still_here(sync_state,
+                     task_cloud_sync_key_root(sync_state->dirlist,
+                        CS_FILE_KEY(server_file)),
+                     CS_FILE_KEY(server_file)))
+               task_cloud_sync_carry_manifests_forward(sync_state,
+                     CS_FILE_KEY(server_file), CS_FILE_HASH(server_file));
+            else
+               task_cloud_sync_fetch_server_file(sync_state);
+         }
          else
          {
             /* it's deleted on the server, remember that and mark the sync of the delete */
@@ -2876,17 +2907,29 @@ static void task_cloud_sync_diff_next(task_cloud_sync_state_t *sync_state)
          /* the file has been deleted locally */
          if (!string_is_empty(CS_FILE_HASH(server_file)))
          {
+            int root = task_cloud_sync_key_root(sync_state->dirlist,
+                  CS_FILE_KEY(server_file));
             if (string_is_empty(CS_FILE_HASH(local_file)))
-               /* previously saw the delete, now it's resurrected */
-               task_cloud_sync_fetch_server_file(sync_state);
+            {
+               /* previously saw the delete, now it's resurrected; not
+                * over a file the walk missed: a conflict next time */
+               if (task_cloud_sync_still_here(sync_state, root,
+                        CS_FILE_KEY(server_file)))
+                  task_cloud_sync_carry_manifests_forward(sync_state,
+                        CS_FILE_KEY(server_file), CS_FILE_HASH(server_file));
+               else
+                  task_cloud_sync_fetch_server_file(sync_state);
+            }
             else if (   string_is_equal(CS_FILE_HASH(server_file), CS_FILE_HASH(local_file))
                      || sync_state->conflict_resolution == 1)
             {
-               int root = task_cloud_sync_key_root(sync_state->dirlist,
-                     CS_FILE_KEY(server_file));
                /* server didn't change, or Keep Local keeps the
                 * delete: delete from the server */
-               if (root >= 0 && (sync_state->dirlist->elems[root].attr.i
+               if (task_cloud_sync_still_here(sync_state, root,
+                        CS_FILE_KEY(server_file)))
+                  task_cloud_sync_carry_manifests_forward(sync_state,
+                        CS_FILE_KEY(server_file), CS_FILE_HASH(server_file));
+               else if (root >= 0 && (sync_state->dirlist->elems[root].attr.i
                         & CS_ROOT_HELD))
                   task_cloud_sync_hold_delete(sync_state);
                else

@@ -2,11 +2,11 @@
  * for the server, threaded tasks on and off: what the sync deletes on
  * the server when a folder under a root can't be read, when a folder
  * is unset, when a root moved, when most of a root's files are
- * missing, and when Keep Local resolves a file deleted here; what the
- * manifests keep of a delete the server refuses, of one taken from it
- * and of an upload or a download that does not happen; that a save
- * which can't be read or hashed fails the sync; and which save folder
- * it walks.
+ * missing, when Keep Local resolves a file deleted here, and when a
+ * state is only renamed aside for a moment; what the manifests keep
+ * of a delete the server refuses, of one taken from it and of an
+ * upload or a download that does not happen; that a save which can't
+ * be read or hashed fails the sync; and which save folder it walks.
  *
  *   ./cloudsync_roots_test [lane...]   (default: every lane) */
 #include <stdio.h>
@@ -237,6 +237,10 @@ static const char *fail_open, *fail_read;
 static struct RDIR *read_dir;
 static bool read_failed;
 static unsigned outside_opens;
+/* Runs once the walk has read this folder (with its slash) to its end */
+static const char *walked_at;
+static void (*walked)(void);
+static struct RDIR *walked_dir;
 
 static struct RDIR *test_opendir(const char *name, bool include_hidden)
 {
@@ -254,17 +258,27 @@ static struct RDIR *test_opendir(const char *name, bool include_hidden)
       read_dir    = d;
       read_failed = false;
    }
+   if (     d && walked_at && string_starts_with(name, walked_at)
+         && strlen(name) == strlen(walked_at) + 1)
+      walked_dir = d;
    return d;
 }
 
 static int test_readdir(struct RDIR *rdir)
 {
+   int more;
    if (rdir == read_dir)
    {
       read_failed = true;
       return 0;
    }
-   return retro_readdir(rdir);
+   more = retro_readdir(rdir);
+   if (!more && rdir == walked_dir)
+   {
+      walked_dir = NULL;
+      walked();
+   }
+   return more;
 }
 
 static bool test_dirent_error(struct RDIR *rdir)
@@ -1987,6 +2001,151 @@ static void keep_server_deleted(bool threaded)
    keep_deleted_lane(threaded, 2, true);
 }
 
+/* A save moves "G.state.auto" aside for a moment, into backups/ or to
+ * its held name, and the walk lands in between. @left: the held name
+ * (1) or the new state's temp (2) stays and the file is not back;
+ * otherwise the file is back by the diff. Nothing is deleted on the
+ * server, the manifests keep it and the held name never uploads. */
+static char aside_states[264];
+static void aside_back(void)
+{
+   put(aside_states, "G.state.auto", "2");
+}
+
+static void auto_aside_lane(bool threaded, int left)
+{
+   char saves[256];
+   const char *name = left == 1 ? "G.state.auto.not-loaded.prev"
+                                : "G.state.auto.tmp";
+   lane_dirs(left == 1 ? "aside_held" : left ? "aside_temp" : "aside_back",
+         threaded, saves, sizeof(saves));
+   snprintf(aside_states, sizeof(aside_states), "%s-st", saves);
+   remove_tree(aside_states);
+   put(saves, "a.srm", "a");
+   put(aside_states, "G.state.auto", "1");
+   CHECK(sync_two(threaded, saves, aside_states));
+   CHECK(uploads == 2);
+
+   if (left)
+   {
+      drop(aside_states, "G.state.auto");
+      put(aside_states, name, left == 1 ? "1" : "2");
+   }
+   else
+   {
+      drop(aside_states, "G.state.auto");
+      put(aside_states, "backups/G - not-loaded.state.auto", "1");
+      walked_at = aside_states;
+      walked    = aside_back;
+   }
+   /* an upload rewrites the server manifest in the same sync */
+   put(saves, "b.srm", "b");
+   CHECK(sync_two(threaded, saves, aside_states));
+   walked_at = NULL;
+   CHECK(deletes == 0);
+   CHECK(uploads == 1);
+   CHECK(holds(srv, "states/G.state.auto", "1"));
+   CHECK(server_entry("states/G.state.auto") == 2);
+   CHECK(local_entry("states/G.state.auto") == 2);
+   CHECK(server_entry("states/G.state.auto.not-loaded.prev") == 0);
+   CHECK(!path_is_valid(srv_key("states/G.state.auto.not-loaded.prev")));
+
+   CHECK(sync_two(threaded, saves, aside_states));
+   CHECK(deletes == 0);
+   if (!left)
+   {
+      /* the new state goes up as a change */
+      CHECK(uploads == 1);
+      CHECK(holds(srv, "states/G.state.auto", "2"));
+      CHECK(local_entry("states/G.state.auto") == 2);
+      remove_tree(aside_states);
+      return;
+   }
+   CHECK(uploads == 0);
+   CHECK(holds(srv, "states/G.state.auto", "1"));
+
+   /* gone for good: deleted */
+   drop(aside_states, name);
+   CHECK(sync_two(threaded, saves, aside_states));
+   CHECK(deletes == 1);
+   CHECK(server_entry("states/G.state.auto") == 1);
+   CHECK(local_entry("states/G.state.auto") == 1);
+   remove_tree(aside_states);
+}
+
+static void auto_aside_back(bool threaded) { auto_aside_lane(threaded, 0); }
+static void auto_aside_held(bool threaded) { auto_aside_lane(threaded, 1); }
+static void auto_aside_temp(bool threaded) { auto_aside_lane(threaded, 2); }
+
+/* Another device's "G.state.auto" is on the server, and the walk here
+ * misses this one's, back by the diff. It is not fetched over; the
+ * next sync meets it as a conflict, which by default moves nothing.
+ * @resurrected: this device synced its delete before; otherwise it
+ * never had the file. */
+static char back_states[264];
+static void auto_back(void)
+{
+   put(back_states, "G.state.auto", "2");
+}
+
+static void auto_back_lane(bool threaded, bool resurrected)
+{
+   char saves[256], saves_b[264], states_b[264];
+   lane_dirs(resurrected ? "back_resurrected" : "back_new", threaded, saves,
+         sizeof(saves));
+   snprintf(back_states, sizeof(back_states), "%s-st", saves);
+   snprintf(saves_b, sizeof(saves_b), "%s-b", saves);
+   snprintf(states_b, sizeof(states_b), "%s-st-b", saves);
+   remove_tree(back_states);
+   remove_tree(saves_b);
+   remove_tree(states_b);
+   CHECK(path_mkdir(back_states));
+   CHECK(path_mkdir(saves_b));
+   CHECK(path_mkdir(states_b));
+   put(saves, "a.srm", "a");
+   if (resurrected)
+   {
+      put(back_states, "G.state.auto", "1");
+      CHECK(sync_two(threaded, saves, back_states));
+      drop(back_states, "G.state.auto");
+      CHECK(sync_two(threaded, saves, back_states));
+      CHECK(deletes == 1);
+      CHECK(local_entry("states/G.state.auto") == 1);
+   }
+   else
+      CHECK(sync_two(threaded, saves, back_states));
+
+   other_device(true);
+   put(states_b, "G.state.auto", "3");
+   conflict_mode = 1;
+   CHECK(sync_two(threaded, saves_b, states_b));
+   conflict_mode = 0;
+   other_device(false);
+   CHECK(holds(srv, "states/G.state.auto", "3"));
+
+   /* an upload rewrites the server manifest in the same sync */
+   put(saves, "b.srm", "b");
+   walked_at = back_states;
+   walked    = auto_back;
+   CHECK(sync_two(threaded, saves, back_states));
+   walked_at = NULL;
+   CHECK(fetches == 0 && uploads == 1);
+   CHECK(holds(back_states, "G.state.auto", "2"));
+   CHECK(server_entry("states/G.state.auto") == 2);
+   CHECK(local_entry("states/G.state.auto") == (resurrected ? 1 : 0));
+
+   sync_two(threaded, saves, back_states);
+   CHECK(fetches == 0 && uploads == 0 && deletes == 0);
+   CHECK(holds(back_states, "G.state.auto", "2"));
+   CHECK(holds(srv, "states/G.state.auto", "3"));
+   remove_tree(back_states);
+   remove_tree(saves_b);
+   remove_tree(states_b);
+}
+
+static void auto_back_resurrected(bool threaded) { auto_back_lane(threaded, true); }
+static void auto_back_new(bool threaded)         { auto_back_lane(threaded, false); }
+
 struct lane
 {
    const char *name;
@@ -2066,6 +2225,11 @@ static const struct lane lanes[] = {
    { "sync_fetch_hash_held",      fetch_hash_held },
    { "sync_new_hash_fails",       new_hash_fails },
    { "sync_fetch_state_written",  fetch_state_written },
+   { "sync_auto_aside_back",      auto_aside_back },
+   { "sync_auto_aside_held",      auto_aside_held },
+   { "sync_auto_aside_temp",      auto_aside_temp },
+   { "sync_auto_back_resurrected", auto_back_resurrected },
+   { "sync_auto_back_new",        auto_back_new },
 };
 
 int main(int argc, char **argv)

@@ -422,7 +422,7 @@ static void fetch_keep_lane(int live, const char *what_keep, const char *what_re
    retro_task_t            *task = task_init();
    struct string_list      *dl   = string_list_new();
    union string_list_elem_attr attr;
-   char     path[128], tmp[160];
+   char     path[128], tmp[160], aside[168];
    char    *old, *srv, *got;
    unsigned i;
    int      carried = 0;
@@ -450,6 +450,10 @@ static void fetch_keep_lane(int live, const char *what_keep, const char *what_re
    srv = hash_of(path);
    write_file(path, 4096, 4);
    old = hash_of(path);
+   /* the local one comes back once the download is under way: a file
+    * here at the diff is not fetched over */
+   snprintf(aside, sizeof(aside), "%s.aside", path);
+   rename(path, aside);
    list_add(st->server_manifest, "saves/keep.srm", NULL, strdup(srv));
    fetch_fail = !live;
 
@@ -463,6 +467,7 @@ static void fetch_keep_lane(int live, const char *what_keep, const char *what_re
       retro_sleep(1);
    check("fetch: callback returned before processing",
          retro_atomic_load_acquire_int(&fetches_reported) != 0);
+   rename(aside, path);
    /* the download is in, not yet in place: a core takes the file now */
    if (live)
    {
