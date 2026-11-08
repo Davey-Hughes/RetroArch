@@ -513,7 +513,8 @@ static void undo_save_state_cb(retro_task_t *task,
       undo_save_buf_tasks_pending--;
    content_save_written();
 
-   /* The .auto the save replaced is back: not the session's */
+   /* The .auto the save replaced is back, over any automatic save
+    * since the push: not the session's */
    if (content_is_auto_state(state->path))
       runloop_state_get_ptr()->auto_state_owned = false;
 
@@ -1170,6 +1171,10 @@ static bool task_push_undo_save_state(const char *path, void *data, size_t len)
       {
          save_state_tasks_pending++;
          undo_save_buf_tasks_pending++;
+         /* Not left to the callback: an automatic save could land
+          * between the write and it */
+         if (content_is_auto_state(path))
+            runloop_state_get_ptr()->auto_state_owned = false;
          return true;
       }
 

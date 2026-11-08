@@ -2089,6 +2089,10 @@ static void test_auto_state_undo(void)
    pump(1000);
    stub_runloop.auto_state_owned = true;
    okf(content_undo_save_state(), "auto undo: Undo Save of the .auto is pushed");
+   okf(!stub_runloop.auto_state_owned,
+       "auto undo: the .auto is handed back at the push");
+   /* An automatic save before the write takes it again */
+   stub_runloop.auto_state_owned = true;
    pump(1000);
    if (!filestream_read_file(auto_slot, &back, &n_back))
       n_back = -2;
@@ -2102,6 +2106,9 @@ static void test_auto_state_undo(void)
    stub_runloop.auto_state_owned = true;
    okf(content_undo_load_state() && !stub_runloop.auto_state_owned,
        "auto undo: Undo Load of the .auto hands it back");
+   stub_runloop.auto_state_owned = true;
+   okf(content_undo_load_state() && stub_runloop.auto_state_owned,
+       "auto undo: undoing that undo keeps the .auto the session's");
 
    stub_runloop.auto_state_owned = true;
    content_save_state(other, true);
