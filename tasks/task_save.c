@@ -26,6 +26,7 @@
 #include <streams/rzip_stream.h>
 #include <rthreads/rthreads.h>
 #include <file/file_path.h>
+#include <string/stdstring.h>
 #include <retro_miscellaneous.h>
 #include <retro_timers.h>
 #include <features/features_cpu.h>
@@ -183,6 +184,8 @@ typedef save_task_state_t load_task_data_t;
 /* Holds the previous saved state
  * Can be restored to disk with undo_save_state(). */
 static struct save_state_buf undo_save_buf;
+/* The last state saved to disk: Undo Save reverts only that one */
+static char undo_save_last_path[PATH_MAX_LENGTH];
 
 /* Holds the data from before a load_state() operation
  * Can be restored with undo_load_state(). */
@@ -1142,15 +1145,14 @@ static bool task_push_undo_save_state(const char *path, void *data, size_t len)
          return true;
       }
 
-      /* The hold is full: this one never runs, so nothing else frees
-       * what it holds */
+      /* The hold is full: this one never runs. The data stays
+       * undo_save_buf's, for another try. */
       task_free_title(task);
       free(task);
-      task = NULL;
+      free(state);
+      return false;
    }
 
-   if (data)
-      free(data);
    if (state)
       free(state);
    if (task)
@@ -1167,6 +1169,8 @@ static bool task_push_undo_save_state(const char *path, void *data, size_t len)
  **/
 bool content_undo_save_state(void)
 {
+   if (content_undo_save_buf_is_empty())
+      return false;
    if (core_info_current_supports_savestate())
       return task_push_undo_save_state(
             undo_save_buf.path,
@@ -2231,6 +2235,8 @@ bool content_save_state_notify(const char *path, bool save_to_disk,
             msg_hash_to_str(MSG_BYTES));
    }
 
+   strlcpy(undo_save_last_path, path, sizeof(undo_save_last_path));
+
    if (!save_state_disable_undo && path_is_valid(path))
    {
       /* Before overwriting the savestate file, load it into a buffer
@@ -2520,7 +2526,8 @@ bool content_undo_load_buf_is_empty(void)
 
 bool content_undo_save_buf_is_empty(void)
 {
-   return undo_save_buf.data == NULL || undo_save_buf.size == 0;
+   return undo_save_buf.data == NULL || undo_save_buf.size == 0
+      || !string_is_equal(undo_save_buf.path, undo_save_last_path);
 }
 
 bool content_undo_save_disabled(void)

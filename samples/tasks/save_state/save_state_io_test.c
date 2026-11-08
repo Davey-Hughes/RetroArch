@@ -1388,6 +1388,97 @@ static void test_load_held_behind_save(void)
    filestream_delete(path);
 }
 
+/* -----------------------------------------------------------------
+ * Undo Save reverts only the last save, in its own slot: a save to
+ * another slot leaves nothing to undo.
+ * ----------------------------------------------------------------- */
+static void test_undo_save_slot(void)
+{
+   const char *one = "sst_undo_one.state";
+   const char *two = "sst_undo_two.state";
+   void   *was = NULL, *now = NULL;
+   int64_t n_was = -1, n_now = -2;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(one);
+   filestream_delete(two);
+   core_fill(2 * TEST_SAVE_STATE_CHUNK + 7);
+   content_save_state(one, true);
+   pump(1000);
+   memset(core_mem, 0x33, core_len);
+   content_save_state(one, true);
+   pump(1000);
+   okf(!content_undo_save_buf_is_empty(),
+       "undo slot: a save over slot one can be undone");
+   if (!filestream_read_file(one, &was, &n_was))
+      n_was = -1;
+
+   memset(core_mem, 0x44, core_len);
+   content_save_state(two, true);
+   pump(1000);
+   okf(content_undo_save_buf_is_empty(),
+       "undo slot: after a save to slot two, nothing to undo");
+   okf(!content_undo_save_state(), "undo slot: the undo is refused");
+   pump(1000);
+   if (!filestream_read_file(one, &now, &n_now))
+      n_now = -2;
+   okf(n_was > 0 && n_now == n_was && !memcmp(was, now, (size_t)n_was),
+       "undo slot: slot one keeps the save made over it");
+
+   free(was);
+   free(now);
+   filestream_delete(one);
+   filestream_delete(two);
+}
+
+/* -----------------------------------------------------------------
+ * An Undo Save turned away (the hold behind a state task is full)
+ * keeps its buffer: twice, then the queue drains, under ASan, and the
+ * retry writes that buffer. Loads fill the hold: a save's backup read
+ * would replace the buffer before the retry.
+ * ----------------------------------------------------------------- */
+static void test_undo_save_refused_push(void)
+{
+   const char *path = "sst_undo_refused.state";
+   void   *was      = NULL;
+   int64_t n_was    = -1;
+   unsigned i;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(path);
+   core_fill(40 * TEST_SAVE_STATE_CHUNK);
+   content_save_state(path, true);
+   pump(1000);
+   if (!filestream_read_file(path, &was, &n_was))
+      n_was = -1;
+   memset(core_mem, 0x55, core_len);
+   content_save_state(path, true);
+   pump(1000);
+
+   /* one load in flight, four held behind it */
+   clock_step = TEST_TICK_BUDGET_US;
+   for (i = 0; i < 5; i++)
+   {
+      content_load_state(path, false, false);
+      task_queue_check();
+   }
+   okf(!content_undo_save_state(), "undo refused: turned away once");
+   okf(!content_undo_save_state(), "undo refused: turned away twice");
+   okf(!content_undo_save_buf_is_empty(),
+       "undo refused: the undo is still there");
+   pump(100000);
+   okf(!queue_busy(), "undo refused: the queue drains");
+   okf(content_undo_save_state(), "undo refused: taken once there is room");
+   pump(1000);
+   okf(n_was > 0 && !written_into(path, was, n_was),
+       "undo refused: the retry writes the buffer it kept");
+   clock_step = 0;
+   free(was);
+   filestream_delete(path);
+}
+
 #ifdef HAVE_COMPRESSION
 /* -----------------------------------------------------------------
  * 13. Undo puts back the file a save replaced, as it was.
@@ -1592,6 +1683,8 @@ static int run_default_lane(void)
    test_state_load_kinds();
    test_state_load_guards();
    test_writes_counted();
+   test_undo_save_slot();
+   test_undo_save_refused_push();
 #ifdef HAVE_COMPRESSION
    test_undo_save_restores_file();
 #endif
