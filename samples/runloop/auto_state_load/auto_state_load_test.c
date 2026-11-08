@@ -34,6 +34,11 @@ void recording_start_frame(void) {}
 void audio_driver_publish_runloop(void) {}
 void RARCH_LOG(const char *fmt, ...) { (void)fmt; }
 bool verbosity_is_enabled(void) { return false; }
+/* core_run() loads held saves (runloop_content_saves_ready) */
+bool event_load_save_files(bool is_sram_load_disabled)
+{ (void)is_sram_load_disabled; return true; }
+bool command_event(enum event_command cmd, void *data)
+{ (void)cmd; (void)data; return true; }
 
 static void mock_run(void) { runs++; }
 static size_t mock_size(void)

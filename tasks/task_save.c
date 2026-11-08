@@ -2696,6 +2696,10 @@ bool content_save_state_automatic(retro_time_t now_us)
    if (savestate_automatic_interval == 0)
       return false;
 
+   /* Held: the session loaded no state to save over */
+   if (runloop_state_get_ptr()->save_load_hold)
+      return false;
+
    /* Check how long since last autosavestate, against the clock the
     * frame already read - no time() call of its own per frame. */
    if ((now_us - last_savestate_automatic_time)

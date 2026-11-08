@@ -80,6 +80,7 @@ settings_t *config_get_ptr(void)      { return test_settings; }
 char *dir_get_ptr(enum rarch_dir_type type) { (void)type; return NULL; }
 /* The file a running core owns, if any. */
 static char live_path[256];
+void runloop_save_load_release(uint8_t bit) { (void)bit; }
 bool content_savefile_is_live(const char *path)
 {
    return *live_path && path && !strcmp(path, live_path);

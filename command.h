@@ -1442,6 +1442,10 @@ bool command_event_reinit(const int flags);
 
 bool command_event_main_state(unsigned cmd);
 
+/* True, with the waiting notice, while the content's saves wait
+ * (save_load_hold): no state, replay or netplay host may start then. */
+bool command_state_held(void);
+
 RETRO_END_DECLS
 
 #endif

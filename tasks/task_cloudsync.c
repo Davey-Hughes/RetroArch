@@ -3314,6 +3314,11 @@ static void task_cloud_sync_task_handler(retro_task_t *task)
  * task's callback run there. */
 static int tcs_followup_mode = -1;
 
+/* Syncs set up that have not called back yet. A task finder cannot
+ * answer this from inside another task's handler on the unthreaded
+ * queue, where a content load runs. Frame thread only. */
+static unsigned tcs_in_flight = 0;
+
 static bool task_push_cloud_sync_with_mode(int conflict_resolution,
       retro_task_callback_t cb, void *cb_data);
 
@@ -3328,6 +3333,13 @@ static void task_cloud_sync_cb(retro_task_t *task, void *task_data,
          error = task->title ? task->title : "Cloud Sync failed";
       sync_state->cb(task, NULL, sync_state->cb_data, error);
    }
+
+   /* Whatever the result: the content's saves load from what is here,
+    * once no other sync can change it. */
+   if (tcs_in_flight)
+      tcs_in_flight--;
+   if (!tcs_in_flight)
+      runloop_save_load_release(SAVE_LOAD_HOLD_CLOUD_SYNC);
 
    if (tcs_followup_mode >= 0)
    {
@@ -3401,6 +3413,7 @@ static void task_cloud_sync_task_setup(retro_task_t *task,
    task->progress_cb = task_window_progress_cb;
    /* Save ownership and local mutations share the content thread. */
    task->flags     |= RETRO_TASK_FLG_MAIN_THREAD;
+   tcs_in_flight++;
 }
 
 static bool task_cloud_sync_task_finder(retro_task_t *task, void *user_data)
@@ -3505,6 +3518,11 @@ static bool task_push_cloud_sync_with_mode(int conflict_resolution,
 
    task_queue_push(task);
    return true;
+}
+
+bool task_cloud_sync_in_progress(void)
+{
+   return tcs_in_flight > 0;
 }
 
 bool task_push_cloud_sync(retro_task_callback_t cb, void *cb_data)

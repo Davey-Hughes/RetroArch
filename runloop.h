@@ -98,6 +98,15 @@ enum poll_type_override_t
    POLL_TYPE_OVERRIDE_LATE
 };
 
+/* What a content's save load waits for (runloop_state.save_load_hold). */
+enum save_load_hold_flags
+{
+   SAVE_LOAD_HOLD_CLOUD_SYNC = (1 << 0),
+   /* Set with the first hold; cleared when the saves load or the content
+    * unloads, so a close while held loads and writes none of them. */
+   SAVE_LOAD_HOLD_PENDING    = (1 << 7)
+};
+
 enum runloop_flags
 {
    RUNLOOP_FLAG_MAX_FRAMES_SCREENSHOT             = (1 << 0),
@@ -405,6 +414,9 @@ struct runloop
     * A platform callback reached from there must not read core memory;
     * it asks with runloop_request_save_files(). */
    bool in_core_frame;
+   /* enum save_load_hold_flags. While set, the core does not run and
+    * nothing loads or writes its saves. Main-thread only. */
+   uint8_t save_load_hold;
    /* quit_pending: a quit from the frame loop is waiting for a state
     * task to finish writing (retroarch_main_quit_staged()).  The loop
     * presents the last frame and runs nothing else until it is through.
@@ -1232,6 +1244,23 @@ bool runloop_is_content_closing(void);
  * the old core to the driver reinit that follows the new one.
  */
 bool runloop_is_content_switching(void);
+
+/**
+ * runloop_save_load_hold:
+ *
+ * Holds the save load of the content being loaded on @bit, one of
+ * enum save_load_hold_flags. Main thread, before event_init_content()
+ * returns.
+ */
+void runloop_save_load_hold(uint8_t bit);
+
+/**
+ * runloop_save_load_release:
+ *
+ * Clears @bit. Once no bit is left, the next frame the content may run
+ * loads its saves instead. Main thread; nothing when @bit is not held.
+ */
+void runloop_save_load_release(uint8_t bit);
 
 RETRO_END_DECLS
 

@@ -30,7 +30,7 @@ static const char *directory = "cloudsync_commit_test_files";
 static int hold_mode;
 static char local_path[128], fetching_path[160];
 static retro_atomic_int_t off_main, ownership_checks;
-static int live, retired, failures, expect_old, expect_failure;
+static int live, retired, failures, expect_old, expect_failure, releases;
 static void *pending_fetch;
 /* 1: moving the save into its backups fails, as across drives;
  * 2: deleting it fails too; 3: the delete removes it but reports a
@@ -166,6 +166,12 @@ unsigned content_savefile_lifetime(void) { return lifetime; }
 unsigned content_save_writes(void) { return writes; }
 bool content_save_state_in_progress(void *data)
 { (void)data; return state_writing; }
+void runloop_save_load_release(uint8_t bit)
+{
+   CHECK(task_is_on_main_thread());
+   CHECK(bit == SAVE_LOAD_HOLD_CLOUD_SYNC);
+   releases++;
+}
 void task_window_progress_cb(retro_task_t *task) { (void)task; }
 size_t fill_pathname_application_special(char *s, size_t len,
       enum application_special_type type)
@@ -307,6 +313,8 @@ static void vanished_next_sync(void)
       free(pending_fetch);
       pending_fetch = NULL;
       task_cloud_sync_cleanup(task);
+      /* run by hand: no callback counted it off */
+      tcs_in_flight--;
       free(task->title);
       free(task);
    }
@@ -380,6 +388,7 @@ static void lane(bool threaded, bool deletion, bool owned, bool no_memory,
    retro_atomic_int_init(&st->waiting, 0);
    retro_atomic_int_init(&st->phase, deletion ? CLOUD_SYNC_PHASE_DIFF : CLOUD_SYNC_PHASE_END);
    st->cb = done;
+   CHECK(!task_cloud_sync_in_progress());
    task_cloud_sync_task_setup(task, st, "Cloud Sync");
    task_queue_init(threaded, NULL);
    if (!deletion)
@@ -404,6 +413,7 @@ static void lane(bool threaded, bool deletion, bool owned, bool no_memory,
    }
    /* A core takes the save after the transfer, before its commit. */
    live = owned;
+   releases = 0;
    retro_atomic_store_release_int(&vanishing, vanish);
    snprintf(manifest, sizeof(manifest), "%s/assets/manifest.local", directory);
 #if defined(TCS_MOVE_WORKER)
@@ -427,6 +437,8 @@ static void lane(bool threaded, bool deletion, bool owned, bool no_memory,
       }
       /* returns at once, the copy still held */
       task_cloud_sync_cleanup(task);
+      /* run by hand: no callback counted it off */
+      tcs_in_flight--;
       CHECK(holds(local_path, "old"));
       retro_atomic_store_release_int(&gate, 0);
       /* hold 3: the copy's own thread deletes it */
@@ -442,6 +454,7 @@ static void lane(bool threaded, bool deletion, bool owned, bool no_memory,
 #endif
    {
       task_queue_push(task);
+      CHECK(task_cloud_sync_in_progress());
       for (i = 0; i < 2000 && !retired; i++)
       {
          task_queue_check();
@@ -480,6 +493,9 @@ static void lane(bool threaded, bool deletion, bool owned, bool no_memory,
       }
       CHECK(retired == 1);
       CHECK(!hold_mode || (polls_at_hold && polls - polls_at_hold >= 3));
+      /* the content's held saves are let go, whatever the result */
+      CHECK(releases == 1);
+      CHECK(!task_cloud_sync_in_progress());
    }
    CHECK(retro_atomic_load_acquire_int(&vanishing) == (vanish ? 2 : 0));
    retro_atomic_store_relaxed_int(&vanishing, 0);
@@ -713,6 +729,8 @@ static void budget_lane(const int64_t *sizes, unsigned count,
    }
    path_rmdir(dir);
    task_cloud_sync_cleanup(task);
+   /* run by hand: no callback counted it off */
+   tcs_in_flight--;
    free(task->title);
    free(task);
    free(buf);
@@ -794,6 +812,8 @@ static void sweep_lane(void)
    CHECK(!path_is_valid(local_path));
    filestream_delete(to);
    task_cloud_sync_cleanup(task);
+   /* run by hand: no callback counted it off */
+   tcs_in_flight--;
    free(task->title);
    free(task);
 #else
@@ -879,6 +899,8 @@ static void walk_lane(void)
    CHECK(!task_cloud_sync_should_ignore_file("saves/backupsx/a.srm"));
    CHECK(!task_cloud_sync_should_ignore_file("system/backups/a.bin"));
    task_cloud_sync_cleanup(task);
+   /* run by hand: no callback counted it off */
+   tcs_in_flight--;
    free(task->title);
    free(task);
    for (i = 0; i < sizeof(walk_files) / sizeof(walk_files[0]); i++)
@@ -893,6 +915,35 @@ static void walk_lane(void)
    }
    snprintf(path, sizeof(path), "%s/walk", directory);
    CHECK(path_rmdir(path));
+}
+
+/* Two syncs alive at once: the second set up before the first called
+ * back, as when the queue runs one's handler between the other's
+ * finish and its callback. The hold goes with the last. */
+static void two_syncs_lane(void)
+{
+   retro_task_t *a = task_init();
+   retro_task_t *b = task_init();
+   task_cloud_sync_state_t *sa = (task_cloud_sync_state_t*)calloc(1, sizeof(*sa));
+   task_cloud_sync_state_t *sb = (task_cloud_sync_state_t*)calloc(1, sizeof(*sb));
+   task_queue_init(false, NULL);
+   CHECK(!task_cloud_sync_in_progress());
+   releases = 0;
+   task_cloud_sync_task_setup(a, sa, "Cloud Sync");
+   task_cloud_sync_task_setup(b, sb, "Cloud Sync");
+   a->callback(a, NULL, NULL, NULL);
+   CHECK(releases == 0);
+   CHECK(task_cloud_sync_in_progress());
+   b->callback(b, NULL, NULL, NULL);
+   CHECK(releases == 1);
+   CHECK(!task_cloud_sync_in_progress());
+   task_queue_deinit();
+   free(sa);
+   free(sb);
+   free(a->title);
+   free(b->title);
+   free(a);
+   free(b);
 }
 
 int main(void)
@@ -974,6 +1025,7 @@ int main(void)
       budget_lane(edge, 2, 1);
    }
 #endif
+   two_syncs_lane();
    sweep_lane();
    backup_location_lane();
    walk_lane();

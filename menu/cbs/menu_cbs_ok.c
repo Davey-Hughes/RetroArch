@@ -7526,6 +7526,8 @@ static int action_ok_netplay_connect_room(const char *path, const char *label,
 
    if (netplay_driver_ctl(RARCH_NETPLAY_CTL_USE_CORE_PACKET_INTERFACE, NULL))
    {
+      if (command_state_held())
+         return -1;
       netplay_driver_ctl(RARCH_NETPLAY_CTL_ENABLE_CLIENT, NULL);
       command_event(CMD_EVENT_NETPLAY_INIT_DIRECT, (void*)hostname);
       menu_input_dialog_end();
@@ -9329,6 +9331,11 @@ static void action_ok_netplay_enable_client_hostname_cb(void *userdata,
    {
       if (netplay_driver_ctl(RARCH_NETPLAY_CTL_USE_CORE_PACKET_INTERFACE, NULL))
       {
+         if (command_state_held())
+         {
+            menu_input_dialog_end();
+            return;
+         }
          netplay_driver_ctl(RARCH_NETPLAY_CTL_ENABLE_CLIENT, NULL);
          command_event(CMD_EVENT_NETPLAY_INIT_DIRECT, (void*)line);
          menu_input_dialog_end();

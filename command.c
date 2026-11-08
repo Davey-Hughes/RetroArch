@@ -1198,8 +1198,16 @@ bool command_run(command_t *handle, const char *name, const char *arg)
 #endif
 #ifdef HAVE_BSV_MOVIE
          else if (map[i].id == RARCH_RECORD_REPLAY_KEY)
+         {
+            if (command_state_held())
+            {
+               command_reply_error(handle, map[i].str, "%s",
+                     msg_hash_to_str(MSG_CLOUD_SYNC_WAITING));
+               return false;
+            }
             return command_reply_event(handle,
                   CMD_EVENT_RECORD_REPLAY, map[i].str);
+         }
          else if (map[i].id == RARCH_SAVE_REPLAY_CHECKPOINT_KEY)
             return command_reply_event(handle,
                   CMD_EVENT_SAVE_REPLAY_CHECKPOINT, map[i].str);
@@ -2098,6 +2106,13 @@ static bool command_state_slot(command_t *cmd, const char *arg, bool load)
       return false;
    }
 
+   if (command_state_held())
+   {
+      command_reply_error(cmd, name, "%s",
+            msg_hash_to_str(MSG_CLOUD_SYNC_WAITING));
+      return false;
+   }
+
    if ((r = command_reply_new(name)))
    {
       runloop_get_savestate_path(r->path, sizeof(r->path), slot);
@@ -2302,6 +2317,12 @@ bool command_play_replay_slot(command_t *cmd, const char *arg)
    {
       command_reply_error(cmd, "PLAY_REPLAY_SLOT", "a slot number, not %s",
             (arg && *arg) ? arg : "nothing");
+      return false;
+   }
+   if (command_state_held())
+   {
+      command_reply_error(cmd, "PLAY_REPLAY_SLOT", "%s",
+            msg_hash_to_str(MSG_CLOUD_SYNC_WAITING));
       return false;
    }
    if (     core_info_current_supports_savestate()
@@ -6230,6 +6251,20 @@ bool command_write_memory(command_t *cmd, const char *arg)
 }
 #endif
 
+/* Held (save_load_hold): a state or replay made now has none of the
+ * content's saves in it, one loaded now is loaded over when they load,
+ * and the netplay init that follows them ends a host started now. */
+bool command_state_held(void)
+{
+   const char *_msg;
+   if (!runloop_state_get_ptr()->save_load_hold)
+      return false;
+   _msg = msg_hash_to_str(MSG_CLOUD_SYNC_WAITING);
+   runloop_msg_queue_push(_msg, strlen(_msg), 1, 180, false, NULL,
+         MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+   return true;
+}
+
 void command_event_set_volume(
       settings_t *settings,
       float gain,
@@ -6465,7 +6500,9 @@ size_t command_event_save_auto_state(void)
    char savestate_name_auto[PATH_MAX_LENGTH];
    const char *a = NULL;
 
-   if (!core_info_current_supports_savestate())
+   /* Held: the session loaded no state to save over */
+   if (     runloop_st->save_load_hold
+         || !core_info_current_supports_savestate())
       return 0;
    a = path_basename(path_get(RARCH_PATH_BASENAME));
    if (!a || !*a)
@@ -7370,6 +7407,9 @@ bool command_event_main_state(unsigned cmd)
    settings_t *settings        = config_get_ptr();
    bool savestates_enabled     = core_info_current_supports_savestate();
    bool ret                    = false;
+
+   if (command_state_held())
+      return false;
 
    if (savestates_enabled)
    {

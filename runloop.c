@@ -5875,6 +5875,7 @@ void runloop_event_deinit_core(void)
 #ifdef HAVE_NETWORKING
    netplay_driver_ctl(RARCH_NETPLAY_CTL_SET_CORE_PACKET_INTERFACE, NULL);
 #endif
+   runloop_st->save_load_hold = 0;
 }
 
 static bool runloop_path_init_subsystem(runloop_state_t *runloop_st)
@@ -6087,72 +6088,23 @@ static void runloop_set_save_backup_roots(runloop_state_t *runloop_st,
    free(app_data);
 }
 
-static bool event_init_content(
-      runloop_state_t *runloop_st,
-      settings_t *settings,
-      input_driver_state_t *input_st)
+/* The rest of a content load, once nothing holds its saves
+ * (save_load_hold): from the frame loop when they were held. */
+static void runloop_content_saves_ready(runloop_state_t *runloop_st)
 {
+   settings_t *settings                         = config_get_ptr();
+#ifdef HAVE_BSV_MOVIE
+   input_driver_state_t *input_st               = input_state_get_ptr();
+#endif
 #ifdef HAVE_CHEEVOS
    bool cheevos_enable                          =
       settings->bools.cheevos_enable;
    bool cheevos_hardcore_mode_enable            =
       settings->bools.cheevos_hardcore_mode_enable;
 #endif
-   const enum rarch_core_type current_core_type = runloop_st->current_core_type;
-   uint8_t flags                                = content_get_flags();
    bool entry_state_load                        = runloop_st->entry_state_slot > -1;
 
-   runloop_reset_auto_state_load(runloop_st);
-
-   if (current_core_type == CORE_TYPE_PLAIN)
-      runloop_st->flags |=  RUNLOOP_FLAG_USE_SRAM;
-   else
-      runloop_st->flags &= ~RUNLOOP_FLAG_USE_SRAM;
-
-   /* No content to be loaded for dummy core,
-    * just successfully exit. */
-   if (current_core_type == CORE_TYPE_DUMMY)
-      return true;
-
-   content_set_subsystem_info();
-
-   if (flags & CONTENT_ST_FLAG_CORE_DOES_NOT_NEED_CONTENT)
-      runloop_path_init_savefile_internal(runloop_st);
-
-   runloop_path_fill_names();
-
-   if (!content_init())
-   {
-#ifdef HAVE_MENU
-      /* Single-click playlist return */
-      if (settings->bools.input_menu_singleclick_playlists)
-         menu_state_get_ptr()->flags |= MENU_ST_FLAG_PENDING_CLOSE_CONTENT;
-
-      /* Return from empty Quick Menu if core is manually loaded and needs reloading */
-      if (!path_is_empty(RARCH_PATH_CORE_LAST))
-         menu_state_get_ptr()->flags |= MENU_ST_FLAG_PENDING_CLOSE_CONTENT;
-#endif
-      return false;
-   }
-
-   command_event_set_savestate_auto_index(settings);
-   command_event_set_replay_auto_index(settings);
-
-   runloop_path_init_savefile(runloop_st);
-   runloop_set_save_backup_roots(runloop_st, settings);
-   {
-      /* The folders list C2 reads; a fallback leaves a note there */
-      size_t i = runloop_save_roots[0] != RUNLOOP_SAVE_ROOT_CONFIGURED
-         ? 0 : 1;
-      if (runloop_save_roots[i] != RUNLOOP_SAVE_ROOT_CONFIGURED)
-         save_backups_note_folders(dir_get_ptr(i
-                  ? RARCH_DIR_SAVESTATE_CONFIGURED
-                  : RARCH_DIR_SAVEFILE_CONFIGURED),
-               dir_get_ptr(i ? RARCH_DIR_SAVESTATE : RARCH_DIR_SAVEFILE),
-               false);
-      else
-         save_backups_note_folders(NULL, NULL, false);
-   }
+   runloop_st->save_load_hold                   = 0;
 
    if (!event_load_save_files(runloop_st->flags & RUNLOOP_FLAG_IS_SRAM_LOAD_DISABLED))
       RARCH_LOG("[SRAM] %s\n", msg_hash_to_str(MSG_SKIPPING_SRAM_LOAD));
@@ -6161,41 +6113,6 @@ static bool event_init_content(
     * an unchanged save is not written back. */
    if (runloop_st->flags & RUNLOOP_FLAG_USE_SRAM)
       command_event(CMD_EVENT_AUTOSAVE_INIT, NULL);
-
-   /* Set entry slot from playlist entry if available */
-   {
-#ifdef HAVE_MENU
-      playlist_t *playlist       = playlist_get_cached();
-      struct menu_state *menu_st = menu_state_get_ptr();
-      menu_handle_t *menu        = menu_st->driver_data;
-
-      if (playlist && menu)
-      {
-         const struct playlist_entry *entry = NULL;
-
-         playlist_get_index(playlist, menu->rpl_entry_selection_ptr, &entry);
-
-         if (entry && PLAYLIST_ENTRY_SLOT(entry) > 0)
-            runloop_st->entry_state_slot = PLAYLIST_ENTRY_SLOT(entry);
-
-         entry_state_load = runloop_st->entry_state_slot > -1;
-      }
-
-      /* The slot picked from the entry's Load State list, captured
-       * when the load was asked for: the menu has moved on since. */
-      if (menu && menu->state_slot_run_pending)
-      {
-         runloop_st->entry_state_slot      = menu->state_slot_run;
-         entry_state_load                  = menu->state_slot_run > -1;
-         runloop_st->auto_state_load_asked = menu->state_slot_run < 0;
-         menu->state_slot_run_pending      = false;
-      }
-#endif
-
-      /* Set current active state slot */
-      if (runloop_st->entry_state_slot > -1)
-         configuration_set_int(settings, settings->ints.state_slot, runloop_st->entry_state_slot);
-   }
 
    /*
     * Since the operations are asynchronous we can't
@@ -6258,6 +6175,126 @@ static bool event_init_content(
 #endif
 
    command_event(CMD_EVENT_NETPLAY_INIT, NULL);
+}
+
+void runloop_save_load_hold(uint8_t bit)
+{
+   runloop_state.save_load_hold |= bit | SAVE_LOAD_HOLD_PENDING;
+}
+
+void runloop_save_load_release(uint8_t bit)
+{
+   runloop_state.save_load_hold &= (uint8_t)~bit;
+}
+
+static bool event_init_content(
+      runloop_state_t *runloop_st,
+      settings_t *settings,
+      input_driver_state_t *input_st)
+{
+   const enum rarch_core_type current_core_type = runloop_st->current_core_type;
+   uint8_t flags                                = content_get_flags();
+
+   runloop_reset_auto_state_load(runloop_st);
+   runloop_st->save_load_hold                   = 0;
+
+   if (current_core_type == CORE_TYPE_PLAIN)
+      runloop_st->flags |=  RUNLOOP_FLAG_USE_SRAM;
+   else
+      runloop_st->flags &= ~RUNLOOP_FLAG_USE_SRAM;
+
+   /* No content to be loaded for dummy core,
+    * just successfully exit. */
+   if (current_core_type == CORE_TYPE_DUMMY)
+      return true;
+
+   content_set_subsystem_info();
+
+   if (flags & CONTENT_ST_FLAG_CORE_DOES_NOT_NEED_CONTENT)
+      runloop_path_init_savefile_internal(runloop_st);
+
+   runloop_path_fill_names();
+
+   if (!content_init())
+   {
+#ifdef HAVE_MENU
+      /* Single-click playlist return */
+      if (settings->bools.input_menu_singleclick_playlists)
+         menu_state_get_ptr()->flags |= MENU_ST_FLAG_PENDING_CLOSE_CONTENT;
+
+      /* Return from empty Quick Menu if core is manually loaded and needs reloading */
+      if (!path_is_empty(RARCH_PATH_CORE_LAST))
+         menu_state_get_ptr()->flags |= MENU_ST_FLAG_PENDING_CLOSE_CONTENT;
+#endif
+      return false;
+   }
+
+   command_event_set_savestate_auto_index(settings);
+   command_event_set_replay_auto_index(settings);
+
+   runloop_path_init_savefile(runloop_st);
+   runloop_set_save_backup_roots(runloop_st, settings);
+   {
+      /* The folders list C2 reads; a fallback leaves a note there */
+      size_t i = runloop_save_roots[0] != RUNLOOP_SAVE_ROOT_CONFIGURED
+         ? 0 : 1;
+      if (runloop_save_roots[i] != RUNLOOP_SAVE_ROOT_CONFIGURED)
+         save_backups_note_folders(dir_get_ptr(i
+                  ? RARCH_DIR_SAVESTATE_CONFIGURED
+                  : RARCH_DIR_SAVEFILE_CONFIGURED),
+               dir_get_ptr(i ? RARCH_DIR_SAVESTATE : RARCH_DIR_SAVEFILE),
+               false);
+      else
+         save_backups_note_folders(NULL, NULL, false);
+   }
+
+   /* Set entry slot from playlist entry if available */
+   {
+#ifdef HAVE_MENU
+      playlist_t *playlist       = playlist_get_cached();
+      struct menu_state *menu_st = menu_state_get_ptr();
+      menu_handle_t *menu        = menu_st->driver_data;
+
+      if (playlist && menu)
+      {
+         const struct playlist_entry *entry = NULL;
+
+         playlist_get_index(playlist, menu->rpl_entry_selection_ptr, &entry);
+
+         if (entry && PLAYLIST_ENTRY_SLOT(entry) > 0)
+            runloop_st->entry_state_slot = PLAYLIST_ENTRY_SLOT(entry);
+      }
+
+      /* The slot picked from the entry's Load State list, captured
+       * when the load was asked for: the menu has moved on since. */
+      if (menu && menu->state_slot_run_pending)
+      {
+         runloop_st->entry_state_slot      = menu->state_slot_run;
+         runloop_st->auto_state_load_asked = menu->state_slot_run < 0;
+         menu->state_slot_run_pending      = false;
+      }
+#endif
+
+      /* Set current active state slot */
+      if (runloop_st->entry_state_slot > -1)
+         configuration_set_int(settings, settings->ints.state_slot, runloop_st->entry_state_slot);
+   }
+
+#ifdef HAVE_CLOUDSYNC
+   /* A sync in flight may replace these saves: they load once it ends
+    * (task_cloud_sync_cb), and the frame loop runs meanwhile. */
+   if (task_cloud_sync_in_progress())
+   {
+      const char *_msg = msg_hash_to_str(MSG_CLOUD_SYNC_WAITING);
+      RARCH_LOG("[CloudSync] %s\n", _msg);
+      runloop_msg_queue_push(_msg, strlen(_msg), 1, 180, false, NULL,
+            MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+      runloop_save_load_hold(SAVE_LOAD_HOLD_CLOUD_SYNC);
+   }
+#endif
+
+   if (!runloop_st->save_load_hold)
+      runloop_content_saves_ready(runloop_st);
 
    return true;
 }
@@ -10540,7 +10577,10 @@ int runloop_iterate(void)
       want_runahead                     = want_runahead && !netplay_is_enabled;
 #endif
 
-      if (want_runahead)
+      /* core_run() alone knows the content's saves are held */
+      if (runloop_st->save_load_hold)
+         frame_advanced = core_run();
+      else if (want_runahead)
          frame_advanced = runahead_run(
                runloop_st,
                run_ahead_num_frames,
@@ -11539,6 +11579,17 @@ bool core_run(void)
     * reads as a hang. */
    if (runloop_st->content_closing || runloop_st->content_switching)
    {
+      input_driver_poll_between_frames(input_driver_poll);
+      video_driver_cached_frame();
+      return false;
+   }
+
+   /* Not before its saves load (save_load_hold); they load at the first
+    * frame nothing holds them, and the core runs from the next one. */
+   if (runloop_st->save_load_hold)
+   {
+      if (runloop_st->save_load_hold == SAVE_LOAD_HOLD_PENDING)
+         runloop_content_saves_ready(runloop_st);
       input_driver_poll_between_frames(input_driver_poll);
       video_driver_cached_frame();
       return false;

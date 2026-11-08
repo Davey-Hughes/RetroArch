@@ -886,7 +886,9 @@ bool autosave_init(bool compress_files, unsigned autosave_interval)
    unsigned i;
    autosave_t **list          = NULL;
 
-   if (autosave_interval < 1 || !task_save_files)
+   if (     autosave_interval < 1
+         || !task_save_files
+         || runloop_state_get_ptr()->save_load_hold)
       return false;
 
    if (!(list = (autosave_t**)
@@ -1489,7 +1491,9 @@ bool event_save_files(bool is_sram_used, bool compress_files, bool sync,
 #ifdef HAVE_CHEATS
    cheat_manager_save_game_specific_cheats(path_cheat_database);
 #endif
-   if (!task_save_files || !is_sram_used)
+   if (     !task_save_files
+         || !is_sram_used
+         || runloop_state_get_ptr()->save_load_hold)
       return false;
    if (sync)
       save_files_unsynced = false;
@@ -1504,7 +1508,9 @@ static void save_files_flush(bool is_sram_used, bool compress_files,
       int owed, bool kept)
 {
    unsigned i;
-   if (!task_save_files || !is_sram_used)
+   if (     !task_save_files
+         || !is_sram_used
+         || runloop_state_get_ptr()->save_load_hold)
       return;
    for (i = 0; i < task_save_files->size; i++)
    {
@@ -1607,7 +1613,10 @@ bool content_savefile_is_live(const char *path)
    size_t i, _len;
    const char *state;
 
-   if (!task_save_files || string_is_empty(path))
+   /* Held (save_load_hold): nothing was loaded, nothing writes them. */
+   if (     !task_save_files
+         || string_is_empty(path)
+         || runloop_state_get_ptr()->save_load_hold)
       return false;
 
    for (i = 0; i < task_save_files->size; i++)

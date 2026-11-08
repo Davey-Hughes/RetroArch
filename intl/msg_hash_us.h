@@ -33802,6 +33802,10 @@ MSG_HASH(
    "Skipping SRAM load."
    )
 MSG_HASH(
+   MSG_CLOUD_SYNC_WAITING,
+   "Waiting for cloud sync before loading saves..."
+   )
+MSG_HASH(
    MSG_SRAM_WILL_NOT_BE_SAVED,
    "SRAM will not be saved."
    )

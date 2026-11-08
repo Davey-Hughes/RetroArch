@@ -4462,6 +4462,8 @@ bool command_event(enum event_command cmd, void *data)
          input_driver_state_t *input_st = input_state_get_ptr();
          char replay_path[PATH_MAX_LENGTH];
          bool res = true;
+         if (command_state_held())
+            return false;
          /* TODO: Consider extending the current replay if we start recording during a playback */
          if (input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_RECORDING)
             res = false;
@@ -4491,6 +4493,8 @@ bool command_event(enum event_command cmd, void *data)
          bool res                       = true;
          input_driver_state_t *input_st = input_state_get_ptr();
          int replay_slot                = settings->ints.replay_slot;
+         if (command_state_held())
+            return false;
          if (settings->bools.replay_auto_index)
             replay_slot += 1;
          /* TODO: Consider cloning and extending the current replay if we start recording during a recording */
@@ -4944,6 +4948,13 @@ bool command_event(enum event_command cmd, void *data)
 #endif
             if (rewind_enable)
             {
+               /* Held: the buffer starts from the saves, once loaded */
+               if (runloop_st->save_load_hold)
+               {
+                  runloop_st->rewind_st.flags |=
+                     STATE_MGR_REWIND_ST_FLAG_INIT_PENDING;
+                  return false;
+               }
 #ifdef HAVE_NETWORKING
                /* Only enable state manager if netplay is not underway
                   TODO/FIXME: Add a setting for these tweaks */
@@ -6088,6 +6099,9 @@ bool command_event(enum event_command cmd, void *data)
          break;
       case CMD_EVENT_NETPLAY_ENABLE_HOST:
          {
+            if (command_state_held())
+               return false;
+
             /* Ask the lobby server for the tunnel address now.
              *
              * This is the point where the user has committed to
@@ -10141,16 +10155,16 @@ bool retroarch_main_init_core(int argc, char *argv[],
       retroarch_find_drivers(settings, verbosity_enabled, true);
 
 #ifdef HAVE_CLOUDSYNC
-   /* Content from the command line loads its save RAM below, before
-    * rarch_main() would push the startup sync. The sync runs first, so
-    * the core reads the save the server has. */
+   /* Content from the command line is loaded below, before rarch_main()
+    * would push the startup sync: it is pushed here instead, and the
+    * content's saves wait for it (save_load_hold). */
    if (      find_drivers
          && (rarch_st.flags & RARCH_FLAGS_LAUNCHED_FROM_CLI)
          && !string_is_empty(p_rarch->path_content)
          && settings->bools.cloud_sync_enable
          && settings->uints.cloud_sync_sync_mode == CLOUD_SYNC_MODE_AUTOMATIC)
    {
-      retroarch_cloud_sync_run();
+      task_push_cloud_sync(NULL, NULL);
       rarch_st.flags |= RARCH_FLAGS_CLOUD_SYNC_AT_INIT;
    }
 #endif

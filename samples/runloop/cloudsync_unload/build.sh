@@ -5,7 +5,8 @@
 # RetroArch with only main() replaced, and one symbol wrapped:
 # task_push_cloud_sync, so the harness sees each sync the frontend
 # asks for, and what the save file holds at that moment, without a
-# server.  The core it loads (sram_core.so) is built here too.
+# server; and cloud_sync_begin, so a real sync task can be held in
+# flight.  The core it loads (sram_core.so) is built here too.
 #
 # Requires a completed NON-Qt build, from the repo root:
 #
@@ -52,7 +53,7 @@ if [ ! -s "$ld_line" ]; then
 fi
 
 sed -e "s#obj-unix/release/retroarch\.o#$out/retroarch_nomain.o $out/harness_main.o#" \
-    -e "s#-o retroarch #-o $out/cloudsync_unload_test -Wl,--wrap=task_push_cloud_sync #" \
+    -e "s#-o retroarch #-o $out/cloudsync_unload_test -Wl,--wrap=task_push_cloud_sync -Wl,--wrap=cloud_sync_begin #" \
    "$ld_line" | sh
 
 core_cc=$(sed 's/ .*//' "$cc_line")

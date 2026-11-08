@@ -675,6 +675,8 @@ bool task_push_cloud_sync(retro_task_callback_t cb, void *user_data);
 /* No sync runs while set: a main config save or state folder is
  * missing. */
 void task_cloud_sync_set_paused(bool paused);
+/* A sync was pushed and has not called back yet. Main thread. */
+bool task_cloud_sync_in_progress(void);
 void task_push_cloud_sync_resolve_keep_local(void);
 void task_push_cloud_sync_resolve_keep_server(void);
 
