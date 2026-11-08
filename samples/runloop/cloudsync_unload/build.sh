@@ -2,11 +2,12 @@
 # Builds the cloud sync unload harness.
 #
 # Like content_closing, this links the SHIPPING objects of a built
-# RetroArch with only main() replaced, and one symbol wrapped:
+# RetroArch with only main() replaced, and three symbols wrapped:
 # task_push_cloud_sync, so the harness sees each sync the frontend
 # asks for, and what the save file holds at that moment, without a
-# server; and cloud_sync_begin, so a real sync task can be held in
-# flight.  The core it loads (sram_core.so) is built here too.
+# server; cloud_sync_begin, so a real sync task can be held in
+# flight; and runloop_msg_queue_push, so a lane can read the notice a
+# command shows.  The core it loads (sram_core.so) is built here too.
 #
 # Requires a completed NON-Qt build, from the repo root:
 #
@@ -53,7 +54,7 @@ if [ ! -s "$ld_line" ]; then
 fi
 
 sed -e "s#obj-unix/release/retroarch\.o#$out/retroarch_nomain.o $out/harness_main.o#" \
-    -e "s#-o retroarch #-o $out/cloudsync_unload_test -Wl,--wrap=task_push_cloud_sync -Wl,--wrap=cloud_sync_begin #" \
+    -e "s#-o retroarch #-o $out/cloudsync_unload_test -Wl,--wrap=task_push_cloud_sync -Wl,--wrap=cloud_sync_begin -Wl,--wrap=runloop_msg_queue_push #" \
    "$ld_line" | sh
 
 core_cc=$(sed 's/ .*//' "$cc_line")

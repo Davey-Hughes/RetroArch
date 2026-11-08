@@ -221,6 +221,9 @@ static unsigned load_state_tasks_pending   = 0;
 /* How long a state load waiting for the core's second frame parks. */
 #define LOAD_STATE_FRAME_WAIT_USEC 8000
 static unsigned save_state_tasks_pending   = 0;
+/* Pending backup reads and undos: each frees or replaces
+ * undo_save_buf before an undo held behind it runs. */
+static unsigned undo_save_buf_tasks_pending = 0;
 static bool save_state_disable_undo        = false;
 
 /* State tasks the queue turned away while another state task ran,
@@ -488,6 +491,8 @@ static void undo_save_state_cb(retro_task_t *task,
 
    if (save_state_tasks_pending)
       save_state_tasks_pending--;
+   if (undo_save_buf_tasks_pending)
+      undo_save_buf_tasks_pending--;
    content_save_written();
 
    /* Wipe the save file buffer as it's intended to be one use only */
@@ -1142,6 +1147,7 @@ static bool task_push_undo_save_state(const char *path, void *data, size_t len)
       if (state_task_push(task))
       {
          save_state_tasks_pending++;
+         undo_save_buf_tasks_pending++;
          return true;
       }
 
@@ -1169,6 +1175,10 @@ static bool task_push_undo_save_state(const char *path, void *data, size_t len)
  **/
 bool content_undo_save_state(void)
 {
+   /* The undo borrows undo_save_buf: a pending backup read or undo
+    * frees or replaces it before a held undo would run */
+   if (undo_save_buf_tasks_pending)
+      return false;
    if (content_undo_save_buf_is_empty())
       return false;
    if (core_info_current_supports_savestate())
@@ -1590,6 +1600,9 @@ static void content_load_state_apply(retro_task_t *task,
     * whichever way this callback exits. */
    if (load_state_tasks_pending)
       load_state_tasks_pending--;
+   if (     (load_data->flags & SAVE_TASK_FLAG_LOAD_TO_BACKUP_BUFF)
+         && undo_save_buf_tasks_pending)
+      undo_save_buf_tasks_pending--;
 
    _len = load_data->size;
    buf  = load_data->data;
@@ -2036,7 +2049,11 @@ static bool task_push_load_and_save_state(const char *path, void *data,
       task->flags              &= ~RETRO_TASK_FLG_MUTE;
 
    if (state_task_push(task))
+   {
       load_state_tasks_pending++;
+      if (load_to_backup_buffer)
+         undo_save_buf_tasks_pending++;
+   }
    else
    {
       /* The hold is full.  No callback will run for this task. */
@@ -2388,7 +2405,11 @@ bool content_load_state_notify(const char *path,
    /* Held behind a state task in flight rather than dropped: Load State
     * pressed while a save was still writing did nothing. */
    if (state_task_push(task))
+   {
       load_state_tasks_pending++;
+      if (load_to_backup_buffer)
+         undo_save_buf_tasks_pending++;
+   }
    else
    {
       /* The hold is full. No callback will run for this task, so the
@@ -2451,6 +2472,10 @@ static void state_tasks_discard_held(void)
          save_state_tasks_pending--;
       if (state)
       {
+         if (     (state->flags & (SAVE_TASK_FLAG_LOAD_TO_BACKUP_BUFF
+                     | SAVE_TASK_FLAG_UNDO_SAVE))
+               && undo_save_buf_tasks_pending)
+            undo_save_buf_tasks_pending--;
          if (state->done_cb)
             state->done_cb(NULL, state->path, task->user_data,
                   msg_hash_to_str(is_load
@@ -2528,6 +2553,11 @@ bool content_undo_save_buf_is_empty(void)
 {
    return undo_save_buf.data == NULL || undo_save_buf.size == 0
       || !string_is_equal(undo_save_buf.path, undo_save_last_path);
+}
+
+bool content_undo_save_buf_in_use(void)
+{
+   return undo_save_buf_tasks_pending != 0;
 }
 
 bool content_undo_save_disabled(void)

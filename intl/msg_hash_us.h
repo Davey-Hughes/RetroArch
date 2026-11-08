@@ -33218,6 +33218,10 @@ MSG_HASH(
    "Failed to undo save state."
    )
 MSG_HASH(
+   MSG_CANNOT_UNDO_SAVE_STATE_YET,
+   "Cannot undo save state yet: a state is still being saved or loaded."
+   )
+MSG_HASH(
    MSG_FAILED_TO_UNMUTE_AUDIO,
    "Failed to unmute audio."
    )

@@ -6430,6 +6430,9 @@ static size_t command_event_save_config(const char *config_path,
 
 static size_t command_event_undo_save_state(char *s, size_t len)
 {
+   if (content_undo_save_buf_in_use())
+      return strlcpy(s,
+         msg_hash_to_str(MSG_CANNOT_UNDO_SAVE_STATE_YET), len);
    if (content_undo_save_buf_is_empty())
    {
       enum msg_hash_enums msg = content_undo_save_disabled()

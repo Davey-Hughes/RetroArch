@@ -1436,7 +1436,7 @@ static void test_undo_save_slot(void)
  * An Undo Save turned away (the hold behind a state task is full)
  * keeps its buffer: twice, then the queue drains, under ASan, and the
  * retry writes that buffer. Loads fill the hold: a save's backup read
- * would replace the buffer before the retry.
+ * would turn the undo away before the hold, and replace the buffer.
  * ----------------------------------------------------------------- */
 static void test_undo_save_refused_push(void)
 {
@@ -1477,6 +1477,192 @@ static void test_undo_save_refused_push(void)
    clock_step = 0;
    free(was);
    filestream_delete(path);
+}
+
+/* -----------------------------------------------------------------
+ * Undo Save pressed while the save it undoes still writes waits
+ * behind it, and the slot ends with the file from before that save.
+ * ----------------------------------------------------------------- */
+static void test_undo_save_during_write(void)
+{
+   const char *path = "sst_undo_write.state";
+   void   *before   = NULL;
+   int64_t n_before = -1;
+   int i;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(path);
+   core_fill(40 * TEST_SAVE_STATE_CHUNK);
+   content_save_state(path, true);
+   pump(1000);
+   if (!filestream_read_file(path, &before, &n_before))
+      n_before = -1;
+
+   /* the save over it past its backup read, still writing */
+   clock_step = TEST_TICK_BUDGET_US;
+   memset(core_mem, 0x99, core_len);
+   content_save_state(path, true);
+   for (i = 0; i < 1000 && content_load_state_in_progress(NULL); i++)
+      task_queue_check();
+   okf(!content_load_state_in_progress(NULL)
+         && content_save_state_in_progress(NULL),
+       "undo during write: the save is writing");
+   okf(content_undo_save_state(), "undo during write: Undo Save is taken");
+   pump(1000);
+   okf(!queue_busy(), "undo during write: the queue drains");
+   okf(n_before > 0 && !written_into(path, before, n_before),
+       "undo during write: the slot holds the state from before the save");
+   okf(content_undo_save_buf_is_empty(),
+       "undo during write: nothing is left to undo");
+   clock_step = 0;
+   free(before);
+   filestream_delete(path);
+}
+
+/* -----------------------------------------------------------------
+ * A backup read counts against Undo Save until it is through: also
+ * one the reset discards while held, and one pushed through
+ * content_load_state().
+ * ----------------------------------------------------------------- */
+static void test_undo_save_count(void)
+{
+   const char *path = "sst_undo_count.state";
+   void   *before   = NULL;
+   int64_t n_before = -1;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(path);
+   core_fill(40 * TEST_SAVE_STATE_CHUNK);
+   content_save_state(path, true);
+   pump(1000);
+
+   /* a save's backup read held behind a load, then discarded */
+   clock_step = TEST_TICK_BUDGET_US;
+   content_load_state(path, false, false);
+   task_queue_check();
+   memset(core_mem, 0xAA, core_len);
+   content_save_state(path, true);
+   okf(content_undo_save_buf_in_use(), "undo count: the backup read is held");
+   content_reset_savestate_backups();
+   pump(1000);
+   clock_step = 0;
+   okf(!content_undo_save_buf_in_use(),
+       "undo count: the discarded one is let go");
+
+   if (!filestream_read_file(path, &before, &n_before))
+      n_before = -1;
+   memset(core_mem, 0xBB, core_len);
+   content_save_state(path, true);
+   pump(1000);
+   okf(content_undo_save_state(), "undo count: Undo Save is taken after it");
+   pump(1000);
+   okf(n_before > 0 && !written_into(path, before, n_before),
+       "undo count: and puts back the state from before the save");
+
+   content_load_state(path, true, false);
+   okf(content_undo_save_buf_in_use(),
+       "undo count: a backup read through content_load_state() counts");
+   pump(1000);
+   okf(!content_undo_save_buf_in_use(),
+       "undo count: and is let go once read");
+   free(before);
+   filestream_delete(path);
+}
+
+/* -----------------------------------------------------------------
+ * Undo Save pressed while a task that frees or replaces its buffer
+ * runs is turned away. Held behind the task, it wrote its buffer into
+ * the slot after the task had freed it: here the first of two undos
+ * in a row, below the backup read of a save over the slot.
+ * ----------------------------------------------------------------- */
+static void test_undo_save_twice(void)
+{
+   const char *path = "sst_undo_twice.state";
+   void   *was      = NULL;
+   int64_t n_was    = -1;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(path);
+   core_fill(40 * TEST_SAVE_STATE_CHUNK);
+   content_save_state(path, true);
+   pump(1000);
+   if (!filestream_read_file(path, &was, &n_was))
+      n_was = -1;
+   memset(core_mem, 0x66, core_len);
+   content_save_state(path, true);
+   pump(1000);
+
+   /* the first undo still writing */
+   clock_step = TEST_TICK_BUDGET_US;
+   okf(content_undo_save_state(), "undo twice: the first is pushed");
+   task_queue_check();
+   okf(!content_undo_save_state(),
+       "undo twice: the second, while the first writes, is turned away");
+   pump(1000);
+   okf(!queue_busy(), "undo twice: the queue drains");
+   okf(n_was > 0 && !written_into(path, was, n_was),
+       "undo twice: the slot holds the state from before the save");
+   okf(!content_undo_save_state(),
+       "undo twice: a retry finds the save already undone");
+   pump(1000);
+   okf(n_was > 0 && !written_into(path, was, n_was),
+       "undo twice: and the slot still holds it");
+   clock_step = 0;
+   free(was);
+   filestream_delete(path);
+}
+
+static void test_undo_save_during_backup(void)
+{
+   const char *path  = "sst_undo_backup.state";
+   const char *ref   = "sst_undo_backup_ref.state";
+   void   *before    = NULL, *last = NULL;
+   int64_t n_before  = -1, n_last = -2;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(path);
+   filestream_delete(ref);
+   core_fill(40 * TEST_SAVE_STATE_CHUNK);
+   content_save_state(path, true);
+   pump(1000);
+   /* what the save in flight below writes */
+   memset(core_mem, 0x88, core_len);
+   content_save_state(ref, true);
+   pump(1000);
+   if (!filestream_read_file(ref, &last, &n_last))
+      n_last = -2;
+   memset(core_mem, 0x77, core_len);
+   content_save_state(path, true);
+   pump(1000);
+   if (!filestream_read_file(path, &before, &n_before))
+      n_before = -1;
+
+   /* the next save's backup read of the slot still running */
+   clock_step = TEST_TICK_BUDGET_US;
+   memset(core_mem, 0x88, core_len);
+   content_save_state(path, true);
+   task_queue_check();
+   okf(content_load_state_in_progress(NULL),
+       "undo during save: the backup read is in flight");
+   okf(!content_undo_save_state(),
+       "undo during save: Undo Save is turned away");
+   pump(1000);
+   okf(!queue_busy(), "undo during save: the queue drains");
+   okf(n_last > 0 && !written_into(path, last, n_last),
+       "undo during save: the slot holds the save");
+   okf(content_undo_save_state(), "undo during save: a retry is taken");
+   pump(1000);
+   okf(n_before > 0 && !written_into(path, before, n_before),
+       "undo during save: and puts back the state from before it");
+   clock_step = 0;
+   free(before);
+   free(last);
+   filestream_delete(path);
+   filestream_delete(ref);
 }
 
 #ifdef HAVE_COMPRESSION
@@ -1685,6 +1871,10 @@ static int run_default_lane(void)
    test_writes_counted();
    test_undo_save_slot();
    test_undo_save_refused_push();
+   test_undo_save_during_write();
+   test_undo_save_count();
+   test_undo_save_twice();
+   test_undo_save_during_backup();
 #ifdef HAVE_COMPRESSION
    test_undo_save_restores_file();
 #endif

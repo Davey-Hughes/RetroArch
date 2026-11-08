@@ -32,6 +32,8 @@
  *  interval held  the timed auto state leaves .auto alone while held.
  *  rewind held  rewind starts from the loaded saves, not the held core.
  *  states held  Save State and Load State are refused while held.
+ *  undo wait  Undo Save behind a backup read or another undo is told
+ *            to wait (runloop_msg_queue_push is wrapped for its text).
  *  replays held  replay record and playback are refused while held.
  *  host held  netplay hosting is refused while held.
  */
@@ -70,6 +72,7 @@
 #include "../../../network/netplay/netplay.h"
 #endif
 #include "../../../tasks/task_content.h"
+#include "../../../msg_hash.h"
 
 static unsigned failures = 0;
 
@@ -171,6 +174,23 @@ static void end_sync(void)
    }
    n_begins--;
    cb(ud, NULL, false, NULL);
+}
+
+static char last_msg[256];
+
+void __real_runloop_msg_queue_push(const char *msg, size_t len,
+      unsigned prio, unsigned duration, bool flush, char *title,
+      enum message_queue_icon icon, enum message_queue_category category);
+
+/* The last notice the frontend showed. */
+void __wrap_runloop_msg_queue_push(const char *msg, size_t len,
+      unsigned prio, unsigned duration, bool flush, char *title,
+      enum message_queue_icon icon, enum message_queue_category category)
+{
+   if (msg)
+      strlcpy(last_msg, msg, sizeof(last_msg));
+   __real_runloop_msg_queue_push(msg, len, prio, duration, flush, title,
+         icon, category);
 }
 
 /* ---- helpers ------------------------------------------------------- */
@@ -590,6 +610,57 @@ static void lane_states_held(const char *core_path, const char *content_path)
    printf("[%s] states held\n", failures == before ? "ok" : "FAIL");
 }
 
+static void run_until_states_done(void)
+{
+   unsigned i;
+   for (i = 0; i < 300
+         && (   content_save_state_in_progress(NULL)
+             || content_load_state_in_progress(NULL)); i++)
+      run_slow(1);
+}
+
+/* Undo Save waits for a pending backup read or undo, which may free or
+ * replace what it would write, and says so before "nothing to undo". */
+static void lane_undo_wait(const char *core_path, const char *content_path)
+{
+   unsigned before      = failures;
+   char slot0[PATH_MAX_LENGTH];
+   const char *wait     = msg_hash_to_str(MSG_CANNOT_UNDO_SAVE_STATE_YET);
+   settings_t *settings = config_get_ptr();
+
+   real_syncs = false;
+   write_save(pre_sync);
+   CHECK(launch_from_menu(core_path, content_path), "the content did not load");
+   runloop_get_savestate_path(slot0, sizeof(slot0), 0);
+   remove(slot0);
+   configuration_set_int(settings, settings->ints.state_slot, 0);
+   command_event(CMD_EVENT_SAVE_STATE, NULL);
+   run_until_file(slot0);
+   CHECK(path_is_valid(slot0), "the state was not saved to %s", slot0);
+
+   /* the first save over the slot, its backup read pending */
+   command_event(CMD_EVENT_SAVE_STATE, NULL);
+   last_msg[0] = '\0';
+   command_event(CMD_EVENT_UNDO_SAVE_STATE, NULL);
+   CHECK(string_is_equal(last_msg, wait),
+         "Undo Save during the backup read said \"%s\"", last_msg);
+   run_until_states_done();
+
+   last_msg[0] = '\0';
+   command_event(CMD_EVENT_UNDO_SAVE_STATE, NULL);
+   CHECK(string_is_equal(last_msg, msg_hash_to_str(MSG_UNDOING_SAVE_STATE)),
+         "Undo Save after the save said \"%s\"", last_msg);
+   last_msg[0] = '\0';
+   command_event(CMD_EVENT_UNDO_SAVE_STATE, NULL);
+   CHECK(string_is_equal(last_msg, wait),
+         "a second Undo Save while the first runs said \"%s\"", last_msg);
+   run_until_states_done();
+
+   command_event(CMD_EVENT_UNLOAD_CORE, NULL);
+   run_until_closed();
+   printf("[%s] undo wait\n", failures == before ? "ok" : "FAIL");
+}
+
 #ifdef HAVE_BSV_MOVIE
 static bool replay_playing(void)
 {
@@ -858,6 +929,7 @@ int main(int argc, char *argv[])
    lane_rewind_held(core_path, content_path);
 #endif
    lane_states_held(core_path, content_path);
+   lane_undo_wait(core_path, content_path);
 #ifdef HAVE_BSV_MOVIE
    lane_replays_held(core_path, content_path);
 #endif

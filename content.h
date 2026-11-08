@@ -147,6 +147,10 @@ bool content_undo_load_buf_is_empty(void);
 bool content_undo_save_buf_is_empty(void);
 bool content_undo_save_disabled(void);
 
+/* True while a backup read or an undo that frees or replaces the
+ * save undo buffer is pending: Undo Save is refused until it is through. */
+bool content_undo_save_buf_in_use(void);
+
 /* Clears the pending subsystem rom buffer */
 bool content_is_subsystem_pending_load(void);
 
