@@ -451,6 +451,7 @@ static bool auto_holds(const char *data)
  * resume from, the file the sync may be fetching. */
 static void lane_interval_held(const char *core_path, const char *content_path)
 {
+   unsigned i;
    unsigned before      = failures;
    settings_t *settings = config_get_ptr();
    char state_auto[PATH_MAX_LENGTH + 8];
@@ -469,9 +470,18 @@ static void lane_interval_held(const char *core_path, const char *content_path)
          "the timed auto state was written while the saves waited");
    land_sync(core_path, synced);
    CHECK(sram_holds(core_path, synced), "the save was not loaded from the synced file");
+   /* the interval counts from the saves' load, not the content's */
    runloop_iterate();
+   CHECK(auto_holds("kept"),
+         "the timed auto state was written on the frame after the saves loaded");
+   for (i = 0; i < 500 && auto_holds("kept"); i++)
+   {
+      runloop_iterate();
+      task_queue_check();
+      retro_sleep(10);
+   }
    CHECK(!auto_holds("kept"),
-         "the timed auto state was not written once the saves loaded");
+         "the timed auto state was not written an interval after the saves loaded");
    configuration_set_uint(settings,
          settings->uints.savestate_automatic_interval, 0);
    real_syncs = false;

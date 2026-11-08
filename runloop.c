@@ -5586,6 +5586,9 @@ static void runloop_reset_auto_state_load(runloop_state_t *runloop_st)
    runloop_st->auto_state_load_ready     = false;
    runloop_st->auto_state_load_core_ran  = false;
    runloop_st->auto_state_load_asked     = false;
+   runloop_st->auto_state_save_ready     = false;
+   runloop_st->auto_state_owned          = false;
+   runloop_st->auto_state_interval_started = false;
 }
 
 static void runloop_apply_fastmotion_override(runloop_state_t *runloop_st,
@@ -6103,6 +6106,7 @@ static void runloop_content_saves_ready(runloop_state_t *runloop_st)
       settings->bools.cheevos_hardcore_mode_enable;
 #endif
    bool entry_state_load                        = runloop_st->entry_state_slot > -1;
+   bool auto_state_wait                         = false;
 
    runloop_st->save_load_hold                   = 0;
 
@@ -6148,9 +6152,13 @@ static void runloop_content_saves_ready(runloop_state_t *runloop_st)
          if (     runloop_st->entry_state_slot < 0
                && (     settings->bools.savestate_auto_load
                      || runloop_st->auto_state_load_asked))
-            command_event_load_auto_state();
+            auto_state_wait = command_event_load_auto_state();
       }
    }
+
+   /* Automatic state saves wait for the auto-load */
+   if (!auto_state_wait)
+      runloop_st->auto_state_save_ready = true;
 
 #ifdef HAVE_BSV_MOVIE
    movie_stop(input_st);
@@ -11518,6 +11526,7 @@ static void runloop_load_deferred_auto_state(void)
       runloop_st->auto_state_load_ready     = false;
       runloop_st->auto_state_load_core_ran  = false;
       runloop_st->auto_state_load_attempted = true;
+      runloop_st->auto_state_save_ready     = true;
       RARCH_LOG("[State] Deferred auto-load canceled because Auto Load State is disabled.\n");
       return;
    }
@@ -11529,6 +11538,7 @@ static void runloop_load_deferred_auto_state(void)
       runloop_st->auto_state_load_ready     = false;
       runloop_st->auto_state_load_core_ran  = false;
       runloop_st->auto_state_load_attempted = true;
+      runloop_st->auto_state_save_ready     = true;
       return;
    }
 
@@ -11539,7 +11549,8 @@ static void runloop_load_deferred_auto_state(void)
    runloop_st->auto_state_load_pending   = false;
    runloop_st->auto_state_load_attempted = true;
    runloop_st->auto_state_load_ready     = true;
-   command_event_load_auto_state();
+   if (!command_event_load_auto_state())
+      runloop_st->auto_state_save_ready  = true;
    runloop_st->auto_state_load_ready     = false;
    runloop_st->auto_state_load_core_ran  = false;
 }

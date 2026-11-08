@@ -580,6 +580,34 @@ static void backup_retention(void)
    CHECK(count_files(dir) == 10 + 10 + 3 + 8);
 }
 
+/* not-loaded keeps the newest copies of an automatic state, every copy
+ * of a save file */
+static void backup_retention_not_loaded(void)
+{
+   unsigned k;
+   char text[8];
+   char dir[] = ROOT "/notloaded/backups";
+   save_backups_set_roots(ROOT "/notloaded", NULL, NULL, NULL, NULL, NULL,
+         "Snes9x");
+   for (k = 0; k < 12; k++)
+   {
+      set_time(14, 0, (int)k);
+      snprintf(text, sizeof(text), "a%u", k);
+      put(ROOT "/notloaded/Game.state.auto", text);
+      CHECK(save_backups_move_to(dir, ROOT "/notloaded/Game.state.auto",
+            NULL, SAVE_BACKUP_NOT_LOADED) == SAVE_BACKUP_MADE);
+      snprintf(text, sizeof(text), "s%u", k);
+      CHECK(save_backups_copy_to(dir, ROOT "/notloaded/Game.srm", NULL,
+            SAVE_BACKUP_NOT_LOADED, text, strlen(text), false)
+            == SAVE_BACKUP_MADE);
+   }
+   CHECK(count_files(dir) == 10 + 12);
+   CHECK(!path_is_valid(ROOT "/notloaded/backups/Game - 2026-11-03 14-00-00 - Snes9x - not-loaded.state.auto"));
+   CHECK(!path_is_valid(ROOT "/notloaded/backups/Game - 2026-11-03 14-00-01 - Snes9x - not-loaded.state.auto"));
+   CHECK(holds(ROOT "/notloaded/backups/Game - 2026-11-03 14-00-02 - Snes9x - not-loaded.state.auto", "a2"));
+   CHECK(holds(ROOT "/notloaded/backups/Game - 2026-11-03 14-00-00 - Snes9x - not-loaded.srm", "s0"));
+}
+
 /* Two names cut to one: a copy may be either file's, so neither's are
  * pruned. */
 static void backup_retention_cut(void)
@@ -1276,6 +1304,7 @@ int main(void)
    backup_collisions();
    backup_identical_skip();
    backup_retention();
+   backup_retention_not_loaded();
    backup_retention_cut();
    backup_retention_long();
    backup_retention_mark();

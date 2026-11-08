@@ -2072,6 +2072,42 @@ static bool task_push_load_and_save_state(const char *path, void *data,
    return true;
 }
 
+/* An .auto the session wanted and did not load (load failed, hardcore,
+ * netplay, a replay, an entry slot) goes to the backups before the
+ * first write over it. */
+static bool content_auto_state_set_aside(const char *path)
+{
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   settings_t *settings        = config_get_ptr();
+
+   if (     !runloop_st->auto_state_owned
+         && (   settings->bools.savestate_auto_load
+             || runloop_st->auto_state_load_asked)
+         && path_is_valid(path))
+   {
+      bool kept = false;
+      char *dir = (char*)malloc(2 * PATH_MAX_LENGTH);
+      /* A rename, else an unsynced copy the new state's rename
+       * replaces: no synced copy inside the frame. */
+      if (dir && save_backups_dir(dir, PATH_MAX_LENGTH, path))
+         kept =    save_backups_move_begin(dir, path, NULL,
+                     SAVE_BACKUP_NOT_LOADED, dir + PATH_MAX_LENGTH,
+                     PATH_MAX_LENGTH) == SAVE_BACKUP_MADE
+                || save_backups_copy_to(dir, path, NULL,
+                     SAVE_BACKUP_NOT_LOADED, NULL, 0, false)
+                     == SAVE_BACKUP_MADE;
+      free(dir);
+      if (!kept)
+      {
+         RARCH_ERR("[State] Could not keep the unloaded \"%s\": not "
+               "saving over it.\n", path);
+         return false;
+      }
+   }
+   runloop_st->auto_state_owned = true;
+   return true;
+}
+
 /**
  * content_auto_save_state:
  * @path      : path of saved state that shall be written to.
@@ -2141,6 +2177,8 @@ bool content_auto_save_state(const char *path)
    free(serial_data);
    free(file);
 
+   if (_close_ret == 0 && !content_auto_state_set_aside(path))
+      _close_ret = -1;
    if (!content_finish_tmp(path, _close_ret == 0, false))
       return false;
    content_save_written();
@@ -2730,6 +2768,7 @@ void set_save_state_disable_undo(bool disable)
 bool content_save_state_automatic(retro_time_t now_us)
 {
    char savestate_path[PATH_MAX_LENGTH];
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
    settings_t *settings = config_get_ptr();
    unsigned savestate_automatic_interval =
       settings->uints.savestate_automatic_interval;
@@ -2742,6 +2781,15 @@ bool content_save_state_automatic(retro_time_t now_us)
    /* Held: the session loaded no state to save over */
    if (runloop_state_get_ptr()->save_load_hold)
       return false;
+
+   /* The interval counts from the auto-load, run or skipped */
+   if (     !runloop_st->auto_state_save_ready
+         || !runloop_st->auto_state_interval_started)
+   {
+      runloop_st->auto_state_interval_started = true;
+      last_savestate_automatic_time           = now_us;
+      return false;
+   }
 
    /* Check how long since last autosavestate, against the clock the
     * frame already read - no time() call of its own per frame. */

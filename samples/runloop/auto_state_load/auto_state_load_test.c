@@ -21,6 +21,8 @@ bool netplay_driver_ctl(enum rarch_netplay_ctl_state state, void *data)
 #ifdef HAVE_CHEEVOS
 static bool hardcore;
 bool rcheevos_hardcore_active(void) { return hardcore; }
+/* Load State on the Auto slot */
+void rcheevos_pause_hardcore(void) { hardcore = false; }
 #endif
 
 settings_t *config_get_ptr(void)
@@ -63,13 +65,35 @@ static size_t mock_size(void)
    return runs >= initialize_after ? 16 : 0;
 }
 
-bool content_load_state(const char *path, bool load_to_backup, bool autoload)
+static retro_task_callback_t load_done;
+static bool load_refused;
+/* Load State on the Auto slot, rather than the auto-load */
+static bool manual_load;
+bool content_load_state_notify(const char *path, bool load_to_backup,
+      bool autoload, retro_task_callback_t cb, void *user_data)
 {
    assert(strcmp(path, "test.auto") == 0);
-   assert(!load_to_backup && autoload);
+   assert(!load_to_backup && autoload == !manual_load);
+   (void)user_data;
+   load_done = cb;
    loads++;
+   return !load_refused;
+}
+bool content_load_state(const char *path, bool load_to_backup, bool autoload)
+{
+   return content_load_state_notify(path, load_to_backup, autoload,
+         NULL, NULL);
+}
+
+/* The close's auto save */
+static unsigned auto_saves;
+bool content_auto_save_state(const char *path)
+{
+   assert(strcmp(path, "test.auto") == 0);
+   auto_saves++;
    return true;
 }
+const char *path_get(enum rarch_path_type type) { (void)type; return "test"; }
 
 bool path_is_valid(const char *path)
 {
@@ -185,6 +209,101 @@ static void reset(unsigned frames, bool quirk)
    strcpy(runloop_state.name.savestate, "test");
    runs = size_checks = loads = settings_checks = path_checks = 0;
    initialize_after = frames;
+   runloop_state.entry_state_slot = -1;
+   load_done    = NULL;
+   load_refused = false;
+   manual_load  = false;
+   auto_saves   = 0;
+}
+
+/* The state task's end, as the queue would call it */
+static void load_finished(const char *error)
+{
+   if (load_done)
+      load_done(NULL, "test.auto", NULL, error);
+}
+
+static void test_auto_state_order(void)
+{
+   unsigned i;
+
+   /* quit_before_autoload: no close save over a .auto not yet loaded */
+   reset(5, true);
+   runloop_content_saves_ready(&runloop_state);
+   core_run();
+   runloop_load_deferred_auto_state();
+   assert(command_event_save_auto_state() == 0 && auto_saves == 0);
+   for (i = 1; i < 5; i++)
+   {
+      core_run();
+      runloop_load_deferred_auto_state();
+   }
+   assert(loads == 1);
+   assert(command_event_save_auto_state() == 0 && auto_saves == 0);
+   load_finished(NULL);
+   assert(command_event_save_auto_state() > 0 && auto_saves == 1);
+
+   /* interval_after_autoload: saves wait for the deferred load's end */
+   reset(5, true);
+   assert(command_event_load_auto_state());
+   for (i = 0; i < 5; i++)
+   {
+      assert(!runloop_state.auto_state_save_ready);
+      core_run();
+      runloop_load_deferred_auto_state();
+   }
+   assert(loads == 1 && !runloop_state.auto_state_save_ready);
+   load_finished(NULL);
+   assert(runloop_state.auto_state_save_ready);
+   assert(runloop_state.auto_state_owned);
+
+   /* a failed load: saves go ahead, the .auto is not this session's */
+   reset(1, false);
+   runloop_content_saves_ready(&runloop_state);
+   assert(loads == 1 && !runloop_state.auto_state_save_ready);
+   load_finished("failed");
+   assert(runloop_state.auto_state_save_ready);
+   assert(!runloop_state.auto_state_owned);
+
+   /* skipped (Auto Load State off), or canceled while deferred */
+   reset(1, false);
+   test_settings.bools.savestate_auto_load = false;
+   runloop_content_saves_ready(&runloop_state);
+   assert(loads == 0 && runloop_state.auto_state_save_ready);
+   reset(3, true);
+   runloop_content_saves_ready(&runloop_state);
+   assert(!runloop_state.auto_state_save_ready);
+   test_settings.bools.savestate_auto_load = false;
+   runloop_load_deferred_auto_state();
+   assert(runloop_state.auto_state_save_ready);
+   assert(!runloop_state.auto_state_owned);
+   /* not one asked for by Load State > Auto */
+   reset(3, true);
+   test_settings.bools.savestate_auto_load = false;
+   runloop_state.auto_state_load_asked     = true;
+   runloop_content_saves_ready(&runloop_state);
+   for (i = 0; i < 3; i++)
+   {
+      core_run();
+      runloop_load_deferred_auto_state();
+   }
+   assert(loads == 1 && !runloop_state.auto_state_save_ready);
+   load_finished(NULL);
+   assert(runloop_state.auto_state_save_ready);
+   assert(runloop_state.auto_state_owned);
+
+   /* a refused push: no load to wait for */
+   reset(1, false);
+   load_refused = true;
+   runloop_content_saves_ready(&runloop_state);
+   assert(loads == 1 && runloop_state.auto_state_save_ready);
+   reset(1, true);
+   runloop_content_saves_ready(&runloop_state);
+   load_refused = true;
+   core_run();
+   runloop_load_deferred_auto_state();
+   assert(loads == 1 && runloop_state.auto_state_save_ready);
+   puts("auto-state order tests passed");
 }
 
 #define STATES "asl_states"
@@ -485,6 +604,37 @@ static void lane_max_keep_exact_name(void)
    assert(there(game));
 }
 
+/* The Auto slot saved or loaded by hand: the .auto is the session's
+ * once that is through */
+static void test_auto_slot_owned(void)
+{
+   reset(0, false);
+   test_settings.ints.state_slot = 0;
+   save_done = NULL;
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE));
+   save_finished(NULL);
+   assert(!runloop_state.auto_state_owned);
+   test_settings.ints.state_slot = -1;
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE));
+   assert(save_done && !runloop_state.auto_state_owned);
+   save_finished("failed");
+   assert(!runloop_state.auto_state_owned);
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE));
+   save_finished(NULL);
+   assert(runloop_state.auto_state_owned);
+   reset(0, false);
+   test_settings.ints.state_slot = -1;
+   manual_load = true;
+   assert(command_event_main_state(CMD_EVENT_LOAD_STATE));
+   assert(loads == 1 && !runloop_state.auto_state_owned);
+   load_finished("failed");
+   assert(!runloop_state.auto_state_owned);
+   assert(command_event_main_state(CMD_EVENT_LOAD_STATE));
+   load_finished(NULL);
+   assert(runloop_state.auto_state_owned);
+   assert(!runloop_state.auto_state_save_ready);
+}
+
 int main(void)
 {
    unsigned i;
@@ -505,6 +655,8 @@ int main(void)
    states_clear();
    filestream_delete(STATES);
    puts("max_keep tests passed");
+   test_auto_slot_owned();
+   test_auto_state_order();
    reset(3, true);
    assert(command_event_load_auto_state());
    runloop_load_deferred_auto_state();
@@ -547,6 +699,7 @@ int main(void)
    core_run();
    runloop_load_deferred_auto_state();
    assert(runs == 0 && loads == 0 && !runloop_state.auto_state_load_pending);
+   assert(runloop_state.auto_state_save_ready);
 
    reset(3, true);
    assert(command_event_load_auto_state());
@@ -557,7 +710,13 @@ int main(void)
    reset(3, true);
    assert(command_event_load_auto_state());
    core_run();
+   runloop_state.auto_state_save_ready       = true;
+   runloop_state.auto_state_owned            = true;
+   runloop_state.auto_state_interval_started = true;
    runloop_reset_auto_state_load(&runloop_state);
+   assert(!runloop_state.auto_state_save_ready);
+   assert(!runloop_state.auto_state_owned);
+   assert(!runloop_state.auto_state_interval_started);
    assert(!runloop_state.auto_state_load_pending);
    assert(!runloop_state.auto_state_load_attempted);
    assert(!runloop_state.auto_state_load_ready);

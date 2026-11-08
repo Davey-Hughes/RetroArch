@@ -131,6 +131,8 @@
 #include <queues/message_queue.h>
 #include <queues/task_queue.h>
 #include <streams/file_stream.h>
+#include <lists/dir_list.h>
+#include <vfs/vfs_implementation.h>
 #include <retro_timers.h>
 
 #include "../../../content.h"
@@ -1892,6 +1894,134 @@ static void test_writes_counted(void)
    filestream_delete(ram_path);
 }
 
+/* -----------------------------------------------------------------
+ * Automatic state saves: the interval counts from the auto-load, and
+ * an .auto the session wanted and did not load goes to the backups
+ * before the first write over it.
+ * ----------------------------------------------------------------- */
+/* NULL @want: any content */
+static unsigned auto_backups(const char *auto_path, const char *want)
+{
+   char dir[PATH_MAX_LENGTH];
+   unsigned i, n = 0;
+   struct string_list *list;
+   struct save_backup_name name;
+
+   if (!save_backups_dir(dir, sizeof(dir), auto_path))
+      return 0;
+   if (!(list = dir_list_new(dir, NULL, false, true, false, false)))
+      return 0;
+   for (i = 0; i < list->size; i++)
+   {
+      void   *data = NULL;
+      int64_t len  = 0;
+      if (     save_backups_parse(path_basename(list->elems[i].data), &name)
+            && name.reason == SAVE_BACKUP_NOT_LOADED
+            && (  !want
+               || (  filestream_read_file(list->elems[i].data, &data, &len)
+                  && len == (int64_t)strlen(want)
+                  && !memcmp(data, want, (size_t)len))))
+         n++;
+      free(data);
+   }
+   dir_list_free(list);
+   return n;
+}
+
+static void auto_state_clear(const char *dir)
+{
+   unsigned i;
+   char backups[PATH_MAX_LENGTH];
+   struct string_list *list;
+   fill_pathname_join(backups, dir, "backups", sizeof(backups));
+   if ((list = dir_list_new(backups, NULL, false, true, false, false)))
+   {
+      for (i = 0; i < list->size; i++)
+         filestream_delete(list->elems[i].data);
+      dir_list_free(list);
+   }
+   filestream_delete(backups);
+   if ((list = dir_list_new(dir, NULL, false, true, false, false)))
+   {
+      for (i = 0; i < list->size; i++)
+         filestream_delete(list->elems[i].data);
+      dir_list_free(list);
+   }
+   filestream_delete(dir);
+}
+
+static void test_auto_state(void)
+{
+   const char *dir  = "sst_auto";
+   const char *path = "sst_auto/Game.state.auto";
+   const char *auto_slot = "save_state_io_test_auto_-1.state";
+
+   frontend_reset();
+   core_fill(TEST_SAVE_STATE_CHUNK);
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   save_backups_set_roots(NULL, dir, NULL, NULL, NULL, NULL, "Core");
+
+   /* interval_after_autoload: from the auto-load on, a whole interval */
+   stub_settings.uints.savestate_automatic_interval = 1;
+   okf(!content_save_state_automatic(10000000),
+       "auto state: no interval save before the auto-load");
+   stub_runloop.auto_state_save_ready = true;
+   okf(!content_save_state_automatic(10500000),
+       "auto state: none until an interval after it");
+   okf(content_save_state_automatic(11000000) && file_size(auto_slot) > 0,
+       "auto state: one an interval after it");
+   filestream_delete(auto_slot);
+
+   /* the next content, its auto-load skipped before any frame: the
+    * interval counts from its first frame, not the last content's */
+   stub_runloop.auto_state_interval_started = false;
+   okf(!content_save_state_automatic(20000000),
+       "auto state: skipped, no interval save on the first frame");
+   okf(!content_save_state_automatic(20500000),
+       "auto state: skipped, none until an interval after it");
+   okf(content_save_state_automatic(21000000) && file_size(auto_slot) > 0,
+       "auto state: skipped, one an interval after it");
+   filestream_delete(auto_slot);
+
+   /* auto_not_loaded_backed_up */
+   stub_runloop.auto_state_owned           = false;
+   stub_settings.bools.savestate_auto_load = true;
+   filestream_write_file(path, "old", 3);
+   okf(content_auto_save_state(path), "auto state: the save is written");
+   okf(file_size(path) > (long)core_len, "auto state: holds the new state");
+   okf(auto_backups(path, "old") == 1,
+       "auto state: the unloaded one is in the backups, not-loaded");
+   okf(content_auto_save_state(path) && auto_backups(path, NULL) == 1,
+       "auto state: once a session");
+
+   /* loaded, or Auto Load State off: written over as it is */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_owned = false;
+   stub_settings.bools.savestate_auto_load = false;
+   filestream_write_file(path, "old", 3);
+   okf(content_auto_save_state(path) && auto_backups(path, "old") == 0,
+       "auto state: no copy without Auto Load State");
+   stub_runloop.auto_state_owned = true;
+   stub_settings.bools.savestate_auto_load = true;
+   filestream_write_file(path, "old", 3);
+   okf(content_auto_save_state(path) && auto_backups(path, "old") == 0,
+       "auto state: no copy of the one loaded");
+
+   /* no backups folder to keep it in: the unloaded one stays */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   filestream_write_file("sst_auto/backups", "file", 4);
+   stub_runloop.auto_state_owned = false;
+   filestream_write_file(path, "old", 3);
+   okf(!content_auto_save_state(path) && file_size(path) == 3,
+       "auto state: not kept, not written over");
+
+   auto_state_clear(dir);
+   save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+}
+
 static int run_default_lane(void)
 {
    printf("== task_save.c I/O regression oracle ==\n");
@@ -1929,6 +2059,7 @@ static int run_default_lane(void)
    test_undo_save_twice();
    test_undo_save_during_backup();
    test_undo_save_not_backed_up();
+   test_auto_state();
 #ifdef HAVE_COMPRESSION
    test_undo_save_restores_file();
 #endif

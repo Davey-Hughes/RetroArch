@@ -6503,8 +6503,10 @@ size_t command_event_save_auto_state(void)
    char savestate_name_auto[PATH_MAX_LENGTH];
    const char *a = NULL;
 
-   /* Held: the session loaded no state to save over */
+   /* Held, or the auto-load still to come: the session loaded no
+    * state to save over */
    if (     runloop_st->save_load_hold
+         || !runloop_st->auto_state_save_ready
          || !core_info_current_supports_savestate())
       return 0;
    a = path_basename(path_get(RARCH_PATH_BASENAME));
@@ -6600,6 +6602,17 @@ bool command_event_load_entry_state(settings_t *settings)
    return ret;
 }
 
+/* The auto-load is through: automatic state saves may write, and
+ * over the .auto as it is only when it was loaded. */
+static void command_event_auto_state_loaded(retro_task_t *task,
+      void *task_data, void *user_data, const char *error)
+{
+   runloop_state_t *runloop_st       = runloop_state_get_ptr();
+   runloop_st->auto_state_save_ready = true;
+   if (!error)
+      runloop_st->auto_state_owned   = true;
+}
+
 bool command_event_load_auto_state(void)
 {
    size_t _len;
@@ -6652,7 +6665,8 @@ bool command_event_load_auto_state(void)
       runloop_st->auto_state_load_attempted = true;
    }
 
-   ret = content_load_state(savestate_name_auto, false, true);
+   ret = content_load_state_notify(savestate_name_auto, false, true,
+         command_event_auto_state_loaded, NULL);
 
    RARCH_LOG("[State] %s \"%s\".\n",
          msg_hash_to_str(MSG_FOUND_AUTO_SAVESTATE_IN),
@@ -6999,6 +7013,15 @@ static void command_event_save_state_done(retro_task_t *task,
    if (!error)
       command_event_set_savestate_garbage_collect(config_get_ptr(), victim);
    free(victim);
+}
+
+/* The Auto slot saved or loaded by hand: the .auto is this session's */
+static void command_event_auto_slot_done(retro_task_t *task,
+      void *task_data, void *user_data, const char *error)
+{
+   if (!error)
+      runloop_state_get_ptr()->auto_state_owned = true;
+   command_event_save_state_done(task, task_data, user_data, error);
 }
 
 bool command_event_ram_state_to_file(const char *path)
@@ -7477,6 +7500,7 @@ bool command_event_main_state(unsigned cmd)
    size_t _len                 = 0;
    settings_t *settings        = config_get_ptr();
    bool savestates_enabled     = core_info_current_supports_savestate();
+   bool auto_slot              = settings->ints.state_slot < 0;
    bool ret                    = false;
 
    if (command_state_held())
@@ -7526,7 +7550,8 @@ bool command_event_main_state(unsigned cmd)
                   struct savestate_victim *victim =
                      command_event_savestate_victim(settings, state_path);
                   queued = content_save_state_notify(state_path, true,
-                        victim ? command_event_save_state_done : NULL,
+                        auto_slot ? command_event_auto_slot_done
+                        : victim ? command_event_save_state_done : NULL,
                         victim);
                   if (!queued)
                      free(victim);
@@ -7563,7 +7588,9 @@ bool command_event_main_state(unsigned cmd)
             {
                bool res = false;
                if (cmd == CMD_EVENT_LOAD_STATE)
-                  res = content_load_state(state_path, false, false);
+                  res = content_load_state_notify(state_path, false, false,
+                        auto_slot ? command_event_auto_slot_done : NULL,
+                        NULL);
                else
                   res = content_load_state_from_ram();
 

@@ -390,6 +390,13 @@ struct runloop
    /* The auto state was asked for by name (Load State > Auto), so it
     * loads whatever Auto Load State says. */
    bool auto_state_load_asked;
+   /* The auto-load ran or was skipped: automatic state saves may
+    * write the .auto */
+   bool auto_state_save_ready;
+   /* The .auto is this session's: loaded, or moved to the backups */
+   bool auto_state_owned;
+   /* The interval auto save has started counting for this content */
+   bool auto_state_interval_started;
 
    bool perfcnt_enable;
    bool paused_hotkey;

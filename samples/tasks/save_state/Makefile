@@ -29,6 +29,12 @@ LIBRETRO_COMM_DIR := $(REPO_ROOT)/libretro-common
 
 SOURCES := save_state_io_test.c \
            $(REPO_ROOT)/tasks/task_save.c \
+           $(REPO_ROOT)/save_backups.c \
+           $(LIBRETRO_COMM_DIR)/compat/compat_posix_string.c \
+           $(LIBRETRO_COMM_DIR)/compat/compat_strcasestr.c \
+           $(LIBRETRO_COMM_DIR)/file/retro_dirent.c \
+           $(LIBRETRO_COMM_DIR)/formats/json/rjson.c \
+           $(LIBRETRO_COMM_DIR)/lists/dir_list.c \
            $(LIBRETRO_COMM_DIR)/compat/compat_strl.c \
            $(LIBRETRO_COMM_DIR)/compat/compat_strldup.c \
            $(LIBRETRO_COMM_DIR)/compat/fopen_utf8.c \

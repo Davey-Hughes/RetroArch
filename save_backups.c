@@ -681,12 +681,12 @@ static enum save_backup_result save_backups_write_copy(char *s, size_t len,
    if (move)
    {
       if (filestream_rename(path, s) != 0)
+      {
          result = SAVE_BACKUP_COPY_OWED;
-      else
-         result = SAVE_BACKUP_MADE;
-      goto end;
+         goto end;
+      }
    }
-   if (!save_backups_write_file(s, data, (int64_t)data_len, sync))
+   else if (!save_backups_write_file(s, data, (int64_t)data_len, sync))
    {
       s[0] = '\0';
       goto end;
@@ -697,7 +697,9 @@ static enum save_backup_result save_backups_write_copy(char *s, size_t len,
    if (     names
          && game_len == base_len
          && (  reason == SAVE_BACKUP_BEFORE_STATE_LOAD
-            || reason == SAVE_BACKUP_CHANGED_ELSEWHERE))
+            || reason == SAVE_BACKUP_CHANGED_ELSEWHERE
+            || (  reason == SAVE_BACKUP_NOT_LOADED
+               && string_is_equal(ext, ".state.auto"))))
       save_backups_retain(list, names, mine, reason, strlen(ext));
 
 end:
