@@ -3231,6 +3231,11 @@ bool content_save_state_automatic(retro_time_t now_us)
    if ((now_us - last_savestate_automatic_time)
          < (retro_time_t)savestate_automatic_interval * 1000000)
       return false;
+
+   /* A state save still writing may share the .auto's temp file:
+    * the next frame tries again */
+   if (content_save_state_in_progress(NULL))
+      return false;
    
    /* Generate the savestate path */
    if (!runloop_get_savestate_path(savestate_path, 

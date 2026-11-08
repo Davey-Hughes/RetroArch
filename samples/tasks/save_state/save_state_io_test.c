@@ -396,16 +396,24 @@ static void msg_push_stub(retro_task_t *task, const char *msg,
 #define REFUSE_BACK   8
 static int      refuse_renames;
 static unsigned file_syncs;
+/* The next temp move in waits here: 1 armed, 2 waiting, 0 let go */
+static int      hold_temp_move;
 int __real_retro_vfs_file_rename_impl(const char *old_path,
       const char *new_path);
 int __wrap_retro_vfs_file_rename_impl(const char *old_path,
       const char *new_path)
 {
    int    refuse = __atomic_load_n(&refuse_renames, __ATOMIC_RELAXED);
+   int    armed  = 1;
    size_t _len   = strlen(old_path);
    bool   temp   = _len > 4 && !strcmp(old_path + _len - 4, ".tmp");
    bool   into   = strstr(new_path, "backups") != NULL;
    bool   held   = _len > 5 && !strcmp(old_path + _len - 5, ".prev");
+   if (     temp
+         && __atomic_compare_exchange_n(&hold_temp_move, &armed, 2, false,
+               __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+      while (__atomic_load_n(&hold_temp_move, __ATOMIC_ACQUIRE) == 2)
+         retro_sleep(1);
    if (     ((refuse & REFUSE_MOVE)   &&  into && !temp)
          || ((refuse & REFUSE_LAND)   &&  into &&  temp)
          || ((refuse & REFUSE_FINISH) && !into &&  temp)
@@ -2133,6 +2141,61 @@ static void test_auto_state_undo(void)
 }
 
 /* -----------------------------------------------------------------
+ * The interval save skips its tick while another state save is still
+ * writing, as both write the .auto's temp; the next frame tries again.
+ * ----------------------------------------------------------------- */
+static void test_auto_state_skip_tick(void)
+{
+   const char *auto_slot = "save_state_io_test_auto_-1.state";
+   const char *other     = "sst_skip_tick.state";
+   void   *before = NULL, *landed = NULL;
+   int64_t n_before = -1, n_landed = -1;
+   int i;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(auto_slot);
+   filestream_delete(other);
+   core_fill(40 * TEST_SAVE_STATE_CHUNK);
+   stub_settings.uints.savestate_automatic_interval = 1;
+   stub_runloop.auto_state_save_ready = true;
+   /* only the save is skipped: the interval starts on its frame */
+   content_save_state(other, true);
+   content_save_state_automatic(10000000);
+   pump(1000);
+   okf(content_save_state_automatic(11000000) && file_size(auto_slot) > 0,
+       "skip tick: nothing writing, the interval save writes");
+   if (!filestream_read_file(auto_slot, &before, &n_before))
+      n_before = -1;
+
+   /* a save to the Auto slot past its backup read, still writing */
+   clock_step = TEST_TICK_BUDGET_US;
+   memset(core_mem, 0x99, core_len);
+   content_save_state(auto_slot, true);
+   for (i = 0; i < 1000 && content_load_state_in_progress(NULL); i++)
+      task_queue_check();
+   task_queue_check();
+   okf(content_save_state_in_progress(NULL) && tmp_exists(auto_slot),
+       "skip tick: the Auto slot save is writing");
+   okf(!content_save_state_automatic(12000000)
+         && n_before > 0 && !written_into(auto_slot, before, n_before),
+       "skip tick: the interval save skips its tick");
+   pump(1000);
+   clock_step = 0;
+   if (!filestream_read_file(auto_slot, &landed, &n_landed))
+      n_landed = -1;
+   memset(core_mem, 0x55, core_len);
+   okf(content_save_state_automatic(12016000)
+         && n_landed > 0 && written_into(auto_slot, landed, n_landed),
+       "skip tick: the next frame saves");
+
+   free(before);
+   free(landed);
+   filestream_delete(auto_slot);
+   filestream_delete(other);
+}
+
+/* -----------------------------------------------------------------
  * A not-loaded .auto that cannot move into its backups (across drives)
  * waits beside itself under a held name while a task copies it there.
  * ----------------------------------------------------------------- */
@@ -2535,6 +2598,90 @@ static void test_auto_state_keep_threaded(void)
    save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 }
 
+/* The worker waiting at its temp's move; the frame keeps gathering */
+static bool temp_move_waits(void)
+{
+   int spins = 0;
+   while (__atomic_load_n(&hold_temp_move, __ATOMIC_ACQUIRE) != 2)
+   {
+      if (spins++ >= 20000)
+         return false;
+      task_queue_check();
+      retro_sleep(1);
+   }
+   return true;
+}
+
+static void test_auto_state_skip_tick_threaded(void)
+{
+   const char *auto_slot = "save_state_io_test_auto_-1.state";
+   void   *was = NULL, *cur = NULL;
+   int64_t n_was = -1, n_cur = -1;
+   bool    waits;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(auto_slot);
+   core_fill(TEST_SAVE_STATE_CHUNK);
+   stub_settings.uints.savestate_automatic_interval = 1;
+   stub_runloop.auto_state_save_ready = true;
+   content_save_state_automatic(10000000);
+
+   memset(core_mem, 0x11, core_len);
+   content_save_state(auto_slot, true);
+   pump_threaded();
+   if (!filestream_read_file(auto_slot, &was, &n_was))
+      n_was = -1;
+   memset(core_mem, 0x33, core_len);
+   content_save_state(auto_slot, true);
+   pump_threaded();
+   if (!filestream_read_file(auto_slot, &cur, &n_cur))
+      n_cur = -1;
+
+   /* Undo Save of the .auto, held at its move into place */
+   __atomic_store_n(&hold_temp_move, 1, __ATOMIC_RELEASE);
+   okf(content_undo_save_state(), "threaded skip tick: Undo Save is pushed");
+   waits = temp_move_waits();
+   okf(waits && !content_save_state_automatic(11000000)
+         && n_cur > 0 && !written_into(auto_slot, cur, n_cur),
+       "threaded skip tick: no interval save during the undo");
+   __atomic_store_n(&hold_temp_move, 0, __ATOMIC_RELEASE);
+   pump_threaded();
+   okf(n_was > 0 && !written_into(auto_slot, was, n_was),
+       "threaded skip tick: the undo lands");
+   memset(core_mem, 0x55, core_len);
+   okf(content_save_state_automatic(11016000)
+         && written_into(auto_slot, was, n_was),
+       "threaded skip tick: the next frame saves after the undo");
+
+   /* Save State to the Auto slot, held the same way */
+   free(cur);
+   cur = NULL;
+   if (!filestream_read_file(auto_slot, &cur, &n_cur))
+      n_cur = -1;
+   memset(core_mem, 0x77, core_len);
+   __atomic_store_n(&hold_temp_move, 1, __ATOMIC_RELEASE);
+   content_save_state(auto_slot, true);
+   waits = temp_move_waits();
+   okf(waits && !content_save_state_automatic(12016000)
+         && n_cur > 0 && !written_into(auto_slot, cur, n_cur),
+       "threaded skip tick: no interval save during the Auto slot save");
+   __atomic_store_n(&hold_temp_move, 0, __ATOMIC_RELEASE);
+   pump_threaded();
+   free(was);
+   was = NULL;
+   if (!filestream_read_file(auto_slot, &was, &n_was))
+      n_was = -1;
+   memset(core_mem, 0x55, core_len);
+   okf(content_save_state_automatic(12032000)
+         && n_was > 0 && written_into(auto_slot, was, n_was),
+       "threaded skip tick: the next frame saves after the Auto slot save");
+
+   free(was);
+   free(cur);
+   filestream_delete(auto_slot);
+}
+
 static int run_default_lane(void)
 {
    printf("== task_save.c I/O regression oracle ==\n");
@@ -2574,6 +2721,7 @@ static int run_default_lane(void)
    test_undo_save_not_backed_up();
    test_auto_state();
    test_auto_state_undo();
+   test_auto_state_skip_tick();
    test_auto_state_keep();
 #ifdef HAVE_COMPRESSION
    test_undo_save_restores_file();
@@ -2595,6 +2743,7 @@ static int run_threaded_lane(void)
    test_threaded_roundtrip();
    test_threaded_load_waits_for_frames();
    test_auto_state_keep_threaded();
+   test_auto_state_skip_tick_threaded();
 
    content_reset_savestate_backups();
    task_queue_deinit();
