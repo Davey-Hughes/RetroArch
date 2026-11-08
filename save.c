@@ -1649,6 +1649,7 @@ void path_init_savefile_rtc(const char *savefile_path)
 /* Changes at every content load and unload. Main thread only. */
 static unsigned content_savefile_lifetimes = 0;
 static unsigned content_save_write_count   = 0;
+static unsigned content_state_fetch_count  = 0;
 
 void path_deinit_savefile(void)
 {
@@ -1680,6 +1681,16 @@ void content_save_written(void)
 unsigned content_save_writes(void)
 {
    return content_save_write_count;
+}
+
+void content_state_fetched(void)
+{
+   content_state_fetch_count++;
+}
+
+unsigned content_state_fetches(void)
+{
+   return content_state_fetch_count;
 }
 
 void *savefile_ptr_get(void)

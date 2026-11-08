@@ -36,6 +36,8 @@ static void *pending_fetch;
  * 2: deleting it fails too; 3: the delete removes it but reports a
  * failure, as a network drive can; 4: the copy fails, a full card */
 static retro_atomic_int_t refuse_move, refused;
+/* states_lane(): moving a state into its backups fails */
+static retro_atomic_int_t refuse_states;
 /* syncs of a backup, and how many came before the save was deleted */
 static retro_atomic_int_t backup_syncs, syncs_at_delete;
 /* syncs of a backup on the main thread; copies held at their sync
@@ -89,6 +91,9 @@ int __wrap_filestream_rename(const char *old_path, const char *new_path)
       retro_atomic_inc_int(&refused);
       return -1;
    }
+   if (     retro_atomic_load_relaxed_int(&refuse_states)
+         && string_ends_with(old_path, ".state"))
+      return -1;
    return __real_filestream_rename(old_path, new_path);
 }
 int __real_filestream_delete(const char *path);
@@ -164,6 +169,8 @@ bool content_savefile_is_live(const char *path)
 }
 unsigned content_savefile_lifetime(void) { return lifetime; }
 unsigned content_save_writes(void) { return writes; }
+static unsigned state_fetches;
+void content_state_fetched(void) { state_fetches++; }
 bool content_save_state_in_progress(void *data)
 { (void)data; return state_writing; }
 void runloop_save_load_release(uint8_t bit)
@@ -570,6 +577,145 @@ static void lane(bool threaded, bool deletion, bool owned, bool no_memory,
    filestream_delete(manifest);
 }
 
+/* Two states whose backups are copies, as with the states folder on
+ * another drive than the saves: one sync places both, the first copy
+ * held until the second is queued. */
+static void states_lane(bool threaded)
+{
+   static const char *names[] = { "a.state", "b.state" };
+   retro_task_t *task = task_init();
+   task_cloud_sync_state_t *st = (task_cloud_sync_state_t*)calloc(1, sizeof(*st));
+   char saves[160], states[160], path[200], key[32], manifest[160];
+   struct string_list *backups;
+   union string_list_elem_attr attr;
+   unsigned i, k, queued = 0;
+   unsigned writes_at = writes;
+   retired = 0;
+   live = 0;
+   expect_old = 0;
+   expect_failure = 0;
+   state_fetches = 0;
+   state_writing = false;
+   snprintf(saves, sizeof(saves), "%s/owed-saves", directory);
+   snprintf(states, sizeof(states), "%s/owed-states", directory);
+   CHECK(path_mkdir(saves));
+   CHECK(path_mkdir(states));
+   st->server_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->local_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->current_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->updated_server_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->updated_local_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->dirlist = string_list_new();
+   attr.i = 0;
+   string_list_append(st->dirlist, "saves", attr);
+   st->dirlist->elems[0].userdata = strdup(saves);
+   string_list_append(st->dirlist, "states", attr);
+   st->dirlist->elems[1].userdata = strdup(states);
+   snprintf(st->dir_core_assets, sizeof(st->dir_core_assets), "%s/assets",
+         directory);
+   CHECK(path_mkdir(st->dir_core_assets));
+   for (k = 0; k < 2; k++)
+   {
+      snprintf(path, sizeof(path), "%s/%s", states, names[k]);
+      pathname_conform_slashes_to_os(path);
+      snprintf(key, sizeof(key), "states/%s", names[k]);
+      CHECK(filestream_write_file(path, "old", 3));
+      add_key(st->server_manifest, NULL, "new", key);
+      add_key(st->local_manifest, NULL, "old", key);
+      add_key(st->current_manifest, path, "old", key);
+   }
+   retro_atomic_int_init(&st->waiting, 0);
+   retro_atomic_int_init(&st->phase, CLOUD_SYNC_PHASE_END);
+   st->cb = done;
+   task_cloud_sync_task_setup(task, st, "Cloud Sync");
+   task_queue_init(threaded, NULL);
+   for (k = 0; k < 2; k++)
+   {
+      RFILE *f;
+      st->server_idx = k;
+      pending_fetch  = NULL;
+      task_cloud_sync_fetch_server_file(st);
+      CHECK(pending_fetch != NULL);
+      snprintf(path, sizeof(path), "%s/%s.rafetching", states, names[k]);
+      pathname_conform_slashes_to_os(path);
+      CHECK(filestream_write_file(path, "new", 3));
+      f = filestream_open(path, RETRO_VFS_FILE_ACCESS_READ,
+            RETRO_VFS_FILE_ACCESS_HINT_NONE);
+      CHECK(f != NULL);
+      snprintf(key, sizeof(key), "states/%s", names[k]);
+      if (pending_fetch)
+         task_cloud_sync_fetch_cb(pending_fetch, key, true, f);
+   }
+   retro_atomic_store_relaxed_int(&refuse_states, 1);
+   retro_atomic_store_release_int(&gate, 1);
+   releases = 0;
+   task_queue_push(task);
+   for (i = 0; i < 2000 && !retired; i++)
+   {
+      task_queue_check();
+#if defined(TCS_MOVE_WORKER)
+      if (     retro_atomic_load_acquire_int(&gate)
+            && retro_atomic_load_acquire_int(&at_gate))
+      {
+         tcs_move_t *mv;
+         unsigned n = 0;
+         for (mv = st->moves; mv; mv = mv->next)
+            n++;
+         if (n == 2)
+         {
+            queued = n;
+            retro_atomic_store_release_int(&gate, 0);
+         }
+      }
+#else
+      queued = 2;
+      retro_atomic_store_release_int(&gate, 0);
+#endif
+      if (i == 1000)
+         retro_atomic_store_release_int(&gate, 0);
+      retro_sleep(1);
+   }
+   CHECK(queued == 2);
+   CHECK(retired == 1);
+   CHECK(releases == 1);
+   retro_atomic_store_relaxed_int(&refuse_states, 0);
+   for (k = 0; k < 2; k++)
+   {
+      snprintf(path, sizeof(path), "%s/%s", states, names[k]);
+      pathname_conform_slashes_to_os(path);
+      CHECK(holds(path, "new"));
+      filestream_delete(path);
+      snprintf(path, sizeof(path), "%s/%s.rafetching", states, names[k]);
+      pathname_conform_slashes_to_os(path);
+      CHECK(!path_is_valid(path));
+   }
+   /* the sync's own downloads are not frontend writes */
+   CHECK(state_fetches == 2);
+   CHECK(writes == writes_at);
+   snprintf(path, sizeof(path), "%s/backups/cloud-sync/states", saves);
+   backups = dir_list_new(path, NULL, false, false, true, true);
+   CHECK(backups && backups->size == 2);
+   for (i = 0; backups && i < backups->size; i++)
+   {
+      CHECK(holds(backups->elems[i].data, "old"));
+      filestream_delete(backups->elems[i].data);
+   }
+   string_list_free(backups);
+   path_rmdir(path);
+   snprintf(path, sizeof(path), "%s/backups/cloud-sync", saves);
+   path_rmdir(path);
+   snprintf(path, sizeof(path), "%s/backups", saves);
+   path_rmdir(path);
+   path_rmdir(saves);
+   path_rmdir(states);
+   task_queue_deinit();
+   snprintf(manifest, sizeof(manifest), "%s/assets/manifest.local", directory);
+   filestream_delete(manifest);
+   snprintf(manifest, sizeof(manifest), "%s/assets/manifest.local.roots",
+         directory);
+   filestream_delete(manifest);
+}
+
 /* Two backups of one key in one second are told apart by number; with
  * no synced save folder they go under the core assets' cloud_backups. */
 static void backup_location_lane(void)
@@ -957,6 +1103,7 @@ int main(void)
    retro_atomic_int_init(&at_gate, 0);
    retro_atomic_int_init(&max_piece, 0);
    retro_atomic_int_init(&vanishing, 0);
+   retro_atomic_int_init(&refuse_states, 0);
 #if defined(HAVE_THREADS) && !defined(TCS_LOCK_FREE)
    tcs_manifest_lock = slock_new();
 #endif
@@ -1025,6 +1172,8 @@ int main(void)
       budget_lane(edge, 2, 1);
    }
 #endif
+   for (t = 0; t < 2; t++)
+      states_lane(t != 0);
    two_syncs_lane();
    sweep_lane();
    backup_location_lane();

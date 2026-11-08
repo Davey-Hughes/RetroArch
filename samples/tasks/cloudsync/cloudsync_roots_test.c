@@ -202,6 +202,8 @@ bool content_savefile_is_live(const char *path)
 { return live_save && string_ends_with(path, live_save); }
 unsigned content_savefile_lifetime(void) { return 0; }
 unsigned content_save_writes(void) { return 0; }
+static unsigned state_fetches;
+void content_state_fetched(void) { state_fetches++; }
 bool content_save_state_in_progress(void *data) { (void)data; return false; }
 void runloop_save_load_release(uint8_t bit) { (void)bit; }
 void task_window_progress_cb(retro_task_t *task) { (void)task; }
@@ -1994,6 +1996,40 @@ struct lane
 static void unreadable_subfolder(bool threaded) { unreadable_lane(threaded, true); }
 static void readdir_error(bool threaded)        { unreadable_lane(threaded, false); }
 
+/* A state that comes down is counted for the state limit's check
+ * across a save; a save that comes down is not. */
+static void fetch_state_written(bool threaded)
+{
+   char saves[256], states[264], saves_b[264], states_b[264];
+   char roots[PATH_MAX_LENGTH], json[1200];
+   lane_dirs("fetch_written", threaded, saves, sizeof(saves));
+   snprintf(states, sizeof(states), "%s-st", saves);
+   snprintf(saves_b, sizeof(saves_b), "%s-b", saves);
+   snprintf(states_b, sizeof(states_b), "%s-st-b", saves);
+   remove_tree(states);
+   remove_tree(saves_b);
+   remove_tree(states_b);
+   CHECK(path_mkdir(saves_b));
+   CHECK(path_mkdir(states_b));
+   put(saves, "a.srm", "1");
+   put(states, "a.state", "2");
+   CHECK(sync_two(threaded, saves, states));
+   CHECK(uploads == 2);
+   roots_path(roots, sizeof(roots));
+   snprintf(json, sizeof(json), "{\"saves\": \"%s\", \"states\": \"%s\"}\n",
+         saves, states);
+   CHECK(filestream_write_file(roots, json, strlen(json)));
+   state_fetches = 0;
+   CHECK(sync_two(threaded, saves_b, states_b));
+   CHECK(fetches == 2);
+   CHECK(holds(saves_b, "a.srm", "1"));
+   CHECK(holds(states_b, "a.state", "2"));
+   CHECK(state_fetches == 1);
+   remove_tree(states);
+   remove_tree(saves_b);
+   remove_tree(states_b);
+}
+
 static const struct lane lanes[] = {
    { "sync_unreadable_subfolder", unreadable_subfolder },
    { "sync_readdir_error",        readdir_error },
@@ -2029,6 +2065,7 @@ static const struct lane lanes[] = {
    { "sync_hash_read_error",      hash_read_error },
    { "sync_fetch_hash_held",      fetch_hash_held },
    { "sync_new_hash_fails",       new_hash_fails },
+   { "sync_fetch_state_written",  fetch_state_written },
 };
 
 int main(int argc, char **argv)

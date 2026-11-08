@@ -1710,6 +1710,9 @@ static bool task_cloud_sync_fetch_place(
       sync_state->failures = true;
       return false;
    }
+   /* the state limit's check across a save (command.c) */
+   if (string_starts_with_case_insensitive(key, "states/"))
+      content_state_fetched();
    return true;
 }
 

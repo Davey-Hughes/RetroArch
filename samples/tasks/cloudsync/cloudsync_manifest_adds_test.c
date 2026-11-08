@@ -61,6 +61,7 @@ char *dir_get_ptr(enum rarch_dir_type type) { (void)type; return NULL; }
 bool content_savefile_is_live(const char *path) { (void)path; return false; }
 unsigned content_savefile_lifetime(void) { return 0; }
 unsigned content_save_writes(void) { return 0; }
+void content_state_fetched(void) {}
 bool content_save_state_in_progress(void *data) { (void)data; return false; }
 void runloop_save_load_release(uint8_t bit) { (void)bit; }
 void task_window_progress_cb(retro_task_t *task) { (void)task; }

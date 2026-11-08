@@ -4370,7 +4370,7 @@ bool command_event(enum event_command cmd, void *data)
             return false;
          break;
       case CMD_EVENT_RAM_STATE_TO_FILE:
-         if (!content_ram_state_to_file((char *) data))
+         if (!command_event_ram_state_to_file((const char*)data))
             return false;
          break;
       case CMD_EVENT_APPLY_WINDOWED_SCALE:

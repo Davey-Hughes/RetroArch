@@ -6668,22 +6668,24 @@ bool command_event_load_auto_state(void)
  * enabled.
  *
  * @param settings The usual RetroArch settings ptr.
+ * @param written State being written, never the one to remove, or NULL.
  * @param last_index Return value for load slot.
  * @param @s Return value for file name that should be removed.
+ * @param len Size of @s.
  */
 static void command_scan_states(
       bool show_hidden_files,
       unsigned savestate_max_keep,
       int curr_state_slot,
-      unsigned *last_index, char *s)
+      const char *written,
+      unsigned *last_index, char *s, size_t len)
 {
-   /* Base name of 128 may be too short for some (<<1%) of the
-      tosec-based file names, but in practice truncating will not
-      lead to mismatch */
-   char state_base[128];
    char state_dir[DIR_MAX_LENGTH];
    runloop_state_t *runloop_st        = runloop_state_get_ptr();
    const char *name_savestate         = runloop_st->name.savestate;
+   const char *state_base             = NULL;
+   size_t state_base_len              = 0;
+   int written_idx                    = -1;
 
    unsigned max_idx                   = 0;
    unsigned loa_idx                   = 0;
@@ -6693,8 +6695,6 @@ static void command_scan_states(
    retro_bits_512_t slot_mapping_high = {{0}};
 
    struct string_list *dir_list       = NULL;
-   const char *savefile_root          = NULL;
-   size_t savefile_root_length        = 0;
 
    size_t i, cnt                      = 0;
    size_t cnt_in_range                = 0;
@@ -6706,52 +6706,39 @@ static void command_scan_states(
                DIR_LIST_PLAIN, NULL, show_hidden_files)))
       return;
 
-   fill_pathname_base(state_base, name_savestate, sizeof(state_base));
+   state_base     = path_basename(name_savestate);
+   state_base_len = strlen(state_base);
+   if (written)
+      written     = path_basename(written);
 
    for (i = 0; i < dir_list->size; i++)
    {
       unsigned idx;
-      size_t _len;
-      char elem_base[128];
-      const char *ext      = NULL;
       const char *end      = NULL;
       const char *dir_elem = dir_list->elems[i].data;
+      const char *base     = NULL;
 
       if (!dir_elem || !*dir_elem)
          continue;
 
-      _len = strlen(dir_elem);
-      fill_pathname_base(elem_base, dir_elem, sizeof(elem_base));
-
-      /* Only consider files with a '.state' extension
-       * > i.e. Ignore '.state.auto', '.state.bak', etc. */
-      ext = path_get_extension(elem_base);
-      if (    (!ext || !*ext)
-          || !string_starts_with_size(ext, "state", STRLEN_CONST("state")))
+      /* Only this content's slots: its exact state name and a number
+       * > i.e. Ignore '.state.auto', '.png', another game's states */
+      base = path_basename(dir_elem);
+      if (!string_starts_with_size(base, state_base, state_base_len))
+         continue;
+      end  = base + state_base_len;
+      while (ISDIGIT((int)*end))
+         end++;
+      if (*end)
          continue;
 
-      /* Check whether this file is associated with
-       * the current content */
-      if (!string_starts_with(elem_base, state_base))
+      idx = string_to_unsigned(base + state_base_len);
+
+      if (written && string_is_equal(base, written))
+      {
+         written_idx = (int)idx;
          continue;
-
-      /* This looks like a valid savestate */
-      /* Save filename root and length (once) */
-      if (savefile_root_length == 0)
-      {
-         savefile_root        = dir_elem;
-         savefile_root_length = _len;
       }
-
-      /* Decode the savestate index */
-      end = dir_elem + _len;
-      while ((end > dir_elem) && ISDIGIT((int)end[-1]))
-      {
-         end--;
-         if (savefile_root == dir_elem)
-            savefile_root_length--;
-      }
-      idx = string_to_unsigned(end);
 
       /* Simple administration: max, total. */
       if (idx > max_idx)
@@ -6850,13 +6837,9 @@ static void command_scan_states(
          *last_index = loa_idx;
 
    if (     s
-         && cnt_in_range >= savestate_max_keep)
-   {
-      strlcpy(s, savefile_root, savefile_root_length + 1);
-      /* ".state0" is just ".state" instead, so don't print that. */
-      if (del_idx > 0)
-         snprintf(s + savefile_root_length, 5, "%d", del_idx);
-   }
+         && cnt_in_range >= savestate_max_keep
+         && (int)del_idx != written_idx)
+      runloop_get_savestate_path(s, len, (int)del_idx);
 
    dir_list_free(dir_list);
 }
@@ -6898,7 +6881,7 @@ void command_event_set_savestate_auto_index(settings_t *settings)
       command_scan_states(
             settings->bools.show_hidden_files,
             settings->uints.savestate_max_keep,
-            settings->ints.state_slot, &max_idx, NULL);
+            settings->ints.state_slot, NULL, &max_idx, NULL, 0);
       configuration_set_int(settings, settings->ints.state_slot, max_idx);
       RARCH_LOG("[State] %s: #%d (slot reset %d -> %u from on-disk scan, "
             "max_keep %u). If the previous slot was higher, earlier saves "
@@ -6912,34 +6895,119 @@ void command_event_set_savestate_auto_index(settings_t *settings)
       configuration_set_int(settings, settings->ints.state_slot, 0);
 }
 
+/* The state to delete once a save is written, as it was when picked */
+struct savestate_victim
+{
+   int64_t size;
+   int64_t mtime;
+   unsigned writes;
+   unsigned fetches;
+   unsigned max_keep;
+   char path[PATH_MAX_LENGTH];
+};
+
 /**
- * Deletes the oldest save state and its thumbnail, if needed.
+ * Picks the oldest save state to delete once @written is saved, if
+ * the limit needs one.
  *
  * @param settings The usual RetroArch settings ptr.
+ * @param written The state about to be written, never the one picked.
+ * @return The pick for command_event_set_savestate_garbage_collect(),
+ * to free, or NULL.
  */
-static void command_event_set_savestate_garbage_collect(settings_t *settings)
+static struct savestate_victim *command_event_savestate_victim(
+      settings_t *settings, const char *written)
 {
-   size_t i;
-   char state_to_delete[PATH_MAX_LENGTH] = {0};
+   struct savestate_victim *victim = NULL;
+   if (     !settings->bools.savestate_auto_index
+         || !settings->uints.savestate_max_keep
+         || !(victim = (struct savestate_victim*)
+            calloc(1, sizeof(*victim))))
+      return NULL;
    command_scan_states(
          settings->bools.show_hidden_files,
          settings->uints.savestate_max_keep,
-         settings->ints.state_slot, NULL, state_to_delete);
+         settings->ints.state_slot, written,
+         NULL, victim->path, sizeof(victim->path));
+   if (     !*victim->path
+         || (victim->size = path_get_size(victim->path)) < 0)
+   {
+      free(victim);
+      return NULL;
+   }
+   if (!path_get_mtime(victim->path, &victim->mtime))
+      victim->mtime = 0;
+   victim->writes   = content_save_writes();
+   victim->fetches  = content_state_fetches();
+   victim->max_keep = settings->uints.savestate_max_keep;
+   return victim;
+}
+
+/**
+ * Deletes the save state picked for a save and its thumbnail.
+ *
+ * @param settings The usual RetroArch settings ptr.
+ * @param victim The pick, or NULL.
+ */
+static void command_event_set_savestate_garbage_collect(settings_t *settings,
+      struct savestate_victim *victim)
+{
+   size_t i;
+   int64_t mtime = 0;
+   if (     !victim
+         || !settings->bools.savestate_auto_index
+         || settings->uints.savestate_max_keep != victim->max_keep
+         || path_get_size(victim->path) != victim->size)
+      return;
+   if (!path_get_mtime(victim->path, &mtime))
+      mtime = 0;
+   /* Another writer put a state there since: kept, one over the limit
+    * until the next save */
+   if (mtime > 0 && victim->mtime > 0)
+   {
+      if (mtime != victim->mtime)
+         return;
+   }
+   /* No mtime: only this save's own write since, no state download,
+    * and none in flight */
+   else if (   content_save_writes()   != victim->writes + 1
+            || content_state_fetches() != victim->fetches
+            || content_save_state_in_progress(NULL))
+      return;
    /* Only delete one save state per save action
     * > Conservative behaviour, designed to minimise
     *   the risk of deleting multiple incorrect files
     *   in case of accident */
-   if (*state_to_delete)
-   {
-      filestream_delete(state_to_delete);
-      RARCH_DBG("[State] Garbage collect, deleting \"%s\".\n",state_to_delete);
-      /* Construct the save state thumbnail name
-       * and delete that one as well. */
-      i = strlen(state_to_delete);
-      strlcpy_lit(state_to_delete + i,".png",STRLEN_CONST(".png")+1);
-      filestream_delete(state_to_delete);
-      RARCH_DBG("[State] Garbage collect, deleting \"%s\".\n",state_to_delete);
-   }
+   filestream_delete(victim->path);
+   RARCH_DBG("[State] Garbage collect, deleting \"%s\".\n",victim->path);
+   /* Construct the save state thumbnail name
+    * and delete that one as well. */
+   i = strlen(victim->path);
+   strlcpy_lit(victim->path + i,".png",STRLEN_CONST(".png")+1);
+   filestream_delete(victim->path);
+   RARCH_DBG("[State] Garbage collect, deleting \"%s\".\n",victim->path);
+}
+
+/* After a slot save: only a save that was written makes room. */
+static void command_event_save_state_done(retro_task_t *task,
+      void *task_data, void *user_data, const char *error)
+{
+   struct savestate_victim *victim = (struct savestate_victim*)user_data;
+   if (!error)
+      command_event_set_savestate_garbage_collect(config_get_ptr(), victim);
+   free(victim);
+}
+
+bool command_event_ram_state_to_file(const char *path)
+{
+   settings_t *settings            = config_get_ptr();
+   struct savestate_victim *victim = command_event_savestate_victim(
+         settings, path);
+   bool ret                        = content_ram_state_to_file(path);
+   if (ret)
+      command_event_set_savestate_garbage_collect(settings, victim);
+   free(victim);
+   return ret;
 }
 
 void command_event_set_replay_auto_index(settings_t *settings)
@@ -7452,7 +7520,13 @@ bool command_event_main_state(unsigned cmd)
 
                if (cmd == CMD_EVENT_SAVE_STATE)
                {
-                  queued = content_save_state(state_path, true);
+                  struct savestate_victim *victim =
+                     command_event_savestate_victim(settings, state_path);
+                  queued = content_save_state_notify(state_path, true,
+                        victim ? command_event_save_state_done : NULL,
+                        victim);
+                  if (!queued)
+                     free(victim);
                   RARCH_LOG("[State] Save dispatch for slot %d, path "
                         "\"%s\": content_save_state queued=%s "
                         "(auto_index=%s, max_keep=%u). NOTE: actual disk "
@@ -7472,12 +7546,6 @@ bool command_event_main_state(unsigned cmd)
                }
                else
                   content_save_state_to_ram();
-
-               /* Clean up excess savestates if necessary: not for a
-                * save that was turned away, which wrote nothing */
-               if (     queued
-                     && savestate_auto_index && (savestate_max_keep > 0))
-                  command_event_set_savestate_garbage_collect(settings);
 
                if (frame_time_counter_auto_reset)
                   video_st->frame_time_count = 0;

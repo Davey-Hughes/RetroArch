@@ -1442,6 +1442,9 @@ bool command_event_reinit(const int flags);
 
 bool command_event_main_state(unsigned cmd);
 
+/* content_ram_state_to_file(), under the state limit as a slot save */
+bool command_event_ram_state_to_file(const char *path);
+
 /* True, with the waiting notice, while the content's saves wait
  * (save_load_hold): no state, replay or netplay host may start then. */
 bool command_state_held(void);

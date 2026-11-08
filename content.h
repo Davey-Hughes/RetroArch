@@ -103,6 +103,11 @@ bool content_save_state_in_progress(void* data);
 unsigned content_save_writes(void);
 void content_save_written(void);
 
+/* Changes as each state file cloud sync downloads lands. Main thread
+ * only. */
+unsigned content_state_fetches(void);
+void content_state_fetched(void);
+
 /* Waits for any in-progress save state tasks to finish */
 void content_wait_for_save_state_task(void);
 /* Waits for any in-progress load state tasks to finish */
