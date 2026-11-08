@@ -127,6 +127,7 @@
 #include <stdarg.h>
 
 #include <retro_common_api.h>
+#include <compat/strl.h>
 #include <queues/message_queue.h>
 #include <queues/task_queue.h>
 #include <streams/file_stream.h>
