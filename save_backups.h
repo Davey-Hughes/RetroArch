@@ -20,6 +20,7 @@
 
 #include <retro_common_api.h>
 #include <boolean.h>
+#include <lists/string_list.h>
 
 RETRO_BEGIN_DECLS
 
@@ -37,6 +38,8 @@ RETRO_BEGIN_DECLS
 #define SAVE_BACKUPS_CORE_CLOUD_SYNC "cloud-sync"
 /* Copies kept per file for each repeating reason. */
 #define SAVE_BACKUPS_KEEP            10
+/* Held names a not-loaded automatic state has beside itself. */
+#define SAVE_BACKUPS_HELD_MAX        9
 
 enum save_backup_result
 {
@@ -122,6 +125,34 @@ enum save_backup_result save_backups_move_begin(const char *dir,
  * as an atomic synced write is. Reads no roots: safe off the main
  * thread. */
 bool save_backups_copy_synced(const char *path, const char *to);
+
+/* Held name @n (1 to SAVE_BACKUPS_HELD_MAX) of @path, in its own
+ * folder: "<path>.not-loaded.prev", then "<path>.not-loaded.<n>.prev".
+ * A not-loaded automatic state that cannot move into its backups waits
+ * there, on its own volume, until its copy is made. Returns its
+ * length, 0 when it does not fit. */
+size_t save_backups_held_name(char *s, size_t len, const char *path,
+      unsigned n);
+
+/* Whether a ".state.auto" @path has a held name in use. */
+bool save_backups_held(const char *path);
+
+/* The name save_backups_copy_to() would give a copy of @path into @s.
+ * Writes no file. */
+enum save_backup_result save_backups_name_copy(char *s, size_t len,
+      const char *dir, const char *path, const char *core,
+      enum save_backup_reason reason);
+
+/* Deletes the temporary files of @path's @reason copies in @dir: copies
+ * that never finished. Returns the copies themselves, newest first,
+ * in a new list; NULL on failure. */
+struct string_list *save_backups_delete_temps(const char *dir,
+      const char *path, const char *core, enum save_backup_reason reason);
+
+/* Retention for a copy of @path at @made, put there by its own copy:
+ * as save_backups_copy_to() runs it, @made counted and kept. */
+void save_backups_retain_made(const char *dir, const char *path,
+      const char *core, enum save_backup_reason reason, const char *made);
 
 /* Deletes @path once its copy at @to is made. A delete that fails
  * deletes the copy and returns false, unless the original went all the

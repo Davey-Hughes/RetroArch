@@ -78,6 +78,14 @@ bool content_save_state_automatic(retro_time_t now_us);
 /* Save an automatic savestate to disk. */
 bool content_auto_save_state(const char *path);
 
+/* Copies the held names of the not-loaded @path (a ".state.auto") into
+ * its backups on a task, one path at a time. Main thread. */
+void content_auto_state_keep(const char *path);
+
+/* At a content load: held names of @path an earlier session left go to
+ * content_auto_state_keep(). Main thread. */
+void content_auto_state_sweep(const char *path);
+
 /* Check a ram state write to disk. */
 bool content_ram_state_pending(void);
 

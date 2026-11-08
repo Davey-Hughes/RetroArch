@@ -6243,6 +6243,14 @@ static bool event_init_content(
    runloop_path_init_savefile(runloop_st);
    runloop_set_save_backup_roots(runloop_st, settings);
    {
+      /* A not-loaded .auto an earlier session left held */
+      char *auto_path = (char*)malloc(PATH_MAX_LENGTH);
+      if (auto_path && runloop_get_savestate_path(auto_path,
+               PATH_MAX_LENGTH, -1))
+         content_auto_state_sweep(auto_path);
+      free(auto_path);
+   }
+   {
       /* The folders list C2 reads; a fallback leaves a note there */
       size_t i = runloop_save_roots[0] != RUNLOOP_SAVE_ROOT_CONFIGURED
          ? 0 : 1;

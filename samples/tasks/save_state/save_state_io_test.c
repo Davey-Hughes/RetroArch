@@ -125,13 +125,16 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <time.h>
 
 #include <retro_common_api.h>
 #include <compat/strl.h>
 #include <queues/message_queue.h>
 #include <queues/task_queue.h>
 #include <streams/file_stream.h>
+#include <file/file_path.h>
 #include <lists/dir_list.h>
+#include <string/stdstring.h>
 #include <vfs/vfs_implementation.h>
 #include <retro_timers.h>
 
@@ -371,12 +374,50 @@ const char *msg_hash_to_str(enum msg_hash_enums msg)
 
 void RARCH_LOG(const char *fmt, ...)  { (void)fmt; }
 void RARCH_WARN(const char *fmt, ...) { (void)fmt; }
-void RARCH_ERR(const char *fmt, ...)  { (void)fmt; }
+static unsigned errors_logged;
+void RARCH_ERR(const char *fmt, ...)  { (void)fmt; errors_logged++; }
 
+static unsigned msgs_pushed;
 static void msg_push_stub(retro_task_t *task, const char *msg,
       unsigned prio, unsigned dur, bool flush)
 {
-   (void)task; (void)msg; (void)prio; (void)dur; (void)flush;
+   (void)task; (void)prio; (void)dur; (void)flush;
+   /* Every finished task pushes, an empty one when it says nothing */
+   if (msg && *msg)
+      msgs_pushed++;
+}
+
+/* Renames refused at the VFS: the .auto's move into its backups, as
+ * across drives; a copy landing there; the new state over the .auto;
+ * a held name put back. */
+#define REFUSE_MOVE   1
+#define REFUSE_LAND   2
+#define REFUSE_FINISH 4
+#define REFUSE_BACK   8
+static int      refuse_renames;
+static unsigned file_syncs;
+int __real_retro_vfs_file_rename_impl(const char *old_path,
+      const char *new_path);
+int __wrap_retro_vfs_file_rename_impl(const char *old_path,
+      const char *new_path)
+{
+   int    refuse = __atomic_load_n(&refuse_renames, __ATOMIC_RELAXED);
+   size_t _len   = strlen(old_path);
+   bool   temp   = _len > 4 && !strcmp(old_path + _len - 4, ".tmp");
+   bool   into   = strstr(new_path, "backups") != NULL;
+   bool   held   = _len > 5 && !strcmp(old_path + _len - 5, ".prev");
+   if (     ((refuse & REFUSE_MOVE)   &&  into && !temp)
+         || ((refuse & REFUSE_LAND)   &&  into &&  temp)
+         || ((refuse & REFUSE_FINISH) && !into &&  temp)
+         || ((refuse & REFUSE_BACK)   && !into &&  held))
+      return -1;
+   return __real_retro_vfs_file_rename_impl(old_path, new_path);
+}
+int __real_retro_vfs_file_sync_impl(libretro_vfs_implementation_file *stream);
+int __wrap_retro_vfs_file_sync_impl(libretro_vfs_implementation_file *stream)
+{
+   __atomic_fetch_add(&file_syncs, 1, __ATOMIC_RELAXED);
+   return __real_retro_vfs_file_sync_impl(stream);
 }
 
 static void frontend_reset(void)
@@ -2022,6 +2063,409 @@ static void test_auto_state(void)
    save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 }
 
+/* -----------------------------------------------------------------
+ * A not-loaded .auto that cannot move into its backups (across drives)
+ * waits beside itself under a held name while a task copies it there.
+ * ----------------------------------------------------------------- */
+#define KEEP_DIR   "sst_keep"
+#define KEEP_AUTO  "sst_keep/Game.state.auto"
+#define KEEP_AUTO2 "sst_keep/Other.state.auto"
+
+static void keep_held(char *s, size_t len, const char *path, unsigned n)
+{
+   char base[256];
+   snprintf(base, sizeof(base), "%s.not-loaded", path);
+   fill_pathname_aside(s, base, n, len);
+}
+
+static bool keep_holds(const char *path, const char *text)
+{
+   return filestream_matches_buf(path, text, strlen(text));
+}
+
+static void keep_put(const char *path, const char *text)
+{
+   filestream_write_file(path, text, (int64_t)strlen(text));
+}
+
+static void keep_reset(void)
+{
+   frontend_reset();
+   core_fill(TEST_SAVE_STATE_CHUNK);
+   auto_state_clear(KEEP_DIR);
+   retro_vfs_mkdir_impl(KEEP_DIR);
+   save_backups_set_roots(NULL, KEEP_DIR, NULL, NULL, NULL, NULL, "Core");
+   stub_runloop.system.info.library_name   = "Core";
+   stub_settings.bools.savestate_auto_load = true;
+   __atomic_store_n(&refuse_renames, REFUSE_MOVE, __ATOMIC_RELAXED);
+}
+
+/* Files in the backups whose names end ".tmp" */
+static unsigned keep_temps(void)
+{
+   unsigned i, n = 0;
+   struct string_list *list = dir_list_new(KEEP_DIR "/backups", NULL,
+         false, true, false, false);
+   for (i = 0; list && i < list->size; i++)
+      if (string_ends_with(list->elems[i].data, ".tmp"))
+         n++;
+   if (list)
+      dir_list_free(list);
+   return n;
+}
+
+/* The not-loaded copy of @path holding @text, into @s */
+static bool keep_copy(char *s, size_t len, const char *path,
+      const char *text)
+{
+   unsigned i;
+   bool found = false;
+   char dir[256];
+   struct string_list *list;
+   if (!save_backups_dir(dir, sizeof(dir), path)
+         || !(list = dir_list_new(dir, NULL, false, true, false, false)))
+      return false;
+   for (i = 0; !found && i < list->size; i++)
+      if (     !string_ends_with(list->elems[i].data, ".tmp")
+            && keep_holds(list->elems[i].data, text))
+      {
+         strlcpy(s, list->elems[i].data, len);
+         found = true;
+      }
+   dir_list_free(list);
+   return found;
+}
+
+/* Every file in the backups a minute old */
+static void keep_age(void)
+{
+   unsigned i;
+   struct string_list *list = dir_list_new(KEEP_DIR "/backups", NULL,
+         false, true, false, false);
+   for (i = 0; list && i < list->size; i++)
+      path_set_mtime(list->elems[i].data, (int64_t)time(NULL) - 61);
+   if (list)
+      dir_list_free(list);
+}
+
+static bool keep_count_task(retro_task_t *t, void *ud)
+{
+   (void)t;
+   (*(unsigned*)ud)++;
+   return false;
+}
+
+static unsigned keep_tasks(void)
+{
+   unsigned n = 0;
+   task_finder_data_t fd;
+   fd.func     = keep_count_task;
+   fd.userdata = &n;
+   task_queue_find(&fd);
+   return n;
+}
+
+static void test_auto_state_keep(void)
+{
+   unsigned k;
+   int ticks;
+   unsigned syncs, errors, msgs, finish_errors;
+   bool once;
+   char h[SAVE_BACKUPS_HELD_MAX + 1][256];
+   char copy[256], name[256], dir[256];
+   char *big = (char*)malloc(4 * TEST_SAVE_STATE_CHUNK + 2);
+
+   for (k = 1; k <= SAVE_BACKUPS_HELD_MAX; k++)
+      keep_held(h[k], sizeof(h[k]), KEEP_AUTO, k);
+   memset(big, 'b', 4 * TEST_SAVE_STATE_CHUNK + 1);
+   big[4 * TEST_SAVE_STATE_CHUNK + 1] = '\0';
+
+   /* across drives: the new state at once, the old one held beside it
+    * and copied on a task, which counts it in the newest 10 */
+   keep_reset();
+   retro_vfs_mkdir_impl(KEEP_DIR "/backups");
+   for (k = 0; k < 10; k++)
+   {
+      char text[4];
+      snprintf(name, sizeof(name), KEEP_DIR "/backups/Game - 2000-01-01 "
+            "00-00-0%u - Core - not-loaded.state.auto", k);
+      snprintf(text, sizeof(text), "p%u", k);
+      keep_put(name, text);
+   }
+   keep_put(KEEP_AUTO, "old");
+   syncs  = file_syncs;
+   errors = errors_logged;
+   msgs   = msgs_pushed;
+   okf(content_auto_save_state(KEEP_AUTO)
+         && file_size(KEEP_AUTO) > (long)core_len,
+       "keep: across drives, the new state is written at once");
+   okf(keep_holds(h[1], "old") && auto_backups(KEEP_AUTO, "old") == 0
+         && stub_runloop.auto_state_owned && keep_tasks() == 1,
+       "keep: the old one is held beside it, its copy on a task");
+   pump(100);
+   okf(keep_copy(copy, sizeof(copy), KEEP_AUTO, "old")
+         && auto_backups(KEEP_AUTO, NULL) == 10
+         && !path_is_valid(KEEP_DIR "/backups/Game - 2000-01-01 00-00-00 "
+            "- Core - not-loaded.state.auto"),
+       "keep: the copy lands, counted in the newest 10");
+   okf(keep_holds(h[1], "old") && file_syncs == syncs,
+       "keep: unthreaded, no sync, and the held one stays");
+   okf(errors_logged == errors && msgs_pushed == msgs && !keep_temps(),
+       "keep: nothing logged or shown, no temp left");
+
+   /* one piece a tick */
+   for (k = 0; k < 2; k++)
+   {
+      keep_reset();
+      keep_put(KEEP_AUTO, big);
+      clock_step = k ? TEST_TICK_BUDGET_US : 0;
+      content_auto_save_state(KEEP_AUTO);
+      ticks = pump(100);
+      okf(auto_backups(KEEP_AUTO, big) == 1 && (k ? ticks >= 7 : ticks <= 4),
+          k ? "keep: a spent budget copies one piece a tick"
+            : "keep: an open budget copies it in one tick");
+   }
+
+   /* a failed copy: the held one stays, the error logged, no notice */
+   keep_reset();
+   keep_put(KEEP_AUTO, "old");
+   __atomic_store_n(&refuse_renames, REFUSE_MOVE | REFUSE_LAND,
+         __ATOMIC_RELAXED);
+   errors = errors_logged;
+   msgs   = msgs_pushed;
+   content_auto_save_state(KEEP_AUTO);
+   pump(100);
+   okf(keep_holds(h[1], "old") && auto_backups(KEEP_AUTO, NULL) == 0
+         && !keep_temps(),
+       "keep: a failed copy keeps the held one");
+   okf(errors_logged > errors && msgs_pushed == msgs,
+       "keep: a failed copy is logged, not shown");
+
+   /* the new state could not take its place: the old one goes back */
+   keep_reset();
+   keep_put(KEEP_AUTO, "old");
+   __atomic_store_n(&refuse_renames, REFUSE_MOVE | REFUSE_FINISH,
+         __ATOMIC_RELAXED);
+   errors = errors_logged;
+   okf(!content_auto_save_state(KEEP_AUTO) && keep_holds(KEEP_AUTO, "old")
+         && !path_is_valid(h[1]) && !stub_runloop.auto_state_owned
+         && !keep_tasks(),
+       "keep: a failed finish puts the held one back");
+   finish_errors = errors_logged - errors;
+
+   /* nor put back: logged, held for the next load */
+   keep_reset();
+   keep_put(KEEP_AUTO, "old");
+   __atomic_store_n(&refuse_renames, REFUSE_MOVE | REFUSE_FINISH
+         | REFUSE_BACK, __ATOMIC_RELAXED);
+   errors = errors_logged;
+   okf(!content_auto_save_state(KEEP_AUTO) && keep_holds(h[1], "old")
+         && !path_is_valid(KEEP_AUTO) && !stub_runloop.auto_state_owned
+         && errors_logged - errors == finish_errors + 1,
+       "keep: a failed put-back is logged, the held one kept");
+
+   /* the first free held name; all nine taken, an inline copy */
+   keep_reset();
+   keep_put(h[1], "held1");
+   keep_put(KEEP_AUTO, "old");
+   content_auto_save_state(KEEP_AUTO);
+   okf(keep_holds(h[1], "held1") && keep_holds(h[2], "old"),
+       "keep: a held name in use, the next one");
+   pump(100);
+   okf(auto_backups(KEEP_AUTO, "held1") == 1
+         && auto_backups(KEEP_AUTO, "old") == 1,
+       "keep: both held ones copied");
+   keep_reset();
+   for (k = 1; k <= SAVE_BACKUPS_HELD_MAX; k++)
+      keep_put(h[k], "held");
+   keep_put(KEEP_AUTO, "old");
+   okf(content_auto_save_state(KEEP_AUTO)
+         && file_size(KEEP_AUTO) > (long)core_len
+         && auto_backups(KEEP_AUTO, "old") == 1 && !keep_tasks()
+         && keep_holds(h[SAVE_BACKUPS_HELD_MAX], "held"),
+       "keep: all nine taken, copied inline and written");
+
+   /* one task at a time; a path asked for twice is copied once */
+   keep_reset();
+   keep_put(KEEP_AUTO, "old1");
+   keep_put(KEEP_AUTO2, "old2");
+   content_auto_save_state(KEEP_AUTO);
+   stub_runloop.auto_state_owned = false;
+   content_auto_save_state(KEEP_AUTO2);
+   content_auto_state_keep(KEEP_AUTO);
+   okf(keep_tasks() == 1, "keep: a second path waits its turn");
+   pump(100);
+   /* the folder's not-loaded copies, of either game */
+   okf(auto_backups(KEEP_AUTO, NULL) == 2
+         && auto_backups(KEEP_AUTO, "old1") == 1
+         && auto_backups(KEEP_AUTO2, "old2") == 1,
+       "keep: each copied once");
+
+   /* exit cancels: the temp goes, the held one stays */
+   keep_reset();
+   keep_put(KEEP_AUTO, big);
+   clock_step = TEST_TICK_BUDGET_US;
+   content_auto_save_state(KEEP_AUTO);
+   task_queue_check();
+   task_queue_check();
+   okf(keep_temps() == 1, "keep: cancel, the copy under way");
+   keep_held(name, sizeof(name), KEEP_AUTO2, 1);
+   keep_put(name, "old2");
+   content_auto_state_keep(KEEP_AUTO2);
+   task_queue_reset();
+   pump(100);
+   okf(!keep_temps() && !auto_backups(KEEP_AUTO, NULL)
+         && keep_holds(h[1], big),
+       "keep: cancel, the temp goes and the held one stays");
+   okf(keep_holds(name, "old2") && !keep_tasks(),
+       "keep: cancel, the path owed waits for its next load");
+
+   /* content load: nothing held, no task */
+   keep_reset();
+   content_auto_state_sweep(KEEP_AUTO);
+   okf(!keep_tasks(), "keep: nothing held, nothing to do");
+
+   /* left held, no copy; the .auto gone and never put back */
+   keep_put(h[1], "old");
+   content_auto_state_sweep(KEEP_AUTO);
+   pump(100);
+   okf(keep_copy(copy, sizeof(copy), KEEP_AUTO, "old")
+         && keep_holds(h[1], "old") && !path_is_valid(KEEP_AUTO),
+       "keep: a load copies one left held, never back as the .auto");
+
+   /* left held with its copy made: kept until that copy is a minute
+    * old, unthreaded, then deleted without another copy */
+   content_auto_state_sweep(KEEP_AUTO);
+   pump(100);
+   okf(keep_holds(h[1], "old") && auto_backups(KEEP_AUTO, NULL) == 1,
+       "keep: its copy too new, the held one stays");
+   path_set_mtime(copy, (int64_t)time(NULL) - 61);
+   content_auto_state_sweep(KEEP_AUTO);
+   pump(100);
+   okf(!path_is_valid(h[1]) && auto_backups(KEEP_AUTO, NULL) == 1,
+       "keep: its copy a minute old, the held one goes, no new copy");
+
+   /* a partial copy: its temp goes, a fresh copy */
+   snprintf(name, sizeof(name), KEEP_DIR "/backups/Game - 2001-01-01 "
+         "00-00-00 - Core - not-loaded.state.auto.tmp");
+   keep_put(name, "part");
+   keep_put(KEEP_DIR "/backups/Other - 2001-01-01 00-00-00 - Core - "
+         "not-loaded.state.auto.tmp", "part");
+   keep_put(h[1], "old2");
+   content_auto_state_sweep(KEEP_AUTO);
+   pump(100);
+   okf(!path_is_valid(name) && keep_temps() == 1
+         && keep_copy(copy, sizeof(copy), KEEP_AUTO, "old2"),
+       "keep: a partial copy's temp goes, copied afresh");
+
+   /* two left held: the one its newest copy holds goes, the other is
+    * copied */
+   path_set_mtime(copy, (int64_t)time(NULL) - 61);
+   keep_put(h[2], "new2");
+   content_auto_state_sweep(KEEP_AUTO);
+   pump(100);
+   okf(!path_is_valid(h[1]) && auto_backups(KEEP_AUTO, "old2") == 1
+         && auto_backups(KEEP_AUTO, "new2") == 1 && keep_holds(h[2], "new2"),
+       "keep: two left held, each taken in turn");
+
+   /* the lower held name newer than the higher, over several loads:
+    * each compared with all its copies, so none copied twice and both
+    * go once their copies are a minute old */
+   keep_reset();
+   retro_vfs_mkdir_impl(KEEP_DIR "/backups");
+   keep_put(KEEP_DIR "/backups/Game - 2000-01-01 00-00-00 - Core - "
+         "not-loaded.state.auto", "Y");
+   keep_put(h[1], "Z");
+   keep_put(h[2], "Y");
+   once = true;
+   for (k = 0; k < 4; k++)
+   {
+      keep_age();
+      content_auto_state_sweep(KEEP_AUTO);
+      pump(100);
+      if (     auto_backups(KEEP_AUTO, "Y") != 1
+            || auto_backups(KEEP_AUTO, "Z") != 1)
+         once = false;
+   }
+   okf(once, "keep: held ones older and newer, none copied twice");
+   okf(!path_is_valid(h[1]) && !path_is_valid(h[2]),
+       "keep: held ones older and newer, both go");
+
+   /* a longer copy that starts the same is no copy of it */
+   keep_reset();
+   retro_vfs_mkdir_impl(KEEP_DIR "/backups");
+   keep_put(KEEP_DIR "/backups/Game - 2000-01-01 00-00-00 - Core - "
+         "not-loaded.state.auto", "YY");
+   keep_put(h[1], "Y");
+   keep_age();
+   content_auto_state_sweep(KEEP_AUTO);
+   pump(100);
+   okf(auto_backups(KEEP_AUTO, "Y") == 1 && keep_holds(h[1], "Y"),
+       "keep: a longer copy that starts the same is no copy");
+
+   /* named as the copy starts, after a compare: never over a copy made
+    * meanwhile */
+   keep_reset();
+   retro_vfs_mkdir_impl(KEEP_DIR "/backups");
+   keep_put(KEEP_DIR "/backups/Game - 2000-01-01 00-00-00 - Core - "
+         "not-loaded.state.auto", big);
+   big[4 * TEST_SAVE_STATE_CHUNK] = 'c';
+   keep_put(h[1], big);
+   clock_step = TEST_TICK_BUDGET_US;
+   content_auto_state_sweep(KEEP_AUTO);
+   task_queue_check();
+   task_queue_check();
+   okf(save_backups_dir(dir, sizeof(dir), KEEP_AUTO)
+         && save_backups_name_copy(name, sizeof(name), dir, KEEP_AUTO,
+            "Core", SAVE_BACKUP_NOT_LOADED) == SAVE_BACKUP_MADE,
+       "keep: a copy named meanwhile");
+   keep_put(name, "made");
+   pump(100);
+   clock_step = 0;
+   okf(keep_holds(name, "made") && auto_backups(KEEP_AUTO, big) == 1,
+       "keep: the copy named as it starts, not over one made meanwhile");
+   big[4 * TEST_SAVE_STATE_CHUNK] = 'b';
+
+   __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+   clock_step = 0;
+   auto_state_clear(KEEP_DIR);
+   save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+   free(big);
+}
+
+/* Threaded: the copy is synced, then the held one goes. Asserted only
+ * once the queue has drained, or on what the worker cannot touch. */
+static void test_auto_state_keep_threaded(void)
+{
+   unsigned syncs;
+   char h1[256];
+
+   keep_held(h1, sizeof(h1), KEEP_AUTO, 1);
+   keep_reset();
+   keep_put(KEEP_AUTO, "old");
+   syncs = __atomic_load_n(&file_syncs, __ATOMIC_RELAXED);
+   okf(content_auto_save_state(KEEP_AUTO)
+         && file_size(KEEP_AUTO) > (long)core_len,
+       "threaded keep: the new state is written at once");
+   pump_threaded();
+   okf(auto_backups(KEEP_AUTO, "old") == 1 && !path_is_valid(h1)
+         && __atomic_load_n(&file_syncs, __ATOMIC_RELAXED) > syncs,
+       "threaded keep: the copy synced, the held one gone");
+
+   /* left held with its copy made by an unthreaded session */
+   keep_put(h1, "old");
+   syncs = __atomic_load_n(&file_syncs, __ATOMIC_RELAXED);
+   content_auto_state_sweep(KEEP_AUTO);
+   pump_threaded();
+   okf(!path_is_valid(h1) && auto_backups(KEEP_AUTO, NULL) == 1
+         && __atomic_load_n(&file_syncs, __ATOMIC_RELAXED) > syncs,
+       "threaded keep: its copy synced, the held one gone, no new copy");
+
+   __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+   auto_state_clear(KEEP_DIR);
+   save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+}
+
 static int run_default_lane(void)
 {
    printf("== task_save.c I/O regression oracle ==\n");
@@ -2060,6 +2504,7 @@ static int run_default_lane(void)
    test_undo_save_during_backup();
    test_undo_save_not_backed_up();
    test_auto_state();
+   test_auto_state_keep();
 #ifdef HAVE_COMPRESSION
    test_undo_save_restores_file();
 #endif
@@ -2079,6 +2524,7 @@ static int run_threaded_lane(void)
 
    test_threaded_roundtrip();
    test_threaded_load_waits_for_frames();
+   test_auto_state_keep_threaded();
 
    content_reset_savestate_backups();
    task_queue_deinit();

@@ -141,6 +141,40 @@ bool save_backups_move_finish(const char *path, const char *to)
    return true;
 }
 
+size_t save_backups_held_name(char *s, size_t len, const char *path,
+      unsigned n)
+{
+   size_t _len;
+   char *base;
+   if (n < 1 || n > SAVE_BACKUPS_HELD_MAX || !len
+         || !(base = (char*)malloc(len)))
+      return 0;
+   _len = strlcpy(base, path, len);
+   if (_len < len)
+      _len += strlcpy(base + _len, ".not-loaded", len - _len);
+   _len = _len < len ? fill_pathname_aside(s, base, n, len) : 0;
+   free(base);
+   return _len;
+}
+
+bool save_backups_held(const char *path)
+{
+   unsigned n;
+   char *s;
+   bool found = false;
+   size_t _len = strlen(path);
+   if (     _len < STRLEN_CONST(".state.auto")
+         || !string_is_equal(path + _len - STRLEN_CONST(".state.auto"),
+            ".state.auto")
+         || !(s = (char*)malloc(PATH_MAX_LENGTH)))
+      return false;
+   for (n = 1; !found && n <= SAVE_BACKUPS_HELD_MAX; n++)
+      found =    save_backups_held_name(s, PATH_MAX_LENGTH, path, n)
+              && path_is_valid(s);
+   free(s);
+   return found;
+}
+
 void save_backups_set_roots(const char *savefile_dir,
       const char *savestate_dir, const char *content_dir,
       const char *system_dir, const char *config_dir,
@@ -573,6 +607,152 @@ static bool save_backups_of(const char *name, struct save_backup_name *out,
       && string_is_equal(name + out->ext_off, ext);
 }
 
+/* The copies of a file in a folder, as a copy's name and retention
+ * read them */
+struct save_backups_copies
+{
+   struct string_list *list;
+   struct save_backup_name *names;
+   bool *mine;
+   char *field;
+   const char *base;
+   const char *ext;
+   size_t base_len;
+   size_t game_len;
+   size_t newest;   /* (size_t)-1 when none */
+   long dir_units;
+   unsigned number; /* the first free in this second */
+   bool mark;
+   char stamp[SAVE_BACKUPS_TIME_LEN + 1];
+};
+
+/* Lists the copies of @path in @dir, named with @core (NULL: the
+ * roots' core). save_backups_free_copies() after, whatever it returns. */
+static bool save_backups_list_copies(struct save_backups_copies *c,
+      const char *dir, const char *path, const char *core)
+{
+   size_t i;
+   time_t now;
+   struct tm tm_;
+
+   memset(c, 0, sizeof(*c));
+   c->newest = (size_t)-1;
+   c->number = 1;
+   c->base   = path_basename_nocompression(path);
+   c->ext    = save_backups_ext(c->base);
+   c->field  = save_backups_core_field(
+         core ? core : save_backups_roots[SAVE_BACKUPS_ROOT_CORE]);
+   if (!c->field || string_is_empty(dir))
+      return false;
+   c->base_len  = (size_t)(c->ext - c->base);
+   c->dir_units = save_backups_dir_units(dir);
+   c->game_len  = save_backups_game_fit(c->dir_units, c->base, c->base_len,
+         c->field, c->ext, &c->mark);
+
+   /* rtime_localtime leaves tm_ unwritten when localtime() fails */
+   memset(&tm_, 0, sizeof(tm_));
+   time(&now);
+   rtime_localtime(&now, &tm_);
+   if (!strftime(c->stamp, sizeof(c->stamp), "%Y-%m-%d %H-%M-%S", &tm_))
+      return false;
+
+   if ((c->list = dir_list_new(dir, NULL, false, true, false, false))
+         && c->list->size)
+   {
+      c->names = (struct save_backup_name*)malloc(
+            c->list->size * sizeof(*c->names));
+      c->mine  = (bool*)calloc(c->list->size, sizeof(*c->mine));
+      if (!c->names || !c->mine)
+         return false;
+   }
+   for (i = 0; c->names && i < c->list->size; i++)
+   {
+      const char *name = path_basename_nocompression(c->list->elems[i].data);
+      if (!save_backups_of(name, &c->names[i], c->base, c->game_len,
+               c->mark, c->ext))
+         continue;
+      c->mine[i] = true;
+      if (c->newest == (size_t)-1
+            || save_backups_cmp(&c->names[i], &c->names[c->newest]) > 0)
+         c->newest = i;
+      if (     !memcmp(c->names[i].time, c->stamp, SAVE_BACKUPS_TIME_LEN)
+            && c->names[i].number >= c->number)
+         c->number = c->names[i].number + 1;
+   }
+   return true;
+}
+
+static void save_backups_free_copies(struct save_backups_copies *c)
+{
+   free(c->names);
+   free(c->mine);
+   if (c->list)
+      string_list_free(c->list);
+   free(c->field);
+}
+
+/* The first free name in @dir for a copy for @reason into @s, the
+ * folder made */
+static bool save_backups_free_name(char *s, size_t len, const char *dir,
+      const struct save_backups_copies *c, enum save_backup_reason reason)
+{
+   size_t _len, name_off;
+   unsigned number = c->number;
+   if (!path_mkdir(dir))
+      return false;
+   name_off = fill_pathname_join(s, dir, "", len);
+   if (name_off + c->game_len + (c->mark ? 1 : 0) >= len)
+      return false;
+   memcpy(s + name_off, c->base, c->game_len);
+   _len    = name_off + c->game_len;
+   if (c->mark)
+      s[_len++] = SAVE_BACKUPS_CUT_MARK;
+   s[_len] = '\0';
+   /* Never over another file, whatever its name's case, nor over a
+    * copy still being written to that name. */
+   for (;; number++)
+   {
+      size_t name_len;
+      if (number > 1)
+         snprintf(s + _len, len - _len, " - %s-%u - %s - %s%s", c->stamp,
+               number, c->field, save_backups_reasons[reason], c->ext);
+      else
+         snprintf(s + _len, len - _len, " - %s - %s - %s%s", c->stamp,
+               c->field, save_backups_reasons[reason], c->ext);
+      if ((name_len = strlen(s)) + SAVE_BACKUPS_TEMP_LEN + 1 >= len)
+         return false;
+#ifdef SAVE_BACKUPS_PATH_MAX
+      if (     c->dir_units >= 0
+            &&   (size_t)c->dir_units + SAVE_BACKUPS_TEMP_LEN
+               + save_backups_units(s + name_off, strlen(s + name_off))
+               > SAVE_BACKUPS_PATH_MAX)
+         return false;
+#endif
+      if (!path_is_valid(s))
+      {
+         bool writing;
+         memcpy(s + name_len, ".tmp", SAVE_BACKUPS_TEMP_LEN + 1);
+         writing     = path_is_valid(s);
+         s[name_len] = '\0';
+         if (!writing)
+            return true;
+      }
+   }
+}
+
+/* Whether @reason's copies are pruned to SAVE_BACKUPS_KEEP. A cut name
+ * may be another file's too. */
+static bool save_backups_retained(const struct save_backups_copies *c,
+      enum save_backup_reason reason)
+{
+   return c->names
+      && c->game_len == c->base_len
+      && (  reason == SAVE_BACKUP_BEFORE_STATE_LOAD
+         || reason == SAVE_BACKUP_CHANGED_ELSEWHERE
+         || (  reason == SAVE_BACKUP_NOT_LOADED
+            && string_is_equal(c->ext, ".state.auto")));
+}
+
 /* Writes @data as a copy of @path into @dir, its path in @s; with
  * @move, renames @path there instead, or names the copy owed when that
  * fails. With @skip_same, nothing is written when the newest copy
@@ -582,101 +762,25 @@ static enum save_backup_result save_backups_write_copy(char *s, size_t len,
       enum save_backup_reason reason, const void *data, size_t data_len,
       bool move, bool skip_same, bool sync)
 {
-   size_t i, _len, base_len, game_len, name_off;
-   long dir_units;
-   bool mark;
-   char stamp[SAVE_BACKUPS_TIME_LEN + 1];
-   time_t now;
-   struct tm tm_;
-   unsigned number                 = 1;
-   size_t newest                   = (size_t)-1;
-   struct string_list *list        = NULL;
-   struct save_backup_name *names  = NULL;
-   bool *mine                      = NULL;
-   enum save_backup_result result  = SAVE_BACKUP_FAILED;
-   const char *base                = path_basename_nocompression(path);
-   const char *ext                 = save_backups_ext(base);
-   char *field                     = save_backups_core_field(
-         core ? core : save_backups_roots[SAVE_BACKUPS_ROOT_CORE]);
+   struct save_backups_copies c;
+   enum save_backup_result result = SAVE_BACKUP_FAILED;
 
    s[0] = '\0';
-   if (!field || string_is_empty(dir))
+   if (!save_backups_list_copies(&c, dir, path, core))
       goto end;
-   base_len  = (size_t)(ext - base);
-   dir_units = save_backups_dir_units(dir);
-   game_len  = save_backups_game_fit(dir_units, base, base_len, field, ext,
-         &mark);
-
-   /* rtime_localtime leaves tm_ unwritten when localtime() fails */
-   memset(&tm_, 0, sizeof(tm_));
-   time(&now);
-   rtime_localtime(&now, &tm_);
-   if (!strftime(stamp, sizeof(stamp), "%Y-%m-%d %H-%M-%S", &tm_))
-      goto end;
-
-   if ((list = dir_list_new(dir, NULL, false, true, false, false))
-         && list->size)
-   {
-      names = (struct save_backup_name*)malloc(
-            list->size * sizeof(*names));
-      mine  = (bool*)calloc(list->size, sizeof(*mine));
-      if (!names || !mine)
-         goto end;
-   }
-   for (i = 0; names && i < list->size; i++)
-   {
-      const char *name = path_basename_nocompression(list->elems[i].data);
-      if (!save_backups_of(name, &names[i], base, game_len, mark, ext))
-         continue;
-      mine[i] = true;
-      if (newest == (size_t)-1
-            || save_backups_cmp(&names[i], &names[newest]) > 0)
-         newest = i;
-      if (     !memcmp(names[i].time, stamp, SAVE_BACKUPS_TIME_LEN)
-            && names[i].number >= number)
-         number = names[i].number + 1;
-   }
 
    if (     skip_same
-         && newest != (size_t)-1
-         && filestream_matches_buf(list->elems[newest].data, data, data_len))
+         && c.newest != (size_t)-1
+         && filestream_matches_buf(c.list->elems[c.newest].data, data,
+            data_len))
    {
-      strlcpy(s, list->elems[newest].data, len);
+      strlcpy(s, c.list->elems[c.newest].data, len);
       result = SAVE_BACKUP_MADE;
       goto end;
    }
 
-   if (!path_mkdir(dir))
+   if (!save_backups_free_name(s, len, dir, &c, reason))
       goto end;
-   name_off = fill_pathname_join(s, dir, "", len);
-   if (name_off + game_len + (mark ? 1 : 0) >= len)
-      goto end;
-   memcpy(s + name_off, base, game_len);
-   _len    = name_off + game_len;
-   if (mark)
-      s[_len++] = SAVE_BACKUPS_CUT_MARK;
-   s[_len] = '\0';
-   /* Never over another file, whatever its name's case. */
-   for (;; number++)
-   {
-      if (number > 1)
-         snprintf(s + _len, len - _len, " - %s-%u - %s - %s%s", stamp,
-               number, field, save_backups_reasons[reason], ext);
-      else
-         snprintf(s + _len, len - _len, " - %s - %s - %s%s", stamp,
-               field, save_backups_reasons[reason], ext);
-      if (strlen(s) + 1 >= len)
-         goto end;
-#ifdef SAVE_BACKUPS_PATH_MAX
-      if (     dir_units >= 0
-            &&   (size_t)dir_units + SAVE_BACKUPS_TEMP_LEN
-               + save_backups_units(s + name_off, strlen(s + name_off))
-               > SAVE_BACKUPS_PATH_MAX)
-         goto end;
-#endif
-      if (!path_is_valid(s))
-         break;
-   }
 
    if (move)
    {
@@ -693,24 +797,102 @@ static enum save_backup_result save_backups_write_copy(char *s, size_t len,
    }
    result = SAVE_BACKUP_MADE;
 
-   /* A cut name may be another file's too */
-   if (     names
-         && game_len == base_len
-         && (  reason == SAVE_BACKUP_BEFORE_STATE_LOAD
-            || reason == SAVE_BACKUP_CHANGED_ELSEWHERE
-            || (  reason == SAVE_BACKUP_NOT_LOADED
-               && string_is_equal(ext, ".state.auto"))))
-      save_backups_retain(list, names, mine, reason, strlen(ext));
+   if (save_backups_retained(&c, reason))
+      save_backups_retain(c.list, c.names, c.mine, reason, strlen(c.ext));
 
 end:
    if (result != SAVE_BACKUP_MADE && result != SAVE_BACKUP_COPY_OWED)
       s[0] = '\0';
-   free(names);
-   free(mine);
-   if (list)
-      string_list_free(list);
-   free(field);
+   save_backups_free_copies(&c);
    return result;
+}
+
+enum save_backup_result save_backups_name_copy(char *s, size_t len,
+      const char *dir, const char *path, const char *core,
+      enum save_backup_reason reason)
+{
+   struct save_backups_copies c;
+   enum save_backup_result result = SAVE_BACKUP_FAILED;
+   if (     save_backups_list_copies(&c, dir, path, core)
+         && save_backups_free_name(s, len, dir, &c, reason))
+      result = SAVE_BACKUP_MADE;
+   else
+      s[0] = '\0';
+   save_backups_free_copies(&c);
+   return result;
+}
+
+struct string_list *save_backups_delete_temps(const char *dir,
+      const char *path, const char *core, enum save_backup_reason reason)
+{
+   size_t i;
+   struct save_backups_copies c;
+   struct string_list *copies = NULL;
+   if (     save_backups_list_copies(&c, dir, path, core)
+         && (copies = string_list_new()))
+   {
+      union string_list_elem_attr attr;
+      attr.i = 0;
+      for (i = 0; c.list && i < c.list->size; i++)
+      {
+         struct save_backup_name parsed;
+         char        name[256];
+         const char *base = path_basename_nocompression(
+               c.list->elems[i].data);
+         size_t      _len = strlen(base);
+         if (     _len <= SAVE_BACKUPS_TEMP_LEN
+               || _len - SAVE_BACKUPS_TEMP_LEN >= sizeof(name)
+               || !string_is_equal(base + _len - SAVE_BACKUPS_TEMP_LEN,
+                  ".tmp"))
+            continue;
+         _len -= SAVE_BACKUPS_TEMP_LEN;
+         memcpy(name, base, _len);
+         name[_len] = '\0';
+         if (     save_backups_of(name, &parsed, c.base, c.game_len, c.mark,
+                  c.ext)
+               && parsed.reason == reason)
+            filestream_delete(c.list->elems[i].data);
+      }
+      /* Newest first */
+      for (;;)
+      {
+         size_t newest = (size_t)-1;
+         for (i = 0; c.names && i < c.list->size; i++)
+            if (     c.mine[i] && c.names[i].reason == reason
+                  && (newest == (size_t)-1
+                     || save_backups_cmp(&c.names[i], &c.names[newest]) > 0))
+               newest = i;
+         if (newest == (size_t)-1)
+            break;
+         if (!string_list_append(copies, c.list->elems[newest].data, attr))
+         {
+            string_list_free(copies);
+            copies = NULL;
+            break;
+         }
+         c.mine[newest] = false;
+      }
+   }
+   save_backups_free_copies(&c);
+   return copies;
+}
+
+void save_backups_retain_made(const char *dir, const char *path,
+      const char *core, enum save_backup_reason reason, const char *made)
+{
+   size_t i;
+   struct save_backups_copies c;
+   if (     save_backups_list_copies(&c, dir, path, core)
+         && save_backups_retained(&c, reason))
+   {
+      const char *name = path_basename_nocompression(made);
+      for (i = 0; i < c.list->size; i++)
+         if (string_is_equal(
+                  path_basename_nocompression(c.list->elems[i].data), name))
+            c.mine[i] = false;
+      save_backups_retain(c.list, c.names, c.mine, reason, strlen(c.ext));
+   }
+   save_backups_free_copies(&c);
 }
 
 enum save_backup_result save_backups_copy_to(const char *dir,

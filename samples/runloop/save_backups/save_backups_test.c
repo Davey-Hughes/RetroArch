@@ -489,6 +489,14 @@ static void backup_collisions(void)
    CHECK(   holds(ROOT "/collide/backups/Game - 2026-11-03 11-00-00-5 - Snes9x - cut.srm", "5")
          || holds(ROOT "/collide/backups/Game - 2026-11-03 11-00-00-6 - Snes9x - cut.srm", "5"));
    CHECK(count_files(dir) == 6);
+   /* nor the name of a copy still being written */
+   set_time(11, 0, 1);
+   put(ROOT "/collide/backups/Game - 2026-11-03 11-00-01 - Snes9x - cut.srm.tmp", "w");
+   CHECK(save_backups_copy_image(ROOT "/collide/Game.srm",
+         SAVE_BACKUP_CUT, "7", 1, true) == SAVE_BACKUP_MADE);
+   CHECK(holds(ROOT "/collide/backups/Game - 2026-11-03 11-00-01-2 - Snes9x - cut.srm", "7"));
+   CHECK(holds(ROOT "/collide/backups/Game - 2026-11-03 11-00-01 - Snes9x - cut.srm.tmp", "w"));
+   CHECK(!path_is_valid(ROOT "/collide/backups/Game - 2026-11-03 11-00-01 - Snes9x - cut.srm"));
 }
 
 static void backup_identical_skip(void)
@@ -606,6 +614,118 @@ static void backup_retention_not_loaded(void)
    CHECK(!path_is_valid(ROOT "/notloaded/backups/Game - 2026-11-03 14-00-01 - Snes9x - not-loaded.state.auto"));
    CHECK(holds(ROOT "/notloaded/backups/Game - 2026-11-03 14-00-02 - Snes9x - not-loaded.state.auto", "a2"));
    CHECK(holds(ROOT "/notloaded/backups/Game - 2026-11-03 14-00-00 - Snes9x - not-loaded.srm", "s0"));
+}
+
+/* A not-loaded automatic state held beside itself while a task copies
+ * it: the held names, naming the copy, its retention, and the temps of
+ * copies that never finished. */
+static void backup_held(void)
+{
+   unsigned k;
+   static char s[PATH_MAX_LENGTH], first[PATH_MAX_LENGTH];
+   struct string_list *copies;
+   char text[8];
+   char dir[] = ROOT "/holding/backups";
+   const char *autop = ROOT "/holding/Game.state.auto";
+   const char *temps[] = {
+      ROOT "/holding/backups/Game - 2026-11-03 16-00-00 - Snes9x - not-loaded.state.auto.tmp",
+      ROOT "/holding/backups/Game - 2026-11-03 16-00-00-2 - Other - not-loaded.state.auto.tmp"
+   };
+   const char *others[] = {
+      ROOT "/holding/backups/Game - 2026-11-03 16-00-00 - Snes9x - before-state-load.state.auto.tmp",
+      ROOT "/holding/backups/Other - 2026-11-03 16-00-00 - Snes9x - not-loaded.state.auto.tmp",
+      ROOT "/holding/backups/Game - 2026-11-03 16-00-00 - Snes9x - not-loaded.srm.tmp",
+      ROOT "/holding/backups/Game.state.auto.tmp"
+   };
+
+   CHECK(save_backups_held_name(s, sizeof(s), autop, 1)
+         && same_path(s, ROOT "/holding/Game.state.auto.not-loaded.prev"));
+   CHECK(save_backups_held_name(s, sizeof(s), autop, 2)
+         && same_path(s, ROOT "/holding/Game.state.auto.not-loaded.2.prev"));
+   CHECK(save_backups_held_name(s, sizeof(s), autop, 9)
+         && same_path(s, ROOT "/holding/Game.state.auto.not-loaded.9.prev"));
+   CHECK(!save_backups_held_name(s, sizeof(s), autop, 0));
+   CHECK(!save_backups_held_name(s, sizeof(s), autop, 10));
+   CHECK(!save_backups_held_name(s, strlen(autop) + 16, autop, 1));
+
+   save_backups_set_roots(ROOT "/holding", NULL, NULL, NULL, NULL, NULL,
+         "Snes9x");
+   CHECK(!save_backups_held(autop));
+   put(ROOT "/holding/Game.state.auto.prev", "aside");
+   CHECK(!save_backups_held(autop));
+   put(ROOT "/holding/Game.state.auto.not-loaded.3.prev", "h3");
+   CHECK(save_backups_held(autop));
+   put(ROOT "/holding/Game.srm.not-loaded.prev", "srm");
+   CHECK(!save_backups_held(ROOT "/holding/Game.srm"));
+
+   /* naming writes nothing */
+   set_time(15, 0, 0);
+   CHECK(save_backups_name_copy(first, sizeof(first), dir, autop, "Snes9x", SAVE_BACKUP_NOT_LOADED) == SAVE_BACKUP_MADE);
+   CHECK(same_path(first, ROOT "/holding/backups/Game - 2026-11-03 15-00-00 - Snes9x - not-loaded.state.auto"));
+   CHECK(count_files(dir) == 0);
+   CHECK((copies = save_backups_delete_temps(dir, autop, "Snes9x",
+         SAVE_BACKUP_NOT_LOADED)) && !copies->size);
+   string_list_free(copies);
+   put(first, "c0");
+   CHECK(save_backups_name_copy(s, sizeof(s), dir, autop, "Snes9x", SAVE_BACKUP_NOT_LOADED) == SAVE_BACKUP_MADE);
+   CHECK(same_path(s, ROOT "/holding/backups/Game - 2026-11-03 15-00-00-2 - Snes9x - not-loaded.state.auto"));
+   CHECK(count_files(dir) == 1);
+
+   /* the copy made counts and stays, even when its clock reads older */
+   for (k = 1; k < 10; k++)
+   {
+      set_time(15, 1, (int)k);
+      snprintf(text, sizeof(text), "c%u", k);
+      CHECK(save_backups_name_copy(s, sizeof(s), dir, autop, "Snes9x", SAVE_BACKUP_NOT_LOADED) == SAVE_BACKUP_MADE);
+      put(s, text);
+   }
+   set_time(9, 0, 0);
+   CHECK(save_backups_name_copy(s, sizeof(s), dir, autop, "Snes9x", SAVE_BACKUP_NOT_LOADED) == SAVE_BACKUP_MADE);
+   put(s, "made");
+   save_backups_retain_made(dir, autop, "Snes9x", SAVE_BACKUP_NOT_LOADED, s);
+   CHECK(count_files(dir) == 10 && holds(s, "made"));
+   CHECK(!path_is_valid(first));
+   CHECK(holds(ROOT "/holding/backups/Game - 2026-11-03 15-01-01 - Snes9x - not-loaded.state.auto", "c1"));
+   /* listed newest first, this reason only */
+   put(ROOT "/holding/backups/Game - 2026-11-03 16-00-00 - Snes9x - before-state-load.state.auto", "b");
+   CHECK((copies = save_backups_delete_temps(dir, autop, "Snes9x",
+         SAVE_BACKUP_NOT_LOADED)) && copies->size == 10);
+   for (k = 0; copies && k < 9; k++)
+   {
+      snprintf(text, sizeof(text), "c%u", 9 - k);
+      CHECK(holds(copies->elems[k].data, text));
+   }
+   CHECK(copies && same_path(copies->elems[9].data, s));
+   string_list_free(copies);
+   filestream_delete(ROOT "/holding/backups/Game - 2026-11-03 16-00-00 - Snes9x - before-state-load.state.auto");
+   /* held names are no copies */
+   CHECK(holds(ROOT "/holding/Game.state.auto.not-loaded.3.prev", "h3"));
+   /* the only copy */
+   CHECK(save_backups_name_copy(s, sizeof(s), dir, ROOT "/holding/Solo.state.auto", "Snes9x",
+         SAVE_BACKUP_NOT_LOADED) == SAVE_BACKUP_MADE);
+   put(s, "solo");
+   save_backups_retain_made(dir, ROOT "/holding/Solo.state.auto", "Snes9x",
+         SAVE_BACKUP_NOT_LOADED, s);
+   CHECK(holds(s, "solo") && count_files(dir) == 11);
+
+   /* this file's not-loaded temps go, of whichever core */
+   for (k = 0; k < sizeof(temps) / sizeof(temps[0]); k++)
+      put(temps[k], "t");
+   for (k = 0; k < sizeof(others) / sizeof(others[0]); k++)
+      put(others[k], "t");
+   string_list_free(save_backups_delete_temps(dir, autop, "Snes9x",
+         SAVE_BACKUP_NOT_LOADED));
+   for (k = 0; k < sizeof(temps) / sizeof(temps[0]); k++)
+      CHECK(!path_is_valid(temps[k]));
+   for (k = 0; k < sizeof(others) / sizeof(others[0]); k++)
+      CHECK(holds(others[k], "t"));
+   CHECK(count_files(dir) == 11 + 4);
+
+   /* nor the name of a copy in flight */
+   set_time(15, 2, 0);
+   put(ROOT "/holding/backups/Game - 2026-11-03 15-02-00 - Snes9x - not-loaded.state.auto.tmp", "w");
+   CHECK(save_backups_name_copy(s, sizeof(s), dir, autop, "Snes9x", SAVE_BACKUP_NOT_LOADED) == SAVE_BACKUP_MADE);
+   CHECK(same_path(s, ROOT "/holding/backups/Game - 2026-11-03 15-02-00-2 - Snes9x - not-loaded.state.auto"));
 }
 
 /* Two names cut to one: a copy may be either file's, so neither's are
@@ -1305,6 +1425,7 @@ int main(void)
    backup_identical_skip();
    backup_retention();
    backup_retention_not_loaded();
+   backup_held();
    backup_retention_cut();
    backup_retention_long();
    backup_retention_mark();

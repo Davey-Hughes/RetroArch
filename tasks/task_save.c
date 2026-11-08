@@ -31,6 +31,7 @@
 #include <retro_timers.h>
 #include <features/features_cpu.h>
 #include <time/rtime.h>
+#include <vfs/vfs_implementation.h>
 
 #ifdef HAVE_CONFIG_H
 #include "../config.h"
@@ -2072,10 +2073,403 @@ static bool task_push_load_and_save_state(const char *path, void *data,
    return true;
 }
 
+/* A not-loaded .auto that cannot move into its backups (another drive,
+ * SAF) is held beside itself under a held name, on its own volume, and
+ * a task copies it there a piece at a time: the copy is synced and the
+ * held one deleted off the frame loop, or on the unthreaded queue the
+ * copy lands unsynced and a later load deletes the held one. */
+enum auto_state_keep_step
+{
+   AUTO_STATE_KEEP_NEXT = 0,
+   AUTO_STATE_KEEP_COMPARE,
+   AUTO_STATE_KEEP_COPY
+};
+
+typedef struct
+{
+   RFILE *in;
+   RFILE *out;    /* the copy's temp, or a copy compared */
+   uint8_t *buf;  /* SAVE_STATE_CHUNK */
+   char *core;
+   struct string_list *copies; /* to compare with, newest first */
+   size_t next;   /* in copies */
+   int64_t size;  /* the held one's */
+   unsigned n;    /* the held name in hand */
+   enum auto_state_keep_step step;
+   bool failed;
+   char path[PATH_MAX_LENGTH];
+   char dir[PATH_MAX_LENGTH];
+   char held[PATH_MAX_LENGTH];
+   char made[PATH_MAX_LENGTH];
+   char compared[PATH_MAX_LENGTH];
+} auto_state_keep_t;
+
+/* How old an unsynced copy is before it is taken to be on the disk */
+#define AUTO_STATE_KEEP_SETTLED_SEC 60
+
+/* One keep task at a time, so copy names and temp deletes never race;
+ * the paths owed wait here, each with its block as userdata. Main
+ * thread: push and callback only. */
+static unsigned            auto_state_keep_tasks = 0;
+static struct string_list *auto_state_keep_owed  = NULL;
+static size_t              auto_state_keep_next  = 0;
+
+static void auto_state_keep_close(auto_state_keep_t *keep)
+{
+   if (keep->in)
+      filestream_close(keep->in);
+   keep->in = NULL;
+   if (keep->out)
+   {
+      filestream_close(keep->out);
+      if (keep->step == AUTO_STATE_KEEP_COPY)
+         filestream_finish_atomic(keep->made, false);
+   }
+   keep->out  = NULL;
+   keep->step = AUTO_STATE_KEEP_NEXT;
+}
+
+/* Opens the next held name and lists the copies to compare it with.
+ * False when none is left. */
+static bool auto_state_keep_begin(auto_state_keep_t *keep)
+{
+   while (++keep->n <= SAVE_BACKUPS_HELD_MAX)
+      if (     save_backups_held_name(keep->held, sizeof(keep->held),
+                  keep->path, keep->n)
+            && path_is_valid(keep->held))
+         break;
+   if (keep->n > SAVE_BACKUPS_HELD_MAX)
+      return false;
+
+   string_list_free(keep->copies);
+   keep->next = 0;
+   if (     !(keep->copies = save_backups_delete_temps(keep->dir, keep->path,
+               keep->core, SAVE_BACKUP_NOT_LOADED))
+         || !(keep->in = filestream_open(keep->held,
+               RETRO_VFS_FILE_ACCESS_READ,
+               RETRO_VFS_FILE_ACCESS_HINT_SEQUENTIAL_BULK)))
+   {
+      keep->failed = true;
+      return true;
+   }
+   keep->size = filestream_get_size(keep->in);
+   keep->step = AUTO_STATE_KEEP_COMPARE;
+   return true;
+}
+
+/* Opens the next copy of the held one's size to compare, or else its
+ * own copy's temp, named only now so that temp holds the name. */
+static bool auto_state_keep_open(auto_state_keep_t *keep)
+{
+   while (keep->next < keep->copies->size)
+   {
+      const char *copy = keep->copies->elems[keep->next++].data;
+      if (     path_get_size(copy) == keep->size
+            && (keep->out = filestream_open(copy,
+                  RETRO_VFS_FILE_ACCESS_READ,
+                  RETRO_VFS_FILE_ACCESS_HINT_SEQUENTIAL_BULK)))
+      {
+         strlcpy(keep->compared, copy, sizeof(keep->compared));
+         return true;
+      }
+   }
+   if (     save_backups_name_copy(keep->made, sizeof(keep->made), keep->dir,
+               keep->path, keep->core, SAVE_BACKUP_NOT_LOADED)
+            == SAVE_BACKUP_MADE
+         && (keep->out = filestream_open_atomic(keep->made)))
+   {
+      keep->step = AUTO_STATE_KEEP_COPY;
+      return true;
+   }
+   return false;
+}
+
+/* The copy is written: in place, and the held one deleted once synced */
+static void auto_state_keep_land(auto_state_keep_t *keep, bool ok)
+{
+   int ret;
+   bool sync = task_queue_is_threaded();
+   filestream_close(keep->in);
+   keep->in = NULL;
+   if (filestream_close(keep->out) != 0)
+      ok = false;
+   keep->out  = NULL;
+   keep->step = AUTO_STATE_KEEP_NEXT;
+   ret        = sync
+      ? filestream_finish_atomic_synced(keep->made, ok)
+      : filestream_finish_atomic(keep->made, ok);
+   /* Written but not renamed into place */
+   if (     ret == 1
+         && filestream_atomic_temp_name(keep->compared,
+            sizeof(keep->compared), keep->made))
+      filestream_delete(keep->compared);
+   if (ret != 0)
+   {
+      keep->failed = true;
+      return;
+   }
+   save_backups_retain_made(keep->dir, keep->path, keep->core,
+         SAVE_BACKUP_NOT_LOADED, keep->made);
+   if (sync)
+      filestream_delete(keep->held);
+}
+
+/* A copy holds the held one: it goes once that copy is on the disk. An
+ * unthreaded session's copy may not be synced, so here it is, or past
+ * AUTO_STATE_KEEP_SETTLED_SEC it is taken to be. */
+static void auto_state_keep_settle(auto_state_keep_t *keep)
+{
+   int64_t mtime;
+   bool on_disk = false;
+   filestream_close(keep->in);
+   filestream_close(keep->out);
+   keep->in   = NULL;
+   keep->out  = NULL;
+   keep->step = AUTO_STATE_KEEP_NEXT;
+   if (task_queue_is_threaded())
+   {
+      RFILE *file = filestream_open(keep->compared,
+            RETRO_VFS_FILE_ACCESS_WRITE
+            | RETRO_VFS_FILE_ACCESS_UPDATE_EXISTING,
+            RETRO_VFS_FILE_ACCESS_HINT_NONE);
+      on_disk = file && filestream_sync(file) == 0;
+      if (file && filestream_close(file) != 0)
+         on_disk = false;
+      /* Its name too, as a synced write's rename */
+      if (on_disk)
+         retro_vfs_dir_sync_impl(keep->dir);
+      else
+         keep->failed = true;
+   }
+   else
+      on_disk =    path_get_mtime(keep->compared, &mtime)
+                && (int64_t)time(NULL) - mtime > AUTO_STATE_KEEP_SETTLED_SEC;
+   if (on_disk)
+      filestream_delete(keep->held);
+}
+
+/* One piece of the copy or the compare; false when this held one is
+ * done. */
+static bool auto_state_keep_piece(auto_state_keep_t *keep)
+{
+   int64_t got, other;
+   if (keep->step == AUTO_STATE_KEEP_COPY)
+   {
+      if (     (got = filestream_read(keep->in, keep->buf, SAVE_STATE_CHUNK))
+               > 0
+            && filestream_write(keep->out, keep->buf, got) == got)
+         return true;
+      auto_state_keep_land(keep, got == 0);
+      return false;
+   }
+   if (!keep->out)
+   {
+      if (auto_state_keep_open(keep))
+         return true;
+      auto_state_keep_close(keep);
+      keep->failed = true;
+      return false;
+   }
+   got   = filestream_read(keep->in, keep->buf, SAVE_STATE_CHUNK / 2);
+   other = got > 0 ? filestream_read(keep->out,
+         keep->buf + SAVE_STATE_CHUNK / 2, got) : got;
+   if (got > 0 && other == got
+         && !memcmp(keep->buf, keep->buf + SAVE_STATE_CHUNK / 2,
+            (size_t)got))
+      return true;
+   if (got == 0)
+   {
+      auto_state_keep_settle(keep);
+      return false;
+   }
+   /* Not the same: the next copy, or one of its own */
+   filestream_close(keep->out);
+   keep->out = NULL;
+   if (     got > 0 && other >= 0
+         && filestream_seek(keep->in, 0, RETRO_VFS_SEEK_POSITION_START) == 0)
+      return true;
+   auto_state_keep_close(keep);
+   keep->failed = true;
+   return false;
+}
+
+static void task_auto_state_keep_handler(retro_task_t *task)
+{
+   retro_time_t deadline;
+   auto_state_keep_t *keep = (auto_state_keep_t*)task->state;
+
+   if (task_get_flags(task) & RETRO_TASK_FLG_CANCELLED)
+   {
+      auto_state_keep_close(keep);
+      keep->n = SAVE_BACKUPS_HELD_MAX;
+   }
+   if (keep->step == AUTO_STATE_KEEP_NEXT)
+   {
+      if (!auto_state_keep_begin(keep))
+      {
+         task_set_data(task, keep);
+         task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
+      }
+      return;
+   }
+   deadline = cpu_features_get_time_usec() + SAVE_STATE_TICK_BUDGET_US;
+   while (     auto_state_keep_piece(keep)
+         && cpu_features_get_time_usec() < deadline);
+}
+
+static bool auto_state_keep_push(auto_state_keep_t *keep);
+
+static void task_auto_state_keep_cb(retro_task_t *task, void *task_data,
+      void *user_data, const char *error)
+{
+   auto_state_keep_t *keep = (auto_state_keep_t*)task_data;
+   if (keep->failed)
+      RARCH_ERR("[State] Could not copy the unloaded \"%s\" to the "
+            "backups: kept beside it for the next load.\n", keep->path);
+   string_list_free(keep->copies);
+   free(keep->buf);
+   free(keep);
+   auto_state_keep_tasks--;
+   /* At exit: the rest wait for their next load */
+   if (task_get_flags(task) & RETRO_TASK_FLG_CANCELLED)
+      auto_state_keep_next = auto_state_keep_owed
+         ? auto_state_keep_owed->size : 0;
+   while (     auto_state_keep_owed
+         && auto_state_keep_next < auto_state_keep_owed->size
+         && !auto_state_keep_tasks)
+   {
+      struct string_list_elem *elem =
+         &auto_state_keep_owed->elems[auto_state_keep_next++];
+      keep           = (auto_state_keep_t*)elem->userdata;
+      elem->userdata = NULL;
+      if (!auto_state_keep_push(keep))
+      {
+         RARCH_ERR("[State] Could not start copying the unloaded \"%s\" "
+               "to the backups: kept beside it for the next load.\n",
+               keep->path);
+         free(keep);
+      }
+   }
+   if (     auto_state_keep_owed
+         && auto_state_keep_next >= auto_state_keep_owed->size)
+   {
+      string_list_free(auto_state_keep_owed);
+      auto_state_keep_owed = NULL;
+      auto_state_keep_next = 0;
+   }
+}
+
+/* The piece buffer only once pushed: owed blocks are freed as a
+ * string_list's userdata. */
+static bool auto_state_keep_push(auto_state_keep_t *keep)
+{
+   retro_task_t *task;
+   if (!(keep->buf = (uint8_t*)malloc(SAVE_STATE_CHUNK)))
+      return false;
+   if (!(task = task_init()))
+   {
+      free(keep->buf);
+      keep->buf = NULL;
+      return false;
+   }
+   task->type     = TASK_TYPE_NONE;
+   task->state    = keep;
+   task->handler  = task_auto_state_keep_handler;
+   task->callback = task_auto_state_keep_cb;
+   task->flags   |= RETRO_TASK_FLG_MUTE;
+   if (!task_queue_push(task))
+   {
+      free(task);
+      free(keep->buf);
+      keep->buf = NULL;
+      return false;
+   }
+   auto_state_keep_tasks++;
+   return true;
+}
+
+void content_auto_state_keep(const char *path)
+{
+   union string_list_elem_attr attr;
+   const char *core        = runloop_state_get_ptr()->system.info.library_name;
+   size_t core_len         = core ? strlen(core) : 0;
+   auto_state_keep_t *keep = (auto_state_keep_t*)calloc(1,
+         sizeof(*keep) + core_len + 1);
+
+   if (!keep)
+      return;
+   /* The core field and folder as set for this content: the roots may
+    * change before the task runs */
+   keep->core = (char*)(keep + 1);
+   if (core_len)
+      memcpy(keep->core, core, core_len);
+   strlcpy(keep->path, path, sizeof(keep->path));
+   attr.i = 0;
+   if (save_backups_dir(keep->dir, sizeof(keep->dir), path))
+   {
+      if (!auto_state_keep_tasks)
+      {
+         if (auto_state_keep_push(keep))
+            return;
+      }
+      else if (   (  auto_state_keep_owed
+                  || (auto_state_keep_owed = string_list_new()))
+               && string_list_append(auto_state_keep_owed, path, attr))
+      {
+         auto_state_keep_owed->elems[
+            auto_state_keep_owed->size - 1].userdata = keep;
+         return;
+      }
+   }
+   RARCH_ERR("[State] Could not start copying the unloaded \"%s\" to the "
+         "backups: kept beside it for the next load.\n", path);
+   free(keep);
+}
+
+void content_auto_state_sweep(const char *path)
+{
+   if (save_backups_held(path))
+      content_auto_state_keep(path);
+}
+
+/* Moves @path to its first free held name, as @held. */
+static bool content_auto_state_hold(const char *path, unsigned *held)
+{
+   unsigned n;
+   bool ok = false;
+   char *s = (char*)malloc(PATH_MAX_LENGTH);
+   for (n = 1; s && n <= SAVE_BACKUPS_HELD_MAX; n++)
+   {
+      if (!save_backups_held_name(s, PATH_MAX_LENGTH, path, n))
+         break;
+      if (path_is_valid(s))
+         continue;
+      if ((ok = filestream_rename(path, s) == 0))
+         *held = n;
+      break;
+   }
+   free(s);
+   return ok;
+}
+
+/* The new state could not take @path's place: held name @n goes back. */
+static void content_auto_state_unhold(const char *path, unsigned n)
+{
+   char *s = (char*)malloc(PATH_MAX_LENGTH);
+   if (     !s
+         || !save_backups_held_name(s, PATH_MAX_LENGTH, path, n)
+         || filestream_rename(s, path) != 0)
+      RARCH_ERR("[State] Could not put the unloaded \"%s\" back: kept "
+            "beside it, copied to the backups at the next load.\n", path);
+   free(s);
+   runloop_state_get_ptr()->auto_state_owned = false;
+}
+
 /* An .auto the session wanted and did not load (load failed, hardcore,
  * netplay, a replay, an entry slot) goes to the backups before the
- * first write over it. */
-static bool content_auto_state_set_aside(const char *path)
+ * first write over it. Across drives it is held beside itself, as
+ * @held, until a task copies it there. */
+static bool content_auto_state_set_aside(const char *path, unsigned *held)
 {
    runloop_state_t *runloop_st = runloop_state_get_ptr();
    settings_t *settings        = config_get_ptr();
@@ -2085,19 +2479,24 @@ static bool content_auto_state_set_aside(const char *path)
              || runloop_st->auto_state_load_asked)
          && path_is_valid(path))
    {
-      bool kept = false;
+      enum save_backup_result result = SAVE_BACKUP_FAILED;
       char *dir = (char*)malloc(2 * PATH_MAX_LENGTH);
-      /* A rename, else an unsynced copy the new state's rename
-       * replaces: no synced copy inside the frame. */
+      /* A rename, else held for a task, else an unsynced copy the new
+       * state's rename replaces: no synced copy inside the frame. */
       if (dir && save_backups_dir(dir, PATH_MAX_LENGTH, path))
-         kept =    save_backups_move_begin(dir, path, NULL,
-                     SAVE_BACKUP_NOT_LOADED, dir + PATH_MAX_LENGTH,
-                     PATH_MAX_LENGTH) == SAVE_BACKUP_MADE
-                || save_backups_copy_to(dir, path, NULL,
-                     SAVE_BACKUP_NOT_LOADED, NULL, 0, false)
-                     == SAVE_BACKUP_MADE;
+      {
+         result = save_backups_move_begin(dir, path, NULL,
+               SAVE_BACKUP_NOT_LOADED, dir + PATH_MAX_LENGTH,
+               PATH_MAX_LENGTH);
+         if (     result == SAVE_BACKUP_COPY_OWED
+               && content_auto_state_hold(path, held))
+            result = SAVE_BACKUP_MADE;
+         else if (result != SAVE_BACKUP_MADE)
+            result = save_backups_copy_to(dir, path, NULL,
+                  SAVE_BACKUP_NOT_LOADED, NULL, 0, false);
+      }
       free(dir);
-      if (!kept)
+      if (result != SAVE_BACKUP_MADE)
       {
          RARCH_ERR("[State] Could not keep the unloaded \"%s\": not "
                "saving over it.\n", path);
@@ -2121,6 +2520,7 @@ bool content_auto_save_state(const char *path)
 {
    size_t _len;
    int _close_ret;
+   unsigned held        = 0;
    settings_t *settings = config_get_ptr();
    void *serial_data    = NULL;
    intfstream_t *file   = NULL;
@@ -2177,10 +2577,16 @@ bool content_auto_save_state(const char *path)
    free(serial_data);
    free(file);
 
-   if (_close_ret == 0 && !content_auto_state_set_aside(path))
+   if (_close_ret == 0 && !content_auto_state_set_aside(path, &held))
       _close_ret = -1;
    if (!content_finish_tmp(path, _close_ret == 0, false))
+   {
+      if (held)
+         content_auto_state_unhold(path, held);
       return false;
+   }
+   if (held)
+      content_auto_state_keep(path);
    content_save_written();
 
 #ifdef HAVE_SCREENSHOTS

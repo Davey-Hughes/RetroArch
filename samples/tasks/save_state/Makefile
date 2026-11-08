@@ -81,7 +81,12 @@ CFLAGS  += -Wall -std=gnu99 -g1 -O1 \
 # --wrap=calloc so a lane can fail the allocations a finishing task
 # would make, to show the notified caller is told regardless.
 # --wrap=task_queue_park so a lane can count the load handler's parks.
+# --wrap=retro_vfs_file_rename_impl so a lane can refuse a rename, as a
+# move across drives fails, and --wrap=retro_vfs_file_sync_impl so it
+# can count the syncs.
 LDFLAGS += -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=task_queue_park \
+           -Wl,--wrap=retro_vfs_file_rename_impl \
+           -Wl,--wrap=retro_vfs_file_sync_impl \
            -lpthread -lm
 
 # Extra flags for the caller; CFLAGS= on the command line would replace

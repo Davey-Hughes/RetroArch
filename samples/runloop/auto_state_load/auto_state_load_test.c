@@ -195,6 +195,52 @@ const char *msg_hash_to_str(enum msg_hash_enums msg)
    return "test";
 }
 
+/* The rest of a content load (event_init_content) */
+static unsigned sweeps;
+void content_auto_state_sweep(const char *path)
+{
+   assert(strcmp(path, "test.auto") == 0);
+   sweeps++;
+}
+void RARCH_WARN(const char *fmt, ...) { (void)fmt; }
+uint8_t content_get_flags(void) { return 0; }
+bool content_init(void) { return true; }
+void content_set_subsystem_info(void) {}
+char *dir_get_ptr(enum rarch_dir_type type)
+{
+   static char none[1];
+   (void)type;
+   return none;
+}
+bool fill_pathname_application_data(char *s, size_t len)
+{ (void)s; (void)len; return false; }
+size_t fill_pathname_application_special(char *s, size_t len,
+      enum application_special_type type)
+{ (void)len; (void)type; *s = '\0'; return 0; }
+const struct retro_subsystem_info *libretro_find_subsystem_info(
+      const struct retro_subsystem_info *info, unsigned num_info,
+      const char *ident)
+{ (void)info; (void)num_info; (void)ident; return NULL; }
+void path_deinit_savefile(void) {}
+void path_init_savefile_new(void) {}
+void path_init_savefile_rtc(const char *savefile_path)
+{ (void)savefile_path; }
+bool path_is_directory(const char *path) { (void)path; return false; }
+bool path_is_empty(enum rarch_path_type type) { (void)type; return true; }
+bool retroarch_override_setting_is_set(enum rarch_override_setting enum_idx,
+      void *data)
+{ (void)enum_idx; (void)data; return false; }
+void *savefile_ptr_get(void) { return NULL; }
+void save_backups_set_roots(const char *savefile_dir,
+      const char *savestate_dir, const char *content_dir,
+      const char *system_dir, const char *config_dir,
+      const char *app_data_dir, const char *core)
+{ (void)savefile_dir; (void)savestate_dir; (void)content_dir;
+  (void)system_dir; (void)config_dir; (void)app_data_dir; (void)core; }
+bool save_backups_note_folders(const char *configured, const char *used,
+      bool sync)
+{ (void)configured; (void)used; (void)sync; return true; }
+
 static void reset(unsigned frames, bool quirk)
 {
    memset(&runloop_state, 0, sizeof(runloop_state));
@@ -606,6 +652,23 @@ static void lane_max_keep_exact_name(void)
 
 /* The Auto slot saved or loaded by hand: the .auto is the session's
  * once that is through */
+/* Each content load hands its .auto to the sweep, before any frame */
+static void test_content_load_sweep(void)
+{
+   reset(1, false);
+   test_settings.bools.savestate_auto_load = false;
+   sweeps = 0;
+   assert(event_init_content(&runloop_state, &test_settings, NULL));
+   assert(sweeps == 1 && runs == 0);
+   assert(event_init_content(&runloop_state, &test_settings, NULL));
+   assert(sweeps == 2);
+   /* no content, no sweep */
+   runloop_state.current_core_type = CORE_TYPE_DUMMY;
+   assert(event_init_content(&runloop_state, &test_settings, NULL));
+   assert(sweeps == 2);
+   puts("content load sweep tests passed");
+}
+
 static void test_auto_slot_owned(void)
 {
    reset(0, false);
@@ -657,6 +720,7 @@ int main(void)
    puts("max_keep tests passed");
    test_auto_slot_owned();
    test_auto_state_order();
+   test_content_load_sweep();
    reset(3, true);
    assert(command_event_load_auto_state());
    runloop_load_deferred_auto_state();
