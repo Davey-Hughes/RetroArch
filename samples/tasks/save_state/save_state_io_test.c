@@ -139,6 +139,7 @@
 #include "../../../core.h"
 #include "../../../msg_hash.h"
 #include "../../../save_backups.h"
+#include "../../../tasks/tasks_internal.h"
 #include "../../../gfx/video_driver.h"
 
 /* Must match tasks/task_save.c.  Duplicated rather than exported: the
@@ -1665,6 +1666,58 @@ static void test_undo_save_during_backup(void)
    filestream_delete(ref);
 }
 
+/* -----------------------------------------------------------------
+ * A save over a slot that backs nothing up (its backup read fails, or
+ * the core turned undo off) leaves nothing to undo: the buffer holds
+ * the file from before an earlier save, an older state.
+ * ----------------------------------------------------------------- */
+static void test_undo_save_not_backed_up(void)
+{
+   const char *path = "sst_undo_stale.state";
+   int k;
+
+   for (k = 0; k < 2; k++)
+   {
+      void   *last   = NULL;
+      int64_t n_last = -1;
+
+      frontend_reset();
+      content_reset_savestate_backups();
+      filestream_delete(path);
+      core_fill(4096);
+      content_save_state(path, true);
+      pump(1000);
+      memset(core_mem, 0x33, core_len);
+      content_save_state(path, true);
+      pump(1000);
+
+      memset(core_mem, 0x44, core_len);
+      if (k)
+         set_save_state_disable_undo(true);
+      content_save_state(path, true);
+      /* the backup read finds no file */
+      if (!k)
+         filestream_delete(path);
+      pump(1000);
+      set_save_state_disable_undo(false);
+      if (!filestream_read_file(path, &last, &n_last))
+         n_last = -1;
+
+      okf(content_undo_save_buf_is_empty(),
+          k ? "undo stale: after a save with undo off, nothing to undo"
+            : "undo stale: after a failed backup read, nothing to undo");
+      okf(!content_undo_save_state(),
+          k ? "undo stale: undo off, the undo is refused"
+            : "undo stale: failed read, the undo is refused");
+      pump(1000);
+      okf(n_last > 0 && !written_into(path, last, n_last),
+          k ? "undo stale: undo off, the slot keeps the last save"
+            : "undo stale: failed read, the slot keeps the last save");
+      free(last);
+   }
+   filestream_delete(path);
+}
+
 #ifdef HAVE_COMPRESSION
 /* -----------------------------------------------------------------
  * 13. Undo puts back the file a save replaced, as it was.
@@ -1875,6 +1928,7 @@ static int run_default_lane(void)
    test_undo_save_count();
    test_undo_save_twice();
    test_undo_save_during_backup();
+   test_undo_save_not_backed_up();
 #ifdef HAVE_COMPRESSION
    test_undo_save_restores_file();
 #endif

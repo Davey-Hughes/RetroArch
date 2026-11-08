@@ -1046,7 +1046,7 @@ static void task_save_handler(retro_task_t *task)
          const char *failed_undo_str = msg_hash_to_str(
                MSG_FAILED_TO_UNDO_SAVE_STATE);
          RARCH_ERR("[State] %s \"%s\".\n", failed_undo_str,
-               undo_save_buf.path);
+               state->path);
          snprintf(msg, sizeof(msg), "%s \"RAM\".", failed_undo_str);
       }
       else
@@ -1742,6 +1742,10 @@ error:
    RARCH_ERR("[State] %s \"%s\".\n",
          msg_hash_to_str(MSG_FAILED_TO_LOAD_STATE),
          load_data->path);
+   /* The save goes ahead without a backup: what the buffer holds is
+    * older. */
+   if (load_data->flags & SAVE_TASK_FLAG_LOAD_TO_BACKUP_BUFF)
+      undo_save_buf.path[0] = '\0';
    if (load_data->done_cb)
    {
       char msg[PATH_MAX_LENGTH + 64];
@@ -2264,6 +2268,8 @@ bool content_save_state_notify(const char *path, bool save_to_disk,
       return task_push_load_and_save_state(path, data, _len, true, false,
             cb, user_data);
    }
+   /* Nothing backs up the file this replaces: the buffer is older */
+   undo_save_buf.path[0] = '\0';
    return task_push_save_state(path, data, _len, false, false, cb, user_data);
 }
 
