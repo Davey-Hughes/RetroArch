@@ -2064,6 +2064,68 @@ static void test_auto_state(void)
 }
 
 /* -----------------------------------------------------------------
+ * Undo Save or Undo Load of the .auto hands it back: the next
+ * automatic save keeps it again. An undo of another slot does not.
+ * ----------------------------------------------------------------- */
+static void test_auto_state_undo(void)
+{
+   const char *auto_slot = "save_state_io_test_auto_-1.state";
+   const char *other     = "sst_auto_undo.state";
+   void   *was = NULL, *back = NULL;
+   int64_t n_was = -1, n_back = -2;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(auto_slot);
+   filestream_delete(other);
+   core_fill(TEST_SAVE_STATE_CHUNK);
+
+   content_save_state(auto_slot, true);
+   pump(1000);
+   if (!filestream_read_file(auto_slot, &was, &n_was))
+      n_was = -1;
+   memset(core_mem, 0x33, core_len);
+   content_save_state(auto_slot, true);
+   pump(1000);
+   stub_runloop.auto_state_owned = true;
+   okf(content_undo_save_state(), "auto undo: Undo Save of the .auto is pushed");
+   pump(1000);
+   if (!filestream_read_file(auto_slot, &back, &n_back))
+      n_back = -2;
+   okf(n_was > 0 && n_back == n_was && !memcmp(was, back, (size_t)n_was)
+         && !stub_runloop.auto_state_owned,
+       "auto undo: the .auto put back is not the session's");
+
+   stub_runloop.auto_state_owned = true;
+   content_load_state(auto_slot, false, false);
+   pump(1000);
+   stub_runloop.auto_state_owned = true;
+   okf(content_undo_load_state() && !stub_runloop.auto_state_owned,
+       "auto undo: Undo Load of the .auto hands it back");
+
+   stub_runloop.auto_state_owned = true;
+   content_save_state(other, true);
+   pump(1000);
+   content_save_state(other, true);
+   pump(1000);
+   okf(content_undo_save_state(), "auto undo: Undo Save of a slot is pushed");
+   pump(1000);
+   okf(stub_runloop.auto_state_owned,
+       "auto undo: Undo Save of a slot keeps the .auto the session's");
+   content_load_state(auto_slot, false, false);
+   pump(1000);
+   content_load_state(other, false, false);
+   pump(1000);
+   okf(content_undo_load_state() && stub_runloop.auto_state_owned,
+       "auto undo: Undo Load of a slot keeps the .auto the session's");
+
+   free(was);
+   free(back);
+   filestream_delete(auto_slot);
+   filestream_delete(other);
+}
+
+/* -----------------------------------------------------------------
  * A not-loaded .auto that cannot move into its backups (across drives)
  * waits beside itself under a held name while a task copies it there.
  * ----------------------------------------------------------------- */
@@ -2504,6 +2566,7 @@ static int run_default_lane(void)
    test_undo_save_during_backup();
    test_undo_save_not_backed_up();
    test_auto_state();
+   test_auto_state_undo();
    test_auto_state_keep();
 #ifdef HAVE_COMPRESSION
    test_undo_save_restores_file();

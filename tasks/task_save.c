@@ -191,6 +191,8 @@ static char undo_save_last_path[PATH_MAX_LENGTH];
 /* Holds the data from before a load_state() operation
  * Can be restored with undo_load_state(). */
 static struct save_state_buf undo_load_buf;
+/* undo_load_buf was taken by a load of the .auto */
+static bool undo_load_auto = false;
 
 /* The allocation undo_load_buf handed back last time it was replaced,
  * kept rather than freed.  Retaking the undo snapshot is the hottest
@@ -309,6 +311,16 @@ static void content_flush_saves_before_load(void)
          compress, 1 << SAVE_BACKUP_BEFORE_STATE_LOAD);
 }
 
+static bool content_is_auto_state(const char *path)
+{
+   bool ret = false;
+   char *s  = (char*)malloc(PATH_MAX_LENGTH);
+   if (s && runloop_get_savestate_path(s, PATH_MAX_LENGTH, -1))
+      ret = string_is_equal(path, s);
+   free(s);
+   return ret;
+}
+
 /**
  * undo_load_state:
  * Revert to the state before a state was loaded.
@@ -321,6 +333,7 @@ bool content_undo_load_state(void)
    bool ret                  = false;
    bool captured             = false;
    bool ramped               = false;
+   bool auto_undone          = undo_load_auto;
    unsigned num_blocks       = 0;
    void *restore_data        = NULL;
    size_t restore_size       = 0;
@@ -473,6 +486,10 @@ bool content_undo_load_state(void)
    }
    free(blocks);
 
+   /* Backed out of the .auto: an automatic save keeps it again */
+   if (auto_undone)
+      runloop_state_get_ptr()->auto_state_owned = false;
+
    if (!ret)
    {
       RARCH_ERR("[State] %s \"%s\".\n",
@@ -495,6 +512,10 @@ static void undo_save_state_cb(retro_task_t *task,
    if (undo_save_buf_tasks_pending)
       undo_save_buf_tasks_pending--;
    content_save_written();
+
+   /* The .auto the save replaced is back: not the session's */
+   if (content_is_auto_state(state->path))
+      runloop_state_get_ptr()->auto_state_owned = false;
 
    /* Wipe the save file buffer as it's intended to be one use only */
    undo_save_buf.path[0]  = '\0';
@@ -1701,7 +1722,8 @@ static void content_load_state_apply(retro_task_t *task,
       bool ramped = audio_driver_jump_fade_begin();
 
       /* Backup the current state so we can undo this load */
-      content_save_state("RAM", false);
+      if (content_save_state("RAM", false))
+         undo_load_auto = content_is_auto_state(load_data->path);
 
       ret = content_deserialize_state(buf, _len);
 
@@ -2679,6 +2701,7 @@ bool content_save_state_notify(const char *path, bool save_to_disk,
       }
 
       undo_load_buf.size = _len;
+      undo_load_auto     = false;
       strlcpy(undo_load_buf.path, path, sizeof(undo_load_buf.path));
       return true;
    }
@@ -2968,6 +2991,7 @@ void content_reset_savestate_backups(void)
    undo_load_buf.path[0]  = '\0';
    undo_load_buf.size     = 0;
    undo_load_buf.capacity = 0;
+   undo_load_auto         = false;
 
    /* The spare is an allocation nobody else knows about, so this is
     * the only place it can be released.  Resetting the backups is
