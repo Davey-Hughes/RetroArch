@@ -8,6 +8,7 @@
 #include <dynamic/dylib.h>
 #include <file/file_path.h>
 #include <queues/task_queue.h>
+#include <retro_atomic.h>
 #include <retro_dirent.h>
 #include <retro_timers.h>
 #include <streams/file_stream.h>
@@ -989,6 +990,71 @@ static void test_stage_path_moved(void)
 }
 #endif
 
+/* One worker runs every task that isn't parallel: a task that holds it
+ * keeps the tasks pushed after it waiting until worker_go() */
+static retro_atomic_int_t worker_held;
+static retro_atomic_int_t worker_free;
+
+static void hold_handler(retro_task_t *task)
+{
+   retro_atomic_store_release_int(&worker_held, 1);
+   while (!retro_atomic_load_acquire_int(&worker_free))
+      retro_sleep(1);
+   task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
+}
+
+static bool worker_hold(void)
+{
+   unsigned i;
+   retro_task_t *task = task_init();
+   if (!task)
+      return false;
+   retro_atomic_store_release_int(&worker_held, 0);
+   retro_atomic_store_release_int(&worker_free, 0);
+   task->handler = hold_handler;
+   task_queue_push(task);
+   for (i = 0; i < 5000 && !retro_atomic_load_acquire_int(&worker_held); i++)
+      pump(1);
+   return retro_atomic_load_acquire_int(&worker_held) != 0;
+}
+
+static void worker_go(void)
+{
+   retro_atomic_store_release_int(&worker_free, 1);
+}
+
+/* Loaded by path outside Android: a file swapped in after the check and
+ * before the worker's open isn't opened */
+static void test_stage_swapped(void)
+{
+   dylib_t lib = NULL;
+   char core[256];
+   start(true);
+   CHECK(put_core(core, "stage_swap_libretro" LIB_EXT, 'a'));
+   CHECK(trust(core));
+   CHECK(worker_hold());
+   CHECK(core_load_check_stage_begin(core));
+   CHECK(!core_load_check_stage_ready());
+#ifdef _WIN32
+   /* The checked file is held: it can't be swapped */
+   CHECK(!put_core(core, "stage_swap_libretro" LIB_EXT, 'c'));
+   worker_go();
+   CHECK(stage_wait());
+   lib = core_load_check_stage_take(core);
+   CHECK(lib_id(lib) == 1);
+#else
+   CHECK(put_core(core, "stage_swap_libretro" LIB_EXT, 'c'));
+   worker_go();
+   CHECK(stage_wait());
+   lib = core_load_check_stage_take(core);
+   CHECK(!lib);
+   CHECK(lib_id(lib) == 0);
+#endif
+   if (lib)
+      dylib_close(lib);
+   stop();
+}
+
 /* A staged load of the core loaded last passes on its record, as the
  * gate's first branch does: no hash, no "Checking core", and nothing
  * kept beside the record's own file */
@@ -1082,6 +1148,7 @@ int main(void)
    test_stage_lent_cancelled();
    test_stage_path_moved();
 #endif
+   test_stage_swapped();
    test_stage_loaded();
    printf("%u checks, %u failures\n", checks, failures);
    return failures ? 1 : 0;

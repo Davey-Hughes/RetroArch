@@ -71,6 +71,7 @@ struct core_load_open_task
 {
    core_file_t *f;
    char *path;
+   char *check_path;
    dylib_t lib;
    unsigned gen;
 };
@@ -393,11 +394,30 @@ static void core_load_check_osd_checking(const char *path)
          MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
 }
 
+/* Worker: loaded by path outside Android, so only while the path still
+ * names the file checked */
+static bool core_load_open_names(const struct core_load_open_task *o)
+{
+#ifdef ANDROID
+   (void)o;
+   return true;
+#else
+   struct core_identity id;
+   core_file_t *f = NULL;
+   bool same      = core_file_identity(o->f, &id)
+      && (f = core_file_open(o->check_path))
+      && core_load_same_file(&id, f);
+   core_file_close(f);
+   return same;
+#endif
+}
+
 static void core_load_open_handler(retro_task_t *task)
 {
    struct core_load_open_task *o = (struct core_load_open_task*)
       task->state;
-   o->lib = core_load_file(o->f, o->path);
+   if (core_load_open_names(o))
+      o->lib = core_load_file(o->f, o->path);
    task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
 }
 
@@ -431,6 +451,7 @@ static void core_load_open_cleanup(retro_task_t *task)
       dylib_close(o->lib);
    core_file_close(o->f);
    free(o->path);
+   free(o->check_path);
    free(o);
    task->state = NULL;
 }
@@ -440,11 +461,16 @@ static void core_load_check_stage_open(void)
    struct core_load_open_task *o = NULL;
    retro_task_t *task            = NULL;
    if (     !core_load_rt.stage_f
+         || !core_load_check_file_path(core_load_rt.stage_path,
+            core_load_rt.check_path, sizeof(core_load_rt.check_path))
          || !(o = (struct core_load_open_task*)calloc(1, sizeof(*o))))
       return;
-   if (!(o->path = strdup(core_load_rt.stage_path)) || !(task = task_init()))
+   if (     !(o->path       = strdup(core_load_rt.stage_path))
+         || !(o->check_path = strdup(core_load_rt.check_path))
+         || !(task          = task_init()))
    {
       free(o->path);
+      free(o->check_path);
       free(o);
       return;
    }
@@ -496,19 +522,19 @@ static void core_load_check_stage_settle(bool pass,
       core_load_check_stage_file_drop();
       return;
    }
-   /* The slot's own file, back to it at the take, or its path opened
-    * again while it names the file checked */
-   if (     grant == CORE_LOAD_GRANT_SLOT
-         && !core_load_rt.stage_f
-         &&  core_load_slot_is(&core_load_rt.slot, core_load_rt.stage_path)
-         &&  core_load_check_file_path(core_load_rt.stage_path,
-               core_load_rt.check_path, sizeof(core_load_rt.check_path))
-         && (core_load_rt.stage_f = core_load_slot_file(&core_load_rt.slot,
-               core_load_rt.check_path, &lent))
-         &&  lent)
+   if (grant == CORE_LOAD_GRANT_SLOT && !core_load_rt.stage_f)
    {
-      core_load_rt.slot.f     = NULL;
-      core_load_rt.stage_lent = true;
+      if (core_load_rt.slot.f)
+      {
+         /* The pass's own file, back to the slot at the take */
+         core_load_rt.stage_f    = core_load_rt.slot.f;
+         core_load_rt.slot.f     = NULL;
+         core_load_rt.stage_lent = true;
+      }
+      else if (core_load_check_file_path(core_load_rt.stage_path,
+               core_load_rt.check_path, sizeof(core_load_rt.check_path)))
+         core_load_rt.stage_f = core_load_slot_file(&core_load_rt.slot,
+               core_load_rt.check_path, &lent);
    }
    core_load_check_stage_open();
 }
