@@ -13,14 +13,15 @@
 
 RETRO_BEGIN_DECLS
 
-/* Loads the core f was opened from, path being the name f was opened by
- * (Android: its real path). Android loads from f itself; Windows by path
- * while f, sharing nothing but reads, holds the file; elsewhere by path.
- * f stays open: close it after. */
+/* Loads the core f (non-NULL) was opened from, path being the resolved
+ * absolute path f was opened by (Android: its real path). Android loads
+ * from f itself; Windows by path while f, sharing nothing but reads,
+ * holds the file; elsewhere by path. f stays open: close it after. */
 dylib_t core_load_file(core_file_t *f, const char *path);
 
-/* Apple: the binary a .framework folder holds, <name>.framework/<name>,
- * which dylib_load opens, so the check must too. False for other paths. */
+/* Apple builds only, where dylib_load opens a .framework folder's
+ * binary, <name>.framework/<name>, so the check must too. s must not
+ * overlap path. False for other paths. */
 bool core_load_framework_binary(const char *path, char *s, size_t len);
 
 RETRO_END_DECLS

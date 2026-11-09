@@ -2167,7 +2167,9 @@ static bool place(const char *from, const char *to, char *s, size_t len)
    void *buf   = NULL;
    int64_t got = 0;
    char *real  = NULL;
-   bool ok     = filestream_read_file(from, &buf, &got)
+   bool ok;
+   *s = '\0';
+   ok = filestream_read_file(from, &buf, &got)
       && filestream_write_file(to, buf, got);
    free(buf);
 #ifdef _WIN32
@@ -2257,6 +2259,14 @@ static void test_load(void)
             "/Applications/RetroArch.app/Contents/Frameworks/snes9x_libretro.framework/snes9x_libretro"));
    CHECK(core_load_framework_binary("a.framework", name, sizeof(name))
          && string_is_equal(name, "a.framework/a"));
+   /* named as dylib_load names it, cut at an archive's '#' */
+   CHECK(core_load_framework_binary("/c/a.zip#b.framework", name,
+            sizeof(name))
+         && string_is_equal(name, "/c/a.zip#b.framework/b"));
+   CHECK(core_load_framework_binary("/c/x.zip#d/snes9x_libretro.framework",
+            one, sizeof(one))
+         && string_is_equal(one,
+            "/c/x.zip#d/snes9x_libretro.framework/d/snes9x_libretro"));
    CHECK(!core_load_framework_binary("/cores/snes9x_libretro.dylib", name,
             sizeof(name)));
    CHECK(!core_load_framework_binary("/cores/x.framework/", name,

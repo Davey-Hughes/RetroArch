@@ -47,7 +47,8 @@ bool core_load_framework_binary(const char *path, char *s, size_t len)
    if (!string_ends_with(path, ext))
       return false;
    n        = strlen(path);
-   name     = path_basename_nocompression(path);
+   /* dylib_load's choice, which cuts at an archive's '#' */
+   name     = path_basename(path);
    name_len = strlen(name) - (sizeof(ext) - 1);
    if (!name_len || n + name_len + 2 > len)
       return false;
