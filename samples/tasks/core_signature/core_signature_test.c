@@ -1769,6 +1769,12 @@ static void test_owner_android(void)
    /* nor the overflow uid, even as 1000 */
    app.overflow_uid = 1000;
    CHECK(!core_mode_exempt_with(&app, 1000, 1000, 1000, 040755, false, android));
+#if !defined(ANDROID)
+   /* Elsewhere uid 1000 is a user's: its folders aren't root's */
+   app.uid          = 1001;
+   app.overflow_uid = 65534;
+   CHECK(!core_mode_exempt(&app, 1001, 1000, 1000, 040755, false));
+#endif
 }
 
 /* RetroArch's own library on Android: inside its APK, the APK */
