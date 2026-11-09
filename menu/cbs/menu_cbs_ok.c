@@ -9948,6 +9948,9 @@ static int action_ok_core_steam_uninstall(
    core_dlc = steam_get_core_dlc_by_name(core_dlc_list, label);
    if (core_dlc == NULL) return 0;
 
+#ifdef HAVE_CORE_LOAD_CHECK
+   core_load_check_release_held();
+#endif
    steam_uninstall_core_dlc(core_dlc);
 
    return 0;
