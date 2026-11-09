@@ -33756,6 +33756,10 @@ MSG_HASH(
    "This build trusts a test signing key: cores anyone can sign will run. Not for everyday use."
    )
 MSG_HASH(
+   MSG_CORE_TRUST_SEEDED,
+   "RetroArch now checks that cores come from libretro. Your installed cores are trusted for now. Use Online Updater > Update Installed Cores to get signed versions."
+   )
+MSG_HASH(
    MSG_TO,
    "to"
    )
