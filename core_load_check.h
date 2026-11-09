@@ -55,6 +55,19 @@ bool core_load_check_stage_refused(void);
 dylib_t core_load_check_stage_take(const char *path);
 void core_load_check_stage_cancel(void);
 
+typedef void (*core_load_rerun_t)(void *userdata);
+
+/* Parks a user-started load the check holds back. It re-runs once the
+ * core passes, or after the user picks Load Once or Always Trust on
+ * the Security Warning. True: free_cb(userdata) runs once, after the
+ * re-run or when the request is dropped. A newer park replaces it. */
+bool core_load_check_park(const char *path, core_load_rerun_t rerun,
+      core_load_rerun_t free_cb, void *userdata);
+/* Each frame: the parked request's waits */
+void core_load_check_iterate(void);
+/* The drivers are up: a message held for them shows */
+void core_load_check_notify(void);
+
 RETRO_END_DECLS
 
 #endif

@@ -45,7 +45,7 @@ const char *msg_hash_to_str(enum msg_hash_enums msg)
    return s;
 }
 
-#define OSD_MAX 16
+#define OSD_MAX 256
 static char osd[OSD_MAX][160];
 static unsigned osd_count;
 
@@ -122,6 +122,13 @@ void RARCH_WARN(const char *fmt, ...)
 void RARCH_ERR(const char *fmt, ...)
 {
    strlcpy(last_log, fmt, sizeof(last_log));
+}
+
+static bool load_pending;
+
+bool task_content_load_pending(void)
+{
+   return load_pending;
 }
 
 /* Hashes started, in place or in a task */
@@ -1258,6 +1265,513 @@ static void test_stage_loaded(void)
 #endif
 }
 
+static unsigned reruns;
+static unsigned frees;
+static int rerun_id;
+
+/* The re-run opens the core as the load it stands for would */
+static void rerun_fn(void *ud)
+{
+   dylib_t lib = NULL;
+   reruns++;
+   rerun_id    = 0;
+   if (core_load_check_open((const char*)ud, &lib) == CORE_LOAD_GATE_OPENED)
+      rerun_id = lib_id(lib);
+   if (lib)
+      dylib_close(lib);
+}
+
+static void free_fn(void *ud)
+{
+   frees++;
+   free(ud);
+}
+
+static bool park(const char *path)
+{
+   size_t len = strlen(path) + 1;
+   char *ud   = (char*)malloc(len);
+   if (!ud)
+      return false;
+   memcpy(ud, path, len);
+   if (core_load_check_park(path, rerun_fn, free_fn, ud))
+      return true;
+   free(ud);
+   return false;
+}
+
+/* Frames until the park re-runs or gives up */
+static void park_wait(unsigned want_reruns)
+{
+   unsigned i;
+   for (i = 0; i < 5000 && reruns < want_reruns; i++)
+   {
+      core_load_check_iterate();
+      pump(1);
+   }
+}
+
+static unsigned osd_refused(void)
+{
+   char want[32];
+   unsigned i;
+   unsigned n = 0;
+   sprintf(want, "msg %d", (int)MSG_CORE_LOAD_REFUSED_NO_MENU);
+   for (i = 0; i < osd_count && i < OSD_MAX; i++)
+      if (string_is_equal(osd[i], want))
+         n++;
+   return n;
+}
+
+static void park_reset(void)
+{
+   reruns   = 0;
+   frees    = 0;
+   rerun_id = 0;
+}
+
+static void test_park_load_once(void)
+{
+   dylib_t lib = NULL;
+   char core[256];
+   unsigned opens;
+   start(false);
+   park_reset();
+   CHECK(put_core(core, "once_libretro" LIB_EXT, 'a'));
+   /* A refused probe, then its standalone entry point parks it */
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_REFUSED);
+   opens = menu_opens;
+   CHECK(park(core));
+   CHECK(queued() == 1);
+   drain();
+   CHECK(menu_opens == opens + 1);
+   CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE));
+   /* Not while a load is still on its way to the dummy core */
+   load_pending = true;
+   core_load_check_iterate();
+   CHECK(reruns == 0);
+   load_pending = false;
+   park_wait(1);
+   CHECK(reruns == 1);
+   CHECK(rerun_id == 1);
+   CHECK(frees == 1);
+   /* The pass is for the file the user saw, never one put there since */
+#ifdef _WIN32
+   /* Its held handle is the binding: nothing replaces the file */
+   CHECK(!put_core(core, "once_libretro" LIB_EXT, 'b'));
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_OPENED);
+   CHECK(lib_id(lib) == 1);
+   if (lib)
+      dylib_close(lib);
+#else
+   CHECK(put_core(core, "once_libretro" LIB_EXT, 'b'));
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_REFUSED);
+   CHECK(!lib);
+#endif
+   stop();
+}
+
+static void test_park_always(void)
+{
+   dylib_t lib = NULL;
+   char core[256];
+   start(false);
+   park_reset();
+   CHECK(put_core(core, "always_libretro" LIB_EXT, 'a'));
+   CHECK(park(core));
+   drain();
+   CHECK(core_warning_choose(CORE_WARNING_ALWAYS_TRUST));
+   park_wait(1);
+   CHECK(rerun_id == 1);
+   drain();
+   core_load_check_deinit();
+#ifdef _WIN32
+   /* No identity record here: the hash Always Trust recorded passes the
+    * core when a load checks it again */
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_REFUSED);
+   CHECK(core_load_check_stage_begin(core));
+   CHECK(stage_wait());
+   CHECK(!core_load_check_stage_refused());
+#else
+   /* Recorded: with the slot gone, the quick check passes it */
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_OPENED);
+   if (lib)
+      dylib_close(lib);
+#endif
+   stop();
+}
+
+/* Always Trust that can't be recorded (the list is full): loaded once,
+ * and the log says so */
+static void test_park_always_full(void)
+{
+   struct core_check fill;
+   char core[256];
+   unsigned i;
+   start(false);
+   park_reset();
+   memset(&fill, 0, sizeof(fill));
+   fill.result = CORE_CHECK_UNSIGNED;
+   strlcpy(fill.rec.name, "fill_libretro" LIB_EXT, sizeof(fill.rec.name));
+   fill.rec.sha256[2] = 0xa5;
+   for (i = 0; i < CORE_TRUST_MAX_HASHES; i++)
+   {
+      fill.rec.sha256[0] = (uint8_t)i;
+      fill.rec.sha256[1] = (uint8_t)(i >> 8);
+      if (!core_trust_runtime_always(&fill))
+         break;
+   }
+   CHECK(i == CORE_TRUST_MAX_HASHES);
+   drain();
+   CHECK(put_core(core, "full_libretro" LIB_EXT, 'a'));
+   CHECK(park(core));
+   drain();
+   last_log[0] = '\0';
+   CHECK(core_warning_choose(CORE_WARNING_ALWAYS_TRUST));
+   CHECK(strstr(last_log, "Could not trust") != NULL);
+   park_wait(1);
+   CHECK(reruns == 1);
+   CHECK(rerun_id == 1);
+   CHECK(frees == 1);
+   stop();
+}
+
+static void test_park_cancel(void)
+{
+   char core[256];
+   start(false);
+   park_reset();
+   CHECK(put_core(core, "cancel_libretro" LIB_EXT, 'a'));
+   CHECK(park(core));
+   drain();
+   CHECK(core_warning_choose(CORE_WARNING_CANCEL));
+   park_wait(1);
+   CHECK(reruns == 0);
+   CHECK(frees == 1);
+   stop();
+}
+
+static void test_park_pass(void)
+{
+   char core[256];
+   unsigned opens;
+   start(false);
+   park_reset();
+   CHECK(put_core(core, "pass_libretro" LIB_EXT, 'a'));
+   CHECK(trust(core));
+   CHECK(put_core(core, "pass_libretro" LIB_EXT, 'a'));
+   opens = menu_opens;
+   CHECK(park(core));
+   park_wait(1);
+   /* Passed its check: re-run with no question asked */
+   CHECK(reruns == 1);
+   CHECK(rerun_id == 1);
+   CHECK(menu_opens == opens);
+   stop();
+}
+
+/* No menu to ask on: Cancel, a log line and an OSD that waits for the
+ * drivers */
+static void test_park_no_menu(void)
+{
+   char core[256];
+   unsigned shown;
+   start(false);
+   park_reset();
+   menu_can_open = false;
+   last_log[0]   = '\0';
+   shown         = osd_refused();
+   CHECK(put_core(core, "nomenu_libretro" LIB_EXT, 'a'));
+   CHECK(park(core));
+   drain();
+   CHECK(frees == 1);
+   CHECK(reruns == 0);
+   CHECK(strstr(last_log, "Always Trust") != NULL);
+   CHECK(osd_refused() == shown);
+   core_load_check_notify();
+   CHECK(osd_refused() == shown + 1);
+   /* With the drivers up it shows at once; the refusal kept for the
+    * file answers, so the park ends at once */
+   CHECK(!park(core));
+   CHECK(frees == 1);
+   CHECK(osd_refused() == shown + 2);
+   /* After a deinit it waits for the drivers again */
+   core_load_check_deinit();
+   CHECK(park(core));
+   drain();
+   CHECK(frees == 2);
+   CHECK(osd_refused() == shown + 2);
+   /* and what it held is gone with the next one */
+   core_load_check_deinit();
+   core_load_check_notify();
+   CHECK(osd_refused() == shown + 2);
+   menu_can_open = true;
+   stop();
+}
+
+static void test_park_replaced(void)
+{
+   char a[256];
+   char b[256];
+   start(false);
+   park_reset();
+   CHECK(put_core(a, "first_libretro" LIB_EXT, 'a'));
+   CHECK(put_core(b, "second_libretro" LIB_EXT, 'b'));
+   CHECK(park(a));
+   drain();
+   /* A newer request replaces the parked one */
+   CHECK(park(b));
+   CHECK(frees == 1);
+   drain();
+   CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE));
+   park_wait(1);
+   CHECK(reruns == 1);
+   CHECK(rerun_id == 2);
+   stop();
+}
+
+/* A newer park while the older one's warning is up, asking at once
+ * (its refusal is kept for this file): the older callback gets CANCEL
+ * inside the newer push, the newer park survives, and nothing pushes
+ * from that CANCEL */
+static void test_park_replaced_up(void)
+{
+   char core[256];
+   unsigned opens;
+   start(false);
+   park_reset();
+   CHECK(put_core(core, "again_libretro" LIB_EXT, 'b'));
+   CHECK(park(core));
+   drain();
+   opens = menu_opens;
+   CHECK(park(core));
+   CHECK(frees == 1);
+   /* One push: the newer request's */
+   CHECK(menu_opens == opens + 1);
+   CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE));
+   park_wait(1);
+   CHECK(reruns == 1);
+   CHECK(rerun_id == 2);
+   CHECK(frees == 2);
+   stop();
+}
+
+/* A park's check is the user's: a pass the slot holds for another core
+ * doesn't turn its answer away */
+static void test_park_other_pass(void)
+{
+   char a[256];
+   char b[256];
+   unsigned opens;
+   start(false);
+   park_reset();
+   CHECK(put_core(a, "other_a_libretro" LIB_EXT, 'a'));
+   CHECK(trust(a));
+   CHECK(put_core(a, "other_a_libretro" LIB_EXT, 'a'));
+   CHECK(put_core(b, "other_b_libretro" LIB_EXT, 'b'));
+   CHECK(park(a));
+   park_wait(1);
+   CHECK(rerun_id == 1);
+   opens = menu_opens;
+   CHECK(park(b));
+   drain();
+   CHECK(menu_opens == opens + 1);
+   CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE));
+   park_wait(2);
+   CHECK(rerun_id == 2);
+   stop();
+}
+
+/* The seed first, then the check. A quiet probe before it leaves
+ * nothing that answers for the seed. */
+static void test_park_seed(void)
+{
+   dylib_t lib = NULL;
+   char store[64];
+   char core[256];
+   void *buf   = NULL;
+   int64_t len = 0;
+   task_queue_init(false, NULL);
+   park_reset();
+   sprintf(store, TMP_DIR "/trust_%u", ++store_n);
+   path_mkdir(TMP_DIR "/seed2");
+   strlcpy(core, TMP_DIR "/seed2/parked_libretro." CORE_EXT, sizeof(core));
+   CHECK(filestream_read_file("core_load_check_test_a" LIB_EXT, &buf, &len));
+   CHECK(buf && filestream_write_file(core, buf, len));
+   free(buf);
+   CHECK(core_trust_runtime_init(store, TMP_DIR "/seed2", CORE_EXT));
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_REFUSED);
+   CHECK(queued() == 1);
+   CHECK(park(core));
+   CHECK(queued() == 1);
+   park_wait(1);
+   CHECK(reruns == 1);
+   CHECK(rerun_id == 1);
+   stop();
+}
+
+/* A core that can't be opened is the caller's error */
+static void test_park_unopenable(void)
+{
+   start(false);
+   park_reset();
+   CHECK(!park(TMP_DIR "/cores/missing_libretro" LIB_EXT));
+   CHECK(frees == 0);
+   CHECK(queued() == 0);
+   stop();
+}
+
+/* The check a park waits on is cancelled: no verdict, so the load ends
+ * as a Cancel would, and nothing stays parked */
+static void test_park_check_cancelled(void)
+{
+   char core[256];
+   unsigned opens;
+   start(false);
+   park_reset();
+   CHECK(put_core(core, "park_cut_libretro" LIB_EXT, 'b'));
+   opens = menu_opens;
+   CHECK(park(core));
+   CHECK(queued() == 1);
+   task_queue_reset();
+   drain();
+   CHECK(frees == 1);
+   CHECK(menu_opens == opens);
+   park_wait(1);
+   CHECK(reruns == 0);
+   /* Nothing kept: a new park checks it again */
+   CHECK(park(core));
+   CHECK(queued() == 1);
+   stop();
+}
+
+/* A check that can't start leaves nothing parked */
+static void test_park_no_check(void)
+{
+#ifdef COUNT_HASHES
+   char core[256];
+   start(false);
+   park_reset();
+   CHECK(put_core(core, "park_nohash_libretro" LIB_EXT, 'b'));
+   hash_init_fails = true;
+   CHECK(!park(core));
+   hash_init_fails = false;
+   CHECK(queued() == 0);
+   CHECK(frees == 0);
+   park_wait(1);
+   CHECK(reruns == 0);
+   stop();
+#endif
+}
+
+/* A deinit drops the park: its warning answered after that re-runs
+ * nothing */
+static void test_park_deinit(void)
+{
+   char core[256];
+   start(false);
+   park_reset();
+   CHECK(put_core(core, "park_deinit_libretro" LIB_EXT, 'b'));
+   CHECK(park(core));
+   drain();
+   core_load_check_deinit();
+   CHECK(frees == 1);
+   CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE));
+   park_wait(1);
+   CHECK(reruns == 0);
+   CHECK(frees == 1);
+   stop();
+}
+
+/* Load Once lasts until another core loads or a release. Its probes
+ * pass after the unload where its identity binds it, as where only its
+ * held file does (Windows), never for a file put there since */
+static void test_load_once_lasts(void)
+{
+   dylib_t lib = NULL;
+   char a[256];
+   char b[256];
+   start(false);
+   park_reset();
+   CHECK(put_core(a, "lasts_a_libretro" LIB_EXT, 'a'));
+   CHECK(put_core(b, "lasts_b_libretro" LIB_EXT, 'b'));
+   CHECK(trust(b));
+   /* Load Once; the re-run (Load Core) only probes */
+   CHECK(park(a));
+   drain();
+   CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE));
+   park_wait(1);
+   CHECK(rerun_id == 1);
+   /* Its load, then Close Content */
+   CHECK(core_load_check_open(a, &lib) == CORE_LOAD_GATE_OPENED);
+   core_load_check_loaded();
+   if (lib)
+      dylib_close(lib);
+   lib = NULL;
+   core_load_check_unloaded();
+   /* Close Content's reload, menu or driver init: no check, no warning */
+   CHECK(core_load_check_open(a, &lib) == CORE_LOAD_GATE_OPENED);
+   CHECK(lib_id(lib) == 1);
+   CHECK(queued() == 0);
+   core_load_check_loaded();
+   if (lib)
+      dylib_close(lib);
+   lib = NULL;
+   /* A release while it runs (the Core Updater from the menu) ends it */
+   core_load_check_release_held();
+   CHECK(core_load_check_open(a, &lib) == CORE_LOAD_GATE_REFUSED);
+   CHECK(queued() == 1);
+   drain();
+   core_load_check_unloaded();
+   /* Load Once again, then another core loads */
+   CHECK(park(a));
+   drain();
+   CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE));
+   park_wait(2);
+   CHECK(rerun_id == 1);
+#ifdef _WIN32
+   load_waited(b, 2);
+#else
+   /* b's identity record passes it: the slot is left alone */
+   CHECK(core_load_check_open(b, &lib) == CORE_LOAD_GATE_OPENED);
+   CHECK(lib_id(lib) == 2);
+   core_load_check_loaded();
+   if (lib)
+      dylib_close(lib);
+   lib = NULL;
+#endif
+   core_load_check_unloaded();
+   CHECK(core_load_check_open(a, &lib) == CORE_LOAD_GATE_REFUSED);
+   CHECK(queued() == 1);
+   drain();
+   /* Load Once again, loaded and unloaded, then a file put there */
+   CHECK(park(a));
+   drain();
+   CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE));
+   park_wait(3);
+   CHECK(rerun_id == 1);
+   CHECK(core_load_check_open(a, &lib) == CORE_LOAD_GATE_OPENED);
+   core_load_check_loaded();
+   if (lib)
+      dylib_close(lib);
+   lib = NULL;
+   core_load_check_unloaded();
+#ifdef _WIN32
+   /* Its held handle is the binding: nothing replaces the file */
+   CHECK(!put_core(a, "lasts_a_libretro" LIB_EXT, 'b'));
+   CHECK(core_load_check_open(a, &lib) == CORE_LOAD_GATE_OPENED);
+   CHECK(lib_id(lib) == 1);
+   if (lib)
+      dylib_close(lib);
+#else
+   CHECK(put_core(a, "lasts_a_libretro" LIB_EXT, 'b'));
+   CHECK(core_load_check_open(a, &lib) == CORE_LOAD_GATE_REFUSED);
+   CHECK(!lib);
+   CHECK(queued() == 1);
+#endif
+   stop();
+}
+
 int main(void)
 {
    if (!path_mkdir(TMP_DIR))
@@ -1294,6 +1808,23 @@ int main(void)
    test_stage_rewritten();
    test_stage_stale_grant();
    test_stage_loaded();
+   test_park_load_once();
+   test_park_always();
+   test_park_always_full();
+   test_park_cancel();
+   test_park_pass();
+   test_park_no_menu();
+   test_park_replaced();
+   test_park_replaced_up();
+   test_park_other_pass();
+   test_park_seed();
+   test_park_unopenable();
+   test_park_check_cancelled();
+   test_park_no_check();
+   test_park_deinit();
+   test_load_once_lasts();
+   /* Messages past OSD_MAX aren't kept for the counts above */
+   CHECK(osd_count <= OSD_MAX);
    printf("%u checks, %u failures\n", checks, failures);
    return failures ? 1 : 0;
 }
