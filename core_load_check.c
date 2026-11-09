@@ -884,6 +884,8 @@ dylib_t core_load_check_stage_take(const char *path)
       {
          lib                    = core_load_rt.stage_lib;
          core_load_rt.stage_lib = NULL;
+         /* Not a grant a probe made while it opened */
+         core_load_rt.granted   = CORE_LOAD_GRANT_NONE;
          if (core_load_slot_is(
                   core_load_rt.stage_grant == CORE_LOAD_GRANT_SLOT
                   ? &core_load_rt.slot : &core_load_rt.quick,

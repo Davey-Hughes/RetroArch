@@ -1055,6 +1055,73 @@ static void test_stage_swapped(void)
    stop();
 }
 
+/* Probes while the stage's worker opens its core grant other cores:
+ * the stage's load still ends the pass of the core loaded before */
+static void test_stage_stale_grant(void)
+{
+#if defined(_WIN32) || defined(__linux__)
+   dylib_t lib = NULL;
+   char p[256];
+   char a[256];
+   char b[256];
+#ifdef __linux__
+   unsigned fds;
+   no_ctime_fs = 1;
+#endif
+   start(true);
+   CHECK(put_core(p, "stale_p_libretro" LIB_EXT, 'a'));
+   CHECK(trust(p));
+   CHECK(put_core(p, "stale_p_libretro" LIB_EXT, 'a'));
+   CHECK(put_core(a, "stale_a_libretro" LIB_EXT, 'a'));
+   CHECK(put_core(b, "stale_b_libretro" LIB_EXT, 'b'));
+   load_waited(p, 1);
+   core_load_check_unloaded();
+#ifdef __linux__
+   fds = open_fds();
+#endif
+   CHECK(core_trust_runtime_set_checks(false));
+   drain();
+   CHECK(worker_hold());
+   CHECK(core_load_check_stage_begin(a));
+   CHECK(!core_load_check_stage_ready());
+   /* b's quick pass takes a's place, then p passes on its record */
+   CHECK(core_load_check_open(b, &lib) == CORE_LOAD_GATE_OPENED);
+   if (lib)
+      dylib_close(lib);
+   lib = NULL;
+   CHECK(core_load_check_open(p, &lib) == CORE_LOAD_GATE_OPENED);
+   if (lib)
+      dylib_close(lib);
+   worker_go();
+   CHECK(stage_wait());
+   lib = core_load_check_stage_take(a);
+   CHECK(lib_id(lib) == 1);
+   core_load_check_loaded();
+   if (lib)
+      dylib_close(lib);
+   lib = NULL;
+   core_load_check_unloaded();
+#ifdef __linux__
+   CHECK(open_fds() == fds - 1);
+#endif
+   CHECK(core_trust_runtime_set_checks(true));
+   drain();
+   CHECK(core_load_check_open(p, &lib) == CORE_LOAD_GATE_REFUSED);
+   CHECK(!lib);
+   CHECK(queued() == 1);
+   if (lib)
+      dylib_close(lib);
+   drain();
+#ifdef _WIN32
+   CHECK(put_core(p, "stale_p_libretro" LIB_EXT, 'a'));
+#endif
+   stop();
+#ifdef __linux__
+   no_ctime_fs = 0;
+#endif
+#endif
+}
+
 /* A staged load of the core loaded last passes on its record, as the
  * gate's first branch does: no hash, no "Checking core", and nothing
  * kept beside the record's own file */
@@ -1149,6 +1216,7 @@ int main(void)
    test_stage_path_moved();
 #endif
    test_stage_swapped();
+   test_stage_stale_grant();
    test_stage_loaded();
    printf("%u checks, %u failures\n", checks, failures);
    return failures ? 1 : 0;
