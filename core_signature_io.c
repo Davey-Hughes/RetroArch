@@ -362,10 +362,11 @@ int core_file_verity_enable(core_file_t *f)
       return 1;
    switch (errno)
    {
-      /* Not this filesystem or kernel, not ours (Play's nativeLibraryDir),
-       * or open for writing somewhere */
+      /* Not this filesystem, mount or kernel, not ours (Play's
+       * nativeLibraryDir), or open for writing somewhere */
       case EOPNOTSUPP:
       case ENOTTY:
+      case EROFS:
       case EACCES:
       case EPERM:
       case ETXTBSY:

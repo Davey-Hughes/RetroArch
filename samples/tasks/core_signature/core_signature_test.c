@@ -2382,6 +2382,25 @@ static void test_verity(void)
    {
       printf("note: no fs-verity on %s's filesystem, not checked\n", TMP_DIR);
       CHECK(f && !core_file_verity_measure(f, &id));
+      /* A digest on record, with none to measure, fails closed */
+      t = real_store();
+      s = core_trust_get(t);
+      CHECK(!core_check_quick(s, f, core, &c));
+      core_trust_set_put(s);
+      sha(fx_core, VERITY_LEN, c.rec.sha256);
+      c.result = CORE_CHECK_OK;
+      c.record = true;
+      CHECK(core_trust_apply(t, &c));
+      s = core_trust_get(t);
+      CHECK(core_check_quick(s, f, core, &d) == records_for(core));
+      core_trust_set_put(s);
+      c.rec.id.verity_len = CORE_SHA256_LEN;
+      verity_digest(fx_core, VERITY_LEN, c.rec.id.verity);
+      CHECK(core_trust_apply(t, &c));
+      s = core_trust_get(t);
+      CHECK(!core_check_quick(s, f, core, &d));
+      core_trust_set_put(s);
+      core_trust_free(t);
    }
    else if (on > 0)
    {
