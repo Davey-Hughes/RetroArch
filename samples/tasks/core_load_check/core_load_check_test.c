@@ -127,11 +127,15 @@ void RARCH_ERR(const char *fmt, ...)
 static unsigned hashes;
 
 #ifdef COUNT_HASHES
+static bool hash_init_fails;
+
 bool __real_core_hash_init(struct core_hash *h);
 
 bool __wrap_core_hash_init(struct core_hash *h)
 {
    hashes++;
+   if (hash_init_fails)
+      return false;
    return __real_core_hash_init(h);
 }
 #endif
@@ -688,6 +692,364 @@ static void test_held_path_moved(void)
 #endif
 }
 
+static unsigned osd_checking(void)
+{
+   char want[32];
+   unsigned i;
+   unsigned n = 0;
+   sprintf(want, "msg %d", (int)MSG_CHECKING_CORE);
+   for (i = 0; i < osd_count && i < OSD_MAX; i++)
+      if (!strncmp(osd[i], want, strlen(want)))
+         n++;
+   return n;
+}
+
+static bool stage_wait(void)
+{
+   unsigned i;
+   for (i = 0; i < 5000; i++)
+   {
+      if (core_load_check_stage_ready())
+         return true;
+      pump(1);
+   }
+   return false;
+}
+
+static void test_stage_quick(void)
+{
+   dylib_t lib = NULL;
+   char core[256];
+#ifdef __linux__
+   unsigned fds;
+#endif
+   start(false);
+   CHECK(put_core(core, "stage_off_libretro" LIB_EXT, 'a'));
+   CHECK(core_trust_runtime_set_checks(false));
+   drain();
+#ifdef __linux__
+   fds = open_fds();
+#endif
+   CHECK(core_load_check_stage_begin(core));
+   /* Settled at once, and no worker to open it on */
+   CHECK(core_load_check_stage_ready());
+   CHECK(queued() == 0);
+   CHECK(!core_load_check_stage_refused());
+#ifdef __linux__
+   /* Nothing kept for a core stage that opens it itself */
+   CHECK(open_fds() == fds);
+#endif
+   CHECK(!core_load_check_stage_take(core));
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_OPENED);
+   CHECK(lib_id(lib) == 1);
+   if (lib)
+      dylib_close(lib);
+   stop();
+}
+
+static void test_stage_check(bool threaded)
+{
+   dylib_t lib = NULL;
+   char core[256];
+   unsigned shown;
+   start(threaded);
+   CHECK(put_core(core, "stage_hash_libretro" LIB_EXT, 'a'));
+   CHECK(trust(core));
+   CHECK(put_core(core, "stage_hash_libretro" LIB_EXT, 'a'));
+   shown = osd_checking();
+   CHECK(core_load_check_stage_begin(core));
+   CHECK(osd_checking() == shown + 1);
+   CHECK(stage_wait());
+   CHECK(!core_load_check_stage_refused());
+   lib = core_load_check_stage_take(core);
+   if (threaded)
+      CHECK(lib_id(lib) == 1);
+   else
+   {
+      /* No worker: the core stage opens it from the slot */
+      CHECK(!lib);
+      CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_OPENED);
+      CHECK(lib_id(lib) == 1);
+   }
+   if (lib)
+      dylib_close(lib);
+   stop();
+}
+
+static void test_stage_refused(void)
+{
+   dylib_t lib = NULL;
+   char core[256];
+   start(false);
+   CHECK(put_core(core, "stage_bad_libretro" LIB_EXT, 'b'));
+   CHECK(core_load_check_stage_begin(core));
+   CHECK(stage_wait());
+   CHECK(core_load_check_stage_refused());
+   CHECK(!core_load_check_stage_take(core));
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_REFUSED);
+   CHECK(queued() == 0);
+   /* Checks turned off: the quick check answers before the refusal */
+   CHECK(core_trust_runtime_set_checks(false));
+   drain();
+   CHECK(core_load_check_stage_begin(core));
+   CHECK(core_load_check_stage_ready());
+   CHECK(!core_load_check_stage_refused());
+   stop();
+}
+
+static void test_stage_take_other(void)
+{
+   char core[256];
+   char other[256];
+   start(true);
+   CHECK(put_core(core, "stage_mine_libretro" LIB_EXT, 'a'));
+   CHECK(put_core(other, "stage_other_libretro" LIB_EXT, 'b'));
+   CHECK(core_trust_runtime_set_checks(false));
+   drain();
+   CHECK(core_load_check_stage_begin(core));
+   CHECK(stage_wait());
+   /* Opened for its own core only */
+   CHECK(!core_load_check_stage_take(other));
+   stop();
+}
+
+/* D4: a core the pending seed covers waits for it, then is checked */
+static void test_stage_seed(void)
+{
+   dylib_t lib = NULL;
+   char store[64];
+   char dir[64];
+   char core[256];
+   void *buf   = NULL;
+   int64_t len = 0;
+   task_queue_init(false, NULL);
+   sprintf(store, TMP_DIR "/trust_%u", ++store_n);
+   strlcpy(dir, TMP_DIR "/seed", sizeof(dir));
+   path_mkdir(dir);
+   strlcpy(core, TMP_DIR "/seed/seeded_libretro." CORE_EXT, sizeof(core));
+   CHECK(filestream_read_file("core_load_check_test_b" LIB_EXT, &buf, &len));
+   CHECK(buf && filestream_write_file(core, buf, len));
+   free(buf);
+   CHECK(core_trust_runtime_init(store, dir, CORE_EXT));
+   CHECK(core_trust_runtime_seed_pending());
+   /* A quiet probe first: refused, nothing checked or kept */
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_REFUSED);
+   CHECK(core_load_check_stage_begin(core));
+   /* Only the seed's own task: no check of a guess */
+   CHECK(queued() == 1);
+   CHECK(!core_load_check_stage_ready());
+   CHECK(stage_wait());
+   CHECK(!core_trust_runtime_seed_pending());
+   /* The seed trusted it, so the check after it passes */
+   CHECK(!core_load_check_stage_refused());
+   stop();
+}
+
+static void test_stage_cancel(void)
+{
+   char core[256];
+   start(true);
+   CHECK(put_core(core, "stage_cancel_libretro" LIB_EXT, 'a'));
+   CHECK(trust(core));
+   CHECK(put_core(core, "stage_cancel_libretro" LIB_EXT, 'a'));
+   CHECK(core_load_check_stage_begin(core));
+   core_load_check_stage_cancel();
+   drain();
+   /* Nothing left over for a later take */
+   CHECK(core_load_check_stage_ready());
+   CHECK(!core_load_check_stage_take(core));
+   stop();
+}
+
+/* The check the stage waits on is cancelled: refused, with no verdict
+ * kept, so the next open checks it again */
+static void test_stage_check_cancelled(void)
+{
+   dylib_t lib = NULL;
+   char core[256];
+   start(false);
+   CHECK(put_core(core, "stage_cut_libretro" LIB_EXT, 'a'));
+   CHECK(trust(core));
+   CHECK(put_core(core, "stage_cut_libretro" LIB_EXT, 'a'));
+   CHECK(core_load_check_stage_begin(core));
+   CHECK(queued() == 1);
+   task_queue_reset();
+   CHECK(stage_wait());
+   CHECK(core_load_check_stage_refused());
+   CHECK(!core_load_check_stage_take(core));
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_REFUSED);
+   CHECK(!lib);
+   CHECK(queued() == 1);
+   stop();
+}
+
+/* A check that can't start leaves no load waiting */
+static void test_stage_no_check(void)
+{
+#ifdef COUNT_HASHES
+   char core[256];
+   start(false);
+   CHECK(put_core(core, "stage_nohash_libretro" LIB_EXT, 'a'));
+   hash_init_fails = true;
+   CHECK(core_load_check_stage_begin(core));
+   hash_init_fails = false;
+   CHECK(queued() == 0);
+   CHECK(core_load_check_stage_ready());
+   CHECK(core_load_check_stage_refused());
+   stop();
+#endif
+}
+
+#if defined(_WIN32) || defined(__linux__)
+/* Where only its file binds a pass, a pass lent to an open the stage
+ * then cancels ends with it */
+static void test_stage_lent_cancelled(void)
+{
+   dylib_t lib = NULL;
+   char core[256];
+#ifdef __linux__
+   no_ctime_fs = 1;
+#endif
+   start(true);
+   CHECK(put_core(core, "stage_lent_libretro" LIB_EXT, 'a'));
+   CHECK(trust(core));
+   CHECK(put_core(core, "stage_lent_libretro" LIB_EXT, 'a'));
+   core_load_check_set_startup(true);
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_OPENED);
+   core_load_check_set_startup(false);
+   if (lib)
+      dylib_close(lib);
+   lib = NULL;
+   CHECK(core_load_check_stage_begin(core));
+   /* Its open on the worker */
+   CHECK(!core_load_check_stage_ready());
+   core_load_check_stage_cancel();
+   drain();
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_REFUSED);
+   CHECK(!lib);
+   CHECK(queued() == 1);
+   if (lib)
+      dylib_close(lib);
+   stop();
+#ifdef __linux__
+   no_ctime_fs = 0;
+#endif
+}
+
+/* Loaded by path, a pass opens on the worker only while its path still
+ * names the file checked */
+static void test_stage_path_moved(void)
+{
+   dylib_t lib = NULL;
+   char a[256];
+   char core[256];
+   void *buf   = NULL;
+   int64_t len = 0;
+#ifdef __linux__
+   no_ctime_fs = 1;
+#endif
+   start(true);
+   CHECK(put_core(a, "stage_moved_libretro" LIB_EXT, 'a'));
+   CHECK(trust(a));
+   strlcpy(core, TMP_DIR "/stage_moved/stage_moved_libretro" LIB_EXT,
+         sizeof(core));
+   path_mkdir(TMP_DIR "/stage_moved");
+   CHECK(filestream_read_file("core_load_check_test_a" LIB_EXT, &buf, &len));
+   CHECK(buf && filestream_write_file(core, buf, len));
+   free(buf);
+   buf = NULL;
+   CHECK(core_load_check_stage_begin(core));
+   /* Its folder swapped while the check runs */
+   if (filestream_rename(TMP_DIR "/stage_moved", TMP_DIR "/stage_moved_aside"))
+      printf("note: a folder holding an open file can't be moved here, "
+            "not checked\n");
+   else
+   {
+      path_mkdir(TMP_DIR "/stage_moved");
+      CHECK(filestream_read_file("core_load_check_test_c" LIB_EXT, &buf,
+               &len));
+      CHECK(buf && filestream_write_file(core, buf, len));
+      free(buf);
+      CHECK(stage_wait());
+      lib = core_load_check_stage_take(core);
+      CHECK(!lib);
+      CHECK(lib_id(lib) == 0);
+      if (lib)
+         dylib_close(lib);
+      lib = NULL;
+      CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_REFUSED);
+      CHECK(!lib);
+      CHECK(queued() == 1);
+   }
+   core_load_check_stage_cancel();
+   stop();
+#ifdef __linux__
+   no_ctime_fs = 0;
+#endif
+}
+#endif
+
+/* A staged load of the core loaded last passes on its record, as the
+ * gate's first branch does: no hash, no "Checking core", and nothing
+ * kept beside the record's own file */
+static void test_stage_loaded(void)
+{
+#if defined(_WIN32) || defined(__linux__)
+   dylib_t lib = NULL;
+   char core[256];
+   unsigned shown;
+#ifdef __linux__
+   unsigned fds;
+   no_ctime_fs = 1;
+#endif
+   start(true);
+   CHECK(put_core(core, "stage_held_libretro" LIB_EXT, 'a'));
+   CHECK(trust(core));
+   CHECK(put_core(core, "stage_held_libretro" LIB_EXT, 'a'));
+#ifdef __linux__
+   fds = open_fds();
+#endif
+   load_waited(core, 1);
+   core_load_check_unloaded();
+   drain();
+   shown = osd_checking();
+   CHECK(core_load_check_stage_begin(core));
+   CHECK(core_load_check_stage_ready());
+   CHECK(queued() == 0);
+   CHECK(osd_checking() == shown);
+   CHECK(stage_wait());
+   CHECK(!core_load_check_stage_refused());
+#ifdef __linux__
+   CHECK(open_fds() == fds + 1);
+#endif
+   /* Nothing opened on the worker: the core stage's gate opens it from
+    * the record */
+   lib = core_load_check_stage_take(core);
+   CHECK(!lib);
+   if (!lib)
+      CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_OPENED);
+   CHECK(lib_id(lib) == 1);
+   core_load_check_loaded();
+   if (lib)
+      dylib_close(lib);
+   core_load_check_unloaded();
+   /* Again, with a release before the stage ends: no file stays open */
+   CHECK(core_load_check_stage_begin(core));
+   CHECK(stage_wait());
+   core_load_check_release_held();
+#ifdef _WIN32
+   CHECK(put_core(core, "stage_held_libretro" LIB_EXT, 'a'));
+#else
+   CHECK(open_fds() == fds);
+#endif
+   core_load_check_stage_cancel();
+   stop();
+#ifdef __linux__
+   no_ctime_fs = 0;
+#endif
+#endif
+}
+
 int main(void)
 {
    if (!path_mkdir(TMP_DIR))
@@ -707,6 +1069,20 @@ int main(void)
    test_unopenable();
    test_held_loaded();
    test_held_path_moved();
+   test_stage_quick();
+   test_stage_check(false);
+   test_stage_check(true);
+   test_stage_refused();
+   test_stage_take_other();
+   test_stage_seed();
+   test_stage_cancel();
+   test_stage_check_cancelled();
+   test_stage_no_check();
+#if defined(_WIN32) || defined(__linux__)
+   test_stage_lent_cancelled();
+   test_stage_path_moved();
+#endif
+   test_stage_loaded();
    printf("%u checks, %u failures\n", checks, failures);
    return failures ? 1 : 0;
 }
