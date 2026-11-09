@@ -5092,7 +5092,7 @@ bool libretro_get_system_info(
       {
          const char *err = NULL;
 #ifdef HAVE_CORE_LOAD_CHECK
-         /* Waiting for its check, which the log already names */
+         /* Refused by the load check: already logged */
          if (core_load_check_refused(path))
             return false;
 #endif
