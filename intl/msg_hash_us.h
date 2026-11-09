@@ -12848,7 +12848,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_DEVICE_INDEX,
-   "The physical controller as recognized by RetroArch."
+   "The physical controller as recognized by RetroArch. To have more than one controller play as this player, use Settings > Input > Controllers."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_DEVICE_RESERVED_DEVICE_NAME,
@@ -12877,14 +12877,6 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_PLAYS_AS_AUTO_PLAYER,
    "Auto (%u)"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_INPUT_PLAYS_AS_ADD,
-   "Add Controller"
-   )
-MSG_HASH(
-   MENU_ENUM_LABEL_VALUE_INPUT_PLAYS_AS_ADD_ITEM,
-   "%s (Player %u)"
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_PLAYS_AS_BINDS,

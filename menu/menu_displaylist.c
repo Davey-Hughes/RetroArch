@@ -8097,9 +8097,9 @@ static void menu_displaylist_restore_plays_as_row(
             && list->list[rows].type >= MENU_SETTINGS_INPUT_PLAYS_AS_BEGIN
             && list->list[rows].type <  MENU_SETTINGS_INPUT_PLAYS_AS_END)
          rows++;
-      /* Add Controller, then the links to sharers' pages */
-      while (     rows + 1 + links < list->size
-            && string_ends_with(list->list[rows + 1 + links].label,
+      /* then the links to sharers' pages */
+      while (     rows + links < list->size
+            && string_ends_with(list->list[rows + links].label,
                   "_input_binds_list"))
          links++;
    }
@@ -8130,12 +8130,11 @@ static void menu_displaylist_restore_plays_as_row(
       {
          to = menu_st->selection_ptr + rows - menu->plays_as_rows;
          if (menu_st->selection_ptr
-               > menu->plays_as_rows + menu->plays_as_links)
+               >= menu->plays_as_rows + menu->plays_as_links)
             to = to + links - menu->plays_as_links;
          /* on a link: within the links when its sharer left */
-         else if (   menu_st->selection_ptr > menu->plays_as_rows
-                  && to > rows + links)
-            to = rows + links;
+         else if (to >= rows + links)
+            to = links ? rows + links - 1 : rows;
       }
    }
    if (to < list->size)
@@ -9159,7 +9158,6 @@ void menu_displaylist_validation_dump(rarch_setting_t *list_settings)
             || t == (unsigned)DISPLAYLIST_DROPDOWN_LIST_INPUT_DEVICE_TYPE
             || t == (unsigned)DISPLAYLIST_DROPDOWN_LIST_INPUT_SELECT_RESERVED_DEVICE
             || t == (unsigned)DISPLAYLIST_DROPDOWN_LIST_INPUT_PLAYS_AS
-            || t == (unsigned)DISPLAYLIST_DROPDOWN_LIST_INPUT_PLAYS_AS_ADD
             || t == (unsigned)DISPLAYLIST_CDROM_DETAIL_INFO
             || t == (unsigned)DISPLAYLIST_PLAYLIST
             || t == (unsigned)DISPLAYLIST_PLAYLIST_COLLECTION
@@ -9426,8 +9424,7 @@ static unsigned menu_displaylist_remap_port_row(file_list_t *list,
 
 /* RetroPad Binds > Port N Controls (@user = N - 1): a row for each
  * connected controller playing as the player port N feeds, in port
- * order, then Add Controller, carrying that player's user, then the
- * links to the sharers' own pages. */
+ * order, then the links to the sharers' own pages. */
 static void menu_displaylist_parse_input_port_controllers(
       file_list_t *list, settings_t *settings, unsigned user)
 {
@@ -9448,48 +9445,7 @@ static void menu_displaylist_parse_input_port_controllers(
          continue;
       menu_displaylist_append_plays_as_row(list, name, s, user + 1);
    }
-   menu_entries_append(list,
-         msg_hash_to_str(MENU_ENUM_LABEL_VALUE_INPUT_PLAYS_AS_ADD),
-         MENU_ENUM_LABEL_INPUT_PLAYS_AS_ADD_STR,
-         MENU_ENUM_LABEL_INPUT_PLAYS_AS_ADD,
-         MENU_SETTING_ACTION, 0, p_user, NULL);
    menu_displaylist_parse_input_port_links(list, settings, user, false);
-}
-
-/* Add Controller: the controllers on a port that do not play as the
- * player whose user is in @info->path, in Controllers' order, each
- * with the player it plays as; that user goes in each item's label,
- * the slot in its entry_idx. */
-static unsigned menu_displaylist_parse_input_plays_as_add_list(
-      menu_displaylist_info_t *info, settings_t *settings)
-{
-   char entry_lbl[12];
-   char text[NAME_MAX_LENGTH];
-   unsigned slots[MAX_INPUT_DEVICES];
-   unsigned i, n;
-   unsigned count  = 0;
-   unsigned p_user = string_to_unsigned(info->path);
-
-   if (p_user >= MAX_USERS)
-      return 0;
-   snprintf(entry_lbl, sizeof(entry_lbl), "%u", p_user);
-   n = menu_displaylist_controller_slots(settings, slots);
-   for (i = 0; i < n; i++)
-   {
-      unsigned player, port;
-      input_config_plays_as_where(slots[i], &player, &port);
-      /* past Max Users: a pick has no port to give it */
-      if (!port || player == p_user + 1)
-         continue;
-      snprintf(text, sizeof(text),
-            msg_hash_to_str(MENU_ENUM_LABEL_VALUE_INPUT_PLAYS_AS_ADD_ITEM),
-            menu_displaylist_controller_name(slots[i]), player);
-      if (menu_entries_append(info->list, text, entry_lbl, MSG_UNKNOWN,
-               MENU_SETTING_DROPDOWN_ITEM_INPUT_PLAYS_AS_ADD, 0, slots[i],
-               NULL))
-         count++;
-   }
-   return count;
 }
 
 /* Settings > Input > Controllers: the connected controllers in port
@@ -17824,15 +17780,6 @@ static bool menu_displaylist_ctl_internal(
          case DISPLAYLIST_DROPDOWN_LIST_INPUT_PLAYS_AS:
             menu_entries_clear(info->list);
             count              = menu_displaylist_parse_input_plays_as_list(
-                  info, settings);
-
-            count = menu_displaylist_no_entries_fallback(info->list, count, FILE_TYPE_NONE);
-            info->flags       |= MD_FLAG_NEED_REFRESH
-                               | MD_FLAG_NEED_PUSH;
-            break;
-         case DISPLAYLIST_DROPDOWN_LIST_INPUT_PLAYS_AS_ADD:
-            menu_entries_clear(info->list);
-            count              = menu_displaylist_parse_input_plays_as_add_list(
                   info, settings);
 
             count = menu_displaylist_no_entries_fallback(info->list, count, FILE_TYPE_NONE);
