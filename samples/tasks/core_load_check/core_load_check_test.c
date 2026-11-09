@@ -1604,6 +1604,8 @@ static void test_park_seed(void)
    CHECK(queued() == 1);
    CHECK(park(core));
    CHECK(queued() == 1);
+   core_load_check_iterate();
+   CHECK(reruns == 0);
    park_wait(1);
    CHECK(reruns == 1);
    CHECK(rerun_id == 1);
