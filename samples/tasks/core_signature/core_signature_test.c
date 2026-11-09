@@ -2052,6 +2052,33 @@ static uint64_t fdinfo_mount(core_file_t *f)
 }
 #endif
 
+#if defined(__linux__) && !defined(__ANDROID__)
+/* The in-package rule's own mount lookup */
+static void test_fd_mount(void)
+{
+   uint64_t a = 0, b = 0, p = 0;
+   core_file_t *one  = core_file_open(self_path);
+   core_file_t *two  = core_file_open(self_path);
+   core_file_t *proc = core_file_open("/proc/self/status");
+   CHECK(one && two);
+   if (!proc)
+      printf("note: no /proc, mount lookup not checked\n");
+   else if (one && two)
+   {
+      /* One file's two opens share a mount, the one /proc gives; /proc
+       * is another */
+      CHECK(core_fd_mount(core_file_fd(one), &a));
+      CHECK(core_fd_mount(core_file_fd(two), &b));
+      CHECK(core_fd_mount(core_file_fd(proc), &p));
+      CHECK(a && a == b && a == fdinfo_mount(one));
+      CHECK(p && p != a);
+   }
+   core_file_close(one);
+   core_file_close(two);
+   core_file_close(proc);
+}
+#endif
+
 /* Cores inside RetroArch's own package */
 static void test_in_package(void)
 {
@@ -2487,6 +2514,9 @@ int main(int argc, char *argv[])
    test_self_path();
    test_check();
    test_in_package();
+#if defined(__linux__) && !defined(__ANDROID__)
+   test_fd_mount();
+#endif
    test_load();
    test_verity();
    test_self_find();

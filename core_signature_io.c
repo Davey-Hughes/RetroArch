@@ -727,7 +727,7 @@ end:
 
 #if defined(__linux__) && !defined(__ANDROID__)
 /* The mount fd is on: statx's STATX_MNT_ID (Linux 5.8), else /proc's */
-static bool core_fd_mount(int fd, uint64_t *mnt)
+bool core_fd_mount(int fd, uint64_t *mnt)
 {
    char text[512];
    char name[64];
