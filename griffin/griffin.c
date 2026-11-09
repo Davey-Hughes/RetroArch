@@ -1630,6 +1630,7 @@ FRONTEND
 #endif
 #include "../core_signature.c"
 #include "../core_signature_io.c"
+#include "../core_trust_runtime.c"
 #endif
 #include "../core_option_manager.c"
 

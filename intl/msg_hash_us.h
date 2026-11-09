@@ -33752,6 +33752,10 @@ MSG_HASH(
    "They can be updated later from the Online Updater."
    )
 MSG_HASH(
+   MSG_CORE_SIGNING_TEST_KEY,
+   "This build trusts a test signing key: cores anyone can sign will run. Not for everyday use."
+   )
+MSG_HASH(
    MSG_TO,
    "to"
    )
