@@ -1915,6 +1915,7 @@ static bool task_cloud_sync_move_push(task_cloud_sync_state_t *sync_state,
       const char *to, const char *fetching, const char *hash)
 {
    tcs_move_t **tail;
+   RFILE *reserve;
    size_t path_len     = strlen(path) + 1;
    size_t to_len       = strlen(to) + 1;
    size_t key_len      = strlen(key) + 1;
@@ -1922,8 +1923,14 @@ static bool task_cloud_sync_move_push(task_cloud_sync_state_t *sync_state,
    tcs_move_t *mv      = (tcs_move_t*)calloc(1,
          sizeof(*mv) + path_len + to_len + key_len + fetching_len);
 
-   if (!mv)
+   /* The copy's temporary holds its name until the copy runs: a cut
+    * name may be another file's too */
+   if (!mv || !(reserve = filestream_open_atomic(to)))
+   {
+      free(mv);
       return false;
+   }
+   filestream_close(reserve);
    mv->path = (char*)(mv + 1);
    memcpy(mv->path, path, path_len);
    mv->to   = mv->path + path_len;
@@ -2059,8 +2066,11 @@ static void task_cloud_sync_moves_abandon(task_cloud_sync_state_t *sync_state)
          case TCS_MOVE_DONE:
             if (mv->ok)
                filestream_delete(mv->to);
-            /* fall through */
+            free(mv);
+            break;
          default:
+            /* never started: its temporary only held the name */
+            filestream_finish_atomic(mv->to, false);
             free(mv);
             break;
       }

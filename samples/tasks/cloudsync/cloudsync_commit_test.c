@@ -38,6 +38,8 @@ static void *pending_fetch;
 static retro_atomic_int_t refuse_move, refused;
 /* states_lane(): moving a state into its backups fails */
 static retro_atomic_int_t refuse_states;
+/* copies held before they start while copy_gate is set */
+static retro_atomic_int_t copy_gate, at_copy_gate;
 /* syncs of a backup, and how many came before the save was deleted */
 static retro_atomic_int_t backup_syncs, syncs_at_delete;
 /* syncs of a backup on the main thread; copies held at their sync
@@ -139,6 +141,18 @@ int __wrap_retro_vfs_file_sync_impl(libretro_vfs_implementation_file *stream)
          return -1;
    }
    return __real_retro_vfs_file_sync_impl(stream);
+}
+bool __real_save_backups_copy_synced(const char *path, const char *to);
+bool __wrap_save_backups_copy_synced(const char *path, const char *to)
+{
+   if (!task_is_on_main_thread())
+   {
+      retro_atomic_inc_int(&at_copy_gate);
+      while (retro_atomic_load_acquire_int(&copy_gate))
+         retro_sleep(1);
+      retro_atomic_dec_int(&at_copy_gate);
+   }
+   return __real_save_backups_copy_synced(path, to);
 }
 int __real_filestream_close(RFILE *stream);
 int __wrap_filestream_close(RFILE *stream)
@@ -579,17 +593,29 @@ static void lane(bool threaded, bool deletion, bool owned, bool no_memory,
 
 /* Two states whose backups are copies, as with the states folder on
  * another drive than the saves: one sync places both, the first copy
- * held until the second is queued. */
-static void states_lane(bool threaded)
+ * held until the second is queued. @cut: 1 both names cut alike, the
+ * copies held before they start; 2 and the second state deleted
+ * meanwhile. */
+static void states_lane(bool threaded, int cut)
 {
-   static const char *names[] = { "a.state", "b.state" };
    retro_task_t *task = task_init();
    task_cloud_sync_state_t *st = (task_cloud_sync_state_t*)calloc(1, sizeof(*st));
-   char saves[160], states[160], path[200], key[32], manifest[160];
+   char saves[160], states[160], path[320], key[192], manifest[160];
+   char name_a[160], name_b[160];
+   char *names[2];
    struct string_list *backups;
    union string_list_elem_attr attr;
    unsigned i, k, queued = 0;
-   unsigned writes_at = writes;
+   retro_atomic_int_t *held = cut ? &copy_gate : &gate;
+   names[0] = name_a;
+   names[1] = name_b;
+   for (k = 0; k < 2; k++)
+   {
+      /* past what a copy's name keeps of a game */
+      size_t n = cut ? 136 : 0;
+      memset(names[k], 'x', n);
+      strlcpy(names[k] + n, k ? "b.state" : "a.state", sizeof(name_a) - n);
+   }
    retired = 0;
    live = 0;
    expect_old = 0;
@@ -647,15 +673,15 @@ static void states_lane(bool threaded)
          task_cloud_sync_fetch_cb(pending_fetch, key, true, f);
    }
    retro_atomic_store_relaxed_int(&refuse_states, 1);
-   retro_atomic_store_release_int(&gate, 1);
+   retro_atomic_store_release_int(held, 1);
    releases = 0;
    task_queue_push(task);
    for (i = 0; i < 2000 && !retired; i++)
    {
       task_queue_check();
 #if defined(TCS_MOVE_WORKER)
-      if (     retro_atomic_load_acquire_int(&gate)
-            && retro_atomic_load_acquire_int(&at_gate))
+      if (     retro_atomic_load_acquire_int(held)
+            && retro_atomic_load_acquire_int(cut ? &at_copy_gate : &at_gate))
       {
          tcs_move_t *mv;
          unsigned n = 0;
@@ -664,15 +690,22 @@ static void states_lane(bool threaded)
          if (n == 2)
          {
             queued = n;
-            retro_atomic_store_release_int(&gate, 0);
+            /* gone before its copy starts */
+            if (cut == 2)
+            {
+               snprintf(path, sizeof(path), "%s/%s", states, names[1]);
+               pathname_conform_slashes_to_os(path);
+               CHECK(filestream_delete(path) == 0);
+            }
+            retro_atomic_store_release_int(held, 0);
          }
       }
 #else
       queued = 2;
-      retro_atomic_store_release_int(&gate, 0);
+      retro_atomic_store_release_int(held, 0);
 #endif
       if (i == 1000)
-         retro_atomic_store_release_int(&gate, 0);
+         retro_atomic_store_release_int(held, 0);
       retro_sleep(1);
    }
    CHECK(queued == 2);
@@ -683,20 +716,23 @@ static void states_lane(bool threaded)
    {
       snprintf(path, sizeof(path), "%s/%s", states, names[k]);
       pathname_conform_slashes_to_os(path);
-      CHECK(holds(path, "new"));
+      if (cut == 2 && k == 1)
+         CHECK(!path_is_valid(path));
+      else
+         CHECK(holds(path, "new"));
       filestream_delete(path);
       snprintf(path, sizeof(path), "%s/%s.rafetching", states, names[k]);
       pathname_conform_slashes_to_os(path);
       CHECK(!path_is_valid(path));
    }
-   /* the sync's own downloads are not frontend writes */
-   CHECK(state_fetches == 2);
-   CHECK(writes == writes_at);
+   CHECK(state_fetches == (cut == 2 ? 1u : 2u));
    snprintf(path, sizeof(path), "%s/backups/cloud-sync/states", saves);
    backups = dir_list_new(path, NULL, false, false, true, true);
-   CHECK(backups && backups->size == 2);
+   /* names cut alike still name two copies, and no temporary is left */
+   CHECK(backups && backups->size == (cut == 2 ? 1u : 2u));
    for (i = 0; backups && i < backups->size; i++)
    {
+      CHECK(!string_ends_with(backups->elems[i].data, CS_TEMP_SUFFIX));
       CHECK(holds(backups->elems[i].data, "old"));
       filestream_delete(backups->elems[i].data);
    }
@@ -823,15 +859,16 @@ static void budget_check(task_cloud_sync_state_t *st, unsigned *most)
       *most = n;
 }
 
-/* Copies run side by side within the budget, each a piece at a time. */
+/* Copies run side by side within the budget, each a piece at a time.
+ * @released: the sync is let go meanwhile, and no copy leaves a file. */
 static void budget_lane(const int64_t *sizes, unsigned count,
-      unsigned held_most)
+      unsigned held_most, bool released)
 {
    retro_task_t *task = task_init();
    task_cloud_sync_state_t *st = (task_cloud_sync_state_t*)calloc(1, sizeof(*st));
    struct item_file server = {0};
-   char path[160], to[200], dir[160];
-   unsigned i, most = 0;
+   char path[160], to[200], temp[210], dir[160];
+   unsigned i, n, most = 0;
    uint8_t *buf = (uint8_t*)calloc(1, (size_t)sizes[0] > 1 ? 32 << 20 : 1);
    st->updated_server_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
    st->updated_local_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
@@ -854,6 +891,32 @@ static void budget_lane(const int64_t *sizes, unsigned count,
       budget_check(st, &most);
    }
    CHECK(most == held_most);
+   if (released)
+   {
+      /* the queued copies never start */
+      task_cloud_sync_cleanup(task);
+      /* run by hand: no callback counted it off */
+      tcs_in_flight--;
+      retro_atomic_store_release_int(&gate, 0);
+      for (i = 0; i < count; i++)
+      {
+         snprintf(path, sizeof(path), "%s/b%u.srm", directory, i);
+         snprintf(to, sizeof(to), "%s/b%u.srm", dir, i);
+         snprintf(temp, sizeof(temp), "%s" CS_TEMP_SUFFIX, to);
+         for (n = 0; n < 2000 && (path_is_valid(to) || path_is_valid(temp));
+               n++)
+            retro_sleep(1);
+         CHECK(!path_is_valid(to));
+         CHECK(!path_is_valid(temp));
+         CHECK(path_get_size(path) == sizes[i]);
+         filestream_delete(path);
+      }
+      path_rmdir(dir);
+      free(task->title);
+      free(task);
+      free(buf);
+      return;
+   }
    retro_atomic_store_release_int(&gate, 0);
    for (i = 0; i < 20000 && st->moves; i++)
    {
@@ -1104,6 +1167,8 @@ int main(void)
    retro_atomic_int_init(&max_piece, 0);
    retro_atomic_int_init(&vanishing, 0);
    retro_atomic_int_init(&refuse_states, 0);
+   retro_atomic_int_init(&copy_gate, 0);
+   retro_atomic_int_init(&at_copy_gate, 0);
 #if defined(HAVE_THREADS) && !defined(TCS_LOCK_FREE)
    tcs_manifest_lock = slock_new();
 #endif
@@ -1166,14 +1231,21 @@ int main(void)
       hold_mode = 0;
       state_writing = false;
       retro_atomic_store_relaxed_int(&refuse_move, 0);
-      budget_lane(small, 5, 3);
-      budget_lane(sized, 5, 2);
+      budget_lane(small, 5, 3, false);
+      budget_lane(sized, 5, 2, false);
       /* at the budget, not under it: the second waits */
-      budget_lane(edge, 2, 1);
+      budget_lane(edge, 2, 1, false);
+      budget_lane(small, 5, 3, true);
    }
 #endif
    for (t = 0; t < 2; t++)
-      states_lane(t != 0);
+   {
+      states_lane(t != 0, 0);
+      states_lane(t != 0, 1);
+#if defined(TCS_MOVE_WORKER)
+      states_lane(t != 0, 2);
+#endif
+   }
    two_syncs_lane();
    sweep_lane();
    backup_location_lane();

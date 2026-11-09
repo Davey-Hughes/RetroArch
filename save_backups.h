@@ -122,8 +122,10 @@ enum save_backup_result save_backups_move_begin(const char *dir,
       char *s, size_t len);
 
 /* Copies @path to @to a piece at a time, synced and renamed into place
- * as an atomic synced write is. Reads no roots: safe off the main
- * thread. */
+ * as an atomic synced write is. Its temporary is opened first and goes
+ * on any later failure; one made beforehand to hold @to's name that
+ * can't be opened stays for the next sync's sweep. Reads no roots:
+ * safe off the main thread. */
 bool save_backups_copy_synced(const char *path, const char *to);
 
 /* Held name @n (1 to SAVE_BACKUPS_HELD_MAX) of @path, in its own

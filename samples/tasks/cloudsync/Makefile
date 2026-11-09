@@ -135,10 +135,10 @@ $(ASYNC_TARGET): $(ASYNC_SOURCES) $(CORE_DIR)/network/cloud_sync_driver.h
 
 # The commit test refuses the move of a save into its backups at the
 # link boundary, as a move across drives fails, counts the syncs and
-# holds the copy at its sync, sees how much a copy reads at once, and
-# deletes the save once its copy has read it.
+# holds the copy at its sync or before it starts, sees how much a copy
+# reads at once, and deletes the save once its copy has read it.
 $(COMMIT_TARGET): cloudsync_commit_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(CORE_DIR)/tasks/task_cloudsync.c
-	$(CC) -o $@ cloudsync_commit_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(filter-out -pedantic,$(CFLAGS)) $(ADDS_DEFS) $(LDFLAGS) -Wl,--wrap=filestream_rename -Wl,--wrap=filestream_delete -Wl,--wrap=retro_vfs_file_sync_impl -Wl,--wrap=filestream_read -Wl,--wrap=filestream_close -lpthread
+	$(CC) -o $@ cloudsync_commit_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(filter-out -pedantic,$(CFLAGS)) $(ADDS_DEFS) $(LDFLAGS) -Wl,--wrap=filestream_rename -Wl,--wrap=filestream_delete -Wl,--wrap=retro_vfs_file_sync_impl -Wl,--wrap=filestream_read -Wl,--wrap=filestream_close -Wl,--wrap=save_backups_copy_synced -lpthread
 
 $(ROOTS_TARGET): cloudsync_roots_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(CORE_DIR)/tasks/task_cloudsync.c
 	$(CC) -o $@ cloudsync_roots_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(filter-out -pedantic,$(CFLAGS)) $(ADDS_DEFS) $(LDFLAGS) -lpthread

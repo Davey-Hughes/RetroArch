@@ -100,13 +100,15 @@ bool save_backups_copy_synced(const char *path, const char *to)
    int ret;
    int64_t got  = 0;
    bool ok      = false;
-   RFILE *out   = NULL;
    void *buf    = malloc(SAVE_BACKUPS_COPY_PIECE);
-   RFILE *in    = buf ? filestream_open(path, RETRO_VFS_FILE_ACCESS_READ,
+   /* First: it may hold the name already */
+   RFILE *out   = filestream_open_atomic(to);
+   RFILE *in    = buf && out ? filestream_open(path,
+         RETRO_VFS_FILE_ACCESS_READ,
          RETRO_VFS_FILE_ACCESS_HINT_SEQUENTIAL_BULK) : NULL;
-   if (in && (out = filestream_open_atomic(to)))
+   if (out)
    {
-      ok = true;
+      ok = in != NULL;
       while (ok && (got = filestream_read(in, buf,
                   SAVE_BACKUPS_COPY_PIECE)) > 0)
          ok = filestream_write(out, buf, got) == got;
