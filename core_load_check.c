@@ -249,6 +249,9 @@ static void core_load_check_cb(retro_task_t *task, void *task_data,
       return;
    if (string_is_equal(core_load_rt.checking, t->path))
       core_load_rt.checking[0] = '\0';
+   /* Its hash may not have ended: no verdict */
+   if (task_get_flags(task) & RETRO_TASK_FLG_CANCELLED)
+      return;
    user = core_load_check_waited(t->path);
    if (!core_trust_runtime_apply(&t->c))
       RARCH_WARN("[Core] Could not record the check of \"%s\".\n",
@@ -304,6 +307,8 @@ static void core_load_check_push(core_file_t *f, const char *path,
    }
    t->f          = f;
    t->c          = *c;
+   /* Only a finished hash gives a pass */
+   t->c.result   = CORE_CHECK_ERROR;
    t->gen        = core_load_rt.gen;
    t->s          = core_trust_runtime_get();
    t->path       = strdup(path);

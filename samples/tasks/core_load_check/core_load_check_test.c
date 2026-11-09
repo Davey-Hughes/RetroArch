@@ -400,6 +400,25 @@ static void test_seed_probe(void)
    stop();
 }
 
+/* Cancelled before its hash ended: no verdict, so checked again */
+static void test_cancelled(void)
+{
+   dylib_t lib = NULL;
+   char core[256];
+   start(false);
+   CHECK(put_core(core, "cancel_libretro" LIB_EXT, 'b'));
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_REFUSED);
+   CHECK(queued() == 1);
+   task_queue_reset();
+   drain();
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_REFUSED);
+   CHECK(!lib);
+   CHECK(queued() == 1);
+   if (lib)
+      dylib_close(lib);
+   stop();
+}
+
 /* Unreadable or gone: the caller's error, not a check's refusal */
 static void test_unopenable(void)
 {
@@ -468,6 +487,7 @@ int main(void)
    test_slot_binds_file();
    test_startup_inline();
    test_deinit_drops();
+   test_cancelled();
    test_seed_probe();
    test_unopenable();
    printf("%u checks, %u failures\n", checks, failures);
