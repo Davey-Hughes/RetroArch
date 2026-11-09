@@ -639,6 +639,55 @@ static void test_held_loaded(void)
 #endif
 }
 
+/* Loaded by path, the held core passes only while its path still names
+ * the held file: a folder above it swapped for another isn't that file */
+static void test_held_path_moved(void)
+{
+#if defined(_WIN32) || defined(__linux__)
+   dylib_t lib = NULL;
+   char a[256];
+   char core[256];
+   void *buf   = NULL;
+   int64_t len = 0;
+#ifdef __linux__
+   no_ctime_fs = 1;
+#endif
+   start(false);
+   CHECK(put_core(a, "moved_libretro" LIB_EXT, 'a'));
+   CHECK(trust(a));
+   strlcpy(core, TMP_DIR "/moved/moved_libretro" LIB_EXT, sizeof(core));
+   path_mkdir(TMP_DIR "/moved");
+   CHECK(filestream_read_file("core_load_check_test_a" LIB_EXT, &buf, &len));
+   CHECK(buf && filestream_write_file(core, buf, len));
+   free(buf);
+   buf = NULL;
+   load_waited(core, 1);
+   core_load_check_unloaded();
+   /* Windows can refuse to move a folder holding an open file; a
+    * junction above it can still be pointed elsewhere */
+   if (filestream_rename(TMP_DIR "/moved", TMP_DIR "/moved_aside"))
+      printf("note: a folder holding an open file can't be moved here, "
+            "not checked\n");
+   else
+   {
+      path_mkdir(TMP_DIR "/moved");
+      CHECK(filestream_read_file("core_load_check_test_c" LIB_EXT, &buf,
+               &len));
+      CHECK(buf && filestream_write_file(core, buf, len));
+      free(buf);
+      CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_REFUSED);
+      CHECK(lib_id(lib) == 0);
+      CHECK(queued() == 1);
+      if (lib)
+         dylib_close(lib);
+   }
+   stop();
+#ifdef __linux__
+   no_ctime_fs = 0;
+#endif
+#endif
+}
+
 int main(void)
 {
    if (!path_mkdir(TMP_DIR))
@@ -657,6 +706,7 @@ int main(void)
    test_seed_probe();
    test_unopenable();
    test_held_loaded();
+   test_held_path_moved();
    printf("%u checks, %u failures\n", checks, failures);
    return failures ? 1 : 0;
 }

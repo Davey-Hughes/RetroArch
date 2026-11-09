@@ -159,10 +159,11 @@ static core_file_t *core_load_slot_file(const struct core_load_slot *sl,
    if (sl->f)
    {
       /* Loaded by path outside Android (D1): the path must still name
-       * the file kept. Windows' kept handle lets nothing replace it. */
+       * the file kept. Windows' kept handle pins the file, not a folder
+       * above it. */
       core_file_close(f);
       *lent = true;
-#if defined(_WIN32) || defined(ANDROID)
+#ifdef ANDROID
       return sl->f;
 #else
       return same ? sl->f : NULL;
