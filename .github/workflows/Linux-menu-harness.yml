@@ -255,7 +255,14 @@ jobs:
           # a save folder missing at launch stays the configured one,
           # and the default stands in for one gone at a content load,
           # with a game override loaded too; an archive member sorted by
-          # content keeps the save in the folder it was sorted to before.
+          # content keeps the save in the folder it was sorted to before;
+          # a quit, Unload Core or another content's load writes the auto
+          # state once, after a state write still in flight, also with a
+          # quit during the close (auto save in a game override only
+          # too), and with the saves held by a cloud sync writes none
+          # and does not wait; Unload Core goes by the
+          # game override the content loaded with: the .auto it did not
+          # load is kept, and the savestate bypass still saves.
           # The kill-mid-write lane and its runs under load stay local.
           # The harness builds above removed the binary to read its link
           # line.
@@ -270,7 +277,13 @@ jobs:
              --lane state_load_copy --lane changed_elsewhere \
              --lane nosave_netplay_disconnect --lane flush_points \
              --lane config_keeps_folder --lane folder_check_each_load \
-             --lane folder_check_override --lane archive_member_old_folder
+             --lane folder_check_override --lane archive_member_old_folder \
+             --lane quit_after_held_state --lane unload_after_held_state \
+             --lane load_after_held_state --lane close_while_held \
+             --lane quit_during_unload --lane quit_during_unload_override \
+             --lane unload_override_kept \
+             --lane unload_override_after_held \
+             --lane unload_bypass_after_held
           make -C samples/runloop/save_e2e clean
 
       - name: Build and run save_paths_test

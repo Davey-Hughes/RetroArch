@@ -2035,7 +2035,7 @@ static void test_auto_state(void)
 
    /* auto_not_loaded_backed_up */
    stub_runloop.auto_state_owned           = false;
-   stub_settings.bools.savestate_auto_load = true;
+   stub_runloop.auto_state_wanted          = true;
    filestream_write_file(path, "old", 3);
    okf(content_auto_save_state(path), "auto state: the save is written");
    okf(file_size(path) > (long)core_len, "auto state: holds the new state");
@@ -2044,16 +2044,31 @@ static void test_auto_state(void)
    okf(content_auto_save_state(path) && auto_backups(path, NULL) == 1,
        "auto state: once a session");
 
+   /* auto_load_turned_on: off at the load, on at the close */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_owned           = false;
+   stub_runloop.auto_state_wanted          = false;
+   stub_settings.bools.savestate_auto_load = true;
+   filestream_write_file(path, "old", 3);
+   okf(content_auto_save_state(path) && file_size(path) > (long)core_len,
+       "auto state: turned on, the save is written");
+   okf(auto_backups(path, "old") == 1,
+       "auto state: turned on, the unloaded one is in the backups");
+   okf(content_auto_save_state(path) && auto_backups(path, NULL) == 1,
+       "auto state: turned on, once a session");
+   stub_settings.bools.savestate_auto_load = false;
+
    /* loaded, or Auto Load State off: written over as it is */
    auto_state_clear(dir);
    retro_vfs_mkdir_impl(dir);
    stub_runloop.auto_state_owned = false;
-   stub_settings.bools.savestate_auto_load = false;
+   stub_runloop.auto_state_wanted = false;
    filestream_write_file(path, "old", 3);
    okf(content_auto_save_state(path) && auto_backups(path, "old") == 0,
        "auto state: no copy without Auto Load State");
    stub_runloop.auto_state_owned = true;
-   stub_settings.bools.savestate_auto_load = true;
+   stub_runloop.auto_state_wanted = true;
    filestream_write_file(path, "old", 3);
    okf(content_auto_save_state(path) && auto_backups(path, "old") == 0,
        "auto state: no copy of the one loaded");
@@ -2228,7 +2243,7 @@ static void keep_reset(void)
    retro_vfs_mkdir_impl(KEEP_DIR);
    save_backups_set_roots(NULL, KEEP_DIR, NULL, NULL, NULL, NULL, "Core");
    stub_runloop.system.info.library_name   = "Core";
-   stub_settings.bools.savestate_auto_load = true;
+   stub_runloop.auto_state_wanted          = true;
    __atomic_store_n(&refuse_renames, REFUSE_MOVE, __ATOMIC_RELAXED);
 }
 

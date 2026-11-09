@@ -395,6 +395,10 @@ struct runloop
    bool auto_state_save_ready;
    /* The .auto is this session's: loaded, or moved to the backups */
    bool auto_state_owned;
+   /* At the auto-load: Auto Load State or asked, and the savestate
+    * bypass.  The close goes by these: an override may be gone. */
+   bool auto_state_wanted;
+   bool auto_state_bypass;
    /* The interval auto save has started counting for this content */
    bool auto_state_interval_started;
 

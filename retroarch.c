@@ -3701,11 +3701,10 @@ static void command_event_core_deinit_begin(void)
     * ends and writes it to a file */
    ram_state_to_file();
 
-   /* Save auto state */
    if (     (runloop_st->flags & RUNLOOP_FLAG_CORE_RUNNING)
          && !(runloop_st->flags & RUNLOOP_FLAG_SHUTDOWN_INITIATED)
          && settings->bools.savestate_auto_save)
-      command_event_save_auto_state();
+      rarch_st.flags |= RARCH_FLAGS_AUTO_SAVE_ON_DEINIT;
 
    /* Closing content starts here: retro_run() is not entered again
     * (core_run's guard), whatever the frame loop does meanwhile. */
@@ -3729,8 +3728,7 @@ static void command_event_core_deinit_begin(void)
  * into core function pointers (retro_serialize via
  * content_get_serialized_data, retro_unserialize via core_unserialize)
  * from the task worker, and the deinit below unloads the library they
- * live in.  The auto-save just pushed is covered too: it runs against
- * the same condition. */
+ * live in. */
 static bool command_event_core_deinit_pending(void)
 {
    return content_save_state_in_progress(NULL)
@@ -3758,6 +3756,12 @@ static void command_event_log_readahead(const char *proto,
 static void command_event_core_deinit_finish(void)
 {
    runloop_state_t *runloop_st = runloop_state_get_ptr();
+   /* After the state writes waited for, so it is the last one */
+   if (rarch_st.flags & RARCH_FLAGS_AUTO_SAVE_ON_DEINIT)
+   {
+      rarch_st.flags &= ~RARCH_FLAGS_AUTO_SAVE_ON_DEINIT;
+      command_event_save_auto_state();
+   }
    command_event_finish_content_deinit();
 #ifdef HAVE_SMBCLIENT
    {
@@ -4650,10 +4654,18 @@ bool command_event(enum event_command cmd, void *data)
              * ends and writes it to a file */
             ram_state_to_file();
 
-            /* Save auto state */
+            /* Save auto state.  A state write still in flight: the
+             * content's deinit saves it once that is through, a frame
+             * or more from now. */
             if (     settings->bools.savestate_auto_save
                   && runloop_st->current_core_type != CORE_TYPE_DUMMY)
-               command_event_save_auto_state();
+            {
+               if (     (flags & CONTENT_ST_FLAG_IS_INITED)
+                     && command_event_core_deinit_pending())
+                  rarch_st.flags |= RARCH_FLAGS_AUTO_SAVE_ON_DEINIT;
+               else
+                  command_event_save_auto_state();
+            }
 
             /* Save last selected disk index, if required */
             if (sys_info)
@@ -5371,6 +5383,9 @@ bool command_event(enum event_command cmd, void *data)
             audio_driver_state_t *audio_st = audio_state_get_ptr();
 
             content_reset_savestate_backups();
+            /* An auto save-state a close never wrote is not this
+             * session's */
+            rarch_st.flags &= ~RARCH_FLAGS_AUTO_SAVE_ON_DEINIT;
 
             /* Ensure that disk control interface is reset */
             if (sys_info)
@@ -11102,14 +11117,15 @@ bool should_quit_on_close(void)
    return false;
 }
 
-/* Quitting, in two halves around the wait for the auto save-state the
- * first half pushes: the state file is only whole once its task is
- * through, and the runtime log, remaps and config written by the second
- * half are the quit's last word.  retroarch_main_quit() waits between
- * the halves in one go; a quit from inside the frame loop
- * (retroarch_main_quit_staged()) returns to the loop between them, which
- * presents the last frame and the "Saving state" notice while the state
- * is written and finishes the quit once it is.
+/* Quitting, in two halves around the wait for a state task still
+ * writing: the second half writes the auto save-state once that is
+ * through, so it is the last write of the .auto, and the runtime log,
+ * remaps and config it writes are the quit's last word.
+ * retroarch_main_quit() waits between the halves in one go; a quit
+ * from inside the frame loop (retroarch_main_quit_staged()) returns to
+ * the loop between them, which presents the last frame and the "Saving
+ * state" notice while the state is written and finishes the quit once
+ * it is.
  *
  * Returns whether this is the quit's first pass, the one that saves
  * what a quit saves; false once shutdown has already begun. */
@@ -11175,9 +11191,6 @@ static bool retroarch_main_quit_begin(void)
    recording_gpu_stop();
    if (recording_state_get_ptr()->start_pending)
       command_event(CMD_EVENT_RECORD_DEINIT, NULL);
-   if (   settings->bools.savestate_auto_save
-       && runloop_st->current_core_type != CORE_TYPE_DUMMY)
-      command_event_save_auto_state();
    return true;
 }
 
@@ -11193,6 +11206,14 @@ static void retroarch_main_quit_finish(bool first)
 
    if (first)
    {
+      if (   settings->bools.savestate_auto_save
+          && runloop_st->current_core_type != CORE_TYPE_DUMMY)
+      {
+         /* A close already under way does not save it again */
+         rarch_st.flags &= ~RARCH_FLAGS_AUTO_SAVE_ON_DEINIT;
+         command_event_save_auto_state();
+      }
+
       runloop_runtime_log_deinit(runloop_st,
             settings->bools.content_runtime_log,
             settings->bools.content_runtime_log_aggregate,
@@ -11277,8 +11298,8 @@ static bool retroarch_quit_state_task_pending(void *data)
 bool retroarch_main_quit(void)
 {
    bool first = retroarch_main_quit_begin();
-   /* A state task still writing - the auto-save just pushed, or one
-    * the user started - would leave a truncated file behind the exit. */
+   /* A state task still writing would leave a truncated file behind
+    * the exit, or land after the auto save-state. */
    if (first)
       task_queue_wait(retroarch_quit_state_task_pending, NULL);
    retroarch_main_quit_finish(first);

@@ -131,8 +131,9 @@ class Run:
 
     def _drain(self):
         with open(self.log, 'wb') as f:
-            for chunk in iter(lambda: self.proc.stdout.read(4096), b''):
+            for chunk in iter(lambda: self.proc.stdout.read1(4096), b''):
                 f.write(chunk)
+                f.flush()
 
     def wait(self, timeout):
         try:
@@ -766,6 +767,272 @@ def lane_archive_member_old_folder(args, n):
     return r, failures
 
 
+def log_text(r):
+    return r.log.read_text(errors='replace') if r.log.exists() else ''
+
+
+NOT_A_STATE = b'NOT A STATE ' * 4
+
+
+def close_after_held_state(args, n, name, port, close, slot=-1,
+                           base=None, override=None, info=None,
+                           unloadable=False, exits=False):
+    """The auto state a close writes lands after a state write still in
+    flight, so it is the last write of the .auto, never a mix of the
+    two: a Save State to @slot (-1 the Auto slot, None no save) is held
+    on the worker in the middle of its write, and @close sends the
+    close.  @override is a game override over @base; @unloadable puts an
+    .auto there the load fails on, which the close keeps in the
+    backups."""
+    r = Run(args.run_dir, '%s-%d' % (name, n))
+    settings = {'savestate_auto_save': 'true', 'savestate_auto_load': 'true',
+                'savestate_file_compression': 'false'}
+    settings.update(base or {})
+    if info:
+        # An info file counts for a core in the cores folder, named as
+        # cores are.
+        cores = r.dir / 'cores'
+        cores.mkdir()
+        core = cores / ('save_e2e_libretro' + args.core.suffix)
+        shutil.copy(args.core, core)
+        (r.dir / 'system' / 'save_e2e_libretro.info').write_text(info)
+        args = argparse.Namespace(**dict(vars(args), core=core))
+        settings['libretro_directory'] = cores
+    cfg = r.config(network_cmd_enable='true', network_cmd_port=str(port),
+                   threaded_data_runloop_enable='true',
+                   savestate_thumbnail_enable='false',
+                   sort_savestates_enable='false',
+                   sort_savestates_by_content_enable='false', **settings)
+    if override:
+        game_cfg = r.dir / 'config' / 'save_e2e' / 'game.cfg'
+        game_cfg.parent.mkdir()
+        game_cfg.write_text(''.join('%s = "%s"\n' % kv
+                                    for kv in override.items()))
+    states = r.dir / 'states'
+    auto = states / 'game.state.auto'
+    old = NOT_A_STATE if unloadable else None
+    if old:
+        auto.write_bytes(old)
+    held, release = r.dir / 'held', r.dir / 'release'
+    mark = r.dir / 'touched'
+    env = {}
+    if slot is not None:
+        env = dict(LD_PRELOAD=args.shim,
+                   SAVE_E2E_STALL=auto if slot < 0 else states / 'game.state',
+                   SAVE_E2E_STALL_MARK=held,
+                   SAVE_E2E_STALL_RELEASE=release)
+    env = r.env(SAVE_E2E_TOUCHES='30:81,400:82', SAVE_E2E_FRAME_MS=10, **env)
+    # A close's wait runs frames unpaced: no frame limit it can reach.
+    r.start(args, cfg, 1000000000, env)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    failures = []
+
+    def send(cmd):
+        sock.sendto(cmd, ('127.0.0.1', port))
+
+    check(failures, r.wait_for(Path('%s-81' % mark)), 'no first touch')
+    if slot is not None:
+        if slot < 0:
+            send(b'STATE_SLOT_MINUS')
+            time.sleep(0.3)
+        send(b'SAVE_STATE')
+        check(failures, r.wait_for(held), 'the state write was not held')
+        check(failures, not Path('%s-82' % mark).exists(),
+              'second touch before the state save: cannot tell them apart')
+    check(failures, r.wait_for(Path('%s-82' % mark)), 'no second touch')
+    close(send, r)
+    if slot is not None:
+        time.sleep(1.0)
+        check(failures, (auto.read_bytes() if auto.exists() else None)
+              == old, 'the close wrote the .auto while a state write was '
+              'held')
+        release.write_bytes(b'')
+    if exits:
+        done = r.wait(60) == 0
+    else:
+        # The next core starts once the close has finished.
+        deadline, done = time.time() + 30, False
+        while not done and time.time() < deadline:
+            done = log_text(r).count(
+                '[Core] Version of libretro API') >= 2
+            if r.proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        time.sleep(0.2 if done else 0)
+        check(failures, r.proc.poll() is None, 'RetroArch quit')
+    r.kill()
+    r.drain.join()
+    data = auto.read_bytes() if auto.exists() else b''
+    log = log_text(r)
+    check(failures, done, 'the close did not finish')
+    check(failures, pattern(82) in data and pattern(81) not in data,
+          'the .auto is not the close\'s state (%d bytes)' % len(data))
+    check(failures, not data.startswith(b'#RZIPv'), 'the .auto is compressed')
+    check(failures, log.count('[State] Auto save state to') == 1,
+          '%d auto state writes' % log.count('[State] Auto save state to'))
+    if old:
+        kept = [p for p in (states / 'backups').rglob('*')
+                if p.name.endswith(' - not-loaded.state.auto')
+                and p.read_bytes() == old] \
+            if (states / 'backups').is_dir() else []
+        check(failures, len(kept) == 1, 'the .auto not loaded was not kept')
+    check(failures, not [p for p in states.iterdir()
+                         if p.name.endswith('.tmp')], 'a temp was left')
+    sock.close()
+    return r, failures
+
+
+def close_quit(send, r):
+    send(b'QUIT')
+
+
+def close_unload(send, r):
+    send(b'UNLOAD_CORE')
+
+
+def lane_quit_after_held_state(args, n):
+    return close_after_held_state(args, n, 'quit_after_held_state',
+                                  55920 + n, close_quit, exits=True)
+
+
+def lane_unload_after_held_state(args, n):
+    return close_after_held_state(args, n, 'unload_after_held_state',
+                                  55940 + n, close_unload)
+
+
+def lane_load_after_held_state(args, n):
+    """Another content loaded closes this one (core deinit)."""
+    other = args.run_dir / ('load_after_held_state-%d' % n) / 'other.bin'
+
+    def close(send, r):
+        other.write_bytes(b'')
+        send(('LOAD_CONTENT %s|%s' % (args.core, other)).encode())
+    return close_after_held_state(args, n, 'load_after_held_state',
+                                  55960 + n, close)
+
+
+def close_unload_quit(send, r):
+    send(b'UNLOAD_CORE')
+    deadline = time.time() + 30
+    while '[Runtime] Content ran' not in log_text(r) \
+            and time.time() < deadline:
+        time.sleep(0.05)
+    r.proc.send_signal(signal.SIGINT)
+
+
+def lane_quit_during_unload(args, n):
+    """A quit (SIGINT) while Unload Core waits for a state write: one
+    auto state, the quit's."""
+    return close_after_held_state(args, n, 'quit_during_unload',
+                                  56000 + n, close_unload_quit, exits=True)
+
+
+# Auto save and load on in a game override only.
+AUTO_OVERRIDE = {'savestate_auto_save': 'true', 'savestate_auto_load': 'true'}
+AUTO_OFF = {'savestate_auto_save': 'false', 'savestate_auto_load': 'false'}
+
+
+def lane_quit_during_unload_override(args, n):
+    """The same with auto save on in a game override only: the quit,
+    after Unload Core dropped the override, does not save; the close
+    still does, once."""
+    return close_after_held_state(args, n, 'quit_during_unload_override',
+                                  56080 + n, close_unload_quit,
+                                  base=AUTO_OFF, override=AUTO_OVERRIDE,
+                                  exits=True)
+
+
+def lane_unload_override_kept(args, n):
+    """Unload Core with nothing in flight saves at once, with the
+    override's settings (an uncompressed state): the .auto the load
+    failed on is kept in the backups."""
+    return close_after_held_state(
+        args, n, 'unload_override_kept', 56020 + n, close_unload,
+        slot=None, base=dict(AUTO_OFF, savestate_file_compression='true'),
+        override=dict(AUTO_OVERRIDE, savestate_file_compression='false'),
+        unloadable=True)
+
+
+def lane_unload_override_after_held(args, n):
+    """Unload Core while a Save State to slot 0 is written: the close
+    saves after the override is gone, as the content was loaded with
+    it, and keeps the .auto the load failed on in the backups."""
+    return close_after_held_state(args, n, 'unload_override_after_held',
+                                  56040 + n, close_unload, slot=0,
+                                  base=AUTO_OFF, override=AUTO_OVERRIDE,
+                                  unloadable=True)
+
+
+def lane_unload_bypass_after_held(args, n):
+    """The same with a core info file that says no save states and the
+    savestate bypass on in the override: the close still saves."""
+    return close_after_held_state(
+        args, n, 'unload_bypass_after_held', 56060 + n, close_unload,
+        slot=0, base={'savestate_auto_load': 'false',
+                      'core_info_savestate_bypass': 'false'},
+        override={'core_info_savestate_bypass': 'true'},
+        info='display_name = "save_e2e"\nsavestate = "false"\n')
+
+
+def lane_close_while_held(args, n):
+    """A close or quit while the content's saves are held (a cloud sync
+    still running at the load) waits for nothing and writes no .auto.
+    The sync's server takes the connection and never answers."""
+    failures = []
+    server = socket.socket()
+    server.bind(('127.0.0.1', 0))
+    server.listen(8)
+    conns = []
+
+    def accept():
+        while True:
+            try:
+                conns.append(server.accept()[0])
+            except OSError:
+                return
+    threading.Thread(target=accept, daemon=True).start()
+    for i, close in enumerate((b'UNLOAD_CORE', b'QUIT')):
+        port = 55980 + 2 * n + i
+        r = Run(args.run_dir, 'close_while_held-%d-%d' % (n, i))
+        cfg = r.config(network_cmd_enable='true', network_cmd_port=str(port),
+                       savestate_auto_save='true',
+                       savestate_auto_load='true',
+                       cloud_sync_enable='true', cloud_sync_driver='webdav',
+                       webdav_url='http://127.0.0.1:%d/' %
+                       server.getsockname()[1])
+        auto = r.dir / 'states' / 'game.state.auto'
+        r.start(args, cfg, 100000, r.env(SAVE_E2E_FRAME_MS=10))
+        deadline, held = time.time() + 30, False
+        while not held and r.proc.poll() is None \
+                and time.time() < deadline:
+            held = '[CloudSync]' in log_text(r) \
+                and len(conns) > i
+            time.sleep(0.05)
+        check(failures, held, '%s: the saves were not held' % close)
+        time.sleep(0.5)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.sendto(close, ('127.0.0.1', port))
+        sock.close()
+        if close == b'QUIT':
+            done = r.wait(30) is not None
+        else:
+            # The dummy core may wait on the sync; the close does not.
+            deadline, done = time.time() + 30, False
+            while not done and time.time() < deadline:
+                done = '[Core] Unloading game' in log_text(r)
+                if r.proc.poll() is not None:
+                    break
+                time.sleep(0.05)
+        r.kill()
+        r.drain.join()
+        check(failures, done, '%s: the close waited for the hold' % close)
+        check(failures, not auto.exists(), '%s: the .auto was written' % close)
+    server.close()
+    for c in conns:
+        c.close()
+    return r, failures
+
+
 LANES = {
     'autosave_full_disk': lane_autosave_full_disk,
     'autosave_kill_mid_write': lane_autosave_kill_mid_write,
@@ -785,13 +1052,26 @@ LANES = {
     'folder_check_each_load': lane_folder_check_each_load,
     'folder_check_override': lane_folder_check_override,
     'archive_member_old_folder': lane_archive_member_old_folder,
+    'quit_after_held_state': lane_quit_after_held_state,
+    'unload_after_held_state': lane_unload_after_held_state,
+    'load_after_held_state': lane_load_after_held_state,
+    'close_while_held': lane_close_while_held,
+    'quit_during_unload': lane_quit_during_unload,
+    'quit_during_unload_override': lane_quit_during_unload_override,
+    'unload_override_kept': lane_unload_override_kept,
+    'unload_override_after_held': lane_unload_override_after_held,
+    'unload_bypass_after_held': lane_unload_bypass_after_held,
 }
+HELD_LANES = ('autosave_kill_mid_write', 'quit_after_held_state',
+              'unload_after_held_state', 'load_after_held_state',
+              'quit_during_unload', 'quit_during_unload_override',
+              'unload_override_after_held', 'unload_bypass_after_held')
 # Lanes that need Windows, and the ones Windows cannot run.
 WINDOWS_LANES = {'windows_locked_close'}
 POSIX_LANES = {'autosave_full_disk', 'autosave_kill_mid_write',
                'no_rewrite_at_launch', 'unreadable_backed_up',
                'explicit_save_copies', 'folder_check_each_load',
-               'folder_check_override'}
+               'folder_check_override'} | set(HELD_LANES)
 
 
 def main():
@@ -815,7 +1095,7 @@ def main():
     lanes = [l for l in args.lane or sorted(LANES)
              if l not in (POSIX_LANES if WINDOWS else WINDOWS_LANES)]
     need = [args.retroarch, args.core]
-    if 'autosave_kill_mid_write' in lanes:
+    if set(HELD_LANES) & set(lanes):
         need.append(args.shim)
     for f in need:
         if not f.exists():

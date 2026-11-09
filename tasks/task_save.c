@@ -2502,8 +2502,8 @@ static bool content_auto_state_set_aside(const char *path, unsigned *held)
    settings_t *settings        = config_get_ptr();
 
    if (     !runloop_st->auto_state_owned
-         && (   settings->bools.savestate_auto_load
-             || runloop_st->auto_state_load_asked)
+         && (   runloop_st->auto_state_wanted
+             || settings->bools.savestate_auto_load)
          && path_is_valid(path))
    {
       enum save_backup_result result = SAVE_BACKUP_FAILED;
@@ -2553,7 +2553,8 @@ bool content_auto_save_state(const char *path)
    intfstream_t *file   = NULL;
    char tmp_path[PATH_MAX_LENGTH];
 
-   if (!core_info_current_supports_savestate())
+   if (     !runloop_state_get_ptr()->auto_state_bypass
+         && !core_info_current_supports_savestate())
    {
       RARCH_LOG("[State] %s\n",
             msg_hash_to_str(MSG_CORE_DOES_NOT_SUPPORT_SAVESTATES));

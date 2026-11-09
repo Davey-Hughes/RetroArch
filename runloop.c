@@ -5588,6 +5588,8 @@ static void runloop_reset_auto_state_load(runloop_state_t *runloop_st)
    runloop_st->auto_state_load_asked     = false;
    runloop_st->auto_state_save_ready     = false;
    runloop_st->auto_state_owned          = false;
+   runloop_st->auto_state_wanted         = false;
+   runloop_st->auto_state_bypass         = false;
    runloop_st->auto_state_interval_started = false;
 }
 
@@ -6117,6 +6119,10 @@ static void runloop_content_saves_ready(runloop_state_t *runloop_st)
     * an unchanged save is not written back. */
    if (runloop_st->flags & RUNLOOP_FLAG_USE_SRAM)
       command_event(CMD_EVENT_AUTOSAVE_INIT, NULL);
+
+   runloop_st->auto_state_wanted =  settings->bools.savestate_auto_load
+                                 || runloop_st->auto_state_load_asked;
+   runloop_st->auto_state_bypass =  settings->bools.core_info_savestate_bypass;
 
    /*
     * Since the operations are asynchronous we can't

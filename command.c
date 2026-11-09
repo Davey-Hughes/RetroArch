@@ -6507,7 +6507,8 @@ size_t command_event_save_auto_state(void)
     * state to save over */
    if (     runloop_st->save_load_hold
          || !runloop_st->auto_state_save_ready
-         || !core_info_current_supports_savestate())
+         || (  !runloop_st->auto_state_bypass
+            && !core_info_current_supports_savestate()))
       return 0;
    a = path_basename(path_get(RARCH_PATH_BASENAME));
    if (!a || !*a)

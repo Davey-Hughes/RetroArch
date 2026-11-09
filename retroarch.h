@@ -132,7 +132,10 @@ enum rarch_state_flags
     * before loading; rarch_main() does not push another. */
    RARCH_FLAGS_CLOUD_SYNC_AT_INIT           = (1 << 23),
    /* See retroarch_user_dirs_hold(). */
-   RARCH_FLAGS_USER_DIRS_HELD               = (1 << 24)
+   RARCH_FLAGS_USER_DIRS_HELD               = (1 << 24),
+   /* The auto save-state the closing content owes: written once the
+    * state tasks the close waits for are through. */
+   RARCH_FLAGS_AUTO_SAVE_ON_DEINIT          = (1 << 25)
 };
 
 bool retroarch_ctl(enum rarch_ctl_state state, void *data);

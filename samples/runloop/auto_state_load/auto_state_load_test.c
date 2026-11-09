@@ -310,12 +310,26 @@ static void test_auto_state_order(void)
    load_finished("failed");
    assert(runloop_state.auto_state_save_ready);
    assert(!runloop_state.auto_state_owned);
+   /* the close keeps that .auto in the backups */
+   assert(runloop_state.auto_state_wanted);
+
+   /* Load State > Auto with Auto Load State off: the same */
+   reset(1, false);
+   test_settings.bools.savestate_auto_load = false;
+   runloop_state.auto_state_load_asked     = true;
+   runloop_content_saves_ready(&runloop_state);
+   assert(loads == 1 && !runloop_state.auto_state_save_ready);
+   load_finished("failed");
+   assert(runloop_state.auto_state_save_ready);
+   assert(!runloop_state.auto_state_owned);
+   assert(runloop_state.auto_state_wanted);
 
    /* skipped (Auto Load State off), or canceled while deferred */
    reset(1, false);
    test_settings.bools.savestate_auto_load = false;
    runloop_content_saves_ready(&runloop_state);
    assert(loads == 0 && runloop_state.auto_state_save_ready);
+   assert(!runloop_state.auto_state_wanted);
    reset(3, true);
    runloop_content_saves_ready(&runloop_state);
    assert(!runloop_state.auto_state_save_ready);
