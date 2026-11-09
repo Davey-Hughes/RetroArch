@@ -38,7 +38,6 @@ struct core_load_check_task
 {
    struct core_check c;
    struct core_hash h;
-   uint8_t sig[CORE_SIG_MAX_LEN + 1];
    core_trust_set_t *s;
    core_file_t *f;
    char *path;
@@ -61,7 +60,6 @@ static struct
    struct core_load_slot loaded;  /* the core loaded last */
    struct core_load_slot quick;   /* the last quick pass */
    struct core_check c;
-   uint8_t sig[CORE_SIG_MAX_LEN + 1];
    char path[PATH_MAX_LENGTH];
    char check_path[PATH_MAX_LENGTH];
    char refused[PATH_MAX_LENGTH];
@@ -193,56 +191,15 @@ static void core_load_slot_set(struct core_load_slot *sl, const char *path,
    }
 }
 
-/* <core>.sig, no further than the longest valid one: its length, -1
- * with none, 0 on a read error. As core_check_file() reads it. */
-static int64_t core_load_check_read_sig(const char *check_path,
-      uint8_t *sig)
-{
-   int64_t got     = 0;
-   int64_t len     = -1;
-   size_t path_len = strlen(check_path);
-   core_file_t *f;
-   char *sig_path;
-   if (!(sig_path = (char*)malloc(path_len + sizeof(".sig"))))
-      return -1;
-   memcpy(sig_path, check_path, path_len);
-   memcpy(sig_path + path_len, ".sig", sizeof(".sig"));
-   if ((f = core_file_open(sig_path)))
-   {
-      for (len = 0; len < CORE_SIG_MAX_LEN + 1; len += got)
-         if ((got = core_file_read(f, sig + (size_t)len,
-                     (size_t)(CORE_SIG_MAX_LEN + 1 - len))) <= 0)
-            break;
-      core_file_close(f);
-      if (got < 0)
-         len = 0;
-   }
-   free(sig_path);
-   return len;
-}
-
 /* Any thread: the check once h has read f to its end (step 0) or
  * failed (step -1). Frees what h holds. */
 static void core_load_check_complete(const core_trust_set_t *s,
       struct core_hash *h, int step, const char *check_path,
-      struct core_check *c, uint8_t *sig)
+      struct core_check *c)
 {
-   uint8_t sha256[CORE_SHA256_LEN];
    size_t num_keys     = 0;
-   const uint8_t *keys = NULL;
-   int64_t sig_len;
-   if (step < 0 || h->done != c->rec.id.size)
-   {
-      core_hash_free(h);
-      c->result = CORE_CHECK_ERROR;
-      return;
-   }
-   core_hash_final(h, sha256);
-   sig_len = core_load_check_read_sig(check_path, sig);
-   keys    = core_sig_builtin_keys(&num_keys);
-   core_check_finish(s, keys, num_keys, sha256,
-         sig_len < 0 ? NULL : sig, sig_len < 0 ? 0 : (size_t)sig_len,
-         0, c);
+   const uint8_t *keys = core_sig_builtin_keys(&num_keys);
+   core_check_hashed(s, keys, num_keys, h, step, check_path, 0, c);
 }
 
 static void core_load_check_task_free(struct core_load_check_task *t)
@@ -274,8 +231,7 @@ static void core_load_check_handler(retro_task_t *task)
    task_nbio_slice_close(&budget);
    if (step > 0)
       return;
-   core_load_check_complete(t->s, &t->h, step, t->check_path, &t->c,
-         t->sig);
+   core_load_check_complete(t->s, &t->h, step, t->check_path, &t->c);
    t->hash_live = false;
    task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
 }
@@ -383,7 +339,7 @@ static enum core_load_gate core_load_check_inline(
          step = core_hash_step(&h, *f);
       while (step > 0);
       core_load_check_complete(*s, &h, step, core_load_rt.check_path,
-            &core_load_rt.c, core_load_rt.sig);
+            &core_load_rt.c);
    }
    else
       core_load_rt.c.result = CORE_CHECK_ERROR;
