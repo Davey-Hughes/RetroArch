@@ -33836,6 +33836,10 @@ MSG_HASH(
    "Core not loaded: RetroArch couldn't confirm it is safe. To trust it, start RetroArch with a menu, load the core and choose Always Trust."
    )
 MSG_HASH(
+   MSG_CORE_LOAD_TRUST_LIST_FULL,
+   "Core loaded this time only: the trusted cores list is full, so RetroArch couldn't remember it."
+   )
+MSG_HASH(
    MSG_TO,
    "to"
    )

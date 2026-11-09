@@ -1311,16 +1311,21 @@ static void park_wait(unsigned want_reruns)
    }
 }
 
-static unsigned osd_refused(void)
+static unsigned osd_shown(enum msg_hash_enums msg)
 {
    char want[32];
    unsigned i;
    unsigned n = 0;
-   sprintf(want, "msg %d", (int)MSG_CORE_LOAD_REFUSED_NO_MENU);
+   sprintf(want, "msg %d", (int)msg);
    for (i = 0; i < osd_count && i < OSD_MAX; i++)
       if (string_is_equal(osd[i], want))
          n++;
    return n;
+}
+
+static unsigned osd_refused(void)
+{
+   return osd_shown(MSG_CORE_LOAD_REFUSED_NO_MENU);
 }
 
 static void park_reset(void)
@@ -1402,12 +1407,17 @@ static void test_park_always(void)
 }
 
 /* Always Trust that can't be recorded (the list is full): loaded once,
- * and the log says so */
+ * and the OSD and the log say so */
 static void test_park_always_full(void)
 {
    struct core_check fill;
+   struct core_check c;
    char core[256];
    unsigned i;
+   unsigned shown;
+   size_t n            = 0;
+   const uint8_t *keys = core_sig_builtin_keys(&n);
+   core_trust_set_t *s = NULL;
    start(false);
    park_reset();
    memset(&fill, 0, sizeof(fill));
@@ -1427,12 +1437,22 @@ static void test_park_always_full(void)
    CHECK(park(core));
    drain();
    last_log[0] = '\0';
+   shown       = osd_shown(MSG_CORE_LOAD_TRUST_LIST_FULL);
    CHECK(core_warning_choose(CORE_WARNING_ALWAYS_TRUST));
    CHECK(strstr(last_log, "Could not trust") != NULL);
    park_wait(1);
    CHECK(reruns == 1);
    CHECK(rerun_id == 1);
    CHECK(frees == 1);
+   CHECK(osd_shown(MSG_CORE_LOAD_TRUST_LIST_FULL) == shown + 1);
+   CHECK((s = core_trust_runtime_get()) != NULL);
+   if (s)
+   {
+      core_check_file(s, keys, n, core, 0, &c);
+      CHECK(core_trust_has_hash(s, fill.rec.sha256));
+      CHECK(!core_trust_has_hash(s, c.rec.sha256));
+      core_trust_set_put(s);
+   }
    stop();
 }
 

@@ -722,8 +722,13 @@ static void core_load_park_choice(enum core_warning_choice choice,
       case CORE_WARNING_ALWAYS_TRUST:
          /* Not recorded, so this once */
          if (!core_trust_runtime_always(c))
+         {
+            const char *msg = msg_hash_to_str(MSG_CORE_LOAD_TRUST_LIST_FULL);
             RARCH_WARN("[Core] Could not trust \"%s\" for good: loading it once.\n",
                   p->path);
+            runloop_msg_queue_push(msg, strlen(msg), 2, 360, false, NULL,
+                  MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+         }
          p->state = CORE_LOAD_PARK_IDLE;
          break;
       default:
