@@ -1055,6 +1055,81 @@ static void test_stage_swapped(void)
    stop();
 }
 
+/* Test library c written over path in place, a byte longer so the
+ * identity changes whatever the clock's grain. False while a held
+ * handle refuses the write (Windows). */
+static bool rewrite_core(const char *path)
+{
+   void *buf   = NULL;
+   int64_t len = 0;
+   bool ok     = false;
+   RFILE *f    = NULL;
+   if (!filestream_read_file("core_load_check_test_c" LIB_EXT, &buf, &len))
+      return false;
+   if ((f = filestream_open(path, RETRO_VFS_FILE_ACCESS_WRITE,
+               RETRO_VFS_FILE_ACCESS_HINT_NONE)))
+   {
+      ok = filestream_write(f, buf, len) == len
+         && filestream_write(f, "", 1) == 1;
+      if (filestream_close(f) != 0)
+         ok = false;
+   }
+   free(buf);
+   return ok;
+}
+
+#ifndef _WIN32
+static bool path_identity(const char *path, struct core_identity *id)
+{
+   core_file_t *f = core_file_open(path);
+   bool ok        = f && core_file_identity(f, id);
+   core_file_close(f);
+   return ok;
+}
+#endif
+
+/* Nor is a file rewritten in place after the check: same inode, so
+ * only the identity checked tells it apart */
+static void test_stage_rewritten(void)
+{
+   dylib_t lib = NULL;
+   char core[256];
+#ifndef _WIN32
+   struct core_identity before;
+   struct core_identity after;
+#endif
+   start(true);
+   CHECK(put_core(core, "stage_rewrite_libretro" LIB_EXT, 'a'));
+   CHECK(trust(core));
+#ifndef _WIN32
+   CHECK(path_identity(core, &before));
+#endif
+   CHECK(worker_hold());
+   CHECK(core_load_check_stage_begin(core));
+   CHECK(!core_load_check_stage_ready());
+#ifdef _WIN32
+   /* The checked file is held: it can't be written */
+   CHECK(!rewrite_core(core));
+   worker_go();
+   CHECK(stage_wait());
+   lib = core_load_check_stage_take(core);
+   CHECK(lib_id(lib) == 1);
+#else
+   CHECK(rewrite_core(core));
+   CHECK(path_identity(core, &after));
+   CHECK(!memcmp(before.ino, after.ino, sizeof(before.ino)));
+   CHECK(!core_identity_equal(&before, &after));
+   worker_go();
+   CHECK(stage_wait());
+   lib = core_load_check_stage_take(core);
+   CHECK(!lib);
+   CHECK(lib_id(lib) == 0);
+#endif
+   if (lib)
+      dylib_close(lib);
+   stop();
+}
+
 /* Probes while the stage's worker opens its core grant other cores:
  * the stage's load still ends the pass of the core loaded before */
 static void test_stage_stale_grant(void)
@@ -1216,6 +1291,7 @@ int main(void)
    test_stage_path_moved();
 #endif
    test_stage_swapped();
+   test_stage_rewritten();
    test_stage_stale_grant();
    test_stage_loaded();
    printf("%u checks, %u failures\n", checks, failures);

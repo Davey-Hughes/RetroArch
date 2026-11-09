@@ -69,6 +69,7 @@ enum core_load_stage
  * runs its constructors off the frame loop */
 struct core_load_open_task
 {
+   struct core_identity id;   /* the file checked */
    core_file_t *f;
    char *path;
    char *check_path;
@@ -395,18 +396,22 @@ static void core_load_check_osd_checking(const char *path)
 }
 
 /* Worker: loaded by path outside Android, so only while the path still
- * names the file checked */
+ * names the file checked, unchanged. A pass with checks off records no
+ * identity: nothing to compare. */
 static bool core_load_open_names(const struct core_load_open_task *o)
 {
 #ifdef ANDROID
    (void)o;
    return true;
 #else
-   struct core_identity id;
+   struct core_identity none;
    core_file_t *f = NULL;
-   bool same      = core_file_identity(o->f, &id)
-      && (f = core_file_open(o->check_path))
-      && core_load_same_file(&id, f);
+   bool same;
+   memset(&none, 0, sizeof(none));
+   if (core_identity_equal(&o->id, &none))
+      return true;
+   same = (f = core_file_open(o->check_path))
+      && core_load_same_file(&o->id, f);
    core_file_close(f);
    return same;
 #endif
@@ -474,6 +479,8 @@ static void core_load_check_stage_open(void)
       free(o);
       return;
    }
+   o->id                = (core_load_rt.stage_grant == CORE_LOAD_GRANT_SLOT
+         ? &core_load_rt.slot : &core_load_rt.quick)->c.rec.id;
    o->f                 = core_load_rt.stage_f;
    o->gen               = core_load_rt.stage_gen;
    core_load_rt.stage_f = NULL;
