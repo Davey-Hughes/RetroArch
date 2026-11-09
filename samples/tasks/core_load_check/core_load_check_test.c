@@ -104,9 +104,12 @@ bool menu_core_warning_can_open(void)
 /* The last warning or error's format, enough to name the line */
 static char last_log[256];
 
+static unsigned checking_logs;
+
 void RARCH_LOG(const char *fmt, ...)
 {
-   (void)fmt;
+   if (strstr(fmt, "Checking"))
+      checking_logs++;
 }
 
 void RARCH_WARN(const char *fmt, ...)
@@ -309,9 +312,11 @@ static void test_attach(void)
    char core[256];
    start(false);
    CHECK(put_core(core, "twice_libretro" LIB_EXT, 'a'));
+   checking_logs = 0;
    CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_REFUSED);
    CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_REFUSED);
    CHECK(queued() == 1);
+   CHECK(checking_logs == 1);
    stop();
 }
 

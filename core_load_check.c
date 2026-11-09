@@ -451,7 +451,8 @@ enum core_load_gate core_load_check_open(const char *path, dylib_t *lib)
          g = NULL;
       core_load_slot_clear(&core_load_rt.slot);
    }
-   RARCH_LOG("[Core] Checking \"%s\" before it loads.\n", path);
+   if (!string_is_equal(core_load_rt.checking, path))
+      RARCH_LOG("[Core] Checking \"%s\" before it loads.\n", path);
    core_load_check_push(f, path, core_load_rt.check_path,
          &core_load_rt.c);
    f = NULL;
