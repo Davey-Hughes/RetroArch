@@ -2224,6 +2224,12 @@ static void test_load(void)
    CHECK((f = core_file_open(two)) != NULL);
 #ifdef _WIN32
    CHECK(!MoveFileExA(two_new, two, MOVEFILE_REPLACE_EXISTING));
+   /* nor moved away or deleted, which frees the path for another */
+   strlcpy(bad, tmp("load_two_moved" LIB_EXT), sizeof(bad));
+   CHECK(!MoveFileExA(two, bad, 0));
+   MoveFileExA(bad, two, 0);
+   CHECK(!DeleteFileA(two));
+   CopyFileA(two_new, two, TRUE);
 #else
    CHECK(filestream_rename(two_new, two) == 0);
 #endif
