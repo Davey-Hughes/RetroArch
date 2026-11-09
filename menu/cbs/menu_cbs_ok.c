@@ -98,6 +98,9 @@
 #ifdef HAVE_CORE_SIGNATURES
 #include "../../core_trust_runtime.h"
 #endif
+#ifdef HAVE_CORE_LOAD_CHECK
+#include "../../core_load_check.h"
+#endif
 #include "../../manual_content_scan.h"
 #ifdef __MACH__
 #include <TargetConditionals.h>
@@ -9620,6 +9623,10 @@ static int action_ok_core_delete(const char *path,
     * loaded - if so, unload it */
    if (retroarch_ctl(RARCH_CTL_IS_CORE_LOADED, (void*)core_path))
       generic_action_ok_command(CMD_EVENT_UNLOAD_CORE);
+
+#ifdef HAVE_CORE_LOAD_CHECK
+   core_load_check_release_held();
+#endif
 
    /* Delete core file */
 #if defined(ANDROID)

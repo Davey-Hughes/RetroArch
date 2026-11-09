@@ -39,6 +39,9 @@
 #include "../msg_hash.h"
 #include "../verbosity.h"
 #include "../core_updater_list.h"
+#ifdef HAVE_CORE_LOAD_CHECK
+#include "../core_load_check.h"
+#endif
 
 #if defined(ANDROID)
 #include "../file_path_special.h"
@@ -1939,6 +1942,10 @@ void *task_push_core_updater_download(
       const char *path_dir_core_assets)
 {
    settings_t *settings = config_get_ptr();
+#ifdef HAVE_CORE_LOAD_CHECK
+   /* Here, not in _internal, which update-all runs on a worker */
+   core_load_check_release_held();
+#endif
    return task_push_core_updater_download_internal(
          core_list, filename, crc, mute, auto_backup,
          settings->bools.core_updater_auto_backup_compress,
@@ -2719,6 +2726,10 @@ void task_push_update_installed_cores(
    task->progress_cb      = task_window_progress_cb;
    task->flags           |= RETRO_TASK_FLG_ALTERNATIVE_LOOK;
 
+#ifdef HAVE_CORE_LOAD_CHECK
+   core_load_check_release_held();
+#endif
+
    /* Push task */
    task_queue_push(task);
 
@@ -3165,6 +3176,9 @@ void *task_push_play_feature_delivery_core_install(
       const char *filename,
       bool mute)
 {
+#ifdef HAVE_CORE_LOAD_CHECK
+   core_load_check_release_held();
+#endif
    return task_push_play_feature_delivery_core_install_internal(
          core_list, filename, mute, NULL);
 }
@@ -3528,6 +3542,10 @@ void task_push_play_feature_delivery_switch_installed_cores(
    task->progress         = 0;
    task->progress_cb      = task_window_progress_cb;
    task->flags           |=  RETRO_TASK_FLG_ALTERNATIVE_LOOK;
+
+#ifdef HAVE_CORE_LOAD_CHECK
+   core_load_check_release_held();
+#endif
 
    /* Push task */
    task_queue_push(task);
