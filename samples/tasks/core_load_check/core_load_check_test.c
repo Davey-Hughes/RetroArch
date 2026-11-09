@@ -119,6 +119,19 @@ void RARCH_ERR(const char *fmt, ...)
    strlcpy(last_log, fmt, sizeof(last_log));
 }
 
+/* Hashes started, in place or in a task */
+static unsigned hashes;
+
+#ifdef COUNT_HASHES
+bool __real_core_hash_init(struct core_hash *h);
+
+bool __wrap_core_hash_init(struct core_hash *h)
+{
+   hashes++;
+   return __real_core_hash_init(h);
+}
+#endif
+
 static void pump(unsigned n)
 {
    while (n--)
@@ -459,6 +472,27 @@ static void test_startup_inline(void)
    stop();
 }
 
+/* D2 allows one wait: the probe after the refused startup load is
+ * answered by the refusal kept for that file */
+static void test_startup_refused_once(void)
+{
+   dylib_t lib = NULL;
+   char bad[256];
+   start(false);
+   CHECK(put_core(bad, "start_once_libretro" LIB_EXT, 'b'));
+   core_load_check_set_startup(true);
+   hashes = 0;
+   CHECK(core_load_check_open(bad, &lib) == CORE_LOAD_GATE_REFUSED);
+   CHECK(core_load_check_open(bad, &lib) == CORE_LOAD_GATE_REFUSED);
+   core_load_check_set_startup(false);
+   CHECK(!lib);
+   CHECK(core_load_check_refused(bad));
+#ifdef COUNT_HASHES
+   CHECK(hashes == 1);
+#endif
+   stop();
+}
+
 static void test_deinit_drops(void)
 {
    dylib_t lib = NULL;
@@ -486,6 +520,7 @@ int main(void)
    test_full_check(true);
    test_slot_binds_file();
    test_startup_inline();
+   test_startup_refused_once();
    test_deinit_drops();
    test_cancelled();
    test_seed_probe();

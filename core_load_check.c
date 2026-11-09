@@ -436,14 +436,14 @@ enum core_load_gate core_load_check_open(const char *path, dylib_t *lib)
             path);
       goto end;
    }
+   /* Refused for this file against this store: no second hash */
+   if (g && core_load_slot_refusal_holds(s))
+      goto end;
    if (core_load_rt.startup)
    {
       ret = core_load_check_inline(&s, &f, path, lib);
       goto end;
    }
-   /* Refused for this file against this store: no second hash */
-   if (g && core_load_slot_refusal_holds(s))
-      goto end;
    if (core_load_slot_is(&core_load_rt.slot, path))
    {
       /* Replaced, or the store changed, since its check */
