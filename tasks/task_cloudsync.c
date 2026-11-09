@@ -2785,12 +2785,17 @@ static void task_cloud_sync_hold_delete(task_cloud_sync_state_t *sync_state)
 
 /* Whether @key's file is here after all. A save renames a state aside
  * and back, and the walk can land in between: the file is back by now,
- * still held (save_backups_held()), or in its temp. */
+ * still held (save_backups_held()), or in a writer's temp. */
 static bool task_cloud_sync_still_here(
       const task_cloud_sync_state_t *sync_state, int root, const char *key)
 {
+   /* A state task's, the RAM state's, and for an ".auto" alone the
+    * synchronous auto save's: "G.state.auto.tmp" is not slot 0's */
+   static const char *const temps[] = { ".tmp", ".ram.tmp", ".auto.tmp" };
    char        local[PATH_MAX_LENGTH];
    const char *path = cloud_sync_manifest_key_path(key);
+   size_t      _len;
+   size_t      i, n;
 
    if (root < 0 || !path)
       return false;
@@ -2800,8 +2805,14 @@ static bool task_cloud_sync_still_here(
    pathname_conform_slashes_to_os(local);
    if (path_is_valid(local) || save_backups_held(local))
       return true;
-   return    strlcat(local, ".tmp", sizeof(local)) < sizeof(local)
-          && path_is_valid(local);
+   _len = strlen(local);
+   n    = string_ends_with(local, ".auto") ? 3 : 2;
+   for (i = 0; i < n; i++)
+      if (     strlcpy(local + _len, temps[i], sizeof(local) - _len)
+                  < sizeof(local) - _len
+            && path_is_valid(local))
+         return true;
+   return false;
 }
 
 static void task_cloud_sync_held_notice(task_cloud_sync_state_t *sync_state)

@@ -60,8 +60,9 @@ if [ ! -s "$ld_line" ]; then
    exit 1
 fi
 
+# The thumbnail lanes gate the PNG encoder's steps (harness_main.o).
 sed -e "s#$objdir/retroarch\.o#$out/retroarch_nomain.o $out/harness_main.o#" \
-    -e "s#-o retroarch\(_debug\)\? #-o $out/content_load_test #" \
+    -e "s#-o retroarch\(_debug\)\? #-Wl,--wrap=rpng_encode_step -o $out/content_load_test #" \
    "$ld_line" | sh
 
 # The harness core: a plain shared library, no sanitizer, so that what

@@ -377,6 +377,35 @@ void RARCH_WARN(const char *fmt, ...) { (void)fmt; }
 static unsigned errors_logged;
 void RARCH_ERR(const char *fmt, ...)  { (void)fmt; errors_logged++; }
 
+/* A thumbnail: "<state>.png" holding "new"; none when @shot_fails.
+ * @png_at_shot: whether the slot still had one when it was taken. */
+static unsigned shots;
+static bool     shot_fails;
+static bool     png_at_shot;
+bool take_screenshot(const char *screenshot_dir, const char *path,
+      bool silence, bool has_valid_framebuffer, bool fullpath,
+      bool use_thread)
+{
+   char png[PATH_MAX_LENGTH];
+   (void)screenshot_dir; (void)silence; (void)has_valid_framebuffer;
+   (void)fullpath; (void)use_thread;
+   shots++;
+   snprintf(png, sizeof(png), "%s.png", path);
+   png_at_shot = path_is_valid(png);
+   if (shot_fails)
+      return false;
+   return filestream_write_file(png, "new", 3);
+}
+
+/* The shots asked to stop: the last one's file */
+static unsigned shots_cancelled;
+static char     shot_cancelled[PATH_MAX_LENGTH];
+void take_screenshot_cancel(const char *path)
+{
+   shots_cancelled++;
+   strlcpy(shot_cancelled, path, sizeof(shot_cancelled));
+}
+
 static unsigned msgs_pushed;
 static void msg_push_stub(retro_task_t *task, const char *msg,
       unsigned prio, unsigned dur, bool flush)
@@ -2157,7 +2186,8 @@ static void test_auto_state_undo(void)
 
 /* -----------------------------------------------------------------
  * The interval save skips its tick while another state save is still
- * writing, as both write the .auto's temp; the next frame tries again.
+ * writing, as both write the .auto's temp, or a load reads it; the
+ * next frame tries again.
  * ----------------------------------------------------------------- */
 static void test_auto_state_skip_tick(void)
 {
@@ -2203,6 +2233,28 @@ static void test_auto_state_skip_tick(void)
    okf(content_save_state_automatic(12016000)
          && n_landed > 0 && written_into(auto_slot, landed, n_landed),
        "skip tick: the next frame saves");
+
+   /* a load of the Auto slot still reading it */
+   free(landed);
+   landed = NULL;
+   if (!filestream_read_file(auto_slot, &landed, &n_landed))
+      n_landed = -1;
+   clock_step = TEST_TICK_BUDGET_US;
+   content_load_state(auto_slot, false, false);
+   task_queue_check();
+   memset(core_mem, 0x66, core_len);
+   okf(     content_load_state_in_progress(NULL)
+         && !content_save_state_in_progress(NULL),
+       "skip tick: a load of the Auto slot is reading");
+   okf(!content_save_state_automatic(13016000)
+         && n_landed > 0 && !written_into(auto_slot, landed, n_landed),
+       "skip tick: the interval save skips its tick during a load");
+   pump(1000);
+   clock_step = 0;
+   memset(core_mem, 0x66, core_len);
+   okf(content_save_state_automatic(13032000)
+         && written_into(auto_slot, landed, n_landed),
+       "skip tick: the next frame saves after the load");
 
    free(before);
    free(landed);
@@ -2697,6 +2749,432 @@ static void test_auto_state_skip_tick_threaded(void)
    filestream_delete(auto_slot);
 }
 
+/* -----------------------------------------------------------------
+ * A save that fails takes no thumbnail: the slot's old one stays.
+ * ----------------------------------------------------------------- */
+static void test_thumbnail_on_success(void)
+{
+   const char *path = "sst_thumb.state";
+   const char *png  = "sst_thumb.state.png";
+   void   *data     = NULL;
+   int64_t len      = 0;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   core_fill(TEST_SAVE_STATE_CHUNK);
+   filestream_delete(path);
+   filestream_write_file(png, "old", 3);
+   stub_settings.bools.savestate_thumbnail_enable = true;
+   shots = 0;
+   set_save_state_in_background(true);
+   core_ser_fails = 1;
+   content_save_state(path, true);
+   pump(1000);
+   core_ser_fails = 0;
+   set_save_state_in_background(false);
+   okf(shots == 0, "thumbnail: none for a save that failed");
+   okf(     filestream_read_file(png, &data, &len) && len == 3
+         && !memcmp(data, "old", 3), "thumbnail: the old one stays");
+   free(data);
+   content_save_state(path, true);
+   pump(1000);
+   okf(shots == 1, "thumbnail: one for a save that was written");
+   filestream_delete(path);
+   filestream_delete(png);
+}
+
+static bool holds_text(const char *path, const char *text)
+{
+   void   *data = NULL;
+   int64_t len  = 0;
+   bool    ok   = filestream_read_file(path, &data, &len)
+         && len == (int64_t)strlen(text) && !memcmp(data, text, (size_t)len);
+   free(data);
+   return ok;
+}
+
+/* -----------------------------------------------------------------
+ * A written state whose new thumbnail fails keeps none: never a
+ * picture of an older state beside it.
+ * ----------------------------------------------------------------- */
+static void test_thumbnail_fails(void)
+{
+   const char *path = "sst_thumbfail.state";
+   const char *png  = "sst_thumbfail.state.png";
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   core_fill(TEST_SAVE_STATE_CHUNK);
+   filestream_delete(path);
+
+   filestream_write_file(png, "old", 3);
+   content_save_state(path, true);
+   pump(1000);
+   okf(file_size(path) > 0 && holds_text(png, "old"),
+       "thumbnail: off, the slot's picture is left alone");
+
+   stub_settings.bools.savestate_thumbnail_enable = true;
+   shot_fails      = true;
+   shots_cancelled = 0;
+   content_save_state(path, true);
+   pump(1000);
+   okf(file_size(png) < 0,
+       "thumbnail: a failed one leaves none beside a written state");
+   filestream_write_file(png, "old", 3);
+   okf(content_auto_save_state(path) && file_size(png) < 0,
+       "thumbnail: a failed one leaves none beside an auto save");
+   okf(shots_cancelled == 0,
+       "thumbnail: a failed one stops no other shot of the slot");
+   shot_fails = false;
+   filestream_write_file(png, "old", 3);
+   okf(content_auto_save_state(path) && holds_text(png, "new"),
+       "thumbnail: an auto save's replaces the old one");
+   filestream_delete(path);
+   filestream_delete(png);
+}
+
+/* -----------------------------------------------------------------
+ * A written state's slot keeps its picture until the new one is
+ * taken: the old one goes only when that fails.
+ * ----------------------------------------------------------------- */
+static void test_thumbnail_kept_until_shot(void)
+{
+   const char *path = "sst_thumbkeep.state";
+   const char *png  = "sst_thumbkeep.state.png";
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   core_fill(TEST_SAVE_STATE_CHUNK);
+   filestream_delete(path);
+   filestream_write_file(png, "old", 3);
+   stub_settings.bools.savestate_thumbnail_enable = true;
+   shots       = 0;
+   png_at_shot = false;
+   content_save_state(path, true);
+   pump(1000);
+   okf(shots == 1 && png_at_shot,
+       "thumbnail: the old one stays until the new one is taken");
+   okf(holds_text(png, "new"), "thumbnail: the new one replaces it");
+   filestream_delete(path);
+   filestream_delete(png);
+}
+
+/* -----------------------------------------------------------------
+ * Undo Save and the RAM state written at close put a state of another
+ * moment in the slot: with thumbnails on, its picture goes once the
+ * state is written.
+ * ----------------------------------------------------------------- */
+static void test_thumbnail_other_moment(void)
+{
+   const char *path = "sst_thumbmoment.state";
+   const char *png  = "sst_thumbmoment.state.png";
+   const char *tmp  = "sst_thumbmoment.state.tmp";
+   const char *rtmp = "sst_thumbmoment.state.ram.tmp";
+   int i;
+
+   for (i = 0; i < 3; i++)
+   {
+      frontend_reset();
+      content_reset_savestate_backups();
+      core_fill(TEST_SAVE_STATE_CHUNK);
+      filestream_delete(path);
+      content_save_state(path, true);
+      pump(1000);
+      memset(core_mem, 0x33, core_len);
+      content_save_state(path, true);
+      pump(1000);
+      stub_settings.bools.savestate_thumbnail_enable = (i > 0);
+      filestream_write_file(png, "new", 3);
+      /* the third undo cannot write its temporary */
+      if (i == 2)
+         path_mkdir(tmp);
+      shots_cancelled = 0;
+      okf(content_undo_save_state(), "thumbnail: Undo Save is taken");
+      pump(1000);
+      if (i == 2)
+         path_rmdir(tmp);
+      okf(shots_cancelled == (i == 1)
+            && (i != 1 || string_is_equal(shot_cancelled, png)),
+          "thumbnail: Undo Save stops a shot of the slot only when it drops");
+      if (i == 0)
+         okf(holds_text(png, "new"),
+             "thumbnail: off, Undo Save leaves the picture alone");
+      else if (i == 1)
+         okf(file_size(png) < 0,
+             "thumbnail: Undo Save drops the undone save's picture");
+      else
+         okf(holds_text(png, "new"),
+             "thumbnail: an Undo Save that fails leaves the picture");
+   }
+
+   for (i = 0; i < 3; i++)
+   {
+      frontend_reset();
+      core_fill(TEST_SAVE_STATE_CHUNK);
+      stub_settings.bools.savestate_thumbnail_enable = (i > 0);
+      filestream_write_file(png, "new", 3);
+      okf(content_save_state_to_ram(), "thumbnail: the RAM state is kept");
+      /* the third cannot write either temporary */
+      if (i == 2)
+      {
+         path_mkdir(rtmp);
+         path_mkdir(tmp);
+      }
+      shots_cancelled = 0;
+      okf(content_ram_state_to_file(path) == (i < 2),
+          "thumbnail: the RAM state is written, or fails");
+      if (i == 2)
+      {
+         path_rmdir(rtmp);
+         path_rmdir(tmp);
+      }
+      okf(shots_cancelled == (i == 1)
+            && (i != 1 || string_is_equal(shot_cancelled, png)),
+          "thumbnail: the RAM state stops a shot of the slot only when it drops");
+      if (i == 0)
+         okf(holds_text(png, "new"),
+             "thumbnail: off, the RAM state leaves the picture alone");
+      else if (i == 1)
+         okf(file_size(png) < 0,
+             "thumbnail: the RAM state drops the slot's picture");
+      else
+         okf(holds_text(png, "new"),
+             "thumbnail: a RAM state that fails leaves the picture");
+   }
+   filestream_delete(path);
+   filestream_delete(png);
+}
+
+/* -----------------------------------------------------------------
+ * A state task and the synchronous auto save writing one file at once
+ * each write their own temporary: both files whole, none left.
+ * ----------------------------------------------------------------- */
+static void test_state_temps_distinct(void)
+{
+   const char *path = "sst_temps.state";
+   const char *ref  = "sst_temps_ref.state";
+   void   *a = NULL, *b = NULL;
+   int64_t n_a = -1, n_b = -2;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(path);
+   filestream_delete(ref);
+   core_fill(20 * TEST_SAVE_STATE_CHUNK);
+   content_save_state(ref, true);
+   pump(1000);
+
+   /* the task's temporary open, one quantum written */
+   clock_step = TEST_TICK_BUDGET_US;
+   content_save_state(path, true);
+   task_queue_check();
+   memset(core_mem, 0x77, core_len);
+   okf(content_auto_save_state(path),
+       "temps: the synchronous auto save is written");
+   pump(100000);
+   clock_step = 0;
+
+   if (!filestream_read_file(path, &a, &n_a))
+      n_a = -1;
+   if (!filestream_read_file(ref, &b, &n_b))
+      n_b = -2;
+   okf(n_a > 0 && n_a == n_b && !memcmp(a, b, (size_t)n_a),
+       "temps: the task's state is written whole");
+   okf(!tmp_exists(path) && file_size("sst_temps.state.auto.tmp") < 0,
+       "temps: no temporary left");
+   free(a);
+   free(b);
+   filestream_delete(path);
+   filestream_delete(ref);
+}
+
+/* -----------------------------------------------------------------
+ * A state task and the RAM state written at close, one file at once:
+ * each its own temporary, the task's state whole, none left.
+ * ----------------------------------------------------------------- */
+static void test_ram_state_temp_distinct(void)
+{
+   const char *path = "sst_ramtemps.state";
+   const char *ref  = "sst_ramtemps_ref.state";
+   void   *a = NULL, *b = NULL;
+   int64_t n_a = -1, n_b = -2;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(path);
+   filestream_delete(ref);
+   core_fill(20 * TEST_SAVE_STATE_CHUNK);
+   content_save_state(ref, true);
+   pump(1000);
+
+   /* the task's temporary open, one quantum written */
+   clock_step = TEST_TICK_BUDGET_US;
+   content_save_state(path, true);
+   task_queue_check();
+   memset(core_mem, 0x66, core_len);
+   okf(content_save_state_to_ram() && content_ram_state_to_file(path),
+       "ram temps: the RAM state is written");
+   pump(100000);
+   clock_step = 0;
+
+   if (!filestream_read_file(path, &a, &n_a))
+      n_a = -1;
+   if (!filestream_read_file(ref, &b, &n_b))
+      n_b = -2;
+   okf(n_a > 0 && n_a == n_b && !memcmp(a, b, (size_t)n_a),
+       "ram temps: the task's state is written whole");
+   okf(!tmp_exists(path) && file_size("sst_ramtemps.state.ram.tmp") < 0,
+       "ram temps: no temporary left");
+   free(a);
+   free(b);
+   filestream_delete(path);
+   filestream_delete(ref);
+}
+
+/* -----------------------------------------------------------------
+ * The RAM state written at close replaces the slot's file, whole,
+ * through its own temporary, with the state kept in RAM.
+ * ----------------------------------------------------------------- */
+static void test_ram_state_file(void)
+{
+   const char *path = "sst_ram.state";
+   const char *ref  = "sst_ram_ref.state";
+   void   *a = NULL, *b = NULL;
+   int64_t n_a = -1, n_b = -2;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(ref);
+   filestream_write_file(path, "old", 3);
+   core_fill(4 * TEST_SAVE_STATE_CHUNK);
+   content_save_state(ref, true);
+   pump(1000);
+   okf(content_save_state_to_ram(), "ram state: kept in RAM");
+   memset(core_mem, 0x66, core_len);
+   okf(content_ram_state_to_file(path), "ram state: written to its file");
+
+   if (!filestream_read_file(path, &a, &n_a))
+      n_a = -1;
+   if (!filestream_read_file(ref, &b, &n_b))
+      n_b = -2;
+   okf(n_a > 0 && n_a == n_b && !memcmp(a, b, (size_t)n_a),
+       "ram state: the file holds the state kept in RAM");
+   okf(!tmp_exists(path) && file_size("sst_ram.state.ram.tmp") < 0,
+       "ram state: no temporary left");
+   free(a);
+   free(b);
+   filestream_delete(path);
+   filestream_delete(ref);
+}
+
+/* The longest name this directory takes: 0 if none fits in the probe */
+static size_t longest_name(void)
+{
+   char   name[1024];
+   size_t lo = 0, hi = sizeof(name) - 1;
+   memset(name, 'n', sizeof(name));
+   /* @lo opens, @hi does not */
+   while (hi - lo > 1)
+   {
+      size_t mid = (lo + hi) / 2;
+      RFILE *f;
+      name[mid] = '\0';
+      if ((f = filestream_open(name, RETRO_VFS_FILE_ACCESS_WRITE,
+            RETRO_VFS_FILE_ACCESS_HINT_NONE)))
+      {
+         filestream_close(f);
+         filestream_delete(name);
+         lo = mid;
+      }
+      else
+         hi = mid;
+      name[mid] = 'n';
+   }
+   return lo;
+}
+
+static bool files_equal(const char *a, const char *b)
+{
+   void   *x = NULL, *y = NULL;
+   int64_t n_x = -1, n_y = -2;
+   bool    ok;
+   if (!filestream_read_file(a, &x, &n_x))
+      n_x = -1;
+   if (!filestream_read_file(b, &y, &n_y))
+      n_y = -2;
+   ok = n_x > 0 && n_x == n_y && !memcmp(x, y, (size_t)n_x);
+   free(x);
+   free(y);
+   return ok;
+}
+
+/* -----------------------------------------------------------------
+ * A slot name too long for the auto save's or the RAM state's own
+ * temporary saves through "<path>.tmp", as before; the RAM state never
+ * while a state task writes that one.
+ * ----------------------------------------------------------------- */
+static void test_long_names(void)
+{
+   const char *ref = "sst_long_ref.state";
+   char   path[1024], tmp[1040], atmp[1040], rtmp[1040];
+   size_t n = longest_name();
+
+   if (n < 16 || n + 8 >= sizeof(path))
+   {
+      printf("       (longest name %u bytes)\n", (unsigned)n);
+      okf(false, "long names: no name length limit found");
+      return;
+   }
+   /* "<path>.tmp" is the longest name the directory takes */
+   memset(path, 'L', n - 4);
+   path[n - 4] = '\0';
+   snprintf(tmp,  sizeof(tmp),  "%s.tmp", path);
+   snprintf(atmp, sizeof(atmp), "%s.auto.tmp", path);
+   snprintf(rtmp, sizeof(rtmp), "%s.ram.tmp", path);
+   printf("       (longest name %u bytes)\n", (unsigned)n);
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(path);
+   filestream_delete(ref);
+   core_fill(4 * TEST_SAVE_STATE_CHUNK);
+   content_save_state(ref, true);
+   pump(1000);
+   okf(content_auto_save_state(path) && files_equal(path, ref),
+       "long names: the auto save is written");
+   okf(file_size(tmp) < 0 && file_size(atmp) < 0,
+       "long names: the auto save leaves no temporary");
+
+   filestream_delete(path);
+   okf(content_save_state_to_ram(), "long names: the RAM state is kept");
+   memset(core_mem, 0x66, core_len);
+   okf(content_ram_state_to_file(path) && files_equal(path, ref),
+       "long names: the RAM state is written");
+   okf(file_size(tmp) < 0 && file_size(rtmp) < 0,
+       "long names: the RAM state leaves no temporary");
+
+   /* the task's "<path>.tmp" open, one quantum written */
+   filestream_delete(path);
+   core_fill(20 * TEST_SAVE_STATE_CHUNK);
+   memset(core_mem, 0x66, core_len);
+   okf(content_save_state_to_ram(), "long names: the RAM state is kept");
+   core_fill(20 * TEST_SAVE_STATE_CHUNK);
+   content_save_state(ref, true);
+   pump(1000);
+   clock_step = TEST_TICK_BUDGET_US;
+   content_save_state(path, true);
+   task_queue_check();
+   okf(!content_ram_state_to_file(path),
+       "long names: the RAM state does not share a state task's temporary");
+   pump(100000);
+   clock_step = 0;
+   okf(files_equal(path, ref) && file_size(tmp) < 0,
+       "long names: the task's state is written whole");
+
+   filestream_delete(path);
+   filestream_delete(ref);
+}
+
 static int run_default_lane(void)
 {
    printf("== task_save.c I/O regression oracle ==\n");
@@ -2738,6 +3216,14 @@ static int run_default_lane(void)
    test_auto_state_undo();
    test_auto_state_skip_tick();
    test_auto_state_keep();
+   test_thumbnail_on_success();
+   test_thumbnail_fails();
+   test_thumbnail_kept_until_shot();
+   test_thumbnail_other_moment();
+   test_long_names();
+   test_state_temps_distinct();
+   test_ram_state_temp_distinct();
+   test_ram_state_file();
 #ifdef HAVE_COMPRESSION
    test_undo_save_restores_file();
 #endif

@@ -2003,9 +2003,10 @@ static void keep_server_deleted(bool threaded)
 
 /* A save moves "G.state.auto" aside for a moment, into backups/ or to
  * its held name, and the walk lands in between. @left: the held name
- * (1) or the new state's temp (2) stays and the file is not back;
- * otherwise the file is back by the diff. Nothing is deleted on the
- * server, the manifests keep it and the held name never uploads. */
+ * (1), the auto save's temp (2) or a state task's (3) stays and the
+ * file is not back; otherwise the file is back by the diff. Nothing is
+ * deleted on the server, the manifests keep it and the held name never
+ * uploads. */
 static char aside_states[264];
 static void aside_back(void)
 {
@@ -2016,8 +2017,10 @@ static void auto_aside_lane(bool threaded, int left)
 {
    char saves[256];
    const char *name = left == 1 ? "G.state.auto.not-loaded.prev"
+                    : left == 2 ? "G.state.auto.auto.tmp"
                                 : "G.state.auto.tmp";
-   lane_dirs(left == 1 ? "aside_held" : left ? "aside_temp" : "aside_back",
+   lane_dirs(left == 1 ? "aside_held" : left == 2 ? "aside_temp"
+         : left ? "aside_task_temp" : "aside_back",
          threaded, saves, sizeof(saves));
    snprintf(aside_states, sizeof(aside_states), "%s-st", saves);
    remove_tree(aside_states);
@@ -2076,23 +2079,29 @@ static void auto_aside_lane(bool threaded, int left)
 static void auto_aside_back(bool threaded) { auto_aside_lane(threaded, 0); }
 static void auto_aside_held(bool threaded) { auto_aside_lane(threaded, 1); }
 static void auto_aside_temp(bool threaded) { auto_aside_lane(threaded, 2); }
+static void auto_aside_task_temp(bool threaded) { auto_aside_lane(threaded, 3); }
 
 /* Another device's "G.state.auto" is on the server, and the walk here
- * misses this one's, back by the diff. It is not fetched over; the
- * next sync meets it as a conflict, which by default moves nothing.
+ * misses this one's: by the diff it is back, or still in @name, the
+ * RAM state's temp, moved in before the next sync. It is not fetched
+ * over; the next sync meets it as a conflict, which by default moves
+ * nothing.
  * @resurrected: this device synced its delete before; otherwise it
  * never had the file. */
 static char back_states[264];
+static const char *back_name;
 static void auto_back(void)
 {
-   put(back_states, "G.state.auto", "2");
+   put(back_states, back_name, "2");
 }
 
-static void auto_back_lane(bool threaded, bool resurrected)
+static void auto_back_lane(bool threaded, bool resurrected,
+      const char *name)
 {
    char saves[256], saves_b[264], states_b[264];
-   lane_dirs(resurrected ? "back_resurrected" : "back_new", threaded, saves,
-         sizeof(saves));
+   lane_dirs(resurrected ? "back_resurrected"
+         : string_is_equal(name, "G.state.auto") ? "back_new" : "back_ram",
+         threaded, saves, sizeof(saves));
    snprintf(back_states, sizeof(back_states), "%s-st", saves);
    snprintf(saves_b, sizeof(saves_b), "%s-b", saves);
    snprintf(states_b, sizeof(states_b), "%s-st-b", saves);
@@ -2125,14 +2134,20 @@ static void auto_back_lane(bool threaded, bool resurrected)
 
    /* an upload rewrites the server manifest in the same sync */
    put(saves, "b.srm", "b");
+   back_name = name;
    walked_at = back_states;
    walked    = auto_back;
    CHECK(sync_two(threaded, saves, back_states));
    walked_at = NULL;
    CHECK(fetches == 0 && uploads == 1);
-   CHECK(holds(back_states, "G.state.auto", "2"));
+   CHECK(holds(back_states, name, "2"));
    CHECK(server_entry("states/G.state.auto") == 2);
    CHECK(local_entry("states/G.state.auto") == (resurrected ? 1 : 0));
+   if (!string_is_equal(name, "G.state.auto"))
+   {
+      drop(back_states, name);
+      put(back_states, "G.state.auto", "2");
+   }
 
    sync_two(threaded, saves, back_states);
    CHECK(fetches == 0 && uploads == 0 && deletes == 0);
@@ -2143,8 +2158,55 @@ static void auto_back_lane(bool threaded, bool resurrected)
    remove_tree(states_b);
 }
 
-static void auto_back_resurrected(bool threaded) { auto_back_lane(threaded, true); }
-static void auto_back_new(bool threaded)         { auto_back_lane(threaded, false); }
+static void auto_back_resurrected(bool threaded)
+{
+   auto_back_lane(threaded, true, "G.state.auto");
+}
+static void auto_back_new(bool threaded)
+{
+   auto_back_lane(threaded, false, "G.state.auto");
+}
+static void auto_back_ram_temp(bool threaded)
+{
+   auto_back_lane(threaded, false, "G.state.auto.ram.tmp");
+}
+
+/* Slot 0's "G.state" is missing here and another device's is on the
+ * server. "G.state.auto.tmp", the Auto slot's state task temp, is not
+ * slot 0's: slot 0 comes down. */
+static void slot0_auto_task_temp(bool threaded)
+{
+   char saves[256], states[264], saves_b[264], states_b[264];
+   lane_dirs("slot0_auto_temp", threaded, saves, sizeof(saves));
+   snprintf(states, sizeof(states), "%s-st", saves);
+   snprintf(saves_b, sizeof(saves_b), "%s-b", saves);
+   snprintf(states_b, sizeof(states_b), "%s-st-b", saves);
+   remove_tree(states);
+   remove_tree(saves_b);
+   remove_tree(states_b);
+   CHECK(path_mkdir(states));
+   CHECK(path_mkdir(saves_b));
+   CHECK(path_mkdir(states_b));
+   put(saves, "a.srm", "a");
+   CHECK(sync_two(threaded, saves, states));
+
+   other_device(true);
+   put(states_b, "G.state", "3");
+   conflict_mode = 1;
+   CHECK(sync_two(threaded, saves_b, states_b));
+   conflict_mode = 0;
+   other_device(false);
+   CHECK(holds(srv, "states/G.state", "3"));
+
+   put(states, "G.state.auto.tmp", "x");
+   CHECK(sync_two(threaded, saves, states));
+   CHECK(fetches == 1);
+   CHECK(holds(states, "G.state", "3"));
+   CHECK(holds(states, "G.state.auto.tmp", "x"));
+   remove_tree(states);
+   remove_tree(saves_b);
+   remove_tree(states_b);
+}
 
 struct lane
 {
@@ -2228,8 +2290,11 @@ static const struct lane lanes[] = {
    { "sync_auto_aside_back",      auto_aside_back },
    { "sync_auto_aside_held",      auto_aside_held },
    { "sync_auto_aside_temp",      auto_aside_temp },
+   { "sync_auto_aside_task_temp", auto_aside_task_temp },
    { "sync_auto_back_resurrected", auto_back_resurrected },
    { "sync_auto_back_new",        auto_back_new },
+   { "sync_auto_back_ram_temp",   auto_back_ram_temp },
+   { "sync_slot0_auto_task_temp", slot0_auto_task_temp },
 };
 
 int main(int argc, char **argv)

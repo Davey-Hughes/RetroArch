@@ -509,6 +509,10 @@ bool take_screenshot(
       const char *path, bool silence,
       bool has_valid_framebuffer, bool fullpath, bool use_thread);
 
+/* Cancels the screenshots of @path running or held; what one already
+ * wrote is deleted. Frame thread only. */
+void take_screenshot_cancel(const char *path);
+
 /* What take_screenshot_notify()'s callback is told, as its task_data */
 struct screenshot_result
 {

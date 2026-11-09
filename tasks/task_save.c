@@ -501,6 +501,70 @@ bool content_undo_load_state(void)
    return true;
 }
 
+/* The synchronous writers' temporaries: a state task in flight writes
+ * "<path>.tmp", and the two never share one. */
+#define AUTO_STATE_TMP_SUFFIX ".auto.tmp"
+#define RAM_STATE_TMP_SUFFIX  ".ram.tmp"
+
+static bool content_state_tmp_name(char *s, size_t len, const char *path,
+      const char *suffix)
+{
+   size_t _len = strlcpy(s, path, len);
+   return _len < len && strlcpy(s + _len, suffix, len - _len) < len - _len;
+}
+
+/* Opens "<path><*suffix>" into @s to write. One that cannot be opened
+ * takes "<path>.tmp", unless a state task is in flight; *suffix says
+ * which. */
+static intfstream_t *content_open_state_tmp(char *s, size_t len,
+      const char *path, const char **suffix, bool compress, unsigned hint)
+{
+   intfstream_t *file = NULL;
+   if (content_state_tmp_name(s, len, path, *suffix))
+   {
+#if defined(HAVE_COMPRESSION)
+      if (compress)
+         file = intfstream_open_rzip_file(s, RETRO_VFS_FILE_ACCESS_WRITE);
+      else
+#endif
+         file = intfstream_open_file(s, RETRO_VFS_FILE_ACCESS_WRITE, hint);
+   }
+   if (     !file
+         && !string_is_equal(*suffix, ".tmp")
+         && !content_save_state_in_progress(NULL))
+   {
+      *suffix = ".tmp";
+      return content_open_state_tmp(s, len, path, suffix, compress, hint);
+   }
+   return file;
+}
+
+#ifdef HAVE_SCREENSHOTS
+/* A state of another moment than the slot's thumbnail: a picture of
+ * an older state is never left beside it. @shots: nor one still being
+ * taken for the slot. */
+static void content_drop_thumbnail(const char *path, bool shots)
+{
+   char png[PATH_MAX_LENGTH];
+   if (content_state_tmp_name(png, sizeof(png), path, ".png"))
+   {
+      if (shots)
+         take_screenshot_cancel(png);
+      filestream_delete(png);
+   }
+}
+#endif
+
+/* As content_finish_tmp(), unsynced, for "<path><suffix>" */
+static bool content_finish_state_tmp(const char *path, const char *tmp_path,
+      const char *suffix, bool ok)
+{
+   int ret = filestream_finish_atomic_suffix(path, suffix, ok, false);
+   if (ret == 1 && path_is_valid(path))
+      filestream_delete(tmp_path);
+   return ret == 0;
+}
+
 static void undo_save_state_cb(retro_task_t *task,
       void *task_data,
       void *user_data, const char *error)
@@ -517,6 +581,11 @@ static void undo_save_state_cb(retro_task_t *task,
     * since the push: not the session's */
    if (content_is_auto_state(state->path))
       runloop_state_get_ptr()->auto_state_owned = false;
+
+#ifdef HAVE_SCREENSHOTS
+   if (!error && config_get_ptr()->bools.savestate_thumbnail_enable)
+      content_drop_thumbnail(state->path, true);
+#endif
 
    /* Wipe the save file buffer as it's intended to be one use only */
    undo_save_buf.path[0]  = '\0';
@@ -1813,12 +1882,15 @@ static void save_state_cb(retro_task_t *task,
    if (state->done_cb)
       state->done_cb(task, state->path, user_data, error);
 #ifdef HAVE_SCREENSHOTS
+   /* Only a written state gets its thumbnail */
+   if (!error && (state->flags & SAVE_TASK_FLAG_THUMBNAIL_ENABLE))
    {
       char               *path   = strdup(state->path);
-      if (state->flags & SAVE_TASK_FLAG_THUMBNAIL_ENABLE)
-         take_screenshot(config_get_ptr()->paths.directory_screenshot,
+      /* a shot that fails later drops it itself */
+      if (!take_screenshot(config_get_ptr()->paths.directory_screenshot,
                path, true,
-               state->flags & SAVE_TASK_FLAG_HAS_VALID_FB, false, true);
+               state->flags & SAVE_TASK_FLAG_HAS_VALID_FB, false, true))
+         content_drop_thumbnail(state->path, false);
       free(path);
    }
 #endif
@@ -2551,6 +2623,7 @@ bool content_auto_save_state(const char *path)
    settings_t *settings = config_get_ptr();
    void *serial_data    = NULL;
    intfstream_t *file   = NULL;
+   const char *suffix   = AUTO_STATE_TMP_SUFFIX;
    char tmp_path[PATH_MAX_LENGTH];
 
    if (     !runloop_state_get_ptr()->auto_state_bypass
@@ -2569,23 +2642,16 @@ bool content_auto_save_state(const char *path)
    if (!serial_data)
       return false;
 
-   /* Write to "<path>.tmp" and move it into place, so a crash or power
-    * loss mid-save leaves the previous state intact. */
-   if (!filestream_atomic_temp_name(tmp_path, sizeof(tmp_path), path))
-   {
-      free(serial_data);
-      return false;
-   }
-
+   /* Write to "<path>.auto.tmp" and move it into place, so a crash or
+    * power loss mid-save leaves the previous state intact. */
+   if (!(file = content_open_state_tmp(tmp_path, sizeof(tmp_path), path,
+         &suffix,
 #if defined(HAVE_COMPRESSION)
-   if (settings->bools.savestate_file_compression)
-      file = intfstream_open_rzip_file(tmp_path, RETRO_VFS_FILE_ACCESS_WRITE);
-   else
+         settings->bools.savestate_file_compression,
+#else
+         false,
 #endif
-      file = intfstream_open_file(tmp_path, RETRO_VFS_FILE_ACCESS_WRITE,
-                                  RETRO_VFS_FILE_ACCESS_HINT_SEQUENTIAL_BULK);
-
-   if (!file)
+         RETRO_VFS_FILE_ACCESS_HINT_SEQUENTIAL_BULK)))
    {
       free(serial_data);
       return false;
@@ -2607,7 +2673,7 @@ bool content_auto_save_state(const char *path)
 
    if (_close_ret == 0 && !content_auto_state_set_aside(path, &held))
       _close_ret = -1;
-   if (!content_finish_tmp(path, _close_ret == 0, false))
+   if (!content_finish_state_tmp(path, tmp_path, suffix, _close_ret == 0))
    {
       if (held)
          content_auto_state_unhold(path, held);
@@ -2623,7 +2689,9 @@ bool content_auto_save_state(const char *path)
       const char *dir_screenshot = settings->paths.directory_screenshot;
       bool validfb = video_driver_cached_frame_is_hw_render();
 
-      take_screenshot(dir_screenshot, path, true, validfb, false, false);
+      if (!take_screenshot(dir_screenshot, path, true, validfb, false,
+               false))
+         content_drop_thumbnail(path, false);
    }
 #endif
    return true;
@@ -3164,20 +3232,27 @@ bool content_ram_state_to_file(const char *path)
    {
       /* Write via a temporary file, so a crash or power loss mid-save
        * leaves the previous file intact instead of a truncated one. */
-      bool written = false;
+      bool written       = false;
+      const char *suffix = RAM_STATE_TMP_SUFFIX;
+      char tmp_path[PATH_MAX_LENGTH];
+      intfstream_t *file = content_open_state_tmp(tmp_path,
+            sizeof(tmp_path), path, &suffix,
 #if defined(HAVE_COMPRESSION)
-      settings_t *settings = config_get_ptr();
-      if (settings->bools.save_file_compression)
-      {
-         char tmp_path[PATH_MAX_LENGTH];
-         if (filestream_atomic_temp_name(tmp_path, sizeof(tmp_path), path))
-            written = content_finish_tmp(path, rzipstream_write_file(tmp_path,
-                  ram_buf.state_buf.data, ram_buf.state_buf.size), false);
-      }
-      else
+            config_get_ptr()->bools.save_file_compression,
+#else
+            false,
 #endif
-         written = filestream_write_file_atomic(path,
-               ram_buf.state_buf.data, ram_buf.state_buf.size);
+            RETRO_VFS_FILE_ACCESS_HINT_SEQUENTIAL_BULK);
+      if (file)
+      {
+         written = intfstream_write(file, ram_buf.state_buf.data,
+               ram_buf.state_buf.size) == (int64_t)ram_buf.state_buf.size;
+         if (intfstream_close(file) != 0)
+            written = false;
+         free(file);
+         written = content_finish_state_tmp(path, tmp_path, suffix,
+               written);
+      }
 
       if (written)
          goto success;
@@ -3188,6 +3263,10 @@ bool content_ram_state_to_file(const char *path)
 success:
    ram_buf.to_write_file = false;
    content_save_written();
+#ifdef HAVE_SCREENSHOTS
+   if (config_get_ptr()->bools.savestate_thumbnail_enable)
+      content_drop_thumbnail(path, true);
+#endif
    return true;
 }
 
@@ -3233,9 +3312,11 @@ bool content_save_state_automatic(retro_time_t now_us)
          < (retro_time_t)savestate_automatic_interval * 1000000)
       return false;
 
-   /* A state save still writing may share the .auto's temp file:
-    * the next frame tries again */
-   if (content_save_state_in_progress(NULL))
+   /* A state save still writing may land after this one and replace
+    * it, and a load may hold the .auto open: the next frame tries
+    * again */
+   if (     content_save_state_in_progress(NULL)
+         || content_load_state_in_progress(NULL))
       return false;
    
    /* Generate the savestate path */

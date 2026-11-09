@@ -69,7 +69,7 @@ CFLAGS  += -DHAVE_COMPRESSION
 endif
 
 CFLAGS  += -Wall -std=gnu99 -g1 -O1 \
-           -DHAVE_THREADS \
+           -DHAVE_THREADS -DHAVE_SCREENSHOTS \
            -I$(REPO_ROOT) \
            -I$(LIBRETRO_COMM_DIR)/include
 
