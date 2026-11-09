@@ -3,7 +3,8 @@
  * must stay on the content thread, including a failed hand-over.
  * A backup's copy across drives runs on a thread of its own, and the
  * sync never waits for it. The walk leaves out the safety copies and
- * recovery files. */
+ * recovery files. Conflict resolution, and a server file named in its
+ * manifest but gone. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,6 +33,7 @@ static char local_path[128], fetching_path[160];
 static retro_atomic_int_t off_main, ownership_checks;
 static int live, retired, failures, expect_old, expect_failure, releases;
 static void *pending_fetch;
+static char updated_key[64];
 /* 1: moving the save into its backups fails, as across drives;
  * 2: deleting it fails too; 3: the delete removes it but reports a
  * failure, as a network drive can; 4: the copy fails, a full card */
@@ -209,7 +211,11 @@ bool cloud_sync_read(const char *path, const char *file,
 { (void)path; (void)file; (void)cb; pending_fetch = ud; return true; }
 bool cloud_sync_update(const char *path, RFILE *file,
       cloud_sync_complete_handler_t cb, void *ud)
-{ (void)path; (void)file; (void)cb; (void)ud; return false; }
+{
+   (void)file; (void)cb; (void)ud;
+   strlcpy(updated_key, path, sizeof(updated_key));
+   return false;
+}
 bool cloud_sync_free(const char *path, cloud_sync_complete_handler_t cb, void *ud)
 { (void)path; (void)cb; (void)ud; return false; }
 void cloud_sync_poll(cloud_sync_poll_budget_t within, void *budget)
@@ -1155,6 +1161,96 @@ static void two_syncs_lane(void)
    free(b);
 }
 
+/* saves/save.srm as the diff meets it: @server in the server manifest,
+ * @last in the local one (NULL: never synced here), @current on disk. */
+static retro_task_t *diff_task(const char *server, const char *last,
+      const char *current)
+{
+   retro_task_t *task = task_init();
+   task_cloud_sync_state_t *st = (task_cloud_sync_state_t*)calloc(1, sizeof(*st));
+   union string_list_elem_attr attr;
+   attr.i = 0;
+   st->server_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->local_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->current_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->updated_server_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->updated_local_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->dirlist = string_list_new();
+   string_list_append(st->dirlist, "saves", attr);
+   st->dirlist->elems[0].userdata = strdup(directory);
+   strlcpy(st->dir_core_assets, directory, sizeof(st->dir_core_assets));
+   add(st->server_manifest, NULL, server);
+   if (last)
+      add(st->local_manifest, NULL, last);
+   if (current)
+   {
+      CHECK(filestream_write_file(local_path, current, strlen(current)));
+      add(st->current_manifest, local_path, current);
+   }
+   retro_atomic_int_init(&st->waiting, 0);
+   task_cloud_sync_task_setup(task, st, "Cloud Sync");
+   updated_key[0] = '\0';
+   pending_fetch  = NULL;
+   live           = 0;
+   return task;
+}
+
+static void diff_task_free(retro_task_t *task)
+{
+   task_cloud_sync_cleanup(task);
+   /* run by hand: no callback counted it off */
+   tcs_in_flight--;
+   free(task->title);
+   free(task);
+   filestream_delete(local_path);
+}
+
+/* Both sides changed since the last sync. Keep local uploads this
+ * device's save, keep server fetches the server's; with neither, a
+ * conflict is reported and both are left as they are. */
+static void conflict_lane(int resolution)
+{
+   retro_task_t *task = diff_task("new", "old", "mine");
+   task_cloud_sync_state_t *st = (task_cloud_sync_state_t*)task->state;
+   size_t at;
+   st->conflict_resolution = resolution;
+   task_cloud_sync_check_server_current(st, true);
+   task_cloud_sync_fold_manifest_adds(st);
+   CHECK(holds(local_path, "mine"));
+   CHECK(st->conflicts == (resolution == 0));
+   CHECK(string_is_equal(updated_key, resolution == 1 ? "saves/save.srm" : ""));
+   CHECK((pending_fetch != NULL) == (resolution == 2));
+   if (resolution == 0)
+      CHECK(!file_list_search(st->updated_local_manifest, "saves/save.srm", &at));
+   if (pending_fetch)
+   {
+      CHECK(string_is_equal(
+            ((task_cloud_sync_fetch_state_t*)pending_fetch)->local, local_path));
+      task_cloud_sync_fetch_cb(pending_fetch, "saves/save.srm", false, NULL);
+   }
+   diff_task_free(task);
+}
+
+/* The server manifest names a file the server does not have: the key
+ * leaves the server manifest, the local save stays. */
+static void missing_on_server_lane(void)
+{
+   retro_task_t *task = diff_task("new", "old", "old");
+   task_cloud_sync_state_t *st = (task_cloud_sync_state_t*)task->state;
+   size_t at;
+   task_cloud_sync_check_server_current(st, true);
+   CHECK(pending_fetch != NULL);
+   if (pending_fetch)
+      task_cloud_sync_fetch_cb(pending_fetch, "saves/save.srm", true, NULL);
+   task_cloud_sync_fold_manifest_adds(st);
+   CHECK(st->need_manifest_uploaded);
+   CHECK(st->failures);
+   CHECK(!file_list_search(st->updated_server_manifest, "saves/save.srm", &at));
+   CHECK(holds(local_path, "old"));
+   CHECK(!path_is_valid(fetching_path));
+   diff_task_free(task);
+}
+
 int main(void)
 {
    unsigned t;
@@ -1250,6 +1346,10 @@ int main(void)
    sweep_lane();
    backup_location_lane();
    walk_lane();
+   conflict_lane(0);
+   conflict_lane(1);
+   conflict_lane(2);
+   missing_on_server_lane();
    puts(failures ? "FAIL cloudsync_commit_test" : "PASS cloudsync_commit_test");
    return failures ? 1 : 0;
 }
