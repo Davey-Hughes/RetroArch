@@ -10,6 +10,8 @@ static settings_t test_settings;
 static video_driver_state_t test_video;
 static unsigned runs, size_checks, loads, settings_checks, path_checks;
 static unsigned initialize_after;
+static unsigned notices;
+static char last_notice[128];
 #ifdef HAVE_NETWORKING
 static bool allow_frame = true;
 bool netplay_driver_ctl(enum rarch_netplay_ctl_state state, void *data)
@@ -44,8 +46,9 @@ void RARCH_DBG(const char *fmt, ...) { (void)fmt; }
 void msg_queue_push(msg_queue_t *queue, const char *msg, unsigned prio,
       unsigned duration, char *title, enum message_queue_icon icon,
       enum message_queue_category category)
-{ (void)queue; (void)msg; (void)prio; (void)duration; (void)title;
-  (void)icon; (void)category; }
+{ (void)queue; (void)prio; (void)duration; (void)title;
+  (void)icon; (void)category; notices++;
+  strlcpy(last_notice, msg, sizeof(last_notice)); }
 size_t msg_queue_size(msg_queue_t *queue) { (void)queue; return 0; }
 void msg_queue_clear(msg_queue_t *queue) { (void)queue; }
 void ui_companion_driver_msg_queue_push(const char *msg, unsigned priority,
@@ -191,7 +194,10 @@ struct string_list *dir_list_new_special(const char *input_dir,
 
 const char *msg_hash_to_str(enum msg_hash_enums msg)
 {
-   (void)msg;
+   if (msg == MSG_REPLAY_SLOT_TAKEN)
+      return "taken %d %d";
+   if (msg == MSG_REPLAY_SLOT_TAKEN_AUTO)
+      return "taken auto %d";
    return "test";
 }
 
@@ -664,6 +670,108 @@ static void lane_max_keep_exact_name(void)
    assert(there(game));
 }
 
+static int free_replay_slot(int slot)
+{
+   assert(command_event_free_replay_slot(&slot));
+   return slot;
+}
+
+static void test_replay_slots(void)
+{
+   char path[PATH_MAX_LENGTH];
+   int slot;
+   states_reset("Game");
+   fill_pathname_join(runloop_state.name.replay, STATES, "Game.replay",
+         sizeof(runloop_state.name.replay));
+   put("Game.replay1");
+   put("Game.replay2");
+   put("Game.replay3");
+   put("Game.replay3.png");
+
+   /* replay_auto_index: the highest number there */
+   test_settings.bools.replay_auto_index = true;
+   test_settings.ints.replay_slot        = 0;
+   command_event_set_replay_auto_index(&test_settings);
+   assert(test_settings.ints.replay_slot == 3);
+
+   /* the next free number from the one asked for */
+   assert(free_replay_slot(4) == 4);
+   put("Game.replay4");
+   assert(free_replay_slot(4) == 5);
+   assert(free_replay_slot(1) == 5);
+   assert(free_replay_slot(0) == 0);
+   /* the last slot, then none */
+   assert(free_replay_slot(999) == 999);
+   put("Game.replay999");
+   slot = 999;
+   assert(!command_event_free_replay_slot(&slot) && slot == 999);
+   /* past the last slot (auto index at 999): none */
+   slot = 1000;
+   assert(!command_event_free_replay_slot(&slot) && slot == 1000);
+
+   /* auto index off, the slot taken: the next free one, the setting
+    * follows it, one notice */
+   test_settings.bools.replay_auto_index = false;
+   test_settings.ints.replay_slot        = 2;
+   notices                               = 0;
+   slot = free_replay_slot(test_settings.ints.replay_slot);
+   assert(slot == 5);
+   assert(runloop_get_replay_path(path, sizeof(path), slot));
+   assert(string_is_equal(path_basename(path), "Game.replay5"));
+   put("Game.replay5");
+   command_event_set_replay_record_slot(&test_settings, 2, slot);
+   assert(test_settings.ints.replay_slot == 5 && notices == 1);
+   assert(string_is_equal(last_notice, "taken 5 2"));
+   /* a free slot asked for, and auto index: no notice */
+   test_settings.ints.replay_slot = 7;
+   command_event_set_replay_record_slot(&test_settings, 7,
+         free_replay_slot(7));
+   assert(test_settings.ints.replay_slot == 7 && notices == 1);
+   test_settings.bools.replay_auto_index = true;
+   command_event_set_replay_record_slot(&test_settings, 7,
+         free_replay_slot(8));
+   assert(test_settings.ints.replay_slot == 8 && notices == 1);
+
+   /* Auto (-1), auto index off: Game.replay while it is free */
+   test_settings.bools.replay_auto_index = false;
+   test_settings.ints.replay_slot        = -1;
+   slot = free_replay_slot(test_settings.ints.replay_slot);
+   assert(slot == -1);
+   assert(runloop_get_replay_path(path, sizeof(path), slot));
+   assert(string_is_equal(path_basename(path), "Game.replay"));
+   put("Game.replay");
+   command_event_set_replay_record_slot(&test_settings, -1, slot);
+   assert(test_settings.ints.replay_slot == -1 && notices == 1);
+   /* then the first free number from 0, with the Auto notice */
+   slot = free_replay_slot(test_settings.ints.replay_slot);
+   assert(slot == 0);
+   assert(runloop_get_replay_path(path, sizeof(path), slot));
+   assert(string_is_equal(path_basename(path), "Game.replay0"));
+   put("Game.replay0");
+   command_event_set_replay_record_slot(&test_settings, -1, slot);
+   assert(test_settings.ints.replay_slot == 0 && notices == 2);
+   assert(string_is_equal(last_notice, "taken auto 0"));
+   /* the setting moved before the start: the notice names the slot
+    * asked for */
+   test_settings.ints.replay_slot = 4;
+   command_event_set_replay_record_slot(&test_settings, 2, 6);
+   assert(test_settings.ints.replay_slot == 6 && notices == 3);
+   assert(string_is_equal(last_notice, "taken 6 2"));
+   /* the notice follows the slot asked for, never the setting */
+   test_settings.ints.replay_slot = 4;
+   command_event_set_replay_record_slot(&test_settings, 2, 2);
+   assert(test_settings.ints.replay_slot == 2 && notices == 3);
+   test_settings.ints.replay_slot = 0;
+   command_event_set_replay_record_slot(&test_settings, -1, 0);
+   assert(notices == 4 && string_is_equal(last_notice, "taken auto 0"));
+   test_settings.ints.replay_slot = 6;
+   command_event_set_replay_record_slot(&test_settings, 3, 6);
+   assert(notices == 5 && string_is_equal(last_notice, "taken 6 3"));
+   states_clear();
+   filestream_delete(STATES);
+   puts("replay slot tests passed");
+}
+
 /* The Auto slot saved or loaded by hand: the .auto is the session's
  * once that is through */
 /* Each content load hands its .auto to the sweep, before any frame */
@@ -732,6 +840,7 @@ int main(void)
    states_clear();
    filestream_delete(STATES);
    puts("max_keep tests passed");
+   test_replay_slots();
    test_auto_slot_owned();
    test_auto_state_order();
    test_content_load_sweep();

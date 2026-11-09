@@ -4083,6 +4083,111 @@ static void lane_not_a_core(void)
             presented_frames);
 }
 
+#ifdef HAVE_BSV_MOVIE
+/* ------------------------------------------------------------------ */
+/* Lane: replay start fails                                            */
+/* ------------------------------------------------------------------ */
+
+static unsigned rs_notified;
+static char     rs_error[128];
+
+/* The caller's notify, as command_reply_handler() passes it. */
+static void rs_notify(retro_task_t *task, void *task_data,
+      void *user_data, const char *error)
+{
+   (void)task; (void)task_data; (void)user_data;
+   rs_notified++;
+   strlcpy(rs_error, error ? error : "", sizeof(rs_error));
+}
+
+/* Record Replay passes over a taken slot, but the recording fails to
+ * start: the caller is told, the replay slot setting stays and no
+ * notice says it moved.
+ * Once a recording starts, the setting follows it with the notice. */
+static void lane_replay_start_fails(const char *dir)
+{
+   runloop_state_t      *runloop_st = runloop_state_get_ptr();
+   input_driver_state_t *input_st   = input_state_get_ptr();
+   settings_t           *settings   = config_get_ptr();
+   command_t cmd;
+   task_notify_t notify;
+   char taken[600], chosen[600];
+   unsigned had     = failures;
+   bool font_enable = settings->bools.video_font_enable;
+
+   run_harness_core();
+   snprintf(runloop_st->name.replay, sizeof(runloop_st->name.replay),
+         "%s/fails.replay", dir);
+   configuration_set_bool(settings, settings->bools.replay_auto_index, false);
+   configuration_set_int(settings, settings->ints.replay_slot, 2);
+   runloop_get_replay_path(taken, sizeof(taken), 2);
+   runloop_get_replay_path(chosen, sizeof(chosen), 3);
+   filestream_write_file(taken, "taken", 5);
+   queued_message("");
+   /* the OSD off, so frames leave the notices on the queue */
+   settings->bools.video_font_enable = false;
+
+   notify.cb        = rs_notify;
+   notify.user_data = NULL;
+   rs_notified      = 0;
+   rs_error[0]      = '\0';
+   CHECK(command_event(CMD_EVENT_RECORD_REPLAY, &notify),
+         "Record Replay was refused");
+   CHECK(!queued_message("has a replay"),
+         "the notice came before the recording started");
+   /* slot 3 taken before the recording opens it */
+   filestream_write_file(chosen, "taken", 5);
+   pump(10);
+   CHECK(!(input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_RECORDING),
+         "recording over %s", chosen);
+   CHECK(settings->ints.replay_slot == 2,
+         "a failed start moved the replay slot setting to %d",
+         settings->ints.replay_slot);
+   CHECK(!queued_message("has a replay"),
+         "a failed start said the slot was taken");
+   CHECK(rs_notified == 1 && *rs_error,
+         "a failed start was answered %u times, error \"%s\"",
+         rs_notified, rs_error);
+
+   /* again as a network command, answered once it has started */
+   remove(chosen);
+   memset(&cmd, 0, sizeof(cmd));
+   cmd.replier    = rr_replier;
+   cmd.reply_dest = rr_reply_dest;
+   cmd.reply_to   = rr_reply_to_cb;
+   rr_replies     = 0;
+   rr_reply[0]    = '\0';
+   rr_source      = 1;
+   CHECK(command_run(&cmd, "RECORD_REPLAY", ""),
+         "RECORD_REPLAY was refused");
+   CHECK(settings->ints.replay_slot == 2,
+         "the replay slot setting moved before the recording started");
+   CHECK(!queued_message("has a replay"),
+         "the notice came before the recording started");
+   pump(10);
+   CHECK(input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_RECORDING,
+         "the recording did not start");
+   CHECK(settings->ints.replay_slot == 3,
+         "the replay slot setting is %d, not the recording's 3",
+         settings->ints.replay_slot);
+   CHECK(queued_message("slot 2 has a replay"),
+         "no notice named the taken slot");
+   CHECK(rr_replies == 1 && strncmp(rr_reply, "RECORD_REPLAY ", 14) == 0
+         && !strstr(rr_reply, "ERROR"),
+         "RECORD_REPLAY was answered \"%s\" (%u replies)",
+         rr_reply, rr_replies);
+   command_event(CMD_EVENT_HALT_REPLAY, NULL);
+   pump(2);
+
+   settings->bools.video_font_enable = font_enable;
+   remove(taken);
+   remove(chosen);
+   runloop_st->name.replay[0] = '\0';
+   if (failures == had)
+      fprintf(stderr, "[pass] replay-start-fails lane\n");
+}
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Lane: close content                                                 */
 /* ------------------------------------------------------------------ */
@@ -4436,6 +4541,7 @@ int main(int argc, char *argv[])
    lane_acceptance(dir);
 #ifdef HAVE_BSV_MOVIE
    lane_replay_reply(dir);
+   lane_replay_start_fails(dir);
 #endif
    lane_state_slot_reply();
 #ifdef HAVE_DYNAMIC

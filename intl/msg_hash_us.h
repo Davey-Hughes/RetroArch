@@ -33838,6 +33838,14 @@ MSG_HASH(
    "Replay slot"
    )
 MSG_HASH(
+   MSG_REPLAY_SLOT_TAKEN,
+   "Recording to slot %d; slot %d has a replay."
+   )
+MSG_HASH(
+   MSG_REPLAY_SLOT_TAKEN_AUTO,
+   "Recording to slot %d; the Auto slot has a replay."
+   )
+MSG_HASH(
    MSG_TAKING_SCREENSHOT,
    "Taking screenshot."
    )

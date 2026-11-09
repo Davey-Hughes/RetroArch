@@ -3931,6 +3931,29 @@ bool command_event_later(enum event_command cmd, const int *arg)
    return true;
 }
 
+#ifdef HAVE_BSV_MOVIE
+/* A Record Replay waiting for its recording to start */
+typedef struct
+{
+   task_notify_t notify;
+   int asked;
+   int slot;
+} replay_record_t;
+
+/* Only a recording that started moves the replay slot setting */
+static void command_event_record_replay_done(retro_task_t *task,
+      void *task_data, void *user_data, const char *error)
+{
+   replay_record_t *rec = (replay_record_t*)user_data;
+   if (!error)
+      command_event_set_replay_record_slot(config_get_ptr(),
+            rec->asked, rec->slot);
+   if (rec->notify.cb)
+      rec->notify.cb(task, task_data, rec->notify.user_data, error);
+   free(rec);
+}
+#endif
+
 bool command_event(enum event_command cmd, void *data)
 {
    struct rarch_state *p_rarch     = &rarch_st;
@@ -4506,16 +4529,29 @@ bool command_event(enum event_command cmd, void *data)
             res = false;
          else if (input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_PLAYBACK)
             res = movie_stop(input_st);
+         /* Never over a replay: the next free number */
+         if (res && !command_event_free_replay_slot(&replay_slot))
+            res = false;
          if (!runloop_get_replay_path(replay_path, sizeof(replay_path), replay_slot))
             res = false;
          if (res)
          {
             const task_notify_t *n = (const task_notify_t*)data;
-            res = movie_start_record_notify(input_st, replay_path,
-                  n ? n->cb : NULL, n ? n->user_data : NULL);
+            replay_record_t *rec   = (replay_record_t*)malloc(sizeof(*rec));
+            RARCH_LOG("[Replay] Recording to slot %d.\n", replay_slot);
+            if (!rec)
+               res = false;
+            else
+            {
+               rec->notify.cb        = n ? n->cb        : NULL;
+               rec->notify.user_data = n ? n->user_data : NULL;
+               rec->asked            = settings->ints.replay_slot;
+               rec->slot             = replay_slot;
+               if (!(res = movie_start_record_notify(input_st, replay_path,
+                     command_event_record_replay_done, rec)))
+                  free(rec);
+            }
          }
-         if (res && settings->bools.replay_auto_index)
-            configuration_set_int(settings, settings->ints.replay_slot, replay_slot);
          if (!res)
          {
             const char *_msg = msg_hash_to_str(MSG_FAILED_TO_START_MOVIE_RECORD);

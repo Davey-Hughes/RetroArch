@@ -7073,12 +7073,12 @@ void command_event_set_replay_auto_index(settings_t *settings)
       unsigned idx;
       const char *end                 = NULL;
       const char *dir_elem            = dir_list->elems[i].data;
-      size_t _len = fill_pathname_base(elem_base, dir_elem, sizeof(elem_base));
+      fill_pathname_base(elem_base, dir_elem, sizeof(elem_base));
 
       if (strstr(elem_base, state_base) != elem_base)
          continue;
 
-      end = dir_elem + _len;
+      end = dir_elem + strlen(dir_elem);
 
       while ((end > dir_elem) && ISDIGIT((int)end[-1]))
          end--;
@@ -7096,6 +7096,42 @@ void command_event_set_replay_auto_index(settings_t *settings)
       RARCH_LOG("[Replay] %s: #%d\n",
             msg_hash_to_str(MSG_FOUND_LAST_REPLAY_SLOT),
             max_idx);
+}
+
+bool command_event_free_replay_slot(int *slot)
+{
+   int i;
+   char path[PATH_MAX_LENGTH];
+   for (i = *slot; i <= 999; i++)
+   {
+      if (!runloop_get_replay_path(path, sizeof(path), i))
+         return false;
+      if (!path_is_valid(path))
+      {
+         *slot = i;
+         return true;
+      }
+   }
+   return false;
+}
+
+void command_event_set_replay_record_slot(settings_t *settings,
+      int asked, int slot)
+{
+   if (slot != asked && !settings->bools.replay_auto_index)
+   {
+      char msg[128];
+      if (asked < 0)
+         snprintf(msg, sizeof(msg),
+               msg_hash_to_str(MSG_REPLAY_SLOT_TAKEN_AUTO), slot);
+      else
+         snprintf(msg, sizeof(msg), msg_hash_to_str(MSG_REPLAY_SLOT_TAKEN),
+               slot, asked);
+      runloop_msg_queue_push(msg, strlen(msg), 1, 180, true, NULL,
+            MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+   }
+   if (slot != settings->ints.replay_slot)
+      configuration_set_int(settings, settings->ints.replay_slot, slot);
 }
 
 void command_event_set_replay_garbage_collect(

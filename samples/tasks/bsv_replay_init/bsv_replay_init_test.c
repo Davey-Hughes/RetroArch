@@ -327,6 +327,7 @@ static void record(const char *path, unsigned frames, bool compress,
    fill_state(frames);
    memcpy(start, core_state, STATE_SIZE);
 
+   filestream_delete(path);
    CHECK(movie_start_record(&input_st, (char*)path), "start_record");
    task_queue_check();   /* runs the record task and its callback */
    CHECK(input_st.bsv_movie_state.flags & BSV_FLAG_MOVIE_RECORDING,
@@ -365,6 +366,27 @@ static void truncate_file(const char *path, int64_t len)
 
 /* ---- lanes ----------------------------------------------------------- */
 
+/* A recording never truncates a replay already there. */
+static void lane_record_refuses_existing(const char *path)
+{
+   void   *data = NULL;
+   int64_t len  = 0;
+
+   reset_counters();
+   CHECK(filestream_write_file(path, "keep", 4), "write replay file");
+   movie_start_record(&input_st, (char*)path);
+   task_queue_check();
+   CHECK(!(input_st.bsv_movie_state.flags & BSV_FLAG_MOVIE_RECORDING),
+         "recording over an existing replay");
+   CHECK(     filestream_read_file(path, &data, &len) && len == 4
+         && !memcmp(data, "keep", 4), "the existing replay was changed");
+   free(data);
+   if (input_st.bsv_movie_state.flags & BSV_FLAG_MOVIE_RECORDING)
+      movie_stop(&input_st);
+   filestream_delete(path);
+   lane_done("record_refuses_existing", NULL);
+}
+
 /* On the threaded queue, a recording started while a state load is in
  * flight waits for it from the main thread, once per check, and starts
  * once the load is through. */
@@ -382,6 +404,7 @@ static void lane_record_waits_for_load(const char *path)
    __atomic_store_n(&load_asks_off_main, 0, __ATOMIC_RELAXED);
    __atomic_store_n(&load_pending, 1, __ATOMIC_RELAXED);
 
+   filestream_delete(path);
    CHECK(movie_start_record(&input_st, (char*)path), "start_record");
    for (i = 0; i < 20; i++)
    {
@@ -1498,6 +1521,7 @@ int main(int argc, char **argv)
    lane_short_block();
    lane_write_oom();
    lane_record_waits_for_load(path);
+   lane_record_refuses_existing(path);
 #ifdef BSV_TEST_NETPLAY
    lane_netplay();
 #endif

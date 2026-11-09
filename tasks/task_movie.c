@@ -131,6 +131,11 @@ static bool bsv_movie_init_record(
    uint32_t block_size;
 #endif
 
+   if (path_is_valid(path))
+   {
+      RARCH_ERR("[Replay] Not recording over \"%s\".\n", path);
+      return false;
+   }
 #ifdef HAVE_NETWORKING
    if (!netplay_bsv_movie_init(handle))
       return false;
