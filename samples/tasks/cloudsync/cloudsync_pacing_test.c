@@ -30,6 +30,7 @@
  *    synced directory in one run, and lists what dir_list_new() listed:
  *    nested and hidden files, ignored names left out, two roots; a root
  *    that cannot be read still stops the sync;
+ *  - an ignored name on the server only is not fetched;
  *  - pushed on the task queue and run to its end, the sync releases
  *    everything it held (LeakSanitizer): the state used to be left
  *    behind by every sync, because it was freed from a callback that
@@ -260,6 +261,15 @@ static void list_add(file_list_t *list, const char *key, const char *path,
    list->list[idx].userdata = hash;
 }
 
+static int in_manifest(file_list_t *list, const char *key)
+{
+   size_t i;
+   for (i = 0; list && i < list->size; i++)
+      if (!strcmp(list->list[i].alt, key))
+         return 1;
+   return 0;
+}
+
 /* A sync at the diff with @n files of @size bytes, all unchanged on the
  * server since the last sync. Runs the handler until the diff ends and
  * returns the number of runs. */
@@ -408,6 +418,49 @@ static void fetch_lane(void)
 
    fetch_size = 0;
    free(want);
+   unlink(path);
+   task_cloud_sync_cleanup(task);
+   free(task->title);
+   free(task);
+}
+
+/* A leftover aside on the server only: kept there, never fetched. */
+static void server_old_lane(void)
+{
+   task_cloud_sync_state_t *st   = (task_cloud_sync_state_t*)calloc(1, sizeof(*st));
+   retro_task_t            *task = task_init();
+   struct string_list      *dl   = string_list_new();
+   union string_list_elem_attr attr;
+   char     path[128];
+   unsigned i;
+
+   attr.i = 0;
+   string_list_append(dl, "saves", attr);
+   dl->elems[0].userdata = strdup(dir);
+   st->dirlist                 = dl;
+   st->server_manifest         = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->local_manifest          = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->current_manifest        = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->updated_server_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->updated_local_manifest  = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->destructive             = true;
+   strlcpy(st->dir_core_assets, dir, sizeof(st->dir_core_assets));
+   retro_atomic_int_init(&st->waiting, 0);
+   retro_atomic_int_init(&st->phase, (int)CLOUD_SYNC_PHASE_DIFF);
+   list_add(st->server_manifest, "saves/x.srm.old2", NULL, strdup("0123456789abcdef"));
+
+   task_cloud_sync_task_setup(task, st, "Cloud Sync in progress");
+   grant = 3; transfers = 0; fetch_size = 0;
+   for (i = 0; i < 5000 && (task_cloud_sync_phase_get(st) == CLOUD_SYNC_PHASE_DIFF
+            || task_cloud_sync_waiting_get(st) > 0); i++)
+      task_cloud_sync_task_handler(task);
+   task_cloud_sync_fold_manifest_adds(st);
+   snprintf(path, sizeof(path), "%s/x.srm.old2", dir);
+   check("server .old2: not fetched",
+         transfers == 0 && st->downloads == 0 && access(path, F_OK) != 0);
+   check("server .old2: kept in the server manifest",
+         in_manifest(st->updated_server_manifest, "saves/x.srm.old2"));
+
    unlink(path);
    task_cloud_sync_cleanup(task);
    free(task->title);
@@ -594,6 +647,12 @@ static void walk_lane(void)
    snprintf(path, sizeof(path), "%s/core2/p.srm.tmp", a);        write_file(path, 4, 1);
    snprintf(path, sizeof(path), "%s/core2/p.srm.prev", a);       write_file(path, 4, 1);
    snprintf(path, sizeof(path), "%s/core2/p.srm.2.prev", a);     write_file(path, 4, 1);
+   snprintf(path, sizeof(path), "%s/core2/p.srm.old", a);        write_file(path, 4, 1);
+   snprintf(path, sizeof(path), "%s/core2/p.srm.old2", a);       write_file(path, 4, 1);
+   snprintf(path, sizeof(path), "%s/core2/p.srm.old17", a);      write_file(path, 4, 1);
+   snprintf(path, sizeof(path), "%s/core2/Game.old.srm", a);     write_file(path, 4, 1);
+   snprintf(path, sizeof(path), "%s/core2/x.oldy", a);           write_file(path, 4, 1);
+   snprintf(path, sizeof(path), "%s/core2/x.old2a", a);          write_file(path, 4, 1);
    snprintf(path, sizeof(path), "%s/.DS_Store", b);          write_file(path, 4, 1);
 
    nkeys = reference_keys(a, "saves", keys, 0);
@@ -621,6 +680,14 @@ static void walk_lane(void)
             || strstr(keys[i], ".tmp") || strstr(keys[i], ".prev"))
          same = 0;
    check("walk: ignored names left out", same);
+   check("walk: .old and .old<digits> left out",
+            !in_manifest(st->current_manifest, "saves/core2/p.srm.old")
+         && !in_manifest(st->current_manifest, "saves/core2/p.srm.old2")
+         && !in_manifest(st->current_manifest, "saves/core2/p.srm.old17"));
+   check("walk: other names with .old in them synced",
+            in_manifest(st->current_manifest, "saves/core2/Game.old.srm")
+         && in_manifest(st->current_manifest, "saves/core2/x.oldy")
+         && in_manifest(st->current_manifest, "saves/core2/x.old2a"));
    task_cloud_sync_cleanup(task);
    free(task->title);
    free(task);
@@ -830,6 +897,7 @@ int main(void)
          "fetch: a download cut off part-way leaves the save as it was",
          "fetch: ... and is fetched again next sync");
    walk_lane();
+   server_old_lane();
    queue_lane();
    begin_lane();
    followup_lane();

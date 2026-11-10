@@ -780,6 +780,8 @@ static void task_cloud_sync_read_local_manifest(task_cloud_sync_state_t *sync_st
 /* takes the filename in manifest format, e.g. "config/retroarch.cfg" */
 static bool task_cloud_sync_should_ignore_file(const char *filename)
 {
+   size_t len;
+
    if (string_starts_with(filename, "config/"))
    {
       const char *path = filename + STRLEN_CONST("config/");
@@ -824,6 +826,15 @@ static bool task_cloud_sync_should_ignore_file(const char *filename)
    /* the old file an atomic write moved aside, or left by one that
     * never finished (filestream_finish_atomic) */
    if (string_ends_with(filename, ".prev"))
+       return true;
+
+   /* the same, left by a rename that moves its destination aside as
+    * ".old", or ".old2" and so on, on some platforms
+    * (retro_vfs_file_rename_impl) */
+   len = strlen(filename);
+   while (len && ISDIGIT(filename[len - 1]))
+      len--;
+   if (string_ends_with_size(filename, ".old", len, STRLEN_CONST(".old")))
        return true;
 
    return false;
