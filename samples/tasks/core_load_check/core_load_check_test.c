@@ -1150,6 +1150,108 @@ static void test_stage_rewritten(void)
    stop();
 }
 
+#ifdef VERITY_STANDIN
+/* The kernel's fs-verity: 0 can't (as on this host), 1 on, 2 on after
+ * verity_write is written over, as by a writer between the check's
+ * hash and the enable */
+static int verity_mode;
+static char verity_write[256];
+
+int __wrap_core_file_verity_enable(core_file_t *f)
+{
+   (void)f;
+   if (verity_mode == 2 && !rewrite_core(verity_write))
+      return -1;
+   return verity_mode ? 1 : 0;
+}
+
+static void verity_digest(struct core_identity *id)
+{
+   memset(id->verity, 0x5a, 32);
+   id->verity_len = 32;
+}
+
+bool __wrap_core_file_verity_measure(core_file_t *f,
+      struct core_identity *id)
+{
+   (void)f;
+   verity_digest(id);
+   return true;
+}
+
+/* Hashed the same with fs-verity on: recorded with its digest */
+static void test_verity_unchanged(void)
+{
+   dylib_t lib = NULL;
+   char core[256];
+   struct core_identity id;
+   core_trust_set_t *s;
+   start(true);
+   CHECK(put_core(core, "verity_libretro" LIB_EXT, 'a'));
+   CHECK(trust(core));
+   CHECK(put_core(core, "verity_libretro" LIB_EXT, 'a'));
+   CHECK(path_identity(core, &id));
+   verity_mode = 1;
+   CHECK(core_load_check_stage_begin(core));
+   CHECK(stage_wait());
+   CHECK(!core_load_check_stage_refused());
+   lib = core_load_check_stage_take(core);
+   CHECK(lib_id(lib) == 1);
+   CHECK((s = core_trust_runtime_get()) != NULL);
+   if (s)
+   {
+      CHECK(!core_trust_has_identity(s, &id, "verity_libretro" LIB_EXT));
+      verity_digest(&id);
+      CHECK(core_trust_has_identity(s, &id, "verity_libretro" LIB_EXT));
+      core_trust_set_put(s);
+   }
+   if (lib)
+      dylib_close(lib);
+   verity_mode = 0;
+   stop();
+}
+
+/* Written over between its hash and the enable: the kernel keeps what
+ * was written, so the check fails and records nothing */
+static void test_verity_rewritten(void)
+{
+   dylib_t lib = NULL;
+   char core[256];
+   struct core_identity before;
+   struct core_identity after;
+   core_trust_set_t *s;
+   start(true);
+   CHECK(put_core(core, "verity_rw_libretro" LIB_EXT, 'a'));
+   CHECK(trust(core));
+   CHECK(put_core(core, "verity_rw_libretro" LIB_EXT, 'a'));
+   CHECK(path_identity(core, &before));
+   strlcpy(verity_write, core, sizeof(verity_write));
+   verity_mode = 2;
+   last_log[0] = '\0';
+   CHECK(core_load_check_stage_begin(core));
+   CHECK(stage_wait());
+   CHECK(strstr(last_log, "changed while it was checked") != NULL);
+   CHECK(core_load_check_stage_refused());
+   lib = core_load_check_stage_take(core);
+   CHECK(!lib);
+   CHECK(path_identity(core, &after));
+   verity_digest(&after);
+   CHECK((s = core_trust_runtime_get()) != NULL);
+   if (s)
+   {
+      CHECK(!core_trust_has_identity(s, &before,
+            "verity_rw_libretro" LIB_EXT));
+      CHECK(!core_trust_has_identity(s, &after,
+            "verity_rw_libretro" LIB_EXT));
+      core_trust_set_put(s);
+   }
+   if (lib)
+      dylib_close(lib);
+   verity_mode = 0;
+   stop();
+}
+#endif
+
 /* Probes while the stage's worker opens its core grant other cores:
  * the stage's load still ends the pass of the core loaded before */
 static void test_stage_stale_grant(void)
@@ -2383,6 +2485,10 @@ int main(void)
 #endif
    test_stage_swapped();
    test_stage_rewritten();
+#ifdef VERITY_STANDIN
+   test_verity_unchanged();
+   test_verity_rewritten();
+#endif
    test_stage_stale_grant();
    test_stage_loaded();
    test_park_load_once();

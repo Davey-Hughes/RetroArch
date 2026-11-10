@@ -55,6 +55,12 @@ else
       # held-core tests
       SOURCES += no_ctime_fs.c
       LDFLAGS += -Wl,--wrap=fstatfs -Wl,--wrap=fstatfs64
+      # The check's fs-verity step, the one thing __ANDROID__ keys in
+      # core_load_check.c, against stand-ins for the kernel's
+      CFLAGS  += -DVERITY_STANDIN
+      LDFLAGS += -Wl,--wrap=core_file_verity_enable \
+                 -Wl,--wrap=core_file_verity_measure
+      $(SAMPLE_OBJDIR)/__/__/__/core_load_check.o: CFLAGS += -D__ANDROID__
    endif
 endif
 
