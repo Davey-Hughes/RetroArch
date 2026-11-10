@@ -59,12 +59,16 @@ typedef void (*core_load_rerun_t)(void *userdata);
 
 /* Parks a user-started load the check holds back. It re-runs once the
  * core passes, or after the user picks Load Once or Always Trust on
- * the Security Warning. True: free_cb(userdata) runs once, after the
- * re-run or when the request is dropped; it may run inside a warning's
- * CANCEL, so it must not push or choose a warning. False also when no
- * menu can ask: the refusal message is shown (or held until the
- * drivers are up), so the caller adds no load error of its own. A
- * newer park replaces it. */
+ * the Security Warning. With no menu to ask, the refusal message is
+ * shown, or held until the drivers are up.
+ * True: free_cb(userdata) runs once, after the re-run or when the
+ * request is dropped; it may run inside a warning's CANCEL, so it must
+ * not push or choose a warning. A newer park replaces it.
+ * False: nothing taken (no runtime, the core can't be opened, or the
+ * park ended at once). Park only after core_load_check_refused(): a
+ * false then means the user was told (barring out of memory or the
+ * file going between the gate and the park), so the caller adds no
+ * load error beyond its failed probe's. */
 bool core_load_check_park(const char *path, core_load_rerun_t rerun,
       core_load_rerun_t free_cb, void *userdata);
 /* Each frame: the parked request's waits */
