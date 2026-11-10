@@ -6,17 +6,30 @@
  * filesystems do - rename onto an existing name fails with EEXIST -
  * and to count every call.
  *
+ * vfs_rename_replace_test_3ds and _wiiu (-DRENAME_REPLACES) run the
+ * same lanes on a VFS compiled with -D_3DS or -DWIIU, whose rename()
+ * may replace an existing name (libctru's deletes it first), so the
+ * wrapped rename replaces one; those look for a free aside name first.
+ *
  * What these lanes pin, through filestream_write_file_atomic():
  *
  *   fresh     - a new file lands with one stat and one rename.
- *   overwrite - the old file is replaced, nothing is left beside it,
- *               and no name that does not exist is removed: on these
- *               filesystems that is a lookup scanning the whole
- *               directory, paid per file of a bulk extraction.
+ *   overwrite - the old file is replaced with one stat, two renames
+ *               and one remove, nothing is left beside it, and no name
+ *               that does not exist is removed: on these filesystems
+ *               that is a lookup scanning the whole directory, paid
+ *               per file of a bulk extraction.
  *   leftover  - an aside file left by an interrupted run does not
- *               stop the replacement and is gone afterwards.
+ *               stop the replacement and is kept: the target goes
+ *               aside as "<target>.old2" instead.
  *   refused   - when the replacement cannot be renamed into place,
  *               the old file is put back unchanged.
+ *   interrupted - with no target and the last good copy at
+ *               "<target>.old", as a replace cut short between its
+ *               renames leaves them, two more writes keep that copy.
+ *   user_old  - the user's own "<target>.old" and "<target>.old2" are
+ *               kept; with every name to "<target>.old99" taken the
+ *               replace fails and the target is kept.
  *   restore   - renaming "<target>.old" onto "<target>", as when a
  *               backup is restored, does not delete the source by
  *               taking it for a leftover aside.
@@ -59,6 +72,7 @@ static unsigned failures = 0;
 #define ASIDE    TARGET ".old"
 #define TEMP     TARGET ".tmp"
 #define ASIDE2   TARGET ".old2"
+#define ASIDE3   TARGET ".old3"
 #define UPPER    "RENAME_REPLACE.BIN.OLD"
 
 /* Wrapped libc */
@@ -83,8 +97,12 @@ static bool exists(const char *path)
 int __wrap_rename(const char *old_path, const char *new_path)
 {
    n_rename++;
+#ifdef RENAME_REPLACES
+   if (refuse_temp && !strcmp(old_path, TEMP))
+#else
    if (     exists(new_path)
          || (refuse_temp && !strcmp(old_path, TEMP)))
+#endif
    {
       n_rename_refused++;
       errno = EEXIST;
@@ -183,13 +201,27 @@ static void install_frontend_vfs(void)
    filestream_vfs_init(&info);
 }
 
+static void aside_name(char *s, unsigned n)
+{
+   if (n > 1)
+      sprintf(s, "%s.old%u", TARGET, n);
+   else
+      sprintf(s, "%s.old", TARGET);
+}
+
 static void clean(void)
 {
+   char     name[64];
+   unsigned n;
+
    __real_remove(TARGET);
-   __real_remove(ASIDE);
    __real_remove(TEMP);
-   __real_remove(ASIDE2);
    __real_remove(UPPER);
+   for (n = 1; n <= 99; n++)
+   {
+      aside_name(name, n);
+      __real_remove(name);
+   }
 }
 
 int main(void)
@@ -197,6 +229,8 @@ int main(void)
    const char *v1 = "first version";
    const char *v2 = "second version, longer";
    const char *v3 = "third";
+   char        name[64];
+   unsigned    n;
 
    clean();
 
@@ -220,6 +254,14 @@ int main(void)
          "overwrite left a file beside the target");
    CHECK(n_remove_missing == 0,
          "overwrite removed a name that did not exist");
+#ifdef RENAME_REPLACES
+   /* and one for the aside name */
+   CHECK(n_stat == 2 && n_rename == 2 && n_remove == 1,
+         "overwrite took more than two stats, two renames and one remove");
+#else
+   CHECK(n_stat == 1 && n_rename == 2 && n_remove == 1,
+         "overwrite took more than one stat, two renames and one remove");
+#endif
 
    /* leftover aside from an interrupted run */
    put(ASIDE, "stale");
@@ -228,8 +270,10 @@ int main(void)
          "overwrite with a leftover aside failed");
    print_counts("leftover");
    CHECK(content_is(TARGET, v3), "leftover lane content wrong");
-   CHECK(!exists(ASIDE) && !exists(TEMP),
+   CHECK(content_is(ASIDE, "stale"), "the leftover aside was not kept");
+   CHECK(!exists(ASIDE2) && !exists(TEMP),
          "leftover lane left a file beside the target");
+   __real_remove(ASIDE);
 
    /* refused: the replacement cannot be renamed into place */
    refuse_temp = true;
@@ -241,6 +285,51 @@ int main(void)
    CHECK(content_is(TARGET, v3), "a refused replacement lost the old file");
    CHECK(!exists(ASIDE) && !exists(TEMP),
          "a refused replacement left a file beside the target");
+
+   /* interrupted: cut short between "target -> .old" and "temp ->
+    * target"; the game then starts empty and saves twice */
+   __real_rename(TARGET, ASIDE);
+   reset_counts();
+   CHECK(filestream_write_file_atomic(TARGET, v1, strlen(v1)),
+         "the first write after an interrupted replace failed");
+   CHECK(filestream_write_file_atomic(TARGET, v2, strlen(v2)),
+         "the second write after an interrupted replace failed");
+   print_counts("interrupted");
+   CHECK(content_is(TARGET, v2), "interrupted lane content wrong");
+   CHECK(content_is(ASIDE, v3), "the last good copy at .old was lost");
+   CHECK(!exists(ASIDE2) && !exists(TEMP),
+         "interrupted lane left a file beside the target");
+   __real_remove(ASIDE);
+
+   /* user_old */
+   put(ASIDE, "mine");
+   put(ASIDE2, "mine too");
+   reset_counts();
+   CHECK(filestream_write_file_atomic(TARGET, v1, strlen(v1)),
+         "overwrite beside the user's .old copies failed");
+   print_counts("user_old");
+   CHECK(content_is(TARGET, v1), "user_old lane content wrong");
+   CHECK(content_is(ASIDE, "mine") && content_is(ASIDE2, "mine too"),
+         "a user's own .old copy was not kept");
+   CHECK(!exists(ASIDE3) && !exists(TEMP),
+         "user_old lane left a file beside the target");
+   for (n = 3; n <= 99; n++)
+   {
+      aside_name(name, n);
+      put(name, "mine");
+   }
+   CHECK(!filestream_write_file_atomic(TARGET, v2, strlen(v2)),
+         "a replace with every aside name taken reported success");
+   CHECK(content_is(TARGET, v1),
+         "a replace with every aside name taken lost the target");
+   CHECK(content_is(ASIDE, "mine") && content_is(name, "mine")
+         && !exists(TEMP),
+         "a replace with every aside name taken changed a file beside it");
+   for (n = 1; n <= 99; n++)
+   {
+      aside_name(name, n);
+      __real_remove(name);
+   }
 
    /* restore: the source is named as the aside would be */
    put(TARGET, "current");
@@ -263,7 +352,7 @@ int main(void)
    CHECK(content_is(ASIDE, "stale"), "restore_case lane touched the aside");
    CHECK(!exists(UPPER) && !exists(ASIDE2),
          "restore_case lane left a file beside the target");
-   printf("[restore_case] source matched regardless of case\n");
+   printf("[restore_case] restored, the leftover aside kept\n");
    __real_remove(ASIDE);
 
    /* frontend */

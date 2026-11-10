@@ -2568,23 +2568,58 @@ int retro_vfs_file_remove_impl(const char *path)
 #endif
 
 #ifdef VFS_RENAME_ASIDE
-/* Where to move @new_path while @old_path takes its place: "<new>.old",
- * whose leftover from an interrupted run gets removed.  The source can
- * be the file of that very name, as when a backup is restored, and must
- * not be mistaken for a leftover.  Compared without regard to case for
- * the FAT volumes most of these targets use. */
-static char *rename_aside_path(const char *old_path, const char *new_path)
+/* Where to move @new_path while another file takes its place:
+ * "<new>.old".  A file already there may be the only copy left by an
+ * interrupted replace, or the user's own, so it is never deleted:
+ * rename_aside_free() finds the next free name instead.  @len is set
+ * to the length of @new_path. */
+static char *rename_aside_path(const char *new_path, size_t *len)
 {
    size_t _len = strlen(new_path);
-   char *aside = (char*)malloc(_len + sizeof(".old2"));
+   char *aside = (char*)malloc(_len + sizeof(".old99"));
 
    if (!aside)
       return NULL;
    memcpy(aside, new_path, _len);
    memcpy(aside + _len, ".old", sizeof(".old"));
-   if (string_is_equal_case_insensitive(aside, old_path))
-      memcpy(aside + _len, ".old2", sizeof(".old2"));
+   *len = _len;
    return aside;
+}
+
+static bool rename_aside_exists(const char *path)
+{
+#if defined(_XBOX)
+   return GetFileAttributes(path) != INVALID_FILE_ATTRIBUTES;
+#elif defined(_WIN32)
+   return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+#elif defined(VITA) || defined(PSP)
+   SceIoStat st;
+   return sceIoGetstat(path, &st) >= 0;
+#else
+   struct stat st;
+   return stat(path, &st) == 0;
+#endif
+}
+
+/* Writes the first free one of "<new>.old", "<new>.old2" ...
+ * "<new>.old99" after the @len characters of @aside, and returns
+ * which (1 to 99), or 0 when all are taken. */
+static unsigned rename_aside_free(char *aside, size_t len)
+{
+   unsigned n;
+
+   for (n = 1; n <= 99; n++)
+   {
+      char *s = aside + len + STRLEN_CONST(".old");
+      if (n > 9)
+         *s++ = (char)('0' + n / 10);
+      if (n > 1)
+         *s++ = (char)('0' + n % 10);
+      *s = '\0';
+      if (!rename_aside_exists(aside))
+         return n;
+   }
+   return 0;
 }
 #endif
 
@@ -2597,18 +2632,20 @@ static char *rename_aside_path(const char *old_path, const char *new_path)
 static int win32_rename_replace_local(const char *old_local,
       const char *new_local)
 {
+   size_t _len;
    char *aside;
    int ret;
 
    if (rename(old_local, new_local) == 0)
       return 0;
 
-   if (!(aside = rename_aside_path(old_local, new_local)))
+   if (!(aside = rename_aside_path(new_local, &_len)))
       return -1;
 
    ret = -1;
-   remove(aside);                      /* a leftover from an earlier run */
-   if (rename(new_local, aside) == 0)
+   if (     rename(new_local, aside) == 0
+         || (     rename_aside_free(aside, _len) > 1
+               && rename(new_local, aside) == 0))
    {
       if (rename(old_local, new_local) == 0)
       {
@@ -2744,6 +2781,7 @@ int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
     * moved-aside copy deleted only then - or put back if the second
     * move fails. */
    {
+      size_t _len;
       char *aside;
       int ret;
 
@@ -2753,12 +2791,13 @@ int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
       if (GetFileAttributes(new_path) == INVALID_FILE_ATTRIBUTES)
          return MoveFile(old_path, new_path) ? 0 : -1;
 
-      if (!(aside = rename_aside_path(old_path, new_path)))
+      if (!(aside = rename_aside_path(new_path, &_len)))
          return -1;
 
       ret = -1;
-      DeleteFile(aside);               /* a leftover from an earlier run */
-      if (MoveFile(new_path, aside))
+      if (     MoveFile(new_path, aside)
+            || (     rename_aside_free(aside, _len) > 1
+                  && MoveFile(new_path, aside)))
       {
          if (MoveFile(old_path, new_path))
          {
@@ -2791,6 +2830,7 @@ int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
     * the replacement cannot be. */
    {
       SceIoStat st;
+      size_t _len;
       char *aside;
       int ret;
 
@@ -2804,14 +2844,14 @@ int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
       if (sceIoGetstat(new_path, &st) < 0)
          return -1;
 
-      if (!(aside = rename_aside_path(old_path, new_path)))
+      if (!(aside = rename_aside_path(new_path, &_len)))
          return -1;
 
       ret = -1;
-      /* A leftover aside from an earlier run is removed only when it
-       * is in the way: a lookup of a missing name scans the directory. */
+      /* A free name is looked for only when "<new>.old" is taken: a
+       * lookup of a missing name scans the directory. */
       if (     sceIoRename(new_path, aside) >= 0
-            || (     sceIoRemove(aside) >= 0
+            || (     rename_aside_free(aside, _len) > 1
                   && sceIoRename(new_path, aside) >= 0))
       {
          if (sceIoRename(old_path, new_path) >= 0)
@@ -2839,6 +2879,7 @@ int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
     * if the replacement cannot be. */
    {
       struct stat st;
+      size_t _len;
       char *aside;
       int ret;
 
@@ -2848,15 +2889,22 @@ int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
       if (stat(new_path, &st) != 0)
          return rename(old_path, new_path) == 0 ? 0 : -1;
 
-      if (!(aside = rename_aside_path(old_path, new_path)))
+      if (!(aside = rename_aside_path(new_path, &_len)))
          return -1;
 
       ret = -1;
-      /* A leftover aside from an earlier run is removed only when it
-       * is in the way: a lookup of a missing name scans the directory. */
+#if defined(_3DS) || defined(WIIU)
+      /* libctru's rename() would delete a file at the aside name, and
+       * Wii U's FSRename() is not known to refuse one */
+      if (     rename_aside_free(aside, _len)
+            && rename(new_path, aside) == 0)
+#else
+      /* A free name is looked for only when "<new>.old" is taken: a
+       * lookup of a missing name scans the directory. */
       if (     rename(new_path, aside) == 0
-            || (     remove(aside) == 0
+            || (     rename_aside_free(aside, _len) > 1
                   && rename(new_path, aside) == 0))
+#endif
       {
          if (rename(old_path, new_path) == 0)
          {

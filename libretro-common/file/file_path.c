@@ -365,7 +365,7 @@ size_t fill_pathname(char *s, const char *in_path,
 }
 
 /* Not ".old": retro_vfs_file_rename_impl() uses that as its own aside
- * on several platforms and deletes one it finds there. */
+ * on several platforms. */
 size_t fill_pathname_aside(char *s, const char *in_path, unsigned n,
       size_t len)
 {

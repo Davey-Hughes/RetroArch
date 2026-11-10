@@ -28,6 +28,7 @@
 #include <wrl/implements.h>
 #include <robuffer.h>
 #include <functional>
+#include <string>
 #include <fileapifromapp.h>
 #include <aclapi.h>
 #include <sddl.h>
@@ -605,12 +606,14 @@ int retro_vfs_restrict_permissions_impl(const char* path)
 /* MoveFileFromAppW cannot replace an existing file, so a destination in
  * the way is moved aside, the source moved into place, and the moved-aside
  * copy deleted only then - or put back if the source could not be moved.
- * A leftover aside from an interrupted run is removed only when it is in
- * the way, and never if it is the source being restored. */
+ * The aside is "<new>.old".  A file already there may be the only copy
+ * left by an interrupted run, or the user's own, so it is never deleted:
+ * the first free of "<new>.old2" ... "<new>.old99" is taken instead. */
 static bool uwp_move_file_replacing(const std::wstring &old_path,
       const std::wstring &new_path)
 {
     WIN32_FILE_ATTRIBUTE_DATA target_info;
+    WIN32_FILE_ATTRIBUTE_DATA aside_info;
     std::wstring aside;
 
     /* Names differing only in case are one file here: moving it aside
@@ -623,13 +626,23 @@ static bool uwp_move_file_replacing(const std::wstring &old_path,
           && !(target_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
     {
         aside = new_path + L".old";
-        if (_wcsicmp(aside.c_str(), old_path.c_str()) == 0)
-            aside += L"2";
-        /* All three return nonzero on success. */
-        if (     !MoveFileFromAppW(new_path.c_str(), aside.c_str())
-              && (     !DeleteFileFromAppW(aside.c_str())
-                    || !MoveFileFromAppW(new_path.c_str(), aside.c_str())))
-            return false;
+        /* Both return nonzero on success. */
+        if (!MoveFileFromAppW(new_path.c_str(), aside.c_str()))
+        {
+            unsigned n = 1;
+
+            /* A free name is looked for only when "<new>.old" is taken */
+            while (GetFileAttributesExFromAppW(aside.c_str(),
+                     GetFileExInfoStandard, &aside_info))
+            {
+                if (++n > 99)
+                    return false;
+                aside = new_path + L".old" + std::to_wstring(n);
+            }
+            if (     n == 1
+                  || !MoveFileFromAppW(new_path.c_str(), aside.c_str()))
+                return false;
+        }
     }
 
     if (!MoveFileFromAppW(old_path.c_str(), new_path.c_str()))

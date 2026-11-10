@@ -284,6 +284,8 @@ jobs:
             vfs_hybrid_test
             filestream_rbuf_fault_test
             vfs_rename_replace_test
+            vfs_rename_replace_test_3ds
+            vfs_rename_replace_test_wiiu
             vfs_close_result_test
             # A read-write stream on the descriptor path, as an emulated
             # file system uses it: in-place writes, truncate, reopen.

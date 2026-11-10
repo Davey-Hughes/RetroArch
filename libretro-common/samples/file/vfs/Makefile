@@ -19,6 +19,8 @@ TARGET_TEST15 := vfs_positional_nommap_test
 TARGET_TEST16 := vfs_positional_off32_test
 TARGET_TEST17 := filestream_atomic_test
 TARGET_TEST18 := vfs_readdir_error_test
+TARGET_TEST19 := vfs_rename_replace_test_3ds
+TARGET_TEST20 := vfs_rename_replace_test_wiiu
 
 LIBRETRO_COMM_DIR := ../../..
 
@@ -90,6 +92,13 @@ RENAME_VFS_OBJ := vfs_implementation_gekko.o
 RENAME_OBJS    := $(filter-out %/vfs_implementation.o,$(COMMON_OBJS)) \
 	$(RENAME_VFS_OBJ)
 
+# vfs_rename_replace_test_3ds and _wiiu run the same lanes on a VFS
+# built with -D_3DS or -DWIIU, under a rename() that replaces an
+# existing name, as libctru's does by deleting it first.
+RENAME_REPLACES_OBJ := vfs_rename_replace_test_replaces.o
+RENAME_3DS_OBJ      := vfs_implementation_3ds.o
+RENAME_WIIU_OBJ     := vfs_implementation_wiiu.o
+
 # vfs_close_result_test runs the descriptor path PS2 takes for whole-file
 # reads and writes, so that one target links its own
 # vfs_implementation.o built with -DPS2 (no mmap there either), with
@@ -160,7 +169,7 @@ endif
 # branch would be compiled ahead of the GEKKO one, so the console
 # rename target is built on Linux only.
 ifeq ($(UNAME_S),Linux)
-   RENAME_TARGET := $(TARGET_TEST7)
+   RENAME_TARGET := $(TARGET_TEST7) $(TARGET_TEST19) $(TARGET_TEST20)
 endif
 
 all: $(TARGET) $(TARGET_TEST) $(TARGET_TEST2) $(TARGET_TEST3) $(TARGET_TEST4) \
@@ -288,6 +297,23 @@ $(RENAME_VFS_OBJ): $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
 $(TARGET_TEST7): vfs_rename_replace_test.o $(RENAME_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=rename,--wrap=remove,--wrap=stat
 
+$(RENAME_REPLACES_OBJ): vfs_rename_replace_test.c
+	$(CC) -c -o $@ $< $(CFLAGS) -DRENAME_REPLACES
+
+$(RENAME_3DS_OBJ): $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
+	$(CC) -c -o $@ $< $(filter-out -DHAVE_MMAP,$(CFLAGS)) -D_3DS
+
+$(RENAME_WIIU_OBJ): $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
+	$(CC) -c -o $@ $< $(filter-out -DHAVE_MMAP,$(CFLAGS)) -DWIIU
+
+$(TARGET_TEST19): $(RENAME_REPLACES_OBJ) $(RENAME_3DS_OBJ) \
+		$(filter-out %/vfs_implementation.o,$(COMMON_OBJS))
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=rename,--wrap=remove,--wrap=stat
+
+$(TARGET_TEST20): $(RENAME_REPLACES_OBJ) $(RENAME_WIIU_OBJ) \
+		$(filter-out %/vfs_implementation.o,$(COMMON_OBJS))
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=rename,--wrap=remove,--wrap=stat
+
 $(CLOSE_VFS_OBJ): $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c close_hook.h
 	$(CC) -c -o $@ $< $(filter-out -DHAVE_MMAP,$(CFLAGS)) -DPS2 \
 		-DRETRO_ATOMIC_FORCE_VOLATILE -I. -include close_hook.h
@@ -317,8 +343,9 @@ clean:
 		$(TARGET_TEST4) $(TARGET_TEST5) $(TARGET_TEST6) \
 		$(TARGET_TEST7) $(TARGET_TEST8) $(TARGET_TEST9) $(TARGET_TEST10) \
 		$(TARGET_TEST11) $(TARGET_TEST12) $(TARGET_TEST13) $(TARGET_TEST14) $(TARGET_TEST15) $(TARGET_TEST16) \
-		$(TARGET_TEST17) $(TARGET_TEST18) $(CLOSE_VFS_OBJ) \
-		$(OBJS) $(FAULT_FS_OBJ) $(RENAME_VFS_OBJ) \
+		$(TARGET_TEST17) $(TARGET_TEST18) $(TARGET_TEST19) $(TARGET_TEST20) $(CLOSE_VFS_OBJ) \
+		$(OBJS) $(FAULT_FS_OBJ) $(RENAME_VFS_OBJ) $(RENAME_REPLACES_OBJ) \
+		$(RENAME_3DS_OBJ) $(RENAME_WIIU_OBJ) \
 		$(RA_VFS_OBJ) $(HOOK_VFS_OBJ) rthreads_ra.o retro_eventcount_ra.o \
 		$(NOMMAP_VFS_OBJ) vfs_positional_required.o $(OFF32_VFS_OBJ)
 	rm -f vfs_positional_off32.bin
@@ -326,7 +353,7 @@ clean:
 	rm -f large_3gib.bin large_5gib.bin seek_small.bin seek_4gib.bin
 	rm -f rbuf_fault.txt vfs_readahead_fixture.bin vfs_prefetch_offthread.bin
 	rm -f vfs_view_fixture.bin vfs_view_update.bin vfs_view_empty.bin
-	rm -f rename_replace.bin rename_replace.bin.old rename_replace.bin.old2 rename_replace.bin.tmp RENAME_REPLACE.BIN.OLD
+	rm -f rename_replace.bin rename_replace.bin.old* rename_replace.bin.tmp RENAME_REPLACE.BIN.OLD
 	rm -f close_result.bin close_result_w.bin
 	rm -f atomic.bin atomic.bin.prev atomic.bin.*.prev atomic.bin.tmp
 	rm -rf readdir_error_dir
