@@ -1281,6 +1281,8 @@ static void test_stage_loaded(void)
 static unsigned reruns;
 static unsigned frees;
 static int rerun_id;
+static bool rerun_loads;      /* the re-run's open goes on to load */
+static unsigned rerun_frees;  /* frees once the re-run's core loaded */
 
 /* The re-run opens the core as the load it stands for would */
 static void rerun_fn(void *ud)
@@ -1290,6 +1292,12 @@ static void rerun_fn(void *ud)
    rerun_id    = 0;
    if (core_load_check_open((const char*)ud, &lib) == CORE_LOAD_GATE_OPENED)
       rerun_id = lib_id(lib);
+   if (lib && rerun_loads)
+   {
+      core_load_check_loaded();
+      rerun_frees = frees;
+      core_load_check_unloaded();
+   }
    if (lib)
       dylib_close(lib);
 }
@@ -1353,9 +1361,11 @@ static unsigned osd_refused(void)
 
 static void park_reset(void)
 {
-   reruns   = 0;
-   frees    = 0;
-   rerun_id = 0;
+   reruns      = 0;
+   frees       = 0;
+   rerun_id    = 0;
+   rerun_loads = false;
+   rerun_frees = 0;
 }
 
 static void test_park_load_once(void)
@@ -1731,8 +1741,8 @@ static void test_park_deinit(void)
    stop();
 }
 
-/* Another core loads, opened as the startup load opens it (no task
- * to wait on) */
+/* A core loads, opened as the startup load opens it (no task to wait
+ * on) */
 static void load_other(const char *path, int id)
 {
    dylib_t lib = NULL;
@@ -1754,9 +1764,10 @@ enum park_wait_kind
    PARK_IN_SEED
 };
 
-/* Another core loads while a park waits: the park ends as a Cancel
- * would, and nothing re-runs over that core */
-static void park_other_load(enum park_wait_kind kind)
+/* Another core, or the parked one by another route, loads while a
+ * park waits: the park ends as a Cancel would, and nothing re-runs
+ * over that session */
+static void park_other_load(enum park_wait_kind kind, bool same)
 {
    char store[64];
    char a[256];
@@ -1785,7 +1796,8 @@ static void park_other_load(enum park_wait_kind kind)
    }
    CHECK(put_core(b, "loads_b_libretro" LIB_EXT, 'b'));
    /* Running the queue would end the seed */
-   CHECK(kind == PARK_IN_SEED ? trust_queued(b) : trust(b));
+   if (!same)
+      CHECK(kind == PARK_IN_SEED ? trust_queued(b) : trust(b));
    opens = menu_opens;
    CHECK(park(a));
    switch (kind)
@@ -1809,7 +1821,14 @@ static void park_other_load(enum park_wait_kind kind)
          CHECK(reruns == 0);
          break;
    }
-   load_other(b, 2);
+   if (same)
+   {
+      /* Passing now, as after an Always Trust from elsewhere */
+      CHECK(trust_queued(a));
+      load_other(a, 1);
+   }
+   else
+      load_other(b, 2);
    CHECK(frees == 1);
    /* A warning up for it closed through its Cancel: nothing to answer */
    CHECK(!core_warning_pending(NULL, NULL));
@@ -1827,39 +1846,43 @@ static void park_other_load(enum park_wait_kind kind)
 
 static void test_park_other_load(void)
 {
-   park_other_load(PARK_IN_CHECK);
-   park_other_load(PARK_IN_USER);
-   park_other_load(PARK_IN_IDLE);
-   park_other_load(PARK_IN_SEED);
+   park_other_load(PARK_IN_CHECK, false);
+   park_other_load(PARK_IN_USER, false);
+   park_other_load(PARK_IN_IDLE, false);
+   park_other_load(PARK_IN_SEED, false);
 }
 
-/* The parked core's own load keeps its park: a pass for it lets it
- * load while the park waits, and the park still re-runs once */
-static void test_park_own_load(void)
+static void test_park_same_load(void)
 {
-   dylib_t lib = NULL;
+   park_other_load(PARK_IN_CHECK, true);
+   park_other_load(PARK_IN_USER, true);
+   park_other_load(PARK_IN_IDLE, true);
+#ifndef _WIN32
+   /* No kept ctime binds a record there: nothing passes it before the
+    * seed is done */
+   park_other_load(PARK_IN_SEED, true);
+#endif
+}
+
+/* The park's own re-run is no other load: its core loading ends
+ * nothing, and free_cb runs once, after the re-run */
+static void test_park_own_rerun(void)
+{
    char a[256];
    start(false);
    park_reset();
    CHECK(put_core(a, "own_libretro" LIB_EXT, 'a'));
-   CHECK(trust(a));
-   CHECK(put_core(a, "own_libretro" LIB_EXT, 'a'));
    CHECK(park(a));
-   /* Its check passes on the hash recorded; the re-run waits */
-   load_pending = true;
    drain();
-   core_load_check_iterate();
-   CHECK(reruns == 0);
-   CHECK(core_load_check_open(a, &lib) == CORE_LOAD_GATE_OPENED);
-   CHECK(lib_id(lib) == 1);
-   core_load_check_loaded();
-   if (lib)
-      dylib_close(lib);
-   CHECK(frees == 0);
-   load_pending = false;
+   CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE));
+   rerun_loads = true;
    park_wait(1);
    CHECK(reruns == 1);
    CHECK(rerun_id == 1);
+   CHECK(rerun_frees == 0);
+   CHECK(frees == 1);
+   park_frames(20);
+   CHECK(reruns == 1);
    CHECK(frees == 1);
    stop();
 }
@@ -2158,7 +2181,8 @@ int main(void)
    test_park_no_check();
    test_park_deinit();
    test_park_other_load();
-   test_park_own_load();
+   test_park_same_load();
+   test_park_own_rerun();
    test_park_fallback();
    test_load_once_lasts();
    test_startup_seed();

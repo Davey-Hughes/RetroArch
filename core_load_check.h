@@ -30,7 +30,7 @@ enum core_load_gate core_load_check_open(const char *path, dylib_t *lib);
 /* The last open of path was refused by the check, not the loader */
 bool core_load_check_refused(const char *path);
 /* The core the last core_load_check_open() opened is now running. A
- * park of another core ends, as the user's Cancel would end it. */
+ * waiting park ends, as the user's Cancel would end it. */
 void core_load_check_loaded(void);
 /* Its pass outlives the unload while its held file or its identity
  * binds it, until another core loads or a release */
@@ -65,8 +65,8 @@ typedef void (*core_load_rerun_t)(void *userdata);
  * made that can't run quits as a failed startup does.
  * True: free_cb(userdata) runs once, after the re-run or when the
  * request is dropped; it may run inside a warning's CANCEL, so it must
- * not push or choose a warning. A newer park replaces it, and another
- * core's load ends it.
+ * not push or choose a warning. A newer park replaces it, and any
+ * other load ends it, the same core's too.
  * False: nothing taken (no runtime, the core can't be opened, or the
  * park ended at once). Park only after core_load_check_refused(): a
  * false then means the user was told (barring out of memory or the

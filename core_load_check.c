@@ -1075,10 +1075,9 @@ void core_load_check_loaded(void)
 {
    struct core_load_slot *from = NULL;
    core_load_rt.running        = true;
-   /* Another core loaded while a park waits: its re-run would replace
-    * that session. path is the one this load's open or take set. */
-   if (     core_load_rt.park.state != CORE_LOAD_PARK_NONE
-         && !string_is_equal(core_load_rt.park.path, core_load_rt.path))
+   /* A load while a park waits, the same core's too: the re-run would
+    * replace that session. The park's own re-run dropped it first. */
+   if (core_load_rt.park.state != CORE_LOAD_PARK_NONE)
       core_load_park_cancel();
    /* Any other pass the slot keeps, such as a Load Once whose re-run
     * only probed, ends when a core loads (D8) */
