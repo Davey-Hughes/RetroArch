@@ -7213,7 +7213,8 @@ static void config_set_save_dir_base(enum rarch_dir_type type,
  * Loads a config file and reads all the values into memory.
  *
  */
-static bool config_load_file(const char *path, settings_t *settings)
+static bool config_load_file(const char *path, settings_t *settings,
+      bool reread)
 {
    unsigned i;
    char tmp_str[PATH_MAX_LENGTH];
@@ -7400,12 +7401,21 @@ static bool config_load_file(const char *path, settings_t *settings)
    /* before any override goes in */
    if (!without_overrides)
    {
+      /* Only a load: Save As changes the path without one */
+      if (!reread)
+         runloop_save_root_set_config(path_get(RARCH_PATH_CONFIG));
       if (config_get_path(conf, "savefile_directory", tmp_str, sizeof(tmp_str)))
+      {
+         runloop_save_root_resolve(tmp_str, sizeof(tmp_str));
          config_set_save_dir_base(RARCH_DIR_SAVEFILE_BASE, tmp_str,
                "saves", g_defaults.dirs[DEFAULT_DIR_SRAM]);
+      }
       if (config_get_path(conf, "savestate_directory", tmp_str, sizeof(tmp_str)))
+      {
+         runloop_save_root_resolve(tmp_str, sizeof(tmp_str));
          config_set_save_dir_base(RARCH_DIR_SAVESTATE_BASE, tmp_str,
                "states", g_defaults.dirs[DEFAULT_DIR_SAVESTATE]);
+      }
    }
 
    if (!path_is_empty(RARCH_PATH_CONFIG_OVERRIDE) && !without_overrides)
@@ -8163,6 +8173,7 @@ static bool config_load_file(const char *path, settings_t *settings)
          && !retroarch_override_setting_is_set(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL)
          && config_get_path(conf, "savefile_directory", tmp_str, sizeof(tmp_str)))
    {
+      runloop_save_root_resolve(tmp_str, sizeof(tmp_str));
       if (config_save_dir_is_default(tmp_str, "saves"))
          dir_set(RARCH_DIR_SAVEFILE, g_defaults.dirs[DEFAULT_DIR_SRAM]);
       else if (path_is_directory(tmp_str))
@@ -8184,6 +8195,7 @@ static bool config_load_file(const char *path, settings_t *settings)
          && !retroarch_override_setting_is_set(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL)
          && config_get_path(conf, "savestate_directory", tmp_str, sizeof(tmp_str)))
    {
+      runloop_save_root_resolve(tmp_str, sizeof(tmp_str));
       if (config_save_dir_is_default(tmp_str, "states"))
          dir_set(RARCH_DIR_SAVESTATE, g_defaults.dirs[DEFAULT_DIR_SAVESTATE]);
       else if (path_is_directory(tmp_str))
@@ -8520,7 +8532,7 @@ bool config_load_override(void *data)
    /* Re-load the configuration with any overrides
     * that might have been found */
 
-   if (!config_load_file(path_get(RARCH_PATH_CONFIG), settings))
+   if (!config_load_file(path_get(RARCH_PATH_CONFIG), settings, true))
       return false;
 
    a = path_get(RARCH_PATH_CONFIG_OVERRIDE);
@@ -8559,7 +8571,7 @@ bool config_load_override_file(const char *config_path)
    /* Re-load the configuration with any overrides
     * that might have been found */
 
-   if (!config_load_file(path_get(RARCH_PATH_CONFIG), settings))
+   if (!config_load_file(path_get(RARCH_PATH_CONFIG), settings, true))
       return false;
 
    if (settings->bools.notification_show_config_override_load)
@@ -8608,7 +8620,7 @@ bool config_unload_override(void)
       config_set_defaults(config_st);
 
    if (!config_load_file(
-            path_get(RARCH_PATH_CONFIG), config_st))
+            path_get(RARCH_PATH_CONFIG), config_st, true))
       return false;
 
    if (settings->bools.video_fullscreen != fullscreen_prev)
@@ -8810,7 +8822,7 @@ static void config_parse_file(void)
    }
 #endif
 
-   if (!config_load_file(config_path, config_st))
+   if (!config_load_file(config_path, config_st, false))
    {
       RARCH_ERR("[Config] Config not found at: \"%s\".\n",
             config_path);
@@ -10619,7 +10631,7 @@ int8_t config_save_overrides(enum override_type type,
 
    /* Load the original config file in memory */
    config_load_file(
-         "without-overrides", settings);
+         "without-overrides", settings, true);
 
    bool_settings       = populate_settings_bool(settings,   &bool_settings_size);
    tmp_i               = SETTINGS_BOOL_COUNT_MAX;

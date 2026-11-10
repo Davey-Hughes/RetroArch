@@ -1211,6 +1211,14 @@ enum runloop_save_root
 enum runloop_save_root runloop_save_root_check(char *s, size_t len,
       const char *configured, const char *def);
 
+/* A relative save or state folder in @s is under the folder of the
+ * main config file last loaded, not the working directory; as written
+ * when that does not fit in @len. */
+void runloop_save_root_resolve(char *s, size_t len);
+
+/* Called at each main config load */
+void runloop_save_root_set_config(const char *path);
+
 #ifdef HAVE_CLOUDSYNC
 /* Cloud sync, which walks only the main config's save and state
  * folders, is paused while one is set but is not a directory. */

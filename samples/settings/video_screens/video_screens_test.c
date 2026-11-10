@@ -4990,6 +4990,31 @@ static void test_save_dir_base(void)
    CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE), a));
    retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
 
+   /* Relative: the folder saves go to, under the config file's */
+   load_fixture("savefile_directory = \"base_a\"\n"
+         "savestate_directory = \"base_a\"\n");
+   CHECK(path_is_directory(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE)));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE),
+         dir_get_ptr(RARCH_DIR_SAVEFILE)));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVESTATE_BASE),
+         dir_get_ptr(RARCH_DIR_SAVESTATE)));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_CONFIGURED),
+         "base_a"));
+
+   /* "./" and ".." folded */
+   strlcpy(text, "savefile_directory = \"./base_a\"\n"
+         "savestate_directory = \"../", sizeof(text));
+   fill_pathname_parent_dir_name(text + strlen(text), fixture_path,
+         sizeof(text) - strlen(text));
+   strlcat(text, "/base_a\"\n", sizeof(text));
+   load_fixture(text);
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE), a));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVESTATE_BASE), a));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE), a));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVESTATE), a));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_CONFIGURED),
+         "./base_a"));
+
    strlcpy(g_defaults.dirs[DEFAULT_DIR_SRAM], b,
          sizeof(g_defaults.dirs[DEFAULT_DIR_SRAM]));
    strlcpy(g_defaults.dirs[DEFAULT_DIR_SAVESTATE], c,
@@ -5006,6 +5031,65 @@ static void test_save_dir_base(void)
    *g_defaults.dirs[DEFAULT_DIR_SAVESTATE] = '\0';
    load_fixture("");
    CHECK(!*dir_get_ptr(RARCH_DIR_SAVEFILE_BASE));
+}
+
+static bool save_dirs_are(const char *dir)
+{
+   return string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE), dir)
+      && string_is_equal(dir_get_ptr(RARCH_DIR_SAVESTATE_BASE), dir)
+      && string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE), dir)
+      && string_is_equal(dir_get_ptr(RARCH_DIR_SAVESTATE), dir);
+}
+
+/* Save As names a file without loading it: an override's re-read
+ * keeps the relative folders where they are, a load moves them. */
+static void test_save_dir_base_save_as(void)
+{
+   static rarch_system_info_t system_info;
+   char dir[2048];
+   char a[2048];
+   char cfg[2048];
+   char moved[2048];
+   char core_cfg[2048];
+   char text[4200];
+
+   memset(&system_info, 0, sizeof(system_info));
+   system_info.info.library_name = "save_as_core";
+   fill_pathname_basedir(dir, fixture_path, sizeof(dir));
+   fill_pathname_join(a, dir, "base_a", sizeof(a));
+   fill_pathname_join(moved, dir, "save_as", sizeof(moved));
+   fill_pathname_join(core_cfg, dir, "save_as_menu", sizeof(core_cfg));
+   path_mkdir(a);
+   path_mkdir(moved);
+   fill_pathname_join(cfg, moved, "mine.cfg", sizeof(cfg));
+   fill_pathname_join(moved, moved, "base_a", sizeof(moved));
+   snprintf(text, sizeof(text), "savefile_directory = \"base_a\"\n"
+         "savestate_directory = \"base_a\"\n"
+         "rgui_config_directory = \"%s\"\n", core_cfg);
+   fill_pathname_join(core_cfg, core_cfg, "save_as_core", sizeof(core_cfg));
+   path_mkdir(core_cfg);
+   fill_pathname_join(core_cfg, core_cfg, "save_as_core.cfg",
+         sizeof(core_cfg));
+   load_fixture(text);
+   CHECK(save_dirs_are(a));
+   CHECK(config_save_file(cfg));
+   path_set(RARCH_PATH_CONFIG, cfg);
+
+   write_config(override_path, "video_smooth = \"true\"\n");
+   CHECK(config_load_override_file(override_path));
+   CHECK(save_dirs_are(a));
+   path_mkdir(moved);
+   CHECK(config_unload_override());
+   CHECK(save_dirs_are(a));
+
+   /* The core override a content load reads */
+   write_config(core_cfg, "video_smooth = \"true\"\n");
+   CHECK(config_load_override(&system_info));
+   CHECK(save_dirs_are(a));
+   CHECK(config_unload_override());
+
+   config_load();
+   CHECK(save_dirs_are(moved));
 }
 
 #ifdef HAVE_CLOUDSYNC
@@ -5089,6 +5173,7 @@ int main(int argc, char **argv)
       test_load_save_dir_args();
       test_override_flags_reset();
       test_save_dir_base();
+      test_save_dir_base_save_as();
 #ifdef HAVE_CLOUDSYNC
       test_save_base_pause();
 #endif

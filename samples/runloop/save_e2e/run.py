@@ -114,11 +114,13 @@ class Run:
         return env
 
     def start(self, args, cfg, frames, env, prefix=(), preexec=None,
-              extra=()):
-        cmd = list(prefix) + [str(args.retroarch), '--config', str(cfg),
-                              '-L', str(args.core), str(self.content),
-                              '--max-frames=%d' % frames, '-v'] + list(extra)
-        self.proc = subprocess.Popen(cmd, cwd=self.dir, env=env,
+              extra=(), cwd=None):
+        # No cfg: RetroArch's default config file.
+        cmd = list(prefix) + [str(args.retroarch)] + (
+            ['--config', str(cfg)] if cfg else []) + [
+                '-L', str(args.core), str(self.content),
+                '--max-frames=%d' % frames, '-v'] + list(extra)
+        self.proc = subprocess.Popen(cmd, cwd=cwd or self.dir, env=env,
                                      stdin=subprocess.DEVNULL,
                                      stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT,
@@ -743,6 +745,71 @@ def lane_folder_check_override(args, n):
     return lane_folder_check_each_load(args, n, override=True)
 
 
+def lane_relative_paths(args, n):
+    """Relative save and state folders are under the config
+    file's folder, not the one RetroArch was started from, and the
+    config keeps them as written."""
+    r = Run(args.run_dir, 'relative_paths-%d' % n)
+    failures = []
+    elsewhere = r.dir / 'home'
+    (elsewhere / 'saves').mkdir()
+    cfg = r.config(savefile_directory='saves', savestate_directory='states',
+                   config_save_on_exit='true')
+    r.start(args, cfg, 60, r.env(SAVE_E2E_TOUCH_FRAME=5), cwd=elsewhere)
+    rc = r.wait(60)
+    check(failures, rc == 0, 'retroarch exit %s' % rc)
+    check(failures, r.srm.is_file(), 'no save in %s' % r.saves)
+    check(failures, not (elsewhere / 'saves' / 'game.srm').exists(),
+          'save in the folder it was started from')
+    log = r.log.read_text(errors='replace')
+    check(failures, 'not found;' not in log, 'fallback notice')
+    for key, want in (('savefile_directory', 'saves'),
+                      ('savestate_directory', 'states')):
+        got = cfg_path(r, cfg, key, args)
+        check(failures, got == want, '%s is %s' % (key, got))
+    return r, failures
+
+
+def lane_relative_config_no_folder(args, n):
+    """relative_paths with --config naming a file and no
+    folder."""
+    r = Run(args.run_dir, 'relative_config_no_folder-%d' % n)
+    failures = []
+    cfg = r.config(savefile_directory='saves', savestate_directory='states')
+    cfg.rename(r.dir / 'a')
+    r.start(args, 'a', 60, r.env(SAVE_E2E_TOUCH_FRAME=5))
+    rc = r.wait(60)
+    check(failures, rc == 0, 'retroarch exit %s' % rc)
+    check(failures, r.srm.is_file(), 'no save in %s' % r.saves)
+    check(failures, not (r.dir / 'asaves').exists(), 'made asaves')
+    return r, failures
+
+
+def lane_relative_default_config(args, n):
+    """relative_paths with the default config file (no
+    --config)."""
+    r = Run(args.run_dir, 'relative_default_config-%d' % n)
+    failures = []
+    cfgdir = r.dir / 'xdg-config' / 'retroarch'
+    cfgdir.mkdir()
+    # Not "saves": that is also the default folder.
+    want = cfgdir / 'mysaves'
+    want.mkdir()
+    elsewhere = r.dir / 'home'
+    (elsewhere / 'mysaves').mkdir()
+    cfg = r.config(savefile_directory='mysaves', savestate_directory='states')
+    cfg.rename(cfgdir / 'retroarch.cfg')
+    r.start(args, None, 60, r.env(SAVE_E2E_TOUCH_FRAME=5), cwd=elsewhere)
+    rc = r.wait(60)
+    check(failures, rc == 0, 'retroarch exit %s' % rc)
+    check(failures, (want / 'game.srm').is_file(), 'no save in %s' % want)
+    check(failures, not (elsewhere / 'mysaves' / 'game.srm').exists(),
+          'save in the folder it was started from')
+    check(failures, 'not found;' not in r.log.read_text(errors='replace'),
+          'fallback notice')
+    return r, failures
+
+
 def lane_archive_member_old_folder(args, n):
     """Sorted by content, a member in a folder of an archive keeps
     using the folder named after its folder inside the archive while
@@ -1051,6 +1118,9 @@ LANES = {
     'config_keeps_folder': lane_config_keeps_folder,
     'folder_check_each_load': lane_folder_check_each_load,
     'folder_check_override': lane_folder_check_override,
+    'relative_paths': lane_relative_paths,
+    'relative_config_no_folder': lane_relative_config_no_folder,
+    'relative_default_config': lane_relative_default_config,
     'archive_member_old_folder': lane_archive_member_old_folder,
     'quit_after_held_state': lane_quit_after_held_state,
     'unload_after_held_state': lane_unload_after_held_state,
@@ -1071,7 +1141,8 @@ WINDOWS_LANES = {'windows_locked_close'}
 POSIX_LANES = {'autosave_full_disk', 'autosave_kill_mid_write',
                'no_rewrite_at_launch', 'unreadable_backed_up',
                'explicit_save_copies', 'folder_check_each_load',
-               'folder_check_override'} | set(HELD_LANES)
+               'folder_check_override',
+               'relative_default_config'} | set(HELD_LANES)
 
 
 def main():

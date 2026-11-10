@@ -43,6 +43,7 @@ static struct string_list *test_dir_list_new(const char *dir,
 #undef dir_list_new
 #include "../../../defaults.h"
 #include <stdio.h>
+#include <stdarg.h>
 #include <rthreads/rthreads.h>
 
 #define ROOT "save_paths_test_files"
@@ -55,10 +56,15 @@ static settings_t test_settings;
 
 void RARCH_LOG(const char *fmt, ...) { (void)fmt; }
 static int pause_logs;
+static char last_log[DIR_MAX_LENGTH * 3];
 void RARCH_WARN(const char *fmt, ...)
 {
+   va_list ap;
    if (strstr(fmt, "[CloudSync] Paused"))
       pause_logs++;
+   va_start(ap, fmt);
+   vsnprintf(last_log, sizeof(last_log), fmt, ap);
+   va_end(ap);
 }
 void RARCH_ERR(const char *fmt, ...) { (void)fmt; }
 bool verbosity_is_enabled(void) { return false; }
@@ -127,6 +133,17 @@ char *dir_get_ptr(enum rarch_dir_type type)
 }
 bool path_set(enum rarch_path_type type, const char *path)
 { (void)type; (void)path; return true; }
+static char test_config_path[PATH_MAX_LENGTH];
+const char *path_get(enum rarch_path_type type)
+{
+   return type == RARCH_PATH_CONFIG ? test_config_path : "";
+}
+/* A main config load, which records the file's folder */
+static void config_loaded(const char *path)
+{
+   strlcpy(test_config_path, path, sizeof(test_config_path));
+   runloop_save_root_set_config(path);
+}
 settings_t *config_get_ptr(void) { return &test_settings; }
 /* -s */
 static bool cli_save_path;
@@ -372,6 +389,8 @@ static void folder_check_each_load(void)
    CHECK(fallback_notices == 1);
    CHECK(same_path(last_notice, "save fallback "
             ROOT "/card/RetroArch/saves " ROOT "/default/saves"));
+   CHECK(same_path(last_log, "[SRAM] save fallback "
+            ROOT "/card/RetroArch/saves " ROOT "/default/saves\n"));
    CHECK(runloop_state.flags & RUNLOOP_FLAG_USE_SRAM);
    CHECK(!path_is_directory(ROOT "/card/RetroArch"));
 
@@ -392,6 +411,8 @@ static void folder_check_each_load(void)
    CHECK(!(runloop_state.flags & RUNLOOP_FLAG_USE_SRAM));
    CHECK(missing_notices == 1);
    CHECK(same_path(last_notice, "save missing " ROOT "/card/RetroArch/saves"));
+   CHECK(same_path(last_log, "[SRAM] save missing "
+            ROOT "/card/RetroArch/saves\n"));
    CHECK(!same_path(runloop_state.name.savestate, "/roms/snes/Game.state"));
    CHECK(!path_is_directory(ROOT "/card"));
 
@@ -1111,6 +1132,187 @@ static void save_files_request(void)
    CHECK(kept_flushes == 1);
 }
 
+/* A relative configured root is under the config file's folder,
+ * wherever RetroArch was started from. */
+static void relative_root(void)
+{
+   config_loaded(ROOT "/cfg/retroarch.cfg");
+   strlcpy(cfg_saves, "saves", sizeof(cfg_saves));
+   strlcpy(cfg_states, "states", sizeof(cfg_states));
+   CHECK(path_mkdir(ROOT "/cfg"));
+   fallback_notices = missing_notices = 0;
+
+   redirect("/roms/snes/Game", false);
+   load("/roms/snes/Game");
+   CHECK(same_path(runloop_state.name.savefile,
+            ROOT "/cfg/saves/snes/Game.srm"));
+   CHECK(same_path(runloop_state.name.savestate,
+            ROOT "/cfg/states/snes/Game.state"));
+   CHECK(fallback_notices == 0 && missing_notices == 0);
+   CHECK(!path_is_directory("saves"));
+
+   config_loaded("");
+   cfg_saves[0] = cfg_states[0] = '\0';
+}
+
+/* Not relative, or no config file: as written */
+static void relative_root_kept(void)
+{
+   static const char *kept[] = {
+      "", "default", "sd:/saves", "C:foo", "/saves",
+#ifdef _WIN32
+      "\\saves", "C:\\saves",
+#endif
+   };
+   char s[DIR_MAX_LENGTH];
+   size_t i;
+   config_loaded(ROOT "/cfg/retroarch.cfg");
+   for (i = 0; i < ARRAY_SIZE(kept); i++)
+   {
+      strlcpy(s, kept[i], sizeof(s));
+      runloop_save_root_resolve(s, sizeof(s));
+      if (!string_is_equal(s, kept[i]))
+      {
+         fprintf(stderr, "FAIL kept \"%s\": \"%s\"\n", kept[i], s);
+         failures++;
+      }
+   }
+   config_loaded("");
+   strlcpy(s, "saves", sizeof(s));
+   runloop_save_root_resolve(s, sizeof(s));
+   CHECK(string_is_equal(s, "saves"));
+}
+
+/* A folder that does not fit under the config file's stays as written,
+ * logged once, never cut. */
+static void relative_root_too_long(void)
+{
+   char cfg[DIR_MAX_LENGTH + 16];
+   char s[DIR_MAX_LENGTH];
+   char big[PATH_MAX_LENGTH];
+   size_t i = strlcpy(cfg, ROOT "/", sizeof(cfg));
+   for (; i < DIR_MAX_LENGTH - 5; i++)
+      cfg[i] = 'a';
+   strlcpy(cfg + i, "/r.cfg", sizeof(cfg) - i);
+   config_loaded(cfg);
+
+   last_log[0] = '\0';
+   strlcpy(s, "saves", sizeof(s));
+   runloop_save_root_resolve(s, sizeof(s));
+   CHECK(string_is_equal(s, "saves"));
+   CHECK(strstr(last_log, "\"saves\"") != NULL);
+   last_log[0] = '\0';
+   runloop_save_root_resolve(s, sizeof(s));
+   CHECK(string_is_equal(s, "saves"));
+   CHECK(!*last_log);
+
+   /* config_load_file's buffer has room for it */
+   strlcpy(big, "saves", sizeof(big));
+   runloop_save_root_resolve(big, sizeof(big));
+   CHECK(strlen(big) == i + 1 + strlen("saves"));
+
+   /* Longer than the resolver's copy */
+   config_loaded(ROOT "/cfg/retroarch.cfg");
+   memset(big, 'b', DIR_MAX_LENGTH + 8);
+   big[DIR_MAX_LENGTH + 8] = '\0';
+   runloop_save_root_resolve(big, sizeof(big));
+   CHECK(strlen(big) == DIR_MAX_LENGTH + 8 && *big == 'b');
+   config_loaded("");
+}
+
+/* A relative main folder gone: sync pauses and says so, as for an
+ * absolute one. The notice names the folder resolved; the log line
+ * names it as written too. */
+static void relative_root_gone(void)
+{
+   CHECK(path_mkdir(ROOT "/cfg"));
+   CHECK(path_mkdir(ROOT "/default/saves"));
+   CHECK(path_mkdir(ROOT "/default/states"));
+   config_loaded(ROOT "/cfg/retroarch.cfg");
+   strlcpy(g_defaults.dirs[DEFAULT_DIR_SRAM], ROOT "/default/saves",
+         sizeof(g_defaults.dirs[DEFAULT_DIR_SRAM]));
+   strlcpy(g_defaults.dirs[DEFAULT_DIR_SAVESTATE], ROOT "/default/states",
+         sizeof(g_defaults.dirs[DEFAULT_DIR_SAVESTATE]));
+   /* As config_load_file sets them */
+   strlcpy(cfg_saves, "../card/saves", sizeof(cfg_saves));
+   strlcpy(base_saves, cfg_saves, sizeof(base_saves));
+   runloop_save_root_resolve(base_saves, sizeof(base_saves));
+   strlcpy(base_states, ROOT "/default/states", sizeof(base_states));
+   cfg_states[0] = '\0';
+   redirect("/roms/snes/Game", false);
+   fallback_notices = missing_notices = sync_notices = 0;
+
+   last_notice[0] = last_log[0] = '\0';
+   load("/roms/snes/Game");
+   CHECK(fallback_notices == 1);
+   CHECK(same_path(last_notice, "save fallback " ROOT "/cfg/../card/saves "
+            ROOT "/default/saves"));
+   CHECK(same_path(last_log, "[SRAM] save fallback " ROOT "/cfg/../card/saves "
+            ROOT "/default/saves (\"../card/saves\" -> \""
+            ROOT "/cfg/../card/saves\")\n"));
+
+   test_settings.bools.cloud_sync_enable = true;
+   sync_paused = false;
+   load("/roms/snes/Game");
+   CHECK(fallback_notices == 2);
+   CHECK(sync_paused);
+   CHECK(sync_notices == 1);
+   test_settings.bools.cloud_sync_enable = false;
+
+   rm_tree(ROOT "/default");
+   last_notice[0] = '\0';
+   load("/roms/snes/Game");
+   CHECK(missing_notices == 1);
+   CHECK(same_path(last_notice, "save missing " ROOT "/cfg/../card/saves"));
+
+   rm_tree(ROOT "/cfg");
+   config_loaded("");
+   cfg_saves[0] = '\0';
+   base_saves[0] = base_states[0] = '\0';
+   g_defaults.dirs[DEFAULT_DIR_SRAM][0]      = '\0';
+   g_defaults.dirs[DEFAULT_DIR_SAVESTATE][0] = '\0';
+}
+
+/* "Save Configuration As" names another config file without loading
+ * it: a relative root stays where it is, with the folder sync walks,
+ * until a config is loaded again. */
+static void relative_root_save_as(void)
+{
+   CHECK(path_mkdir(ROOT "/cfg/saves"));
+   CHECK(path_mkdir(ROOT "/cfg/states"));
+   CHECK(path_mkdir(ROOT "/cfg/config"));
+   config_loaded(ROOT "/cfg/retroarch.cfg");
+   strlcpy(cfg_saves, "saves", sizeof(cfg_saves));
+   strlcpy(cfg_states, "states", sizeof(cfg_states));
+   strlcpy(base_saves, cfg_saves, sizeof(base_saves));
+   runloop_save_root_resolve(base_saves, sizeof(base_saves));
+   strlcpy(base_states, cfg_states, sizeof(base_states));
+   runloop_save_root_resolve(base_states, sizeof(base_states));
+   redirect("/roms/snes/Game", false);
+   fallback_notices = missing_notices = 0;
+   load("/roms/snes/Game");
+   CHECK(same_path(live_saves, ROOT "/cfg/saves"));
+
+   strlcpy(test_config_path, ROOT "/cfg/config/mine.cfg",
+         sizeof(test_config_path));
+   sync_paused = false;
+   load("/roms/snes/Game");
+   CHECK(same_path(live_saves, base_saves));
+   CHECK(same_path(live_states, base_states));
+   CHECK(!path_is_directory(ROOT "/cfg/config/saves"));
+   CHECK(!sync_paused);
+   CHECK(fallback_notices == 0 && missing_notices == 0);
+
+   config_loaded(ROOT "/cfg/config/mine.cfg");
+   load("/roms/snes/Game");
+   CHECK(same_path(live_saves, ROOT "/cfg/config/saves"));
+
+   rm_tree(ROOT "/cfg");
+   config_loaded("");
+   cfg_saves[0] = cfg_states[0] = '\0';
+   base_saves[0] = base_states[0] = '\0';
+}
+
 int main(void)
 {
    rm_tree(ROOT);
@@ -1134,6 +1336,11 @@ int main(void)
    pause_follows_main_folder();
    pause_checked_again();
    save_files_request();
+   relative_root();
+   relative_root_kept();
+   relative_root_too_long();
+   relative_root_gone();
+   relative_root_save_as();
    rm_tree(ROOT);
    puts(failures ? "FAIL save_paths_test" : "PASS save_paths_test");
    return failures ? 1 : 0;

@@ -445,6 +445,8 @@ static bool runloop_netplay_saves_off = false;
  * (runloop_path_set_redirect), and whether that turned saves off. */
 static enum runloop_save_root runloop_save_roots[2];
 static bool runloop_save_folder_off = false;
+/* The main config file's folder, as last loaded */
+static char runloop_save_config_dir[PATH_MAX_LENGTH];
 /* The content's folders inside its archive ("" if none), which its
  * kept name and the old-folder lookup use. */
 static char runloop_archive_dir[DIR_MAX_LENGTH];
@@ -5978,19 +5980,23 @@ static void runloop_path_init_savefile_internal(runloop_state_t *runloop_st)
 }
 
 #ifdef HAVE_CLOUDSYNC
-/* A main config folder was the one not found: cloud sync waits for it. */
-static bool runloop_save_base_replaced(void)
+/* A main config folder was the one not found: cloud sync waits for it.
+ * @s is room for a folder. */
+static bool runloop_save_base_replaced(char *s, size_t len)
 {
    size_t i;
    for (i = 0; i < 2; i++)
    {
       const char *configured = dir_get_ptr(i
             ? RARCH_DIR_SAVESTATE_CONFIGURED : RARCH_DIR_SAVEFILE_CONFIGURED);
-      if (     runloop_save_roots[i] != RUNLOOP_SAVE_ROOT_CONFIGURED
-            && string_is_equal(dir_get_ptr(i
-                  ? RARCH_DIR_SAVESTATE_BASE : RARCH_DIR_SAVEFILE_BASE),
-               *configured ? configured : g_defaults.dirs[i
-                  ? DEFAULT_DIR_SAVESTATE : DEFAULT_DIR_SRAM]))
+      if (runloop_save_roots[i] == RUNLOOP_SAVE_ROOT_CONFIGURED)
+         continue;
+      strlcpy(s, *configured ? configured : g_defaults.dirs[i
+            ? DEFAULT_DIR_SAVESTATE : DEFAULT_DIR_SRAM], len);
+      if (*configured)
+         runloop_save_root_resolve(s, len);
+      if (string_is_equal(dir_get_ptr(i
+            ? RARCH_DIR_SAVESTATE_BASE : RARCH_DIR_SAVEFILE_BASE), s))
          return true;
    }
    return false;
@@ -6001,6 +6007,7 @@ static bool runloop_save_base_replaced(void)
 static void runloop_save_folder_notice(void)
 {
    char msg[DIR_MAX_LENGTH * 2 + 128];
+   char dir[DIR_MAX_LENGTH];
    size_t i;
    for (i = 0; i < 2; i++)
    {
@@ -6008,24 +6015,29 @@ static void runloop_save_folder_notice(void)
             ? RARCH_DIR_SAVESTATE_CONFIGURED : RARCH_DIR_SAVEFILE_CONFIGURED);
       if (runloop_save_roots[i] == RUNLOOP_SAVE_ROOT_CONFIGURED)
          continue;
+      strlcpy(dir, configured, sizeof(dir));
+      runloop_save_root_resolve(dir, sizeof(dir));
       if (runloop_save_roots[i] == RUNLOOP_SAVE_ROOT_FALLBACK)
          snprintf(msg, sizeof(msg),
                msg_hash_to_str(i
                   ? MSG_STATE_FOLDER_FALLBACK : MSG_SAVE_FOLDER_FALLBACK),
-               configured,
+               dir,
                dir_get_ptr(i ? RARCH_DIR_SAVESTATE : RARCH_DIR_SAVEFILE));
       else
          snprintf(msg, sizeof(msg),
                msg_hash_to_str(i
                   ? MSG_STATE_FOLDER_MISSING : MSG_SAVE_FOLDER_MISSING),
-               *configured ? configured : dir_get_ptr(i
+               *dir ? dir : dir_get_ptr(i
                   ? RARCH_DIR_SAVESTATE : RARCH_DIR_SAVEFILE));
-      RARCH_WARN("[SRAM] %s\n", msg);
+      if (string_is_equal(dir, configured))
+         RARCH_WARN("[SRAM] %s\n", msg);
+      else
+         RARCH_WARN("[SRAM] %s (\"%s\" -> \"%s\")\n", msg, configured, dir);
       runloop_msg_queue_push(msg, strlen(msg), 1, 180, true, NULL,
             MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
 #ifdef HAVE_CLOUDSYNC
       if (     config_get_ptr()->bools.cloud_sync_enable
-            && runloop_save_base_replaced())
+            && runloop_save_base_replaced(dir, sizeof(dir)))
       {
          const char *_msg = msg_hash_to_str(MSG_CLOUD_SYNC_PAUSED_FALLBACK);
          runloop_msg_queue_push(_msg, strlen(_msg), 1, 180, false, NULL,
@@ -11843,21 +11855,59 @@ void runloop_save_base_check(void)
 }
 #endif
 
+void runloop_save_root_set_config(const char *path)
+{
+   strlcpy(runloop_save_config_dir, path ? path : "",
+         sizeof(runloop_save_config_dir));
+   /* Absolute: a core's chdir() must not move it */
+   if (*runloop_save_config_dir)
+      path_resolve_realpath(runloop_save_config_dir,
+            sizeof(runloop_save_config_dir), false);
+   path_basedir(runloop_save_config_dir);
+}
+
+void runloop_save_root_resolve(char *s, size_t len)
+{
+   static bool logged = false;
+   char dir[DIR_MAX_LENGTH];
+   size_t _len = strlcpy(dir, s, sizeof(dir));
+   /* Not relative: "sd:/" (a console's device), "\saves" (a drive's root) */
+   if (     !*s
+         || !*runloop_save_config_dir
+         || path_is_absolute(s)
+         || PATH_CHAR_IS_SLASH(*s)
+         || strchr(s, ':')
+         || string_is_equal(s, "default"))
+      return;
+   /* Never a cut path */
+   if (     _len < sizeof(dir)
+         && strlen(runloop_save_config_dir) + _len + 1 < len)
+   {
+      fill_pathname_resolve_relative(s, runloop_save_config_dir, dir, len);
+      if (strlen(s) + 1 < len)
+         return;
+      strlcpy(s, dir, len);
+   }
+   if (!logged)
+      RARCH_WARN("[SRAM] Folder \"%s\" is too long under \"%s\"; "
+            "using it as written.\n", s, runloop_save_config_dir);
+   logged = true;
+}
+
 enum runloop_save_root runloop_save_root_check(char *s, size_t len,
       const char *configured, const char *def)
 {
    const char *dir = (configured && *configured) ? configured : def;
-   if (!dir || !*dir || runloop_save_root_usable(dir))
-   {
-      strlcpy(s, dir ? dir : "", len);
+   strlcpy(s, dir ? dir : "", len);
+   if (dir == configured)
+      runloop_save_root_resolve(s, len);
+   if (!*s || runloop_save_root_usable(s))
       return RUNLOOP_SAVE_ROOT_CONFIGURED;
-   }
    if (dir != def && def && *def && runloop_save_root_usable(def))
    {
       strlcpy(s, def, len);
       return RUNLOOP_SAVE_ROOT_FALLBACK;
    }
-   strlcpy(s, dir, len);
    return RUNLOOP_SAVE_ROOT_NONE;
 }
 
