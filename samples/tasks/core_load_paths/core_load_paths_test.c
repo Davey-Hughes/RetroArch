@@ -161,6 +161,18 @@ static bool refusal_queued(const char *core, bool *error)
    return found;
 }
 
+/* Equal but for the separators: RetroArch keeps a Windows path with
+ * backslashes */
+static bool same_path(const char *a, const char *b)
+{
+   if (!a || !b)
+      return false;
+   for (; *a && *b; a++, b++)
+      if (*a != *b && !(PATH_CHAR_IS_SLASH(*a) && PATH_CHAR_IS_SLASH(*b)))
+         return false;
+   return *a == *b;
+}
+
 static bool core_is(enum rarch_core_type type)
 {
    return runloop_state_get_ptr()->current_core_type == type
@@ -281,7 +293,7 @@ static bool nc_loaded(void)
    return !runloop_is_content_switching()
       &&  (runloop_st->flags & RUNLOOP_FLAG_HAS_SET_CORE)
       &&  runloop_st->explicit_current_core_type == CORE_TYPE_PLAIN
-      &&  string_is_equal(path_get(RARCH_PATH_CORE), nc_core)
+      &&  same_path(path_get(RARCH_PATH_CORE), nc_core)
       &&  path_is_empty(RARCH_PATH_CONTENT)
       &&  name && string_is_equal(name, "needs_content");
 }
@@ -328,7 +340,7 @@ static void mode_null_seed(void)
       pump(1);
    CHECK(is_plain(), "the startup load did not run again after the seed");
    CHECK(!quitting(), "RetroArch quits");
-   CHECK(string_is_equal(path_get(RARCH_PATH_CORE), seeded),
+   CHECK(same_path(path_get(RARCH_PATH_CORE), seeded),
          "another core runs");
 }
 
@@ -345,7 +357,7 @@ static void staged_trust(const char *core)
    CHECK(answer(CORE_WARNING_ALWAYS_TRUST), "Always Trust not taken");
    CHECK(wait_for(is_plain, 600), "Always Trust did not run the core");
    CHECK(!shown(), "the staged load's warning screen stayed after its answer");
-   CHECK(string_is_equal(path_get(RARCH_PATH_CORE), core),
+   CHECK(same_path(path_get(RARCH_PATH_CORE), core),
          "another core runs");
    load_quietly(core);
 }
@@ -376,7 +388,7 @@ static void mode_playlist(void)
    check_shown(1, "the warning screen did not outlast the refused Run");
    CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE), "Load Once not taken");
    CHECK(wait_for(is_plain, 600), "Load Once did not run the playlist entry");
-   CHECK(string_is_equal(path_get(RARCH_PATH_CONTENT), game),
+   CHECK(same_path(path_get(RARCH_PATH_CONTENT), game),
          "the re-run lost its content");
 }
 
@@ -496,7 +508,7 @@ static bool sub_restored(void)
          && string_is_equal(p_content->pending_subsystem_ident, "harness_sub")
          && p_content->pending_subsystem_rom_num == 1
          && p_content->pending_subsystem_roms[0]
-         && string_is_equal(p_content->pending_subsystem_roms[0], sub_game))
+         && same_path(p_content->pending_subsystem_roms[0], sub_game))
       || string_is_equal(path_get(RARCH_PATH_SUBSYSTEM), "harness_sub");
 }
 
@@ -577,7 +589,7 @@ static void mode_seed(void)
       pump(1);
    }
    CHECK(is_plain(), "the startup load did not run again after the seed");
-   CHECK(string_is_equal(path_get(RARCH_PATH_CORE), seeded),
+   CHECK(same_path(path_get(RARCH_PATH_CORE), seeded),
          "another core runs");
 }
 
@@ -648,7 +660,7 @@ static void mode_park_ends(void)
       CHECK(!runloop_is_content_switching(), "the ended park ran again");
       pump(1);
    }
-   CHECK(string_is_equal(path_get(RARCH_PATH_CORE), good_core),
+   CHECK(same_path(path_get(RARCH_PATH_CORE), good_core),
          "the parked core replaced the session");
 }
 
@@ -747,6 +759,7 @@ int main(int argc, char *argv[])
    static char env_home[400];
 #ifdef _WIN32
    static char env_appdata[400];
+   static char env_cores[400];
 #endif
    char cfg_path[300];
    char *rarch_argv[8]  = {0};
@@ -781,6 +794,11 @@ int main(int argc, char *argv[])
    /* The store's folder there */
    snprintf(env_appdata, sizeof(env_appdata), "APPDATA=%s", cfg_home);
    putenv(env_appdata);
+   /* The default cores folder, the seed's, is beside the program
+    * unless this names it */
+   snprintf(env_cores, sizeof(env_cores), "LIBRETRO_DIRECTORY=%s/cores",
+         ra_dir);
+   putenv(env_cores);
 #endif
    if (getenv("HARNESS_VERBOSE"))
       verbosity_enable();
