@@ -1172,6 +1172,7 @@ struct core_load_match
 {
    struct core_hash h;
    struct core_load_source src;
+   struct core_identity id;      /* the copy's, as the match began */
    uint8_t sha256[CORE_SHA256_LEN];
    core_file_t *copy;
    core_file_t *source;          /* open while it is hashed */
@@ -1199,7 +1200,8 @@ core_load_match_t *core_load_match_new(const char *copy_path,
       return NULL;
    m->src = *src;
    if (     !(m->copy_path = strdup(copy_path))
-         || !(m->copy      = core_file_open(copy_path)))
+         || !(m->copy      = core_file_open(copy_path))
+         || !core_file_identity(m->copy, &m->id))
       goto fail;
    /* No hash from its check: hash the running core's file, if it is
     * still the one loaded */
@@ -1217,12 +1219,13 @@ fail:
 
 int core_load_match_step(core_load_match_t *m)
 {
-   struct core_identity id;
-   core_file_t *f = m->source ? m->source : m->copy;
-   int step       = core_hash_step(&m->h, f);
+   core_file_t *f                 = m->source ? m->source : m->copy;
+   const struct core_identity *id = m->source ? &m->src.id : &m->id;
+   int step                       = core_hash_step(&m->h, f);
    if (step > 0)
       return 1;
-   if (step < 0 || !core_file_identity(f, &id) || m->h.done != id.size)
+   /* Written since the match began: not the bytes hashed */
+   if (step < 0 || !core_load_same_file(id, f) || m->h.done != id->size)
       return -1;
    m->hash_live = false;
    if (m->source)
@@ -1239,6 +1242,15 @@ int core_load_match_step(core_load_match_t *m)
 
 dylib_t core_load_match_load(core_load_match_t *m)
 {
+#ifndef ANDROID
+   /* Loaded by path outside Android: only while the path still names
+    * the copy hashed, unchanged */
+   core_file_t *f = core_file_open(m->copy_path);
+   bool same      = f && core_load_same_file(&m->id, f);
+   core_file_close(f);
+   if (!same)
+      return NULL;
+#endif
    return core_load_file(m->copy, m->copy_path);
 }
 

@@ -2266,6 +2266,47 @@ static void test_copy_not_a_load(void)
 }
 
 #ifndef _WIN32
+/* Files written in place while the match runs (Windows: its open files
+ * can't be): the copy after it matched isn't loaded, and a running
+ * core and copy rewritten alike don't match */
+static void test_copy_rewritten(void)
+{
+   dylib_t lib = NULL;
+   struct core_load_source src;
+   core_load_match_t *m = NULL;
+   char core[256];
+   char tmp[256];
+   start(false);
+   CHECK(put_core(core, "rw_libretro" LIB_EXT, 'a'));
+   strlcpy(tmp, TMP_DIR "/rw_copy" LIB_EXT, sizeof(tmp));
+   CHECK(trust(core));
+   CHECK(put_core(core, "rw_libretro" LIB_EXT, 'a'));
+   CHECK(core_load_check_stage_begin(core));
+   CHECK(stage_wait());
+   CHECK(!core_load_check_stage_take(core));
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_OPENED);
+   core_load_check_loaded();
+   /* Unmapped before its file is written */
+   if (lib)
+      dylib_close(lib);
+   CHECK(core_load_check_copy_source(core, &src) == CORE_LOAD_COPY_CHECK);
+   CHECK(copy_core(core, tmp));
+   CHECK((m = core_load_match_new(tmp, core, &src)) != NULL);
+   CHECK(m && match_all(m) == 0);
+   CHECK(rewrite_core(tmp));
+   CHECK(m && !core_load_match_load(m));
+   core_load_match_free(m);
+   src.hashed = false;
+   CHECK(copy_core(core, tmp));
+   CHECK((m = core_load_match_new(tmp, core, &src)) != NULL);
+   CHECK(rewrite_core(core));
+   CHECK(rewrite_core(tmp));
+   CHECK(m && match_all(m) == -1);
+   core_load_match_free(m);
+   core_load_check_unloaded();
+   stop();
+}
+
 /* A probe's quick pass while the stage's worker opens its core takes
  * the stage's place: the stage's own pass is still the one granted, so
  * run-ahead has its source (Windows: no record passes a core unhashed) */
@@ -2368,6 +2409,7 @@ int main(void)
 #endif
    test_copy_not_a_load();
 #ifndef _WIN32
+   test_copy_rewritten();
    test_stage_stale_quick();
 #endif
    /* Messages past OSD_MAX aren't kept for the counts above */
