@@ -90,6 +90,10 @@ bool task_content_load_pending(void);
  * after it: parks a core load for when its check passes or the user
  * answers the Security Warning */
 bool task_content_park_core_load(const char *core_path);
+/* After a refused probe of core_path from a user's action that can't
+ * park it: says it wasn't loaded and how to trust it. False when the
+ * check didn't refuse it. */
+bool task_content_core_refused_notify(const char *core_path);
 /* A startup load refused, or waiting for the first run's seed: runs
  * again from the dummy core, as a menu load, or with no menu as a
  * staged load that quits RetroArch if it fails */

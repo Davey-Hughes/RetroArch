@@ -2519,6 +2519,21 @@ bool task_content_park_core_load(const char *core_path)
    return false;
 }
 
+bool task_content_core_refused_notify(const char *core_path)
+{
+   char msg[NAME_MAX_LENGTH + 128];
+   if (!core_path || !core_load_check_refused(core_path))
+      return false;
+   RARCH_WARN("[Core] Not loading \"%s\": not trusted. Load it from Load Core and choose Always Trust to approve it.\n",
+         core_path);
+   snprintf(msg, sizeof(msg),
+         msg_hash_to_str(MSG_CORE_LOAD_REFUSED_LOAD_CORE),
+         path_basename_nocompression(core_path));
+   runloop_msg_queue_push(msg, strlen(msg), 2, 360, false, NULL,
+         MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+   return true;
+}
+
 #ifdef HAVE_MENU
 /* The startup load again, as a menu load: its startup-only options
  * (-H, --record, --entryslot, subsystems) aren't replayed */

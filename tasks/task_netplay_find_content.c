@@ -639,7 +639,17 @@ static void task_netplay_crc_scan_callback(retro_task_t *task,
             }
             else
             {
-               RARCH_ERR("[Lobby] Subsystem not found.\n");
+#ifdef HAVE_CORE_LOAD_CHECK
+               /* Held back by its check: the dummy core starts without
+                * it, as if it had never been set */
+               if (task_content_core_refused_notify(data->core))
+               {
+                  path_clear(RARCH_PATH_CORE);
+                  runloop_state_get_ptr()->flags &= ~RUNLOOP_FLAG_HAS_SET_CORE;
+               }
+               else
+#endif
+                  RARCH_ERR("[Lobby] Subsystem not found.\n");
 
                /* Disable netplay if we don't have the subsystem. */
                netplay_driver_ctl(RARCH_NETPLAY_CTL_DISABLE, NULL);
