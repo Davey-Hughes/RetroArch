@@ -956,7 +956,7 @@ static void core_load_park_result(const char *path, bool checked)
       return;
    if (!checked)
    {
-      core_load_park_drop();
+      core_load_park_fail();
       return;
    }
    p->c                = core_load_rt.slot.c;

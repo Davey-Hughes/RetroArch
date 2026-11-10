@@ -2273,11 +2273,20 @@ static void test_startup_refused(void)
    stop();
 }
 
+enum seed_park_change
+{
+   SEED_PARK_SAME = 0,
+   SEED_PARK_CHANGED,
+   SEED_PARK_CUT,     /* changed, and quitting cancels its check */
+   SEED_PARK_GONE
+};
+
 /* A first run's startup load held for the seed, with no menu to fall
  * back to: run again once the seed trusts it; refused after the seed,
  * it says how to approve the core and quits as a failed startup does.
- * With a menu it asks there instead. */
-static void startup_seed_park(bool menu, bool changed)
+ * With a menu it asks there instead. Not run for any other reason, it
+ * quits with no menu and leaves the menu up with one. */
+static void startup_seed_park(bool menu, enum seed_park_change change)
 {
    dylib_t lib = NULL;
    char store[64];
@@ -2309,16 +2318,30 @@ static void startup_seed_park(bool menu, bool changed)
     * trusted */
    while (core_trust_runtime_seed_pending())
       pump(1);
-   if (changed)
+   if (change == SEED_PARK_GONE)
+      CHECK(filestream_delete(core) == 0);
+   else if (change != SEED_PARK_SAME)
       CHECK(rewrite_core(core));
    opens = menu_opens;
+   if (change == SEED_PARK_CUT)
+   {
+      drain();
+      core_load_check_iterate();
+      CHECK(queued() == 1);
+      task_queue_reset();
+   }
    park_frames(2);
    drain();
    park_frames(20);
-   if (!changed)
+   if (change == SEED_PARK_SAME)
    {
       CHECK(reruns == 1);
       CHECK(rerun_id == 1);
+   }
+   else if (change != SEED_PARK_CHANGED)
+   {
+      CHECK(reruns == 0);
+      CHECK(menu_opens == opens);
    }
    else if (menu)
    {
@@ -2332,16 +2355,20 @@ static void startup_seed_park(bool menu, bool changed)
       CHECK(strstr(last_log, "Always Trust") != NULL);
    }
    CHECK(frees == 1);
-   CHECK(quits == ((changed && !menu) ? 1u : 0u));
+   CHECK(quits == ((change != SEED_PARK_SAME && !menu) ? 1u : 0u));
    menu_can_open = true;
    stop();
 }
 
 static void test_startup_seed_park(void)
 {
-   startup_seed_park(false, false);
-   startup_seed_park(false, true);
-   startup_seed_park(true, true);
+   startup_seed_park(false, SEED_PARK_SAME);
+   startup_seed_park(false, SEED_PARK_CHANGED);
+   startup_seed_park(true, SEED_PARK_CHANGED);
+   startup_seed_park(false, SEED_PARK_CUT);
+   startup_seed_park(true, SEED_PARK_CUT);
+   startup_seed_park(false, SEED_PARK_GONE);
+   startup_seed_park(true, SEED_PARK_GONE);
 }
 
 /* A copy of path as run-ahead makes one, a new file */
