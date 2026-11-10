@@ -977,8 +977,8 @@ enum core_load_gate core_load_check_open(const char *path, dylib_t *lib)
    {
       RARCH_LOG("[Core] Not loading \"%s\" before the first run's check of its folder.\n",
             path);
-      /* The seed can't finish before the frame loop: the startup load
-       * runs again once it has */
+      /* The startup load can't wait for the seed: it runs again once
+       * the seed is done */
       if (core_load_rt.startup)
          core_load_rt.startup_state = CORE_LOAD_STARTUP_SEED;
       goto end;
