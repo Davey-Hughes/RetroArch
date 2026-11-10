@@ -24,6 +24,9 @@
 #include "../../../runloop.h"
 #include "../../../tasks/tasks_internal.h"
 #include "../../../verbosity.h"
+#ifdef VERITY_STANDIN
+#include "../core_signature/core_signature_fixtures.h"
+#endif
 
 #define TMP_DIR "core_load_check_test_tmp"
 #ifdef _WIN32
@@ -1216,6 +1219,41 @@ int __wrap_ioctl(int fd, unsigned long req, ...)
    return __real_ioctl(fd, req, arg);
 }
 
+/* The build time of what Always Trust records */
+static uint64_t always_build_time;
+
+bool __real_core_trust_runtime_always(const struct core_check *c);
+
+bool __wrap_core_trust_runtime_always(const struct core_check *c)
+{
+   always_build_time = c->rec.build_time;
+   return __real_core_trust_runtime_always(c);
+}
+
+/* The core_signature harness's signed core and its .sig, as FX_NAME */
+static bool put_signed_core(char *s, size_t len)
+{
+   char sig[280];
+   unsigned long x = FX_CORE_SEED;
+   uint8_t *buf    = (uint8_t*)malloc(FX_CORE_SIZE);
+   bool ok         = false;
+   size_t i;
+   if (!buf)
+      return false;
+   for (i = 0; i < FX_CORE_SIZE; i++)
+   {
+      x      = (x * 1103515245UL + 12345UL) & 0xffffffffUL;
+      buf[i] = (uint8_t)(x >> 24);
+   }
+   strlcpy(s, TMP_DIR "/cores/" FX_NAME, len);
+   strlcpy(sig, s, sizeof(sig));
+   strlcat(sig, ".sig", sizeof(sig));
+   ok = filestream_write_file(s, buf, FX_CORE_SIZE)
+      && filestream_write_file(sig, fx_sig_good, sizeof(fx_sig_good));
+   free(buf);
+   return ok;
+}
+
 /* Not threaded: the check's handler runs on the main thread, where the
  * enable (a read of the whole core) must never run */
 static void test_verity_main_thread(void)
@@ -2186,34 +2224,45 @@ static void test_load_once_lasts(void)
    stop();
 }
 
-/* A first run's startup load of a core the pending seed covers */
 #ifdef VERITY_STANDIN
-/* Written over between its hash and the enable, then trusted: Always
- * Trust records the file as the kernel keeps it, so later loads pass
- * the quick check with no hash */
+/* A signed core written over between its hash and the enable, then
+ * trusted: Always Trust records the file as the kernel keeps it, with
+ * its digest and no signed build time, so later loads pass the quick
+ * check with no hash */
 static void test_verity_rewritten_always(void)
 {
    dylib_t lib                   = NULL;
    enum core_check_result result = CORE_CHECK_OK;
    char core[256];
+   struct core_identity id;
+   core_trust_set_t *s;
    unsigned n;
    start(true);
    park_reset();
-   CHECK(put_core(core, "verity_at_libretro" LIB_EXT, 'a'));
-   CHECK(trust(core));
-   CHECK(put_core(core, "verity_at_libretro" LIB_EXT, 'a'));
+   CHECK(put_signed_core(core, sizeof(core)));
    strlcpy(verity_write, core, sizeof(verity_write));
    verity_mode = 2;
    CHECK(park(core));
    drain();
    CHECK(core_warning_pending(NULL, &result));
    CHECK(result == CORE_CHECK_MODIFIED);
-   verity_mode = 1;
-   n           = hashes;
+   CHECK(path_identity(core, &id));
+   verity_mode       = 1;
+   n                 = hashes;
+   always_build_time = FX_TIME;
    CHECK(core_warning_choose(CORE_WARNING_ALWAYS_TRUST));
+   CHECK(always_build_time == 0);
    park_wait(1);
    CHECK(rerun_id == 3);
    drain();
+   CHECK((s = core_trust_runtime_get()) != NULL);
+   if (s)
+   {
+      CHECK(!core_trust_has_identity(s, &id, FX_NAME));
+      verity_digest(&id);
+      CHECK(core_trust_has_identity(s, &id, FX_NAME));
+      core_trust_set_put(s);
+   }
    core_load_check_deinit();
    CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_OPENED);
    CHECK(lib_id(lib) == 3);
@@ -2225,6 +2274,7 @@ static void test_verity_rewritten_always(void)
 }
 #endif
 
+/* A first run's startup load of a core the pending seed covers */
 static void test_startup_seed(void)
 {
    dylib_t lib = NULL;
