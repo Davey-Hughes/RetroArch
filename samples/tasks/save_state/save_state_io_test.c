@@ -427,10 +427,8 @@ static int      refuse_renames;
 static unsigned file_syncs;
 /* The next temp move in waits here: 1 armed, 2 waiting, 0 let go */
 static int      hold_temp_move;
-int __real_retro_vfs_file_rename_impl(const char *old_path,
-      const char *new_path);
-int __wrap_retro_vfs_file_rename_impl(const char *old_path,
-      const char *new_path)
+/* Holds or refuses a rename as the lane asks; false to refuse */
+static bool rename_allowed(const char *old_path, const char *new_path)
 {
    int    refuse = __atomic_load_n(&refuse_renames, __ATOMIC_RELAXED);
    int    armed  = 1;
@@ -447,8 +445,27 @@ int __wrap_retro_vfs_file_rename_impl(const char *old_path,
          || ((refuse & REFUSE_LAND)   &&  into &&  temp)
          || ((refuse & REFUSE_FINISH) && !into &&  temp)
          || ((refuse & REFUSE_BACK)   && !into &&  held))
+      return false;
+   return true;
+}
+int __real_retro_vfs_file_rename_impl(const char *old_path,
+      const char *new_path);
+int __wrap_retro_vfs_file_rename_impl(const char *old_path,
+      const char *new_path)
+{
+   if (!rename_allowed(old_path, new_path))
       return -1;
    return __real_retro_vfs_file_rename_impl(old_path, new_path);
+}
+/* A synced write's rename (a threaded queue) */
+int __real_retro_vfs_file_rename_synced_impl(const char *old_path,
+      const char *new_path);
+int __wrap_retro_vfs_file_rename_synced_impl(const char *old_path,
+      const char *new_path)
+{
+   if (!rename_allowed(old_path, new_path))
+      return -1;
+   return __real_retro_vfs_file_rename_synced_impl(old_path, new_path);
 }
 int __real_retro_vfs_file_sync_impl(libretro_vfs_implementation_file *stream);
 int __wrap_retro_vfs_file_sync_impl(libretro_vfs_implementation_file *stream)

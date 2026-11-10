@@ -2661,7 +2661,10 @@ static int win32_rename_replace_local(const char *old_local,
 }
 #endif
 
-int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
+/* @write_through: on Windows, the rename is on the disk before this
+ * returns (MOVEFILE_WRITE_THROUGH), as a synced write needs. */
+static int retro_vfs_file_rename_flags(const char *old_path,
+      const char *new_path, bool write_through)
 {
 #if defined(ANDROID) && defined(HAVE_SAF)
       if (path_is_saf(old_path) && path_is_saf(new_path))
@@ -2727,7 +2730,8 @@ int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
          if (new_path_wide)
          {
             if (MoveFileExW(old_path_wide, new_path_wide,
-                  MOVEFILE_REPLACE_EXISTING))
+                  MOVEFILE_REPLACE_EXISTING
+                  | (write_through ? MOVEFILE_WRITE_THROUGH : 0)))
                ret = 0;
             free(new_path_wide);
          }
@@ -2763,7 +2767,8 @@ int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
          if (new_path_wide)
          {
             if (MoveFileExW(old_path_wide, new_path_wide,
-                  MOVEFILE_REPLACE_EXISTING))
+                  MOVEFILE_REPLACE_EXISTING
+                  | (write_through ? MOVEFILE_WRITE_THROUGH : 0)))
                ret = 0;
             free(new_path_wide);
          }
@@ -2924,6 +2929,17 @@ int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
       return -1;
    return rename(old_path, new_path) == 0 ? 0 : -1;
 #endif
+}
+
+int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
+{
+   return retro_vfs_file_rename_flags(old_path, new_path, false);
+}
+
+int retro_vfs_file_rename_synced_impl(const char *old_path,
+      const char *new_path)
+{
+   return retro_vfs_file_rename_flags(old_path, new_path, true);
 }
 
 const char *retro_vfs_file_get_path_impl(

@@ -2571,8 +2571,18 @@ static char *filestream_aside_name(const char *path)
    return NULL;
 }
 
+/* A synced write's rename is on the disk too when it returns
+ * (MOVEFILE_WRITE_THROUGH on Windows). */
+static int filestream_rename_atomic(const char *old_path,
+      const char *new_path, bool sync)
+{
+   if (sync && !filestream_rename_cb)
+      return retro_vfs_file_rename_synced_impl(old_path, new_path);
+   return filestream_rename(old_path, new_path);
+}
+
 static int filestream_finish_atomic_internal(const char *path,
-      const char *suffix, bool ok)
+      const char *suffix, bool ok, bool sync)
 {
    char *temp_path;
 
@@ -2587,7 +2597,7 @@ static int filestream_finish_atomic_internal(const char *path,
       return -1;
    }
 
-   if (filestream_rename(temp_path, path) == 0)
+   if (filestream_rename_atomic(temp_path, path, sync) == 0)
    {
       free(temp_path);
       return 0;
@@ -2649,14 +2659,14 @@ static int filestream_finish_atomic_synced_internal(const char *path,
          ok = false;
    }
 
-   if ((ret = filestream_finish_atomic_internal(path, suffix, ok)) == 0)
+   if ((ret = filestream_finish_atomic_internal(path, suffix, ok, true)) == 0)
       filestream_sync_parent(path);
    return ret;
 }
 
 int filestream_finish_atomic(const char *path, bool ok)
 {
-   return filestream_finish_atomic_internal(path, ".tmp", ok);
+   return filestream_finish_atomic_internal(path, ".tmp", ok, false);
 }
 
 int filestream_finish_atomic_synced(const char *path, bool ok)
@@ -2671,7 +2681,7 @@ int filestream_finish_atomic_suffix(const char *path, const char *suffix,
       return -1;
    return sync
       ? filestream_finish_atomic_synced_internal(path, suffix, ok)
-      : filestream_finish_atomic_internal(path, suffix, ok);
+      : filestream_finish_atomic_internal(path, suffix, ok, false);
 }
 
 static bool filestream_write_file_atomic_internal(const char *path,
@@ -2687,7 +2697,10 @@ static bool filestream_write_file_atomic_internal(const char *path,
    ok = filestream_write(file, data, size) == size;
    if (ok && sync)
       ok = filestream_sync(file) == 0;
-   ret = filestream_commit_atomic(file, path, ok);
+   /* As filestream_commit_atomic(), passing @sync on to the rename */
+   if (filestream_close(file) != 0)
+      ok = false;
+   ret = filestream_finish_atomic_internal(path, ".tmp", ok, sync);
 
    /* Written but not renamed into place */
    if (ret == 1)

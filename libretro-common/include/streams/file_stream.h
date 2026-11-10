@@ -360,7 +360,9 @@ bool filestream_write_file_atomic(const char *path, const void *data, int64_t si
  * As filestream_write_file_atomic(), and the new contents are on the
  * storage device before they replace the old ones: the temporary file
  * is synced (filestream_sync()) before the rename and, on POSIX, its
- * folder after it, so a power loss leaves the old file or the new one.
+ * folder after it; on Windows the rename is written through
+ * (MOVEFILE_WRITE_THROUGH). A power loss leaves the old file or the
+ * new one.
  * A failed sync fails the write and leaves \c path as it was.
  *
  * Blocks until the disk has the data: for worker threads and for

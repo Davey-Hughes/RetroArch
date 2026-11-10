@@ -23,10 +23,13 @@
  *                           the rename; the plain one never does, nor
  *                           does a write through a frontend VFS; a
  *                           failed sync keeps the old file.
+ *   synced_rename_write_through - (Windows) the synced atomic writes
+ *                           rename with MOVEFILE_WRITE_THROUGH; the
+ *                           plain ones do not.
  *
  * vfs_implementation.c is compiled into this file so that its fopen
- * goes through a stand-in that can fail with EEXIST, and its syncs
- * through counting ones.
+ * goes through a stand-in that can fail with EEXIST, and its syncs and
+ * MoveFileExW through counting ones.
  */
 
 /* The *_impl functions and the VFS interface's callbacks share a
@@ -42,7 +45,9 @@
 #if defined(_WIN32)
 #include <windows.h>
 BOOL WINAPI test_flush_file_buffers(HANDLE h);
+BOOL WINAPI test_move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags);
 #define FlushFileBuffers test_flush_file_buffers
+#define MoveFileExW      test_move_file_ex_w
 #else
 #include <unistd.h>
 #include <fcntl.h>
@@ -63,6 +68,7 @@ void *test_fopen_utf8(const char *filename, const char *mode);
 #include "../../../vfs/vfs_implementation.c"
 #undef fopen_utf8
 #undef FlushFileBuffers
+#undef MoveFileExW
 #undef fsync
 #undef fdatasync
 #undef fcntl
@@ -95,12 +101,22 @@ static unsigned dir_syncs;
 static bool     fail_sync;
 
 #if defined(_WIN32)
+static unsigned moves;
+static DWORD    move_flags;    /* of the last MoveFileExW */
+
 BOOL WINAPI test_flush_file_buffers(HANDLE h)
 {
    if (fail_sync)
       return FALSE;
    file_syncs++;
    return FlushFileBuffers(h);
+}
+
+BOOL WINAPI test_move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags)
+{
+   moves++;
+   move_flags = flags;
+   return MoveFileExW(from, to, flags);
 }
 #else
 int test_fsync(int fd)
@@ -529,6 +545,51 @@ static void lane_atomic_synced_calls_sync(void)
    printf("[atomic_synced_calls_sync] done\n");
 }
 
+static void lane_synced_rename_write_through(void)
+{
+#if defined(_WIN32) && !defined(_XBOX)
+   clean();
+   put(TARGET, "old");
+   moves = 0;
+   CHECK(filestream_write_file_atomic(TARGET, "new", 3), "plain write failed");
+   CHECK(moves == 1 && !(move_flags & MOVEFILE_WRITE_THROUGH),
+         "the plain write renamed with MOVEFILE_WRITE_THROUGH");
+
+   moves = 0;
+   CHECK(filestream_write_file_atomic_synced(TARGET, "newer", 5),
+         "synced write failed");
+   CHECK(moves == 1 && (move_flags & MOVEFILE_WRITE_THROUGH)
+         && (move_flags & MOVEFILE_REPLACE_EXISTING),
+         "synced write: not renamed with MOVEFILE_WRITE_THROUGH");
+
+   moves = 0;
+   put(TEMP, "newest");
+   CHECK(filestream_finish_atomic_synced(TARGET, true) == 0,
+         "synced finish failed");
+   CHECK(moves == 1 && (move_flags & MOVEFILE_WRITE_THROUGH),
+         "synced finish: not renamed with MOVEFILE_WRITE_THROUGH");
+
+   moves = 0;
+   put(OWN_TEMP, "own");
+   CHECK(filestream_finish_atomic_suffix(TARGET, ".auto.tmp", true, true) == 0,
+         "synced suffix finish failed");
+   CHECK(moves == 1 && (move_flags & MOVEFILE_WRITE_THROUGH),
+         "synced suffix finish: not renamed with MOVEFILE_WRITE_THROUGH");
+
+   moves = 0;
+   put(TEMP, "plain");
+   CHECK(filestream_finish_atomic(TARGET, true) == 0, "plain finish failed");
+   CHECK(content_is(TARGET, "plain"), "plain finish content wrong");
+   CHECK(moves == 1 && !(move_flags & MOVEFILE_WRITE_THROUGH),
+         "the plain finish renamed with MOVEFILE_WRITE_THROUGH");
+
+   clean();
+   printf("[synced_rename_write_through] done\n");
+#else
+   printf("[synced_rename_write_through] skipped: Windows only\n");
+#endif
+}
+
 /* A temporary of the caller's own name: used instead of "<path>.tmp",
  * under the same rules. */
 static void lane_atomic_suffix(void)
@@ -594,6 +655,7 @@ int main(void)
    lane_windows_locked_rename();
    lane_ios_eexist_moves_aside();
    lane_atomic_synced_calls_sync();
+   lane_synced_rename_write_through();
    lane_atomic_suffix();
 
    if (failures)

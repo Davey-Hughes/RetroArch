@@ -103,6 +103,12 @@ int retro_vfs_file_remove_impl(const char *path);
 
 int retro_vfs_file_rename_impl(const char *old_path, const char *new_path);
 
+/* As retro_vfs_file_rename_impl(), and on Windows the rename is on the
+ * storage device before this returns (MOVEFILE_WRITE_THROUGH). Blocks
+ * on the disk: not for the frame loop. */
+int retro_vfs_file_rename_synced_impl(const char *old_path,
+      const char *new_path);
+
 const char *retro_vfs_file_get_path_impl(libretro_vfs_implementation_file *stream);
 
 /* Borrowed pointer to the whole file, when this stream is backed by a

@@ -786,6 +786,13 @@ int retro_vfs_file_rename_impl(const char* old_path, const char* new_path)
           std::filesystem::path(new_path), true);
 }
 
+/* MoveFileFromAppW takes no MOVEFILE_WRITE_THROUGH */
+int retro_vfs_file_rename_synced_impl(const char* old_path,
+      const char* new_path)
+{
+    return retro_vfs_file_rename_impl(old_path, new_path);
+}
+
 const char *retro_vfs_file_get_path_impl(libretro_vfs_implementation_file *stream)
 {
    /* Should never happen, do something noisy so caller can be fixed */
