@@ -217,19 +217,24 @@ static int lib_id(dylib_t lib)
    return fn ? fn() : 0;
 }
 
-/* What Always Trust records for path: its hash and identity */
-static bool trust(const char *path)
+/* What Always Trust records for path: its hash and identity. Its save
+ * is left queued. */
+static bool trust_queued(const char *path)
 {
    struct core_check c;
    size_t n            = 0;
    const uint8_t *keys = core_sig_builtin_keys(&n);
    core_trust_set_t *s = core_trust_runtime_get();
-   bool ok;
    if (!s)
       return false;
    core_check_file(s, keys, n, path, 0, &c);
    core_trust_set_put(s);
-   ok = core_trust_runtime_always(&c);
+   return core_trust_runtime_always(&c);
+}
+
+static bool trust(const char *path)
+{
+   bool ok = trust_queued(path);
    drain();
    return ok;
 }
@@ -1311,6 +1316,16 @@ static void park_wait(unsigned want_reruns)
    }
 }
 
+/* A few frames: enough for a park to re-run if it is going to */
+static void park_frames(unsigned n)
+{
+   while (n--)
+   {
+      core_load_check_iterate();
+      pump(1);
+   }
+}
+
 static unsigned osd_shown(enum msg_hash_enums msg)
 {
    char want[32];
@@ -1705,6 +1720,164 @@ static void test_park_deinit(void)
    stop();
 }
 
+/* Another core loads, opened as the startup load opens it (no task
+ * to wait on) */
+static void load_other(const char *path, int id)
+{
+   dylib_t lib = NULL;
+   core_load_check_set_startup(true);
+   CHECK(core_load_check_open(path, &lib) == CORE_LOAD_GATE_OPENED);
+   core_load_check_set_startup(false);
+   CHECK(lib_id(lib) == id);
+   core_load_check_loaded();
+   if (lib)
+      dylib_close(lib);
+   core_load_check_unloaded();
+}
+
+enum park_wait_kind
+{
+   PARK_IN_CHECK = 0,
+   PARK_IN_USER,
+   PARK_IN_IDLE,
+   PARK_IN_SEED
+};
+
+/* Another core loads while a park waits: the park ends as a Cancel
+ * would, and nothing re-runs over that core */
+static void park_other_load(enum park_wait_kind kind)
+{
+   char store[64];
+   char a[256];
+   char b[256];
+   unsigned opens;
+   void *buf   = NULL;
+   int64_t len = 0;
+   park_reset();
+   if (kind == PARK_IN_SEED)
+   {
+      task_queue_init(false, NULL);
+      sprintf(store, TMP_DIR "/trust_%u", ++store_n);
+      path_mkdir(TMP_DIR "/seed4");
+      path_mkdir(TMP_DIR "/cores");
+      strlcpy(a, TMP_DIR "/seed4/waits_libretro." CORE_EXT, sizeof(a));
+      CHECK(filestream_read_file("core_load_check_test_a" LIB_EXT,
+               &buf, &len));
+      CHECK(buf && filestream_write_file(a, buf, len));
+      free(buf);
+      CHECK(core_trust_runtime_init(store, TMP_DIR "/seed4", CORE_EXT));
+   }
+   else
+   {
+      start(false);
+      CHECK(put_core(a, "waits_a_libretro" LIB_EXT, 'a'));
+   }
+   CHECK(put_core(b, "loads_b_libretro" LIB_EXT, 'b'));
+   /* Running the queue would end the seed */
+   CHECK(kind == PARK_IN_SEED ? trust_queued(b) : trust(b));
+   opens = menu_opens;
+   CHECK(park(a));
+   switch (kind)
+   {
+      case PARK_IN_CHECK:
+         CHECK(queued() == 1);
+         break;
+      case PARK_IN_SEED:
+         CHECK(core_trust_runtime_seed_pending());
+         break;
+      case PARK_IN_USER:
+         drain();
+         CHECK(core_warning_pending(NULL, NULL));
+         break;
+      case PARK_IN_IDLE:
+         drain();
+         CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE));
+         /* Waits for a load on its way */
+         load_pending = true;
+         core_load_check_iterate();
+         CHECK(reruns == 0);
+         break;
+   }
+   load_other(b, 2);
+   CHECK(frees == 1);
+   /* A warning up for it closed through its Cancel: nothing to answer */
+   CHECK(!core_warning_pending(NULL, NULL));
+   CHECK(!core_warning_choose(CORE_WARNING_LOAD_ONCE));
+   load_pending = false;
+   drain();
+   park_frames(20);
+   CHECK(reruns == 0);
+   CHECK(frees == 1);
+   /* Its check, if one ran, ended quietly: no warning came of it */
+   if (kind != PARK_IN_USER && kind != PARK_IN_IDLE)
+      CHECK(menu_opens == opens);
+   stop();
+}
+
+static void test_park_other_load(void)
+{
+   park_other_load(PARK_IN_CHECK);
+   park_other_load(PARK_IN_USER);
+   park_other_load(PARK_IN_IDLE);
+   park_other_load(PARK_IN_SEED);
+}
+
+/* The parked core's own load keeps its park: a pass for it lets it
+ * load while the park waits, and the park still re-runs once */
+static void test_park_own_load(void)
+{
+   dylib_t lib = NULL;
+   char a[256];
+   start(false);
+   park_reset();
+   CHECK(put_core(a, "own_libretro" LIB_EXT, 'a'));
+   CHECK(trust(a));
+   CHECK(put_core(a, "own_libretro" LIB_EXT, 'a'));
+   CHECK(park(a));
+   /* Its check passes on the hash recorded; the re-run waits */
+   load_pending = true;
+   drain();
+   core_load_check_iterate();
+   CHECK(reruns == 0);
+   CHECK(core_load_check_open(a, &lib) == CORE_LOAD_GATE_OPENED);
+   CHECK(lib_id(lib) == 1);
+   core_load_check_loaded();
+   if (lib)
+      dylib_close(lib);
+   CHECK(frees == 0);
+   load_pending = false;
+   park_wait(1);
+   CHECK(reruns == 1);
+   CHECK(rerun_id == 1);
+   CHECK(frees == 1);
+   stop();
+}
+
+/* The refused load's fallback to the dummy core (the unload, and the
+ * dummy's probe of the core it stands for) leaves the park asking */
+static void test_park_fallback(void)
+{
+   dylib_t lib = NULL;
+   char a[256];
+   start(false);
+   park_reset();
+   CHECK(put_core(a, "fallback_libretro" LIB_EXT, 'a'));
+   CHECK(core_load_check_open(a, &lib) == CORE_LOAD_GATE_REFUSED);
+   CHECK(park(a));
+   drain();
+   CHECK(core_warning_pending(NULL, NULL));
+   core_load_check_unloaded();
+   CHECK(core_load_check_open(a, &lib) == CORE_LOAD_GATE_REFUSED);
+   CHECK(frees == 0);
+   CHECK(core_warning_pending(NULL, NULL));
+   CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE));
+   park_wait(1);
+   CHECK(reruns == 1);
+   CHECK(rerun_id == 1);
+   CHECK(frees == 1);
+   stop();
+}
+
 /* Load Once lasts until another core loads or a release. Its probes
  * pass after the unload where its identity binds it, as where only its
  * held file does (Windows), never for a file put there since */
@@ -1902,6 +2075,9 @@ int main(void)
    test_park_check_cancelled();
    test_park_no_check();
    test_park_deinit();
+   test_park_other_load();
+   test_park_own_load();
+   test_park_fallback();
    test_load_once_lasts();
    test_startup_seed();
    test_startup_refused();
