@@ -112,6 +112,7 @@ void win32_window_release_kept(void);
 #include "../core_info.h"
 #ifdef HAVE_CORE_LOAD_CHECK
 #include "../core_load_check.h"
+#include "../core_trust_runtime.h"
 #endif
 #include "../content.h"
 #include "../core.h"
@@ -2054,7 +2055,8 @@ enum content_load_after
    CONTENT_LOAD_AFTER_QUICK_MENU       = 1 << 4,
    CONTENT_LOAD_AFTER_QUICK_MENU_KEEP  = 1 << 5, /* without a menu flush */
    CONTENT_LOAD_AFTER_MENU_ON_FAIL     = 1 << 6, /* retroarch_menu_running */
-   CONTENT_LOAD_AFTER_DUMMY_IS_FAIL    = 1 << 7  /* the dummy core counts as failure */
+   CONTENT_LOAD_AFTER_DUMMY_IS_FAIL    = 1 << 7, /* the dummy core counts as failure */
+   CONTENT_LOAD_AFTER_QUIT_ON_FAIL     = 1 << 8  /* retroarch_main_quit_failure */
 };
 
 #ifdef HAVE_CORE_LOAD_CHECK
@@ -2326,6 +2328,9 @@ static void content_load_finish(struct content_load_job *job,
          && runloop_st->current_core_type == CORE_TYPE_DUMMY)
       ok = false;
 
+   if (!ok && (after & CONTENT_LOAD_AFTER_QUIT_ON_FAIL))
+      retroarch_main_quit_failure();
+
    if (ok)
    {
       if (after & CONTENT_LOAD_AFTER_HISTORY)
@@ -2431,12 +2436,15 @@ static void content_load_parked_run(void *ud)
       p_content->flags |= CONTENT_ST_FLAG_PENDING_SUBSYSTEM_INIT;
    }
    runloop_set_current_core_type(CORE_TYPE_PLAIN, true);
-#ifdef HAVE_MENU
    if (!content_load(&d->info, p_content, d->after, true))
-      retroarch_menu_running();
-#else
-   content_load(&d->info, p_content, d->after, true);
+   {
+      if (d->after & CONTENT_LOAD_AFTER_QUIT_ON_FAIL)
+         retroarch_main_quit_failure();
+#ifdef HAVE_MENU
+      else
+         retroarch_menu_running();
 #endif
+   }
 }
 
 /* What the re-run needs, taken before the core stage's dummy fallback
@@ -2521,14 +2529,24 @@ static void content_load_startup_rerun(void *ud)
    if (d->content_path)
       task_push_load_content_with_new_core_from_menu(d->core_path,
             d->content_path, &content_info, CORE_TYPE_PLAIN, NULL, NULL);
-   else
+   /* With no content, started only by a core that runs without it, as
+    * at startup; else loaded, waiting for content */
+   else if (task_push_load_new_core(d->core_path, NULL, &content_info,
+            CORE_TYPE_PLAIN, NULL, NULL)
+         && runloop_state_get_ptr()->system.load_no_content
+         && config_get_ptr()->bools.set_supports_no_game_enable)
       task_push_load_contentless_core_from_menu(d->core_path);
+   else
+      menu_state_get_ptr()->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH
+                                  |  MENU_ST_FLAG_PREVENT_POPULATE;
 }
+#endif
 
 bool task_content_park_startup(const char *core_path,
       const char *content_path)
 {
    struct content_load_parked *d = NULL;
+   core_load_rerun_t rerun       = content_load_parked_run;
    if (     !core_path || !*core_path
          || !core_load_check_refused(core_path)
          || !(d = (struct content_load_parked*)calloc(1, sizeof(*d))))
@@ -2536,13 +2554,27 @@ bool task_content_park_startup(const char *core_path,
    d->core_path    = strdup(core_path);
    d->content_path = (content_path && *content_path)
       ? strdup(content_path) : NULL;
-   if (core_load_check_park(d->core_path, content_load_startup_rerun,
+#ifdef HAVE_MENU
+   if (menu_core_warning_can_open())
+      rerun = content_load_startup_rerun;
+   else
+#endif
+   {
+      /* No menu: a staged load, as the menu's are; failing, it ends
+       * RetroArch, as the startup load would have */
+      d->info.environ_get = menu_content_environment_get;
+      d->after            = CONTENT_LOAD_AFTER_HISTORY
+                          | CONTENT_LOAD_AFTER_HISTORY_MENU
+                          | CONTENT_LOAD_AFTER_HISTORY_CLI
+                          | CONTENT_LOAD_AFTER_DUMMY_IS_FAIL
+                          | CONTENT_LOAD_AFTER_QUIT_ON_FAIL;
+   }
+   if (core_load_check_park(d->core_path, rerun,
             content_load_parked_free, d))
       return true;
    content_load_parked_free(d);
    return false;
 }
-#endif
 #endif
 
 /* Runs the job's current stage and moves it on. */

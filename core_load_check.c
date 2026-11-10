@@ -13,6 +13,7 @@
 #include "core_load_file.h"
 #include "core_trust_runtime.h"
 #include "msg_hash.h"
+#include "retroarch.h"
 #include "runloop.h"
 #include "tasks/task_content.h"
 #include "tasks/tasks_internal.h"
@@ -86,6 +87,7 @@ struct core_load_park
    char path[PATH_MAX_LENGTH];
    enum core_load_park_state state;
    unsigned serial;
+   bool startup;                /* the startup load's */
 };
 
 /* Opens the checked file on a worker: the loader maps the core and
@@ -711,6 +713,25 @@ static void core_load_check_refusal(const char *path,
       core_load_rt.refusal_held = true;
 }
 
+static bool core_load_check_can_ask(void)
+{
+#ifdef HAVE_MENU
+   return menu_core_warning_can_open();
+#else
+   return false;
+#endif
+}
+
+/* The parked load won't run. A startup load with no menu to fall back
+ * to then ends RetroArch, as its failure before the frame loop would. */
+static void core_load_park_fail(void)
+{
+   bool quit = core_load_rt.park.startup && !core_load_check_can_ask();
+   core_load_park_drop();
+   if (quit)
+      retroarch_main_quit_failure();
+}
+
 static void core_load_park_choice(enum core_warning_choice choice,
       const struct core_check *c, const char *core_path, void *userdata)
 {
@@ -768,7 +789,7 @@ static void core_load_park_answer(void)
       free(token);
    }
    core_load_check_refusal(p->path, p->c.result);
-   core_load_park_drop();
+   core_load_park_fail();
 }
 
 /* The park takes the slot's file g; the slot keeps the answer */
@@ -798,7 +819,7 @@ static void core_load_park_start(void)
             sizeof(core_load_rt.check_path))
          || !(f = core_file_open(core_load_rt.check_path)))
    {
-      core_load_park_drop();
+      core_load_park_fail();
       goto end;
    }
    if (core_check_quick(s, f, core_load_rt.check_path, &p->c))
@@ -839,7 +860,7 @@ static void core_load_park_start(void)
    p->state = CORE_LOAD_PARK_CHECK;
    /* No check will answer: ended, as a cancelled one ends it */
    if (!core_load_check_push(f, p->path, core_load_rt.check_path, &p->c))
-      core_load_park_drop();
+      core_load_park_fail();
    f = NULL;
 end:
    if (g && !lent)
@@ -1002,13 +1023,14 @@ enum core_load_gate core_load_check_open(const char *path, dylib_t *lib)
       if (ret == CORE_LOAD_GATE_REFUSED)
       {
          /* Asked from the menu the failure falls back to; with no menu
-          * it fails as before, saying why */
-#ifdef HAVE_MENU
-         if (menu_core_warning_can_open())
+          * it fails, saying why */
+         if (core_load_check_can_ask())
             core_load_rt.startup_state = CORE_LOAD_STARTUP_REFUSED;
          else
-#endif
+         {
             core_load_check_refusal(path, core_load_rt.slot.c.result);
+            core_load_rt.startup_state = CORE_LOAD_STARTUP_FAILED;
+         }
       }
       goto end;
    }
@@ -1208,6 +1230,7 @@ bool core_load_check_park(const char *path, core_load_rerun_t rerun,
     * that push, must not match this park */
    p->serial++;
    p->rerun    = rerun;
+   p->startup  = core_load_rt.startup;
    /* Set once parked: a drop during the start leaves userdata to the
     * caller (nothing re-runs before the next frame) */
    p->free_cb  = NULL;

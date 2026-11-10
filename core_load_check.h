@@ -61,7 +61,8 @@ typedef void (*core_load_rerun_t)(void *userdata);
 /* Parks a user-started load the check holds back. It re-runs once the
  * core passes, or after the user picks Load Once or Always Trust on
  * the Security Warning. With no menu to ask, the refusal message is
- * shown, or held until the drivers are up.
+ * shown, or held until the drivers are up, and a park the startup load
+ * made that can't run quits as a failed startup does.
  * True: free_cb(userdata) runs once, after the re-run or when the
  * request is dropped; it may run inside a warning's CANCEL, so it must
  * not push or choose a warning. A newer park replaces it, and another
@@ -84,7 +85,9 @@ enum core_load_startup
    /* The pending seed covers it: run again once the seed is done */
    CORE_LOAD_STARTUP_SEED,
    /* Refused, with a menu to ask on */
-   CORE_LOAD_STARTUP_REFUSED
+   CORE_LOAD_STARTUP_REFUSED,
+   /* Refused with no menu to ask on: the startup fails */
+   CORE_LOAD_STARTUP_FAILED
 };
 
 /* What a refused startup load left, for its failure path; read once */
