@@ -2541,19 +2541,26 @@ static void content_load_startup_rerun(void *ud)
 {
    struct content_load_parked *d   = (struct content_load_parked*)ud;
    content_ctx_info_t content_info = {0};
+   rarch_system_info_t *sys_info   = &runloop_state_get_ptr()->system;
    if (d->content_path)
       task_push_load_content_with_new_core_from_menu(d->core_path,
             d->content_path, &content_info, CORE_TYPE_PLAIN, NULL, NULL);
    /* With no content, started only by a core that runs without it, as
-    * at startup; else loaded, waiting for content */
-   else if (task_push_load_new_core(d->core_path, NULL, &content_info,
-            CORE_TYPE_PLAIN, NULL, NULL)
-         && runloop_state_get_ptr()->system.load_no_content
-         && config_get_ptr()->bools.set_supports_no_game_enable)
-      task_push_load_contentless_core_from_menu(d->core_path);
+    * at startup; else loaded, waiting for content. On the probe's word
+    * alone (it sets the flag only when it opens the core): a core
+    * outside the core info list starts at startup too. */
    else
-      menu_state_get_ptr()->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH
-                                  |  MENU_ST_FLAG_PREVENT_POPULATE;
+   {
+      sys_info->load_no_content = false;
+      task_push_load_new_core(d->core_path, NULL, &content_info,
+            CORE_TYPE_PLAIN, NULL, NULL);
+      if (     sys_info->load_no_content
+            && config_get_ptr()->bools.set_supports_no_game_enable)
+         task_push_load_contentless_core_from_menu(d->core_path);
+      else
+         menu_state_get_ptr()->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH
+                                     |  MENU_ST_FLAG_PREVENT_POPULATE;
+   }
 }
 #endif
 
