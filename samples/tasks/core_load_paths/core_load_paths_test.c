@@ -1,0 +1,737 @@
+/* Copyright (C) 2026 The RetroArch team
+ * SPDX-License-Identifier: GPL-3.0-or-later */
+/* Real loads through the load check: the shipping objects of a build
+ * with HAVE_CORE_LOAD_CHECK, the public test key, null drivers, rgui.
+ * One mode a run: a startup load happens once a process. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <boolean.h>
+#include <compat/strl.h>
+#include <features/features_cpu.h>
+#include <file/config_file.h>
+#include <file/file_path.h>
+#include <queues/task_queue.h>
+#include <retro_timers.h>
+#include <streams/file_stream.h>
+#include <string/stdstring.h>
+#include <time/rtime.h>
+
+#include "../../../command.h"
+#include "../../../configuration.h"
+#include "../../../content.h"
+#include "../../../core_load_check.h"
+#include "../../../core_trust_runtime.h"
+#include "../../../frontend/frontend.h"
+#include "../../../frontend/frontend_driver.h"
+#include "../../../menu/menu_driver.h"
+#include "../../../menu/menu_entries.h"
+#include "../../../menu/menu_setting.h"
+#include "../../../msg_hash.h"
+#include "../../../msg_hash_lbl_str.h"
+#include "../../../paths.h"
+#include "../../../retroarch.h"
+#include "../../../runloop.h"
+#include "../../../verbosity.h"
+#include "../../../tasks/task_content.h"
+#include "../../../tasks/tasks_internal.h"
+#if defined(HAVE_RUNAHEAD) && defined(HAVE_DYNAMIC) && defined(HAVE_THREADS)
+#include "../../../runahead.h"
+#endif
+
+static unsigned failures;
+#define CHECK(cond, what) do { if (!(cond)) { \
+   fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, what); \
+   failures++; } } while (0)
+
+static char dir[256];
+static char ext[16];
+static char good_core[400];   /* never trusted before the mode trusts it */
+static char bad_core[400];    /* another build: never trusted */
+static char nc_core[400];     /* needs content: never trusted */
+static char seeded[400];      /* in the first run's seed folder */
+static char game[400];
+static char sub_game[400];
+
+static void pump(unsigned n)
+{
+   while (n--)
+   {
+      runloop_iterate();
+      task_queue_check();
+   }
+}
+
+static bool warning_up(void)
+{
+   enum core_warning_kind kind;
+   enum core_check_result result;
+   return core_warning_pending(&kind, &result) && kind == CORE_WARNING_LOAD;
+}
+
+/* The Security Warning is the screen on top */
+static bool shown(void)
+{
+   const char *label = NULL;
+   menu_entries_get_last_stack(NULL, &label, NULL, NULL, NULL);
+   return string_is_equal(label, MENU_ENUM_LABEL_DEFERRED_CORE_WARNING_STR);
+}
+
+static bool core_is(enum rarch_core_type type)
+{
+   return runloop_state_get_ptr()->current_core_type == type
+      && !runloop_is_content_switching();
+}
+
+static bool is_plain(void) { return core_is(CORE_TYPE_PLAIN); }
+static bool is_dummy(void) { return core_is(CORE_TYPE_DUMMY); }
+
+static bool quitting(void)
+{
+   return (runloop_state_get_ptr()->flags
+         & RUNLOOP_FLAG_SHUTDOWN_INITIATED) != 0;
+}
+
+static bool wait_for(bool (*cond)(void), unsigned frames)
+{
+   while (frames--)
+   {
+      if (cond())
+         return true;
+      pump(1);
+   }
+   return cond();
+}
+
+/* The screen comes up within frames, or what is up instead is said */
+static void check_shown(unsigned frames, const char *what)
+{
+   const char *label = NULL;
+   if (wait_for(shown, frames))
+      return;
+   menu_entries_get_last_stack(NULL, &label, NULL, NULL, NULL);
+   CHECK(false, what);
+   fprintf(stderr, "  menu %s, on top \"%s\"\n",
+         (menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE) ? "up" : "down",
+         label ? label : "");
+}
+
+/* A load that must not ask: runs to its end with no warning */
+static void load_quietly(const char *core)
+{
+   unsigned i;
+   CHECK(task_push_load_contentless_core_from_menu(core),
+         "a trusted core's load was not started");
+   for (i = 0; i < 600 && runloop_is_content_switching(); i++)
+   {
+      CHECK(!warning_up(), "a trusted core asked");
+      pump(1);
+   }
+   pump(2);
+   CHECK(is_plain(), "a trusted core did not run");
+}
+
+static void write_file(const char *path)
+{
+   FILE *f = fopen(path, "wb");
+   if (!f)
+      return;
+   fputs("harness content", f);
+   fclose(f);
+}
+
+/* name, from beside argv0, to dst: a new file in a folder the user can
+ * write, so no exemption passes it */
+static bool copy_beside(const char *argv0, const char *name,
+      const char *dst)
+{
+   char src[600];
+   void *buf         = NULL;
+   int64_t len       = 0;
+   const char *slash = strrchr(argv0, '/');
+   bool ok;
+#ifdef _WIN32
+   const char *bslash = strrchr(argv0, '\\');
+   if (bslash && (!slash || bslash > slash))
+      slash = bslash;
+#endif
+   snprintf(src, sizeof(src), "%.*s/%s", slash ? (int)(slash - argv0) : 1,
+         slash ? argv0 : ".", name);
+   if (!filestream_read_file(src, &buf, &len))
+      return false;
+   ok = filestream_write_file(dst, buf, len);
+   free(buf);
+   return ok;
+}
+
+/* D2, Q2: -L of a core nothing passes is hashed in place, refused, and
+ * falls back to the dummy core and menu, asking there. The answer runs
+ * it as a normal startup would have, from the file checked. */
+static void mode_startup(enum core_warning_choice choice)
+{
+   CHECK(wait_for(warning_up, 120), "no Security Warning for the startup core");
+   check_shown(60, "the startup core's warning is not shown");
+   CHECK(core_warning_choose(choice), "the startup warning's answer was not taken");
+   CHECK(wait_for(is_plain, 600), "the answer did not run the startup core");
+   CHECK(!warning_up(), "the startup warning stayed after its answer");
+   /* Load Once lasts until another core loads */
+   load_quietly(bad_core);
+   if (choice != CORE_WARNING_ALWAYS_TRUST)
+      return;
+   /* After another core's load only the record passes it */
+   CHECK(task_push_load_contentless_core_from_menu(good_core), "not started");
+   CHECK(wait_for(warning_up, 600), "no Security Warning for the other core");
+   CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE), "Load Once not taken");
+   CHECK(wait_for(is_plain, 600), "Load Once did not run the other core");
+   load_quietly(bad_core);
+}
+
+/* Load Core's state: the core named and described, waiting for content,
+ * where a startup with --load-menu-on-error lands for a core that needs
+ * content (without it, that startup fails) */
+static bool nc_loaded(void)
+{
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   const char *name            = runloop_st->system.info.library_name;
+   return !runloop_is_content_switching()
+      &&  (runloop_st->flags & RUNLOOP_FLAG_HAS_SET_CORE)
+      &&  runloop_st->explicit_current_core_type == CORE_TYPE_PLAIN
+      &&  string_is_equal(path_get(RARCH_PATH_CORE), nc_core)
+      &&  path_is_empty(RARCH_PATH_CONTENT)
+      &&  name && string_is_equal(name, "needs_content");
+}
+
+static void mode_startup_needs_content(void)
+{
+   unsigned i;
+   bool loads = false;
+   CHECK(wait_for(warning_up, 120), "no Security Warning for the startup core");
+   CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE), "Load Once not taken");
+   /* As Load Core: the core is named, no load starts */
+   for (i = 0; i < 600 && !nc_loaded(); i++)
+   {
+      pump(1);
+      if (runloop_is_content_switching())
+         loads = true;
+   }
+   CHECK(!loads, "Load Once started a load of a core that needs content");
+   if (!nc_loaded())
+   {
+      const char *name = runloop_state_get_ptr()->system.info.library_name;
+      CHECK(false, "Load Once of a core that needs content did not land on the core loaded");
+      fprintf(stderr, "  core type %d, switching %d, core \"%s\", library \"%s\"\n",
+            (int)runloop_state_get_ptr()->current_core_type,
+            (int)runloop_is_content_switching(), path_get(RARCH_PATH_CORE),
+            name ? name : "");
+   }
+   pump(30);
+   CHECK(nc_loaded(), "the core loaded did not stay");
+   CHECK(!warning_up(), "the warning came back");
+   CHECK(menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE, "the menu is not up");
+   CHECK(!quitting(), "RetroArch quits");
+}
+
+/* With no menu to ask on, a startup load the pending seed holds back
+ * runs again once the seed has trusted its core */
+static void mode_null_seed(void)
+{
+   unsigned i;
+   for (i = 0; i < 1200 && !is_plain() && !quitting(); i++)
+      pump(1);
+   CHECK(is_plain(), "the startup load did not run again after the seed");
+   CHECK(!quitting(), "RetroArch quits");
+   CHECK(string_is_equal(path_get(RARCH_PATH_CORE), seeded),
+         "another core runs");
+}
+
+/* A staged load is refused and asks; the screen outlasts the menu its
+ * failed load returns to. Always Trust runs it and asks no more. */
+static void staged_trust(const char *core)
+{
+   CHECK(task_push_load_contentless_core_from_menu(core),
+         "the staged load was not started");
+   CHECK(wait_for(warning_up, 600), "no Security Warning for the staged load");
+   CHECK(wait_for(is_dummy, 120), "the refused load did not end on the dummy core");
+   pump(30);
+   check_shown(1, "the warning screen did not outlast the refused load");
+   CHECK(core_warning_choose(CORE_WARNING_ALWAYS_TRUST),
+         "Always Trust not taken");
+   CHECK(wait_for(is_plain, 600), "Always Trust did not run the core");
+   CHECK(string_is_equal(path_get(RARCH_PATH_CORE), core),
+         "another core runs");
+   load_quietly(core);
+}
+
+/* The check and the open on the task worker: the worker opens only the
+ * file the check passed */
+static void set_threaded(void)
+{
+   settings_t *settings = config_get_ptr();
+   configuration_set_bool(settings,
+         settings->bools.threaded_data_runloop_enable, true);
+   task_queue_set_threaded();
+}
+
+/* Decision 19: a playlist Run reaches CMD_EVENT_LOAD_CORE with no
+ * explicit core type; its refused open parks and asks all the same */
+static void mode_playlist(void)
+{
+   content_ctx_info_t info;
+   snprintf(game, sizeof(game), "%s/title.bin", dir);
+   write_file(game);
+   memset(&info, 0, sizeof(info));
+   CHECK(task_push_load_content_from_playlist_from_menu(bad_core, game,
+            "title", &info, NULL, NULL), "the playlist Run was not started");
+   CHECK(wait_for(warning_up, 600), "no Security Warning for the playlist Run");
+   CHECK(wait_for(is_dummy, 120), "the refused Run did not end on the dummy core");
+   pump(30);
+   check_shown(1, "the warning screen did not outlast the refused Run");
+   CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE), "Load Once not taken");
+   CHECK(wait_for(is_plain, 600), "Load Once did not run the playlist entry");
+   CHECK(string_is_equal(path_get(RARCH_PATH_CONTENT), game),
+         "the re-run lost its content");
+}
+
+/* The pending state as restored, or what the re-run's load set from it
+ * (content_set_subsystem_info()) if a later stage cleared it already */
+static bool sub_restored(void)
+{
+   content_state_t *p_content = content_state_get_ptr();
+   return ((p_content->flags & CONTENT_ST_FLAG_PENDING_SUBSYSTEM_INIT)
+         && string_is_equal(p_content->pending_subsystem_ident, "harness_sub")
+         && p_content->pending_subsystem_rom_num == 1
+         && p_content->pending_subsystem_roms[0]
+         && string_is_equal(p_content->pending_subsystem_roms[0], sub_game))
+      || string_is_equal(path_get(RARCH_PATH_SUBSYSTEM), "harness_sub");
+}
+
+/* Q10: the re-run restores the subsystem state it parked, not the one
+ * current then. The harness core loads no subsystem, so the re-run's
+ * load fails; what it restored is checked. */
+static void mode_subsystem(void)
+{
+   content_state_t *p_content = content_state_get_ptr();
+   content_ctx_info_t info;
+   snprintf(sub_game, sizeof(sub_game), "%s/sub.bin", dir);
+   write_file(sub_game);
+   memset(&info, 0, sizeof(info));
+   path_set(RARCH_PATH_CORE, bad_core);
+   content_clear_subsystem();
+   strlcpy(p_content->pending_subsystem_ident, "harness_sub",
+         sizeof(p_content->pending_subsystem_ident));
+   p_content->pending_subsystem_id      = 0;
+   p_content->pending_subsystem_rom_num = 1;
+   p_content->pending_subsystem_rom_id  = 1;
+   p_content->pending_subsystem_roms[0] = strdup(sub_game);
+   CHECK(task_push_load_subsystem_with_core(NULL, "sub", &info,
+            CORE_TYPE_PLAIN, NULL, NULL), "the subsystem load was not started");
+   CHECK(wait_for(warning_up, 600), "no Security Warning for the subsystem load");
+   CHECK(wait_for(is_dummy, 120), "the refused load did not end");
+   /* Anything in between may change the current state */
+   content_clear_subsystem();
+   path_clear(RARCH_PATH_SUBSYSTEM);
+   CHECK(!sub_restored(), "the subsystem state outlived its clear");
+   CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE), "Load Once not taken");
+   CHECK(wait_for(sub_restored, 600), "the re-run lost the parked subsystem state");
+}
+
+/* A probe is quiet; Load Core's park asks, through a tab switch's flush
+ * and a Quick Menu push; Cancel drops it. The Core row's own action
+ * probes quietly: the menu's OK on that row opens the core browser. */
+static void mode_probe(void)
+{
+   struct retro_system_info info;
+   rarch_setting_t *setting = NULL;
+   bool no_content          = false;
+   bool flush               = true;
+   CHECK(!libretro_get_system_info(bad_core, &info, &no_content),
+         "a probe opened an unchecked core");
+   pump(60);
+   CHECK(!warning_up(), "a probe asked");
+   CHECK(task_content_park_core_load(bad_core), "Load Core was not parked");
+   CHECK(wait_for(warning_up, 120), "no warning for the parked Load Core");
+   check_shown(60, "the parked Load Core's warning is not shown");
+   menu_entries_flush_stack(MENU_ENUM_LABEL_MAIN_MENU_STR, 0);
+   check_shown(60, "the warning did not come back after a menu flush");
+   menu_driver_ctl(RARCH_MENU_CTL_SET_PENDING_QUICK_MENU, &flush);
+   pump(10);
+   check_shown(60, "the warning did not come back after a Quick Menu push");
+   CHECK(core_warning_choose(CORE_WARNING_CANCEL), "Cancel not taken");
+   pump(10);
+   CHECK(!warning_up(), "the warning stayed after Cancel");
+   path_set(RARCH_PATH_CORE, bad_core);
+   setting = menu_setting_find_enum(MENU_ENUM_LABEL_CORE_LIST);
+   CHECK(setting && setting->actions && setting->actions->ok,
+         "no Core row");
+   if (setting && setting->actions && setting->actions->ok)
+      setting->actions->ok(setting, 0, false);
+   pump(60);
+   CHECK(!warning_up(), "the Core row's action asked");
+   CHECK(core_load_check_refused(bad_core),
+         "the Core row's action did not probe the core");
+}
+
+/* D6: the first run's seed decides, then the startup load runs again */
+static void mode_seed(void)
+{
+   unsigned i;
+   for (i = 0; i < 1200 && !is_plain(); i++)
+   {
+      CHECK(!warning_up(), "the seed's core asked");
+      pump(1);
+   }
+   CHECK(is_plain(), "the startup load did not run again after the seed");
+   CHECK(string_is_equal(path_get(RARCH_PATH_CORE), seeded),
+         "another core runs");
+}
+
+/* Close Content's reload of the core library: the dummy session
+ * carries the harness core's system info */
+static bool reloaded(void)
+{
+   const char *name = runloop_state_get_ptr()->system.info.library_name;
+   return is_dummy() && name && string_is_equal(name, "content_load_harness");
+}
+
+/* D8: Load Once lasts through Close Content and a load of that core
+ * again, until another core loads */
+static void mode_load_once(void)
+{
+   struct core_load_source src;
+   char cache[300];
+   unsigned i;
+   CHECK(task_push_load_contentless_core_from_menu(bad_core), "not started");
+   CHECK(wait_for(warning_up, 600), "no Security Warning for the staged load");
+   CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE), "Load Once not taken");
+   CHECK(wait_for(is_plain, 600), "Load Once did not run the core");
+   CHECK(core_load_check_copy_source(bad_core, &src) == CORE_LOAD_COPY_CHECK,
+         "the running core gives run-ahead no source");
+   /* A probe cache hit opens nothing: the reload must reach the check */
+   snprintf(cache, sizeof(cache), "%s/core_probe.cache", dir);
+   runloop_core_probe_cache_free();
+   remove(cache);
+   /* Close Content as the Quick Menu's does, with Load Core's last core */
+   if (!(menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE))
+      command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+   path_set(RARCH_PATH_CORE_LAST, bad_core);
+   menu_state_get_ptr()->flags |= MENU_ST_FLAG_PENDING_CLOSE_CONTENT;
+   for (i = 0; i < 600 && !reloaded(); i++)
+   {
+      CHECK(!warning_up(), "Close Content's reload asked");
+      pump(1);
+   }
+   CHECK(reloaded(), "the reload after Close Content was refused");
+   CHECK(core_load_check_copy_source(bad_core, &src) == CORE_LOAD_COPY_NONE,
+         "the closed core still counts as running");
+   load_quietly(bad_core);
+   /* Another core loads: the first one's Load Once ends */
+   CHECK(task_push_load_contentless_core_from_menu(good_core), "not started");
+   CHECK(wait_for(warning_up, 600), "no Security Warning for the other core");
+   CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE), "Load Once not taken");
+   CHECK(wait_for(is_plain, 600), "Load Once did not run the other core");
+   CHECK(task_push_load_contentless_core_from_menu(bad_core), "not started");
+   CHECK(wait_for(warning_up, 600), "Load Once outlived another core's load");
+   CHECK(core_warning_choose(CORE_WARNING_CANCEL), "Cancel not taken");
+   pump(10);
+}
+
+/* Any load but its own re-run ends a waiting park, as Cancel would */
+static void mode_park_ends(void)
+{
+   unsigned i;
+   staged_trust(good_core);
+   CHECK(task_push_load_contentless_core_from_menu(bad_core), "not started");
+   CHECK(wait_for(warning_up, 600), "no Security Warning for the other core");
+   CHECK(wait_for(is_dummy, 120), "the refused load did not end");
+   CHECK(task_push_load_contentless_core_from_menu(good_core),
+         "the trusted core's load was not started");
+   CHECK(wait_for(is_plain, 600), "the trusted core did not run");
+   CHECK(!warning_up(), "the parked core's warning outlived another load");
+   for (i = 0; i < 60; i++)
+   {
+      CHECK(!runloop_is_content_switching(), "the ended park ran again");
+      pump(1);
+   }
+   CHECK(string_is_equal(path_get(RARCH_PATH_CORE), good_core),
+         "the parked core replaced the session");
+}
+
+#if defined(HAVE_RUNAHEAD) && defined(HAVE_DYNAMIC) && defined(HAVE_THREADS)
+/* Until the copy task has an answer: it reads and writes the whole
+ * core file, which a loaded runner takes seconds over */
+static enum runahead_copy_status secondary_wait(runloop_state_t *runloop_st,
+      settings_t *settings)
+{
+   retro_time_t deadline = cpu_features_get_time_usec() + 10000000;
+   for (;;)
+   {
+      enum runahead_copy_status st =
+         secondary_core_ensure_exists(runloop_st, settings);
+      if (     st != RUNAHEAD_COPY_PENDING
+            || cpu_features_get_time_usec() > deadline)
+         return st;
+      task_queue_check();
+      retro_sleep(1);
+   }
+}
+
+/* Run-ahead's copy of a core trusted through its check: the copy
+ * matches and its second instance runs. bad_core is the build without
+ * a hardware context, which run-ahead's second instance needs. */
+static void mode_runahead(void)
+{
+   settings_t *settings        = config_get_ptr();
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   enum runahead_copy_status st;
+   set_threaded();
+   staged_trust(bad_core);
+   st = secondary_wait(runloop_st, settings);
+   CHECK(st == RUNAHEAD_COPY_READY,
+         "the copy of a trusted running core gave no instance");
+   CHECK(runloop_st->secondary_lib_handle
+         && runloop_st->secondary_lib_handle != runloop_st->lib_handle,
+         "no second instance");
+   runahead_secondary_core_destroy(runloop_st);
+}
+#endif
+
+/* What RetroArch makes in its config folder, deepest first */
+static const char *const made_dirs[] = {
+   "autoconfig", "cheats/content_load_harness", "cheats", "config/remaps",
+   "config", "cores", "database/rdb", "database", "downloads",
+   "filters/audio", "filters/video", "filters", "logs",
+   "overlays/keyboards", "overlays", "playlists", "records",
+   "records_config", "saves", "screenshots", "shaders", "states",
+   "system", "thumbnails"
+};
+
+static void remove_in(const char *in, const char *name)
+{
+   char path[800];
+   snprintf(path, sizeof(path), "%s/%s", in, name);
+   remove(path);
+}
+
+int main(int argc, char *argv[])
+{
+   static char env_xdg[400];
+   static char env_home[400];
+   char cfg_path[300];
+   char cfg_home[300];
+   char ra_dir[320];
+   char cores[340];
+   char *rarch_argv[8]  = {0};
+   int rarch_argc       = 0;
+   const char *mode     = argc > 1 ? argv[1] : "";
+   const char *tmp      = getenv("TMPDIR");
+   bool startup_dummy   = false;
+   bool no_menu         = string_is_equal(mode, "null-seed")
+                       || string_is_equal(mode, "null-refused");
+   bool inited;
+   FILE *cfg;
+
+   if (!tmp || !*tmp)
+      tmp = getenv("TEMP");
+   if (!tmp || !*tmp)
+      tmp = "/tmp";
+   snprintf(dir, sizeof(dir), "%s/core_load_paths_%ld", tmp, (long)getpid());
+   snprintf(cfg_home, sizeof(cfg_home), "%s/cfg", dir);
+   snprintf(ra_dir, sizeof(ra_dir), "%s/retroarch", cfg_home);
+   snprintf(cores, sizeof(cores), "%s/cores", dir);
+   if (!path_mkdir(cfg_home) || !path_mkdir(cores))
+      return 1;
+   /* A fresh trust store and default cores folder for every mode */
+   snprintf(env_xdg, sizeof(env_xdg), "XDG_CONFIG_HOME=%s", cfg_home);
+   snprintf(env_home, sizeof(env_home), "HOME=%s", cfg_home);
+   putenv(env_xdg);
+   putenv(env_home);
+   if (getenv("HARNESS_VERBOSE"))
+      verbosity_enable();
+
+   config_file_set_io_default(config_file_io_filestream());
+   rtime_init();
+   retroarch_config_init();
+   retroarch_ctl(RARCH_CTL_STATE_FREE, NULL);
+   frontend_driver_init_first(NULL);
+   runloop_msg_queue_init();
+
+   /* The seed walks only files with the platform's core extension */
+   if (!frontend_driver_get_core_extension(ext, sizeof(ext)))
+      strlcpy(ext, "so", sizeof(ext));
+   snprintf(good_core, sizeof(good_core), "%s/good_libretro.%s", cores, ext);
+   snprintf(bad_core, sizeof(bad_core), "%s/bad_libretro.%s", cores, ext);
+   snprintf(nc_core, sizeof(nc_core), "%s/nc_libretro.%s", cores, ext);
+   if (     !copy_beside(argv[0], "harness_core.so", good_core)
+         || !copy_beside(argv[0], "harness_core_b.so", bad_core)
+         || !copy_beside(argv[0], "needs_content_core.so", nc_core))
+   {
+      fprintf(stderr, "FAIL: no harness cores beside %s: build.sh builds them\n",
+            argv[0]);
+      return 1;
+   }
+
+   snprintf(cfg_path, sizeof(cfg_path), "%s/harness.cfg", dir);
+   if (!(cfg = fopen(cfg_path, "wb")))
+      return 1;
+   fprintf(cfg, "video_driver = \"null\"\n");
+   fprintf(cfg, "audio_driver = \"null\"\n");
+   fprintf(cfg, "audio_enable = \"false\"\n");
+   fprintf(cfg, "microphone_enable = \"false\"\n");
+   fprintf(cfg, "input_driver = \"null\"\n");
+   fprintf(cfg, "input_joypad_driver = \"test\"\n");
+   fprintf(cfg, "menu_driver = \"%s\"\n", no_menu ? "null" : "rgui");
+   fprintf(cfg, "video_threaded = \"false\"\n");
+   fprintf(cfg, "video_vsync = \"false\"\n");
+   fprintf(cfg, "menu_pause_libretro = \"true\"\n");
+   fprintf(cfg, "pause_nonactive = \"false\"\n");
+   fprintf(cfg, "gamemode_enable = \"false\"\n");
+   fprintf(cfg, "suspend_screensaver_enable = \"false\"\n");
+   fprintf(cfg, "config_save_on_exit = \"false\"\n");
+   fprintf(cfg, "savestate_auto_save = \"false\"\n");
+   fprintf(cfg, "history_list_enable = \"false\"\n");
+   fprintf(cfg, "sort_savefiles_enable = \"false\"\n");
+   fprintf(cfg, "sort_savestates_enable = \"false\"\n");
+   fprintf(cfg, "menu_show_load_content_animation = \"false\"\n");
+   fprintf(cfg, "threaded_data_runloop_enable = \"false\"\n");
+   fprintf(cfg, "libretro_info_path = \"%s\"\n", dir);
+   fprintf(cfg, "savefile_directory = \"%s\"\n", dir);
+   fprintf(cfg, "savestate_directory = \"%s\"\n", dir);
+   fclose(cfg);
+
+   rarch_argv[rarch_argc++] = (char*)"retroarch";
+   rarch_argv[rarch_argc++] = (char*)"--config";
+   rarch_argv[rarch_argc++] = cfg_path;
+   if (     string_is_equal(mode, "startup")
+         || string_is_equal(mode, "startup-always")
+         || string_is_equal(mode, "null-refused"))
+   {
+      rarch_argv[rarch_argc++] = (char*)"-L";
+      rarch_argv[rarch_argc++] = bad_core;
+      startup_dummy            = true;
+   }
+   else if (string_is_equal(mode, "startup-needs-content"))
+   {
+      rarch_argv[rarch_argc++] = (char*)"-L";
+      rarch_argv[rarch_argc++] = nc_core;
+      startup_dummy            = true;
+   }
+   else if (string_is_equal(mode, "seed") || string_is_equal(mode, "null-seed"))
+   {
+      /* In the default cores folder, which the first run's seed walks */
+      snprintf(seeded, sizeof(seeded), "%s/cores", ra_dir);
+      path_mkdir(seeded);
+      strlcat(seeded, "/seeded_libretro.", sizeof(seeded));
+      strlcat(seeded, ext, sizeof(seeded));
+      if (!copy_beside(argv[0], "harness_core.so", seeded))
+         return 1;
+      rarch_argv[rarch_argc++] = (char*)"-L";
+      rarch_argv[rarch_argc++] = seeded;
+      startup_dummy            = true;
+   }
+
+   retroarch_user_dirs_hold();
+   {
+      /* As rarch_main() starts: the one load the check hashes in place */
+      frontend_ctx_driver_t *frontend = frontend_state_get_ptr()->current_frontend_ctx;
+      content_ctx_info_t info;
+      info.argc        = rarch_argc;
+      info.argv        = rarch_argv;
+      info.args        = NULL;
+      info.environ_get = frontend ? frontend->environment_get : NULL;
+      inited           = task_push_load_content_from_cli(NULL, NULL, &info,
+            CORE_TYPE_PLAIN, NULL, NULL);
+   }
+   if (string_is_equal(mode, "null-refused"))
+      /* Refused with no menu to ask on: the startup fails */
+      CHECK(!inited, "a refused startup load with no menu did not fail");
+   else if (!inited)
+   {
+      fprintf(stderr, "FAIL: the startup failed\n");
+      failures++;
+   }
+   else
+   {
+      /* Before any frame: nothing can have run it again yet */
+      if (startup_dummy)
+         CHECK(is_dummy(), "the held back startup core did not fall back to the dummy core");
+      pump(5);
+      if (!core_trust_runtime_active())
+      {
+         fprintf(stderr, "FAIL: no trust store: build with build.sh\n");
+         failures++;
+      }
+      else if (string_is_equal(mode, "startup"))
+         mode_startup(CORE_WARNING_LOAD_ONCE);
+      else if (string_is_equal(mode, "startup-always"))
+         mode_startup(CORE_WARNING_ALWAYS_TRUST);
+      else if (string_is_equal(mode, "startup-needs-content"))
+         mode_startup_needs_content();
+      else if (string_is_equal(mode, "null-seed"))
+         mode_null_seed();
+      else if (string_is_equal(mode, "staged"))
+         staged_trust(bad_core);
+      else if (string_is_equal(mode, "staged-threaded"))
+      {
+         set_threaded();
+         staged_trust(bad_core);
+      }
+      else if (string_is_equal(mode, "playlist"))
+         mode_playlist();
+      else if (string_is_equal(mode, "subsystem"))
+         mode_subsystem();
+      else if (string_is_equal(mode, "probe"))
+         mode_probe();
+      else if (string_is_equal(mode, "seed"))
+         mode_seed();
+      else if (string_is_equal(mode, "load-once"))
+         mode_load_once();
+      else if (string_is_equal(mode, "park-ends"))
+         mode_park_ends();
+      else if (string_is_equal(mode, "runahead"))
+#if defined(HAVE_RUNAHEAD) && defined(HAVE_DYNAMIC) && defined(HAVE_THREADS)
+         mode_runahead();
+#else
+         fprintf(stderr, "runahead: not in this build\n");
+#endif
+      else
+      {
+         fprintf(stderr, "FAIL: mode \"%s\"\n", mode);
+         failures++;
+      }
+      main_exit(NULL);
+      /* Nothing a session refused, parked or held outlives it */
+      if (string_is_equal(mode, "probe"))
+         CHECK(!core_load_check_refused(bad_core),
+               "the load check's state outlived main_exit");
+   }
+
+   remove(good_core);
+   remove(bad_core);
+   remove(nc_core);
+   rmdir(cores);
+   if (*seeded)
+      remove(seeded);
+   remove_in(ra_dir, CORE_TRUST_FILE_NAME);
+   remove_in(ra_dir, CORE_TRUST_FILE_NAME ".testkey");
+   {
+      size_t i;
+      for (i = 0; i < sizeof(made_dirs) / sizeof(made_dirs[0]); i++)
+      {
+         snprintf(cores, sizeof(cores), "%s/%s", ra_dir, made_dirs[i]);
+         rmdir(cores);
+      }
+   }
+   rmdir(ra_dir);
+   rmdir(cfg_home);
+   remove_in(dir, "harness.cfg");
+   remove_in(dir, "title.bin");
+   remove_in(dir, "sub.bin");
+   remove_in(dir, "core_probe.cache");
+   remove_in(dir, "core_info.cache");
+   rmdir(dir);
+
+   fprintf(stderr, "%s: %u failures\n", mode, failures);
+   return failures ? 1 : 0;
+}

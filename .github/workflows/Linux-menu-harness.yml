@@ -37,6 +37,14 @@ on:
       - 'samples/menu/core_info_page/**'
       - 'samples/menu/load_content_filter/**'
       - 'samples/menu/core_warning/**'
+      - 'samples/tasks/core_load_paths/**'
+      - 'samples/tasks/content_load/harness_core.c'
+      - 'core_load_check.c'
+      - 'core_load_check.h'
+      - 'core_load_file.c'
+      - 'core_load_file.h'
+      - 'runahead.c'
+      - 'retroarch.c'
       - 'core_trust_runtime.c'
       - 'core_trust_runtime.h'
       - 'core_signature.c'
@@ -67,6 +75,14 @@ on:
       - 'samples/menu/core_info_page/**'
       - 'samples/menu/load_content_filter/**'
       - 'samples/menu/core_warning/**'
+      - 'samples/tasks/core_load_paths/**'
+      - 'samples/tasks/content_load/harness_core.c'
+      - 'core_load_check.c'
+      - 'core_load_check.h'
+      - 'core_load_file.c'
+      - 'core_load_file.h'
+      - 'runahead.c'
+      - 'retroarch.c'
       - 'core_trust_runtime.c'
       - 'core_trust_runtime.h'
       - 'core_signature.c'
@@ -156,7 +172,8 @@ jobs:
                       --disable-opengl --disable-opengl_core \
                       --disable-opengl1 --disable-vulkan \
                       --disable-cheevos \
-                      --disable-ffmpeg
+                      --disable-ffmpeg \
+                      --enable-core_load_check
           make -j$(nproc)
 
       - name: Build and run content_closing_test
@@ -459,6 +476,22 @@ jobs:
           samples/menu/core_warning/build.sh
           ./samples/menu/core_warning/core_warning_test
           make -C samples/menu/core_warning clean
+
+      - name: Build and run core_load_paths_test
+        shell: bash
+        run: |
+          set -eu
+          # Real loads through the load check, on this build with the
+          # public test key: a startup -L checked in place and answered
+          # from the menu (Load Once, Always Trust, a core that needs
+          # content) or with no menu, staged loads with and without a
+          # task worker, a playlist Run, a parked subsystem load, a quiet
+          # probe and a parked Load Core, the first run's seed, run-ahead's
+          # copy, Load Once lasting through Close Content until another
+          # core loads, and another load ending a waiting park.
+          samples/tasks/core_load_paths/build.sh
+          make -C samples/tasks/core_load_paths check
+          make -C samples/tasks/core_load_paths clean
 
       - name: Build and run explore_build_test
         shell: bash
