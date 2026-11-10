@@ -1787,7 +1787,14 @@ bool companion_core_load_core(companion_core_t *core, const char *path)
 
    core_info_init_current_core();
 
+#ifdef HAVE_CORE_LOAD_CHECK
+   if (command_event(CMD_EVENT_LOAD_CORE, NULL))
+      return true;
+   task_content_park_core_load(path);
+   return false;
+#else
    return command_event(CMD_EVENT_LOAD_CORE, NULL);
+#endif
 #else
    (void)core;
    (void)path;
