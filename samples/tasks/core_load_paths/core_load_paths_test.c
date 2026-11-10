@@ -998,6 +998,8 @@ int main(int argc, char *argv[])
       CHECK(!inited, "a refused startup load with no menu did not fail");
       CHECK(core_load_check_refused(bad_core),
             "the startup failed, but not on the check's refusal");
+      /* As the process's exit would: Windows deletes no open file */
+      core_load_check_deinit();
    }
    else if (!inited)
    {
