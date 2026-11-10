@@ -2293,8 +2293,9 @@ enum seed_park_change
 /* A first run's startup load held for the seed, with no menu to fall
  * back to: run again once the seed trusts it; refused after the seed,
  * it says how to approve the core and quits as a failed startup does.
- * With a menu it asks there instead. Not run for any other reason, it
- * quits with no menu and leaves the menu up with one. */
+ * With a menu it asks there instead. Its check cut off by quitting, it
+ * is only dropped; not run for any other reason, it quits with no menu
+ * and leaves the menu up with one. */
 static void startup_seed_park(bool menu, enum seed_park_change change)
 {
    dylib_t lib = NULL;
@@ -2364,7 +2365,8 @@ static void startup_seed_park(bool menu, enum seed_park_change change)
       CHECK(strstr(last_log, "Always Trust") != NULL);
    }
    CHECK(frees == 1);
-   CHECK(quits == ((change != SEED_PARK_SAME && !menu) ? 1u : 0u));
+   CHECK(quits == ((!menu && (change == SEED_PARK_CHANGED
+               || change == SEED_PARK_GONE)) ? 1u : 0u));
    menu_can_open = true;
    stop();
 }

@@ -956,7 +956,8 @@ static void core_load_park_result(const char *path, bool checked)
       return;
    if (!checked)
    {
-      core_load_park_fail();
+      /* Only quitting cancels a check: the quit sets the exit status */
+      core_load_park_drop();
       return;
    }
    p->c                = core_load_rt.slot.c;
