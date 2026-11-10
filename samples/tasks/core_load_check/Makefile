@@ -59,7 +59,7 @@ else
       # core_load_check.c, against stand-ins for the kernel's
       CFLAGS  += -DVERITY_STANDIN
       LDFLAGS += -Wl,--wrap=core_file_verity_enable \
-                 -Wl,--wrap=core_file_verity_measure
+                 -Wl,--wrap=core_file_verity_measure -Wl,--wrap=ioctl
       $(SAMPLE_OBJDIR)/__/__/__/core_load_check.o: CFLAGS += -D__ANDROID__
    endif
 endif

@@ -311,17 +311,17 @@ static void core_load_check_verity_end(struct core_load_check_task *t,
    else
    {
       core_hash_final(&t->h, sha256);
+      /* Enabling may move ctime: the file as it is now, recorded, or
+       * if it changed, what Always Trust records */
+      if (     !core_file_identity(t->f, &t->c.rec.id)
+            || !core_file_verity_measure(t->f, &t->c.rec.id))
+         t->c.record = false;
       if (!memcmp(sha256, t->c.rec.sha256, sizeof(sha256)))
-      {
-         /* Enabling may move ctime: record the file as it is now */
-         if (     !core_file_identity(t->f, &t->c.rec.id)
-               || !core_file_verity_measure(t->f, &t->c.rec.id))
-            t->c.record = false;
          return;
-      }
       /* Changed since its hash and now kept so: a Load Once opens
        * these bytes, so Always Trust takes their hash */
       memcpy(t->c.rec.sha256, sha256, sizeof(sha256));
+      t->c.rec.build_time = 0;
       RARCH_WARN("[Core] \"%s\" changed while it was checked.\n", t->path);
    }
    t->c.result       = (step < 0) ? CORE_CHECK_ERROR : CORE_CHECK_MODIFIED;

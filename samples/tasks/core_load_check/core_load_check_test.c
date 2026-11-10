@@ -3,6 +3,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef VERITY_STANDIN
+#include <stdarg.h>
+#include <stdint.h>
+#include <sys/ioctl.h>
+#endif
 
 #include <compat/strl.h>
 #include <dynamic/dylib.h>
@@ -1156,10 +1161,12 @@ static void test_stage_rewritten(void)
  * hash and the enable */
 static int verity_mode;
 static char verity_write[256];
+static unsigned verity_enables;
 
 int __wrap_core_file_verity_enable(core_file_t *f)
 {
    (void)f;
+   verity_enables++;
    if (verity_mode == 2 && !rewrite_core(verity_write))
       return -1;
    return verity_mode ? 1 : 0;
@@ -1177,6 +1184,73 @@ bool __wrap_core_file_verity_measure(core_file_t *f,
    (void)f;
    verity_digest(id);
    return true;
+}
+
+/* The quick check's measure, made inside core_signature_io.c, reaches
+ * the kernel through ioctl: while fs-verity is on, every file measures
+ * as verity_digest() */
+struct verity_head
+{
+   uint16_t alg;
+   uint16_t size;
+};
+
+int __real_ioctl(int fd, unsigned long req, ...);
+
+int __wrap_ioctl(int fd, unsigned long req, ...)
+{
+   va_list ap;
+   void *arg;
+   va_start(ap, req);
+   arg = va_arg(ap, void*);
+   va_end(ap);
+   if (verity_mode && req == (unsigned long)_IOWR('f', 134,
+            struct verity_head))
+   {
+      struct verity_head *h = (struct verity_head*)arg;
+      h->alg  = 1;
+      h->size = 32;
+      memset(h + 1, 0x5a, 32);
+      return 0;
+   }
+   return __real_ioctl(fd, req, arg);
+}
+
+/* Not threaded: the check's handler runs on the main thread, where the
+ * enable (a read of the whole core) must never run */
+static void test_verity_main_thread(void)
+{
+   dylib_t lib = NULL;
+   char core[256];
+   struct core_identity id;
+   core_trust_set_t *s;
+   start(false);
+   CHECK(put_core(core, "verity_main_libretro" LIB_EXT, 'a'));
+   CHECK(trust(core));
+   CHECK(put_core(core, "verity_main_libretro" LIB_EXT, 'a'));
+   CHECK(path_identity(core, &id));
+   verity_mode    = 1;
+   verity_enables = 0;
+   CHECK(core_load_check_stage_begin(core));
+   CHECK(stage_wait());
+   CHECK(!core_load_check_stage_refused());
+   CHECK(!core_load_check_stage_take(core));
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_OPENED);
+   CHECK(lib_id(lib) == 1);
+   CHECK(verity_enables == 0);
+   CHECK((s = core_trust_runtime_get()) != NULL);
+   if (s)
+   {
+      CHECK(core_trust_has_identity(s, &id, "verity_main_libretro" LIB_EXT));
+      verity_digest(&id);
+      CHECK(!core_trust_has_identity(s, &id,
+            "verity_main_libretro" LIB_EXT));
+      core_trust_set_put(s);
+   }
+   if (lib)
+      dylib_close(lib);
+   verity_mode = 0;
+   stop();
 }
 
 /* Hashed the same with fs-verity on: recorded with its digest */
@@ -2104,6 +2178,44 @@ static void test_load_once_lasts(void)
 }
 
 /* A first run's startup load of a core the pending seed covers */
+#ifdef VERITY_STANDIN
+/* Written over between its hash and the enable, then trusted: Always
+ * Trust records the file as the kernel keeps it, so later loads pass
+ * the quick check with no hash */
+static void test_verity_rewritten_always(void)
+{
+   dylib_t lib                   = NULL;
+   enum core_check_result result = CORE_CHECK_OK;
+   char core[256];
+   unsigned n;
+   start(true);
+   park_reset();
+   CHECK(put_core(core, "verity_at_libretro" LIB_EXT, 'a'));
+   CHECK(trust(core));
+   CHECK(put_core(core, "verity_at_libretro" LIB_EXT, 'a'));
+   strlcpy(verity_write, core, sizeof(verity_write));
+   verity_mode = 2;
+   CHECK(park(core));
+   drain();
+   CHECK(core_warning_pending(NULL, &result));
+   CHECK(result == CORE_CHECK_MODIFIED);
+   verity_mode = 1;
+   n           = hashes;
+   CHECK(core_warning_choose(CORE_WARNING_ALWAYS_TRUST));
+   park_wait(1);
+   CHECK(rerun_id == 3);
+   drain();
+   core_load_check_deinit();
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_OPENED);
+   CHECK(lib_id(lib) == 3);
+   CHECK(hashes == n);
+   if (lib)
+      dylib_close(lib);
+   verity_mode = 0;
+   stop();
+}
+#endif
+
 static void test_startup_seed(void)
 {
    dylib_t lib = NULL;
@@ -2488,6 +2600,7 @@ int main(void)
 #ifdef VERITY_STANDIN
    test_verity_unchanged();
    test_verity_rewritten();
+   test_verity_main_thread();
 #endif
    test_stage_stale_grant();
    test_stage_loaded();
@@ -2510,6 +2623,9 @@ int main(void)
    test_park_own_rerun();
    test_park_fallback();
    test_load_once_lasts();
+#ifdef VERITY_STANDIN
+   test_verity_rewritten_always();
+#endif
    test_startup_seed();
    test_startup_refused();
    test_startup_seed_park();
