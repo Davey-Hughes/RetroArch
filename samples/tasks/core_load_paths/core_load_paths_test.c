@@ -298,6 +298,26 @@ static void mode_startup(enum core_warning_choice choice)
    load_quietly(bad_core);
 }
 
+static bool bad_runs_game(void)
+{
+   return bad_runs()
+      && (content_state_get_ptr()->flags & CONTENT_ST_FLAG_IS_INITED)
+      && same_path(path_get(RARCH_PATH_CONTENT), game);
+}
+
+/* -L of a refused core with content: the answer runs it with that
+ * content, as the startup would have */
+static void mode_startup_content(void)
+{
+   CHECK(wait_for(warning_up, 120), "no Security Warning for the startup core");
+   check_shown(60, "the startup core's warning is not shown");
+   CHECK(answer(CORE_WARNING_LOAD_ONCE),
+         "the startup warning's answer was not taken");
+   CHECK(wait_for(bad_runs_game, 600),
+         "the answer did not run the startup core with its content");
+   CHECK(!warning_up(), "the startup warning stayed after its answer");
+}
+
 /* Load Core's state: the core named and described, waiting for content,
  * where a startup with --load-menu-on-error lands for a core that needs
  * content (without it, that startup fails) */
@@ -958,6 +978,15 @@ int main(int argc, char *argv[])
       rarch_argv[rarch_argc++] = bad_core;
       startup_dummy            = true;
    }
+   else if (string_is_equal(mode, "startup-content"))
+   {
+      snprintf(game, sizeof(game), "%s/title.bin", dir);
+      write_file(game);
+      rarch_argv[rarch_argc++] = (char*)"-L";
+      rarch_argv[rarch_argc++] = bad_core;
+      rarch_argv[rarch_argc++] = game;
+      startup_dummy            = true;
+   }
    else if (string_is_equal(mode, "startup-needs-content"))
    {
       rarch_argv[rarch_argc++] = (char*)"-L";
@@ -1023,6 +1052,8 @@ int main(int argc, char *argv[])
          mode_startup(CORE_WARNING_ALWAYS_TRUST);
       else if (string_is_equal(mode, "startup-outside"))
          mode_startup(CORE_WARNING_LOAD_ONCE);
+      else if (string_is_equal(mode, "startup-content"))
+         mode_startup_content();
       else if (string_is_equal(mode, "startup-needs-content"))
          mode_startup_needs_content();
       else if (string_is_equal(mode, "null-seed"))

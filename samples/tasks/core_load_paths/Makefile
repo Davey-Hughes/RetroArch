@@ -2,7 +2,8 @@
 # build with the load check, main() replaced. One mode a run, since a
 # startup load happens once a process.
 TARGET := core_load_paths_test
-MODES  := startup startup-always startup-outside startup-needs-content \
+MODES  := startup startup-always startup-outside startup-content \
+          startup-needs-content \
           null-seed null-refused staged staged-threaded playlist subsystem \
           playlist-sub netplay-sub probe seed runahead load-once park-ends
 
