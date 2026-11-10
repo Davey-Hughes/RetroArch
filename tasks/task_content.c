@@ -2547,8 +2547,8 @@ static void content_load_startup_rerun(void *ud)
             d->content_path, &content_info, CORE_TYPE_PLAIN, NULL, NULL);
    /* With no content, started only by a core that runs without it, as
     * at startup; else loaded, waiting for content. On the probe's word
-    * alone (it sets the flag only when it opens the core): a core
-    * outside the core info list starts at startup too. */
+    * alone (it sets the flag only when it succeeds): a core outside
+    * the core info list starts at startup too. */
    else
    {
       sys_info->load_no_content = false;
