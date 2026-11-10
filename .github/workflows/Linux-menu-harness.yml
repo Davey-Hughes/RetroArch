@@ -495,12 +495,13 @@ jobs:
           set -eu
           # Real loads through the load check, on this build with the
           # public test key: a startup -L checked in place and answered
-          # from the menu (Load Once, Always Trust, a core that needs
-          # content) or with no menu, staged loads with and without a
-          # task worker, a playlist Run, a parked subsystem load, a quiet
-          # probe and a parked Load Core, the first run's seed, run-ahead's
-          # copy, Load Once lasting through Close Content until another
-          # core loads, and another load ending a waiting park.
+          # from the menu (Load Once, Always Trust, a core outside the
+          # cores folder, a core that needs content) or with no menu,
+          # staged loads with and without a task worker, a playlist Run,
+          # a parked subsystem load, a quiet probe and a parked Load
+          # Core, the first run's seed, run-ahead's copy, Load Once
+          # lasting through Close Content until another core loads, and
+          # another load ending a waiting park.
           make -C samples/tasks/core_load_paths check
           make -C samples/tasks/core_load_paths clean
 

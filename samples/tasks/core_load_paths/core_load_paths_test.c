@@ -182,6 +182,21 @@ static bool core_is(enum rarch_core_type type)
 static bool is_plain(void) { return core_is(CORE_TYPE_PLAIN); }
 static bool is_dummy(void) { return core_is(CORE_TYPE_DUMMY); }
 
+/* The core itself runs: a probe latches the plain type over the dummy
+ * core too */
+static bool runs(const char *core)
+{
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   const char *name            = runloop_st->system.info.library_name;
+   return is_plain()
+      && runloop_st->lib_handle
+      && name && string_is_equal(name, "content_load_harness")
+      && same_path(path_get(RARCH_PATH_CORE), core);
+}
+
+static bool bad_runs(void)  { return runs(bad_core); }
+static bool good_runs(void) { return runs(good_core); }
+
 static bool quitting(void)
 {
    return (runloop_state_get_ptr()->flags
@@ -224,7 +239,7 @@ static void load_quietly(const char *core)
       pump(1);
    }
    pump(2);
-   CHECK(is_plain(), "a trusted core did not run");
+   CHECK(runs(core), "a trusted core did not run");
 }
 
 static void write_file(const char *path)
@@ -268,7 +283,7 @@ static void mode_startup(enum core_warning_choice choice)
    CHECK(wait_for(warning_up, 120), "no Security Warning for the startup core");
    check_shown(60, "the startup core's warning is not shown");
    CHECK(answer(choice), "the startup warning's answer was not taken");
-   CHECK(wait_for(is_plain, 600), "the answer did not run the startup core");
+   CHECK(wait_for(bad_runs, 600), "the answer did not run the startup core");
    CHECK(!warning_up(), "the startup warning stayed after its answer");
    CHECK(!shown(), "the startup warning's screen stayed after its answer");
    /* Load Once lasts until another core loads */
@@ -279,7 +294,7 @@ static void mode_startup(enum core_warning_choice choice)
    CHECK(task_push_load_contentless_core_from_menu(good_core), "not started");
    CHECK(wait_for(warning_up, 600), "no Security Warning for the other core");
    CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE), "Load Once not taken");
-   CHECK(wait_for(is_plain, 600), "Load Once did not run the other core");
+   CHECK(wait_for(good_runs, 600), "Load Once did not run the other core");
    load_quietly(bad_core);
 }
 
@@ -716,6 +731,23 @@ static const char *const made_dirs[] = {
 static char cfg_home[300];
 static char ra_dir[320];
 static char cores[340];
+static char ra_cores[340];
+
+#ifdef _WIN32
+/* RetroArch's default folders beside the program; the cfg can't move
+ * them all, deepest first */
+static const char *const win_dirs[] = {
+   ":\\assets\\wallpapers", ":\\assets", ":\\autoconfig",
+   ":\\cheats\\content_load_harness", ":\\cheats", ":\\config\\record",
+   ":\\config\\remaps", ":\\config", ":\\cores", ":\\database\\rdb",
+   ":\\database", ":\\downloads", ":\\filters\\audio",
+   ":\\filters\\video", ":\\filters", ":\\info", ":\\logs",
+   ":\\overlays\\keyboards", ":\\overlays", ":\\playlists",
+   ":\\recordings", ":\\saves", ":\\screenshots", ":\\shaders",
+   ":\\states", ":\\system", ":\\thumbnails"
+};
+static bool win_had[sizeof(win_dirs) / sizeof(win_dirs[0])];
+#endif
 
 static void remove_in(const char *in, const char *name)
 {
@@ -728,12 +760,26 @@ static void remove_in(const char *in, const char *name)
 static void clean_run(void)
 {
    size_t i;
+#ifdef _WIN32
+   /* Only the folders this run made: rmdir takes only empty ones */
+   for (i = 0; i < sizeof(win_dirs) / sizeof(win_dirs[0]); i++)
+   {
+      char path[PATH_MAX_LENGTH];
+      if (win_had[i])
+         continue;
+      fill_pathname_expand_special(path, win_dirs[i], sizeof(path));
+      rmdir(path);
+   }
+#endif
    remove(good_core);
    remove(bad_core);
    remove(nc_core);
    rmdir(cores);
    if (*seeded)
       remove(seeded);
+   /* LIBRETRO_DIRECTORY puts the caches there */
+   remove_in(ra_cores, "core_probe.cache");
+   remove_in(ra_cores, "core_info.cache");
    remove_in(ra_dir, CORE_TRUST_FILE_NAME);
    remove_in(ra_dir, CORE_TRUST_FILE_NAME ".testkey");
    for (i = 0; i < sizeof(made_dirs) / sizeof(made_dirs[0]); i++)
@@ -762,6 +808,7 @@ int main(int argc, char *argv[])
    static char env_cores[400];
 #endif
    char cfg_path[300];
+   char name[32];
    char *rarch_argv[8]  = {0};
    int rarch_argc       = 0;
    const char *mode     = argc > 1 ? argv[1] : "";
@@ -769,16 +816,45 @@ int main(int argc, char *argv[])
    bool startup_dummy   = false;
    bool no_menu         = string_is_equal(mode, "null-seed")
                        || string_is_equal(mode, "null-refused");
+   bool seed_mode       = string_is_equal(mode, "seed")
+                       || string_is_equal(mode, "null-seed");
    bool inited;
+   unsigned n;
+   size_t i;
    FILE *cfg;
 
+#ifdef _WIN32
+   for (i = 0; i < sizeof(win_dirs) / sizeof(win_dirs[0]); i++)
+   {
+      char path[PATH_MAX_LENGTH];
+      fill_pathname_expand_special(path, win_dirs[i], sizeof(path));
+      win_had[i] = path_is_directory(path);
+   }
+#endif
    if (!tmp || !*tmp)
       tmp = getenv("TEMP");
    if (!tmp || !*tmp)
       tmp = "/tmp";
-   snprintf(dir, sizeof(dir), "%s/core_load_paths_%ld", tmp, (long)getpid());
+   /* A new folder for each run: nothing one leaves reaches the next,
+    * even with a pid that repeats (Wine's) */
+   for (i = 0; mode[i] && i < sizeof(name) - 1; i++)
+      name[i] = ISALNUM(mode[i]) ? mode[i] : '-';
+   name[i] = '\0';
+   for (n = 0; ; n++)
+   {
+      snprintf(dir, sizeof(dir), "%s/core_load_paths_%s_%ld_%u", tmp,
+            name, (long)getpid(), n);
+      if (!path_is_valid(dir))
+         break;
+      if (n == 99)
+      {
+         fprintf(stderr, "FAIL: no new run folder in %s\n", tmp);
+         return 1;
+      }
+   }
    snprintf(cfg_home, sizeof(cfg_home), "%s/cfg", dir);
    snprintf(ra_dir, sizeof(ra_dir), "%s/retroarch", cfg_home);
+   snprintf(ra_cores, sizeof(ra_cores), "%s/cores", ra_dir);
    snprintf(cores, sizeof(cores), "%s/cores", dir);
    if (!path_mkdir(cfg_home) || !path_mkdir(cores))
    {
@@ -795,10 +871,14 @@ int main(int argc, char *argv[])
    snprintf(env_appdata, sizeof(env_appdata), "APPDATA=%s", cfg_home);
    putenv(env_appdata);
    /* The default cores folder, the seed's, is beside the program
-    * unless this names it */
-   snprintf(env_cores, sizeof(env_cores), "LIBRETRO_DIRECTORY=%s/cores",
-         ra_dir);
-   putenv(env_cores);
+    * unless this names it. It also overrides libretro_directory, so
+    * only for the seed modes. */
+   if (seed_mode)
+   {
+      snprintf(env_cores, sizeof(env_cores), "LIBRETRO_DIRECTORY=%s",
+            ra_cores);
+      putenv(env_cores);
+   }
 #endif
    if (getenv("HARNESS_VERBOSE"))
       verbosity_enable();
@@ -855,6 +935,13 @@ int main(int argc, char *argv[])
    fprintf(cfg, "rgui_show_start_screen = \"false\"\n");
    fprintf(cfg, "threaded_data_runloop_enable = \"false\"\n");
    fprintf(cfg, "libretro_info_path = \"%s\"\n", dir);
+   /* The cores folder, whose cores the core info list holds: the
+    * harness cores' but for startup-outside; the seed modes keep the
+    * default, the seed's */
+   if (string_is_equal(mode, "startup-outside"))
+      fprintf(cfg, "libretro_directory = \"%s\"\n", ra_cores);
+   else if (!seed_mode)
+      fprintf(cfg, "libretro_directory = \"%s\"\n", cores);
    fprintf(cfg, "savefile_directory = \"%s\"\n", dir);
    fprintf(cfg, "savestate_directory = \"%s\"\n", dir);
    fclose(cfg);
@@ -864,6 +951,7 @@ int main(int argc, char *argv[])
    rarch_argv[rarch_argc++] = cfg_path;
    if (     string_is_equal(mode, "startup")
          || string_is_equal(mode, "startup-always")
+         || string_is_equal(mode, "startup-outside")
          || string_is_equal(mode, "null-refused"))
    {
       rarch_argv[rarch_argc++] = (char*)"-L";
@@ -876,13 +964,12 @@ int main(int argc, char *argv[])
       rarch_argv[rarch_argc++] = nc_core;
       startup_dummy            = true;
    }
-   else if (string_is_equal(mode, "seed") || string_is_equal(mode, "null-seed"))
+   else if (seed_mode)
    {
       /* In the default cores folder, which the first run's seed walks */
-      snprintf(seeded, sizeof(seeded), "%s/cores", ra_dir);
-      path_mkdir(seeded);
-      strlcat(seeded, "/seeded_libretro.", sizeof(seeded));
-      strlcat(seeded, ext, sizeof(seeded));
+      path_mkdir(ra_cores);
+      snprintf(seeded, sizeof(seeded), "%s/seeded_libretro.%s", ra_cores,
+            ext);
       if (!copy_beside(argv[0], "harness_core.so", seeded))
       {
          clean_run();
@@ -932,6 +1019,8 @@ int main(int argc, char *argv[])
          mode_startup(CORE_WARNING_LOAD_ONCE);
       else if (string_is_equal(mode, "startup-always"))
          mode_startup(CORE_WARNING_ALWAYS_TRUST);
+      else if (string_is_equal(mode, "startup-outside"))
+         mode_startup(CORE_WARNING_LOAD_ONCE);
       else if (string_is_equal(mode, "startup-needs-content"))
          mode_startup_needs_content();
       else if (string_is_equal(mode, "null-seed"))
