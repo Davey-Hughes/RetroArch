@@ -376,6 +376,17 @@ bool filestream_write_file_atomic(const char *path, const void *data, int64_t si
 bool filestream_write_file_atomic_synced(const char *path, const void *data, int64_t size);
 
 /**
+ * Whether \c path is on a backend with no rename (smb://, nfs://).
+ * filestream_write_file_atomic() and filestream_write_file_atomic_synced()
+ * write such a file in place: a crash or a failed write can leave it
+ * short.  The other atomic calls still go through a temporary file.
+ *
+ * @param path Path of the file that will be replaced.
+ * @return \c true if an atomic write of \c path goes in place.
+ */
+bool filestream_atomic_in_place(const char *path);
+
+/**
  * Opens the sibling temporary file an atomic write of \c path goes
  * through (\c path with ".tmp" appended), for a writer that produces
  * the contents a piece at a time.  Finish with

@@ -17,7 +17,10 @@ int main(int argc, char **argv)
    struct nfs_settings cfg;
    RFILE *f;
    char url[600];
+   char tmp[610];
    uint8_t buf[300];
+   void *got      = NULL;
+   int64_t got_len = 0;
    int64_t mtime = 0;
    time_t now;
    int found = 0;
@@ -87,6 +90,30 @@ int main(int argc, char **argv)
             (long long)mtime, (long long)now);
       return 1;
    }
+
+   /* nfs:// has no rename: an atomic write goes in place, and a
+    * shorter one leaves no tail and no temporary */
+   snprintf(url, sizeof(url), "nfs://%s/rnfs_dir/atomic.srm", argv[1]);
+   snprintf(tmp, sizeof(tmp), "%s.tmp", url);
+   memset(buf, 0x11, sizeof(buf));
+   if (!filestream_write_file_atomic(url, buf, sizeof(buf)))
+   {
+      fprintf(stderr, "FAIL: atomic write (temporary left: %d)\n",
+            path_is_valid(tmp));
+      return 1;
+   }
+   memset(buf, 0x22, 100);
+   if (     !filestream_write_file_atomic_synced(url, buf, 100)
+         || !filestream_read_file(url, &got, &got_len)
+         || got_len != 100 || memcmp(got, buf, 100)
+         || path_is_valid(tmp))
+   {
+      fprintf(stderr, "FAIL: synced atomic write (%lld bytes, "
+            "temporary left: %d)\n", (long long)got_len,
+            path_is_valid(tmp));
+      return 1;
+   }
+   free(got);
 
    /* listing */
    snprintf(url, sizeof(url), "nfs://%s/rnfs_dir", argv[1]);

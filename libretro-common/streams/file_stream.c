@@ -2684,12 +2684,22 @@ int filestream_finish_atomic_suffix(const char *path, const char *suffix,
       : filestream_finish_atomic_internal(path, suffix, ok, false);
 }
 
+bool filestream_atomic_in_place(const char *path)
+{
+   return string_starts_with_size(path, "smb://", STRLEN_CONST("smb://"))
+      ||  string_starts_with_size(path, "nfs://", STRLEN_CONST("nfs://"));
+}
+
 static bool filestream_write_file_atomic_internal(const char *path,
       const void *data, int64_t size, bool sync)
 {
    int ret;
    bool ok;
-   RFILE *file = filestream_open_atomic(path);
+   bool in_place = filestream_atomic_in_place(path);
+   RFILE *file   = in_place
+      ? filestream_open(path, RETRO_VFS_FILE_ACCESS_WRITE,
+            RETRO_VFS_FILE_ACCESS_HINT_SEQUENTIAL_BULK)
+      : filestream_open_atomic(path);
 
    if (!file)
       return false;
@@ -2700,6 +2710,8 @@ static bool filestream_write_file_atomic_internal(const char *path,
    /* As filestream_commit_atomic(), passing @sync on to the rename */
    if (filestream_close(file) != 0)
       ok = false;
+   if (in_place)
+      return ok;
    ret = filestream_finish_atomic_internal(path, ".tmp", ok, sync);
 
    /* Written but not renamed into place */

@@ -8,6 +8,7 @@
 #include <time.h>
 #include <net/net_compat.h>
 #include <file/file_path.h>
+#include <streams/file_stream.h>
 #include <vfs/vfs.h>
 #include <vfs/vfs_implementation.h>
 #include "../../../libretro-common/vfs/vfs_implementation_smb.h"
@@ -174,7 +175,10 @@ int main(int argc, char **argv)
    libretro_vfs_implementation_dir *rdir;
    struct smbc_dirent *ent;
    char url[512];
+   char tmp[520];
    uint8_t buf[4096];
+   void *got      = NULL;
+   int64_t got_len = 0;
    int64_t size  = 0;
    int64_t mtime = 0;
    time_t now;
@@ -266,6 +270,29 @@ int main(int argc, char **argv)
       fprintf(stderr, "FAIL: readdir\n");
       return 1;
    }
+   /* smb:// has no rename: an atomic write goes in place, and a
+    * shorter one leaves no tail and no temporary */
+   snprintf(url, sizeof(url), "smb://%s/%s/rsmb_atomic.srm", argv[1], argv[2]);
+   snprintf(tmp, sizeof(tmp), "%s.tmp", url);
+   memset(buf, 0x11, 300);
+   if (!filestream_write_file_atomic(url, buf, 300))
+   {
+      fprintf(stderr, "FAIL: atomic write (temporary left: %d)\n",
+            path_is_valid(tmp));
+      return 1;
+   }
+   memset(buf, 0x22, 100);
+   if (     !filestream_write_file_atomic_synced(url, buf, 100)
+         || !filestream_read_file(url, &got, &got_len)
+         || got_len != 100 || memcmp(got, buf, 100)
+         || path_is_valid(tmp))
+   {
+      fprintf(stderr, "FAIL: synced atomic write (%lld bytes, "
+            "temporary left: %d)\n", (long long)got_len,
+            path_is_valid(tmp));
+      return 1;
+   }
+   free(got);
    /* both pool slots held by open files: a missing path's stat, open
     * and opendir each connect privately, and LSan sees any of those
     * connections a failure does not close */

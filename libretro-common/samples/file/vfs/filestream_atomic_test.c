@@ -26,6 +26,9 @@
  *   synced_rename_write_through - (Windows) the synced atomic writes
  *                           rename with MOVEFILE_WRITE_THROUGH; the
  *                           plain ones do not.
+ *   share_in_place        - smb:// and nfs:// can't rename or remove:
+ *                           an atomic write there goes in place, whole,
+ *                           and leaves no temporary.
  *
  * vfs_implementation.c is compiled into this file so that its fopen
  * goes through a stand-in that can fail with EEXIST, and its syncs and
@@ -253,6 +256,70 @@ static void use_frontend_vfs(bool on)
    info.required_interface_version = FILESTREAM_REQUIRED_VFS_VERSION;
    info.iface                      = on ? &frontend_iface : NULL;
    filestream_vfs_init(&info);
+}
+
+/* smb:// and nfs:// as the backends have them, over local files: no
+ * rename and no remove. */
+static const char *share_local(const char *path)
+{
+   if (!strncmp(path, "smb://", 6) || !strncmp(path, "nfs://", 6))
+      return path + 6;
+   return NULL;
+}
+
+static struct retro_vfs_file_handle *RETRO_CALLCONV share_open(
+      const char *path, unsigned mode, unsigned hints)
+{
+   const char *local = share_local(path);
+   return retro_vfs_file_open_impl(local ? local : path, mode, hints);
+}
+
+static int RETRO_CALLCONV share_remove(const char *path)
+{
+   if (share_local(path))
+      return -1;
+   return retro_vfs_file_remove_impl(path);
+}
+
+static int RETRO_CALLCONV share_rename(const char *old_path,
+      const char *new_path)
+{
+   if (share_local(old_path) || share_local(new_path))
+      return -1;
+   return retro_vfs_file_rename_impl(old_path, new_path);
+}
+
+static void lane_share_in_place(void)
+{
+   static const char *const urls[] = { "smb://" TARGET, "nfs://" TARGET };
+   struct retro_vfs_interface_info info;
+   unsigned i;
+
+   use_frontend_vfs(true);
+   frontend_iface.open             = share_open;
+   frontend_iface.remove           = share_remove;
+   frontend_iface.rename           = share_rename;
+   info.required_interface_version = FILESTREAM_REQUIRED_VFS_VERSION;
+   info.iface                      = &frontend_iface;
+   filestream_vfs_init(&info);
+   for (i = 0; i < 2; i++)
+   {
+      clean();
+      put(TARGET, "old contents");
+      CHECK(filestream_write_file_atomic(urls[i], "new", 3),
+            "share: the write failed");
+      CHECK(content_is(TARGET, "new"), "share: not replaced in place");
+      CHECK(!exists(TEMP), "share: a temporary was left");
+      CHECK(filestream_write_file_atomic_synced(urls[i], "newer", 5),
+            "share: the synced write failed");
+      CHECK(content_is(TARGET, "newer"),
+            "share: the synced write not replaced in place");
+      CHECK(!exists(TEMP), "share: the synced write left a temporary");
+   }
+   use_frontend_vfs(false);
+
+   clean();
+   printf("[share_in_place] done\n");
 }
 
 static void lane_rename_cb_keeps_dest(void)
@@ -657,6 +724,7 @@ int main(void)
    lane_atomic_synced_calls_sync();
    lane_synced_rename_write_through();
    lane_atomic_suffix();
+   lane_share_in_place();
 
    if (failures)
    {

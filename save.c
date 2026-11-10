@@ -377,20 +377,22 @@ static bool autosave_flush_waiting(autosave_t *save)
          & AUTOSAVE_FLUSH_FULL) != 0;
 }
 
-/* Writes @image through the worker's own temporary. False when
+/* Writes @image through the worker's own temporary, or in place where
+ * the file can't be renamed (filestream_atomic_in_place()). False when
  * opening, writing, syncing or renaming failed: the file keeps its old
- * contents. */
+ * contents, unless written in place. */
 static bool autosave_write(autosave_t *save, const void *image)
 {
    int ret;
    intfstream_t *file = NULL;
    bool written       = false;
+   bool in_place      = filestream_atomic_in_place(save->path);
+   const char *out    = in_place ? save->path : save->tmp_path;
 
    if (save->compress)
-      file = intfstream_open_rzip_file(save->tmp_path,
-            RETRO_VFS_FILE_ACCESS_WRITE);
+      file = intfstream_open_rzip_file(out, RETRO_VFS_FILE_ACCESS_WRITE);
    else
-      file = intfstream_open_file(save->tmp_path,
+      file = intfstream_open_file(out,
             RETRO_VFS_FILE_ACCESS_WRITE, RETRO_VFS_FILE_ACCESS_HINT_SEQUENTIAL_BULK);
 
    if (file)
@@ -404,6 +406,8 @@ static bool autosave_write(autosave_t *save, const void *image)
       free(file);
    }
 
+   if (in_place)
+      return written;
    ret = filestream_finish_atomic_suffix(save->path,
          AUTOSAVE_TMP_SUFFIX, written, true);
    if (ret == 1)
@@ -1432,12 +1436,19 @@ static bool content_save_ram_file(unsigned slot, bool compress, bool sync,
          ram.path);
 
    /* Write via a temporary file, so a crash or power loss mid-save
-    * leaves the previous save intact instead of a truncated one. */
+    * leaves the previous save intact instead of a truncated one; in
+    * place where there is no rename (filestream_atomic_in_place()). */
 #if defined(HAVE_COMPRESSION)
    if (compress)
    {
       char tmp_path[PATH_MAX_LENGTH];
-      if (     !filestream_atomic_temp_name(tmp_path, sizeof(tmp_path), ram.path)
+      if (filestream_atomic_in_place(ram.path))
+      {
+         if (!rzipstream_write_file(ram.path, mem_info.data, mem_info.size))
+            goto fail;
+      }
+      else if (     !filestream_atomic_temp_name(tmp_path,
+                        sizeof(tmp_path), ram.path)
             || !content_finish_tmp(ram.path, rzipstream_write_file(
                   tmp_path, mem_info.data, mem_info.size), sync))
          goto fail;

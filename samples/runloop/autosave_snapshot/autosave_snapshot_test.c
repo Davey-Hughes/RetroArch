@@ -88,6 +88,12 @@ int filestream_finish_atomic_suffix(const char *path, const char *suffix,
    return ok ? 0 : -1;
 }
 
+bool filestream_atomic_in_place(const char *path)
+{
+   (void)path;
+   return false;
+}
+
 int filestream_delete(const char *path)
 {
    (void)path;
