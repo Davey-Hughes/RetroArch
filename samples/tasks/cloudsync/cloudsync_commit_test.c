@@ -1251,10 +1251,37 @@ static void missing_on_server_lane(void)
    diff_task_free(task);
 }
 
+#if defined(_WIN32) && !defined(_XBOX)
+/* Whether states_lane()'s longest copy fits Win32's 259: in a deep
+ * folder both games are cut to nothing, so the second is numbered. */
+static bool run_folder_fits(void)
+{
+   char s[PATH_MAX_LENGTH];
+   size_t i;
+   long n = 0;
+   snprintf(s, sizeof(s), "%s/owed-saves/backups/cloud-sync/states/"
+         "~ - 2000-01-01 00-00-00-2 - cloud-sync - replaced.state.tmp",
+         directory);
+   if (!path_resolve_realpath(s, sizeof(s), false))
+      return false;
+   for (i = 0; s[i]; i++)
+      if (((unsigned char)s[i] & 0xC0) != 0x80)
+         n += (unsigned char)s[i] >= 0xF0 ? 2 : 1;
+   return n <= 259;
+}
+#endif
+
 int main(void)
 {
    unsigned t;
    int m;
+#if defined(_WIN32) && !defined(_XBOX)
+   if (!run_folder_fits())
+   {
+      puts("FAIL cloudsync_commit_test: run folder too long");
+      return 1;
+   }
+#endif
    retro_atomic_int_init(&off_main, 0);
    retro_atomic_int_init(&ownership_checks, 0);
    retro_atomic_int_init(&main_syncs, 0);
