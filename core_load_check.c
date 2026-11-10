@@ -528,8 +528,8 @@ static void core_load_check_osd_checking(const char *path)
 }
 
 /* Worker: loaded by path outside Android, so only while the path still
- * names the file checked, unchanged. A pass with checks off records no
- * identity: nothing to compare. */
+ * names the file checked, unchanged, which o->f holds. A pass with
+ * checks off records no identity: nothing to compare. */
 static bool core_load_open_names(const struct core_load_open_task *o)
 {
 #ifdef ANDROID
@@ -543,7 +543,7 @@ static bool core_load_open_names(const struct core_load_open_task *o)
    if (core_identity_equal(&o->id, &none))
       return true;
    same = (f = core_file_open(o->check_path))
-      && core_load_same_file(&o->id, f);
+      && core_load_same_held(&o->id, f);
    core_file_close(f);
    return same;
 #endif

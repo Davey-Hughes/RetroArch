@@ -895,6 +895,34 @@ static void test_stage_check(bool threaded)
    stop();
 }
 
+/* The worker still opens a held pass's core once its first load moved
+ * its ChangeTime (real Windows) */
+static void test_stage_held_ctime_moved(void)
+{
+#ifdef _WIN32
+   dylib_t lib = NULL;
+   char core[256];
+   start(true);
+   CHECK(put_core(core, "stage_ctime_libretro" LIB_EXT, 'a'));
+   CHECK(trust(core));
+   CHECK(put_core(core, "stage_ctime_libretro" LIB_EXT, 'a'));
+   /* A waited pass keeps its handle; a probe loads the core first */
+   core_load_check_set_startup(true);
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_OPENED);
+   core_load_check_set_startup(false);
+   if (lib)
+      dylib_close(lib);
+   CHECK(ctime_move(core));
+   CHECK(core_load_check_stage_begin(core));
+   CHECK(stage_wait());
+   lib = core_load_check_stage_take(core);
+   CHECK(lib_id(lib) == 1);
+   if (lib)
+      dylib_close(lib);
+   stop();
+#endif
+}
+
 static void test_stage_refused(void)
 {
    dylib_t lib = NULL;
@@ -2763,6 +2791,7 @@ int main(void)
    test_stage_quick();
    test_stage_check(false);
    test_stage_check(true);
+   test_stage_held_ctime_moved();
    test_stage_refused();
    test_stage_take_other();
    test_stage_seed();
