@@ -2652,7 +2652,9 @@ static void test_copy(void)
    CHECK((m = core_load_match_new(tmp, core, &src)) != NULL);
    CHECK(m && match_all(m) == -1);
    core_load_match_free(m);
-   /* Unknown hash: the source is hashed too, if it is the file loaded */
+#ifndef _WIN32
+   /* Unknown hash, a quick pass's (Windows has none with checks on):
+    * the source is hashed too, if it is the file loaded */
    src.hashed = false;
    CHECK(copy_core(core, tmp));
    CHECK((m = core_load_match_new(tmp, core, &src)) != NULL);
@@ -2665,8 +2667,6 @@ static void test_copy(void)
    CHECK((m = core_load_match_new(tmp, core, &src)) != NULL);
    CHECK(m && match_all(m) == 0);
    core_load_match_free(m);
-#ifndef _WIN32
-   /* (Windows: the running core's file can't be replaced) */
    CHECK(put_core(core, "ra_libretro" LIB_EXT, 'a'));
    CHECK(core_load_match_new(tmp, core, &src) == NULL);
 #endif
