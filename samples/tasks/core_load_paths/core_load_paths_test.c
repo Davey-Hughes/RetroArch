@@ -13,6 +13,7 @@
 #include <features/features_cpu.h>
 #include <file/config_file.h>
 #include <file/file_path.h>
+#include <lists/string_list.h>
 #include <queues/message_queue.h>
 #include <queues/task_queue.h>
 #include <retro_miscellaneous.h>
@@ -28,12 +29,14 @@
 #include "../../../core_trust_runtime.h"
 #include "../../../frontend/frontend.h"
 #include "../../../frontend/frontend_driver.h"
+#include "../../../menu/menu_cbs.h"
 #include "../../../menu/menu_driver.h"
 #include "../../../menu/menu_entries.h"
 #include "../../../menu/menu_setting.h"
 #include "../../../msg_hash.h"
 #include "../../../msg_hash_lbl_str.h"
 #include "../../../paths.h"
+#include "../../../playlist.h"
 #include "../../../retroarch.h"
 #include "../../../runloop.h"
 #include "../../../verbosity.h"
@@ -132,6 +135,28 @@ static bool error_queued(void)
    while (msg_queue_extract(&runloop_st->msg_queue, &entry))
       if (entry.category == MESSAGE_QUEUE_CATEGORY_ERROR)
          found = true;
+   runloop_st->msg_queue_size = 0;
+   return found;
+}
+
+/* Drains the queue: whether it said core isn't trusted; *error set for
+ * an error message */
+static bool refusal_queued(const char *core, bool *error)
+{
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   msg_queue_entry_t entry;
+   char want[NAME_MAX_LENGTH + 128];
+   bool found = false;
+   snprintf(want, sizeof(want),
+         msg_hash_to_str(MSG_CORE_LOAD_REFUSED_LOAD_CORE),
+         path_basename_nocompression(core));
+   while (msg_queue_extract(&runloop_st->msg_queue, &entry))
+   {
+      if (string_is_equal(entry.msg, want))
+         found = true;
+      else if (entry.category == MESSAGE_QUEUE_CATEGORY_ERROR)
+         *error = true;
+   }
    runloop_st->msg_queue_size = 0;
    return found;
 }
@@ -354,6 +379,113 @@ static void mode_playlist(void)
    CHECK(string_is_equal(path_get(RARCH_PATH_CONTENT), game),
          "the re-run lost its content");
 }
+
+/* Its refused core said and not loaded, the action asking nothing */
+static void check_refusal_said(bool said, bool error, const char *what)
+{
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   const char *name            = runloop_st->system.info.library_name;
+   CHECK(said, what);
+   CHECK(!error, "a refused core put an error on screen");
+   CHECK(!warning_up(), "a refused core's action asked");
+   CHECK(     !runloop_st->lib_handle
+         && !(name && string_is_equal(name, "content_load_harness")),
+         "a refused core loaded");
+}
+
+/* A playlist entry with subsystem content probes its core with no load
+ * after it to park: a refused core is said, not loaded */
+static void mode_playlist_sub(void)
+{
+   menu_file_list_cbs_t cbs;
+   playlist_config_t config;
+   struct playlist_entry entry;
+   union string_list_elem_attr attr;
+   struct string_list *roms = string_list_new();
+   char lpl[400];
+   bool said                = false;
+   bool error               = false;
+   bool loads               = false;
+   unsigned i;
+   snprintf(sub_game, sizeof(sub_game), "%s/sub.bin", dir);
+   write_file(sub_game);
+   snprintf(lpl, sizeof(lpl), "%s/harness.lpl", dir);
+   memset(&config, 0, sizeof(config));
+   config.capacity       = 16;
+   playlist_config_set_path(&config, lpl);
+   attr.i                = 0;
+   memset(&entry, 0, sizeof(entry));
+   entry.path            = sub_game;
+   entry.label           = (char*)"sub";
+   entry.core_path       = bad_core;
+   entry.core_name       = (char*)"bad";
+   entry.subsystem_ident = (char*)"harness_sub";
+   entry.subsystem_name  = (char*)"Harness Sub";
+   entry.subsystem_roms  = roms;
+   CHECK(     roms && string_list_append(roms, sub_game, attr)
+         &&   playlist_init_cached(&config)
+         &&   playlist_push(playlist_get_cached(), &entry),
+         "no playlist entry");
+   string_list_free(roms);
+   refusal_queued(bad_core, &error);
+   error = false;
+   memset(&cbs, 0, sizeof(cbs));
+   menu_cbs_init_bind_ok(&cbs, "", "", 0, FILE_TYPE_PLAYLIST_ENTRY, 0, "", 0);
+   CHECK(cbs.action_ok != NULL, "no OK action for a playlist entry");
+   if (cbs.action_ok)
+      cbs.action_ok(sub_game, "", FILE_TYPE_PLAYLIST_ENTRY, 0, 0);
+   CHECK(core_load_check_refused(bad_core), "the entry's core was not refused");
+   said = refusal_queued(bad_core, &error);
+   for (i = 0; i < 60; i++)
+   {
+      if (runloop_is_content_switching())
+         loads = true;
+      pump(1);
+      if (refusal_queued(bad_core, &error))
+         said = true;
+   }
+   CHECK(!loads, "the playlist entry's refused core started a load");
+   check_refusal_said(said, error,
+         "the playlist entry's refused core was not said");
+}
+
+#ifdef HAVE_NETWORKING
+/* Netplay's reload of a session with subsystem content probes its core
+ * with no load after it to park: a refused core is said, not loaded */
+static void mode_netplay_sub(void)
+{
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   union string_list_elem_attr attr;
+   bool said                   = false;
+   bool error                  = false;
+   unsigned i;
+   snprintf(sub_game, sizeof(sub_game), "%s/sub.bin", dir);
+   write_file(sub_game);
+   attr.i = 0;
+   /* A core runs; netplay reloads a session of bad_core with subsystem
+    * content */
+   staged_trust(good_core);
+   path_set(RARCH_PATH_CORE, bad_core);
+   path_set(RARCH_PATH_SUBSYSTEM, "harness_sub");
+   if (!runloop_st->subsystem_fullpaths)
+      runloop_st->subsystem_fullpaths = string_list_new();
+   string_list_append(runloop_st->subsystem_fullpaths, sub_game, attr);
+   refusal_queued(bad_core, &error);
+   error = false;
+   CHECK(task_push_netplay_content_reload(NULL),
+         "netplay's reload was not started");
+   for (i = 0; i < 120; i++)
+   {
+      pump(1);
+      if (refusal_queued(bad_core, &error))
+         said = true;
+   }
+   /* The unload's dummy core start ran without it */
+   CHECK(is_dummy(), "netplay's unload did not end on the dummy core");
+   check_refusal_said(said, error,
+         "netplay's refused core was not said");
+}
+#endif
 
 /* The pending state as restored, or what the re-run's load set from it
  * (content_set_subsystem_info()) if a later stage cleared it already */
@@ -603,6 +735,7 @@ static void clean_run(void)
    remove_in(dir, "harness.cfg");
    remove_in(dir, "title.bin");
    remove_in(dir, "sub.bin");
+   remove_in(dir, "harness.lpl");
    remove_in(dir, "core_probe.cache");
    remove_in(dir, "core_info.cache");
    rmdir(dir);
@@ -796,6 +929,14 @@ int main(int argc, char *argv[])
          mode_playlist();
       else if (string_is_equal(mode, "subsystem"))
          mode_subsystem();
+      else if (string_is_equal(mode, "playlist-sub"))
+         mode_playlist_sub();
+      else if (string_is_equal(mode, "netplay-sub"))
+#ifdef HAVE_NETWORKING
+         mode_netplay_sub();
+#else
+         fprintf(stderr, "netplay-sub: not in this build\n");
+#endif
       else if (string_is_equal(mode, "probe"))
          mode_probe();
       else if (string_is_equal(mode, "seed"))
