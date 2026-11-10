@@ -291,6 +291,26 @@ static void core_load_check_task_free(struct core_load_check_task *t)
    free(t);
 }
 
+#ifdef __ANDROID__
+/* After a full check that passed: fs-verity, so the kernel keeps the
+ * file from changing, and its digest goes in the record. Building the
+ * tree reads the whole file: on a task worker only, never the main
+ * thread or the startup's in-place check. */
+static void core_load_check_verity(core_file_t *f, struct core_check *c)
+{
+   if (c->result != CORE_CHECK_OK || !c->record)
+      return;
+   /* Can't here (no fs-verity, not our file, a writer has it, an old
+    * kernel's page size): the identity record works as before */
+   if (core_file_verity_enable(f) <= 0)
+      return;
+   /* Enabling moves ctime: record the file as it is now */
+   if (     !core_file_identity(f, &c->rec.id)
+         || !core_file_verity_measure(f, &c->rec.id))
+      c->record = false;
+}
+#endif
+
 static void core_load_check_handler(retro_task_t *task)
 {
    struct core_load_check_task *t = (struct core_load_check_task*)
@@ -310,6 +330,12 @@ static void core_load_check_handler(retro_task_t *task)
       return;
    core_load_check_complete(t->s, &t->h, step, t->check_path, &t->c);
    t->hash_live = false;
+#ifdef __ANDROID__
+   /* The enable reads the whole core in one call, and this handler runs
+    * on the main thread when tasks aren't threaded */
+   if (task_queue_is_threaded())
+      core_load_check_verity(t->f, &t->c);
+#endif
    task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
 }
 

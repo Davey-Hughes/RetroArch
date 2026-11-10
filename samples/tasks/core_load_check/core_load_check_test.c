@@ -2194,6 +2194,13 @@ static void test_copy(void)
    CHECK((m = core_load_match_new(tmp, core, &src)) != NULL);
    CHECK(m && match_all(m) == 0);
    core_load_match_free(m);
+   /* Its record gained an fs-verity digest (Android), which reading the
+    * file doesn't show: still the core loaded */
+   src.id.verity_len = 32;
+   memset(src.id.verity, 0x5a, 32);
+   CHECK((m = core_load_match_new(tmp, core, &src)) != NULL);
+   CHECK(m && match_all(m) == 0);
+   core_load_match_free(m);
 #ifndef _WIN32
    /* (Windows: the running core's file can't be replaced) */
    CHECK(put_core(core, "ra_libretro" LIB_EXT, 'a'));
