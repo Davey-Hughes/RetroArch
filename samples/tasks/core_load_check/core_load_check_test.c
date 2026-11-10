@@ -2342,6 +2342,50 @@ static void test_load_once_lasts(void)
    stop();
 }
 
+/* On real Windows a core's first load moves its ChangeTime: a Load
+ * Once core whose re-run loaded it first still loads, and still passes
+ * Close Content's reload, while its handle is held. On Linux nothing
+ * pins a held file, so its ctime binds it. */
+static void test_held_ctime_moved(void)
+{
+#if defined(_WIN32) || defined(__linux__)
+   dylib_t lib = NULL;
+   char a[256];
+#ifdef __linux__
+   no_ctime_fs = 1;
+#endif
+   start(false);
+   park_reset();
+   CHECK(put_core(a, "ctime_libretro" LIB_EXT, 'a'));
+   CHECK(park(a));
+   drain();
+   CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE));
+   park_wait(1);
+   CHECK(rerun_id == 1);
+   CHECK(ctime_move(a));
+#ifdef _WIN32
+   CHECK(core_load_check_open(a, &lib) == CORE_LOAD_GATE_OPENED);
+   core_load_check_loaded();
+   if (lib)
+      dylib_close(lib);
+   lib = NULL;
+   core_load_check_unloaded();
+   CHECK(core_load_check_open(a, &lib) == CORE_LOAD_GATE_OPENED);
+   CHECK(lib_id(lib) == 1);
+   CHECK(queued() == 0);
+   if (lib)
+      dylib_close(lib);
+#else
+   CHECK(core_load_check_open(a, &lib) == CORE_LOAD_GATE_REFUSED);
+   CHECK(queued() == 1);
+#endif
+   stop();
+#ifdef __linux__
+   no_ctime_fs = 0;
+#endif
+#endif
+}
+
 #ifdef VERITY_STANDIN
 /* A signed core written over between its hash and the enable, then
  * trusted: Always Trust records the file as the kernel keeps it, with
@@ -2830,6 +2874,7 @@ int main(void)
    test_park_own_rerun();
    test_park_fallback();
    test_load_once_lasts();
+   test_held_ctime_moved();
 #ifdef VERITY_STANDIN
    test_verity_rewritten_always();
 #endif
