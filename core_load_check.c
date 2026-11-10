@@ -117,6 +117,7 @@ static struct
    enum core_load_stage stage;
    enum core_load_grant stage_grant;
    enum core_load_grant granted;
+   enum core_load_startup startup_state;
    unsigned gen;
    unsigned stage_gen;
    bool stage_lent;               /* stage_f is the slot's own */
@@ -976,6 +977,10 @@ enum core_load_gate core_load_check_open(const char *path, dylib_t *lib)
    {
       RARCH_LOG("[Core] Not loading \"%s\" before the first run's check of its folder.\n",
             path);
+      /* The seed can't finish before the frame loop: the startup load
+       * runs again once it has */
+      if (core_load_rt.startup)
+         core_load_rt.startup_state = CORE_LOAD_STARTUP_SEED;
       goto end;
    }
    /* Refused for this file against this store: no second hash */
@@ -984,6 +989,17 @@ enum core_load_gate core_load_check_open(const char *path, dylib_t *lib)
    if (core_load_rt.startup)
    {
       ret = core_load_check_inline(&s, &f, path, lib);
+      if (ret == CORE_LOAD_GATE_REFUSED)
+      {
+         /* Asked from the menu the failure falls back to; with no menu
+          * it fails as before, saying why */
+#ifdef HAVE_MENU
+         if (menu_core_warning_can_open())
+            core_load_rt.startup_state = CORE_LOAD_STARTUP_REFUSED;
+         else
+#endif
+            core_load_check_refusal(path, core_load_rt.slot.c.result);
+      }
       goto end;
    }
    if (core_load_slot_is(&core_load_rt.slot, path))
@@ -1079,7 +1095,15 @@ void core_load_check_release_held(void)
 
 void core_load_check_set_startup(bool on)
 {
-   core_load_rt.startup = on;
+   core_load_rt.startup       = on;
+   core_load_rt.startup_state = CORE_LOAD_STARTUP_NONE;
+}
+
+enum core_load_startup core_load_check_startup_take(void)
+{
+   enum core_load_startup state = core_load_rt.startup_state;
+   core_load_rt.startup_state   = CORE_LOAD_STARTUP_NONE;
+   return state;
 }
 
 bool core_load_check_stage_begin(const char *path)

@@ -76,6 +76,18 @@ void core_load_check_iterate(void);
 /* The drivers are up: a message held for them shows */
 void core_load_check_notify(void);
 
+enum core_load_startup
+{
+   CORE_LOAD_STARTUP_NONE = 0,
+   /* The pending seed covers it: run again once the seed is done */
+   CORE_LOAD_STARTUP_SEED,
+   /* Refused, with a menu to ask on */
+   CORE_LOAD_STARTUP_REFUSED
+};
+
+/* What a refused startup load left, for its failure path; read once */
+enum core_load_startup core_load_check_startup_take(void);
+
 RETRO_END_DECLS
 
 #endif

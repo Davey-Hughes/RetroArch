@@ -1794,6 +1794,64 @@ static void test_load_once_lasts(void)
    stop();
 }
 
+/* A first run's startup load of a core the pending seed covers */
+static void test_startup_seed(void)
+{
+   dylib_t lib = NULL;
+   char store[64];
+   char core[256];
+   void *buf   = NULL;
+   int64_t len = 0;
+   task_queue_init(false, NULL);
+   sprintf(store, TMP_DIR "/trust_%u", ++store_n);
+   path_mkdir(TMP_DIR "/seed3");
+   strlcpy(core, TMP_DIR "/seed3/first_libretro." CORE_EXT, sizeof(core));
+   CHECK(filestream_read_file("core_load_check_test_b" LIB_EXT, &buf, &len));
+   CHECK(buf && filestream_write_file(core, buf, len));
+   free(buf);
+   CHECK(core_trust_runtime_init(store, TMP_DIR "/seed3", CORE_EXT));
+   core_load_check_set_startup(true);
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_REFUSED);
+   /* Not hashed in place: the seed decides first */
+   CHECK(core_load_check_startup_take() == CORE_LOAD_STARTUP_SEED);
+   CHECK(core_load_check_startup_take() == CORE_LOAD_STARTUP_NONE);
+   core_load_check_set_startup(false);
+   stop();
+}
+
+/* Refused at startup: asked from the menu, or with none, told how to
+ * approve it */
+static void test_startup_refused(void)
+{
+   dylib_t lib = NULL;
+   char core[256];
+   unsigned opens;
+   start(false);
+   park_reset();
+   CHECK(put_core(core, "start_refused_libretro" LIB_EXT, 'b'));
+   core_load_check_set_startup(true);
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_REFUSED);
+   CHECK(core_load_check_startup_take() == CORE_LOAD_STARTUP_REFUSED);
+   core_load_check_set_startup(false);
+   /* Its park asks at once, about the file checked in place */
+   opens = menu_opens;
+   CHECK(park(core));
+   CHECK(menu_opens == opens + 1);
+   CHECK(queued() == 0);
+   CHECK(core_warning_choose(CORE_WARNING_CANCEL));
+   CHECK(frees == 1);
+   menu_can_open = false;
+   last_log[0]   = '\0';
+   CHECK(put_core(core, "start_refused_libretro" LIB_EXT, 'b'));
+   core_load_check_set_startup(true);
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_REFUSED);
+   CHECK(core_load_check_startup_take() == CORE_LOAD_STARTUP_NONE);
+   CHECK(strstr(last_log, "Always Trust") != NULL);
+   core_load_check_set_startup(false);
+   menu_can_open = true;
+   stop();
+}
+
 int main(void)
 {
    if (!path_mkdir(TMP_DIR))
@@ -1845,6 +1903,8 @@ int main(void)
    test_park_no_check();
    test_park_deinit();
    test_load_once_lasts();
+   test_startup_seed();
+   test_startup_refused();
    /* Messages past OSD_MAX aren't kept for the counts above */
    CHECK(osd_count <= OSD_MAX);
    printf("%u checks, %u failures\n", checks, failures);

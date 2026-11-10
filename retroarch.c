@@ -10123,10 +10123,25 @@ bool retroarch_main_init_core(int argc, char *argv[],
    /* Handle core initialization failure */
    if (init_failed)
    {
+#ifdef HAVE_CORE_LOAD_CHECK
+      /* A startup core the check holds back falls back to the dummy
+       * core and menu, parked to run again from there */
+      bool parked = false;
+#ifdef HAVE_MENU
+      if (core_load_check_startup_take() != CORE_LOAD_STARTUP_NONE)
+         parked = task_content_park_startup(p_rarch->path_libretro,
+               p_rarch->path_content);
+#else
+      core_load_check_startup_take();
+#endif
+#endif
 #ifdef HAVE_DYNAMIC
       /* Check if menu was active prior to core initialization */
       if (   (!(rarch_st.flags & RARCH_FLAGS_LAUNCHED_FROM_CLI))
           ||   (rarch_st.flags & RARCH_FLAGS_CLI_LOAD_MENU_ON_ERR)
+#ifdef HAVE_CORE_LOAD_CHECK
+          ||   parked
+#endif
 #ifdef HAVE_MENU
           ||  (menu_st->flags & MENU_ST_FLAG_ALIVE)
 #endif

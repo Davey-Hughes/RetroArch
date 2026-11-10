@@ -2510,6 +2510,39 @@ bool task_content_park_core_load(const char *core_path)
    free(d);
    return false;
 }
+
+#ifdef HAVE_MENU
+/* The startup load again, as a menu load: its startup-only options
+ * (-H, --record, --entryslot, subsystems) aren't replayed */
+static void content_load_startup_rerun(void *ud)
+{
+   struct content_load_parked *d   = (struct content_load_parked*)ud;
+   content_ctx_info_t content_info = {0};
+   if (d->content_path)
+      task_push_load_content_with_new_core_from_menu(d->core_path,
+            d->content_path, &content_info, CORE_TYPE_PLAIN, NULL, NULL);
+   else
+      task_push_load_contentless_core_from_menu(d->core_path);
+}
+
+bool task_content_park_startup(const char *core_path,
+      const char *content_path)
+{
+   struct content_load_parked *d = NULL;
+   if (     !core_path || !*core_path
+         || !core_load_check_refused(core_path)
+         || !(d = (struct content_load_parked*)calloc(1, sizeof(*d))))
+      return false;
+   d->core_path    = strdup(core_path);
+   d->content_path = (content_path && *content_path)
+      ? strdup(content_path) : NULL;
+   if (core_load_check_park(d->core_path, content_load_startup_rerun,
+            content_load_parked_free, d))
+      return true;
+   content_load_parked_free(d);
+   return false;
+}
+#endif
 #endif
 
 /* Runs the job's current stage and moves it on. */
