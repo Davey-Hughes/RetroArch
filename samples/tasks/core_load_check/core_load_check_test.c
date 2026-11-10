@@ -2130,6 +2130,177 @@ static void test_startup_seed_park(void)
    startup_seed_park(true, true);
 }
 
+/* A copy of path as run-ahead makes one, a new file */
+static bool copy_core(const char *from, const char *to)
+{
+   void *buf   = NULL;
+   int64_t len = 0;
+   bool ok;
+   if (!filestream_read_file(from, &buf, &len))
+      return false;
+   filestream_delete(to);
+   ok = filestream_write_file(to, buf, len);
+   free(buf);
+   return ok;
+}
+
+static int match_all(core_load_match_t *m)
+{
+   int st = 1;
+   while (st > 0)
+      st = core_load_match_step(m);
+   return st;
+}
+
+static void test_copy(void)
+{
+   dylib_t lib  = NULL;
+   dylib_t copy = NULL;
+   struct core_load_source src;
+   core_load_match_t *m = NULL;
+   char core[256];
+   char tmp[256];
+   start(false);
+   CHECK(put_core(core, "ra_libretro" LIB_EXT, 'a'));
+   strlcpy(tmp, TMP_DIR "/ra_copy" LIB_EXT, sizeof(tmp));
+   /* Not the running core: no copy */
+   CHECK(core_load_check_copy_source(core, &src) == CORE_LOAD_COPY_NONE);
+   /* Loaded through a full check: its hash is known */
+   CHECK(trust(core));
+   CHECK(put_core(core, "ra_libretro" LIB_EXT, 'a'));
+   /* A staged load waits on its check, so the pass is kept on every
+    * platform (a quiet one isn't on Windows) */
+   CHECK(core_load_check_stage_begin(core));
+   CHECK(stage_wait());
+   CHECK(!core_load_check_stage_take(core));
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_OPENED);
+   core_load_check_loaded();
+   CHECK(core_load_check_copy_source(core, &src) == CORE_LOAD_COPY_CHECK);
+   CHECK(copy_core(core, tmp));
+   CHECK((m = core_load_match_new(tmp, core, &src)) != NULL);
+   CHECK(m && match_all(m) == 0);
+   CHECK(m && lib_id(copy = core_load_match_load(m)) == 1);
+   if (copy)
+      dylib_close(copy);
+   core_load_match_free(m);
+   /* A copy with other bytes */
+   CHECK(copy_core("core_load_check_test_b" LIB_EXT, tmp));
+   CHECK((m = core_load_match_new(tmp, core, &src)) != NULL);
+   CHECK(m && match_all(m) == -1);
+   core_load_match_free(m);
+   /* Unknown hash: the source is hashed too, if it is the file loaded */
+   src.hashed = false;
+   CHECK(copy_core(core, tmp));
+   CHECK((m = core_load_match_new(tmp, core, &src)) != NULL);
+   CHECK(m && match_all(m) == 0);
+   core_load_match_free(m);
+#ifndef _WIN32
+   /* (Windows: the running core's file can't be replaced) */
+   CHECK(put_core(core, "ra_libretro" LIB_EXT, 'a'));
+   CHECK(core_load_match_new(tmp, core, &src) == NULL);
+#endif
+   if (lib)
+      dylib_close(lib);
+   core_load_check_unloaded();
+   CHECK(core_load_check_copy_source(core, &src) == CORE_LOAD_COPY_NONE);
+   stop();
+}
+
+/* Run-ahead's copy of the running core is no load: a park waiting on
+ * the user, the running core's Load Once and its held file all stay */
+static void test_copy_not_a_load(void)
+{
+   dylib_t lib  = NULL;
+   dylib_t copy = NULL;
+   struct core_load_source src;
+   core_load_match_t *m = NULL;
+   char a[256];
+   char b[256];
+   char tmp[256];
+   start(false);
+   park_reset();
+   CHECK(put_core(a, "copy_once_libretro" LIB_EXT, 'a'));
+   CHECK(put_core(b, "copy_waits_libretro" LIB_EXT, 'b'));
+   strlcpy(tmp, TMP_DIR "/copy_once" LIB_EXT, sizeof(tmp));
+   /* a runs on Load Once */
+   CHECK(park(a));
+   drain();
+   CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE));
+   park_wait(1);
+   CHECK(core_load_check_open(a, &lib) == CORE_LOAD_GATE_OPENED);
+   core_load_check_loaded();
+   /* b waits on the user */
+   CHECK(park(b));
+   drain();
+   CHECK(core_warning_pending(NULL, NULL));
+   CHECK(core_load_check_copy_source(a, &src) == CORE_LOAD_COPY_CHECK);
+   CHECK(copy_core(a, tmp));
+   CHECK((m = core_load_match_new(tmp, a, &src)) != NULL);
+   CHECK(m && match_all(m) == 0);
+   CHECK(m && lib_id(copy = core_load_match_load(m)) == 1);
+   core_load_match_free(m);
+   if (copy)
+      dylib_close(copy);
+   CHECK(core_warning_pending(NULL, NULL));
+   CHECK(frees == 1);
+   if (lib)
+      dylib_close(lib);
+   lib = NULL;
+   core_load_check_unloaded();
+#ifdef _WIN32
+   CHECK(!put_core(a, "copy_once_libretro" LIB_EXT, 'a'));
+#endif
+   /* a's probes still pass on its Load Once */
+   CHECK(core_load_check_open(a, &lib) == CORE_LOAD_GATE_OPENED);
+   CHECK(lib_id(lib) == 1);
+   CHECK(queued() == 0);
+   if (lib)
+      dylib_close(lib);
+   /* b's park still re-runs on the user's answer */
+   CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE));
+   park_wait(2);
+   CHECK(reruns == 2);
+   CHECK(rerun_id == 2);
+   CHECK(frees == 2);
+   stop();
+}
+
+#ifndef _WIN32
+/* A probe's quick pass while the stage's worker opens its core takes
+ * the stage's place: the stage's own pass is still the one granted, so
+ * run-ahead has its source (Windows: no record passes a core unhashed) */
+static void test_stage_stale_quick(void)
+{
+   dylib_t lib = NULL;
+   struct core_load_source src;
+   char a[256];
+   char b[256];
+   start(true);
+   CHECK(put_core(a, "squick_a_libretro" LIB_EXT, 'a'));
+   CHECK(put_core(b, "squick_b_libretro" LIB_EXT, 'b'));
+   CHECK(trust(a));
+   CHECK(trust(b));
+   CHECK(worker_hold());
+   CHECK(core_load_check_stage_begin(a));
+   CHECK(!core_load_check_stage_ready());
+   CHECK(core_load_check_open(b, &lib) == CORE_LOAD_GATE_OPENED);
+   CHECK(lib_id(lib) == 2);
+   if (lib)
+      dylib_close(lib);
+   worker_go();
+   CHECK(stage_wait());
+   lib = core_load_check_stage_take(a);
+   CHECK(lib_id(lib) == 1);
+   core_load_check_loaded();
+   CHECK(core_load_check_copy_source(a, &src) == CORE_LOAD_COPY_CHECK);
+   CHECK(core_load_check_copy_source(b, &src) == CORE_LOAD_COPY_NONE);
+   if (lib)
+      dylib_close(lib);
+   core_load_check_unloaded();
+   stop();
+}
+#endif
+
 int main(void)
 {
    if (!path_mkdir(TMP_DIR))
@@ -2188,6 +2359,17 @@ int main(void)
    test_startup_seed();
    test_startup_refused();
    test_startup_seed_park();
+   test_copy();
+#ifdef __linux__
+   /* No ctime binds the record: its held file does */
+   no_ctime_fs = 1;
+   test_copy();
+   no_ctime_fs = 0;
+#endif
+   test_copy_not_a_load();
+#ifndef _WIN32
+   test_stage_stale_quick();
+#endif
    /* Messages past OSD_MAX aren't kept for the counts above */
    CHECK(osd_count <= OSD_MAX);
    printf("%u checks, %u failures\n", checks, failures);
