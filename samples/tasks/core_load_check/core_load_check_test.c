@@ -8,6 +8,11 @@
 #else
 #include <sys/stat.h>
 #endif
+#ifdef VERITY_STANDIN
+#include <stdarg.h>
+#include <stdint.h>
+#include <sys/ioctl.h>
+#endif
 
 #include <compat/strl.h>
 #include <dynamic/dylib.h>
@@ -24,6 +29,9 @@
 #include "../../../runloop.h"
 #include "../../../tasks/tasks_internal.h"
 #include "../../../verbosity.h"
+#ifdef VERITY_STANDIN
+#include "../core_signature/core_signature_fixtures.h"
+#endif
 
 #define TMP_DIR "core_load_check_test_tmp"
 #ifdef _WIN32
@@ -151,12 +159,19 @@ void retroarch_main_quit_failure(void)
 /* Hashes started, in place or in a task */
 static unsigned hashes;
 static bool hash_init_fails;
+/* hash_moves's ctime moved as hash number hash_move_at starts */
+static char hash_moves[256];
+static unsigned hash_move_at;
+static bool hash_moved;
+
+static bool ctime_move(const char *path);
 
 bool __real_core_hash_init(struct core_hash *h);
 
 bool __wrap_core_hash_init(struct core_hash *h)
 {
-   hashes++;
+   if (++hashes == hash_move_at)
+      hash_moved = ctime_move(hash_moves);
    if (hash_init_fails)
       return false;
    return __real_core_hash_init(h);
@@ -1428,6 +1443,322 @@ static void test_stage_rewritten(void)
    stop();
 }
 
+#ifdef VERITY_STANDIN
+/* The kernel's fs-verity: 0 can't (as on this host), 1 on, 2 on after
+ * verity_write is written over, as by a writer between the check's
+ * hash and the enable, 3 refused (EPERM: require_signatures, a core
+ * with no kernel signature) by a rollback that moves verity_write's
+ * ctime, as f2fs's truncate does */
+static int verity_mode;
+static char verity_write[256];
+static unsigned verity_enables;
+static bool verity_moved;
+
+/* As the app's: the real path, here wherever it is */
+bool android_core_path_resolve(const char *path, char *s, size_t len)
+{
+   if (     !path || !*path || strlcpy(s, path, len) >= len
+         || !path_resolve_realpath(s, len, true))
+   {
+      if (len)
+         *s = '\0';
+      return false;
+   }
+   return true;
+}
+
+int __wrap_core_file_verity_enable(core_file_t *f)
+{
+   (void)f;
+   verity_enables++;
+   if (verity_mode == 2 && !rewrite_core(verity_write))
+      return -1;
+   if (verity_mode == 3)
+   {
+      verity_moved = ctime_move(verity_write);
+      return 0;
+   }
+   return verity_mode ? 1 : 0;
+}
+
+static void verity_digest(struct core_identity *id)
+{
+   memset(id->verity, 0x5a, 32);
+   id->verity_len = 32;
+}
+
+bool __wrap_core_file_verity_measure(core_file_t *f,
+      struct core_identity *id)
+{
+   (void)f;
+   verity_digest(id);
+   return true;
+}
+
+/* The quick check's measure, made inside core_signature_io.c, reaches
+ * the kernel through ioctl: while fs-verity is on, every file measures
+ * as verity_digest() */
+struct verity_head
+{
+   uint16_t alg;
+   uint16_t size;
+};
+
+int __real_ioctl(int fd, unsigned long req, ...);
+
+int __wrap_ioctl(int fd, unsigned long req, ...)
+{
+   va_list ap;
+   void *arg;
+   va_start(ap, req);
+   arg = va_arg(ap, void*);
+   va_end(ap);
+   if (     (verity_mode == 1 || verity_mode == 2)
+         && req == (unsigned long)_IOWR('f', 134,
+            struct verity_head))
+   {
+      struct verity_head *h = (struct verity_head*)arg;
+      h->alg  = 1;
+      h->size = 32;
+      memset(h + 1, 0x5a, 32);
+      return 0;
+   }
+   return __real_ioctl(fd, req, arg);
+}
+
+/* The build time of what Always Trust records */
+static uint64_t always_build_time;
+
+bool __real_core_trust_runtime_always(const struct core_check *c);
+
+bool __wrap_core_trust_runtime_always(const struct core_check *c)
+{
+   always_build_time = c->rec.build_time;
+   return __real_core_trust_runtime_always(c);
+}
+
+/* The core_signature harness's signed core and its .sig, as FX_NAME */
+static bool put_signed_core(char *s, size_t len)
+{
+   char sig[280];
+   unsigned long x = FX_CORE_SEED;
+   uint8_t *buf    = (uint8_t*)malloc(FX_CORE_SIZE);
+   bool ok         = false;
+   size_t i;
+   if (!buf)
+      return false;
+   for (i = 0; i < FX_CORE_SIZE; i++)
+   {
+      x      = (x * 1103515245UL + 12345UL) & 0xffffffffUL;
+      buf[i] = (uint8_t)(x >> 24);
+   }
+   strlcpy(s, TMP_DIR "/cores/" FX_NAME, len);
+   strlcpy(sig, s, sizeof(sig));
+   strlcat(sig, ".sig", sizeof(sig));
+   ok = filestream_write_file(s, buf, FX_CORE_SIZE)
+      && filestream_write_file(sig, fx_sig_good, sizeof(fx_sig_good));
+   free(buf);
+   return ok;
+}
+
+/* Not threaded: the check's handler runs on the main thread, where the
+ * enable (a read of the whole core) must never run */
+static void test_verity_main_thread(void)
+{
+   dylib_t lib = NULL;
+   char core[256];
+   struct core_identity id;
+   core_trust_set_t *s;
+   start(false);
+   CHECK(put_core(core, "verity_main_libretro" LIB_EXT, 'a'));
+   CHECK(trust(core));
+   CHECK(put_core(core, "verity_main_libretro" LIB_EXT, 'a'));
+   CHECK(path_identity(core, &id));
+   verity_mode    = 1;
+   verity_enables = 0;
+   CHECK(core_load_check_stage_begin(core));
+   CHECK(stage_wait());
+   CHECK(!core_load_check_stage_refused());
+   CHECK(!core_load_check_stage_take(core));
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_OPENED);
+   CHECK(lib_id(lib) == 1);
+   CHECK(verity_enables == 0);
+   CHECK((s = core_trust_runtime_get()) != NULL);
+   if (s)
+   {
+      CHECK(core_trust_has_identity(s, &id, "verity_main_libretro" LIB_EXT));
+      verity_digest(&id);
+      CHECK(!core_trust_has_identity(s, &id,
+            "verity_main_libretro" LIB_EXT));
+      core_trust_set_put(s);
+   }
+   if (lib)
+      dylib_close(lib);
+   verity_mode = 0;
+   stop();
+}
+
+/* Hashed the same with fs-verity on: recorded with its digest */
+static void test_verity_unchanged(void)
+{
+   dylib_t lib = NULL;
+   char core[256];
+   struct core_identity id;
+   core_trust_set_t *s;
+   start(true);
+   CHECK(put_core(core, "verity_libretro" LIB_EXT, 'a'));
+   CHECK(trust(core));
+   CHECK(put_core(core, "verity_libretro" LIB_EXT, 'a'));
+   CHECK(path_identity(core, &id));
+   verity_mode = 1;
+   CHECK(core_load_check_stage_begin(core));
+   CHECK(stage_wait());
+   CHECK(!core_load_check_stage_refused());
+   lib = core_load_check_stage_take(core);
+   CHECK(lib_id(lib) == 1);
+   CHECK((s = core_trust_runtime_get()) != NULL);
+   if (s)
+   {
+      CHECK(!core_trust_has_identity(s, &id, "verity_libretro" LIB_EXT));
+      verity_digest(&id);
+      CHECK(core_trust_has_identity(s, &id, "verity_libretro" LIB_EXT));
+      core_trust_set_put(s);
+   }
+   if (lib)
+      dylib_close(lib);
+   verity_mode = 0;
+   stop();
+}
+
+/* The refused enable moved the file: recorded as it is after the
+ * attempt, so loading it again needs no second check */
+static void test_verity_refused_moved(void)
+{
+   dylib_t lib = NULL;
+   char core[256];
+   struct core_identity after;
+   core_trust_set_t *s;
+   unsigned before;
+   start(true);
+   CHECK(put_core(core, "verity_eperm_libretro" LIB_EXT, 'a'));
+   CHECK(trust(core));
+   CHECK(put_core(core, "verity_eperm_libretro" LIB_EXT, 'a'));
+   strlcpy(verity_write, core, sizeof(verity_write));
+   verity_mode    = 3;
+   verity_enables = 0;
+   before         = hashes;
+   /* Loaded */
+   CHECK(core_load_check_stage_begin(core));
+   CHECK(stage_wait());
+   CHECK(!core_load_check_stage_refused());
+   lib = core_load_check_stage_take(core);
+   CHECK(lib_id(lib) == 1);
+   if (lib)
+      dylib_close(lib);
+   lib = NULL;
+   core_load_check_loaded();
+   core_load_check_unloaded();
+   CHECK(verity_moved);
+   CHECK(verity_enables == 1);
+   CHECK(hashes == before + 2);
+   CHECK(path_identity(core, &after));
+   CHECK((s = core_trust_runtime_get()) != NULL);
+   if (s)
+   {
+      CHECK(core_trust_has_identity(s, &after,
+            "verity_eperm_libretro" LIB_EXT));
+      core_trust_set_put(s);
+   }
+   /* Started: no second check */
+   CHECK(core_load_check_stage_begin(core));
+   CHECK(stage_wait());
+   CHECK(!core_load_check_stage_refused());
+   CHECK(!core_load_check_stage_take(core));
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_OPENED);
+   CHECK(lib_id(lib) == 1);
+   CHECK(queued() == 0);
+   CHECK(hashes == before + 2);
+   CHECK(verity_enables == 1);
+   if (lib)
+      dylib_close(lib);
+   verity_mode = 0;
+   stop();
+}
+
+/* Moved again while hashed again: nothing held it, so it isn't
+ * recorded so and the load checks it once more */
+static void test_verity_refused_moved_again(void)
+{
+   dylib_t lib = NULL;
+   char core[256];
+   unsigned before;
+   start(true);
+   CHECK(put_core(core, "verity_eperm2_libretro" LIB_EXT, 'a'));
+   CHECK(trust(core));
+   CHECK(put_core(core, "verity_eperm2_libretro" LIB_EXT, 'a'));
+   strlcpy(verity_write, core, sizeof(verity_write));
+   strlcpy(hash_moves, core, sizeof(hash_moves));
+   verity_mode    = 3;
+   verity_enables = 0;
+   before         = hashes;
+   hash_moved     = false;
+   hash_move_at   = before + 2;
+   CHECK(core_load_check_stage_begin(core));
+   CHECK(stage_wait());
+   CHECK(hash_moved);
+   CHECK(!core_load_check_stage_refused());
+   lib = core_load_check_stage_take(core);
+   CHECK(lib_id(lib) == 1);
+   CHECK(verity_enables == 2);
+   CHECK(hashes == before + 4);
+   if (lib)
+      dylib_close(lib);
+   hash_move_at = 0;
+   verity_mode  = 0;
+   stop();
+}
+
+/* Written over between its hash and the enable: the kernel keeps what
+ * was written, so the check fails and records nothing */
+static void test_verity_rewritten(void)
+{
+   dylib_t lib = NULL;
+   char core[256];
+   struct core_identity before;
+   struct core_identity after;
+   core_trust_set_t *s;
+   start(true);
+   CHECK(put_core(core, "verity_rw_libretro" LIB_EXT, 'a'));
+   CHECK(trust(core));
+   CHECK(put_core(core, "verity_rw_libretro" LIB_EXT, 'a'));
+   CHECK(path_identity(core, &before));
+   strlcpy(verity_write, core, sizeof(verity_write));
+   verity_mode = 2;
+   last_log[0] = '\0';
+   CHECK(core_load_check_stage_begin(core));
+   CHECK(stage_wait());
+   CHECK(strstr(last_log, "changed while it was checked") != NULL);
+   CHECK(core_load_check_stage_refused());
+   lib = core_load_check_stage_take(core);
+   CHECK(!lib);
+   CHECK(path_identity(core, &after));
+   verity_digest(&after);
+   CHECK((s = core_trust_runtime_get()) != NULL);
+   if (s)
+   {
+      CHECK(!core_trust_has_identity(s, &before,
+            "verity_rw_libretro" LIB_EXT));
+      CHECK(!core_trust_has_identity(s, &after,
+            "verity_rw_libretro" LIB_EXT));
+      core_trust_set_put(s);
+   }
+   if (lib)
+      dylib_close(lib);
+   verity_mode = 0;
+   stop();
+}
+#endif
+
 /* Probes while the stage's worker opens its core grant other cores:
  * the stage's load still ends the pass of the core loaded before */
 static void test_stage_stale_grant(void)
@@ -2535,6 +2866,56 @@ static void test_held_ctime_moved(void)
 #endif
 }
 
+#ifdef VERITY_STANDIN
+/* A signed core written over between its hash and the enable, then
+ * trusted: Always Trust records the file as the kernel keeps it, with
+ * its digest and no signed build time, so later loads pass the quick
+ * check with no hash */
+static void test_verity_rewritten_always(void)
+{
+   dylib_t lib                   = NULL;
+   enum core_check_result result = CORE_CHECK_OK;
+   char core[256];
+   struct core_identity id;
+   core_trust_set_t *s;
+   unsigned n;
+   start(true);
+   park_reset();
+   CHECK(put_signed_core(core, sizeof(core)));
+   strlcpy(verity_write, core, sizeof(verity_write));
+   verity_mode = 2;
+   CHECK(park(core));
+   drain();
+   CHECK(core_warning_pending(NULL, &result));
+   CHECK(result == CORE_CHECK_MODIFIED);
+   CHECK(path_identity(core, &id));
+   verity_mode       = 1;
+   n                 = hashes;
+   always_build_time = FX_TIME;
+   CHECK(core_warning_choose(CORE_WARNING_ALWAYS_TRUST));
+   CHECK(always_build_time == 0);
+   park_wait(1);
+   CHECK(rerun_id == 3);
+   drain();
+   CHECK((s = core_trust_runtime_get()) != NULL);
+   if (s)
+   {
+      CHECK(!core_trust_has_identity(s, &id, FX_NAME));
+      verity_digest(&id);
+      CHECK(core_trust_has_identity(s, &id, FX_NAME));
+      core_trust_set_put(s);
+   }
+   core_load_check_deinit();
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_OPENED);
+   CHECK(lib_id(lib) == 3);
+   CHECK(hashes == n);
+   if (lib)
+      dylib_close(lib);
+   verity_mode = 0;
+   stop();
+}
+#endif
+
 /* A first run's startup load of a core the pending seed covers */
 static void test_startup_seed(void)
 {
@@ -2756,6 +3137,13 @@ static void test_copy(void)
     * the source is hashed too, if it is the file loaded */
    src.hashed = false;
    CHECK(copy_core(core, tmp));
+   CHECK((m = core_load_match_new(tmp, core, &src)) != NULL);
+   CHECK(m && match_all(m) == 0);
+   core_load_match_free(m);
+   /* Its record gained an fs-verity digest (Android), which reading the
+    * file doesn't show: still the core loaded */
+   src.id.verity_len = 32;
+   memset(src.id.verity, 0x5a, 32);
    CHECK((m = core_load_match_new(tmp, core, &src)) != NULL);
    CHECK(m && match_all(m) == 0);
    core_load_match_free(m);
@@ -3008,10 +3396,24 @@ static void test_stage_stale_quick(void)
 }
 #endif
 
-int main(void)
+int main(int argc, char *argv[])
 {
    if (!path_mkdir(TMP_DIR))
       return 1;
+#ifdef VERITY_STANDIN
+   /* core_load_check.c built as for Android (Makefile) */
+   if (argc > 1 && string_is_equal(argv[1], "android"))
+   {
+      test_verity_unchanged();
+      test_verity_refused_moved();
+      test_verity_refused_moved_again();
+      test_verity_rewritten();
+      test_verity_main_thread();
+      test_verity_rewritten_always();
+      printf("%u checks, %u failures\n", checks, failures);
+      return failures ? 1 : 0;
+   }
+#endif
    test_inactive();
    test_checks_off();
    test_refused_cached();
