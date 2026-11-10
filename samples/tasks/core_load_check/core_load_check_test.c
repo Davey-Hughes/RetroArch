@@ -3,6 +3,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/stat.h>
+#endif
 #ifdef VERITY_STANDIN
 #include <stdarg.h>
 #include <stdint.h>
@@ -226,6 +231,84 @@ static bool put_core(char *s, const char *name, char which)
    return ok;
 }
 
+#ifdef _WIN32
+/* FILE_BASIC_INFO, which older SDKs lack */
+struct test_basic_info
+{
+   LARGE_INTEGER creation;
+   LARGE_INTEGER access;
+   LARGE_INTEGER write;
+   LARGE_INTEGER change;
+   DWORD attributes;
+};
+
+typedef BOOL (WINAPI *test_file_info_t)(HANDLE, int, LPVOID, DWORD);
+#endif
+
+/* Moves only the file's ctime, as real Windows' first load of a DLL
+ * does (Code Integrity writes an extended attribute; Wine doesn't).
+ * False if it didn't move. */
+static bool ctime_move(const char *path)
+{
+   struct core_identity was, now;
+   core_file_t *f = core_file_open(path);
+   bool moved     = false;
+   unsigned i;
+#ifdef _WIN32
+   HMODULE k32          = GetModuleHandleA("kernel32.dll");
+   test_file_info_t get = (test_file_info_t)GetProcAddress(k32,
+         "GetFileInformationByHandleEx");
+   test_file_info_t set = (test_file_info_t)GetProcAddress(k32,
+         "SetFileInformationByHandle");
+   struct test_basic_info b;
+   HANDLE h;
+#else
+   struct stat st;
+#endif
+   memset(&now, 0, sizeof(now));
+   if (!f || !core_file_identity(f, &was))
+   {
+      core_file_close(f);
+      return false;
+   }
+   /* Retried until a coarse clock ticks */
+   for (i = 0; i < 1000 && !moved; i++)
+   {
+#ifdef _WIN32
+      /* Attributes only, which no share mode refuses. NTFS takes the
+       * ChangeTime given; Wine reports the Unix ctime, which setting
+       * the write time moves. */
+      h = CreateFileA(path, FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+            OPEN_EXISTING, 0, NULL);
+      if (h == INVALID_HANDLE_VALUE)
+         break;
+      if (get && set && get(h, 0, &b, sizeof(b)))
+      {
+         b.creation.QuadPart = 0;
+         b.access.QuadPart   = 0;
+         b.attributes        = 0;
+         b.change.QuadPart  += 10000000;
+         set(h, 0, &b, sizeof(b));
+      }
+      CloseHandle(h);
+#else
+      if (stat(path, &st) != 0 || chmod(path, st.st_mode & 07777) != 0)
+         break;
+#endif
+      if (!core_file_identity(f, &now))
+         break;
+      moved = now.ctime != was.ctime || now.ctime_nsec != was.ctime_nsec;
+      if (!moved)
+         retro_sleep(1);
+   }
+   core_file_close(f);
+   return   moved
+         && now.size       == was.size
+         && now.mtime      == was.mtime
+         && now.mtime_nsec == was.mtime_nsec;
+}
+
 static int lib_id(dylib_t lib)
 {
    int (*fn)(void) = lib
@@ -401,6 +484,8 @@ static void test_slot_binds_file(void)
    if (lib)
       dylib_close(lib);
    lib = NULL;
+   /* As its first load does on NTFS: the held handle still binds it */
+   CHECK(ctime_move(core));
    CHECK(!put_core(core, "bind_libretro" LIB_EXT, 'b'));
    CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_OPENED);
    CHECK(lib_id(lib) == 1);
@@ -408,6 +493,11 @@ static void test_slot_binds_file(void)
       dylib_close(lib);
 #else
    CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_REFUSED);
+   drain();
+   /* With no held handle, its ctime binds the pass */
+   CHECK(ctime_move(core));
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_REFUSED);
+   CHECK(queued() == 1);
    drain();
    /* Replaced after its check: the pass was for the file checked */
    CHECK(put_core(core, "bind_libretro" LIB_EXT, 'a'));

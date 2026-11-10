@@ -214,6 +214,27 @@ static bool core_load_same_file(const struct core_identity *id,
    return core_identity_equal(id, &now);
 }
 
+/* As core_load_same_file(), the file held open since its check. On
+ * Windows that handle (no write or delete share) pins the file, and
+ * its first load as a DLL moves its ChangeTime (Code Integrity writes
+ * an extended attribute), so that isn't compared. */
+static bool core_load_same_held(const struct core_identity *id,
+      core_file_t *f)
+{
+#ifdef _WIN32
+   struct core_identity now;
+   if (!core_file_identity(f, &now))
+      return false;
+   memcpy(now.verity, id->verity, sizeof(now.verity));
+   now.verity_len = id->verity_len;
+   now.ctime      = id->ctime;
+   now.ctime_nsec = id->ctime_nsec;
+   return core_identity_equal(id, &now);
+#else
+   return core_load_same_file(id, f);
+#endif
+}
+
 /* The slot's own file, or check_path opened again if it is still the
  * file the slot was checked from */
 static core_file_t *core_load_slot_file(const struct core_load_slot *sl,
@@ -224,7 +245,8 @@ static core_file_t *core_load_slot_file(const struct core_load_slot *sl,
    *lent = false;
    if (!(f = core_file_open(check_path)))
       return NULL;
-   same = core_load_same_file(&sl->c.rec.id, f);
+   same = sl->f ? core_load_same_held(&sl->c.rec.id, f)
+      : core_load_same_file(&sl->c.rec.id, f);
    if (sl->f)
    {
       /* Loaded by path outside Android (D1): the path must still name
