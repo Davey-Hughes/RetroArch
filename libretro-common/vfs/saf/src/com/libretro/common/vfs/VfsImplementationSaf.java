@@ -33,6 +33,7 @@ import java.io.Closeable;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 public final class VfsImplementationSaf
@@ -353,10 +354,22 @@ public final class VfsImplementationSaf
       return false;
    }
 
+   /** Longest name, in UTF-8 bytes, a provider keeps; it shortens a longer one. */
+   private static final int MAX_NAME_BYTES = 255;
+
+   /**
+    * Aside name n (1 to 99) of a file name, as fill_pathname_aside() in file_path.c builds it:
+    * "<name>.prev", then "<name>.2.prev" ... "<name>.99.prev".
+    */
+   private static String getAsideName(String name, int n) {
+      return n == 1 ? name.concat(".prev") : name + "." + n + ".prev";
+   }
+
    /**
     * Rename a Storage Access Framework file, replacing the destination if it exists, returning whether or not the operation succeeded.
     * Moving between directories needs API level 24 and a provider that supports moves.
-    * Storage Access Framework has no atomic replace, so an existing destination is first renamed to the destination path with ".old" appended,
+    * Storage Access Framework has no atomic replace, so an existing destination is first renamed aside, to the first free name of
+    * "<name>.prev", "<name>.2.prev" ... "<name>.99.prev", or to "<name>.old" if "<name>.prev" would be too long,
     * and is only deleted once the file has been renamed into its place; if that fails, the destination is restored.
     * Each provider call below is a Binder transaction, by far the largest cost here: replacing a file takes four and creating one takes two, plus one for a move or two for a move under a new name in place of the rename.
     * @param content the content resolver returned by getContentResolver()
@@ -404,28 +417,33 @@ public final class VfsImplementationSaf
          if (newMimeType.equals(Document.MIME_TYPE_DIR))
             return false;
 
-         // The source may itself be called "<destination>.old", and must not be mistaken for a leftover
-         asideName = newPath.concat(".old").equals(oldPath) ? newName.concat(".old2") : newName.concat(".old");
+         asideName = getAsideName(newName, 1);
+         // A name too long for any ".prev" aside takes the shorter ".old" one
+         final boolean oldAside = asideName.getBytes(StandardCharsets.UTF_8).length > MAX_NAME_BYTES;
+         if (oldAside)
+            asideName = newName.concat(".old");
 
          asideUri = renameDocumentExact(content, newUri, asideName, newName);
          if (asideUri == null)
          {
-            // Most likely a leftover from an earlier rename that could not clean up, which is rare enough to only look for now.
-            // Deleting a directory would delete everything in it, so anything but a file stays where it is.
-            final Uri leftoverUri = getDocumentUri(treeUri, newPath.substring(0, newSlash + 1).concat(asideName));
-            final String leftoverMimeType = queryMimeType(content, leftoverUri);
-
-            if (leftoverMimeType == null || leftoverMimeType.equals(Document.MIME_TYPE_DIR))
+            // A file already at "<name>.old" is never deleted either, so the replace cannot be made
+            if (oldAside)
                return false;
 
-            try
+            // Most likely a leftover from an earlier rename that was cut short, which is rare enough to only look for now.
+            // A leftover may be the only copy of the file left, so it is never deleted or reused; the next free name is taken.
+            final String directory = newPath.substring(0, newSlash + 1);
+            int n = 1;
+
+            while (queryMimeType(content, getDocumentUri(treeUri, directory.concat(asideName))) != null)
             {
-               DocumentsContract.deleteDocument(content, leftoverUri);
+               if (++n > 99)
+                  return false;
+               asideName = getAsideName(newName, n);
             }
-            catch (FileNotFoundException | RuntimeException e)
-            {
+
+            if (n == 1)
                return false;
-            }
 
             asideUri = renameDocumentExact(content, newUri, asideName, newName);
             if (asideUri == null)
@@ -448,7 +466,7 @@ public final class VfsImplementationSaf
       {
          if (asideUri != null)
          {
-            // The file is in place; a failed cleanup only leaves a stale ".old" for the next rename to remove
+            // The file is in place; a failed cleanup only leaves a stale aside, which later renames never delete
             try
             {
                DocumentsContract.deleteDocument(content, asideUri);

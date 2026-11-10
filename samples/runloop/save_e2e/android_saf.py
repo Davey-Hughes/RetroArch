@@ -3,16 +3,29 @@
 
 Lanes:
   saf_rename               autosave on, a state save, a quit: the .srm is
-                           whole, no .tmp or .old is left, the state file
+                           whole, no .tmp or .prev is left, the state file
                            exists; then a force-stop mid-session leaves a
                            whole .srm.
-  saf_stale_aside          autosave off, a stale "<game>.srm.old" file
-                           there: the close write deletes it, replaces the
-                           .srm through that name and leaves no .old.
-  saf_rename_replace_fail  a folder at the aside name "<game>.srm.old",
-                           which the rename never deletes, so the replace
-                           cannot be made: the .srm keeps its old bytes,
-                           the folder stays and the failed write is logged.
+  saf_stale_aside          autosave off, a stale "<game>.srm.prev" left by
+                           a killed replace, and "<game>.srm.3.prev" to
+                           "<game>.srm.99.prev" taken: the close write
+                           replaces the .srm through "<game>.srm.2.prev",
+                           the only free aside name, every taken name keeps
+                           its bytes and no aside of the write is left.
+  saf_rename_replace_fail  "<game>.srm.2.prev" taken too, so every aside
+                           name is: the .srm keeps its old bytes and the
+                           failed write is logged.
+  saf_aside_folder         autosave off, in a folder of its own, a folder
+                           at "<game>.srm.prev": the close write replaces
+                           the .srm through "<game>.srm.2.prev", the
+                           folder and the file in it stay as they were.
+  saf_long_name            autosave off, in a folder of its own, a copy of
+                           the content whose save name is 251 bytes, too
+                           long for any ".prev" aside: the second close
+                           write replaces the .srm through "<name>.old"
+                           and leaves none; with a file at "<name>.old",
+                           the third keeps the .srm and that file as they
+                           were and logs the failed write.
   saf_root_tree            autosave off, in a tree picked at a volume root
                            (--saf-root): the first close writes the .srm,
                            the second replaces it, nothing is left beside
@@ -74,8 +87,15 @@ def md5(dev, path):
     return out[0] if out else None
 
 
+def asides_md5(dev, srm, first):
+    out = dev.sh("for n in $(seq %d 99); do cat '%s'.$n.prev || echo gone; "
+                 "done | md5sum" % (first, srm), check=False).split()
+    return out[0] if out else None
+
+
 def is_dir(dev, path):
-    return dev.sh("test -d '%s' && echo y" % path, check=False).strip() == "y"
+    out = dev.sh("[ -d '%s' ] && echo dir" % path, check=False)
+    return out.strip() == "dir"
 
 
 def listing(dev, folder):
@@ -110,10 +130,10 @@ def write_config(dev, args, cfg, saf_run, interval):
     dev.push_text(text, cfg)
 
 
-def launch(dev, args, cfg):
+def launch(dev, args, cfg, content=None):
     dev.sh("logcat -c", check=False)
     dev.sh("am start -n %s/%s -e ROM '%s' -e LIBRETRO '%s' -e CONFIGFILE '%s'"
-           % (args.package, ACTIVITY, args.content, args.core, cfg))
+           % (args.package, ACTIVITY, content or args.content, args.core, cfg))
     time.sleep(10)
     if not running(dev, args.package):
         raise RuntimeError("the package did not start")
@@ -187,8 +207,8 @@ def main():
     check("quit ends the process", quit_and_wait(dev, args.package))
     names = listing(dev, saves)
     check(".srm written", game + ".srm" in names)
-    check("no .tmp or .old left in saves",
-          not [n for n in names if n.endswith((".tmp", ".old"))])
+    check("no .tmp or .prev left in saves",
+          not [n for n in names if n.endswith((".tmp", ".prev"))])
     snames = listing(dev, states)
     check("state file written", game + ".state" in snames)
     check("no .tmp left in states",
@@ -206,28 +226,89 @@ def main():
 
     print("saf_stale_aside")
     write_config(dev, args, cfg, saf_run, 0)
-    dev.push_text("stale aside\n", srm + ".old")
+    dev.push_text("stale aside\n", srm + ".prev")
+    dev.sh("for n in $(seq 3 99); do echo taken $n > '%s'.$n.prev; done" % srm)
+    stale = md5(dev, srm + ".prev")
+    taken = asides_md5(dev, srm, 3)
     before = md5(dev, srm)
     launch(dev, args, cfg)
     time.sleep(5)
     check("quit ends the process", quit_and_wait(dev, args.package))
     check(".srm replaced", before is not None and md5(dev, srm) not in (None, before))
-    check("no .old left in saves",
-          not [n for n in listing(dev, saves) if n.endswith(".old")])
+    check("the stale aside keeps its bytes", md5(dev, srm + ".prev") == stale)
+    check("every taken aside name keeps its bytes",
+          asides_md5(dev, srm, 3) == taken)
+    check("no .2.prev left", md5(dev, srm + ".2.prev") is None)
     check("no failed save logged", log_count(dev, "Failed to save SRAM") == 0)
 
     print("saf_rename_replace_fail")
     before = md5(dev, srm)
-    dev.sh("mkdir '%s.old'" % srm)
+    dev.sh("echo taken 2 > '%s.2.prev'" % srm)
     launch(dev, args, cfg)
     time.sleep(5)
     check("quit ends the process", quit_and_wait(dev, args.package))
     check(".srm keeps its old bytes", before is not None and md5(dev, srm) == before)
-    check("the folder at the aside name stays", is_dir(dev, srm + ".old"))
     check("the failed write is logged",
           log_count(dev, "Failed to save SRAM") >= 1)
     check("no .tmp left in saves",
           not [n for n in listing(dev, saves) if n.endswith(".tmp")])
+
+    print("saf_aside_folder")
+    folder_srm = "%s/folder/saves/%s.srm" % (fs_run, game)
+    write_config(dev, args, cfg, saf_run + "/folder", 0)
+    launch(dev, args, cfg)
+    time.sleep(5)
+    check("quit ends the process", quit_and_wait(dev, args.package))
+    dev.sh("mkdir '%s.prev' && echo inside > '%s.prev/keep'"
+           % (folder_srm, folder_srm))
+    before = md5(dev, folder_srm)
+    inside = md5(dev, folder_srm + ".prev/keep")
+    launch(dev, args, cfg)
+    time.sleep(5)
+    check("quit ends the process", quit_and_wait(dev, args.package))
+    check(".srm replaced",
+          before is not None and md5(dev, folder_srm) not in (None, before))
+    check("the folder at .prev and its file stay as they were",
+          is_dir(dev, folder_srm + ".prev") and inside is not None
+          and md5(dev, folder_srm + ".prev/keep") == inside)
+    check("no .2.prev left", md5(dev, folder_srm + ".2.prev") is None)
+    check("no failed save logged", log_count(dev, "Failed to save SRAM") == 0)
+
+    print("saf_long_name")
+    long_game = ("long-name-" + "x" * 247)[:247]
+    assert len((long_game + ".srm").encode()) == 251
+    ext = args.content.rsplit("/", 1)[-1].rsplit(".", 1)[1:]
+    long_content = "/sdcard/Android/data/%s/files/%s" % (
+        args.package, ".".join([long_game] + ext))
+    long_srm = "%s/long/saves/%s.srm" % (fs_run, long_game)
+    dev.sh("cp '%s' '%s'" % (args.content, long_content))
+    left.append(long_content)
+    write_config(dev, args, cfg, saf_run + "/long", 0)
+    launch(dev, args, cfg, long_content)
+    time.sleep(5)
+    check("quit ends the process", quit_and_wait(dev, args.package))
+    before = md5(dev, long_srm)
+    check(".srm written", before is not None)
+    launch(dev, args, cfg, long_content)
+    time.sleep(5)
+    check("quit ends the process", quit_and_wait(dev, args.package))
+    check(".srm replaced", md5(dev, long_srm) not in (None, before))
+    check("no .old or .tmp left",
+          md5(dev, long_srm + ".old") is None
+          and md5(dev, long_srm + ".tmp") is None)
+    check("no failed save logged", log_count(dev, "Failed to save SRAM") == 0)
+    dev.push_text("taken old\n", long_srm + ".old")
+    before = md5(dev, long_srm)
+    taken = md5(dev, long_srm + ".old")
+    launch(dev, args, cfg, long_content)
+    time.sleep(5)
+    check("quit ends the process", quit_and_wait(dev, args.package))
+    check(".srm keeps its old bytes",
+          before is not None and md5(dev, long_srm) == before)
+    check("the file at .old keeps its bytes",
+          taken is not None and md5(dev, long_srm + ".old") == taken)
+    check("the failed write is logged",
+          log_count(dev, "Failed to save SRAM") >= 1)
 
     if args.saf_root:
         print("saf_root_tree")
@@ -244,9 +325,9 @@ def main():
         time.sleep(5)
         check("quit ends the process", quit_and_wait(dev, args.package))
         check(".srm replaced", md5(dev, root_srm) not in (None, first))
-        check("no .tmp or .old left in saves",
+        check("no .tmp or .prev left in saves",
               not [n for n in listing(dev, root_saves)
-                   if n.endswith((".tmp", ".old"))])
+                   if n.endswith((".tmp", ".prev"))])
         check("no failed save logged", log_count(dev, "Failed to save SRAM") == 0)
         left.append("%s/%s" % (args.fs_root, stamp))
     else:
