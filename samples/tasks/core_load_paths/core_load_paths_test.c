@@ -13,7 +13,9 @@
 #include <features/features_cpu.h>
 #include <file/config_file.h>
 #include <file/file_path.h>
+#include <queues/message_queue.h>
 #include <queues/task_queue.h>
+#include <retro_miscellaneous.h>
 #include <retro_timers.h>
 #include <streams/file_stream.h>
 #include <string/stdstring.h>
@@ -77,6 +79,61 @@ static bool shown(void)
    const char *label = NULL;
    menu_entries_get_last_stack(NULL, &label, NULL, NULL, NULL);
    return string_is_equal(label, MENU_ENUM_LABEL_DEFERRED_CORE_WARNING_STR);
+}
+
+#define NO_ROW ((size_t)-1)
+
+/* The row with that label on the screen on top, or NO_ROW */
+static size_t row(const char *want)
+{
+   menu_list_t *menu_list = menu_state_get_ptr()->entries.list;
+   file_list_t *buf       = menu_list ? MENU_LIST_GET_SELECTION(menu_list, 0) : NULL;
+   size_t i;
+   for (i = 0; buf && i < buf->size; i++)
+      if (buf->list[i].label && string_is_equal(buf->list[i].label, want))
+         return i;
+   return NO_ROW;
+}
+
+/* OK on the screen's row for a choice, as the user answers: the screen
+ * closes itself. True when the answer was taken. */
+static bool answer(enum core_warning_choice choice)
+{
+   menu_entry_t entry;
+   const char *want = msg_hash_to_str(
+         choice == CORE_WARNING_CANCEL    ? MENU_ENUM_LABEL_CORE_WARNING_CANCEL
+       : choice == CORE_WARNING_LOAD_ONCE ? MENU_ENUM_LABEL_CORE_WARNING_LOAD_ONCE
+       : MENU_ENUM_LABEL_CORE_WARNING_ALWAYS_TRUST);
+   size_t i;
+   unsigned frames;
+   /* The rows come with the screen's first menu frame */
+   for (frames = 0; frames < 60 && shown() && row(want) == NO_ROW; frames++)
+      pump(1);
+   if (!shown() || (i = row(want)) == NO_ROW)
+      return false;
+   menu_state_get_ptr()->selection_ptr = i;
+   MENU_ENTRY_INITIALIZE(entry);
+   entry.flags |= MENU_ENTRY_FLAG_PATH_ENABLED
+                | MENU_ENTRY_FLAG_LABEL_ENABLED
+                | MENU_ENTRY_FLAG_RICH_LABEL_ENABLED
+                | MENU_ENTRY_FLAG_VALUE_ENABLED
+                | MENU_ENTRY_FLAG_SUBLABEL_ENABLED;
+   menu_entry_get(&entry, 0, i, NULL, true);
+   menu_entry_action(&entry, i, MENU_ACTION_OK);
+   return !warning_up();
+}
+
+/* An error a load put on screen since the last call; drains the queue */
+static bool error_queued(void)
+{
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   msg_queue_entry_t entry;
+   bool found = false;
+   while (msg_queue_extract(&runloop_st->msg_queue, &entry))
+      if (entry.category == MESSAGE_QUEUE_CATEGORY_ERROR)
+         found = true;
+   runloop_st->msg_queue_size = 0;
+   return found;
 }
 
 static bool core_is(enum rarch_core_type type)
@@ -173,9 +230,10 @@ static void mode_startup(enum core_warning_choice choice)
 {
    CHECK(wait_for(warning_up, 120), "no Security Warning for the startup core");
    check_shown(60, "the startup core's warning is not shown");
-   CHECK(core_warning_choose(choice), "the startup warning's answer was not taken");
+   CHECK(answer(choice), "the startup warning's answer was not taken");
    CHECK(wait_for(is_plain, 600), "the answer did not run the startup core");
    CHECK(!warning_up(), "the startup warning stayed after its answer");
+   CHECK(!shown(), "the startup warning's screen stayed after its answer");
    /* Load Once lasts until another core loads */
    load_quietly(bad_core);
    if (choice != CORE_WARNING_ALWAYS_TRUST)
@@ -208,12 +266,14 @@ static void mode_startup_needs_content(void)
    unsigned i;
    bool loads = false;
    CHECK(wait_for(warning_up, 120), "no Security Warning for the startup core");
+   error_queued();
    CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE), "Load Once not taken");
-   /* As Load Core: the core is named, no load starts */
+   /* As Load Core: the core is named, no load starts. A load can start
+    * and fail inside one frame: its error message stays queued. */
    for (i = 0; i < 600 && !nc_loaded(); i++)
    {
       pump(1);
-      if (runloop_is_content_switching())
+      if (runloop_is_content_switching() || error_queued())
          loads = true;
    }
    CHECK(!loads, "Load Once started a load of a core that needs content");
@@ -227,6 +287,7 @@ static void mode_startup_needs_content(void)
             name ? name : "");
    }
    pump(30);
+   CHECK(!error_queued(), "Load Once of a core that needs content put an error on screen");
    CHECK(nc_loaded(), "the core loaded did not stay");
    CHECK(!warning_up(), "the warning came back");
    CHECK(menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE, "the menu is not up");
@@ -256,9 +317,9 @@ static void staged_trust(const char *core)
    CHECK(wait_for(is_dummy, 120), "the refused load did not end on the dummy core");
    pump(30);
    check_shown(1, "the warning screen did not outlast the refused load");
-   CHECK(core_warning_choose(CORE_WARNING_ALWAYS_TRUST),
-         "Always Trust not taken");
+   CHECK(answer(CORE_WARNING_ALWAYS_TRUST), "Always Trust not taken");
    CHECK(wait_for(is_plain, 600), "Always Trust did not run the core");
+   CHECK(!shown(), "the staged load's warning screen stayed after its answer");
    CHECK(string_is_equal(path_get(RARCH_PATH_CORE), core),
          "another core runs");
    load_quietly(core);
@@ -358,9 +419,10 @@ static void mode_probe(void)
    menu_driver_ctl(RARCH_MENU_CTL_SET_PENDING_QUICK_MENU, &flush);
    pump(10);
    check_shown(60, "the warning did not come back after a Quick Menu push");
-   CHECK(core_warning_choose(CORE_WARNING_CANCEL), "Cancel not taken");
+   CHECK(answer(CORE_WARNING_CANCEL), "Cancel not taken");
    pump(10);
    CHECK(!warning_up(), "the warning stayed after Cancel");
+   CHECK(!shown(), "the warning screen stayed after Cancel");
    path_set(RARCH_PATH_CORE, bad_core);
    setting = menu_setting_find_enum(MENU_ENUM_LABEL_CORE_LIST);
    CHECK(setting && setting->actions && setting->actions->ok,
@@ -507,6 +569,10 @@ static const char *const made_dirs[] = {
    "system", "thumbnails"
 };
 
+static char cfg_home[300];
+static char ra_dir[320];
+static char cores[340];
+
 static void remove_in(const char *in, const char *name)
 {
    char path[800];
@@ -514,14 +580,42 @@ static void remove_in(const char *in, const char *name)
    remove(path);
 }
 
+/* Everything a run made, by name; what was never made is skipped */
+static void clean_run(void)
+{
+   size_t i;
+   remove(good_core);
+   remove(bad_core);
+   remove(nc_core);
+   rmdir(cores);
+   if (*seeded)
+      remove(seeded);
+   remove_in(ra_dir, CORE_TRUST_FILE_NAME);
+   remove_in(ra_dir, CORE_TRUST_FILE_NAME ".testkey");
+   for (i = 0; i < sizeof(made_dirs) / sizeof(made_dirs[0]); i++)
+   {
+      char path[PATH_MAX_LENGTH];
+      snprintf(path, sizeof(path), "%s/%s", ra_dir, made_dirs[i]);
+      rmdir(path);
+   }
+   rmdir(ra_dir);
+   rmdir(cfg_home);
+   remove_in(dir, "harness.cfg");
+   remove_in(dir, "title.bin");
+   remove_in(dir, "sub.bin");
+   remove_in(dir, "core_probe.cache");
+   remove_in(dir, "core_info.cache");
+   rmdir(dir);
+}
+
 int main(int argc, char *argv[])
 {
    static char env_xdg[400];
    static char env_home[400];
+#ifdef _WIN32
+   static char env_appdata[400];
+#endif
    char cfg_path[300];
-   char cfg_home[300];
-   char ra_dir[320];
-   char cores[340];
    char *rarch_argv[8]  = {0};
    int rarch_argc       = 0;
    const char *mode     = argc > 1 ? argv[1] : "";
@@ -541,12 +635,20 @@ int main(int argc, char *argv[])
    snprintf(ra_dir, sizeof(ra_dir), "%s/retroarch", cfg_home);
    snprintf(cores, sizeof(cores), "%s/cores", dir);
    if (!path_mkdir(cfg_home) || !path_mkdir(cores))
+   {
+      clean_run();
       return 1;
+   }
    /* A fresh trust store and default cores folder for every mode */
    snprintf(env_xdg, sizeof(env_xdg), "XDG_CONFIG_HOME=%s", cfg_home);
    snprintf(env_home, sizeof(env_home), "HOME=%s", cfg_home);
    putenv(env_xdg);
    putenv(env_home);
+#ifdef _WIN32
+   /* The store's folder there */
+   snprintf(env_appdata, sizeof(env_appdata), "APPDATA=%s", cfg_home);
+   putenv(env_appdata);
+#endif
    if (getenv("HARNESS_VERBOSE"))
       verbosity_enable();
 
@@ -569,12 +671,16 @@ int main(int argc, char *argv[])
    {
       fprintf(stderr, "FAIL: no harness cores beside %s: build.sh builds them\n",
             argv[0]);
+      clean_run();
       return 1;
    }
 
    snprintf(cfg_path, sizeof(cfg_path), "%s/harness.cfg", dir);
    if (!(cfg = fopen(cfg_path, "wb")))
+   {
+      clean_run();
       return 1;
+   }
    fprintf(cfg, "video_driver = \"null\"\n");
    fprintf(cfg, "audio_driver = \"null\"\n");
    fprintf(cfg, "audio_enable = \"false\"\n");
@@ -594,6 +700,8 @@ int main(int argc, char *argv[])
    fprintf(cfg, "sort_savefiles_enable = \"false\"\n");
    fprintf(cfg, "sort_savestates_enable = \"false\"\n");
    fprintf(cfg, "menu_show_load_content_animation = \"false\"\n");
+   /* A first run's prompt would take the warning screen's input */
+   fprintf(cfg, "rgui_show_start_screen = \"false\"\n");
    fprintf(cfg, "threaded_data_runloop_enable = \"false\"\n");
    fprintf(cfg, "libretro_info_path = \"%s\"\n", dir);
    fprintf(cfg, "savefile_directory = \"%s\"\n", dir);
@@ -625,7 +733,10 @@ int main(int argc, char *argv[])
       strlcat(seeded, "/seeded_libretro.", sizeof(seeded));
       strlcat(seeded, ext, sizeof(seeded));
       if (!copy_beside(argv[0], "harness_core.so", seeded))
+      {
+         clean_run();
          return 1;
+      }
       rarch_argv[rarch_argc++] = (char*)"-L";
       rarch_argv[rarch_argc++] = seeded;
       startup_dummy            = true;
@@ -644,8 +755,12 @@ int main(int argc, char *argv[])
             CORE_TYPE_PLAIN, NULL, NULL);
    }
    if (string_is_equal(mode, "null-refused"))
+   {
       /* Refused with no menu to ask on: the startup fails */
       CHECK(!inited, "a refused startup load with no menu did not fail");
+      CHECK(core_load_check_refused(bad_core),
+            "the startup failed, but not on the check's refusal");
+   }
    else if (!inited)
    {
       fprintf(stderr, "FAIL: the startup failed\n");
@@ -707,30 +822,7 @@ int main(int argc, char *argv[])
                "the load check's state outlived main_exit");
    }
 
-   remove(good_core);
-   remove(bad_core);
-   remove(nc_core);
-   rmdir(cores);
-   if (*seeded)
-      remove(seeded);
-   remove_in(ra_dir, CORE_TRUST_FILE_NAME);
-   remove_in(ra_dir, CORE_TRUST_FILE_NAME ".testkey");
-   {
-      size_t i;
-      for (i = 0; i < sizeof(made_dirs) / sizeof(made_dirs[0]); i++)
-      {
-         snprintf(cores, sizeof(cores), "%s/%s", ra_dir, made_dirs[i]);
-         rmdir(cores);
-      }
-   }
-   rmdir(ra_dir);
-   rmdir(cfg_home);
-   remove_in(dir, "harness.cfg");
-   remove_in(dir, "title.bin");
-   remove_in(dir, "sub.bin");
-   remove_in(dir, "core_probe.cache");
-   remove_in(dir, "core_info.cache");
-   rmdir(dir);
+   clean_run();
 
    fprintf(stderr, "%s: %u failures\n", mode, failures);
    return failures ? 1 : 0;

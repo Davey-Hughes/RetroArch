@@ -49,6 +49,11 @@ on:
       - 'core_trust_runtime.h'
       - 'core_signature.c'
       - 'core_signing_keys.h'
+      - 'core_signature.h'
+      - 'core_signature_io.c'
+      - 'runahead.h'
+      - 'Makefile.common'
+      - 'qb/config.libs.sh'
       - 'samples/settings/packed_rows/**'
       - 'setting_list.h'
       - 'gfx/video_defines.h'
@@ -87,6 +92,11 @@ on:
       - 'core_trust_runtime.h'
       - 'core_signature.c'
       - 'core_signing_keys.h'
+      - 'core_signature.h'
+      - 'core_signature_io.c'
+      - 'runahead.h'
+      - 'Makefile.common'
+      - 'qb/config.libs.sh'
       - 'samples/settings/packed_rows/**'
       - 'setting_list.h'
       - 'gfx/video_defines.h'
@@ -489,7 +499,6 @@ jobs:
           # probe and a parked Load Core, the first run's seed, run-ahead's
           # copy, Load Once lasting through Close Content until another
           # core loads, and another load ending a waiting park.
-          samples/tasks/core_load_paths/build.sh
           make -C samples/tasks/core_load_paths check
           make -C samples/tasks/core_load_paths clean
 
