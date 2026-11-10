@@ -1370,6 +1370,11 @@ static void open_core_handler(ui_browser_window_state_t *state, bool result)
 
    path_set(RARCH_PATH_CORE, state->result);
    ui_companion_event_command(CMD_EVENT_LOAD_CORE);
+#ifdef HAVE_CORE_LOAD_CHECK
+   /* Held back for its check: loads after it, or asks */
+   if (task_content_park_core_load(state->result))
+      return;
+#endif
 
    if (     sys_info
          && sys_info->load_no_content

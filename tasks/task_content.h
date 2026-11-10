@@ -85,6 +85,12 @@ bool task_content_is_load_stage(const retro_task_t *task);
 void task_content_load_notify_finish(const char *error);
 /* Whether a content load is in progress. */
 bool task_content_load_pending(void);
+#ifdef HAVE_CORE_LOAD_CHECK
+/* After a refused probe of core_path from a user's action with no load
+ * after it: parks a core load for when its check passes or the user
+ * answers the Security Warning */
+bool task_content_park_core_load(const char *core_path);
+#endif
 
 /* Every task_push_load_* entry point below (the CLI one excepted, which
  * is startup itself and loads in one go) starts the load as a chain of

@@ -2564,6 +2564,10 @@ static int generic_action_ok(const char *path,
                      CORE_TYPE_PLAIN,
                      NULL, NULL))
             {
+#ifdef HAVE_CORE_LOAD_CHECK
+               /* Held back for its check: loads after it, or asks */
+               task_content_park_core_load(action_path);
+#endif
 #ifndef HAVE_DYNAMIC
                ret = -1;
 #endif

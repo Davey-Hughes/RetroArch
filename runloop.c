@@ -9909,6 +9909,10 @@ int runloop_iterate(void)
 
    recording_gpu_poll();
    runloop_msg_queue_drain_deferred();
+#ifdef HAVE_CORE_LOAD_CHECK
+   if (!runloop_st->quit_pending)
+      core_load_check_iterate();
+#endif
 
    /* A quit waiting for its state to be written: the core is not run
     * and nothing is read but the input the window needs drained; the
