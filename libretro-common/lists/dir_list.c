@@ -334,6 +334,13 @@ static int dir_list_read_ctx(size_t dir_len, struct dir_list_ctx *ctx)
       }
    }
 
+   /* Read only part-way: a file missing from the list may be there */
+   if (retro_dirent_error(entry))
+   {
+      retro_closedir(entry);
+      return -1;
+   }
+
    retro_closedir(entry);
 
    return 0;

@@ -330,11 +330,14 @@ $(TARGET_TEST17): filestream_atomic_test.o \
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 # vfs_readdir_error_test compiles vfs_implementation.c into itself too,
-# to break a directory handle underneath a read.
+# to break a directory handle underneath a read, and lists through
+# dir_list.
 vfs_readdir_error_test.o: $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
 
 $(TARGET_TEST18): vfs_readdir_error_test.o \
-		$(filter-out %/vfs_implementation.o,$(COMMON_OBJS))
+		$(filter-out %/vfs_implementation.o,$(COMMON_OBJS)) \
+		$(call sample_objs,$(LIBRETRO_COMM_DIR)/lists/dir_list.o \
+		$(LIBRETRO_COMM_DIR)/lists/string_list.o)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 clean:

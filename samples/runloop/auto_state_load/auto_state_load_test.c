@@ -6,6 +6,31 @@
 #include <streams/file_stream.h>
 #include <vfs/vfs_implementation.h>
 
+/* A listing's read fails after this many entries; -1 for none.
+ * retro_dirent.c is compiled in here to read through these. */
+static int  fail_read_after = -1;
+static bool read_failed;
+static bool test_readdir(libretro_vfs_implementation_dir *rdir)
+{
+   if (fail_read_after == 0)
+   {
+      read_failed = true;
+      return false;
+   }
+   if (fail_read_after > 0)
+      fail_read_after--;
+   return retro_vfs_readdir_impl(rdir);
+}
+static bool test_dirent_error(libretro_vfs_implementation_dir *rdir)
+{
+   return read_failed || retro_vfs_dirent_error_impl(rdir);
+}
+#define retro_vfs_readdir_impl      test_readdir
+#define retro_vfs_dirent_error_impl test_dirent_error
+#include "../../../libretro-common/file/retro_dirent.c"
+#undef retro_vfs_readdir_impl
+#undef retro_vfs_dirent_error_impl
+
 static settings_t test_settings;
 static video_driver_state_t test_video;
 static unsigned runs, size_checks, loads, settings_checks, path_checks;
@@ -670,6 +695,35 @@ static void lane_max_keep_exact_name(void)
    assert(there(game));
 }
 
+/* state_auto_index_unlisted: a state folder read only part-way keeps
+ * the slot, so the next save goes over no state */
+static void test_state_auto_index_unlisted(void)
+{
+   states_reset("Game");
+   test_settings.uints.savestate_max_keep = 0;
+   put("Game.state1");
+   put("Game.state2");
+   put("Game.state3");
+   command_event_set_savestate_auto_index(&test_settings);
+   assert(test_settings.ints.state_slot == 3);
+
+   fail_read_after = 1;
+   command_event_set_savestate_auto_index(&test_settings);
+   assert(read_failed);
+   fail_read_after = -1;
+   read_failed     = false;
+   assert(test_settings.ints.state_slot == 3);
+   /* the advance CMD_EVENT_SAVE_STATE makes first (retroarch.c) */
+   test_settings.ints.state_slot =
+      command_event_get_next_savestate_auto_index(&test_settings);
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE));
+   assert(string_ends_with(saved_path, "Game.state4"));
+   save_finished(NULL);
+   assert(there("Game.state1") && there("Game.state2")
+         && there("Game.state3"));
+   puts("state auto-index tests passed");
+}
+
 static int free_replay_slot(int slot)
 {
    assert(command_event_free_replay_slot(&slot));
@@ -840,6 +894,7 @@ int main(void)
    states_clear();
    filestream_delete(STATES);
    puts("max_keep tests passed");
+   test_state_auto_index_unlisted();
    test_replay_slots();
    test_auto_slot_owned();
    test_auto_state_order();

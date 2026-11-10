@@ -1,6 +1,9 @@
 /* retro_dirent_error() once retro_readdir() has returned false: true
  * when the folder could not be read to its end, false at its end.
  *
+ *   dir_list_midway_error - a folder whose read fails part-way is not
+ *                           listed: dir_list_new() returns NULL.
+ *
  * vfs_implementation.c is compiled into this file so that a test can
  * break a handle underneath the next read, as a failing disk would. */
 
@@ -19,10 +22,15 @@
 #include <dirent.h>
 #endif
 
+/* dir_list reads through the wrapper below */
+#define retro_vfs_readdir_impl test_real_readdir
 #include "../../../vfs/vfs_implementation.c"
+#undef retro_vfs_readdir_impl
 
 #include <retro_dirent.h>
 #include <file/file_path.h>
+#include <lists/dir_list.h>
+#include <lists/string_list.h>
 #include <streams/file_stream.h>
 
 static int failures;
@@ -48,6 +56,17 @@ static void break_handle(struct RDIR *rdir)
 #endif
 }
 
+/* The read before which the wrapper breaks the handle; -1 for none */
+static int break_at = -1;
+static int reads;
+
+bool retro_vfs_readdir_impl(libretro_vfs_implementation_dir *rdir)
+{
+   if (reads++ == break_at)
+      break_handle((struct RDIR*)rdir);
+   return test_real_readdir(rdir);
+}
+
 static unsigned read_all(struct RDIR *rdir)
 {
    unsigned n = 0;
@@ -58,8 +77,10 @@ static unsigned read_all(struct RDIR *rdir)
 
 int main(void)
 {
-   struct RDIR *rdir;
-   unsigned     i;
+   struct RDIR        *rdir;
+   struct string_list *list;
+   struct string_list  init_list = {0};
+   unsigned            i;
 
    path_mkdir(dir_name);
    for (i = 0; i < 3; i++)
@@ -89,6 +110,25 @@ int main(void)
       CHECK(retro_dirent_error(rdir));
       retro_closedir(rdir);
    }
+
+   /* dir_list_midway_error: as above, under dir_list */
+#if defined(_WIN32)
+   break_at = 1;
+#else
+   break_at = 0;
+#endif
+   reads = 0;
+   list  = dir_list_new(dir_name, NULL, false, true, false, false);
+   CHECK(!list);
+   string_list_free(list);
+   reads = 0;
+   CHECK(!dir_list_initialize(&init_list, dir_name, NULL, false, true,
+         false, false));
+   string_list_deinitialize(&init_list);
+   break_at = -1;
+   list = dir_list_new(dir_name, NULL, false, true, false, false);
+   CHECK(list && list->size == 3);
+   string_list_free(list);
 
    for (i = 0; i < 3; i++)
       filestream_delete(files[i]);

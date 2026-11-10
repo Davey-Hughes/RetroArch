@@ -2,7 +2,6 @@ TARGET := auto_state_load_test
 ROOT := ../../..
 SOURCES := auto_state_load_test.c $(ROOT)/command.c \
            $(ROOT)/libretro-common/file/file_path.c \
-           $(ROOT)/libretro-common/file/retro_dirent.c \
            $(ROOT)/libretro-common/lists/dir_list.c \
            $(ROOT)/libretro-common/lists/string_list.c \
            $(ROOT)/libretro-common/streams/file_stream.c \
@@ -22,7 +21,9 @@ endif
 
 all: $(TARGET)
 
-$(TARGET): $(SOURCES) $(ROOT)/runloop.c $(ROOT)/runloop.h
+# retro_dirent.c is compiled into the test, so a lane can fail a read
+$(TARGET): $(SOURCES) $(ROOT)/runloop.c $(ROOT)/runloop.h \
+		$(ROOT)/libretro-common/file/retro_dirent.c
 	$(CC) $(CFLAGS) $(SOURCES) -o $@ $(LDFLAGS)
 
 # The states a lane leaves when it fails go too

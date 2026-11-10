@@ -6690,8 +6690,9 @@ bool command_event_load_auto_state(void)
  * @param last_index Return value for load slot.
  * @param @s Return value for file name that should be removed.
  * @param len Size of @s.
+ * @return false when the folder could not be listed.
  */
-static void command_scan_states(
+static bool command_scan_states(
       bool show_hidden_files,
       unsigned savestate_max_keep,
       int curr_state_slot,
@@ -6722,7 +6723,7 @@ static void command_scan_states(
 
    if (!(dir_list = dir_list_new_special(state_dir,
                DIR_LIST_PLAIN, NULL, show_hidden_files)))
-      return;
+      return false;
 
    state_base     = path_basename(name_savestate);
    state_base_len = strlen(state_base);
@@ -6860,6 +6861,7 @@ static void command_scan_states(
       runloop_get_savestate_path(s, len, (int)del_idx);
 
    dir_list_free(dir_list);
+   return true;
 }
 
 /**
@@ -6896,10 +6898,16 @@ void command_event_set_savestate_auto_index(settings_t *settings)
    if (savestate_auto_index)
    {
       int prev_slot          = settings->ints.state_slot;
-      command_scan_states(
+      /* Unlisted: from slot 0, the next save may overwrite a missed state */
+      if (!command_scan_states(
             settings->bools.show_hidden_files,
             settings->uints.savestate_max_keep,
-            settings->ints.state_slot, NULL, &max_idx, NULL, 0);
+            settings->ints.state_slot, NULL, &max_idx, NULL, 0))
+      {
+         RARCH_WARN("[State] Could not list the state folder: "
+               "slot #%d kept.\n", prev_slot);
+         return;
+      }
       configuration_set_int(settings, settings->ints.state_slot, max_idx);
       RARCH_LOG("[State] %s: #%d (slot reset %d -> %u from on-disk scan, "
             "max_keep %u). If the previous slot was higher, earlier saves "
