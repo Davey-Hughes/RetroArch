@@ -1949,6 +1949,7 @@ static void park_other_load(enum park_wait_kind kind, bool same)
    char a[256];
    char b[256];
    unsigned opens;
+   dylib_t lib = NULL;
    void *buf   = NULL;
    int64_t len = 0;
    park_reset();
@@ -2017,6 +2018,14 @@ static void park_other_load(enum park_wait_kind kind, bool same)
    /* Its check, if one ran, ended quietly: no warning came of it */
    if (kind != PARK_IN_USER && kind != PARK_IN_IDLE)
       CHECK(menu_opens == opens);
+   /* Its Load Once went with it */
+   if (kind == PARK_IN_IDLE && !same)
+   {
+      CHECK(core_load_check_open(a, &lib) == CORE_LOAD_GATE_REFUSED);
+      CHECK(!lib);
+      if (lib)
+         dylib_close(lib);
+   }
    stop();
 }
 
