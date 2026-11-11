@@ -5,7 +5,8 @@ TARGET := core_load_paths_test
 MODES  := startup startup-always startup-outside startup-content \
           startup-needs-content \
           null-seed null-refused staged staged-threaded playlist subsystem \
-          playlist-sub netplay-sub probe seed runahead load-once park-ends
+          playlist-sub netplay-sub probe seed runahead load-once park-ends \
+          builtin
 
 all:
 	@MAKE_ARGS="$(MAKE_ARGS)" ./build.sh

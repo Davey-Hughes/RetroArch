@@ -699,6 +699,79 @@ static void mode_park_ends(void)
          "the parked core replaced the session");
 }
 
+#ifdef HAVE_NETWORKGAMEPAD
+static bool pad_runs(void) { return core_is(CORE_TYPE_NETRETROPAD); }
+
+/* Drains the queue: whether it said core is being checked */
+static bool checking_queued(const char *core)
+{
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   msg_queue_entry_t entry;
+   char want[NAME_MAX_LENGTH + 64];
+   bool found = false;
+   snprintf(want, sizeof(want), "%s%s", msg_hash_to_str(MSG_CHECKING_CORE),
+         path_basename_nocompression(core));
+   while (msg_queue_extract(&runloop_st->msg_queue, &entry))
+      if (string_is_equal(entry.msg, want))
+         found = true;
+   runloop_st->msg_queue_size = 0;
+   return found;
+}
+
+static void start_pad(void)
+{
+   content_ctx_info_t info;
+   info.argc        = 0;
+   info.argv        = NULL;
+   info.args        = NULL;
+   info.environ_get = NULL;
+   CHECK(task_push_start_builtin_core(&info, CORE_TYPE_NETRETROPAD,
+            NULL, NULL), "the built-in core's start was not pushed");
+}
+
+/* A built-in core opens no library, so its load checks none; it ends a
+ * waiting park and Load Once as another core's load does */
+static void mode_builtin(void)
+{
+   unsigned i;
+   CHECK(task_push_load_contentless_core_from_menu(bad_core), "not started");
+   CHECK(wait_for(warning_up, 600), "no Security Warning for the core");
+   CHECK(wait_for(is_dummy, 120), "the refused load did not end");
+   start_pad();
+   CHECK(wait_for(pad_runs, 600), "the built-in core did not run");
+   CHECK(!warning_up(), "the parked core's warning outlived a built-in core's load");
+   if (warning_up())
+      core_warning_choose(CORE_WARNING_CANCEL);
+   for (i = 0; i < 60; i++)
+   {
+      CHECK(!runloop_is_content_switching(), "the ended park ran again");
+      pump(1);
+   }
+   CHECK(pad_runs(), "the parked core replaced the built-in core");
+   /* Load Core's core, never checked, is still named */
+   path_set(RARCH_PATH_CORE, nc_core);
+   checking_queued(nc_core);
+   start_pad();
+   for (i = 0; i < 600 && runloop_is_content_switching(); i++)
+   {
+      CHECK(!checking_queued(nc_core),
+            "a built-in core's load checked another core");
+      pump(1);
+   }
+   CHECK(wait_for(pad_runs, 60), "the built-in core did not run again");
+   CHECK(task_push_load_contentless_core_from_menu(bad_core), "not started");
+   CHECK(wait_for(warning_up, 600), "no Security Warning for the core");
+   CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE), "Load Once not taken");
+   CHECK(wait_for(bad_runs, 600), "Load Once did not run the core");
+   start_pad();
+   CHECK(wait_for(pad_runs, 600), "the built-in core did not run");
+   CHECK(task_push_load_contentless_core_from_menu(bad_core), "not started");
+   CHECK(wait_for(warning_up, 600), "Load Once outlived a built-in core's load");
+   CHECK(core_warning_choose(CORE_WARNING_CANCEL), "Cancel not taken");
+   pump(10);
+}
+#endif
+
 #if defined(HAVE_RUNAHEAD) && defined(HAVE_DYNAMIC) && defined(HAVE_THREADS)
 /* Until the copy task has an answer: it reads and writes the whole
  * core file, which a loaded runner takes seconds over */
@@ -1123,6 +1196,12 @@ int main(int argc, char *argv[])
          mode_load_once();
       else if (string_is_equal(mode, "park-ends"))
          mode_park_ends();
+      else if (string_is_equal(mode, "builtin"))
+#ifdef HAVE_NETWORKGAMEPAD
+         mode_builtin();
+#else
+         fprintf(stderr, "builtin: not in this build\n");
+#endif
       else if (string_is_equal(mode, "runahead"))
 #if defined(HAVE_RUNAHEAD) && defined(HAVE_DYNAMIC) && defined(HAVE_THREADS)
          mode_runahead();

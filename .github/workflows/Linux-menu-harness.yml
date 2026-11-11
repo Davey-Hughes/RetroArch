@@ -500,7 +500,8 @@ jobs:
           # playlist Run, a parked subsystem load, a quiet probe and a
           # parked Load Core, the first run's seed, run-ahead's copy,
           # Load Once lasting through Close Content until another core
-          # loads, and another load ending a waiting park.
+          # loads, another load ending a waiting park, and a built-in
+          # core's load, which checks no core and is another core's.
           make -C samples/tasks/core_load_paths check
           make -C samples/tasks/core_load_paths clean
 
