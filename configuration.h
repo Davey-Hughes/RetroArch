@@ -321,6 +321,8 @@ typedef struct settings
       unsigned video_openxr_edit_snap_angles;
       unsigned video_openxr_edit_hinge_gap;
       unsigned video_openxr_edit_smoothing;
+      unsigned video_openxr_touch_hands;
+      unsigned video_openxr_touch_button;
       unsigned video_openxr_placement;
       unsigned video_fse_negotiation;
       unsigned video_hw_decode;
@@ -605,6 +607,12 @@ typedef struct settings
       float video_aspect_ratio;
       float video_vp_bias_x;
       float video_vp_bias_y;
+#ifdef HAVE_COCOATOUCH
+      float video_ios_margin_left;
+      float video_ios_margin_right;
+      float video_ios_margin_top;
+      float video_ios_margin_bottom;
+#endif
 #if defined(RARCH_MOBILE)
       float video_vp_bias_portrait_x;
       float video_vp_bias_portrait_y;
@@ -724,6 +732,7 @@ typedef struct settings
       bool video_openxr_perf_boost;
       bool video_openxr_edit_pause;
       bool video_openxr_edit_snap;
+      bool video_openxr_touch_passthrough;
       bool video_ctx_scaling;
       bool video_force_aspect;
       bool video_frame_delay_auto;

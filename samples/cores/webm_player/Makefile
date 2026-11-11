@@ -4,6 +4,7 @@ ROOT := ../../..
 COMMON := $(ROOT)/libretro-common
 TARGET := webm_player_test$(EXE)
 AUDIO ?= 1
+WMA ?= 1
 MP4 ?= 1
 THREADS ?= 1
 
@@ -53,6 +54,12 @@ ifeq ($(AUDIO),1)
 CFLAGS += -DHAVE_RAAC -DHAVE_ROPUS -DHAVE_RVORBIS
 SOURCES += $(COMMON)/formats/aac/raac.c \
  $(COMMON)/formats/opus/ropus.c $(COMMON)/formats/vorbis/rvorbis.c
+ifeq ($(WMA),1)
+CFLAGS += -DHAVE_RWMA
+SOURCES += $(COMMON)/formats/wma/rwma_pro.c \
+ $(COMMON)/formats/wma/rwma_standard.c $(COMMON)/formats/wma/rwma_stream.c \
+ $(COMMON)/audio/conversion/float_to_s16.c
+endif
 endif
 ifeq ($(THREADS),1)
 CFLAGS += -DHAVE_THREADS
@@ -70,6 +77,8 @@ OBJS := $(SAMPLE_OBJDIR)/webm_player_test.o \
 
 all: $(TARGET)
 
+$(call sample_objs,$(COMMON)/formats/wma/rwma_stream.o): $(COMMON)/formats/wma/rwma_xma_stream.h
+
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
@@ -79,6 +88,18 @@ $(SAMPLE_OBJDIR)/%.o: $$(call sample_src,$$*).c
 
 $(TARGET): $(OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+ifeq ($(AUDIO)$(WMA),11)
+WMA_TARGET := wma_player_test$(EXE)
+else
+WMA_TARGET := wma_player_disabled_test$(EXE)
+endif
+WMA_OBJS := $(filter-out $(SAMPLE_OBJDIR)/webm_player_test.o,$(OBJS))
+$(WMA_TARGET): wma_player_test.c $(ROOT)/libretro-common/samples/formats/audio_transfer_wma/wma_fixture.h $(WMA_OBJS)
+	$(CC) $(CFLAGS) -o $@ wma_player_test.c $(WMA_OBJS) $(LDFLAGS) $(LDLIBS)
+
+check-wma: $(WMA_TARGET)
+	$(RUNNER) ./$(WMA_TARGET)
 
 ifeq ($(MP4),1)
 HW_TARGET := webm_hw_test$(EXE)
@@ -177,6 +198,14 @@ VP9_HW_TARGET := webm_vp9_hw_test$(EXE)
 $(VP9_HW_TARGET): webm_vp9_hw_test.c $(ROOT)/cores/libretro-media/media_core.c $(VP9_HW_OBJS)
 	$(CC) $(CFLAGS) -o $@ webm_vp9_hw_test.c $(VP9_HW_OBJS) $(LDFLAGS) $(LDLIBS)
 
+ifeq ($(MP4),1)
+MP4_PREFETCH_TARGET := mp4_hw_prefetch_test$(EXE)
+$(MP4_PREFETCH_TARGET): mp4_hw_prefetch_test.c webm_vp9_hw_test.c $(ROOT)/cores/libretro-media/media_core.c $(RESIDENCY_OBJS)
+	$(CC) $(CFLAGS) -o $@ mp4_hw_prefetch_test.c $(RESIDENCY_OBJS) $(LDFLAGS) $(LDLIBS)
+all: $(MP4_PREFETCH_TARGET)
+check: $(MP4_PREFETCH_TARGET)
+endif
+
 DEVICE_TARGET := webm_vp9_device_test$(EXE)
 ifeq ($(EXE),.exe)
 $(DEVICE_TARGET): webm_vp9_device_test.c $(ROOT)/cores/libretro-media/media_core.c \
@@ -238,10 +267,13 @@ ifeq ($(MP4)$(AUDIO),11)
 endif
 ifeq ($(MP4),1)
 	$(RUNNER) ./$(MP4_SEEK_TARGET) fixtures/h264-seek-aac.mp4 fixtures/hevc-seek-aac.mp4 fixtures/h264-long-seek.mp4 fixtures/video-timeline-1.mp4
+	$(RUNNER) ./$(MP4_PREFETCH_TARGET)
 	$(RUNNER) ./$(HW_TARGET)
 endif
 
 clean:
+	rm -f mp4_hw_prefetch_test mp4_hw_prefetch_test.exe
+	rm -f wma_player_test wma_player_test.exe wma_player_disabled_test wma_player_disabled_test.exe
 	rm -f video_timeline_test video_timeline_test.exe
 	rm -f webm_audio_timeline_test webm_audio_timeline_test.exe
 	rm -f $(PROGRESSIVE_GROUP_TARGET)
@@ -256,4 +288,4 @@ clean:
 	rm -rf $(SAMPLE_OBJDIR)
 	rm -f webm_player_test.o $(TARGET) webm_hw_test webm_hw_test.exe webm_residency_test webm_residency_test.exe webm_vp9_hw_test webm_vp9_hw_test.exe webm_vp9_device_test webm_vp9_device_test.exe
 
-.PHONY: all check clean
+.PHONY: all check check-wma clean

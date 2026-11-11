@@ -958,6 +958,14 @@ jobs:
           python3 samples/menu/rgui_media/run.py --driver rgui --video-driver ${{ matrix.driver }} --gpu-surface --refresh-pixels samples/menu/rgui_media/fixture.mp4
           python3 samples/menu/rgui_media/run.py --driver rgui --video-driver ${{ matrix.driver }} --gpu-surface --continuous-error samples/menu/rgui_media/fixture.mp4
 
+      - name: External Ozone movie settings at drive root and in a subfolder
+        if: matrix.driver == 'd3d11'
+        shell: msys2 {0}
+        run: |
+          set -eu
+          ffmpeg -v error -y -f lavfi -i color=orange:size=320x240:rate=30 -t 3 -c:v libx264 -preset ultrafast -pix_fmt yuv420p samples/menu/rgui_media/settings-preview.mp4
+          MEDIA_TEST_SETTINGS_ORANGE=1 python3 samples/menu/texture_media/external_settings_paths.py samples/menu/rgui_media/settings-preview.mp4 --video-driver ${{ matrix.driver }} --threaded
+
   views-sdl3:
     name: Views on SDL3, end to end (Xvfb, llvmpipe)
     runs-on: ubuntu-latest
@@ -1000,7 +1008,8 @@ jobs:
         run: |
           set -eu
           SDL3_VER=3.2.20
-          curl -sL -o /tmp/sdl3.tar.gz \
+          curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 --connect-timeout 10 \
+             -o /tmp/sdl3.tar.gz \
              "https://github.com/libsdl-org/SDL/releases/download/release-$SDL3_VER/SDL3-$SDL3_VER.tar.gz"
           tar -C /tmp -xzf /tmp/sdl3.tar.gz
           cmake -S "/tmp/SDL3-$SDL3_VER" -B /tmp/sdl3-build -G Ninja \

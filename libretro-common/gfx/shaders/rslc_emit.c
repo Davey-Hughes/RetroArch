@@ -85,6 +85,7 @@ struct rslc_pr
 #ifdef RSLC_EXTENDED
    bool                     msl_boolread;   /* inside the bool(...) of a block read */
    bool                     msl_dual;       /* a dual-source output: every color names its index */
+   const struct rslc_var   *fb_out;         /* GLSL: the output an input attachment reads */
 #endif
    uint8_t                 *active[RSLC_MAX_BLOCKS];
    unsigned                 version;
@@ -417,6 +418,9 @@ static void pr_type_full(struct rslc_pr *p, const struct rslc_type *t)
    pr_array_suffix(p, t);
 }
 
+/* GLSL ES: of the opaque types only sampler2D and samplerCube have a
+ * default precision (and int and uint sampler2D the statements the stage
+ * opens with); any other takes its own, highp where none is stated. */
 static void pr_precision(struct rslc_pr *p, unsigned prec, const struct rslc_type *t)
 {
    const struct rslc_type *bt = t;
@@ -426,6 +430,17 @@ static void pr_precision(struct rslc_pr *p, unsigned prec, const struct rslc_typ
       bt = bt->elem;
    if (bt->kind == RSLC_TY_STRUCT || bt->kind == RSLC_TY_VOID || bt->base == RSLC_BASE_BOOL)
       return;
+   if (!prec && (RSLC_TY_IS_SAMPLER(bt->kind) || RSLC_TY_IS_IMAGE(bt->kind)))
+   {
+      if (bt->kind == RSLC_TY_SAMPLER2D)
+         return;
+#ifdef RSLC_EXTENDED
+      if (     bt->kind == RSLC_TY_SAMPLERX && bt->rows == RSLC_SDIM_CUBE
+            && !bt->cols && bt->base == RSLC_BASE_FLOAT)
+         return;
+#endif
+      prec = RSLC_PREC_HIGH;
+   }
    switch (prec)
    {
       case RSLC_PREC_LOW:    pr_s(p, "lowp "); break;
@@ -1970,6 +1985,17 @@ static void pr_builtin(struct rslc_pr *p, const struct rslc_node *n)
       pr_msl_builtin(p, n);
       return;
    }
+#ifdef RSLC_EXTENDED
+   /* the framebuffer's value: the inout output, or ARM's built-in */
+   if (bfn == RSLC_BFN_SUBPASSLOAD)
+   {
+      if (p->fb_out)
+         pr_var_name(p, p->fb_out);
+      else
+         pr_s(p, "gl_LastFragColorARM");
+      return;
+   }
+#endif
    /* fma() needs GLSL 4.00 / ES 3.20; below that it is written out */
    if (bfn == RSLC_BFN_FMA && ((!p->es && p->version < 400) || (p->es && p->version < 320)))
    {
@@ -4490,6 +4516,32 @@ static void pr_ioblock_decl(struct rslc_pr *p, const struct rslc_var *v, bool is
 }
 #endif
 
+#ifdef RSLC_EXTENDED
+/* GLSL, GL_EXT_shader_framebuffer_fetch: the colour output an input
+ * attachment reads, the one at its index (an output without a location
+ * is at 0); it prints inout.  Every attachment must find one. */
+static bool pr_fb_fetch_output(struct rslc_pr *p, const struct rslc_var *in)
+{
+   const struct rslc_prog *pr = &p->c->prog;
+   const struct rslc_var  *out = NULL;
+   uint32_t i;
+   if (p->c->opts->fb_fetch != RSLC_FB_FETCH_EXT)
+      return true;
+   for (i = 0; i < pr->noutputs && !out; i++)
+   {
+      const struct rslc_var *v = pr->outputs[i];
+      if (v->index)
+         continue;
+      if (v->location == in->member || (v->location == RSLC_UNSET && in->member == 0))
+         out = v;
+   }
+   if (!out || (p->fb_out && p->fb_out != out))
+      return false;
+   p->fb_out = out;
+   return true;
+}
+#endif
+
 static void pr_io_decl(struct rslc_pr *p, const struct rslc_var *v, bool is_in)
 {
    bool layout_ok = p->es ? p->version >= 300 : p->version >= 330;
@@ -4528,6 +4580,11 @@ static void pr_io_decl(struct rslc_pr *p, const struct rslc_var *v, bool is_in)
       pr_s(p, "centroid ");
    if (v->quals & RSLC_VQ_SAMPLE)
       pr_s(p, "sample ");
+#ifdef RSLC_EXTENDED
+   if (v == p->fb_out)
+      pr_s(p, "inout ");
+   else
+#endif
    pr_s(p, is_in ? "in " : "out ");
    pr_precision(p, v->precision, v->type);
    pr_type(p, v->type);
@@ -4558,6 +4615,8 @@ static const char *pr_image_format(unsigned fmt)
       case RSLC_IMGFMT_RGBA16F:  return "rgba16f";
       case RSLC_IMGFMT_R32F:     return "r32f";
       case RSLC_IMGFMT_RGBA8:    return "rgba8";
+      case RSLC_IMGFMT_RG8:      return "rg8";
+      case RSLC_IMGFMT_R8:       return "r8";
       case RSLC_IMGFMT_RGBA32I:  return "rgba32i";
       case RSLC_IMGFMT_RGBA16I:  return "rgba16i";
       case RSLC_IMGFMT_RGBA8I:   return "rgba8i";
@@ -4717,6 +4776,31 @@ static bool pr_glsl(struct rslc_pr *p, struct rslc_result *result)
       pr_s(p, "#extension GL_ARB_shader_bit_encoding : require");
       pr_nl(p);
    }
+#ifdef RSLC_EXTENDED
+   for (i = 1; i < pr->nvars; i++)
+      if (pr->vars[i]->storage == RSLC_ST_SUBPASS)
+      {
+         pr_s(p, c->opts->fb_fetch == RSLC_FB_FETCH_ARM
+               ? "#extension GL_ARM_shader_framebuffer_fetch : require"
+               : "#extension GL_EXT_shader_framebuffer_fetch : require");
+         pr_nl(p);
+         break;
+      }
+   if (pr->early_fragment_tests && c->opts->early_z_depth_unchanged
+         && (p->es || p->version < 420))
+   {
+      pr_s(p, p->es ? "#extension GL_EXT_conservative_depth : require"
+            : "#extension GL_ARB_conservative_depth : require");
+      pr_nl(p);
+   }
+   if (pr->subgroup)
+   {
+      pr_s(p, "#extension GL_KHR_shader_subgroup_basic : require");
+      pr_nl(p);
+      pr_s(p, "#extension GL_KHR_shader_subgroup_arithmetic : require");
+      pr_nl(p);
+   }
+#endif
    if (!p->es && p->version < 400 && p->uses_gather)
    {
       pr_s(p, "#extension GL_ARB_texture_gather : require");
@@ -4772,6 +4856,7 @@ static bool pr_glsl(struct rslc_pr *p, struct rslc_result *result)
    for (i = 0; i < pr->nsamplers; i++)
    {
       pr_s(p, "uniform ");
+      pr_precision(p, pr->samplers[i]->precision, pr->samplers[i]->type);
       pr_type(p, pr->samplers[i]->type);
       pr_c(p, ' ');
       pr_var_name(p, pr->samplers[i]);
@@ -4781,6 +4866,13 @@ static bool pr_glsl(struct rslc_pr *p, struct rslc_result *result)
    }
    if (pr->early_fragment_tests)
    {
+#ifdef RSLC_EXTENDED
+      /* the driver may then test depth early, as the stage does not
+       * change it */
+      if (c->opts->early_z_depth_unchanged)
+         pr_s(p, "layout(depth_unchanged) out float gl_FragDepth;");
+      else
+#endif
       pr_s(p, "layout(early_fragment_tests) in;");
       pr_nl(p);
    }
@@ -4832,6 +4924,7 @@ static bool pr_glsl(struct rslc_pr *p, struct rslc_result *result)
             pr_s(p, "readonly ");
          if (v->quals & RSLC_VQ_WRITEONLY)
             pr_s(p, "writeonly ");
+         pr_precision(p, v->precision, v->type);
       }
       else if (v->storage == RSLC_ST_SHARED)
          pr_s(p, "shared ");
@@ -6685,12 +6778,11 @@ bool rslc_emit_text(struct rslc_ctx *c, struct rslc_result *result)
       rslc_err(c, p->hlsl ? "hlsl: no geometry stage yet" : "msl: no geometry stage", NULL, 0);
       return false;
    }
-   /* subgroup operations have a form in SPIR-V and MSL alone; HLSL's
-    * shader models here have no helper invocation either */
-   if (!p->msl && pr->subgroup)
+   /* subgroup operations have no form in HLSL's shader models here,
+    * which have no helper invocation either */
+   if (p->hlsl && pr->subgroup)
    {
-      rslc_err(c, p->hlsl ? "hlsl: no form of subgroup operations"
-            : "glsl: no form of subgroup operations", NULL, 0);
+      rslc_err(c, "hlsl: no form of subgroup operations", NULL, 0);
       return false;
    }
    if (p->hlsl)
@@ -6701,8 +6793,19 @@ bool rslc_emit_text(struct rslc_ctx *c, struct rslc_result *result)
             rslc_err(c, "hlsl: no form of gl_HelperInvocation", NULL, 0);
             return false;
          }
-   /* an input attachment has a form in MSL alone */
-   if (!p->msl)
+   /* an input attachment has a form in MSL, and in GLSL where the caller
+    * names the framebuffer fetch extension */
+   if (!p->msl && !p->hlsl && c->opts->fb_fetch != RSLC_FB_FETCH_NONE)
+   {
+      for (k = 1; k < pr->nvars; k++)
+         if (pr->vars[k]->storage == RSLC_ST_SUBPASS && !pr_fb_fetch_output(p, pr->vars[k]))
+         {
+            rslc_err(c, "glsl: no colour output for the input attachment", NULL,
+                  pr->vars[k]->line);
+            return false;
+         }
+   }
+   else if (!p->msl)
       for (k = 1; k < pr->nvars; k++)
          if (pr->vars[k]->storage == RSLC_ST_SUBPASS)
          {
@@ -6710,6 +6813,17 @@ bool rslc_emit_text(struct rslc_ctx *c, struct rslc_result *result)
                   NULL, pr->vars[k]->line);
             return false;
          }
+   if (p->es)
+      for (k = 1; k < pr->nvars; k++)
+      {
+         const struct rslc_var *v = pr->vars[k];
+         if (v->storage == RSLC_ST_IMAGE &&
+               (v->type->cols == RSLC_IMGFMT_R8 || v->type->cols == RSLC_IMGFMT_RG8))
+         {
+            rslc_err(c, "glsl es: no r8 or rg8 storage image format", NULL, v->line);
+            return false;
+         }
+      }
    if (p->hlsl && c->stage == RSLC_STAGE_COMPUTE)
    {
       uint32_t k;
@@ -7360,7 +7474,7 @@ static bool rslc_rm_snippet(struct rslc_rm *r, struct rslc_pbuf *b)
             "ivec2 rarch_rect_m = rarch_rect_i - rarch_rect_q * rarch_rect_n;\n"
             "rarch_rect_m = ivec2("
             "rarch_rect_m.x < 0 ? rarch_rect_m.x + rarch_rect_n.x : rarch_rect_m.x, "
-            "rarch_rect_m.y < 0 ? rarch_rect_m.y + rarch_rect_n.y : rarch_rect_m.y);\n"
+            "rarch_rect_m.y < 0 ? rarch_rect_m.y + rarch_rect_n.y : rarch_rect_m.y);\n") && rslc_rm_text(r, b,
             "return ivec2("
             "rarch_rect_m.x >= rarch_rect_n.x ? rarch_rect_m.x - rarch_rect_n.x : rarch_rect_m.x, "
             "rarch_rect_m.y >= rarch_rect_n.y ? rarch_rect_m.y - rarch_rect_n.y : rarch_rect_m.y);\n}\n");

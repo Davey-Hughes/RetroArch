@@ -35,6 +35,11 @@
 #include <formats/rav1_frame.h>
 #endif
 #include <features/features_cpu.h>
+#ifdef HAVE_RWMA
+#include <file/file_path.h>
+#include <string/stdstring.h>
+#include <audio/conversion/float_to_s16.h>
+#endif
 
 #ifdef HAVE_RMP4
 #include <formats/rmp4.h>
@@ -45,7 +50,7 @@
 #include <formats/rh264.h>
 #endif
 
-#if defined(HAVE_ROPUS) || defined(HAVE_RVORBIS) || defined(HAVE_RAAC)
+#if defined(HAVE_ROPUS) || defined(HAVE_RVORBIS) || defined(HAVE_RAAC) || defined(HAVE_RWMA)
 #define MEDIA_HAVE_AUDIO 1
 #include <formats/audio.h>
 #endif
@@ -152,6 +157,7 @@ typedef struct
    int          webm_step;
    int          webm_restore_clock;
    int          webm_cpu_resume;
+   int          webm_prefetched;
    video_hw_frame_t hw_frame;
    int          hw_video;
    int64_t      hw_restart_ns;
@@ -161,7 +167,7 @@ typedef struct
    int64_t      mp4_prefetch_ns, mp4_prefetch_start_ns;
    rmp4_video_stream_t *mp4vs;       /* video stream when playing MP4   */
    int          mp4_hw_required;
-   int          mp4_restoring;
+   int          mp4_restoring, mp4_cpu_resume;
    int          mp4_prefetched, mp4_prefetching, mp4_prefetch_count;
    int          mp4_prefetch_discard, mp4_prefetch_last;
 #endif
@@ -218,6 +224,15 @@ typedef struct
    int64_t      apos;                /* frames emitted so far           */
    int64_t      atotal;              /* emit clamp; <0 = no clamp       */
    int          aeof;
+#ifdef HAVE_RWMA
+   float       *wma_pcm;
+   int32_t      wma_matrix[8][2];
+   int16_t     *wma_s16;
+   retro_audio_sample_batch_float_t wma_batch;
+   size_t       wma_ready, wma_offset, wma_want;
+   unsigned     wma_phase;
+   int          wma_audio_only;
+#endif
 #endif
    rwebm_t     *wgather;             /* progressive native path: one
                                         persistent gather walking both
@@ -600,11 +615,13 @@ static void media_drop_hw(media_player_t *p)
    if (p->hw_frame.image)
       video_hw_frame_abandon(&p->hw_frame);
    memset(&p->hw_frame, 0, sizeof(p->hw_frame));
+   p->webm_prefetched = 0;
 #ifdef HAVE_RMP4
    p->mp4_prefetched = p->mp4_prefetching = p->mp4_prefetch_count = 0;
    p->mp4_prefetch_ns = p->mp4_prefetch_start_ns = 0;
    p->mp4_prefetch_discard = -1;
    p->mp4_prefetch_last = 0;
+   p->mp4_cpu_resume = 0;
 #endif
 }
 
@@ -690,8 +707,19 @@ static bool media_make_framebuffer(media_player_t *p, bool blank)
 static void media_present_hw(media_player_t *p)
 {
    if (p->hw_frame.image && media_hw_refresh(media_hw_user, &p->hw_frame))
+   {
       memset(&p->hw_frame, 0, sizeof(p->hw_frame));
-   MEDIA_CORE_PREFIX(video_cb)(NULL, p->width, p->height, 0);
+#ifdef HAVE_RMP4
+      p->mp4_cpu_resume = 0;
+#endif
+   }
+#ifdef HAVE_RMP4
+   if (p->mp4vs && p->mp4_cpu_resume && p->fb)
+      MEDIA_CORE_PREFIX(video_cb)(p->fb, p->width, p->height,
+            p->width * sizeof(uint32_t));
+   else
+#endif
+      MEDIA_CORE_PREFIX(video_cb)(NULL, p->width, p->height, 0);
 }
 
 #ifdef HAVE_RMP4
@@ -699,7 +727,7 @@ static void media_prefetch_mp4(media_player_t *p, int64_t target)
 {
    int64_t started;
    unsigned budget = 32;
-   if (!p->hw_video || !rmp4_video_stream_h265(p->mp4vs)
+   if (!p->hw_video
          || p->eof || !p->vshown || p->seeking || p->mp4_restoring
          || p->pending_seek_ns >= 0)
       return;
@@ -718,7 +746,9 @@ static void media_prefetch_mp4(media_player_t *p, int64_t target)
       p->mp4_prefetching = 1;
       p->mp4_prefetch_ns = p->mp4_prefetch_start_ns = 0;
       p->mp4_prefetch_count = 0;
-      p->mp4_prefetch_discard = -1;
+      /* A foreground output retry already owns a non-discard packet. */
+      p->mp4_prefetch_discard = rmp4_video_stream_wait_reason(p->mp4vs)
+            == RMP4_VIDEO_WAIT_DECODER ? 0 : -1;
    }
    started = cpu_features_get_time_usec();
    do
@@ -790,14 +820,64 @@ static void media_present_mp4(media_player_t *p, int have)
 }
 #endif
 
+static void media_prefetch_webm(media_player_t *p)
+{
+   int64_t started = cpu_features_get_time_usec();
+   unsigned budget = 32;
+   if (!p->webmvs || !p->hw_video || p->hw_frame.image || p->eof
+         || p->webm_seek_slot >= 0 || p->webm_restore_clock || p->seeking
+         || p->pending_seek_ns >= 0)
+      return;
+   do
+   {
+      int ret, skipped;
+      if (!p->webm_step)
+         p->webm_step = p->webm_hw_shown < p->vshown ? 2 : 1;
+      skipped = p->webm_step == 2;
+      if (skipped)
+         ret = rwebm_video_stream_skip(p->webmvs, NULL);
+      else if (rwebm_video_stream_next(p->webmvs, NULL))
+         ret = 1;
+      else
+         ret = rwebm_video_stream_waiting(p->webmvs) ? 2 : 0;
+      if (ret == 2)
+         return;
+      p->webm_step = 0;
+      if (ret != 1)
+      {
+         p->eof = 1;
+         return;
+      }
+      p->webm_hw_shown++;
+      if (!skipped)
+      {
+         if (!rwebm_video_stream_hw_frame(p->webmvs, &p->hw_frame))
+         {
+            p->eof = 1;
+            return;
+         }
+         if (p->webm_hw_shown > p->vshown)
+         {
+            p->webm_prefetched = 1;
+            return;
+         }
+         video_hw_frame_abandon(&p->hw_frame);
+         memset(&p->hw_frame, 0, sizeof(p->hw_frame));
+      }
+   } while (--budget && cpu_features_get_time_usec() - started < 4000);
+}
+
 /* -------------------------------------------------------------------- */
-/* Limited-range I420 -> XRGB8888.  Coefficients follow the Colour       */
+/* I420 -> XRGB8888.  Coefficients follow the Colour                     */
 /* element's MatrixCoefficients; untagged content defaults to BT.601     */
 /* below 720 lines and BT.709 at or above (industry convention).         */
 /* -------------------------------------------------------------------- */
 static const int16_t media_coef_601[4]  = { 409, 100, 208, 516 };
 static const int16_t media_coef_709[4]  = { 459,  55, 136, 541 };
 static const int16_t media_coef_2020[4] = { 431,  48, 167, 548 };
+static const int16_t media_full_601[4] = { 359, 88, 183, 454 };
+static const int16_t media_full_709[4] = { 403, 48, 120, 475 };
+static const int16_t media_full_2020[4] = { 377, 42, 146, 482 };
 
 static const int16_t *media_yuv_coefs(unsigned matrix, unsigned height)
 {
@@ -810,9 +890,10 @@ static const int16_t *media_yuv_coefs(unsigned matrix, unsigned height)
    }
 }
 
-static INLINE uint32_t media_yuv_px(int y, int u, int v, const int16_t *k)
+static INLINE uint32_t media_yuv_px(int y, int u, int v, const int16_t *k,
+      int full)
 {
-   int c = 298 * (y - 16) + 128;
+   int c = full ? 256 * y + 128 : 298 * (y - 16) + 128;
    int r = (c + k[0] * (v - 128)) >> 8;
    int g = (c - k[1] * (u - 128) - k[2] * (v - 128)) >> 8;
    int b = (c + k[3] * (u - 128)) >> 8;
@@ -850,10 +931,13 @@ static void media_expand_8888_to_2101010(uint32_t *dst, unsigned stride,
 
 static void media_blit_yuv(uint32_t *dst, unsigned w, unsigned h,
       const uint8_t *y, int ys, const uint8_t *u, const uint8_t *v, int uvs,
-      unsigned matrix, int cvsh)
+      unsigned matrix, int cvsh, int full)
 {
    const int16_t *k = media_yuv_coefs(matrix, h);
    unsigned i, j;
+   if (full)
+      k = k == media_coef_709 ? media_full_709
+         : (k == media_coef_2020 ? media_full_2020 : media_full_601);
    for (j = 0; j < h; j++)
    {
       const uint8_t *yr = y + j * ys;
@@ -861,16 +945,16 @@ static void media_blit_yuv(uint32_t *dst, unsigned w, unsigned h,
       const uint8_t *vr = v + (j >> cvsh) * uvs;
       uint32_t *dr      = dst + j * w;
       for (i = 0; i < w; i++)
-         dr[i] = media_yuv_px(yr[i], ur[i >> 1], vr[i >> 1], k);
+         dr[i] = media_yuv_px(yr[i], ur[i >> 1], vr[i >> 1], k, full);
    }
 }
 
 /* 4:2:0: two luma rows share a chroma row. */
 static void media_blit_i420(uint32_t *dst, unsigned w, unsigned h,
       const uint8_t *y, int ys, const uint8_t *u, const uint8_t *v, int uvs,
-      unsigned matrix)
+      unsigned matrix, int full)
 {
-   media_blit_yuv(dst, w, h, y, ys, u, v, uvs, matrix, 1);
+   media_blit_yuv(dst, w, h, y, ys, u, v, uvs, matrix, 1, full);
 }
 
 /* -------------------------------------------------------------------- */
@@ -1014,7 +1098,9 @@ static int media_present_vp9(media_player_t *p, int show)
       {
          const rwebm_track *ct = rwebm_get_track(p->webm, p->vtrack);
          media_blit_i420(p->fb, w, h, fb->y, p->vp9->ys, fb->u, fb->v,
-            p->vp9->uvs, ct ? ct->matrix_coefficients : 0);
+            p->vp9->uvs, ct ? ct->matrix_coefficients : 0,
+            ct && ct->colour_range ? ct->colour_range == 2
+               : p->vp9->hd.color_range);
          if (p->pix10)
             media_expand_8888_to_2101010(p->fb, p->width, w, h);
       }
@@ -1101,7 +1187,7 @@ static int media_decode_packet(media_player_t *p, const rwebm_packet *pkt)
       {
          const rwebm_track *ct = rwebm_get_track(p->webm, p->vtrack);
          media_blit_i420(p->fb, (unsigned)w, (unsigned)h, y, ys, u, v, uvs,
-            ct ? ct->matrix_coefficients : 0);
+            ct ? ct->matrix_coefficients : 0, 0);
          if (p->pix10)
             media_expand_8888_to_2101010(p->fb, p->width,
                (unsigned)w, (unsigned)h);
@@ -1151,7 +1237,7 @@ static int media_decode_packet(media_player_t *p, const rwebm_packet *pkt)
          const rwebm_track *ct = rwebm_get_track(p->webm, p->vtrack);
          media_blit_yuv(p->fb, (unsigned)w, (unsigned)h, y, ys, u, v, uvs,
             ct ? ct->matrix_coefficients : 0,
-               (ch < h) ? 1 : 0);
+               (ch < h) ? 1 : 0, 0);
          if (p->pix10)
             media_expand_8888_to_2101010(p->fb, p->width,
                (unsigned)w, (unsigned)h);
@@ -1187,7 +1273,7 @@ static int media_drain_h264(media_player_t *p)
       const rwebm_track *ct = rwebm_get_track(p->webm, p->vtrack);
       media_blit_yuv(p->fb, (unsigned)w, (unsigned)h, y, ys, u, v, uvs,
          ct ? ct->matrix_coefficients : 0,
-         (ch < h) ? 1 : 0);
+         (ch < h) ? 1 : 0, 0);
       if (p->pix10)
          media_expand_8888_to_2101010(p->fb, p->width,
             (unsigned)w, (unsigned)h);
@@ -1280,6 +1366,10 @@ static void media_free_player(media_player_t *p)
    free(p->fb);
    free(p->vts);
    free(p->silence);
+#ifdef HAVE_RWMA
+   free(p->wma_pcm);
+   free(p->wma_s16);
+#endif
    if (p->dt)
       data_transfer_free(p->dt);   /* owns file_buf; cancels in-flight */
    else
@@ -1314,11 +1404,14 @@ void MEDIA_CORE_PREFIX(retro_get_system_info)(
    info->library_name     = "media";
    info->library_version  = "v1";
    info->need_fullpath    = true;
+   info->valid_extensions = "webm|mkv"
 #ifdef HAVE_RMP4
-   info->valid_extensions = "webm|mkv|mp4|m4v|mov";
-#else
-   info->valid_extensions = "webm|mkv";
+      "|mp4|m4v|mov"
 #endif
+#ifdef HAVE_RWMA
+      "|wma|xwma|xma"
+#endif
+      ;
 }
 
 static unsigned media_audio_rate(const media_player_t *p)
@@ -1396,6 +1489,18 @@ void MEDIA_CORE_PREFIX(retro_set_input_state)(retro_input_state_t cb)
 void MEDIA_CORE_PREFIX(retro_reset)(void)
 {
    media_player_t *p = &media_player;
+#ifdef HAVE_RWMA
+   if (p->wma_audio_only)
+   {
+      data_transfer_window_rewind(p->dt);
+      audio_transfer_seek(p->actx, p->atype, 0);
+      p->wma_ready = p->wma_offset = p->wma_want = 0;
+      p->wma_phase = 0;
+      p->apos = 0;
+      p->aeof = p->eof = 0;
+      return;
+   }
+#endif
    if (p->dt && p->discarded)
    {
       data_transfer_refill(p->dt, 0);
@@ -1991,10 +2096,13 @@ void media_video_hw_ready(void)
                p->pending_seek_ns = target;
          }
       }
+      if (p->vshown)
+         media_prefetch_webm(p);
    }
 #ifdef HAVE_RMP4
    if (p->mp4vs)
    {
+      int restarting = p->hw_restart;
       if (p->hw_restart && p->dt && p->discarded)
       {
          if (!data_transfer_refill(p->dt, 0))
@@ -2012,6 +2120,9 @@ void media_video_hw_ready(void)
          p->hw_started = 1;
          p->hw_video = ready && rmp4_video_stream_set_hw(p->mp4vs, 1);
       }
+      if (p->hw_restart == 1)
+         p->mp4_cpu_resume = p->hw_video && p->fb && !p->mp4_hw_required
+               && !p->mp4_restoring;
       if (p->hw_restart && p->mp4_restoring)
       {
          if (rmp4_video_stream_seek_frame(p->mp4vs, (int)p->vshown - 1) < 0)
@@ -2062,6 +2173,9 @@ void media_video_hw_ready(void)
             p->hw_restart = 0;
          }
       }
+      if (restarting && !p->hw_restart)
+         media_prefetch_mp4(p, p->play_ns > INT64_MAX - p->frame_ns / 2
+               ? INT64_MAX : p->play_ns + p->frame_ns / 2);
    }
 #endif
 
@@ -2180,6 +2294,7 @@ static void media_run_webm_cpu(media_player_t *p, int advance_clock)
 static void media_run_webm_hw(media_player_t *p)
 {
    int64_t started = cpu_features_get_time_usec();
+   int64_t clock = p->play_ns;
    int64_t target = p->webm_seek_slot;
    if (p->webm_restore_clock)
    {
@@ -2193,6 +2308,28 @@ static void media_run_webm_hw(media_player_t *p)
       while (target + 1 < p->nvts
             && p->vts[target + 1] + p->frame_ns / 2 <= p->play_ns)
          target++;
+   }
+   if (p->webm_prefetched)
+   {
+      if (p->webm_hw_shown - 1 < target)
+         media_drop_hw(p);
+      else if (p->webm_hw_shown - 1 == target)
+      {
+         p->webm_prefetched = 0;
+         p->webm_cpu_resume = 0;
+         p->vshown = p->webm_hw_shown;
+         p->vpts_ns = p->vts && p->vshown <= p->nvts
+               ? p->vts[p->vshown - 1] : p->vpts_ns;
+      }
+      else
+      {
+         if (p->webm_cpu_resume && p->fb)
+            MEDIA_CORE_PREFIX(video_cb)(p->fb, p->width, p->height,
+                  p->width * sizeof(uint32_t));
+         else
+            MEDIA_CORE_PREFIX(video_cb)(NULL, p->width, p->height, 0);
+         return;
+      }
    }
    while ((!p->eof || p->webm_seek_slot >= 0)
          && !p->hw_frame.image && p->webm_hw_shown <= target)
@@ -2209,6 +2346,8 @@ static void media_run_webm_hw(media_player_t *p)
          ret = rwebm_video_stream_waiting(p->webmvs) ? 2 : 0;
       if (ret != 1)
       {
+         if (ret == 2 && !p->vshown && p->webm_seek_slot < 0)
+            p->play_ns = clock;
          if (ret != 2)
          {
             p->eof = 1;
@@ -2248,6 +2387,7 @@ static void media_run_webm_hw(media_player_t *p)
             p->width * sizeof(uint32_t));
    else
       media_present_hw(p);
+   media_prefetch_webm(p);
    if (!p->hw_frame.image && p->nvts > 0 && p->webm_hw_shown >= p->nvts
          && (!p->dt || data_transfer_complete(p->dt) || data_transfer_failed(p->dt)))
       p->eof = 1;
@@ -2263,9 +2403,85 @@ static void media_run_webm_hw(media_player_t *p)
    }
 }
 
+#ifdef HAVE_RWMA
+static void media_wma_stereo(media_player_t *p, size_t frames)
+{
+   size_t i;
+   if (p->ach == 1)
+   {
+      for (i = frames; i; i--)
+         p->wma_pcm[2*i-1] = p->wma_pcm[2*i-2] = p->wma_pcm[i-1];
+   }
+   else if (p->ach > 2)
+      for (i = 0; i < frames; i++)
+      {
+         const float *s = p->wma_pcm + i * p->ach;
+         float l = 0, r = 0;
+         unsigned c;
+         for (c = 0; c < p->ach; c++)
+         {
+            l += s[c] * (float)p->wma_matrix[c][0] * (1.0f / 32768);
+            r += s[c] * (float)p->wma_matrix[c][1] * (1.0f / 32768);
+         }
+         p->wma_pcm[2*i] = l; p->wma_pcm[2*i+1] = r;
+      }
+}
+
+static void media_run_wma(media_player_t *p)
+{
+   size_t avail = 0, consumed;
+   MEDIA_CORE_PREFIX(input_poll_cb)();
+   MEDIA_CORE_PREFIX(video_cb)(p->fb, p->width, p->height, sizeof(uint32_t));
+   if (!p->wma_ready && !p->aeof)
+   {
+      size_t got = 0;
+      int status;
+      size_t tell = audio_transfer_buffer_tell(p->actx, p->atype);
+      if (!data_transfer_window_feed_budget(p->dt, tell, 256*1024, 64*1024,
+               64*1024, &avail))
+         p->aeof = 1;
+      else
+      {
+         audio_transfer_set_avail(p->actx, p->atype, avail);
+         if (!p->wma_want)
+         {
+            p->wma_phase += p->arate;
+            p->wma_want = p->wma_phase / 60;
+            p->wma_phase %= 60;
+         }
+         status = audio_transfer_read_f32(p->actx, p->atype, p->wma_pcm,
+               p->wma_want, &got);
+         if (got)
+         {
+            media_wma_stereo(p, got);
+            p->wma_ready = got; p->wma_offset = 0; p->wma_want -= got;
+            if (!p->wma_batch) convert_float_to_s16(p->wma_s16, p->wma_pcm, got*2);
+         }
+         if (status != AUDIO_PROCESS_NEXT) p->aeof = 1;
+      }
+   }
+   if (p->wma_ready)
+   {
+      consumed = p->wma_batch ? p->wma_batch(p->wma_pcm+p->wma_offset*2,p->wma_ready) :
+            MEDIA_CORE_PREFIX(audio_batch_cb)(p->wma_s16+p->wma_offset*2,p->wma_ready);
+      if (consumed > p->wma_ready) consumed = p->wma_ready;
+      p->wma_ready -= consumed; p->wma_offset += consumed; p->apos += (int64_t)consumed;
+   }
+   if (p->aeof && !p->wma_ready)
+      MEDIA_CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
+}
+#endif
+
 void MEDIA_CORE_PREFIX(retro_run)(void)
 {
    media_player_t *p = &media_player;
+#ifdef HAVE_RWMA
+   if (p->wma_audio_only)
+   {
+      media_run_wma(p);
+      return;
+   }
+#endif
 
 #ifdef RARCH_INTERNAL
    libretro_media_video_hw_ready();
@@ -2445,7 +2661,11 @@ void MEDIA_CORE_PREFIX(retro_run)(void)
                   || p->mp4_prefetch_start_ns
                      > p->play_ns - p->frame_ns / 2 - p->vpts_ns)
             {
-               MEDIA_CORE_PREFIX(video_cb)(NULL, p->width, p->height, 0);
+               if (p->mp4_cpu_resume && p->fb)
+                  MEDIA_CORE_PREFIX(video_cb)(p->fb, p->width, p->height,
+                        p->width * sizeof(uint32_t));
+               else
+                  MEDIA_CORE_PREFIX(video_cb)(NULL, p->width, p->height, 0);
                goto audio;
             }
             if (p->mp4_prefetch_ns > INT64_MAX - p->vpts_ns)
@@ -3049,6 +3269,61 @@ static bool media_load_mp4(media_player_t *p)
 }
 #endif /* HAVE_RMP4 */
 
+#ifdef HAVE_RWMA
+static bool media_load_wma(media_player_t *p, const char *path)
+{
+   struct retro_audio_sample_float_callback callback;
+   enum retro_pixel_format pixel = RETRO_PIXEL_FORMAT_XRGB8888;
+   size_t length = 0, keep, capacity;
+   uint64_t header = 0;
+   unsigned i;
+   p->dt = data_transfer_open_window(path, 64*1024);
+   if (!p->dt) return false;
+   p->file_buf = (uint8_t*)data_transfer_window_base(p->dt, &length);
+   if (!p->file_buf || length < 12 || length > (uint64_t)INT64_MAX) return false;
+   p->file_len = (int64_t)length;
+   keep = length < 64*1024 ? length : 64*1024;
+   if (length >= 30 && !memcmp(p->file_buf, "\x30\x26\xb2\x75\x8e\x66\xcf\x11", 8))
+   {
+      for (i = 0; i < 8; i++) header |= (uint64_t)p->file_buf[16+i] << (i*8);
+      if (header > 16*1024*1024 || header > length || length - (size_t)header < 50)
+         return false;
+      if (header + 50 > keep)
+      {
+         keep = (size_t)header + 50;
+         if (!data_transfer_window_grow_keep(p->dt, keep)) return false;
+      }
+   }
+   p->atype = AUDIO_TYPE_WMA;
+   p->actx = audio_transfer_new(p->atype);
+   if (!p->actx) return false;
+   audio_transfer_set_buffer_ptr(p->actx, p->atype, p->file_buf, length);
+   audio_transfer_set_avail(p->actx, p->atype, keep);
+   if (!audio_transfer_start(p->actx, p->atype) ||
+         !audio_transfer_info(p->actx, p->atype, &p->ach, &p->arate, NULL) ||
+         !p->ach || p->ach > 8 || p->arate < 8000 || p->arate > 192000)
+      return false;
+   if (!audio_transfer_stereo_matrix(p->actx,p->atype,p->wma_matrix)) return false;
+   capacity = (p->arate + 59) / 60;
+   p->wma_pcm = (float*)malloc(capacity * (p->ach > 2 ? p->ach : 2) * sizeof(float));
+   memset(&callback, 0, sizeof(callback));
+   if (MEDIA_CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_AUDIO_SAMPLE_BATCH_FLOAT, &callback))
+      p->wma_batch = callback.batch;
+   if (!p->wma_batch)
+   {
+      p->wma_s16 = (int16_t*)malloc(capacity * 2 * sizeof(int16_t));
+      if (!p->wma_s16) return false;
+      convert_float_to_s16_init_simd();
+   }
+   p->fb = (uint32_t*)calloc(1, sizeof(uint32_t));
+   if (!p->wma_pcm || !p->fb || !MEDIA_CORE_PREFIX(environ_cb)(
+            RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &pixel)) return false;
+   p->width = p->height = 1; p->fps = 60; p->wma_audio_only = 1;
+   data_transfer_window_punch(p->dt, 0, audio_transfer_buffer_tell(p->actx,p->atype));
+   return true;
+}
+#endif
+
 bool MEDIA_CORE_PREFIX(retro_load_game)(const struct retro_game_info *info)
 {
    media_player_t *p = &media_player;
@@ -3065,6 +3340,16 @@ bool MEDIA_CORE_PREFIX(retro_load_game)(const struct retro_game_info *info)
 
    memset(p, 0, sizeof(*p));
    p->pending_seek_ns = -1;
+#ifdef HAVE_RWMA
+   {
+      const char *ext = path_get_extension(info->path);
+      if (string_is_equal_noncase(ext, "wma") || string_is_equal_noncase(ext, "xwma") || string_is_equal_noncase(ext, "xma"))
+      {
+         if (media_load_wma(p, info->path)) return true;
+         goto error;
+      }
+   }
+#endif
 
    /* The file arrives through a data_transfer: a stable full-size
     * buffer filled incrementally.  MP4 plays progressively (the fill
@@ -3449,6 +3734,9 @@ size_t MEDIA_CORE_PREFIX(retro_get_memory_size)(unsigned id)
 
 size_t MEDIA_CORE_PREFIX(retro_serialize_size)(void)
 {
+#ifdef HAVE_RWMA
+   if (media_player.wma_audio_only) return 0;
+#endif
    return MEDIA_STATE_SIZE;
 }
 
@@ -3461,6 +3749,9 @@ bool MEDIA_CORE_PREFIX(retro_serialize)(void *data, size_t size)
    uint64_t clock = (uint64_t)p->play_ns;
    uint64_t audio_pos = 0;
    int i;
+#ifdef HAVE_RWMA
+   if (p->wma_audio_only) return false;
+#endif
    if (size < MEDIA_STATE_SIZE || !d || !p->file_buf)
       return false;
 #ifdef HAVE_RMP4
@@ -3500,6 +3791,9 @@ bool MEDIA_CORE_PREFIX(retro_unserialize)(const void *data, size_t size)
    const uint8_t *d = (const uint8_t*)data;
    uint64_t v = 0, s = 0, clock = 0, audio_pos = 0;
    int i;
+#ifdef HAVE_RWMA
+   if (p->wma_audio_only) return false;
+#endif
    if (size < 16 || !d || !p->file_buf)
       return false;
    if (d[0] != 'W' || d[1] != 'P' || d[2] != 'O' || d[3] != 'S')

@@ -14,6 +14,7 @@
  */
 
 #include <stdint.h>
+#include <math.h>
 #include "../../apple_runtime.h"
 #include <stddef.h>
 #include <stdlib.h>
@@ -252,18 +253,25 @@ bool ios_running_on_ipad(void)
 }
 
 /* Input helpers: This is kept here because it needs ObjC */
+/* Main thread only; the next layout pass applies the current settings */
+void cocoa_request_layout(void)
+{
+   [[CocoaView get].view setNeedsLayout];
+}
+
 static void handle_touch_event(NSArray* touches)
 {
 #if !TARGET_OS_TV
    unsigned i;
-   float scale               = cocoa_screen_get_native_scale();
+   UIView *renderView        = [apple_platform renderView];
+   float scale               = [renderView contentScaleFactor];
 
    cocoa_input_touches_begin();
 
    for (i = 0; i < touches.count; i++)
    {
       UITouch      *touch = [touches objectAtIndex:i];
-      CGPoint       coord = [touch locationInView:[touch view]];
+      CGPoint       coord = [touch locationInView:renderView];
       if (touch.phase != UITouchPhaseEnded && touch.phase != UITouchPhaseCancelled)
          if (!cocoa_input_touch_add((int16_t)(coord.x * scale),
                   (int16_t)(coord.y * scale)))
@@ -641,8 +649,8 @@ API_AVAILABLE(ios(13.0), tvos(13.0))
 
 - (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)connectionOptions {
    RetroArch_iOS *app = [RetroArch_iOS get];
-   app.window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
-
+   app.window.windowScene = (UIWindowScene *)scene;
+   app.window.frame = ((UIWindowScene *)scene).coordinateSpace.bounds;
    [app.window makeKeyAndVisible];
 
    /* A URL that launched the app comes here, not to
@@ -787,6 +795,10 @@ API_AVAILABLE(ios(13.0), tvos(13.0))
       _renderView.userInteractionEnabled = YES;
    }
 #endif
+#if TARGET_OS_IOS
+   _renderView.autoresizingMask = UIViewAutoresizingNone;
+   [self layoutRenderView];
+#else
    /* Layout anchors are iOS 9; the view is asked whether it has them
     * and pinned to the container's edges either way. The anchors, the
     * constraint between them and its activation (iOS 8) go by selector,
@@ -812,8 +824,40 @@ API_AVAILABLE(ios(13.0), tvos(13.0))
       _renderView.frame            = rootView.bounds;
       _renderView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
    }
+#endif
    [_renderView layoutIfNeeded];
 }
+
+#if TARGET_OS_IOS
+/* Whole device pixels, so the layer is not resampled at a fractional
+ * position or size. Config files are not range checked; clamp here. */
+static CGFloat cocoa_margin_points(float percent, CGFloat extent, CGFloat scale)
+{
+   return round(extent * fminf(fmaxf(percent, 0), 25) / 100 * scale) / scale;
+}
+
+- (void)layoutRenderView
+{
+   CGRect bounds;
+   CGFloat scale, left, right, top, bottom;
+   settings_t *settings = config_get_ptr();
+   if (!_renderView || !settings)
+      return;
+   bounds = [CocoaView get].view.bounds;
+   if (bounds.size.width <= 0 || bounds.size.height <= 0)
+      return;
+   scale  = [_renderView contentScaleFactor];
+   if (scale <= 0)
+      scale = 1;
+   left   = cocoa_margin_points(settings->floats.video_ios_margin_left,   bounds.size.width,  scale);
+   right  = cocoa_margin_points(settings->floats.video_ios_margin_right,  bounds.size.width,  scale);
+   top    = cocoa_margin_points(settings->floats.video_ios_margin_top,    bounds.size.height, scale);
+   bottom = cocoa_margin_points(settings->floats.video_ios_margin_bottom, bounds.size.height, scale);
+   _renderView.frame = CGRectMake(bounds.origin.x + left,
+         bounds.origin.y + top, bounds.size.width - left - right,
+         bounds.size.height - top - bottom);
+}
+#endif
 
 - (apple_view_type_t)viewType { return _vt; }
 
@@ -1604,12 +1648,14 @@ bool cocoa_audio_session_begin_record(unsigned preferred_rate,
                           defaultRegion:(UIPointerRegion *)defaultRegion API_AVAILABLE(ios(13.4))
 {
    CGPoint location;
+   CGFloat scale;
    if (cocoa_input_mouse_grabbed())
       return nil;
-   location = [apple_platform.renderView convertPoint:[request location] fromView:nil];
+   location = [request location];
+   scale    = [apple_platform.renderView contentScaleFactor];
    cocoa_input_pointer_at(
-         (int16_t)(location.x * [[UIScreen mainScreen] scale]),
-         (int16_t)(location.y * [[UIScreen mainScreen] scale]));
+         (int16_t)(location.x * scale),
+         (int16_t)(location.y * scale));
    return [UIPointerRegion regionWithRect:[apple_platform.renderView bounds] identifier:@"game view"];
 }
 #endif

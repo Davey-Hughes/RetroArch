@@ -320,7 +320,7 @@ void android_second_display_request(unsigned ordinal, bool given_up)
          android_app->setSecondDisplay, (jint)ordinal, (jint)number);
 }
 
-void android_activity_move_request(unsigned ordinal)
+void android_activity_move_request(int display_id, unsigned move)
 {
    JNIEnv *env;
    struct android_app *android_app = (struct android_app*)g_android;
@@ -329,21 +329,22 @@ void android_activity_move_request(unsigned ordinal)
       return;
    /* Not asked is a failure placement hears of on the next frame */
    if (     !android_app->moveToDisplay
+         || display_id < 0
          || !(env = jni_thread_getenv()))
    {
       retro_atomic_store_release_int(
-            &android_app->second_display.move_failed, 1);
+            &android_app->second_display.move_failed, (int)move);
       return;
    }
    CALL_VOID_METHOD_PARAM(env, android_app->activity->clazz,
-         android_app->moveToDisplay, (jint)ordinal);
+         android_app->moveToDisplay, (jint)display_id, (jint)move);
 }
 
-bool android_activity_move_failed(void)
+unsigned android_activity_move_failed(void)
 {
    struct android_app *android_app = (struct android_app*)g_android;
-   return android_app && retro_atomic_exchange_int(
-         &android_app->second_display.move_failed, 0) != 0;
+   return android_app ? (unsigned)retro_atomic_exchange_int(
+         &android_app->second_display.move_failed, 0) : 0;
 }
 
 /* UI thread: the second display's window goes. Never waits for the
@@ -367,6 +368,21 @@ static void android_second_surface_term(struct android_app *android_app)
       android_app_write_cmd(android_app, APP_CMD_SECOND_WINDOW_CHANGED);
 }
 
+/* Filled by SecondDisplayController on the UI thread just before the
+ * native call that names it and read in place during that call, so
+ * what it holds crosses JNI with nothing copied. The Java class's
+ * SHARED_ sizes follow this layout. */
+typedef struct android_second_shared
+{
+   /* For each pointer: VIDEO_POS_PACK, then id << 1 | down */
+   int32_t touches[MAX_TOUCH * 2];
+   /* For each display: id, connection, ANDROID_DISPLAY_ flags, and
+    * VIDEO_SCALE_PACK of its size, 0 where unknown */
+   int32_t displays[VIDEO_WINDOW_DISPLAYS_MAX * 4];
+} android_second_shared_t;
+
+static android_second_shared_t *android_second_shared = NULL;
+
 /* Element @i of @strings into @s, "" for none */
 static void android_jni_string_at(JNIEnv *env, jobjectArray strings,
       jsize i, char *s, size_t len)
@@ -389,52 +405,42 @@ static void android_jni_string_at(JNIEnv *env, jobjectArray strings,
 }
 
 JNIEXPORT void JNICALL Java_com_retroarch_browser_retroactivity_SecondDisplayController_nativeDisplaysChanged(
-      JNIEnv *env, jclass clazz, jintArray connections, jintArray flags,
-      jintArray widths, jintArray heights, jobjectArray names,
+      JNIEnv *env, jclass clazz, jint count, jobjectArray names,
       jobjectArray models)
 {
    video_window_display_t list[VIDEO_WINDOW_DISPLAYS_MAX];
-   jint conn[VIDEO_WINDOW_DISPLAYS_MAX];
-   jint bits[VIDEO_WINDOW_DISPLAYS_MAX];
-   jint w[VIDEO_WINDOW_DISPLAYS_MAX];
-   jint h[VIDEO_WINDOW_DISPLAYS_MAX];
-   jsize i, count;
+   jint i;
    struct android_app *android_app = g_android_early;
+   const android_second_shared_t *shared = android_second_shared;
 
-   if (     !android_app || !connections || !flags || !widths || !heights
-         || !names || !models)
+   if (!android_app || !shared || !names || !models)
       return;
-   count = (*env)->GetArrayLength(env, connections);
    if (count > VIDEO_WINDOW_DISPLAYS_MAX)
       count = VIDEO_WINDOW_DISPLAYS_MAX;
-   if (     (*env)->GetArrayLength(env, flags)   < count
-         || (*env)->GetArrayLength(env, widths)  < count
-         || (*env)->GetArrayLength(env, heights) < count
-         || (*env)->GetArrayLength(env, names)   < count
-         || (*env)->GetArrayLength(env, models)  < count)
-      return;
-   (*env)->GetIntArrayRegion(env, connections, 0, count, conn);
-   (*env)->GetIntArrayRegion(env, flags, 0, count, bits);
-   (*env)->GetIntArrayRegion(env, widths, 0, count, w);
-   (*env)->GetIntArrayRegion(env, heights, 0, count, h);
 
    for (i = 0; i < count; i++)
    {
       video_window_display_t *d = &list[i];
+      const int32_t *fields     = &shared->displays[i * 4];
+      int32_t bits              = fields[2];
       memset(d, 0, sizeof(*d));
       d->ordinal    = (unsigned)i + 1;
-      d->connection = (conn[i] >= 0
-            && conn[i] <= VIDEO_WINDOW_CONNECTION_TRANSITIVE)
-         ? (unsigned)conn[i] : VIDEO_WINDOW_CONNECTION_UNKNOWN;
-      d->own        = (bits[i] & ANDROID_DISPLAY_OWN)      != 0;
-      d->valid      = (bits[i] & ANDROID_DISPLAY_VALID)    != 0;
-      d->on         = (bits[i] & ANDROID_DISPLAY_ON)       != 0;
-      d->is_private = (bits[i] & ANDROID_DISPLAY_PRIVATE)  != 0;
-      d->physical   = (bits[i] & ANDROID_DISPLAY_PHYSICAL) != 0;
-      d->refused    = (bits[i] & ANDROID_DISPLAY_REFUSED)  != 0;
-      d->is_default = (bits[i] & ANDROID_DISPLAY_DEFAULT)  != 0;
-      d->dims       = (w[i] > 0 && h[i] > 0)
-         ? VIDEO_SCALE_PACK(w[i], h[i]) : 0;
+      d->id         = fields[0];
+      d->connection = (fields[1] >= 0
+            && fields[1] <= VIDEO_WINDOW_CONNECTION_TRANSITIVE)
+         ? (unsigned)fields[1] : VIDEO_WINDOW_CONNECTION_UNKNOWN;
+      d->own        = (bits & ANDROID_DISPLAY_OWN)      != 0;
+      d->valid      = (bits & ANDROID_DISPLAY_VALID)    != 0;
+      d->on         = (bits & ANDROID_DISPLAY_ON)       != 0;
+      d->is_private = (bits & ANDROID_DISPLAY_PRIVATE)  != 0;
+      d->physical   = (bits & ANDROID_DISPLAY_PHYSICAL) != 0;
+      d->refused    = (bits & ANDROID_DISPLAY_REFUSED)  != 0;
+      d->is_default = (bits & ANDROID_DISPLAY_DEFAULT)  != 0;
+      d->type       = (bits & ANDROID_DISPLAY_EXTERNAL)
+         ? VIDEO_WINDOW_TYPE_EXTERNAL
+         : (bits & ANDROID_DISPLAY_INTERNAL)
+         ? VIDEO_WINDOW_TYPE_INTERNAL : VIDEO_WINDOW_TYPE_UNKNOWN;
+      d->dims       = (unsigned)fields[3];
       android_jni_string_at(env, names, i, d->name, sizeof(d->name));
       android_jni_string_at(env, models, i, d->model, sizeof(d->model));
    }
@@ -522,63 +528,86 @@ static void android_second_wake(struct android_app *android_app)
       ALooper_wake(looper);
 }
 
-/* For each pointer of a touch on the second display. Downs and moves
- * keep room in the ring for every finger's up. */
-JNIEXPORT void JNICALL Java_com_retroarch_browser_retroactivity_SecondDisplayController_nativeTouch(
-      JNIEnv *env, jclass clazz, jint pointer_id, jint x, jint y,
-      jboolean down, jint generation)
+/* A MotionEvent's pointers, read where Java wrote them: one crossing
+ * and one wake for the event, whatever its finger count. Downs and
+ * moves keep room in the ring for every finger's up. */
+JNIEXPORT void JNICALL Java_com_retroarch_browser_retroactivity_SecondDisplayController_nativeTouches(
+      JNIEnv *env, jclass clazz, jint count, jint generation)
 {
    /* Ids whose last record written was a down; UI thread only */
    static uint32_t down_ids        = 0;
    android_second_touch_t touch;
-   uint32_t bit;
    size_t room;
+   jint i;
+   bool wrote                      = false;
    struct android_app *android_app = g_android_early;
+   const android_second_shared_t *shared = android_second_shared;
 
-   if (!android_app)
+   if (!android_app || !shared)
       return;
-#ifdef DEBUG_ANDROID_INPUT
-   RARCH_LOG("[RA Input] Second display touch id=%d x=%d y=%d down=%d"
-         " surface=%d\n", (int)pointer_id, (int)x, (int)y,
-         (int)(down != JNI_FALSE), (int)generation);
-#endif
-   /* MotionEvent ids are 0-31 */
-   if (pointer_id < 0 || pointer_id > 31)
-      return;
-   bit  = (uint32_t)1 << pointer_id;
+   if (count > MAX_TOUCH)
+      count = MAX_TOUCH;
    room = retro_spsc_write_avail(&android_app->second_display.touches);
-   if (down != JNI_FALSE)
+   for (i = 0; i < count; i++)
    {
-      if (room < (MAX_TOUCH + 1) * sizeof(touch))
-         return;
-      down_ids |= bit;
+      uint32_t bit;
+      int32_t word     = shared->touches[i * 2 + 1];
+      int32_t id       = word >> 1;
+      bool down        = (word & 1) != 0;
+#ifdef DEBUG_ANDROID_INPUT
+      RARCH_LOG("[RA Input] Second display touch id=%d pos=%08x down=%d"
+            " surface=%d\n", (int)id, (unsigned)shared->touches[i * 2],
+            (int)down, (int)generation);
+#endif
+      /* MotionEvent ids are 0-31 */
+      if (id < 0 || id > 31)
+         continue;
+      bit = (uint32_t)1 << id;
+      if (down)
+      {
+         if (room < (MAX_TOUCH + 1) * sizeof(touch))
+            continue;
+         down_ids |= bit;
+      }
+      else
+      {
+         if (!(down_ids & bit) || room < sizeof(touch))
+            continue;
+         down_ids &= ~bit;
+      }
+      touch.pointer_id = id;
+      touch.pos        = (uint32_t)shared->touches[i * 2];
+      touch.generation = generation;
+      touch.down       = down;
+      retro_spsc_write(&android_app->second_display.touches, &touch,
+            sizeof(touch));
+      room            -= sizeof(touch);
+      wrote            = true;
    }
-   else
-   {
-      if (!(down_ids & bit) || room < sizeof(touch))
-         return;
-      down_ids &= ~bit;
-   }
-   touch.pointer_id = pointer_id;
-   touch.x          = x;
-   touch.y          = y;
-   touch.generation = generation;
-   touch.down       = (down != JNI_FALSE);
-   retro_spsc_write(&android_app->second_display.touches, &touch,
-         sizeof(touch));
-   android_second_wake(android_app);
+   if (wrote)
+      android_second_wake(android_app);
 }
 
-/* Java could not start the move android_activity_move_request() asked
- * for */
+/* The memory the two sides share, once per Activity */
+JNIEXPORT void JNICALL Java_com_retroarch_browser_retroactivity_SecondDisplayController_nativeShare(
+      JNIEnv *env, jclass clazz, jobject buffer)
+{
+   if ((*env)->GetDirectBufferCapacity(env, buffer)
+         >= (jlong)sizeof(android_second_shared_t))
+      android_second_shared = (android_second_shared_t*)
+         (*env)->GetDirectBufferAddress(env, buffer);
+}
+
+/* Java could not start move @move, which
+ * android_activity_move_request() asked for */
 JNIEXPORT void JNICALL Java_com_retroarch_browser_retroactivity_SecondDisplayController_nativeMoveFailed(
-      JNIEnv *env, jclass clazz)
+      JNIEnv *env, jclass clazz, jint move)
 {
    struct android_app *android_app = g_android_early;
 
    if (android_app)
       retro_atomic_store_release_int(
-            &android_app->second_display.move_failed, 1);
+            &android_app->second_display.move_failed, (int)move);
 }
 
 /* Upper bound on how long a lifecycle callback will block waiting for the
@@ -4063,7 +4092,7 @@ static void frontend_unix_init(void *data)
    GET_METHOD_ID(env, android_app->setSecondDisplay, class,
          "setSecondDisplay", "(II)V");
    GET_METHOD_ID(env, android_app->moveToDisplay, class,
-         "moveToDisplay", "(I)V");
+         "moveToDisplay", "(II)V");
 #ifdef HAVE_VULKAN_CUSTOM_DRIVER
    GET_METHOD_ID(env, android_app->addSafeStartShortcut, class,
          "addSafeStartShortcut", "()V");

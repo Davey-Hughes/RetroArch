@@ -407,6 +407,11 @@ static uint32_t rd_adler32_update(uint32_t adler,
    return rd_adler32_on(adler, buf, len, 16);
 }
 
+uint32_t encoding_adler32(uint32_t adler, const uint8_t *buf, size_t len)
+{
+   return rd_adler32_update(adler, buf, len);
+}
+
 /* Test entry point for tools/encodings/adler32_test.c: the kernel above is
  * static, and driving it only through rinflate/rdeflate would exercise
  * whatever lengths and alignments a stream happens to produce rather than
@@ -2220,6 +2225,7 @@ struct rdeflate
    uint32_t crc;       /* gzip: running crc32 of the input              */
    uint32_t total_in;  /* gzip: mod 2^32, for ISIZE                     */
    int      final_in;    /* caller signalled end of input                  */
+   int      flush_req;   /* sync flush asked for: 1 pending, 2 marker out */
    int      done;
    int      error;
 
@@ -2238,7 +2244,7 @@ struct rdeflate
    int      use_stored;
    int      use_dynamic;
    int      emitting;
-   int      header_done;
+   int      header_done;  /* container header bytes written */
 
    /* dynamic Huffman tables for the current block */
    uint8_t  dyn_lit_len[288];
@@ -2944,6 +2950,14 @@ void rdeflate_finish(void *data)
    s->final_in = 1;
 }
 
+/* write out everything taken so far, ending on a byte boundary */
+void rdeflate_flush(void *data)
+{
+   struct rdeflate *s = (struct rdeflate*)data;
+   if (!s->flush_req)
+      s->flush_req = 1;
+}
+
 /* ------- the parser: consume win[block_start..win_len) into symbols ------- */
 /* Fills the symbol buffer using greedy/lazy matching.  Leaves s->pos at the
  * first unprocessed byte.  Stops early if the symbol buffer is near full.
@@ -3141,8 +3155,10 @@ static void rd_parse(struct rdeflate *s)
       s->prev_lit       = prev_lit;
    }
 
-   /* flush a deferred match/literal at true end of input */
-   if (s->final_in && s->pos >= end && s->have_prev
+   /* flush a deferred match/literal at true end of input, or at a sync
+    * flush once all the input given so far is in */
+   if ((s->final_in || (s->flush_req && s->in_pos >= s->in_size))
+       && s->pos >= end && s->have_prev
        && s->nsyms < RD_BLOCK_SYMS - 2)
    {
       s->have_prev = 0;
@@ -3738,30 +3754,33 @@ int rdeflate_process(void *data, size_t *read, size_t *wrote)
    size_t in_start    = s->in_pos;
    size_t out_start   = s->out_pos;
 
-   /* 0) container header once, at stream start */
-   if (s->wrap == RINF_WRAP_GZIP && !s->header_done)
+   /* 0) container header once, at stream start, resumable byte by byte */
+   if (s->wrap == RINF_WRAP_GZIP || s->wrap == RINF_WRAP_ZLIB)
    {
       /* RFC 1952: ID1 ID2 CM FLG MTIME[4] XFL OS.  No optional fields,
        * no mtime (0 means "not available"), OS 255 "unknown" - the same
        * minimal header zlib emits when it is not given a gz_header. */
       static const uint8_t gz_hdr[10] =
          { 0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff };
-      if (s->out_pos + sizeof(gz_hdr) > s->out_size)
-         goto suspend;
-      memcpy(s->out + s->out_pos, gz_hdr, sizeof(gz_hdr));
-      s->out_pos    += sizeof(gz_hdr);
-      s->header_done = 1;
-   }
-   if (s->wrap == RINF_WRAP_ZLIB && !s->header_done)
-   {
-      /* FLG: FLEVEL 2 (default compression), no preset dict, and the
-       * check bits making (CMF*256+FLG) % 31 == 0; 0x78 0x9C for a 32K
-       * window. */
-      if (s->out_pos + 2 > s->out_size)
-         goto suspend;
-      s->out[s->out_pos++] = s->cmf;
-      s->out[s->out_pos++] = (uint8_t)(0x80 + 31 - (s->cmf * 256 + 0x80) % 31);
-      s->header_done       = 1;
+      uint8_t hdr[10];
+      int     hdr_len = 10;
+      if (s->wrap == RINF_WRAP_GZIP)
+         memcpy(hdr, gz_hdr, sizeof(gz_hdr));
+      else
+      {
+         /* FLG: FLEVEL 2 (default compression), no preset dict, and the
+          * check bits making (CMF*256+FLG) % 31 == 0; 0x78 0x9C for a
+          * 32K window. */
+         hdr[0]  = s->cmf;
+         hdr[1]  = (uint8_t)(0x80 + 31 - (s->cmf * 256 + 0x80) % 31);
+         hdr_len = 2;
+      }
+      while (s->header_done < hdr_len)
+      {
+         if (s->out_pos >= s->out_size)
+            goto suspend;
+         s->out[s->out_pos++] = hdr[s->header_done++];
+      }
    }
 
    /* 1) ingest available input into the window */
@@ -3784,8 +3803,9 @@ int rdeflate_process(void *data, size_t *read, size_t *wrote)
    }
 
    /* We only emit once we know the block is complete: either the symbol
-    * buffer is full, the window is full, or input has finished. */
-   for (;;)
+    * buffer is full, the window is full, or input has finished.  Past
+    * the final block (phase 10 on) only the trailer is left. */
+   while (s->emit_phase < 10)
    {
       /* Resume emitting a block that was mid-output */
       if (s->emitting)
@@ -3881,6 +3901,33 @@ int rdeflate_process(void *data, size_t *read, size_t *wrote)
          {
             block_ready  = 1;
             is_final     = 1;
+         }
+         /* sync flush: once all the input given is parsed, the pending
+          * symbols go out as a block, then an empty stored block ends
+          * the output on a byte boundary (zlib's Z_SYNC_FLUSH). The
+          * window is kept, so matches still reach across it. */
+         if (!block_ready && s->flush_req && !s->final_in
+               && s->in_pos >= s->in_size && s->pos >= s->win_len
+               && !s->have_prev)
+         {
+            if (s->nsyms)
+               block_ready = 1;
+            else
+            {
+               if (s->flush_req == 1)
+               {
+                  rd_putbits(s, 0, 3);  /* BFINAL=0, BTYPE=00 */
+                  if (s->bitcnt & 7)
+                     rd_putbits(s, 0, 8 - (s->bitcnt & 7));
+                  rd_putbits(s, 0x0000, 16);
+                  rd_putbits(s, 0xffff, 16);
+                  s->flush_req = 2;
+               }
+               if (!rd_flush_bytes(s))
+                  goto suspend;
+               s->flush_req = 0;
+               goto suspend;
+            }
          }
          if (!block_ready) /* need more input */
             goto suspend;   
@@ -4023,7 +4070,11 @@ static INLINE void rinf64_need(struct rinf64 *s, unsigned k)
    }
    while (s->n < k)
    {
-      uint64_t b = s->p < s->end ? *s->p++ : (s->over++, 0u);
+      uint64_t b = 0;
+      if (s->p < s->end)
+         b = *s->p++;
+      else
+         s->over++;
       s->bits   |= b << s->n;
       s->n      += 8;
    }

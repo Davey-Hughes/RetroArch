@@ -1680,7 +1680,7 @@ static void d3d9_font_render_msg(
    float line_height;
    d3d9_font_t *font  = (d3d9_font_t*)data;
    d3d9_video_t     *d3d   = (d3d9_video_t*)userdata;
-   unsigned          width  = 0;
+   float             width  = 0.0f;
    unsigned          height = 0;
 
    if (!font || !msg || !*msg)
@@ -1694,6 +1694,7 @@ static void d3d9_font_render_msg(
       return;
 
    font_driver_resolve_params(params, &rp);
+   width      = width / rp.x_scale;
    x          = rp.x;
    y          = rp.y;
    scale      = rp.scale;
@@ -1893,7 +1894,7 @@ static void d3d9_font_render_msg(
          line_vbuf = !!(verts_s = d3d9_menu_vbuf_map(d3d, \
                   (unsigned)(bytes) * 12, &vb_start)); \
          if (!line_vbuf) \
-            verts_s = d3d9_font_get_scratch(font, (bytes) * 12); \
+            verts_s = d3d9_font_get_scratch(font, (unsigned)(bytes) * 12); \
          if (!(line_ok = !!verts_s)) \
             break; \
          verts_f   = verts_s + fg_off; \
@@ -5440,8 +5441,13 @@ static void d3d9_hlsl_ensure_compiler(void)
          dll = LoadLibraryA(names[i]);
       if (dll)
       {
-         d3d9_pCompile    = (PFN_D3DCOMPILE)GetProcAddress(dll, "D3DCompile");
-         d3d9_pPreprocess = (PFN_D3DPREPROCESS)GetProcAddress(dll, "D3DPreprocess");
+         /* Through void (*)(void), which casts to any function pointer
+          * without -Wcast-function-type taking FARPROC's () for a
+          * mismatch */
+         d3d9_pCompile    = (PFN_D3DCOMPILE)(void (*)(void))
+            GetProcAddress(dll, "D3DCompile");
+         d3d9_pPreprocess = (PFN_D3DPREPROCESS)(void (*)(void))
+            GetProcAddress(dll, "D3DPreprocess");
          if (d3d9_pCompile)
          {
             RARCH_LOG("[D3D9 HLSL] Loaded D3DCompile from %s.\n", names[i]);
@@ -6972,11 +6978,11 @@ static bool d3d9_hlsl_views_hw_copy(hlsl_renderchain_t *c,
    to.top      = 0;
    to.right    = (LONG)v->width;
    to.bottom   = (LONG)v->height;
+   /* The slot's last_dims stays the size its vertices were made for:
+    * the first pass makes them again when the view's differs, and the
+    * chain's end records the new one */
    ok = SUCCEEDED(IDirect3DDevice9_StretchRect(c->chain.dev, s, &from, t,
             &to, D3DTEXF_POINT));
-   /* The size the first pass reads it at, as a software frame's put
-    * leaves it */
-   c->chain.prev.last_dims[slot] = dims;
 end:
    if (s)
       IDirect3DSurface9_Release(s);
@@ -8704,7 +8710,9 @@ static bool d3d9_hlsl_frame_body(void *data, const void *frame,
 #else
    bool menu_is_alive                  = false;
 #endif
+#ifdef HAVE_OVERLAY
    bool overlay_behind_menu            = video_info->overlay_behind_menu;
+#endif
 #ifdef HAVE_GFX_WIDGETS
    bool widgets_active                 = video_info->widgets_active;
 #endif

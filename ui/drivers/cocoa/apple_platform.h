@@ -120,6 +120,9 @@ UINavigationControllerDelegate> {
 + (RetroArch_iOS*)get;
 
 - (void)showGameView;
+#if TARGET_OS_IOS
+- (void)layoutRenderView;
+#endif
 - (void)supportOtherAudioSessions;
 - (BOOL)openRetroArchURL:(NSURL *)url;
 

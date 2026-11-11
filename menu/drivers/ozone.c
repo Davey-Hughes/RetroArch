@@ -2267,6 +2267,7 @@ static uintptr_t ozone_entries_icon_get_texture(
       case MENU_ENUM_LABEL_QUICK_MENU_SHOW_CONTROLS:
       case MENU_ENUM_LABEL_UPDATE_AUTOCONFIG_PROFILES:
       case MENU_ENUM_LABEL_INPUT_RETROPAD_BINDS:
+      case MENU_ENUM_LABEL_INPUT_CONTROLLERS:
       case MENU_ENUM_LABEL_INPUT_USER_1_BINDS:
       case MENU_ENUM_LABEL_INPUT_USER_2_BINDS:
       case MENU_ENUM_LABEL_INPUT_USER_3_BINDS:
@@ -9179,6 +9180,7 @@ static enum menu_action ozone_parse_menu_entry_action(
             || ((ozone->flags & OZONE_FLAG_IS_PLAYLIST)
                && action == MENU_ACTION_OK
                && menu_media_selected_in_history(menu_st)))
+         && !(ozone->flags  & OZONE_FLAG_CURSOR_IN_SIDEBAR)
          && !(ozone->flags2 & OZONE_FLAG2_SHOW_FULLSCREEN_THUMBNAILS)
          && (action == MENU_ACTION_OK || action == MENU_ACTION_SELECT || action == MENU_ACTION_START)
          && menu_media_open_selected_file(menu_st, &ozone->thumbnails.left, &ozone->thumbnails.right,
@@ -10345,7 +10347,7 @@ static void ozone_refresh_thumbnail_image(void *data, size_t i)
    ozone_handle_t *ozone        = (ozone_handle_t*)data;
    struct menu_state   *menu_st = menu_state_get_ptr();
 
-   if (!ozone)
+   if (!ozone || menu_media_controls_settings_active(&ozone->media))
       return;
 
    ozone->flags &= ~OZONE_FLAG_SKIP_THUMBNAIL_RESET;
@@ -12919,8 +12921,9 @@ static void ozone_selection_changed(ozone_handle_t *ozone, bool allow_animation)
       ozone_update_scroll(ozone, allow_animation, node);
 
       /* Update thumbnail */
-      if (   gfx_thumbnail_is_enabled(menu_st->thumbnail_path_data, GFX_THUMBNAIL_RIGHT)
-          || gfx_thumbnail_is_enabled(menu_st->thumbnail_path_data, GFX_THUMBNAIL_LEFT))
+      if (!menu_media_controls_settings_active(&ozone->media)
+            && (gfx_thumbnail_is_enabled(menu_st->thumbnail_path_data, GFX_THUMBNAIL_RIGHT)
+               || gfx_thumbnail_is_enabled(menu_st->thumbnail_path_data, GFX_THUMBNAIL_LEFT)))
       {
          bool update_thumbnails = false;
 

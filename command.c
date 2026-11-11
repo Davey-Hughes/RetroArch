@@ -57,6 +57,7 @@
 #endif
 
 #include "audio/audio_driver.h"
+#include "input/input_remapping.h"
 #if defined(HAVE_CG) || defined(HAVE_GLSL) || defined(HAVE_SLANG) || defined(HAVE_HLSL)
 #include "gfx/video_shader_parse.h"
 #endif
@@ -288,7 +289,7 @@ static void network_command_reply(command_t *cmd,
 {
    command_network_t *netcmd = (command_network_t*)cmd->userptr;
    /* Respond (fire and forget since it's UDP) */
-   sendto(netcmd->net_fd, s, len, 0,
+   sendto(netcmd->net_fd, s, (int)len, 0,
       (struct sockaddr*)&netcmd->cmd_source, netcmd->cmd_source_len);
 }
 
@@ -316,7 +317,7 @@ static void network_command_reply_to(command_t *cmd, void *data,
 {
    command_network_t      *netcmd = (command_network_t*)cmd->userptr;
    command_network_dest_t *dest   = (command_network_dest_t*)data;
-   sendto(netcmd->net_fd, s, len, 0,
+   sendto(netcmd->net_fd, s, (int)len, 0,
       (struct sockaddr*)&dest->addr, dest->addr_len);
 }
 
@@ -1948,13 +1949,13 @@ static bool udp_send_packet(const char *host, uint16_t port, const char *msg)
 
    do
    {
-      int fd = socket(tmp_info->ai_family,
+      int fd = (int)socket(tmp_info->ai_family,
          tmp_info->ai_socktype, tmp_info->ai_protocol);
 
       if (fd < 0)
          continue;
 
-      if (sendto(fd, msg, len, 0, tmp_info->ai_addr, tmp_info->ai_addrlen) ==
+      if (sendto(fd, msg, (int)len, 0, tmp_info->ai_addr, (socklen_t)tmp_info->ai_addrlen) ==
             (ssize_t)len)
          ret = true;
 
@@ -2027,9 +2028,14 @@ bool command_network_send(const char *cmd_)
 
    if (port_str && *port_str)
    {
-      unsigned long val = strtoul(port_str, NULL, 0);
-      if (val > 0 && val <= 0xFFFF)
-         port = (uint16_t)val;
+      char *end;
+      unsigned long val = strtoul(port_str, &end, 0);
+      if (*end || !val || val > 0xFFFF)
+      {
+         RARCH_ERR("[NetCMD] Invalid port \"%s\".\n", port_str);
+         return false;
+      }
+      port = (uint16_t)val;
    }
 
    RARCH_LOG("[NetCMD] %s: \"%s\" to %s:%hu.\n",
@@ -6353,7 +6359,7 @@ void command_event_init_controllers(rarch_system_info_t *sys_info,
          if (i >= MAX_USERS)
             break;
 
-         if (port == settings->uints.input_remap_ports[i])
+         if (port == input_remapping_user_port((unsigned)i))
          {
             device = input_config_get_device(port);
             break;

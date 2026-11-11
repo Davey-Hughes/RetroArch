@@ -950,7 +950,7 @@ static void gl1_raster_font_render_message(gl1_t *gl,
       GLfloat scale, const GLfloat color[4], GLfloat pos_x, GLfloat pos_y,
       float inv_tex_size_x,
       float inv_tex_size_y,
-      float inv_win_width,
+      float win_width,
       float inv_win_height,
       unsigned text_align)
 {
@@ -965,7 +965,8 @@ static void gl1_raster_font_render_message(gl1_t *gl,
    GLfloat *font_tex_coords               = font->font_tex_coords;
    GLfloat *font_vertex                   = font->font_vertex;
    GLfloat *font_color                    = font->font_color;
-   int pre_x                              = roundf(pos_x * VIDEO_SCALE_W(gl->vp.dims));
+   float inv_win_width                    = 1.0f / win_width;
+   int pre_x                              = roundf(pos_x * win_width);
    const struct font_glyph* (*get_glyph)(void*, uint32_t)
                                           = font->font_driver->get_glyph;
    void *font_data                        = font->font_data;
@@ -1111,7 +1112,7 @@ static void gl1_raster_font_render_msg(
             ? gl->screen_dims : gl->frame_dims;
       float inv_tex_size_x    = 1.0f / VIDEO_SCALE_W(font->tex_dims);
       float inv_tex_size_y    = 1.0f / VIDEO_SCALE_H(font->tex_dims);
-      float inv_win_width;
+      float win_width;
       float inv_win_height;
       /* setup_viewport may change gl->vp, so capture inv_win_width/height
        * AFTER it runs — otherwise the vertex math uses one viewport while
@@ -1120,7 +1121,7 @@ static void gl1_raster_font_render_msg(
        * gl->vp as-is. */
       if (!font->block)
          gl1_raster_font_setup_viewport(gl, dims, font, full_screen);
-      inv_win_width           = 1.0f / VIDEO_SCALE_W(gl->vp.dims);
+      win_width               = VIDEO_SCALE_W(gl->vp.dims) / rp.x_scale;
       inv_win_height          = 1.0f / VIDEO_SCALE_H(gl->vp.dims);
 
       if (msg && *msg
@@ -1137,11 +1138,11 @@ static void gl1_raster_font_render_msg(
 
             gl1_raster_font_render_message(gl, font, msg, msg_len, scale,
                   color_dark,
-                  x + scale * drop_x / VIDEO_SCALE_W(gl->vp.dims),
+                  x + scale * drop_x / win_width,
                   y + scale * drop_y / VIDEO_SCALE_H(gl->vp.dims),
                   inv_tex_size_x,
                   inv_tex_size_y,
-                  inv_win_width,
+                  win_width,
                   inv_win_height,
                   text_align);
          }
@@ -1151,7 +1152,7 @@ static void gl1_raster_font_render_msg(
                x, y,
                inv_tex_size_x,
                inv_tex_size_y,
-               inv_win_width,
+               win_width,
                inv_win_height,
                text_align);
       }
@@ -3625,10 +3626,8 @@ static void gl1_viewport_info(void *data, struct video_viewport *vp)
 static bool gl1_read_viewport_internal(gl1_t *gl1, uint8_t *buffer,
       bool is_idle, bool bgrx)
 {
-   unsigned num_pixels = 0;
-
-   num_pixels                      = VIDEO_SCALE_AREA(gl1->vp.dims);
-   gl1->readback_buffer_screenshot = malloc(num_pixels * sizeof(uint32_t));
+   gl1->readback_buffer_screenshot = malloc(
+         VIDEO_SCALE_AREA(gl1->vp.dims) * sizeof(uint32_t));
 
    if (!gl1->readback_buffer_screenshot)
       return false;
@@ -4179,8 +4178,8 @@ static bool gl1_overlay_alloc(gl1_t *gl, unsigned num_images,
    for (i = 0; i < num_images; i++)
    {
       /* Default. Stretch to whole screen. */
-      gl1_overlay_tex_geom(gl, i, 0, 0, 1, 1);
-      gl1_overlay_vertex_geom(gl, i, 0, 0, 1, 1);
+      gl1_overlay_tex_geom(gl, (unsigned)i, 0, 0, 1, 1);
+      gl1_overlay_vertex_geom(gl, (unsigned)i, 0, 0, 1, 1);
 
       for (j = 0; j < 16; j++)
          gl->overlay_color_coord[16 * i + j] = 1.0f;

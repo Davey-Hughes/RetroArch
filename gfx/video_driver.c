@@ -3755,19 +3755,29 @@ void video_driver_hw_request_restore(const struct video_hw_request *req)
 /* The idle logo, loaded the first frame it is wanted; app thread */
 static gfx_surface_t *video_driver_windows_logo = NULL;
 
-/* The logo from the widgets' icon set, once the widgets know where it
- * is. Its own frame keeps the path off the frame function's stack. */
+/* The logo from the widgets' icon set: their path, or with the widgets
+ * off the same path built from the assets directory. Its own frame
+ * keeps the path off the frame function's stack. */
 static VIDEO_NOINLINE void video_driver_windows_logo_load(void)
 {
    char path[PATH_MAX_LENGTH];
-   const char *dir = dispwidget_get_ptr()->monochrome_png_path;
-   if (!*dir)
+   const char *dir    = dispwidget_get_ptr()->monochrome_png_path;
+   const char *assets = config_get_ptr()->paths.directory_assets;
+   if (!*dir && !*assets)
       return;
    video_driver_windows_logo = gfx_surface_new_still(
          gfx_display_texture_filter());
    if (!video_driver_windows_logo)
       return;
-   fill_pathname_join_special(path, dir, "retroarch.png", sizeof(path));
+   if (*dir)
+      fill_pathname_join_special(path, dir, "retroarch.png", sizeof(path));
+   else
+   {
+      fill_pathname_join_special(path, assets, "xmb", sizeof(path));
+      fill_pathname_join_special(path, path, "monochrome", sizeof(path));
+      fill_pathname_join_special(path, path, "png", sizeof(path));
+      fill_pathname_join_special(path, path, "retroarch.png", sizeof(path));
+   }
    gfx_surface_submit_path(video_driver_windows_logo, path,
          gfx_surface_wants_rgba());
 }
@@ -3848,11 +3858,9 @@ void video_driver_free_internal(void)
 
    if (video_st->data && vid && vid->free)
       vid->free(video_st->data);
-#if defined(ANDROID) && defined(HAVE_VIDEO_WINDOWS)
    /* No driver follows to take what this one left up */
    if (runloop_get_flags() & RUNLOOP_FLAG_SHUTDOWN_INITIATED)
-      android_windows_release_kept();
-#endif
+      VIDEO_ANDROID_RELEASE_KEPT_WINDOWS();
    video_driver_set_hdr_output_mode(0);
    retro_atomic_store_release_int(&video_hdr_source_10bpc, 0);
 
@@ -4265,6 +4273,18 @@ unsigned video_driver_get_ui_layer_dims(unsigned layer)
    return video_driver_get_ui_dims();
 }
 
+float video_driver_ui_display_aspect(void)
+{
+#ifdef HAVE_MODELINE
+   video_driver_state_t *video_st = &video_driver_st;
+   if (     retro_atomic_load_acquire_int(&video_st->crt_switching_active)
+         && video_st->crt_switch_st.gen
+         && strcmp(video_st->crt_switch_st.gen->monitor, "lcd"))
+      return (float)video_st->crt_switch_st.gen->monitor_aspect;
+#endif
+   return 0.0f;
+}
+
 const video_views_layout_t *video_driver_get_views_layout(void)
 {
    video_driver_state_t *video_st = &video_driver_st;
@@ -4507,7 +4527,7 @@ static void video_driver_windows_place(video_driver_state_t *video_st,
       : video_st->views.num_views ? video_st->views.num_screens : 1;
    in->mapless        = running && !video_st->views.num_views;
    in->switching      = runloop_st->content_switching;
-   in->move_failed    = false;
+   in->failed_move    = 0;
 #ifdef ANDROID
    {
       unsigned i;
@@ -4516,16 +4536,20 @@ static void video_driver_windows_place(video_driver_state_t *video_st,
          routed = list[i].own;
       /* Reading clears it; placement hears it only with an own display */
       if (routed)
-         in->move_failed = android_activity_move_failed();
+         in->failed_move = android_activity_move_failed();
    }
 #endif
    video_windows_place(&video_st->windows_host, in, route);
 #ifdef ANDROID
+   /* An ordinal is its display's place in the list, from 1 */
    if (route->move)
-      android_activity_move_request(route->move);
+      android_activity_move_request(
+            route->move <= count ? list[route->move - 1].id : -1,
+            route->move_seq);
 #endif
    /* A redraw reuses the stored route; it must not ask again */
-   route->move = 0;
+   route->move     = 0;
+   route->move_seq = 0;
 }
 
 /* App thread: the snapshot's UI targets are those this frame was laid
@@ -4557,6 +4581,12 @@ static void video_driver_windows_ui(video_driver_state_t *video_st,
             & VIDEO_WINDOW_UI_BIT(VIDEO_WINDOW_UI_NOTIFICATIONS);
    }
    out->window_ui[VIDEO_WINDOWS_PRESENTATION] = use;
+   /* A Presentation on another display gets its own wait */
+   if (route->display != video_st->windows_ui_display)
+   {
+      video_st->windows_ui_display = route->display;
+      video_st->windows_ui_asked   = 0;
+   }
    /* 1 once shown, so a later loss falls back at once */
    if (!use)
       video_st->windows_ui_asked = 0;
@@ -4786,7 +4816,8 @@ static void video_driver_views_frame(video_driver_state_t *video_st,
       }
    }
 #ifdef HAVE_VIDEO_WINDOWS
-   /* With or without views: the menu and the idle logo use them too */
+   /* With or without views: it also places the menu and decides the
+    * idle logo */
    video_info->windows = video_driver_windows_frame(video_st, settings,
          flags.flags, redraw, now);
 #else
@@ -6960,6 +6991,12 @@ void video_driver_cached_frame_invalidate(void)
  * the cached pointer is one of its own allocations. */
 void video_driver_cached_frame_retire(void)
 {
+   {
+      size_t keeper = retro_atomic_load_acquire_size(
+            &video_driver_st.frame_cache_keeper);
+      if (keeper && keeper == VIDEO_CACHE_KEEPER)
+         return;
+   }
    video_driver_cached_frame_invalidate();
 #ifdef FRAME_CACHE_HAZARDS
    /* Bump first, then scan: a reader that armed before the bump is
@@ -7569,6 +7606,7 @@ void video_driver_build_info(video_frame_info_t *video_info)
    video_info->input_driver_grab_mouse_state = (input_flags & INP_FLAG_GRAB_MOUSE_STATE) ? true : false;
    video_info->input_poll_time               = input_driver_get_poll_time();
    video_info->disp_userdata                 = disp_get_ptr();
+   video_info->widget_display_aspect         = video_driver_ui_display_aspect();
 #if defined(HAVE_GFX_WIDGETS) && defined(HAVE_THREADS)
    /* The worker lays the widgets out at this, with the dims and the
     * fullscreen state the main thread would have */
@@ -7576,7 +7614,9 @@ void video_driver_build_info(video_frame_info_t *video_info)
          (     video_info->widgets_active
             && retro_atomic_load_relaxed_int(&p_dispwidget->worker))
       ? gfx_widgets_scale_factor(video_info->disp_userdata, settings,
-            video_driver_get_ui_layer_dims(VIDEO_WINDOW_UI_NOTIFICATIONS),
+            gfx_widgets_layout_dims(
+               video_driver_get_ui_layer_dims(VIDEO_WINDOW_UI_NOTIFICATIONS),
+               video_info->widget_display_aspect),
             video_info->fullscreen)
       : 0.0f;
 #endif
@@ -9076,6 +9116,7 @@ VIDEO_NOINLINE static void video_driver_frame_statistics(
    video_info->osd_stat_params.y           = 0.970f;
    video_info->osd_stat_params.text_align  = TEXT_ALIGN_LEFT;
    video_info->osd_stat_params.scale       = scale;
+   video_info->osd_stat_params.x_scale     = 1.0f;
    video_info->osd_stat_params.full_screen = true;
    video_info->osd_stat_params.drop_x      = 2;
    video_info->osd_stat_params.drop_y      = -2;
@@ -9472,6 +9513,9 @@ void video_driver_frame(const void *data, unsigned width,
    unsigned view_dims;
 #if defined(HAVE_VIDEO_FILTER) && defined(HAVE_THREADS)
    bool filter_deferred           = false;
+#endif
+#ifdef HAVE_VIDEO_FILTER
+   bool filter_lent               = false;
 #endif
    video_driver_state_t *video_st = &video_driver_st;
    const video_driver_t *vid      = video_st->current_video;
@@ -10033,14 +10077,26 @@ void video_driver_frame(const void *data, unsigned width,
    {
       unsigned output_dims  = 0;
       unsigned output_pitch = 0;
+      void    *output       = NULL;
 
       rarch_softfilter_get_output_size(video_st->state_filter,
             &output_dims, dims);
 
       output_pitch = VIDEO_SCALE_W(output_dims) * video_st->state_out_bpp;
+      retro_atomic_store_release_size(&video_st->frame_cache_keeper,
+            VIDEO_CACHE_KEEPER);
+      if ((output = video_driver_filter_lend(video_st->poke,
+                  video_st->data, output_dims, video_st->state_out_bpp,
+                  &output_pitch)))
+         filter_lent = true;
+      else
+      {
+         output    = video_st->state_buffer;
+         retro_atomic_store_release_size(&video_st->frame_cache_keeper, 0);
+      }
 
       rarch_softfilter_process(video_st->state_filter,
-            video_st->state_buffer, output_pitch,
+            output, output_pitch,
             data, dims, pitch);
 
       if (     video_info.post_filter_record
@@ -10048,10 +10104,10 @@ void video_driver_frame(const void *data, unsigned width,
             && recording_st->driver
             && recording_st->driver->push_video)
          recording_dump_frame(
-               video_st->state_buffer, output_dims, output_pitch,
+               output, output_dims, output_pitch,
                runloop_idle, runloop_st->perfcnt_enable);
 
-      data   = video_st->state_buffer;
+      data   = output;
       dims   = output_dims;
       pitch  = output_pitch;
    }
@@ -10198,6 +10254,11 @@ void video_driver_frame(const void *data, unsigned width,
          video_st->main_flags |=  VIDEO_FLAG_ACTIVE;
       else
          video_st->main_flags &= ~VIDEO_FLAG_ACTIVE;
+
+#ifdef HAVE_VIDEO_FILTER
+      if (filter_lent)
+         retro_atomic_store_release_size(&video_st->frame_cache_keeper, 0);
+#endif
 
 #ifdef HAVE_THREADS
       /* Under the wrapper the video thread is the presenter and

@@ -30,6 +30,7 @@
 #include "../common/vulkan_video_import.h"
 #include <retro_inline.h>
 #include <retro_miscellaneous.h>
+#include <math/float16.h>
 #include <queues/mpsc_stack.h>
 #include <queues/task_queue.h>
 #include <retro_math.h>
@@ -59,6 +60,12 @@
 #ifdef HAVE_VAAPI
 #include "../common/vaapi_hevc_vulkan_cache.h"
 #include "../common/vaapi_hevc_backend.h"
+#ifdef HAVE_RVP9
+#include "../common/vaapi_vp9_backend.h"
+#endif
+#ifdef HAVE_RAV1
+#include "../common/vaapi_av1_backend.h"
+#endif
 #include "../common/vulkan_android_queue.h"
 #endif
 #ifdef HAVE_TEMPORAL_UPSCALER
@@ -452,6 +459,9 @@ typedef struct vk
        * when the image goes there */
       unsigned ui_direct;
       const char *ui_msg;
+      /* This frame: views an up window with no free image shows,
+       * copied all the same for a later repeat */
+      unsigned copy;
    } windows;
 #endif
 #ifdef HAVE_OPENXR
@@ -864,6 +874,12 @@ typedef struct vk
 
 #ifdef HAVE_VAAPI
 #include "vulkan_vaapi_backend.h"
+#ifdef HAVE_RVP9
+#include "vulkan_vaapi_vp9_backend.h"
+#endif
+#ifdef HAVE_RAV1
+#include "vulkan_vaapi_av1_backend.h"
+#endif
 #endif
 
 #if defined(ANDROID) && defined(HAVE_THREADS) \
@@ -4539,6 +4555,7 @@ static void vulkan_font_render_msg(
    const struct font_glyph *glyph_q;
    float x, y, scale, drop_mod, drop_alpha;
    float inv_tex_size_x, inv_tex_size_y, inv_win_width, inv_win_height;
+   float win_width;
    float scale_iww, scale_iwh;           /* pre-multiplied scale * inv_win */
    const struct font_glyph *(*get_glyph)(void*, uint32_t);
    void *font_data;
@@ -4640,7 +4657,8 @@ static void vulkan_font_render_msg(
    /* Hoist reciprocals, function pointer, and pre-multiplied factors. */
    inv_tex_size_x   = 1.0f / VIDEO_SCALE_W(font->texture.dims);
    inv_tex_size_y   = 1.0f / VIDEO_SCALE_H(font->texture.dims);
-   inv_win_width    = 1.0f / VIDEO_SCALE_W(vk->vp.dims);
+   win_width        = VIDEO_SCALE_W(vk->vp.dims) / rp.x_scale;
+   inv_win_width    = 1.0f / win_width;
    inv_win_height   = 1.0f / VIDEO_SCALE_H(vk->vp.dims);
    scale_iww        = scale * inv_win_width;
    scale_iwh        = scale * inv_win_height;
@@ -4659,7 +4677,7 @@ static void vulkan_font_render_msg(
 
       vk_color         = rgba16_pack(color);
 
-      fg_base_x        = roundf(x * VIDEO_SCALE_W(vk->vp.dims)) * inv_win_width;
+      fg_base_x        = roundf(x * win_width) * inv_win_width;
 
       sh_base_x        = 0.0f;
       sh_y_origin      = 0.0f;
@@ -4672,7 +4690,7 @@ static void vulkan_font_render_msg(
          dark[3]         = color[3] * drop_alpha;
          vk_color_dark   = rgba16_pack(dark);
          sh_base_x       = roundf((x + scale * drop_x
-                              * inv_win_width) * VIDEO_SCALE_W(vk->vp.dims))
+                              * inv_win_width) * win_width)
                               * inv_win_width;
          sh_y_origin     = y + scale * drop_y * inv_win_height;
       }
@@ -6811,8 +6829,8 @@ static bool vulkan_init_default_filter_chain(vk_t *vk)
 }
 
 /* Frees the view chains from index first on, the headset's too, and
- * with first 0 the headset's whole-frame chains. */
-static void vulkan_views_free_chains(vk_t *vk, unsigned first)
+ * with frame the headset's whole-frame chains. */
+static void vulkan_views_free_chains(vk_t *vk, unsigned first, bool frame)
 {
    unsigned i;
    for (i = first; i < RETRO_VIDEO_VIEWS_MAX; i++)
@@ -6838,7 +6856,7 @@ static void vulkan_views_free_chains(vk_t *vk, unsigned first)
 #endif
    }
 #ifdef HAVE_OPENXR
-   if (!first)
+   if (frame)
    {
       if (vk->xr.frame_chain)
          vulkan_filter_chain_free(vk->xr.frame_chain);
@@ -6984,7 +7002,7 @@ static void vulkan_views_build_chains(vk_t *vk)
 static void vulkan_views_set_preset(vk_t *vk, const char *path)
 {
    strlcpy(vk->views.preset, path ? path : "", sizeof(vk->views.preset));
-   vulkan_views_free_chains(vk, 0);
+   vulkan_views_free_chains(vk, 0, true);
    vulkan_views_build_chains(vk);
 }
 
@@ -7565,6 +7583,12 @@ static void vulkan_free(void *data)
 #endif
 #ifdef HAVE_VAAPI
    vaapi_hevc_backend_withdraw(&vulkan_vaapi_backend, vk);
+#ifdef HAVE_RVP9
+   vaapi_vp9_backend_withdraw(&vulkan_vaapi_vp9_backend, vk);
+#endif
+#ifdef HAVE_RAV1
+   vaapi_av1_backend_withdraw(&vulkan_vaapi_av1_backend, vk);
+#endif
 #endif
 
    if (vk->context && vk->context->device)
@@ -7629,7 +7653,7 @@ static void vulkan_free(void *data)
       if (vk->filter_chain_default)
          vulkan_filter_chain_free((vulkan_filter_chain_t*)vk->filter_chain_default);
 
-      vulkan_views_free_chains(vk, 0);
+      vulkan_views_free_chains(vk, 0, true);
 
       /* Whatever the context, not only with HDR: the retained image is
        * the presenter's, not the HDR path's. */
@@ -8387,7 +8411,16 @@ static void *vulkan_init(const video_info_t *video)
 #if defined(HAVE_RMP4) || defined(HAVE_RWEBM)
       /* previews decoded on the GPU, where the device can */
 #ifdef HAVE_VAAPI
-      vulkan_vaapi_decoder_publish(vk, vulkan_video_decode_init(vk->context));
+      {
+         bool native_video = vulkan_video_decode_init(vk->context);
+         vulkan_vaapi_decoder_publish(vk, native_video);
+#ifdef HAVE_RVP9
+         vulkan_vaapi_vp9_decoder_publish(vk, native_video);
+#endif
+#ifdef HAVE_RAV1
+         vulkan_vaapi_av1_decoder_publish(vk, native_video);
+#endif
+      }
 #elif defined(VULKAN_ANDROID_DECODERS)
       vulkan_android_decoder_publish(vk, vulkan_video_decode_init(vk->context));
 #else
@@ -11322,6 +11355,7 @@ static VIDEO_NOINLINE void vulkan_windows_prepare(vk_t *vk,
    const gfx_ctx_window_driver_t *ctx = vk->ctx_driver
       ? vk->ctx_driver->windows : NULL;
 
+   vk->windows.copy = 0;
    if (!ctx)
       return;
    if (vk->windows.held.live)
@@ -11415,14 +11449,21 @@ static VIDEO_NOINLINE void vulkan_windows_prepare(vk_t *vk,
       if (state < 0)
       {
          RARCH_WARN("[Vulkan] A screen window can't be drawn. "
-               "Its screens go back to the main window.\n");
+               "What it shows stays in the main window.\n");
          vulkan_window_attach(vk, f, w);
          continue;
       }
       /* No free image is no failure: its last image stays */
       win->flags |= VK_WINDOW_FLAG_UP;
       if (!state)
+      {
+         if (screens && new_frame)
+            for (i = 0; i < video_info->views.num_views; i++)
+               if (f->window_screens[w]
+                     & (1u << video_info->views.views[i].screen))
+                  vk->windows.copy |= 1u << i;
          continue;
+      }
 
       if (screens)
       {
@@ -11620,7 +11661,7 @@ static void vulkan_windows_present(vk_t *vk,
          if (win->output.flags & VK_OUTPUT_FLAG_LOST)
          {
             RARCH_WARN("[Vulkan] A screen window's surface is gone. "
-                  "Its screens go back to the main window.\n");
+                  "What it shows stays in the main window.\n");
             vulkan_window_attach(vk, f, w);
          }
          continue;
@@ -13192,6 +13233,9 @@ static bool vulkan_frame(void *data, const void *frame,
       for (i = 0; i < video_info->views.num_views; i++)
          if (view_chains[i])
             copy_views |= 1u << i;
+#ifdef HAVE_VIDEO_WINDOWS
+      copy_views |= vk->windows.copy;
+#endif
    }
 #ifdef HAVE_OPENXR
    /* The headset's views and its tracked eyes come from the same
@@ -14683,6 +14727,9 @@ static bool vulkan_get_current_sw_framebuffer(void *data,
                chain->texture.format, /* Ensure we use the non-remapped format. */
                NULL, NULL, VULKAN_TEXTURE_DYNAMIC);
       }
+      /* Sampled whenever it exists, and of the old format */
+      else if (chain->texture_optimal.memory != VK_NULL_HANDLE)
+         vulkan_texture_defer_copy(vk, &chain->texture_optimal);
    }
 
    /* If the driver picked a row pitch wider than width*bpp for this linear
@@ -16774,18 +16821,21 @@ static bool vulkan_texture_lend_ready(void *data, uintptr_t id,
 
 static void vulkan_set_view_count(void *data, unsigned count)
 {
-   unsigned i, j;
+   unsigned i, j, had;
    vk_t *vk = (vk_t*)data;
    if (!vk || !vk->context)
       return;
+   had                    = vk->views.chains.count;
    vk->views.chains.count = MIN(count, RETRO_VIDEO_VIEWS_MAX);
-   vulkan_views_free_chains(vk, vk->views.chains.count);
+   vulkan_views_free_chains(vk, vk->views.chains.count, false);
    /* Frames in flight may still read the copies. */
    for (i = 0; i < vk->num_swapchain_images; i++)
       for (j = vk->views.chains.count; j < RETRO_VIDEO_VIEWS_MAX; j++)
          vulkan_texture_defer_copy(vk, &vk->swapchain[i].view_images[j]);
    vk->views.copied &= (1u << vk->views.chains.count) - 1u;
-   vulkan_views_build_chains(vk);
+   /* The threaded wrapper applies a shrink with the main thread running */
+   if (vk->views.chains.count > had)
+      vulkan_views_build_chains(vk);
 }
 
 #ifdef HAVE_OPENXR
@@ -17326,35 +17376,6 @@ static bool vulkan_read_viewport_bgrx(void *data, uint8_t *buffer,
 }
 
 #ifdef VULKAN_HDR_SWAPCHAIN
-/* IEEE-754 half (binary16) -> float, for reading an RGBA16F scRGB backbuffer
- * on the CPU. Handles normals, subnormals, sign and inf/nan. */
-static float vulkan_half_to_float(uint16_t h)
-{
-   uint32_t sign = (uint32_t)(h & 0x8000) << 16;
-   uint32_t exp  = (h >> 10) & 0x1F;
-   uint32_t mant = h & 0x3FF;
-   uint32_t f;
-   float    out;
-   if (exp == 0)
-   {
-      if (mant == 0)
-         f = sign;
-      else
-      {
-         exp = 127 - 15 + 1;
-         while (!(mant & 0x400)) { mant <<= 1; exp--; }
-         mant &= 0x3FF;
-         f = sign | (exp << 23) | (mant << 13);
-      }
-   }
-   else if (exp == 0x1F)
-      f = sign | 0x7F800000 | (mant << 13);
-   else
-      f = sign | ((exp - 15 + 127) << 23) | (mant << 13);
-   memcpy(&out, &f, sizeof(out));
-   return out;
-}
-
 /* ST.2084 (PQ) inverse-EOTF: normalised linear (v = nits/10000, [0,1]) ->
  * PQ code [0,1]. Same constants as the forward HDR pipeline. */
 static float vulkan_pq_encode(float v)
@@ -17540,9 +17561,9 @@ static bool vulkan_read_viewport_hdr(void *data, uint16_t *buffer,
             int x;
             for (x = 0; x < (int)vp_width; x++)
             {
-               float r = vulkan_half_to_float(row[x * 4 + 0]);
-               float g = vulkan_half_to_float(row[x * 4 + 1]);
-               float b = vulkan_half_to_float(row[x * 4 + 2]);
+               float r = retro_half_to_float(row[x * 4 + 0]);
+               float g = retro_half_to_float(row[x * 4 + 1]);
+               float b = retro_half_to_float(row[x * 4 + 2]);
                float lvl;
                buffer[x * 3 + 0] = vulkan_scrgb_channel_to_pq16(r);
                buffer[x * 3 + 1] = vulkan_scrgb_channel_to_pq16(g);

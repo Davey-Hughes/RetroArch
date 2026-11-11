@@ -631,7 +631,13 @@ enum msg_file_type msg_hash_to_file_type(const char *value)
       { "ps",        FILE_TYPE_PS },
       { "ts",        FILE_TYPE_TS },
       { "mxf",       FILE_TYPE_MXF },
+#endif
+#if defined(HAVE_FFMPEG) || defined(HAVE_MPV) || defined(HAVE_RWMA)
       { "wma",       FILE_TYPE_WMA },
+#endif
+#ifdef HAVE_RWMA
+      { "xwma",      FILE_TYPE_WMA },
+      { "xma",       FILE_TYPE_WMA },
 #endif
 #if defined(HAVE_FFMPEG) || defined(HAVE_MPV) || defined(HAVE_AUDIOMIXER)
 #if !defined(HAVE_AUDIOMIXER) || defined(HAVE_RMP3)
@@ -715,6 +721,8 @@ enum msg_file_type msg_hash_to_file_type(const char *value)
       { "bmp",       FILE_TYPE_BMP },
       { "webp",      FILE_TYPE_WEBP },
       { "WEBP",      FILE_TYPE_WEBP },
+      { "gif",       FILE_TYPE_GIF },
+      { "GIF",       FILE_TYPE_GIF },
 #endif
 #ifdef HAVE_EASTEREGG
       { "gong",      FILE_TYPE_GONG },

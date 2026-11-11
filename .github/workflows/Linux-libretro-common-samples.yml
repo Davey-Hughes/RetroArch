@@ -41,7 +41,7 @@ jobs:
         group: [codecs, formats, core]
     env:
       SAMPLE_GROUP: ${{ matrix.group }}
-      APT_PKGS: build-essential zlib1g-dev clang ffmpeg ccache
+      APT_PKGS: build-essential zlib1g-dev clang ffmpeg ccache curl
     timeout-minutes: 15
 
     steps:
@@ -114,6 +114,8 @@ jobs:
           # self-contained test and exits 0 on success / non-zero on
           # failure.  These are built AND executed.
           declare -a RUN_TARGETS=(
+            rwma_test
+            audio_transfer_wma_test
             flv_mux_test
             rtmp_chunk_test
             rtmp_handshake_test
@@ -124,9 +126,15 @@ jobs:
             rtmp_control_test
             rtmp_session_test
             rtmp_socket_test
+            rtmp_connect_test
+            rtmp_connect_select_test
+            rtmp_resolve_test
+            rtmp_resolve_native_test
             rslc_test
             rslc_build_test
             rslc_ext_test
+            rslc_ext_build_test
+            rslc_plane_test
             s16_to_float_test
             float_to_s16_test
             float_to_s32_test
@@ -140,9 +148,12 @@ jobs:
             xxhash_test
             rzstd_raw_block_test
             rzstd_raw_block_test_novec
+            rzstd_dict_test
             rbzip2_test
             rinflate_window_test
             rdeflate_hash_test
+            rdeflate_flush_test
+            encoding_adler32_test
             emscripten_mmap_test
             archive_zip_test
             archive_zstd_test
@@ -159,6 +170,10 @@ jobs:
             path_mkdir_test
             path_parent_dir_test
             rpng
+            # a PNG a row at a time, as stored, from input in pieces
+            rpng_rows_test
+            # a GIF's first image, straight into the caller's rows
+            rgif_test
             rzip_chunk_size_test
             rzip_matches_buf_test
             rzip_codec_test
@@ -179,10 +194,16 @@ jobs:
             rh264_state_test
             # rmp3's frame-at-a-time API against its pull API.
             rmp3_frame_test
+            # rmp3's gapless trimming against ffmpeg's, and its tag parser.
+            rmp3_gapless_test
             # raac_last_size over units followed by more.
             raac_size_test
             # raac's savestates: saved between units, loaded into a new decoder.
             raac_state_test
+            # raac's ADTS header parse and WAVE channel order.
+            raac_layout_test
+            # HE-AAC v2 parametric stereo, with reset and savestates.
+            raac_ps_test
             rh265_lossless_test
             rh265_lossless_test_nothreads
             rh265_lossless_test_volatile
@@ -242,6 +263,17 @@ jobs:
             filestream_printf_test
             strlcpy_append_test
             http_parse_test
+            # UPnP gateway client: parsers, and SOAP against a fake gateway.
+            net_upnp_test
+            # net_http: a 3xx handed back unfollowed, a DELETE body's
+            # Content-Length, the caller's Accept-Encoding/User-Agent.
+            net_http_options_test
+            # socket_poll past FD_SETSIZE sockets.
+            socket_poll_test
+            # Half floats both ways, against F16C.
+            float16_test
+            # TrueType and CID-keyed CFF glyphs, metrics and kerning.
+            rtt_test
             rjson_test
             rm3u_test
             rmp4_fragment_test
@@ -396,6 +428,11 @@ jobs:
             # stereo stream (tones, gain points, swap and negate masks)
             # and a mono one, then bad frames and garbage.
             ratrac3p_test
+            # ATRAC9 against a reference decoder's output for generated
+            # streams in every channel layout, rate and superframe size,
+            # with reset and savestates; then its own unit checks.
+            ratrac9_vectors_test
+            ratrac9_test
             # Animation playback against a scripted stream: order,
             # pacing, loops, catch-up, the worker's two jobs.
             video_player_test
@@ -407,7 +444,9 @@ jobs:
             rvp9_config_test
             rvp9_reference_test
             rvp9_hw_session_test
+            rvp9_hw_segments_test
             rwebm_language_test
+            rwebm_lacing_test
             rwebm_hw_stream_test
             # The NGX and NVAPI loaders against a stand-in NGX core
             # library on LD_LIBRARY_PATH; the Windows discovery runs
@@ -595,6 +634,51 @@ jobs:
             exit 1
           fi
 
+      # fate-suite.ffmpeg.org times out or resets connections now and
+      # then; the two files never change (their sha256s are checked), so
+      # one good download is kept in the Actions cache.
+      - name: Restore the XMA2 reference fixture
+        if: matrix.group == 'formats'
+        id: xma2_fixture
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/xma2-fixture
+          key: xma2-multistream-tail-9f0a3fbee3f2-154755c1d14c
+
+      - name: Compare native XMA2 startup and multistream tail against reference PCM
+        if: matrix.group == 'formats'
+        shell: bash
+        working-directory: libretro-common/samples/formats/wma
+        run: |
+          set -euo pipefail
+          fixture="$HOME/xma2-fixture"
+          mkdir -p "$fixture"
+          check() {
+            printf '%s  %s\n' \
+              9f0a3fbee3f2da4833b3e385905e1edebacf086c53a2e5eb358941e74fc67d80 "$fixture/input.xma" \
+              154755c1d14cddcc497ceef2996a98c3ee9c054735a8fe6d5c1d790cf93981cf "$fixture/input.pcm" \
+              | sha256sum --quiet -c - 2>/dev/null
+          }
+          if ! check; then
+            for suffix in xma pcm; do
+              curl --fail --location --retry 8 --retry-all-errors --retry-max-time 300 \
+                --connect-timeout 10 --max-time 45 \
+                "https://fate-suite.ffmpeg.org/xma2/xma2-multistream-tail.$suffix" \
+                -o "$fixture/input.$suffix"
+            done
+            check || { echo "XMA2 fixture does not match its sha256s"; exit 1; }
+          fi
+          make -j2 file-reference SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
+            ./rwma_file_reference "$fixture/input.xma" "$fixture/input.pcm"
+
+      - name: Save the XMA2 reference fixture
+        if: matrix.group == 'formats' && steps.xma2_fixture.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/xma2-fixture
+          key: xma2-multistream-tail-9f0a3fbee3f2-154755c1d14c
+
       - name: Parse a generated DVD VOB with the native readers
         if: matrix.group == 'formats'
         shell: bash
@@ -637,6 +721,14 @@ jobs:
             -frames:v 3 -c:v mpeg1video -g 1 -bf 0 -q:v 3 -f mpeg1video -y "$fixture"
           ffmpeg -hide_banner -loglevel error -i "$fixture" -pix_fmt yuv420p -f rawvideo -y "$reference"
           ./rdvd_h262_test "$fixture" "$reference"
+
+      - name: Frontend H.264 decode interface, v1 to v4, plain and under ASan/UBSan
+        if: matrix.group == 'codecs'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/test_video_decode_interface.py
+          python3 tools/test_video_decode_interface.py --sanitize
 
       - name: Compile-test retro_atomic.h from a C++11 TU
         if: matrix.group == 'core'
@@ -933,6 +1025,21 @@ jobs:
 
           make clean
           CC=clang make check SANITIZER=thread
+
+      - name: WMA checkpoint validation under fast-math
+        if: matrix.group == 'formats'
+        shell: bash
+        working-directory: libretro-common/samples/formats/wma
+        run: |
+          set -eu
+          make -j2 test TARGET=rwma_fast_math_test CFLAGS='-O2 -ffast-math'
+
+      - name: WMA codec disabled
+        if: matrix.group == 'formats'
+        working-directory: libretro-common/samples/formats/audio_transfer_wma
+        run: |
+          make -j2 WMA=0 SAMPLE_OBJDIR=obj-disabled TARGET=audio_transfer_wma_disabled_test SANITIZER=address,undefined
+          ./audio_transfer_wma_disabled_test
 
       - name: Run rzip_parallel_test under Clang + ThreadSanitizer
         if: matrix.group == 'core'
@@ -1326,6 +1433,47 @@ jobs:
           done
           [[ $fails -eq 0 ]]
 
+      - name: Release eventcount thread caches under Wine
+        shell: bash
+        working-directory: libretro-common/samples/rthreads/retro_eventcount_test
+        env:
+          WINEDEBUG: -all
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          x86_64-w64-mingw32-gcc -std=c89 -O2 -DHAVE_THREADS -DHAVE_THREAD_STORAGE \
+            -I../../../include thread_cleanup_test.c ../../../rthreads/rthreads.c \
+            -lwinmm -o thread_cleanup_test.exe
+          timeout 30 wine ./thread_cleanup_test.exe
+
+      - name: rtt under Wine
+        shell: bash
+        working-directory: libretro-common/samples/gfx/font
+        env:
+          WINEDEBUG: -all
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make clean
+          make CC=x86_64-w64-mingw32-gcc all
+          timeout 60 wine ./rtt_test.exe
+          make clean
+
+      - name: socket_poll past FD_SETSIZE under Wine
+        shell: bash
+        working-directory: libretro-common/samples/net/socket_poll
+        env:
+          WINEDEBUG: -all
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          # select() takes 64 sockets a set; past that the sets are sized
+          # for the call.
+          make clean
+          make CC=x86_64-w64-mingw32-gcc all
+          timeout 60 wine ./socket_poll_test.exe
+          make clean
+
       - name: Build and run the NVIDIA loaders under Wine
         shell: bash
         working-directory: libretro-common/samples/gfx/nvidia
@@ -1355,6 +1503,20 @@ jobs:
             t=$(sed -nE 's/^TARGET[[:space:]]*:?=[[:space:]]*//p' "$d/Makefile")
             ( cd "$d" && make clean && make CC=x86_64-w64-mingw32-gcc all && timeout 120 wine "./$t.exe" && make clean )
           done
+
+      - name: Build and run shader compiler samples under Wine
+        shell: bash
+        working-directory: libretro-common/samples/gfx
+        env:
+          WINEDEBUG: -all
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          for d in rslc rslc_build rslc_ext; do
+            ( cd "$d" && make clean && make CC=x86_64-w64-mingw32-gcc all && timeout 120 wine "./${d}_test.exe" && make clean )
+          done
+          ( cd rslc_ext && make CC=x86_64-w64-mingw32-gcc rslc_plane_test && timeout 120 wine ./rslc_plane_test.exe && make clean )
+          ( cd rslc_ext && make CC=x86_64-w64-mingw32-gcc rslc_ext_build_test && timeout 120 wine ./rslc_ext_build_test.exe && make clean )
 
       - name: Build and run the mapped read-ahead test under Wine
         shell: bash

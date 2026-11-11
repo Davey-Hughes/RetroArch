@@ -821,18 +821,25 @@ retro_time_t cocoa_last_vblank_time(void)
          return;
 
       /* Check if we're in multitasking mode (Split View or Slide Over)
-       * by comparing our view size to the full screen size */
+       * by comparing our window size to the full screen size */
       RAScreen *screen     = (BRIDGE RAScreen*)cocoa_screen_get_chosen();
       if (!screen)
          return;
 
-      CGRect screenSize    = [screen bounds];
+      UIWindow *window     = self.view.window;
+      if (!window)
+         window = [[UIApplication sharedApplication] delegate].window;
+
+      CGRect screenBounds  = [screen bounds];
+      CGRect screenSize    = window ? window.bounds : screenBounds;
 
       if (ios_running_on_ipad())
       {
-         CGRect currentBounds = self.view.bounds;
-         bool isMultitasking  = (currentBounds.size.width < screenSize.size.width ||
-                                 currentBounds.size.height < screenSize.size.height);
+         /* Split View, Slide Over and Stage Manager make the window
+          * smaller than the screen; the view always fills its window,
+          * so it is the window that has to be compared. */
+         bool isMultitasking  = (screenSize.size.width  < screenBounds.size.width ||
+                                 screenSize.size.height < screenBounds.size.height);
 
          /* In multitasking mode, don't override the frame - let iOS handle it */
          if (isMultitasking)
@@ -846,7 +853,6 @@ retro_time_t cocoa_last_vblank_time(void)
       }
 
       /* Only apply safe area adjustments when in full screen mode */
-      UIWindow *window     = [[UIApplication sharedApplication] delegate].window;
       if (!window)
          return;
 
@@ -920,7 +926,14 @@ retro_time_t cocoa_last_vblank_time(void)
 
 - (void)viewWillLayoutSubviews
 {
+   [super viewWillLayoutSubviews];
    [self adjustViewFrameForSafeArea];
+}
+
+- (void)viewDidLayoutSubviews
+{
+   [super viewDidLayoutSubviews];
+   [[RetroArch_iOS get] layoutRenderView];
 #if defined(HAVE_OPENGL)
    /* Runs on the main thread; refresh the published backing size so a
     * threaded-video worker observes orientation/safe-area changes. Safe

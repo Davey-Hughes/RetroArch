@@ -927,6 +927,13 @@ OBJ += $(LIBRETRO_COMM_DIR)/audio/conversion/s16_to_float.o \
        $(LIBRETRO_COMM_DIR)/audio/conversion/mono_to_stereo_float.o \
        $(LIBRETRO_COMM_DIR)/audio/conversion/stereo_to_mono_float.o \
 
+ifeq ($(HAVE_RWMA),1)
+DEFINES += -DHAVE_RWMA
+OBJ += $(LIBRETRO_COMM_DIR)/formats/wma/rwma_pro.o \
+       $(LIBRETRO_COMM_DIR)/formats/wma/rwma_standard.o \
+       $(LIBRETRO_COMM_DIR)/formats/wma/rwma_stream.o
+endif
+
 # AC-3: the frame layer, decoder and encoder from ATSC A/52 and the
 # IEC 61937 burst framing, no dependencies. The decoder is an arm of
 # audio_transfer (an .ac3 file in the mixer); the encoder and the
@@ -1141,7 +1148,8 @@ ifeq ($(HAVE_OVERLAY), 1)
           led/drivers/led_overlay.o
 endif
 
-OBJ += gfx/drivers_font_renderer/stb.o
+OBJ += gfx/drivers_font_renderer/stb.o \
+       $(LIBRETRO_COMM_DIR)/gfx/font/rtt.o
 
 ifeq ($(HAVE_FREETYPE), 1)
    OBJ += gfx/drivers_font_renderer/freetype.o
@@ -1850,7 +1858,6 @@ ifeq ($(HAVE_VULKAN), 1)
 
    ifeq ($(HAVE_VAAPI), 1)
       DEFINES += -DHAVE_VAAPI
-      DEF_FLAGS += $(VAAPI_DRM_CFLAGS)
       OBJ += gfx/common/vaapi_frame.o \
              gfx/common/vaapi_hevc_decoder.o \
              gfx/common/vaapi_hevc_owner.o \
@@ -1867,6 +1874,20 @@ ifeq ($(HAVE_VULKAN), 1)
              gfx/common/vaapi_hevc_vulkan_resources.o \
              gfx/common/vaapi_hevc_vulkan_cache.o \
              gfx/common/vulkan_android_queue.o
+      ifeq ($(HAVE_RVP9), 1)
+         OBJ += gfx/common/vaapi_vp9_backend.o \
+                gfx/common/vaapi_vp9_owner.o \
+                gfx/common/vaapi_vp9_decoder.o \
+                gfx/common/vaapi_vp9_submit.o \
+                gfx/common/vaapi_vp9_pool.o
+      endif
+      ifeq ($(HAVE_RAV1), 1)
+         OBJ += gfx/common/vaapi_av1_submit.o \
+                gfx/common/vaapi_av1_pool.o \
+                gfx/common/vaapi_av1_decoder.o \
+                gfx/common/vaapi_av1_owner.o \
+                gfx/common/vaapi_av1_backend.o
+      endif
    endif
 
    # H.264/HEVC previews decoded on the GPU
@@ -2525,6 +2546,11 @@ ifeq ($(HAVE_RTGA), 1)
    OBJ += $(LIBRETRO_COMM_DIR)/formats/tga/rtga.o
 endif
 
+ifeq ($(HAVE_RGIF), 1)
+   DEFINES += -DHAVE_RGIF
+   OBJ += $(LIBRETRO_COMM_DIR)/formats/gif/rgif.o
+endif
+
 ifeq ($(HAVE_RDDS), 1)
    DEFINES += -DHAVE_RDDS
    OBJ += $(LIBRETRO_COMM_DIR)/formats/dds/rdds.o
@@ -2768,6 +2794,7 @@ ifeq ($(HAVE_NETWORKING), 1)
           $(LIBRETRO_COMM_DIR)/net/net_http.o \
           $(LIBRETRO_COMM_DIR)/net/net_http_parse.o \
           $(LIBRETRO_COMM_DIR)/net/net_socket.o \
+          $(LIBRETRO_COMM_DIR)/net/net_resolve.o \
           core_updater_list.o \
           network/natt.o \
           network/natt_desc.o \

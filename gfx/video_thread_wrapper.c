@@ -1017,6 +1017,35 @@ static void thread_update_driver_state(thread_video_t *thr)
    }
 }
 
+static void video_thread_views_apply(thread_video_t *thr, unsigned count)
+{
+   thr->views_count       = count;
+   thr->views_shrink_left = 0;
+   if (thr->driver_data && thr->poke && thr->poke->set_view_count)
+      thr->poke->set_view_count(thr->driver_data, count);
+}
+
+/* A frame queued before the count shrank draws with its own map's
+ * views, as it would unthreaded, so the driver takes a smaller count
+ * after the frames older than the command. The main thread pushes them
+ * and is waiting in the send: they are the one claimed and the ones
+ * pending. A grow parses the shader preset, which needs the main
+ * thread waiting, so it applies now. */
+static void video_thread_set_view_count(thread_video_t *thr,
+      unsigned count)
+{
+   int st         = video_thread_ring_load(thr);
+   unsigned older = VIDEO_THREAD_RING_BUSY_OF(st)
+      + VIDEO_THREAD_RING_PENDING_OF(st);
+   if (count < thr->views_count && older)
+   {
+      thr->views_shrink_to   = count;
+      thr->views_shrink_left = older;
+   }
+   else
+      video_thread_views_apply(thr, count);
+}
+
 /* returns true when video_thread_loop should quit */
 static bool video_thread_handle_packet(
       thread_video_t *thr,
@@ -1434,9 +1463,7 @@ static bool video_thread_handle_packet(
          break;
 
       case CMD_POKE_SET_VIEW_COUNT:
-         if (thr->driver_data && thr->poke && thr->poke->set_view_count)
-            thr->poke->set_view_count(thr->driver_data,
-                  (unsigned)pkt.data.i);
+         video_thread_set_view_count(thr, (unsigned)pkt.data.i);
          video_thread_reply(thr, &pkt);
          break;
 
@@ -2256,11 +2283,13 @@ void video_thread_defer_convert(enum video_thread_convert kind)
  * video_thread_defer_filter() arrives raw, in the core's format, with
  * the filter it was staged with. One replaced since is retired behind
  * the frames that name it (video_thread_retire_filter()). */
-static void video_thread_filter(void *filter, void *buffer,
-      unsigned out_bpp, const void **data, unsigned *dims, unsigned *pitch)
+static void video_thread_filter(thread_video_t *lend_thr, void *filter,
+      void *buffer, unsigned out_bpp, const void **data, unsigned *dims,
+      unsigned *pitch)
 {
    unsigned out_dims = 0;
    unsigned out_pitch;
+   void    *lent     = NULL;
 
    if (!*data || !filter || !buffer)
       return;
@@ -2268,6 +2297,21 @@ static void video_thread_filter(void *filter, void *buffer,
    rarch_softfilter_get_output_size((rarch_softfilter_t*)filter,
          &out_dims, *dims);
    out_pitch = VIDEO_SCALE_W(out_dims) * out_bpp;
+   /* A driver retires the cached frame as it remakes or copies out the
+    * memory it lends. That frame is the main thread's, and never in
+    * this memory: kept until the driver has the frame. */
+   if (lend_thr)
+   {
+      video_driver_state_t *video_st = lend_thr->video_st;
+      retro_atomic_store_release_size(&video_st->frame_cache_keeper,
+            VIDEO_CACHE_KEEPER);
+      lent = video_driver_filter_lend(lend_thr->poke, lend_thr->driver_data,
+            out_dims, out_bpp, &out_pitch);
+      if (!lent)
+         retro_atomic_store_release_size(&video_st->frame_cache_keeper, 0);
+   }
+   if (lent)
+      buffer = lent;
    rarch_softfilter_process((rarch_softfilter_t*)filter, buffer,
          out_pitch, *data, *dims, *pitch);
 
@@ -2998,7 +3042,7 @@ static void video_thread_loop(void *data)
                            &fdata, fdims, &fpitch);
 #ifdef HAVE_VIDEO_FILTER
                   if (fdata && thr->frame.slot[slot].filter_bpp)
-                     video_thread_filter(thr->frame.slot[slot].filter,
+                     video_thread_filter(thr, thr->frame.slot[slot].filter,
                            thr->frame.slot[slot].filter_buf,
                            thr->frame.slot[slot].filter_out_bpp,
                            &fdata, &fdims, &fpitch);
@@ -3012,6 +3056,11 @@ static void video_thread_loop(void *data)
                      *thr->frame.slot[slot].msg
                         ? thr->frame.slot[slot].msg : NULL,
                      video_info);
+#ifdef HAVE_VIDEO_FILTER
+                  if (thr->frame.slot[slot].filter_bpp)
+                     retro_atomic_store_release_size(
+                           &thr->video_st->frame_cache_keeper, 0);
+#endif
                   if (dupe_hw_slot >= 0)
                      video_thread_hw_after_frame(thr, dupe_hw_slot);
                   /* Read from the driver's frame memory where it lies:
@@ -3240,6 +3289,10 @@ static void video_thread_loop(void *data)
             thr->frame.mem_busy |= 1u << frame_mem;
             retro_atomic_store_release_int(&thr->frame.mem[frame_mem].busy, 1);
          }
+         /* Before the slot goes: whoever waited for an idle ring may
+          * use the driver the moment it sees one */
+         if (thr->views_shrink_left && !--thr->views_shrink_left)
+            video_thread_views_apply(thr, thr->views_shrink_to);
          video_thread_ring_complete(thr);
 
          if (tex_retire)
@@ -3908,7 +3961,7 @@ static VIDEO_NOINLINE bool video_thread_frame_replay(thread_video_t *thr,
          video_thread_convert(thr, convert, &frame_, dims, &pitch);
 #ifdef HAVE_VIDEO_FILTER
       if (filter_bpp)
-         video_thread_filter(thr->video_st->state_filter,
+         video_thread_filter(NULL, thr->video_st->state_filter,
                thr->video_st->state_buffer, thr->video_st->state_out_bpp,
                &frame_, &dims, &pitch);
 #endif

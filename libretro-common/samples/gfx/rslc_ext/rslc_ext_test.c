@@ -546,6 +546,13 @@ static const char fs_subpass[] =
    "   ocol1 = initial_ocol0;\n"
    "}\n";
 
+/* Framebuffer fetch with no colour output for the attachment's index */
+static const char fs_subpass_no_out[] =
+   "#version 450\n"
+   "layout(set = 0, binding = 0, input_attachment_index = 1) uniform subpassInput in_ocol1;\n"
+   "layout(location = 0) out vec4 col;\n"
+   "void main() { col = subpassLoad(in_ocol1); }\n";
+
 static const char fs_subpass_bad[] =
    "#version 450\n"
    "layout(set = 0, binding = 0) uniform subpassInput in_ocol0;\n"
@@ -874,7 +881,8 @@ int main(int argc, char **argv)
    }
 
    /* an input attachment (InputAttachment 40): SPIR-V and MSL, which
-    * takes it as the colour attachment's value; GLSL and HLSL refuse */
+    * takes it as the colour attachment's value; GLSL as the caller's
+    * framebuffer fetch extension, refused without one; HLSL refuses */
    {
       char err[256];
       struct rslc_opts   o;
@@ -903,14 +911,167 @@ int main(int argc, char **argv)
       }
       memset(&r, 0, sizeof(r));
       CHECK(!compile(fs_subpass, RSLC_DST_GLSL, 450, &o, &r, err, sizeof(err)));
+      CHECK(strstr(err, "subpassInput") != NULL);
+      {
+         static const struct { enum rslc_dst dst; unsigned version, fetch; const char *ext, *decl,
+               *read; } gl[] = {
+            { RSLC_DST_GLSL_ES, 320, RSLC_FB_FETCH_EXT, "GL_EXT_shader_framebuffer_fetch",
+               "inout vec4 real_ocol0;", "vec4 initial_ocol0 = real_ocol0;" },
+            { RSLC_DST_GLSL, 450, RSLC_FB_FETCH_EXT, "GL_EXT_shader_framebuffer_fetch",
+               "inout vec4 real_ocol0;", "return real_ocol0.w;" },
+            { RSLC_DST_GLSL_ES, 320, RSLC_FB_FETCH_ARM, "GL_ARM_shader_framebuffer_fetch",
+               "out vec4 real_ocol0;", "vec4 initial_ocol0 = gl_LastFragColorARM;" } };
+         unsigned i;
+         for (i = 0; i < sizeof(gl) / sizeof(gl[0]); i++)
+         {
+            memset(&o, 0, sizeof(o));
+            o.dst     = gl[i].dst;
+            o.version = gl[i].version;
+            o.err     = err;
+            o.err_cap = sizeof(err);
+            o.fb_fetch = gl[i].fetch;
+            err[0]    = '\0';
+            memset(&r, 0, sizeof(r));
+            CHECK(rslc_compile(fs_subpass, strlen(fs_subpass), RSLC_STAGE_FRAGMENT, &o, &r));
+            if (err[0])
+               fprintf(stderr, "subpass glsl: %s\n", err);
+            if (r.blob)
+            {
+               CHECK(strstr(r.text, gl[i].ext) != NULL);
+               CHECK(strstr(r.text, gl[i].decl) != NULL);
+               CHECK(strstr(r.text, gl[i].read) != NULL);
+               CHECK(strstr(r.text, "subpass") == NULL);
+               if (gl[i].fetch == RSLC_FB_FETCH_ARM)
+                  CHECK(strstr(r.text, "inout") == NULL);
+               if (!i)
+                  write_text(dir, "subpass.glsl", r.text);
+               rslc_result_free(&r, &o);
+            }
+            /* GL_EXT_shader_framebuffer_fetch reads the output at the
+             * attachment's index, which has to be there */
+            o.err = err;
+            err[0] = '\0';
+            CHECK(rslc_compile(fs_subpass_no_out, strlen(fs_subpass_no_out), RSLC_STAGE_FRAGMENT,
+                  &o, &r) == (gl[i].fetch == RSLC_FB_FETCH_ARM));
+            if (r.blob && gl[i].fetch == RSLC_FB_FETCH_ARM)
+               rslc_result_free(&r, &o);
+            if (gl[i].fetch == RSLC_FB_FETCH_EXT)
+               CHECK(strstr(err, "colour output") != NULL);
+            memset(&r, 0, sizeof(r));
+         }
+      }
       CHECK(!compile(fs_subpass, RSLC_DST_HLSL, 50, &o, &r, err, sizeof(err)));
       CHECK(strstr(err, "subpassInput") != NULL);
       CHECK(!compile(fs_subpass_bad, RSLC_DST_SPIRV, 0, &o, &r, err, sizeof(err)));
       CHECK(strstr(err, "input_attachment_index") != NULL);
    }
 
+   /* early fragment tests as conservative depth's depth_unchanged, for
+    * a GL context without image load / store: under the extension
+    * below GLSL 4.20 and in GLSL ES */
+   {
+      static const struct { enum rslc_dst dst; unsigned version; const char *ext; } gl[] = {
+         { RSLC_DST_GLSL, 410, "#extension GL_ARB_conservative_depth : require" },
+         { RSLC_DST_GLSL, 450, NULL },
+         { RSLC_DST_GLSL_ES, 320, "#extension GL_EXT_conservative_depth : require" } };
+      unsigned i;
+      char err[256];
+      struct rslc_opts   o;
+      struct rslc_result r;
+      cur_stage = RSLC_STAGE_FRAGMENT;
+      for (i = 0; i < sizeof(gl) / sizeof(gl[0]); i++)
+      {
+         memset(&o, 0, sizeof(o));
+         o.dst     = gl[i].dst;
+         o.version = gl[i].version;
+         o.err     = err;
+         o.err_cap = sizeof(err);
+         o.early_z_depth_unchanged = true;
+         err[0]    = '\0';
+         memset(&r, 0, sizeof(r));
+         CHECK(rslc_compile(fs_dual_source, strlen(fs_dual_source), RSLC_STAGE_FRAGMENT, &o, &r));
+         if (err[0])
+            fprintf(stderr, "depth_unchanged: %s\n", err);
+         if (r.blob)
+         {
+            CHECK(strstr(r.text, "layout(depth_unchanged) out float gl_FragDepth;") != NULL);
+            CHECK(strstr(r.text, "early_fragment_tests") == NULL);
+            CHECK(gl[i].ext ? strstr(r.text, gl[i].ext) != NULL
+                  : strstr(r.text, "conservative_depth") == NULL);
+            if (gl[i].version == 450)
+               write_text(dir, "depth_unchanged.glsl", r.text);
+            rslc_result_free(&r, &o);
+         }
+      }
+   }
+
+   /* GLSL ES: a sampler type without a default precision is declared
+    * highp, as the stage cannot compile without one; sampler2D keeps its
+    * default */
+   {
+      static const char fs_sampler2d[] =
+         "#version 450\n"
+         "layout(set = 0, binding = 0) uniform sampler2D tex;\n"
+         "layout(location = 0) in vec2 uv;\n"
+         "layout(location = 0) out vec4 col;\n"
+         "void main() { col = texture(tex, uv); }\n";
+      static const char fs_sampler_param[] =
+         "#version 450\n"
+         "layout(set = 0, binding = 0) uniform sampler2DArray samp[2];\n"
+         "layout(location = 0) in vec3 uv;\n"
+         "layout(location = 0) out vec4 col;\n"
+         "vec4 fetch(sampler2DArray s) { return texture(s, uv); }\n"
+         "void main() { col = fetch(samp[0]) + fetch(samp[1]); }\n";
+      char err[256];
+      struct rslc_opts   o;
+      struct rslc_result r;
+      cur_stage = RSLC_STAGE_FRAGMENT;
+      memset(&r, 0, sizeof(r));
+      CHECK(compile(fs_sampler_array, RSLC_DST_GLSL_ES, 310, &o, &r, err, sizeof(err)));
+      if (err[0])
+         fprintf(stderr, "es sampler array: %s\n", err);
+      if (r.blob)
+      {
+         CHECK(strstr(r.text, "uniform highp sampler2DArray samp[8];") != NULL);
+         rslc_result_free(&r, &o);
+      }
+      memset(&r, 0, sizeof(r));
+      CHECK(compile(fs_samplers, RSLC_DST_GLSL_ES, 320, &o, &r, err, sizeof(err)));
+      if (err[0])
+         fprintf(stderr, "es samplers: %s\n", err);
+      if (r.blob)
+      {
+         CHECK(strstr(r.text, "uniform highp sampler2DArray samp;") != NULL);
+         CHECK(strstr(r.text, "uniform highp usamplerBuffer texels;") != NULL);
+         CHECK(strstr(r.text, "uniform highp sampler2DMSArray ms;") != NULL);
+         CHECK(strstr(r.text, "uniform highp isampler2DArray isamp;") != NULL);
+         write_text(dir, "es_samplers.glsl", r.text);
+         rslc_result_free(&r, &o);
+      }
+      memset(&r, 0, sizeof(r));
+      CHECK(compile(fs_sampler2d, RSLC_DST_GLSL_ES, 310, &o, &r, err, sizeof(err)));
+      if (err[0])
+         fprintf(stderr, "es sampler2D: %s\n", err);
+      if (r.blob)
+      {
+         CHECK(strstr(r.text, "uniform sampler2D tex;") != NULL);
+         rslc_result_free(&r, &o);
+      }
+      memset(&r, 0, sizeof(r));
+      CHECK(compile(fs_sampler_param, RSLC_DST_GLSL_ES, 310, &o, &r, err, sizeof(err)));
+      if (err[0])
+         fprintf(stderr, "es sampler parameter: %s\n", err);
+      if (r.blob)
+      {
+         CHECK(strstr(r.text, "highp sampler2DArray s") != NULL);
+         write_text(dir, "es_sampler_param.glsl", r.text);
+         rslc_result_free(&r, &o);
+      }
+   }
+
    /* subgroup operations (GroupNonUniform 61, its Arithmetic 63) in a
-    * SPIR-V 1.3 module; MSL's simdgroup functions; GLSL and HLSL refuse */
+    * SPIR-V 1.3 module; MSL's simdgroup functions; GLSL's under
+    * GL_KHR_shader_subgroup, read back; HLSL refuses */
    {
       char err[256];
       struct rslc_opts   o;
@@ -940,8 +1101,45 @@ int main(int argc, char **argv)
          write_text(dir, "subgroup.msl", r.text);
          rslc_result_free(&r, &o);
       }
+      {
+         static const struct { enum rslc_dst dst; unsigned version; } gl[] = {
+            { RSLC_DST_GLSL, 450 }, { RSLC_DST_GLSL_ES, 320 } };
+         unsigned i;
+         for (i = 0; i < sizeof(gl) / sizeof(gl[0]); i++)
+         {
+            memset(&r, 0, sizeof(r));
+            CHECK(compile(fs_subgroup, gl[i].dst, gl[i].version, &o, &r, err, sizeof(err)));
+            if (err[0])
+               fprintf(stderr, "subgroup glsl: %s\n", err);
+            if (r.blob)
+            {
+               struct rslc_opts   o2;
+               struct rslc_result r2;
+               char err2[256];
+               CHECK(strstr(r.text, "#extension GL_KHR_shader_subgroup_basic : require") != NULL);
+               CHECK(strstr(r.text, "#extension GL_KHR_shader_subgroup_arithmetic : require") != NULL);
+               CHECK(strstr(r.text, "subgroupMin(") != NULL);
+               CHECK(strstr(r.text, "subgroupElect()") != NULL);
+               CHECK(strstr(r.text, "gl_HelperInvocation") != NULL);
+               if (gl[i].dst == RSLC_DST_GLSL)
+               {
+                  /* what it printed reads back as the same stage */
+                  memset(&r2, 0, sizeof(r2));
+                  CHECK(compile(r.text, RSLC_DST_SPIRV, 0, &o2, &r2, err2, sizeof(err2)));
+                  if (err2[0])
+                     fprintf(stderr, "subgroup glsl read back: %s\n", err2);
+                  if (r2.blob)
+                  {
+                     CHECK(has_capability(r2.spirv, r2.spirv_len, 63));
+                     rslc_result_free(&r2, &o2);
+                  }
+                  write_text(dir, "subgroup.glsl", r.text);
+               }
+               rslc_result_free(&r, &o);
+            }
+         }
+      }
       memset(&r, 0, sizeof(r));
-      CHECK(!compile(fs_subgroup, RSLC_DST_GLSL, 450, &o, &r, err, sizeof(err)));
       CHECK(!compile(fs_subgroup, RSLC_DST_HLSL, 50, &o, &r, err, sizeof(err)));
       CHECK(strstr(err, "subgroup") != NULL);
       /* a plain stage stays SPIR-V 1.0 */

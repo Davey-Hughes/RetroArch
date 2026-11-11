@@ -369,6 +369,9 @@ struct rjpeg_jpeg_s
    rjpeg_huffman huff_dc[4];     /* unsigned int alignment */
    rjpeg_huffman huff_ac[4];     /* unsigned int alignment */
    int16_t fast_ac[4][1 << FAST_BITS];
+   unsigned char huff_dc_defined;
+   unsigned char huff_ac_defined;
+   unsigned char dequant_defined;
    unsigned char  marker;        /* marker seen while filling entropy buffer */
    uint8_t dequant[4][64];
 };
@@ -1069,7 +1072,6 @@ static int rjpeg_jpeg_decode_block_prog_dc(
       int diff = 0;
 
       /* first scan for DC coefficient, must be first */
-      memset(data,0,64*sizeof(data[0])); /* 0 all the ac values now */
       t       = rjpeg_jpeg_huff_decode(j, hdc);
       /* huff_decode returns -1 on a bad code, and a corrupt table can
        * yield a category above 15; both are out-of-range indices for
@@ -2581,6 +2583,7 @@ static int rjpeg_process_marker(rjpeg_jpeg *z, int m)
                for (i = 0; i < 64; ++i)
                   z->dequant[t][rjpeg_jpeg_dezigzag[i]] = RJPEG_GET8(z);
             }
+            z->dequant_defined |= (unsigned char)(1U << t);
             L -= 65;
          }
          return L == 0;
@@ -2658,7 +2661,12 @@ static int rjpeg_process_marker(rjpeg_jpeg *z, int m)
                   v[i] = RJPEG_GET8(z);
             }
             if (tc != 0)
+            {
                rjpeg_build_fast_ac(z->fast_ac[th], z->huff_ac + th);
+               z->huff_ac_defined |= (unsigned char)(1U << th);
+            }
+            else
+               z->huff_dc_defined |= (unsigned char)(1U << th);
             L -= n;
          }
          return L == 0;
@@ -2776,6 +2784,38 @@ static int rjpeg_process_scan_header(rjpeg_jpeg *z)
       z->spec_end = 63;
    }
 
+   for (i = 0; i < z->scan_n; ++i)
+   {
+      int which = z->order[i];
+      unsigned char tq = (unsigned char)(1U << z->img_comp[which].tq);
+      unsigned char hd = (unsigned char)(1U << z->img_comp[which].hd);
+      unsigned char ha = (unsigned char)(1U << z->img_comp[which].ha);
+
+      if (!z->progressive)
+      {
+         if (!(z->dequant_defined & tq) ||
+               !(z->huff_dc_defined & hd) ||
+               !(z->huff_ac_defined & ha))
+            return 0;
+      }
+      else if (z->spec_start == 0)
+      {
+         if (z->succ_high == 0 && !(z->huff_dc_defined & hd))
+            return 0;
+      }
+      else if (!(z->huff_ac_defined & ha))
+         return 0;
+   }
+
+   return 1;
+}
+
+static int rjpeg_has_quantization_tables(const rjpeg_jpeg *j)
+{
+   int i;
+   for (i = 0; i < j->img_n; ++i)
+      if (!(j->dequant_defined & (1U << j->img_comp[i].tq)))
+         return 0;
    return 1;
 }
 
@@ -2971,7 +3011,8 @@ static int rjpeg_process_frame_header(rjpeg_jpeg *z, int scan)
          arena_size = (arena_size + 15) & ~(size_t)15;
       }
 
-      arena = (uint8_t*)malloc(arena_size);
+      /* A scan may never reach a coefficient. */
+      arena = (uint8_t*)calloc(1, arena_size);
       if (!arena)
          return 0;
 
@@ -3028,7 +3069,10 @@ static int rjpeg_process_frame_header(rjpeg_jpeg *z, int scan)
          arena_size = (arena_size + 15) & ~(size_t)15;
       }
 
-      arena = (uint8_t*)malloc(arena_size);
+      /* Whole planes can outlive a stream that never scans them; a
+       * ring is only used when one scan covers every component. */
+      arena = (uint8_t*)(z->plane_ring ? malloc(arena_size)
+            : calloc(1, arena_size));
       if (!arena)
          return 0;
 
@@ -3143,7 +3187,11 @@ static int rjpeg_decode_jpeg_image(rjpeg_jpeg *j)
    }
 
    if (j->progressive)
+   {
+      if (!rjpeg_has_quantization_tables(j))
+         return 0;
       rjpeg_jpeg_finish(j);
+   }
    return 1;
 }
 
@@ -4333,14 +4381,16 @@ bool rjpeg_start(rjpeg_t *rjpeg)
    if (!j)
       return false;
 
-   /* Zero only fields that need init — saves zeroing ~18 KB of
-    * Huffman tables that build_huffman will fully overwrite. */
+   /* Zero only fields that need init. The definition masks below guard
+    * the table contents until the corresponding marker initializes them. */
    memset(j->img_comp, 0, sizeof(j->img_comp));
    j->code_bits = 0; j->code_buffer = 0;
    j->nomore = 0; j->progressive = 0;
    j->scan_n = 0; j->eob_run = 0;
    j->marker = RJPEG_MARKER_NONE;
    j->restart_interval = 0; j->todo = 0;
+   j->huff_dc_defined = 0; j->huff_ac_defined = 0;
+   j->dequant_defined = 0;
    j->comp_arena = NULL; j->comp_arena_size = 0;
    j->plane_ring = 1;   /* iterative: fused decode may ring the planes */
    j->img_n = 0;
@@ -4468,7 +4518,7 @@ static int rjpeg_resample_setup(rjpeg_jpeg *j, rjpeg_resample *res)
 /* Emit output rows until *cur_row reaches stop_row (clamped to the
  * image height), advancing the per-component resample cursors.
  *
- * For the dominant 4:2:0 colour case a fused kernel upsamples chroma
+ * For 4:2:0 and 4:2:2 colour a fused kernel upsamples chroma
  * and colour-converts in one pass, so the Cb/Cr rows are never
  * materialised; the fused near/far row pointers must be captured
  * BEFORE the resample loop advances ystep, which is why they are
@@ -4489,7 +4539,9 @@ static void rjpeg_output_rows(rjpeg_jpeg *z, rjpeg_resample *res,
          && z->upsample_YCbCr_to_BGRA_kernel
          && decode_n >= 3
          && res[1].hs == 2
-         && res[1].vs == 2);
+         && res[2].hs == 2
+         && res[1].vs == res[2].vs
+         && (res[1].vs == 1 || res[1].vs == 2));
 
    if (stop_row > z->img_y)
       stop_row = z->img_y;
@@ -4514,6 +4566,13 @@ static void rjpeg_output_rows(rjpeg_jpeg *z, rjpeg_resample *res,
          fused_cb_far  = fused_y_bot1 ? r1->line0 : r1->line1;
          fused_cr_near = fused_y_bot2 ? r2->line1 : r2->line0;
          fused_cr_far  = fused_y_bot2 ? r2->line0 : r2->line1;
+         /* 4:2:2: near == far reduces the kernel's vertical filter to
+          * a no-op, leaving exactly rjpeg_resample_row_h_2. */
+         if (r1->vs == 1)
+         {
+            fused_cb_far = fused_cb_near;
+            fused_cr_far = fused_cr_near;
+         }
       }
 
       for (k = 0; k < decode_n; ++k)
@@ -4714,7 +4773,9 @@ static int rjpeg_plane_ring_undo(rjpeg_jpeg *z)
       arena_size = (arena_size + 15) & ~(size_t)15;
    }
 
-   arena = (uint8_t*)malloc(arena_size);
+   /* Grayscale's only scan fills its plane. */
+   arena = (uint8_t*)(z->img_n == 1 ? malloc(arena_size)
+         : calloc(1, arena_size));
    if (!arena)
       return 0;
 
@@ -5180,6 +5241,11 @@ bool rjpeg_iterate_image(rjpeg_t *rjpeg)
 
          if (m == JPEG_MARKER_EOI)
          {
+            if (!rjpeg_has_quantization_tables(j))
+            {
+               rjpeg->iter_state = RJPEG_ITER_ERROR;
+               return false;
+            }
             /* All scans consumed - transition to IDCT phase, which
              * emits the output as it goes (see FINISH_PROG): the
              * planes may be ring-sized, so there is no later pass that
@@ -5429,6 +5495,8 @@ int rjpeg_process_image(rjpeg_t *rjpeg, void **buf_data,
          j->scan_n = 0; j->eob_run = 0;
          j->marker = RJPEG_MARKER_NONE;
          j->restart_interval = 0; j->todo = 0;
+         j->huff_dc_defined = 0; j->huff_ac_defined = 0;
+         j->dequant_defined = 0;
          j->comp_arena = NULL; j->comp_arena_size = 0;
          j->plane_ring = 0;   /* monolithic: full planes required */
 

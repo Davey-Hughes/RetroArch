@@ -85,7 +85,9 @@ static void input_pointer_frames_set(const input_pointer_frame_t *frames,
 {
    if (count > MAX_USERS)
       count = MAX_USERS;
-   memcpy(input_pointers.frame, frames, count * sizeof(*frames));
+   /* written in place by a driver the frames were lent to */
+   if (frames != input_pointers.frame)
+      memcpy(input_pointers.frame, frames, count * sizeof(*frames));
 #ifdef HAVE_VIDEO_WINDOWS
    input_pointers.in_window     = (uint16_t)input_pointer_windows_set(
          input_pointers.window, windows, count);
@@ -111,7 +113,9 @@ static void input_pointer_touches_set(const uint32_t *pos,
    if (count > INPUT_TOUCHES_MAX)
       count = INPUT_TOUCHES_MAX;
    all = (count < 32) ? (((uint32_t)1 << count) - 1) : 0xffffffffu;
-   memcpy(input_pointers.touch_pos, pos, count * sizeof(*pos));
+   /* written in place by a driver the places were lent to */
+   if (pos != input_pointers.touch_pos)
+      memcpy(input_pointers.touch_pos, pos, count * sizeof(*pos));
 #ifdef HAVE_VIDEO_WINDOWS
    input_pointers.touch_in_window = input_pointer_windows_set(
          input_pointers.touch_window, windows, count);
@@ -722,6 +726,7 @@ static bool input_pointer_window_touch(unsigned window, unsigned idx,
    for (t = 0; t < input_pointers.touch_count; t++)
    {
       if (     !(input_pointers.touch_present & ((uint32_t)1 << t))
+            || !(input_pointers.touch_in_window & ((uint32_t)1 << t))
             || input_pointers.touch_window[t].window != window)
          continue;
       if (idx)

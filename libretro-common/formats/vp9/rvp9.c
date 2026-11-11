@@ -1263,6 +1263,9 @@ static void rvp9_get_tile_n_bits(int mi_cols, int *min_log2, int *max_log2)
    *max_log2 = mx;
 }
 
+/* Largest coded dimension of any VP9 level (6.x). */
+#define RVP9_MAX_DIM 16832
+
 static int rvp9_read_frame_size(rvp9_rb *rb, int *w, int *h)
 {
    *w = rvp9_rb_lit(rb, 16) + 1;
@@ -1421,6 +1424,9 @@ static int rvp9_parse_uncompressed(const uint8_t *data, size_t len,
       }
    }
 
+   if (hd->w > RVP9_MAX_DIM || hd->h > RVP9_MAX_DIM)
+      return -1;
+
    if (!hd->error_resilient)
    {
       hd->refresh_frame_context     = rvp9_rb_bit(&rb);
@@ -1528,6 +1534,14 @@ static int rvp9_parse_uncompressed(const uint8_t *data, size_t len,
    return rb.error ? -1 : 0;
 }
 
+/* The compressed header has to be present, lie inside the frame, and
+ * leave at least one byte of tile data behind it. */
+static int rvp9_first_partition_fits(const rvp9_hdr *hd, size_t len)
+{
+   return hd->first_partition_size && hd->uncomp_size < len
+      && (size_t)hd->first_partition_size < len - hd->uncomp_size;
+}
+
 int rvp9_parse_frame_header(const uint8_t *data, size_t len,
       const rvp9_hdr *previous, const int *ref_dims, rvp9_hdr *out)
 {
@@ -1537,9 +1551,7 @@ int rvp9_parse_frame_header(const uint8_t *data, size_t len,
    else memset(out, 0, sizeof(*out));
    ret = rvp9_parse_uncompressed(data, len, out, ref_dims);
    if (ret) return ret;
-   if (out->w <= 0 || out->h <= 0 || !out->first_partition_size
-         || out->uncomp_size >= len
-         || (size_t)out->first_partition_size >= len - out->uncomp_size)
+   if (!rvp9_first_partition_fits(out, len))
       return -1;
    return 0;
 }
@@ -1746,7 +1758,7 @@ static int rvp9_parse_compressed_intra(const uint8_t *data, size_t sz,
    static const int band_ctx[RVP9_COEF_BANDS] = { 3, 6, 6, 6, 6, 6 };
    static const int biggest_tx[5] = { 0, 1, 2, 3, 3 };
 
-   rvp9_br_init(&r, data, sz);
+   if (rvp9_br_init(&r, data, sz)) return -1;
 
    if (hd->lossless)
       tx_mode = 0;
@@ -2031,6 +2043,79 @@ static int rvp9_seg_qindex(const rvp9_hdr *hd, int seg)
       return q < 0 ? 0 : (q > 255 ? 255 : q);
    }
    return hd->base_qindex;
+}
+
+bool rvp9_hw_segments(const rvp9_hdr *header,
+      rvp9_hw_segment_t segments[RVP9_MAX_SEGMENTS])
+{
+   static const int limits[4] = {255, 63, 3, 0};
+   rvp9_hw_segment_t ready[RVP9_MAX_SEGMENTS];
+   const int16_t *dcq, *acq;
+   unsigned seg, feature, ref, mode;
+   int scale;
+   if (!header || !segments
+         || (header->bit_depth != 8 && header->bit_depth != 10
+            && header->bit_depth != 12)
+         || (unsigned)header->base_qindex > 255
+         || header->y_dc_delta_q < -15 || header->y_dc_delta_q > 15
+         || header->uv_dc_delta_q < -15 || header->uv_dc_delta_q > 15
+         || header->uv_ac_delta_q < -15 || header->uv_ac_delta_q > 15
+         || (unsigned)header->seg_enabled > 1
+         || (unsigned)header->seg_abs_delta > 1
+         || (unsigned)header->lf_level > 63
+         || (unsigned)header->lf_delta_enabled > 1)
+      return false;
+   for (ref = 0; ref < 4; ref++)
+      if (header->lf_ref_deltas[ref] < -63
+            || header->lf_ref_deltas[ref] > 63)
+         return false;
+   for (mode = 0; mode < 2; mode++)
+      if (header->lf_mode_deltas[mode] < -63
+            || header->lf_mode_deltas[mode] > 63)
+         return false;
+   for (seg = 0; seg < RVP9_MAX_SEGMENTS; seg++)
+      for (feature = 0; feature < 4; feature++)
+         if ((unsigned)header->seg_feature_enabled[seg][feature] > 1
+               || header->seg_feature_data[seg][feature] < -limits[feature]
+               || header->seg_feature_data[seg][feature] > limits[feature]
+               || (feature == RVP9_SEG_LVL_REF_FRAME
+                  && header->seg_feature_data[seg][feature] < 0))
+            return false;
+   dcq = header->bit_depth == 12 ? rvp9_dc_qlookup_12
+         : header->bit_depth == 10 ? rvp9_dc_qlookup_10 : rvp9_dc_qlookup;
+   acq = header->bit_depth == 12 ? rvp9_ac_qlookup_12
+         : header->bit_depth == 10 ? rvp9_ac_qlookup_10 : rvp9_ac_qlookup;
+   memset(ready, 0, sizeof(ready));
+   scale = 1 << (header->lf_level >> 5);
+   for (seg = 0; seg < RVP9_MAX_SEGMENTS; seg++)
+   {
+      int q = rvp9_seg_qindex(header, (int)seg);
+      int level = header->lf_level;
+      ready[seg].y_quant[0] = dcq[rvp9_clamp(q + header->y_dc_delta_q, 0, 255)];
+      ready[seg].y_quant[1] = acq[q];
+      ready[seg].uv_quant[0] = dcq[rvp9_clamp(q + header->uv_dc_delta_q, 0, 255)];
+      ready[seg].uv_quant[1] = acq[rvp9_clamp(q + header->uv_ac_delta_q, 0, 255)];
+      if (rvp9_segfeature_active(header, (int)seg, RVP9_SEG_LVL_ALT_LF))
+      {
+         int data = header->seg_feature_data[seg][RVP9_SEG_LVL_ALT_LF];
+         level = rvp9_clamp(header->seg_abs_delta ? data : level + data, 0, 63);
+      }
+      for (ref = 0; ref < 4; ref++)
+         for (mode = 0; mode < 2; mode++)
+         {
+            int filter = level;
+            if (header->lf_delta_enabled)
+            {
+               filter += header->lf_ref_deltas[ref] * scale;
+               if (ref)
+                  filter += header->lf_mode_deltas[mode] * scale;
+            }
+            ready[seg].filter_level[ref][mode] =
+                  (uint8_t)rvp9_clamp(filter, 0, 63);
+         }
+   }
+   memcpy(segments, ready, sizeof(ready));
+   return true;
 }
 
 static int rvp9_read_segment_id(rvp9_br *r, const rvp9_hdr *hd)

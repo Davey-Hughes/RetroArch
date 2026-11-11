@@ -29,9 +29,9 @@
 /* The main window's 16 slots and the second display's 16 fingers */
 #define ANDROID_POINTERS_MAX 32
 
-/* A touch slot: index n is the n-th finger down. A lifted finger's
- * slot keeps its place and the slots above it shift down, so an index
- * that is not down still reads a place. */
+/* A touch slot: index n is the n-th finger down. The slots above a
+ * lifted finger's shift down onto it and the top one keeps its place,
+ * so an index that is not down still reads a place. */
 struct input_pointer
 {
    uint32_t pos;    /* in its window, VIDEO_POS_PACK */
@@ -79,18 +79,18 @@ static INLINE unsigned android_pointers_gun_fingers(unsigned main_count,
 /* One poll's mouse and touches to the frontend; app thread */
 static INLINE void android_pointers_publish(const android_pointers_t *p)
 {
-   input_pointer_frame_t frame;
+   input_pointer_frame_t *frame = input_driver_pointers_lend();
    input_video_window_t windows[ANDROID_POINTERS_MAX];
-   uint32_t pos[ANDROID_POINTERS_MAX];
+   uint32_t *pos    = input_driver_touches_lend();
    unsigned present = 0;
    unsigned down    = 0;
    unsigned count   = 0;
    unsigned i;
 
-   frame.pos     = p->mouse_pos;
-   frame.rel     = 0;   /* the driver's own (MOUSE_BY_DRIVER) */
-   frame.buttons = p->mouse_buttons;
-   input_driver_publish_window_pointers(&frame, NULL, 1,
+   frame->pos     = p->mouse_pos;
+   frame->rel     = 0;   /* the driver's own (MOUSE_BY_DRIVER) */
+   frame->buttons = p->mouse_buttons;
+   input_driver_publish_window_pointers(frame, NULL, 1,
          android_pointers_flags(p->mouse_used));
 
    for (i = 0; i < p->slots && count < ANDROID_POINTERS_MAX; i++, count++)

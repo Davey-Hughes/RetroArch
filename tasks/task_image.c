@@ -439,6 +439,7 @@ static void task_image_set_one(unsigned i, void *ud)
    image_loader_t *l;
    const uint8_t *ptr;
    size_t len = 0;
+   bool kept  = false;
 
    item->png_probe = -1;
    if (     type == IMAGE_TYPE_NONE
@@ -451,6 +452,7 @@ static void task_image_set_one(unsigned i, void *ud)
          && (l = image_loader_new(type, &set->req)))
    {
       image_loader_set_abort(l, task_image_set_cancelled, set->task);
+      image_loader_keep_source(l, dt);
       if (     image_loader_start(l, ptr, len, len)
             && image_loader_step(l, NULL, 0) == IMAGE_LOADER_DONE
             && (item->img = (struct texture_image*)malloc(
@@ -468,9 +470,11 @@ static void task_image_set_one(unsigned i, void *ud)
             item->img = NULL;
          }
       }
+      kept = image_loader_source_kept(l);
       image_loader_free(l);
    }
-   data_transfer_free(dt);
+   if (!kept)
+      data_transfer_free(dt);
 }
 
 /* The worker: the whole set at once, then done. Its decodes run
@@ -680,6 +684,9 @@ bool task_push_image_load_ex(const char *fullpath, unsigned load_flags,
          break;
       case IMAGE_TYPE_MP4:
          nbio->type = NBIO_TYPE_MP4;
+         break;
+      case IMAGE_TYPE_GIF:
+         nbio->type = NBIO_TYPE_GIF;
          break;
       default:
          nbio->type = NBIO_TYPE_NONE;

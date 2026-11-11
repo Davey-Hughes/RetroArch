@@ -586,13 +586,10 @@ bool manual_content_scan_set_menu_content_dir_kind(const char *content_dir,
 
 int manual_content_scan_content_stat(const char *path)
 {
-#ifdef HAVE_SMBCLIENT
-   if (   scan_content_kind != MANUAL_CONTENT_SCAN_PATH_UNKNOWN
-       && string_starts_with_size(path, "smb://", STRLEN_CONST("smb://")))
+   if (scan_content_kind != MANUAL_CONTENT_SCAN_PATH_UNKNOWN)
       return scan_content_kind == MANUAL_CONTENT_SCAN_PATH_FOLDER
          ? RETRO_VFS_STAT_IS_VALID | RETRO_VFS_STAT_IS_DIRECTORY
          : RETRO_VFS_STAT_IS_VALID;
-#endif
    return path_stat(path);
 }
 
@@ -1983,6 +1980,16 @@ bool manual_content_scan_is_single_playlist(void)
                 != MANUAL_CONTENT_SCAN_SYSTEM_NAME_AUTO;
 }
 
+/* @name is a whole name: a dot in it is not an extension to replace
+ * (Tiger - Game.com, VTech - V.Smile). */
+static void manual_content_scan_set_lpl_name(char *s, const char *name,
+      size_t len)
+{
+   size_t _len = strlcpy(s, name, len);
+   if (_len < len)
+      strlcpy_lit(s + _len, ".lpl", len - _len);
+}
+
 /* Parses current manual content scan settings,
  * and extracts all information required to configure
  * a manual content scan task.
@@ -2089,10 +2096,9 @@ bool manual_content_scan_get_task_config(
    /* Store database name and playlist path, depending on scan settings */
    /* Old manual scan method: db name == target playlist */
 
-   fill_pathname(
+   manual_content_scan_set_lpl_name(
          task_config->database_name,
          task_config->system_name,
-         ".lpl",
          sizeof(task_config->database_name));
 
    /* ...which can in turn be used to generate the
@@ -2116,10 +2122,9 @@ bool manual_content_scan_get_task_config(
       /* Pass the selected DB name to the task if there is one */
       if (scan_settings.db_selection == MANUAL_CONTENT_SCAN_SELECT_DB_SPECIFIC)
       {
-         fill_pathname(
+         manual_content_scan_set_lpl_name(
                task_config->database_name,
                scan_system_name_database,
-               ".lpl",
                sizeof(task_config->database_name));
       }
       /* Or make it empty (auto DB select case). The omit_db_ref is handled elsewhere. */
@@ -2129,10 +2134,9 @@ bool manual_content_scan_get_task_config(
          if (scan_settings.system_name_type == MANUAL_CONTENT_SCAN_SYSTEM_NAME_AUTO)
             task_config->playlist_file[0] = '\0';
          /* Abuse dat_file_path for a convenient placeholder value */
-         fill_pathname(
+         manual_content_scan_set_lpl_name(
                task_config->dat_file_path,
                scan_system_name_content_dir,
-               ".lpl",
                sizeof(task_config->dat_file_path));
       }
    }
@@ -2280,6 +2284,10 @@ bool manual_content_scan_content_list_iter_new(
 
    if (path_is_directory(task_config->content_dir))
    {
+      /* An expected file that has since become a folder */
+      if (task_config->content_is_file)
+         return false;
+
       if (!(*list = string_list_new()))
          return false;
 
@@ -2303,6 +2311,9 @@ bool manual_content_scan_content_list_iter_new(
       }
       return true;
    }
+
+   if (!task_config->content_is_file)
+      return false;
 
    /* A plain-file content dir needs no walk: the list
     * is complete here and *iter stays NULL. */

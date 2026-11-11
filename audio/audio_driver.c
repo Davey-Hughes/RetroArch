@@ -886,6 +886,8 @@ static void audio_driver_extra_resample(audio_driver_state_t *audio_st,
    size_t f, out_frames = 0;
    if (!audio_st->extra.pending)
       return;
+   audio_st->extra.read_f = audio_st->extra.out_f;
+   audio_st->extra.read_i = audio_st->extra.out_i;
    if (input_frames > audio_st->extra.in_frames)
       input_frames = audio_st->extra.in_frames;
    /* Keep the extra histories fresh while the front pair bypasses SRC.
@@ -921,14 +923,14 @@ static void audio_driver_extra_resample(audio_driver_state_t *audio_st,
          if (audio_st->extra.is_float)
             convert_float_to_s16(audio_st->extra.out_i, audio_st->extra.in_f, samples);
          else
-            memcpy(audio_st->extra.out_i, audio_st->extra.in_i, samples * sizeof(int16_t));
+            audio_st->extra.read_i = audio_st->extra.in_i;
       }
       else
       {
          if (!audio_st->extra.is_float)
             convert_s16_to_float(audio_st->extra.out_f, audio_st->extra.in_i, samples, 1.0f);
          else
-            memcpy(audio_st->extra.out_f, audio_st->extra.in_f, samples * sizeof(float));
+            audio_st->extra.read_f = audio_st->extra.in_f;
       }
       audio_st->extra.out_frames = n;
       audio_st->extra.pending    = false;
@@ -2961,7 +2963,7 @@ static void audio_driver_extra_merge_layout_f32(audio_driver_state_t *audio_st,
    }
    for (f = 0; f < frames; f++)
    {
-      const float *e = audio_st->extra.out_f + (first + f) * ch;
+      const float *e = audio_st->extra.read_f + (first + f) * ch;
       float *d = dev + f * och;
       for (k = 0; k < n; k++)
       {
@@ -3017,7 +3019,7 @@ static void audio_driver_extra_merge_s16(audio_driver_state_t *audio_st,
    }
    for (f = 0; f < frames; f++)
    {
-      const int16_t *e = audio_st->extra.out_i + (first + f) * ch;
+      const int16_t *e = audio_st->extra.read_i + (first + f) * ch;
       int16_t *d = dev + f * och;
       for (k = 0; k < n; k++)
       {
@@ -3230,8 +3232,11 @@ static ssize_t audio_driver_write_frames(audio_driver_state_t *audio_st,
       if (audio_st->extra.out_frames >= frames && audio_st->extra.channels)
       {
          if (audio_st->extra.res_int16)
-            convert_s16_to_float(audio_st->extra.out_f, audio_st->extra.out_i,
+         {
+            convert_s16_to_float(audio_st->extra.out_f, audio_st->extra.read_i,
                   frames * audio_st->extra.channels, 1.0f);
+            audio_st->extra.read_f = audio_st->extra.out_f;
+         }
          audio_driver_extra_merge_layout_f32(audio_st, audio_st->virt_buf,
                0, frames, AUDIO_LAYOUT_5POINT1, 6);
          audio_st->extra.out_frames = 0;
@@ -3274,7 +3279,10 @@ static ssize_t audio_driver_write_frames(audio_driver_state_t *audio_st,
       ssize_t w;
       /* extras resampled as float behind an int16 front: narrow */
       if (u.merge && !audio_st->extra.res_int16)
-         convert_float_to_s16(audio_st->extra.out_i, audio_st->extra.out_f, frames * audio_st->extra.channels);
+      {
+         convert_float_to_s16(audio_st->extra.out_i, audio_st->extra.read_f, frames * audio_st->extra.channels);
+         audio_st->extra.read_i = audio_st->extra.out_i;
+      }
       w = audio_driver_stage_write(audio_st, audio, audio_stage_upmix_s16,
             &u, frames, audio_st->out_channels * sizeof(int16_t),
             (uint8_t*)audio_st->upmix_i16, wait_room);
@@ -3283,7 +3291,10 @@ static ssize_t audio_driver_write_frames(audio_driver_state_t *audio_st,
       return w;
    }
    if (u.merge && audio_st->extra.res_int16)
-      convert_s16_to_float(audio_st->extra.out_f, audio_st->extra.out_i, frames * audio_st->extra.channels, 1.0f);
+   {
+      convert_s16_to_float(audio_st->extra.out_f, audio_st->extra.read_i, frames * audio_st->extra.channels, 1.0f);
+      audio_st->extra.read_f = audio_st->extra.out_f;
+   }
    {
       ssize_t w;
       if (!stereo_is_float)
@@ -3963,8 +3974,8 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
       {
          const char *rs_ident =
                (audio_st->resampler && audio_st->resampler->short_ident)
-                     ? audio_st->resampler->short_ident : "resampler";
-         RARCH_LOG("[Audio] %s resampler active path: %s\n",
+                     ? audio_st->resampler->short_ident : "null";
+         RARCH_LOG("[Audio] Resampler \"%s\" path: \"%s\".\n",
                rs_ident,
                use_i16 ? "integer s16 (no float round-trip)" : "float");
          audio_i16_path_logged = (int)use_i16;
@@ -3981,6 +3992,9 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
          /* The master gain already applied on the way into the output
           * scratch (see the unity branch). */
          bool gained          = false;
+#ifdef HAVE_AUDIOMIXER
+         const int16_t *mix_over = NULL;
+#endif
          bool     synth_on    = midi_driver_synth_active()
                && audio_st->synth_buf && audio_st->input_data_int16;
          /* Writable view of the input for the synth sum and the DSP
@@ -4114,6 +4128,11 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
                      rs_frames * 2, audio_volume_gain);
                gained = true;
             }
+#ifdef HAVE_AUDIOMIXER
+            /* Summed with the voices straight into the scratch, below */
+            else if (aflags & AUDIO_FLAG_MIXER_ACTIVE)
+               mix_over = rs_in;
+#endif
             else
                memcpy(audio_st->output_samples_int16, rs_in,
                      (size_t)rs_frames * 2 * sizeof(int16_t));
@@ -4248,8 +4267,12 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
                   mixer_gain                       = audio_st->mixer_volume_gain;
                }
 
-               audio_mixer_mix_s16(ob, out_frames,
-                     GAIN_TO_Q16(mixer_gain), override);
+               if (mix_over)
+                  audio_mixer_mix_s16_over(ob, mix_over, out_frames,
+                        GAIN_TO_Q16(mixer_gain), override);
+               else
+                  audio_mixer_mix_s16(ob, out_frames,
+                        GAIN_TO_Q16(mixer_gain), override);
                if (audio_mixer_has_float_voices())
                   audio_mixer_fold_float_voices_into_s16(ob,
                         audio_st->output_samples_buf, out_frames,
@@ -4427,20 +4450,6 @@ static void audio_driver_flush(audio_driver_state_t *audio_st,
          double adjust            = audio_driver_compute_rate_adjust(audio_st, samples);
          audio_st->src_ratio_curr = audio_st->src_ratio_orig * adjust;
          audio_st->drc_pending    = false;
-
-#if 0
-         if (verbosity_is_enabled())
-         {
-            RARCH_LOG_OUTPUT("[Audio] Audio buffer is %u%% full\n",
-                  (unsigned)(100 - (audio_st->free_samples_buf[
-                     (audio_st->free_samples_count - 1)
-                     & (AUDIO_BUFFER_FREE_SAMPLES_COUNT - 1)] * 100) /
-                     audio_st->buffer_size));
-            RARCH_LOG_OUTPUT("[Audio] New rate: %lf, Orig rate: %lf\n",
-                  audio_st->src_ratio_curr,
-                  audio_st->src_ratio_orig);
-         }
-#endif
       }
    }
 
@@ -5335,7 +5344,7 @@ bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
       AUDIO_FLAGS_SET(&audio_driver_st, AUDIO_FLAG_PIPELINE_THREADED);
       audio_driver_st.pipe_threaded       = true;
       retro_atomic_int_init(&audio_driver_st.pipe_consumer_gone, 0);
-      RARCH_LOG("[Audio] Threaded pipeline: ring holds %u frames of %s core audio.\n",
+      RARCH_LOG("[Audio] Threaded pipeline: Ring holds %u frames of %s core audio.\n",
             (unsigned)(audio_driver_st.pipe_ring.capacity / audio_driver_st.pipe_frame_bytes),
             audio_driver_st.pipe_float ? "float" : "int16");
    }
@@ -5482,7 +5491,7 @@ bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
       {
          audio_driver_st.virtualize   = true;
          audio_driver_st.upmix_frames = frames;
-         RARCH_LOG("[Audio] Headphone virtual surround: the stereo mix goes through a virtual 5.1 to two ears.\n");
+         RARCH_LOG("[Audio] Headphone virtual surround: The stereo mix goes through a virtual 5.1 to two ears.\n");
       }
       else
       {
@@ -5531,7 +5540,7 @@ bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
    if (!audio_driver_resampler_realloc(&audio_driver_st,
             settings->bools.audio_resampler_hq_oversampling))
    {
-      RARCH_ERR("Failed to initialize resampler \"%s\".\n",
+      RARCH_ERR("[Audio] Failed to initialize resampler: \"%s\".\n",
             audio_driver_st.resampler_ident);
       AUDIO_FLAGS_CLEAR(&audio_driver_st, AUDIO_FLAG_ACTIVE);
    }
@@ -5577,7 +5586,7 @@ bool audio_driver_init_internal(void *settings_data, bool audio_cb_inited)
       audio_driver_st.resampler_int16_reset   = rs.reset;
       audio_driver_st.resampler_int16_sibling = rs.sibling;
       if (audio_driver_st.resampler_int16_process)
-         RARCH_LOG("[Audio] %s resampler: integer s16 path %s.\n",
+         RARCH_LOG("[Audio] Resampler \"%s\": integer s16 path %s.\n",
                rs_ident,
                audio_driver_st.resampler_data_int16
                      ? "available" : "unavailable");
@@ -9889,6 +9898,11 @@ static bool audio_driver_mixer_add_stream_internal(
             handle = audio_mixer_load_ac3(buf, params->bufsize);
    #endif
             break;
+         case AUDIO_MIXER_TYPE_WMA:
+   #ifdef HAVE_RWMA
+            handle = audio_mixer_load_wma(buf, params->bufsize);
+   #endif
+            break;
          case AUDIO_MIXER_TYPE_LPCM:
    #ifdef HAVE_RLPCM
             handle = audio_mixer_load_lpcm(buf, params->bufsize);
@@ -10627,8 +10641,12 @@ bool audio_driver_start(bool is_shutdown)
       goto error;
    }
 
-   RARCH_DBG("[Audio] Started audio driver \"%s\" (is_shutdown=%s)\n",
-         audio_driver_get_ident(), is_shutdown ? "true" : "false");
+   if (!is_shutdown)
+      RARCH_DBG("[Audio] Started audio driver: \"%s\".\n",
+            audio_driver_get_ident());
+   else
+      RARCH_DBG("[Audio] Shutdown audio driver: \"%s\".\n",
+            audio_driver_get_ident());
 
    return true;
 
@@ -11674,7 +11692,7 @@ bool audio_driver_stop(void)
          }
       }
       AUDIO_FLAGS_CLEAR(audio_st, AUDIO_FLAG_STARTED);
-      RARCH_DBG("[Audio] Stopped audio driver \"%s\".\n",
+      RARCH_DBG("[Audio] Stopped audio driver: \"%s\".\n",
             audio_driver_get_ident());
    }
 
@@ -12432,7 +12450,7 @@ static bool mic_driver_open_mic_internal(retro_microphone_t* microphone)
    microphone->resampler_int16_process = NULL;
    microphone->resampler_int16_free    = NULL;
    if (fabs(microphone->orig_ratio - 1.0f) < 1e-8)
-      RARCH_LOG("[Microphone] Resample path: none (rates match)\n");
+      RARCH_LOG("[Microphone] Resampler path: none (rates match).\n");
    else
    {
       const retro_resampler_t *backend =
@@ -12460,10 +12478,10 @@ static bool mic_driver_open_mic_internal(retro_microphone_t* microphone)
                mic_st->resampler_quality,
                microphone->orig_ratio))
       {
-         RARCH_ERR("[Microphone] Failed to initialize resampler \"%s\".\n", mic_st->resampler_ident);
+         RARCH_ERR("[Microphone] Failed to initialize resampler: \"%s\".\n", mic_st->resampler_ident);
          goto error;
       }
-      RARCH_LOG("[Microphone] Resample path: %s\n",
+      RARCH_LOG("[Microphone] Resampler path: \"%s\".\n",
             microphone->resampler_data_int16
                   ? "integer s16 (no float round-trip)" : "float");
    }
@@ -12490,7 +12508,7 @@ static bool mic_driver_open_mic_internal(retro_microphone_t* microphone)
       if (     retro_eventcount_init(&microphone->capture_park)
             && (microphone->capture_thread = sthread_create(
                   microphone_driver_capture_thread, mic_st)))
-         RARCH_LOG("[Microphone] Threaded capture: the worker owns the read"
+         RARCH_LOG("[Microphone] Threaded capture: The worker owns the read"
                " and the resampler.\n");
       else
       {
@@ -12692,12 +12710,45 @@ static size_t microphone_driver_flush(
 #endif
    size_t bytes_to_read = MIN(mic_st->input_frames_length, num_frames * sample_size);
    size_t frames_to_enqueue;
-   int bytes_read       = mic_st->driver->read(
+   int bytes_read;
+
+   /* 16-bit at the requested rate has nothing to change: the device
+    * reads straight into the ring. With no room, the read below still
+    * drains it. */
+   if (     sample_size == sizeof(int16_t)
+         && fabs((double)microphone->effective_params.rate
+            / (double)microphone->actual_params.rate - 1.0) < 1e-8)
+   {
+      void  *span = NULL;
+      size_t want = retro_spsc_write_begin(&microphone->outgoing_samples, &span);
+      size_t room = microphone_outgoing_room(microphone);
+      if (want > room)
+         want = room;
+      if (want > num_frames * sizeof(int16_t))
+         want = num_frames * sizeof(int16_t);
+      want &= ~(size_t)1;
+      if (want && span)
+      {
+         bytes_read = mic_st->driver->read(mic_st->driver_context,
+               microphone->microphone_context, span, want);
+         if (bytes_read < 0)
+            bytes_read = 0;
+         if ((size_t)bytes_read > want)
+            bytes_read = (int)want;
+         bytes_read &= ~1;
+         retro_spsc_write_end(&microphone->outgoing_samples,
+               (size_t)bytes_read);
+         return (size_t)bytes_read / sizeof(int16_t);
+      }
+      retro_spsc_write_end(&microphone->outgoing_samples, 0);
+   }
+
+   /* First, get the most recent mic data */
+   bytes_read = mic_st->driver->read(
          mic_st->driver_context,
          microphone->microphone_context,
          mic_st->input_frames,
          bytes_to_read);
-   /* First, get the most recent mic data */
 
    if (bytes_read <= 0)
       return 0;

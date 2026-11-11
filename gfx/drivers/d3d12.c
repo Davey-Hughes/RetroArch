@@ -1504,7 +1504,7 @@ static void d3d12_release_texture(d3d12_video_t *d3d12,
          D3D12_CPU_DESCRIPTOR_HANDLE handle    = texture->cpu_descriptor[i];
          if (handle.ptr)
          {
-            unsigned _i                        = (handle.ptr - heap->cpu.ptr) / heap->stride;
+            unsigned _i                        = (unsigned)((handle.ptr - heap->cpu.ptr) / heap->stride);
             heap->map[_i]                      = false;
             if (heap->start > (int)_i)
                heap->start                     = _i;
@@ -1523,7 +1523,7 @@ static void d3d12_release_texture(d3d12_video_t *d3d12,
       for (i = 0; i < 2; i++)
          if (heap && h[i].ptr)
          {
-            unsigned _i = (h[i].ptr - heap->cpu.ptr) / heap->stride;
+            unsigned _i = (unsigned)((h[i].ptr - heap->cpu.ptr) / heap->stride);
             heap->map[_i] = false;
             if (heap->start > (int)_i)
                heap->start = _i;
@@ -1856,7 +1856,7 @@ static void d3d12_generate_mipmaps(D3D12GraphicsCommandList cmd,
 
       for (i = 1; i < texture->desc.MipLevels; i++)
       {
-         unsigned width  = texture->desc.Width  >> i;
+         unsigned width  = (unsigned)(texture->desc.Width >> i);
          unsigned height = texture->desc.Height >> i;
          struct
          {
@@ -3205,7 +3205,7 @@ static void d3d12_font_render_msg(
    get_glyph  = font->font_driver->get_glyph;
    font_data  = font->font_data;
 
-   inv_vp_w   = 1.0f / (float)d3d12->chain.viewport.Width;
+   inv_vp_w   = rp.x_scale / (float)d3d12->chain.viewport.Width;
    inv_vp_h   = 1.0f / (float)d3d12->chain.viewport.Height;
    inv_tex_w  = 1.0f / (float)font->texture.desc.Width;
    inv_tex_h  = 1.0f / (float)font->texture.desc.Height;
@@ -3279,7 +3279,7 @@ static void d3d12_font_render_msg(
    {
       d3d12_sprite_t *line_v_first = v;
       bool line_ok                 = false;
-      int xi                       = roundf(x * width);
+      int xi                       = roundf(x * width / rp.x_scale);
       int lx                       = 0;
       int ly                       = 0;
       size_t line_cap              = font->block
@@ -3373,7 +3373,7 @@ static void d3d12_font_render_msg(
 #include "../font_layout.h"
    }
 
-   total_count = v - v_batch_start;
+   total_count = (unsigned)(v - v_batch_start);
 
    if (font->block)
    {
@@ -3878,7 +3878,7 @@ static void d3d12_render_overlay(d3d12_video_t *d3d12)
 
       cmd->lpVtbl->SetGraphicsRootDescriptorTable(
             cmd, ROOT_ID_TEXTURE_T, tex->gpu_descriptor[0]);
-      cmd->lpVtbl->DrawInstanced(cmd, 1, 1, i, 0);
+      cmd->lpVtbl->DrawInstanced(cmd, 1, 1, (UINT)i, 0);
    }
 }
 #endif
@@ -4990,7 +4990,7 @@ static bool d3d12_gfx_set_shader(void* data, enum rarch_shader_type type, const 
       d3d12_frame_rect_semantics(d3d12, &semantics_map,
             (d3d12->flags & D3D12_ST_FLAG_HW_IFACE_ENABLE) != 0);
       if (!slang_process(
-               d3d12->filter.shader_preset, i, RARCH_SHADER_HLSL, 50, &semantics_map,
+               d3d12->filter.shader_preset, (unsigned)i, RARCH_SHADER_HLSL, 50, &semantics_map,
                &d3d12->filter.pass[i].semantics))
          goto error;
 
@@ -7988,7 +7988,7 @@ static void d3d12_chain_frame(d3d12_video_t *d3d12, d3d12_filter_chain_t *c,
          pass->frame_count = frame_count
             % c->shader_preset->pass[i].frame_count_mod;
       else
-         pass->frame_count = frame_count;
+         pass->frame_count = (uint32_t)frame_count;
       pass->frame_direction  = frame_direction;
       pass->frame_time_delta = frame_time_delta;
       pass->original_fps     = original_fps;
@@ -9352,6 +9352,11 @@ static void d3d12_menu_texture_draw(d3d12_video_t *d3d12)
          menu_sc.bottom   = menu_sc.top  + (LONG)VIDEO_SCALE_H(vp.dims);
          cmd->lpVtbl->RSSetViewports(cmd, 1, &menu_vp);
          cmd->lpVtbl->RSSetScissorRects(cmd, 1, &menu_sc);
+      }
+      else
+      {
+         cmd->lpVtbl->RSSetViewports(cmd, 1, &d3d12->frame.viewport);
+         cmd->lpVtbl->RSSetScissorRects(cmd, 1, &d3d12->frame.scissorRect);
       }
 
       cmd->lpVtbl->SetGraphicsRootDescriptorTable(cmd, ROOT_ID_TEXTURE_T,

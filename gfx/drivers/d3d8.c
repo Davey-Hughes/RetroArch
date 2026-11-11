@@ -1497,7 +1497,7 @@ static void d3d8_font_render_msg(
    float line_height;
    d3d8_font_t  *font  = (d3d8_font_t*)data;
    d3d8_video_t *d3d   = (d3d8_video_t*)userdata;
-   unsigned      width  = 0;
+   float         width  = 0.0f;
    unsigned      height = 0;
    /* Top-down ortho mapping x[0..1]→[-1..1], y[0..1]→[1..-1] so
     * (0,0) is the top-left corner.  D3D uses row-vector convention
@@ -1532,6 +1532,7 @@ static void d3d8_font_render_msg(
       return;
 
    font_driver_resolve_params(params, &rp);
+   width      = width / rp.x_scale;
    x          = rp.x;
    y          = rp.y;
    scale      = rp.scale;
@@ -2539,10 +2540,12 @@ static bool d3d8_init_internal(d3d8_video_t *d3d,
 
    windowed_full         = settings->bools.video_windowed_fullscreen;
 
-   full_x                = (windowed_full || VIDEO_SCALE_W(info->dims)  == 0) ?
-      (mon_rect.right  - mon_rect.left) : VIDEO_SCALE_W(info->dims);
-   full_y                = (windowed_full || VIDEO_SCALE_H(info->dims) == 0) ?
-      (mon_rect.bottom - mon_rect.top)  : VIDEO_SCALE_H(info->dims);
+   full_x                = (windowed_full || VIDEO_SCALE_W(info->dims)  == 0)
+      ? (unsigned)(mon_rect.right  - mon_rect.left)
+      : VIDEO_SCALE_W(info->dims);
+   full_y                = (windowed_full || VIDEO_SCALE_H(info->dims) == 0)
+      ? (unsigned)(mon_rect.bottom - mon_rect.top)
+      : VIDEO_SCALE_H(info->dims);
 #else
    {
       unsigned full_dims;
@@ -3434,7 +3437,9 @@ static bool d3d8_frame(void *data, const void *frame,
    unsigned frame_width = VIDEO_SCALE_W(dims);
    unsigned frame_height = VIDEO_SCALE_H(dims);
    D3DVIEWPORT8 screen_vp;
+#ifdef HAVE_OVERLAY
    unsigned i                          = 0;
+#endif
    d3d8_video_t *d3d                    = (d3d8_video_t*)data;
    unsigned width                      = VIDEO_SCALE_W(video_info->dims);
    unsigned height                     = VIDEO_SCALE_H(video_info->dims);

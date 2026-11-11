@@ -39,7 +39,7 @@ jobs:
     name: TLS, SMB and NFS clients against local servers
     runs-on: ubuntu-latest
     env:
-      APT_PKGS: --no-install-recommends build-essential clang gcc-mingw-w64-x86-64 openssl samba libtirpc-dev flex bison autoconf automake wine wine64 nfs-ganesha nfs-ganesha-vfs krb5-kdc krb5-admin-server krb5-user winbind samba-dsdb-modules samba-ad-provision samba-vfs-modules acl smbclient tshark
+      APT_PKGS: --no-install-recommends build-essential clang gcc-mingw-w64-x86-64 openssl samba libtirpc-dev flex bison autoconf automake wine wine64 nfs-ganesha nfs-ganesha-vfs krb5-kdc krb5-admin-server krb5-user winbind samba-dsdb-modules samba-ad-provision samba-vfs-modules acl smbclient tshark iproute2
     timeout-minutes: 45
 
     steps:
@@ -91,6 +91,12 @@ jobs:
           # line has to carry Winsock, which nothing on Linux checks.
           make -C samples/network/tls_retro clean
 
+      - name: Incremental built-in TLS handshakes
+        shell: bash
+        run: |
+          set -eu
+          TLS_TEST_HANDSHAKE_STEP=1 samples/network/tls_retro/local_server_test.sh
+          make -C samples/network/tls_retro clean
 
       - name: Built-in SMB2/3 client against a local smbd
         shell: bash
@@ -228,7 +234,7 @@ jobs:
           # client with the fuzzer's input), under ASan + UBSan, from a
           # seed corpus recorded off real servers. Any crash, timeout or
           # leak artifact fails the step.
-          make -C libretro-common/test/fuzz fuzz-run FUZZ_SECONDS=30
+          make -j$(nproc) -C libretro-common/test/fuzz fuzz-run FUZZ_SECONDS=30
           if ls libretro-common/test/fuzz/crash-* libretro-common/test/fuzz/leak-* libretro-common/test/fuzz/timeout-* >/dev/null 2>&1; then
             echo "fuzzer artifacts found"; exit 1
           fi

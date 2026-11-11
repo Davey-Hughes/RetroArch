@@ -651,6 +651,14 @@ static void *apple_display_server_init(void)
       }
    }
 
+#if TARGET_OS_IOS
+   {
+      /* ui_cocoatouch.m. Overrides can change the screen margins
+       * across a video reinit that keeps the same render view. */
+      void cocoa_request_layout(void);
+      cocoa_request_layout();
+   }
+#endif
    return apple;
 }
 

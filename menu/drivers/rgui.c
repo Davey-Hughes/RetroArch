@@ -6140,14 +6140,17 @@ RGUI_NOINLINE static void rgui_media_subtitle_draw(rgui_t *rgui, unsigned dims)
       : (int)height - (int)rgui->font_height_stride;
    for (i = 0; i < count; i++)
    {
-      size_t glyphs = utf8len(lines[i]);
+      size_t len = utf8len(lines[i]);
+      unsigned glyphs;
       int x, y;
-      if (glyphs > columns)
+      if (len > columns)
       {
          char *end = (char*)utf8skip(lines[i], columns);
          *end = '\0';
          glyphs = columns;
       }
+      else
+         glyphs = (unsigned)len;
       x = (width - glyphs * rgui->font_width_stride) / 2;
       y = bottom - ((int)count - (int)i) * rgui->font_height_stride;
       if (y < (int)rgui->font_height_stride)
@@ -9607,6 +9610,8 @@ static void rgui_context_reset(void *data, bool is_threaded)
    if (!disp_get_ptr()->dispctx)
       gfx_display_init_first_driver(disp_get_ptr(), is_threaded);
    video_driver_monitor_reset();
+   /* A new video driver holds no menu texture until the next upload */
+   disp_get_ptr()->flags |= GFX_DISP_FLAG_FB_DIRTY;
 }
 
 static void rgui_thumbnail_cycle_dupe(rgui_t *rgui)

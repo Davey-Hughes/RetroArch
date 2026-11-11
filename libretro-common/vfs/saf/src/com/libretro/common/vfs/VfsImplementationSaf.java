@@ -41,6 +41,10 @@ public final class VfsImplementationSaf
       Document.COLUMN_MIME_TYPE,
    };
 
+   private static final String[] QUERY_ARGS_DISPLAY_NAME = {
+      Document.COLUMN_DISPLAY_NAME,
+   };
+
    private static String normalizePath(String path) {
       try
       {
@@ -180,6 +184,285 @@ public final class VfsImplementationSaf
          return false;
       }
       return true;
+   }
+
+   private static Uri getDocumentUri(Uri treeUri, String path) {
+      return DocumentsContract.buildDocumentUriUsingTree(treeUri, path.length() == 1 ? DocumentsContract.getTreeDocumentId(treeUri) : DocumentsContract.getTreeDocumentId(treeUri) + path);
+   }
+
+   /**
+    * Get the MIME type of a document, or null if it could not be queried.
+    */
+   private static String queryMimeType(ContentResolver content, Uri fileUri) {
+      final Cursor cursor;
+      try
+      {
+         cursor = content.query(fileUri, QUERY_ARGS_MIME_TYPE, null, null, null);
+      }
+      catch (IllegalArgumentException e)
+      {
+         return null;
+      }
+
+      if (cursor == null)
+         return null;
+
+      try
+      {
+         return cursor.moveToNext() ? cursor.getString(0) : null;
+      }
+      finally
+      {
+         cursor.close();
+      }
+   }
+
+   private static String getDisplayName(ContentResolver content, Uri fileUri) {
+      final Cursor cursor;
+      try
+      {
+         cursor = content.query(fileUri, QUERY_ARGS_DISPLAY_NAME, null, null, null);
+      }
+      catch (RuntimeException e)
+      {
+         return null;
+      }
+
+      if (cursor == null)
+         return null;
+
+      try
+      {
+         return cursor.moveToNext() ? cursor.getString(0) : null;
+      }
+      finally
+      {
+         cursor.close();
+      }
+   }
+
+   /**
+    * Whether or not a document is named exactly name.
+    * Every query is a Binder call into the document provider, so one is only made
+    * if the name cannot be read from the end of a path-style document ID.
+    */
+   private static boolean hasName(ContentResolver content, Uri fileUri, String name) {
+      final String id = DocumentsContract.getDocumentId(fileUri);
+      final int separator = id.length() - name.length() - 1;
+
+      if (separator >= 0 && id.endsWith(name) && (id.charAt(separator) == '/' || id.charAt(separator) == ':'))
+         return true;
+
+      return name.equals(getDisplayName(content, fileUri));
+   }
+
+   /**
+    * Rename a document, returning its URI if it ended up named exactly name or null if not.
+    * Some providers pick a different name (such as "name (1)") instead of failing when the name is taken,
+    * so on a mismatch the document is renamed back to originalName.
+    */
+   private static Uri renameDocumentExact(ContentResolver content, Uri fileUri, String name, String originalName) {
+      final Uri renamedUri;
+      try
+      {
+         renamedUri = DocumentsContract.renameDocument(content, fileUri, name);
+      }
+      catch (FileNotFoundException | RuntimeException e)
+      {
+         return null;
+      }
+
+      // Returning null is how DocumentsContract reports a failure: a rename that keeps the ID returns fileUri
+      if (renamedUri == null)
+         return null;
+
+      if (hasName(content, renamedUri, name))
+         return renamedUri;
+
+      try
+      {
+         DocumentsContract.renameDocument(content, renamedUri, originalName);
+      }
+      catch (FileNotFoundException | RuntimeException e)
+      {}
+
+      return null;
+   }
+
+   /**
+    * Move a document to another directory, returning its URI if it ended up there named exactly name or null if not.
+    * A null URI from DocumentsContract means the move failed.
+    */
+   private static Uri moveDocumentExact(ContentResolver content, Uri fileUri, Uri fromUri, Uri toUri, String name) {
+      if (Build.VERSION.SDK_INT < 24)
+         return null;
+
+      final Uri movedUri;
+      try
+      {
+         movedUri = DocumentsContract.moveDocument(content, fileUri, fromUri, toUri);
+      }
+      catch (FileNotFoundException | RuntimeException e)
+      {
+         return null;
+      }
+
+      if (movedUri == null)
+         return null;
+
+      if (hasName(content, movedUri, name))
+         return movedUri;
+
+      try
+      {
+         DocumentsContract.moveDocument(content, movedUri, toUri, fromUri);
+      }
+      catch (FileNotFoundException | RuntimeException e)
+      {}
+
+      return null;
+   }
+
+   /**
+    * Move a document to another directory under a new name, returning whether or not it got there.
+    * A provider can only move a document under the name it already has, so this takes a move and a rename.
+    * The name is changed first, unless newName is taken in the source directory; on failure the document is put back.
+    */
+   private static boolean moveAndRenameDocument(ContentResolver content, Uri fileUri, Uri fromUri, Uri toUri, String oldName, String newName) {
+      if (oldName.equals(newName))
+         return moveDocumentExact(content, fileUri, fromUri, toUri, newName) != null;
+
+      final Uri renamedUri = renameDocumentExact(content, fileUri, newName, oldName);
+      if (renamedUri != null)
+      {
+         if (moveDocumentExact(content, renamedUri, fromUri, toUri, newName) != null)
+            return true;
+
+         renameDocumentExact(content, renamedUri, oldName, newName);
+         return false;
+      }
+
+      final Uri movedUri = moveDocumentExact(content, fileUri, fromUri, toUri, oldName);
+      if (movedUri == null)
+         return false;
+
+      if (renameDocumentExact(content, movedUri, newName, oldName) != null)
+         return true;
+
+      moveDocumentExact(content, movedUri, toUri, fromUri, oldName);
+      return false;
+   }
+
+   /**
+    * Rename a Storage Access Framework file, replacing the destination if it exists, returning whether or not the operation succeeded.
+    * Moving between directories needs API level 24 and a provider that supports moves.
+    * Storage Access Framework has no atomic replace, so an existing destination is first renamed to the destination path with ".old" appended,
+    * and is only deleted once the file has been renamed into its place; if that fails, the destination is restored.
+    * Each provider call below is a Binder transaction, by far the largest cost here: replacing a file takes four and creating one takes two, plus one for a move or two for a move under a new name in place of the rename.
+    * @param content the content resolver returned by getContentResolver()
+    * @param tree the URI returned by the ACTION_OPEN_DOCUMENT_TREE intent action
+    * @param oldPath path of the file to rename, relative to the root directory of the tree
+    * @param newPath path to rename the file to, relative to the root directory of the tree
+    */
+   public static boolean renameSafFile(ContentResolver content, String tree, String oldPath, String newPath)
+   {
+      if (Build.VERSION.SDK_INT < 21)
+         return false;
+
+      final Uri treeUri = Uri.parse(tree);
+
+      if (isDocument(treeUri))
+         return false;
+
+      oldPath = normalizePath(oldPath);
+      newPath = normalizePath(newPath);
+
+      if (oldPath.equals(newPath))
+         return new SafStat(content, tree, oldPath, false).getIsOpen();
+
+      // Both paths are canonical now, so they can be taken apart without going back to the filesystem
+      final int oldSlash = oldPath.lastIndexOf('/');
+      final int newSlash = newPath.lastIndexOf('/');
+
+      if (oldSlash + 1 == oldPath.length() || newSlash + 1 == newPath.length())
+         return false;
+
+      final boolean sameDirectory = oldSlash == newSlash && oldPath.regionMatches(0, newPath, 0, oldSlash);
+
+      if (!sameDirectory && Build.VERSION.SDK_INT < 24)
+         return false;
+
+      final String oldName = oldPath.substring(oldSlash + 1);
+      final String newName = newPath.substring(newSlash + 1);
+      final Uri newUri = getDocumentUri(treeUri, newPath);
+      String asideName = null;
+      Uri asideUri = null;
+
+      final String newMimeType = queryMimeType(content, newUri);
+      if (newMimeType != null)
+      {
+         if (newMimeType.equals(Document.MIME_TYPE_DIR))
+            return false;
+
+         // The source may itself be called "<destination>.old", and must not be mistaken for a leftover
+         asideName = newPath.concat(".old").equals(oldPath) ? newName.concat(".old2") : newName.concat(".old");
+
+         asideUri = renameDocumentExact(content, newUri, asideName, newName);
+         if (asideUri == null)
+         {
+            // Most likely a leftover from an earlier rename that could not clean up, which is rare enough to only look for now.
+            // Deleting a directory would delete everything in it, so anything but a file stays where it is.
+            final Uri leftoverUri = getDocumentUri(treeUri, newPath.substring(0, newSlash + 1).concat(asideName));
+            final String leftoverMimeType = queryMimeType(content, leftoverUri);
+
+            if (leftoverMimeType == null || leftoverMimeType.equals(Document.MIME_TYPE_DIR))
+               return false;
+
+            try
+            {
+               DocumentsContract.deleteDocument(content, leftoverUri);
+            }
+            catch (FileNotFoundException | RuntimeException e)
+            {
+               return false;
+            }
+
+            asideUri = renameDocumentExact(content, newUri, asideName, newName);
+            if (asideUri == null)
+               return false;
+         }
+      }
+
+      final Uri oldUri = getDocumentUri(treeUri, oldPath);
+      final boolean placed;
+
+      if (sameDirectory)
+         placed = renameDocumentExact(content, oldUri, newName, oldName) != null;
+      else
+         placed = moveAndRenameDocument(content, oldUri,
+               getDocumentUri(treeUri, oldSlash == 0 ? "/" : oldPath.substring(0, oldSlash)),
+               getDocumentUri(treeUri, newSlash == 0 ? "/" : newPath.substring(0, newSlash)),
+               oldName, newName);
+
+      if (placed)
+      {
+         if (asideUri != null)
+         {
+            // The file is in place; a failed cleanup only leaves a stale ".old" for the next rename to remove
+            try
+            {
+               DocumentsContract.deleteDocument(content, asideUri);
+            }
+            catch (FileNotFoundException | RuntimeException e)
+            {}
+         }
+         return true;
+      }
+
+      if (asideUri != null)
+         renameDocumentExact(content, asideUri, newName, asideName);
+
+      return false;
    }
 
    public static class SafStat
