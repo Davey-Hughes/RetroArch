@@ -166,6 +166,7 @@ jobs:
           set -eu
           ./configure --disable-qt --enable-core_signing_test_key
           grep -qx 'HAVE_CORE_SIGNING_TEST_KEY = 1' config.mk
+          grep -qx 'HAVE_CORE_LOAD_CHECK = 1' config.mk
 
       - name: Build
         run: make -j$(nproc)
