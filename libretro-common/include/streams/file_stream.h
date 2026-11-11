@@ -468,6 +468,20 @@ int filestream_finish_atomic_suffix(const char *path, const char *suffix,
       bool ok, bool sync);
 
 /**
+ * As filestream_finish_atomic_suffix() with \c sync set, for a
+ * temporary file its writer has synced already: only the rename is
+ * synced, written through (MOVEFILE_WRITE_THROUGH) on Windows and its
+ * folder synced after it on POSIX.
+ *
+ * @param path Path of the file that will be replaced.
+ * @param suffix What the temporary file's name adds to \c path.
+ * @param ok Whether the temporary file holds everything it should.
+ * @return As filestream_commit_atomic().
+ */
+int filestream_finish_atomic_rename_synced(const char *path,
+      const char *suffix, bool ok);
+
+/**
  * Writes a single character to the given file.
  *
  * @param stream The file to write to.

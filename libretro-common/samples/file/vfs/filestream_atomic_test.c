@@ -22,10 +22,13 @@
  *                           once and, on POSIX, its folder once after
  *                           the rename; the plain one never does, nor
  *                           does a write through a frontend VFS; a
- *                           failed sync keeps the old file.
+ *                           failed sync keeps the old file. A finish
+ *                           of a temporary synced already syncs only
+ *                           the folder.
  *   synced_rename_write_through - (Windows) the synced atomic writes
- *                           rename with MOVEFILE_WRITE_THROUGH; the
- *                           plain ones do not.
+ *                           and finishes rename with
+ *                           MOVEFILE_WRITE_THROUGH; the plain ones do
+ *                           not.
  *   share_in_place        - smb:// and nfs:// can't rename or remove:
  *                           an atomic write there goes in place, whole,
  *                           and leaves no temporary.
@@ -599,6 +602,21 @@ static void lane_atomic_synced_calls_sync(void)
    CHECK(content_is(TARGET, "newest"), "a failed sync cost the old file");
    CHECK(!exists(TEMP), "a failed sync left the temporary");
 
+   /* a temporary its writer synced: only the rename is */
+   file_syncs = dir_syncs = 0;
+   put(OWN_TEMP, "own");
+   CHECK(filestream_finish_atomic_rename_synced(TARGET, ".auto.tmp", true)
+         == 0, "rename-synced finish failed");
+   CHECK(content_is(TARGET, "own") && !exists(OWN_TEMP),
+         "rename-synced finish did not move the temporary in");
+   CHECK(file_syncs == 0 && dir_syncs == want_dir,
+         "rename-synced finish: a file sync, or not one folder sync");
+   put(OWN_TEMP, "lost");
+   CHECK(filestream_finish_atomic_rename_synced(TARGET, ".auto.tmp", false)
+         == -1, "rename-synced finish of a bad temporary succeeded");
+   CHECK(content_is(TARGET, "own") && !exists(OWN_TEMP),
+         "rename-synced finish of a bad temporary touched the old file");
+
    use_frontend_vfs(true);
    file_syncs = dir_syncs = 0;
    CHECK(filestream_write_file_atomic_synced(TARGET, "front", 5),
@@ -642,6 +660,14 @@ static void lane_synced_rename_write_through(void)
          "synced suffix finish failed");
    CHECK(moves == 1 && (move_flags & MOVEFILE_WRITE_THROUGH),
          "synced suffix finish: not renamed with MOVEFILE_WRITE_THROUGH");
+
+   moves = file_syncs = 0;
+   put(OWN_TEMP, "synced");
+   CHECK(filestream_finish_atomic_rename_synced(TARGET, ".auto.tmp", true)
+         == 0, "rename-synced finish failed");
+   CHECK(moves == 1 && (move_flags & MOVEFILE_WRITE_THROUGH)
+         && file_syncs == 0,
+         "rename-synced finish: not written through, or the file synced");
 
    moves = 0;
    put(TEMP, "plain");

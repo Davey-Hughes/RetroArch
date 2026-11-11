@@ -2684,6 +2684,17 @@ int filestream_finish_atomic_suffix(const char *path, const char *suffix,
       : filestream_finish_atomic_internal(path, suffix, ok, false);
 }
 
+int filestream_finish_atomic_rename_synced(const char *path,
+      const char *suffix, bool ok)
+{
+   int ret;
+   if (!suffix || !*suffix)
+      return -1;
+   if ((ret = filestream_finish_atomic_internal(path, suffix, ok, true)) == 0)
+      filestream_sync_parent(path);
+   return ret;
+}
+
 bool filestream_atomic_in_place(const char *path)
 {
    return string_starts_with_size(path, "smb://", STRLEN_CONST("smb://"))
