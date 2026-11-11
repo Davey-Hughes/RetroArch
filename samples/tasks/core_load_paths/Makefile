@@ -21,8 +21,11 @@ check: all
 clean:
 	rm -f $(TARGET) $(TARGET).exe harness_core.so harness_core_b.so \
 	      needs_content_core.so retroarch_nomain.o harness_main.o \
-	      core_signature_testkey.o \
+	      core_signature_testkey.o ui_cocoa_nomain.o \
 	      retroarch_nomain.d harness_main.d core_signature_testkey.d \
+	      ui_cocoa_nomain.d \
 	      check-*.log
+	rm -rf harness_core.so.dSYM harness_core_b.so.dSYM \
+	       needs_content_core.so.dSYM
 
 .PHONY: all check clean

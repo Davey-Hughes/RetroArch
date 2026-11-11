@@ -25,7 +25,8 @@ cd "$root"
 cc_line=$(mktemp)
 ld_line=$(mktemp)
 sig_line=$(mktemp)
-trap 'rm -f "$cc_line" "$ld_line" "$sig_line"' EXIT
+cocoa_line=$(mktemp)
+trap 'rm -f "$cc_line" "$ld_line" "$sig_line" "$cocoa_line"' EXIT
 
 touch retroarch.c
 make -n $MAKE_ARGS 2>/dev/null | grep -E '\-o obj-unix/[^/ ]+/retroarch\.o' | head -1 > "$cc_line"
@@ -61,6 +62,18 @@ fi
 sed "s#-o $objdir/core_signature\.o#-DHAVE_CORE_SIGNING_TEST_KEY -o $out/core_signature_testkey.o#" \
    "$sig_line" | sh
 
+# macOS: main() is ui_cocoa.m's (HAVE_MAIN)
+if [ -f "$objdir/ui/drivers/ui_cocoa.o" ]; then
+   touch ui/drivers/ui_cocoa.m
+   make -n $MAKE_ARGS 2>/dev/null | grep -E "\-o $objdir/ui/drivers/ui_cocoa\.o" | head -1 > "$cocoa_line"
+   if [ ! -s "$cocoa_line" ]; then
+      echo "could not determine the compile command for ui_cocoa.o" >&2
+      exit 1
+   fi
+   sed "s#-o $objdir/ui/drivers/ui_cocoa\.o#-Dmain=rarch_harness_unused_cocoa_main -o $out/ui_cocoa_nomain.o#" \
+      "$cocoa_line" | sh
+fi
+
 rm -f retroarch retroarch_debug
 make -n $MAKE_ARGS 2>/dev/null | grep -E ' -o retroarch(_debug)? ' | tail -1 > "$ld_line"
 if [ ! -s "$ld_line" ]; then
@@ -70,6 +83,7 @@ fi
 
 sed -e "s#$objdir/retroarch\.o#$out/retroarch_nomain.o $out/harness_main.o#" \
     -e "s#$objdir/core_signature\.o#$out/core_signature_testkey.o#" \
+    -e "s#$objdir/ui/drivers/ui_cocoa\.o#$out/ui_cocoa_nomain.o#" \
     -e "s#-o retroarch #-o $out/core_load_paths_test #" \
     -e "s#-o retroarch_debug #-o $out/core_load_paths_test #" \
    "$ld_line" | sh

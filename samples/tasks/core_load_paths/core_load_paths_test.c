@@ -740,6 +740,9 @@ static void mode_runahead(void)
 
 /* What RetroArch makes in its config folder, deepest first */
 static const char *const made_dirs[] = {
+#ifdef __APPLE__
+   "assets", "cht/content_load_harness", "cht",
+#endif
    "autoconfig", "cheats/content_load_harness", "cheats", "config/remaps",
    "config", "cores", "database/rdb", "database", "downloads",
    "filters/audio", "filters/video", "filters", "logs",
@@ -747,6 +750,19 @@ static const char *const made_dirs[] = {
    "records_config", "saves", "screenshots", "shaders", "states",
    "system", "thumbnails"
 };
+
+#ifdef __APPLE__
+/* Under the run's home: macOS keeps the store and most folders in
+ * HOME's Application Support, the rest in Foundation's Documents */
+static const char *const apple_dirs[] = {
+   "Library/Application Support", "Library",
+   "Documents/RetroArch/logs", "Documents/RetroArch/playlists/builtin",
+   "Documents/RetroArch/playlists", "Documents/RetroArch/records",
+   "Documents/RetroArch/records_config", "Documents/RetroArch/saves",
+   "Documents/RetroArch/screenshots", "Documents/RetroArch/states",
+   "Documents/RetroArch/system", "Documents/RetroArch", "Documents"
+};
+#endif
 
 static char cfg_home[300];
 static char ra_dir[320];
@@ -809,6 +825,14 @@ static void clean_run(void)
       rmdir(path);
    }
    rmdir(ra_dir);
+#ifdef __APPLE__
+   for (i = 0; i < sizeof(apple_dirs) / sizeof(apple_dirs[0]); i++)
+   {
+      char path[PATH_MAX_LENGTH];
+      snprintf(path, sizeof(path), "%s/%s", cfg_home, apple_dirs[i]);
+      rmdir(path);
+   }
+#endif
    rmdir(cfg_home);
    remove_in(dir, "harness.cfg");
    remove_in(dir, "title.bin");
@@ -823,6 +847,9 @@ int main(int argc, char *argv[])
 {
    static char env_xdg[400];
    static char env_home[400];
+#ifdef __APPLE__
+   static char env_cf_home[400];
+#endif
 #ifdef _WIN32
    static char env_appdata[400];
    static char env_cores[400];
@@ -873,7 +900,12 @@ int main(int argc, char *argv[])
       }
    }
    snprintf(cfg_home, sizeof(cfg_home), "%s/cfg", dir);
+#ifdef __APPLE__
+   snprintf(ra_dir, sizeof(ra_dir), "%s/Library/Application Support/RetroArch",
+         cfg_home);
+#else
    snprintf(ra_dir, sizeof(ra_dir), "%s/retroarch", cfg_home);
+#endif
    snprintf(ra_cores, sizeof(ra_cores), "%s/cores", ra_dir);
    snprintf(cores, sizeof(cores), "%s/cores", dir);
    if (!path_mkdir(cfg_home) || !path_mkdir(cores))
@@ -886,6 +918,12 @@ int main(int argc, char *argv[])
    snprintf(env_home, sizeof(env_home), "HOME=%s", cfg_home);
    putenv(env_xdg);
    putenv(env_home);
+#ifdef __APPLE__
+   /* Foundation's home, which ignores HOME */
+   snprintf(env_cf_home, sizeof(env_cf_home), "CFFIXED_USER_HOME=%s",
+         cfg_home);
+   putenv(env_cf_home);
+#endif
 #ifdef _WIN32
    /* The store's folder there */
    snprintf(env_appdata, sizeof(env_appdata), "APPDATA=%s", cfg_home);
