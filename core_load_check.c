@@ -857,8 +857,9 @@ static void core_load_park_choice(enum core_warning_choice choice,
    (void)core_path;
    free(userdata);
    /* A newer push runs this with CANCEL inside itself, its request
-    * already in phase 2's slot: only our own park may go, and nothing
-    * here pushes or chooses. The re-run starts from the frame loop. */
+    * already in the warning's slot: only our own park may go, and
+    * nothing here pushes or chooses. The re-run starts from the frame
+    * loop. */
    if (serial != p->serial || p->state != CORE_LOAD_PARK_USER)
       return;
    /* Either way the re-run opens only the file the user was asked
@@ -920,9 +921,8 @@ static void core_load_park_take_slot(core_file_t *g, bool lent)
    core_load_park_answer();
 }
 
-/* The stage's order: the quick check, a pass the slot holds, the
- * seed's wait, a refusal the slot holds for this file and store, or a
- * check task */
+/* In order: the quick check, a pass the slot holds, the seed's wait, a
+ * refusal the slot holds for this file and store, or a check task */
 static void core_load_park_start(void)
 {
    struct core_load_park *p = &core_load_rt.park;
@@ -979,7 +979,7 @@ static void core_load_park_start(void)
       core_load_slot_clear(&core_load_rt.slot);
    }
    p->state = CORE_LOAD_PARK_CHECK;
-   /* No check will answer: ended, as a cancelled one ends it */
+   /* No check will answer: the load won't run */
    if (!core_load_check_push(f, p->path, core_load_rt.check_path, &p->c))
       core_load_park_fail();
    f = NULL;
