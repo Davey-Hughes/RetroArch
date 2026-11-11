@@ -1111,6 +1111,9 @@ void runloop_recover_save_files(bool sync);
  * the content's save RAM. */
 bool runloop_save_files_recovered(void);
 
+/* Saving is off for want of a save folder */
+bool runloop_save_files_off(void);
+
 /* Any thread: the main thread does runloop_flush_save_files() at its
  * next frame. */
 void runloop_request_save_files(void);

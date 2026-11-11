@@ -889,7 +889,8 @@ def lane_folder_off_unchanged(args, n):
     check(failures, c.paused(True), 'run 0: not paused')
     check(failures, c.paused(False), 'run 0: not unpaused')
     reply = c.ask(b'SAVE_FILES')
-    check(failures, reply.startswith('SAVE_FILES ERROR nothing to save'),
+    check(failures, reply.strip()
+          == 'SAVE_FILES ERROR saving is off for this session',
           'run 0: SAVE_FILES reply %r' % reply)
     rc = c.quit()
     if rc is None:

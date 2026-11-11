@@ -425,7 +425,8 @@ static void folder_check_each_load(void)
    saves_off_notices = 0;
    load("/roms/snes/Game");
    CHECK(runloop_state.flags & RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED);
-   CHECK(saves_off_notices == 1);
+   /* The folder's notice already said saves are off */
+   CHECK(saves_off_notices == 0);
    runloop_recover_save_files(true);
    CHECK(recover_calls == 1);
    CHECK(missing_notices == 2);

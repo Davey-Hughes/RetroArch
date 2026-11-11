@@ -445,7 +445,7 @@ static bool runloop_netplay_saves_off = false;
  * (runloop_path_set_redirect), and whether that turned saves off. */
 static enum runloop_save_root runloop_save_roots[2];
 static bool runloop_save_folder_off = false;
-/* Its save RAM is taken at the first frame */
+/* Seed the recovery CRC at the next frame */
 static bool runloop_save_folder_seed = false;
 /* The main config file's folder, as last loaded */
 static char runloop_save_config_dir[PATH_MAX_LENGTH];
@@ -6060,7 +6060,9 @@ static void runloop_path_init_savefile(runloop_state_t *runloop_st)
    runloop_save_folder_notice();
 
 #ifdef HAVE_NETWORKING
-   if (runloop_netplay_saves_off)
+   /* With no save root, the folder's notice said so */
+   if (     runloop_netplay_saves_off
+         && runloop_save_roots[0] != RUNLOOP_SAVE_ROOT_NONE)
    {
       const char *_msg = msg_hash_to_str(MSG_NETPLAY_SAVES_OFF);
       RARCH_WARN("[SRAM] %s\n", _msg);
@@ -7300,6 +7302,11 @@ void runloop_recover_save_files(bool sync)
 bool runloop_save_files_recovered(void)
 {
    return runloop_save_folder_off && event_save_files_recovered();
+}
+
+bool runloop_save_files_off(void)
+{
+   return runloop_save_folder_off;
 }
 
 static retro_atomic_int_t runloop_save_files_request

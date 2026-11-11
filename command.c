@@ -2424,6 +2424,9 @@ bool command_save_savefiles(command_t *cmd, const char* arg)
          command_reply_error(cmd, "SAVE_FILES",
                "saving is off for this session; progress kept in a "
                "recovery file");
+      else if (runloop_save_files_off())
+         command_reply_error(cmd, "SAVE_FILES",
+               "saving is off for this session");
       else
          command_reply_error(cmd, "SAVE_FILES",
                "nothing to save: no content is loaded, or the core has no "
