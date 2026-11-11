@@ -96,6 +96,9 @@ struct save_file
    retro_atomic_int_t owed;    /* 1 << enum save_backup_reason */
    retro_atomic_int_t flags;   /* enum save_file_flags */
    retro_atomic_int_t stat;    /* save_file_stat(), 0 until kept */
+   /* The number of this session's first before-state-load copy, never
+    * pruned; 0 until made */
+   retro_atomic_int_t first_bsl;
 };
 
 static struct save_file *save_files = NULL;
@@ -118,6 +121,7 @@ static struct save_file *save_file_get(unsigned slot)
          retro_atomic_int_init(&save_files[i].owed, 0);
          retro_atomic_int_init(&save_files[i].flags, 0);
          retro_atomic_int_init(&save_files[i].stat, 0);
+         retro_atomic_int_init(&save_files[i].first_bsl, 0);
       }
    }
    return slot < save_files_num ? &save_files[slot] : NULL;
@@ -182,6 +186,26 @@ static bool save_file_changed(struct save_file *f, const char *path)
    return true;
 }
 
+/* @seq for save_backups_copy_file() of @f's file for @r: the session's
+ * first state-load copy is kept and recorded. NULL when there is none
+ * to keep nor to record. */
+static unsigned *save_file_seq(struct save_file *f, unsigned r,
+      unsigned *seq)
+{
+   if (!f)
+      return NULL;
+   *seq = (unsigned)retro_atomic_load_acquire_int(&f->first_bsl);
+   return (*seq || r == SAVE_BACKUP_BEFORE_STATE_LOAD) ? seq : NULL;
+}
+
+/* After a copy for @r made with save_file_seq() */
+static void save_file_seq_made(struct save_file *f, unsigned r,
+      unsigned seq)
+{
+   if (f && seq && r == SAVE_BACKUP_BEFORE_STATE_LOAD)
+      (void)retro_atomic_cas_int(&f->first_bsl, 0, (int)seq);
+}
+
 /* All 0x00 or all 0xFF */
 static bool save_image_blank(const void *data, size_t len)
 {
@@ -223,10 +247,12 @@ static bool save_file_pay(struct save_file *f, const char *path,
       return false;
    for (r = 0; r < SAVE_BACKUP_REASON_LAST; r++)
    {
+      unsigned seq = 0;
       enum save_backup_result res;
       if (!(owed & (1 << r)))
          continue;
-      res = save_backups_copy_file(path, (enum save_backup_reason)r, sync);
+      res = save_backups_copy_file(path, (enum save_backup_reason)r, sync,
+            save_file_seq(f, r, &seq));
       if (res == SAVE_BACKUP_FAILED)
       {
          retro_atomic_fetch_or_int(&f->flags, SAVE_FILE_BACKUP_FAILED);
@@ -235,8 +261,11 @@ static bool save_file_pay(struct save_file *f, const char *path,
       /* Once per reason a load, a state load or an outside change,
        * so a worker may log it. */
       if (res == SAVE_BACKUP_MADE)
+      {
+         save_file_seq_made(f, r, seq);
          RARCH_LOG("[SRAM] Backed up \"%s\" (%s) before writing it.\n",
                path, save_backups_reason_name((enum save_backup_reason)r));
+      }
       retro_atomic_fetch_and_int(&f->owed, ~(1 << r));
    }
    return true;
@@ -1247,18 +1276,22 @@ static void autosave_main_pay(autosave_t *handle, bool sync)
          continue;
       for (r = 0; r < SAVE_BACKUP_REASON_LAST; r++)
       {
+         unsigned seq = 0;
          enum save_backup_result res;
          if (!(owed & (1 << r)))
             continue;
          res = save_backups_copy_image(handle->path,
                (enum save_backup_reason)r, handle->flush_buf[slot],
-               handle->bufsize, sync);
+               handle->bufsize, sync, save_file_seq(handle->file, r, &seq));
          if (res == SAVE_BACKUP_FAILED)
             break;
          if (res == SAVE_BACKUP_MADE)
+         {
+            save_file_seq_made(handle->file, r, seq);
             RARCH_LOG("[SRAM] Backed up \"%s\" (%s) before writing it.\n",
                   handle->path,
                   save_backups_reason_name((enum save_backup_reason)r));
+         }
       }
       if (r < SAVE_BACKUP_REASON_LAST)
          continue;

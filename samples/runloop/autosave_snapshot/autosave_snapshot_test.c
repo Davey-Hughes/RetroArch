@@ -147,11 +147,12 @@ bool path_get_mtime(const char *path, int64_t *mtime)
 
 /* No copy is ever owed here: the handles have no session state. */
 enum save_backup_result save_backups_copy_file(const char *path,
-      enum save_backup_reason reason, bool sync)
+      enum save_backup_reason reason, bool sync, unsigned *seq)
 {
    (void)path;
    (void)reason;
    (void)sync;
+   (void)seq;
    return SAVE_BACKUP_FAILED;
 }
 

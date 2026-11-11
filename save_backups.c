@@ -20,10 +20,14 @@
 #include <time.h>
 
 #include <compat/strl.h>
+#if defined(HAVE_CRYPTO)
+#include <crypto/kdf.h>
+#endif
 #include <file/file_path.h>
 #include <formats/rjson.h>
 #include <lists/dir_list.h>
 #include <lists/string_list.h>
+#include <retro_atomic.h>
 #include <retro_miscellaneous.h>
 #include <streams/file_stream.h>
 #if defined(HAVE_COMPRESSION)
@@ -37,10 +41,17 @@
 
 /* A whole name stays under this many bytes. */
 #define SAVE_BACKUPS_NAME_MAX    200
-/* Room kept in every name for the longest reason word and a "-n", so
- * the game is cut the same way for all of one file's copies. */
+/* Room kept in every name for the longest reason word, so the game is
+ * cut the same way for all of one file's copies. */
 #define SAVE_BACKUPS_REASON_ROOM 17
-#define SAVE_BACKUPS_NUMBER_ROOM 8
+/* And for a copy's number at its widest and its device's tag:
+ * " - ", 9 digits, "-" and 4 letters */
+#define SAVE_BACKUPS_SEQ_ROOM    17
+#define SAVE_BACKUPS_TAG_LEN     4
+/* Past it, a number is no copy's */
+#define SAVE_BACKUPS_SEQ_MAX     999999999u
+/* Numbers a copy tries past taken names before it fails */
+#define SAVE_BACKUPS_SEQ_TRIES   99
 /* Most a cut steps back from the limit, to a UTF-8 boundary. */
 #define SAVE_BACKUPS_CUT_ROOM    3
 #define SAVE_BACKUPS_TIME_LEN    19
@@ -88,6 +99,68 @@ static const char *const save_backups_reasons[SAVE_BACKUP_REASON_LAST] =
 };
 
 static char *save_backups_roots[SAVE_BACKUPS_ROOT_LAST];
+
+/* A device's tag: Crockford's base32 letters, lowercase, so it never
+ * reads as a number nor changes on a case-blind drive */
+static const char save_backups_tag_letters[] = "abcdefghjkmnpqrstvwxyz";
+/* This device's tag, its letters packed; 0 until read or made */
+static retro_atomic_int_t save_backups_device;
+/* That tag is save_folders.json's */
+static bool save_backups_device_kept;
+
+static void save_backups_device_read(void);
+
+/* @t starts with a device's tag */
+static bool save_backups_is_tag(const char *t)
+{
+   unsigned i;
+   for (i = 0; i < SAVE_BACKUPS_TAG_LEN; i++)
+      if (!t[i] || !strchr(save_backups_tag_letters, t[i]))
+         return false;
+   return true;
+}
+
+static int save_backups_tag_pack(const char *t)
+{
+   return (int)t[0] | (int)t[1] << 8 | (int)t[2] << 16 | (int)t[3] << 24;
+}
+
+/* This device's tag into @s: as read, else one made now, which the
+ * next save_backups_note_folders() keeps */
+static void save_backups_device_get(char *s)
+{
+   unsigned i;
+   int v = retro_atomic_load_acquire_int(&save_backups_device);
+   if (!v)
+   {
+      unsigned char r[SAVE_BACKUPS_TAG_LEN];
+      bool got = false;
+      char t[SAVE_BACKUPS_TAG_LEN];
+#if defined(HAVE_CRYPTO)
+      got = crypto_random_bytes(r, sizeof(r)) == 0;
+#endif
+      if (!got)
+      {
+         unsigned x = (unsigned)time(NULL) ^ ((unsigned)clock() << 16)
+            ^ (unsigned)(size_t)&v;
+         for (i = 0; i < SAVE_BACKUPS_TAG_LEN; i++)
+         {
+            x    = x * 1103515245u + 12345u;
+            r[i] = (unsigned char)(x >> 16);
+         }
+      }
+      for (i = 0; i < SAVE_BACKUPS_TAG_LEN; i++)
+         t[i] = save_backups_tag_letters[r[i]
+            % (sizeof(save_backups_tag_letters) - 1)];
+      /* Another thread's may be in first */
+      v = save_backups_tag_pack(t);
+      if (!retro_atomic_cas_int(&save_backups_device, 0, v))
+         v = retro_atomic_load_acquire_int(&save_backups_device);
+   }
+   for (i = 0; i < SAVE_BACKUPS_TAG_LEN; i++)
+      s[i] = (char)((unsigned)v >> (8 * i) & 0xFF);
+   s[SAVE_BACKUPS_TAG_LEN] = '\0';
+}
 
 /* Every file this helper writes goes through here. */
 static bool save_backups_write_file(const char *path,
@@ -200,6 +273,8 @@ void save_backups_set_roots(const char *savefile_dir,
       free(save_backups_roots[i]);
       save_backups_roots[i] = string_is_empty(in[i]) ? NULL : strdup(in[i]);
    }
+   if (!save_backups_device_kept)
+      save_backups_device_read();
 }
 
 /* The part of @path below @root, or NULL when it is not under it. */
@@ -320,11 +395,51 @@ const char *save_backups_reason_name(enum save_backup_reason reason)
       ? save_backups_reasons[reason] : "";
 }
 
+/* @t starts with a time "YYYY-MM-DD HH-MM-SS" */
+static bool save_backups_time(const char *t)
+{
+   unsigned i;
+   for (i = 0; i < SAVE_BACKUPS_TIME_LEN; i++)
+   {
+      char c = t[i];
+      if (i == 4 || i == 7 || i == 13 || i == 16)
+      {
+         if (c != '-')
+            return false;
+      }
+      else if (i == 10)
+      {
+         if (c != ' ')
+            return false;
+      }
+      else if (c < '0' || c > '9')
+         return false;
+   }
+   return true;
+}
+
+/* The @n digits at @t as a number from 1 to SAVE_BACKUPS_SEQ_MAX; 0
+ * when they are not one */
+static unsigned save_backups_seq(const char *t, size_t n)
+{
+   size_t i;
+   unsigned v = 0;
+   if (n > 9)
+      return 0;
+   for (i = 0; i < n; i++)
+   {
+      if (t[i] < '0' || t[i] > '9')
+         return 0;
+      v = v * 10 + (unsigned)(t[i] - '0');
+   }
+   return v;
+}
+
 bool save_backups_parse(const char *name, struct save_backup_name *out)
 {
    unsigned i, reason;
    size_t n;
-   const char *sep3, *sep2, *sep1, *rest, *t;
+   const char *sep3, *sep2, *sep1, *sep0, *rest, *t;
    const char *end = name + strlen(name);
 
    if (!(sep3 = save_backups_sep(name, end)))
@@ -352,28 +467,30 @@ bool save_backups_parse(const char *name, struct save_backup_name *out)
    if (sep3 == sep2 + 3)
       return false;
 
-   t = sep1 + 3;
-   n = (size_t)(sep2 - t);
-   if (n < SAVE_BACKUPS_TIME_LEN)
-      return false;
-   for (i = 0; i < SAVE_BACKUPS_TIME_LEN; i++)
+   t              = sep1 + 3;
+   n              = (size_t)(sep2 - t);
+   out->number    = 1;
+   out->seq       = 0;
+   out->device[0] = '\0';
+   if (     n > SAVE_BACKUPS_TAG_LEN + 1
+         && t[n - SAVE_BACKUPS_TAG_LEN - 1] == '-'
+         && save_backups_is_tag(t + n - SAVE_BACKUPS_TAG_LEN)
+         && (out->seq = save_backups_seq(t,
+               n - SAVE_BACKUPS_TAG_LEN - 1)))
    {
-      char c = t[i];
-      if (i == 4 || i == 7 || i == 13 || i == 16)
-      {
-         if (c != '-')
-            return false;
-      }
-      else if (i == 10)
-      {
-         if (c != ' ')
-            return false;
-      }
-      else if (c < '0' || c > '9')
+      memcpy(out->device, t + n - SAVE_BACKUPS_TAG_LEN,
+            SAVE_BACKUPS_TAG_LEN);
+      out->device[SAVE_BACKUPS_TAG_LEN] = '\0';
+      if (     !(sep0 = save_backups_sep(name, sep1))
+            || sep1 - (sep0 + 3) != SAVE_BACKUPS_TIME_LEN
+            || !save_backups_time(sep0 + 3))
          return false;
+      t    = sep0 + 3;
+      sep1 = sep0;
    }
-   out->number = 1;
-   if (n > SAVE_BACKUPS_TIME_LEN)
+   else if (n < SAVE_BACKUPS_TIME_LEN || !save_backups_time(t))
+      return false;
+   else if (n > SAVE_BACKUPS_TIME_LEN)
    {
       unsigned long num = 0;
       if (     n > SAVE_BACKUPS_TIME_LEN + 10
@@ -394,6 +511,7 @@ bool save_backups_parse(const char *name, struct save_backup_name *out)
 
    memcpy(out->time, t, SAVE_BACKUPS_TIME_LEN);
    out->time[SAVE_BACKUPS_TIME_LEN] = '\0';
+   memcpy(out->eff, out->time, sizeof(out->eff));
    out->game_len = (size_t)(sep1 - name);
    out->core_off = (size_t)(sep2 + 3 - name);
    out->core_len = (size_t)(sep3 - (sep2 + 3));
@@ -436,8 +554,8 @@ static char *save_backups_core_field(const char *core)
  * whole name stays under the limit. */
 static size_t save_backups_game_max(size_t core_len, size_t ext_len)
 {
-   size_t fixed = 3 + SAVE_BACKUPS_TIME_LEN + SAVE_BACKUPS_NUMBER_ROOM
-      + 3 + core_len + 3 + SAVE_BACKUPS_REASON_ROOM + ext_len;
+   size_t fixed = 3 + SAVE_BACKUPS_TIME_LEN + SAVE_BACKUPS_SEQ_ROOM + 3
+      + core_len + 3 + SAVE_BACKUPS_REASON_ROOM + ext_len;
    return fixed + 2 < SAVE_BACKUPS_NAME_MAX
       ? SAVE_BACKUPS_NAME_MAX - 1 - fixed : 1;
 }
@@ -478,7 +596,8 @@ static long save_backups_game_room(size_t dir_units, const char *core,
       const char *ext)
 {
    size_t fixed = dir_units + 3 + SAVE_BACKUPS_TIME_LEN
-      + SAVE_BACKUPS_NUMBER_ROOM + 3 + save_backups_units(core, strlen(core))
+      + SAVE_BACKUPS_SEQ_ROOM + 3
+      + save_backups_units(core, strlen(core))
       + 3 + SAVE_BACKUPS_REASON_ROOM + save_backups_units(ext, strlen(ext))
       + SAVE_BACKUPS_TEMP_LEN;
    return (long)SAVE_BACKUPS_PATH_MAX - (long)fixed;
@@ -552,20 +671,46 @@ static size_t save_backups_game_fit(long dir_units, const char *game,
    return n;
 }
 
+/* A name from before numbering is older. On one device by number, so
+ * a clock set back keeps the order; between devices by time, each
+ * device's held at its latest (eff), so the order never loops. Then by
+ * number, device and time. */
 static int save_backups_cmp(const struct save_backup_name *a,
       const struct save_backup_name *b)
 {
-   int c = memcmp(a->time, b->time, SAVE_BACKUPS_TIME_LEN);
-   if (c)
+   int c;
+   if (!a->seq != !b->seq)
+      return a->seq ? 1 : -1;
+   if ((c = memcmp(a->eff, b->eff, SAVE_BACKUPS_TIME_LEN)))
+      return c;
+   if (a->seq != b->seq)
+      return a->seq < b->seq ? -1 : 1;
+   if ((c = strcmp(a->device, b->device)))
+      return c;
+   if ((c = memcmp(a->time, b->time, SAVE_BACKUPS_TIME_LEN)))
       return c;
    return a->number < b->number ? -1 : a->number > b->number;
 }
 
+/* What a caller holds a copy by: its number; at the last number,
+ * which copies share, a value above every number from its time */
+static unsigned save_backups_record(unsigned seq, const char *time)
+{
+   unsigned i, h = 0;
+   if (seq < SAVE_BACKUPS_SEQ_MAX)
+      return seq;
+   for (i = 0; i < SAVE_BACKUPS_TIME_LEN; i++)
+      h = h * 31 + (unsigned char)time[i];
+   /* Up to INT_MAX, as callers keep it in an int */
+   return SAVE_BACKUPS_SEQ_MAX + 1 + h % (0x7FFFFFFFu - SAVE_BACKUPS_SEQ_MAX);
+}
+
 /* Deletes the oldest copies of one file for @reason in @list, all but
- * SAVE_BACKUPS_KEEP counting the one just made, which is not in it. */
+ * SAVE_BACKUPS_KEEP counting the one just made, which is not in it.
+ * The copy held by @keep is neither counted nor deleted. */
 static void save_backups_retain(struct string_list *list,
       struct save_backup_name *names, const bool *mine,
-      enum save_backup_reason reason, size_t ext_len)
+      enum save_backup_reason reason, size_t ext_len, unsigned keep)
 {
    size_t i;
    size_t count = 0;
@@ -577,7 +722,9 @@ static void save_backups_retain(struct string_list *list,
       name = path_basename_nocompression(list->elems[i].data);
       /* Near its limit or marked, the game may be a longer name's cut:
        * never pruned */
-      if (     names[i].game_len + SAVE_BACKUPS_CUT_ROOM
+      if (keep && save_backups_record(names[i].seq, names[i].time) == keep)
+         names[i].reason = SAVE_BACKUP_REASON_LAST;
+      else if (names[i].game_len + SAVE_BACKUPS_CUT_ROOM
                < save_backups_game_max(names[i].core_len, ext_len)
             && (  !names[i].game_len
                || name[names[i].game_len - 1] != SAVE_BACKUPS_CUT_MARK))
@@ -626,9 +773,11 @@ struct save_backups_copies
    size_t game_len;
    size_t newest;   /* (size_t)-1 when none */
    long dir_units;
-   unsigned number; /* the first free in this second */
+   unsigned seq;    /* the next number, past SAVE_BACKUPS_SEQ_MAX when
+                     * none is left */
    bool mark;
    char stamp[SAVE_BACKUPS_TIME_LEN + 1];
+   char device[SAVE_BACKUPS_TAG_LEN + 1];
 };
 
 /* Lists the copies of @path in @dir, named with @core (NULL: the
@@ -636,13 +785,12 @@ struct save_backups_copies
 static bool save_backups_list_copies(struct save_backups_copies *c,
       const char *dir, const char *path, const char *core)
 {
-   size_t i;
+   size_t i, j;
    time_t now;
    struct tm tm_;
 
    memset(c, 0, sizeof(*c));
    c->newest = (size_t)-1;
-   c->number = 1;
    c->base   = path_basename_nocompression(path);
    c->ext    = save_backups_ext(c->base);
    c->field  = save_backups_core_field(
@@ -660,6 +808,7 @@ static bool save_backups_list_copies(struct save_backups_copies *c,
    rtime_localtime(&now, &tm_);
    if (!strftime(c->stamp, sizeof(c->stamp), "%Y-%m-%d %H-%M-%S", &tm_))
       return false;
+   save_backups_device_get(c->device);
 
    if ((c->list = dir_list_new(dir, NULL, false, true, false, false))
          && c->list->size)
@@ -670,6 +819,9 @@ static bool save_backups_list_copies(struct save_backups_copies *c,
       if (!c->names || !c->mine)
          return false;
    }
+   /* Not listed, the copy's number would be a guess */
+   else if (!c->list && path_is_directory(dir))
+      return false;
    for (i = 0; c->names && i < c->list->size; i++)
    {
       const char *name = path_basename_nocompression(c->list->elems[i].data);
@@ -677,13 +829,27 @@ static bool save_backups_list_copies(struct save_backups_copies *c,
                c->mark, c->ext))
          continue;
       c->mine[i] = true;
-      if (c->newest == (size_t)-1
-            || save_backups_cmp(&c->names[i], &c->names[c->newest]) > 0)
-         c->newest = i;
-      if (     !memcmp(c->names[i].time, c->stamp, SAVE_BACKUPS_TIME_LEN)
-            && c->names[i].number >= c->number)
-         c->number = c->names[i].number + 1;
+      if (c->names[i].seq > c->seq)
+         c->seq = c->names[i].seq;
    }
+   c->seq++;
+   /* Numbers on one device never go down: a copy's time is held up to
+    * its device's latest at a number no higher, all reasons' */
+   for (i = 0; c->names && i < c->list->size; i++)
+      for (j = 0; c->mine[i] && c->names[i].seq && j < c->list->size; j++)
+         if (     c->mine[j]
+               && c->names[j].seq
+               && c->names[j].seq <= c->names[i].seq
+               && string_is_equal(c->names[j].device, c->names[i].device)
+               && memcmp(c->names[j].time, c->names[i].eff,
+                  SAVE_BACKUPS_TIME_LEN) > 0)
+            memcpy(c->names[i].eff, c->names[j].time,
+                  SAVE_BACKUPS_TIME_LEN);
+   for (i = 0; c->names && i < c->list->size; i++)
+      if (     c->mine[i]
+            && (c->newest == (size_t)-1
+               || save_backups_cmp(&c->names[i], &c->names[c->newest]) > 0))
+         c->newest = i;
    return true;
 }
 
@@ -696,13 +862,15 @@ static void save_backups_free_copies(struct save_backups_copies *c)
    free(c->field);
 }
 
-/* The first free name in @dir for a copy for @reason into @s, the
- * folder made */
+/* A free name in @dir for a copy for @reason into @s, the folder made,
+ * its number in *@seq. With none left, the last again: its time orders
+ * it among those. */
 static bool save_backups_free_name(char *s, size_t len, const char *dir,
-      const struct save_backups_copies *c, enum save_backup_reason reason)
+      const struct save_backups_copies *c, enum save_backup_reason reason,
+      unsigned *seq)
 {
    size_t _len, name_off;
-   unsigned number = c->number;
+   unsigned i;
    if (!path_mkdir(dir))
       return false;
    name_off = fill_pathname_join(s, dir, "", len);
@@ -715,15 +883,15 @@ static bool save_backups_free_name(char *s, size_t len, const char *dir,
    s[_len] = '\0';
    /* Never over another file, whatever its name's case, nor over a
     * copy still being written to that name. */
-   for (;; number++)
+   for (i = 0; i < SAVE_BACKUPS_SEQ_TRIES; i++)
    {
       size_t name_len;
-      if (number > 1)
-         snprintf(s + _len, len - _len, " - %s-%u - %s - %s%s", c->stamp,
-               number, c->field, save_backups_reasons[reason], c->ext);
-      else
-         snprintf(s + _len, len - _len, " - %s - %s - %s%s", c->stamp,
-               c->field, save_backups_reasons[reason], c->ext);
+      unsigned number = c->seq + i;
+      if (number > SAVE_BACKUPS_SEQ_MAX)
+         number = SAVE_BACKUPS_SEQ_MAX;
+      snprintf(s + _len, len - _len, " - %s - %04u-%s - %s - %s%s",
+            c->stamp, number, c->device, c->field,
+            save_backups_reasons[reason], c->ext);
       if ((name_len = strlen(s)) + SAVE_BACKUPS_TEMP_LEN + 1 >= len)
          return false;
 #ifdef SAVE_BACKUPS_PATH_MAX
@@ -740,9 +908,15 @@ static bool save_backups_free_name(char *s, size_t len, const char *dir,
          writing     = path_is_valid(s);
          s[name_len] = '\0';
          if (!writing)
+         {
+            *seq = number;
             return true;
+         }
       }
+      if (number == SAVE_BACKUPS_SEQ_MAX)
+         return false;
    }
+   return false;
 }
 
 /* Whether @reason's copies are pruned to SAVE_BACKUPS_KEEP. A cut name
@@ -787,14 +961,17 @@ static bool save_backups_holds(const char *copy, const void *data,
 /* Writes @data as a copy of @path into @dir, its path in @s; with
  * @move, renames @path there instead, or names the copy owed when that
  * fails. With @skip_same, nothing is written when the newest copy
- * holds it; @of_file: @data is @path's bytes. */
+ * holds it; @of_file: @data is @path's bytes. @seq as in
+ * save_backups_copy_image(). */
 static enum save_backup_result save_backups_write_copy(char *s, size_t len,
       const char *dir, const char *path, const char *core,
       enum save_backup_reason reason, const void *data, size_t data_len,
-      bool move, bool skip_same, bool of_file, bool sync)
+      bool move, bool skip_same, bool of_file, bool sync, unsigned *seq)
 {
    struct save_backups_copies c;
    enum save_backup_result result = SAVE_BACKUP_FAILED;
+   unsigned keep                  = seq ? *seq : 0;
+   unsigned made                  = 0;
 
    s[0] = '\0';
    if (!save_backups_list_copies(&c, dir, path, core))
@@ -802,16 +979,20 @@ static enum save_backup_result save_backups_write_copy(char *s, size_t len,
 
    if (     skip_same
          && c.newest != (size_t)-1
+         && (!seq || keep || c.names[c.newest].seq)
          && save_backups_holds(c.list->elems[c.newest].data, data, data_len,
                of_file ? path : NULL))
    {
       strlcpy(s, c.list->elems[c.newest].data, len);
+      made   = save_backups_record(c.names[c.newest].seq,
+            c.names[c.newest].time);
       result = SAVE_BACKUP_MADE;
       goto end;
    }
 
-   if (!save_backups_free_name(s, len, dir, &c, reason))
+   if (!save_backups_free_name(s, len, dir, &c, reason, &made))
       goto end;
+   made = save_backups_record(made, c.stamp);
 
    if (move)
    {
@@ -829,11 +1010,14 @@ static enum save_backup_result save_backups_write_copy(char *s, size_t len,
    result = SAVE_BACKUP_MADE;
 
    if (save_backups_retained(&c, reason))
-      save_backups_retain(c.list, c.names, c.mine, reason, strlen(c.ext));
+      save_backups_retain(c.list, c.names, c.mine, reason, strlen(c.ext),
+            keep);
 
 end:
    if (result != SAVE_BACKUP_MADE && result != SAVE_BACKUP_COPY_OWED)
       s[0] = '\0';
+   else if (seq)
+      *seq = made;
    save_backups_free_copies(&c);
    return result;
 }
@@ -842,10 +1026,11 @@ enum save_backup_result save_backups_name_copy(char *s, size_t len,
       const char *dir, const char *path, const char *core,
       enum save_backup_reason reason)
 {
+   unsigned seq;
    struct save_backups_copies c;
    enum save_backup_result result = SAVE_BACKUP_FAILED;
    if (     save_backups_list_copies(&c, dir, path, core)
-         && save_backups_free_name(s, len, dir, &c, reason))
+         && save_backups_free_name(s, len, dir, &c, reason, &seq))
       result = SAVE_BACKUP_MADE;
    else
       s[0] = '\0';
@@ -921,14 +1106,15 @@ void save_backups_retain_made(const char *dir, const char *path,
          if (string_is_equal(
                   path_basename_nocompression(c.list->elems[i].data), name))
             c.mine[i] = false;
-      save_backups_retain(c.list, c.names, c.mine, reason, strlen(c.ext));
+      save_backups_retain(c.list, c.names, c.mine, reason, strlen(c.ext),
+            0);
    }
    save_backups_free_copies(&c);
 }
 
-enum save_backup_result save_backups_copy_to(const char *dir,
+static enum save_backup_result save_backups_copy_seq(const char *dir,
       const char *path, const char *core, enum save_backup_reason reason,
-      const void *data, size_t len, bool sync)
+      const void *data, size_t len, bool sync, unsigned *seq)
 {
    enum save_backup_result result;
    void *buf = NULL;
@@ -952,10 +1138,18 @@ enum save_backup_result save_backups_copy_to(const char *dir,
       len  = (size_t)n;
    }
    result = save_backups_write_copy(made, PATH_MAX_LENGTH, dir, path,
-         core, reason, data, len, false, true, buf != NULL, sync);
+         core, reason, data, len, false, true, buf != NULL, sync, seq);
    free(buf);
    free(made);
    return result;
+}
+
+enum save_backup_result save_backups_copy_to(const char *dir,
+      const char *path, const char *core, enum save_backup_reason reason,
+      const void *data, size_t len, bool sync)
+{
+   return save_backups_copy_seq(dir, path, core, reason, data, len, sync,
+         NULL);
 }
 
 enum save_backup_result save_backups_move_begin(const char *dir,
@@ -965,7 +1159,7 @@ enum save_backup_result save_backups_move_begin(const char *dir,
    if (!path_is_valid(path))
       return SAVE_BACKUP_NO_FILE;
    return save_backups_write_copy(s, len, dir, path, core, reason,
-         NULL, 0, true, false, false, false);
+         NULL, 0, true, false, false, false, NULL);
 }
 
 enum save_backup_result save_backups_move_to(const char *dir,
@@ -978,7 +1172,7 @@ enum save_backup_result save_backups_move_to(const char *dir,
    if (!(made = (char*)malloc(PATH_MAX_LENGTH)))
       return SAVE_BACKUP_FAILED;
    result = save_backups_write_copy(made, PATH_MAX_LENGTH, dir, path,
-         core, reason, NULL, 0, true, false, false, false);
+         core, reason, NULL, 0, true, false, false, false, NULL);
    if (result == SAVE_BACKUP_COPY_OWED)
       result = (  save_backups_copy_synced(path, made)
                && save_backups_move_finish(path, made))
@@ -989,24 +1183,25 @@ enum save_backup_result save_backups_move_to(const char *dir,
 
 enum save_backup_result save_backups_copy_image(const char *path,
       enum save_backup_reason reason, const void *data, size_t len,
-      bool sync)
+      bool sync, unsigned *seq)
 {
    enum save_backup_result result = SAVE_BACKUP_FAILED;
    char *dir = (char*)malloc(PATH_MAX_LENGTH);
    if (dir && save_backups_dir(dir, PATH_MAX_LENGTH, path))
-      result = save_backups_copy_to(dir, path, NULL, reason,
-            data ? data : "", data ? len : 0, sync);
+      result = save_backups_copy_seq(dir, path, NULL, reason,
+            data ? data : "", data ? len : 0, sync, seq);
    free(dir);
    return result;
 }
 
 enum save_backup_result save_backups_copy_file(const char *path,
-      enum save_backup_reason reason, bool sync)
+      enum save_backup_reason reason, bool sync, unsigned *seq)
 {
    enum save_backup_result result = SAVE_BACKUP_FAILED;
    char *dir = (char*)malloc(PATH_MAX_LENGTH);
    if (dir && save_backups_dir(dir, PATH_MAX_LENGTH, path))
-      result = save_backups_copy_to(dir, path, NULL, reason, NULL, 0, sync);
+      result = save_backups_copy_seq(dir, path, NULL, reason, NULL, 0, sync,
+            seq);
    free(dir);
    return result;
 }
@@ -1057,7 +1252,8 @@ size_t save_backups_recover(char *s, size_t len, const char *path,
       return 0;
    if (save_backups_dir(dir, PATH_MAX_LENGTH, path))
       made = save_backups_write_copy(s, len, dir, path, NULL,
-            SAVE_BACKUP_UNSAVED, data, data_len, false, false, false, sync)
+            SAVE_BACKUP_UNSAVED, data, data_len, false, false, false, sync,
+            NULL)
          == SAVE_BACKUP_MADE;
    for (i = SAVE_BACKUPS_ROOT_CONFIG;
          !made && i <= SAVE_BACKUPS_ROOT_APP_DATA; i++)
@@ -1067,7 +1263,8 @@ size_t save_backups_recover(char *s, size_t len, const char *path,
       fill_pathname_join(dir, save_backups_roots[i],
             SAVE_BACKUPS_RECOVERY_DIR, PATH_MAX_LENGTH);
       made = save_backups_write_copy(s, len, dir, path, NULL,
-            SAVE_BACKUP_UNSAVED, data, data_len, false, false, false, sync)
+            SAVE_BACKUP_UNSAVED, data, data_len, false, false, false, sync,
+            NULL)
          == SAVE_BACKUP_MADE;
    }
    free(dir);
@@ -1141,7 +1338,8 @@ size_t save_backups_find_recovery(char *s, size_t len, const char *path,
 
 enum save_folders_key
 {
-   SAVE_FOLDERS_SAVES = 0,
+   SAVE_FOLDERS_DEVICE = 0,
+   SAVE_FOLDERS_SAVES,
    SAVE_FOLDERS_STATES,
    SAVE_FOLDERS_FIRST_SEEN,
    SAVE_FOLDERS_LAST_SEEN,
@@ -1153,8 +1351,8 @@ enum save_folders_key
 
 static const char *const save_folders_keys[SAVE_FOLDERS_KEY_LAST] =
 {
-   "saves", "states", "first_seen", "last_seen", "configured", "used",
-   "time"
+   "device", "saves", "states", "first_seen", "last_seen", "configured",
+   "used", "time"
 };
 
 struct save_folders_entry
@@ -1294,6 +1492,58 @@ static bool save_folders_same(const char *a, const char *b)
    return string_is_equal(a ? a : "", b ? b : "");
 }
 
+/* The device tag in @l, or NULL */
+static const char *save_folders_device(const struct save_folders_list *l)
+{
+   size_t i;
+   for (i = 0; i < l->n; i++)
+   {
+      const char *t = l->e[i].v[SAVE_FOLDERS_DEVICE];
+      if (t && strlen(t) == SAVE_BACKUPS_TAG_LEN && save_backups_is_tag(t))
+         return t;
+   }
+   return NULL;
+}
+
+static void save_folders_free(struct save_folders_list *l)
+{
+   size_t i, k;
+   for (i = 0; i < l->n; i++)
+      for (k = 0; k < SAVE_FOLDERS_KEY_LAST; k++)
+         free(l->e[i].v[k]);
+   free(l->e);
+}
+
+/* <config>/save_folders.json into @s; false with no config folder */
+static bool save_folders_path(char *s, size_t len)
+{
+   if (!save_backups_roots[SAVE_BACKUPS_ROOT_CONFIG])
+      return false;
+   fill_pathname_join_special(s, save_backups_roots[SAVE_BACKUPS_ROOT_CONFIG],
+         SAVE_BACKUPS_FOLDERS_FILE, len);
+   return true;
+}
+
+static void save_backups_device_read(void)
+{
+   struct save_folders_list l;
+   const char *t;
+   char *path = (char*)malloc(PATH_MAX_LENGTH);
+   memset(&l, 0, sizeof(l));
+   if (path && save_folders_path(path, PATH_MAX_LENGTH))
+   {
+      save_folders_read(&l, path);
+      if ((t = save_folders_device(&l)))
+      {
+         retro_atomic_store_release_int(&save_backups_device,
+               save_backups_tag_pack(t));
+         save_backups_device_kept = true;
+      }
+   }
+   save_folders_free(&l);
+   free(path);
+}
+
 bool save_backups_note_folders(const char *configured, const char *used,
       bool sync)
 {
@@ -1304,6 +1554,8 @@ bool save_backups_note_folders(const char *configured, const char *used,
    struct save_folders_list l;
    struct save_folders_entry *last = NULL;
    struct save_folders_entry *e    = NULL;
+   const char *device              = NULL;
+   bool tagged                     = false;
    bool changed                    = false;
    bool ok                         = true;
    bool whole;
@@ -1311,12 +1563,12 @@ bool save_backups_note_folders(const char *configured, const char *used,
    const char *states = save_backups_roots[SAVE_BACKUPS_ROOT_SAVESTATE];
    char *path         = NULL;
 
-   if (     !save_backups_roots[SAVE_BACKUPS_ROOT_CONFIG]
-         || !(path = (char*)malloc(PATH_MAX_LENGTH)))
+   if (     !(path = (char*)malloc(PATH_MAX_LENGTH))
+         || !save_folders_path(path, PATH_MAX_LENGTH))
+   {
+      free(path);
       return false;
-   fill_pathname_join_special(path,
-         save_backups_roots[SAVE_BACKUPS_ROOT_CONFIG],
-         SAVE_BACKUPS_FOLDERS_FILE, PATH_MAX_LENGTH);
+   }
 
    memset(&tm_, 0, sizeof(tm_));
    time(&now);
@@ -1325,6 +1577,18 @@ bool save_backups_note_folders(const char *configured, const char *used,
 
    memset(&l, 0, sizeof(l));
    whole = save_folders_read(&l, path);
+   /* This device's tag: the one kept, else the one copies use added */
+   if ((device = save_folders_device(&l)))
+      retro_atomic_store_release_int(&save_backups_device,
+            save_backups_tag_pack(device));
+   else if ((e = save_folders_add(&l)))
+   {
+      char t[SAVE_BACKUPS_TAG_LEN + 1];
+      save_backups_device_get(t);
+      e->v[SAVE_FOLDERS_DEVICE]     = strdup(t);
+      e->v[SAVE_FOLDERS_FIRST_SEEN] = strdup(stamp);
+      changed = tagged = true;
+   }
    for (i = l.n; i-- > 0; )
       if (l.e[i].v[SAVE_FOLDERS_SAVES] || l.e[i].v[SAVE_FOLDERS_STATES])
       {
@@ -1387,13 +1651,9 @@ bool save_backups_note_folders(const char *configured, const char *used,
          filestream_rename(aside, path);
       free(aside);
    }
-   for (i = 0; i < l.n; i++)
-   {
-      size_t k;
-      for (k = 0; k < SAVE_FOLDERS_KEY_LAST; k++)
-         free(l.e[i].v[k]);
-   }
-   free(l.e);
+   if (device || (tagged && ok))
+      save_backups_device_kept = true;
+   save_folders_free(&l);
    free(path);
    return ok;
 }

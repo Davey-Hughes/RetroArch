@@ -631,9 +631,13 @@ static unsigned copies(const char *dir, enum save_backup_reason reason,
       if (     !save_backups_parse(path_basename(list->elems[i].data), &name)
             || (reason != SAVE_BACKUP_REASON_LAST && name.reason != reason))
          continue;
-      if (newest && (!n || memcmp(name.time, best.time, sizeof(best.time)) > 0
-               || (!memcmp(name.time, best.time, sizeof(best.time))
-                  && name.number > best.number)))
+      /* By number; one from before numbering by time, then number */
+      if (newest && (!n
+               || (name.seq != best.seq
+                  ? name.seq && (!best.seq || name.seq > best.seq)
+                  : memcmp(name.time, best.time, sizeof(best.time)) > 0
+                  || (!memcmp(name.time, best.time, sizeof(best.time))
+                     && name.number > best.number))))
       {
          strlcpy(newest, list->elems[i].data, len);
          best = name;
@@ -811,6 +815,57 @@ static void lane_state_load_copy_sync(void)
    event_flush_save_files(true, false, 0);
    CHECK(get_write_opens() == opens, "state_load_sync: unchanged, written");
    use_test_vfs(false);
+   path_deinit_savefile();
+   clean();
+}
+
+/* The session's first before-state-load copy outlives retention
+ * over 12 state loads; the next session's copies prune it. */
+static void lane_state_load_keeps_first_sync(void)
+{
+   static unsigned char ram[BIG], p0[BIG], p[BIG], l[BIG];
+   char first[PATH_MAX_LENGTH];
+   unsigned k;
+   const int bsl = 1 << SAVE_BACKUP_BEFORE_STATE_LOAD;
+
+   clean();
+   first[0]  = '\0';
+   fill(p0, BIG, 100);
+   memset(ram, 0, BIG);
+   core_data = ram;
+   core_size = BIG;
+   path_init_savefile_new();
+   path_init_savefile_rtc(SAVE);
+   event_load_save_files(false);
+   for (k = 0; k < 13; k++)
+   {
+      if (k == 12)
+      {
+         path_deinit_savefile();
+         path_init_savefile_new();
+         path_init_savefile_rtc(SAVE);
+         event_load_save_files(false);
+      }
+      fill(p, BIG, 100 + k);
+      fill(l, BIG, 200 + k);
+      memcpy(ram, p, BIG);
+      event_flush_save_files(true, false, bsl);
+      memcpy(ram, l, BIG);
+      event_save_files(true, false, true, true, NULL);
+      if (!k)
+         CHECK(copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, first,
+                  sizeof(first)) == 1 && holds(first, p0, BIG),
+               "keeps_first: no first copy");
+      if (k == 11)
+      {
+         CHECK(holds(first, p0, BIG),
+               "keeps_first: the session's first copy pruned");
+         CHECK(copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, NULL, 0)
+               == 11, "keeps_first: not 10 others beside it");
+      }
+   }
+   CHECK(copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, NULL, 0) == 10
+         && !exists(first), "keeps_first: kept past its session");
    path_deinit_savefile();
    clean();
 }
@@ -4823,6 +4878,7 @@ int main(void)
    lane_explicit_copy_fails();
    lane_backup_logged();
    lane_state_load_copy_sync();
+   lane_state_load_keeps_first_sync();
    lane_flush_copy_fails_sync();
    lane_flush_write_fails_sync();
    lane_flush_same_image_sync();

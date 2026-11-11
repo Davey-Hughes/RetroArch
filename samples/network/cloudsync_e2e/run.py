@@ -878,7 +878,8 @@ def sync_backups_beside_saves(srv, a, b):
     folder = b.p("saves", "backups", "cloud-sync", "saves", CORE_DIR)
     check(kept and os.path.dirname(kept) == folder
           and re.match(re.escape(GAME)
-                       + r" - \d{4}-\d\d-\d\d \d\d-\d\d-\d\d - cloud-sync - replaced\.srm$",
+                       + r" - \d{4}-\d\d-\d\d \d\d-\d\d-\d\d - \d{4,9}-[a-z]{4} - cloud-sync"
+                       r" - replaced\.srm$",
                        os.path.basename(kept)),
           "the replaced save was kept at %s" % (kept and os.path.relpath(kept, b.dir)))
 

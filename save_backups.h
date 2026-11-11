@@ -67,7 +67,8 @@ enum save_backup_reason
    SAVE_BACKUP_REASON_LAST
 };
 
-/* A parsed name "<Game> - <time>[-<n>] - <core> - <reason><ext>". */
+/* A parsed name "<Game> - <time> - <seq>-<device> - <core> - <reason><ext>",
+ * or from before numbering "<Game> - <time>[-<n>] - <core> - <reason><ext>". */
 struct save_backup_name
 {
    size_t game_len; /* the game is the first game_len bytes */
@@ -75,13 +76,20 @@ struct save_backup_name
    size_t core_len;
    size_t ext_off;  /* to the end of the name */
    unsigned number; /* 1 when the name has none */
+   unsigned seq;    /* 0 when the name has none */
    enum save_backup_reason reason;
    char time[20];   /* "YYYY-MM-DD HH-MM-SS" */
+   char device[5];  /* "" when the name has none */
+   /* The time copies are ordered by: the parse sets it to time; among
+    * a folder's copies, the latest of its device's numbered up to it */
+   char eff[20];
 };
 
 /* Copies the folders copies are placed by and the core named in them.
  * An empty or NULL @savefile_dir is the content folder. Main thread,
- * while no copy is being made. NULLs throughout clear them. */
+ * while no copy is being made. NULLs throughout clear them. Until a
+ * save_folders.json gave this device's tag, reads it from
+ * @config_dir's. */
 void save_backups_set_roots(const char *savefile_dir,
       const char *savestate_dir, const char *content_dir,
       const char *system_dir, const char *config_dir,
@@ -161,12 +169,16 @@ void save_backups_retain_made(const char *dir, const char *path,
  * same (a network drive's lost reply). */
 bool save_backups_move_finish(const char *path, const char *to);
 
-/* save_backups_copy_to() into save_backups_dir() of @path. */
+/* save_backups_copy_to() into save_backups_dir() of @path. With @seq:
+ * in, a copy retention keeps (0: none); out, the copy that holds the
+ * data (0: none), with 0 in never a copy from before numbering. A copy
+ * is held by its number; at the last number, which copies share, by a
+ * value above every number made from its time. */
 enum save_backup_result save_backups_copy_image(const char *path,
       enum save_backup_reason reason, const void *data, size_t len,
-      bool sync);
+      bool sync, unsigned *seq);
 enum save_backup_result save_backups_copy_file(const char *path,
-      enum save_backup_reason reason, bool sync);
+      enum save_backup_reason reason, bool sync, unsigned *seq);
 
 /* Writes @data, meant for @path, as a new "unsaved" file: in the copy
  * folder, else <config>/recovery, else <app data>/recovery. When the
@@ -185,7 +197,8 @@ size_t save_backups_find_recovery(char *s, size_t len, const char *path,
 /* <config>/save_folders.json: adds the save and state roots as an
  * entry when they differ from the last one, else updates its last_seen
  * once a day; with @configured, also a note that @used stood in for
- * it. Rewritten only when something changed. */
+ * it; and this device's tag when it holds none, else takes the tag
+ * from it. Rewritten only when something changed. */
 bool save_backups_note_folders(const char *configured, const char *used,
       bool sync);
 

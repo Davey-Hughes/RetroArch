@@ -21,6 +21,7 @@ IO_SOURCES := autosave_io_test.c $(ROOT)/save_backups.c \
               $(LRC)/file/file_path.c \
               $(LRC)/file/file_path_io.c \
               $(LRC)/file/retro_dirent.c \
+              $(LRC)/formats/json/rjson.c \
               $(LRC)/lists/dir_list.c \
               $(LRC)/lists/string_list.c \
               $(LRC)/streams/file_stream.c \

@@ -213,7 +213,7 @@ jobs:
         shell: bash
         run: |
           set -eu
-          # save_backups.c: copy folders, names read back, same-second
+          # save_backups.c: copy folders, names read back, copy
           # numbers, the identical-copy skip, retention and the
           # recovery-file chain, with and without HAVE_THREADS.
           make -C samples/runloop/save_backups clean check

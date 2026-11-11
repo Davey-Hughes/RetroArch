@@ -806,7 +806,7 @@ static void backup_location_lane(void)
       CHECK(save_backups_parse(path_basename(list->elems[1].data), &b));
       CHECK(a.reason == SAVE_BACKUP_REPLACED && b.reason == SAVE_BACKUP_REPLACED);
       CHECK(!memcmp(a.time, b.time, sizeof(a.time)));
-      CHECK(a.number == 1 && b.number == 2);
+      CHECK(a.seq == 1 && b.seq == 2);
       CHECK(!strncmp(path_basename(list->elems[0].data) + a.core_off,
                "cloud-sync", a.core_len) && a.core_len == 10);
       CHECK(holds(list->elems[0].data, "one"));
@@ -978,7 +978,8 @@ static void sweep_lane(void)
    snprintf(dir, sizeof(dir), "%s/backups/cloud-sync/saves", directory);
    CHECK(path_mkdir(dir));
    snprintf(stale, sizeof(stale),
-         "%s/save - 2026-11-07 09-00-00-2 - cloud-sync - deleted.srm.tmp", dir);
+         "%s/save - 2026-11-07 09-00-00 - 0002-abcd - cloud-sync - deleted.srm.tmp",
+         dir);
    CHECK(filestream_write_file(stale, "x", 1));
    for (i = 0; i < sizeof(kept) / sizeof(kept[0]); i++)
    {
@@ -1253,14 +1254,14 @@ static void missing_on_server_lane(void)
 
 #if defined(_WIN32) && !defined(_XBOX)
 /* Whether states_lane()'s longest copy fits Win32's 259: in a deep
- * folder both games are cut to nothing, so the second is numbered. */
+ * folder both games are cut to nothing, so the second is number 2. */
 static bool run_folder_fits(void)
 {
    char s[PATH_MAX_LENGTH];
    size_t i;
    long n = 0;
    snprintf(s, sizeof(s), "%s/owed-saves/backups/cloud-sync/states/"
-         "~ - 2000-01-01 00-00-00-2 - cloud-sync - replaced.state.tmp",
+         "~ - 2000-01-01 00-00-00 - 0002-abcd - cloud-sync - replaced.state.tmp",
          directory);
    if (!path_resolve_realpath(s, sizeof(s), false))
       return false;
