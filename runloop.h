@@ -1107,6 +1107,10 @@ void runloop_flush_save_files(void);
  * to recovery files outside it. */
 void runloop_recover_save_files(bool sync);
 
+/* Saving is off for want of a save folder, and a recovery file holds
+ * the content's save RAM. */
+bool runloop_save_files_recovered(void);
+
 /* Any thread: the main thread does runloop_flush_save_files() at its
  * next frame. */
 void runloop_request_save_files(void);

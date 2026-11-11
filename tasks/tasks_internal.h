@@ -577,8 +577,13 @@ void event_flush_save_files(bool sram_used, bool compress_files,
 void event_flush_kept_save_files(bool sram_used, bool compress_files);
 
 /* Saving is off for want of a folder: save RAM goes to recovery files
- * outside it (save_backups_recover_away()). */
+ * outside it (save_backups_recover_away()), when it changed since the
+ * first frame, where event_seed_recovered_save_files() takes it. */
 void event_recover_save_files(bool sync);
+void event_seed_recovered_save_files(void);
+
+/* A recovery file holds the save RAM event_recover_save_files() saw */
+bool event_save_files_recovered(void);
 
 void path_init_savefile_rtc(const char *savefile_path);
 

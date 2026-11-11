@@ -445,6 +445,8 @@ static bool runloop_netplay_saves_off = false;
  * (runloop_path_set_redirect), and whether that turned saves off. */
 static enum runloop_save_root runloop_save_roots[2];
 static bool runloop_save_folder_off = false;
+/* Its save RAM is taken at the first frame */
+static bool runloop_save_folder_seed = false;
 /* The main config file's folder, as last loaded */
 static char runloop_save_config_dir[PATH_MAX_LENGTH];
 /* The content's folders inside its archive ("" if none), which its
@@ -7295,6 +7297,11 @@ void runloop_recover_save_files(bool sync)
       event_recover_save_files(sync);
 }
 
+bool runloop_save_files_recovered(void)
+{
+   return runloop_save_folder_off && event_save_files_recovered();
+}
+
 static retro_atomic_int_t runloop_save_files_request
    = RETRO_ATOMIC_INT_INITIALIZER(0);
 
@@ -10644,6 +10651,12 @@ int runloop_iterate(void)
 
    runloop_load_deferred_auto_state();
 
+   if (frame_advanced && runloop_save_folder_seed)
+   {
+      runloop_save_folder_seed = false;
+      event_seed_recovered_save_files();
+   }
+
 #ifdef HAVE_COMMAND
    if (frame_advanced && (runloop_st->frame_work & RUNLOOP_WORK_RUN_FRAMES))
       command_run_frames_tick();
@@ -12048,6 +12061,7 @@ void runloop_path_set_redirect(settings_t *settings,
    if (runloop_save_folder_off)
    {
       runloop_save_folder_off  = false;
+      runloop_save_folder_seed = false;
       runloop_st->flags       &= ~RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED;
    }
    runloop_save_roots[0] = RUNLOOP_SAVE_ROOT_CONFIGURED;
@@ -12065,6 +12079,7 @@ void runloop_path_set_redirect(settings_t *settings,
             && !(runloop_st->flags & RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED))
       {
          runloop_save_folder_off  = true;
+         runloop_save_folder_seed = true;
          runloop_st->flags       |= RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED;
       }
    }
@@ -12236,6 +12251,17 @@ void runloop_path_set_redirect(settings_t *settings,
 
 
 #ifdef HAVE_NETWORKING
+   /* A netplay client's save RAM is the host's: no recovery files */
+   if (      runloop_save_folder_off
+         &&  netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_ENABLED, NULL)
+         && !netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_SERVER, NULL)
+         && !netplay_driver_ctl(RARCH_NETPLAY_CTL_USE_CORE_PACKET_INTERFACE, NULL))
+   {
+      runloop_save_folder_off   = false;
+      runloop_save_folder_seed  = false;
+      runloop_netplay_saves_off = true;
+   }
+
    /* Special save directory for netplay clients. */
    if (      runloop_save_roots[0] != RUNLOOP_SAVE_ROOT_NONE
          &&  netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_ENABLED, NULL)

@@ -170,6 +170,7 @@ bool netplay_driver_ctl(enum rarch_netplay_ctl_state state, void *data)
    return false;
 }
 static int saves_off_notices;
+static unsigned recover_calls;
 static char last_notice[DIR_MAX_LENGTH * 2 + 64];
 void ui_companion_driver_msg_queue_push(const char *msg, unsigned priority,
       unsigned duration, bool flush)
@@ -415,6 +416,20 @@ static void folder_check_each_load(void)
             ROOT "/card/RetroArch/saves\n"));
    CHECK(!same_path(runloop_state.name.savestate, "/roms/snes/Game.state"));
    CHECK(!path_is_directory(ROOT "/card"));
+   recover_calls = 0;
+   runloop_recover_save_files(true);
+   CHECK(recover_calls == 1);
+
+   /* A netplay client's save RAM is the host's: off, and not kept. */
+   netplay_client    = true;
+   saves_off_notices = 0;
+   load("/roms/snes/Game");
+   CHECK(runloop_state.flags & RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED);
+   CHECK(saves_off_notices == 1);
+   runloop_recover_save_files(true);
+   CHECK(recover_calls == 1);
+   CHECK(missing_notices == 2);
+   netplay_client    = false;
 
    /* The card again: saves on. */
    CHECK(path_mkdir(ROOT "/card/RetroArch/saves"));
@@ -422,7 +437,7 @@ static void folder_check_each_load(void)
    load("/roms/snes/Game");
    CHECK(!(runloop_state.flags & RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED));
    CHECK(runloop_state.flags & RUNLOOP_FLAG_USE_SRAM);
-   CHECK(missing_notices == 1);
+   CHECK(missing_notices == 2);
 
    cfg_saves[0] = cfg_states[0] = '\0';
    g_defaults.dirs[DEFAULT_DIR_SRAM][0]      = '\0';
@@ -921,7 +936,8 @@ static void netplay_then_folder_gone(void)
 }
 
 /* A netplay client with no usable save root makes no ".netplay"
- * chain under the missing parent. */
+ * chain under the missing parent, and its saves are off as a client's:
+ * the host's save RAM goes to no recovery file. */
 static void netplay_folder_gone(void)
 {
    rm_tree(ROOT "/card");
@@ -935,8 +951,8 @@ static void netplay_folder_gone(void)
    netplay_client = false;
    CHECK(!path_is_directory(ROOT "/card"));
    CHECK(!path_is_directory(ROOT "/default"));
-   CHECK(runloop_save_folder_off);
-   CHECK(!runloop_netplay_saves_off);
+   CHECK(!runloop_save_folder_off);
+   CHECK(runloop_netplay_saves_off);
    CHECK(runloop_state.flags & RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED);
 
    cfg_saves[0] = cfg_states[0] = '\0';
@@ -1107,10 +1123,19 @@ void event_flush_kept_save_files(bool sram_used, bool compress_files)
       kept_flushes++;
 }
 
-/* Saving off for want of a folder is save_e2e's folder_off_recovers. */
+/* Saving off for want of a folder is save_e2e's folder_off_recovers;
+ * here only whether it is asked for. */
 void event_recover_save_files(bool sync)
 {
    (void)sync;
+   recover_calls++;
+}
+
+void event_seed_recovered_save_files(void) { }
+
+bool event_save_files_recovered(void)
+{
+   return false;
 }
 
 static void request_save_files(void *data)

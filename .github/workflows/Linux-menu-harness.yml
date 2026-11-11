@@ -257,7 +257,8 @@ jobs:
           # and the default stands in for one gone at a content load,
           # with a game override loaded too; with saving off for want
           # of a folder, the session's save goes to a recovery file in
-          # the config folder; relative save and state
+          # the config folder once it changed from the first frame,
+          # and only once while unchanged; relative save and state
           # folders are under the config file's folder, not the one
           # RetroArch started in, also for the default config file and
           # one named without a folder; an archive member sorted by
@@ -285,7 +286,7 @@ jobs:
              --lane nosave_netplay_disconnect --lane flush_points \
              --lane config_keeps_folder --lane folder_check_each_load \
              --lane folder_check_override --lane folder_off_recovers \
-             --lane relative_paths \
+             --lane folder_off_unchanged --lane relative_paths \
              --lane relative_config_no_folder \
              --lane relative_default_config \
              --lane archive_member_old_folder \

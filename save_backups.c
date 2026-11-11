@@ -1339,7 +1339,7 @@ enum save_backup_result save_backups_copy_file(const char *path,
  * @data. @sync: it may not have been synced when written, so it is now,
  * and false if that fails. */
 static bool save_backups_recovered(char *s, size_t len, const char *path,
-      const void *data, size_t data_len, bool sync)
+      const void *data, size_t data_len, bool sync, bool beside)
 {
    bool ok;
    char *dir;
@@ -1347,8 +1347,10 @@ static bool save_backups_recovered(char *s, size_t len, const char *path,
    if (     !save_backups_find_recovery(s, len, path, INT64_MIN)
          || !filestream_matches_buf(s, data, data_len))
       return false;
-   /* Newer than the save again, so it is announced */
-   path_set_mtime(s, (int64_t)time(NULL));
+   /* Newer than the save again, so it is announced. Away from a missing
+    * folder there is no save to be newer than. */
+   if (beside)
+      path_set_mtime(s, (int64_t)time(NULL));
    if (!sync)
       return true;
    file = filestream_open(s,
@@ -1374,7 +1376,7 @@ static size_t save_backups_recover_in(char *s, size_t len, const char *path,
    unsigned i;
    char *dir;
    bool made = false;
-   if (save_backups_recovered(s, len, path, data, data_len, sync))
+   if (save_backups_recovered(s, len, path, data, data_len, sync, beside))
       return strlen(s);
    s[0] = '\0';
    if (!(dir = (char*)malloc(PATH_MAX_LENGTH)))

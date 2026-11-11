@@ -803,44 +803,175 @@ def lane_folder_check_each_load(args, n, override=False):
     return r, failures
 
 
+class Commands:
+    """Network commands to a run, each confirmed by its reply or a
+    GET_STATUS, so a check after one never runs before it was read."""
+
+    def __init__(self, r, port):
+        self.r, self.port = r, port
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.settimeout(1)
+
+    def ready(self, timeout=30):
+        """Commands are read: one sent before is lost."""
+        deadline = time.time() + timeout
+        while time.time() < deadline and self.r.proc.poll() is None:
+            if self.ask(b'GET_STATUS').startswith('GET_STATUS'):
+                return True
+        return False
+
+    def send(self, cmd):
+        self.sock.sendto(cmd, ('127.0.0.1', self.port))
+
+    def ask(self, cmd):
+        self.send(cmd)
+        try:
+            return self.sock.recv(4096).decode(errors='replace')
+        except socket.timeout:
+            return ''
+
+    def paused(self, want, timeout=10):
+        """PAUSE_TOGGLE until GET_STATUS says @want (paused or not)."""
+        self.send(b'PAUSE_TOGGLE')
+        deadline = time.time() + timeout
+        while time.time() < deadline and self.r.proc.poll() is None:
+            if self.ask(b'GET_STATUS').startswith(
+                    'GET_STATUS PAUSED' if want else 'GET_STATUS PLAYING'):
+                return True
+            time.sleep(0.02)
+        return False
+
+    def quit(self, timeout=60):
+        self.send(b'QUIT')
+        rc = self.r.wait(timeout)
+        self.sock.close()
+        return rc
+
+
+def traced_kill(r):
+    """Kill what strace runs under a run, then strace: ours alone."""
+    if r.proc.poll() is None:
+        try:
+            kids = Path('/proc/%d/task/%d/children' % (r.proc.pid, r.proc.pid))
+            for pid in kids.read_text().split():
+                os.kill(int(pid), signal.SIGKILL)
+        except OSError:
+            pass
+    r.kill()
+
+
+def folder_off_run(r, port=None):
+    """Saving off: the save folder's parent missing, the default's parent
+    a file, so nothing stands in."""
+    (r.dir / 'xdg-config' / 'retroarch').write_text('')
+    extra = {}
+    if port:
+        extra = dict(network_cmd_enable='true', network_cmd_port=str(port))
+    return r.config(savefile_directory=r.dir / 'gone' / 'saves', **extra)
+
+
+def lane_folder_off_unchanged(args, n):
+    """Saving off and save RAM as the core made it at its first
+    frame: neither a pause nor the close keeps a recovery file, the
+    network SAVE_FILES says so, and the next load with the folder back
+    announces nothing."""
+    r = Run(args.run_dir, 'folder_off_unchanged-%d' % n)
+    failures = []
+    gone = r.dir / 'gone'
+    port = 56300 + n
+    cfg = folder_off_run(r, port)
+    # The core fills save RAM in its first frame.
+    r.start(args, cfg, 20000, r.env(SAVE_E2E_TOUCH_FRAME=0,
+                                    SAVE_E2E_SEED=95, SAVE_E2E_FRAME_MS=10))
+    c = Commands(r, port)
+    check(failures, c.ready(), 'run 0: no network commands')
+    check(failures, r.wait_for(r.dir / 'touched'), 'run 0: no touch')
+    check(failures, c.paused(True), 'run 0: not paused')
+    check(failures, c.paused(False), 'run 0: not unpaused')
+    reply = c.ask(b'SAVE_FILES')
+    check(failures, reply.startswith('SAVE_FILES ERROR nothing to save'),
+          'run 0: SAVE_FILES reply %r' % reply)
+    rc = c.quit()
+    if rc is None:
+        traced_kill(r)
+    check(failures, rc == 0, 'run 0: retroarch exit %s' % rc)
+    log = r.log.read_text(errors='replace')
+    check(failures, 'saving is off for this session' in log,
+          'run 0: saving was not off')
+    recs = sorted(r.dir.rglob('game - * - unsaved.srm'))
+    check(failures, not recs, 'run 0: recovery files %s' % recs)
+    check(failures, 'Unsaved progress' not in log, 'run 0: logged one')
+    check(failures, not gone.exists(), 'run 0: made %s' % gone)
+
+    (gone / 'saves').mkdir(parents=True)
+    r.start(args, cfg, 60, r.env())
+    rc = r.wait(60)
+    check(failures, rc == 0, 'run 1: retroarch exit %s' % rc)
+    log = r.log.read_text(errors='replace')
+    check(failures, 'Unsaved progress' not in log, 'run 1: announced one')
+    return r, failures
+
+
 def lane_folder_off_recovers(args, n):
-    """MR2: the save folder's parent missing and the default unusable,
-    so saving is off: a pause puts the session's save in a recovery file
-    in the config folder, kept through a crash, and a pause with it
-    unchanged adds none; the close does the same; nothing is made under
-    the missing parent.  With the folder back, the next load announces
-    it, and the save that load's session writes resolves it."""
+    """Saving off: a pause puts a changed save RAM in a recovery file
+    in the config folder; pauses with it unchanged neither write, re-date,
+    sync nor log again, and the network SAVE_FILES says where it went; the
+    close does the same; nothing is made under the missing parent.  With
+    the folder back, the next load announces it, and the save that load's
+    session writes resolves it."""
     r = Run(args.run_dir, 'folder_off_recovers-%d' % n)
     failures = []
     gone = r.dir / 'gone'
     rec_dir = r.dir / 'config' / 'recovery'
     port = 56200 + n
-    # The default save folder's parent is a file: no stand-in.
-    (r.dir / 'xdg-config' / 'retroarch').write_text('')
-    cfg = r.config(savefile_directory=gone / 'saves',
-                   network_cmd_enable='true', network_cmd_port=str(port))
-    # Ended by kill, as a crash: only the pause can have written.
+    cfg = folder_off_run(r, port)
+    trace = r.dir / 'strace.log'
+    prefix = ['strace', '-f', '-qq', '-ttt', '-y', '-o', str(trace), '-e',
+              'trace=fsync,fdatasync,utimensat,utimes']
     r.start(args, cfg, 20000, r.env(SAVE_E2E_TOUCHES='30:90',
-                                    SAVE_E2E_FRAME_MS=10))
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                                    SAVE_E2E_FRAME_MS=10), prefix=prefix)
+    c = Commands(r, port)
+    check(failures, c.ready(), 'run 0: no network commands')
     check(failures, r.wait_for(Path('%s-90' % (r.dir / 'touched'))),
           'run 0: no touch')
-    sock.sendto(b'PAUSE_TOGGLE', ('127.0.0.1', port))
+    check(failures, c.paused(True), 'run 0: not paused')
     deadline = time.time() + 10
     while not r.copies('unsaved', rec_dir) and time.time() < deadline:
         time.sleep(0.02)
-    for _ in range(2):
-        sock.sendto(b'PAUSE_TOGGLE', ('127.0.0.1', port))
-        time.sleep(0.5)
-    sock.close()
-    r.kill()
-    r.drain.join()
+    recs = r.copies('unsaved', rec_dir)
+    before = recs[0].stat() if recs else None
+    since = time.time()
+    for want in (False, True, False, True):
+        check(failures, c.paused(want), 'run 0: pause toggle not read')
+    reply = c.ask(b'SAVE_FILES')
+    check(failures, reply.startswith('SAVE_FILES ERROR saving is off for '
+                                     'this session; progress kept in a '
+                                     'recovery file'),
+          'run 0: SAVE_FILES reply %r' % reply)
+    rc = c.quit()
+    if rc is None:
+        traced_kill(r)
+    check(failures, rc == 0, 'run 0: retroarch exit %s' % rc)
     recs = r.copies('unsaved', rec_dir)
     check(failures, len(recs) == 1, 'run 0: %d recovery files' % len(recs))
     check(failures, bool(recs) and recs[-1].read_bytes() == pattern(90),
           'run 0: the recovery file is not the session\'s save')
+    after = recs[0].stat() if recs else None
+    check(failures, before and after
+          and (before.st_ino, before.st_mtime_ns)
+          == (after.st_ino, after.st_mtime_ns),
+          'run 0: the recovery file was rewritten or re-dated')
+    log = r.log.read_text(errors='replace')
+    check(failures, log.count('Unsaved progress') == 1,
+          'run 0: %d log lines' % log.count('Unsaved progress'))
+    late = [l for l in trace.read_text(errors='replace').splitlines()
+            if str(rec_dir) in l and any(
+                float(t) >= since for t in l.split()[:2]
+                if t.replace('.', '', 1).isdigit() and '.' in t)]
+    check(failures, not late, 'run 0: %d syncs or re-dates after the '
+          'first: %s' % (len(late), late[:2]))
 
-    cfg = r.config(savefile_directory=gone / 'saves')
+    cfg = folder_off_run(r)
     r.start(args, cfg, 60, r.env(SAVE_E2E_TOUCH_FRAME=5, SAVE_E2E_SEED=91))
     rc = r.wait(60)
     check(failures, rc == 0, 'run 1: retroarch exit %s' % rc)
@@ -1247,6 +1378,7 @@ LANES = {
     'folder_check_each_load': lane_folder_check_each_load,
     'folder_check_override': lane_folder_check_override,
     'folder_off_recovers': lane_folder_off_recovers,
+    'folder_off_unchanged': lane_folder_off_unchanged,
     'relative_paths': lane_relative_paths,
     'relative_config_no_folder': lane_relative_config_no_folder,
     'relative_default_config': lane_relative_default_config,
@@ -1271,6 +1403,7 @@ POSIX_LANES = {'autosave_full_disk', 'autosave_kill_mid_write',
                'no_rewrite_at_launch', 'unreadable_backed_up',
                'explicit_save_copies', 'folder_check_each_load',
                'folder_check_override', 'folder_off_recovers',
+               'folder_off_unchanged',
                'relative_default_config'} | set(HELD_LANES)
 
 

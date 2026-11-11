@@ -2420,9 +2420,14 @@ bool command_save_savefiles(command_t *cmd, const char* arg)
       to the replier. */
    if (!command_event(CMD_EVENT_SAVE_FILES, NULL))
    {
-      command_reply_error(cmd, "SAVE_FILES",
-            "nothing to save: no content is loaded, or the core has no "
-            "save files");
+      if (runloop_save_files_recovered())
+         command_reply_error(cmd, "SAVE_FILES",
+               "saving is off for this session; progress kept in a "
+               "recovery file");
+      else
+         command_reply_error(cmd, "SAVE_FILES",
+               "nothing to save: no content is loaded, or the core has no "
+               "save files");
       return false;
    }
    cmd->replier(cmd, "OK\n", 3);

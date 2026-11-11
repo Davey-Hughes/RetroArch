@@ -23,8 +23,8 @@
 #include <streams/file_stream.h>
 #include <streams/rzip_stream.h>
 #include <rthreads/rthreads.h>
-#ifdef HAVE_THREADS
 #include <encodings/crc32.h>
+#ifdef HAVE_THREADS
 #include <features/features_cpu.h>
 #include <rthreads/retro_eventcount.h>
 #endif
@@ -89,6 +89,15 @@ enum save_file_flags
    SAVE_FILE_WRITTEN_AFTER      = (1 << 14)
 };
 
+/* Saving off for want of a folder: main thread only */
+enum save_file_rec_flags
+{
+   SAVE_FILE_REC_RAN            = (1 << 0), /* a frame ran */
+   SAVE_FILE_REC_CRC            = (1 << 1), /* rec_crc is set */
+   SAVE_FILE_REC_KEPT           = (1 << 2), /* a recovery file holds it */
+   SAVE_FILE_REC_UNSYNCED       = (1 << 3)
+};
+
 /* One per entry of task_save_files, for the session. Workers read and
  * raise these; the main thread makes them, frees them and turns the
  * raised flags into notices. */
@@ -101,6 +110,9 @@ struct save_file
    /* The number of this session's first before-state-load copy, never
     * pruned; 0 until made */
    retro_atomic_int_t first_bsl;
+   /* Save RAM at the first frame or in the last recovery file */
+   uint32_t rec_crc;
+   unsigned rec_flags;          /* enum save_file_rec_flags */
 };
 
 static struct save_file *save_files = NULL;
@@ -124,6 +136,8 @@ static struct save_file *save_file_get(unsigned slot)
          retro_atomic_int_init(&save_files[i].flags, 0);
          retro_atomic_int_init(&save_files[i].stat, 0);
          retro_atomic_int_init(&save_files[i].first_bsl, 0);
+         save_files[i].rec_crc   = 0;
+         save_files[i].rec_flags = 0;
       }
    }
    return slot < save_files_num ? &save_files[slot] : NULL;
@@ -1780,6 +1794,30 @@ void event_flush_kept_save_files(bool is_sram_used, bool compress_files)
    save_files_flush(is_sram_used, compress_files, 0, true);
 }
 
+void event_seed_recovered_save_files(void)
+{
+   unsigned i;
+   if (!task_save_files)
+      return;
+   for (i = 0; i < task_save_files->size; i++)
+   {
+      struct ram_type ram;
+      retro_ctx_memory_info_t mem_info;
+      struct save_file *f = save_file_get(i);
+      if (!f)
+         continue;
+      f->rec_flags = SAVE_FILE_REC_RAN;
+      /* A core that reports its memory later has nothing to compare
+       * with: any it reports is kept. */
+      if (content_get_memory(&mem_info, &ram, i))
+      {
+         f->rec_crc    = encoding_crc32(0, (const uint8_t*)mem_info.data,
+               mem_info.size);
+         f->rec_flags |= SAVE_FILE_REC_CRC;
+      }
+   }
+}
+
 void event_recover_save_files(bool sync)
 {
    unsigned i;
@@ -1790,16 +1828,44 @@ void event_recover_save_files(bool sync)
       struct ram_type ram;
       retro_ctx_memory_info_t mem_info;
       char *rec;
-      content_get_memory(&mem_info, &ram, i);
-      if (     !mem_info.data || !mem_info.size
-            || !(rec = (char*)malloc(PATH_MAX_LENGTH)))
+      uint32_t crc;
+      struct save_file *f = save_file_get(i);
+      /* Before the first frame nothing has run */
+      if (     !f || !(f->rec_flags & SAVE_FILE_REC_RAN)
+            || !content_get_memory(&mem_info, &ram, i))
+         continue;
+      crc = encoding_crc32(0, (const uint8_t*)mem_info.data, mem_info.size);
+      if (     (f->rec_flags & SAVE_FILE_REC_CRC) && crc == f->rec_crc
+            && (!sync || !(f->rec_flags & SAVE_FILE_REC_UNSYNCED)))
+         continue;
+      if (!(rec = (char*)malloc(PATH_MAX_LENGTH)))
          continue;
       if (save_backups_recover_away(rec, PATH_MAX_LENGTH,
                task_save_files->elems[i].data, mem_info.data, mem_info.size,
                sync))
-         RARCH_WARN("[SRAM] Unsaved progress: \"%s\"\n", rec);
+      {
+         if (!(f->rec_flags & SAVE_FILE_REC_CRC) || crc != f->rec_crc)
+            RARCH_WARN("[SRAM] Unsaved progress: \"%s\"\n", rec);
+         f->rec_crc    = crc;
+         f->rec_flags |= SAVE_FILE_REC_CRC | SAVE_FILE_REC_KEPT;
+         if (sync)
+            f->rec_flags &= ~SAVE_FILE_REC_UNSYNCED;
+         else
+            f->rec_flags |= SAVE_FILE_REC_UNSYNCED;
+      }
+      else
+         f->rec_flags &= ~SAVE_FILE_REC_KEPT;
       free(rec);
    }
+}
+
+bool event_save_files_recovered(void)
+{
+   size_t i;
+   for (i = 0; i < save_files_num; i++)
+      if (save_files[i].rec_flags & SAVE_FILE_REC_KEPT)
+         return true;
+   return false;
 }
 
 bool event_load_save_files(bool is_sram_load_disabled)
