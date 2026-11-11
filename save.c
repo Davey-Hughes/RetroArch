@@ -1783,7 +1783,7 @@ void event_flush_kept_save_files(bool is_sram_used, bool compress_files)
 void event_recover_save_files(bool sync)
 {
    unsigned i;
-   if (!task_save_files)
+   if (!task_save_files || runloop_state_get_ptr()->save_load_hold)
       return;
    for (i = 0; i < task_save_files->size; i++)
    {
