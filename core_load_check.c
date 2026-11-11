@@ -962,7 +962,11 @@ static void core_load_park_start(void)
       p->state = CORE_LOAD_PARK_SEED;
       goto end;
    }
-   if (g && core_load_slot_refusal_holds(s))
+   /* Only the file hashed may be answered, so g must be held or bound
+    * by its ctime */
+   if (     g
+         && (lent || core_load_rt.slot.c.rec.id.ctime_kept)
+         && core_load_slot_refusal_holds(s))
    {
       core_load_park_take_slot(g, lent);
       g = NULL;

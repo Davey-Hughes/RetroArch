@@ -1916,15 +1916,26 @@ static void test_park_no_menu(void)
    core_load_check_notify();
    CHECK(osd_refused() == shown + 1);
    /* With the drivers up it shows at once; the refusal kept for the
-    * file answers, so the park ends at once */
+    * file answers, so the park ends at once. Windows keeps no file or
+    * ctime to bind it: checked again. */
+#ifdef _WIN32
+   CHECK(park(core));
+   drain();
+   CHECK(frees == 2);
+#else
    CHECK(!park(core));
    CHECK(frees == 1);
+#endif
    CHECK(osd_refused() == shown + 2);
    /* After a deinit it waits for the drivers again */
    core_load_check_deinit();
    CHECK(park(core));
    drain();
+#ifdef _WIN32
+   CHECK(frees == 3);
+#else
    CHECK(frees == 2);
+#endif
    CHECK(osd_refused() == shown + 2);
    /* and what it held is gone with the next one */
    core_load_check_deinit();
@@ -1971,6 +1982,10 @@ static void test_park_replaced_up(void)
    opens = menu_opens;
    CHECK(park(core));
    CHECK(frees == 1);
+#ifdef _WIN32
+   /* Checked again first: nothing binds the refusal's file */
+   drain();
+#endif
    /* One push: the newer request's */
    CHECK(menu_opens == opens + 1);
    CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE));
@@ -1979,6 +1994,36 @@ static void test_park_replaced_up(void)
    CHECK(rerun_id == 2);
    CHECK(frees == 2);
    stop();
+}
+
+/* A quiet check's refusal keeps no file. With no kept ctime to bind it,
+ * a park checks again rather than answer on a file opened after the
+ * hash. */
+static void test_park_quiet_refused(bool ctime_kept)
+{
+   dylib_t lib = NULL;
+   char core[256];
+   unsigned opens;
+#ifdef __linux__
+   no_ctime_fs = !ctime_kept;
+#endif
+   start(false);
+   park_reset();
+   CHECK(put_core(core, "quiet_libretro" LIB_EXT, 'b'));
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_REFUSED);
+   drain();
+   opens = menu_opens;
+   CHECK(park(core));
+   CHECK(queued() == (ctime_kept ? 0 : 1));
+   drain();
+   CHECK(menu_opens == opens + 1);
+   CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE));
+   park_wait(1);
+   CHECK(rerun_id == 2);
+   stop();
+#ifdef __linux__
+   no_ctime_fs = 0;
+#endif
 }
 
 /* A park's check is the user's: a pass the slot holds for another core
@@ -2936,6 +2981,14 @@ int main(void)
    test_park_no_menu();
    test_park_replaced();
    test_park_replaced_up();
+#ifdef _WIN32
+   test_park_quiet_refused(false);
+#else
+   test_park_quiet_refused(true);
+#ifdef __linux__
+   test_park_quiet_refused(false);
+#endif
+#endif
    test_park_other_pass();
    test_park_seed();
    test_park_unopenable();
