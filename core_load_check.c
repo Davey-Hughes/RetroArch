@@ -1230,6 +1230,13 @@ void core_load_check_loaded(void)
       core_load_rt.loaded.pass = false;
 }
 
+void core_load_check_builtin_loaded(void)
+{
+   /* Opened for no library: a probe's grant isn't this load's */
+   core_load_rt.granted = CORE_LOAD_GRANT_NONE;
+   core_load_check_loaded();
+}
+
 void core_load_check_unloaded(void)
 {
    core_load_rt.running = false;

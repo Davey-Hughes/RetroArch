@@ -32,6 +32,9 @@ bool core_load_check_refused(const char *path);
 /* The core the last core_load_check_open() opened is now running. A
  * waiting park ends, as the user's Cancel would end it. */
 void core_load_check_loaded(void);
+/* A built-in core is now running: it ends what another core's load
+ * ends */
+void core_load_check_builtin_loaded(void);
 /* Its pass outlives the unload while its held file or its identity
  * binds it, until another core loads or a release */
 void core_load_check_unloaded(void);

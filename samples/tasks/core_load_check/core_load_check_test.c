@@ -2275,6 +2275,43 @@ static void test_park_other_load(void)
    park_other_load(PARK_IN_SEED, false);
 }
 
+/* A built-in core's start is another core's load: it ends a waiting
+ * park and the Load Once of the core loaded last */
+static void test_builtin_load(void)
+{
+   dylib_t lib = NULL;
+   char core[256];
+   start(false);
+   park_reset();
+   CHECK(put_core(core, "builtin_libretro" LIB_EXT, 'a'));
+   CHECK(park(core));
+   drain();
+   core_load_check_builtin_loaded();
+   CHECK(frees == 1);
+   CHECK(reruns == 0);
+   /* Load Once, its load, Close Content and its reload */
+   CHECK(park(core));
+   drain();
+   CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE));
+   park_wait(1);
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_OPENED);
+   core_load_check_loaded();
+   if (lib)
+      dylib_close(lib);
+   lib = NULL;
+   core_load_check_unloaded();
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_OPENED);
+   if (lib)
+      dylib_close(lib);
+   lib = NULL;
+   /* The reload's grant is no built-in core's */
+   core_load_check_builtin_loaded();
+   core_load_check_unloaded();
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_REFUSED);
+   CHECK(!lib);
+   stop();
+}
+
 static void test_park_same_load(void)
 {
    park_other_load(PARK_IN_CHECK, true);
@@ -2996,6 +3033,7 @@ int main(void)
    test_park_no_check();
    test_park_deinit();
    test_park_other_load();
+   test_builtin_load();
    test_park_same_load();
    test_park_own_rerun();
    test_park_fallback();
