@@ -1765,6 +1765,32 @@ static void backup_no_room_recovery_dir(void)
          true, NULL) == SAVE_BACKUP_NO_FILE);
 }
 
+/* A copy that fails in a recovery folder leaves no folder behind; a
+ * recovery folder that can't be made gives way to the next root's. */
+static void backup_no_room_recovery_fallbacks(void)
+{
+   static char dir[512], path[PATH_MAX_LENGTH];
+   static char s[PATH_MAX_LENGTH], t[256], u[256];
+   set_time(23, 30, 0);
+   roots();
+   CHECK(deep_dir(dir, sizeof(dir), "noroom3", SAVE_BACKUPS_PATH_MAX - 29));
+   fill_pathname_join(path, dir, "Game.srm", sizeof(path));
+   recovery_folder(t, sizeof(t), path);
+   snprintf(u, sizeof(u), ROOT "/appdata/recovery/%s", path_basename(t));
+   write_fails = true;
+   CHECK(save_backups_copy_image(path, SAVE_BACKUP_CUT, "f", 1, false, NULL)
+         == SAVE_BACKUP_FAILED);
+   write_fails = false;
+   CHECK(!path_is_valid(t) && !path_is_valid(u));
+
+   put(ROOT "/rfile/recovery", "file");
+   save_backups_set_roots(ROOT "/saves", ROOT "/states", ROOT "/roms",
+         ROOT "/system", ROOT "/rfile", ROOT "/appdata", "Snes9x");
+   CHECK(save_backups_recovery_dir(s, sizeof(s), path, NULL,
+         SAVE_BACKUP_NOT_LOADED));
+   CHECK(same_path(s, u));
+}
+
 /* Two saves of one name, both too deep for a copy name beside them,
  * each past retention: one's copies never prune the other's. */
 static void backup_no_room_own_folder(void)
@@ -2401,6 +2427,7 @@ int main(void)
    backup_no_room();
    backup_no_room_recovery_dir();
    backup_no_room_own_folder();
+   backup_no_room_recovery_fallbacks();
    backup_moved();
    backup_dir_units();
 #endif

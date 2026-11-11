@@ -2308,6 +2308,7 @@ typedef struct
    char held[PATH_MAX_LENGTH];
    char made[PATH_MAX_LENGTH];
    char compared[PATH_MAX_LENGTH];
+   char recovery[2][PATH_MAX_LENGTH]; /* where no name fits in dir */
 } auto_state_keep_t;
 
 /* How old an unsynced copy is before it is taken to be on the disk */
@@ -2339,6 +2340,11 @@ static void auto_state_keep_close(auto_state_keep_t *keep)
  * False when none is left. */
 static bool auto_state_keep_begin(auto_state_keep_t *keep)
 {
+   /* Where the set-aside went: off the main thread, it lists them */
+   if (!keep->n)
+      save_backups_recovery_pick(keep->dir, sizeof(keep->dir),
+            keep->recovery[0], keep->recovery[1], keep->path, keep->core,
+            SAVE_BACKUP_NOT_LOADED);
    while (++keep->n <= SAVE_BACKUPS_HELD_MAX)
       if (     save_backups_held_name(keep->held, sizeof(keep->held),
                   keep->path, keep->n)
@@ -2611,6 +2617,10 @@ void content_auto_state_keep(const char *path)
       memcpy(keep->core, core, core_len);
    strlcpy(keep->path, path, sizeof(keep->path));
    attr.i = 0;
+   save_backups_recovery_folder(keep->recovery[0],
+         sizeof(keep->recovery[0]), path, false);
+   save_backups_recovery_folder(keep->recovery[1],
+         sizeof(keep->recovery[1]), path, true);
    if (save_backups_dir(keep->dir, sizeof(keep->dir), path))
    {
       if (!auto_state_keep_tasks)
@@ -2687,10 +2697,37 @@ static void content_auto_state_unhold(const char *path, unsigned n,
    runloop_state_get_ptr()->auto_state_owned = false;
 }
 
-/* Moves @path to the backups, its copy's name into @moved; across
- * drives holds it beside itself, as @held, until a task copies it
- * there. @sync: a move or copy into the backups is on the disk before
- * the slot's folder is. Files only, for any thread. */
+/* content_auto_state_move_aside() into @dir, of PATH_MAX_LENGTH and
+ * as much again after it. */
+static enum save_backup_result content_auto_state_move_into(char *dir,
+      const char *path, unsigned *held, char *moved, size_t len, bool sync)
+{
+   /* A rename, else held for a task, else an unsynced copy the new
+    * state's rename replaces: no synced copy inside the frame. */
+   enum save_backup_result result = save_backups_move_begin(dir, path,
+         NULL, SAVE_BACKUP_NOT_LOADED, dir + PATH_MAX_LENGTH,
+         PATH_MAX_LENGTH);
+   if (result == SAVE_BACKUP_MADE)
+   {
+      if (len)
+         strlcpy(moved, dir + PATH_MAX_LENGTH, len);
+      if (sync)
+         retro_vfs_dir_sync_impl(dir);
+   }
+   else if (     result == SAVE_BACKUP_COPY_OWED
+         && content_auto_state_hold(path, held))
+      result = SAVE_BACKUP_MADE;
+   else
+      result = save_backups_copy_to(dir, path, NULL,
+            SAVE_BACKUP_NOT_LOADED, NULL, 0, sync);
+   return result;
+}
+
+/* Moves @path to the backups, or where no name fits there to its
+ * recovery folder, its copy's name into @moved; across drives holds it
+ * beside itself, as @held, until a task copies it there. @sync: a move
+ * or copy into the backups is on the disk before the slot's folder is.
+ * Files only, for any thread. */
 static bool content_auto_state_move_aside(const char *path, unsigned *held,
       char *moved, size_t len, bool sync)
 {
@@ -2698,27 +2735,14 @@ static bool content_auto_state_move_aside(const char *path, unsigned *held,
    char *dir = (char*)malloc(2 * PATH_MAX_LENGTH);
    if (len)
       moved[0] = '\0';
-   /* A rename, else held for a task, else an unsynced copy the new
-    * state's rename replaces: no synced copy inside the frame. */
    if (dir && save_backups_dir(dir, PATH_MAX_LENGTH, path))
-   {
-      result = save_backups_move_begin(dir, path, NULL,
-            SAVE_BACKUP_NOT_LOADED, dir + PATH_MAX_LENGTH,
-            PATH_MAX_LENGTH);
-      if (result == SAVE_BACKUP_MADE)
-      {
-         if (len)
-            strlcpy(moved, dir + PATH_MAX_LENGTH, len);
-         if (sync)
-            retro_vfs_dir_sync_impl(dir);
-      }
-      else if (     result == SAVE_BACKUP_COPY_OWED
-            && content_auto_state_hold(path, held))
-         result = SAVE_BACKUP_MADE;
-      else
-         result = save_backups_copy_to(dir, path, NULL,
-               SAVE_BACKUP_NOT_LOADED, NULL, 0, sync);
-   }
+      result = content_auto_state_move_into(dir, path, held, moved, len,
+            sync);
+   if (     result != SAVE_BACKUP_MADE && dir
+         && save_backups_recovery_dir(dir, PATH_MAX_LENGTH, path, NULL,
+            SAVE_BACKUP_NOT_LOADED))
+      result = content_auto_state_move_into(dir, path, held, moved, len,
+            sync);
    free(dir);
    if (result != SAVE_BACKUP_MADE)
    {

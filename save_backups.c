@@ -1206,7 +1206,7 @@ enum save_backup_result save_backups_move_to(const char *dir,
 
 /* @path's own folder in root @i's recovery folder, named by its
  * CRC-32, into @s: saves of one name never share copies there. */
-static bool save_backups_recovery_folder(char *s, size_t len, unsigned i,
+static bool save_backups_recovery_at(char *s, size_t len, unsigned i,
       const char *path)
 {
    char id[9];
@@ -1241,11 +1241,84 @@ static enum save_backup_result save_backups_copy_any(const char *path,
    for (i = SAVE_BACKUPS_ROOT_CONFIG; no_room
          && result == SAVE_BACKUP_FAILED && i <= SAVE_BACKUPS_ROOT_APP_DATA;
          i++)
-      if (save_backups_recovery_folder(dir, PATH_MAX_LENGTH, i, path))
-         result = save_backups_copy_seq(dir, path, NULL, reason, data, len,
-               sync, seq, NULL);
+      /* Not left behind empty */
+      if (     save_backups_recovery_at(dir, PATH_MAX_LENGTH, i, path)
+            && (result = save_backups_copy_seq(dir, path, NULL, reason,
+                  data, len, sync, seq, NULL)) == SAVE_BACKUP_FAILED)
+         path_rmdir(dir);
    free(dir);
    return result;
+}
+
+/* Whether no name of a copy of @path for @reason fits in @dir */
+static bool save_backups_no_room(const char *dir, const char *path,
+      const char *core, enum save_backup_reason reason)
+{
+   unsigned seq;
+   struct save_backups_copies c;
+   bool no_room = false;
+   char *s      = (char*)malloc(PATH_MAX_LENGTH);
+   if (!s)
+      return false;
+   if (save_backups_list_copies(&c, dir, path, core))
+      save_backups_free_name(s, PATH_MAX_LENGTH, dir, &c, reason, &seq,
+            &no_room);
+   save_backups_free_copies(&c);
+   free(s);
+   return no_room;
+}
+
+bool save_backups_recovery_folder(char *s, size_t len, const char *path,
+      bool app_data)
+{
+   if (save_backups_recovery_at(s, len, app_data
+            ? SAVE_BACKUPS_ROOT_APP_DATA : SAVE_BACKUPS_ROOT_CONFIG, path))
+      return true;
+   if (len)
+      s[0] = '\0';
+   return false;
+}
+
+bool save_backups_recovery_pick(char *dir, size_t len,
+      const char *config_rec, const char *app_rec, const char *path,
+      const char *core, enum save_backup_reason reason)
+{
+   unsigned i;
+   const char *rec[2];
+   rec[0] = config_rec;
+   rec[1] = app_rec;
+   if (!save_backups_no_room(dir, path, core, reason))
+      return false;
+   for (i = 0; i < 2; i++)
+   {
+      if (string_is_empty(rec[i]) || !path_mkdir(rec[i]))
+         continue;
+      if (!save_backups_no_room(rec[i], path, core, reason))
+      {
+         strlcpy(dir, rec[i], len);
+         return true;
+      }
+      /* Made for nothing */
+      path_rmdir(rec[i]);
+   }
+   return false;
+}
+
+bool save_backups_recovery_dir(char *s, size_t len, const char *path,
+      const char *core, enum save_backup_reason reason)
+{
+   bool picked = false;
+   char *rec   = (char*)malloc(2 * PATH_MAX_LENGTH);
+   if (!rec)
+      return false;
+   save_backups_recovery_folder(rec, PATH_MAX_LENGTH, path, false);
+   save_backups_recovery_folder(rec + PATH_MAX_LENGTH, PATH_MAX_LENGTH,
+         path, true);
+   if (save_backups_dir(s, len, path))
+      picked = save_backups_recovery_pick(s, len, rec,
+            rec + PATH_MAX_LENGTH, path, core, reason);
+   free(rec);
+   return picked;
 }
 
 enum save_backup_result save_backups_copy_image(const char *path,

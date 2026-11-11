@@ -129,6 +129,7 @@
 
 #include <retro_common_api.h>
 #include <compat/strl.h>
+#include <encodings/crc32.h>
 #include <queues/message_queue.h>
 #include <queues/task_queue.h>
 #include <streams/file_stream.h>
@@ -137,6 +138,7 @@
 #include <string/stdstring.h>
 #include <vfs/vfs_implementation.h>
 #include <retro_timers.h>
+#include <rthreads/rthreads.h>
 
 #include "../../../content.h"
 #include "../../../configuration.h"
@@ -514,6 +516,48 @@ int __wrap_retro_vfs_dir_sync_impl(const char *dir)
    if (dir && strstr(dir, "backups"))
       __atomic_fetch_add(&backups_syncs, 1, __ATOMIC_RELAXED);
    return __real_retro_vfs_dir_sync_impl(dir);
+}
+
+/* Listings, mkdirs and stats made on the thread fs_watch() started */
+static int       fs_watching;
+static uintptr_t fs_watcher;
+static unsigned  fs_calls;
+static void fs_count(void)
+{
+   if (     __atomic_load_n(&fs_watching, __ATOMIC_ACQUIRE)
+         && sthread_get_current_thread_id() == fs_watcher)
+      fs_calls++;
+}
+/* Starts counting on this thread; stopped, returns the count */
+static unsigned fs_watch(bool on)
+{
+   if (on)
+   {
+      fs_calls   = 0;
+      fs_watcher = sthread_get_current_thread_id();
+   }
+   __atomic_store_n(&fs_watching, on, __ATOMIC_RELEASE);
+   return fs_calls;
+}
+libretro_vfs_implementation_dir *__real_retro_vfs_opendir_impl(
+      const char *dir, bool include_hidden);
+libretro_vfs_implementation_dir *__wrap_retro_vfs_opendir_impl(
+      const char *dir, bool include_hidden)
+{
+   fs_count();
+   return __real_retro_vfs_opendir_impl(dir, include_hidden);
+}
+int __real_retro_vfs_mkdir_impl(const char *dir);
+int __wrap_retro_vfs_mkdir_impl(const char *dir)
+{
+   fs_count();
+   return __real_retro_vfs_mkdir_impl(dir);
+}
+int __real_retro_vfs_stat_64_impl(const char *path, int64_t *size);
+int __wrap_retro_vfs_stat_64_impl(const char *path, int64_t *size)
+{
+   fs_count();
+   return __real_retro_vfs_stat_64_impl(path, size);
 }
 
 static void frontend_reset(void)
@@ -2096,16 +2140,13 @@ static void test_writes_counted(void)
  * an .auto the session wanted and did not load goes to the backups
  * before the first write over it.
  * ----------------------------------------------------------------- */
-/* NULL @want: any content */
-static unsigned auto_backups(const char *auto_path, const char *want)
+/* Not-loaded copies in @dir holding @want; NULL @want: any content */
+static unsigned auto_backups_in(const char *dir, const char *want)
 {
-   char dir[PATH_MAX_LENGTH];
    unsigned i, n = 0;
    struct string_list *list;
    struct save_backup_name name;
 
-   if (!save_backups_dir(dir, sizeof(dir), auto_path))
-      return 0;
    if (!(list = dir_list_new(dir, NULL, false, true, false, false)))
       return 0;
    for (i = 0; i < list->size; i++)
@@ -2123,6 +2164,14 @@ static unsigned auto_backups(const char *auto_path, const char *want)
    }
    dir_list_free(list);
    return n;
+}
+
+static unsigned auto_backups(const char *auto_path, const char *want)
+{
+   char dir[PATH_MAX_LENGTH];
+   if (!save_backups_dir(dir, sizeof(dir), auto_path))
+      return 0;
+   return auto_backups_in(dir, want);
 }
 
 static void auto_state_clear(const char *dir)
@@ -2232,6 +2281,81 @@ static void test_auto_state(void)
 
    auto_state_clear(dir);
    save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+}
+
+static void deep_rm(const char *dir)
+{
+   unsigned i;
+   struct string_list *list = dir_list_new(dir, NULL, true, true, false,
+         false);
+   for (i = 0; list && i < list->size; i++)
+   {
+      if (path_is_directory(list->elems[i].data))
+         deep_rm(list->elems[i].data);
+      else
+         filestream_delete(list->elems[i].data);
+   }
+   if (list)
+      dir_list_free(list);
+   path_rmdir(dir);
+}
+
+/* auto_not_loaded_no_room: an .auto so deep that no copy name fits in
+ * its backups is set aside in its own folder in <config>/recovery */
+static void test_auto_state_no_room(void)
+{
+   unsigned k;
+   size_t _len;
+   static char path[PATH_MAX_LENGTH], dir[PATH_MAX_LENGTH];
+   static char held[PATH_MAX_LENGTH];
+
+   frontend_reset();
+   core_fill(TEST_SAVE_STATE_CHUNK);
+   deep_rm("sst_deep");
+   deep_rm("sst_deepcfg");
+   _len = strlcpy(path, "sst_deep", sizeof(path));
+   for (k = 0; k < 9; k++)
+   {
+      path[_len++] = '/';
+      memset(path + _len, 'd', 220);
+      _len        += 220;
+      path[_len]   = '\0';
+   }
+   path_mkdir(path);
+   strlcpy(path + _len, "/Game.state.auto", sizeof(path) - _len);
+   snprintf(dir, sizeof(dir), "sst_deepcfg/recovery/%08lx", (unsigned long)
+         encoding_crc32(0, (const uint8_t*)path, strlen(path)));
+   save_backups_set_roots(NULL, "sst_deep", NULL, NULL, "sst_deepcfg", NULL,
+         "Core");
+   stub_runloop.auto_state_owned  = false;
+   stub_runloop.auto_state_wanted = true;
+   filestream_write_file(path, "old", 3);
+   okf(content_auto_save_state(path) && file_size(path) > (long)core_len,
+       "auto state: no room, the save is written");
+   okf(auto_backups_in(dir, "old") == 1,
+       "auto state: no room, the unloaded one is in its recovery folder");
+
+   /* the new one not moved in: the old one back from there */
+   deep_rm("sst_deepcfg");
+   stub_runloop.auto_state_owned = false;
+   filestream_write_file(path, "old", 3);
+   __atomic_store_n(&refuse_renames, REFUSE_FINISH, __ATOMIC_RELAXED);
+   okf(!content_auto_save_state(path) && file_size(path) == 3
+         && auto_backups_in(dir, NULL) == 0,
+       "auto state: no room, a failed finish puts it back from there");
+   __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+
+   /* held beside it: its task copies it there */
+   deep_rm("sst_deepcfg");
+   save_backups_held_name(held, sizeof(held), path, 1);
+   filestream_write_file(held, "held", 4);
+   content_auto_state_keep(path);
+   pump(100);
+   okf(auto_backups_in(dir, "held") == 1,
+       "auto state: no room, a held one is copied to its recovery folder");
+   save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+   deep_rm("sst_deep");
+   deep_rm("sst_deepcfg");
 }
 
 /* auto_state_close_synced: the close's Auto save, the move of an
@@ -2924,6 +3048,38 @@ static void test_auto_state_policy_chain(void)
        "policy chain: the session's own .auto is saved at the interval");
 
    filestream_delete(path);
+}
+
+/* keep_push_names_only: a held .auto's copy, pushed on the main thread,
+ * only names folders there: the task lists, makes and reads them,
+ * however full the backups */
+static void test_auto_state_keep_push(void)
+{
+   unsigned k, calls;
+   char h[256], name[256], copy[256];
+
+   keep_reset();
+   save_backups_set_roots(NULL, KEEP_DIR, NULL, NULL, KEEP_DIR "/cfg", NULL,
+         "Core");
+   retro_vfs_mkdir_impl(KEEP_DIR "/backups");
+   for (k = 0; k < 200; k++)
+   {
+      snprintf(name, sizeof(name), KEEP_DIR "/backups/Other %u - 2000-01-01 "
+            "00-00-00 - Core - not-loaded.state.auto", k);
+      keep_put(name, "x");
+   }
+   keep_held(h, sizeof(h), KEEP_AUTO, 1);
+   keep_put(h, "old");
+   fs_watch(true);
+   content_auto_state_keep(KEEP_AUTO);
+   calls = fs_watch(false);
+   okf(calls == 0,
+       "keep: the push lists, makes and reads no folder on the main thread");
+   pump(100);
+   okf(keep_copy(copy, sizeof(copy), KEEP_AUTO, "old"),
+       "keep: the task copies it into the backups");
+   auto_state_clear(KEEP_DIR);
+   save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 }
 
 static void test_auto_state_keep(void)
@@ -3905,11 +4061,13 @@ static int run_default_lane(void)
    test_undo_save_during_backup();
    test_undo_save_not_backed_up();
    test_auto_state();
+   test_auto_state_no_room();
    test_auto_state_close_synced();
    test_auto_state_close_fail_notice();
    test_auto_state_undo();
    test_manual_auto_slot_sets_aside();
    test_auto_state_skip_tick();
+   test_auto_state_keep_push();
    test_auto_state_keep();
    test_auto_state_policy_chain();
    test_thumbnail_on_success();

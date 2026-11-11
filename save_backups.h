@@ -174,14 +174,34 @@ bool save_backups_move_finish(const char *path, const char *to);
  * name fits there, into @path's own folder where save_backups_recover()
  * writes. With @seq: in, a copy retention keeps (0: none); out, the
  * copy that holds the data (0: none), with 0 in never a copy from
- * before numbering. A copy
- * is held by its number; at the last number, which copies share, by a
- * value above every number made from its time. */
+ * before numbering. A copy is held by its number; at the last number,
+ * which copies share, by a value above every number made from its
+ * time. */
 enum save_backup_result save_backups_copy_image(const char *path,
       enum save_backup_reason reason, const void *data, size_t len,
       bool sync, unsigned *seq);
 enum save_backup_result save_backups_copy_file(const char *path,
       enum save_backup_reason reason, bool sync, unsigned *seq);
+
+/* @path's own folder where save_backups_recover() writes, under
+ * <config>, or with @app_data under <app data>, into @s ("" and false
+ * when that root is not set). Builds the name only. */
+bool save_backups_recovery_folder(char *s, size_t len, const char *path,
+      bool app_data);
+
+/* When no name of a copy of @path for @reason, named with @core,
+ * fits in the folder @dir: the first of @config_rec and @app_rec
+ * (save_backups_recovery_folder(); "" skipped) that can be made and
+ * one fits in, into @dir. False, @dir as it was, otherwise. Lists the
+ * folders; reads no roots when @core is set. */
+bool save_backups_recovery_pick(char *dir, size_t len,
+      const char *config_rec, const char *app_rec, const char *path,
+      const char *core, enum save_backup_reason reason);
+
+/* save_backups_recovery_pick() from save_backups_dir() of @path, into
+ * @s. */
+bool save_backups_recovery_dir(char *s, size_t len, const char *path,
+      const char *core, enum save_backup_reason reason);
 
 /* Writes @data, meant for @path, as a new "unsaved" file: in the copy
  * folder, else <config>/recovery, else <app data>/recovery. When the
