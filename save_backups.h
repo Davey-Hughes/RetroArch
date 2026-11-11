@@ -107,7 +107,8 @@ const char *save_backups_reason_name(enum save_backup_reason reason);
 
 /* Writes @data, or with NULL the file at @path as it is, into @dir as
  * a copy of @path, named with @core (NULL: the roots' core). Nothing
- * is written when the newest copy of @path there holds the same bytes.
+ * is written when the newest copy of @path there is @core's, made on
+ * this device, and holds the same bytes.
  * NO_FILE: @data is NULL and there is no file at @path.
  * @sync: the write reaches the disk before it replaces anything (off
  * the frame loop); false inside a frame. */

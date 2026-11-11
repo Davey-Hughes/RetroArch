@@ -820,16 +820,18 @@ static void lane_state_load_copy_sync(void)
 }
 
 /* The session's first before-state-load copy outlives retention
- * over 12 state loads; the next session's copies prune it. */
+ * over 12 state loads; the next session's copies prune it. Another
+ * device's copy at its number is not held for it. */
 static void lane_state_load_keeps_first_sync(void)
 {
    static unsigned char ram[BIG], p0[BIG], p[BIG], l[BIG];
-   char first[PATH_MAX_LENGTH];
+   char first[PATH_MAX_LENGTH], other[PATH_MAX_LENGTH];
    unsigned k;
    const int bsl = 1 << SAVE_BACKUP_BEFORE_STATE_LOAD;
 
    clean();
    first[0]  = '\0';
+   other[0]  = '\0';
    fill(p0, BIG, 100);
    memset(ram, 0, BIG);
    core_data = ram;
@@ -853,13 +855,31 @@ static void lane_state_load_keeps_first_sync(void)
       memcpy(ram, l, BIG);
       event_save_files(true, false, true, true, NULL);
       if (!k)
+      {
+         struct save_backup_name n;
+         const char *base;
          CHECK(copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, first,
                   sizeof(first)) == 1 && holds(first, p0, BIG),
                "keeps_first: no first copy");
+         /* synced in from another device that took the same number */
+         base = path_basename(first);
+         if (save_backups_parse(base, &n))
+         {
+            snprintf(other, sizeof(other),
+                  "backups/%.*s - 2000-01-01 00-00-00 - %04u-%s - %s",
+                  (int)n.game_len, base, n.seq,
+                  strcmp(n.device, "abcd") ? "abcd" : "bcde",
+                  base + n.core_off);
+            put(other, p0, BIG);
+         }
+         CHECK(exists(other), "keeps_first: no other device's copy");
+      }
       if (k == 11)
       {
          CHECK(holds(first, p0, BIG),
                "keeps_first: the session's first copy pruned");
+         CHECK(!exists(other),
+               "keeps_first: another device's copy held for this one");
          CHECK(copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, NULL, 0)
                == 11, "keeps_first: not 10 others beside it");
       }

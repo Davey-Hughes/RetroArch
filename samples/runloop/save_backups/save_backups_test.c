@@ -567,6 +567,37 @@ static void backup_identical_skip(void)
    CHECK(count_files(dir) == 4);
 }
 
+/* One folder for every core: an identical copy is skipped only onto
+ * the same core's newest. */
+static void identical_skip_same_core(void)
+{
+   unsigned seq;
+   char dir[] = ROOT "/shared/backups";
+   save_backups_set_roots(ROOT "/shared", NULL, NULL, NULL, NULL, NULL,
+         "Snes9x");
+   set_time(14, 0, 0);
+   CHECK(save_backups_copy_image(ROOT "/shared/Game.srm",
+         SAVE_BACKUP_BEFORE_STATE_LOAD, "blank", 5, true, NULL)
+         == SAVE_BACKUP_MADE);
+   save_backups_set_roots(ROOT "/shared", NULL, NULL, NULL, NULL, NULL,
+         "bsnes");
+   set_time(14, 0, 1);
+   seq = 0;
+   CHECK(save_backups_copy_image(ROOT "/shared/Game.srm",
+         SAVE_BACKUP_BEFORE_STATE_LOAD, "blank", 5, true, &seq)
+         == SAVE_BACKUP_MADE);
+   CHECK(seq == 2 && count_files(dir) == 2);
+   CHECK(holds(ROOT "/shared/backups/"
+         "Game - 2026-11-03 14-00-01 - 0002-kqmz - bsnes - before-state-load.srm",
+         "blank"));
+   set_time(14, 0, 2);
+   seq = 0;
+   CHECK(save_backups_copy_image(ROOT "/shared/Game.srm",
+         SAVE_BACKUP_BEFORE_STATE_LOAD, "blank", 5, true, &seq)
+         == SAVE_BACKUP_MADE);
+   CHECK(seq == 2 && count_files(dir) == 2);
+}
+
 static void backup_retention(void)
 {
    unsigned k;
@@ -836,6 +867,53 @@ static void make_copies(const char *dir, const char *name, const char *core,
             SAVE_BACKUP_BEFORE_STATE_LOAD, text, strlen(text), true)
             == SAVE_BACKUP_MADE);
    }
+}
+
+/* Another device's newest copy never stands for this one's: an
+ * identical copy is made beside it, and a held number keeps only this
+ * device's copy. */
+static void skip_other_device(void)
+{
+   unsigned k, seq, first;
+   char text[8];
+   char dir[]  = ROOT "/otherdev/backups";
+   char dir2[] = ROOT "/otherdev2/backups";
+   save_backups_set_roots(ROOT "/otherdev", NULL, NULL, NULL, NULL, NULL,
+         "Snes9x");
+   put(ROOT "/otherdev/backups/"
+         "Game - 2026-11-03 15-59-00 - 0001-abcd - Snes9x - before-state-load.srm",
+         "same");
+   set_time(16, 0, 0);
+   seq = 0;
+   CHECK(save_backups_copy_image(ROOT "/otherdev/Game.srm",
+         SAVE_BACKUP_BEFORE_STATE_LOAD, "same", 4, true, &seq)
+         == SAVE_BACKUP_MADE);
+   CHECK(seq == 2 && count_files(dir) == 2);
+   CHECK(holds(ROOT "/otherdev/backups/"
+         "Game - 2026-11-03 16-00-00 - 0002-kqmz - Snes9x - before-state-load.srm",
+         "same"));
+   save_backups_set_roots(ROOT "/otherdev2", NULL, NULL, NULL, NULL, NULL,
+         "Snes9x");
+   seq = 0;
+   CHECK(save_backups_copy_image(ROOT "/otherdev2/Game.srm",
+         SAVE_BACKUP_BEFORE_STATE_LOAD, "first", 5, true, &seq)
+         == SAVE_BACKUP_MADE);
+   CHECK(seq == 1);
+   first = seq;
+   put(ROOT "/otherdev2/backups/"
+         "Game - 2026-11-03 15-59-01 - 0001-abcd - Snes9x - before-state-load.srm",
+         "x");
+   for (k = 0; k < 12; k++)
+   {
+      set_time(16, 1, (int)k);
+      snprintf(text, sizeof(text), "b%u", k);
+      seq = first;
+      CHECK(save_backups_copy_image(ROOT "/otherdev2/Game.srm",
+            SAVE_BACKUP_BEFORE_STATE_LOAD, text, strlen(text), true, &seq)
+            == SAVE_BACKUP_MADE);
+   }
+   CHECK(count_files(dir2) == 11 && count_tagged(dir2, 'b') == 10);
+   CHECK(count_tagged(dir2, 'x') == 0 && count_tagged(dir2, 'f') == 1);
 }
 
 /* A long file's copies are never pruned by a shorter file whose name
@@ -2146,6 +2224,8 @@ int main(void)
    backup_core_chars();
    backup_collisions();
    backup_identical_skip();
+   identical_skip_same_core();
+   skip_other_device();
    backup_retention();
    backup_retention_not_loaded();
    backup_held();

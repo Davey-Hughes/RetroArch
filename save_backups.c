@@ -707,10 +707,11 @@ static unsigned save_backups_record(unsigned seq, const char *time)
 
 /* Deletes the oldest copies of one file for @reason in @list, all but
  * SAVE_BACKUPS_KEEP counting the one just made, which is not in it.
- * The copy held by @keep is neither counted nor deleted. */
+ * The copy held by @keep, @device's, is neither counted nor deleted. */
 static void save_backups_retain(struct string_list *list,
       struct save_backup_name *names, const bool *mine,
-      enum save_backup_reason reason, size_t ext_len, unsigned keep)
+      enum save_backup_reason reason, size_t ext_len, unsigned keep,
+      const char *device)
 {
    size_t i;
    size_t count = 0;
@@ -722,7 +723,9 @@ static void save_backups_retain(struct string_list *list,
       name = path_basename_nocompression(list->elems[i].data);
       /* Near its limit or marked, the game may be a longer name's cut:
        * never pruned */
-      if (keep && save_backups_record(names[i].seq, names[i].time) == keep)
+      if (     keep
+            && save_backups_record(names[i].seq, names[i].time) == keep
+            && string_is_equal(names[i].device, device))
          names[i].reason = SAVE_BACKUP_REASON_LAST;
       else if (names[i].game_len + SAVE_BACKUPS_CUT_ROOM
                < save_backups_game_max(names[i].core_len, ext_len)
@@ -932,6 +935,16 @@ static bool save_backups_retained(const struct save_backups_copies *c,
             && string_is_equal(c->ext, ".state.auto")));
 }
 
+/* Whether copy @i in @c's list is named for @c's core */
+static bool save_backups_core_is(const struct save_backups_copies *c,
+      size_t i)
+{
+   const char *name = path_basename_nocompression(c->list->elems[i].data);
+   return c->names[i].core_len == strlen(c->field)
+      && !memcmp(name + c->names[i].core_off, c->field,
+            c->names[i].core_len);
+}
+
 /* Whether the copy @copy holds @data, compressed or not: @data is the
  * file @file's bytes, or with NULL an image. */
 static bool save_backups_holds(const char *copy, const void *data,
@@ -960,9 +973,9 @@ static bool save_backups_holds(const char *copy, const void *data,
 
 /* Writes @data as a copy of @path into @dir, its path in @s; with
  * @move, renames @path there instead, or names the copy owed when that
- * fails. With @skip_same, nothing is written when the newest copy
- * holds it; @of_file: @data is @path's bytes. @seq as in
- * save_backups_copy_image(). */
+ * fails. With @skip_same, nothing is written when the newest copy is
+ * this core's, made on this device, and holds it; @of_file: @data is
+ * @path's bytes. @seq as in save_backups_copy_image(). */
 static enum save_backup_result save_backups_write_copy(char *s, size_t len,
       const char *dir, const char *path, const char *core,
       enum save_backup_reason reason, const void *data, size_t data_len,
@@ -980,6 +993,8 @@ static enum save_backup_result save_backups_write_copy(char *s, size_t len,
    if (     skip_same
          && c.newest != (size_t)-1
          && (!seq || keep || c.names[c.newest].seq)
+         && save_backups_core_is(&c, c.newest)
+         && string_is_equal(c.names[c.newest].device, c.device)
          && save_backups_holds(c.list->elems[c.newest].data, data, data_len,
                of_file ? path : NULL))
    {
@@ -1011,7 +1026,7 @@ static enum save_backup_result save_backups_write_copy(char *s, size_t len,
 
    if (save_backups_retained(&c, reason))
       save_backups_retain(c.list, c.names, c.mine, reason, strlen(c.ext),
-            keep);
+            keep, c.device);
 
 end:
    if (result != SAVE_BACKUP_MADE && result != SAVE_BACKUP_COPY_OWED)
@@ -1107,7 +1122,7 @@ void save_backups_retain_made(const char *dir, const char *path,
                   path_basename_nocompression(c.list->elems[i].data), name))
             c.mine[i] = false;
       save_backups_retain(c.list, c.names, c.mine, reason, strlen(c.ext),
-            0);
+            0, c.device);
    }
    save_backups_free_copies(&c);
 }
