@@ -1369,6 +1369,10 @@ int core_load_match_step(core_load_match_t *m)
 
 dylib_t core_load_match_load(core_load_match_t *m)
 {
+#ifndef ANDROID
+   core_file_t *f;
+   bool same;
+#endif
 #ifdef _WIN32
    if (core_load_dll_appended(m->copy_path))
       return NULL;
@@ -1376,8 +1380,8 @@ dylib_t core_load_match_load(core_load_match_t *m)
 #ifndef ANDROID
    /* Loaded by path outside Android: only while the path still names
     * the copy hashed, unchanged */
-   core_file_t *f = core_file_open(m->copy_path);
-   bool same      = f && core_load_same_file(&m->id, f);
+   f    = core_file_open(m->copy_path);
+   same = f && core_load_same_file(&m->id, f);
    core_file_close(f);
    if (!same)
       return NULL;
