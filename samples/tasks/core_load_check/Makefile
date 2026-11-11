@@ -82,6 +82,10 @@ OBJS := $(call sample_objs,$(SOURCES:.c=.o))
 core_load_check_test.o: CFLAGS += -std=c89 -Wno-long-long \
           -Wdeclaration-after-statement -Wframe-larger-than=4096 \
           -D_POSIX_C_SOURCE=199309L
+ifeq ($(shell uname -s),Darwin)
+# _POSIX_C_SOURCE hides strlcpy() from Darwin string.h, which strl.h relies on
+core_load_check_test.o: CFLAGS += -D_DARWIN_C_SOURCE
+endif
 
 ifneq ($(SANITIZER),)
    CFLAGS  := -fsanitize=$(SANITIZER) -fno-omit-frame-pointer $(CFLAGS)
