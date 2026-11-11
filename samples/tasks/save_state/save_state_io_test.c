@@ -427,6 +427,17 @@ static void msg_push_stub(retro_task_t *task, const char *msg,
    }
 }
 
+/* The frontend's own notices */
+static unsigned notices_pushed;
+void runloop_msg_queue_push(const char *msg, size_t len, unsigned prio,
+      unsigned duration, bool flush, char *title,
+      enum message_queue_icon icon, enum message_queue_category category)
+{
+   (void)msg; (void)len; (void)prio; (void)duration; (void)flush;
+   (void)title; (void)icon; (void)category;
+   notices_pushed++;
+}
+
 /* Renames refused at the VFS: the .auto's move into its backups, as
  * across drives; a copy landing there; the new state over the .auto;
  * a held name or a moved one put back. */
@@ -2305,6 +2316,70 @@ static void test_auto_state_close_synced(void)
    save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 }
 
+/* The "unsaved" recovery files of @path holding a whole state */
+static unsigned unsaved_states(const char *path)
+{
+   char dir[PATH_MAX_LENGTH];
+   unsigned i, n = 0;
+   struct string_list *list;
+   struct save_backup_name name;
+   if (     !save_backups_dir(dir, sizeof(dir), path)
+         || !(list = dir_list_new(dir, NULL, false, true, false, false)))
+      return 0;
+   for (i = 0; i < list->size; i++)
+      if (     save_backups_parse(path_basename(list->elems[i].data), &name)
+            && name.reason == SAVE_BACKUP_UNSAVED
+            && file_size(list->elems[i].data) > (long)core_len)
+         n++;
+   dir_list_free(list);
+   return n;
+}
+
+/* auto_state_close_fail_notice: an interval or close Auto save that
+ * cannot be written keeps the old .auto and is shown once a session;
+ * at a close the new state goes to a recovery file */
+static void test_auto_state_close_fail_notice(void)
+{
+   const char *dir  = "sst_auto";
+   const char *path = "sst_auto/Game.state.auto";
+   unsigned notices;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   core_fill(TEST_SAVE_STATE_CHUNK);
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   save_backups_set_roots(NULL, dir, NULL, NULL, NULL, NULL, "Core");
+   auto_slot_path = path;
+   filestream_write_file(path, "old", 3);
+
+   stub_settings.uints.savestate_automatic_interval = 1;
+   stub_runloop.auto_state_save_ready = true;
+   stub_runloop.auto_state_owned      = true;
+   __atomic_store_n(&refuse_renames, REFUSE_FINISH, __ATOMIC_RELAXED);
+   content_save_state_automatic(10000000);
+   notices = notices_pushed;
+   okf(     !content_save_state_automatic(11000000)
+         && filestream_matches_buf(path, "old", 3) && notices_pushed == notices + 1
+         && !unsaved_states(path),
+       "close fail: the interval's failure is shown, the old one kept");
+   okf(     !content_save_state_automatic(12000000)
+         && notices_pushed == notices + 1,
+       "close fail: shown once a session");
+
+   /* the close, before the session's end resets: its recovery file is
+    * shown all the same */
+   okf(     !content_auto_save_state(path) && filestream_matches_buf(path, "old", 3)
+         && unsaved_states(path) == 1 && notices_pushed == notices + 2,
+       "close fail: the close's state goes to a recovery file, shown");
+   __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+
+   auto_slot_path = NULL;
+   content_reset_savestate_backups();
+   auto_state_clear(dir);
+   save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+}
+
 /* -----------------------------------------------------------------
  * manual_auto_slot_sets_aside: Save State to the Auto slot over an
  * .auto the session did not load keeps that one in the backups
@@ -3831,6 +3906,7 @@ static int run_default_lane(void)
    test_undo_save_not_backed_up();
    test_auto_state();
    test_auto_state_close_synced();
+   test_auto_state_close_fail_notice();
    test_auto_state_undo();
    test_manual_auto_slot_sets_aside();
    test_auto_state_skip_tick();

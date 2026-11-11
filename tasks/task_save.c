@@ -233,6 +233,8 @@ static unsigned save_state_tasks_pending   = 0;
  * undo_save_buf before an undo held behind it runs. */
 static unsigned undo_save_buf_tasks_pending = 0;
 static bool save_state_disable_undo        = false;
+/* A close or interval Auto save's failure was shown this session */
+static bool auto_state_failure_shown       = false;
 
 /* State tasks the queue turned away while another state task ran,
  * held here in order and pushed as each one ahead of them finishes.
@@ -2746,6 +2748,34 @@ static bool content_auto_state_set_aside(const char *path, unsigned *held,
    return true;
 }
 
+/* A close or interval Auto save not written, the old .auto kept: at a
+ * close @data, the new one, goes to a recovery file. Shown once a
+ * session, and each time a recovery file is made. */
+static void content_auto_state_failed(const char *path, const void *data,
+      size_t len, bool closing)
+{
+   char msg[256];
+   char *rec = NULL;
+   bool made = false;
+   if (     closing
+         && (rec = (char*)malloc(PATH_MAX_LENGTH))
+         && save_backups_recover(rec, PATH_MAX_LENGTH, path, data, len,
+               true))
+   {
+      made = true;
+      RARCH_WARN("[State] Unsaved progress: \"%s\".\n", rec);
+   }
+   free(rec);
+   if (auto_state_failure_shown && !made)
+      return;
+   auto_state_failure_shown = true;
+   snprintf(msg, sizeof(msg), msg_hash_to_str(made
+            ? MSG_SAVE_WRITE_RECOVERED : MSG_SAVE_WRITE_FAILED),
+         path_basename(path));
+   runloop_msg_queue_push(msg, strlen(msg), 1, 180, true, NULL,
+         MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+}
+
 /* The close's Auto save (@closing: synced) or the interval's. A
  * blocking write, not a task. */
 static bool content_auto_state_write(const char *path, bool closing)
@@ -2786,24 +2816,25 @@ static bool content_auto_state_write(const char *path, bool closing)
          false,
 #endif
          RETRO_VFS_FILE_ACCESS_HINT_SEQUENTIAL_BULK)))
-   {
-      free(serial_data);
-      return false;
-   }
+      goto failed;
 
    if (_len != (size_t)intfstream_write(file, serial_data, _len))
    {
       intfstream_close(file);
-      free(serial_data);
       free(file);
       filestream_delete(tmp_path);
-      return false;
+      goto failed;
    }
 
    /* A failed close (rzip's last chunk, a full disk) is a failed save. */
    _close_ret = intfstream_close(file);
-   free(serial_data);
    free(file);
+   /* Kept for a recovery file at a close only */
+   if (!closing)
+   {
+      free(serial_data);
+      serial_data = NULL;
+   }
 
    /* No room to record a move: one could not be put back. At a close
     * the new one is synced before the old one moves, as Save State. */
@@ -2825,9 +2856,10 @@ static bool content_auto_state_write(const char *path, bool closing)
             filestream_delete(tmp_path);
       }
       free(moved);
-      return false;
+      goto failed;
    }
    free(moved);
+   free(serial_data);
    if (held)
       content_auto_state_keep(path);
    content_save_written();
@@ -2844,6 +2876,11 @@ static bool content_auto_state_write(const char *path, bool closing)
    }
 #endif
    return true;
+
+failed:
+   content_auto_state_failed(path, serial_data, _len, closing);
+   free(serial_data);
+   return false;
 }
 
 /**
@@ -3253,6 +3290,7 @@ void content_reset_savestate_backups(void)
    ram_buf.state_buf.size     = 0;
    ram_buf.state_buf.capacity = 0;
    ram_buf.to_write_file      = false;
+   auto_state_failure_shown   = false;
 }
 
 bool content_undo_load_buf_is_empty(void)
