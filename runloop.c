@@ -843,8 +843,8 @@ void libretro_get_environment_info(
    runloop_st->flags &= ~RUNLOOP_FLAG_IGNORE_ENVIRONMENT_CB;
 }
 
-/* No check: only where core_load_check_open() found no trust store, or
- * on a worker whose core the main thread found none for. Any thread. */
+/* No check: where there is no trust store or checks are off, or on a
+ * worker whose core the main thread found none for. Any thread. */
 dylib_t runloop_core_dylib_open(const char *path, bool quiet)
 {
 #if defined(ANDROID)
