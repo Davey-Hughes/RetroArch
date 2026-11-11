@@ -33883,7 +33883,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MSG_CORE_TRUST_SEEDED,
-   "RetroArch now checks that cores come from libretro. Your installed cores are trusted for now. Use Online Updater > Update Installed Cores to get signed versions."
+   "RetroArch now checks core signatures. Your cores stay trusted; Update Installed Cores gets signed ones."
    )
 MSG_HASH(
    MSG_CORE_WARNING_UNSIGNED,
