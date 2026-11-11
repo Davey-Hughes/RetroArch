@@ -2611,6 +2611,11 @@ bool task_content_park_startup(const char *core_path,
    d->core_path    = strdup(core_path);
    d->content_path = (content_path && *content_path)
       ? strdup(content_path) : NULL;
+   if (content_path && *content_path && !d->content_path)
+   {
+      content_load_parked_free(d);
+      return false;
+   }
 #ifdef HAVE_MENU
    if (menu_core_warning_can_open())
       rerun = content_load_startup_rerun;
