@@ -275,7 +275,7 @@ static bool copy_beside(const char *argv0, const char *name,
    return ok;
 }
 
-/* D2, Q2: -L of a core nothing passes is hashed in place, refused, and
+/* -L of a core nothing passes is hashed in place, refused, and
  * falls back to the dummy core and menu, asking there. The answer runs
  * it as a normal startup would have, from the file checked. */
 static void mode_startup(enum core_warning_choice choice)
@@ -407,8 +407,8 @@ static void set_threaded(void)
    task_queue_set_threaded();
 }
 
-/* Decision 19: a playlist Run reaches CMD_EVENT_LOAD_CORE with no
- * explicit core type; its refused open parks and asks all the same */
+/* A playlist Run reaches CMD_EVENT_LOAD_CORE with no explicit core
+ * type; its refused open parks and asks all the same */
 static void mode_playlist(void)
 {
    content_ctx_info_t info;
@@ -547,7 +547,7 @@ static bool sub_restored(void)
       || string_is_equal(path_get(RARCH_PATH_SUBSYSTEM), "harness_sub");
 }
 
-/* Q10: the re-run restores the subsystem state it parked, not the one
+/* The re-run restores the subsystem state it parked, not the one
  * current then. The harness core loads no subsystem, so the re-run's
  * load fails; what it restored is checked. */
 static void mode_subsystem(void)
@@ -620,7 +620,7 @@ static void mode_probe(void)
    CHECK(wait_for(bad_runs, 600), "the answered Load Core did not start the core");
 }
 
-/* D6: the first run's seed decides, then the startup load runs again */
+/* The first run's seed decides, then the startup load runs again */
 static void mode_seed(void)
 {
    unsigned i;
@@ -642,7 +642,7 @@ static bool reloaded(void)
    return is_dummy() && name && string_is_equal(name, "content_load_harness");
 }
 
-/* D8: Load Once lasts through Close Content and a load of that core
+/* Load Once lasts through Close Content and a load of that core
  * again, until another core loads */
 static void mode_load_once(void)
 {
