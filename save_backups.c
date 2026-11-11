@@ -20,6 +20,7 @@
 #include <time.h>
 
 #include <compat/strl.h>
+#include <encodings/crc32.h>
 #if defined(HAVE_CRYPTO)
 #include <crypto/kdf.h>
 #endif
@@ -867,10 +868,10 @@ static void save_backups_free_copies(struct save_backups_copies *c)
 
 /* A free name in @dir for a copy for @reason into @s, the folder made,
  * its number in *@seq. With none left, the last again: its time orders
- * it among those. */
+ * it among those. *@no_room: no name fits. */
 static bool save_backups_free_name(char *s, size_t len, const char *dir,
       const struct save_backups_copies *c, enum save_backup_reason reason,
-      unsigned *seq)
+      unsigned *seq, bool *no_room)
 {
    size_t _len, name_off;
    unsigned i;
@@ -896,13 +897,13 @@ static bool save_backups_free_name(char *s, size_t len, const char *dir,
             c->stamp, number, c->device, c->field,
             save_backups_reasons[reason], c->ext);
       if ((name_len = strlen(s)) + SAVE_BACKUPS_TEMP_LEN + 1 >= len)
-         return false;
+         break;
 #ifdef SAVE_BACKUPS_PATH_MAX
       if (     c->dir_units >= 0
             &&   (size_t)c->dir_units + SAVE_BACKUPS_TEMP_LEN
                + save_backups_units(s + name_off, strlen(s + name_off))
                > SAVE_BACKUPS_PATH_MAX)
-         return false;
+         break;
 #endif
       if (!path_is_valid(s))
       {
@@ -919,6 +920,8 @@ static bool save_backups_free_name(char *s, size_t len, const char *dir,
       if (number == SAVE_BACKUPS_SEQ_MAX)
          return false;
    }
+   if (no_room && i < SAVE_BACKUPS_SEQ_TRIES)
+      *no_room = true;
    return false;
 }
 
@@ -979,7 +982,8 @@ static bool save_backups_holds(const char *copy, const void *data,
 static enum save_backup_result save_backups_write_copy(char *s, size_t len,
       const char *dir, const char *path, const char *core,
       enum save_backup_reason reason, const void *data, size_t data_len,
-      bool move, bool skip_same, bool of_file, bool sync, unsigned *seq)
+      bool move, bool skip_same, bool of_file, bool sync, unsigned *seq,
+      bool *no_room)
 {
    struct save_backups_copies c;
    enum save_backup_result result = SAVE_BACKUP_FAILED;
@@ -1005,7 +1009,7 @@ static enum save_backup_result save_backups_write_copy(char *s, size_t len,
       goto end;
    }
 
-   if (!save_backups_free_name(s, len, dir, &c, reason, &made))
+   if (!save_backups_free_name(s, len, dir, &c, reason, &made, no_room))
       goto end;
    made = save_backups_record(made, c.stamp);
 
@@ -1019,6 +1023,9 @@ static enum save_backup_result save_backups_write_copy(char *s, size_t len,
    }
    else if (!save_backups_write_file(s, data, (int64_t)data_len, sync))
    {
+      /* Written in place: the free name holds only our partial copy */
+      if (filestream_atomic_in_place(s))
+         filestream_delete(s);
       s[0] = '\0';
       goto end;
    }
@@ -1045,7 +1052,7 @@ enum save_backup_result save_backups_name_copy(char *s, size_t len,
    struct save_backups_copies c;
    enum save_backup_result result = SAVE_BACKUP_FAILED;
    if (     save_backups_list_copies(&c, dir, path, core)
-         && save_backups_free_name(s, len, dir, &c, reason, &seq))
+         && save_backups_free_name(s, len, dir, &c, reason, &seq, NULL))
       result = SAVE_BACKUP_MADE;
    else
       s[0] = '\0';
@@ -1129,7 +1136,7 @@ void save_backups_retain_made(const char *dir, const char *path,
 
 static enum save_backup_result save_backups_copy_seq(const char *dir,
       const char *path, const char *core, enum save_backup_reason reason,
-      const void *data, size_t len, bool sync, unsigned *seq)
+      const void *data, size_t len, bool sync, unsigned *seq, bool *no_room)
 {
    enum save_backup_result result;
    void *buf = NULL;
@@ -1153,7 +1160,8 @@ static enum save_backup_result save_backups_copy_seq(const char *dir,
       len  = (size_t)n;
    }
    result = save_backups_write_copy(made, PATH_MAX_LENGTH, dir, path,
-         core, reason, data, len, false, true, buf != NULL, sync, seq);
+         core, reason, data, len, false, true, buf != NULL, sync, seq,
+         no_room);
    free(buf);
    free(made);
    return result;
@@ -1164,7 +1172,7 @@ enum save_backup_result save_backups_copy_to(const char *dir,
       const void *data, size_t len, bool sync)
 {
    return save_backups_copy_seq(dir, path, core, reason, data, len, sync,
-         NULL);
+         NULL, NULL);
 }
 
 enum save_backup_result save_backups_move_begin(const char *dir,
@@ -1174,7 +1182,7 @@ enum save_backup_result save_backups_move_begin(const char *dir,
    if (!path_is_valid(path))
       return SAVE_BACKUP_NO_FILE;
    return save_backups_write_copy(s, len, dir, path, core, reason,
-         NULL, 0, true, false, false, false, NULL);
+         NULL, 0, true, false, false, false, NULL, NULL);
 }
 
 enum save_backup_result save_backups_move_to(const char *dir,
@@ -1187,7 +1195,7 @@ enum save_backup_result save_backups_move_to(const char *dir,
    if (!(made = (char*)malloc(PATH_MAX_LENGTH)))
       return SAVE_BACKUP_FAILED;
    result = save_backups_write_copy(made, PATH_MAX_LENGTH, dir, path,
-         core, reason, NULL, 0, true, false, false, false, NULL);
+         core, reason, NULL, 0, true, false, false, false, NULL, NULL);
    if (result == SAVE_BACKUP_COPY_OWED)
       result = (  save_backups_copy_synced(path, made)
                && save_backups_move_finish(path, made))
@@ -1196,29 +1204,62 @@ enum save_backup_result save_backups_move_to(const char *dir,
    return result;
 }
 
+/* @path's own folder in root @i's recovery folder, named by its
+ * CRC-32, into @s: saves of one name never share copies there. */
+static bool save_backups_recovery_folder(char *s, size_t len, unsigned i,
+      const char *path)
+{
+   char id[9];
+   if (!save_backups_roots[i])
+      return false;
+   snprintf(id, sizeof(id), "%08lx", (unsigned long)encoding_crc32(0,
+         (const uint8_t*)path, strlen(path)));
+   fill_pathname_join(s, save_backups_roots[i], SAVE_BACKUPS_RECOVERY_DIR,
+         len);
+   fill_pathname_join(s, s, id, len);
+   return true;
+}
+
+/* A copy no name fits for beside the save goes to its own folder where
+ * recovery files do. */
+static enum save_backup_result save_backups_copy_any(const char *path,
+      enum save_backup_reason reason, const void *data, size_t len,
+      bool sync, unsigned *seq)
+{
+   unsigned i;
+   bool no_room                   = false;
+   enum save_backup_result result = SAVE_BACKUP_FAILED;
+   char *dir = (char*)malloc(PATH_MAX_LENGTH);
+   if (!dir)
+      return SAVE_BACKUP_FAILED;
+   if (save_backups_dir(dir, PATH_MAX_LENGTH, path))
+      result = save_backups_copy_seq(dir, path, NULL, reason, data, len,
+            sync, seq, &no_room);
+   /* Nor the folder's own name */
+   else
+      no_room = !string_is_empty(path);
+   for (i = SAVE_BACKUPS_ROOT_CONFIG; no_room
+         && result == SAVE_BACKUP_FAILED && i <= SAVE_BACKUPS_ROOT_APP_DATA;
+         i++)
+      if (save_backups_recovery_folder(dir, PATH_MAX_LENGTH, i, path))
+         result = save_backups_copy_seq(dir, path, NULL, reason, data, len,
+               sync, seq, NULL);
+   free(dir);
+   return result;
+}
+
 enum save_backup_result save_backups_copy_image(const char *path,
       enum save_backup_reason reason, const void *data, size_t len,
       bool sync, unsigned *seq)
 {
-   enum save_backup_result result = SAVE_BACKUP_FAILED;
-   char *dir = (char*)malloc(PATH_MAX_LENGTH);
-   if (dir && save_backups_dir(dir, PATH_MAX_LENGTH, path))
-      result = save_backups_copy_seq(dir, path, NULL, reason,
-            data ? data : "", data ? len : 0, sync, seq);
-   free(dir);
-   return result;
+   return save_backups_copy_any(path, reason, data ? data : "",
+         data ? len : 0, sync, seq);
 }
 
 enum save_backup_result save_backups_copy_file(const char *path,
       enum save_backup_reason reason, bool sync, unsigned *seq)
 {
-   enum save_backup_result result = SAVE_BACKUP_FAILED;
-   char *dir = (char*)malloc(PATH_MAX_LENGTH);
-   if (dir && save_backups_dir(dir, PATH_MAX_LENGTH, path))
-      result = save_backups_copy_seq(dir, path, NULL, reason, NULL, 0, sync,
-            seq);
-   free(dir);
-   return result;
+   return save_backups_copy_any(path, reason, NULL, 0, sync, seq);
 }
 
 /* Whether the newest recovery file of @path, its path in @s, holds
@@ -1268,7 +1309,7 @@ size_t save_backups_recover(char *s, size_t len, const char *path,
    if (save_backups_dir(dir, PATH_MAX_LENGTH, path))
       made = save_backups_write_copy(s, len, dir, path, NULL,
             SAVE_BACKUP_UNSAVED, data, data_len, false, false, false, sync,
-            NULL)
+            NULL, NULL)
          == SAVE_BACKUP_MADE;
    for (i = SAVE_BACKUPS_ROOT_CONFIG;
          !made && i <= SAVE_BACKUPS_ROOT_APP_DATA; i++)
@@ -1279,7 +1320,7 @@ size_t save_backups_recover(char *s, size_t len, const char *path,
             SAVE_BACKUPS_RECOVERY_DIR, PATH_MAX_LENGTH);
       made = save_backups_write_copy(s, len, dir, path, NULL,
             SAVE_BACKUP_UNSAVED, data, data_len, false, false, false, sync,
-            NULL)
+            NULL, NULL)
          == SAVE_BACKUP_MADE;
    }
    free(dir);

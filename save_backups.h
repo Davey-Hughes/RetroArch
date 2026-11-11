@@ -170,9 +170,11 @@ void save_backups_retain_made(const char *dir, const char *path,
  * same (a network drive's lost reply). */
 bool save_backups_move_finish(const char *path, const char *to);
 
-/* save_backups_copy_to() into save_backups_dir() of @path. With @seq:
- * in, a copy retention keeps (0: none); out, the copy that holds the
- * data (0: none), with 0 in never a copy from before numbering. A copy
+/* save_backups_copy_to() into save_backups_dir() of @path, or when no
+ * name fits there, into @path's own folder where save_backups_recover()
+ * writes. With @seq: in, a copy retention keeps (0: none); out, the
+ * copy that holds the data (0: none), with 0 in never a copy from
+ * before numbering. A copy
  * is held by its number; at the last number, which copies share, by a
  * value above every number made from its time. */
 enum save_backup_result save_backups_copy_image(const char *path,

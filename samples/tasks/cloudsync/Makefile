@@ -58,6 +58,7 @@ ADDS_SOURCES := cloudsync_manifest_adds_test.c \
 	$(filter-out cloudsync_savefile_owner_test.c,$(SOURCES)) \
 	$(CORE_DIR)/tasks/task_cloudsync_path.c \
 	$(CORE_DIR)/save_backups.c \
+	$(LIBRETRO_COMM_DIR)/encodings/encoding_crc32.c \
 	$(LIBRETRO_COMM_DIR)/formats/json/rjson.c \
 	$(LIBRETRO_COMM_DIR)/utils/md5.c \
 	$(LIBRETRO_COMM_DIR)/queues/task_queue.c \

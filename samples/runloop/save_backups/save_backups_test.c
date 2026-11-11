@@ -7,6 +7,7 @@
 #include <string.h>
 #include <time.h>
 
+#include <encodings/crc32.h>
 #include <file/file_path.h>
 #include <lists/dir_list.h>
 #include <lists/string_list.h>
@@ -38,10 +39,33 @@ static size_t test_strftime(char *s, size_t max, const char *format,
 
 static unsigned plain_writes, synced_writes;
 static bool write_fails;
+/* Files under it stand in for ones on smb:// or nfs://: written in
+ * place, as file_stream.c writes those; write_fails cuts them short. */
+static const char *in_place_dir;
+
+static bool test_in_place(const char *path)
+{
+   return   (in_place_dir && string_starts_with(path, in_place_dir))
+         || filestream_atomic_in_place(path);
+}
+
+static bool write_in_place(const char *path, const void *data,
+      int64_t len)
+{
+   int64_t n = write_fails ? len / 2 : len;
+   RFILE *f  = filestream_open(path, RETRO_VFS_FILE_ACCESS_WRITE,
+         RETRO_VFS_FILE_ACCESS_HINT_NONE);
+   bool ok   = f && filestream_write(f, data, n) == n;
+   if (f && filestream_close(f) != 0)
+      ok = false;
+   return ok && !write_fails;
+}
 
 static bool test_write(const char *path, const void *data, int64_t len)
 {
    plain_writes++;
+   if (test_in_place(path))
+      return write_in_place(path, data, len);
    if (write_fails)
       return false;
    return filestream_write_file_atomic(path, data, len);
@@ -51,6 +75,8 @@ static bool test_write_synced(const char *path, const void *data,
       int64_t len)
 {
    synced_writes++;
+   if (test_in_place(path))
+      return write_in_place(path, data, len);
    return filestream_write_file_atomic_synced(path, data, len);
 }
 
@@ -112,6 +138,7 @@ static struct string_list *test_dir_list_new(const char *dir,
 #define strftime test_strftime
 #define filestream_write_file_atomic test_write
 #define filestream_write_file_atomic_synced test_write_synced
+#define filestream_atomic_in_place test_in_place
 #define filestream_rename test_rename
 #define filestream_read_file test_read_file
 #define filestream_sync test_sync
@@ -131,6 +158,7 @@ static long path_max = SAVE_BACKUPS_PATH_MAX;
 #undef strftime
 #undef filestream_write_file_atomic
 #undef filestream_write_file_atomic_synced
+#undef filestream_atomic_in_place
 #undef filestream_rename
 #undef filestream_read_file
 #undef filestream_sync
@@ -1260,8 +1288,8 @@ static void backup_taken_number(void)
    unsigned k;
    char name[160];
    char dir[] = ROOT "/taken/backups";
-   save_backups_set_roots(ROOT "/taken", NULL, NULL, NULL, NULL, NULL,
-         "Snes9x");
+   save_backups_set_roots(ROOT "/taken", NULL, NULL, NULL, ROOT "/takencfg",
+         ROOT "/takenapp", "Snes9x");
    set_time(5, 0, 0);
    CHECK(save_backups_copy_image(ROOT "/taken/Game.srm", SAVE_BACKUP_CUT,
          "1", 1, true, NULL) == SAVE_BACKUP_MADE);
@@ -1286,6 +1314,9 @@ static void backup_taken_number(void)
    CHECK(!path_is_valid(ROOT "/taken/backups/Game - 2026-11-03 05-00-00 - 0200-kqmz - Snes9x - cut.srm"));
    CHECK(count_files(dir) == 2 + 98 + 99);
    CHECK(count_tagged(dir, 'w') == 98 + 99);
+   /* out of numbers is not out of room */
+   CHECK(!path_is_valid(ROOT "/takencfg/recovery"));
+   CHECK(!path_is_valid(ROOT "/takenapp/recovery"));
 }
 
 /* Names from before numbering and numbered ones with a device's tag
@@ -1555,6 +1586,13 @@ static bool deep_dir(char *dir, size_t size, const char *name, long len)
    return true;
 }
 
+/* @path's own folder in <config>/recovery, named by its CRC-32 */
+static void recovery_folder(char *s, size_t len, const char *path)
+{
+   snprintf(s, len, ROOT "/config/recovery/%08lx", (unsigned long)
+         encoding_crc32(0, (const uint8_t*)path, strlen(path)));
+}
+
 /* In a deep folder only the game is cut, at a character, to what fits
  * beside the mark: the copy is made and reads back, and its recovery
  * file is found. A file whose whole name is the cut's prefix and
@@ -1698,6 +1736,71 @@ static void backup_no_room(void)
    CHECK(count_files(dir) == 0);
 }
 
+/* A save so deep that no copy name fits beside it: its copies go to
+ * its own folder in <config>/recovery. A folder that can't be made is
+ * not a reason to: recovery_chain. */
+static void backup_no_room_recovery_dir(void)
+{
+   static char dir[512], path[PATH_MAX_LENGTH];
+   static char s[PATH_MAX_LENGTH], t[256];
+   set_time(22, 0, 0);
+   roots();
+   CHECK(deep_dir(dir, sizeof(dir), "noroom2", SAVE_BACKUPS_PATH_MAX - 29));
+   fill_pathname_join(path, dir, "Game.srm", sizeof(path));
+   put(path, "r0");
+   CHECK(save_backups_copy_file(path, SAVE_BACKUP_BEFORE_STATE_LOAD, true,
+         NULL) == SAVE_BACKUP_MADE);
+   CHECK(save_backups_copy_image(path, SAVE_BACKUP_CUT, "r1", 2, true, NULL)
+         == SAVE_BACKUP_MADE);
+   recovery_folder(t, sizeof(t), path);
+   snprintf(s, sizeof(s), "%s/Game - 2026-11-03 22-00-00"
+         " - 0001-kqmz - Snes9x - before-state-load.srm", t);
+   CHECK(holds(s, "r0"));
+   snprintf(s, sizeof(s), "%s/Game - 2026-11-03 22-00-00"
+         " - 0002-kqmz - Snes9x - cut.srm", t);
+   CHECK(holds(s, "r1"));
+   snprintf(s, sizeof(s), "%s/backups", dir);
+   CHECK(count_files(s) == 0);
+   CHECK(save_backups_copy_file(ROOT "/noroom2/Missing.srm", SAVE_BACKUP_CUT,
+         true, NULL) == SAVE_BACKUP_NO_FILE);
+}
+
+/* Two saves of one name, both too deep for a copy name beside them,
+ * each past retention: one's copies never prune the other's. */
+static void backup_no_room_own_folder(void)
+{
+   unsigned k;
+   char text[16];
+   static char dir[512], a[PATH_MAX_LENGTH], b[PATH_MAX_LENGTH];
+   static char s[PATH_MAX_LENGTH], t[PATH_MAX_LENGTH];
+   roots();
+   CHECK(deep_dir(dir, sizeof(dir), "noroomA", SAVE_BACKUPS_PATH_MAX - 29));
+   fill_pathname_join(a, dir, "Game.srm", sizeof(a));
+   CHECK(deep_dir(dir, sizeof(dir), "noroomB", SAVE_BACKUPS_PATH_MAX - 29));
+   fill_pathname_join(b, dir, "Game.srm", sizeof(b));
+   for (k = 0; k < SAVE_BACKUPS_KEEP + 2; k++)
+   {
+      set_time(23, 0, (int)k);
+      snprintf(text, sizeof(text), "a%u", k);
+      CHECK(save_backups_copy_image(a, SAVE_BACKUP_BEFORE_STATE_LOAD, text,
+            strlen(text), true, NULL) == SAVE_BACKUP_MADE);
+   }
+   for (k = 0; k < SAVE_BACKUPS_KEEP + 2; k++)
+   {
+      set_time(23, 1, (int)k);
+      snprintf(text, sizeof(text), "b%u", k);
+      CHECK(save_backups_copy_image(b, SAVE_BACKUP_BEFORE_STATE_LOAD, text,
+            strlen(text), true, NULL) == SAVE_BACKUP_MADE);
+   }
+   recovery_folder(s, sizeof(s), a);
+   recovery_folder(t, sizeof(t), b);
+   CHECK(strcmp(s, t));
+   CHECK(count_files(s) == SAVE_BACKUPS_KEEP);
+   CHECK(count_tagged(s, 'a') == SAVE_BACKUPS_KEEP);
+   CHECK(count_files(t) == SAVE_BACKUPS_KEEP);
+   CHECK(count_tagged(t, 'b') == SAVE_BACKUPS_KEEP);
+}
+
 /* Copies cut in a deep folder, the folder moved somewhere roomier: a
  * file named exactly their cut game prunes none of them. */
 static void backup_moved(void)
@@ -1745,6 +1848,53 @@ static void backup_dir_units(void)
 #endif
 }
 #endif
+
+/* A copy or recovery file written in place (smb://, nfs://) that
+ * fails is not left behind cut short; the recovery file goes where
+ * the next folder takes it. */
+static void in_place_write_fails(void)
+{
+   char s[PATH_MAX_LENGTH];
+   const char *path = ROOT "/isaves/Game.srm";
+   save_backups_set_roots(ROOT "/isaves", NULL, NULL, NULL,
+         ROOT "/iconfig", NULL, "Snes9x");
+   set_time(14, 0, 0);
+   in_place_dir = ROOT "/isaves";
+   write_fails  = true;
+   CHECK(save_backups_copy_image(path, SAVE_BACKUP_CUT, "abcd", 4, true,
+         NULL) == SAVE_BACKUP_FAILED);
+   CHECK(count_files(ROOT "/isaves/backups") == 0);
+   in_place_dir = ROOT "/isaves/backups";
+   CHECK(save_backups_recover(s, sizeof(s), path, "r1r1", 4, true));
+   write_fails  = false;
+   in_place_dir = NULL;
+   CHECK(count_files(ROOT "/isaves/backups") == 0);
+   CHECK(same_path(s, ROOT "/iconfig/recovery/Game - 2026-11-03 14-00-00 - 0001-kqmz - Snes9x - unsaved.srm"));
+   CHECK(holds(s, "r1r1"));
+   /* Written whole, it stays */
+   in_place_dir = ROOT "/isaves";
+   CHECK(save_backups_copy_image(path, SAVE_BACKUP_CUT, "abcd", 4, true,
+         NULL) == SAVE_BACKUP_MADE);
+   in_place_dir = NULL;
+   CHECK(count_files(ROOT "/isaves/backups") == 1);
+}
+
+/* A save whose backups folder's name doesn't fit has its copy where
+ * one no name fits for goes */
+static void backup_dir_too_long(void)
+{
+   static char path[PATH_MAX_LENGTH], d[PATH_MAX_LENGTH], t[256];
+   size_t n = PATH_MAX_LENGTH - 7;
+   roots();
+   memset(path, 'd', n);
+   memcpy(path + n, "/G.srm", 7);
+   snprintf(t, sizeof(t), ROOT "/config/recovery/%08lx", (unsigned long)
+         encoding_crc32(0, (const uint8_t*)path, strlen(path)));
+   CHECK(!save_backups_dir(d, sizeof(d), path));
+   CHECK(save_backups_copy_image(path, SAVE_BACKUP_CUT, "f", 1, false,
+         NULL) == SAVE_BACKUP_MADE);
+   CHECK(count_files(t) == 1);
+}
 
 static void recovery_chain(void)
 {
@@ -2249,10 +2399,14 @@ int main(void)
 #ifdef SAVE_BACKUPS_PATH_MAX
    backup_deep();
    backup_no_room();
+   backup_no_room_recovery_dir();
+   backup_no_room_own_folder();
    backup_moved();
    backup_dir_units();
 #endif
    recovery_chain();
+   in_place_write_fails();
+   backup_dir_too_long();
    recovery_newest_tie();
    backup_sync();
    recovery_held_sync();

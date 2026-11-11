@@ -26,14 +26,15 @@ SOURCES := save_backups_test.c \
 	$(LIBRETRO_COMM_DIR)/compat/compat_strcasestr.c \
 	$(LIBRETRO_COMM_DIR)/string/stdstring.c \
 	$(LIBRETRO_COMM_DIR)/string/rstrtod.c \
+	$(LIBRETRO_COMM_DIR)/encodings/encoding_crc32.c \
 	$(LIBRETRO_COMM_DIR)/encodings/encoding_utf.c \
+	$(LIBRETRO_COMM_DIR)/features/features_cpu.c \
 	$(LIBRETRO_COMM_DIR)/formats/json/rjson.c \
 	$(LIBRETRO_COMM_DIR)/time/rtime.c
 
 # What the Win32 VFS reaches with threads.
 THREAD_SOURCES := $(LIBRETRO_COMM_DIR)/rthreads/rthreads.c \
-	$(LIBRETRO_COMM_DIR)/rthreads/retro_eventcount.c \
-	$(LIBRETRO_COMM_DIR)/features/features_cpu.c
+	$(LIBRETRO_COMM_DIR)/rthreads/retro_eventcount.c
 
 # RARCH_INTERNAL, as the frontend builds it, for path_resolve_realpath()
 CFLAGS += -std=gnu89 -Wall -g -O1 -DRARCH_INTERNAL \
