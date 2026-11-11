@@ -184,8 +184,7 @@ jobs:
                       --disable-opengl --disable-opengl_core \
                       --disable-opengl1 --disable-vulkan \
                       --disable-cheevos \
-                      --disable-ffmpeg \
-                      --enable-core_load_check
+                      --disable-ffmpeg
           make -j$(nproc)
 
       - name: Build and run content_closing_test
