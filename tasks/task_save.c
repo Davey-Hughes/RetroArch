@@ -147,7 +147,10 @@ enum save_task_state_flags
    SAVE_TASK_FLAG_MUTE                  = (1 << 4),
    SAVE_TASK_FLAG_THUMBNAIL_ENABLE      = (1 << 5),
    SAVE_TASK_FLAG_HAS_VALID_FB          = (1 << 6),
-   SAVE_TASK_FLAG_COMPRESS_FILES        = (1 << 7)
+   SAVE_TASK_FLAG_COMPRESS_FILES        = (1 << 7),
+   /* Over a .auto the session does not own: kept aside before the
+    * new one lands */
+   SAVE_TASK_FLAG_AUTO_ASIDE            = (1 << 8)
 };
 
 typedef struct
@@ -160,7 +163,9 @@ typedef struct
    ssize_t written;
    ssize_t bytes_read;
    int state_slot;
-   uint8_t flags;
+   /* The .auto's held name, SAVE_TASK_FLAG_AUTO_ASIDE */
+   unsigned held;
+   uint16_t flags;
    /* Frontend rastate blocks, captured on the main thread at push for
     * the background path: SET_SAVE_STATE_IN_BACKGROUND is the core's
     * promise about its own serialize, not about the frontend's replay
@@ -619,6 +624,55 @@ bool content_finish_tmp(const char *path, bool ok, bool sync)
    return ret == 0;
 }
 
+static bool content_auto_state_move_aside(const char *path, unsigned *held,
+      char *moved, size_t len);
+static void content_auto_state_put_back(const char *path, unsigned n,
+      const char *moved);
+
+/* fsync of the file at @path */
+static bool content_sync_file(const char *path)
+{
+   RFILE *file = filestream_open(path,
+         RETRO_VFS_FILE_ACCESS_WRITE | RETRO_VFS_FILE_ACCESS_UPDATE_EXISTING,
+         RETRO_VFS_FILE_ACCESS_HINT_NONE);
+   bool ok     = file && filestream_sync(file) == 0;
+   if (file && filestream_close(file) != 0)
+      ok = false;
+   return ok;
+}
+
+/* Whole and closed: as the automatic saves, the .auto the session does
+ * not own is kept first, or not saved over. A synced save syncs before
+ * the move, so only its rename is left before the new one lands. False
+ * with the task's error set. */
+static bool content_save_state_aside(retro_task_t *task,
+      save_task_state_t *state, const char *tmp_path, char *moved,
+      bool sync)
+{
+   char msg[128];
+   /* No room to record a move: one could not be put back */
+   if (!moved || (sync && !content_sync_file(tmp_path)))
+   {
+      task_set_error(task, strdup(
+            msg_hash_to_str(MSG_FAILED_TO_SAVE_STATE_TO)));
+      return false;
+   }
+   if (content_auto_state_move_aside(state->path, &state->held, moved,
+            PATH_MAX_LENGTH))
+      return true;
+   snprintf(msg, sizeof(msg), "%s \"%s\".",
+         msg_hash_to_str(MSG_FAILED_TO_SAVE_STATE_TO),
+         path_basename(state->path));
+   task_set_error(task, strdup(msg));
+   /* Said in place of the "saved" title */
+   if (!(task_get_flags(task) & RETRO_TASK_FLG_MUTE))
+   {
+      task_free_title(task);
+      task_set_title(task, strdup(msg));
+   }
+   return false;
+}
+
 /**
  * task_save_handler_finished:
  * @task : the task to finish
@@ -666,12 +720,35 @@ static void task_save_handler_finished(retro_task_t *task,
             task_set_error(task, strdup(
                   msg_hash_to_str(MSG_FAILED_TO_SAVE_STATE_TO)));
       }
-      /* Off the frame loop only on the threaded queue. */
-      else if (!content_finish_tmp(state->path, !task_get_error(task),
-                  task_queue_is_threaded())
-            && !task_get_error(task))
-         task_set_error(task, strdup(
-               msg_hash_to_str(MSG_FAILED_TO_SAVE_STATE_TO)));
+      else
+      {
+         bool ok     = !task_get_error(task);
+         /* Off the frame loop only on the threaded queue. */
+         bool sync   = task_queue_is_threaded();
+         char *moved = NULL;
+         if (     ok && (state->flags & SAVE_TASK_FLAG_AUTO_ASIDE)
+               && path_is_valid(state->path))
+         {
+            moved = (char*)calloc(1, PATH_MAX_LENGTH);
+            ok    = content_save_state_aside(task, state, tmp_path, moved,
+                  sync);
+         }
+         if (!content_finish_tmp(state->path, ok, sync) && ok)
+         {
+            task_set_error(task, strdup(
+                  msg_hash_to_str(MSG_FAILED_TO_SAVE_STATE_TO)));
+            ok = false;
+         }
+         /* Not landed: the old one back in its slot, the new one gone */
+         if (!ok && (state->held || (moved && *moved)))
+         {
+            content_auto_state_put_back(state->path, state->held, moved);
+            state->held = 0;
+            if (path_is_valid(state->path))
+               filestream_delete(tmp_path);
+         }
+         free(moved);
+      }
    }
 
    if (state->data)
@@ -1888,6 +1965,13 @@ static void save_state_cb(retro_task_t *task,
    if (save_state_tasks_pending)
       save_state_tasks_pending--;
    content_save_written();
+   /* As content_auto_state_set_aside(): the .auto is the session's */
+   if ((state->flags & SAVE_TASK_FLAG_AUTO_ASIDE) && !error)
+   {
+      runloop_state_get_ptr()->auto_state_owned = true;
+      if (state->held)
+         content_auto_state_keep(state->path);
+   }
    if (state->done_cb)
       state->done_cb(task, state->path, user_data, error);
 #ifdef HAVE_SCREENSHOTS
@@ -2008,6 +2092,9 @@ static bool task_push_save_state(const char *path, void *data, size_t len,
 #endif
    if (!settings->bools.notification_show_save_state)
       state->flags              |= SAVE_TASK_FLAG_MUTE;
+   if (     !runloop_state_get_ptr()->auto_state_owned
+         && content_is_auto_state(path))
+      state->flags              |= SAVE_TASK_FLAG_AUTO_ASIDE;
 
    task->type                    = TASK_TYPE_BLOCKING;
    task->state                   = state;
@@ -2560,23 +2647,73 @@ static bool content_auto_state_hold(const char *path, unsigned *held)
    return ok;
 }
 
-/* The new state could not take @path's place: held name @n goes back. */
-static void content_auto_state_unhold(const char *path, unsigned n)
+/* The new state could not take @path's place: what the move took goes
+ * back, the copy @moved or held name @n. Files only, for any thread. */
+static void content_auto_state_put_back(const char *path, unsigned n,
+      const char *moved)
 {
-   char *s = (char*)malloc(PATH_MAX_LENGTH);
+   char *s;
+   if (moved && *moved)
+   {
+      if (filestream_rename(moved, path) != 0)
+         RARCH_ERR("[State] Could not put the unloaded \"%s\" back: kept "
+               "in the backups.\n", path);
+      return;
+   }
+   s = (char*)malloc(PATH_MAX_LENGTH);
    if (     !s
          || !save_backups_held_name(s, PATH_MAX_LENGTH, path, n)
          || filestream_rename(s, path) != 0)
       RARCH_ERR("[State] Could not put the unloaded \"%s\" back: kept "
             "beside it, copied to the backups at the next load.\n", path);
    free(s);
+}
+
+static void content_auto_state_unhold(const char *path, unsigned n)
+{
+   content_auto_state_put_back(path, n, NULL);
    runloop_state_get_ptr()->auto_state_owned = false;
+}
+
+/* Moves @path to the backups, its copy's name into @moved; across
+ * drives holds it beside itself, as @held, until a task copies it
+ * there. Files only, for any thread. */
+static bool content_auto_state_move_aside(const char *path, unsigned *held,
+      char *moved, size_t len)
+{
+   enum save_backup_result result = SAVE_BACKUP_FAILED;
+   char *dir = (char*)malloc(2 * PATH_MAX_LENGTH);
+   if (len)
+      moved[0] = '\0';
+   /* A rename, else held for a task, else an unsynced copy the new
+    * state's rename replaces: no synced copy inside the frame. */
+   if (dir && save_backups_dir(dir, PATH_MAX_LENGTH, path))
+   {
+      result = save_backups_move_begin(dir, path, NULL,
+            SAVE_BACKUP_NOT_LOADED, dir + PATH_MAX_LENGTH,
+            PATH_MAX_LENGTH);
+      if (result == SAVE_BACKUP_MADE && len)
+         strlcpy(moved, dir + PATH_MAX_LENGTH, len);
+      else if (     result == SAVE_BACKUP_COPY_OWED
+            && content_auto_state_hold(path, held))
+         result = SAVE_BACKUP_MADE;
+      else if (result != SAVE_BACKUP_MADE)
+         result = save_backups_copy_to(dir, path, NULL,
+               SAVE_BACKUP_NOT_LOADED, NULL, 0, false);
+   }
+   free(dir);
+   if (result != SAVE_BACKUP_MADE)
+   {
+      RARCH_ERR("[State] Could not keep the unloaded \"%s\": not "
+            "saving over it.\n", path);
+      return false;
+   }
+   return true;
 }
 
 /* An .auto the session wanted and did not load (load failed, hardcore,
  * netplay, a replay, an entry slot) goes to the backups before the
- * first write over it. Across drives it is held beside itself, as
- * @held, until a task copies it there. */
+ * first write over it. */
 static bool content_auto_state_set_aside(const char *path, unsigned *held)
 {
    runloop_state_t *runloop_st = runloop_state_get_ptr();
@@ -2585,32 +2722,9 @@ static bool content_auto_state_set_aside(const char *path, unsigned *held)
    if (     !runloop_st->auto_state_owned
          && (   runloop_st->auto_state_wanted
              || settings->bools.savestate_auto_load)
-         && path_is_valid(path))
-   {
-      enum save_backup_result result = SAVE_BACKUP_FAILED;
-      char *dir = (char*)malloc(2 * PATH_MAX_LENGTH);
-      /* A rename, else held for a task, else an unsynced copy the new
-       * state's rename replaces: no synced copy inside the frame. */
-      if (dir && save_backups_dir(dir, PATH_MAX_LENGTH, path))
-      {
-         result = save_backups_move_begin(dir, path, NULL,
-               SAVE_BACKUP_NOT_LOADED, dir + PATH_MAX_LENGTH,
-               PATH_MAX_LENGTH);
-         if (     result == SAVE_BACKUP_COPY_OWED
-               && content_auto_state_hold(path, held))
-            result = SAVE_BACKUP_MADE;
-         else if (result != SAVE_BACKUP_MADE)
-            result = save_backups_copy_to(dir, path, NULL,
-                  SAVE_BACKUP_NOT_LOADED, NULL, 0, false);
-      }
-      free(dir);
-      if (result != SAVE_BACKUP_MADE)
-      {
-         RARCH_ERR("[State] Could not keep the unloaded \"%s\": not "
-               "saving over it.\n", path);
-         return false;
-      }
-   }
+         && path_is_valid(path)
+         && !content_auto_state_move_aside(path, held, NULL, 0))
+      return false;
    runloop_st->auto_state_owned = true;
    return true;
 }

@@ -360,16 +360,23 @@ void content_save_written(void) { save_writes++; }
 bool audio_driver_jump_fade_begin(void) { return false; }
 void audio_driver_jump_fade_end(bool ramped) { (void)ramped; }
 
+/* The Auto slot's file, when a lane names one */
+static const char *auto_slot_path;
 bool runloop_get_savestate_path(char *path, size_t len, int slot)
 {
-   snprintf(path, len, "save_state_io_test_auto_%d.state", slot);
+   if (slot < 0 && auto_slot_path)
+      strlcpy(path, auto_slot_path, len);
+   else
+      snprintf(path, len, "save_state_io_test_auto_%d.state", slot);
    return true;
 }
 
+/* A translation a lane sets, else one short text for all */
+static const char *msg_text;
 const char *msg_hash_to_str(enum msg_hash_enums msg)
 {
    (void)msg;
-   return "state message";
+   return msg_text ? msg_text : "state message";
 }
 
 void RARCH_LOG(const char *fmt, ...)  { (void)fmt; }
@@ -407,18 +414,22 @@ void take_screenshot_cancel(const char *path)
 }
 
 static unsigned msgs_pushed;
+static char     msg_last[256];
 static void msg_push_stub(retro_task_t *task, const char *msg,
       unsigned prio, unsigned dur, bool flush)
 {
    (void)task; (void)prio; (void)dur; (void)flush;
    /* Every finished task pushes, an empty one when it says nothing */
    if (msg && *msg)
+   {
       msgs_pushed++;
+      strlcpy(msg_last, msg, sizeof(msg_last));
+   }
 }
 
 /* Renames refused at the VFS: the .auto's move into its backups, as
  * across drives; a copy landing there; the new state over the .auto;
- * a held name put back. */
+ * a held name or a moved one put back. */
 #define REFUSE_MOVE   1
 #define REFUSE_LAND   2
 #define REFUSE_FINISH 4
@@ -436,6 +447,7 @@ static bool rename_allowed(const char *old_path, const char *new_path)
    bool   temp   = _len > 4 && !strcmp(old_path + _len - 4, ".tmp");
    bool   into   = strstr(new_path, "backups") != NULL;
    bool   held   = _len > 5 && !strcmp(old_path + _len - 5, ".prev");
+   bool   out    = strstr(old_path, "backups") != NULL;
    if (     temp
          && __atomic_compare_exchange_n(&hold_temp_move, &armed, 2, false,
                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
@@ -444,7 +456,7 @@ static bool rename_allowed(const char *old_path, const char *new_path)
    if (     ((refuse & REFUSE_MOVE)   &&  into && !temp)
          || ((refuse & REFUSE_LAND)   &&  into &&  temp)
          || ((refuse & REFUSE_FINISH) && !into &&  temp)
-         || ((refuse & REFUSE_BACK)   && !into &&  held))
+         || ((refuse & REFUSE_BACK)   && !into && (held || out)))
       return false;
    return true;
 }
@@ -468,9 +480,13 @@ int __wrap_retro_vfs_file_rename_synced_impl(const char *old_path,
    return __real_retro_vfs_file_rename_synced_impl(old_path, new_path);
 }
 int __real_retro_vfs_file_sync_impl(libretro_vfs_implementation_file *stream);
+/* Set: every sync fails, as on a full or failing disk */
+static int fail_syncs;
 int __wrap_retro_vfs_file_sync_impl(libretro_vfs_implementation_file *stream)
 {
    __atomic_fetch_add(&file_syncs, 1, __ATOMIC_RELAXED);
+   if (__atomic_load_n(&fail_syncs, __ATOMIC_RELAXED))
+      return -1;
    return __real_retro_vfs_file_sync_impl(stream);
 }
 
@@ -670,6 +686,20 @@ static void test_serialize_failure(void)
  * save that fails over an existing state leaves that state as it was,
  * and none leaves its temporary file behind.
  * ----------------------------------------------------------------- */
+/* Temporaries left in @dir */
+static unsigned temps_in(const char *dir)
+{
+   unsigned i, n = 0;
+   struct string_list *list = dir_list_new(dir, NULL, false, true, false,
+         false);
+   for (i = 0; list && i < list->size; i++)
+      if (string_ends_with(list->elems[i].data, ".tmp"))
+         n++;
+   if (list)
+      dir_list_free(list);
+   return n;
+}
+
 static bool tmp_exists(const char *path)
 {
    char tmp[256];
@@ -2179,6 +2209,210 @@ static void test_auto_state(void)
 }
 
 /* -----------------------------------------------------------------
+ * manual_auto_slot_sets_aside: Save State to the Auto slot over an
+ * .auto the session did not load keeps that one in the backups
+ * first, as the automatic saves do. Undo Save still puts it back.
+ * ----------------------------------------------------------------- */
+static void test_manual_auto_slot_sets_aside(void)
+{
+   const char *dir  = "sst_auto";
+   const char *path = "sst_auto/Game.state.auto";
+   int d;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   core_fill(TEST_SAVE_STATE_CHUNK);
+   save_backups_set_roots(NULL, dir, NULL, NULL, NULL, NULL, "Core");
+   auto_slot_path = path;
+
+   /* with the backup read for Undo Save, and without */
+   for (d = 0; d < 2; d++)
+   {
+      auto_state_clear(dir);
+      retro_vfs_mkdir_impl(dir);
+      set_save_state_disable_undo(d);
+      stub_runloop.auto_state_owned  = false;
+      stub_runloop.auto_state_wanted = true;
+      filestream_write_file(path, "old", 3);
+      okf(content_save_state(path, true), d
+            ? "manual auto (no undo): pushed" : "manual auto: pushed");
+      pump(1000);
+      okf(file_size(path) > (long)core_len, d
+            ? "manual auto (no undo): the slot holds the new state"
+            : "manual auto: the slot holds the new state");
+      okf(auto_backups(path, "old") == 1, d
+            ? "manual auto (no undo): the unloaded one is in the backups"
+            : "manual auto: the unloaded one is in the backups");
+      okf(stub_runloop.auto_state_owned, d
+            ? "manual auto (no undo): the .auto is the session's"
+            : "manual auto: the .auto is the session's");
+      content_save_state(path, true);
+      pump(1000);
+      okf(auto_backups(path, NULL) == 1, d
+            ? "manual auto (no undo): the session's own is saved over"
+            : "manual auto: the session's own is saved over");
+   }
+   set_save_state_disable_undo(false);
+
+   /* across drives: held beside it, copied on a task */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_owned = false;
+   filestream_write_file(path, "old", 3);
+   __atomic_store_n(&refuse_renames, REFUSE_MOVE, __ATOMIC_RELAXED);
+   content_save_state(path, true);
+   pump(1000);
+   __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+   okf(file_size(path) > (long)core_len && auto_backups(path, "old") == 1,
+       "manual auto: across drives, the unloaded one is copied over");
+
+   /* Undo Save puts the unloaded one back */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   content_reset_savestate_backups();
+   stub_runloop.auto_state_owned = false;
+   filestream_write_file(path, "old", 3);
+   content_save_state(path, true);
+   pump(1000);
+   okf(content_undo_save_state(), "manual auto: Undo Save is pushed");
+   pump(1000);
+   okf(file_size(path) == 3 && auto_backups(path, "old") == 1,
+       "manual auto: Undo Save puts the unloaded one back");
+
+   /* Auto Load State off: kept all the same */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_owned  = false;
+   stub_runloop.auto_state_wanted = false;
+   filestream_write_file(path, "old", 3);
+   content_save_state(path, true);
+   pump(1000);
+   okf(file_size(path) > (long)core_len && auto_backups(path, "old") == 1,
+       "manual auto: kept with Auto Load State off too");
+
+   /* the write fails: nothing set aside, the old one in its slot */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_owned  = false;
+   stub_runloop.auto_state_wanted = true;
+   filestream_write_file(path, "old", 3);
+   set_save_state_in_background(true);
+   core_ser_fails = 1;
+   content_save_state(path, true);
+   pump(1000);
+   core_ser_fails = 0;
+   set_save_state_in_background(false);
+   okf(     file_size(path) == 3 && auto_backups(path, NULL) == 0
+         && !stub_runloop.auto_state_owned,
+       "manual auto: a failed write leaves the old one in place, no copy");
+
+   /* turned away, the hold full behind loads in flight */
+   for (d = 0; d < 2; d++)
+   {
+      unsigned i;
+      auto_state_clear(dir);
+      retro_vfs_mkdir_impl(dir);
+      core_fill(40 * TEST_SAVE_STATE_CHUNK);
+      content_save_state("sst_auto/hold.state", true);
+      pump(1000);
+      filestream_write_file(path, "old", 3);
+      stub_runloop.auto_state_owned = false;
+      set_save_state_disable_undo(d);
+      clock_step = TEST_TICK_BUDGET_US;
+      for (i = 0; i < 5; i++)
+      {
+         content_load_state("sst_auto/hold.state", false, false);
+         task_queue_check();
+      }
+      okf(!content_save_state(path, true), d
+            ? "manual auto (no undo): turned away"
+            : "manual auto: turned away");
+      pump(100000);
+      clock_step = 0;
+      okf(file_size(path) == 3 && auto_backups(path, NULL) == 0, d
+            ? "manual auto (no undo): turned away, the old one in place"
+            : "manual auto: turned away, the old one in place");
+   }
+   set_save_state_disable_undo(false);
+   core_fill(TEST_SAVE_STATE_CHUNK);
+
+   /* nowhere to keep it: not written over, and said */
+   stub_settings.bools.notification_show_save_state = true;
+   for (d = 0; d < 2; d++)
+   {
+      auto_state_clear(dir);
+      retro_vfs_mkdir_impl(dir);
+      filestream_write_file("sst_auto/backups", "file", 4);
+      stub_runloop.auto_state_owned  = false;
+      filestream_write_file(path, "old", 3);
+      set_save_state_disable_undo(d);
+      msg_last[0] = '\0';
+      content_save_state(path, true);
+      pump(1000);
+      okf(file_size(path) == 3, d
+            ? "manual auto (no undo): not kept, not written over"
+            : "manual auto: not kept, not written over");
+      okf(!strncmp(msg_last, "Task failed", 11), d
+            ? "manual auto (no undo): the failure is shown"
+            : "manual auto: the failure is shown");
+   }
+   set_save_state_disable_undo(false);
+
+   /* the new one not moved in after a same-drive move: the old one back */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_owned = false;
+   filestream_write_file(path, "old", 3);
+   msg_last[0] = '\0';
+   __atomic_store_n(&refuse_renames, REFUSE_FINISH, __ATOMIC_RELAXED);
+   content_save_state(path, true);
+   pump(1000);
+   __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+   okf(     file_size(path) == 3 && auto_backups(path, NULL) == 0
+         && !temps_in(dir) && !strncmp(msg_last, "Task failed", 11),
+       "manual auto: a refused rename puts the old one back, shown");
+
+   /* no room to record the move: not moved, not saved over */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_owned = false;
+   filestream_write_file(path, "old", 3);
+   content_save_state(path, true);
+   calloc_fail_big = 1;
+   pump(1000);
+   calloc_fail_big = 0;
+   okf(file_size(path) == 3 && auto_backups(path, NULL) == 0
+         && !temps_in(dir),
+       "manual auto: a move that cannot be recorded is not made");
+
+   /* a translation longer than the notice and the handler's frame */
+   {
+      char *text = (char*)malloc(3 * PATH_MAX_LENGTH);
+      memset(text, 'x', 3 * PATH_MAX_LENGTH - 1);
+      text[3 * PATH_MAX_LENGTH - 1] = '\0';
+      auto_state_clear(dir);
+      retro_vfs_mkdir_impl(dir);
+      filestream_write_file("sst_auto/backups", "file", 4);
+      stub_runloop.auto_state_owned = false;
+      filestream_write_file(path, "old", 3);
+      msg_last[0] = '\0';
+      msg_text    = text;
+      content_save_state(path, true);
+      pump(1000);
+      msg_text    = NULL;
+      free(text);
+      okf(file_size(path) == 3 && !strncmp(msg_last, "Task failed", 11),
+          "manual auto: a long translation is cut in the notice");
+   }
+   stub_settings.bools.notification_show_save_state = false;
+
+   auto_slot_path = NULL;
+   content_reset_savestate_backups();
+   auto_state_clear(dir);
+   save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+}
+
+/* -----------------------------------------------------------------
  * Undo Save or Undo Load of the .auto hands it back: the next
  * automatic save keeps it again. An undo of another slot does not.
  * ----------------------------------------------------------------- */
@@ -2693,6 +2927,94 @@ static void test_auto_state_keep(void)
    auto_state_clear(KEEP_DIR);
    save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
    free(big);
+}
+
+/* manual_auto_slot_sets_aside on the threaded queue: the worker moves
+ * the .auto aside, the callback starts the cross-drive copy */
+static void test_manual_auto_slot_threaded(void)
+{
+   const char *dir  = "sst_auto";
+   const char *path = "sst_auto/Game.state.auto";
+   unsigned errors;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   core_fill(4 * TEST_SAVE_STATE_CHUNK);
+   save_backups_set_roots(NULL, dir, NULL, NULL, NULL, NULL, "Core");
+   auto_slot_path = path;
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_wanted = true;
+   filestream_write_file(path, "old", 3);
+   okf(content_save_state(path, true), "threaded manual auto: pushed");
+   pump_threaded();
+   okf(     file_size(path) > (long)core_len
+         && auto_backups(path, "old") == 1 && stub_runloop.auto_state_owned,
+       "threaded manual auto: the unloaded one kept, the new one in place");
+
+   /* across drives: held by the worker, copied on a task */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_owned = false;
+   filestream_write_file(path, "old", 3);
+   __atomic_store_n(&refuse_renames, REFUSE_MOVE, __ATOMIC_RELAXED);
+   content_save_state(path, true);
+   pump_threaded();
+   __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+   okf(file_size(path) > (long)core_len && auto_backups(path, "old") == 1,
+       "threaded manual auto: across drives, the unloaded one copied over");
+
+   /* same drive, then the sync fails, or the rename: the old one in
+    * its slot, no copy, no temporary, the failure shown */
+   stub_settings.bools.notification_show_save_state = true;
+   {
+      int k;
+      for (k = 0; k < 2; k++)
+      {
+         auto_state_clear(dir);
+         retro_vfs_mkdir_impl(dir);
+         stub_runloop.auto_state_owned = false;
+         filestream_write_file(path, "old", 3);
+         msg_last[0] = '\0';
+         if (k)
+            __atomic_store_n(&refuse_renames, REFUSE_FINISH,
+                  __ATOMIC_RELAXED);
+         else
+            __atomic_store_n(&fail_syncs, 1, __ATOMIC_RELAXED);
+         content_save_state(path, true);
+         pump_threaded();
+         __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+         __atomic_store_n(&fail_syncs, 0, __ATOMIC_RELAXED);
+         okf(     file_size(path) == 3 && auto_backups(path, NULL) == 0
+               && !temps_in(dir) && !strncmp(msg_last, "Task failed", 11),
+             k ? "threaded manual auto: a refused rename puts the old one back"
+               : "threaded manual auto: a failed sync leaves the old one");
+      }
+   }
+
+   /* nor put back: logged, the old one in the backups, the new one in
+    * its temporary, the failure shown */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_owned = false;
+   filestream_write_file(path, "old", 3);
+   msg_last[0] = '\0';
+   errors      = errors_logged;
+   __atomic_store_n(&refuse_renames, REFUSE_FINISH | REFUSE_BACK,
+         __ATOMIC_RELAXED);
+   content_save_state(path, true);
+   pump_threaded();
+   __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+   okf(     auto_backups(path, "old") == 1 && !path_is_valid(path)
+         && temps_in(dir) == 1 && errors_logged > errors
+         && !strncmp(msg_last, "Task failed", 11),
+       "threaded manual auto: a failed put-back is logged, the old one kept");
+   stub_settings.bools.notification_show_save_state = false;
+
+   auto_slot_path = NULL;
+   content_reset_savestate_backups();
+   auto_state_clear(dir);
+   save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 }
 
 /* Threaded: the copy is synced, then the held one goes. Asserted only
@@ -3278,6 +3600,7 @@ static int run_default_lane(void)
    test_undo_save_not_backed_up();
    test_auto_state();
    test_auto_state_undo();
+   test_manual_auto_slot_sets_aside();
    test_auto_state_skip_tick();
    test_auto_state_keep();
    test_thumbnail_on_success();
@@ -3308,6 +3631,7 @@ static int run_threaded_lane(void)
    test_threaded_roundtrip();
    test_threaded_load_waits_for_frames();
    test_auto_state_keep_threaded();
+   test_manual_auto_slot_threaded();
    test_auto_state_skip_tick_threaded();
 
    content_reset_savestate_backups();
