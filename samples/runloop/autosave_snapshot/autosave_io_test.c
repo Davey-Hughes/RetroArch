@@ -4412,6 +4412,91 @@ static void lane_recovery_announced(void)
    clean();
 }
 
+/* A recovery file a session made is announced at the next load, also
+ * when the session wrote the save after it, with FAT's mtimes too (a
+ * re-date of 1 s reads back as the save's time); once a load announced
+ * it, a newer save write resolves it and leaves its time as it was. */
+static void lane_recovery_announced_after_write(void)
+{
+   static unsigned char cut[BIG * 2], ram[BIG], p1[BIG];
+   char rec[PATH_MAX_LENGTH];
+   int64_t cut_len   = 0;
+   int64_t mtime     = 0;
+   int64_t dated     = 0;
+   unsigned before, fat;
+   const char *save  = "blk/game.srm";
+   const int bsl     = 1 << SAVE_BACKUP_BEFORE_STATE_LOAD;
+
+   for (fat = 0; fat < 2; fat++)
+   {
+      clean();
+      use_test_vfs(fat != 0);
+      fat_mtime = fat != 0;
+      path_mkdir("blk");
+      put("blk/backups", "x", 1);
+      fill(ram, BIG, 31);
+      put_cut_rzip(save, ram, BIG, cut, &cut_len);
+      memset(ram, 0, BIG);
+      core_data = ram;
+      core_size = BIG;
+      path_init_savefile_new();
+      path_init_savefile_rtc(save);
+      CHECK(!event_load_save_files(false),
+            "announced_after_write: a cut rzip loaded");
+      fill(p1, BIG, 32);
+      memcpy(ram, p1, BIG);
+      event_flush_save_files(true, false, bsl);
+      CHECK(copies("cfg/recovery", SAVE_BACKUP_UNSAVED, rec, sizeof(rec))
+               == 1
+            && holds(rec, p1, BIG),
+            "announced_after_write: no recovery file");
+      /* made a minute before the session's later write */
+      CHECK(path_get_mtime(rec, &mtime) && path_set_mtime(rec, mtime - 60),
+            "announced_after_write: cannot age the recovery file");
+      CHECK(filestream_delete("blk/backups") == 0,
+            "announced_after_write: cannot clear the copy's way");
+      fill(ram, BIG, 33);
+      event_save_files(true, false, true, true, NULL);
+      CHECK(holds(save, ram, BIG),
+            "announced_after_write: the save not written");
+      path_deinit_savefile();
+
+      before = notices(MSG_SAVE_RECOVERY_NEWER);
+      path_init_savefile_new();
+      path_init_savefile_rtc(save);
+      event_load_save_files(false);
+      CHECK(notices(MSG_SAVE_RECOVERY_NEWER) == before + 1, fat
+            ? "announced_after_write: not announced after a write (FAT)"
+            : "announced_after_write: not announced after the session's "
+              "write");
+      /* that write long after it: a re-date would move it */
+      CHECK(   path_get_mtime(rec, &mtime)
+            && path_set_mtime(rec, mtime - 120)
+            && path_get_mtime(rec, &dated),
+            "announced_after_write: cannot age the recovery file again");
+      fill(ram, BIG, 34);
+      event_save_files(true, false, true, true, NULL);
+      path_deinit_savefile();
+      CHECK(path_get_mtime(rec, &mtime) && mtime == dated,
+            "announced_after_write: re-dated by the resolving session");
+      /* that write a minute later than the recovery file */
+      CHECK(path_set_mtime(save, mtime + 60),
+            "announced_after_write: cannot date the save");
+
+      path_init_savefile_new();
+      path_init_savefile_rtc(save);
+      event_load_save_files(false);
+      CHECK(notices(MSG_SAVE_RECOVERY_NEWER) == before + 1,
+            "announced_after_write: announced once resolved");
+      path_deinit_savefile();
+      fat_mtime = false;
+      use_test_vfs(false);
+      clear_dir("blk/backups");
+      path_rmdir("blk/backups");
+   }
+   clean();
+}
+
 /* A recovery file used again for the same image is announced, though
  * the save was written after the file was first made. */
 static void lane_recovery_reused_announced(void)
@@ -4886,6 +4971,7 @@ int main(void)
    lane_owed_copy_fails();
    lane_write_failed_notice();
    lane_recovery_announced();
+   lane_recovery_announced_after_write();
    lane_recovery_reused_announced();
    lane_recovery_elsewhere();
    lane_recovery_no_mtime();

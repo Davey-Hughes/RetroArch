@@ -585,6 +585,70 @@ def lane_recovery_announced(args, n):
     return r, failures
 
 
+def lane_recovery_announced_after_write(args, n):
+    """A state load's flush, the copy a longer save owes blocked by a
+    file named backups, goes to a recovery file; the session then writes
+    the save.  The next load announces the file all the same, and its
+    own write resolves it."""
+    r = Run(args.run_dir, 'recovery_announced_after_write-%d' % n)
+    port = 56100 + n
+    r.srm.write_bytes(pattern(100))
+    blocker = r.saves / 'backups'
+    blocker.write_bytes(b'x')
+    cfg = r.config(autosave_interval='60', network_cmd_enable='true',
+                   network_cmd_port=str(port),
+                   sort_savestates_enable='false',
+                   sort_savestates_by_content_enable='false')
+    env = r.env(SAVE_E2E_SRAM=2048,
+                SAVE_E2E_TOUCHES='30:101,300:102,700:103',
+                SAVE_E2E_FRAME_MS=10)
+    notice = 'Unsaved progress for %s is in Save Backups.' % r.srm
+    failures = []
+    r.start(args, cfg, 1200, env)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    state = r.dir / 'states' / 'game.state'
+    mark = r.dir / 'touched'
+    check(failures, r.wait_for(Path('%s-101' % mark)), 'no first touch')
+    sock.sendto(b'SAVE_STATE', ('127.0.0.1', port))
+    check(failures, r.wait_for(state, 10)
+          and not Path('%s-102' % mark).exists(),
+          'state not saved before the second touch')
+    check(failures, r.wait_for(Path('%s-102' % mark)), 'no second touch')
+    sock.sendto(b'LOAD_STATE', ('127.0.0.1', port))
+    sock.close()
+    recs = []
+    deadline = time.time() + 10
+    while not recs and time.time() < deadline:
+        recs = sorted(r.dir.rglob('game - * - unsaved.srm'))
+        time.sleep(0.02)
+    check(failures, not Path('%s-103' % mark).exists(),
+          'touch 103 came before the recovery file')
+    blocker.unlink()
+    rc = r.wait(60)
+    check(failures, rc == 0, 'run 0: retroarch exit %s' % rc)
+    check(failures, len(recs) == 1
+          and recs[0].read_bytes() == pattern(102, 2048),
+          'run 0: recovery files %s' % [str(p) for p in recs])
+    check(failures, r.srm.read_bytes() == pattern(103, 2048),
+          'run 0: the save was not written after the recovery file')
+    cfg = r.config()
+    # Run 1 writes at least 3 s after run 0's close, past the 2 s the
+    # close moved the recovery file ahead of the save.
+    for i, (seed, touch, frames) in enumerate(((104, 300, 400),
+                                               (105, 30, 100)), 1):
+        env = r.env(SAVE_E2E_SRAM=2048, SAVE_E2E_TOUCH_FRAME=touch,
+                    SAVE_E2E_SEED=seed, SAVE_E2E_FRAME_MS=10)
+        r.start(args, cfg, frames, env)
+        rc = r.wait(60)
+        log = r.log.read_text(errors='replace')
+        check(failures, rc == 0, 'run %d: retroarch exit %s' % (i, rc))
+        check(failures, log.count(notice) == (1, 0)[i - 1],
+              'run %d: %d notices' % (i, log.count(notice)))
+        check(failures, r.srm.read_bytes() == pattern(seed, 2048),
+              'run %d: the save was not written' % i)
+    return r, failures
+
+
 def lane_nosave_netplay_disconnect(args, n):
     """--sram-mode load-nosave: a netplay host stopped in the game (the
     hotkey's network command) starts no autosave, so a later change in
@@ -1110,6 +1174,7 @@ LANES = {
     'explicit_save_copies': lane_explicit_save_copies,
     'cut_copy_old_core': lane_cut_copy_old_core,
     'recovery_announced': lane_recovery_announced,
+    'recovery_announced_after_write': lane_recovery_announced_after_write,
     'state_load_copy': lane_state_load_copy,
     'changed_elsewhere': lane_changed_elsewhere,
     'flush_points': lane_flush_points,

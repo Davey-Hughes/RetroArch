@@ -248,7 +248,8 @@ jobs:
           # the network command's unsynced SAVE_FILES, and one longer
           # than the core's memory before the first shorter write;
           # unsaved progress from a failed write is announced at the
-          # next load; the progress a state load rolls back, and a save
+          # next load, also when the session wrote the save after it;
+          # the progress a state load rolls back, and a save
           # another RetroArch wrote meanwhile, are backed up; with saves
           # off, a netplay host stopped in the game writes nothing;
           # pausing and opening the menu write a changed save at once;
@@ -277,6 +278,7 @@ jobs:
              --lane unreadable_backed_up --lane late_core_backed_up \
              --lane noload_save_backed_up --lane explicit_save_copies \
              --lane cut_copy_old_core --lane recovery_announced \
+             --lane recovery_announced_after_write \
              --lane state_load_copy --lane changed_elsewhere \
              --lane nosave_netplay_disconnect --lane flush_points \
              --lane config_keeps_folder --lane folder_check_each_load \

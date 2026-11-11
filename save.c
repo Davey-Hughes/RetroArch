@@ -84,7 +84,9 @@ enum save_file_flags
    SAVE_FILE_FLUSH_RECOVERED    = (1 << 9),
    SAVE_FILE_FLUSH_LOST         = (1 << 10),
    SAVE_FILE_CHANGED_ELSEWHERE  = (1 << 11),
-   SAVE_FILE_CHANGED_NOTICED    = (1 << 12)
+   SAVE_FILE_CHANGED_NOTICED    = (1 << 12),
+   SAVE_FILE_RECOVERY_MADE      = (1 << 13),
+   SAVE_FILE_WRITTEN_AFTER      = (1 << 14)
 };
 
 /* One per entry of task_save_files, for the session. Workers read and
@@ -162,8 +164,11 @@ static int save_file_stat(const char *path)
  * clock, so coarse mtimes (FAT: 2 s) never look like a change. */
 static void save_file_keep_stat(struct save_file *f, const char *path)
 {
-   if (f)
-      retro_atomic_store_release_int(&f->stat, save_file_stat(path));
+   if (!f)
+      return;
+   retro_atomic_store_release_int(&f->stat, save_file_stat(path));
+   if (retro_atomic_load_acquire_int(&f->flags) & SAVE_FILE_RECOVERY_MADE)
+      retro_atomic_fetch_or_int(&f->flags, SAVE_FILE_WRITTEN_AFTER);
 }
 
 /* Another program wrote @path since it was loaded or last written
@@ -568,8 +573,9 @@ static void autosave_recover(autosave_t *save, const void *image)
             save->bufsize, true) != 0;
    free(rec);
    if (save->file)
-      retro_atomic_fetch_or_int(&save->file->flags,
-            made ? SAVE_FILE_FLUSH_RECOVERED : SAVE_FILE_FLUSH_LOST);
+      retro_atomic_fetch_or_int(&save->file->flags, made
+            ? SAVE_FILE_FLUSH_RECOVERED | SAVE_FILE_RECOVERY_MADE
+            : SAVE_FILE_FLUSH_LOST);
 }
 
 /* Writes @image, taken at main_gen @gen, unless it is the last one
@@ -1430,8 +1436,8 @@ static bool content_load_ram_file(unsigned slot)
 /* The image a close or flush write could not put in @path goes to a
  * recovery file, uncompressed; either way the user is told. An erase
  * leaves nothing to recover. */
-static void save_file_recover(const char *path, const void *data,
-      size_t len, bool sync)
+static void save_file_recover(struct save_file *f, const char *path,
+      const void *data, size_t len, bool sync)
 {
    char *rec = NULL;
    if (     len
@@ -1439,6 +1445,8 @@ static void save_file_recover(const char *path, const void *data,
          && save_backups_recover(rec, PATH_MAX_LENGTH, path, data, len,
                sync))
    {
+      if (f)
+         retro_atomic_fetch_or_int(&f->flags, SAVE_FILE_RECOVERY_MADE);
       save_file_notice(MSG_SAVE_WRITE_RECOVERED, path, true);
       RARCH_WARN("[SRAM] Unsaved progress: \"%s\"\n", rec);
    }
@@ -1469,6 +1477,31 @@ static void save_file_check_recovery(unsigned slot)
       save_file_notice(MSG_SAVE_RECOVERY_NEWER, path, true);
       RARCH_WARN("[SRAM] Unsaved progress: \"%s\"\n", rec);
    }
+   free(rec);
+}
+
+/* A recovery file this session made stays newer than the save the
+ * session wrote after it (SAVE_FILE_WRITTEN_AFTER): the next load
+ * announces it. */
+static void save_file_keep_recovery(unsigned slot)
+{
+   char *rec;
+   int64_t saved       = 0;
+   int64_t made        = 0;
+   struct save_file *f = save_file_get(slot);
+   const char *path    = task_save_files->elems[slot].data;
+   if (     !f
+         || !(retro_atomic_load_acquire_int(&f->flags)
+            & SAVE_FILE_WRITTEN_AFTER)
+         || !path_get_mtime(path, &saved)
+         || !(rec = (char*)malloc(PATH_MAX_LENGTH)))
+      return;
+   /* 2 s, not 1: FAT keeps whole 2 s, and older vfat reads back the
+    * time asked for until the inode is dropped. */
+   if (     save_backups_find_recovery(rec, PATH_MAX_LENGTH, path, INT64_MIN)
+         && path_get_mtime(rec, &made)
+         && made <= saved)
+      path_set_mtime(rec, saved + 2);
    free(rec);
 }
 
@@ -1527,7 +1560,7 @@ static bool content_save_ram_file(unsigned slot, bool compress, bool sync,
       if (autosave_main_write(slot))
       {
          if (flush)
-            save_file_recover(ram.path, mem_info.data, mem_info.size,
+            save_file_recover(f, ram.path, mem_info.data, mem_info.size,
                   sync);
          return !flush;
       }
@@ -1600,7 +1633,7 @@ static bool content_save_ram_file(unsigned slot, bool compress, bool sync,
       if (!mem_info.size)
          RARCH_WARN("[SRAM] \"%s\" not emptied: it could not be "
                "backed up.\n", ram.path);
-      save_file_recover(ram.path, mem_info.data, mem_info.size, sync);
+      save_file_recover(f, ram.path, mem_info.data, mem_info.size, sync);
       return false;
    }
 
@@ -1672,7 +1705,7 @@ fail:
          save_file_notice(MSG_SAVE_WRITE_FAILED, ram.path, true);
       return false;
    }
-   save_file_recover(ram.path, mem_info.data, mem_info.size, sync);
+   save_file_recover(f, ram.path, mem_info.data, mem_info.size, sync);
    return false;
 }
 
@@ -1695,6 +1728,9 @@ bool event_save_files(bool is_sram_used, bool compress_files, bool sync,
       if (!content_save_ram_file(i, compress_files, sync, rewrite, copy,
                false, false))
          ret = false;
+   if (sync)
+      for (i = 0; i < task_save_files->size; i++)
+         save_file_keep_recovery(i);
    return ret;
 }
 
