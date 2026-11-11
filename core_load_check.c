@@ -1202,7 +1202,7 @@ void core_load_check_loaded(void)
    if (core_load_rt.park.state != CORE_LOAD_PARK_NONE)
       core_load_park_cancel();
    /* Any other pass the slot keeps, such as a Load Once whose re-run
-    * only probed, ends when a core loads (D8) */
+    * only probed, ends when a core loads */
    if (     core_load_rt.slot.pass
          && core_load_rt.granted != CORE_LOAD_GRANT_SLOT)
       core_load_slot_clear(&core_load_rt.slot);
@@ -1240,7 +1240,7 @@ void core_load_check_unloaded(void)
 {
    core_load_rt.running = false;
    /* Kept while it passes, Load Once too: the reload after Close
-    * Content and menu or driver init pass it (D8) */
+    * Content and menu or driver init pass it */
    if (!core_load_rt.loaded.pass)
       core_load_slot_clear(&core_load_rt.loaded);
 }
