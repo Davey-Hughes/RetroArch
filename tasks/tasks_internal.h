@@ -576,6 +576,10 @@ void event_flush_save_files(bool sram_used, bool compress_files,
  * is written here synced, so this can wait on the disk. */
 void event_flush_kept_save_files(bool sram_used, bool compress_files);
 
+/* Saving is off for want of a folder: save RAM goes to recovery files
+ * outside it (save_backups_recover_away()). */
+void event_recover_save_files(bool sync);
+
 void path_init_savefile_rtc(const char *savefile_path);
 
 void *savefile_ptr_get(void);

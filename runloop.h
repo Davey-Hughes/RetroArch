@@ -1103,6 +1103,10 @@ void runloop_pause_checks(void);
  * by the autosave worker where one runs. */
 void runloop_flush_save_files(void);
 
+/* Saving is off for want of a save folder: the content's save RAM goes
+ * to recovery files outside it. */
+void runloop_recover_save_files(bool sync);
+
 /* Any thread: the main thread does runloop_flush_save_files() at its
  * next frame. */
 void runloop_request_save_files(void);

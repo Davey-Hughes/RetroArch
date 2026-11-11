@@ -1107,6 +1107,12 @@ void event_flush_kept_save_files(bool sram_used, bool compress_files)
       kept_flushes++;
 }
 
+/* Saving off for want of a folder is save_e2e's folder_off_recovers. */
+void event_recover_save_files(bool sync)
+{
+   (void)sync;
+}
+
 static void request_save_files(void *data)
 {
    (void)data;

@@ -3987,6 +3987,7 @@ bool command_event(enum event_command cmd, void *data)
             /* NULL is an explicit save request (network command, web
              * export): not synced, but it makes the copies owed. */
             bool sync = data ? *(bool*)data : false;
+            runloop_recover_save_files(sync);
             return event_save_files(
                   runloop_st->flags & RUNLOOP_FLAG_USE_SRAM,
 #if defined(HAVE_COMPRESSION)

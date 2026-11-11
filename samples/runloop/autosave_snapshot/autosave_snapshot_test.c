@@ -169,6 +169,12 @@ size_t save_backups_recover(char *s, size_t len, const char *path,
    return 0;
 }
 
+size_t save_backups_recover_away(char *s, size_t len, const char *path,
+      const void *data, size_t data_len, bool sync)
+{
+   return save_backups_recover(s, len, path, data, data_len, sync);
+}
+
 const char *save_backups_reason_name(enum save_backup_reason reason)
 {
    (void)reason;

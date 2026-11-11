@@ -1780,6 +1780,28 @@ void event_flush_kept_save_files(bool is_sram_used, bool compress_files)
    save_files_flush(is_sram_used, compress_files, 0, true);
 }
 
+void event_recover_save_files(bool sync)
+{
+   unsigned i;
+   if (!task_save_files)
+      return;
+   for (i = 0; i < task_save_files->size; i++)
+   {
+      struct ram_type ram;
+      retro_ctx_memory_info_t mem_info;
+      char *rec;
+      content_get_memory(&mem_info, &ram, i);
+      if (     !mem_info.data || !mem_info.size
+            || !(rec = (char*)malloc(PATH_MAX_LENGTH)))
+         continue;
+      if (save_backups_recover_away(rec, PATH_MAX_LENGTH,
+               task_save_files->elems[i].data, mem_info.data, mem_info.size,
+               sync))
+         RARCH_WARN("[SRAM] Unsaved progress: \"%s\"\n", rec);
+      free(rec);
+   }
+}
+
 bool event_load_save_files(bool is_sram_load_disabled)
 {
    unsigned i;

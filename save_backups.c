@@ -1368,8 +1368,8 @@ static bool save_backups_recovered(char *s, size_t len, const char *path,
    return ok;
 }
 
-size_t save_backups_recover(char *s, size_t len, const char *path,
-      const void *data, size_t data_len, bool sync)
+static size_t save_backups_recover_in(char *s, size_t len, const char *path,
+      const void *data, size_t data_len, bool sync, bool beside)
 {
    unsigned i;
    char *dir;
@@ -1379,7 +1379,7 @@ size_t save_backups_recover(char *s, size_t len, const char *path,
    s[0] = '\0';
    if (!(dir = (char*)malloc(PATH_MAX_LENGTH)))
       return 0;
-   if (save_backups_dir(dir, PATH_MAX_LENGTH, path))
+   if (beside && save_backups_dir(dir, PATH_MAX_LENGTH, path))
       made = save_backups_write_copy(s, len, dir, path, NULL,
             SAVE_BACKUP_UNSAVED, data, data_len, false, false, false, sync,
             NULL, NULL)
@@ -1398,6 +1398,18 @@ size_t save_backups_recover(char *s, size_t len, const char *path,
    }
    free(dir);
    return made ? strlen(s) : 0;
+}
+
+size_t save_backups_recover(char *s, size_t len, const char *path,
+      const void *data, size_t data_len, bool sync)
+{
+   return save_backups_recover_in(s, len, path, data, data_len, sync, true);
+}
+
+size_t save_backups_recover_away(char *s, size_t len, const char *path,
+      const void *data, size_t data_len, bool sync)
+{
+   return save_backups_recover_in(s, len, path, data, data_len, sync, false);
 }
 
 /* The newest recovery file of @base in @dir changed after *@newest.

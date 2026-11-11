@@ -7285,6 +7285,14 @@ void runloop_flush_save_files(void)
       event_flush_kept_save_files(true, false);
 #endif
    }
+   else
+      runloop_recover_save_files(true);
+}
+
+void runloop_recover_save_files(bool sync)
+{
+   if (runloop_save_folder_off)
+      event_recover_save_files(sync);
 }
 
 static retro_atomic_int_t runloop_save_files_request

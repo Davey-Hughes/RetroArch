@@ -803,6 +803,69 @@ def lane_folder_check_each_load(args, n, override=False):
     return r, failures
 
 
+def lane_folder_off_recovers(args, n):
+    """MR2: the save folder's parent missing and the default unusable,
+    so saving is off: a pause puts the session's save in a recovery file
+    in the config folder, kept through a crash, and a pause with it
+    unchanged adds none; the close does the same; nothing is made under
+    the missing parent.  With the folder back, the next load announces
+    it, and the save that load's session writes resolves it."""
+    r = Run(args.run_dir, 'folder_off_recovers-%d' % n)
+    failures = []
+    gone = r.dir / 'gone'
+    rec_dir = r.dir / 'config' / 'recovery'
+    port = 56200 + n
+    # The default save folder's parent is a file: no stand-in.
+    (r.dir / 'xdg-config' / 'retroarch').write_text('')
+    cfg = r.config(savefile_directory=gone / 'saves',
+                   network_cmd_enable='true', network_cmd_port=str(port))
+    # Ended by kill, as a crash: only the pause can have written.
+    r.start(args, cfg, 20000, r.env(SAVE_E2E_TOUCHES='30:90',
+                                    SAVE_E2E_FRAME_MS=10))
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    check(failures, r.wait_for(Path('%s-90' % (r.dir / 'touched'))),
+          'run 0: no touch')
+    sock.sendto(b'PAUSE_TOGGLE', ('127.0.0.1', port))
+    deadline = time.time() + 10
+    while not r.copies('unsaved', rec_dir) and time.time() < deadline:
+        time.sleep(0.02)
+    for _ in range(2):
+        sock.sendto(b'PAUSE_TOGGLE', ('127.0.0.1', port))
+        time.sleep(0.5)
+    sock.close()
+    r.kill()
+    r.drain.join()
+    recs = r.copies('unsaved', rec_dir)
+    check(failures, len(recs) == 1, 'run 0: %d recovery files' % len(recs))
+    check(failures, bool(recs) and recs[-1].read_bytes() == pattern(90),
+          'run 0: the recovery file is not the session\'s save')
+
+    cfg = r.config(savefile_directory=gone / 'saves')
+    r.start(args, cfg, 60, r.env(SAVE_E2E_TOUCH_FRAME=5, SAVE_E2E_SEED=91))
+    rc = r.wait(60)
+    check(failures, rc == 0, 'run 1: retroarch exit %s' % rc)
+    log = r.log.read_text(errors='replace')
+    check(failures, 'saving is off for this session' in log,
+          'run 1: saving was not off')
+    recs = [p for p in r.copies('unsaved', rec_dir)
+            if p.read_bytes() == pattern(91)]
+    check(failures, len(recs) == 1,
+          'run 1: %d recovery files of the session\'s save' % len(recs))
+    check(failures, not gone.exists(), 'run 1: made %s' % gone)
+
+    (gone / 'saves').mkdir(parents=True)
+    notice = 'Unsaved progress for %s is in Save Backups.' % (
+        gone / 'saves' / 'game.srm')
+    for i in (2, 3):
+        r.start(args, cfg, 60, r.env())
+        rc = r.wait(60)
+        check(failures, rc == 0, 'run %d: retroarch exit %s' % (i, rc))
+        log = r.log.read_text(errors='replace')
+        check(failures, log.count(notice) == (1, 0)[i - 2],
+              'run %d: %d notices' % (i, log.count(notice)))
+    return r, failures
+
+
 def lane_folder_check_override(args, n):
     """The same with a game override, which must not skip the
     check."""
@@ -1183,6 +1246,7 @@ LANES = {
     'config_keeps_folder': lane_config_keeps_folder,
     'folder_check_each_load': lane_folder_check_each_load,
     'folder_check_override': lane_folder_check_override,
+    'folder_off_recovers': lane_folder_off_recovers,
     'relative_paths': lane_relative_paths,
     'relative_config_no_folder': lane_relative_config_no_folder,
     'relative_default_config': lane_relative_default_config,
@@ -1206,7 +1270,7 @@ WINDOWS_LANES = {'windows_locked_close'}
 POSIX_LANES = {'autosave_full_disk', 'autosave_kill_mid_write',
                'no_rewrite_at_launch', 'unreadable_backed_up',
                'explicit_save_copies', 'folder_check_each_load',
-               'folder_check_override',
+               'folder_check_override', 'folder_off_recovers',
                'relative_default_config'} | set(HELD_LANES)
 
 
