@@ -1619,6 +1619,52 @@ static void test_undo_save_during_write(void)
 }
 
 /* -----------------------------------------------------------------
+ * undo_save_write_fails: an Undo Save whose write fails keeps the
+ * state it would have put back, and a second Undo puts it back.
+ * ----------------------------------------------------------------- */
+static void test_undo_save_write_fails(void)
+{
+   const char *path = "sst_undo_fails.state";
+   void   *was      = NULL, *over = NULL;
+   int64_t n_was    = -1, n_over = -2;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(path);
+   core_fill(3 * TEST_SAVE_STATE_CHUNK + 5);
+   content_save_state(path, true);
+   pump(1000);
+   if (!filestream_read_file(path, &was, &n_was))
+      n_was = -1;
+   memset(core_mem, 0x77, core_len);
+   content_save_state(path, true);
+   pump(1000);
+   if (!filestream_read_file(path, &over, &n_over))
+      n_over = -2;
+
+   /* the undo's own file is not moved into place */
+   __atomic_store_n(&refuse_renames, REFUSE_FINISH, __ATOMIC_RELAXED);
+   okf(content_undo_save_state(), "undo fails: the undo is pushed");
+   pump(1000);
+   __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+   okf(n_over > 0 && !written_into(path, over, n_over),
+       "undo fails: the slot keeps the save");
+   okf(!content_undo_save_buf_is_empty(),
+       "undo fails: the state it would put back is kept");
+   okf(content_undo_save_state(), "undo fails: a second Undo is taken");
+   pump(1000);
+   okf(n_was > 0 && !written_into(path, was, n_was),
+       "undo fails: the second Undo puts the state back");
+   okf(content_undo_save_buf_is_empty(),
+       "undo fails: then nothing is left to undo");
+
+   free(was);
+   free(over);
+   filestream_delete(path);
+   filestream_delete("sst_undo_fails.state.tmp");
+}
+
+/* -----------------------------------------------------------------
  * A backup read counts against Undo Save until it is through: also
  * one the reset discards while held, and one pushed through
  * content_load_state().
@@ -3225,6 +3271,7 @@ static int run_default_lane(void)
    test_undo_save_slot();
    test_undo_save_refused_push();
    test_undo_save_during_write();
+   test_undo_save_write_fails();
    test_undo_save_count();
    test_undo_save_twice();
    test_undo_save_during_backup();

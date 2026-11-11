@@ -587,14 +587,18 @@ static void undo_save_state_cb(retro_task_t *task,
       content_drop_thumbnail(state->path, true);
 #endif
 
-   /* Wipe the save file buffer as it's intended to be one use only */
-   undo_save_buf.path[0]  = '\0';
-   undo_save_buf.size     = 0;
-   undo_save_buf.capacity = 0;
-   if (undo_save_buf.data)
+   /* Wipe the save file buffer as it's intended to be one use only;
+    * a failed undo keeps it for another try */
+   if (!error)
    {
-      free(undo_save_buf.data);
-      undo_save_buf.data = NULL;
+      undo_save_buf.path[0]  = '\0';
+      undo_save_buf.size     = 0;
+      undo_save_buf.capacity = 0;
+      if (undo_save_buf.data)
+      {
+         free(undo_save_buf.data);
+         undo_save_buf.data = NULL;
+      }
    }
 
    free(state);
@@ -672,10 +676,15 @@ static void task_save_handler_finished(retro_task_t *task,
 
    if (state->data)
    {
-      if (     (state->flags & SAVE_TASK_FLAG_UNDO_SAVE)
-            && (state->data == undo_save_buf.data))
-         undo_save_buf.data = NULL;
-      free(state->data);
+      bool undo =    (state->flags & SAVE_TASK_FLAG_UNDO_SAVE)
+                  && (state->data == undo_save_buf.data);
+      /* A failed undo leaves it to undo_save_buf, for another try */
+      if (!undo || !task_get_error(task))
+      {
+         if (undo)
+            undo_save_buf.data = NULL;
+         free(state->data);
+      }
       state->data = NULL;
    }
    free(state->fe_replay);
