@@ -2786,6 +2786,7 @@ static void test_copy(void)
    CHECK((m = core_load_match_new(tmp, core, &src)) != NULL);
    CHECK(m && match_all(m) == 0);
    core_load_match_free(m);
+   /* Replaced since its load (Windows' held file can't be) */
    CHECK(put_core(core, "ra_libretro" LIB_EXT, 'a'));
    CHECK(core_load_match_new(tmp, core, &src) == NULL);
 #endif
