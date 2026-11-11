@@ -508,6 +508,43 @@ static void test_slot_binds_file(void)
    stop();
 }
 
+#ifdef _WIN32
+/* LoadLibraryW loads <name>.dll for a file name with no '.': the check
+ * reads that file, and "<name>." for <name> itself */
+static void test_dll_name(void)
+{
+   dylib_t lib = NULL;
+   char core[256];
+   char dll[256];
+   char dot[256];
+   start(false);
+   path_mkdir(TMP_DIR "/cores/dir.d");
+   core_load_check_set_startup(true);
+   CHECK(put_core(core, "dir.d/noext_libretro", 'a'));
+   CHECK(trust(core));
+   CHECK(put_core(dll, "dir.d/noext_libretro" LIB_EXT, 'b'));
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_REFUSED);
+   CHECK(lib_id(lib) == 0);
+   if (lib)
+      dylib_close(lib);
+   lib = NULL;
+   CHECK(core_load_check_refused(dll));
+   CHECK(trust(dll));
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_OPENED);
+   CHECK(lib_id(lib) == 2);
+   if (lib)
+      dylib_close(lib);
+   lib = NULL;
+   sprintf(dot, "%s.", core);
+   CHECK(core_load_check_open(dot, &lib) == CORE_LOAD_GATE_OPENED);
+   CHECK(lib_id(lib) == 1);
+   if (lib)
+      dylib_close(lib);
+   core_load_check_set_startup(false);
+   stop();
+}
+#endif
+
 /* D4: while the seed is pending, a core it covers is refused quietly
  * and not checked; nothing from before the seed answers after it */
 static void test_seed_probe(void)
@@ -2824,6 +2861,9 @@ int main(void)
    test_full_check(false);
    test_full_check(true);
    test_slot_binds_file();
+#ifdef _WIN32
+   test_dll_name();
+#endif
    test_startup_inline();
    test_startup_refused_once();
    test_deinit_drops();

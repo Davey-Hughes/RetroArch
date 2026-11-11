@@ -179,11 +179,29 @@ static bool core_load_slot_is(const struct core_load_slot *sl,
    return sl->used && string_is_equal(sl->path, path);
 }
 
+#ifdef _WIN32
+/* LoadLibraryW loads <name>.dll for this name */
+static bool core_load_dll_appended(const char *path)
+{
+   return !strchr(path_basename_nocompression(path), '.');
+}
+#endif
+
 /* Absolute, as the loader is given it */
 static void core_load_abs(const char *path, char *s, size_t len)
 {
    strlcpy(s, path, len);
+#ifdef _WIN32
+   /* Named in full, so the check reads the file loaded */
+   if (core_load_dll_appended(s))
+      strlcat(s, ".dll", len);
+#endif
    path_resolve_realpath(s, len, false);
+#ifdef _WIN32
+   /* Its trailing dots went: one keeps ".dll" off */
+   if (core_load_dll_appended(s))
+      strlcat(s, ".", len);
+#endif
 }
 
 /* The file the check reads: Apple's dylib_load opens a .framework's
