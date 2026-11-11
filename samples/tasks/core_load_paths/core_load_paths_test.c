@@ -612,6 +612,12 @@ static void mode_probe(void)
    CHECK(!warning_up(), "the Core row's action asked");
    CHECK(core_load_check_refused(bad_core),
          "the Core row's action did not probe the core");
+   /* The companion UI's Load Core starts a core that runs without
+    * content once answered */
+   CHECK(task_content_park_core_start(bad_core), "Load Core was not parked");
+   CHECK(wait_for(warning_up, 120), "no warning for the parked Load Core");
+   CHECK(core_warning_choose(CORE_WARNING_LOAD_ONCE), "Load Once not taken");
+   CHECK(wait_for(bad_runs, 600), "the answered Load Core did not start the core");
 }
 
 /* D6: the first run's seed decides, then the startup load runs again */
