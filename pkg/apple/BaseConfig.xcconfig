@@ -29,6 +29,8 @@ OTHER_CFLAGS = $(inherited) -DHAVE_COREAUDIO
 OTHER_CFLAGS = $(inherited) -DHAVE_CORELOCATION
 OTHER_CFLAGS = $(inherited) -DHAVE_CORETEXT
 OTHER_CFLAGS = $(inherited) -DHAVE_CORE_SIGNATURES
+// The app bundle lookup in core_signature_io.c.
+OTHER_LDFLAGS = $(inherited) -framework CoreFoundation
 OTHER_CFLAGS = $(inherited) -DHAVE_CORE_LOAD_CHECK
 OTHER_CFLAGS = $(inherited) -DHAVE_DR_FLAC
 OTHER_CFLAGS = $(inherited) -DHAVE_DR_MP3
@@ -48,7 +50,7 @@ OTHER_CFLAGS = $(inherited) -DHAVE_LROUND
 OTHER_CFLAGS = $(inherited) -DHAVE_MENU
 OTHER_CFLAGS = $(inherited) -DHAVE_METAL
 // Metal's optional builtin HEVC backend uses these framework APIs.
-OTHER_LDFLAGS = $(inherited) -framework CoreMedia -framework VideoToolbox -framework CoreFoundation
+OTHER_LDFLAGS = $(inherited) -framework CoreMedia -framework VideoToolbox
 OTHER_CFLAGS = $(inherited) -DHAVE_MFI
 OTHER_CFLAGS = $(inherited) -DHAVE_MMAP
 OTHER_CFLAGS = $(inherited) -DHAVE_MICROPHONE
