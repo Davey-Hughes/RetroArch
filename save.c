@@ -1476,8 +1476,30 @@ static bool content_save_ram_file(unsigned slot, bool compress, bool sync,
       return false;
    f = save_file_get(slot);
 #ifdef HAVE_THREADS
-   handle = autosave_main_write(slot);
-   if (handle && copy)
+   /* Written in place (no rename): while its worker lives only the
+    * worker writes it, this image after its own and recovered if that
+    * fails. */
+   if (filestream_atomic_in_place(ram.path))
+   {
+      retro_ctx_memory_info_t live;
+      if ((handle = autosave_flushable(slot, &live)))
+      {
+         autosave_flush(handle, live.data, 0, false);
+         content_save_written();
+         return true;
+      }
+      /* A worker of the old size still writing: the next check retires
+       * it, and its replacement writes this memory at once. A state
+       * load's image, which that memory won't hold, is recovered. */
+      if (autosave_main_write(slot))
+      {
+         if (flush)
+            save_file_recover(ram.path, mem_info.data, mem_info.size,
+                  sync);
+         return !flush;
+      }
+   }
+   else if ((handle = autosave_main_write(slot)) && copy)
       autosave_main_pay(handle, sync);
 #endif
 

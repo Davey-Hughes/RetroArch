@@ -14,6 +14,7 @@
 #include <vfs/vfs_implementation.h>
 
 #define filestream_write_file_atomic_synced test_write_atomic_synced
+#define filestream_atomic_in_place test_atomic_in_place
 #ifdef HAVE_THREADS
 #define sthread_create test_sthread_create
 #define sthread_join test_sthread_join
@@ -27,8 +28,10 @@ static long long test_busy_usec = 0;
 #endif
 #include "../../../save.c"
 #undef filestream_write_file_atomic_synced
+#undef filestream_atomic_in_place
 bool filestream_write_file_atomic_synced(const char *path, const void *data,
       int64_t size);
+bool filestream_atomic_in_place(const char *path);
 #ifdef HAVE_THREADS
 #undef sthread_create
 #undef sthread_join
@@ -193,10 +196,29 @@ bool content_finish_tmp(const char *path, bool ok, bool sync)
          : filestream_finish_atomic(path, ok)) == 0;
 }
 
+/* The save stands in for one on smb:// or nfs:// (no rename): written
+ * in place, as file_stream.c writes those (filestream_atomic_test). */
+static bool in_place_saves;
+
+bool test_atomic_in_place(const char *path)
+{
+   return   (in_place_saves && string_is_equal(path_basename(path), SAVE))
+         || filestream_atomic_in_place(path);
+}
+
 bool test_write_atomic_synced(const char *path, const void *data,
       int64_t size)
 {
    synced_writes++;
+   if (in_place_saves && test_atomic_in_place(path))
+   {
+      RFILE *f = filestream_open(path, RETRO_VFS_FILE_ACCESS_WRITE,
+            RETRO_VFS_FILE_ACCESS_HINT_NONE);
+      bool ok  = f && filestream_write(f, data, size) == size;
+      if (f && filestream_close(f) != 0)
+         ok = false;
+      return ok;
+   }
    return filestream_write_file_atomic_synced(path, data, size);
 }
 
@@ -220,6 +242,10 @@ static bool refuse_rename;
 /* The worker's temporary refused, as a name too long for it is */
 static bool refuse_worker_temp;
 static unsigned write_opens;
+/* Handles open for writing on the save itself; a second one opened
+ * while one is open sets save_overlap. */
+static struct retro_vfs_file_handle *save_writers[MAX_OPEN];
+static bool save_overlap;
 /* What reached the save, in order: each image's first byte. */
 static char put_log[16];
 static unsigned put_num;
@@ -227,11 +253,13 @@ static unsigned put_num;
 static uintptr_t main_thread;
 static unsigned main_write_opens;
 static unsigned worker_close_temp_opens;
+static unsigned worker_save_opens;
 
 /* The worker stops in its stat of the save (1), in opening its
  * temporary (2), after renaming it (3), after its first open of
- * CLOSE_TEMP (4) or a later one (5) until stall_mode changes; the main
- * thread never stops. */
+ * CLOSE_TEMP (4) or a later one (5), or after its first open of the
+ * save itself for writing (6) or a later one (7) until stall_mode
+ * changes; the main thread never stops. */
 static retro_atomic_int_t stall_mode;
 static retro_atomic_int_t stalled;
 
@@ -299,7 +327,31 @@ static struct retro_vfs_file_handle *RETRO_CALLCONV test_open(
          open_written[i] = 0;
          break;
       }
+   if (string_is_equal(path_basename(path), SAVE))
+   {
+      unsigned free_at = MAX_OPEN;
+      for (i = 0; i < MAX_OPEN; i++)
+      {
+         if (save_writers[i])
+            save_overlap = true;
+         else if (free_at == MAX_OPEN)
+            free_at = i;
+      }
+      if (free_at < MAX_OPEN)
+         save_writers[free_at] = h;
+   }
    VFS_UNLOCK();
+#ifdef HAVE_THREADS
+   if (     string_is_equal(path_basename(path), SAVE)
+         && sthread_get_current_thread_id() != main_thread)
+   {
+      unsigned n;
+      VFS_LOCK();
+      n = ++worker_save_opens;
+      VFS_UNLOCK();
+      stall_here(n > 1 ? 7 : 6);
+   }
+#endif
    return h;
 }
 
@@ -308,8 +360,12 @@ static int RETRO_CALLCONV test_close(struct retro_vfs_file_handle *h)
    unsigned i;
    VFS_LOCK();
    for (i = 0; i < MAX_OPEN; i++)
+   {
       if (open_files[i] == h)
          open_files[i] = NULL;
+      if (save_writers[i] == h)
+         save_writers[i] = NULL;
+   }
    VFS_UNLOCK();
    return retro_vfs_file_close_impl(h);
 }
@@ -879,6 +935,43 @@ static void lane_flush_points_sync_noworker(void)
    CHECK(notices(MSG_SAVE_BACKUP_FAILED) == 1 && notice_num == 1,
          "flush_noworker: a failed copy not told once");
    path_deinit_savefile();
+   clean();
+}
+
+/* With no worker, a menu or pause flush of a save on smb:// or nfs://
+ * is written in place: no temporary, no rename. */
+static void lane_flush_in_place_noworker(void)
+{
+   static unsigned char disk[BIG], ram[BIG];
+   unsigned c;
+
+   for (c = 0; c < 2; c++)
+   {
+      unsigned renames;
+      clean();
+      fill(disk, BIG, 71);
+      put(SAVE, disk, BIG);
+      memset(ram, 0, BIG);
+      core_data = ram;
+      core_size = BIG;
+      path_init_savefile_new();
+      path_init_savefile_rtc(SAVE);
+      CHECK(event_load_save_files(false), "in_place_noworker: no load");
+      in_place_saves = true;
+      use_test_vfs(true);
+      fill(ram, BIG, 72);
+      event_flush_kept_save_files(true, c != 0);
+      VFS_LOCK();
+      renames = put_num;
+      VFS_UNLOCK();
+      use_test_vfs(false);
+      in_place_saves = false;
+      CHECK(!renames && !path_is_valid(CLOSE_TEMP),
+            "in_place_noworker: not written in place");
+      CHECK(holds_as(SAVE, ram, BIG, c != 0),
+            "in_place_noworker: not written");
+      path_deinit_savefile();
+   }
    clean();
 }
 
@@ -2645,6 +2738,114 @@ static void lane_long_name(void)
          "long name: a write of its own taken for another program's");
    CHECK(!notice_num, "long name: told");
    flush_lane_end();
+}
+
+/* A save written in place (smb://, nfs://; stood in for here): a
+ * SAVE_FILES while the worker writes it hands its image to the worker,
+ * which writes it after its own. The two never write the save at once,
+ * the newest lands last, and nothing is told. */
+static void lane_in_place_save_files(void)
+{
+   static unsigned char disk[BIG], ram[BIG], s1[BIG], m2[BIG];
+
+   fill_id(disk, BIG, 101, 'D');
+   fill_id(s1, BIG, 102, 'A');
+   fill_id(m2, BIG, 103, 'B');
+   flush_lane_begin(disk, ram);
+   in_place_saves = true;
+   start(ram, BIG, false);
+   VFS_LOCK();
+   worker_save_opens = 0;
+   save_overlap      = false;
+   VFS_UNLOCK();
+
+   memcpy(ram, s1, BIG);
+   stall(6);
+   autosave_check();
+   CHECK(wait_stalled(), "in place: the worker did not stop in its write");
+   memcpy(ram, m2, BIG);
+   event_save_files(true, false, true, true, NULL);
+   stall(0);
+   wait_flushed();
+   wait_requested();
+   VFS_LOCK();
+   CHECK(!save_overlap, "in place: the save written by both at once");
+   VFS_UNLOCK();
+   CHECK(holds(SAVE, m2, BIG), "in place: the newest image not last");
+   CHECK(!notice_num && !copies("backups", SAVE_BACKUP_REASON_LAST, NULL, 0),
+         "in place: a notice or a copy");
+   flush_lane_end();
+   in_place_saves = false;
+}
+
+/* A save written in place whose worker is still writing an image of
+ * the old size when the core's memory changes size: a SAVE_FILES then
+ * writes nothing itself; the worker that replaces the old one writes
+ * the new memory at once. */
+static void lane_in_place_resized(void)
+{
+   static unsigned char disk[BIG], ram[BIG], s1[BIG], m2[BIG];
+
+   fill_id(disk, BIG, 104, 'D');
+   fill_id(s1, BIG, 105, 'A');
+   fill_id(m2, BIG, 106, 'B');
+   flush_lane_begin(disk, ram);
+   in_place_saves = true;
+   start(ram, BIG, false);
+   VFS_LOCK();
+   worker_save_opens = 0;
+   save_overlap      = false;
+   VFS_UNLOCK();
+
+   memcpy(ram, s1, BIG);
+   stall(6);
+   autosave_check();
+   CHECK(wait_stalled(), "in place resized: the worker did not stop");
+   memcpy(ram, m2, BIG);
+   core_size = BIG / 2;
+   event_save_files(true, false, true, true, NULL);
+   stall(0);
+   wait_requested();
+   autosave_check();
+   wait_requested();
+   autosave_check();
+   wait_requested();
+   VFS_LOCK();
+   CHECK(!save_overlap, "in place resized: the save written by both at once");
+   VFS_UNLOCK();
+   CHECK(holds(SAVE, m2, BIG / 2), "in place resized: the newest not last");
+   CHECK(!notice_num, "in place resized: told");
+   flush_lane_end();
+   in_place_saves = false;
+}
+
+/* A SAVE_FILES image a worker writes in place for the main thread and
+ * fails to write goes to a recovery file, as the main thread's own
+ * failed write did. */
+static void lane_in_place_write_fails(void)
+{
+   static unsigned char disk[BIG], ram[BIG], m1[BIG];
+   char rec[PATH_MAX_LENGTH];
+
+   fill_id(disk, BIG, 107, 'D');
+   fill_id(m1, BIG, 108, 'A');
+   flush_lane_begin(disk, ram);
+   in_place_saves = true;
+   start(ram, BIG, false);
+   set_vfs(BIG / 2, false);
+
+   memcpy(ram, m1, BIG);
+   event_save_files(true, false, true, true, NULL);
+   wait_flushed();
+   wait_requested();
+   autosave_check();
+   CHECK(copies("backups", SAVE_BACKUP_UNSAVED, rec, sizeof(rec)) == 1
+         && holds(rec, m1, BIG),
+         "in place fails: the image not in a recovery file");
+   CHECK(notices(MSG_SAVE_WRITE_RECOVERED) == 1,
+         "in place fails: not told it was recovered");
+   flush_lane_end();
+   in_place_saves = false;
 }
 
 /* At a quit: state loads' images of a long-named save queued when
@@ -4598,6 +4799,7 @@ int main(void)
    lane_changed_elsewhere_copy_fails();
    lane_flush_points_sync();
    lane_flush_points_sync_noworker();
+   lane_flush_in_place_noworker();
 #ifdef HAVE_THREADS
    retro_atomic_int_init(&wait_entries, 0);
    retro_atomic_int_init(&wait_leaves, 0);
@@ -4620,6 +4822,9 @@ int main(void)
    lane_long_name();
    lane_long_name_at_quit();
    lane_long_name_keeps_stat();
+   lane_in_place_save_files();
+   lane_in_place_resized();
+   lane_in_place_write_fails();
    lane_flush_points_queue();
    lane_main_write_pays_waiting();
    lane_main_write_pays_landed();
