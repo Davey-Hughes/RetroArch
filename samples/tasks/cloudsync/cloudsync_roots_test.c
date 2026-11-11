@@ -6,7 +6,9 @@
  * state is only renamed aside for a moment; what the manifests keep
  * of a delete the server refuses, of one taken from it and of an
  * upload or a download that does not happen; that a save which can't
- * be read or hashed fails the sync; and which save folder it walks.
+ * be read or hashed fails the sync; which save folder it walks; and
+ * what a server that lost its manifest or a file, a download unlike
+ * its manifest and a fetch cut short leave behind.
  *
  *   ./cloudsync_roots_test [lane...]   (default: every lane) */
 #include <stdio.h>
@@ -330,6 +332,8 @@ bool cloud_sync_end(cloud_sync_complete_handler_t cb, void *ud)
 /* Downloads of this key fail, at the call with fail_fetch_call */
 static const char *fail_fetch;
 static bool fail_fetch_call;
+/* The core takes this save while its download is read */
+static const char *live_on_read;
 
 bool cloud_sync_read(const char *path, const char *file,
       cloud_sync_complete_handler_t cb, void *ud)
@@ -354,6 +358,8 @@ bool cloud_sync_read(const char *path, const char *file,
             RETRO_VFS_FILE_ACCESS_HINT_NONE);
    if (f && !string_is_equal(path, MANIFEST_FILENAME_SERVER))
       fetches++;
+   if (f && live_on_read && string_ends_with(path, live_on_read))
+      live_save = live_on_read;
    cb(ud, path, f != NULL, f);
    return true;
 }
@@ -2251,6 +2257,210 @@ static void fetch_state_written(bool threaded)
    remove_tree(states_b);
 }
 
+/* The server lost its manifest, or a file it lists: A uploads only
+ * what changed here since its last sync, so B's newer save is not
+ * replaced by A's unchanged older one, and Upload Local puts B's back.
+ * A sync that holds files back says so once; one that doesn't, never. */
+static void server_lost_lane(bool threaded, bool file_only)
+{
+   char root_a[256], root_b[264];
+   lane_dirs(file_only ? "server_missing" : "manifest_lost", threaded,
+         root_a, sizeof(root_a));
+   snprintf(root_b, sizeof(root_b), "%s-b", root_a);
+   CHECK(path_mkdir(root_b));
+   put(root_a, "a.srm", "1");
+   put(root_a, "b.srm", "b1");
+   put(root_a, "c.srm", "c1");
+   CHECK(sync_saves(threaded, root_a));
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   put(root_b, "a.srm", "2");
+   CHECK(sync_saves(threaded, root_b));
+   other_device(false);
+   put(root_a, "c.srm", "c2");
+   if (file_only)
+      CHECK(filestream_delete(srv_key("saves/a.srm")) == 0);
+   else
+      CHECK(filestream_delete(srv_key(MANIFEST_FILENAME_SERVER)) == 0);
+   sync_saves(threaded, root_a);
+   sync_saves(threaded, root_a);
+   CHECK(uploads == 0);
+   CHECK(notices == 1);
+   CHECK(holds(root_a, "a.srm", "1"));
+   CHECK(holds(srv, "saves/c.srm", "c2"));
+   CHECK(file_only ? !path_is_valid(srv_key("saves/a.srm"))
+                   : holds(srv, "saves/a.srm", "2"));
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   CHECK(uploads == 0);
+   CHECK(notices == 1);
+   conflict_mode = 3;
+   CHECK(sync_saves(threaded, root_b));
+   conflict_mode = 0;
+   CHECK(uploads == (file_only ? 1u : 2u));
+   CHECK(notices == 0);
+   CHECK(holds(srv, "saves/a.srm", "2"));
+   other_device(false);
+   CHECK(sync_saves(threaded, root_a));
+   CHECK(notices == 0);
+   CHECK(holds(root_a, "a.srm", "2"));
+}
+
+static void manifest_lost(bool threaded)  { server_lost_lane(threaded, false); }
+static void server_missing(bool threaded) { server_lost_lane(threaded, true); }
+
+/* A download that is not what the server manifest says, or an empty
+ * one over a save (@listed: the manifest lists it empty), does not
+ * replace B's save: a conflict, met again next sync. Keep Server takes
+ * the first, never the second; Keep Local puts B's back. */
+static void download_kept_out_lane(bool threaded, const char *body,
+      bool listed)
+{
+   char root_a[256], root_b[264];
+   bool empty = !*body;
+   lane_dirs(listed ? "empty_listed" : empty ? "empty_download"
+         : "hash_mismatch", threaded, root_a, sizeof(root_a));
+   snprintf(root_b, sizeof(root_b), "%s-b", root_a);
+   CHECK(path_mkdir(root_b));
+   put(root_a, "a.srm", "1");
+   CHECK(sync_saves(threaded, root_a));
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   other_device(false);
+   put(root_a, "a.srm", listed ? body : "2");
+   CHECK(sync_saves(threaded, root_a));
+   if (!listed)
+      put(srv, "saves/a.srm", body);
+   other_device(true);
+   CHECK(!sync_saves(threaded, root_b));
+   CHECK(holds(root_b, "a.srm", "1"));
+   CHECK(!sync_saves(threaded, root_b));
+   CHECK(fetches == 0);
+   CHECK(holds(root_b, "a.srm", "1"));
+   conflict_mode = 2;
+   sync_saves(threaded, root_b);
+   CHECK(holds(root_b, "a.srm", empty ? "1" : body));
+   if (empty)
+   {
+      conflict_mode = 1;
+      CHECK(sync_saves(threaded, root_b));
+      CHECK(holds(srv, "saves/a.srm", "1"));
+   }
+   conflict_mode = 0;
+   CHECK(sync_saves(threaded, root_b));
+   CHECK(fetches == 0 && uploads == 0);
+   CHECK(holds(root_b, "a.srm", empty ? "1" : body));
+   other_device(false);
+}
+
+static void hash_mismatch(bool threaded)
+{ download_kept_out_lane(threaded, "X", false); }
+static void empty_download(bool threaded)
+{ download_kept_out_lane(threaded, "", false); }
+static void empty_listed(bool threaded)
+{ download_kept_out_lane(threaded, "", true); }
+
+/* Killed after A's copy went to its backups and before the download
+ * was moved in: the next sync finishes the download, no conflict. */
+static void rafetching_here(bool threaded)
+{
+   char root_a[256], root_b[264], left[PATH_MAX_LENGTH];
+   lane_dirs("rafetching", threaded, root_a, sizeof(root_a));
+   snprintf(root_b, sizeof(root_b), "%s-b", root_a);
+   CHECK(path_mkdir(root_b));
+   put(root_a, "a.srm", "1");
+   CHECK(sync_saves(threaded, root_a));
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   put(root_b, "a.srm", "2");
+   CHECK(sync_saves(threaded, root_b));
+   other_device(false);
+   drop(root_a, "a.srm");
+   put(root_a, "a.srm.rafetching", "2");
+   CHECK(sync_saves(threaded, root_a));
+   CHECK(holds(root_a, "a.srm", "2"));
+   fill_pathname_join_special(left, root_a, "a.srm.rafetching", sizeof(left));
+   CHECK(!path_is_valid(left));
+}
+
+/* The same cut, of a file new here: the leftover does not stop it
+ * being fetched. */
+static void rafetching_new(bool threaded)
+{
+   char root_a[256], root_b[264], left[PATH_MAX_LENGTH];
+   lane_dirs("rafetching_new", threaded, root_a, sizeof(root_a));
+   snprintf(root_b, sizeof(root_b), "%s-b", root_a);
+   CHECK(path_mkdir(root_b));
+   put(root_a, "b.srm", "b1");
+   CHECK(sync_saves(threaded, root_a));
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   put(root_b, "a.srm", "2");
+   CHECK(sync_saves(threaded, root_b));
+   other_device(false);
+   put(root_a, "a.srm.rafetching", "x");
+   CHECK(sync_saves(threaded, root_a));
+   CHECK(holds(root_a, "a.srm", "2"));
+   fill_pathname_join_special(left, root_a, "a.srm.rafetching", sizeof(left));
+   CHECK(!path_is_valid(left));
+}
+
+/* The download finishing a cut fetch fails, or (@live) the core takes
+ * the save during it: the next sync tries again, and meanwhile neither
+ * a sync nor Keep Local takes the file for deleted here. */
+static void rafetching_retry_lane(bool threaded, bool keep_local, bool live)
+{
+   char root_a[256], root_b[264], left[PATH_MAX_LENGTH], lane[32];
+   snprintf(lane, sizeof(lane), "rafetching_%s%s", live ? "live" : "retry",
+         keep_local ? "_kl" : "");
+   lane_dirs(lane, threaded, root_a, sizeof(root_a));
+   snprintf(root_b, sizeof(root_b), "%s-b", root_a);
+   CHECK(path_mkdir(root_b));
+   put(root_a, "a.srm", "1");
+   CHECK(sync_saves(threaded, root_a));
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   put(root_b, "a.srm", "2");
+   CHECK(sync_saves(threaded, root_b));
+   other_device(false);
+   drop(root_a, "a.srm");
+   put(root_a, "a.srm.rafetching", "x");
+   if (live)
+   {
+      live_on_read = "a.srm";
+      sync_saves(threaded, root_a);
+      live_on_read = NULL;
+   }
+   else
+   {
+      fail_fetch = "saves/a.srm";
+      CHECK(!sync_saves(threaded, root_a));
+      fail_fetch = NULL;
+   }
+   if (keep_local || live)
+   {
+      conflict_mode = keep_local ? 1 : 0;
+      CHECK(sync_saves(threaded, root_a));
+      conflict_mode = 0;
+      CHECK(holds(srv, "saves/a.srm", "2"));
+   }
+   live_save = NULL;
+   CHECK(sync_saves(threaded, root_a));
+   CHECK(holds(root_a, "a.srm", "2"));
+   CHECK(holds(srv, "saves/a.srm", "2"));
+   fill_pathname_join_special(left, root_a, "a.srm.rafetching", sizeof(left));
+   CHECK(!path_is_valid(left));
+}
+
+static void rafetching_retry(bool threaded)
+{ rafetching_retry_lane(threaded, false, false); }
+static void rafetching_retry_kl(bool threaded)
+{ rafetching_retry_lane(threaded, true, false); }
+static void rafetching_live(bool threaded)
+{ rafetching_retry_lane(threaded, false, true); }
+static void rafetching_live_kl(bool threaded)
+{ rafetching_retry_lane(threaded, true, true); }
+
 static const struct lane lanes[] = {
    { "sync_unreadable_subfolder", unreadable_subfolder },
    { "sync_readdir_error",        readdir_error },
@@ -2295,6 +2505,17 @@ static const struct lane lanes[] = {
    { "sync_auto_back_new",        auto_back_new },
    { "sync_auto_back_ram_temp",   auto_back_ram_temp },
    { "sync_slot0_auto_task_temp", slot0_auto_task_temp },
+   { "sync_server_manifest_lost", manifest_lost },
+   { "sync_server_missing_no_upload", server_missing },
+   { "sync_hash_mismatch_conflict", hash_mismatch },
+   { "sync_empty_download_kept_out", empty_download },
+   { "sync_rafetching_counts_as_here", rafetching_here },
+   { "sync_empty_listed_kept_out", empty_listed },
+   { "sync_rafetching_new_fetched", rafetching_new },
+   { "sync_rafetching_retried",   rafetching_retry },
+   { "sync_rafetching_retried_keep_local", rafetching_retry_kl },
+   { "sync_rafetching_live_deferred", rafetching_live },
+   { "sync_rafetching_live_deferred_keep_local", rafetching_live_kl },
 };
 
 int main(int argc, char **argv)

@@ -28,6 +28,14 @@ S_ACTION_EX(CLOUD_SYNC_RESOLVE_KEEP_SERVER,
       "Resolve Conflicts: Keep Server",
       "Resolve all conflicts by downloading server files, replacing local copies.")
 #endif
+/* Descriptor and configuration rows are #ifdef HAVE_CLOUDSYNC; the string
+ * tables always carry this row via the strings pass. */
+#if defined(HAVE_CLOUDSYNC) || defined(SETTINGS_DEF_STRINGS_PASS)
+S_ACTION_EX(CLOUD_SYNC_UPLOAD_ALL,
+      "cloud_sync_upload_all", SD_FLAG_NONE, NULL, NULL, CMD_EVENT_CLOUD_SYNC_UPLOAD_ALL,
+      "Resolve Server Reset: Upload Local",
+      "Upload every local file the server no longer lists, changed here or not. Use it on the device with the newest saves after the server lost its files or was reset.")
+#endif
 S_ACTION_EX(CONFIGURATIONS_LIST,
       "configurations_list", SD_FLAG_LAKKA_ADVANCED, NULL, NULL, 0,
       "Configuration File",

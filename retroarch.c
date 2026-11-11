@@ -5783,6 +5783,9 @@ bool command_event(enum event_command cmd, void *data)
       case CMD_EVENT_CLOUD_SYNC_RESOLVE_KEEP_SERVER:
          task_push_cloud_sync_resolve_keep_server();
          break;
+      case CMD_EVENT_CLOUD_SYNC_UPLOAD_ALL:
+         task_push_cloud_sync_upload_all();
+         break;
 #endif
       case CMD_EVENT_MENU_RESET_TO_DEFAULT_CONFIG:
          config_set_defaults(config_get_ptr());

@@ -33170,6 +33170,10 @@ MSG_HASH(
    "Cloud sync kept %u files on the server that are missing here."
    )
 MSG_HASH(
+   MSG_CLOUD_SYNC_UNCHANGED_NOT_SENT,
+   "Cloud sync did not upload %u unchanged files the server lost. To send them, use Cloud Sync > Resolve Server Reset: Upload Local."
+   )
+MSG_HASH(
    MSG_FAILED_TO_SAVE_STATE_TO,
    "Failed to save state to"
    )
@@ -33912,6 +33916,10 @@ MSG_HASH(
 MSG_HASH(
    MSG_PRESS_AGAIN_TO_RESET,
    "Press again to reset..."
+   )
+MSG_HASH(
+   MSG_PRESS_AGAIN_TO_UPLOAD_ALL,
+   "Press again to upload every local file the server lost..."
    )
 MSG_HASH(
    MSG_FIRST_RUN_DOWNLOAD_PROMPT,

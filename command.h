@@ -165,6 +165,8 @@ enum event_command
    CMD_EVENT_CLOUD_SYNC_RESOLVE_KEEP_LOCAL,
    /* Resolve cloud sync conflicts by keeping server files */
    CMD_EVENT_CLOUD_SYNC_RESOLVE_KEEP_SERVER,
+   /* Upload the local files the server no longer lists */
+   CMD_EVENT_CLOUD_SYNC_UPLOAD_ALL,
 #endif
    /* Shutdown the OS */
    CMD_EVENT_SHUTDOWN,

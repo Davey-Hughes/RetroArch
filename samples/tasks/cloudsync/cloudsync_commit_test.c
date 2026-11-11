@@ -225,6 +225,9 @@ void task_nbio_slice_close(nbio_budget_t *b) { (void)b; }
 bool task_nbio_slice_within_budget(void *ud, size_t avail, size_t len)
 { (void)ud; (void)avail; (void)len; return true; }
 
+/* The server manifest's hash of the downloads, which hold "new" */
+#define NEW_MD5 "22af645d1859cb5ca6da0c484f1f37ea"
+
 static void add_key(file_list_t *list, const char *path, const char *hash,
       const char *key)
 {
@@ -299,7 +302,7 @@ static void vanished_next_sync(void)
 {
 #if defined(TCS_MOVE_WORKER)
    int n;
-   CHECK(string_is_equal(synced_server, "new"));
+   CHECK(string_is_equal(synced_server, NEW_MD5));
    CHECK(string_is_equal(synced_local, "old"));
    for (n = 0; n < 3; n++)
    {
@@ -330,7 +333,7 @@ static void vanished_next_sync(void)
       CHECK(n == 2 || (file_list_search(st->updated_server_manifest,
                   "saves/save.srm", &at)
             && string_is_equal(CS_FILE_HASH(
-                  &st->updated_server_manifest->list[at]), "new")));
+                  &st->updated_server_manifest->list[at]), NEW_MD5)));
       CHECK(n == 2 || (file_list_search(st->updated_local_manifest,
                   "saves/save.srm", &at)
             && string_is_equal(CS_FILE_HASH(
@@ -401,7 +404,7 @@ static void lane(bool threaded, bool deletion, bool owned, bool no_memory,
    snprintf(st->dir_core_assets, sizeof(st->dir_core_assets), "%s/assets",
          directory);
    CHECK(path_mkdir(st->dir_core_assets));
-   add(st->server_manifest, NULL, deletion ? NULL : "new");
+   add(st->server_manifest, NULL, deletion ? NULL : NEW_MD5);
    add(st->local_manifest, NULL, "old");
    add(st->current_manifest, local_path, "old");
    if (hold_mode == 5)
@@ -652,7 +655,7 @@ static void states_lane(bool threaded, int cut)
       pathname_conform_slashes_to_os(path);
       snprintf(key, sizeof(key), "states/%s", names[k]);
       CHECK(filestream_write_file(path, "old", 3));
-      add_key(st->server_manifest, NULL, "new", key);
+      add_key(st->server_manifest, NULL, NEW_MD5, key);
       add_key(st->local_manifest, NULL, "old", key);
       add_key(st->current_manifest, path, "old", key);
    }
