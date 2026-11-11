@@ -2714,6 +2714,39 @@ static void test_copy(void)
    stop();
 }
 
+#ifdef _WIN32
+/* A copy named with no '.' would load <name>.dll */
+static void test_copy_dll_name(void)
+{
+   dylib_t lib  = NULL;
+   dylib_t copy = NULL;
+   struct core_load_source src;
+   core_load_match_t *m = NULL;
+   char core[256];
+   start(false);
+   CHECK(put_core(core, "ra_name_libretro" LIB_EXT, 'b'));
+   CHECK(trust(core));
+   core_load_check_set_startup(true);
+   CHECK(core_load_check_open(core, &lib) == CORE_LOAD_GATE_OPENED);
+   core_load_check_set_startup(false);
+   core_load_check_loaded();
+   CHECK(core_load_check_copy_source(core, &src) == CORE_LOAD_COPY_CHECK);
+   CHECK(copy_core(core, TMP_DIR "/ra_name"));
+   CHECK(copy_core("core_load_check_test_a" LIB_EXT,
+            TMP_DIR "/ra_name" LIB_EXT));
+   CHECK((m = core_load_match_new(TMP_DIR "/ra_name", core, &src)) != NULL);
+   CHECK(m && match_all(m) == 0);
+   CHECK(m && lib_id(copy = core_load_match_load(m)) == 0);
+   if (copy)
+      dylib_close(copy);
+   core_load_match_free(m);
+   if (lib)
+      dylib_close(lib);
+   core_load_check_unloaded();
+   stop();
+}
+#endif
+
 /* Run-ahead's copy of the running core is no load: a park waiting on
  * the user, the running core's Load Once and its held file all stay */
 static void test_copy_not_a_load(void)
@@ -2929,6 +2962,9 @@ int main(void)
    no_ctime_fs = 0;
 #endif
    test_copy_not_a_load();
+#ifdef _WIN32
+   test_copy_dll_name();
+#endif
 #ifndef _WIN32
    test_copy_rewritten();
    test_stage_stale_quick();

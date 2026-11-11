@@ -1359,6 +1359,10 @@ int core_load_match_step(core_load_match_t *m)
 
 dylib_t core_load_match_load(core_load_match_t *m)
 {
+#ifdef _WIN32
+   if (core_load_dll_appended(m->copy_path))
+      return NULL;
+#endif
 #ifndef ANDROID
    /* Loaded by path outside Android: only while the path still names
     * the copy hashed, unchanged */
