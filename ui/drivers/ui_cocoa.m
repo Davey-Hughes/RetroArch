@@ -1317,6 +1317,13 @@ void cocoa_publish_focus(bool focused);
    return NSTerminateLater;
 }
 
+/* A quit ends here, in AppKit's exit(0), even main_exit()'s */
+- (void)applicationWillTerminate:(NSNotification *)notification
+{
+   if (retroarch_get_flags() & RARCH_FLAGS_QUIT_FAILURE)
+      exit(1);
+}
+
 - (void)application:(NSApplication *)sender openFiles:(NSArray *)filenames
 {
    if ((filenames.count == 1) && [filenames objectAtIndex:0])
