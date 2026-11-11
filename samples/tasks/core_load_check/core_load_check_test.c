@@ -997,7 +997,7 @@ static void test_stage_take_other(void)
    stop();
 }
 
-/* D4: a core the pending seed covers waits for it, then is checked */
+/* A core the pending seed covers waits for it, then is checked */
 static void test_stage_seed(void)
 {
    dylib_t lib = NULL;

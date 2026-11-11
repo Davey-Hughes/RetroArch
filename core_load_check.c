@@ -696,9 +696,8 @@ static void core_load_check_stage_settle(bool pass,
    core_load_check_stage_open();
 }
 
-/* Decision 18's order: the quick check, a pass the slot holds, the
- * seed's wait (D4), a refusal the slot holds for this file and store,
- * or a check task */
+/* In order: the quick check, a pass the slot holds, the seed's wait, a
+ * refusal the slot holds for this file and store, or a check task */
 static void core_load_check_stage_start(void)
 {
    const char *path    = core_load_rt.stage_path;
@@ -750,7 +749,7 @@ static void core_load_check_stage_start(void)
       core_load_check_stage_settle(true, CORE_LOAD_GRANT_SLOT);
       goto end;
    }
-   /* D4: the seed may trust it; that it covers it is only a guess */
+   /* The seed may trust it; that it covers it is only a guess */
    if (     core_trust_runtime_seed_pending()
          && core_trust_runtime_seed_covers(path))
    {
