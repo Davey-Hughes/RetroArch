@@ -87,6 +87,10 @@ ifeq ($(shell uname -s),Darwin)
 core_load_check_test.o: CFLAGS += -D_DARWIN_C_SOURCE
 endif
 
+# No other C89 build compiles the check's Windows branch
+$(SAMPLE_OBJDIR)/__/__/__/core_load_check.o: CFLAGS += \
+          -Werror=declaration-after-statement
+
 ifneq ($(SANITIZER),)
    CFLAGS  := -fsanitize=$(SANITIZER) -fno-omit-frame-pointer $(CFLAGS)
    LDFLAGS := -fsanitize=$(SANITIZER) $(LDFLAGS)
