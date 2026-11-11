@@ -1317,7 +1317,7 @@ void cocoa_publish_focus(bool focused);
    return NSTerminateLater;
 }
 
-/* A quit ends here, in AppKit's exit(0), even main_exit()'s */
+/* AppKit ends a quit with exit(0) */
 - (void)applicationWillTerminate:(NSNotification *)notification
 {
    if (retroarch_get_flags() & RARCH_FLAGS_QUIT_FAILURE)
