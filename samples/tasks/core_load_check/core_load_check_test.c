@@ -545,7 +545,7 @@ static void test_dll_name(void)
 }
 #endif
 
-/* D4: while the seed is pending, a core it covers is refused quietly
+/* While the seed is pending, a core it covers is refused quietly
  * and not checked; nothing from before the seed answers after it */
 static void test_seed_probe(void)
 {
@@ -641,8 +641,8 @@ static void test_startup_inline(void)
    stop();
 }
 
-/* D2 allows one wait: the probe after the refused startup load is
- * answered by the refusal kept for that file */
+/* The startup's one wait isn't repeated: the probe after the refused
+ * startup load is answered by the refusal kept for that file */
 static void test_startup_refused_once(void)
 {
    dylib_t lib = NULL;

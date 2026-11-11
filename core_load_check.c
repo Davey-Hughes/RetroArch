@@ -155,9 +155,9 @@ static void core_load_slot_clear(struct core_load_slot *sl)
 }
 
 /* A refusal takes the reference to the set it was checked against.
- * Phase 2 publishes a new set on every change (a record, Always Trust,
- * the switch, the seed) and none for a refusal, and the reference
- * keeps the address from being reused. */
+ * The trust store publishes a new set on every change (a record,
+ * Always Trust, the switch, the seed) and none for a refusal, and the
+ * reference keeps the address from being reused. */
 static void core_load_slot_keep_store(struct core_load_slot *sl,
       core_trust_set_t **s)
 {
@@ -267,7 +267,7 @@ static core_file_t *core_load_slot_file(const struct core_load_slot *sl,
       : core_load_same_file(&sl->c.rec.id, f);
    if (sl->f)
    {
-      /* Loaded by path outside Android (D1): the path must still name
+      /* Loaded by path outside Android: the path must still name
        * the file kept. Windows' kept handle pins the file, not a folder
        * above it. */
       core_file_close(f);
@@ -1096,8 +1096,8 @@ enum core_load_gate core_load_check_open(const char *path, dylib_t *lib)
       goto end;
    }
    checked = true;
-   /* First (Decision 18): checks off, a record or an exemption answer
-    * whatever the slot holds */
+   /* First: checks off, a record or an exemption answer whatever the
+    * slot holds */
    if (core_check_quick(s, f, core_load_rt.check_path, &core_load_rt.c))
    {
       if (core_load_rt.c.result == CORE_CHECK_OK)
@@ -1124,7 +1124,7 @@ enum core_load_gate core_load_check_open(const char *path, dylib_t *lib)
       ret                  = CORE_LOAD_GATE_OPENED;
       goto end;
    }
-   /* D4: the seed decides first. That it covers the core is a guess,
+   /* The seed decides first. That it covers the core is a guess,
     * so nothing is checked or kept before it. */
    if (     core_trust_runtime_seed_pending()
          && core_trust_runtime_seed_covers(path))

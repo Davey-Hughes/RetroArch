@@ -92,7 +92,8 @@ ifneq ($(SANITIZER),)
    LDFLAGS := -fsanitize=$(SANITIZER) $(LDFLAGS)
 endif
 
-# 3A's test library, built three times, told apart by core_load_test_id()
+# core_signature's test library, built three times, told apart by
+# core_load_test_id()
 TEST_LIBS := core_load_check_test_a$(LIB_EXT) core_load_check_test_b$(LIB_EXT) \
              core_load_check_test_c$(LIB_EXT)
 
