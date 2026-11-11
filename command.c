@@ -7042,12 +7042,12 @@ static void command_event_auto_slot_done(retro_task_t *task,
    command_event_save_state_done(task, task_data, user_data, error);
 }
 
-bool command_event_ram_state_to_file(const char *path)
+bool command_event_ram_state_to_file(const char *path, bool sync)
 {
    settings_t *settings            = config_get_ptr();
    struct savestate_victim *victim = command_event_savestate_victim(
          settings, path);
-   bool ret                        = content_ram_state_to_file(path);
+   bool ret                        = content_ram_state_to_file(path, sync);
    if (ret)
       command_event_set_savestate_garbage_collect(settings, victim);
    free(victim);

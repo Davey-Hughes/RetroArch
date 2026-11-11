@@ -482,12 +482,27 @@ int __wrap_retro_vfs_file_rename_synced_impl(const char *old_path,
 int __real_retro_vfs_file_sync_impl(libretro_vfs_implementation_file *stream);
 /* Set: every sync fails, as on a full or failing disk */
 static int fail_syncs;
+/* Set when a sync, as a power cut there, finds sync_slot empty */
+static const char *sync_slot;
+static int         sync_slot_empty;
 int __wrap_retro_vfs_file_sync_impl(libretro_vfs_implementation_file *stream)
 {
+   const char *slot = __atomic_load_n(&sync_slot, __ATOMIC_RELAXED);
+   if (slot && !path_is_valid(slot))
+      __atomic_store_n(&sync_slot_empty, 1, __ATOMIC_RELAXED);
    __atomic_fetch_add(&file_syncs, 1, __ATOMIC_RELAXED);
    if (__atomic_load_n(&fail_syncs, __ATOMIC_RELAXED))
       return -1;
    return __real_retro_vfs_file_sync_impl(stream);
+}
+int __real_retro_vfs_dir_sync_impl(const char *dir);
+/* Syncs of a backups folder */
+static unsigned backups_syncs;
+int __wrap_retro_vfs_dir_sync_impl(const char *dir)
+{
+   if (dir && strstr(dir, "backups"))
+      __atomic_fetch_add(&backups_syncs, 1, __ATOMIC_RELAXED);
+   return __real_retro_vfs_dir_sync_impl(dir);
 }
 
 static void frontend_reset(void)
@@ -2059,7 +2074,7 @@ static void test_writes_counted(void)
 
    okf(content_save_state_to_ram(), "writes: a state is kept in RAM");
    save_writes = 0;
-   okf(content_ram_state_to_file(ram_path) && save_writes == 1,
+   okf(content_ram_state_to_file(ram_path, false) && save_writes == 1,
          "writes: a RAM state written to file counts as a save write");
    filestream_delete(path);
    filestream_delete(ram_path);
@@ -2208,10 +2223,93 @@ static void test_auto_state(void)
    save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 }
 
+/* auto_state_close_synced: the close's Auto save, the move of an
+ * unloaded .auto it makes and the RAM state written at a close are on
+ * the disk when they return; the interval's Auto save is not synced */
+static void test_auto_state_close_synced(void)
+{
+   const char *dir  = "sst_auto";
+   const char *path = "sst_auto/Game.state.auto";
+   const char *ram  = "sst_auto/Game.state";
+   unsigned syncs, dirs;
+   bool failed;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   core_fill(TEST_SAVE_STATE_CHUNK);
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   save_backups_set_roots(NULL, dir, NULL, NULL, NULL, NULL, "Core");
+   auto_slot_path = path;
+
+   stub_settings.uints.savestate_automatic_interval = 1;
+   stub_runloop.auto_state_save_ready = true;
+   stub_runloop.auto_state_owned      = true;
+   content_save_state_automatic(10000000);
+   syncs = file_syncs;
+   okf(     content_save_state_automatic(11000000)
+         && file_size(path) > (long)core_len && file_syncs == syncs,
+       "close synced: the interval's Auto save is not synced");
+
+   stub_runloop.auto_state_owned  = false;
+   stub_runloop.auto_state_wanted = true;
+   filestream_write_file(path, "old", 3);
+   syncs = file_syncs;
+   dirs  = backups_syncs;
+   okf(     content_auto_save_state(path) && auto_backups(path, "old") == 1
+         && file_syncs == syncs + 1 && backups_syncs > dirs,
+       "close synced: the close's Auto save, synced once, and its move");
+   syncs = file_syncs;
+   okf(content_auto_save_state(path) && file_syncs == syncs + 1,
+       "close synced: over its own .auto, synced once");
+
+   content_save_state_to_ram();
+   syncs = file_syncs;
+   okf(content_ram_state_to_file(ram, false) && file_syncs == syncs,
+       "close synced: a RAM state written in play is not synced");
+   content_save_state_to_ram();
+   syncs = file_syncs;
+   okf(content_ram_state_to_file(ram, true) && file_syncs == syncs + 1,
+       "close synced: a RAM state written at a close is synced once");
+   content_save_state_to_ram();
+   filestream_write_file(ram, "old", 3);
+   __atomic_store_n(&fail_syncs, 1, __ATOMIC_RELAXED);
+   failed = !content_ram_state_to_file(ram, true);
+   __atomic_store_n(&fail_syncs, 0, __ATOMIC_RELAXED);
+   okf(     failed && filestream_matches_buf(ram, "old", 3)
+         && file_size("sst_auto/Game.state.ram.tmp") < 0,
+       "close synced: a failed sync of the RAM state leaves the old one");
+   okf(content_ram_state_to_file(ram, true) && file_size(ram) > 3,
+       "close synced: the RAM state not written is written next time");
+
+   /* the new one synced before the unloaded one moves: a sync that
+    * fails, or a power cut there, finds the old one in its slot */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_owned = false;
+   filestream_write_file(path, "old", 3);
+   __atomic_store_n(&sync_slot_empty, 0, __ATOMIC_RELAXED);
+   __atomic_store_n(&sync_slot, path, __ATOMIC_RELAXED);
+   __atomic_store_n(&fail_syncs, 1, __ATOMIC_RELAXED);
+   failed = !content_auto_save_state(path);
+   __atomic_store_n(&fail_syncs, 0, __ATOMIC_RELAXED);
+   __atomic_store_n(&sync_slot, NULL, __ATOMIC_RELAXED);
+   okf(     failed && filestream_matches_buf(path, "old", 3)
+         && auto_backups(path, NULL) == 0
+         && !__atomic_load_n(&sync_slot_empty, __ATOMIC_RELAXED),
+       "close synced: a failed sync leaves the unloaded one in its slot");
+
+   auto_slot_path = NULL;
+   content_reset_savestate_backups();
+   auto_state_clear(dir);
+   save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+}
+
 /* -----------------------------------------------------------------
  * manual_auto_slot_sets_aside: Save State to the Auto slot over an
  * .auto the session did not load keeps that one in the backups
- * first, as the automatic saves do. Undo Save still puts it back.
+ * first, as the automatic saves do. Undo Save still puts it back. A
+ * RAM state written there does the same.
  * ----------------------------------------------------------------- */
 static void test_manual_auto_slot_sets_aside(void)
 {
@@ -2405,6 +2503,58 @@ static void test_manual_auto_slot_sets_aside(void)
           "manual auto: a long translation is cut in the notice");
    }
    stub_settings.bools.notification_show_save_state = false;
+
+   /* a RAM state written to the Auto slot (3DS), unsynced and synced */
+   for (d = 0; d < 2; d++)
+   {
+      auto_state_clear(dir);
+      retro_vfs_mkdir_impl(dir);
+      stub_runloop.auto_state_owned = false;
+      filestream_write_file(path, "old", 3);
+      okf(     content_save_state_to_ram()
+            && content_ram_state_to_file(path, d)
+            && file_size(path) > (long)core_len
+            && auto_backups(path, "old") == 1
+            && stub_runloop.auto_state_owned, d
+            ? "manual auto (RAM, synced): the unloaded one is kept first"
+            : "manual auto (RAM): the unloaded one is kept first");
+   }
+
+   /* across drives: held beside it, copied on a task */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_owned = false;
+   filestream_write_file(path, "old", 3);
+   content_save_state_to_ram();
+   __atomic_store_n(&refuse_renames, REFUSE_MOVE, __ATOMIC_RELAXED);
+   okf(content_ram_state_to_file(path, false),
+       "manual auto (RAM): across drives, written");
+   pump(1000);
+   __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+   okf(file_size(path) > (long)core_len && auto_backups(path, "old") == 1,
+       "manual auto (RAM): across drives, the unloaded one is copied over");
+
+   /* the new one not moved in: the old one back, no copy */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_owned = false;
+   filestream_write_file(path, "old", 3);
+   content_save_state_to_ram();
+   __atomic_store_n(&refuse_renames, REFUSE_FINISH, __ATOMIC_RELAXED);
+   okf(     !content_ram_state_to_file(path, false)
+         && file_size(path) == 3 && auto_backups(path, NULL) == 0
+         && !temps_in(dir) && !stub_runloop.auto_state_owned,
+       "manual auto (RAM): a refused rename puts the old one back");
+   __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+
+   /* nowhere to keep it: not written over */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   filestream_write_file("sst_auto/backups", "file", 4);
+   filestream_write_file(path, "old", 3);
+   okf(     !content_ram_state_to_file(path, false)
+         && file_size(path) == 3 && !temps_in(dir),
+       "manual auto (RAM): not kept, not written over");
 
    auto_slot_path = NULL;
    content_reset_savestate_backups();
@@ -2729,12 +2879,12 @@ static void test_auto_state_keep(void)
       keep_put(name, text);
    }
    keep_put(KEEP_AUTO, "old");
-   syncs  = file_syncs;
    errors = errors_logged;
    msgs   = msgs_pushed;
    okf(content_auto_save_state(KEEP_AUTO)
          && file_size(KEEP_AUTO) > (long)core_len,
        "keep: across drives, the new state is written at once");
+   syncs  = file_syncs;
    okf(keep_holds(h[1], "old") && auto_backups(KEEP_AUTO, "old") == 0
          && stub_runloop.auto_state_owned && keep_tasks() == 1,
        "keep: the old one is held beside it, its copy on a task");
@@ -3010,7 +3160,7 @@ static void test_manual_auto_slot_threaded(void)
 {
    const char *dir  = "sst_auto";
    const char *path = "sst_auto/Game.state.auto";
-   unsigned errors;
+   unsigned errors, syncs, files;
 
    frontend_reset();
    content_reset_savestate_backups();
@@ -3021,11 +3171,17 @@ static void test_manual_auto_slot_threaded(void)
    retro_vfs_mkdir_impl(dir);
    stub_runloop.auto_state_wanted = true;
    filestream_write_file(path, "old", 3);
+   syncs = __atomic_load_n(&backups_syncs, __ATOMIC_RELAXED);
+   files = __atomic_load_n(&file_syncs, __ATOMIC_RELAXED);
    okf(content_save_state(path, true), "threaded manual auto: pushed");
    pump_threaded();
    okf(     file_size(path) > (long)core_len
          && auto_backups(path, "old") == 1 && stub_runloop.auto_state_owned,
        "threaded manual auto: the unloaded one kept, the new one in place");
+   okf(__atomic_load_n(&backups_syncs, __ATOMIC_RELAXED) > syncs,
+       "threaded manual auto: the move is synced in the backups folder");
+   okf(__atomic_load_n(&file_syncs, __ATOMIC_RELAXED) == files + 1,
+       "threaded manual auto: the new one synced once");
 
    /* across drives: held by the worker, copied on a task */
    auto_state_clear(dir);
@@ -3381,7 +3537,7 @@ static void test_thumbnail_other_moment(void)
          path_mkdir(tmp);
       }
       shots_cancelled = 0;
-      okf(content_ram_state_to_file(path) == (i < 2),
+      okf(content_ram_state_to_file(path, false) == (i < 2),
           "thumbnail: the RAM state is written, or fails");
       if (i == 2)
       {
@@ -3472,7 +3628,7 @@ static void test_ram_state_temp_distinct(void)
    content_save_state(path, true);
    task_queue_check();
    memset(core_mem, 0x66, core_len);
-   okf(content_save_state_to_ram() && content_ram_state_to_file(path),
+   okf(content_save_state_to_ram() && content_ram_state_to_file(path, false),
        "ram temps: the RAM state is written");
    pump(100000);
    clock_step = 0;
@@ -3511,7 +3667,7 @@ static void test_ram_state_file(void)
    pump(1000);
    okf(content_save_state_to_ram(), "ram state: kept in RAM");
    memset(core_mem, 0x66, core_len);
-   okf(content_ram_state_to_file(path), "ram state: written to its file");
+   okf(content_ram_state_to_file(path, false), "ram state: written to its file");
 
    if (!filestream_read_file(path, &a, &n_a))
       n_a = -1;
@@ -3608,7 +3764,7 @@ static void test_long_names(void)
    filestream_delete(path);
    okf(content_save_state_to_ram(), "long names: the RAM state is kept");
    memset(core_mem, 0x66, core_len);
-   okf(content_ram_state_to_file(path) && files_equal(path, ref),
+   okf(content_ram_state_to_file(path, false) && files_equal(path, ref),
        "long names: the RAM state is written");
    okf(file_size(tmp) < 0 && file_size(rtmp) < 0,
        "long names: the RAM state leaves no temporary");
@@ -3624,7 +3780,7 @@ static void test_long_names(void)
    clock_step = TEST_TICK_BUDGET_US;
    content_save_state(path, true);
    task_queue_check();
-   okf(!content_ram_state_to_file(path),
+   okf(!content_ram_state_to_file(path, false),
        "long names: the RAM state does not share a state task's temporary");
    pump(100000);
    clock_step = 0;
@@ -3674,6 +3830,7 @@ static int run_default_lane(void)
    test_undo_save_during_backup();
    test_undo_save_not_backed_up();
    test_auto_state();
+   test_auto_state_close_synced();
    test_auto_state_undo();
    test_manual_auto_slot_sets_aside();
    test_auto_state_skip_tick();

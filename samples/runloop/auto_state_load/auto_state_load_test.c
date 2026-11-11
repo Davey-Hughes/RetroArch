@@ -200,9 +200,10 @@ bool content_save_state_to_ram(void)
    ram_pending = true;
    return true;
 }
-bool content_ram_state_to_file(const char *path)
+bool content_ram_state_to_file(const char *path, bool sync)
 {
    const char *name = path_basename(path);
+   (void)sync;
    if (!ram_pending)
       return false;
    ram_pending = false;
@@ -463,7 +464,7 @@ static void ram_write(const char *name)
    char path[PATH_MAX_LENGTH];
    fill_pathname_join(path, STATES, name, sizeof(path));
    ram_pending = true;
-   assert(content_ram_state_to_file(path));
+   assert(content_ram_state_to_file(path, false));
 }
 
 /* Ends the slot save the command pushed, once, as the task does */
@@ -623,12 +624,12 @@ static void lane_ram_state_max_keep(void)
    put_old("Game.state2");
    put_old("Game.state1.png");
    runloop_get_current_savestate_path(path, sizeof(path));
-   assert(!command_event_ram_state_to_file(path));
+   assert(!command_event_ram_state_to_file(path, false));
    assert(!there("Game.state") && there("Game.state1")
          && there("Game.state1.png"));
    assert(command_event_main_state(CMD_EVENT_SAVE_STATE_TO_RAM));
    assert(saves == 0);
-   assert(command_event_ram_state_to_file(path));
+   assert(command_event_ram_state_to_file(path, false));
    assert(there("Game.state") && !there("Game.state1")
          && !there("Game.state1.png") && there("Game.state2"));
 
@@ -641,7 +642,7 @@ static void lane_ram_state_max_keep(void)
    test_settings.ints.state_slot = 0;
    assert(command_event_main_state(CMD_EVENT_SAVE_STATE_TO_RAM));
    runloop_get_current_savestate_path(path, sizeof(path));
-   assert(command_event_ram_state_to_file(path));
+   assert(command_event_ram_state_to_file(path, false));
    put("Game.state2");
    save_finished(NULL);
    assert(there("Game.state") && there("Game.state1")
@@ -657,7 +658,7 @@ static void lane_ram_state_max_keep(void)
    assert(command_event_main_state(CMD_EVENT_SAVE_STATE_TO_RAM));
    runloop_get_current_savestate_path(path, sizeof(path));
    ram_meanwhile = saved_path;
-   assert(command_event_ram_state_to_file(path));
+   assert(command_event_ram_state_to_file(path, false));
    save_finished(NULL);
    assert(there("Game.state") && there("Game.state1")
          && there("Game.state2"));

@@ -52,8 +52,8 @@ bool content_save_state_to_ram(void);
  * @sync waits for the disk first (filestream_finish_atomic_synced). */
 bool content_finish_tmp(const char *path, bool ok, bool sync);
 
-/* Save a ram state from memory to disk. */
-bool content_ram_state_to_file(const char *path);
+/* Save a ram state from memory to disk; @sync, as at a close. */
+bool content_ram_state_to_file(const char *path, bool sync);
 
 /* Load a state from disk to memory. */
 bool content_load_state(const char* path, bool load_to_backup_buffer, bool autoload);

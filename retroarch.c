@@ -3232,8 +3232,9 @@ static void ram_state_to_file(void)
 
    state_path[0] = '\0';
 
+   /* At a close: synced */
    if (runloop_get_current_savestate_path(state_path, sizeof(state_path)))
-      command_event(CMD_EVENT_RAM_STATE_TO_FILE, state_path);
+      command_event_ram_state_to_file(state_path, true);
 }
 
 enum rarch_content_type path_is_media_type(const char *path)
@@ -4397,7 +4398,7 @@ bool command_event(enum event_command cmd, void *data)
             return false;
          break;
       case CMD_EVENT_RAM_STATE_TO_FILE:
-         if (!command_event_ram_state_to_file((const char*)data))
+         if (!command_event_ram_state_to_file((const char*)data, false))
             return false;
          break;
       case CMD_EVENT_APPLY_WINDOWED_SCALE:

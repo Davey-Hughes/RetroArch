@@ -83,11 +83,13 @@ CFLAGS  += -Wall -std=gnu99 -g1 -O1 \
 # --wrap=task_queue_park so a lane can count the load handler's parks.
 # --wrap=retro_vfs_file_rename_impl and its synced twin so a lane can
 # refuse a rename, as a move across drives fails, and
-# --wrap=retro_vfs_file_sync_impl so it can count the syncs.
+# --wrap=retro_vfs_file_sync_impl and retro_vfs_dir_sync_impl so it can
+# count the syncs.
 LDFLAGS += -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=task_queue_park \
            -Wl,--wrap=retro_vfs_file_rename_impl \
            -Wl,--wrap=retro_vfs_file_rename_synced_impl \
            -Wl,--wrap=retro_vfs_file_sync_impl \
+           -Wl,--wrap=retro_vfs_dir_sync_impl \
            -lpthread -lm
 
 # Extra flags for the caller; CFLAGS= on the command line would replace

@@ -3657,7 +3657,7 @@ static void lane_thumbnail_dropped(void)
             "the first thumbnail was done before %s", what[i]);
       if (i)
          CHECK(content_save_state_to_ram()
-               && content_ram_state_to_file(state),
+               && content_ram_state_to_file(state, false),
                "%s was not written", what[i]);
       else
       {
@@ -3711,7 +3711,7 @@ static void lane_thumbnail_dropped(void)
          "the other shot was not taken");
    CHECK(take_screenshot("", thumb, true, false, true, true),
          "the slot's shot was not taken");
-   CHECK(content_ram_state_to_file(state),
+   CHECK(content_ram_state_to_file(state, false),
          "the threaded RAM state was not written");
    for (n = 0; n < 2000 && task_queue_find(&live); n++)
    {

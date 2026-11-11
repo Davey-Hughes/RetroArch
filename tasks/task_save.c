@@ -560,11 +560,14 @@ static void content_drop_thumbnail(const char *path, bool shots)
 }
 #endif
 
-/* As content_finish_tmp(), unsynced, for "<path><suffix>" */
+/* As content_finish_tmp(), for "<path><suffix>". @synced: its writer
+ * synced it, and the rename is synced too. */
 static bool content_finish_state_tmp(const char *path, const char *tmp_path,
-      const char *suffix, bool ok)
+      const char *suffix, bool ok, bool synced)
 {
-   int ret = filestream_finish_atomic_suffix(path, suffix, ok, false);
+   int ret = synced
+      ? filestream_finish_atomic_rename_synced(path, suffix, ok)
+      : filestream_finish_atomic_suffix(path, suffix, ok, false);
    if (ret == 1 && path_is_valid(path))
       filestream_delete(tmp_path);
    return ret == 0;
@@ -625,7 +628,7 @@ bool content_finish_tmp(const char *path, bool ok, bool sync)
 }
 
 static bool content_auto_state_move_aside(const char *path, unsigned *held,
-      char *moved, size_t len);
+      char *moved, size_t len, bool sync);
 static void content_auto_state_put_back(const char *path, unsigned n,
       const char *moved);
 
@@ -658,7 +661,7 @@ static bool content_save_state_aside(retro_task_t *task,
       return false;
    }
    if (content_auto_state_move_aside(state->path, &state->held, moved,
-            PATH_MAX_LENGTH))
+            PATH_MAX_LENGTH, sync))
       return true;
    snprintf(msg, sizeof(msg), "%s \"%s\".",
          msg_hash_to_str(MSG_FAILED_TO_SAVE_STATE_TO),
@@ -722,6 +725,7 @@ static void task_save_handler_finished(retro_task_t *task,
       }
       else
       {
+         bool landed;
          bool ok     = !task_get_error(task);
          /* Off the frame loop only on the threaded queue. */
          bool sync   = task_queue_is_threaded();
@@ -733,7 +737,12 @@ static void task_save_handler_finished(retro_task_t *task,
             ok    = content_save_state_aside(task, state, tmp_path, moved,
                   sync);
          }
-         if (!content_finish_tmp(state->path, ok, sync) && ok)
+         /* A synced aside synced the temporary */
+         landed = (moved && sync)
+            ? content_finish_state_tmp(state->path, tmp_path, ".tmp", ok,
+                  true)
+            : content_finish_tmp(state->path, ok, sync);
+         if (!landed && ok)
          {
             task_set_error(task, strdup(
                   msg_hash_to_str(MSG_FAILED_TO_SAVE_STATE_TO)));
@@ -2678,9 +2687,10 @@ static void content_auto_state_unhold(const char *path, unsigned n,
 
 /* Moves @path to the backups, its copy's name into @moved; across
  * drives holds it beside itself, as @held, until a task copies it
- * there. Files only, for any thread. */
+ * there. @sync: a move or copy into the backups is on the disk before
+ * the slot's folder is. Files only, for any thread. */
 static bool content_auto_state_move_aside(const char *path, unsigned *held,
-      char *moved, size_t len)
+      char *moved, size_t len, bool sync)
 {
    enum save_backup_result result = SAVE_BACKUP_FAILED;
    char *dir = (char*)malloc(2 * PATH_MAX_LENGTH);
@@ -2693,14 +2703,19 @@ static bool content_auto_state_move_aside(const char *path, unsigned *held,
       result = save_backups_move_begin(dir, path, NULL,
             SAVE_BACKUP_NOT_LOADED, dir + PATH_MAX_LENGTH,
             PATH_MAX_LENGTH);
-      if (result == SAVE_BACKUP_MADE && len)
-         strlcpy(moved, dir + PATH_MAX_LENGTH, len);
+      if (result == SAVE_BACKUP_MADE)
+      {
+         if (len)
+            strlcpy(moved, dir + PATH_MAX_LENGTH, len);
+         if (sync)
+            retro_vfs_dir_sync_impl(dir);
+      }
       else if (     result == SAVE_BACKUP_COPY_OWED
             && content_auto_state_hold(path, held))
          result = SAVE_BACKUP_MADE;
-      else if (result != SAVE_BACKUP_MADE)
+      else
          result = save_backups_copy_to(dir, path, NULL,
-               SAVE_BACKUP_NOT_LOADED, NULL, 0, false);
+               SAVE_BACKUP_NOT_LOADED, NULL, 0, sync);
    }
    free(dir);
    if (result != SAVE_BACKUP_MADE)
@@ -2716,7 +2731,7 @@ static bool content_auto_state_move_aside(const char *path, unsigned *held,
  * netplay, a replay, an entry slot) goes to the backups before the
  * first write over it: held as @held, or moved as @moved. */
 static bool content_auto_state_set_aside(const char *path, unsigned *held,
-      char *moved, size_t len)
+      char *moved, size_t len, bool sync)
 {
    runloop_state_t *runloop_st = runloop_state_get_ptr();
    settings_t *settings        = config_get_ptr();
@@ -2725,22 +2740,15 @@ static bool content_auto_state_set_aside(const char *path, unsigned *held,
          && (   runloop_st->auto_state_wanted
              || settings->bools.savestate_auto_load)
          && path_is_valid(path)
-         && !content_auto_state_move_aside(path, held, moved, len))
+         && !content_auto_state_move_aside(path, held, moved, len, sync))
       return false;
    runloop_st->auto_state_owned = true;
    return true;
 }
 
-/**
- * content_auto_save_state:
- * @path      : path of saved state that shall be written to.
- * Save a state from memory to disk. This is used for automatic saving right
- * before a core unload/deinit or content closing. The save is a blocking
- * operation (does not use the task queue).
- *
- * Returns: true if successful, false otherwise.
- **/
-bool content_auto_save_state(const char *path)
+/* The close's Auto save (@closing: synced) or the interval's. A
+ * blocking write, not a task. */
+static bool content_auto_state_write(const char *path, bool closing)
 {
    size_t _len;
    int _close_ret;
@@ -2797,13 +2805,17 @@ bool content_auto_save_state(const char *path)
    free(serial_data);
    free(file);
 
-   /* No room to record a move: one could not be put back */
+   /* No room to record a move: one could not be put back. At a close
+    * the new one is synced before the old one moves, as Save State. */
    moved = (char*)calloc(1, PATH_MAX_LENGTH);
    if (     _close_ret == 0
-         && (!moved || !content_auto_state_set_aside(path, &held, moved,
-               PATH_MAX_LENGTH)))
+         && (   !moved
+             || (closing && !content_sync_file(tmp_path))
+             || !content_auto_state_set_aside(path, &held, moved,
+               PATH_MAX_LENGTH, closing)))
       _close_ret = -1;
-   if (!content_finish_state_tmp(path, tmp_path, suffix, _close_ret == 0))
+   if (!content_finish_state_tmp(path, tmp_path, suffix, _close_ret == 0,
+            closing))
    {
       /* The old one back in its slot, the new one gone */
       if (held || (moved && *moved))
@@ -2832,6 +2844,20 @@ bool content_auto_save_state(const char *path)
    }
 #endif
    return true;
+}
+
+/**
+ * content_auto_save_state:
+ * @path      : path of saved state that shall be written to.
+ * Save a state from memory to disk. This is used for automatic saving right
+ * before a core unload/deinit or content closing. The save is a blocking
+ * operation (does not use the task queue).
+ *
+ * Returns: true if successful, false otherwise.
+ **/
+bool content_auto_save_state(const char *path)
+{
+   return content_auto_state_write(path, true);
 }
 
 /**
@@ -3356,12 +3382,13 @@ bool content_save_state_to_ram(void)
 /**
  * content_ram_state_to_file:
  * @path             : path of RAM state that shall be written to.
+ * @sync             : synced, as at a close.
  *
  * Save a RAM state from memory to disk.
  *
  * @return true if successful, false otherwise.
  **/
-bool content_ram_state_to_file(const char *path)
+bool content_ram_state_to_file(const char *path, bool sync)
 {
    if (     path
          && ram_buf.state_buf.data
@@ -3370,6 +3397,11 @@ bool content_ram_state_to_file(const char *path)
       /* Write via a temporary file, so a crash or power loss mid-save
        * leaves the previous file intact instead of a truncated one. */
       bool written       = false;
+      unsigned held      = 0;
+      char *moved        = NULL;
+      /* As Save State: an .auto the session does not own is kept first */
+      bool aside         = !runloop_state_get_ptr()->auto_state_owned
+         && content_is_auto_state(path);
       const char *suffix = RAM_STATE_TMP_SUFFIX;
       char tmp_path[PATH_MAX_LENGTH];
       intfstream_t *file = content_open_state_tmp(tmp_path,
@@ -3387,12 +3419,39 @@ bool content_ram_state_to_file(const char *path)
          if (intfstream_close(file) != 0)
             written = false;
          free(file);
-         written = content_finish_state_tmp(path, tmp_path, suffix,
-               written);
+         if (written && sync && !content_sync_file(tmp_path))
+            written = false;
+         /* No room to record a move: one could not be put back */
+         if (     written && aside && path_is_valid(path)
+               && (   !(moved = (char*)calloc(1, PATH_MAX_LENGTH))
+                   || !content_auto_state_move_aside(path, &held, moved,
+                     PATH_MAX_LENGTH, sync)))
+            written = false;
+         if (!content_finish_state_tmp(path, tmp_path, suffix, written,
+                  sync))
+         {
+            /* The old one back in its slot, the new one gone */
+            if (held || (moved && *moved))
+            {
+               content_auto_state_put_back(path, held, moved);
+               if (path_is_valid(path))
+                  filestream_delete(tmp_path);
+            }
+            written = false;
+         }
+         free(moved);
       }
 
       if (written)
+      {
+         if (aside)
+         {
+            runloop_state_get_ptr()->auto_state_owned = true;
+            if (held)
+               content_auto_state_keep(path);
+         }
          goto success;
+      }
    }
 
    return false;
@@ -3477,5 +3536,5 @@ bool content_save_state_automatic(retro_time_t now_us)
    /* Update the last savestate time, rinse/repeat */
    last_savestate_automatic_time = now_us;
    
-   return content_auto_save_state(savestate_path);
+   return content_auto_state_write(savestate_path, false);
 }
