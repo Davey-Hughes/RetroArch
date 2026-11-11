@@ -20,7 +20,9 @@
  * - a write that fails part way, a backup that cannot be made and a
  *   final rename that fails all leave the old file exactly as it was
  *   and no temporary file behind, reported as one failure;
- * - an empty upload, a subdirectory, and every result reported once.
+ * - an empty upload, a subdirectory, and every result reported once;
+ * - the server manifest, replaced without a copy kept, is moved aside
+ *   until the new one is in place, so a failed rename puts it back.
  *
  * Includes the driver's translation unit so it is tested as shipped.
  */
@@ -260,6 +262,24 @@ static void test_failed_final_rename_restores_old(void)
    CHECK(no_temp_files(), "a failed final rename must not leave a temporary file");
 }
 
+static void test_manifest_rename_fails(void)
+{
+   done_t       done;
+   fake_node_t *backup;
+
+   fresh_share("");
+   fake_smb_put(CLOUD_SYNC_SERVER_MANIFEST, "[old]");
+   fake_smb.fail_rename_from = CLOUD_SYNC_SERVER_MANIFEST ".rauploading";
+   upload(CLOUD_SYNC_SERVER_MANIFEST, "[new]", false, &done);
+
+   CHECK(done.calls == 1 && !done.success,
+         "a manifest rename that fails must report failure once");
+   CHECK(fake_smb_is(CLOUD_SYNC_SERVER_MANIFEST, "[old]"),
+         "a manifest rename that fails must put the old manifest back");
+   CHECK(!backups_of(CLOUD_SYNC_SERVER_MANIFEST, &backup) && no_temp_files(),
+         "a failed manifest rename must leave no aside or temporary file");
+}
+
 static void test_empty_and_subdir(void)
 {
    done_t       done;
@@ -286,6 +306,7 @@ int main(void)
    test_failed_write_keeps_old(true);
    test_failed_backup_keeps_old();
    test_failed_final_rename_restores_old();
+   test_manifest_rename_fails();
    test_empty_and_subdir();
 
    fake_smb_reset();

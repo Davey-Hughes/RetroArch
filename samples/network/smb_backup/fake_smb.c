@@ -220,6 +220,8 @@ int smb2_rename(struct smb2_context *smb2, const char *oldpath,
    if (fake_smb.fail_rename_number
          && fake_smb.renames == fake_smb.fail_rename_number)
       return -EACCES;
+   if (fake_smb.fail_rename_from && !strcmp(oldpath, fake_smb.fail_rename_from))
+      return -EACCES;
    if (!n)
       return -ENOENT;
    if (fake_smb_find(newpath))
