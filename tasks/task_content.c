@@ -2466,6 +2466,12 @@ static struct content_load_parked *content_load_parked_new(
    d->core_path          = strdup(core_path ? core_path : "");
    d->content_path       = (content_path && *content_path)
       ? strdup(content_path) : NULL;
+   /* Else the re-run would start the core without its content */
+   if (content_path && *content_path && !d->content_path)
+   {
+      content_load_parked_free(d);
+      return NULL;
+   }
    d->label              = strdup(runloop_st->name.label);
    d->db_name            = strdup(p_content->companion_ui_db_name);
    d->crc32              = strdup(p_content->companion_ui_crc32);
