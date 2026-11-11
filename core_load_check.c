@@ -185,6 +185,19 @@ static bool core_load_dll_appended(const char *path)
 {
    return !strchr(path_basename_nocompression(path), '.');
 }
+
+/* CreateFileW opens this name's trailing '.' as written; LoadLibraryW
+ * may drop it and map another file */
+static bool core_load_verbatim_dot(const char *path)
+{
+   size_t n = strlen(path);
+   return   n > 4
+         && path[n - 1] == '.'
+         && PATH_CHAR_IS_SLASH(path[0])
+         && (PATH_CHAR_IS_SLASH(path[1]) || path[1] == '?')
+         && path[2] == '?'
+         && PATH_CHAR_IS_SLASH(path[3]);
+}
 #endif
 
 /* Absolute, as the loader is given it */
@@ -205,10 +218,14 @@ static void core_load_abs(const char *path, char *s, size_t len)
 }
 
 /* The file the check reads: Apple's dylib_load opens a .framework's
- * binary, so the check does too */
+ * binary, so the check does too. False: none it can vouch for. */
 static bool core_load_check_file_path(const char *path, char *s,
       size_t len)
 {
+#ifdef _WIN32
+   if (core_load_verbatim_dot(path))
+      return false;
+#endif
 #ifdef __APPLE__
    if (core_load_framework_binary(path, s, len))
       return true;
@@ -705,7 +722,7 @@ static void core_load_check_stage_start(void)
    core_file_t *f      = NULL;
    core_file_t *g      = NULL;   /* a record's file */
    bool lent           = false;
-   /* No store, a .framework without its binary, the core loaded last
+   /* No store, no file the check can vouch for, the core loaded last
     * (the gate passes it from its record: nothing to hash or keep), or
     * a file that can't be opened: the core stage's own open answers */
    if (     !s
@@ -1075,8 +1092,13 @@ enum core_load_gate core_load_check_open(const char *path, dylib_t *lib)
    if (!core_load_check_file_path(path, core_load_rt.check_path,
             sizeof(core_load_rt.check_path)))
    {
+#ifdef _WIN32
+      RARCH_ERR("[Core] Not loading \"%s\": a \\\\?\\ path ending in '.' may load another file.\n",
+            path);
+#else
       RARCH_ERR("[Core] Not loading \"%s\": no binary in the framework.\n",
             path);
+#endif
       goto end;
    }
    /* The core loaded last, opened again for its system info or its
@@ -1374,7 +1396,8 @@ dylib_t core_load_match_load(core_load_match_t *m)
    bool same;
 #endif
 #ifdef _WIN32
-   if (core_load_dll_appended(m->copy_path))
+   if (     core_load_dll_appended(m->copy_path)
+         || core_load_verbatim_dot(m->copy_path))
       return NULL;
 #endif
 #ifndef ANDROID

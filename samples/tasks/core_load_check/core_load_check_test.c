@@ -2828,6 +2828,75 @@ static void test_copy_dll_name(void)
    core_load_check_unloaded();
    stop();
 }
+
+/* \\?\ + the absolute form of rel, and suffix */
+static void verbatim_path(char *s, size_t len, const char *rel,
+      const char *suffix)
+{
+   char abs[512];
+   strlcpy(abs, rel, sizeof(abs));
+   path_resolve_realpath(abs, sizeof(abs), false);
+   strlcpy(s, "\\\\?\\", len);
+   strlcat(s, abs, len);
+   strlcat(s, suffix, len);
+}
+
+/* CreateFileW opens a \\?\ path's trailing '.' as written, and
+ * LoadLibraryW may drop it: refused, though trusted, wherever it is
+ * asked for. Another \\?\ path loads. */
+static void test_verbatim_dot(void)
+{
+   dylib_t lib  = NULL;
+   dylib_t copy = NULL;
+   struct core_load_source src;
+   core_load_match_t *m = NULL;
+   char core[256];
+   char path[512];
+   start(true);
+   core_load_check_set_startup(true);
+   CHECK(put_core(core, "verb_libretro" LIB_EXT, 'a'));
+   CHECK(trust(core));
+   verbatim_path(path, sizeof(path), core, "");
+   CHECK(core_load_check_open(path, &lib) == CORE_LOAD_GATE_OPENED);
+   CHECK(lib_id(lib) == 1);
+   /* Run-ahead's copy, named so, isn't loaded either */
+   core_load_check_loaded();
+   CHECK(core_load_check_copy_source(path, &src) == CORE_LOAD_COPY_CHECK);
+   verbatim_path(path, sizeof(path), TMP_DIR "/ra_verb", ".");
+   CHECK(copy_core(core, path));
+   CHECK(copy_core("core_load_check_test_b" LIB_EXT, TMP_DIR "/ra_verb"));
+   CHECK((m = core_load_match_new(path, core, &src)) != NULL);
+   CHECK(m && match_all(m) == 0);
+   CHECK(m && lib_id(copy = core_load_match_load(m)) == 0);
+   if (copy)
+      dylib_close(copy);
+   core_load_match_free(m);
+   if (lib)
+      dylib_close(lib);
+   lib = NULL;
+   core_load_check_unloaded();
+   /* The trusted bytes as "verb_dot_libretro." itself */
+   CHECK(put_core(core, "verb_dot_libretro", 'b'));
+   verbatim_path(path, sizeof(path), core, ".");
+   CHECK(copy_core("core_load_check_test_a" LIB_EXT, path));
+   CHECK(trust(path));
+   last_log[0] = '\0';
+   CHECK(core_load_check_open(path, &lib) == CORE_LOAD_GATE_REFUSED);
+   CHECK(!lib);
+   CHECK(strstr(last_log, "ending in '.'") != NULL);
+   CHECK(!core_load_check_refused(path));
+   core_load_check_set_startup(false);
+   CHECK(core_load_check_stage_begin(path));
+   CHECK(stage_wait());
+   CHECK(!core_load_check_stage_refused());
+   CHECK(!core_load_check_stage_take(path));
+   park_reset();
+   CHECK(!park(path));
+   CHECK(queued() == 0);
+   if (lib)
+      dylib_close(lib);
+   stop();
+}
 #endif
 
 /* Run-ahead's copy of the running core is no load: a park waiting on
@@ -3056,6 +3125,7 @@ int main(void)
    test_copy_not_a_load();
 #ifdef _WIN32
    test_copy_dll_name();
+   test_verbatim_dot();
 #endif
 #ifndef _WIN32
    test_copy_rewritten();
