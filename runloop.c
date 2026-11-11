@@ -912,15 +912,18 @@ static bool load_dynamic_core_resolves_symlinks(void)
 #ifdef HAVE_CORE_LOAD_CHECK
 /* With a trust store the preload stage is the core's check, with or
  * without a worker, and the open moves to a worker only from the file
- * the check passed. Any core path: a playlist Run sets no explicit
- * core type, and only a refused open parks (Decision 19). */
+ * the check passed. Any core path but a built-in core's: a playlist
+ * Run sets no explicit core type, and only a refused open parks. */
 static bool runloop_core_check_begin(void)
 {
    const char *path = path_get(RARCH_PATH_CORE);
 #if defined(ANDROID)
    char real_path[PATH_MAX_LENGTH];
 #endif
-   if (!path || !*path)
+   if (     !path || !*path
+         || (     (runloop_state.flags & RUNLOOP_FLAG_HAS_SET_CORE)
+               &&  runloop_state.explicit_current_core_type
+                  != CORE_TYPE_PLAIN))
       return false;
    /* The path load_dynamic_core() opens, resolved the same way */
    path_resolve_realpath(path_get_ptr(RARCH_PATH_CORE),
