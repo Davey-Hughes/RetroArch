@@ -6510,6 +6510,9 @@ size_t command_event_save_auto_state(void)
          || (  !runloop_st->auto_state_bypass
             && !core_info_current_supports_savestate()))
       return 0;
+   /* The auto-load skipped by policy: the .auto stays as it is */
+   if (runloop_st->auto_state_refused && !runloop_st->auto_state_owned)
+      return 0;
    a = path_basename(path_get(RARCH_PATH_BASENAME));
    if (!a || !*a)
       return 0;
@@ -6629,11 +6632,17 @@ bool command_event_load_auto_state(void)
 
 #ifdef HAVE_CHEEVOS
    if (rcheevos_hardcore_active())
+   {
+      runloop_st->auto_state_refused = true;
       return false;
+   }
 #endif
 #ifdef HAVE_NETWORKING
    if (netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_ENABLED, NULL))
+   {
+      runloop_st->auto_state_refused = true;
       return false;
+   }
 #endif
 
    if (must_initialize

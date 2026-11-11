@@ -3420,6 +3420,10 @@ bool content_save_state_automatic(retro_time_t now_us)
    if (runloop_state_get_ptr()->save_load_hold)
       return false;
 
+   /* The auto-load skipped by policy: the .auto stays as it is */
+   if (runloop_st->auto_state_refused && !runloop_st->auto_state_owned)
+      return false;
+
    /* The interval counts from the auto-load, run or skipped */
    if (     !runloop_st->auto_state_save_ready
          || !runloop_st->auto_state_interval_started)

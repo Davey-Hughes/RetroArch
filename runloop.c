@@ -5592,6 +5592,7 @@ static void runloop_reset_auto_state_load(runloop_state_t *runloop_st)
    runloop_st->auto_state_owned          = false;
    runloop_st->auto_state_wanted         = false;
    runloop_st->auto_state_bypass         = false;
+   runloop_st->auto_state_refused        = false;
    runloop_st->auto_state_interval_started = false;
 }
 
@@ -6135,6 +6136,8 @@ static void runloop_content_saves_ready(runloop_state_t *runloop_st)
    runloop_st->auto_state_wanted =  settings->bools.savestate_auto_load
                                  || runloop_st->auto_state_load_asked;
    runloop_st->auto_state_bypass =  settings->bools.core_info_savestate_bypass;
+   /* Until the auto-load below is tried */
+   runloop_st->auto_state_refused = runloop_st->auto_state_wanted;
 
    /*
     * Since the operations are asynchronous we can't
@@ -6170,7 +6173,10 @@ static void runloop_content_saves_ready(runloop_state_t *runloop_st)
          if (     runloop_st->entry_state_slot < 0
                && (     settings->bools.savestate_auto_load
                      || runloop_st->auto_state_load_asked))
+         {
+            runloop_st->auto_state_refused = false;
             auto_state_wait = command_event_load_auto_state();
+         }
       }
    }
 

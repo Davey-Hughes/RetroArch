@@ -39,9 +39,12 @@ static unsigned notices;
 static char last_notice[128];
 #ifdef HAVE_NETWORKING
 static bool allow_frame = true;
+static bool netplay_on;
 bool netplay_driver_ctl(enum rarch_netplay_ctl_state state, void *data)
 {
    (void)data;
+   if (state == RARCH_NETPLAY_CTL_IS_ENABLED)
+      return netplay_on;
    return state == RARCH_NETPLAY_CTL_PRE_FRAME ? allow_frame : false;
 }
 #endif
@@ -97,10 +100,13 @@ static retro_task_callback_t load_done;
 static bool load_refused;
 /* Load State on the Auto slot, rather than the auto-load */
 static bool manual_load;
+/* An entry slot's state, loaded instead of the .auto */
+static const char *entry_path;
 bool content_load_state_notify(const char *path, bool load_to_backup,
       bool autoload, retro_task_callback_t cb, void *user_data)
 {
-   assert(strcmp(path, "test.auto") == 0);
+   assert(strcmp(path, "test.auto") == 0
+         || (entry_path && strcmp(path, entry_path) == 0));
    assert(!load_to_backup && autoload == !manual_load);
    (void)user_data;
    load_done = cb;
@@ -845,6 +851,83 @@ static void test_content_load_sweep(void)
    puts("content load sweep tests passed");
 }
 
+/* The close leaves the .auto alone until the Auto slot is saved by
+ * hand */
+static void refused_close(void)
+{
+   assert(runloop_state.auto_state_save_ready);
+   assert(command_event_save_auto_state() == 0 && auto_saves == 0);
+   initialize_after              = 0;
+   test_settings.ints.state_slot = -1;
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE));
+   save_finished(NULL);
+   assert(command_event_save_auto_state() > 0 && auto_saves == 1);
+}
+
+/* auto_state_policy: an auto-load skipped by policy (an entry slot,
+ * netplay, hardcore) leaves the .auto it did not load as it is. A
+ * replay's skip is the same flag, not built here. */
+static void test_auto_state_refused(void)
+{
+   unsigned i;
+
+   reset(1, false);
+   entry_path = "test2.entry";
+   assert(filestream_write_file(entry_path, "e", 1));
+   runloop_state.entry_state_slot = 2;
+   runloop_content_saves_ready(&runloop_state);
+   assert(loads == 1 && runloop_state.entry_state_slot == 2);
+   refused_close();
+   filestream_delete(entry_path);
+   entry_path = NULL;
+#ifdef HAVE_NETWORKING
+   reset(1, false);
+   netplay_on = true;
+   runloop_content_saves_ready(&runloop_state);
+   assert(loads == 0);
+   refused_close();
+   netplay_on = false;
+#endif
+#ifdef HAVE_CHEEVOS
+   reset(1, false);
+   test_settings.bools.cheevos_enable               = true;
+   test_settings.bools.cheevos_hardcore_mode_enable = true;
+   runloop_content_saves_ready(&runloop_state);
+   assert(loads == 0);
+   refused_close();
+   /* on by the deferred auto-load */
+   reset(3, true);
+   runloop_content_saves_ready(&runloop_state);
+   hardcore = true;
+   for (i = 0; i < 3; i++)
+   {
+      core_run();
+      runloop_load_deferred_auto_state();
+   }
+   assert(loads == 0);
+   refused_close();
+   hardcore = false;
+#endif
+   (void)i;
+
+   /* a failed load, or Auto Load State off: the close saves */
+   reset(1, false);
+   runloop_content_saves_ready(&runloop_state);
+   load_finished("failed");
+   assert(command_event_save_auto_state() > 0 && auto_saves == 1);
+   reset(1, false);
+   test_settings.bools.savestate_auto_load = false;
+   entry_path = "test2.entry";
+   assert(filestream_write_file(entry_path, "e", 1));
+   runloop_state.entry_state_slot = 2;
+   runloop_content_saves_ready(&runloop_state);
+   assert(loads == 1);
+   assert(command_event_save_auto_state() > 0 && auto_saves == 1);
+   filestream_delete(entry_path);
+   entry_path = NULL;
+   puts("auto-state policy tests passed");
+}
+
 static void test_auto_slot_owned(void)
 {
    reset(0, false);
@@ -897,6 +980,7 @@ int main(void)
    test_state_auto_index_unlisted();
    test_replay_slots();
    test_auto_slot_owned();
+   test_auto_state_refused();
    test_auto_state_order();
    test_content_load_sweep();
    reset(3, true);
@@ -955,7 +1039,9 @@ int main(void)
    runloop_state.auto_state_save_ready       = true;
    runloop_state.auto_state_owned            = true;
    runloop_state.auto_state_interval_started = true;
+   runloop_state.auto_state_refused          = true;
    runloop_reset_auto_state_load(&runloop_state);
+   assert(!runloop_state.auto_state_refused);
    assert(!runloop_state.auto_state_save_ready);
    assert(!runloop_state.auto_state_owned);
    assert(!runloop_state.auto_state_interval_started);

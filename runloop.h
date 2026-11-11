@@ -399,6 +399,9 @@ struct runloop
     * bypass.  The close goes by these: an override may be gone. */
    bool auto_state_wanted;
    bool auto_state_bypass;
+   /* The auto-load was skipped by policy (hardcore, netplay, a replay,
+    * an entry slot): no automatic save over a .auto not the session's */
+   bool auto_state_refused;
    /* The interval auto save has started counting for this content */
    bool auto_state_interval_started;
 

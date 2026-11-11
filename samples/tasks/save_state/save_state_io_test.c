@@ -2661,6 +2661,46 @@ static unsigned keep_tasks(void)
    return n;
 }
 
+/* -----------------------------------------------------------------
+ * auto_state_policy_chain: eleven sessions whose auto-load policy
+ * skipped (hardcore, netplay, a replay, an entry slot) write no
+ * interval save over the .auto and keep no copies of it.
+ * ----------------------------------------------------------------- */
+static void test_auto_state_policy_chain(void)
+{
+   const char *path = "save_state_io_test_auto_-1.state";
+   retro_time_t now = 10000000;
+   unsigned i;
+
+   frontend_reset();
+   core_fill(TEST_SAVE_STATE_CHUNK);
+   stub_settings.uints.savestate_automatic_interval = 1;
+   filestream_write_file(path, "old", 3);
+
+   for (i = 0; i < 11; i++)
+   {
+      stub_runloop.auto_state_save_ready       = true;
+      stub_runloop.auto_state_interval_started = false;
+      stub_runloop.auto_state_owned            = false;
+      stub_runloop.auto_state_wanted           = true;
+      stub_runloop.auto_state_refused          = true;
+      content_save_state_automatic(now);
+      content_save_state_automatic(now + 1000000);
+      now += 10000000;
+   }
+   okf(file_size(path) == 3 && auto_backups(path, NULL) == 0,
+       "policy chain: no interval save over it, no copies");
+
+   /* the Auto slot saved or loaded by hand: the session's */
+   stub_runloop.auto_state_owned = true;
+   content_save_state_automatic(now);
+   okf(content_save_state_automatic(now + 1000000)
+         && file_size(path) > (long)core_len,
+       "policy chain: the session's own .auto is saved at the interval");
+
+   filestream_delete(path);
+}
+
 static void test_auto_state_keep(void)
 {
    unsigned k;
@@ -3603,6 +3643,7 @@ static int run_default_lane(void)
    test_manual_auto_slot_sets_aside();
    test_auto_state_skip_tick();
    test_auto_state_keep();
+   test_auto_state_policy_chain();
    test_thumbnail_on_success();
    test_thumbnail_fails();
    test_thumbnail_kept_until_shot();
