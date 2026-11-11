@@ -26,6 +26,9 @@
 #include <lists/string_list.h>
 #include <retro_miscellaneous.h>
 #include <streams/file_stream.h>
+#if defined(HAVE_COMPRESSION)
+#include <streams/rzip_stream.h>
+#endif
 #include <string/stdstring.h>
 #include <time/rtime.h>
 #include <vfs/vfs_implementation.h>
@@ -755,14 +758,40 @@ static bool save_backups_retained(const struct save_backups_copies *c,
             && string_is_equal(c->ext, ".state.auto")));
 }
 
+/* Whether the copy @copy holds @data, compressed or not: @data is the
+ * file @file's bytes, or with NULL an image. */
+static bool save_backups_holds(const char *copy, const void *data,
+      size_t len, const char *file)
+{
+#if defined(HAVE_COMPRESSION)
+   bool same;
+   void *plain = NULL;
+   int64_t n   = 0;
+#endif
+   if (filestream_matches_buf(copy, data, len))
+      return true;
+#if defined(HAVE_COMPRESSION)
+   /* Compared decompressed: a copy from the image is raw */
+   if (!file)
+      return rzipstream_matches_buf(copy, data, len);
+   if (!rzipstream_read_file(file, &plain, &n))
+      return false;
+   same = rzipstream_matches_buf(copy, plain, (size_t)n);
+   free(plain);
+   return same;
+#else
+   return false;
+#endif
+}
+
 /* Writes @data as a copy of @path into @dir, its path in @s; with
  * @move, renames @path there instead, or names the copy owed when that
  * fails. With @skip_same, nothing is written when the newest copy
- * holds it. */
+ * holds it; @of_file: @data is @path's bytes. */
 static enum save_backup_result save_backups_write_copy(char *s, size_t len,
       const char *dir, const char *path, const char *core,
       enum save_backup_reason reason, const void *data, size_t data_len,
-      bool move, bool skip_same, bool sync)
+      bool move, bool skip_same, bool of_file, bool sync)
 {
    struct save_backups_copies c;
    enum save_backup_result result = SAVE_BACKUP_FAILED;
@@ -773,8 +802,8 @@ static enum save_backup_result save_backups_write_copy(char *s, size_t len,
 
    if (     skip_same
          && c.newest != (size_t)-1
-         && filestream_matches_buf(c.list->elems[c.newest].data, data,
-            data_len))
+         && save_backups_holds(c.list->elems[c.newest].data, data, data_len,
+               of_file ? path : NULL))
    {
       strlcpy(s, c.list->elems[c.newest].data, len);
       result = SAVE_BACKUP_MADE;
@@ -923,7 +952,7 @@ enum save_backup_result save_backups_copy_to(const char *dir,
       len  = (size_t)n;
    }
    result = save_backups_write_copy(made, PATH_MAX_LENGTH, dir, path,
-         core, reason, data, len, false, true, sync);
+         core, reason, data, len, false, true, buf != NULL, sync);
    free(buf);
    free(made);
    return result;
@@ -936,7 +965,7 @@ enum save_backup_result save_backups_move_begin(const char *dir,
    if (!path_is_valid(path))
       return SAVE_BACKUP_NO_FILE;
    return save_backups_write_copy(s, len, dir, path, core, reason,
-         NULL, 0, true, false, false);
+         NULL, 0, true, false, false, false);
 }
 
 enum save_backup_result save_backups_move_to(const char *dir,
@@ -949,7 +978,7 @@ enum save_backup_result save_backups_move_to(const char *dir,
    if (!(made = (char*)malloc(PATH_MAX_LENGTH)))
       return SAVE_BACKUP_FAILED;
    result = save_backups_write_copy(made, PATH_MAX_LENGTH, dir, path,
-         core, reason, NULL, 0, true, false, false);
+         core, reason, NULL, 0, true, false, false, false);
    if (result == SAVE_BACKUP_COPY_OWED)
       result = (  save_backups_copy_synced(path, made)
                && save_backups_move_finish(path, made))
@@ -1028,7 +1057,7 @@ size_t save_backups_recover(char *s, size_t len, const char *path,
       return 0;
    if (save_backups_dir(dir, PATH_MAX_LENGTH, path))
       made = save_backups_write_copy(s, len, dir, path, NULL,
-            SAVE_BACKUP_UNSAVED, data, data_len, false, false, sync)
+            SAVE_BACKUP_UNSAVED, data, data_len, false, false, false, sync)
          == SAVE_BACKUP_MADE;
    for (i = SAVE_BACKUPS_ROOT_CONFIG;
          !made && i <= SAVE_BACKUPS_ROOT_APP_DATA; i++)
@@ -1038,7 +1067,7 @@ size_t save_backups_recover(char *s, size_t len, const char *path,
       fill_pathname_join(dir, save_backups_roots[i],
             SAVE_BACKUPS_RECOVERY_DIR, PATH_MAX_LENGTH);
       made = save_backups_write_copy(s, len, dir, path, NULL,
-            SAVE_BACKUP_UNSAVED, data, data_len, false, false, sync)
+            SAVE_BACKUP_UNSAVED, data, data_len, false, false, false, sync)
          == SAVE_BACKUP_MADE;
    }
    free(dir);

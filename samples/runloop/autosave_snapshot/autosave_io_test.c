@@ -3104,6 +3104,37 @@ static void lane_main_write_pays_both(void)
    flush_lane_end();
 }
 
+/* Compression on, a state load's image backed up from the image and
+ * from the file it was written to, as when the main thread pays it
+ * while the worker owes it: one copy, raw and rzip being the same. */
+static void lane_state_load_copy_once_compressed(void)
+{
+   static unsigned char disk[BIG], ram[BIG], p1[BIG], l1[BIG];
+   char newest[PATH_MAX_LENGTH];
+
+   fill_id(disk, BIG, 104, 'D');
+   fill_id(p1, BIG, 105, 'P');
+   fill_id(l1, BIG, 106, 'L');
+   flush_lane_begin(disk, ram);
+   start_parked(ram);
+   memcpy(ram, p1, BIG);
+   event_flush_save_files(true, true, 1 << SAVE_BACKUP_BEFORE_STATE_LOAD);
+   /* The worker's write of the image, and its copy owed */
+   CHECK(rzipstream_write_file(SAVE, p1, BIG), "copy once: not written");
+   save_file_keep_stat(save_file_get(0), SAVE);
+   save_file_owe(save_file_get(0), SAVE_BACKUP_BEFORE_STATE_LOAD);
+   memcpy(ram, l1, BIG);
+   event_save_files(true, true, true, true, NULL);
+   retro_atomic_store_release_int(&gate_open, 1);
+   wait_flushed();
+   wait_requested();
+   CHECK(reads_as(SAVE, l1, BIG), "copy once: the save is not the memory");
+   CHECK(copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, newest,
+            sizeof(newest)) == 1 && reads_as(newest, p1, BIG),
+         "copy once: the pre-load save not backed up once");
+   flush_lane_end();
+}
+
 /* A copy dropped for the main thread's write is taken again at the
  * next check, not after the worker's interval. */
 static void lane_main_write_no_rest(void)
@@ -4829,6 +4860,7 @@ int main(void)
    lane_main_write_pays_waiting();
    lane_main_write_pays_landed();
    lane_main_write_pays_both();
+   lane_state_load_copy_once_compressed();
    lane_main_write_no_rest();
    lane_main_write_pays_failed();
    lane_main_write_paid_taken();
