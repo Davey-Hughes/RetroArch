@@ -271,8 +271,17 @@ static void save_file_notice(enum msg_hash_enums msg, const char *path,
 
 #ifdef HAVE_THREADS
 /* The worker's own temporary: a SAVE_FILES on the main thread uses
- * "<path>.tmp" and may run while the worker writes. */
+ * "<path>.tmp" and may run while the worker writes. Where it can't be
+ * opened (a name too long for it), the main thread writes the image,
+ * or at a quit the worker writes it through "<path>.tmp". */
 #define AUTOSAVE_TMP_SUFFIX ".auto.tmp"
+
+/* autosave.handoff: an image waits for the main thread, then what
+ * became of it. */
+#define AUTOSAVE_HANDOFF_POSTED  1
+#define AUTOSAVE_HANDOFF_WRITTEN 2
+#define AUTOSAVE_HANDOFF_FAILED  3
+#define AUTOSAVE_HANDOFF_DROPPED 4
 
 /* Set in a slot of autosave.flush while its flush waits or is being
  * written; the bits below KEPT are owed once it is written. */
@@ -320,6 +329,12 @@ struct autosave
    int snapshot_gen;
    /* Worker only: main_gen of the last image written here */
    int put_gen;
+   /* The image handed to the main thread, its main_gen and flush slot;
+    * set before handoff is posted */
+   const void *handoff_image;
+   int handoff_gen;
+   unsigned handoff_slot;
+   bool handoff_flush;
    char *path;
    char *tmp_path;
    /* Its file's session state; outlives the handle */
@@ -351,6 +366,7 @@ struct autosave
    /* Set by the worker from its last check of main_gen until its
     * write is done. */
    retro_atomic_int_t committing;
+   retro_atomic_int_t handoff; /* AUTOSAVE_HANDOFF_*, 0 when none */
    retro_atomic_int_t quit;
    /* The worker's last store: the handle is the main thread's after it */
    retro_atomic_int_t exited;
@@ -377,17 +393,19 @@ static bool autosave_flush_waiting(autosave_t *save)
          & AUTOSAVE_FLUSH_FULL) != 0;
 }
 
-/* Writes @image through the worker's own temporary, or in place where
- * the file can't be renamed (filestream_atomic_in_place()). False when
- * opening, writing, syncing or renaming failed: the file keeps its old
+/* Writes @image through the temporary @tmp, "<path><suffix>", or in
+ * place where the file can't be renamed (filestream_atomic_in_place()).
+ * 0 when written; 1 when the temporary can't be opened; -1 when opening
+ * in place, writing, syncing or renaming failed: the file keeps its old
  * contents, unless written in place. */
-static bool autosave_write(autosave_t *save, const void *image)
+static int autosave_write(autosave_t *save, const void *image,
+      const char *tmp, const char *suffix)
 {
    int ret;
    intfstream_t *file = NULL;
    bool written       = false;
    bool in_place      = filestream_atomic_in_place(save->path);
-   const char *out    = in_place ? save->path : save->tmp_path;
+   const char *out    = in_place ? save->path : tmp;
 
    if (save->compress)
       file = intfstream_open_rzip_file(out, RETRO_VFS_FILE_ACCESS_WRITE);
@@ -395,6 +413,8 @@ static bool autosave_write(autosave_t *save, const void *image)
       file = intfstream_open_file(out,
             RETRO_VFS_FILE_ACCESS_WRITE, RETRO_VFS_FILE_ACCESS_HINT_SEQUENTIAL_BULK);
 
+   if (!file && !in_place)
+      return 1;
    if (file)
    {
       written = intfstream_write(file, image,
@@ -407,12 +427,104 @@ static bool autosave_write(autosave_t *save, const void *image)
    }
 
    if (in_place)
-      return written;
-   ret = filestream_finish_atomic_suffix(save->path,
-         AUTOSAVE_TMP_SUFFIX, written, true);
+      return written ? 0 : -1;
+   ret = filestream_finish_atomic_suffix(save->path, suffix, written, true);
    if (ret == 1)
-      filestream_delete(save->tmp_path);
-   return ret == 0;
+      filestream_delete(tmp);
+   return ret == 0 ? 0 : -1;
+}
+
+/* Once quit is set the main thread is joining the worker and writes
+ * nothing until it has: the worker takes "<path>.tmp" itself. */
+static int autosave_write_at_quit(autosave_t *save, const void *image)
+{
+   int ret   = -1;
+   char *tmp = (char*)malloc(PATH_MAX_LENGTH);
+   if (tmp && filestream_atomic_temp_name(tmp, PATH_MAX_LENGTH, save->path))
+      ret = autosave_write(save, image, tmp, ".tmp") ? -1 : 0;
+   free(tmp);
+   return ret;
+}
+
+/* Hands @image, taken at main_gen @gen, to the main thread, which
+ * writes it through "<path>.tmp" at its next check, and waits: 0 when
+ * written, -1 when that failed, 1 when dropped. At a quit the worker
+ * writes it itself. */
+static int autosave_hand_over(autosave_t *save, const void *image, int gen,
+      bool flush)
+{
+   int r;
+   if (autosave_quitting(save))
+      return autosave_write_at_quit(save, image);
+   save->handoff_image = image;
+   save->handoff_gen   = gen;
+   save->handoff_slot  = save->flush_take;
+   save->handoff_flush = flush;
+   retro_atomic_store_release_int(&save->handoff, AUTOSAVE_HANDOFF_POSTED);
+   for (;;)
+   {
+      int key;
+      if ((r = retro_atomic_load_acquire_int(&save->handoff))
+            != AUTOSAVE_HANDOFF_POSTED)
+         break;
+      if (     autosave_quitting(save)
+            && retro_atomic_cas_int(&save->handoff,
+                  AUTOSAVE_HANDOFF_POSTED, 0))
+         return autosave_write_at_quit(save, image);
+      key = retro_eventcount_prepare_wait(&save->ec);
+      if (     autosave_quitting(save)
+            || retro_atomic_load_acquire_int(&save->handoff)
+               != AUTOSAVE_HANDOFF_POSTED)
+         retro_eventcount_cancel_wait(&save->ec);
+      else
+         retro_eventcount_commit_wait(&save->ec, key);
+   }
+   retro_atomic_store_release_int(&save->handoff, 0);
+   if (r == AUTOSAVE_HANDOFF_WRITTEN)
+      return 0;
+   return r == AUTOSAVE_HANDOFF_FAILED ? -1 : 1;
+}
+
+/* Main thread: the image a worker handed over, written through
+ * "<path>.tmp" and synced, unless the main thread wrote the file since
+ * or backed up the state load's image. */
+static void autosave_serve(autosave_t *save)
+{
+   int r;
+   if (     retro_atomic_load_acquire_int(&save->handoff)
+         != AUTOSAVE_HANDOFF_POSTED)
+      return;
+   if (save->handoff_flush
+         ? (retro_atomic_load_acquire_int(&save->flush[save->handoff_slot])
+            & AUTOSAVE_FLUSH_PAID) != 0
+         : retro_atomic_load_acquire_int(&save->main_gen)
+            != save->handoff_gen)
+      r = AUTOSAVE_HANDOFF_DROPPED;
+   else
+   {
+      bool ok;
+      /* Synced in the frame loop: only saves with no room for .auto.tmp */
+#if defined(HAVE_COMPRESSION)
+      if (save->compress)
+      {
+         char *tmp_path = (char*)malloc(PATH_MAX_LENGTH);
+         ok =     tmp_path
+               && filestream_atomic_temp_name(tmp_path, PATH_MAX_LENGTH,
+                     save->path)
+               && content_finish_tmp(save->path, rzipstream_write_file(
+                     tmp_path, save->handoff_image, save->bufsize), true);
+         free(tmp_path);
+      }
+      else
+#endif
+         ok = filestream_write_file_atomic_synced(save->path,
+               save->handoff_image, save->bufsize);
+      if (ok)
+         save_file_keep_stat(save->file, save->path);
+      r = ok ? AUTOSAVE_HANDOFF_WRITTEN : AUTOSAVE_HANDOFF_FAILED;
+   }
+   if (retro_atomic_cas_int(&save->handoff, AUTOSAVE_HANDOFF_POSTED, r))
+      retro_eventcount_notify(&save->ec);
 }
 
 /* A flush's image that could not be written: no later check has it. The
@@ -482,7 +594,14 @@ static void autosave_put(autosave_t *save, const void *image, int gen,
             & AUTOSAVE_FLUSH_PAID) != 0
          : retro_atomic_load_seq_cst_int(&save->main_gen) != gen;
       if (!dropped)
-         written = autosave_write(save, image);
+      {
+         int ret = autosave_write(save, image, save->tmp_path,
+               AUTOSAVE_TMP_SUFFIX);
+         if (ret > 0)
+            ret = autosave_hand_over(save, image, gen, flush);
+         dropped = ret > 0;
+         written = ret == 0;
+      }
       retro_atomic_store_release_int(&save->committing, 0);
       if (dropped)
          return;
@@ -658,10 +777,15 @@ static autosave_t *autosave_new(const char *path,
    retro_atomic_int_init(&handle->flush[1], 0);
    retro_atomic_int_init(&handle->main_gen, 0);
    retro_atomic_int_init(&handle->committing, 0);
+   retro_atomic_int_init(&handle->handoff, 0);
    handle->flush_owed[0]         = 0;
    handle->flush_owed[1]         = 0;
    handle->flush_gen[0]          = 0;
    handle->flush_gen[1]          = 0;
+   handle->handoff_image         = NULL;
+   handle->handoff_gen           = 0;
+   handle->handoff_slot          = 0;
+   handle->handoff_flush         = false;
    handle->snapshot_gen          = 0;
    handle->put_gen               = 0;
    handle->last_write            = cpu_features_get_time_usec();
@@ -804,6 +928,7 @@ static void save_file_check_notices(struct save_file *f, const char *path,
  **/
 static void autosave_free(autosave_t *handle, bool log)
 {
+   autosave_serve(handle);
    retro_atomic_store_release_int(&handle->quit, 1);
    retro_eventcount_notify(&handle->ec);
    sthread_join(handle->thread);
@@ -973,6 +1098,9 @@ void autosave_check(void)
       autosave_t *handle = autosave_state.list[i];
       if (!handle)
          continue;
+      /* A quitting worker takes its image back. */
+      if (!autosave_quitting(handle))
+         autosave_serve(handle);
       save_file_check_notices(handle->file, handle->path, false);
       if (handle->prev)
          autosave_reap(handle);

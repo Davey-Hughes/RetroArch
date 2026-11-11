@@ -217,6 +217,8 @@ static struct retro_vfs_file_handle *open_files[MAX_OPEN];
 static int64_t open_written[MAX_OPEN];
 static int64_t cut_at;
 static bool refuse_rename;
+/* The worker's temporary refused, as a name too long for it is */
+static bool refuse_worker_temp;
 static unsigned write_opens;
 /* What reached the save, in order: each image's first byte. */
 static char put_log[16];
@@ -224,10 +226,12 @@ static unsigned put_num;
 #ifdef HAVE_THREADS
 static uintptr_t main_thread;
 static unsigned main_write_opens;
+static unsigned worker_close_temp_opens;
 
 /* The worker stops in its stat of the save (1), in opening its
- * temporary (2) or after renaming it (3) until stall_mode changes; the
- * main thread never stops. */
+ * temporary (2), after renaming it (3), after its first open of
+ * CLOSE_TEMP (4) or a later one (5) until stall_mode changes; the main
+ * thread never stops. */
 static retro_atomic_int_t stall_mode;
 static retro_atomic_int_t stalled;
 
@@ -257,7 +261,29 @@ static struct retro_vfs_file_handle *RETRO_CALLCONV test_open(
          && string_is_equal(path_basename(path), WORKER_TEMP))
       stall_here(2);
 #endif
+   if (     (mode & RETRO_VFS_FILE_ACCESS_WRITE)
+         && string_is_equal(path_basename(path), WORKER_TEMP))
+   {
+      bool refuse;
+      VFS_LOCK();
+      refuse = refuse_worker_temp;
+      VFS_UNLOCK();
+      if (refuse)
+         return NULL;
+   }
    h = retro_vfs_file_open_impl(path, mode, hints);
+#ifdef HAVE_THREADS
+   if (     h && (mode & RETRO_VFS_FILE_ACCESS_WRITE)
+         && string_is_equal(path_basename(path), CLOSE_TEMP)
+         && sthread_get_current_thread_id() != main_thread)
+   {
+      unsigned n;
+      VFS_LOCK();
+      n = ++worker_close_temp_opens;
+      VFS_UNLOCK();
+      stall_here(n > 1 ? 5 : 4);
+   }
+#endif
    if (!h || !(mode & RETRO_VFS_FILE_ACCESS_WRITE) || !save_own(path))
       return h;
    VFS_LOCK();
@@ -398,8 +424,9 @@ static void use_test_vfs(bool on)
 static void set_vfs(int64_t cut, bool refuse)
 {
    VFS_LOCK();
-   cut_at        = cut;
-   refuse_rename = refuse;
+   cut_at             = cut;
+   refuse_rename      = refuse;
+   refuse_worker_temp = false;
    VFS_UNLOCK();
 }
 
@@ -2524,6 +2551,182 @@ static void lane_suspend_race(void)
    flush_lane_end();
 }
 
+/* The worker stopped in a write, or waiting for the main thread to
+ * write its image. */
+static bool wait_parked(void)
+{
+   unsigned i;
+   for (i = 0; i < 5000; i++)
+   {
+      if (     retro_atomic_load_acquire_int(&stalled)
+#ifdef AUTOSAVE_HANDOFF_POSTED
+            || retro_atomic_load_acquire_int(&slots[0]->handoff)
+               == AUTOSAVE_HANDOFF_POSTED
+#endif
+            )
+         return true;
+      retro_sleep(1);
+   }
+   return false;
+}
+
+/* Until the worker asks for a copy, the main thread writes any image
+ * it hands over. */
+static bool serve_until_requested(void)
+{
+   unsigned i;
+   for (i = 0; i < 5000; i++)
+   {
+      if (retro_atomic_load_acquire_int(&slots[0]->snapshot_requested))
+         return true;
+#ifdef AUTOSAVE_HANDOFF_POSTED
+      autosave_serve(slots[0]);
+#endif
+      retro_sleep(1);
+   }
+   return false;
+}
+
+/* A save name with no room for ".auto.tmp" (refused here, as a
+ * 250-byte one is). The worker's image is written by the main thread
+ * through ".tmp" at its next check, never beside the main thread's own
+ * write: a suspend's write while the image waits is not torn, nor
+ * followed by an older image, a notice or a copy. */
+static void lane_long_name(void)
+{
+   static unsigned char disk[BIG], ram[BIG], s1[BIG], s3[BIG], m5[BIG];
+
+   fill_id(disk, BIG, 81, 'D');
+   fill_id(s1, BIG, 82, 'A');
+   fill_id(s3, BIG, 83, 'C');
+   fill_id(m5, BIG, 84, 'F');
+   flush_lane_begin(disk, ram);
+   start(ram, BIG, false);
+   VFS_LOCK();
+   refuse_worker_temp = true;
+   VFS_UNLOCK();
+
+   memcpy(ram, s1, BIG);
+   autosave_check();
+   CHECK(wait_parked(), "long name: the image not handed over");
+   CHECK(holds(SAVE, disk, BIG) && main_write_opens == 0,
+         "long name: written before the next check");
+   synced_writes = 0;
+   autosave_check();
+   wait_requested();
+   CHECK(synced_writes == 1, "long name: the served write not synced");
+   CHECK(holds(SAVE, s1, BIG) && main_write_opens == 1,
+         "long name: the image not written by the main thread");
+   CHECK(!exists(WORKER_TEMP) && !exists(CLOSE_TEMP),
+         "long name: a temporary left");
+
+   memcpy(ram, s3, BIG);
+   VFS_LOCK();
+   worker_close_temp_opens = 0;
+   VFS_UNLOCK();
+   stall(4);
+   autosave_check();
+   CHECK(wait_parked(), "long name: the worker did not stop");
+   memcpy(ram, m5, BIG);
+   event_save_files(true, false, true, true, NULL);
+   CHECK(holds(SAVE, m5, BIG), "long name: the suspend's write not made");
+   stall(5);
+   CHECK(wait_parked(), "long name: the worker did not go on");
+   CHECK(holds(SAVE, m5, BIG),
+         "long name: an older image over the suspend's write");
+   stall(0);
+   CHECK(serve_until_requested(), "long name: the worker did not ask again");
+   autosave_check();
+   wait_requested();
+   CHECK(holds(SAVE, m5, BIG), "long name: the suspend's write lost");
+   CHECK(written_in_order("AFF"),
+         "long name: the waiting image written after the suspend's");
+   CHECK(!copies("backups", SAVE_BACKUP_REASON_LAST, NULL, 0),
+         "long name: a write of its own taken for another program's");
+   CHECK(!notice_num, "long name: told");
+   flush_lane_end();
+}
+
+/* At a quit: state loads' images of a long-named save queued when
+ * the main thread joins the worker are written by the worker itself,
+ * through ".tmp", in order; none goes to a recovery file. */
+static void lane_long_name_at_quit(void)
+{
+   static unsigned char disk[BIG], ram[BIG], p1[BIG], p2[BIG], l1[BIG];
+   char newest[PATH_MAX_LENGTH];
+   const int bsl = 1 << SAVE_BACKUP_BEFORE_STATE_LOAD;
+
+   fill_id(disk, BIG, 94, 'D');
+   fill_id(p1, BIG, 95, 'P');
+   fill_id(p2, BIG, 96, 'Q');
+   fill_id(l1, BIG, 97, 'L');
+   flush_lane_begin(disk, ram);
+   VFS_LOCK();
+   refuse_worker_temp = true;
+   VFS_UNLOCK();
+   start_parked(ram);
+   memcpy(ram, p1, BIG);
+   event_flush_save_files(true, false, bsl);
+   memcpy(ram, p2, BIG);
+   event_flush_save_files(true, false, bsl);
+   memcpy(ram, l1, BIG);
+   autosave_check();
+
+   stop();
+   CHECK(holds(SAVE, p2, BIG), "long name at quit: the newest not written");
+   CHECK(written_in_order("PQ"), "long name at quit: not those in order");
+   CHECK(copies("backups", SAVE_BACKUP_BEFORE_STATE_LOAD, newest,
+            sizeof(newest)) == 1 && holds(newest, p1, BIG),
+         "long name at quit: the first image is not in a copy");
+   CHECK(quiet(), "long name at quit: a recovery file, notice or warning");
+   CHECK(!exists(WORKER_TEMP) && !exists(CLOSE_TEMP),
+         "long name at quit: a temporary left");
+   gate_next = false;
+   gate_ec   = NULL;
+   set_vfs(0, false);
+   use_test_vfs(false);
+   path_deinit_savefile();
+   clean();
+}
+
+/* The main thread's write of a handed-over image keeps the save's
+ * stat, so its own write in the same frame, before the worker wakes,
+ * is not taken for another program's. */
+static void lane_long_name_keeps_stat(void)
+{
+   static unsigned char disk[BIG], ram[BIG], s1[BIG], m2[BIG];
+   int64_t mtime = 0;
+
+   fill_id(disk, BIG, 91, 'D');
+   fill_id(s1, BIG, 92, 'A');
+   fill_id(m2, BIG, 93, 'B');
+   flush_lane_begin(disk, ram);
+   start(ram, BIG, false);
+   VFS_LOCK();
+   refuse_worker_temp = true;
+   VFS_UNLOCK();
+
+   memcpy(ram, s1, BIG);
+   autosave_check();
+   CHECK(wait_parked(), "long name stat: the image not handed over");
+   /* Aged: the served write gives the save another mtime. */
+   CHECK(path_get_mtime(SAVE, &mtime) && path_set_mtime(SAVE, mtime - 60),
+         "long name stat: cannot age the save");
+   save_file_keep_stat(save_file_get(0), SAVE);
+   stall(1);
+   autosave_check();
+   CHECK(wait_stalled(), "long name stat: the worker did not stop");
+   memcpy(ram, m2, BIG);
+   event_save_files(true, false, true, true, NULL);
+   CHECK(holds(SAVE, m2, BIG), "long name stat: the save not written");
+   CHECK(!notices(MSG_SAVE_CHANGED_ELSEWHERE)
+         && !copies("backups", SAVE_BACKUP_REASON_LAST, NULL, 0),
+         "long name stat: the served write taken for another program's");
+   stall(0);
+   CHECK(serve_until_requested(), "long name stat: the worker did not go on");
+   flush_lane_end();
+}
+
 /* Beside state loads, the worker parked: a flush of memory that
  * stays never drops or reorders a state load's image. It replaces only
  * one of its own not yet taken, and a state load's replaces that too.
@@ -4414,6 +4617,9 @@ int main(void)
    lane_flush_same_image();
    lane_flush_points_worker();
    lane_suspend_race();
+   lane_long_name();
+   lane_long_name_at_quit();
+   lane_long_name_keeps_stat();
    lane_flush_points_queue();
    lane_main_write_pays_waiting();
    lane_main_write_pays_landed();

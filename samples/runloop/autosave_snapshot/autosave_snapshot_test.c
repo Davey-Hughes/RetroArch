@@ -88,6 +88,32 @@ int filestream_finish_atomic_suffix(const char *path, const char *suffix,
    return ok ? 0 : -1;
 }
 
+/* The main thread's write of an image the worker hands over: it fails
+ * where the worker's open does. */
+bool filestream_write_file_atomic_synced(const char *path, const void *data,
+      int64_t size)
+{
+   bool fail;
+   (void)path;
+   assert(size == SRAM_SIZE);
+   slock_lock(io_lock);
+   fail = fail_stage == 1;
+   if (!fail)
+      memcpy(disk_image, data, SRAM_SIZE);
+   slock_unlock(io_lock);
+   return !fail;
+}
+
+bool filestream_atomic_temp_name(char *s, size_t len, const char *path)
+{
+   size_t path_len = strlen(path);
+   if (path_len + sizeof(".tmp") > len)
+      return false;
+   memcpy(s, path, path_len);
+   memcpy(s + path_len, ".tmp", sizeof(".tmp"));
+   return true;
+}
+
 bool filestream_atomic_in_place(const char *path)
 {
    (void)path;
@@ -183,6 +209,7 @@ bool core_get_memory(retro_ctx_memory_info_t *info)
    return true;
 }
 
+/* The main thread meanwhile writes any image the worker hands over. */
 static void wait_requested(void)
 {
    unsigned i;
@@ -190,6 +217,7 @@ static void wait_requested(void)
    {
       if (retro_atomic_load_acquire_int(&current->snapshot_requested))
          return;
+      autosave_serve(current);
       retro_sleep(1);
    }
    assert(!"snapshot request timed out");
