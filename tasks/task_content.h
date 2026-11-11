@@ -90,6 +90,9 @@ bool task_content_load_pending(void);
  * after it: parks a core load for when its check passes or the user
  * answers the Security Warning */
 bool task_content_park_core_load(const char *core_path);
+/* As task_content_park_core_load(), and the answered load starts a core
+ * that runs without content */
+bool task_content_park_core_start(const char *core_path);
 /* After a refused probe of core_path from a user's action that can't
  * park it: says it wasn't loaded and how to trust it. False when the
  * check didn't refuse it. */

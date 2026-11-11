@@ -2506,17 +2506,46 @@ static void content_load_core_rerun(void *ud)
 #endif
 }
 
-bool task_content_park_core_load(const char *core_path)
+/* As content_load_core_rerun(), then started if it runs without
+ * content, as the companion UI's Load Core starts it after a probe */
+static void content_load_core_start_rerun(void *ud)
+{
+   content_ctx_info_t content_info = {0};
+   rarch_system_info_t *sys_info   = &runloop_state_get_ptr()->system;
+   /* Set by the probe only when it succeeds */
+   sys_info->load_no_content       = false;
+   content_load_core_rerun(ud);
+   if (     sys_info->load_no_content
+         && config_get_ptr()->bools.set_supports_no_game_enable)
+   {
+      path_clear(RARCH_PATH_CONTENT);
+      task_push_load_content_with_current_core_from_companion_ui(NULL,
+            &content_info, CORE_TYPE_PLAIN, NULL, NULL);
+   }
+}
+
+static bool content_load_park_core(const char *core_path,
+      core_load_rerun_t rerun)
 {
    char *d = NULL;
    if (     !core_path
          || !core_load_check_refused(core_path)
          || !(d = strdup(core_path)))
       return false;
-   if (core_load_check_park(d, content_load_core_rerun, free, d))
+   if (core_load_check_park(d, rerun, free, d))
       return true;
    free(d);
    return false;
+}
+
+bool task_content_park_core_load(const char *core_path)
+{
+   return content_load_park_core(core_path, content_load_core_rerun);
+}
+
+bool task_content_park_core_start(const char *core_path)
+{
+   return content_load_park_core(core_path, content_load_core_start_rerun);
 }
 
 bool task_content_core_refused_notify(const char *core_path)
