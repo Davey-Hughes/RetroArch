@@ -2800,6 +2800,41 @@ static void test_auto_state_keep(void)
          && errors_logged - errors == finish_errors + 1,
        "keep: a failed put-back is logged, the held one kept");
 
+   /* same drive: moved into the backups, then the new one not moved
+    * in: the old one back in its slot, no copy, no temporary */
+   keep_reset();
+   keep_put(KEEP_AUTO, "old");
+   __atomic_store_n(&refuse_renames, REFUSE_FINISH, __ATOMIC_RELAXED);
+   okf(!content_auto_save_state(KEEP_AUTO) && keep_holds(KEEP_AUTO, "old"),
+       "keep: same drive, a failed finish puts the moved one back");
+   okf(     auto_backups(KEEP_AUTO, NULL) == 0 && !temps_in(KEEP_DIR)
+         && !stub_runloop.auto_state_owned,
+       "keep: same drive, no copy and no temporary left");
+
+   /* nor put back: logged, the old one in the backups, the new one in
+    * its temporary */
+   keep_reset();
+   keep_put(KEEP_AUTO, "old");
+   __atomic_store_n(&refuse_renames, REFUSE_FINISH | REFUSE_BACK,
+         __ATOMIC_RELAXED);
+   errors = errors_logged;
+   okf(     !content_auto_save_state(KEEP_AUTO)
+         && auto_backups(KEEP_AUTO, "old") == 1 && !path_is_valid(KEEP_AUTO)
+         && temps_in(KEEP_DIR) == 1 && errors_logged > errors
+         && !stub_runloop.auto_state_owned,
+       "keep: same drive, a failed put-back is logged, the old one kept");
+
+   /* no room to record the move: not moved, not saved over */
+   keep_reset();
+   keep_put(KEEP_AUTO, "old");
+   __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+   calloc_fail_big = 1;
+   okf(     !content_auto_save_state(KEEP_AUTO)
+         && keep_holds(KEEP_AUTO, "old") && auto_backups(KEEP_AUTO, NULL) == 0
+         && !temps_in(KEEP_DIR),
+       "keep: a move that cannot be recorded is not made");
+   calloc_fail_big = 0;
+
    /* the first free held name; all nine taken, an inline copy */
    keep_reset();
    keep_put(h[1], "held1");

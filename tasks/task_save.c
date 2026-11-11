@@ -2669,9 +2669,10 @@ static void content_auto_state_put_back(const char *path, unsigned n,
    free(s);
 }
 
-static void content_auto_state_unhold(const char *path, unsigned n)
+static void content_auto_state_unhold(const char *path, unsigned n,
+      const char *moved)
 {
-   content_auto_state_put_back(path, n, NULL);
+   content_auto_state_put_back(path, n, moved);
    runloop_state_get_ptr()->auto_state_owned = false;
 }
 
@@ -2713,8 +2714,9 @@ static bool content_auto_state_move_aside(const char *path, unsigned *held,
 
 /* An .auto the session wanted and did not load (load failed, hardcore,
  * netplay, a replay, an entry slot) goes to the backups before the
- * first write over it. */
-static bool content_auto_state_set_aside(const char *path, unsigned *held)
+ * first write over it: held as @held, or moved as @moved. */
+static bool content_auto_state_set_aside(const char *path, unsigned *held,
+      char *moved, size_t len)
 {
    runloop_state_t *runloop_st = runloop_state_get_ptr();
    settings_t *settings        = config_get_ptr();
@@ -2723,7 +2725,7 @@ static bool content_auto_state_set_aside(const char *path, unsigned *held)
          && (   runloop_st->auto_state_wanted
              || settings->bools.savestate_auto_load)
          && path_is_valid(path)
-         && !content_auto_state_move_aside(path, held, NULL, 0))
+         && !content_auto_state_move_aside(path, held, moved, len))
       return false;
    runloop_st->auto_state_owned = true;
    return true;
@@ -2746,6 +2748,7 @@ bool content_auto_save_state(const char *path)
    settings_t *settings = config_get_ptr();
    void *serial_data    = NULL;
    intfstream_t *file   = NULL;
+   char *moved          = NULL;
    const char *suffix   = AUTO_STATE_TMP_SUFFIX;
    char tmp_path[PATH_MAX_LENGTH];
 
@@ -2794,14 +2797,25 @@ bool content_auto_save_state(const char *path)
    free(serial_data);
    free(file);
 
-   if (_close_ret == 0 && !content_auto_state_set_aside(path, &held))
+   /* No room to record a move: one could not be put back */
+   moved = (char*)calloc(1, PATH_MAX_LENGTH);
+   if (     _close_ret == 0
+         && (!moved || !content_auto_state_set_aside(path, &held, moved,
+               PATH_MAX_LENGTH)))
       _close_ret = -1;
    if (!content_finish_state_tmp(path, tmp_path, suffix, _close_ret == 0))
    {
-      if (held)
-         content_auto_state_unhold(path, held);
+      /* The old one back in its slot, the new one gone */
+      if (held || (moved && *moved))
+      {
+         content_auto_state_unhold(path, held, moved);
+         if (path_is_valid(path))
+            filestream_delete(tmp_path);
+      }
+      free(moved);
       return false;
    }
+   free(moved);
    if (held)
       content_auto_state_keep(path);
    content_save_written();
