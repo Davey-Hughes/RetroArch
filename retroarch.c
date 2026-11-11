@@ -7337,6 +7337,14 @@ static int mkdir_p(const char *path, mode_t mode)
  *
  * Returns: varies per platform.
  **/
+#ifdef HAVE_CLOUDSYNC
+/* The command line, kept for a launch that waits for the startup sync
+ * (retroarch_cli_sync_done). */
+static int    rarch_cli_argc;
+static char **rarch_cli_argv;
+static void  *rarch_cli_args;
+#endif
+
 int rarch_main(int argc, char *argv[], void *data)
 {
    settings_t *settings;
@@ -7478,6 +7486,11 @@ int rarch_main(int argc, char *argv[], void *data)
       info.argv            = argv;
       info.args            = data;
       info.environ_get     = frontend_state_get_ptr()->current_frontend_ctx->environment_get;
+#ifdef HAVE_CLOUDSYNC
+      rarch_cli_argc       = argc;
+      rarch_cli_argv       = argv;
+      rarch_cli_args       = data;
+#endif
 
       if (!task_push_load_content_from_cli(
                NULL,
@@ -8739,6 +8752,65 @@ static void retroarch_cli_scan(task_dbscan_item_t *items, size_t count,
 #endif
 
 #ifdef HAVE_CLOUDSYNC
+/* The startup sync of a command-line launch ended, whatever its
+ * result: load the command line's content, unless the menu started
+ * other content meanwhile. */
+static void retroarch_cli_sync_done(retro_task_t *task,
+      void *task_data, void *user_data, const char *err)
+{
+   content_ctx_info_t info;
+   runloop_state_t *runloop_st     = runloop_state_get_ptr();
+   frontend_ctx_driver_t *frontend =
+      frontend_state_get_ptr()->current_frontend_ctx;
+
+   /* A quit cancels the sync: no load as it drains the tasks */
+   if (     runloop_st->current_core_type != CORE_TYPE_DUMMY
+         || (runloop_st->flags & RUNLOOP_FLAG_SHUTDOWN_INITIATED)
+         || task_content_load_pending())
+      return;
+   info.argc        = rarch_cli_argc;
+   info.argv        = rarch_cli_argv;
+   info.args        = rarch_cli_args;
+   info.environ_get = frontend ? frontend->environment_get : NULL;
+   task_push_load_content_from_cli_staged(&info);
+}
+
+/* rarch_cli_argv in one block of its own: the caller's can be gone by
+ * the time the sync ends (UWP's returns with rarch_main). Kept until
+ * the next one, as the load reads it after the callback. */
+static bool retroarch_cli_keep_argv(void)
+{
+   static char **kept = NULL;
+   char **copy;
+   char *s;
+   int i;
+   size_t len = (rarch_cli_argc + 1) * sizeof(char*);
+
+   if (!rarch_cli_argv)
+      return false;
+   for (i = 0; i < rarch_cli_argc; i++)
+      if (rarch_cli_argv[i])
+         len += strlen(rarch_cli_argv[i]) + 1;
+   if (!(copy = (char**)malloc(len)))
+      return false;
+   s = (char*)(copy + rarch_cli_argc + 1);
+   for (i = 0; i < rarch_cli_argc; i++)
+   {
+      copy[i] = NULL;
+      if (rarch_cli_argv[i])
+      {
+         size_t _len = strlen(rarch_cli_argv[i]) + 1;
+         memcpy(s, rarch_cli_argv[i], _len);
+         copy[i] = s;
+         s      += _len;
+      }
+   }
+   copy[rarch_cli_argc] = NULL;
+   free(kept);
+   kept = rarch_cli_argv = copy;
+   return true;
+}
+
 /* The sync's verdict, where the waiting caller reads it. */
 static void retroarch_cloud_sync_finished(retro_task_t *task,
       void *task_data, void *user_data, const char *err)
@@ -10211,16 +10283,28 @@ bool retroarch_main_init_core(int argc, char *argv[],
       retroarch_find_drivers(settings, verbosity_enabled, true);
 
 #ifdef HAVE_CLOUDSYNC
-   /* Content from the command line is loaded below, before rarch_main()
-    * would push the startup sync: it is pushed here instead, and the
-    * content's saves wait for it (save_load_hold). */
+   /* Content from the command line would load below, before rarch_main()
+    * pushes the startup sync: the sync is pushed here instead, the
+    * session starts on the dummy core, and the command line loads again
+    * once the sync ends, so a core reads even the save files it keeps
+    * itself after the sync. */
    if (      find_drivers
          && (rarch_st.flags & RARCH_FLAGS_LAUNCHED_FROM_CLI)
          && !string_is_empty(p_rarch->path_content)
          && settings->bools.cloud_sync_enable
          && settings->uints.cloud_sync_sync_mode == CLOUD_SYNC_MODE_AUTOMATIC)
    {
-      task_push_cloud_sync(NULL, NULL);
+      bool defer = retroarch_cli_keep_argv();
+      if (     task_push_cloud_sync(defer ? retroarch_cli_sync_done : NULL, NULL)
+            && defer)
+      {
+         const char *_msg = msg_hash_to_str(MSG_CLOUD_SYNC_WAITING_CONTENT);
+         RARCH_LOG("[CloudSync] %s\n", _msg);
+         runloop_msg_queue_push(_msg, strlen(_msg), 1, 180, false, NULL,
+               MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+         path_clear(RARCH_PATH_CONTENT);
+         runloop_set_current_core_type(CORE_TYPE_DUMMY, true);
+      }
       rarch_st.flags |= RARCH_FLAGS_CLOUD_SYNC_AT_INIT;
    }
 #endif

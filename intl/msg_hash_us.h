@@ -33814,6 +33814,10 @@ MSG_HASH(
    "Waiting for cloud sync before loading saves..."
    )
 MSG_HASH(
+   MSG_CLOUD_SYNC_WAITING_CONTENT,
+   "Waiting for cloud sync before starting the content..."
+   )
+MSG_HASH(
    MSG_SRAM_WILL_NOT_BE_SAVED,
    "SRAM will not be saved."
    )

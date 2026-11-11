@@ -6,7 +6,9 @@
  *                   whole save RAM at frame 10
  *   "state <hex>"   a state was loaded
  *   "run <n>"       every 60 frames
- * <hex> is the first 8 bytes of the save RAM. */
+ *   "card <hex>"    at load: CLOUDSYNC_E2E_CARD, a file the core reads
+ *                   itself (a memory card) and writes back at unload
+ * <hex> is the first 8 bytes of the save RAM, or of the card. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,8 +21,9 @@ static unsigned frame_buf[16 * 16];
 static unsigned frames;
 static retro_video_refresh_t video_cb;
 static retro_environment_t   environ_cb;
+static unsigned char card[8];
 
-static void note(const char *what)
+static void note_bytes(const char *what, const unsigned char *bytes)
 {
    const char *path = getenv("CLOUDSYNC_E2E_LOG");
    FILE *f;
@@ -30,9 +33,17 @@ static void note(const char *what)
       return;
    fprintf(f, "%s ", what);
    for (i = 0; i < 8; i++)
-      fprintf(f, "%02x", sram[i]);
+      fprintf(f, "%02x", bytes[i]);
    fprintf(f, "\n");
    fclose(f);
+}
+
+static void note(const char *what) { note_bytes(what, sram); }
+
+static const char *card_path(void)
+{
+   const char *path = getenv("CLOUDSYNC_E2E_CARD");
+   return path && *path ? path : NULL;
 }
 
 void retro_set_environment(retro_environment_t cb)
@@ -116,12 +127,34 @@ void retro_cheat_set(unsigned i, bool e, const char *c) { (void)i; (void)e; (voi
 bool retro_load_game(const struct retro_game_info *game)
 {
    enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
+   const char *path            = card_path();
+   FILE       *f;
    (void)game;
+   if (path)
+   {
+      memset(card, 0, sizeof(card));
+      if ((f = fopen(path, "rb")))
+      {
+         if (fread(card, 1, sizeof(card), f) != sizeof(card))
+            memset(card, 0, sizeof(card));
+         fclose(f);
+      }
+      note_bytes("card", card);
+   }
    return environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt);
 }
 bool retro_load_game_special(unsigned t, const struct retro_game_info *g, size_t n)
 { (void)t; (void)g; (void)n; return false; }
-void retro_unload_game(void) { }
+void retro_unload_game(void)
+{
+   const char *path = card_path();
+   FILE       *f;
+   if (path && (f = fopen(path, "wb")))
+   {
+      fwrite(card, 1, sizeof(card), f);
+      fclose(f);
+   }
+}
 unsigned retro_get_region(void) { return RETRO_REGION_NTSC; }
 
 void *retro_get_memory_data(unsigned id)

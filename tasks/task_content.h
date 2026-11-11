@@ -48,6 +48,10 @@ bool task_push_load_content_with_current_core_from_companion_ui(
       retro_task_callback_t cb,
       void *user_data);
 
+/* The command line's content, staged: its launch waited for the
+ * startup cloud sync on the dummy core. */
+bool task_push_load_content_from_cli_staged(content_ctx_info_t *content_info);
+
 bool task_push_load_content_from_cli(
       const char *core_path,
       const char *fullpath,

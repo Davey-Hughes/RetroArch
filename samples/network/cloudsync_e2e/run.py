@@ -131,6 +131,7 @@ class Device:
         self.retroarch = retroarch
         self.proc      = None
         self.runs      = 0
+        self.card      = None
         for d in self.DIRS:
             os.makedirs(os.path.join(self.dir, d), exist_ok=True)
         self.cfg      = os.path.join(self.dir, "config", "retroarch.cfg")
@@ -223,6 +224,7 @@ class Device:
             "XDG_STATE_HOME": os.path.join(home, ".local", "state"),
             "CLOUDSYNC_E2E_LOG": self.core_log,
             "CLOUDSYNC_E2E_FILL": fill or "",
+            "CLOUDSYNC_E2E_CARD": self.card or "",
         })
         return env
 
@@ -986,6 +988,50 @@ def cli_launch_keeps_running(srv, a, b):
     check(answered is not None and not synced_at,
           "nothing answered while the launch sync ran (first answer %s s)"
           % (answered and "%.1f" % answered))
+
+
+@lane(2)
+def cli_launch_core_file(srv, a, b):
+    """A core that reads a save file of its own at load (a memory card)
+    reads the one the startup sync fetched, and its close sends no older
+    card back."""
+    put(a.key("saves/%s/Game.mcd" % CORE_DIR), b"\xa1" * 8)
+    first_sync(a, b)
+    put(b.key("saves/%s/Game.mcd" % CORE_DIR), b"\xb3" * 8)
+    cli_ok(b)
+    srv.state.delay = {"manifest.server": 2.0}
+    a.card = a.key("saves/%s/Game.mcd" % CORE_DIR)
+    a.start(content=True, fill=None)
+    check(a.wait_core("loaded"), "the game did not start")
+    a.cmd("CLOSE_CONTENT")
+    check(a.wait_log(r"\[CloudSync\] Finished after", count=2),
+          "no sync after the game closed")
+    check(a.stop() == 0, "A did not quit cleanly")
+    check(a.core_notes("card")[0] == "b3" * 8,
+          "the game read the card it had before the sync: %s"
+          % a.core_notes("card"))
+    on_server = [get(os.path.join(r, f)) for r, _, fs in os.walk(srv.root)
+                 for f in fs if f == "Game.mcd" and "deleted" not in r]
+    check(on_server == [b"\xb3" * 8],
+          "the server's card was replaced: %s" % on_server)
+
+
+@lane(2)
+def cli_launch_quit_while_waiting(srv, a, b):
+    """Quitting while a command-line launch waits for the startup sync
+    quits without starting the game."""
+    first_sync(a, b)
+    srv.state.delay = {"manifest.server": 5.0}
+    a.card = a.key("saves/%s/Game.mcd" % CORE_DIR)
+    a.start(content=True, fill=None)
+    check(a.wait_commands(), "A takes no commands")
+    check(not re.search(r"\[CloudSync\] Finished after", a.log()),
+          "the sync ended before the quit")
+    check("Waiting for cloud sync before starting the content" in a.log(),
+          "no waiting notice")
+    check(a.stop() == 0, "A did not quit cleanly")
+    check(not a.core_notes("card"),
+          "the game started as A quit: %s" % a.core_notes("card"))
 
 
 @lane(2)

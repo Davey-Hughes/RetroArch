@@ -1303,7 +1303,9 @@ def lane_unload_bypass_after_held(args, n):
 def lane_close_while_held(args, n):
     """A close or quit while the content's saves are held (a cloud sync
     still running at the load) waits for nothing and writes no .auto.
-    The sync's server takes the connection and never answers."""
+    The sync's server takes the connection and never answers. The
+    command line's launch waits for the sync on the dummy core, so the
+    game is loaded by command, as from the menu."""
     failures = []
     server = socket.socket()
     server.bind(('127.0.0.1', 0))
@@ -1327,16 +1329,22 @@ def lane_close_while_held(args, n):
                        webdav_url='http://127.0.0.1:%d/' %
                        server.getsockname()[1])
         auto = r.dir / 'states' / 'game.state.auto'
-        r.start(args, cfg, 100000, r.env(SAVE_E2E_FRAME_MS=10))
-        deadline, held = time.time() + 30, False
+        # The dummy core's frames are unpaced: no frame limit it can reach
+        r.start(args, cfg, 1000000000, r.env(SAVE_E2E_FRAME_MS=10))
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        load = ('LOAD_CONTENT %s|%s' % (args.core, r.content)).encode()
+        deadline, held, sent = time.time() + 30, False, 0.0
         while not held and r.proc.poll() is None \
                 and time.time() < deadline:
-            held = '[CloudSync]' in log_text(r) \
+            held = 'before loading saves' in log_text(r) \
                 and len(conns) > i
+            # Again until it lands: the command port may not be open yet
+            if not held and time.time() - sent > 1.0:
+                sock.sendto(load, ('127.0.0.1', port))
+                sent = time.time()
             time.sleep(0.05)
         check(failures, held, '%s: the saves were not held' % close)
         time.sleep(0.5)
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.sendto(close, ('127.0.0.1', port))
         sock.close()
         if close == b'QUIT':
