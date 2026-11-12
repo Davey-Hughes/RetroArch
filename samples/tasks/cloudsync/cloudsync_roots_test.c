@@ -857,7 +857,7 @@ static void mass_lane(bool threaded, unsigned n, unsigned gone, bool held)
    CHECK(deletes == 0);
    CHECK(notices == 1);
    CHECK(notice_count == gone);
-   CHECK(roots_name("\"held\""));
+   CHECK(roots_name("\"held_at\""));
    CHECK(roots_name("saves/f00.srm"));
    for (i = 0; i < gone; i++)
    {
@@ -1124,6 +1124,147 @@ static void nested_roots(bool threaded)
    free(settings);
 }
 
+/* Resolve Kept Files: one sync deletes on the server what any hold
+ * would keep, a whole folder's and a mass deletion's; the sync after
+ * holds again. */
+static void delete_missing(bool threaded)
+{
+   static const char *dirs[] = {
+      "Snes9x/a.srm", "Snes9x/b.srm", "Snes9x/c.srm",
+      "Gamb/p.srm", "Gamb/q.srm", "Gamb/r.srm" };
+   char     root[256], name[32];
+   unsigned i;
+   lane_dirs("delete_missing", threaded, root, sizeof(root));
+   for (i = 0; i < 12; i++)
+   {
+      name_file(name, sizeof(name), i);
+      put(root, name, name);
+   }
+   for (i = 0; i < 6; i++)
+      put(root, dirs[i], dirs[i]);
+   put(root, "zz.srm", "zz");
+   CHECK(sync_saves(threaded, root));
+   CHECK(uploads == 19);
+   for (i = 0; i < 11; i++)
+   {
+      name_file(name, sizeof(name), i);
+      drop(root, name);
+   }
+   for (i = 0; i < 3; i++)
+      drop(root, dirs[i]);
+   conflict_mode = 4;
+   CHECK(sync_saves(threaded, root));
+   conflict_mode = 0;
+   CHECK(deletes == 14);
+   CHECK(notices == 0);
+   CHECK(!path_is_valid(srv_key("saves/Snes9x/a.srm")));
+   CHECK(!path_is_valid(srv_key("saves/f10.srm")));
+   for (i = 3; i < 6; i++)
+      drop(root, dirs[i]);
+   CHECK(sync_saves(threaded, root));
+   CHECK(deletes == 0);
+   CHECK(notices == 1);
+   CHECK(notice_count == 3);
+   CHECK(holds(srv, "saves/Gamb/p.srm", "Gamb/p.srm"));
+}
+
+/* Resolve Kept Files after the sync that kept them: those files go on
+ * the server, nothing comes back down, and the sync after is quiet. */
+static void delete_missing_after_hold(bool threaded)
+{
+   static const char *files[] = {
+      "Snes9x/a.srm", "Snes9x/b.srm", "Snes9x/c.srm", "t1.srm", "t2.srm" };
+   char     root[256];
+   unsigned i;
+   lane_dirs("delete_after_hold", threaded, root, sizeof(root));
+   for (i = 0; i < 5; i++)
+      put(root, files[i], files[i]);
+   CHECK(sync_saves(threaded, root));
+   for (i = 0; i < 3; i++)
+      drop(root, files[i]);
+   CHECK(sync_saves(threaded, root));
+   CHECK(deletes == 0);
+   CHECK(notices == 1);
+   conflict_mode = 4;
+   CHECK(sync_saves(threaded, root));
+   conflict_mode = 0;
+   CHECK(deletes == 3);
+   CHECK(fetches == 0);
+   CHECK(!path_is_valid(srv_key("saves/Snes9x/a.srm")));
+   CHECK(!holds(root, "Snes9x/a.srm", "Snes9x/a.srm"));
+   CHECK(holds(srv, "saves/t1.srm", "t1.srm"));
+   CHECK(sync_saves(threaded, root));
+   CHECK(deletes == 0);
+   CHECK(fetches == 0);
+   CHECK(uploads == 0);
+   CHECK(notices == 0);
+}
+
+/* A held list of keys only, from before hashes were kept: ignored, so
+ * the kept files come back rather than standing as conflicts. */
+static void delete_missing_old_held(bool threaded)
+{
+   static const char *files[] = {
+      "Snes9x/a.srm", "Snes9x/b.srm", "Snes9x/c.srm", "t1.srm", "t2.srm" };
+   char     root[256], roots[PATH_MAX_LENGTH], json[600];
+   unsigned i;
+   lane_dirs("delete_old_held", threaded, root, sizeof(root));
+   for (i = 0; i < 5; i++)
+      put(root, files[i], files[i]);
+   CHECK(sync_saves(threaded, root));
+   for (i = 0; i < 3; i++)
+      drop(root, files[i]);
+   CHECK(sync_saves(threaded, root));
+   CHECK(notices == 1);
+   roots_path(roots, sizeof(roots));
+   snprintf(json, sizeof(json), "{\"saves\": \"%s\", \"held\": "
+         "[\"saves/Snes9x/a.srm\", \"saves/Snes9x/b.srm\", "
+         "\"saves/Snes9x/c.srm\"]}\n", root);
+   CHECK(filestream_write_file(roots, json, strlen(json)));
+   conflict_mode = 4;
+   CHECK(sync_saves(threaded, root));
+   conflict_mode = 0;
+   CHECK(deletes == 0);
+   CHECK(fetches == 3);
+   CHECK(holds(root, "Snes9x/a.srm", "Snes9x/a.srm"));
+}
+
+static bool sync_two(bool threaded, const char *saves, const char *states);
+
+/* Resolve Kept Files with the kept folder's sync off: its held keys
+ * stay out of the record, so a later sync with it on fetches them
+ * rather than deleting them on the server. */
+static void delete_missing_root_off(bool threaded)
+{
+   static const char *files[] = {
+      "Snes9x/a.srm", "Snes9x/b.srm", "Snes9x/c.srm", "t1.srm" };
+   char     saves[256], states[256];
+   unsigned i;
+   lane_dirs("delete_root_off", threaded, saves, sizeof(saves));
+   fill_pathname_basedir(states, saves, sizeof(states));
+   strlcat(states, "states", sizeof(states));
+   CHECK(path_mkdir(states));
+   put(saves, "s.srm", "s");
+   for (i = 0; i < 4; i++)
+      put(states, files[i], files[i]);
+   CHECK(sync_two(threaded, saves, states));
+   for (i = 0; i < 3; i++)
+      drop(states, files[i]);
+   CHECK(sync_two(threaded, saves, states));
+   CHECK(deletes == 0);
+   CHECK(notices == 1);
+   conflict_mode = 4;
+   CHECK(sync_saves(threaded, saves));
+   conflict_mode = 0;
+   CHECK(deletes == 0);
+   put(states, files[0], files[0]);
+   CHECK(sync_two(threaded, saves, states));
+   CHECK(deletes == 0);
+   CHECK(fetches == 2);
+   CHECK(holds(srv, "states/Snes9x/b.srm", "Snes9x/b.srm"));
+   CHECK(holds(states, "Snes9x/c.srm", "Snes9x/c.srm"));
+}
+
 static bool sync_two(bool threaded, const char *saves, const char *states)
 {
    struct string_list *l = string_list_new();
@@ -1308,7 +1449,7 @@ static void copies_any_backups(bool threaded)
 }
 
 /* Copies an older sync sent stay on the server with their records,
- * here or pruned, and no other device fetches them. */
+ * here or pruned, in every mode, and no other device fetches them. */
 static void server_copies_kept(bool threaded)
 {
    static const char *keys[] = {
@@ -1344,6 +1485,10 @@ static void server_copies_kept(bool threaded)
    CHECK(sync_two(threaded, root, states));
    CHECK(deletes == 0);
    CHECK(notices == 0);
+   conflict_mode = 4;
+   CHECK(sync_two(threaded, root, states));
+   conflict_mode = 0;
+   CHECK(deletes == 0);
    other_device(true);
    CHECK(sync_two(threaded, root, states));
    CHECK(fetches == 0);
@@ -1464,6 +1609,45 @@ static void server_respelled(bool threaded)
    CHECK(fetches == 0);
    server_id[0] = '\0';
    free(settings);
+}
+
+/* Resolve Kept Files after another device saved one of the kept files
+ * on the server: that one is a conflict, not deleted; the rest go. */
+static void delete_missing_changed_there(bool threaded)
+{
+   static const char *files[] = {
+      "Snes9x/a.srm", "Snes9x/b.srm", "Snes9x/c.srm", "t1.srm", "t2.srm" };
+   char     root[256], root_b[264];
+   unsigned i;
+   lane_dirs("delete_changed_there", threaded, root, sizeof(root));
+   snprintf(root_b, sizeof(root_b), "%s-b", root);
+   remove_tree(root_b);
+   for (i = 0; i < 5; i++)
+   {
+      put(root, files[i], files[i]);
+      put(root_b, files[i], files[i]);
+   }
+   CHECK(sync_saves(threaded, root));
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   other_device(false);
+   for (i = 0; i < 3; i++)
+      drop(root, files[i]);
+   CHECK(sync_saves(threaded, root));
+   CHECK(notices == 1);
+   other_device(true);
+   put(root_b, "Snes9x/a.srm", "newer");
+   CHECK(sync_saves(threaded, root_b));
+   CHECK(uploads == 1);
+   other_device(false);
+   conflict_mode = 4;
+   CHECK(!sync_saves(threaded, root));
+   conflict_mode = 0;
+   CHECK(deletes == 2);
+   CHECK(fetches == 0);
+   CHECK(holds(srv, "saves/Snes9x/a.srm", "newer"));
+   CHECK(!path_is_valid(srv_key("saves/Snes9x/b.srm")));
+   remove_tree(root_b);
 }
 
 /* Another device changes "a.srm" on the server, and this one has
@@ -2963,6 +3147,11 @@ static const struct lane lanes[] = {
    { "sync_copies_any_backups",   copies_any_backups },
    { "sync_server_copies_kept",   server_copies_kept },
    { "sync_nested_roots_walked_once", nested_roots },
+   { "sync_delete_missing_once",  delete_missing },
+   { "sync_delete_missing_after_hold", delete_missing_after_hold },
+   { "sync_delete_missing_changed_there", delete_missing_changed_there },
+   { "sync_delete_missing_old_held", delete_missing_old_held },
+   { "sync_delete_missing_root_off", delete_missing_root_off },
    { "sync_keep_local_deleted",   keep_local_deleted },
    { "sync_keep_local_other",     keep_local_other },
    { "sync_keep_local_held",      keep_local_held },

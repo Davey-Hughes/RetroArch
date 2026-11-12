@@ -6667,6 +6667,19 @@ static int action_ok_cloud_sync_upload_all(const char *path, const char *label, 
    }
    return generic_action_ok_command(CMD_EVENT_CLOUD_SYNC_UPLOAD_ALL);
 }
+
+static int action_ok_cloud_sync_delete_missing(const char *path, const char *label, unsigned type, size_t idx, size_t entry_idx)
+{
+   settings_t *settings       = config_get_ptr();
+
+   if (settings->bools.menu_show_confirm)
+   {
+      struct menu_state *menu_st = menu_state_get_ptr();
+      menu_dialog_confirm_set(menu_st, MSG_PRESS_AGAIN_TO_DELETE_MISSING, CMD_EVENT_CLOUD_SYNC_DELETE_MISSING);
+      return action_ok_dialog_init(menu_st);
+   }
+   return generic_action_ok_command(CMD_EVENT_CLOUD_SYNC_DELETE_MISSING);
+}
 #endif
 
 STATIC_DEFAULT_ACTION_OK_CMD_FUNC(action_ok_cheat_apply_changes,      CMD_EVENT_CHEATS_APPLY)
@@ -10191,6 +10204,7 @@ static int menu_cbs_init_bind_ok_compare_label(menu_file_list_cbs_t *cbs,
          {MENU_ENUM_LABEL_RESTART_CONTENT,                     action_ok_restart_content},
 #ifdef HAVE_CLOUDSYNC
          {MENU_ENUM_LABEL_CLOUD_SYNC_UPLOAD_ALL,               action_ok_cloud_sync_upload_all},
+         {MENU_ENUM_LABEL_CLOUD_SYNC_DELETE_MISSING,           action_ok_cloud_sync_delete_missing},
 #endif
          {MENU_ENUM_LABEL_TAKE_SCREENSHOT,                     action_ok_screenshot},
          {MENU_ENUM_LABEL_RENAME_ENTRY,                        action_ok_rename_entry},

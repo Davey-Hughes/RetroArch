@@ -5786,6 +5786,9 @@ bool command_event(enum event_command cmd, void *data)
       case CMD_EVENT_CLOUD_SYNC_UPLOAD_ALL:
          task_push_cloud_sync_upload_all();
          break;
+      case CMD_EVENT_CLOUD_SYNC_DELETE_MISSING:
+         task_push_cloud_sync_delete_missing();
+         break;
 #endif
       case CMD_EVENT_MENU_RESET_TO_DEFAULT_CONFIG:
          config_set_defaults(config_get_ptr());

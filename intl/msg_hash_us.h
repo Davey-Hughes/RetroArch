@@ -33926,6 +33926,10 @@ MSG_HASH(
    "Press again to upload every local file the server lost..."
    )
 MSG_HASH(
+   MSG_PRESS_AGAIN_TO_DELETE_MISSING,
+   "Press again to delete the kept files from the server..."
+   )
+MSG_HASH(
    MSG_FIRST_RUN_DOWNLOAD_PROMPT,
    "Some of RetroArch's downloadable files (menu assets, controller profiles, core info, databases) are missing.\n\nDownload them now? This needs an internet connection.\n\nThey can be updated later from the Online Updater."
    )

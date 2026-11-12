@@ -693,6 +693,7 @@ bool task_cloud_sync_in_progress(void);
 void task_push_cloud_sync_resolve_keep_local(void);
 void task_push_cloud_sync_resolve_keep_server(void);
 void task_push_cloud_sync_upload_all(void);
+void task_push_cloud_sync_delete_missing(void);
 
 RETRO_END_DECLS
 

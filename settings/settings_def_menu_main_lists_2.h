@@ -35,6 +35,10 @@ S_ACTION_EX(CLOUD_SYNC_UPLOAD_ALL,
       "cloud_sync_upload_all", SD_FLAG_NONE, NULL, NULL, CMD_EVENT_CLOUD_SYNC_UPLOAD_ALL,
       "Resolve Server Reset: Upload Local",
       "Upload every local file the server no longer lists, changed here or not. Use it on the device with the newest saves after the server lost its files or was reset.")
+S_ACTION_EX(CLOUD_SYNC_DELETE_MISSING,
+      "cloud_sync_delete_missing", SD_FLAG_NONE, NULL, NULL, CMD_EVENT_CLOUD_SYNC_DELETE_MISSING,
+      "Resolve Kept Files: Delete on Server",
+      "Delete from the server, in one sync, the files missing here that cloud sync kept there. Use it after deleting a folder of saves on purpose.")
 #endif
 S_ACTION_EX(CONFIGURATIONS_LIST,
       "configurations_list", SD_FLAG_LAKKA_ADVANCED, NULL, NULL, 0,

@@ -163,7 +163,8 @@ typedef struct
    bool conflicts;
    const char *fatal_error;
    /* Conflict resolution mode: 0=none, 1=keep_local, 2=keep_server,
-    * 3=upload_all (files the server lost, changed here or not) */
+    * 3=upload_all (files the server lost, changed here or not),
+    * 4=delete_missing (as 0, nothing held) */
    int conflict_resolution;
    uint32_t uploads;
    uint32_t downloads;
@@ -183,14 +184,17 @@ typedef struct
    /* The roots file as the last sync left it: data is a root's name,
     * userdata the folder it was walked from. NULL when there is none. */
    struct string_list *roots;
-   /* Keys this sync did not delete on the server (CS_ROOT_HELD), and
-    * how many: the list falls short when out of memory. */
+   /* Keys this sync did not delete on the server (CS_ROOT_HELD), each
+    * with the server's hash as userdata, and how many: the list falls
+    * short when out of memory. */
    struct string_list *held;
    unsigned held_count;
    /* Folders whose missing files are held, as "saves/Snes9x/" */
    struct string_list *held_dirs;
    /* task_cloud_sync_find_shadowed() */
    struct string_list *shadowed;
+   /* Mode 4: the last sync's held list, from its roots file */
+   struct string_list *held_before;
    /* files the server lost, not uploaded: unchanged here */
    unsigned unsent_count;
    /* Whoever pushed the sync, told when it is done. */
@@ -492,9 +496,10 @@ static void task_cloud_sync_roots_filename(char *s, size_t len,
 
 /* The roots file in @out, NULL when there is none or it can't be
  * read, and then @unreadable; the server it names in @server (33
- * bytes). False when out of memory. */
+ * bytes), and with @held the keys it held. False when out of memory. */
 static bool task_cloud_sync_read_roots(const char *dir_core_assets,
-      struct string_list **out, char *server, bool *unreadable)
+      struct string_list **out, char *server, struct string_list **held,
+      bool *unreadable)
 {
    char                path[PATH_MAX_LENGTH];
    void               *buf   = NULL;
@@ -515,16 +520,39 @@ static bool task_cloud_sync_read_roots(const char *dir_core_assets,
          || !(roots = string_list_new()))
       goto oom;
 
-   /* the root members' strings; "held" is an array and skipped */
+   /* the root members' strings, and the "held_at" array's when asked */
    while ((type = rjson_next(json)) != RJSON_DONE)
    {
       const char *str;
       if (type == RJSON_ERROR)
          goto error;
-      if (     type != RJSON_STRING
-            || rjson_get_context_type(json) != RJSON_OBJECT)
+      if (type != RJSON_STRING)
          continue;
       str = rjson_get_string(json, NULL);
+      if (rjson_get_context_type(json) == RJSON_ARRAY)
+      {
+         /* "held_at": each key, then the server's hash it was held
+          * at; an older "held" list of keys only is ignored */
+         if (held && name && string_is_equal(name, "held_at"))
+         {
+            if (rjson_get_context_count(json) & 1)
+            {
+               union string_list_elem_attr attr;
+               attr.i = 0;
+               if (     (!*held && !(*held = string_list_new()))
+                     || !string_list_append(*held, str, attr))
+                  goto oom;
+            }
+            else if (*held && (*held)->size
+                  && !(*held)->elems[(*held)->size - 1].userdata
+                  && !((*held)->elems[(*held)->size - 1].userdata
+                     = strdup(str)))
+               goto oom;
+         }
+         continue;
+      }
+      if (rjson_get_context_type(json) != RJSON_OBJECT)
+         continue;
       if (rjson_get_context_count(json) & 1)
       {
          free(name);
@@ -565,6 +593,11 @@ error:
    if (json)
       rjson_free(json);
    string_list_free(roots);
+   if (held)
+   {
+      string_list_free(*held);
+      *held = NULL;
+   }
    free(buf);
    return ok;
 }
@@ -799,13 +832,17 @@ static void task_cloud_sync_write_roots(task_cloud_sync_state_t *sync_state)
       if (!first)
          rjsonwriter_raw(writer, ",\n", 2);
       rjsonwriter_add_spaces(writer, 2);
-      rjsonwriter_add_string(writer, "held");
+      rjsonwriter_add_string(writer, "held_at");
       rjsonwriter_raw(writer, ": [", 3);
+      /* each key, then the server's hash it was held at */
       for (i = 0; sync_state->held && i < sync_state->held->size; i++)
       {
+         const char *hash = (const char*)sync_state->held->elems[i].userdata;
          if (i)
             rjsonwriter_raw(writer, ", ", 2);
          rjsonwriter_add_string(writer, sync_state->held->elems[i].data);
+         rjsonwriter_raw(writer, ", ", 2);
+         rjsonwriter_add_string(writer, hash ? hash : "");
       }
       rjsonwriter_raw(writer, "]\n}\n", 4);
       buf = rjsonwriter_get_memory_buffer(writer, &len);
@@ -817,6 +854,57 @@ static void task_cloud_sync_write_roots(task_cloud_sync_state_t *sync_state)
    }
    if (writer)
       rjsonwriter_free(writer);
+}
+
+/* Mode 4: the keys the last sync held back in the local manifest at
+ * the server's hash they were held at, so the diff takes them as
+ * deleted here: deleted on the server where it still has that copy, a
+ * conflict where another device has changed it since. False when out
+ * of memory. */
+static bool task_cloud_sync_restore_held(task_cloud_sync_state_t *sync_state)
+{
+   file_list_t              *local   = sync_state->local_manifest;
+   const struct string_list *held    = sync_state->held_before;
+   const struct string_list *dirlist = sync_state->dirlist;
+   /* sorted on alt up to here: a binary search for each key */
+   size_t                    sorted  = local->size;
+   size_t                    i;
+
+   for (i = 0; i < held->size; i++)
+   {
+      const char *key  = held->elems[i].data;
+      const char *hash = (const char*)held->elems[i].userdata;
+      size_t      lo   = 0;
+      size_t      hi   = sorted;
+      char       *copy;
+      /* a folder this sync leaves out keeps no record */
+      if (     string_is_empty(hash) || !dirlist
+            || task_cloud_sync_key_root(dirlist, key) < 0)
+         continue;
+      while (lo < hi)
+      {
+         size_t mid = lo + (hi - lo) / 2;
+         int    cmp = strcasecmp(local->list[mid].alt, key);
+         if (!cmp)
+            break;
+         if (cmp < 0)
+            lo = mid + 1;
+         else
+            hi = mid;
+      }
+      if (lo < hi)
+         continue;
+      if (     !(copy = strdup(hash))
+            || !file_list_append(local, NULL, NULL, 0, 0, 0))
+      {
+         free(copy);
+         return false;
+      }
+      file_list_set_alt_at_offset(local, local->size - 1, key);
+      local->list[local->size - 1].userdata = copy;
+   }
+   file_list_sort_on_alt(local);
+   return true;
 }
 
 static void task_cloud_sync_read_local_manifest(task_cloud_sync_state_t *sync_state)
@@ -862,7 +950,9 @@ static void task_cloud_sync_read_local_manifest(task_cloud_sync_state_t *sync_st
 
    server[0] = '\0';
    if (!task_cloud_sync_read_roots(sync_state->dir_core_assets,
-            &sync_state->roots, server, &unreadable))
+            &sync_state->roots, server,
+            sync_state->conflict_resolution == 4
+            ? &sync_state->held_before : NULL, &unreadable))
    {
       sync_state->failures = true;
       task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_END);
@@ -882,6 +972,16 @@ static void task_cloud_sync_read_local_manifest(task_cloud_sync_state_t *sync_st
       sync_state->local_manifest = NULL;
       string_list_free(sync_state->roots);
       sync_state->roots          = NULL;
+      string_list_free(sync_state->held_before);
+      sync_state->held_before    = NULL;
+   }
+
+   if (     sync_state->held_before && sync_state->local_manifest
+         && !task_cloud_sync_restore_held(sync_state))
+   {
+      sync_state->failures = true;
+      task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_END);
+      return;
    }
 
    /* A missing roots file, or a root it does not name, is unchanged */
@@ -1346,7 +1446,7 @@ static void task_cloud_sync_mark_held_roots(task_cloud_sync_state_t *sync_state)
    file_list_t        *server  = sync_state->server_manifest;
    size_t              r;
 
-   if (!local || !server)
+   if (!local || !server || sync_state->conflict_resolution == 4)
       return;
 
    for (r = 0; r < dirlist->size; r++)
@@ -1436,7 +1536,7 @@ static void task_cloud_sync_mark_held_dirs(task_cloud_sync_state_t *sync_state)
    size_t              s       = 0;
    size_t              i;
 
-   if (!local || !server)
+   if (!local || !server || sync_state->conflict_resolution == 4)
       return;
 
    for (i = 0; i <= local->size; i++)
@@ -3180,6 +3280,7 @@ static void task_cloud_sync_maybe_ignore(task_cloud_sync_state_t *sync_state)
 static void task_cloud_sync_hold_delete(task_cloud_sync_state_t *sync_state)
 {
    struct item_file *server_file = &sync_state->server_manifest->list[sync_state->server_idx];
+   const char       *hash        = (const char*)server_file->userdata;
    union string_list_elem_attr attr;
 
    attr.i = 0;
@@ -3191,6 +3292,9 @@ static void task_cloud_sync_hold_delete(task_cloud_sync_state_t *sync_state)
    if (     !sync_state->held
          || !string_list_append(sync_state->held, CS_FILE_KEY(server_file), attr))
       sync_state->failures = true;
+   else
+      sync_state->held->elems[sync_state->held->size - 1].userdata =
+         hash ? strdup(hash) : NULL;
 }
 
 /* Whether @current_file differs from what the last sync left here
@@ -3943,6 +4047,7 @@ static void task_cloud_sync_cleanup(retro_task_t *task)
    string_list_free(sync_state->held);
    string_list_free(sync_state->held_dirs);
    string_list_free(sync_state->shadowed);
+   string_list_free(sync_state->held_before);
    task_cloud_sync_walk_free(sync_state);
    if (sync_state->hash_cur.file)
       filestream_close(sync_state->hash_cur.file);
@@ -4206,4 +4311,10 @@ void task_push_cloud_sync_upload_all(void)
 {
    RARCH_LOG(CSPFX "Starting sync uploading every file the server lost.\n");
    task_push_cloud_sync_with_mode(3, NULL, NULL);
+}
+
+void task_push_cloud_sync_delete_missing(void)
+{
+   RARCH_LOG(CSPFX "Starting sync deleting on the server every file missing here.\n");
+   task_push_cloud_sync_with_mode(4, NULL, NULL);
 }

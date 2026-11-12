@@ -167,6 +167,8 @@ enum event_command
    CMD_EVENT_CLOUD_SYNC_RESOLVE_KEEP_SERVER,
    /* Upload the local files the server no longer lists */
    CMD_EVENT_CLOUD_SYNC_UPLOAD_ALL,
+   /* Delete on the server the files cloud sync kept there */
+   CMD_EVENT_CLOUD_SYNC_DELETE_MISSING,
 #endif
    /* Shutdown the OS */
    CMD_EVENT_SHUTDOWN,

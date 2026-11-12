@@ -14380,6 +14380,7 @@ unsigned menu_displaylist_build_list(
                      { MENU_ENUM_LABEL_CLOUD_SYNC_RESOLVE_KEEP_LOCAL, PARSE_ACTION, false },
                      { MENU_ENUM_LABEL_CLOUD_SYNC_RESOLVE_KEEP_SERVER, PARSE_ACTION, false },
                      { MENU_ENUM_LABEL_CLOUD_SYNC_UPLOAD_ALL, PARSE_ACTION, false },
+                     { MENU_ENUM_LABEL_CLOUD_SYNC_DELETE_MISSING, PARSE_ACTION, false },
                   };
                   count += menu_displaylist_parse_settings_rows(list, settings,
                         dl_rows_16, (unsigned)ARRAY_SIZE(dl_rows_16));
