@@ -211,9 +211,11 @@ void content_state_fetched(void) { state_fetches++; }
 bool content_save_state_in_progress(void *data) { (void)data; return false; }
 void runloop_save_load_release(uint8_t bit) { (void)bit; }
 void task_window_progress_cb(retro_task_t *task) { (void)task; }
+/* The config folder, for a lane that syncs it */
+static char config_dir[272];
 size_t fill_pathname_application_special(char *s, size_t len,
       enum application_special_type type)
-{ (void)s; (void)len; (void)type; return 0; }
+{ (void)type; return strlcpy(s, config_dir, len); }
 const char *msg_hash_to_str(enum msg_hash_enums msg)
 { (void)msg; return "%u"; }
 void runloop_msg_queue_push(const char *msg, size_t len,
@@ -910,6 +912,218 @@ static void subfolder_gone(bool threaded)
    CHECK(holds(root, "Snes9x/sub/c.srm", "Snes9x/sub/c.srm"));
 }
 
+/* Adds @key with a hash to the manifest at @path */
+static void plant(const char *path, const char *key)
+{
+   void    *buf = NULL;
+   int64_t  len = 0;
+   char    *s;
+   size_t   n;
+   CHECK(filestream_read_file(path, &buf, &len) && len > 1);
+   if (!buf)
+      return;
+   n = strlen(key) + 64 + (size_t)len;
+   if ((s = (char*)malloc(n)))
+   {
+      snprintf(s, n, "[\n  {\n    \"path\": \"%s\",\n    \"hash\": \"0123\"\n  },%s",
+            key, (const char*)buf + 1);
+      CHECK(filestream_write_file(path, s, strlen(s)));
+   }
+   free(s);
+   free(buf);
+}
+
+/* Files the sync leaves out that an older sync sent stay in both
+ * manifests while they are here. They are not missing: a save deleted
+ * here is deleted on the server, not held, and stays deleted. */
+static void ignored_not_missing(bool threaded)
+{
+   static const char *left_out[] = { "backups/a.srm", "._a.srm" };
+   char     root[256], rel[48], key[64];
+   char     local[PATH_MAX_LENGTH], server[PATH_MAX_LENGTH];
+   unsigned i;
+   lane_dirs("ignored_kept", threaded, root, sizeof(root));
+   put(root, "a.srm", "a");
+   put(root, "b.srm", "b");
+   CHECK(sync_saves(threaded, root));
+   CHECK(uploads == 2);
+   fill_pathname_join_special(local, assets, MANIFEST_FILENAME_LOCAL,
+         sizeof(local));
+   strlcpy(server, srv_key(MANIFEST_FILENAME_SERVER), sizeof(server));
+   for (i = 0; i < 14; i++)
+   {
+      if (i < 12)
+         snprintf(rel, sizeof(rel), ".stversions/x%02u.srm", i);
+      else
+         strlcpy(rel, left_out[i - 12], sizeof(rel));
+      snprintf(key, sizeof(key), "saves/%s", rel);
+      put(root, rel, rel);
+      plant(local, key);
+      plant(server, key);
+   }
+   drop(root, "a.srm");
+   warn_about = "missing here";
+   CHECK(sync_saves(threaded, root));
+   CHECK(warned == 0);
+   CHECK(deletes == 1);
+   CHECK(notices == 0);
+   CHECK(!path_is_valid(srv_key("saves/a.srm")));
+   CHECK(sync_saves(threaded, root));
+   warn_about = NULL;
+   CHECK(fetches == 0);
+   CHECK(deletes == 0);
+   CHECK(!holds(root, "a.srm", "a"));
+}
+
+/* Names save_backups gives its copies, an unsaved file among them */
+#define SRM_COPY     "p - 2026-11-12 10-00-00 - 0001-kqmz - Beetle PSX - replaced.srm"
+#define SRM_UNSAVED  "p - 2026-11-12 10-00-01 - 0002-kqmz - Beetle PSX - unsaved.srm"
+#define STATE_COPY   "p - 2026-11-12 10-00-00 - 0001-kqmz - Beetle PSX - before-state-load.state"
+/* From before numbering: no device tag */
+#define OLD_COPY     "p - 2026-11-12 10-00-00 - Beetle PSX - replaced.srm"
+
+/* Safety copies go to backups/ in the save and state folders in use. An
+ * override's folder inside the main one, or with Sync Saves off the
+ * save folder inside the config folder, keeps its copies off the
+ * server, also at the syncs at close and startup, when no override is
+ * in force; the rest of the folder syncs. */
+static void in_use_backups(bool threaded, bool config)
+{
+   char        root[256], states[264], live[280], live_st[280];
+   settings_t *settings = (settings_t*)calloc(1, sizeof(*settings));
+   lane_dirs(config ? "in_use_backups_cfg" : "in_use_backups", threaded,
+         root, sizeof(root));
+   if (config)
+   {
+      snprintf(config_dir, sizeof(config_dir), "%s-cfg", root);
+      remove_tree(config_dir);
+      snprintf(live, sizeof(live), "%s/saves", config_dir);
+      strlcpy(main_saves, live, sizeof(main_saves));
+      strlcpy(live_saves, live, sizeof(live_saves));
+      put(config_dir, "c.cfg", "c");
+      put(live, "a.srm", "a");
+      put(live, "backups/" SRM_COPY, "x");
+      put(live, "Snes9x/backups/s.srm", "s");
+      settings->bools.cloud_sync_sync_configs = true;
+      CHECK(sync_list(threaded, task_cloud_sync_directory_map_new(settings)));
+      CHECK(uploads == 3);
+      CHECK(holds(srv, "config/saves/a.srm", "a"));
+      CHECK(holds(srv, "config/saves/Snes9x/backups/s.srm", "s"));
+      CHECK(!path_is_valid(srv_key("config/saves/backups/" SRM_COPY)));
+      remove_tree(config_dir);
+      config_dir[0] = '\0';
+   }
+   else
+   {
+      snprintf(states, sizeof(states), "%s-st", root);
+      snprintf(live, sizeof(live), "%s/PSX", root);
+      snprintf(live_st, sizeof(live_st), "%s/PSX", states);
+      strlcpy(main_saves, root, sizeof(main_saves));
+      strlcpy(live_saves, live, sizeof(live_saves));
+      strlcpy(main_states, states, sizeof(main_states));
+      strlcpy(live_states, live_st, sizeof(live_states));
+      put(root, "a.srm", "a");
+      put(live, "p.srm", "p");
+      put(live, "backups/" SRM_COPY, "x");
+      put(live, "backups/p.srm", "r");
+      put(live, "sub/backups/q.srm", "q");
+      put(live_st, "p.state", "s");
+      put(live_st, "backups/" STATE_COPY, "x");
+      settings->bools.cloud_sync_sync_saves = true;
+      CHECK(sync_list(threaded, task_cloud_sync_directory_map_new(settings)));
+      CHECK(uploads == 5);
+      CHECK(holds(srv, "saves/PSX/p.srm", "p"));
+      CHECK(holds(srv, "saves/PSX/backups/p.srm", "r"));
+      CHECK(holds(srv, "saves/PSX/sub/backups/q.srm", "q"));
+      CHECK(holds(srv, "states/PSX/p.state", "s"));
+      CHECK(!path_is_valid(srv_key("saves/PSX/backups/" SRM_COPY)));
+      CHECK(!path_is_valid(srv_key("states/PSX/backups/" STATE_COPY)));
+   }
+   /* and at the next sync, nothing to do */
+   CHECK(sync_list(threaded, task_cloud_sync_directory_map_new(settings)));
+   CHECK(uploads == 0);
+   CHECK(deletes == 0);
+   CHECK(fetches == 0);
+   if (!config)
+   {
+      strlcpy(live_saves, main_saves, sizeof(live_saves));
+      strlcpy(live_states, main_states, sizeof(live_states));
+      CHECK(sync_list(threaded, task_cloud_sync_directory_map_new(settings)));
+      CHECK(uploads == 0);
+      CHECK(deletes == 0);
+      CHECK(fetches == 0);
+      CHECK(!path_is_valid(srv_key("saves/PSX/backups/" SRM_COPY)));
+      CHECK(!path_is_valid(srv_key("states/PSX/backups/" STATE_COPY)));
+   }
+   main_saves[0] = live_saves[0] = main_states[0] = live_states[0] = '\0';
+   free(settings);
+}
+static void in_use_backups_override(bool threaded)
+{ in_use_backups(threaded, false); }
+static void in_use_backups_config(bool threaded)
+{ in_use_backups(threaded, true); }
+
+/* Overlapping folders sync each file once, under its own root's key.
+ * Config Directory empty: config is the folder holding saves/ and
+ * states/, and the system folder is the save folder; the folders are
+ * spelled with a doubled separator and a "." name. What config sent of
+ * saves/ before saves synced stays on the server, left alone. Each
+ * overlap is told once. */
+static void nested_roots(bool threaded)
+{
+   char                root[256], saves[288], states[288];
+   struct string_list *map;
+   settings_t         *settings = (settings_t*)calloc(1, sizeof(*settings));
+   lane_dirs("nested", threaded, root, sizeof(root));
+   snprintf(config_dir, sizeof(config_dir), "%s-cfg", root);
+   remove_tree(config_dir);
+   snprintf(saves, sizeof(saves), "%s//saves", config_dir);
+   snprintf(states, sizeof(states), "%s/./states", config_dir);
+   tcs_told_same_dir = tcs_told_nested_dir = false;
+   strlcpy(main_saves, saves, sizeof(main_saves));
+   strlcpy(main_states, states, sizeof(main_states));
+   strlcpy(settings->paths.directory_system, saves,
+         sizeof(settings->paths.directory_system));
+   put(config_dir, "c.cfg", "c");
+   put(saves, "a.srm", "a");
+   put(states, "a.state", "a");
+   settings->bools.cloud_sync_sync_configs = true;
+   CHECK(sync_list(threaded, task_cloud_sync_directory_map_new(settings)));
+   CHECK(uploads == 3);
+   CHECK(holds(srv, "config/saves/a.srm", "a"));
+
+   settings->bools.cloud_sync_sync_saves  = true;
+   settings->bools.cloud_sync_sync_system = true;
+   put(saves, "b.srm", "b");
+   put(states, "b.state", "b");
+   map = task_cloud_sync_directory_map_new(settings);
+   CHECK(map && string_list_find_elem(map, "saves"));
+   CHECK(map && !string_list_find_elem(map, "system"));
+   warn_about = "once";
+   CHECK(sync_list(threaded, map));
+   CHECK(warned == 1);
+   CHECK(uploads == 4);
+   CHECK(deletes == 0);
+   CHECK(fetches == 0);
+   CHECK(holds(srv, "saves/b.srm", "b"));
+   CHECK(holds(srv, "states/b.state", "b"));
+   CHECK(holds(srv, "config/saves/a.srm", "a"));
+   CHECK(!path_is_valid(srv_key("config/saves/b.srm")));
+   CHECK(!path_is_valid(srv_key("config/states/b.state")));
+   CHECK(!path_is_valid(srv_key("system/a.srm")));
+
+   CHECK(sync_list(threaded, task_cloud_sync_directory_map_new(settings)));
+   CHECK(warned == 0);
+   warn_about = NULL;
+   CHECK(uploads == 0);
+   CHECK(deletes == 0);
+   CHECK(fetches == 0);
+   CHECK(holds(srv, "config/states/a.state", "a"));
+   remove_tree(config_dir);
+   config_dir[0] = main_saves[0] = main_states[0] = '\0';
+   free(settings);
+}
+
 static bool sync_two(bool threaded, const char *saves, const char *states)
 {
    struct string_list *l = string_list_new();
@@ -1053,6 +1267,96 @@ static void third_device(bool on)
    }
    else
       strlcpy(assets, own, sizeof(assets));
+}
+
+/* In any backups/ folder, at any depth, only names save_backups gives
+ * its copies stay off the server, with their temporaries: another file
+ * there, a name from before numbering or a copy's name outside
+ * backups/ syncs. */
+static void copies_any_backups(bool threaded)
+{
+   char root[256], states[264];
+   lane_dirs("copies_any", threaded, root, sizeof(root));
+   snprintf(states, sizeof(states), "%s-st", root);
+   CHECK(path_mkdir(states));
+   strlcpy(main_saves, root, sizeof(main_saves));
+   strlcpy(live_saves, root, sizeof(live_saves));
+   strlcpy(main_states, states, sizeof(main_states));
+   strlcpy(live_states, states, sizeof(live_states));
+   put(root, "a.srm", "a");
+   put(root, "PSX/backups/" SRM_COPY, "x");
+   put(root, "PSX/backups/sub/" SRM_UNSAVED, "u");
+   put(root, "PSX/backups/" SRM_COPY ".tmp", "t");
+   put(root, "PSX/backups/notes.srm", "n");
+   put(root, "PSX/backups/" OLD_COPY, "o");
+   put(root, "PSX/" SRM_COPY, "c");
+   put(states, "PSX/backups/" STATE_COPY, "s");
+   CHECK(sync_two(threaded, root, states));
+   CHECK(uploads == 4);
+   CHECK(holds(srv, "saves/a.srm", "a"));
+   CHECK(holds(srv, "saves/PSX/backups/notes.srm", "n"));
+   CHECK(holds(srv, "saves/PSX/backups/" OLD_COPY, "o"));
+   CHECK(holds(srv, "saves/PSX/" SRM_COPY, "c"));
+   CHECK(!path_is_valid(srv_key("saves/PSX/backups/" SRM_COPY)));
+   CHECK(!path_is_valid(srv_key("saves/PSX/backups/sub/" SRM_UNSAVED)));
+   CHECK(!path_is_valid(srv_key("states/PSX/backups/" STATE_COPY)));
+   CHECK(sync_two(threaded, root, states));
+   CHECK(uploads == 0);
+   CHECK(deletes == 0);
+   CHECK(fetches == 0);
+   main_saves[0] = live_saves[0] = main_states[0] = live_states[0] = '\0';
+}
+
+/* Copies an older sync sent stay on the server with their records,
+ * here or pruned, and no other device fetches them. */
+static void server_copies_kept(bool threaded)
+{
+   static const char *keys[] = {
+      "saves/PSX/backups/" SRM_COPY, "states/PSX/backups/" STATE_COPY };
+   char     root[256], states[264], local[PATH_MAX_LENGTH];
+   unsigned i;
+   lane_dirs("server_copies", threaded, root, sizeof(root));
+   snprintf(states, sizeof(states), "%s-st", root);
+   CHECK(path_mkdir(states));
+   strlcpy(main_saves, root, sizeof(main_saves));
+   strlcpy(live_saves, root, sizeof(live_saves));
+   strlcpy(main_states, states, sizeof(main_states));
+   strlcpy(live_states, states, sizeof(live_states));
+   put(root, "a.srm", "a");
+   CHECK(sync_two(threaded, root, states));
+   CHECK(uploads == 1);
+   fill_pathname_join_special(local, assets, MANIFEST_FILENAME_LOCAL,
+         sizeof(local));
+   put(root, "PSX/backups/" SRM_COPY, "x");
+   put(states, "PSX/backups/" STATE_COPY, "y");
+   for (i = 0; i < 2; i++)
+   {
+      put(srv, keys[i], keys[i]);
+      plant(local, keys[i]);
+      plant(srv_key(MANIFEST_FILENAME_SERVER), keys[i]);
+   }
+   CHECK(sync_two(threaded, root, states));
+   CHECK(uploads == 0);
+   CHECK(deletes == 0);
+   CHECK(fetches == 0);
+   drop(root, "PSX/backups/" SRM_COPY);
+   drop(states, "PSX/backups/" STATE_COPY);
+   CHECK(sync_two(threaded, root, states));
+   CHECK(deletes == 0);
+   CHECK(notices == 0);
+   other_device(true);
+   CHECK(sync_two(threaded, root, states));
+   CHECK(fetches == 0);
+   other_device(false);
+   for (i = 0; i < 2; i++)
+   {
+      CHECK(holds(srv, keys[i], keys[i]));
+      CHECK(server_entry(keys[i]) == 2);
+      CHECK(local_entry(keys[i]) == 2);
+   }
+   CHECK(!holds(root, "PSX/backups/" SRM_COPY, keys[0]));
+   CHECK(!holds(states, "PSX/backups/" STATE_COPY, keys[1]));
+   main_saves[0] = live_saves[0] = main_states[0] = live_states[0] = '\0';
 }
 
 /* Pointed at another server, the last sync's record is the old one's:
@@ -2653,6 +2957,12 @@ static const struct lane lanes[] = {
    { "sync_mass_held",            mass_held },
    { "sync_held_no_memory",       held_no_memory },
    { "sync_subfolder_gone_held",  subfolder_gone },
+   { "sync_ignored_not_missing",  ignored_not_missing },
+   { "sync_in_use_backups_override", in_use_backups_override },
+   { "sync_in_use_backups_config", in_use_backups_config },
+   { "sync_copies_any_backups",   copies_any_backups },
+   { "sync_server_copies_kept",   server_copies_kept },
+   { "sync_nested_roots_walked_once", nested_roots },
    { "sync_keep_local_deleted",   keep_local_deleted },
    { "sync_keep_local_other",     keep_local_other },
    { "sync_keep_local_held",      keep_local_held },

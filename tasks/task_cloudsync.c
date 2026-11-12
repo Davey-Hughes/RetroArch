@@ -189,6 +189,8 @@ typedef struct
    unsigned held_count;
    /* Folders whose missing files are held, as "saves/Snes9x/" */
    struct string_list *held_dirs;
+   /* task_cloud_sync_find_shadowed() */
+   struct string_list *shadowed;
    /* files the server lost, not uploaded: unchanged here */
    unsigned unsent_count;
    /* Whoever pushed the sync, told when it is done. */
@@ -579,6 +581,80 @@ static bool task_cloud_sync_same_dir(const char *a, const char *b)
    return la == lb && !memcmp(a, b, la);
 }
 
+#define CS_IS_SEP(c) ((c) == '/' || (c) == '\\')
+
+/* The next folder name in @p, past separators of either kind and "."
+ * names; its length in @len, 0 at the end. */
+static const char *task_cloud_sync_next_name(const char *p, size_t *len)
+{
+   for (;;)
+   {
+      size_t n = 0;
+      while (CS_IS_SEP(*p))
+         p++;
+      while (p[n] && !CS_IS_SEP(p[n]))
+         n++;
+      if (n == 1 && *p == '.')
+      {
+         p++;
+         continue;
+      }
+      *len = n;
+      return p;
+   }
+}
+
+/* Where @dir goes on below @root, name by name: 0 when it is @root
+ * itself, -1 when it is not under it, else the offset of its first
+ * name below @root. */
+static int task_cloud_sync_dir_within(const char *root, const char *dir)
+{
+   const char *r = root;
+   const char *d = dir;
+   size_t      rn;
+   size_t      dn;
+   for (;;)
+   {
+      r = task_cloud_sync_next_name(r, &rn);
+      d = task_cloud_sync_next_name(d, &dn);
+      if (!rn)
+         return dn ? (int)(d - dir) : 0;
+      if (rn != dn || memcmp(r, d, rn))
+         return -1;
+      r += rn;
+      d += dn;
+   }
+}
+
+/* Whether @key lies under another root's folder within its own root
+ * (task_cloud_sync_find_shadowed()) */
+static bool task_cloud_sync_key_shadowed(
+      const task_cloud_sync_state_t *sync_state, const char *key)
+{
+   const struct string_list *shadowed = sync_state->shadowed;
+   size_t                    i;
+   for (i = 0; shadowed && i < shadowed->size; i++)
+      if (string_starts_with(key, shadowed->elems[i].data))
+         return true;
+   return false;
+}
+
+/* Whether @key is a copy save_backups made (a numbered name with a
+ * device tag) in a backups/ folder at any depth: it stays on its
+ * device, whichever save or state folder was in use for it. */
+static bool task_cloud_sync_key_is_copy(const char *key)
+{
+   struct save_backup_name name;
+   const char *base = strrchr(key, '/');
+   const char *p;
+   if (!base)
+      return false;
+   for (p = key; p < base; p = strchr(p, '/') + 1)
+      if (string_starts_with_case_insensitive(p, SAVE_BACKUPS_DIR "/"))
+         return save_backups_parse(base + 1, &name) && name.device[0];
+   return false;
+}
+
 /* The dirlist root @key lies under, or -1 */
 static int task_cloud_sync_key_root(const struct string_list *dirlist,
       const char *key)
@@ -898,6 +974,11 @@ static bool task_cloud_sync_should_ignore_file(const char *filename)
    return false;
 }
 
+/* Each overlap of synced folders is told once a session: the same
+ * folder twice (main thread), one inside another (the sync's handler) */
+static bool tcs_told_same_dir   = false;
+static bool tcs_told_nested_dir = false;
+
 /* A directory open in the walk, and the length of its path. */
 struct tcs_walk_dir
 {
@@ -1009,6 +1090,27 @@ static bool task_cloud_sync_walk_step(task_cloud_sync_state_t *sync_state)
 #endif
    if (is_dir)
    {
+      /* another root's folder syncs once, as that root: the rule
+       * task_cloud_sync_key_in_scope() keeps for its keys */
+      if (sync_state->shadowed)
+      {
+         path_relative_to(CS_WALK_REL(sync_state), path,
+               CS_WALK_ROOT(sync_state), PATH_MAX_LENGTH);
+         fill_pathname_join_special(CS_WALK_ALT(sync_state),
+               sync_state->dirlist->elems[sync_state->walk_root_idx].data,
+               CS_WALK_REL(sync_state), PATH_MAX_LENGTH);
+         fill_pathname_slash(CS_WALK_ALT(sync_state), PATH_MAX_LENGTH);
+         pathname_make_slashes_portable(CS_WALK_ALT(sync_state));
+         if (task_cloud_sync_key_shadowed(sync_state,
+                  CS_WALK_ALT(sync_state)))
+         {
+            if (!tcs_told_nested_dir)
+               RARCH_WARN(CSPFX "\"%s\" syncs once, as its own folder, not as \"%s\".\n",
+                     path, CS_WALK_ALT(sync_state));
+            tcs_told_nested_dir = true;
+            return true;
+         }
+      }
       /* a folder the sync ignores is not walked */
       if (sync_state->walk_depth == 1)
       {
@@ -1039,6 +1141,9 @@ static bool task_cloud_sync_walk_step(task_cloud_sync_state_t *sync_state)
     * to a portable standard, but use that as the portable representation of paths. While the actual
     * "manifest" is comprised of full, local-style paths associated with "alt"s which are portable. */
    pathname_make_slashes_portable(CS_WALK_ALT(sync_state));
+   /* out of scope (task_cloud_sync_key_in_scope()) */
+   if (task_cloud_sync_key_is_copy(CS_WALK_ALT(sync_state)))
+      return true;
    idx = sync_state->current_manifest->size;
    file_list_append(sync_state->current_manifest, path, NULL, 0, 0, 0);
    file_list_set_alt_at_offset(sync_state->current_manifest, idx,
@@ -1062,10 +1167,22 @@ static bool task_cloud_sync_directory_map_add(struct string_list *list,
       const char *name, size_t name_len, const char *dir)
 {
    union string_list_elem_attr attr = {0};
-   char *path;
+   char  *path;
+   size_t i;
    /* an unset folder is left out: not walked, its server keys kept */
    if (string_is_empty(dir))
       return true;
+   /* and so is a folder an earlier root syncs */
+   for (i = 0; i < list->size; i++)
+      if (!task_cloud_sync_dir_within(
+               (const char*)list->elems[i].userdata, dir))
+      {
+         if (!tcs_told_same_dir)
+            RARCH_WARN(CSPFX "\"%.*s\" is the same folder as \"%s\": syncing it once, as \"%s\".\n",
+                  (int)name_len, name, list->elems[i].data, list->elems[i].data);
+         tcs_told_same_dir = true;
+         return true;
+      }
    if (!(path = strdup(dir)))
       return false;
    if (!string_list_append_n(list, name, name_len, attr))
@@ -1131,11 +1248,66 @@ error:
    return NULL;
 }
 
-/* True when @key lies under one of the directories this sync covers. */
-static bool task_cloud_sync_key_in_scope(const struct string_list *dirlist,
-      const char *key)
+/* Keys of one root under another root's folder, as "config/saves/":
+ * that folder syncs once, as its own root, and what the outer root
+ * sent of it before is left alone, as keys out of scope are. False
+ * when out of memory. */
+static bool task_cloud_sync_find_shadowed(task_cloud_sync_state_t *sync_state)
 {
-   size_t i;
+   struct string_list *dirlist = sync_state->dirlist;
+   char               *prefix  = CS_WALK_ALT(sync_state);
+   size_t              o;
+   size_t              i;
+
+   for (o = 0; o < dirlist->size; o++)
+      for (i = 0; i < dirlist->size; i++)
+      {
+         union string_list_elem_attr attr;
+         const char *inner = (const char*)dirlist->elems[i].userdata;
+         int         at    = task_cloud_sync_dir_within(
+               (const char*)dirlist->elems[o].userdata, inner);
+         size_t      len;
+         size_t      n;
+         if (at <= 0)
+            continue;
+         /* its names below the outer root, as the walk names them */
+         len    = strlcpy(prefix, dirlist->elems[o].data, PATH_MAX_LENGTH);
+         inner += at;
+         for (;;)
+         {
+            inner = task_cloud_sync_next_name(inner, &n);
+            if (!n || len + n + 2 >= PATH_MAX_LENGTH)
+               break;
+            prefix[len++] = '/';
+            memcpy(prefix + len, inner, n);
+            len   += n;
+            inner += n;
+         }
+         if (n)
+            continue;
+         prefix[len++] = '/';
+         prefix[len]   = '\0';
+         attr.i = 0;
+         if (     !sync_state->shadowed
+               && !(sync_state->shadowed = string_list_new()))
+            return false;
+         if (!string_list_append(sync_state->shadowed, prefix, attr))
+            return false;
+      }
+   return true;
+}
+
+/* True when @key lies under one of the directories this sync covers,
+ * not under another root's folder within it, and is not a safety copy
+ * (task_cloud_sync_key_is_copy()). */
+static bool task_cloud_sync_key_in_scope(
+      const task_cloud_sync_state_t *sync_state, const char *key)
+{
+   const struct string_list *dirlist = sync_state->dirlist;
+   size_t                    i;
+   if (     task_cloud_sync_key_shadowed(sync_state, key)
+         || task_cloud_sync_key_is_copy(key))
+      return false;
    for (i = 0; i < dirlist->size; i++)
       if (string_starts_with(key, dirlist->elems[i].data))
          return true;
@@ -1154,7 +1326,7 @@ static size_t task_cloud_sync_count_out_of_scope(
       return 0;
 
    for (i = 0; i < server->size; i++)
-      if (!task_cloud_sync_key_in_scope(dirlist,
+      if (!task_cloud_sync_key_in_scope(sync_state,
                CS_FILE_KEY(&server->list[i])))
          count++;
 
@@ -1192,7 +1364,9 @@ static void task_cloud_sync_mark_held_roots(task_cloud_sync_state_t *sync_state)
          int               cmp        = 1;
 
          if (     string_is_empty(CS_FILE_HASH(local_file))
-               || task_cloud_sync_key_root(dirlist, key) != (int)r)
+               || task_cloud_sync_key_root(dirlist, key) != (int)r
+               || !task_cloud_sync_key_in_scope(sync_state, key)
+               || task_cloud_sync_should_ignore_file(key))
             continue;
          total++;
          while (c < current->size
@@ -1284,7 +1458,9 @@ static void task_cloud_sync_mark_held_dirs(task_cloud_sync_state_t *sync_state)
       }
       if (     i == local->size
             || string_is_empty(CS_FILE_HASH(&local->list[i]))
-            || task_cloud_sync_key_root(sync_state->dirlist, key) < 0)
+            || task_cloud_sync_key_root(sync_state->dirlist, key) < 0
+            || !task_cloud_sync_key_in_scope(sync_state, key)
+            || task_cloud_sync_should_ignore_file(key))
          continue;
 
       cmp = 1;
@@ -1362,7 +1538,8 @@ static void task_cloud_sync_build_current_manifest(
       if (     !(sync_state->current_manifest        = (file_list_t *)calloc(1, sizeof(file_list_t)))
             || !(sync_state->updated_server_manifest = (file_list_t *)calloc(1, sizeof(file_list_t)))
             || !(sync_state->updated_local_manifest  = (file_list_t *)calloc(1, sizeof(file_list_t)))
-            || !(sync_state->walk_bufs               = (char*)malloc(4 * PATH_MAX_LENGTH)))
+            || !(sync_state->walk_bufs               = (char*)malloc(4 * PATH_MAX_LENGTH))
+            || !task_cloud_sync_find_shadowed(sync_state))
       {
          task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_END);
          return;
@@ -2968,7 +3145,7 @@ static void task_cloud_sync_maybe_ignore(task_cloud_sync_state_t *sync_state)
       {
          struct item_file *local_file  = &sync_state->local_manifest->list[sync_state->local_idx];
          const char *key = CS_FILE_KEY(local_file);
-         found = task_cloud_sync_key_in_scope(dirlist, key);
+         found = task_cloud_sync_key_in_scope(sync_state, key);
          /* we have a record of doing a sync for this file but now no longer
           * wish to sync it. keep the record? might as well, in case the option
           * gets turned back on later. */
@@ -2986,7 +3163,7 @@ static void task_cloud_sync_maybe_ignore(task_cloud_sync_state_t *sync_state)
       {
          struct item_file *server_file  = &sync_state->server_manifest->list[sync_state->server_idx];
          const char *key = CS_FILE_KEY(server_file);
-         found = task_cloud_sync_key_in_scope(dirlist, key);
+         found = task_cloud_sync_key_in_scope(sync_state, key);
          /* must keep the server's manifest complete */
          if (!found)
          {
@@ -3765,6 +3942,7 @@ static void task_cloud_sync_cleanup(retro_task_t *task)
    string_list_free(sync_state->roots);
    string_list_free(sync_state->held);
    string_list_free(sync_state->held_dirs);
+   string_list_free(sync_state->shadowed);
    task_cloud_sync_walk_free(sync_state);
    if (sync_state->hash_cur.file)
       filestream_close(sync_state->hash_cur.file);
