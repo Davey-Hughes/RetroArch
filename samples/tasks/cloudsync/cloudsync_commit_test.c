@@ -1117,6 +1117,26 @@ static void walk_lane(void)
    CHECK(!task_cloud_sync_should_ignore_file("saves/Snes9x/backups/y.srm"));
    CHECK(!task_cloud_sync_should_ignore_file("saves/backupsx/a.srm"));
    CHECK(!task_cloud_sync_should_ignore_file("system/backups/a.bin"));
+   /* other tools' files */
+   CHECK(task_cloud_sync_should_ignore_file("saves/._a.srm"));
+   CHECK(task_cloud_sync_should_ignore_file("saves/Snes9x/._a.srm"));
+   CHECK(task_cloud_sync_should_ignore_file("saves/Snes9x/Thumbs.db"));
+   CHECK(task_cloud_sync_should_ignore_file("states/desktop.ini"));
+   CHECK(task_cloud_sync_should_ignore_file("states/Desktop.ini"));
+   CHECK(task_cloud_sync_should_ignore_file("saves/.nomedia"));
+   CHECK(task_cloud_sync_should_ignore_file("saves/.stversions/"));
+   CHECK(task_cloud_sync_should_ignore_file(
+            "saves/.stversions/Snes9x/a~20261110-120000.srm"));
+   CHECK(task_cloud_sync_should_ignore_file(
+            "saves/a (Alex's conflicted copy 2026-11-10).srm"));
+   CHECK(task_cloud_sync_should_ignore_file(
+            "saves/a (conflicted copy 2026-11-10 120000).srm"));
+   CHECK(task_cloud_sync_should_ignore_file(
+            "saves/a.sync-conflict-20261110-120000-ABCDEFG.srm"));
+   CHECK(!task_cloud_sync_should_ignore_file("saves/a._b.srm"));
+   CHECK(!task_cloud_sync_should_ignore_file("saves/Thumbs.db.srm"));
+   CHECK(!task_cloud_sync_should_ignore_file("saves/stversions/a.srm"));
+   CHECK(!task_cloud_sync_should_ignore_file("saves/.nomedia.srm"));
    task_cloud_sync_cleanup(task);
    /* run by hand: no callback counted it off */
    tcs_in_flight--;

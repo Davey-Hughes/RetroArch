@@ -818,7 +818,8 @@ static void task_cloud_sync_read_local_manifest(task_cloud_sync_state_t *sync_st
 /* takes the filename in manifest format, e.g. "config/retroarch.cfg" */
 static bool task_cloud_sync_should_ignore_file(const char *filename)
 {
-   size_t len;
+   const char *base;
+   size_t      len;
 
    if (string_starts_with(filename, "config/"))
    {
@@ -849,6 +850,19 @@ static bool task_cloud_sync_should_ignore_file(const char *filename)
       return true;
 
    if (string_ends_with(filename, "/.DS_Store"))
+       return true;
+
+   /* other tools' files: folder metadata, Syncthing's old versions and
+    * sync tools' conflicted copies */
+   base = strrchr(filename, '/');
+   base = base ? base + 1 : filename;
+   if (     string_starts_with(base, "._")
+         || string_is_equal_case_insensitive(base, "Thumbs.db")
+         || string_is_equal_case_insensitive(base, "desktop.ini")
+         || string_is_equal(base, ".nomedia")
+         || strstr(filename, "/.stversions/")
+         || strstr(base, "conflicted copy")
+         || strstr(base, ".sync-conflict-"))
        return true;
 
    /* a download still being written, or left by one that never
