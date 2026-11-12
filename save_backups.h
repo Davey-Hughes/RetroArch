@@ -95,6 +95,11 @@ void save_backups_set_roots(const char *savefile_dir,
       const char *system_dir, const char *config_dir,
       const char *app_data_dir, const char *core);
 
+/* Until a save_folders.json gave this device's tag, reads it from
+ * @config_dir's: copies made before any content load are named with
+ * it too. Main thread. */
+void save_backups_device_load(const char *config_dir);
+
 /* The folder copies of the file at @path go to. Returns its length,
  * 0 when there is none. */
 size_t save_backups_dir(char *s, size_t len, const char *path);
@@ -119,16 +124,20 @@ enum save_backup_result save_backups_copy_to(const char *dir,
 /* Moves the file at @path into @dir under the name
  * save_backups_copy_to() would give its copy: a rename, or across
  * drives a synced copy and then the delete, undone when the original
- * stays. */
+ * stays. Retention follows as for a copy; *@unpruned, unless NULL, is
+ * set when a copy due to go stays. */
 enum save_backup_result save_backups_move_to(const char *dir,
-      const char *path, const char *core, enum save_backup_reason reason);
+      const char *path, const char *core, enum save_backup_reason reason,
+      bool *unpruned);
 
 /* save_backups_move_to() up to the copy: renames @path into @dir, or
  * when that fails returns COPY_OWED with the copy's path in @s and
- * nothing written. */
+ * nothing written. With @due, the copies retention would delete after
+ * a rename go into *@due (a new list when NULL) for the caller to
+ * delete; only those it can't take are deleted here. */
 enum save_backup_result save_backups_move_begin(const char *dir,
       const char *path, const char *core, enum save_backup_reason reason,
-      char *s, size_t len);
+      char *s, size_t len, struct string_list **due, bool *unpruned);
 
 /* Copies @path to @to a piece at a time, synced and renamed into place
  * as an atomic synced write is. Its temporary is opened first and goes
@@ -161,8 +170,9 @@ struct string_list *save_backups_delete_temps(const char *dir,
       const char *path, const char *core, enum save_backup_reason reason);
 
 /* Retention for a copy of @path at @made, put there by its own copy:
- * as save_backups_copy_to() runs it, @made counted and kept. */
-void save_backups_retain_made(const char *dir, const char *path,
+ * as save_backups_copy_to() runs it, @made counted and kept. False
+ * when a copy due to go stays or @dir can't be listed. */
+bool save_backups_retain_made(const char *dir, const char *path,
       const char *core, enum save_backup_reason reason, const char *made);
 
 /* Deletes @path once its copy at @to is made. A delete that fails

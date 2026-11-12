@@ -109,8 +109,6 @@ static retro_atomic_int_t save_backups_device;
 /* That tag is save_folders.json's */
 static bool save_backups_device_kept;
 
-static void save_backups_device_read(void);
-
 /* @t starts with a device's tag */
 static bool save_backups_is_tag(const char *t)
 {
@@ -274,8 +272,7 @@ void save_backups_set_roots(const char *savefile_dir,
       free(save_backups_roots[i]);
       save_backups_roots[i] = string_is_empty(in[i]) ? NULL : strdup(in[i]);
    }
-   if (!save_backups_device_kept)
-      save_backups_device_read();
+   save_backups_device_load(config_dir);
 }
 
 /* The part of @path below @root, or NULL when it is not under it. */
@@ -708,31 +705,41 @@ static unsigned save_backups_record(unsigned seq, const char *time)
 
 /* Deletes the oldest copies of one file for @reason in @list, all but
  * SAVE_BACKUPS_KEEP counting the one just made, which is not in it.
- * The copy held by @keep, @device's, is neither counted nor deleted. */
-static void save_backups_retain(struct string_list *list,
+ * The copy held by @keep, @device's, is neither counted nor deleted.
+ * With @due, adds them to *@due (a new list when NULL) instead, and
+ * deletes only those it can't add. False when a delete failed. */
+static bool save_backups_retain(struct string_list *list,
       struct save_backup_name *names, const bool *mine,
       enum save_backup_reason reason, size_t ext_len, unsigned keep,
-      const char *device)
+      const char *device, struct string_list **due)
 {
    size_t i;
+   union string_list_elem_attr attr;
    size_t count = 0;
+   bool ok      = true;
+   attr.i       = 0;
    for (i = 0; i < list->size; i++)
    {
       const char *name;
       if (!mine[i] || names[i].reason != reason)
          continue;
       name = path_basename_nocompression(list->elems[i].data);
-      /* Near its limit or marked, the game may be a longer name's cut:
-       * never pruned */
       if (     keep
             && save_backups_record(names[i].seq, names[i].time) == keep
             && string_is_equal(names[i].device, device))
+         names[i].reason = SAVE_BACKUP_REASON_LAST;
+      /* Cloud sync's from before numbering: never pruned */
+      else if (!names[i].seq
+            && (   reason == SAVE_BACKUP_REPLACED
+                || reason == SAVE_BACKUP_DELETED))
          names[i].reason = SAVE_BACKUP_REASON_LAST;
       else if (names[i].game_len + SAVE_BACKUPS_CUT_ROOM
                < save_backups_game_max(names[i].core_len, ext_len)
             && (  !names[i].game_len
                || name[names[i].game_len - 1] != SAVE_BACKUPS_CUT_MARK))
          count++;
+      /* Near its limit or marked, the game may be a longer name's cut:
+       * never pruned */
       else
          names[i].reason = SAVE_BACKUP_REASON_LAST;
    }
@@ -744,10 +751,15 @@ static void save_backups_retain(struct string_list *list,
                && (oldest == list->size
                   || save_backups_cmp(&names[i], &names[oldest]) < 0))
             oldest = i;
-      filestream_delete(list->elems[oldest].data);
+      if (     (   !due
+               || (!*due && !(*due = string_list_new()))
+               || !string_list_append(*due, list->elems[oldest].data, attr))
+            && filestream_delete(list->elems[oldest].data) != 0)
+         ok = false;
       names[oldest].reason = SAVE_BACKUP_REASON_LAST;
       count--;
    }
+   return ok;
 }
 
 /* @name (a basename) is a copy of the file named @base, whose game
@@ -934,6 +946,8 @@ static bool save_backups_retained(const struct save_backups_copies *c,
       && c->game_len == c->base_len
       && (  reason == SAVE_BACKUP_BEFORE_STATE_LOAD
          || reason == SAVE_BACKUP_CHANGED_ELSEWHERE
+         || reason == SAVE_BACKUP_REPLACED
+         || reason == SAVE_BACKUP_DELETED
          || (  reason == SAVE_BACKUP_NOT_LOADED
             && string_is_equal(c->ext, ".state.auto")));
 }
@@ -978,12 +992,13 @@ static bool save_backups_holds(const char *copy, const void *data,
  * @move, renames @path there instead, or names the copy owed when that
  * fails. With @skip_same, nothing is written when the newest copy is
  * this core's, made on this device, and holds it; @of_file: @data is
- * @path's bytes. @seq as in save_backups_copy_image(). */
+ * @path's bytes. @seq as in save_backups_copy_image(). *@unpruned: a
+ * copy due to go stays. */
 static enum save_backup_result save_backups_write_copy(char *s, size_t len,
       const char *dir, const char *path, const char *core,
       enum save_backup_reason reason, const void *data, size_t data_len,
       bool move, bool skip_same, bool of_file, bool sync, unsigned *seq,
-      bool *no_room)
+      bool *no_room, struct string_list **due, bool *unpruned)
 {
    struct save_backups_copies c;
    enum save_backup_result result = SAVE_BACKUP_FAILED;
@@ -1031,9 +1046,11 @@ static enum save_backup_result save_backups_write_copy(char *s, size_t len,
    }
    result = SAVE_BACKUP_MADE;
 
-   if (save_backups_retained(&c, reason))
-      save_backups_retain(c.list, c.names, c.mine, reason, strlen(c.ext),
-            keep, c.device);
+   if (     save_backups_retained(&c, reason)
+         && !save_backups_retain(c.list, c.names, c.mine, reason,
+               strlen(c.ext), keep, c.device, due)
+         && unpruned)
+      *unpruned = true;
 
 end:
    if (result != SAVE_BACKUP_MADE && result != SAVE_BACKUP_COPY_OWED)
@@ -1115,23 +1132,24 @@ struct string_list *save_backups_delete_temps(const char *dir,
    return copies;
 }
 
-void save_backups_retain_made(const char *dir, const char *path,
+bool save_backups_retain_made(const char *dir, const char *path,
       const char *core, enum save_backup_reason reason, const char *made)
 {
    size_t i;
    struct save_backups_copies c;
-   if (     save_backups_list_copies(&c, dir, path, core)
-         && save_backups_retained(&c, reason))
+   bool ok = save_backups_list_copies(&c, dir, path, core);
+   if (ok && save_backups_retained(&c, reason))
    {
       const char *name = path_basename_nocompression(made);
       for (i = 0; i < c.list->size; i++)
          if (string_is_equal(
                   path_basename_nocompression(c.list->elems[i].data), name))
             c.mine[i] = false;
-      save_backups_retain(c.list, c.names, c.mine, reason, strlen(c.ext),
-            0, c.device);
+      ok = save_backups_retain(c.list, c.names, c.mine, reason,
+            strlen(c.ext), 0, c.device, NULL);
    }
    save_backups_free_copies(&c);
+   return ok;
 }
 
 static enum save_backup_result save_backups_copy_seq(const char *dir,
@@ -1161,7 +1179,7 @@ static enum save_backup_result save_backups_copy_seq(const char *dir,
    }
    result = save_backups_write_copy(made, PATH_MAX_LENGTH, dir, path,
          core, reason, data, len, false, true, buf != NULL, sync, seq,
-         no_room);
+         no_room, NULL, NULL);
    free(buf);
    free(made);
    return result;
@@ -1177,16 +1195,17 @@ enum save_backup_result save_backups_copy_to(const char *dir,
 
 enum save_backup_result save_backups_move_begin(const char *dir,
       const char *path, const char *core, enum save_backup_reason reason,
-      char *s, size_t len)
+      char *s, size_t len, struct string_list **due, bool *unpruned)
 {
    if (!path_is_valid(path))
       return SAVE_BACKUP_NO_FILE;
    return save_backups_write_copy(s, len, dir, path, core, reason,
-         NULL, 0, true, false, false, false, NULL, NULL);
+         NULL, 0, true, false, false, false, NULL, NULL, due, unpruned);
 }
 
 enum save_backup_result save_backups_move_to(const char *dir,
-      const char *path, const char *core, enum save_backup_reason reason)
+      const char *path, const char *core, enum save_backup_reason reason,
+      bool *unpruned)
 {
    enum save_backup_result result;
    char *made;
@@ -1195,11 +1214,18 @@ enum save_backup_result save_backups_move_to(const char *dir,
    if (!(made = (char*)malloc(PATH_MAX_LENGTH)))
       return SAVE_BACKUP_FAILED;
    result = save_backups_write_copy(made, PATH_MAX_LENGTH, dir, path,
-         core, reason, NULL, 0, true, false, false, false, NULL, NULL);
+         core, reason, NULL, 0, true, false, false, false, NULL, NULL,
+         NULL, unpruned);
    if (result == SAVE_BACKUP_COPY_OWED)
+   {
       result = (  save_backups_copy_synced(path, made)
                && save_backups_move_finish(path, made))
          ? SAVE_BACKUP_MADE : SAVE_BACKUP_FAILED;
+      if (     result == SAVE_BACKUP_MADE
+            && !save_backups_retain_made(dir, path, core, reason, made)
+            && unpruned)
+         *unpruned = true;
+   }
    free(made);
    return result;
 }
@@ -1431,7 +1457,7 @@ static size_t save_backups_recover_in(char *s, size_t len, const char *path,
    if (beside && save_backups_dir(dir, PATH_MAX_LENGTH, path))
       made = save_backups_write_copy(s, len, dir, path, NULL,
             SAVE_BACKUP_UNSAVED, data, data_len, false, false, false, sync,
-            NULL, NULL)
+            NULL, NULL, NULL, NULL)
          == SAVE_BACKUP_MADE;
    for (i = SAVE_BACKUPS_ROOT_CONFIG;
          !made && i <= SAVE_BACKUPS_ROOT_APP_DATA; i++)
@@ -1442,7 +1468,7 @@ static size_t save_backups_recover_in(char *s, size_t len, const char *path,
             SAVE_BACKUPS_RECOVERY_DIR, PATH_MAX_LENGTH);
       made = save_backups_write_copy(s, len, dir, path, NULL,
             SAVE_BACKUP_UNSAVED, data, data_len, false, false, false, sync,
-            NULL, NULL)
+            NULL, NULL, NULL, NULL)
          == SAVE_BACKUP_MADE;
    }
    free(dir);
@@ -1714,14 +1740,16 @@ static bool save_folders_path(char *s, size_t len)
    return true;
 }
 
-static void save_backups_device_read(void)
+static void save_backups_device_read(const char *config_dir)
 {
    struct save_folders_list l;
    const char *t;
    char *path = (char*)malloc(PATH_MAX_LENGTH);
    memset(&l, 0, sizeof(l));
-   if (path && save_folders_path(path, PATH_MAX_LENGTH))
+   if (path)
    {
+      fill_pathname_join_special(path, config_dir,
+            SAVE_BACKUPS_FOLDERS_FILE, PATH_MAX_LENGTH);
       save_folders_read(&l, path);
       if ((t = save_folders_device(&l)))
       {
@@ -1732,6 +1760,12 @@ static void save_backups_device_read(void)
    }
    save_folders_free(&l);
    free(path);
+}
+
+void save_backups_device_load(const char *config_dir)
+{
+   if (!save_backups_device_kept && !string_is_empty(config_dir))
+      save_backups_device_read(config_dir);
 }
 
 bool save_backups_note_folders(const char *configured, const char *used,

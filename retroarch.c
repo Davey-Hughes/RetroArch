@@ -212,6 +212,7 @@
 #include "msg_hash.h"
 #include "paths.h"
 #include "file_path_special.h"
+#include "save_backups.h"
 #include "ui/ui_companion_driver.h"
 #include "verbosity.h"
 
@@ -9319,6 +9320,19 @@ static bool retroarch_parse_input_and_config(
           && path_is_empty(RARCH_PATH_CONFIG_DEFAULT))
          path_set(RARCH_PATH_CONFIG_DEFAULT,
                path_get(RARCH_PATH_CONFIG));
+   }
+
+   /* This device's tag, for copies a sync makes before any content */
+   {
+      char *config_dir = (char*)malloc(DIR_MAX_LENGTH);
+      if (config_dir)
+      {
+         config_dir[0] = '\0';
+         fill_pathname_application_special(config_dir, DIR_MAX_LENGTH,
+               APPLICATION_SPECIAL_DIRECTORY_CONFIG);
+         save_backups_device_load(config_dir);
+         free(config_dir);
+      }
    }
 
    verbosity_enabled = verbosity_is_enabled();

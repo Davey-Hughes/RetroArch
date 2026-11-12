@@ -3,23 +3,23 @@
  * must stay on the content thread, including a failed hand-over.
  * A backup's copy across drives runs on a thread of its own, and the
  * sync never waits for it. The walk leaves out the safety copies and
- * recovery files. Conflict resolution, and a server file named in its
- * manifest but gone. */
+ * recovery files. A file's backups are kept to ten. Conflict
+ * resolution, and a server file named in its manifest but gone. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <rthreads/rthreads.h>
 #include <retro_timers.h>
+#include <retro_atomic.h>
 #include <vfs/vfs_implementation.h>
 
-static int fail_alloc;
+/* read on the move worker's threads too */
+static retro_atomic_int_t fail_alloc;
 static void *test_malloc(size_t size)
 {
-   if (fail_alloc)
-   {
-      fail_alloc = 0;
+   if (     retro_atomic_load_relaxed_int(&fail_alloc)
+         && retro_atomic_exchange_int(&fail_alloc, 0))
       return NULL;
-   }
    return malloc(size);
 }
 
@@ -65,13 +65,26 @@ static retro_atomic_int_t vanishing;
 /* what the last sync recorded for the save */
 static char synced_server[33], synced_local[33];
 static bool synced_server_listed;
+/* prune_lane(): the save's backups hold copies already, the oldest
+ * at prune_first; deleting it fails while refuse_prune is set;
+ * warnings of copies left */
+static bool pruning;
+static char prune_first[320];
+static retro_atomic_int_t refuse_prune, prune_warns;
+/* deletes of the oldest on the main thread; one off it is held while
+ * prune_gate is set */
+static retro_atomic_int_t main_prunes, prune_gate, prune_at_gate;
 
 #define CHECK(c) do { if (!(c)) { \
    fprintf(stderr, "FAIL line %d (hold %d): %s\n", __LINE__, hold_mode, #c); \
    failures++; } } while (0)
 
 void RARCH_LOG(const char *fmt, ...) { (void)fmt; }
-void RARCH_WARN(const char *fmt, ...) { (void)fmt; }
+void RARCH_WARN(const char *fmt, ...)
+{
+   if (strstr(fmt, "old backups"))
+      retro_atomic_inc_int(&prune_warns);
+}
 void RARCH_ERR(const char *fmt, ...) { (void)fmt; }
 bool verbosity_is_enabled(void) { return false; }
 const char *msg_hash_to_str(enum msg_hash_enums msg) { (void)msg; return ""; }
@@ -108,6 +121,20 @@ int __wrap_filestream_delete(const char *path)
    if (     strstr(path, SAVE_BACKUPS_CORE_CLOUD_SYNC)
          && !task_is_on_main_thread())
       retro_atomic_inc_int(&worker_deletes);
+   if (strstr(path, " - 0001-wxyz - "))
+   {
+      if (task_is_on_main_thread())
+         retro_atomic_inc_int(&main_prunes);
+      else if (retro_atomic_load_acquire_int(&prune_gate))
+      {
+         retro_atomic_store_release_int(&prune_at_gate, 1);
+         while (retro_atomic_load_acquire_int(&prune_gate))
+            retro_sleep(1);
+      }
+   }
+   if (     retro_atomic_load_relaxed_int(&refuse_prune)
+         && strstr(path, " - 0001-wxyz - "))
+      return -1;
    if (     string_is_equal(path, local_path)
          && retro_atomic_load_relaxed_int(&syncs_at_delete) < 0)
       retro_atomic_store_relaxed_int(&syncs_at_delete,
@@ -356,6 +383,62 @@ static void vanished_next_sync(void)
 #endif
 }
 
+/* prune_lane()'s backups after its sync */
+static void prune_check(const struct string_list *backups, bool deletion)
+{
+   size_t i;
+   char first_path[320];
+   unsigned numbered = 0, older = 0, made = 0, first = 0;
+   int refuse = retro_atomic_load_relaxed_int(&refuse_prune);
+   int held   = retro_atomic_load_acquire_int(&prune_gate);
+   first_path[0] = '\0';
+   for (i = 0; backups && i < backups->size; i++)
+   {
+      struct save_backup_name name;
+      const char *path = backups->elems[i].data;
+      if (!save_backups_parse(path_basename(path), &name) || !name.seq)
+         older += holds(path, "older");
+      else if (name.reason == (deletion
+               ? SAVE_BACKUP_DELETED : SAVE_BACKUP_REPLACED))
+      {
+         numbered++;
+         if (name.seq == 1)
+         {
+            first++;
+            strlcpy(first_path, path, sizeof(first_path));
+         }
+         else if (name.seq == SAVE_BACKUPS_KEEP + 1)
+            made += holds(path, "old");
+      }
+   }
+   /* told by the sync, or by its prune's thread once the sync is gone */
+   for (i = 0; i < 2000
+         && retro_atomic_load_acquire_int(&prune_warns) < refuse; i++)
+      retro_sleep(1);
+   CHECK(older == 3);
+   CHECK(numbered == SAVE_BACKUPS_KEEP + (unsigned)(refuse || held));
+   CHECK(made == 1);
+   CHECK(first == (unsigned)(refuse || held));
+   CHECK(retro_atomic_load_relaxed_int(&prune_warns) == refuse);
+#if defined(TCS_MOVE_WORKER)
+   /* the delete runs on the move worker, after a rename too */
+   CHECK(retro_atomic_load_relaxed_int(&main_prunes) == 0);
+#endif
+   if (held)
+   {
+      /* the sync ended without waiting on its prune, which goes on */
+      for (i = 0; i < 2000
+            && !retro_atomic_load_acquire_int(&prune_at_gate); i++)
+         retro_sleep(1);
+      CHECK(retro_atomic_load_acquire_int(&prune_at_gate) == 1);
+      retro_atomic_store_release_int(&prune_gate, 0);
+      for (i = 0; i < 2000 && path_is_valid(first_path); i++)
+         retro_sleep(1);
+      CHECK(!path_is_valid(first_path));
+   }
+   retro_atomic_store_relaxed_int(&refuse_prune, 0);
+}
+
 static void lane(bool threaded, bool deletion, bool owned, bool no_memory)
 {
    retro_task_t *task = task_init();
@@ -427,7 +510,7 @@ static void lane(bool threaded, bool deletion, bool owned, bool no_memory)
       CHECK(pending_fetch != NULL);
       CHECK(holds(local_path, "old"));
       CHECK(filestream_write_file(fetching_path, "new", 3));
-      fail_alloc = no_memory;
+      retro_atomic_store_relaxed_int(&fail_alloc, no_memory);
 #ifdef HAVE_THREADS
       worker = sthread_create(complete_fetch, pending_fetch);
       CHECK(worker != NULL);
@@ -557,8 +640,17 @@ static void lane(bool threaded, bool deletion, bool owned, bool no_memory)
       CHECK(!path_is_valid(local_path));
    CHECK(!path_is_valid(fetching_path));
    snprintf(backup_dir, sizeof(backup_dir), "%s/backups/cloud-sync/saves", directory);
+#if defined(TCS_MOVE_WORKER)
+   /* a rename's prune goes on after its sync */
+   if (     pruning && !retro_atomic_load_relaxed_int(&refuse_prune)
+         && !retro_atomic_load_acquire_int(&prune_gate))
+      for (i = 0; i < 2000 && path_is_valid(prune_first); i++)
+         retro_sleep(1);
+#endif
    backups = dir_list_new(backup_dir, NULL, false, false, true, true);
-   if (!expect_old || vanish)
+   if (pruning)
+      prune_check(backups, deletion);
+   else if (!expect_old || vanish)
    {
       CHECK(backups && backups->size == (hold_mode == 5 ? 2u : 1u));
       if (backups && backups->size)
@@ -597,6 +689,183 @@ static void lane(bool threaded, bool deletion, bool owned, bool no_memory)
          directory);
    filestream_delete(manifest);
 }
+
+/* The save's backups hold ten numbered copies for the lane's reason,
+ * another device's, made before it (with @future, after), and older
+ * names: master's and from before numbering. The sync's copy keeps
+ * ten, its own one of them; the older names stay, never counted.
+ * @refuse: the oldest won't go, which the sync logs once and goes on.
+ * @hold: its delete is held until the sync has ended. */
+static void prune_lane(bool threaded, bool deletion, bool future,
+      bool refuse, bool hold)
+{
+   const char *word = deletion ? "deleted" : "replaced";
+   char dir[160], path[320];
+   unsigned i;
+   snprintf(dir, sizeof(dir), "%s/backups/cloud-sync/saves", directory);
+   CHECK(path_mkdir(dir));
+   for (i = 1; i <= SAVE_BACKUPS_KEEP; i++)
+   {
+      snprintf(path, sizeof(path),
+            "%s/save - %s-01-01 00-00-%02u - %04u-wxyz - cloud-sync - %s.srm",
+            dir, future ? "2099" : "2026", i, i, word);
+      CHECK(filestream_write_file(path, "copy", 4));
+      if (i == 1)
+         strlcpy(prune_first, path, sizeof(prune_first));
+   }
+   snprintf(path, sizeof(path), "%s/save.srm-260101-120000", dir);
+   CHECK(filestream_write_file(path, "older", 5));
+   snprintf(path, sizeof(path),
+         "%s/save - 2026-01-01 12-00-00 - cloud-sync - %s.srm", dir, word);
+   CHECK(filestream_write_file(path, "older", 5));
+   snprintf(path, sizeof(path),
+         "%s/save - 2026-01-01 12-00-00-2 - cloud-sync - %s.srm", dir, word);
+   CHECK(filestream_write_file(path, "older", 5));
+   retro_atomic_store_relaxed_int(&refuse_prune, refuse);
+   retro_atomic_store_relaxed_int(&prune_warns, 0);
+   retro_atomic_store_relaxed_int(&main_prunes, 0);
+   retro_atomic_store_relaxed_int(&prune_at_gate, 0);
+   retro_atomic_store_release_int(&prune_gate, hold);
+   pruning = true;
+   lane(threaded, deletion, false, false);
+   pruning = false;
+   retro_atomic_store_release_int(&prune_gate, 0);
+}
+
+#if defined(TCS_MOVE_WORKER)
+/* A sync of the test's saves folder, run by hand */
+static retro_task_t *prune_sync(void)
+{
+   retro_task_t *task = task_init();
+   task_cloud_sync_state_t *st = (task_cloud_sync_state_t*)calloc(1, sizeof(*st));
+   union string_list_elem_attr attr;
+   st->updated_server_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->updated_local_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->dirlist = string_list_new();
+   attr.i = 0;
+   string_list_append(st->dirlist, "saves", attr);
+   st->dirlist->elems[0].userdata = strdup(directory);
+   retro_atomic_int_init(&st->waiting, 0);
+   retro_atomic_int_init(&st->phase, CLOUD_SYNC_PHASE_DIFF);
+   task_cloud_sync_task_setup(task, st, "Cloud Sync");
+   return task;
+}
+
+static void prune_sync_free(retro_task_t *task)
+{
+   task_cloud_sync_cleanup(task);
+   /* run by hand: no callback counted it off */
+   tcs_in_flight--;
+   free(task->title);
+   free(task);
+}
+
+/* The numbered replaced copies in @dir, and the lowest number */
+static unsigned prune_count(const char *dir, unsigned *oldest)
+{
+   size_t i;
+   unsigned n = 0;
+   struct string_list *list = dir_list_new(dir, NULL, false, false, true, true);
+   *oldest = 0;
+   for (i = 0; list && i < list->size; i++)
+   {
+      struct save_backup_name name;
+      if (     save_backups_parse(path_basename(list->elems[i].data), &name)
+            && name.seq && name.reason == SAVE_BACKUP_REPLACED)
+      {
+         n++;
+         if (!*oldest || name.seq < *oldest)
+            *oldest = name.seq;
+      }
+   }
+   string_list_free(list);
+   return n;
+}
+
+/* A rename's prune still queued behind copies when its sync is let
+ * go is dropped: one copy over, until the next copy's prune. */
+static void prune_queued_lane(void)
+{
+   retro_task_t *task = prune_sync();
+   task_cloud_sync_state_t *st = (task_cloud_sync_state_t*)task->state;
+   struct item_file server = {0}, save = {0};
+   struct string_list *backups;
+   tcs_move_t *mv;
+   char dir[160], busy[160], path[320], to[200], temp[210];
+   char *owed = NULL;
+   unsigned i, n, oldest;
+   snprintf(dir, sizeof(dir), "%s/backups/cloud-sync/saves", directory);
+   snprintf(busy, sizeof(busy), "%s/backups/cloud-sync/busy", directory);
+   CHECK(path_mkdir(dir));
+   CHECK(path_mkdir(busy));
+   for (i = 1; i <= SAVE_BACKUPS_KEEP; i++)
+   {
+      snprintf(path, sizeof(path),
+            "%s/save - 2026-01-01 00-00-%02u - %04u-wxyz - cloud-sync - replaced.srm",
+            dir, i, i);
+      CHECK(filestream_write_file(path, "copy", 4));
+   }
+   retro_atomic_store_relaxed_int(&prune_warns, 0);
+   server.alt = (char*)"saves/b.srm";
+   save.path  = local_path;
+   save.alt   = (char*)"saves/save.srm";
+   /* copies held at their syncs take every slot */
+   retro_atomic_store_release_int(&gate, 1);
+   for (i = 0; i + 1 < TCS_MOVE_MAX; i++)
+   {
+      snprintf(path, sizeof(path), "%s/b%u.srm", directory, i);
+      snprintf(to, sizeof(to), "%s/b%u.srm", busy, i);
+      CHECK(filestream_write_file(path, "b", 1));
+      CHECK(task_cloud_sync_move_push(st, NULL, &server, "saves/b.srm",
+               path, to, NULL, NULL));
+   }
+   CHECK(filestream_write_file(local_path, "old", 3));
+   CHECK(task_cloud_sync_backup_file(st, &save, SAVE_BACKUP_REPLACED, &owed)
+         == SAVE_BACKUP_MADE);
+   CHECK(!owed);
+   free(owed);
+   for (mv = st->moves; mv && mv->next; mv = mv->next);
+   CHECK(mv && mv->due
+         && retro_atomic_load_acquire_int(&mv->state) == TCS_MOVE_QUEUED);
+   prune_sync_free(task);
+   retro_atomic_store_release_int(&gate, 0);
+   for (i = 0; i + 1 < TCS_MOVE_MAX; i++)
+   {
+      snprintf(path, sizeof(path), "%s/b%u.srm", directory, i);
+      snprintf(to, sizeof(to), "%s/b%u.srm", busy, i);
+      snprintf(temp, sizeof(temp), "%s" CS_TEMP_SUFFIX, to);
+      for (n = 0; n < 2000 && (path_is_valid(to) || path_is_valid(temp)); n++)
+         retro_sleep(1);
+      CHECK(!path_is_valid(to));
+      CHECK(!path_is_valid(temp));
+      filestream_delete(path);
+   }
+   path_rmdir(busy);
+   CHECK(prune_count(dir, &oldest) == SAVE_BACKUPS_KEEP + 1);
+   CHECK(oldest == 1);
+   /* the next copy's prune takes both */
+   task = prune_sync();
+   st   = (task_cloud_sync_state_t*)task->state;
+   CHECK(filestream_write_file(local_path, "old", 3));
+   CHECK(task_cloud_sync_backup_file(st, &save, SAVE_BACKUP_REPLACED, &owed)
+         == SAVE_BACKUP_MADE);
+   free(owed);
+   for (i = 0; i < 2000 && st->moves; i++)
+   {
+      task_cloud_sync_moves_run(st);
+      retro_sleep(1);
+   }
+   CHECK(!st->moves);
+   prune_sync_free(task);
+   CHECK(prune_count(dir, &oldest) == SAVE_BACKUPS_KEEP);
+   CHECK(oldest == 3);
+   CHECK(retro_atomic_load_relaxed_int(&prune_warns) == 0);
+   backups = dir_list_new(dir, NULL, false, false, true, true);
+   for (i = 0; backups && i < backups->size; i++)
+      filestream_delete(backups->elems[i].data);
+   string_list_free(backups);
+}
+#endif
 
 /* Two states whose backups are copies, as with the states folder on
  * another drive than the saves: one sync places both, the first copy
@@ -1304,6 +1573,7 @@ int main(void)
       return 1;
    }
 #endif
+   retro_atomic_int_init(&fail_alloc, 0);
    retro_atomic_int_init(&off_main, 0);
    retro_atomic_int_init(&ownership_checks, 0);
    retro_atomic_int_init(&main_syncs, 0);
@@ -1313,6 +1583,11 @@ int main(void)
    retro_atomic_int_init(&vanishing, 0);
    retro_atomic_int_init(&refuse_states, 0);
    retro_atomic_int_init(&copy_gate, 0);
+   retro_atomic_int_init(&refuse_prune, 0);
+   retro_atomic_int_init(&prune_warns, 0);
+   retro_atomic_int_init(&main_prunes, 0);
+   retro_atomic_int_init(&prune_gate, 0);
+   retro_atomic_int_init(&prune_at_gate, 0);
    retro_atomic_int_init(&at_copy_gate, 0);
 #if defined(HAVE_THREADS) && !defined(TCS_LOCK_FREE)
    tcs_manifest_lock = slock_new();
@@ -1386,6 +1661,30 @@ int main(void)
       states_lane(t != 0, 2);
 #endif
    }
+   /* renamed into the backups, and copied across drives */
+   for (m = 0; m <= 1; m++)
+   {
+      retro_atomic_store_relaxed_int(&refuse_move, m);
+      for (t = 0; t < 2; t++)
+      {
+         prune_lane(t != 0, false, false, false, false);
+         prune_lane(t != 0, true, false, false, false);
+         prune_lane(t != 0, false, true, false, false);
+         prune_lane(t != 0, true, true, false, false);
+         prune_lane(t != 0, false, false, true, false);
+#if defined(TCS_MOVE_WORKER)
+         if (!m)
+         {
+            prune_lane(t != 0, false, false, false, true);
+            prune_lane(t != 0, true, false, false, true);
+         }
+#endif
+      }
+   }
+   retro_atomic_store_relaxed_int(&refuse_move, 0);
+#if defined(TCS_MOVE_WORKER)
+   prune_queued_lane();
+#endif
    two_syncs_lane();
    sweep_lane();
    backup_location_lane();

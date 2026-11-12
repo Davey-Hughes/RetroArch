@@ -161,6 +161,8 @@ typedef struct
    bool need_manifest_uploaded;
    bool failures;
    bool conflicts;
+   /* An old backup due to go stayed; said once a sync */
+   bool unpruned;
    const char *fatal_error;
    /* Conflict resolution mode: 0=none, 1=keep_local, 2=keep_server,
     * 3=upload_all (files the server lost, changed here or not),
@@ -2009,6 +2011,21 @@ static bool task_cloud_sync_backup_root(task_cloud_sync_state_t *sync_state,
    return true;
 }
 
+/* Says once a sync that old backups of @path due to go stayed */
+static void task_cloud_sync_unpruned(task_cloud_sync_state_t *sync_state,
+      const char *path)
+{
+   if (sync_state->unpruned)
+      return;
+   sync_state->unpruned = true;
+   RARCH_WARN(CSPFX "Could not delete old backups of \"%s\".\n", path);
+}
+
+#if defined(TCS_MOVE_WORKER)
+static void task_cloud_sync_prune_push(task_cloud_sync_state_t *sync_state,
+      const char *path, struct string_list *due);
+#endif
+
 /* don't pass a server/local item_file to this, only current has ->path set */
 /* Anything but MADE leaves the caller holding a file it must not
  * replace or remove: a sync promises a local copy of anything it
@@ -2020,6 +2037,10 @@ static enum save_backup_result task_cloud_sync_backup_file(
       enum save_backup_reason reason, char **owed)
 {
    enum save_backup_result result = SAVE_BACKUP_FAILED;
+   bool unpruned  = false;
+#if defined(TCS_MOVE_WORKER)
+   struct string_list *due = NULL;
+#endif
    /* one heap block for the two paths: the task runs on small stacks */
    char *new_dir  = (char*)malloc(DIR_MAX_LENGTH + PATH_MAX_LENGTH);
    char *new_path = new_dir + DIR_MAX_LENGTH;
@@ -2036,14 +2057,19 @@ static enum save_backup_result task_cloud_sync_backup_file(
 
 #if defined(TCS_MOVE_WORKER)
    result = save_backups_move_begin(new_dir, file->path,
-         SAVE_BACKUPS_CORE_CLOUD_SYNC, reason, new_path, PATH_MAX_LENGTH);
+         SAVE_BACKUPS_CORE_CLOUD_SYNC, reason, new_path, PATH_MAX_LENGTH,
+         &due, &unpruned);
+   if (due)
+      task_cloud_sync_prune_push(sync_state, file->path, due);
    if (     result == SAVE_BACKUP_COPY_OWED
          && !(*owed = strdup(new_path)))
       result = SAVE_BACKUP_FAILED;
 #else
    result = save_backups_move_to(new_dir, file->path,
-         SAVE_BACKUPS_CORE_CLOUD_SYNC, reason);
+         SAVE_BACKUPS_CORE_CLOUD_SYNC, reason, &unpruned);
 #endif
+   if (unpruned)
+      task_cloud_sync_unpruned(sync_state, file->path);
    if (result != SAVE_BACKUP_MADE && result != SAVE_BACKUP_COPY_OWED)
       RARCH_ERR(CSPFX "Could not back \"%s\" up to \"%s\".\n",
             file->path, new_dir);
@@ -2328,9 +2354,11 @@ enum
    TCS_MOVE_ABANDONED
 };
 
-/* A backup's copy across drives, on a detached thread. The task thread
- * fills it before the thread starts; the thread then reads only path
- * and to and writes only ok, and its exchange of state hands it back.
+/* A backup's copy across drives, or the delete of copies a rename's
+ * retention left (due), on a detached thread. The task thread fills it
+ * before the thread starts; the thread then reads only path, to,
+ * fetching and due and writes only ok and unpruned, and its exchange
+ * of state hands it back.
  * A copy nobody polls for (ABANDONED) is the thread's to dispose of.
  * Everything else is the task thread's. */
 typedef struct tcs_move
@@ -2338,6 +2366,7 @@ typedef struct tcs_move
    struct tcs_move               *next;
    retro_atomic_int_t             state;
    bool                           ok;
+   bool                           unpruned;
    unsigned                       lifetime;
    unsigned                       writes;
    int64_t                        size;
@@ -2348,6 +2377,7 @@ typedef struct tcs_move
    /* A fetch's download, placed once the file is moved; NULL for the
     * server's deletion */
    char                          *fetching;
+   struct string_list            *due;
    task_cloud_sync_fetch_state_t *fetch_state;
    struct item_file              *server_file;
    char                           hash[33];
@@ -2357,17 +2387,54 @@ typedef struct tcs_move
 #define TCS_MOVE_MAX     4
 #define TCS_MOVE_BUDGET  (16 * 1024 * 1024)
 
+/* The copy, then retention for the copies it joins, on the copy's
+ * thread; or a prune's deletes */
+static void task_cloud_sync_move_copy(tcs_move_t *mv)
+{
+   char *dir;
+   if (mv->due)
+   {
+      size_t i;
+      for (i = 0; i < mv->due->size; i++)
+         if (filestream_delete(mv->due->elems[i].data) != 0)
+            mv->unpruned = true;
+      return;
+   }
+   if (!(mv->ok = save_backups_copy_synced(mv->path, mv->to)))
+      return;
+   if (!(dir = (char*)malloc(DIR_MAX_LENGTH)))
+   {
+      mv->unpruned = true;
+      return;
+   }
+   fill_pathname_basedir(dir, mv->to, DIR_MAX_LENGTH);
+   mv->unpruned = !save_backups_retain_made(dir, mv->path,
+         SAVE_BACKUPS_CORE_CLOUD_SYNC,
+         mv->fetching ? SAVE_BACKUP_REPLACED : SAVE_BACKUP_DELETED, mv->to);
+   free(dir);
+}
+
+static void task_cloud_sync_move_free(tcs_move_t *mv)
+{
+   string_list_free(mv->due);
+   free(mv);
+}
+
 static void task_cloud_sync_move_worker(void *data)
 {
    tcs_move_t *mv = (tcs_move_t*)data;
-   mv->ok         = save_backups_copy_synced(mv->path, mv->to);
+   task_cloud_sync_move_copy(mv);
    if (retro_atomic_exchange_int(&mv->state, TCS_MOVE_DONE)
          == TCS_MOVE_ABANDONED)
    {
+      /* its sync is gone: nobody else can say so */
+      if (mv->unpruned)
+         RARCH_WARN(CSPFX "Could not delete old backups of \"%s\".\n",
+               mv->path);
       /* nobody deletes the original now */
       if (mv->ok)
          filestream_delete(mv->to);
-      free(mv);
+      task_cloud_sync_move_free(mv);
    }
 }
 
@@ -2380,7 +2447,7 @@ static void task_cloud_sync_move_start(tcs_move_t *mv)
       sthread_detach(thread);
       return;
    }
-   mv->ok = save_backups_copy_synced(mv->path, mv->to);
+   task_cloud_sync_move_copy(mv);
    retro_atomic_store_release_int(&mv->state, TCS_MOVE_DONE);
 }
 
@@ -2462,6 +2529,30 @@ static bool task_cloud_sync_move_push(task_cloud_sync_state_t *sync_state,
    return true;
 }
 
+/* Queues the delete of @due, old copies of @path. Not in `waiting`: a
+ * sync never waits for it, and one released first drops it, as the
+ * next copy's retention deletes them too. */
+static void task_cloud_sync_prune_push(task_cloud_sync_state_t *sync_state,
+      const char *path, struct string_list *due)
+{
+   tcs_move_t **tail;
+   size_t path_len = strlen(path) + 1;
+   tcs_move_t *mv  = (tcs_move_t*)calloc(1, sizeof(*mv) + path_len);
+   if (!mv)
+   {
+      string_list_free(due);
+      task_cloud_sync_unpruned(sync_state, path);
+      return;
+   }
+   mv->path = (char*)(mv + 1);
+   memcpy(mv->path, path, path_len);
+   mv->due  = due;
+   retro_atomic_int_init(&mv->state, TCS_MOVE_QUEUED);
+   for (tail = &sync_state->moves; *tail; tail = &(*tail)->next);
+   *tail = mv;
+   task_cloud_sync_moves_start(sync_state);
+}
+
 /* The file may have been written after the copy read it: by content
  * loaded or closed meanwhile, by a save or state write of the frontend
  * (one still in flight may land yet), or by the core itself, which only
@@ -2489,6 +2580,13 @@ static void task_cloud_sync_move_finish(task_cloud_sync_state_t *sync_state,
    task_cloud_sync_fetch_state_t *fetch_state = mv->fetch_state;
    const char *server_hash = CS_FILE_HASH(mv->server_file);
 
+   if (mv->unpruned)
+      task_cloud_sync_unpruned(sync_state, mv->path);
+   if (mv->due)
+   {
+      task_cloud_sync_move_free(mv);
+      return;
+   }
    if (task_cloud_sync_move_touched(mv))
    {
       RARCH_LOG(CSPFX "Deferring \"%s\", it may have been written during its backup.\n",
@@ -2564,14 +2662,17 @@ static void task_cloud_sync_moves_abandon(task_cloud_sync_state_t *sync_state)
          case TCS_MOVE_RUNNING:
             break;
          case TCS_MOVE_DONE:
+            if (mv->unpruned)
+               task_cloud_sync_unpruned(sync_state, mv->path);
             if (mv->ok)
                filestream_delete(mv->to);
-            free(mv);
+            task_cloud_sync_move_free(mv);
             break;
          default:
             /* never started: its temporary only held the name */
-            filestream_finish_atomic(mv->to, false);
-            free(mv);
+            if (mv->to)
+               filestream_finish_atomic(mv->to, false);
+            task_cloud_sync_move_free(mv);
             break;
       }
    }

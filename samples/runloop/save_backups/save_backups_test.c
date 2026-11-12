@@ -711,7 +711,7 @@ static void backup_retention_not_loaded(void)
       snprintf(text, sizeof(text), "a%u", k);
       put(ROOT "/notloaded/Game.state.auto", text);
       CHECK(save_backups_move_to(dir, ROOT "/notloaded/Game.state.auto",
-            NULL, SAVE_BACKUP_NOT_LOADED) == SAVE_BACKUP_MADE);
+            NULL, SAVE_BACKUP_NOT_LOADED, NULL) == SAVE_BACKUP_MADE);
       snprintf(text, sizeof(text), "s%u", k);
       CHECK(save_backups_copy_to(dir, ROOT "/notloaded/Game.srm", NULL,
             SAVE_BACKUP_NOT_LOADED, text, strlen(text), false)

@@ -893,6 +893,100 @@ def sync_backups_beside_saves(srv, a, b):
 
 
 @lane(2)
+def copies_tagged_before_content(srv, a, b):
+    """A sync before any content load, at start-up or from the command
+    line, names its copies with the tag save_folders.json holds."""
+    first_sync(a, b)
+    put(b.p("config", "save_folders.json"), b'[\n  {"device": "qrst"}\n]\n')
+    put(a.save(), sram(0xA2))
+    cli_ok(a)
+    synced(b)
+    put(a.save(), sram(0xA3))
+    cli_ok(a)
+    cli_ok(b)
+    for data in (sram(0xA1), sram(0xA2)):
+        kept = kept_copy(b, data, b.save())
+        check(kept and re.search(r" - \d{4,9}-qrst - cloud-sync - replaced"
+                                 r"\.srm$", kept),
+              "the replaced save was kept as %s"
+              % (kept and os.path.basename(kept)))
+
+
+def copies_kept_to_ten(srv, a, b, destructive):
+    """B's backups hold ten numbered copies of each kind, another
+    device's, and older names: fetches and deletes each keep ten, the
+    newest B's own; the older names stay."""
+    a.write_config(cloud_sync_destructive=destructive)
+    b.write_config(cloud_sync_destructive=destructive)
+    first_sync(a, b)
+    folder = b.p("saves", "backups", "cloud-sync", "saves", CORE_DIR)
+    older = [os.path.join(folder, GAME + ".srm-260101-120000"),
+             b.p("assets", "cloud_backups", "saves", CORE_DIR,
+                 GAME + ".srm-260101-120000")]
+    for word in ("replaced", "deleted"):
+        for i in range(1, 11):
+            put(os.path.join(folder, "%s - 2026-01-01 00-00-%02d - %04d-wxyz"
+                             " - cloud-sync - %s.srm" % (GAME, i, i, word)),
+                b"copy")
+        older += [os.path.join(folder, "%s - 2026-01-01 12-00-00%s"
+                               " - cloud-sync - %s.srm" % (GAME, n, word))
+                  for n in ("", "-2")]
+    for p in older:
+        put(p, b"older")
+
+    def numbered(word, data):
+        seqs, newest = [], False
+        for f in os.listdir(folder):
+            m = re.match(re.escape(GAME) + r" - \d{4}-\d\d-\d\d \d\d-\d\d-\d\d"
+                         r" - (\d{4,9})-[a-z]{4} - cloud-sync - %s\.srm$" % word, f)
+            if m:
+                seqs.append(int(m.group(1)))
+                newest = newest or get(os.path.join(folder, f)) == data
+        return len(seqs), min(seqs or [0]), newest
+
+    # Three copies past ten. A prune the CLI's exit cuts short leaves
+    # one over, which the next copy's prune takes.
+    def kept(copies):
+        return 10 <= copies[0] <= 11 and copies[1] > 2 and copies[2]
+
+    for k in range(3):
+        put(a.save(), sram(0xA2 + k))
+        cli_ok(a)
+        cli_ok(b)
+        check(get(b.save()) == sram(0xA2 + k), "B did not fetch A's save")
+    replaced = numbered("replaced", sram(0xA3))
+    check(kept(replaced), "replaced copies (count, oldest, newest kept): %s"
+          % (replaced,))
+    for k in range(3):
+        if k:
+            put(a.save(), sram(0xB0 + k))
+            cli_ok(a)
+            cli_ok(b)
+        os.remove(a.save())
+        cli_ok(a)
+        cli_ok(b)
+        check(not os.path.exists(b.save()), "B kept the save A deleted")
+    deleted = numbered("deleted", sram(0xB2))
+    check(kept(deleted), "deleted copies (count, oldest, newest kept): %s"
+          % (deleted,))
+    check(numbered("replaced", sram(0xA3)) == replaced,
+          "the deletes changed the replaced copies")
+    gone = [os.path.relpath(p, b.dir) for p in older
+            if not os.path.isfile(p) or get(p) != b"older"]
+    check(not gone, "older copies touched: %s" % gone)
+
+
+@lane(2)
+def copies_kept_to_ten_each(srv, a, b):
+    copies_kept_to_ten(srv, a, b, "false")
+
+
+@lane(2)
+def destructive_copies_kept_to_ten_each(srv, a, b):
+    copies_kept_to_ten(srv, a, b, "true")
+
+
+@lane(2)
 def auto_state_not_replaced(srv, a, b):
     a.write_config(savestate_auto_save="true")
     put(a.save(), sram(0xA1))

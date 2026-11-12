@@ -2706,7 +2706,7 @@ static enum save_backup_result content_auto_state_move_into(char *dir,
     * state's rename replaces: no synced copy inside the frame. */
    enum save_backup_result result = save_backups_move_begin(dir, path,
          NULL, SAVE_BACKUP_NOT_LOADED, dir + PATH_MAX_LENGTH,
-         PATH_MAX_LENGTH);
+         PATH_MAX_LENGTH, NULL, NULL);
    if (result == SAVE_BACKUP_MADE)
    {
       if (len)
