@@ -13492,7 +13492,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_SORT_SAVEFILES_ENABLE,
-   "Sort save files into folders named after the core used."
+   "Sort save files into folders named after the core used. Changing it changes where saves are looked for; existing saves are not moved."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_SORT_SAVESTATES_ENABLE,
