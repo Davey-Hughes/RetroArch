@@ -356,8 +356,7 @@ static void vanished_next_sync(void)
 #endif
 }
 
-static void lane(bool threaded, bool deletion, bool owned, bool no_memory,
-      bool destructive)
+static void lane(bool threaded, bool deletion, bool owned, bool no_memory)
 {
    retro_task_t *task = task_init();
    task_cloud_sync_state_t *st = (task_cloud_sync_state_t*)calloc(1, sizeof(*st));
@@ -396,7 +395,6 @@ static void lane(bool threaded, bool deletion, bool owned, bool no_memory,
    st->current_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
    st->updated_server_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
    st->updated_local_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
-   st->destructive = destructive;
    st->dirlist = string_list_new();
    attr.i = 0;
    string_list_append(st->dirlist, "saves", attr);
@@ -560,7 +558,7 @@ static void lane(bool threaded, bool deletion, bool owned, bool no_memory,
    CHECK(!path_is_valid(fetching_path));
    snprintf(backup_dir, sizeof(backup_dir), "%s/backups/cloud-sync/saves", directory);
    backups = dir_list_new(backup_dir, NULL, false, false, true, true);
-   if (!destructive && (!expect_old || vanish))
+   if (!expect_old || vanish)
    {
       CHECK(backups && backups->size == (hold_mode == 5 ? 2u : 1u));
       if (backups && backups->size)
@@ -1327,16 +1325,11 @@ int main(void)
    pathname_conform_slashes_to_os(z_path);
    for (t = 0; t < 2; t++)
    {
-      lane(t != 0, false, false, false, true);
-      lane(t != 0, false, true, false, true);
-      lane(t != 0, false, false, true, true);
-      lane(t != 0, true, true, false, true);
-      lane(t != 0, true, false, false, true);
-      lane(t != 0, false, false, false, false);
-      lane(t != 0, false, true, false, false);
-      lane(t != 0, false, false, true, false);
-      lane(t != 0, true, true, false, false);
-      lane(t != 0, true, false, false, false);
+      lane(t != 0, false, false, false);
+      lane(t != 0, false, true, false);
+      lane(t != 0, false, false, true);
+      lane(t != 0, true, true, false);
+      lane(t != 0, true, false, false);
    }
    /* across drives the move is a copy, then the delete */
    for (m = 1; m <= 4; m++)
@@ -1344,8 +1337,8 @@ int main(void)
       retro_atomic_store_relaxed_int(&refuse_move, m);
       for (t = 0; t < 2; t++)
       {
-         lane(t != 0, false, false, false, false);
-         lane(t != 0, true, false, false, false);
+         lane(t != 0, false, false, false);
+         lane(t != 0, true, false, false);
       }
    }
    retro_atomic_store_relaxed_int(&refuse_move, 0);
@@ -1355,8 +1348,8 @@ int main(void)
    vanish = true;
    for (t = 0; t < 2; t++)
    {
-      lane(t != 0, false, false, false, false);
-      lane(t != 0, true, false, false, false);
+      lane(t != 0, false, false, false);
+      lane(t != 0, true, false, false);
    }
    vanish = false;
    retro_atomic_store_relaxed_int(&refuse_move, 0);
@@ -1372,8 +1365,8 @@ int main(void)
          for (t = 0; t < 2; t++)
          {
             if (hold_mode != 5)
-               lane(t != 0, false, false, false, false);
-            lane(t != 0, true, false, false, false);
+               lane(t != 0, false, false, false);
+            lane(t != 0, true, false, false);
          }
       hold_mode = 0;
       state_writing = false;

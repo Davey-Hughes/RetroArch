@@ -559,6 +559,8 @@ def destructive_mode(srv, a, b):
           "a destructive upload kept a server copy")
     cli_ok(b)
     check(get(b.save()) == sram(0xA2), "B did not fetch A's save")
+    check(kept_copy(b, sram(0xA1), b.save()),
+          "B kept no copy of the save the sync replaced")
     os.remove(a.save())
     srv.state.clear_log()
     cli_ok(a)
@@ -566,6 +568,8 @@ def destructive_mode(srv, a, b):
     check(not srv.has(SRM) and not srv.backups(SRM), "the server kept the save")
     cli_ok(b)
     check(not os.path.exists(b.save()), "B kept the save A deleted")
+    check(kept_copy(b, sram(0xA2), b.save()),
+          "B kept no copy of the save the sync deleted")
 
 
 @lane(1)

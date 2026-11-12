@@ -1329,9 +1329,9 @@ static bool webdav_update(const char *path, RFILE *rfile,
    /* With destructive sync off, a delete keeps the server's copy in
     * deleted/, and so does an upload that replaces it: otherwise the
     * setting protected against the server's copy being removed but not
-    * against it being overwritten.  The local side does the same with
-    * cloud_backups/ before a fetch replaces a local file.  The server
-    * manifest is rewritten every sync and is not backed up. */
+    * against it being overwritten.  The local side always backs up a
+    * file a fetch replaces.  The server manifest is rewritten every
+    * sync and is not backed up. */
    if (   !settings->bools.cloud_sync_destructive
        && !string_is_equal(path, CLOUD_SYNC_SERVER_MANIFEST))
    {

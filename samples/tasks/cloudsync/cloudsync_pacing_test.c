@@ -358,7 +358,6 @@ static void fetch_lane(void)
    st->current_manifest        = (file_list_t*)calloc(1, sizeof(file_list_t));
    st->updated_server_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
    st->updated_local_manifest  = (file_list_t*)calloc(1, sizeof(file_list_t));
-   st->destructive             = true;
    strlcpy(st->dir_core_assets, dir, sizeof(st->dir_core_assets));
    retro_atomic_int_init(&st->waiting, 0);
    retro_atomic_int_init(&st->phase, (int)CLOUD_SYNC_PHASE_DIFF);
@@ -443,7 +442,6 @@ static void server_old_lane(void)
    st->current_manifest        = (file_list_t*)calloc(1, sizeof(file_list_t));
    st->updated_server_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
    st->updated_local_manifest  = (file_list_t*)calloc(1, sizeof(file_list_t));
-   st->destructive             = true;
    strlcpy(st->dir_core_assets, dir, sizeof(st->dir_core_assets));
    retro_atomic_int_init(&st->waiting, 0);
    retro_atomic_int_init(&st->phase, (int)CLOUD_SYNC_PHASE_DIFF);
@@ -489,7 +487,6 @@ static void fetch_keep_lane(int live, const char *what_keep, const char *what_re
    st->current_manifest        = (file_list_t*)calloc(1, sizeof(file_list_t));
    st->updated_server_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
    st->updated_local_manifest  = (file_list_t*)calloc(1, sizeof(file_list_t));
-   st->destructive             = true;
    strlcpy(st->dir_core_assets, dir, sizeof(st->dir_core_assets));
    retro_atomic_int_init(&st->waiting, 0);
    retro_atomic_int_init(&st->phase, (int)CLOUD_SYNC_PHASE_DIFF);

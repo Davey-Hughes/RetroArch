@@ -172,7 +172,6 @@ typedef struct
    /* Captured on the main thread when the task is pushed: the handler
     * runs on the threaded task queue's worker, and a worker takes what
     * it needs as arguments rather than reading the settings mid-sync. */
-   bool destructive;
    char dir_core_assets[DIR_MAX_LENGTH];
    /* task_cloud_sync_server_id() */
    char server_id[33];
@@ -2012,9 +2011,9 @@ static bool task_cloud_sync_backup_root(task_cloud_sync_state_t *sync_state,
 
 /* don't pass a server/local item_file to this, only current has ->path set */
 /* Anything but MADE leaves the caller holding a file it must not
- * replace or remove: non-destructive mode promises a local copy of
- * anything it displaces, and without the backup there is nothing to
- * fall back on. With a move worker, COPY_OWED: the file is still in
+ * replace or remove: a sync promises a local copy of anything it
+ * displaces, and without the backup there is nothing to fall back
+ * on. With a move worker, COPY_OWED: the file is still in
  * place and its copy is owed at *@owed (the caller frees it). */
 static enum save_backup_result task_cloud_sync_backup_file(
       task_cloud_sync_state_t *sync_state, struct item_file *file,
@@ -2261,7 +2260,7 @@ static enum tcs_commit task_cloud_sync_fetch_commit(
          return TCS_COMMIT_LEFT;
       }
    }
-   if (!sync_state->destructive && path_is_valid(fetch_state->local))
+   if (path_is_valid(fetch_state->local))
    {
       struct item_file local_file = {0};
       enum save_backup_result made;
@@ -3061,10 +3060,10 @@ static void task_cloud_sync_upload_current_file(task_cloud_sync_state_t *sync_st
  * records it once done. */
 static bool task_cloud_sync_delete_current_file(task_cloud_sync_state_t *sync_state)
 {
-   bool removed;
+   enum save_backup_result made;
+   char *owed                    = NULL;
    struct item_file *item        = &sync_state->current_manifest->list[sync_state->current_idx];
    struct item_file *server_file = &sync_state->server_manifest->list[sync_state->server_idx];
-   bool cloud_sync_destructive   = sync_state->destructive;
 
    if (task_cloud_sync_defer_live_savefile(sync_state, CS_FILE_KEY(item),
             item->path, CS_FILE_HASH(server_file)))
@@ -3072,28 +3071,21 @@ static bool task_cloud_sync_delete_current_file(task_cloud_sync_state_t *sync_st
 
    RARCH_WARN(CSPFX "Server has deleted \"%s\", so shall we.\n", CS_FILE_KEY(item));
 
-   if (cloud_sync_destructive)
-      removed = filestream_delete(item->path) == 0;
-   else
-   {
-      char *owed = NULL;
-      enum save_backup_result made = task_cloud_sync_backup_file(
-            sync_state, item, SAVE_BACKUP_DELETED, &owed);
+   made = task_cloud_sync_backup_file(sync_state, item, SAVE_BACKUP_DELETED,
+         &owed);
 #if defined(TCS_MOVE_WORKER)
-      if (made == SAVE_BACKUP_COPY_OWED)
-      {
-         bool queued = task_cloud_sync_move_push(sync_state, NULL,
-               server_file, CS_FILE_KEY(server_file), item->path, owed,
-               NULL, NULL);
-         free(owed);
-         if (queued)
-            return false;
-      }
-#endif
-      removed = made == SAVE_BACKUP_MADE;
+   if (made == SAVE_BACKUP_COPY_OWED)
+   {
+      bool queued = task_cloud_sync_move_push(sync_state, NULL,
+            server_file, CS_FILE_KEY(server_file), item->path, owed,
+            NULL, NULL);
+      free(owed);
+      if (queued)
+         return false;
    }
+#endif
 
-   if (!removed)
+   if (made != SAVE_BACKUP_MADE)
    {
       RARCH_ERR(CSPFX "Keeping \"%s\", the local file could not be removed.\n",
             CS_FILE_KEY(item));
@@ -4227,7 +4219,6 @@ static bool task_push_cloud_sync_with_mode(int conflict_resolution,
    /* Keep this sync's settings across subsequent frames. */
    {
       settings_t *settings    = config_get_ptr();
-      sync_state->destructive = settings->bools.cloud_sync_destructive;
       strlcpy(sync_state->dir_core_assets,
             settings->paths.directory_core_assets,
             sizeof(sync_state->dir_core_assets));
