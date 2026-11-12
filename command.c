@@ -2442,6 +2442,12 @@ bool command_save_savefiles(command_t *cmd, const char* arg)
 
 bool command_load_savefiles(command_t *cmd, const char* arg)
 {
+   if (command_state_held())
+   {
+      command_reply_error(cmd, "LOAD_FILES", "%s",
+            msg_hash_to_str(MSG_CLOUD_SYNC_WAITING));
+      return false;
+   }
    if (!command_event(CMD_EVENT_LOAD_FILES, NULL))
    {
       command_reply_error(cmd, "LOAD_FILES",

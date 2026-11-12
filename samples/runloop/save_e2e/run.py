@@ -1367,10 +1367,10 @@ def lane_unload_bypass_after_held(args, n):
 def lane_close_while_held(args, n):
     """A close or quit while the content's saves are held (a cloud sync
     still running at the load) waits for nothing and writes no .auto;
-    a network SAVE_FILES before it says the saves wait. The sync's
-    server takes the connection and never answers. The command line's
-    launch waits for the sync on the dummy core, so the game is loaded
-    by command, as from the menu."""
+    a network SAVE_FILES or LOAD_FILES before it says the saves wait.
+    The sync's server takes the connection and never answers. The
+    command line's launch waits for the sync on the dummy core, so the
+    game is loaded by command, as from the menu."""
     failures = []
     server = socket.socket()
     server.bind(('127.0.0.1', 0))
@@ -1411,10 +1411,14 @@ def lane_close_while_held(args, n):
         check(failures, held, '%s: the saves were not held' % close)
         c = Commands(r, port)
         reply = c.ask(b'SAVE_FILES').strip()
+        load_reply = c.ask(b'LOAD_FILES').strip()
         c.sock.close()
         check(failures, reply == 'SAVE_FILES ERROR Waiting for cloud sync '
               'before loading saves...',
               '%s: SAVE_FILES reply %r' % (close, reply))
+        check(failures, load_reply == 'LOAD_FILES ERROR Waiting for cloud '
+              'sync before loading saves...',
+              '%s: LOAD_FILES reply %r' % (close, load_reply))
         time.sleep(0.5)
         sock.sendto(close, ('127.0.0.1', port))
         sock.close()
