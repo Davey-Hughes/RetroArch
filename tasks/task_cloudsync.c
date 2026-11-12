@@ -187,6 +187,8 @@ typedef struct
     * how many: the list falls short when out of memory. */
    struct string_list *held;
    unsigned held_count;
+   /* Folders whose missing files are held, as "saves/Snes9x/" */
+   struct string_list *held_dirs;
    /* files the server lost, not uploaded: unchanged here */
    unsigned unsent_count;
    /* Whoever pushed the sync, told when it is done. */
@@ -475,6 +477,10 @@ static void task_cloud_sync_fetch_server_manifest(task_cloud_sync_state_t *sync_
 #define CS_ROOT_HELD    2
 /* More missing files than this, and more than half of a root's */
 #define CS_HOLD_MIN     10
+/* A folder with this many synced files or more, all missing */
+#define CS_HOLD_DIR_MIN 3
+/* Folder levels a key is checked at */
+#define CS_HOLD_DEPTH   32
 
 static void task_cloud_sync_roots_filename(char *s, size_t len,
       const char *dir_core_assets)
@@ -1212,6 +1218,124 @@ static void task_cloud_sync_mark_held_roots(task_cloud_sync_state_t *sync_state)
    }
 }
 
+/* A folder open in task_cloud_sync_mark_held_dirs(): its key prefix
+ * (the first @len of @key) and its synced files. */
+struct tcs_hold_dir
+{
+   const char *key;
+   size_t      len;
+   unsigned total;
+   unsigned missing;
+};
+
+static void task_cloud_sync_hold_dir(task_cloud_sync_state_t *sync_state,
+      const struct tcs_hold_dir *d)
+{
+   union string_list_elem_attr attr;
+   int root;
+   attr.i = 0;
+   RARCH_WARN(CSPFX "All %u files under \"%.*s\" are missing here, not deleting them on the server.\n",
+         d->total, (int)d->len, d->key);
+   if (!sync_state->held_dirs)
+      sync_state->held_dirs = string_list_new();
+   if (     sync_state->held_dirs
+         && string_list_append_n(sync_state->held_dirs, d->key, d->len, attr))
+      return;
+   /* out of memory: hold its root instead */
+   if ((root = task_cloud_sync_key_root(sync_state->dirlist, d->key)) >= 0)
+      sync_state->dirlist->elems[root].attr.i |= CS_ROOT_HELD;
+}
+
+/* Every synced file of a root or folder missing here that the server
+ * still has, CS_HOLD_DIR_MIN or more of them: a folder more likely
+ * lost than emptied, so the diff deletes none of them on the server.
+ * The lists are in file_list_sort_on_alt() order, so a folder's keys
+ * are together. */
+static void task_cloud_sync_mark_held_dirs(task_cloud_sync_state_t *sync_state)
+{
+   struct tcs_hold_dir dirs[CS_HOLD_DEPTH];
+   file_list_t        *local   = sync_state->local_manifest;
+   file_list_t        *current = sync_state->current_manifest;
+   file_list_t        *server  = sync_state->server_manifest;
+   size_t              depth   = 0;
+   size_t              c       = 0;
+   size_t              s       = 0;
+   size_t              i;
+
+   if (!local || !server)
+      return;
+
+   for (i = 0; i <= local->size; i++)
+   {
+      const char *key   = i < local->size ? CS_FILE_KEY(&local->list[i]) : "";
+      const char *slash;
+      bool        missing;
+      int         cmp;
+      size_t      d;
+
+      /* the folders this key is not under are complete */
+      while (depth && strncasecmp(key, dirs[depth - 1].key,
+               dirs[depth - 1].len))
+      {
+         depth--;
+         if (     dirs[depth].total >= CS_HOLD_DIR_MIN
+               && dirs[depth].missing == dirs[depth].total)
+            task_cloud_sync_hold_dir(sync_state, &dirs[depth]);
+      }
+      if (     i == local->size
+            || string_is_empty(CS_FILE_HASH(&local->list[i]))
+            || task_cloud_sync_key_root(sync_state->dirlist, key) < 0)
+         continue;
+
+      cmp = 1;
+      while (c < current->size
+            && (cmp = strcasecmp(current->list[c].alt, key)) < 0)
+         c++;
+      missing = !(c < current->size && !cmp);
+      if (missing)
+      {
+         cmp = 1;
+         while (s < server->size
+               && (cmp = strcasecmp(server->list[s].alt, key)) < 0)
+            s++;
+         missing = s < server->size && !cmp
+               && !string_is_empty(CS_FILE_HASH(&server->list[s]));
+      }
+
+      for (slash = strchr(key + (depth ? dirs[depth - 1].len : 0), '/');
+            slash && depth < CS_HOLD_DEPTH; slash = strchr(slash + 1, '/'))
+      {
+         dirs[depth].key     = key;
+         dirs[depth].len     = (size_t)(slash + 1 - key);
+         dirs[depth].total   = 0;
+         dirs[depth].missing = 0;
+         depth++;
+      }
+      for (d = 0; d < depth; d++)
+      {
+         dirs[d].total++;
+         if (missing)
+            dirs[d].missing++;
+      }
+   }
+}
+
+/* Whether a file missing here under @root is held on the server */
+static bool task_cloud_sync_key_held(
+      const task_cloud_sync_state_t *sync_state, int root, const char *key)
+{
+   const struct string_list *dirs = sync_state->held_dirs;
+   size_t                    i;
+   if (root < 0)
+      return false;
+   if (sync_state->dirlist->elems[root].attr.i & CS_ROOT_HELD)
+      return true;
+   for (i = 0; dirs && i < dirs->size; i++)
+      if (!strncasecmp(key, dirs->elems[i].data, strlen(dirs->elems[i].data)))
+         return true;
+   return false;
+}
+
 /**
  * task_cloud_sync_build_current_manifest:
  * @sync_state       : pointer to the current sync state
@@ -1287,6 +1411,7 @@ static void task_cloud_sync_build_current_manifest(
    sync_state->server_out_of_scope =
       task_cloud_sync_count_out_of_scope(sync_state);
    task_cloud_sync_mark_held_roots(sync_state);
+   task_cloud_sync_mark_held_dirs(sync_state);
    task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_DIFF);
    RARCH_LOG(CSPFX "Created in-memory manifest of current disk state with %d files.\n", sync_state->current_manifest->size);
 }
@@ -3133,8 +3258,8 @@ static void task_cloud_sync_diff_next(task_cloud_sync_state_t *sync_state)
                            CS_FILE_KEY(server_file)))
                   task_cloud_sync_carry_manifests_forward(sync_state,
                         CS_FILE_KEY(server_file), CS_FILE_HASH(server_file));
-               else if (root >= 0 && (sync_state->dirlist->elems[root].attr.i
-                        & CS_ROOT_HELD))
+               else if (task_cloud_sync_key_held(sync_state, root,
+                        CS_FILE_KEY(server_file)))
                   task_cloud_sync_hold_delete(sync_state);
                else
                   task_cloud_sync_delete_server_file(sync_state);
@@ -3639,6 +3764,7 @@ static void task_cloud_sync_cleanup(retro_task_t *task)
       string_list_free(sync_state->dirlist);
    string_list_free(sync_state->roots);
    string_list_free(sync_state->held);
+   string_list_free(sync_state->held_dirs);
    task_cloud_sync_walk_free(sync_state);
    if (sync_state->hash_cur.file)
       filestream_close(sync_state->hash_cur.file);

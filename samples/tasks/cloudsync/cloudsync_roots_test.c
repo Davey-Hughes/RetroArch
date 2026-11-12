@@ -875,6 +875,41 @@ static void mass_lane(bool threaded, unsigned n, unsigned gone, bool held)
    }
 }
 
+/* Every synced file of a folder that had 3 or more is missing: held,
+ * as a lost folder more likely is than an emptied one. A folder of 2,
+ * or one only partly gone, deletes as before. */
+static void subfolder_gone(bool threaded)
+{
+   static const char *files[] = {
+      "Snes9x/a.srm", "Snes9x/b.srm", "Snes9x/sub/c.srm",
+      "mGBA/x.srm", "mGBA/y.srm",
+      "Gamb/p.srm", "Gamb/q.srm", "Gamb/r.srm",
+      "t1.srm", "t2.srm" };
+   char     root[256];
+   unsigned i;
+   lane_dirs("subfolder_gone", threaded, root, sizeof(root));
+   for (i = 0; i < 10; i++)
+      put(root, files[i], files[i]);
+   CHECK(sync_saves(threaded, root));
+   CHECK(uploads == 10);
+   for (i = 0; i < 6; i++)
+      drop(root, files[i]);
+   CHECK(sync_saves(threaded, root));
+   CHECK(deletes == 3);
+   CHECK(notices == 1);
+   CHECK(notice_count == 3);
+   CHECK(holds(srv, "saves/Snes9x/a.srm", "Snes9x/a.srm"));
+   CHECK(holds(srv, "saves/Snes9x/sub/c.srm", "Snes9x/sub/c.srm"));
+   CHECK(!path_is_valid(srv_key("saves/mGBA/x.srm")));
+   CHECK(!path_is_valid(srv_key("saves/Gamb/p.srm")));
+   CHECK(holds(srv, "saves/Gamb/q.srm", "Gamb/q.srm"));
+   /* not applied: the next sync fetches them back */
+   CHECK(sync_saves(threaded, root));
+   CHECK(deletes == 0);
+   CHECK(fetches == 3);
+   CHECK(holds(root, "Snes9x/sub/c.srm", "Snes9x/sub/c.srm"));
+}
+
 static bool sync_two(bool threaded, const char *saves, const char *states)
 {
    struct string_list *l = string_list_new();
@@ -2617,6 +2652,7 @@ static const struct lane lanes[] = {
    { "sync_main_folder_only",     main_folder_only },
    { "sync_mass_held",            mass_held },
    { "sync_held_no_memory",       held_no_memory },
+   { "sync_subfolder_gone_held",  subfolder_gone },
    { "sync_keep_local_deleted",   keep_local_deleted },
    { "sync_keep_local_other",     keep_local_other },
    { "sync_keep_local_held",      keep_local_held },
