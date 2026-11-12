@@ -730,6 +730,38 @@ static void roots_no_memory(bool threaded)
    CHECK(roots_name(root_a));
 }
 
+/* A roots file that can't be read, cut short or empty, says nothing
+ * of where the folders were: the moved save folder is a first sync of
+ * it, nothing deleted. */
+static void roots_unreadable(bool threaded)
+{
+   static const char *bad[] = { "{\n  \"saves\": \"", "" };
+   char     root_a[256], root_b[264], roots[PATH_MAX_LENGTH];
+   unsigned i;
+   for (i = 0; i < 2; i++)
+   {
+      lane_dirs(i ? "roots_empty" : "roots_unreadable", threaded, root_a,
+            sizeof(root_a));
+      snprintf(root_b, sizeof(root_b), "%s-b", root_a);
+      remove_tree(root_b);
+      CHECK(path_mkdir(root_b));
+      put(root_a, "a.srm", "1");
+      put(root_a, "b.srm", "2");
+      put(root_a, "c.srm", "3");
+      CHECK(sync_saves(threaded, root_a));
+      roots_path(roots, sizeof(roots));
+      filestream_delete(roots);
+      CHECK(filestream_write_file(roots, bad[i], strlen(bad[i])));
+      CHECK(sync_saves(threaded, root_b));
+      CHECK(deletes == 0);
+      CHECK(fetches == 3);
+      CHECK(holds(srv, "saves/a.srm", "1"));
+      CHECK(holds(root_b, "c.srm", "3"));
+      CHECK(roots_name(root_b));
+      remove_tree(root_b);
+   }
+}
+
 /* Sync walks the main config's save and state folders, not the ones
  * in use (an override's or the command line's): other folders in use
  * are no root change. */
@@ -2469,6 +2501,7 @@ static const struct lane lanes[] = {
    { "sync_no_roots_file",        no_roots_file },
    { "sync_unset_no_entry",       unset_no_entry },
    { "sync_roots_no_memory",      roots_no_memory },
+   { "sync_roots_unreadable_no_delete", roots_unreadable },
    { "sync_main_folder_only",     main_folder_only },
    { "sync_mass_held",            mass_held },
    { "sync_held_no_memory",       held_no_memory },

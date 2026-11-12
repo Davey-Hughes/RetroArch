@@ -481,9 +481,9 @@ static void task_cloud_sync_roots_filename(char *s, size_t len,
 }
 
 /* The roots file in @out, NULL when there is none or it can't be
- * read. False when out of memory. */
+ * read, and then @unreadable. False when out of memory. */
 static bool task_cloud_sync_read_roots(const char *dir_core_assets,
-      struct string_list **out)
+      struct string_list **out, bool *unreadable)
 {
    char                path[PATH_MAX_LENGTH];
    void               *buf   = NULL;
@@ -498,7 +498,7 @@ static bool task_cloud_sync_read_roots(const char *dir_core_assets,
    task_cloud_sync_roots_filename(path, sizeof(path), dir_core_assets);
    if (!path_is_valid(path))
       return true;
-   if (!filestream_read_file(path, &buf, &len))
+   if (!filestream_read_file(path, &buf, &len) || !len)
       goto error;
    if (     !(json  = rjson_open_buffer(buf, (size_t)len))
          || !(roots = string_list_new()))
@@ -544,7 +544,10 @@ oom:
    ok = false;
 error:
    if (ok)
-      RARCH_WARN(CSPFX "Ignoring unreadable \"%s\".\n", path);
+   {
+      RARCH_WARN(CSPFX "Could not read \"%s\": syncing every folder as a first sync.\n", path);
+      *unreadable = true;
+   }
    free(name);
    if (json)
       rjson_free(json);
@@ -579,12 +582,12 @@ static int task_cloud_sync_key_root(const struct string_list *dirlist,
    return -1;
 }
 
-/* A root walked from another folder than the last sync's leaves the
- * local manifest, so the diff runs first-sync rules for its keys:
- * fetch, upload or conflict, never a delete. False when out of
- * memory. */
+/* A root walked from another folder than the last sync's, or every
+ * root when @all, leaves the local manifest, so the diff runs
+ * first-sync rules for its keys: fetch, upload or conflict, never a
+ * delete. False when out of memory. */
 static bool task_cloud_sync_drop_changed_roots(
-      task_cloud_sync_state_t *sync_state)
+      task_cloud_sync_state_t *sync_state, bool all)
 {
    struct string_list *dirlist = sync_state->dirlist;
    file_list_t        *local   = sync_state->local_manifest;
@@ -596,7 +599,9 @@ static bool task_cloud_sync_drop_changed_roots(
    {
       int at = string_list_find_elem(sync_state->roots,
             dirlist->elems[i].data);
-      if (at && !task_cloud_sync_same_dir(
+      if (all)
+         dirlist->elems[i].attr.i |= CS_ROOT_CHANGED;
+      else if (at && !task_cloud_sync_same_dir(
                (const char*)sync_state->roots->elems[at - 1].userdata,
                (const char*)dirlist->elems[i].userdata))
       {
@@ -608,7 +613,7 @@ static bool task_cloud_sync_drop_changed_roots(
          changed = true;
       }
    }
-   if (!changed || !local)
+   if (!(changed || all) || !local)
       return true;
 
    if (!(kept = (file_list_t*)calloc(1, sizeof(*kept))))
@@ -729,6 +734,7 @@ static void task_cloud_sync_write_roots(task_cloud_sync_state_t *sync_state)
 static void task_cloud_sync_read_local_manifest(task_cloud_sync_state_t *sync_state)
 {
    char manifest_path[PATH_MAX_LENGTH];
+   bool unreadable = false;
 
    task_cloud_sync_manifest_filename(manifest_path, sizeof(manifest_path), false,
          sync_state->dir_core_assets);
@@ -767,10 +773,11 @@ static void task_cloud_sync_read_local_manifest(task_cloud_sync_state_t *sync_st
 
    /* A missing roots file, or a root it does not name, is unchanged */
    if (     !task_cloud_sync_read_roots(sync_state->dir_core_assets,
-               &sync_state->roots)
-         || (    sync_state->roots
+               &sync_state->roots, &unreadable)
+         || (    (sync_state->roots || unreadable)
              &&  sync_state->dirlist
-             && !task_cloud_sync_drop_changed_roots(sync_state)))
+             && !task_cloud_sync_drop_changed_roots(sync_state,
+                   unreadable)))
    {
       sync_state->failures = true;
       task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_END);
