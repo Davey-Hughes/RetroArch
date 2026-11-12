@@ -2786,16 +2786,26 @@ static void content_auto_state_failed(const char *path, const void *data,
          && save_backups_recover(rec, PATH_MAX_LENGTH, path, data, len,
                true))
    {
+      enum save_backups_place place = save_backups_place_of(rec);
       made = true;
       RARCH_WARN("[State] Unsaved progress: \"%s\".\n", rec);
+      /* No full path: just the folder's name */
+      if (!save_backups_place_dir(rec, PATH_MAX_LENGTH, path, place,
+               false))
+         strlcpy(rec, place == SAVE_BACKUPS_PLACE_COPIES
+               ? SAVE_BACKUPS_DIR : SAVE_BACKUPS_RECOVERY_DIR,
+               PATH_MAX_LENGTH);
    }
-   free(rec);
    if (auto_state_failure_shown && !made)
+   {
+      free(rec);
       return;
+   }
    auto_state_failure_shown = true;
    snprintf(msg, sizeof(msg), msg_hash_to_str(made
             ? MSG_SAVE_WRITE_RECOVERED : MSG_SAVE_WRITE_FAILED),
-         path_basename(path));
+         path_basename(path), made ? rec : "");
+   free(rec);
    runloop_msg_queue_push(msg, strlen(msg), 1, 180, true, NULL,
          MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
 }

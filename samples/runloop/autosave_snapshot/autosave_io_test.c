@@ -132,19 +132,35 @@ static unsigned logged(char level, const char *text)
    return n;
 }
 
-/* Each message is "msg<n> %s", so a notice tells which it was. */
+/* The notices that name the folder their file is in */
+static bool notice_names_dir(int msg)
+{
+   return msg == MSG_SAVE_WRITE_RECOVERED || msg == MSG_SAVE_RECOVERY_NEWER
+      || msg == MSG_SAVE_CHANGED_ELSEWHERE;
+}
+
+/* Each message is "msg<n> %s", so a notice tells which it was; one
+ * naming a folder is "msg<n> %s|%s". */
 const char *msg_hash_to_str(enum msg_hash_enums msg)
 {
    static char ring[8][32];
    static unsigned next;
    char *s = ring[next++ & 7];
-   snprintf(s, sizeof(ring[0]), "msg%d %%s", (int)msg);
+   snprintf(s, sizeof(ring[0]), notice_names_dir((int)msg)
+         ? "msg%d %%s|%%s" : "msg%d %%s", (int)msg);
    return s;
 }
 
 #define MAX_NOTICES 32
 static int notice_ids[MAX_NOTICES];
 static unsigned notice_num;
+/* Notices naming a folder without their file in it */
+static unsigned notice_dir_wrong;
+/* The last notice; with notice_dir_unchecked its folder isn't checked */
+static char notice_last[64];
+static bool notice_dir_unchecked;
+static unsigned copies(const char *dir, enum save_backup_reason reason,
+      char *newest, size_t len);
 
 void runloop_msg_queue_push(const char *msg, size_t len,
       unsigned prio, unsigned duration, bool flush, char *title,
@@ -159,6 +175,19 @@ void runloop_msg_queue_push(const char *msg, size_t len,
    (void)category;
    if (notice_num < MAX_NOTICES)
       notice_ids[notice_num++] = atoi(msg + 3);
+   strlcpy(notice_last, msg, sizeof(notice_last));
+   if (notice_names_dir(atoi(msg + 3)) && !notice_dir_unchecked)
+   {
+      const char *dir = strchr(msg, '|');
+      if (     !dir || !dir[1]
+            || !copies(dir + 1, atoi(msg + 3) == MSG_SAVE_CHANGED_ELSEWHERE
+               ? SAVE_BACKUP_CHANGED_ELSEWHERE : SAVE_BACKUP_UNSAVED,
+               NULL, 0))
+      {
+         fprintf(stderr, "notice names the wrong folder: %s\n", msg);
+         notice_dir_wrong++;
+      }
+   }
 }
 
 static unsigned notices(enum msg_hash_enums msg)
@@ -759,6 +788,141 @@ static void lane_changed_elsewhere_close(void)
    fat_mtime = false;
    use_test_vfs(false);
    path_deinit_savefile();
+   clean();
+}
+
+#if defined(_WIN32) && !defined(_XBOX)
+/* save_backups.c's MAX_PATH, in the full path */
+static long deep_save_want(const char *dir, size_t len)
+{
+   static char full[PATH_MAX_LENGTH];
+   strlcpy(full, dir, sizeof(full));
+   path_resolve_realpath(full, sizeof(full), false);
+   return (long)len + 259 - 29 - (long)strlen(full);
+}
+#endif
+
+/* A save so deep that no copy name fits beside it, while it and its
+ * temporaries do: its copies go to its folder in <config>/recovery. */
+static void deep_save(char *path, size_t len)
+{
+   static char dir[PATH_MAX_LENGTH];
+   long want;
+   size_t _len = strlcpy(dir, "nr", sizeof(dir));
+#if defined(_WIN32) && !defined(_XBOX)
+   path_mkdir(dir);
+   want = deep_save_want(dir, _len);
+#else
+   want = PATH_MAX_LENGTH - 60;
+#endif
+   while ((long)_len + 2 < want)
+   {
+      size_t k = (size_t)(want - (long)_len - 1);
+      if (k > 200)
+         k = 200;
+      dir[_len++] = '/';
+      memset(dir + _len, 'd', k);
+      _len += k;
+   }
+   dir[_len] = '\0';
+   path_mkdir(dir);
+   fill_pathname_join(path, dir, SAVE, len);
+}
+
+static void deep_save_remove(const char *path)
+{
+   static char dir[PATH_MAX_LENGTH];
+   char *slash;
+   remove(path);
+   save_backups_place_dir(dir, sizeof(dir), path,
+         SAVE_BACKUPS_PLACE_CONFIG, true);
+   clear_dir(dir);
+   path_rmdir(dir);
+   save_backups_dir(dir, sizeof(dir), path);
+   clear_dir(dir);
+   path_rmdir(dir);
+   strlcpy(dir, path, sizeof(dir));
+   while ((slash = find_last_slash(dir)))
+   {
+      *slash = '\0';
+      path_rmdir(dir);
+   }
+}
+
+/* Whether an outside change to deep_save()'s @path left one copy in
+ * its folder in <config>/recovery, none beside it, and one notice
+ * naming that folder. */
+static bool no_room_copy_told(const char *path, const void *other,
+      unsigned wrong)
+{
+   static char dir[PATH_MAX_LENGTH], newest[PATH_MAX_LENGTH];
+   bool ok;
+   save_backups_place_dir(dir, sizeof(dir), path,
+         SAVE_BACKUPS_PLACE_CONFIG, true);
+   ok = copies(dir, SAVE_BACKUP_CHANGED_ELSEWHERE, newest,
+         sizeof(newest)) == 1 && holds(newest, other, BIG);
+   save_backups_dir(dir, sizeof(dir), path);
+   return ok && !copies(dir, SAVE_BACKUP_REASON_LAST, NULL, 0)
+         && notices(MSG_SAVE_CHANGED_ELSEWHERE) == 1 && notice_num == 1
+         && notice_dir_wrong == wrong;
+}
+
+/* Another program's write, with no worker and no copy name fitting
+ * beside the save: the close write's notice names the folder its copy
+ * went to. */
+static void lane_changed_elsewhere_no_room_close(void)
+{
+   static unsigned char disk[BIG], ram[BIG], other[BIG];
+   static char path[PATH_MAX_LENGTH];
+   int64_t mtime = 0;
+   unsigned wrong = notice_dir_wrong;
+
+   clean();
+   deep_save(path, sizeof(path));
+   fill(disk, BIG, 71);
+   put(path, disk, BIG);
+   CHECK(path_get_mtime(path, &mtime) && path_set_mtime(path, mtime - 60),
+         "no_room_close: cannot age the save");
+   memset(ram, 0, BIG);
+   core_data = ram;
+   core_size = BIG;
+   use_test_vfs(true);
+   fat_mtime = true;
+   path_init_savefile_new();
+   path_init_savefile_rtc(path);
+   CHECK(event_load_save_files(false), "no_room_close: no load");
+
+   fill(other, BIG, 72);
+   put_elsewhere(path, other, BIG, 4);
+   fill(ram, BIG, 73);
+   event_save_files(true, false, true, true, NULL);
+   CHECK(holds(path, ram, BIG), "no_room_close: not written after the copy");
+   CHECK(no_room_copy_told(path, other, wrong),
+         "no_room_close: the copy or its notice not in its recovery folder");
+   fat_mtime = false;
+   use_test_vfs(false);
+   path_deinit_savefile();
+   deep_save_remove(path);
+   clean();
+}
+
+/* A notice whose folder's full name can't be built names the folder
+ * alone: no config folder, or no path. */
+static void lane_place_notice_no_name(void)
+{
+   clean();
+   notice_dir_unchecked = true;
+   save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, "as_core");
+   save_file_place_notice(MSG_SAVE_CHANGED_ELSEWHERE, SAVE,
+         SAVE_BACKUPS_PLACE_CONFIG, true, false);
+   CHECK(string_ends_with(notice_last, "|" SAVE_BACKUPS_RECOVERY_DIR),
+         "place_notice_no_name: recovery folder not named");
+   save_file_place_notice(MSG_SAVE_CHANGED_ELSEWHERE, "",
+         SAVE_BACKUPS_PLACE_COPIES, true, false);
+   CHECK(string_ends_with(notice_last, "|" SAVE_BACKUPS_DIR),
+         "place_notice_no_name: backups folder not named");
+   CHECK(notice_num == 2, "place_notice_no_name: not two notices");
+   notice_dir_unchecked = false;
    clean();
 }
 
@@ -1826,6 +1990,45 @@ static void lane_changed_elsewhere_worker(void)
    clean();
 }
 
+/* lane_changed_elsewhere_no_room_close() with a worker: its notice
+ * names that folder too. */
+static void lane_changed_elsewhere_no_room_worker(void)
+{
+   static unsigned char disk[BIG], ram[BIG], other[BIG];
+   static char path[PATH_MAX_LENGTH];
+   int64_t mtime = 0;
+   unsigned wrong = notice_dir_wrong;
+
+   clean();
+   deep_save(path, sizeof(path));
+   fill(disk, BIG, 74);
+   put(path, disk, BIG);
+   CHECK(path_get_mtime(path, &mtime) && path_set_mtime(path, mtime - 60),
+         "no_room_worker: cannot age the save");
+   memset(ram, 0, BIG);
+   use_test_vfs(true);
+   fat_mtime = true;
+   path_init_savefile_new();
+   path_init_savefile_rtc(path);
+   CHECK(event_load_save_files(false), "no_room_worker: no load");
+   start_at(path, ram, BIG, false);
+
+   fill(other, BIG, 75);
+   put_elsewhere(path, other, BIG, 4);
+   ram[0] = 9;
+   capture_and_wait();
+   capture_and_wait();
+   CHECK(holds(path, ram, BIG), "no_room_worker: not written after the copy");
+   CHECK(no_room_copy_told(path, other, wrong),
+         "no_room_worker: the copy or its notice not in its recovery folder");
+   stop();
+   fat_mtime = false;
+   use_test_vfs(false);
+   path_deinit_savefile();
+   deep_save_remove(path);
+   clean();
+}
+
 /* A flush and a filled snapshot pending together, whichever came
  * first: the flush is written and the snapshot, which the next check
  * makes again, is not. */
@@ -2500,6 +2703,7 @@ static void lane_flush_fails_at_quit(void)
 static void lane_flush_reap_no_log(void)
 {
    static unsigned char disk[BIG], ram[BIG], big[BIG + 64];
+   static char rec[PATH_MAX_LENGTH];
    unsigned i;
    autosave_t *held;
 
@@ -2517,6 +2721,8 @@ static void lane_flush_reap_no_log(void)
       retro_sleep(1);
    CHECK(retro_atomic_load_acquire_int(&held->exited),
          "reap: the retired worker did not end");
+   CHECK(save_backups_recover(rec, sizeof(rec), SAVE, big, BIG, false),
+         "reap: no recovery file made");
    retro_atomic_fetch_or_int(&held->file->flags, SAVE_FILE_FLUSH_RECOVERED);
    autosave_reap(slots[0]);
    CHECK(!slots[0]->prev, "reap: not joined");
@@ -4957,6 +5163,13 @@ static void lane_backup_logged(void)
 
 int main(void)
 {
+#if defined(_WIN32) && !defined(_XBOX)
+   if (deep_save_want("nr", 2) <= 2 + 2)
+   {
+      puts("FAIL autosave_io_test: run folder too long");
+      return 1;
+   }
+#endif
 #ifdef HAVE_THREADS
    if (!(vfs_lock = slock_new()) || !(log_lock = slock_new()))
       return 2;
@@ -4989,6 +5202,8 @@ int main(void)
    lane_flush_write_fails_sync();
    lane_flush_same_image_sync();
    lane_changed_elsewhere_close();
+   lane_changed_elsewhere_no_room_close();
+   lane_place_notice_no_name();
    lane_changed_elsewhere_copy_fails();
    lane_flush_points_sync();
    lane_flush_points_sync_noworker();
@@ -4998,6 +5213,7 @@ int main(void)
    retro_atomic_int_init(&wait_leaves, 0);
    lane_state_load_copy_worker();
    lane_changed_elsewhere_worker();
+   lane_changed_elsewhere_no_room_worker();
    lane_flush_with_snapshot();
    lane_flush_queue();
    lane_flush_retire_guard();
@@ -5042,6 +5258,7 @@ int main(void)
    slock_free(vfs_lock);
    slock_free(log_lock);
 #endif
+   CHECK(!notice_dir_wrong, "a notice names a folder its file is not in");
    if (failures)
    {
       printf("autosave io: %d failure(s)\n", failures);

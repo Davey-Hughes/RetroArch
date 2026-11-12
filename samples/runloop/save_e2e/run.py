@@ -550,8 +550,9 @@ def lane_changed_elsewhere(args, n):
                    if p not in copies) if backups.is_dir() else []
     check(failures, not extra, 'other copies or recovery files %s' % extra)
     check(failures, r.srm.read_bytes() == pattern(74), '.srm not written')
-    check(failures, log.count('changed outside RetroArch') == (0 if worker
-                                                                else 1),
+    told = 'changed outside RetroArch; that version is in %s.' % (
+        copies[0].parent if copies else backups)
+    check(failures, log.count(told) == (0 if worker else 1),
           'changed-elsewhere log lines')
     check(failures, 'changed outside RetroArch' not in
           other.log.read_text(errors='replace'), 'the other told')
@@ -569,7 +570,7 @@ def lane_recovery_announced(args, n):
     old = time.time() - 120
     os.utime(r.srm, (old, old))
     cfg = r.config()
-    notice = 'Unsaved progress for %s is in Save Backups.' % r.srm
+    notice = 'Unsaved progress for %s is in %s.' % (r.srm, rec.parent)
     failures = []
     for i, seed in enumerate((73, 74)):
         env = r.env(SAVE_E2E_TOUCH_FRAME=30, SAVE_E2E_SEED=seed,
@@ -602,7 +603,6 @@ def lane_recovery_announced_after_write(args, n):
     env = r.env(SAVE_E2E_SRAM=2048,
                 SAVE_E2E_TOUCHES='30:101,300:102,700:103',
                 SAVE_E2E_FRAME_MS=10)
-    notice = 'Unsaved progress for %s is in Save Backups.' % r.srm
     failures = []
     r.start(args, cfg, 1200, env)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -623,6 +623,8 @@ def lane_recovery_announced_after_write(args, n):
         time.sleep(0.02)
     check(failures, not Path('%s-103' % mark).exists(),
           'touch 103 came before the recovery file')
+    notice = 'Unsaved progress for %s is in %s.' % (
+        r.srm, recs[0].parent if recs else '(no recovery file)')
     blocker.unlink()
     rc = r.wait(60)
     check(failures, rc == 0, 'run 0: retroarch exit %s' % rc)
@@ -723,7 +725,7 @@ def lane_windows_locked_close(args, n):
               key=lambda t: t.count("Couldn't save"))
     recs = r.copies('unsaved')
     notices = [l for l in log.splitlines() if "Couldn't save" in l
-               and 'your progress is in Save Backups' in l]
+               and 'your progress is in %s.' % (r.saves / 'backups') in l]
     failures = []
     check(failures, (r.dir / 'touched').exists(), 'core never touched save RAM')
     check(failures, rc == 0, 'retroarch exit %s' % rc)
@@ -986,8 +988,8 @@ def lane_folder_off_recovers(args, n):
     check(failures, not gone.exists(), 'run 1: made %s' % gone)
 
     (gone / 'saves').mkdir(parents=True)
-    notice = 'Unsaved progress for %s is in Save Backups.' % (
-        gone / 'saves' / 'game.srm')
+    notice = 'Unsaved progress for %s is in %s.' % (
+        gone / 'saves' / 'game.srm', rec_dir)
     for i in (2, 3):
         r.start(args, cfg, 60, r.env())
         rc = r.wait(60)

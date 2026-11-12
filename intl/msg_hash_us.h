@@ -33127,7 +33127,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MSG_SAVE_WRITE_RECOVERED,
-   "Couldn't save %s; your progress is in Save Backups."
+   "Couldn't save %s; your progress is in %s."
    )
 MSG_HASH(
    MSG_SAVE_WRITE_FAILED,
@@ -33135,11 +33135,11 @@ MSG_HASH(
    )
 MSG_HASH(
    MSG_SAVE_RECOVERY_NEWER,
-   "Unsaved progress for %s is in Save Backups."
+   "Unsaved progress for %s is in %s."
    )
 MSG_HASH(
    MSG_SAVE_CHANGED_ELSEWHERE,
-   "%s changed outside RetroArch; that version is in Save Backups."
+   "%s changed outside RetroArch; that version is in %s."
    )
 MSG_HASH(
    MSG_NETPLAY_SAVES_OFF,

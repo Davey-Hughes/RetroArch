@@ -98,6 +98,6 @@ clean:
 	      $(DEFAULT_TARGET) $(DEFAULT_TARGET).exe \
 	      $(DEFAULT_NOTHREADS_TARGET) $(DEFAULT_NOTHREADS_TARGET).exe
 	rm -f game.srm game.srm.tmp game.srm.auto.tmp
-	rm -rf backups blk cfg
+	rm -rf backups blk cfg nr
 
 .PHONY: all check clean

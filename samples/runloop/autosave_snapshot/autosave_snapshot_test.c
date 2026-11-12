@@ -146,14 +146,33 @@ bool path_get_mtime(const char *path, int64_t *mtime)
 }
 
 /* No copy is ever owed here: the handles have no session state. */
-enum save_backup_result save_backups_copy_file(const char *path,
-      enum save_backup_reason reason, bool sync, unsigned *seq)
+enum save_backup_result save_backups_copy_file_at(const char *path,
+      enum save_backup_reason reason, bool sync, unsigned *seq,
+      enum save_backups_place *place)
 {
    (void)path;
    (void)reason;
    (void)sync;
    (void)seq;
+   *place = SAVE_BACKUPS_PLACE_COPIES;
    return SAVE_BACKUP_FAILED;
+}
+
+enum save_backups_place save_backups_place_of(const char *file)
+{
+   (void)file;
+   return SAVE_BACKUPS_PLACE_COPIES;
+}
+
+size_t save_backups_place_dir(char *s, size_t len, const char *path,
+      enum save_backups_place place, bool own)
+{
+   (void)path;
+   (void)place;
+   (void)own;
+   if (len)
+      s[0] = '\0';
+   return 0;
 }
 
 /* No flush runs here. */

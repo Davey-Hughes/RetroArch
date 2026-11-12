@@ -1224,12 +1224,14 @@ static bool save_backups_recovery_at(char *s, size_t len, unsigned i,
  * recovery files do. */
 static enum save_backup_result save_backups_copy_any(const char *path,
       enum save_backup_reason reason, const void *data, size_t len,
-      bool sync, unsigned *seq)
+      bool sync, unsigned *seq, enum save_backups_place *place)
 {
    unsigned i;
    bool no_room                   = false;
    enum save_backup_result result = SAVE_BACKUP_FAILED;
    char *dir = (char*)malloc(PATH_MAX_LENGTH);
+   if (place)
+      *place = SAVE_BACKUPS_PLACE_COPIES;
    if (!dir)
       return SAVE_BACKUP_FAILED;
    if (save_backups_dir(dir, PATH_MAX_LENGTH, path))
@@ -1241,11 +1243,16 @@ static enum save_backup_result save_backups_copy_any(const char *path,
    for (i = SAVE_BACKUPS_ROOT_CONFIG; no_room
          && result == SAVE_BACKUP_FAILED && i <= SAVE_BACKUPS_ROOT_APP_DATA;
          i++)
+   {
       /* Not left behind empty */
       if (     save_backups_recovery_at(dir, PATH_MAX_LENGTH, i, path)
             && (result = save_backups_copy_seq(dir, path, NULL, reason,
                   data, len, sync, seq, NULL)) == SAVE_BACKUP_FAILED)
          path_rmdir(dir);
+      else if (result != SAVE_BACKUP_FAILED && place)
+         *place = i == SAVE_BACKUPS_ROOT_CONFIG
+               ? SAVE_BACKUPS_PLACE_CONFIG : SAVE_BACKUPS_PLACE_APP_DATA;
+   }
    free(dir);
    return result;
 }
@@ -1326,13 +1333,53 @@ enum save_backup_result save_backups_copy_image(const char *path,
       bool sync, unsigned *seq)
 {
    return save_backups_copy_any(path, reason, data ? data : "",
-         data ? len : 0, sync, seq);
+         data ? len : 0, sync, seq, NULL);
 }
 
-enum save_backup_result save_backups_copy_file(const char *path,
-      enum save_backup_reason reason, bool sync, unsigned *seq)
+enum save_backup_result save_backups_copy_file_at(const char *path,
+      enum save_backup_reason reason, bool sync, unsigned *seq,
+      enum save_backups_place *place)
 {
-   return save_backups_copy_any(path, reason, NULL, 0, sync, seq);
+   return save_backups_copy_any(path, reason, NULL, 0, sync, seq, place);
+}
+
+enum save_backups_place save_backups_place_of(const char *file)
+{
+   unsigned i;
+   enum save_backups_place place = SAVE_BACKUPS_PLACE_COPIES;
+   char *dir = (char*)malloc(PATH_MAX_LENGTH);
+   for (i = SAVE_BACKUPS_ROOT_CONFIG; dir
+         && i <= SAVE_BACKUPS_ROOT_APP_DATA; i++)
+   {
+      if (!save_backups_roots[i])
+         continue;
+      fill_pathname_join(dir, save_backups_roots[i],
+            SAVE_BACKUPS_RECOVERY_DIR, PATH_MAX_LENGTH);
+      if (save_backups_below(dir, file))
+      {
+         place = i == SAVE_BACKUPS_ROOT_CONFIG
+               ? SAVE_BACKUPS_PLACE_CONFIG : SAVE_BACKUPS_PLACE_APP_DATA;
+         break;
+      }
+   }
+   free(dir);
+   return place;
+}
+
+size_t save_backups_place_dir(char *s, size_t len, const char *path,
+      enum save_backups_place place, bool own)
+{
+   unsigned i = place == SAVE_BACKUPS_PLACE_APP_DATA
+         ? SAVE_BACKUPS_ROOT_APP_DATA : SAVE_BACKUPS_ROOT_CONFIG;
+   if (place == SAVE_BACKUPS_PLACE_COPIES)
+      return save_backups_dir(s, len, path);
+   s[0] = '\0';
+   if (own)
+      return save_backups_recovery_at(s, len, i, path) ? strlen(s) : 0;
+   if (!save_backups_roots[i])
+      return 0;
+   return fill_pathname_join(s, save_backups_roots[i],
+         SAVE_BACKUPS_RECOVERY_DIR, len);
 }
 
 /* Whether the newest recovery file of @path, its path in @s, holds

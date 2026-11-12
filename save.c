@@ -110,6 +110,10 @@ struct save_file
    /* The number of this session's first before-state-load copy, never
     * pruned; 0 until made */
    retro_atomic_int_t first_bsl;
+   /* enum save_backups_place of the last recovery file and outside
+    * change copy, for their notices */
+   retro_atomic_int_t rec_place;
+   retro_atomic_int_t copy_place;
    /* Save RAM at the first frame or in the last recovery file */
    uint32_t rec_crc;
    unsigned rec_flags;          /* enum save_file_rec_flags */
@@ -136,6 +140,8 @@ static struct save_file *save_file_get(unsigned slot)
          retro_atomic_int_init(&save_files[i].flags, 0);
          retro_atomic_int_init(&save_files[i].stat, 0);
          retro_atomic_int_init(&save_files[i].first_bsl, 0);
+         retro_atomic_int_init(&save_files[i].rec_place, 0);
+         retro_atomic_int_init(&save_files[i].copy_place, 0);
          save_files[i].rec_crc   = 0;
          save_files[i].rec_flags = 0;
       }
@@ -205,7 +211,7 @@ static bool save_file_changed(struct save_file *f, const char *path)
    return true;
 }
 
-/* @seq for save_backups_copy_file() of @f's file for @r: the session's
+/* @seq for save_backups_copy_file_at() of @f's file for @r: the session's
  * first state-load copy is kept and recorded. NULL when there is none
  * to keep nor to record. */
 static unsigned *save_file_seq(struct save_file *f, unsigned r,
@@ -267,11 +273,12 @@ static bool save_file_pay(struct save_file *f, const char *path,
    for (r = 0; r < SAVE_BACKUP_REASON_LAST; r++)
    {
       unsigned seq = 0;
+      enum save_backups_place place = SAVE_BACKUPS_PLACE_COPIES;
       enum save_backup_result res;
       if (!(owed & (1 << r)))
          continue;
-      res = save_backups_copy_file(path, (enum save_backup_reason)r, sync,
-            save_file_seq(f, r, &seq));
+      res = save_backups_copy_file_at(path, (enum save_backup_reason)r,
+            sync, save_file_seq(f, r, &seq), &place);
       if (res == SAVE_BACKUP_FAILED)
       {
          retro_atomic_fetch_or_int(&f->flags, SAVE_FILE_BACKUP_FAILED);
@@ -285,19 +292,21 @@ static bool save_file_pay(struct save_file *f, const char *path,
          RARCH_LOG("[SRAM] Backed up \"%s\" (%s) before writing it.\n",
                path, save_backups_reason_name((enum save_backup_reason)r));
       }
+      if (r == SAVE_BACKUP_CHANGED_ELSEWHERE)
+         retro_atomic_store_release_int(&f->copy_place, (int)place);
       retro_atomic_fetch_and_int(&f->owed, ~(1 << r));
    }
    return true;
 }
 
-/* On screen with the file's name; with @log, also in the log with
- * its path (never from autosave_check()). */
-static void save_file_notice(enum msg_hash_enums msg, const char *path,
-      bool log)
+/* On screen with the file's name, and @dir for a second %s; with
+ * @log, also in the log with its path (never from autosave_check()). */
+static void save_file_notice_in(enum msg_hash_enums msg, const char *path,
+      const char *dir, bool log)
 {
    char s[256];
    int _len = snprintf(s, sizeof(s), msg_hash_to_str(msg),
-         path_basename_nocompression(path));
+         path_basename_nocompression(path), dir);
    if (_len < 0)
       return;
    if ((size_t)_len >= sizeof(s))
@@ -306,15 +315,37 @@ static void save_file_notice(enum msg_hash_enums msg, const char *path,
          MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
    if (log)
    {
-      size_t len = PATH_MAX_LENGTH + sizeof(s);
+      size_t len = 2 * PATH_MAX_LENGTH + sizeof(s);
       char *full = (char*)malloc(len);
       if (full)
       {
-         snprintf(full, len, msg_hash_to_str(msg), path);
+         snprintf(full, len, msg_hash_to_str(msg), path, dir);
          RARCH_WARN("[SRAM] %s\n", full);
          free(full);
       }
    }
+}
+
+static void save_file_notice(enum msg_hash_enums msg, const char *path,
+      bool log)
+{
+   save_file_notice_in(msg, path, "", log);
+}
+
+/* Names the folder at @place (enum save_backups_place) its file is in;
+ * @own as in save_backups_place_dir(). */
+static void save_file_place_notice(enum msg_hash_enums msg,
+      const char *path, int place, bool own, bool log)
+{
+   char *dir = (char*)malloc(PATH_MAX_LENGTH);
+   /* No full path: just the folder's name */
+   if (!dir || !save_backups_place_dir(dir, PATH_MAX_LENGTH, path,
+            (enum save_backups_place)place, own))
+      save_file_notice_in(msg, path, place == SAVE_BACKUPS_PLACE_COPIES
+            ? SAVE_BACKUPS_DIR : SAVE_BACKUPS_RECOVERY_DIR, log);
+   else
+      save_file_notice_in(msg, path, dir, log);
+   free(dir);
 }
 
 #ifdef HAVE_THREADS
@@ -585,6 +616,9 @@ static void autosave_recover(autosave_t *save, const void *image)
          && (rec = (char*)malloc(PATH_MAX_LENGTH)))
       made = save_backups_recover(rec, PATH_MAX_LENGTH, save->path, image,
             save->bufsize, true) != 0;
+   if (made && save->file)
+      retro_atomic_store_release_int(&save->file->rec_place,
+            (int)save_backups_place_of(rec));
    free(rec);
    if (save->file)
       retro_atomic_fetch_or_int(&save->file->flags, made
@@ -959,10 +993,12 @@ static void save_file_check_notices(struct save_file *f, const char *path,
          && !(flags & SAVE_FILE_CHANGED_NOTICED))
    {
       retro_atomic_fetch_or_int(&f->flags, SAVE_FILE_CHANGED_NOTICED);
-      save_file_notice(MSG_SAVE_CHANGED_ELSEWHERE, path, false);
+      save_file_place_notice(MSG_SAVE_CHANGED_ELSEWHERE, path,
+            retro_atomic_load_acquire_int(&f->copy_place), true, false);
    }
    if (flags & SAVE_FILE_FLUSH_RECOVERED)
-      save_file_notice(MSG_SAVE_WRITE_RECOVERED, path, log);
+      save_file_place_notice(MSG_SAVE_WRITE_RECOVERED, path,
+            retro_atomic_load_acquire_int(&f->rec_place), false, log);
    if (flags & SAVE_FILE_FLUSH_LOST)
       save_file_notice(MSG_SAVE_WRITE_FAILED, path, log);
 }
@@ -1461,7 +1497,8 @@ static void save_file_recover(struct save_file *f, const char *path,
    {
       if (f)
          retro_atomic_fetch_or_int(&f->flags, SAVE_FILE_RECOVERY_MADE);
-      save_file_notice(MSG_SAVE_WRITE_RECOVERED, path, true);
+      save_file_place_notice(MSG_SAVE_WRITE_RECOVERED, path,
+            save_backups_place_of(rec), false, true);
       RARCH_WARN("[SRAM] Unsaved progress: \"%s\"\n", rec);
    }
    else
@@ -1488,7 +1525,8 @@ static void save_file_check_recovery(unsigned slot)
    if (save_backups_find_recovery(rec, PATH_MAX_LENGTH, path, mtime))
    {
       retro_atomic_fetch_or_int(&f->flags, SAVE_FILE_RECOVERY_NOTICED);
-      save_file_notice(MSG_SAVE_RECOVERY_NEWER, path, true);
+      save_file_place_notice(MSG_SAVE_RECOVERY_NEWER, path,
+            save_backups_place_of(rec), false, true);
       RARCH_WARN("[SRAM] Unsaved progress: \"%s\"\n", rec);
    }
    free(rec);
@@ -1654,7 +1692,8 @@ static bool content_save_ram_file(unsigned slot, bool compress, bool sync,
    if (     changed
          && !(retro_atomic_fetch_or_int(&f->flags, SAVE_FILE_CHANGED_NOTICED)
             & SAVE_FILE_CHANGED_NOTICED))
-      save_file_notice(MSG_SAVE_CHANGED_ELSEWHERE, ram.path, true);
+      save_file_place_notice(MSG_SAVE_CHANGED_ELSEWHERE, ram.path,
+            retro_atomic_load_acquire_int(&f->copy_place), true, true);
 
    if (!sync)
       save_files_unsynced = true;

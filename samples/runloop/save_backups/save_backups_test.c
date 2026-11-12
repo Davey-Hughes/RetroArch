@@ -200,6 +200,20 @@ static bool same_path(const char *a, const char *b)
    return !*a && !*b;
 }
 
+/* A notice for @file, a copy (@own) or recovery file of @path, names
+ * the folder @file is in. */
+static bool place_names(const char *path, const char *file, bool own)
+{
+   static char d[PATH_MAX_LENGTH], f[PATH_MAX_LENGTH];
+   size_t n;
+   fill_pathname_basedir(f, file, sizeof(f));
+   n = strlen(f);
+   while (n > 1 && PATH_CHAR_IS_SLASH(f[n - 1]))
+      f[--n] = '\0';
+   return save_backups_place_dir(d, sizeof(d), path,
+         save_backups_place_of(file), own) && same_path(d, f);
+}
+
 static void rm_tree(const char *dir)
 {
    size_t i;
@@ -347,8 +361,8 @@ static void backup_system_fallback(void)
          NULL, NULL, "Snes9x");
    set_time(18, 0, 0);
    put(ROOT "/fsystem/pcsx2/Mcd001.ps2", "card");
-   CHECK(save_backups_copy_file(ROOT "/fsystem/pcsx2/Mcd001.ps2",
-         SAVE_BACKUP_CUT, true, NULL) == SAVE_BACKUP_MADE);
+   CHECK(save_backups_copy_file_at(ROOT "/fsystem/pcsx2/Mcd001.ps2",
+         SAVE_BACKUP_CUT, true, NULL, NULL) == SAVE_BACKUP_MADE);
    CHECK(holds(ROOT "/fsystem/pcsx2/backups/"
          "Mcd001 - 2026-11-03 18-00-00 - 0001-kqmz - Snes9x - cut.ps2", "card"));
    CHECK(count_files(ROOT "/fsystem/pcsx2/backups") == 1);
@@ -584,14 +598,14 @@ static void backup_identical_skip(void)
 
    /* the file's own bytes */
    put(ROOT "/same/File.srm", "file");
-   CHECK(save_backups_copy_file(ROOT "/same/File.srm", SAVE_BACKUP_CUT, true, NULL)
-         == SAVE_BACKUP_MADE);
+   CHECK(save_backups_copy_file_at(ROOT "/same/File.srm", SAVE_BACKUP_CUT,
+         true, NULL, NULL) == SAVE_BACKUP_MADE);
    CHECK(holds(ROOT "/same/backups/File - 2026-11-03 12-00-02 - 0001-kqmz - Snes9x - cut.srm", "file"));
-   CHECK(save_backups_copy_file(ROOT "/same/File.srm", SAVE_BACKUP_CUT, true, NULL)
-         == SAVE_BACKUP_MADE);
+   CHECK(save_backups_copy_file_at(ROOT "/same/File.srm", SAVE_BACKUP_CUT,
+         true, NULL, NULL) == SAVE_BACKUP_MADE);
    CHECK(count_files(dir) == 4);
-   CHECK(save_backups_copy_file(ROOT "/same/Missing.srm", SAVE_BACKUP_CUT, true, NULL)
-         == SAVE_BACKUP_NO_FILE);
+   CHECK(save_backups_copy_file_at(ROOT "/same/Missing.srm", SAVE_BACKUP_CUT,
+         true, NULL, NULL) == SAVE_BACKUP_NO_FILE);
    CHECK(count_files(dir) == 4);
 }
 
@@ -1741,6 +1755,7 @@ static void backup_no_room(void)
  * not a reason to: recovery_chain. */
 static void backup_no_room_recovery_dir(void)
 {
+   enum save_backups_place place;
    static char dir[512], path[PATH_MAX_LENGTH];
    static char s[PATH_MAX_LENGTH], t[256];
    set_time(22, 0, 0);
@@ -1748,27 +1763,30 @@ static void backup_no_room_recovery_dir(void)
    CHECK(deep_dir(dir, sizeof(dir), "noroom2", SAVE_BACKUPS_PATH_MAX - 29));
    fill_pathname_join(path, dir, "Game.srm", sizeof(path));
    put(path, "r0");
-   CHECK(save_backups_copy_file(path, SAVE_BACKUP_BEFORE_STATE_LOAD, true,
-         NULL) == SAVE_BACKUP_MADE);
+   CHECK(save_backups_copy_file_at(path, SAVE_BACKUP_BEFORE_STATE_LOAD, true,
+         NULL, &place) == SAVE_BACKUP_MADE);
+   CHECK(place == SAVE_BACKUPS_PLACE_CONFIG);
    CHECK(save_backups_copy_image(path, SAVE_BACKUP_CUT, "r1", 2, true, NULL)
          == SAVE_BACKUP_MADE);
    recovery_folder(t, sizeof(t), path);
    snprintf(s, sizeof(s), "%s/Game - 2026-11-03 22-00-00"
          " - 0001-kqmz - Snes9x - before-state-load.srm", t);
    CHECK(holds(s, "r0"));
+   CHECK(place_names(path, s, true));
    snprintf(s, sizeof(s), "%s/Game - 2026-11-03 22-00-00"
          " - 0002-kqmz - Snes9x - cut.srm", t);
    CHECK(holds(s, "r1"));
    snprintf(s, sizeof(s), "%s/backups", dir);
    CHECK(count_files(s) == 0);
-   CHECK(save_backups_copy_file(ROOT "/noroom2/Missing.srm", SAVE_BACKUP_CUT,
-         true, NULL) == SAVE_BACKUP_NO_FILE);
+   CHECK(save_backups_copy_file_at(ROOT "/noroom2/Missing.srm", SAVE_BACKUP_CUT,
+         true, NULL, NULL) == SAVE_BACKUP_NO_FILE);
 }
 
 /* A copy that fails in a recovery folder leaves no folder behind; a
  * recovery folder that can't be made gives way to the next root's. */
 static void backup_no_room_recovery_fallbacks(void)
 {
+   enum save_backups_place place;
    static char dir[512], path[PATH_MAX_LENGTH];
    static char s[PATH_MAX_LENGTH], t[256], u[256];
    set_time(23, 30, 0);
@@ -1789,6 +1807,13 @@ static void backup_no_room_recovery_fallbacks(void)
    CHECK(save_backups_recovery_dir(s, sizeof(s), path, NULL,
          SAVE_BACKUP_NOT_LOADED));
    CHECK(same_path(s, u));
+   put(path, "a");
+   CHECK(save_backups_copy_file_at(path, SAVE_BACKUP_CHANGED_ELSEWHERE, true,
+         NULL, &place) == SAVE_BACKUP_MADE);
+   CHECK(place == SAVE_BACKUPS_PLACE_APP_DATA);
+   CHECK(save_backups_place_dir(s, sizeof(s), path, place, true)
+         && same_path(s, u));
+   CHECK(count_files(u) == 1);
 }
 
 /* Two saves of one name, both too deep for a copy name beside them,
@@ -1955,6 +1980,7 @@ static void recovery_chain(void)
    CHECK(save_backups_recover(s, sizeof(s), ROOT "/rsaves/Game.srm", "c9", 2, true));
    CHECK(holds(s, "c9"));
    CHECK(count_files(ROOT "/rsaves/backups") == 5);
+   CHECK(place_names(ROOT "/rsaves/Game.srm", s, false));
 
    /* the save folder can't be written: a file where its folder goes */
    put(ROOT "/rsaves2/backups", "file");
@@ -1966,6 +1992,7 @@ static void recovery_chain(void)
    CHECK(save_backups_recover(s, sizeof(s), ROOT "/rsaves2/Game.srm", "r2", 2, true));
    CHECK(same_path(s, ROOT "/rconfig/recovery/Game - 2026-11-03 14-00-00 - 0001-kqmz - Snes9x - unsaved.srm"));
    CHECK(holds(s, "r2"));
+   CHECK(place_names(ROOT "/rsaves2/Game.srm", s, false));
    /* the same rule in the fallback */
    plain_writes = synced_writes = 0;
    CHECK(save_backups_recover(s, sizeof(s), ROOT "/rsaves2/Game.srm", "r2", 2, true));
@@ -1980,6 +2007,7 @@ static void recovery_chain(void)
    CHECK(save_backups_recover(s, sizeof(s), ROOT "/rsaves2/Game.srm", "r3", 2, true));
    CHECK(same_path(s, ROOT "/rapp/recovery/Game - 2026-11-03 14-00-00 - 0001-kqmz - Snes9x - unsaved.srm"));
    CHECK(holds(s, "r3"));
+   CHECK(place_names(ROOT "/rsaves2/Game.srm", s, false));
    CHECK(save_backups_recover(s, sizeof(s), ROOT "/rsaves2/Game.srm", "r3", 2, true));
    CHECK(same_path(s, ROOT "/rapp/recovery/Game - 2026-11-03 14-00-00 - 0001-kqmz - Snes9x - unsaved.srm"));
    CHECK(count_files(ROOT "/rapp/recovery") == 1);
@@ -2071,12 +2099,12 @@ static void backup_sync(void)
          "2", 1, false, NULL) == SAVE_BACKUP_MADE);
    CHECK(synced_writes == 1 && plain_writes == 1);
    put(ROOT "/sync/File.srm", "f1");
-   CHECK(save_backups_copy_file(ROOT "/sync/File.srm", SAVE_BACKUP_CUT,
-         true, NULL) == SAVE_BACKUP_MADE);
+   CHECK(save_backups_copy_file_at(ROOT "/sync/File.srm", SAVE_BACKUP_CUT,
+         true, NULL, NULL) == SAVE_BACKUP_MADE);
    CHECK(synced_writes == 2 && plain_writes == 1);
    put(ROOT "/sync/File.srm", "f2");
-   CHECK(save_backups_copy_file(ROOT "/sync/File.srm", SAVE_BACKUP_CUT,
-         false, NULL) == SAVE_BACKUP_MADE);
+   CHECK(save_backups_copy_file_at(ROOT "/sync/File.srm", SAVE_BACKUP_CUT,
+         false, NULL, NULL) == SAVE_BACKUP_MADE);
    CHECK(synced_writes == 2 && plain_writes == 2);
    CHECK(save_backups_copy_to(ROOT "/sync/backups/cloud-sync",
          ROOT "/sync/Game.srm", SAVE_BACKUPS_CORE_CLOUD_SYNC,

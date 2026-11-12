@@ -180,8 +180,30 @@ bool save_backups_move_finish(const char *path, const char *to);
 enum save_backup_result save_backups_copy_image(const char *path,
       enum save_backup_reason reason, const void *data, size_t len,
       bool sync, unsigned *seq);
-enum save_backup_result save_backups_copy_file(const char *path,
-      enum save_backup_reason reason, bool sync, unsigned *seq);
+
+/* Where a copy or recovery file is: the copy folder, or the recovery
+ * folder under <config> or <app data> */
+enum save_backups_place
+{
+   SAVE_BACKUPS_PLACE_COPIES = 0,
+   SAVE_BACKUPS_PLACE_CONFIG,
+   SAVE_BACKUPS_PLACE_APP_DATA
+};
+
+/* save_backups_copy_image() of @path's file; the copy's place in
+ * @place, unless NULL */
+enum save_backup_result save_backups_copy_file_at(const char *path,
+      enum save_backup_reason reason, bool sync, unsigned *seq,
+      enum save_backups_place *place);
+
+/* The place of @file, a copy or recovery file */
+enum save_backups_place save_backups_place_of(const char *file);
+
+/* The folder at @place for @path's files: with @own, its own folder
+ * there, where copies go; else where recovery files go. Builds the
+ * name only. Returns its length, 0 when there is none. */
+size_t save_backups_place_dir(char *s, size_t len, const char *path,
+      enum save_backups_place place, bool own);
 
 /* @path's own folder where save_backups_recover() writes, under
  * <config>, or with @app_data under <app data>, into @s ("" and false
