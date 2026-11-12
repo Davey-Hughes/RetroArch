@@ -153,6 +153,8 @@ static int failures;
 static unsigned deletes, uploads, fetches, notices, notice_count;
 static int sync_done, sync_failed;
 static int conflict_mode;
+/* The server's identity a sync is given */
+static char server_id[33];
 
 #define CHECK(c) do { if (!(c)) { \
    fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #c); failures++; } } while (0)
@@ -495,6 +497,7 @@ static bool sync_list(bool threaded, struct string_list *dirlist)
    st->dirlist = dirlist;
    st->conflict_resolution = conflict_mode;
    strlcpy(st->dir_core_assets, assets, sizeof(st->dir_core_assets));
+   strlcpy(st->server_id, server_id, sizeof(st->server_id));
    retro_atomic_int_init(&st->waiting, 0);
    retro_atomic_int_init(&st->phase, CLOUD_SYNC_PHASE_BEGIN);
    st->cb      = on_done;
@@ -1015,6 +1018,113 @@ static void third_device(bool on)
    }
    else
       strlcpy(assets, own, sizeof(assets));
+}
+
+/* Pointed at another server, the last sync's record is the old one's:
+ * a first sync with the new server, which deletes nothing, sends what
+ * it lacks and replaces nothing here. The same server again is no
+ * change. */
+static void server_changed(bool threaded)
+{
+   char        root[256], root_b[264];
+   settings_t *settings = (settings_t*)calloc(1, sizeof(*settings));
+   lane_dirs("server_changed", threaded, root, sizeof(root));
+   snprintf(root_b, sizeof(root_b), "%s-b", root);
+   remove_tree(root_b);
+   CHECK(path_mkdir(root_b));
+   strlcpy(settings->arrays.cloud_sync_driver, "webdav",
+         sizeof(settings->arrays.cloud_sync_driver));
+   strlcpy(settings->arrays.webdav_url, "https://a.example/dav/",
+         sizeof(settings->arrays.webdav_url));
+   task_cloud_sync_server_id(server_id, settings);
+   put(root, "a.srm", "1");
+   put(root, "b.srm", "2");
+   put(root, "c.srm", "3");
+   CHECK(sync_saves(threaded, root));
+   CHECK(uploads == 3);
+   /* the other server, where another device keeps its own b.srm */
+   strlcat(srv, "-b", sizeof(srv));
+   CHECK(path_mkdir(srv));
+   put(root_b, "b.srm", "B");
+   other_device(true);
+   CHECK(sync_saves(threaded, root_b));
+   other_device(false);
+   strlcpy(settings->arrays.webdav_url, "https://b.example/dav/",
+         sizeof(settings->arrays.webdav_url));
+   task_cloud_sync_server_id(server_id, settings);
+   /* b.srm differs on the two: a conflict */
+   CHECK(!sync_saves(threaded, root));
+   CHECK(deletes == 0);
+   CHECK(uploads == 2);
+   CHECK(holds(srv, "saves/a.srm", "1"));
+   CHECK(holds(root, "b.srm", "2"));
+   CHECK(holds(srv, "saves/b.srm", "B"));
+   drop(root, "c.srm");
+   CHECK(!sync_saves(threaded, root));
+   CHECK(deletes == 1);
+   CHECK(!path_is_valid(srv_key("saves/c.srm")));
+   server_id[0] = '\0';
+   remove_tree(root_b);
+   free(settings);
+}
+
+/* The same server spelled as its driver takes it, or reached with a
+ * new password or sign-in, is the same server; another host, driver or
+ * username is not. A trailing slash added between two syncs is no
+ * first sync. */
+static void server_respelled(bool threaded)
+{
+   char        root[256], a[33], b[33];
+   settings_t *settings = (settings_t*)calloc(1, sizeof(*settings));
+   strlcpy(settings->arrays.cloud_sync_driver, "webdav",
+         sizeof(settings->arrays.cloud_sync_driver));
+   strlcpy(settings->arrays.webdav_url, "a.example/dav",
+         sizeof(settings->arrays.webdav_url));
+   task_cloud_sync_server_id(a, settings);
+   strlcpy(settings->arrays.webdav_url, "http://a.example/dav/",
+         sizeof(settings->arrays.webdav_url));
+   strlcpy(settings->arrays.webdav_password, "secret",
+         sizeof(settings->arrays.webdav_password));
+   task_cloud_sync_server_id(b, settings);
+   CHECK(string_is_equal(a, b));
+   /* another account on a shared address */
+   strlcpy(settings->arrays.webdav_username, "someone",
+         sizeof(settings->arrays.webdav_username));
+   task_cloud_sync_server_id(b, settings);
+   CHECK(!string_is_equal(a, b));
+   strlcpy(settings->arrays.webdav_url, "http://b.example/dav/",
+         sizeof(settings->arrays.webdav_url));
+   task_cloud_sync_server_id(b, settings);
+   CHECK(!string_is_equal(a, b));
+   strlcpy(settings->arrays.cloud_sync_driver, "google_drive",
+         sizeof(settings->arrays.cloud_sync_driver));
+   strlcpy(settings->arrays.google_drive_refresh_token, "t1",
+         sizeof(settings->arrays.google_drive_refresh_token));
+   task_cloud_sync_server_id(a, settings);
+   CHECK(!string_is_equal(a, b));
+   strlcpy(settings->arrays.google_drive_refresh_token, "t2",
+         sizeof(settings->arrays.google_drive_refresh_token));
+   task_cloud_sync_server_id(b, settings);
+   CHECK(string_is_equal(a, b));
+
+   lane_dirs("server_respelled", threaded, root, sizeof(root));
+   strlcpy(settings->arrays.cloud_sync_driver, "webdav",
+         sizeof(settings->arrays.cloud_sync_driver));
+   strlcpy(settings->arrays.webdav_url, "https://a.example/dav",
+         sizeof(settings->arrays.webdav_url));
+   task_cloud_sync_server_id(server_id, settings);
+   put(root, "a.srm", "1");
+   put(root, "b.srm", "2");
+   CHECK(sync_saves(threaded, root));
+   strlcpy(settings->arrays.webdav_url, "https://a.example/dav/",
+         sizeof(settings->arrays.webdav_url));
+   task_cloud_sync_server_id(server_id, settings);
+   drop(root, "a.srm");
+   CHECK(sync_saves(threaded, root));
+   CHECK(deletes == 1);
+   CHECK(fetches == 0);
+   server_id[0] = '\0';
+   free(settings);
 }
 
 /* Another device changes "a.srm" on the server, and this one has
@@ -2502,6 +2612,8 @@ static const struct lane lanes[] = {
    { "sync_unset_no_entry",       unset_no_entry },
    { "sync_roots_no_memory",      roots_no_memory },
    { "sync_roots_unreadable_no_delete", roots_unreadable },
+   { "sync_server_identity_change_first_sync", server_changed },
+   { "sync_server_identity_respelled_same", server_respelled },
    { "sync_main_folder_only",     main_folder_only },
    { "sync_mass_held",            mass_held },
    { "sync_held_no_memory",       held_no_memory },

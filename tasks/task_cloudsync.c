@@ -173,6 +173,8 @@ typedef struct
     * it needs as arguments rather than reading the settings mid-sync. */
    bool destructive;
    char dir_core_assets[DIR_MAX_LENGTH];
+   /* task_cloud_sync_server_id() */
+   char server_id[33];
    /* The directory map for this sync, built at push. Per task rather
     * than a process-wide cache: a fresh list per sync is a handful of
     * strdups, and it cannot go stale against the sync toggles. An
@@ -481,9 +483,10 @@ static void task_cloud_sync_roots_filename(char *s, size_t len,
 }
 
 /* The roots file in @out, NULL when there is none or it can't be
- * read, and then @unreadable. False when out of memory. */
+ * read, and then @unreadable; the server it names in @server (33
+ * bytes). False when out of memory. */
 static bool task_cloud_sync_read_roots(const char *dir_core_assets,
-      struct string_list **out, bool *unreadable)
+      struct string_list **out, char *server, bool *unreadable)
 {
    char                path[PATH_MAX_LENGTH];
    void               *buf   = NULL;
@@ -520,6 +523,8 @@ static bool task_cloud_sync_read_roots(const char *dir_core_assets,
          if (!(name = strdup(str)))
             goto oom;
       }
+      else if (name && string_is_equal(name, "server"))
+         strlcpy(server, str, 33);
       else if (name)
       {
          union string_list_elem_attr attr;
@@ -582,12 +587,12 @@ static int task_cloud_sync_key_root(const struct string_list *dirlist,
    return -1;
 }
 
-/* A root walked from another folder than the last sync's, or every
- * root when @all, leaves the local manifest, so the diff runs
- * first-sync rules for its keys: fetch, upload or conflict, never a
- * delete. False when out of memory. */
+/* A root walked from another folder than the last sync's leaves the
+ * local manifest, so the diff runs first-sync rules for its keys:
+ * fetch, upload or conflict, never a delete. False when out of
+ * memory. */
 static bool task_cloud_sync_drop_changed_roots(
-      task_cloud_sync_state_t *sync_state, bool all)
+      task_cloud_sync_state_t *sync_state)
 {
    struct string_list *dirlist = sync_state->dirlist;
    file_list_t        *local   = sync_state->local_manifest;
@@ -599,9 +604,7 @@ static bool task_cloud_sync_drop_changed_roots(
    {
       int at = string_list_find_elem(sync_state->roots,
             dirlist->elems[i].data);
-      if (all)
-         dirlist->elems[i].attr.i |= CS_ROOT_CHANGED;
-      else if (at && !task_cloud_sync_same_dir(
+      if (at && !task_cloud_sync_same_dir(
                (const char*)sync_state->roots->elems[at - 1].userdata,
                (const char*)dirlist->elems[i].userdata))
       {
@@ -613,7 +616,7 @@ static bool task_cloud_sync_drop_changed_roots(
          changed = true;
       }
    }
-   if (!(changed || all) || !local)
+   if (!changed || !local)
       return true;
 
    if (!(kept = (file_list_t*)calloc(1, sizeof(*kept))))
@@ -700,6 +703,9 @@ static void task_cloud_sync_write_roots(task_cloud_sync_state_t *sync_state)
    if (writer)
    {
       rjsonwriter_raw(writer, "{\n", 2);
+      if (*sync_state->server_id)
+         task_cloud_sync_write_root(writer, "server",
+               sync_state->server_id, &first);
       for (i = 0; i < dirlist->size; i++)
          task_cloud_sync_write_root(writer, dirlist->elems[i].data,
                (const char*)dirlist->elems[i].userdata, &first);
@@ -734,6 +740,7 @@ static void task_cloud_sync_write_roots(task_cloud_sync_state_t *sync_state)
 static void task_cloud_sync_read_local_manifest(task_cloud_sync_state_t *sync_state)
 {
    char manifest_path[PATH_MAX_LENGTH];
+   char server[33];
    bool unreadable = false;
 
    task_cloud_sync_manifest_filename(manifest_path, sizeof(manifest_path), false,
@@ -771,13 +778,34 @@ static void task_cloud_sync_read_local_manifest(task_cloud_sync_state_t *sync_st
       }
    }
 
+   server[0] = '\0';
+   if (!task_cloud_sync_read_roots(sync_state->dir_core_assets,
+            &sync_state->roots, server, &unreadable))
+   {
+      sync_state->failures = true;
+      task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_END);
+      return;
+   }
+
+   /* What the last sync left is another server's, or can't be told:
+    * a first sync */
+   if (     unreadable
+         || (    *server && *sync_state->server_id
+             && !string_is_equal(server, sync_state->server_id)))
+   {
+      if (!unreadable)
+         RARCH_WARN(CSPFX "The server changed since the last sync: syncing as a first sync.\n");
+      if (sync_state->local_manifest)
+         file_list_free(sync_state->local_manifest);
+      sync_state->local_manifest = NULL;
+      string_list_free(sync_state->roots);
+      sync_state->roots          = NULL;
+   }
+
    /* A missing roots file, or a root it does not name, is unchanged */
-   if (     !task_cloud_sync_read_roots(sync_state->dir_core_assets,
-               &sync_state->roots, &unreadable)
-         || (    (sync_state->roots || unreadable)
-             &&  sync_state->dirlist
-             && !task_cloud_sync_drop_changed_roots(sync_state,
-                   unreadable)))
+   if (      sync_state->roots
+         &&  sync_state->dirlist
+         && !task_cloud_sync_drop_changed_roots(sync_state))
    {
       sync_state->failures = true;
       task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_END);
@@ -3644,6 +3672,85 @@ static bool task_cloud_sync_task_finder(retro_task_t *task, void *user_data)
           && !(task_get_flags(task) & RETRO_TASK_FLG_FINISHED);
 }
 
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
+/* @s into @md5 with its separators one way and none at either end,
+ * as a driver joins it into its paths */
+static void task_cloud_sync_id_path(MD5_CTX *md5, const char *s)
+{
+   size_t len;
+   size_t i;
+   while (*s == '/' || *s == '\\')
+      s++;
+   len = strlen(s);
+   while (len && (s[len - 1] == '/' || s[len - 1] == '\\'))
+      len--;
+   for (i = 0; i < len; i++)
+      MD5_Update(md5, (s[i] == '\\') ? "/" : s + i, 1);
+   MD5_Update(md5, "", 1);
+}
+#endif
+
+/* @url into @md5 as network/cloud_sync/webdav.c takes it: http:// when
+ * it names no scheme, and no trailing slash */
+static void task_cloud_sync_id_url(MD5_CTX *md5, const char *url)
+{
+   size_t len = strlen(url);
+   if (!strstr(url, "://"))
+      MD5_Update(md5, "http://", STRLEN_CONST("http://"));
+   while (len && url[len - 1] == '/')
+      len--;
+   MD5_Update(md5, url, (unsigned long)len);
+   MD5_Update(md5, "", 1);
+}
+
+/* The server and account the sync talks to, as its driver addresses
+ * them, hashed into @s (33 bytes): another one's files are not what
+ * the last sync left. A username names the account; passwords, keys
+ * and tokens are left out, so a new key or a new sign-in is the same
+ * server. Google Drive and iCloud keep no account id to tell another
+ * account by: the driver alone. */
+static void task_cloud_sync_server_id(char *s, const settings_t *settings)
+{
+   const char *drv = settings->arrays.cloud_sync_driver;
+   MD5_CTX     md5;
+
+   MD5_Init(&md5);
+   MD5_Update(&md5, drv, (unsigned long)strlen(drv) + 1);
+   if (string_is_equal(drv, "webdav"))
+   {
+      task_cloud_sync_id_url(&md5, settings->arrays.webdav_url);
+      MD5_Update(&md5, settings->arrays.webdav_username,
+            (unsigned long)strlen(settings->arrays.webdav_username) + 1);
+   }
+#ifdef HAVE_S3
+   else if (string_is_equal(drv, "s3"))
+      task_cloud_sync_id_url(&md5, settings->arrays.s3_url);
+#endif
+#ifdef HAVE_SMBCLIENT
+   else if (string_is_equal(drv, "smb"))
+   {
+      task_cloud_sync_id_path(&md5, settings->arrays.smb_client_server_address);
+      task_cloud_sync_id_path(&md5, settings->arrays.smb_client_share);
+      task_cloud_sync_id_path(&md5, settings->arrays.smb_client_subdir);
+      MD5_Update(&md5, settings->arrays.smb_client_username,
+            (unsigned long)strlen(settings->arrays.smb_client_username) + 1);
+   }
+#endif
+#ifdef HAVE_NFSCLIENT
+   else if (string_is_equal(drv, "nfs"))
+   {
+      task_cloud_sync_id_path(&md5, settings->arrays.nfs_server);
+      task_cloud_sync_id_path(&md5, settings->arrays.nfs_export);
+      /* as network/cloud_sync/nfs.c picks it */
+      task_cloud_sync_id_path(&md5,
+            string_is_empty(settings->arrays.cloud_sync_nfs_subdir)
+            ? settings->arrays.nfs_subdir
+            : settings->arrays.cloud_sync_nfs_subdir);
+   }
+#endif
+   task_cloud_sync_md5_hex(s, &md5);
+}
+
 /* Set while a main config save or state folder is missing (main thread) */
 static bool tcs_paused = false;
 
@@ -3701,6 +3808,7 @@ static bool task_push_cloud_sync_with_mode(int conflict_resolution,
       strlcpy(sync_state->dir_core_assets,
             settings->paths.directory_core_assets,
             sizeof(sync_state->dir_core_assets));
+      task_cloud_sync_server_id(sync_state->server_id, settings);
       sync_state->dirlist     = task_cloud_sync_directory_map_new(settings);
    }
    cloud_sync_capture();
