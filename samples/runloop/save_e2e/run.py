@@ -1075,6 +1075,8 @@ def lane_archive_member_old_folder(args, n):
     that folder has its save and the new one has none."""
     r = Run(args.run_dir, 'archive_member_old_folder-%d' % n)
     failures = []
+    # No loose game.bin: it would keep the folder by itself
+    r.content.unlink()
     pack = r.dir / 'pack.zip'
     with zipfile.ZipFile(pack, 'w', zipfile.ZIP_STORED) as z:
         z.writestr('Disks/game.bin', bytes(16))
@@ -1088,6 +1090,66 @@ def lane_archive_member_old_folder(args, n):
     check(failures, rc == 0, 'retroarch exit %s' % rc)
     check(failures, old.read_bytes() == pattern(32),
           'save not written to %s' % old)
+    new = r.saves / r.dir.name
+    check(failures, not new.exists(), 'made %s' % new)
+    return r, failures
+
+
+def lane_archive_member_same_name(args, n):
+    """Members of one archive with one name in different folders
+    keep their folders, each with its own save: beside the archive and
+    sorted by content."""
+    r = Run(args.run_dir, 'archive_member_same_name-%d' % n)
+    failures = []
+    r.content.unlink()
+    pack = r.dir / 'pack.zip'
+    with zipfile.ZipFile(pack, 'w', zipfile.ZIP_STORED) as z:
+        z.writestr('USA/game.bin', bytes(16))
+        z.writestr('JPN/game.bin', bytes(16))
+    usa = r.dir / 'USA' / 'game.srm'
+    jpn = r.saves / 'JPN' / 'game.srm'
+    for member, key, seed, srm in (
+            ('USA', 'savefiles_in_content_dir', 32, usa),
+            ('JPN', 'sort_savefiles_by_content_enable', 33, jpn)):
+        cfg = r.config(**{key: 'true'})
+        r.content = '%s#%s/game.bin' % (pack, member)
+        r.start(args, cfg, 60,
+                r.env(SAVE_E2E_TOUCH_FRAME=5, SAVE_E2E_SEED=seed))
+        rc = r.wait(60)
+        check(failures, rc == 0, '%s: retroarch exit %s' % (member, rc))
+        check(failures, srm.is_file() and srm.read_bytes() == pattern(seed),
+              'save not written to %s' % srm)
+    check(failures, not (r.dir / 'game.srm').exists(), 'one save for both')
+    new = r.saves / r.dir.name
+    check(failures, not new.exists(), 'made %s' % new)
+    return r, failures
+
+
+def lane_archive_member_same_name_7z(args, n):
+    """archive_member_same_name through a 7z's listing, with no
+    other file of the name beside it."""
+    r = Run(args.run_dir, 'archive_member_same_name_7z-%d' % n)
+    tool = next(filter(None, map(shutil.which, ('7z', '7zz', '7za', '7zr'))),
+                None)
+    if not tool:
+        return r, ['no 7z tool on the PATH']
+    failures = []
+    r.content.unlink()
+    src = r.dir / 'src'
+    for member in ('USA', 'JPN'):
+        (src / member).mkdir(parents=True)
+        (src / member / 'game.bin').write_bytes(bytes(16))
+    pack = r.dir / 'pack.7z'
+    subprocess.run([tool, 'a', '-bd', str(pack), 'USA', 'JPN'], cwd=src,
+                   check=True, stdout=subprocess.DEVNULL)
+    r.content = '%s#USA/game.bin' % pack
+    cfg = r.config(sort_savefiles_by_content_enable='true')
+    r.start(args, cfg, 60, r.env(SAVE_E2E_TOUCH_FRAME=5, SAVE_E2E_SEED=34))
+    rc = r.wait(60)
+    check(failures, rc == 0, 'retroarch exit %s' % rc)
+    srm = r.saves / 'USA' / 'game.srm'
+    check(failures, srm.is_file() and srm.read_bytes() == pattern(34),
+          'save not written to %s' % srm)
     new = r.saves / r.dir.name
     check(failures, not new.exists(), 'made %s' % new)
     return r, failures
@@ -1392,6 +1454,8 @@ LANES = {
     'relative_config_no_folder': lane_relative_config_no_folder,
     'relative_default_config': lane_relative_default_config,
     'archive_member_old_folder': lane_archive_member_old_folder,
+    'archive_member_same_name': lane_archive_member_same_name,
+    'archive_member_same_name_7z': lane_archive_member_same_name_7z,
     'quit_after_held_state': lane_quit_after_held_state,
     'unload_after_held_state': lane_unload_after_held_state,
     'load_after_held_state': lane_load_after_held_state,
@@ -1412,8 +1476,8 @@ POSIX_LANES = {'autosave_full_disk', 'autosave_kill_mid_write',
                'no_rewrite_at_launch', 'unreadable_backed_up',
                'explicit_save_copies', 'folder_check_each_load',
                'folder_check_override', 'folder_off_recovers',
-               'folder_off_unchanged',
-               'relative_default_config'} | set(HELD_LANES)
+               'folder_off_unchanged', 'relative_default_config',
+               'archive_member_same_name_7z'} | set(HELD_LANES)
 
 
 def main():

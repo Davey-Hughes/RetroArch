@@ -100,7 +100,7 @@ jobs:
     name: Build and run the menu navigation harness
     runs-on: ubuntu-latest
     env:
-      APT_PKGS: build-essential zlib1g-dev ccache strace
+      APT_PKGS: build-essential zlib1g-dev ccache strace p7zip-full
     timeout-minutes: 25
 
     steps:
@@ -262,7 +262,9 @@ jobs:
           # folders are under the config file's folder, not the one
           # RetroArch started in, also for the default config file and
           # one named without a folder; an archive member sorted by
-          # content keeps the save in the folder it was sorted to before;
+          # content keeps the save in the folder it was sorted to before,
+          # and members with one name in two folders keep their folders,
+          # in a zip and in a 7z;
           # a quit, Unload Core or another content's load writes the auto
           # state once, after a state write still in flight, also with a
           # quit during the close (auto save in a game override only
@@ -290,6 +292,8 @@ jobs:
              --lane relative_config_no_folder \
              --lane relative_default_config \
              --lane archive_member_old_folder \
+             --lane archive_member_same_name \
+             --lane archive_member_same_name_7z \
              --lane quit_after_held_state --lane unload_after_held_state \
              --lane load_after_held_state --lane close_while_held \
              --lane quit_during_unload --lane quit_during_unload_override \
