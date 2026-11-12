@@ -7326,6 +7326,23 @@ static int mkdir_p(const char *path, mode_t mode)
 }
 #endif
 
+#ifdef HAVE_CLOUDSYNC
+/* The command line, kept for a launch that waits for the startup sync
+ * (retroarch_cli_sync_done), and where that launch is. */
+enum rarch_cli_wait
+{
+   RARCH_CLI_WAIT_NONE = 0,
+   RARCH_CLI_WAIT_SYNC,  /* until the sync ends; any load drops it */
+   RARCH_CLI_WAIT_LOAD   /* the next load is the command line's */
+};
+static int    rarch_cli_argc;
+static char **rarch_cli_argv;
+static void  *rarch_cli_args;
+static enum rarch_cli_wait rarch_cli_wait;
+/* That load failed: rarch_main returns 1, as at startup */
+static bool   rarch_cli_failed;
+#endif
+
 /**
  * main_entry:
  *
@@ -7337,14 +7354,6 @@ static int mkdir_p(const char *path, mode_t mode)
  *
  * Returns: varies per platform.
  **/
-#ifdef HAVE_CLOUDSYNC
-/* The command line, kept for a launch that waits for the startup sync
- * (retroarch_cli_sync_done). */
-static int    rarch_cli_argc;
-static char **rarch_cli_argv;
-static void  *rarch_cli_args;
-#endif
-
 int rarch_main(int argc, char *argv[], void *data)
 {
    settings_t *settings;
@@ -7490,6 +7499,7 @@ int rarch_main(int argc, char *argv[], void *data)
       rarch_cli_argc       = argc;
       rarch_cli_argv       = argv;
       rarch_cli_args       = data;
+      rarch_cli_failed     = false;
 #endif
 
       if (!task_push_load_content_from_cli(
@@ -7555,6 +7565,10 @@ int rarch_main(int argc, char *argv[], void *data)
    main_exit(data);
 #endif
 
+#ifdef HAVE_CLOUDSYNC
+   if (rarch_cli_failed)
+      return 1;
+#endif
    return 0;
 }
 
@@ -8764,7 +8778,8 @@ static void retroarch_cli_sync_done(retro_task_t *task,
       frontend_state_get_ptr()->current_frontend_ctx;
 
    /* A quit cancels the sync: no load as it drains the tasks */
-   if (     runloop_st->current_core_type != CORE_TYPE_DUMMY
+   if (     rarch_cli_wait != RARCH_CLI_WAIT_SYNC
+         || runloop_st->current_core_type != CORE_TYPE_DUMMY
          || (runloop_st->flags & RUNLOOP_FLAG_SHUTDOWN_INITIATED)
          || task_content_load_pending())
       return;
@@ -8772,7 +8787,9 @@ static void retroarch_cli_sync_done(retro_task_t *task,
    info.argv        = rarch_cli_argv;
    info.args        = rarch_cli_args;
    info.environ_get = frontend ? frontend->environment_get : NULL;
-   task_push_load_content_from_cli_staged(&info);
+   rarch_cli_wait   = RARCH_CLI_WAIT_LOAD;
+   if (!task_push_load_content_from_cli_staged(&info))
+      rarch_cli_wait = RARCH_CLI_WAIT_NONE;
 }
 
 /* rarch_cli_argv in one block of its own: the caller's can be gone by
@@ -9981,6 +9998,11 @@ bool retroarch_main_init_core(int argc, char *argv[],
 #ifdef HAVE_MENU
    struct menu_state *menu_st    = menu_state_get_ptr();
 #endif
+#ifdef HAVE_CLOUDSYNC
+   /* Whatever loads now ends the command line's wait */
+   bool cli_load                 = rarch_cli_wait == RARCH_CLI_WAIT_LOAD;
+   rarch_cli_wait                = RARCH_CLI_WAIT_NONE;
+#endif
 
    core_info_set_savestate_probe(retroarch_core_info_savestate_probe);
 
@@ -10304,6 +10326,7 @@ bool retroarch_main_init_core(int argc, char *argv[],
                MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
          path_clear(RARCH_PATH_CONTENT);
          runloop_set_current_core_type(CORE_TYPE_DUMMY, true);
+         rarch_cli_wait = RARCH_CLI_WAIT_SYNC;
       }
       rarch_st.flags |= RARCH_FLAGS_CLOUD_SYNC_AT_INIT;
    }
@@ -10371,6 +10394,16 @@ bool retroarch_main_init_core(int argc, char *argv[],
          runloop_st->current_core_type = CORE_TYPE_DUMMY;
          if (!command_event(CMD_EVENT_CORE_INIT, &runloop_st->current_core_type))
             return retroarch_main_init_fail();
+#ifdef HAVE_CLOUDSYNC
+         /* The command line's load after the startup sync: quit as a
+          * failed load at startup does, unless the menu was asked for */
+         if (      cli_load
+               && !(rarch_st.flags & RARCH_FLAGS_CLI_LOAD_MENU_ON_ERR))
+         {
+            rarch_cli_failed   = true;
+            runloop_st->flags |= RUNLOOP_FLAG_SHUTDOWN_INITIATED;
+         }
+#endif
       }
 #ifdef HAVE_DYNAMIC
       else /* Fall back to regular error handling */

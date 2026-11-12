@@ -8,6 +8,7 @@
  *   "run <n>"       every 60 frames
  *   "card <hex>"    at load: CLOUDSYNC_E2E_CARD, a file the core reads
  *                   itself (a memory card) and writes back at unload
+ *   "refused <hex>" at load: CLOUDSYNC_E2E_FAIL_LOAD set, the load fails
  * <hex> is the first 8 bytes of the save RAM, or of the card. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -128,8 +129,14 @@ bool retro_load_game(const struct retro_game_info *game)
 {
    enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
    const char *path            = card_path();
+   const char *fail            = getenv("CLOUDSYNC_E2E_FAIL_LOAD");
    FILE       *f;
    (void)game;
+   if (fail && *fail)
+   {
+      note("refused");
+      return false;
+   }
    if (path)
    {
       memset(card, 0, sizeof(card));

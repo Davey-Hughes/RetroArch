@@ -132,6 +132,7 @@ class Device:
         self.proc      = None
         self.runs      = 0
         self.card      = None
+        self.fail_load = False
         for d in self.DIRS:
             os.makedirs(os.path.join(self.dir, d), exist_ok=True)
         self.cfg      = os.path.join(self.dir, "config", "retroarch.cfg")
@@ -225,6 +226,7 @@ class Device:
             "CLOUDSYNC_E2E_LOG": self.core_log,
             "CLOUDSYNC_E2E_FILL": fill or "",
             "CLOUDSYNC_E2E_CARD": self.card or "",
+            "CLOUDSYNC_E2E_FAIL_LOAD": "1" if self.fail_load else "",
         })
         return env
 
@@ -1032,6 +1034,62 @@ def cli_launch_quit_while_waiting(srv, a, b):
     check(a.stop() == 0, "A did not quit cleanly")
     check(not a.core_notes("card"),
           "the game started as A quit: %s" % a.core_notes("card"))
+
+
+@lane(2)
+def cli_launch_user_content_wins(srv, a, b):
+    """Content started and closed while a command-line launch waits for
+    the startup sync drops the command line's load."""
+    first_sync(a, b)
+    other = os.path.join(a.dir, "content", "Other.bin")
+    put(other, b"other content\n")
+    srv.state.delay = {"manifest.server": 6.0}
+    a.card = a.key("saves/%s/Game.mcd" % CORE_DIR)
+    a.start(content=True, fill=None)
+    check(a.wait_commands(), "A takes no commands")
+    a.cmd("LOAD_CONTENT %s|%s" % (a.core, other), reply=False)
+    check(a.wait_core("card"), "the other game did not start")
+    a.cmd("CLOSE_CONTENT")
+    check(not re.search(r"\[CloudSync\] Finished after", a.log()),
+          "the sync ended before the other game closed")
+    check(a.wait_log(r"\[CloudSync\] Finished after"), "the sync did not end")
+    time.sleep(3)
+    check(len(a.core_notes("card")) == 1,
+          "the command line's game started after the other one closed: %s"
+          % a.core_notes("card"))
+    check(a.stop() == 0, "A did not quit cleanly")
+
+
+@lane(2)
+def cli_launch_failed_load(srv, a, b):
+    """A command-line game that fails to load after the wait quits as a
+    failed load does without cloud sync; with --load-menu-on-error the
+    menu stays up."""
+    first_sync(a, b)
+    a.fail_load = True
+    codes = []
+    for sync in ("false", "true"):
+        a.write_config(cloud_sync_enable=sync)
+        srv.state.delay = {"manifest.server": 2.0}
+        a.start(content=True, fill=None)
+        deadline = time.time() + SYNC_S
+        while a.proc.poll() is None and time.time() < deadline:
+            time.sleep(0.1)
+        codes.append(a.stop())
+    check(len(a.core_notes("refused")) == 2
+          and "Waiting for cloud sync before starting the content" in a.log(),
+          "the load did not wait for the sync")
+    check(codes[0] not in (0, None) and codes[1] == codes[0],
+          "a failed load quits with %s, after the sync with %s"
+          % tuple(codes))
+    srv.state.delay = {"manifest.server": 2.0}
+    a.start(content=True, fill=None, extra_args=("--load-menu-on-error",))
+    check(a.wait_core("refused", timeout=SYNC_S, count=3),
+          "the load after the sync was not tried")
+    time.sleep(1)
+    check(a.proc.poll() is None and a.wait_commands(),
+          "A quit with --load-menu-on-error")
+    check(a.stop() == 0, "A did not quit cleanly")
 
 
 @lane(2)
