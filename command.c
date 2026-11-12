@@ -2420,7 +2420,10 @@ bool command_save_savefiles(command_t *cmd, const char* arg)
       to the replier. */
    if (!command_event(CMD_EVENT_SAVE_FILES, NULL))
    {
-      if (runloop_save_files_recovered())
+      if (command_state_held())
+         command_reply_error(cmd, "SAVE_FILES", "%s",
+               msg_hash_to_str(MSG_CLOUD_SYNC_WAITING));
+      else if (runloop_save_files_recovered())
          command_reply_error(cmd, "SAVE_FILES",
                "saving is off for this session; progress kept in a "
                "recovery file");
