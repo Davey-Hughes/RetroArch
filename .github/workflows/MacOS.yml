@@ -85,7 +85,11 @@ jobs:
         # hung), and a cloud file that could not be loaded or a local
         # file that could not be read reported twice. With iCloud
         # unavailable, read and delete reported success. Also covers
-        # the ordinary read, missing file, upload and delete paths.
+        # the ordinary read, missing file, upload and delete paths, and
+        # that deletes and uploads keep deleted/<path>-<time> with
+        # destructive sync off (not for destructive sync or the
+        # manifest), replacing a copy from the same second, and fail
+        # when the copy can't be kept.
         cd samples/network/icloud_drive
         make clean check SANITIZER=address,undefined
 

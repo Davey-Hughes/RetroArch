@@ -76,7 +76,9 @@ enum screenshot_task_flags
    /* encoded into memory for the callback; no file is written */
    SS_TASK_FLAG_MEMORY              = (1 << 9),
    /* holds screenshot_file_claim until the task finishes */
-   SS_TASK_FLAG_CLAIM               = (1 << 10)
+   SS_TASK_FLAG_CLAIM               = (1 << 10),
+   /* a state's thumbnail */
+   SS_TASK_FLAG_SAVESTATE           = (1 << 11)
 };
 
 /* One screenshot that writes a file at a time, among screenshots
@@ -109,6 +111,10 @@ struct screenshot_task_state
    /* SS_TASK_FLAG_MEMORY: what the encoder writes into */
    uint8_t *png;
    size_t   png_size;
+   /* the file's temporary, its suffix; NULL written in place */
+   const char *suffix;
+   /* take_screenshot_cancel() named its file; frame thread only */
+   bool dropped;
    char filename[PATH_MAX_LENGTH];
    char shotname[NAME_MAX_LENGTH];
    /* Colour-space metadata for an HDR screenshot (SS_TASK_FLAG_HDR). The
@@ -130,6 +136,57 @@ struct screenshot_task_state
  * When the in-memory encode cannot allocate (very large frames on
  * memory-constrained platforms), we fall back to streaming the encode
  * straight into the file, which needs only a few rows of scratch. */
+
+#if defined(HAVE_RPNG) || defined(HAVE_RBMP)
+static bool screenshot_tmp_name(char *s, size_t len, const char *path,
+      const char *suffix)
+{
+   size_t _len = strlcpy(s, path, len);
+   return _len < len && strlcpy(s + _len, suffix, len - _len) < len - _len;
+}
+
+/* Opens "<path><*suffix>" to write. One that cannot be opened takes
+ * "<path>.tmp", then @path itself (*suffix NULL). */
+static intfstream_t *screenshot_open_tmp(const char *path,
+      const char **suffix)
+{
+   char tmp_path[PATH_MAX_LENGTH];
+   for (;;)
+   {
+      intfstream_t *s = NULL;
+      if (!*suffix)
+         return intfstream_open_file(path, RETRO_VFS_FILE_ACCESS_WRITE,
+               RETRO_VFS_FILE_ACCESS_HINT_NONE);
+      if (     screenshot_tmp_name(tmp_path, sizeof(tmp_path), path, *suffix)
+            && (s = intfstream_open_file(tmp_path,
+                  RETRO_VFS_FILE_ACCESS_WRITE,
+                  RETRO_VFS_FILE_ACCESS_HINT_NONE)))
+         return s;
+      *suffix = string_is_equal(*suffix, ".tmp") ? NULL : ".tmp";
+   }
+}
+
+/* Moves "<path><suffix>" into place when @ok, else drops it: a failed
+ * shot keeps the old file. One written in place goes when it failed. */
+static bool screenshot_finish_tmp(const char *path, const char *suffix,
+      bool ok)
+{
+   char tmp_path[PATH_MAX_LENGTH];
+   int ret;
+   if (!suffix)
+   {
+      if (!ok)
+         filestream_delete(path);
+      return ok;
+   }
+   ret = filestream_finish_atomic_suffix(path, suffix, ok, false);
+   if (     ret == 1
+         && path_is_valid(path)
+         && screenshot_tmp_name(tmp_path, sizeof(tmp_path), path, suffix))
+      filestream_delete(tmp_path);
+   return ret == 0;
+}
+#endif
 
 #if defined(HAVE_RPNG)
 /* Opens the file and begins the encode: the header is written, the
@@ -159,9 +216,8 @@ static bool screenshot_png_begin(screenshot_task_state_t *state,
                   RETRO_VFS_FILE_ACCESS_HINT_NONE, state->png_size)))
          return false;
    }
-   else if (!(state->enc_s = intfstream_open_file(state->filename,
-         RETRO_VFS_FILE_ACCESS_WRITE,
-         RETRO_VFS_FILE_ACCESS_HINT_NONE)))
+   else if (!(state->enc_s = screenshot_open_tmp(state->filename,
+         &state->suffix)))
       return false;
    if (!(state->enc = rpng_encode_begin(data, state->enc_s,
          VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims), pitch, fmt, hdr)))
@@ -170,23 +226,24 @@ static bool screenshot_png_begin(screenshot_task_state_t *state,
       free(state->enc_s);
       state->enc_s = NULL;
       if (!(state->flags & SS_TASK_FLAG_MEMORY))
-         filestream_delete(state->filename);
+         screenshot_finish_tmp(state->filename, state->suffix, false);
       return false;
    }
    return true;
 }
 
 /* Closes the file and lets go of the encoder and the scaled copy.  A
- * file not written through (@done false) is removed rather than left
- * half-written. */
-static void screenshot_png_end(screenshot_task_state_t *state, bool done)
+ * file written through (@done) replaces the old one; otherwise the old
+ * one stays. Returns whether the shot was written. */
+static bool screenshot_png_end(screenshot_task_state_t *state, bool done)
 {
    rpng_encode_free(state->enc);
    state->enc = NULL;
    if (state->enc_s)
    {
       int64_t len = intfstream_tell(state->enc_s);
-      intfstream_close(state->enc_s);
+      if (intfstream_close(state->enc_s) != 0)
+         done = false;
       free(state->enc_s);
       state->enc_s = NULL;
       if (state->flags & SS_TASK_FLAG_MEMORY)
@@ -195,23 +252,23 @@ static void screenshot_png_end(screenshot_task_state_t *state, bool done)
             state->image_b64 = base64(state->png, (int)len,
                   &state->image_b64_len);
       }
-      else if (!done)
-         filestream_delete(state->filename);
+      else
+         done = screenshot_finish_tmp(state->filename, state->suffix,
+               done);
    }
    free(state->png);
    state->png = NULL;
    free(state->out_buffer);
    state->out_buffer = NULL;
+   return done;
 }
 #elif defined(HAVE_RBMP)
-static bool screenshot_save_bmp(const char *path, const void *frame,
-      unsigned dims, unsigned pitch,
+static bool screenshot_save_bmp(const char *path, const char **suffix,
+      const void *frame, unsigned dims, unsigned pitch,
       enum rbmp_source_type type)
 {
    bool ret;
-   intfstream_t *intf_s = intfstream_open_file(path,
-         RETRO_VFS_FILE_ACCESS_WRITE,
-         RETRO_VFS_FILE_ACCESS_HINT_NONE);
+   intfstream_t *intf_s = screenshot_open_tmp(path, suffix);
 
    /* BMP has no compression - the file is the raw pixel block - so
     * buffering the whole image first would only add a full-frame
@@ -225,9 +282,10 @@ static bool screenshot_save_bmp(const char *path, const void *frame,
    ret = rbmp_save_image_stream(intf_s, frame,
          VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims), pitch, type);
 
-   intfstream_close(intf_s);
+   if (intfstream_close(intf_s) != 0)
+      ret = false;
    free(intf_s);
-   return ret;
+   return screenshot_finish_tmp(path, *suffix, ret);
 }
 #endif
 
@@ -324,7 +382,7 @@ static bool screenshot_dump_direct(screenshot_task_state_t *state)
 #if defined(HAVE_RPNG)
    if (screenshot_encode_begin(state))
       ret = (rpng_encode_step(state->enc, NULL, NULL) == 1);
-   screenshot_png_end(state, ret);
+   ret = screenshot_png_end(state, ret);
 #elif defined(HAVE_RBMP)
    {
       enum rbmp_source_type bmp_type = RBMP_SOURCE_TYPE_DONT_CARE;
@@ -334,6 +392,7 @@ static bool screenshot_dump_direct(screenshot_task_state_t *state)
          bmp_type = RBMP_SOURCE_TYPE_XRGB888;
 
       ret = screenshot_save_bmp(state->filename,
+            &state->suffix,
             state->frame,
             state->dims,
             state->pitch,
@@ -394,8 +453,7 @@ static void task_screenshot_handler(retro_task_t *task)
       }
       if (r == 0)
          return;
-      ret = (r == 1);
-      screenshot_png_end(state, ret);
+      ret = screenshot_png_end(state, r == 1);
    }
 #else
    ret = screenshot_dump_direct(state);
@@ -463,6 +521,13 @@ task_finished:
    if (task)
       task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
 
+   /* A state's thumbnail not written leaves none: not one of an older
+    * state beside it */
+   if (     state
+         && (state->flags & SS_TASK_FLAG_SAVESTATE)
+         && !(state->flags & SS_TASK_FLAG_WRITTEN))
+      filestream_delete(state->filename);
+
    if (state && (state->flags & SS_TASK_FLAG_CLAIM))
    {
       state->flags &= ~SS_TASK_FLAG_CLAIM;
@@ -474,6 +539,12 @@ task_finished:
    if (state && state->enc)
       screenshot_png_end(state, false);
 #endif
+
+   if (state)
+   {
+      free(state->out_buffer);
+      state->out_buffer = NULL;
+   }
 
    if (task->title)
       task_free_title(task);
@@ -523,15 +594,17 @@ static void task_screenshot_callback(retro_task_t *task,
       void *task_data,
       void *user_data, const char *error)
 {
-   screenshot_task_state_t *state = NULL;
+   screenshot_task_state_t *state = task
+      ? (screenshot_task_state_t*)task->state : NULL;
+
+   /* what a step under way at the cancel wrote, before the next shot */
+   if (state && state->dropped)
+      filestream_delete(state->filename);
 
    /* this one's claim went as it finished */
    screenshots_release_held();
 
-   if (!task)
-      return;
-
-   if (!(state = (screenshot_task_state_t*)task->state))
+   if (!state)
       return;
 
 #if defined(HAVE_GFX_WIDGETS)
@@ -560,6 +633,32 @@ static void task_screenshot_callback(retro_task_t *task,
     * to avoid potential heap-use-after-free errors */
    state       = NULL;
    task->state = NULL;
+}
+
+/* Only a task with this callback: its state is freed there, on this
+ * thread, not by the handler */
+static bool screenshot_cancel_finder(retro_task_t *task, void *path)
+{
+   screenshot_task_state_t *state;
+   if (     task->handler  != task_screenshot_handler
+         || task->callback != task_screenshot_callback
+         || !(state = (screenshot_task_state_t*)task->state)
+         || !string_is_equal(state->filename, (const char*)path))
+      return false;
+   state->dropped = true;
+   task_set_flags(task, RETRO_TASK_FLG_CANCELLED, true);
+   return false;
+}
+
+void take_screenshot_cancel(const char *path)
+{
+   unsigned i;
+   task_finder_data_t find;
+   for (i = 0; i < screenshots_held_count; i++)
+      screenshot_cancel_finder(screenshots_held[i], (void*)path);
+   find.func     = screenshot_cancel_finder;
+   find.userdata = (void*)path;
+   task_queue_find(&find);
 }
 
 /**
@@ -703,6 +802,7 @@ static bool screenshot_dump(
    state->pitch                  = pitch;
    state->frame                  = frame;
    state->userbuf                = userbuf;
+   state->suffix                 = ".tmp";
    state->cb                     = cb;
    if (cb)
       state->flags              |= SS_TASK_FLAG_WANT_IMAGE;
@@ -732,7 +832,8 @@ static bool screenshot_dump(
             || VIDEO_SCALE_H(state->out_dims) > VIDEO_SCALE_H(dims))
          state->out_dims         = dims;
 
-      state->flags              |= SS_TASK_FLAG_SILENCE;
+      state->flags              |= SS_TASK_FLAG_SILENCE
+                                 | SS_TASK_FLAG_SAVESTATE;
    }
    /* The frame, scaled to fit @frame_max and never up, for the callback
     * alone: no file, no notification */
@@ -950,7 +1051,10 @@ static bool screenshot_dump(
       /* Same ownership as the task path: the caller's buffer is ours
        * once the screenshot is written, and stays the caller's to
        * free if it is not. */
-      bool ret = screenshot_dump_direct(state);
+      bool ret;
+      /* its own temporary: a task may be writing "<path>.tmp" */
+      state->suffix = ".direct.tmp";
+      ret = screenshot_dump_direct(state);
       if (ret && state->userbuf)
          free(state->userbuf);
       if (ret && state->cb)

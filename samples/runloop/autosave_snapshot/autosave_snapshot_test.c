@@ -3,6 +3,8 @@
 #include <assert.h>
 #include <stdio.h>
 #include <retro_timers.h>
+/* No busy cap: these lanes change save RAM at consecutive checks. */
+#define AUTOSAVE_BUSY_USEC 0
 #include "../../../save.c"
 
 #define SRAM_SIZE 17
@@ -18,11 +20,6 @@ static unsigned char disk_image[SRAM_SIZE];
 static autosave_t *current;
 static unsigned char ram_storage[SRAM_SIZE + 1];
 static unsigned char *ram = ram_storage + 1;
-
-void RARCH_ERR(const char *fmt, ...)
-{
-   (void)fmt;
-}
 
 intfstream_t *intfstream_open_file(const char *path,
       unsigned mode, unsigned hints)
@@ -82,6 +79,163 @@ int intfstream_close(intfstream_t *file)
    return result;
 }
 
+int filestream_finish_atomic_suffix(const char *path, const char *suffix,
+      bool ok, bool sync)
+{
+   (void)path;
+   (void)suffix;
+   (void)sync;
+   return ok ? 0 : -1;
+}
+
+/* The main thread's write of an image the worker hands over: it fails
+ * where the worker's open does. */
+bool filestream_write_file_atomic_synced(const char *path, const void *data,
+      int64_t size)
+{
+   bool fail;
+   (void)path;
+   assert(size == SRAM_SIZE);
+   slock_lock(io_lock);
+   fail = fail_stage == 1;
+   if (!fail)
+      memcpy(disk_image, data, SRAM_SIZE);
+   slock_unlock(io_lock);
+   return !fail;
+}
+
+bool filestream_atomic_temp_name(char *s, size_t len, const char *path)
+{
+   size_t path_len = strlen(path);
+   if (path_len + sizeof(".tmp") > len)
+      return false;
+   memcpy(s, path, path_len);
+   memcpy(s + path_len, ".tmp", sizeof(".tmp"));
+   return true;
+}
+
+bool filestream_atomic_in_place(const char *path)
+{
+   (void)path;
+   return false;
+}
+
+int filestream_delete(const char *path)
+{
+   (void)path;
+   return 0;
+}
+
+bool path_is_valid(const char *path)
+{
+   (void)path;
+   return true;
+}
+
+int64_t path_get_size(const char *path)
+{
+   (void)path;
+   return -1;
+}
+
+bool path_get_mtime(const char *path, int64_t *mtime)
+{
+   (void)path;
+   (void)mtime;
+   return false;
+}
+
+/* No copy is ever owed here: the handles have no session state. */
+enum save_backup_result save_backups_copy_file_at(const char *path,
+      enum save_backup_reason reason, bool sync, unsigned *seq,
+      enum save_backups_place *place)
+{
+   (void)path;
+   (void)reason;
+   (void)sync;
+   (void)seq;
+   *place = SAVE_BACKUPS_PLACE_COPIES;
+   return SAVE_BACKUP_FAILED;
+}
+
+enum save_backups_place save_backups_place_of(const char *file)
+{
+   (void)file;
+   return SAVE_BACKUPS_PLACE_COPIES;
+}
+
+size_t save_backups_place_dir(char *s, size_t len, const char *path,
+      enum save_backups_place place, bool own)
+{
+   (void)path;
+   (void)place;
+   (void)own;
+   if (len)
+      s[0] = '\0';
+   return 0;
+}
+
+/* No flush runs here. */
+size_t save_backups_recover(char *s, size_t len, const char *path,
+      const void *data, size_t data_len, bool sync)
+{
+   (void)s;
+   (void)len;
+   (void)path;
+   (void)data;
+   (void)data_len;
+   (void)sync;
+   return 0;
+}
+
+size_t save_backups_recover_away(char *s, size_t len, const char *path,
+      const void *data, size_t data_len, bool sync)
+{
+   return save_backups_recover(s, len, path, data, data_len, sync);
+}
+
+const char *save_backups_reason_name(enum save_backup_reason reason)
+{
+   (void)reason;
+   return "";
+}
+
+const char *path_basename_nocompression(const char *path)
+{
+   return path;
+}
+
+void RARCH_LOG(const char *fmt, ...) { (void)fmt; }
+void RARCH_WARN(const char *fmt, ...) { (void)fmt; }
+
+const char *msg_hash_to_str(enum msg_hash_enums msg)
+{
+   (void)msg;
+   return "";
+}
+
+void runloop_msg_queue_push(const char *msg, size_t len,
+      unsigned prio, unsigned duration, bool flush, char *title,
+      enum message_queue_icon icon, enum message_queue_category category)
+{
+   (void)msg;
+   (void)len;
+   (void)prio;
+   (void)duration;
+   (void)flush;
+   (void)title;
+   (void)icon;
+   (void)category;
+}
+
+bool core_get_memory(retro_ctx_memory_info_t *info)
+{
+   info->data = ram;
+   info->size = SRAM_SIZE;
+   return true;
+}
+
+/* The main thread meanwhile writes any image the worker hands over. */
 static void wait_requested(void)
 {
    unsigned i;
@@ -89,6 +243,7 @@ static void wait_requested(void)
    {
       if (retro_atomic_load_acquire_int(&current->snapshot_requested))
          return;
+      autosave_serve(current);
       retro_sleep(1);
    }
    assert(!"snapshot request timed out");
@@ -104,7 +259,8 @@ static void capture_and_wait(void)
 static void start_save(bool compress)
 {
    memset(ram, 0, SRAM_SIZE);
-   current = autosave_new("unused.srm", ram, SRAM_SIZE, 0, compress);
+   current = autosave_new("unused.srm", ram, SRAM_SIZE, 0, compress,
+         RETRO_MEMORY_SAVE_RAM, false, NULL);
    assert(current);
    autosave_state.list = &current;
    autosave_state.num  = 1;
@@ -114,7 +270,7 @@ static void start_save(bool compress)
 static void stop_save(void)
 {
    /* No further frames: shutdown must wake a worker awaiting a copy. */
-   autosave_free(current);
+   autosave_free(current, false);
    current = NULL;
    autosave_state.list = NULL;
    autosave_state.num  = 0;

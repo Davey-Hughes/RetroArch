@@ -81,6 +81,7 @@
  * cannot preprocess. */
 void android_app_set_window_settings(bool notch_write_over,
       bool auto_mouse_grab);
+bool android_is_default_dir(const char *dir, const char *leaf);
 #endif
 
 #include "list_special.h"
@@ -2221,8 +2222,8 @@ static struct config_path_setting *populate_settings_path(
    SETTING_PATH("thumbnails_directory",          settings->paths.directory_thumbnails, true, NULL, true);
    SETTING_PATH("runtime_log_directory",         settings->paths.directory_runtime_log, true, NULL, true);
    SETTING_PATH("joypad_autoconfig_dir",         settings->paths.directory_autoconfig, false, NULL, true);
-   SETTING_PATH("savefile_directory",            dir_get_ptr(RARCH_DIR_SAVEFILE), true, NULL, false);
-   SETTING_PATH("savestate_directory",           dir_get_ptr(RARCH_DIR_SAVESTATE), true, NULL, false);
+   SETTING_PATH("savefile_directory",            dir_get_ptr(RARCH_DIR_SAVEFILE_CONFIGURED), true, NULL, false);
+   SETTING_PATH("savestate_directory",           dir_get_ptr(RARCH_DIR_SAVESTATE_CONFIGURED), true, NULL, false);
    SETTING_PATH("screenshot_directory",          settings->paths.directory_screenshot, true, NULL, true);
    SETTING_PATH("recording_output_directory",    recording_st->output_dir, false, NULL, true);
    SETTING_PATH("recording_config_directory",    recording_st->config_dir, false, NULL, true);
@@ -6393,11 +6394,20 @@ void config_set_defaults(settings_t *target)
    custom_vp->pos    = 0;
 
    /* Make sure settings from other configs carry over into defaults
-    * for another config. */
-   if (!retroarch_override_setting_is_set(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL))
-      dir_clear(RARCH_DIR_SAVEFILE);
-   if (!retroarch_override_setting_is_set(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL))
-      dir_clear(RARCH_DIR_SAVESTATE);
+    * for another config. config_save_file()'s defaults copy leaves
+    * the folders in use and the configured ones alone. */
+   if (target == config_st)
+   {
+      if (!retroarch_override_setting_is_set(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL))
+         dir_clear(RARCH_DIR_SAVEFILE);
+      if (!retroarch_override_setting_is_set(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL))
+         dir_clear(RARCH_DIR_SAVESTATE);
+      dir_clear(RARCH_DIR_SAVEFILE_CONFIGURED);
+      dir_clear(RARCH_DIR_SAVESTATE_CONFIGURED);
+      dir_set(RARCH_DIR_SAVEFILE_BASE, g_defaults.dirs[DEFAULT_DIR_SRAM]);
+      dir_set(RARCH_DIR_SAVESTATE_BASE,
+            g_defaults.dirs[DEFAULT_DIR_SAVESTATE]);
+   }
 
    *settings->paths.path_libretro_info = '\0';
    *settings->paths.directory_libretro = '\0';
@@ -6600,10 +6610,10 @@ void config_set_defaults(settings_t *target)
             settings->paths.directory_autoconfig,
             g_defaults.dirs[DEFAULT_DIR_AUTOCONFIG]);
 
-   if (*g_defaults.dirs[DEFAULT_DIR_SAVESTATE])
+   if (target == config_st && *g_defaults.dirs[DEFAULT_DIR_SAVESTATE])
       dir_set(RARCH_DIR_SAVESTATE, g_defaults.dirs[DEFAULT_DIR_SAVESTATE]);
 
-   if (*g_defaults.dirs[DEFAULT_DIR_SRAM])
+   if (target == config_st && *g_defaults.dirs[DEFAULT_DIR_SRAM])
       dir_set(RARCH_DIR_SAVEFILE, g_defaults.dirs[DEFAULT_DIR_SRAM]);
 
    if (*g_defaults.dirs[DEFAULT_DIR_SYSTEM])
@@ -7139,6 +7149,61 @@ CONFIG_NOINLINE static void config_load_video_windows(settings_t *settings, conf
 #undef CONFIG_NOINLINE
 #endif
 
+#ifdef ANDROID
+/* One of the folders Android picks for @leaf by storage permission,
+ * which an earlier fallback may have written, when it is this launch's
+ * default or cannot be opened. A readable one keeps its saves. */
+static bool config_android_save_dir_is_default(const char *dir,
+      const char *leaf)
+{
+   const char *def = g_defaults.dirs[string_is_equal(leaf, "saves")
+         ? DEFAULT_DIR_SRAM : DEFAULT_DIR_SAVESTATE];
+   size_t len      = strlen(def);
+   if (!android_is_default_dir(dir, leaf))
+      return false;
+   while (len > 1 && PATH_CHAR_IS_SLASH(def[len - 1]))
+      len--;
+   if (     !strncmp(dir, def, len)
+         && (!dir[len] || (PATH_CHAR_IS_SLASH(dir[len]) && !dir[len + 1])))
+      return true;
+   return !path_is_directory(dir);
+}
+#endif
+
+/* "default", or on Android a permission-picked folder that stands
+ * for it. */
+static bool config_save_dir_is_default(const char *dir, const char *leaf)
+{
+   if (string_is_equal(dir, "default"))
+      return true;
+#ifdef ANDROID
+   return config_android_save_dir_is_default(dir, leaf);
+#else
+   (void)leaf;
+   return false;
+#endif
+}
+
+/* The configured folder is kept for saving, whatever is used now. */
+static void config_set_save_dir_configured(enum rarch_dir_type type,
+      const char *dir, const char *leaf)
+{
+   if (config_save_dir_is_default(dir, leaf))
+      dir_clear(type);
+   else
+      dir_set(type, dir);
+}
+
+/* The main config's folder, the one cloud sync walks */
+static void config_set_save_dir_base(enum rarch_dir_type type,
+      const char *dir, const char *leaf, const char *def)
+{
+   if (!*dir || config_save_dir_is_default(dir, leaf))
+      dir_set(type, def);
+   else
+      dir_set(type, dir);
+}
+
 /**
  * config_load:
  * @path                : path to be read from.
@@ -7148,7 +7213,8 @@ CONFIG_NOINLINE static void config_load_video_windows(settings_t *settings, conf
  * Loads a config file and reads all the values into memory.
  *
  */
-static bool config_load_file(const char *path, settings_t *settings)
+static bool config_load_file(const char *path, settings_t *settings,
+      bool reread)
 {
    unsigned i;
    char tmp_str[PATH_MAX_LENGTH];
@@ -7331,6 +7397,26 @@ static bool config_load_file(const char *path, settings_t *settings)
    /* the controllers' own players, the main config's; each override's
     * go over them by controller as it is appended */
    input_plays_as_read(conf);
+
+   /* before any override goes in */
+   if (!without_overrides)
+   {
+      /* Only a load: Save As changes the path without one */
+      if (!reread)
+         runloop_save_root_set_config(path_get(RARCH_PATH_CONFIG));
+      if (config_get_path(conf, "savefile_directory", tmp_str, sizeof(tmp_str)))
+      {
+         runloop_save_root_resolve(tmp_str, sizeof(tmp_str));
+         config_set_save_dir_base(RARCH_DIR_SAVEFILE_BASE, tmp_str,
+               "saves", g_defaults.dirs[DEFAULT_DIR_SRAM]);
+      }
+      if (config_get_path(conf, "savestate_directory", tmp_str, sizeof(tmp_str)))
+      {
+         runloop_save_root_resolve(tmp_str, sizeof(tmp_str));
+         config_set_save_dir_base(RARCH_DIR_SAVESTATE_BASE, tmp_str,
+               "states", g_defaults.dirs[DEFAULT_DIR_SAVESTATE]);
+      }
+   }
 
    if (!path_is_empty(RARCH_PATH_CONFIG_OVERRIDE) && !without_overrides)
    {
@@ -8075,10 +8161,20 @@ static bool config_load_file(const char *path, settings_t *settings)
     * override would reset the live save directory to the base config
     * value (issue #18809). */
    if (    !without_overrides
+         && config_get_path(conf, "savefile_directory", tmp_str, sizeof(tmp_str)))
+      config_set_save_dir_configured(RARCH_DIR_SAVEFILE_CONFIGURED,
+            tmp_str, "saves");
+   if (    !without_overrides
+         && config_get_path(conf, "savestate_directory", tmp_str, sizeof(tmp_str)))
+      config_set_save_dir_configured(RARCH_DIR_SAVESTATE_CONFIGURED,
+            tmp_str, "states");
+
+   if (    !without_overrides
          && !retroarch_override_setting_is_set(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL)
          && config_get_path(conf, "savefile_directory", tmp_str, sizeof(tmp_str)))
    {
-      if (string_is_equal(tmp_str, "default"))
+      runloop_save_root_resolve(tmp_str, sizeof(tmp_str));
+      if (config_save_dir_is_default(tmp_str, "saves"))
          dir_set(RARCH_DIR_SAVEFILE, g_defaults.dirs[DEFAULT_DIR_SRAM]);
       else if (path_is_directory(tmp_str))
       {
@@ -8099,7 +8195,8 @@ static bool config_load_file(const char *path, settings_t *settings)
          && !retroarch_override_setting_is_set(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL)
          && config_get_path(conf, "savestate_directory", tmp_str, sizeof(tmp_str)))
    {
-      if (string_is_equal(tmp_str, "default"))
+      runloop_save_root_resolve(tmp_str, sizeof(tmp_str));
+      if (config_save_dir_is_default(tmp_str, "states"))
          dir_set(RARCH_DIR_SAVESTATE, g_defaults.dirs[DEFAULT_DIR_SAVESTATE]);
       else if (path_is_directory(tmp_str))
       {
@@ -8121,6 +8218,11 @@ static bool config_load_file(const char *path, settings_t *settings)
       else
          RARCH_WARN("[Config] \"savestate_directory\" is not a directory, ignoring...\n");
    }
+#ifdef HAVE_CLOUDSYNC
+   /* Until a content load checks the folders again */
+   if (!without_overrides)
+      runloop_save_base_check();
+#endif
 
    config_read_keybinds_conf(conf);
    /* the binds, and the device settings read above */
@@ -8430,11 +8532,7 @@ bool config_load_override(void *data)
    /* Re-load the configuration with any overrides
     * that might have been found */
 
-   /* Toggle has_save_path to false so it resets */
-   retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL);
-   retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
-
-   if (!config_load_file(path_get(RARCH_PATH_CONFIG), settings))
+   if (!config_load_file(path_get(RARCH_PATH_CONFIG), settings, true))
       return false;
 
    a = path_get(RARCH_PATH_CONFIG_OVERRIDE);
@@ -8446,10 +8544,6 @@ bool config_load_override(void *data)
       runloop_msg_queue_push(msg, _len, 2, 100, false, NULL,
             MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
    }
-
-   /* Reset save paths. */
-   retroarch_override_setting_set(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL);
-   retroarch_override_setting_set(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
 
    a = path_get(RARCH_PATH_CONFIG_OVERRIDE);
    if (a && *a)
@@ -8477,11 +8571,7 @@ bool config_load_override_file(const char *config_path)
    /* Re-load the configuration with any overrides
     * that might have been found */
 
-   /* Toggle has_save_path to false so it resets */
-   retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL);
-   retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
-
-   if (!config_load_file(path_get(RARCH_PATH_CONFIG), settings))
+   if (!config_load_file(path_get(RARCH_PATH_CONFIG), settings, true))
       return false;
 
    if (settings->bools.notification_show_config_override_load)
@@ -8491,10 +8581,6 @@ bool config_load_override_file(const char *config_path)
       runloop_msg_queue_push(msg, _len, 2, 100, false, NULL,
             MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
    }
-
-   /* Reset save paths. */
-   retroarch_override_setting_set(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL);
-   retroarch_override_setting_set(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
 
    a = path_get(RARCH_PATH_CONFIG_OVERRIDE);
    if (a && *a)
@@ -8524,10 +8610,6 @@ bool config_unload_override(void)
    runloop_st->flags &= ~RUNLOOP_FLAG_OVERRIDES_ACTIVE;
    path_clear(RARCH_PATH_CONFIG_OVERRIDE);
 
-   /* Toggle has_save_path to false so it resets */
-   retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL);
-   retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
-
    /* When using minimal config, reset to defaults first.
     * This ensures settings not present in the config file
     * get their default values restored after override unload. */
@@ -8538,7 +8620,7 @@ bool config_unload_override(void)
       config_set_defaults(config_st);
 
    if (!config_load_file(
-            path_get(RARCH_PATH_CONFIG), config_st))
+            path_get(RARCH_PATH_CONFIG), config_st, true))
       return false;
 
    if (settings->bools.video_fullscreen != fullscreen_prev)
@@ -8560,10 +8642,6 @@ bool config_unload_override(void)
       config_load_remap(settings->paths.directory_input_remapping, &runloop_st->system);
 
    RARCH_LOG("[Override] Configuration overrides unloaded, original configuration restored.\n");
-
-   /* Reset save paths */
-   retroarch_override_setting_set(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL);
-   retroarch_override_setting_set(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
 
    /* each port's deadzones, from the settings put back */
    input_driver_deadzones_refresh();
@@ -8744,7 +8822,7 @@ static void config_parse_file(void)
    }
 #endif
 
-   if (!config_load_file(config_path, config_st))
+   if (!config_load_file(config_path, config_st, false))
    {
       RARCH_ERR("[Config] Config not found at: \"%s\".\n",
             config_path);
@@ -10553,7 +10631,7 @@ int8_t config_save_overrides(enum override_type type,
 
    /* Load the original config file in memory */
    config_load_file(
-         "without-overrides", settings);
+         "without-overrides", settings, true);
 
    bool_settings       = populate_settings_bool(settings,   &bool_settings_size);
    tmp_i               = SETTINGS_BOOL_COUNT_MAX;
@@ -10589,9 +10667,9 @@ int8_t config_save_overrides(enum override_type type,
     * both 'settings' (base) and 'overrides' (live). The generic path
     * diff below is therefore blind to changes in these two dirs
     * (issue #18809). Read the pre-override baseline straight from the
-    * on-disk config so the live dirs can be diffed against it explicitly.
-    * "default" is resolved the same way the loader does, so an unchanged
-    * default does not register as a spurious change. The command-line
+    * on-disk config so the configured dirs can be diffed against it
+    * explicitly, never the folder used in place of a missing one;
+    * "default" compares as "default". The command-line
     * --save/--savestate overrides mirror the loader's gate: when set,
     * the dir cannot be applied from an override on load, so leave it to
     * the (no-op) generic comparison instead. */
@@ -10606,20 +10684,22 @@ int8_t config_save_overrides(enum override_type type,
             path_get(RARCH_PATH_CONFIG));
       if (base_conf)
       {
-         if (config_get_path(base_conf, "savefile_directory",
+         if (     config_get_path(base_conf, "savefile_directory",
                   base_savefile, sizeof(base_savefile))
-               && string_is_equal(base_savefile, "default"))
-            strlcpy(base_savefile, g_defaults.dirs[DEFAULT_DIR_SRAM],
-                  sizeof(base_savefile));
-         if (config_get_path(base_conf, "savestate_directory",
+               && config_save_dir_is_default(base_savefile, "saves"))
+            base_savefile[0] = '\0';
+         if (     config_get_path(base_conf, "savestate_directory",
                   base_savestate, sizeof(base_savestate))
-               && string_is_equal(base_savestate, "default"))
-            strlcpy(base_savestate, g_defaults.dirs[DEFAULT_DIR_SAVESTATE],
-                  sizeof(base_savestate));
+               && config_save_dir_is_default(base_savestate, "states"))
+            base_savestate[0] = '\0';
          config_file_free(base_conf);
       }
       config_path_strip_trailing_slash(base_savefile);
       config_path_strip_trailing_slash(base_savestate);
+      if (!*base_savefile)
+         strlcpy(base_savefile, "default", sizeof(base_savefile));
+      if (!*base_savestate)
+         strlcpy(base_savestate, "default", sizeof(base_savestate));
    }
 
    if (conf->flags & CONF_FILE_FLG_MODIFIED)
@@ -10727,7 +10807,7 @@ int8_t config_save_overrides(enum override_type type,
          /* savefile_directory / savestate_directory alias a global
           * buffer, so path_settings[] and path_overrides[] point at the
           * same string and the generic comparison never fires. Diff the
-          * live dir against the on-disk baseline read above instead,
+          * configured dir against the on-disk baseline read above instead,
           * normalising a trailing separator on both sides. When the
           * matching command-line override is set the dir cannot be
           * applied from an override on load, so fall through to the
@@ -10735,7 +10815,8 @@ int8_t config_save_overrides(enum override_type type,
          if (     !savefile_cmdline
                && string_is_equal(path_overrides[i].ident, "savefile_directory"))
          {
-            strlcpy(cur_buf, cur ? cur : "", sizeof(cur_buf));
+            strlcpy(cur_buf, (cur && *cur) ? cur : "default",
+                  sizeof(cur_buf));
             config_path_strip_trailing_slash(cur_buf);
             cur  = cur_buf;
             base = base_savefile;
@@ -10743,7 +10824,8 @@ int8_t config_save_overrides(enum override_type type,
          else if (!savestate_cmdline
                && string_is_equal(path_overrides[i].ident, "savestate_directory"))
          {
-            strlcpy(cur_buf, cur ? cur : "", sizeof(cur_buf));
+            strlcpy(cur_buf, (cur && *cur) ? cur : "default",
+                  sizeof(cur_buf));
             config_path_strip_trailing_slash(cur_buf);
             cur  = cur_buf;
             base = base_savestate;

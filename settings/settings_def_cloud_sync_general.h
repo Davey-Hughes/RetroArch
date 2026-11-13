@@ -20,7 +20,7 @@ S_BOOL(cloud_sync_destructive, CLOUD_SYNC_DESTRUCTIVE,
       "cloud_sync_destructive",
       false, SD_FLAG_NONE, 0, 0,
       "Destructive Cloud Sync",
-      "When disabled, files are moved to a backup folder before being overwritten or deleted.")
+      "When enabled, a file a sync deletes or replaces on the server is not kept on the server. Local files a sync replaces or deletes are copied to backups first either way.")
 #endif
 /* Descriptor and configuration rows are #ifdef HAVE_CLOUDSYNC; the string
  * tables always carry this row via the strings pass. */
@@ -29,7 +29,7 @@ S_BOOL(cloud_sync_sync_saves, CLOUD_SYNC_SYNC_SAVES,
       "cloud_sync_sync_saves",
       true, SD_FLAG_NONE, 0, 0,
       "Sync: Saves/States",
-      "When enabled, saves/states will be synced to cloud.")
+      "When enabled, the save and state folders set in the main configuration are synced to cloud; folders set by an override or the command line are not.")
 #endif
 /* Descriptor and configuration rows are #ifdef HAVE_CLOUDSYNC; the string
  * tables always carry this row via the strings pass. */
@@ -65,7 +65,7 @@ S_UINT_EX(cloud_sync_sync_mode, CLOUD_SYNC_SYNC_MODE,
       "cloud_sync_sync_mode",
       CLOUD_SYNC_MODE_AUTOMATIC, SD_FLAG_NONE, SDESC_RANGE_MINMAX, 0, 0, CLOUD_SYNC_MODE_LAST-1, 1, 0, setting_action_ok_uint, setting_get_string_representation_uint_cloud_sync_sync_mode, NULL, NULL, NULL, NULL, ST_UI_TYPE_UINT_COMBOBOX,
       "Sync Mode",
-      "Automatic: Sync on RetroArch startup and when cores are unloaded. Manual: Only sync when 'Sync Now' button is manually triggered.")
+      "Automatic: Sync on RetroArch startup and when cores are unloaded; content launched from the command line starts once the startup sync ends. Manual: Only sync when 'Sync Now' button is manually triggered.")
 #endif
 
 #if (defined(HAVE_CLOUDSYNC) && defined(HAVE_NFSCLIENT)) || defined(SETTINGS_DEF_STRINGS_PASS)

@@ -48,9 +48,22 @@ void RARCH_LOG(const char *fmt, ...)  { (void)fmt; }
 void RARCH_WARN(const char *fmt, ...) { (void)fmt; }
 void RARCH_ERR(const char *fmt, ...)  { (void)fmt; }
 bool verbosity_is_enabled(void)       { return false; }
+const char *msg_hash_to_str(enum msg_hash_enums msg) { (void)msg; return ""; }
+void runloop_msg_queue_push(const char *msg, size_t len, unsigned prio,
+      unsigned duration, bool flush, char *title,
+      enum message_queue_icon icon, enum message_queue_category category)
+{
+   (void)msg; (void)len; (void)prio; (void)duration; (void)flush;
+   (void)title; (void)icon; (void)category;
+}
 settings_t *config_get_ptr(void)      { return NULL; }
 char *dir_get_ptr(enum rarch_dir_type type) { (void)type; return NULL; }
 bool content_savefile_is_live(const char *path) { (void)path; return false; }
+unsigned content_savefile_lifetime(void) { return 0; }
+unsigned content_save_writes(void) { return 0; }
+void content_state_fetched(void) {}
+bool content_save_state_in_progress(void *data) { (void)data; return false; }
+void runloop_save_load_release(uint8_t bit) { (void)bit; }
 void task_window_progress_cb(retro_task_t *task) { (void)task; }
 size_t fill_pathname_application_special(char *s, size_t len,
       enum application_special_type type)

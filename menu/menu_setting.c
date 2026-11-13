@@ -11085,6 +11085,35 @@ static void general_write_handler(rarch_setting_t *setting)
 
    switch (setting->enum_idx)
    {
+      case MENU_ENUM_LABEL_SAVEFILE_DIRECTORY:
+      case MENU_ENUM_LABEL_SAVESTATE_DIRECTORY:
+         {
+            /* The folder picked here is the one the config saves */
+            bool save       = setting->enum_idx
+               == MENU_ENUM_LABEL_SAVEFILE_DIRECTORY;
+            const char *dir = dir_get_ptr(save
+                  ? RARCH_DIR_SAVEFILE : RARCH_DIR_SAVESTATE);
+            enum rarch_dir_type configured = save
+               ? RARCH_DIR_SAVEFILE_CONFIGURED
+               : RARCH_DIR_SAVESTATE_CONFIGURED;
+            if (string_is_equal(dir, g_defaults.dirs[save
+                     ? DEFAULT_DIR_SRAM : DEFAULT_DIR_SAVESTATE]))
+               dir_clear(configured);
+            else
+               dir_set(configured, dir);
+            /* an override's folder is not the main config's */
+            if (!(runloop_state_get_ptr()->flags
+                     & RUNLOOP_FLAG_OVERRIDES_ACTIVE))
+            {
+               dir_set(save
+                     ? RARCH_DIR_SAVEFILE_BASE
+                     : RARCH_DIR_SAVESTATE_BASE, dir);
+#ifdef HAVE_CLOUDSYNC
+               runloop_save_base_check();
+#endif
+            }
+         }
+         break;
       case MENU_ENUM_LABEL_VIDEO_GPU_INDEX:
          video_driver_gpu_index_select(video_context_driver_get_api(),
                *setting->value.target.integer);

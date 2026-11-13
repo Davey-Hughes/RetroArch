@@ -145,8 +145,12 @@ int rsmb_mkdir(struct rsmb_ctx *c, const char *path);
 int rsmb_rename(struct rsmb_ctx *c, const char *from, const char *to);
 
 struct rsmb_dir *rsmb_opendir(struct rsmb_ctx *c, const char *path);
-/* NULL at the end; "." and ".." are skipped. */
+/* NULL at the end or on a failure, which rsmb_readdir_failed() tells
+ * apart; "." and ".." are skipped. */
 const struct rsmb_dirent *rsmb_readdir(struct rsmb_ctx *c, struct rsmb_dir *d);
+/* Nonzero once rsmb_readdir() has returned NULL on a failed or
+ * malformed reply rather than at the end of the listing. */
+int rsmb_readdir_failed(const struct rsmb_dir *d);
 void rsmb_closedir(struct rsmb_ctx *c, struct rsmb_dir *d);
 
 /* One share as SRVSVC reports it. */

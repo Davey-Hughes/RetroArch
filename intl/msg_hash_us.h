@@ -13492,7 +13492,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_SORT_SAVEFILES_ENABLE,
-   "Sort save files into folders named after the core used."
+   "Sort save files into folders named after the core used. Changing it changes where saves are looked for; existing saves are not moved."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_SORT_SAVESTATES_ENABLE,
@@ -33118,6 +33118,62 @@ MSG_HASH(
    "Failed to load SRAM"
    )
 MSG_HASH(
+   MSG_SAVE_FILE_UNREADABLE,
+   "Couldn't read %s; it will be backed up before the game saves."
+   )
+MSG_HASH(
+   MSG_SAVE_BACKUP_FAILED,
+   "Couldn't back up %s; its changes are kept for now."
+   )
+MSG_HASH(
+   MSG_SAVE_WRITE_RECOVERED,
+   "Couldn't save %s; your progress is in %s."
+   )
+MSG_HASH(
+   MSG_SAVE_WRITE_FAILED,
+   "Couldn't save %s."
+   )
+MSG_HASH(
+   MSG_SAVE_RECOVERY_NEWER,
+   "Unsaved progress for %s is in %s."
+   )
+MSG_HASH(
+   MSG_SAVE_CHANGED_ELSEWHERE,
+   "%s changed outside RetroArch; that version is in %s."
+   )
+MSG_HASH(
+   MSG_NETPLAY_SAVES_OFF,
+   "No netplay save folder; saves are off for this session."
+   )
+MSG_HASH(
+   MSG_SAVE_FOLDER_FALLBACK,
+   "Save folder %s not found; saving to %s for this session."
+   )
+MSG_HASH(
+   MSG_SAVE_FOLDER_MISSING,
+   "Save folder %s not found; saving is off for this session."
+   )
+MSG_HASH(
+   MSG_STATE_FOLDER_FALLBACK,
+   "Savestate folder %s not found; savestates go to %s for this session."
+   )
+MSG_HASH(
+   MSG_STATE_FOLDER_MISSING,
+   "Savestate folder %s not found; savestates will fail until it is back."
+   )
+MSG_HASH(
+   MSG_CLOUD_SYNC_PAUSED_FALLBACK,
+   "Cloud sync paused: the save folder is a temporary one."
+   )
+MSG_HASH(
+   MSG_CLOUD_SYNC_DELETIONS_HELD,
+   "Cloud sync kept %u files on the server that are missing here."
+   )
+MSG_HASH(
+   MSG_CLOUD_SYNC_UNCHANGED_NOT_SENT,
+   "Cloud sync did not upload %u unchanged files the server lost. To send them, use Cloud Sync > Resolve Server Reset: Upload Local."
+   )
+MSG_HASH(
    MSG_FAILED_TO_SAVE_STATE_TO,
    "Failed to save state to"
    )
@@ -33164,6 +33220,10 @@ MSG_HASH(
 MSG_HASH(
    MSG_FAILED_TO_UNDO_SAVE_STATE,
    "Failed to undo save state."
+   )
+MSG_HASH(
+   MSG_CANNOT_UNDO_SAVE_STATE_YET,
+   "Cannot undo save state yet: a state is still being saved or loaded."
    )
 MSG_HASH(
    MSG_FAILED_TO_UNMUTE_AUDIO,
@@ -33750,6 +33810,14 @@ MSG_HASH(
    "Skipping SRAM load."
    )
 MSG_HASH(
+   MSG_CLOUD_SYNC_WAITING,
+   "Waiting for cloud sync before loading saves..."
+   )
+MSG_HASH(
+   MSG_CLOUD_SYNC_WAITING_CONTENT,
+   "Waiting for cloud sync before starting the content..."
+   )
+MSG_HASH(
    MSG_SRAM_WILL_NOT_BE_SAVED,
    "SRAM will not be saved."
    )
@@ -33776,6 +33844,14 @@ MSG_HASH(
 MSG_HASH(
    MSG_REPLAY_SLOT,
    "Replay slot"
+   )
+MSG_HASH(
+   MSG_REPLAY_SLOT_TAKEN,
+   "Recording to slot %d; slot %d has a replay."
+   )
+MSG_HASH(
+   MSG_REPLAY_SLOT_TAKEN_AUTO,
+   "Recording to slot %d; the Auto slot has a replay."
    )
 MSG_HASH(
    MSG_TAKING_SCREENSHOT,
@@ -33844,6 +33920,14 @@ MSG_HASH(
 MSG_HASH(
    MSG_PRESS_AGAIN_TO_RESET,
    "Press again to reset..."
+   )
+MSG_HASH(
+   MSG_PRESS_AGAIN_TO_UPLOAD_ALL,
+   "Press again to upload every local file the server lost..."
+   )
+MSG_HASH(
+   MSG_PRESS_AGAIN_TO_DELETE_MISSING,
+   "Press again to delete the kept files from the server..."
    )
 MSG_HASH(
    MSG_FIRST_RUN_DOWNLOAD_PROMPT,

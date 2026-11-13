@@ -1,7 +1,7 @@
 /* A core with nothing but save RAM, for cloudsync_unload_test.  The
  * harness finds the RAM through harness_core_sram() and writes a
  * pattern into it, which only reaches disk when RetroArch flushes the
- * content's save files. */
+ * content's save files.  Its states are the save RAM. */
 #include <stdint.h>
 #include <string.h>
 #include <libretro.h>
@@ -13,8 +13,11 @@ static uint32_t frame[16 * 16];
 static retro_video_refresh_t video_cb;
 static retro_environment_t   environ_cb;
 
+static unsigned runs;
+
 uint8_t *harness_core_sram(void) { return sram; }
 size_t   harness_core_sram_size(void) { return SRAM_SIZE; }
+unsigned harness_core_runs(void) { return runs; }
 
 void retro_set_environment(retro_environment_t cb)
 {
@@ -53,10 +56,22 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
 
 void retro_set_controller_port_device(unsigned port, unsigned device) { (void)port; (void)device; }
 void retro_reset(void) { }
-void retro_run(void) { video_cb(frame, 16, 16, 16 * sizeof(uint32_t)); }
-size_t retro_serialize_size(void) { return 0; }
-bool retro_serialize(void *data, size_t size) { (void)data; (void)size; return false; }
-bool retro_unserialize(const void *data, size_t size) { (void)data; (void)size; return false; }
+void retro_run(void) { runs++; video_cb(frame, 16, 16, 16 * sizeof(uint32_t)); }
+size_t retro_serialize_size(void) { return SRAM_SIZE; }
+bool retro_serialize(void *data, size_t size)
+{
+   if (size < SRAM_SIZE)
+      return false;
+   memcpy(data, sram, SRAM_SIZE);
+   return true;
+}
+bool retro_unserialize(const void *data, size_t size)
+{
+   if (size < SRAM_SIZE)
+      return false;
+   memcpy(sram, data, SRAM_SIZE);
+   return true;
+}
 void retro_cheat_reset(void) { }
 void retro_cheat_set(unsigned i, bool e, const char *c) { (void)i; (void)e; (void)c; }
 

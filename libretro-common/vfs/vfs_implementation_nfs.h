@@ -66,6 +66,7 @@ typedef struct
    void *ctx;                   /* struct rnfs_ctx, from the pool */
    void *dir;                   /* struct rnfs_dir */
    struct nfs_dirent ent;
+   bool error;                  /* the listing stopped on a read error */
 } nfs_dir_handle;
 
 /* Hands the client new settings: they are copied, strings included,
@@ -92,7 +93,7 @@ struct nfs_dirent *retro_vfs_readdir_nfs(nfs_dir_handle *dh);
 int retro_vfs_closedir_nfs(nfs_dir_handle *dh);
 
 /* Stat / error / lifecycle */
-int retro_vfs_stat_nfs(const char *path, int64_t *size);
+int retro_vfs_stat_nfs(const char *path, int64_t *size, int64_t *mtime);
 int retro_vfs_file_error_nfs(libretro_vfs_implementation_file *stream);
 void nfs_shutdown(void);
 

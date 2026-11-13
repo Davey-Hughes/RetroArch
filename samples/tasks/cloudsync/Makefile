@@ -13,6 +13,9 @@
 #  - cloudsync_async_test: a blocking driver's calls run on a worker
 #    and complete through cloud_sync_poll() on the caller's thread
 #    (network/cloud_sync_driver.c).
+#  - cloudsync_roots_test: whole syncs over a folder standing in for
+#    the server; what reaches the server's delete when a folder can't
+#    be read (tasks/task_cloudsync.c, #included by the test).
 #
 #   make check
 #   make check SANITIZER=address
@@ -54,6 +57,8 @@ ADDS_TARGET  := cloudsync_manifest_adds_test
 ADDS_SOURCES := cloudsync_manifest_adds_test.c \
 	$(filter-out cloudsync_savefile_owner_test.c,$(SOURCES)) \
 	$(CORE_DIR)/tasks/task_cloudsync_path.c \
+	$(CORE_DIR)/save_backups.c \
+	$(LIBRETRO_COMM_DIR)/encodings/encoding_crc32.c \
 	$(LIBRETRO_COMM_DIR)/formats/json/rjson.c \
 	$(LIBRETRO_COMM_DIR)/utils/md5.c \
 	$(LIBRETRO_COMM_DIR)/queues/task_queue.c \
@@ -62,6 +67,7 @@ ADDS_SOURCES := cloudsync_manifest_adds_test.c \
 	$(LIBRETRO_COMM_DIR)/rthreads/retro_eventcount.c
 PACING_TARGET := cloudsync_pacing_test
 COMMIT_TARGET := cloudsync_commit_test
+ROOTS_TARGET  := cloudsync_roots_test
 
 ASYNC_TARGET  := cloudsync_async_test
 ASYNC_SOURCES := cloudsync_async_test.c \
@@ -90,6 +96,11 @@ ADDS_DEFS    := -DHAVE_THREADS -DRARCH_INTERNAL -DHAVE_CLOUDSYNC \
 ifneq ($(FORCE_LOCK),)
    ADDS_DEFS += -DTASK_CLOUDSYNC_FORCE_LOCK
 endif
+# NOTHREADS=1: the task as a build without threads has it, where a
+# backup's copy runs inline
+ifneq ($(NOTHREADS),)
+   ADDS_DEFS := $(filter-out -DHAVE_THREADS,$(ADDS_DEFS))
+endif
 
 CFLAGS += -Wall -pedantic -std=gnu99 -g1 -O1 -fno-omit-frame-pointer \
           -I$(LIBRETRO_COMM_DIR)/include -I$(CORE_DIR)
@@ -99,7 +110,7 @@ ifneq ($(SANITIZER),)
    LDFLAGS := -fsanitize=$(SANITIZER) $(LDFLAGS)
 endif
 
-all: $(TARGET) $(PATH_TARGET) $(ADDS_TARGET) $(PACING_TARGET) $(ASYNC_TARGET) $(COMMIT_TARGET)
+all: $(TARGET) $(PATH_TARGET) $(ADDS_TARGET) $(PACING_TARGET) $(ASYNC_TARGET) $(COMMIT_TARGET) $(ROOTS_TARGET)
 
 %.o: %.c
 	$(CC) -c -o $@ $< $(CFLAGS)
@@ -123,19 +134,28 @@ $(PACING_TARGET): cloudsync_pacing_test.c $(filter-out cloudsync_manifest_adds_t
 $(ASYNC_TARGET): $(ASYNC_SOURCES) $(CORE_DIR)/network/cloud_sync_driver.h
 	$(CC) -o $@ $(ASYNC_SOURCES) $(filter-out -pedantic,$(CFLAGS)) $(ASYNC_DEFS) $(LDFLAGS) -lpthread
 
+# The commit test refuses the move of a save into its backups at the
+# link boundary, as a move across drives fails, counts the syncs and
+# holds the copy at its sync or before it starts, sees how much a copy
+# reads at once, and deletes the save once its copy has read it.
 $(COMMIT_TARGET): cloudsync_commit_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(CORE_DIR)/tasks/task_cloudsync.c
-	$(CC) -o $@ cloudsync_commit_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(filter-out -pedantic,$(CFLAGS)) $(ADDS_DEFS) $(LDFLAGS) -lpthread
+	$(CC) -o $@ cloudsync_commit_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(filter-out -pedantic,$(CFLAGS)) $(ADDS_DEFS) $(LDFLAGS) -Wl,--wrap=filestream_rename -Wl,--wrap=filestream_delete -Wl,--wrap=retro_vfs_file_sync_impl -Wl,--wrap=filestream_read -Wl,--wrap=filestream_close -Wl,--wrap=save_backups_copy_synced -lpthread
 
-check: $(TARGET) $(PATH_TARGET) $(ADDS_TARGET) $(PACING_TARGET) $(ASYNC_TARGET) $(COMMIT_TARGET)
+$(ROOTS_TARGET): cloudsync_roots_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(CORE_DIR)/tasks/task_cloudsync.c
+	$(CC) -o $@ cloudsync_roots_test.c $(filter-out cloudsync_manifest_adds_test.c,$(ADDS_SOURCES)) $(filter-out -pedantic,$(CFLAGS)) $(ADDS_DEFS) $(LDFLAGS) -lpthread
+
+check: $(TARGET) $(PATH_TARGET) $(ADDS_TARGET) $(PACING_TARGET) $(ASYNC_TARGET) $(COMMIT_TARGET) $(ROOTS_TARGET)
 	./$(TARGET)
 	./$(PATH_TARGET)
 	./$(ADDS_TARGET)
 	./$(PACING_TARGET)
 	./$(ASYNC_TARGET)
 	./$(COMMIT_TARGET)
+	./$(ROOTS_TARGET)
 
 clean:
 	rm -rf $(SAMPLE_OBJDIR)
-	rm -f $(TARGET) $(OBJS) $(PATH_TARGET) $(PATH_OBJS) $(ADDS_TARGET) $(PACING_TARGET) $(ASYNC_TARGET) $(COMMIT_TARGET) $(COMMIT_TARGET).exe
+	rm -f $(TARGET) $(OBJS) $(PATH_TARGET) $(PATH_OBJS) $(ADDS_TARGET) $(PACING_TARGET) $(ASYNC_TARGET) $(COMMIT_TARGET) $(COMMIT_TARGET).exe $(ROOTS_TARGET) $(ROOTS_TARGET).exe
+	rm -rf cloudsync_roots_test_files cloudsync_commit_test_files
 
 .PHONY: all check clean

@@ -1,22 +1,58 @@
 /* Include the shipping loop to exercise its private deferred dispatcher. */
 #include "../../../runloop.c"
 #include <assert.h>
+#include <file/file_path.h>
+#include <lists/dir_list.h>
+#include <streams/file_stream.h>
+#include <vfs/vfs_implementation.h>
+
+/* A listing's read fails after this many entries; -1 for none.
+ * retro_dirent.c is compiled in here to read through these. */
+static int  fail_read_after = -1;
+static bool read_failed;
+static bool test_readdir(libretro_vfs_implementation_dir *rdir)
+{
+   if (fail_read_after == 0)
+   {
+      read_failed = true;
+      return false;
+   }
+   if (fail_read_after > 0)
+      fail_read_after--;
+   return retro_vfs_readdir_impl(rdir);
+}
+static bool test_dirent_error(libretro_vfs_implementation_dir *rdir)
+{
+   return read_failed || retro_vfs_dirent_error_impl(rdir);
+}
+#define retro_vfs_readdir_impl      test_readdir
+#define retro_vfs_dirent_error_impl test_dirent_error
+#include "../../../libretro-common/file/retro_dirent.c"
+#undef retro_vfs_readdir_impl
+#undef retro_vfs_dirent_error_impl
 
 static settings_t test_settings;
 static video_driver_state_t test_video;
 static unsigned runs, size_checks, loads, settings_checks, path_checks;
 static unsigned initialize_after;
+static unsigned notices;
+static char last_notice[128];
 #ifdef HAVE_NETWORKING
 static bool allow_frame = true;
+static bool netplay_on;
 bool netplay_driver_ctl(enum rarch_netplay_ctl_state state, void *data)
 {
    (void)data;
+   if (state == RARCH_NETPLAY_CTL_IS_ENABLED)
+      return netplay_on;
    return state == RARCH_NETPLAY_CTL_PRE_FRAME ? allow_frame : false;
 }
 #endif
 #ifdef HAVE_CHEEVOS
 static bool hardcore;
 bool rcheevos_hardcore_active(void) { return hardcore; }
+/* Load State on the Auto slot */
+void rcheevos_pause_hardcore(void) { hardcore = false; }
 #endif
 
 settings_t *config_get_ptr(void)
@@ -33,7 +69,25 @@ void audio_driver_frame_end(void) {}
 void recording_start_frame(void) {}
 void audio_driver_publish_runloop(void) {}
 void RARCH_LOG(const char *fmt, ...) { (void)fmt; }
+void RARCH_DBG(const char *fmt, ...) { (void)fmt; }
+/* runloop_msg_queue_push() */
+void msg_queue_push(msg_queue_t *queue, const char *msg, unsigned prio,
+      unsigned duration, char *title, enum message_queue_icon icon,
+      enum message_queue_category category)
+{ (void)queue; (void)prio; (void)duration; (void)title;
+  (void)icon; (void)category; notices++;
+  strlcpy(last_notice, msg, sizeof(last_notice)); }
+size_t msg_queue_size(msg_queue_t *queue) { (void)queue; return 0; }
+void msg_queue_clear(msg_queue_t *queue) { (void)queue; }
+void ui_companion_driver_msg_queue_push(const char *msg, unsigned priority,
+      unsigned duration, bool flush)
+{ (void)msg; (void)priority; (void)duration; (void)flush; }
 bool verbosity_is_enabled(void) { return false; }
+/* core_run() loads held saves (runloop_content_saves_ready) */
+bool event_load_save_files(bool is_sram_load_disabled)
+{ (void)is_sram_load_disabled; return true; }
+bool command_event(enum event_command cmd, void *data)
+{ (void)cmd; (void)data; return true; }
 
 static void mock_run(void) { runs++; }
 static size_t mock_size(void)
@@ -42,26 +96,188 @@ static size_t mock_size(void)
    return runs >= initialize_after ? 16 : 0;
 }
 
+static retro_task_callback_t load_done;
+static bool load_refused;
+/* Load State on the Auto slot, rather than the auto-load */
+static bool manual_load;
+/* An entry slot's state, loaded instead of the .auto */
+static const char *entry_path;
+bool content_load_state_notify(const char *path, bool load_to_backup,
+      bool autoload, retro_task_callback_t cb, void *user_data)
+{
+   assert(strcmp(path, "test.auto") == 0
+         || (entry_path && strcmp(path, entry_path) == 0));
+   assert(!load_to_backup && autoload == !manual_load);
+   (void)user_data;
+   load_done = cb;
+   loads++;
+   return !load_refused;
+}
 bool content_load_state(const char *path, bool load_to_backup, bool autoload)
 {
+   return content_load_state_notify(path, load_to_backup, autoload,
+         NULL, NULL);
+}
+
+/* The close's auto save */
+static unsigned auto_saves;
+bool content_auto_save_state(const char *path)
+{
    assert(strcmp(path, "test.auto") == 0);
-   assert(!load_to_backup && autoload);
-   loads++;
+   auto_saves++;
    return true;
 }
+const char *path_get(enum rarch_path_type type) { (void)type; return "test"; }
 
 bool path_is_valid(const char *path)
 {
-   assert(strcmp(path, "test.auto") == 0);
+   if (strcmp(path, "test.auto"))
+      return filestream_exists(path);
    path_checks++;
    return true;
 }
 
+/* file_path_io.c's, which would bring its own path_is_valid() */
+int64_t path_get_size(const char *path)
+{
+   int64_t size = 0;
+   return retro_vfs_stat_64_impl(path, &size) ? size : -1;
+}
+/* 0: the file's; 1: none, as smb, nfs and SAF can report; 2: 0, as a
+ * stat that leaves st_mtime unset does */
+static int mtime_mode;
+bool path_get_mtime(const char *path, int64_t *mtime)
+{
+   if (mtime_mode == 1)
+      return false;
+   if (mtime_mode == 2)
+   {
+      *mtime = 0;
+      return true;
+   }
+   return retro_vfs_get_mtime_impl(path, mtime) == 0;
+}
+
+/* The frontend's save writes, bumped where task_save.c bumps them */
+static unsigned writes, in_flight;
+unsigned content_save_writes(void) { return writes; }
+/* Cloud sync's state downloads */
+static unsigned fetches;
+unsigned content_state_fetches(void) { return fetches; }
+bool content_save_state_in_progress(void *data)
+{
+   (void)data;
+   return in_flight != 0;
+}
+
+/* Slot saves: the save task is the test's */
+static retro_task_callback_t save_done;
+static void *save_user;
+static char saved_path[PATH_MAX_LENGTH];
+static unsigned saves;
+bool content_save_state(const char *path, bool save_to_disk)
+{
+   (void)save_to_disk;
+   strlcpy(saved_path, path, sizeof(saved_path));
+   saves++;
+   return true;
+}
+bool content_save_state_notify(const char *path, bool save_to_disk,
+      retro_task_callback_t cb, void *user_data)
+{
+   save_done = cb;
+   save_user = user_data;
+   in_flight++;
+   return content_save_state(path, save_to_disk);
+}
+
+/* The 3DS RAM state: written to its file at close */
+static bool ram_pending;
+/* written beside it, as the in-flight save's worker renames its file */
+static const char *ram_meanwhile;
+bool content_save_state_to_ram(void)
+{
+   ram_pending = true;
+   return true;
+}
+bool content_ram_state_to_file(const char *path, bool sync)
+{
+   const char *name = path_basename(path);
+   (void)sync;
+   if (!ram_pending)
+      return false;
+   ram_pending = false;
+   if (ram_meanwhile)
+      assert(filestream_write_file(ram_meanwhile, path_basename(ram_meanwhile),
+            (int64_t)strlen(path_basename(ram_meanwhile))));
+   if (!filestream_write_file(path, name, (int64_t)strlen(name)))
+      return false;
+   writes++;
+   return true;
+}
+bool core_info_current_supports_savestate(void) { return true; }
+struct string_list *dir_list_new_special(const char *input_dir,
+      enum dir_list_type type, const char *filter, bool show_hidden_files)
+{
+   (void)type;
+   return dir_list_new(input_dir, filter, false, show_hidden_files,
+         false, false);
+}
+
 const char *msg_hash_to_str(enum msg_hash_enums msg)
 {
-   (void)msg;
+   if (msg == MSG_REPLAY_SLOT_TAKEN)
+      return "taken %d %d";
+   if (msg == MSG_REPLAY_SLOT_TAKEN_AUTO)
+      return "taken auto %d";
    return "test";
 }
+
+/* The rest of a content load (event_init_content) */
+static unsigned sweeps;
+void content_auto_state_sweep(const char *path)
+{
+   assert(strcmp(path, "test.auto") == 0);
+   sweeps++;
+}
+void RARCH_WARN(const char *fmt, ...) { (void)fmt; }
+uint8_t content_get_flags(void) { return 0; }
+bool content_init(void) { return true; }
+void content_set_subsystem_info(void) {}
+char *dir_get_ptr(enum rarch_dir_type type)
+{
+   static char none[1];
+   (void)type;
+   return none;
+}
+bool fill_pathname_application_data(char *s, size_t len)
+{ (void)s; (void)len; return false; }
+size_t fill_pathname_application_special(char *s, size_t len,
+      enum application_special_type type)
+{ (void)len; (void)type; *s = '\0'; return 0; }
+const struct retro_subsystem_info *libretro_find_subsystem_info(
+      const struct retro_subsystem_info *info, unsigned num_info,
+      const char *ident)
+{ (void)info; (void)num_info; (void)ident; return NULL; }
+void path_deinit_savefile(void) {}
+void path_init_savefile_new(void) {}
+void path_init_savefile_rtc(const char *savefile_path)
+{ (void)savefile_path; }
+bool path_is_directory(const char *path) { (void)path; return false; }
+bool path_is_empty(enum rarch_path_type type) { (void)type; return true; }
+bool retroarch_override_setting_is_set(enum rarch_override_setting enum_idx,
+      void *data)
+{ (void)enum_idx; (void)data; return false; }
+void *savefile_ptr_get(void) { return NULL; }
+void save_backups_set_roots(const char *savefile_dir,
+      const char *savestate_dir, const char *content_dir,
+      const char *system_dir, const char *config_dir,
+      const char *app_data_dir, const char *core)
+{ (void)savefile_dir; (void)savestate_dir; (void)content_dir;
+  (void)system_dir; (void)config_dir; (void)app_data_dir; (void)core; }
+bool save_backups_note_folders(const char *configured, const char *used,
+      bool sync)
+{ (void)configured; (void)used; (void)sync; return true; }
 
 static void reset(unsigned frames, bool quirk)
 {
@@ -77,11 +293,697 @@ static void reset(unsigned frames, bool quirk)
    strcpy(runloop_state.name.savestate, "test");
    runs = size_checks = loads = settings_checks = path_checks = 0;
    initialize_after = frames;
+   runloop_state.entry_state_slot = -1;
+   load_done    = NULL;
+   load_refused = false;
+   manual_load  = false;
+   auto_saves   = 0;
+}
+
+/* The state task's end, as the queue would call it */
+static void load_finished(const char *error)
+{
+   if (load_done)
+      load_done(NULL, "test.auto", NULL, error);
+}
+
+static void test_auto_state_order(void)
+{
+   unsigned i;
+
+   /* quit_before_autoload: no close save over a .auto not yet loaded */
+   reset(5, true);
+   runloop_content_saves_ready(&runloop_state);
+   core_run();
+   runloop_load_deferred_auto_state();
+   assert(command_event_save_auto_state() == 0 && auto_saves == 0);
+   for (i = 1; i < 5; i++)
+   {
+      core_run();
+      runloop_load_deferred_auto_state();
+   }
+   assert(loads == 1);
+   assert(command_event_save_auto_state() == 0 && auto_saves == 0);
+   load_finished(NULL);
+   assert(command_event_save_auto_state() > 0 && auto_saves == 1);
+
+   /* interval_after_autoload: saves wait for the deferred load's end */
+   reset(5, true);
+   assert(command_event_load_auto_state());
+   for (i = 0; i < 5; i++)
+   {
+      assert(!runloop_state.auto_state_save_ready);
+      core_run();
+      runloop_load_deferred_auto_state();
+   }
+   assert(loads == 1 && !runloop_state.auto_state_save_ready);
+   load_finished(NULL);
+   assert(runloop_state.auto_state_save_ready);
+   assert(runloop_state.auto_state_owned);
+
+   /* a failed load: saves go ahead, the .auto is not this session's */
+   reset(1, false);
+   runloop_content_saves_ready(&runloop_state);
+   assert(loads == 1 && !runloop_state.auto_state_save_ready);
+   load_finished("failed");
+   assert(runloop_state.auto_state_save_ready);
+   assert(!runloop_state.auto_state_owned);
+   /* the close keeps that .auto in the backups */
+   assert(runloop_state.auto_state_wanted);
+
+   /* Load State > Auto with Auto Load State off: the same */
+   reset(1, false);
+   test_settings.bools.savestate_auto_load = false;
+   runloop_state.auto_state_load_asked     = true;
+   runloop_content_saves_ready(&runloop_state);
+   assert(loads == 1 && !runloop_state.auto_state_save_ready);
+   load_finished("failed");
+   assert(runloop_state.auto_state_save_ready);
+   assert(!runloop_state.auto_state_owned);
+   assert(runloop_state.auto_state_wanted);
+
+   /* skipped (Auto Load State off), or canceled while deferred */
+   reset(1, false);
+   test_settings.bools.savestate_auto_load = false;
+   runloop_content_saves_ready(&runloop_state);
+   assert(loads == 0 && runloop_state.auto_state_save_ready);
+   assert(!runloop_state.auto_state_wanted);
+   reset(3, true);
+   runloop_content_saves_ready(&runloop_state);
+   assert(!runloop_state.auto_state_save_ready);
+   test_settings.bools.savestate_auto_load = false;
+   runloop_load_deferred_auto_state();
+   assert(runloop_state.auto_state_save_ready);
+   assert(!runloop_state.auto_state_owned);
+   /* not one asked for by Load State > Auto */
+   reset(3, true);
+   test_settings.bools.savestate_auto_load = false;
+   runloop_state.auto_state_load_asked     = true;
+   runloop_content_saves_ready(&runloop_state);
+   for (i = 0; i < 3; i++)
+   {
+      core_run();
+      runloop_load_deferred_auto_state();
+   }
+   assert(loads == 1 && !runloop_state.auto_state_save_ready);
+   load_finished(NULL);
+   assert(runloop_state.auto_state_save_ready);
+   assert(runloop_state.auto_state_owned);
+
+   /* a refused push: no load to wait for */
+   reset(1, false);
+   load_refused = true;
+   runloop_content_saves_ready(&runloop_state);
+   assert(loads == 1 && runloop_state.auto_state_save_ready);
+   reset(1, true);
+   runloop_content_saves_ready(&runloop_state);
+   load_refused = true;
+   core_run();
+   runloop_load_deferred_auto_state();
+   assert(loads == 1 && runloop_state.auto_state_save_ready);
+   puts("auto-state order tests passed");
+}
+
+#define STATES "asl_states"
+/* Older than any write the test makes, so a rewrite of the same size
+ * still differs */
+#define OLD_MTIME 1000000000
+
+static void write_state(const char *name, const char *data, int64_t mtime)
+{
+   char path[PATH_MAX_LENGTH];
+   fill_pathname_join(path, STATES, name, sizeof(path));
+   assert(filestream_write_file(path, data, (int64_t)strlen(data)));
+   if (mtime)
+      assert(retro_vfs_set_mtime_impl(path, mtime) == 0);
+}
+
+static void put(const char *name) { write_state(name, name, 0); }
+static void put_old(const char *name) { write_state(name, name, OLD_MTIME); }
+
+static bool there(const char *name)
+{
+   char path[PATH_MAX_LENGTH];
+   fill_pathname_join(path, STATES, name, sizeof(path));
+   return filestream_exists(path);
+}
+
+static void states_clear(void)
+{
+   unsigned i;
+   struct string_list *list = dir_list_new(STATES, NULL, false, true,
+         false, false);
+   for (i = 0; list && i < list->size; i++)
+      filestream_delete(list->elems[i].data);
+   dir_list_free(list);
+}
+
+static void states_reset(const char *game)
+{
+   states_clear();
+   retro_vfs_mkdir_impl(STATES);
+   reset(0, false);
+   fill_pathname_join(runloop_state.name.savestate, STATES, game,
+         sizeof(runloop_state.name.savestate));
+   strlcat(runloop_state.name.savestate, ".state",
+         sizeof(runloop_state.name.savestate));
+   test_settings.bools.savestate_auto_index = true;
+   test_settings.uints.savestate_max_keep   = 2;
+   test_settings.ints.state_slot            = 0;
+   save_done     = NULL;
+   save_user     = NULL;
+   saves         = 0;
+   in_flight     = 0;
+   ram_pending   = false;
+   ram_meanwhile = NULL;
+}
+
+/* The RAM state written to @name now, as at close */
+static void ram_write(const char *name)
+{
+   char path[PATH_MAX_LENGTH];
+   fill_pathname_join(path, STATES, name, sizeof(path));
+   ram_pending = true;
+   assert(content_ram_state_to_file(path, false));
+}
+
+/* Ends the slot save the command pushed, once, as the task does */
+static void save_finished(const char *error)
+{
+   retro_task_callback_t cb = save_done;
+   save_done = NULL;
+   if (in_flight)
+      in_flight--;
+   writes++;
+   if (cb)
+      cb(NULL, saved_path, save_user, error);
+   save_user = NULL;
+}
+
+/* max_keep_on_success: nothing goes before the save is written */
+static void lane_max_keep_on_success(void)
+{
+   states_reset("Game");
+   put("Game.state1");
+   put("Game.state2");
+   put("Game.state1.png");
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE));
+   assert(saves == 1);
+   assert(there("Game.state1") && there("Game.state2"));
+   save_finished("failed");
+   assert(there("Game.state1") && there("Game.state2"));
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE));
+   put("Game.state");
+   save_finished(NULL);
+   assert(there("Game.state") && !there("Game.state1")
+         && !there("Game.state1.png") && there("Game.state2"));
+}
+
+/* max_keep_not_target: never the slot just written */
+static void lane_max_keep_not_target(void)
+{
+   /* the lowest */
+   states_reset("Game");
+   put("Game.state");
+   put("Game.state1");
+   put("Game.state2");
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE));
+   save_finished(NULL);
+   assert(there("Game.state") && !there("Game.state1")
+         && there("Game.state2"));
+
+   /* over a slot, under the limit without it */
+   states_reset("Game");
+   test_settings.uints.savestate_max_keep = 3;
+   test_settings.ints.state_slot          = 2;
+   put("Game.state");
+   put("Game.state2");
+   put("Game.state3");
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE));
+   save_finished(NULL);
+   assert(there("Game.state") && there("Game.state2")
+         && there("Game.state3"));
+}
+
+/* max_keep_victim_rewritten: the RAM state written at close lands in
+ * the slot picked while the save was in flight */
+static void lane_max_keep_victim_rewritten(void)
+{
+   states_reset("Game");
+   test_settings.ints.state_slot = 2;
+   put_old("Game.state");
+   put_old("Game.state1");
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE));
+   ram_write("Game.state");
+   put("Game.state2");
+   save_finished(NULL);
+   assert(there("Game.state") && there("Game.state1")
+         && there("Game.state2"));
+}
+
+/* max_keep_victim_fetched: a sync downloads the slot picked, the same
+ * size, while the save is in flight */
+static void lane_max_keep_victim_fetched(void)
+{
+   states_reset("Game");
+   put_old("Game.state1");
+   put_old("Game.state2");
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE));
+   write_state("Game.state1", "Game.state9", 0);
+   fetches++;
+   put("Game.state");
+   save_finished(NULL);
+   assert(there("Game.state") && there("Game.state1")
+         && there("Game.state2"));
+}
+
+/* max_keep_victim_resized: a download into the slot picked, keeping
+ * the old mtime */
+static void lane_max_keep_victim_resized(void)
+{
+   states_reset("Game");
+   put_old("Game.state1");
+   put_old("Game.state2");
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE));
+   write_state("Game.state1", "Game.state1 from the server", OLD_MTIME);
+   put("Game.state");
+   save_finished(NULL);
+   assert(there("Game.state") && there("Game.state1")
+         && there("Game.state2"));
+}
+
+/* max_keep_refused: a save the hold turns away deletes nothing, now
+ * or at a later save */
+static void lane_max_keep_refused(void)
+{
+   states_reset("Game");
+   put("Game.state1");
+   put("Game.state2");
+   runloop_state.save_load_hold = SAVE_LOAD_HOLD_CLOUD_SYNC;
+   assert(!command_event_main_state(CMD_EVENT_SAVE_STATE));
+   assert(saves == 0 && !save_done);
+   assert(there("Game.state1") && there("Game.state2"));
+   runloop_state.save_load_hold = 0;
+   test_settings.uints.savestate_max_keep = 3;
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE));
+   put("Game.state");
+   save_finished(NULL);
+   assert(there("Game.state") && there("Game.state1")
+         && there("Game.state2"));
+
+   /* max_keep_off_meanwhile: turned off before the save lands */
+   states_reset("Game");
+   put("Game.state1");
+   put("Game.state2");
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE));
+   test_settings.uints.savestate_max_keep = 0;
+   put("Game.state");
+   save_finished(NULL);
+   assert(there("Game.state") && there("Game.state1")
+         && there("Game.state2"));
+
+   /* max_keep_raised_meanwhile: picked under the old limit */
+   states_reset("Game");
+   put("Game.state1");
+   put("Game.state2");
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE));
+   test_settings.uints.savestate_max_keep = 10;
+   put("Game.state");
+   save_finished(NULL);
+   assert(there("Game.state") && there("Game.state1")
+         && there("Game.state2"));
+}
+
+/* ram_state_max_keep: the RAM state's file keeps the limit too */
+static void lane_ram_state_max_keep(void)
+{
+   char path[PATH_MAX_LENGTH];
+
+   states_reset("Game");
+   put_old("Game.state1");
+   put_old("Game.state2");
+   put_old("Game.state1.png");
+   runloop_get_current_savestate_path(path, sizeof(path));
+   assert(!command_event_ram_state_to_file(path, false));
+   assert(!there("Game.state") && there("Game.state1")
+         && there("Game.state1.png"));
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE_TO_RAM));
+   assert(saves == 0);
+   assert(command_event_ram_state_to_file(path, false));
+   assert(there("Game.state") && !there("Game.state1")
+         && !there("Game.state1.png") && there("Game.state2"));
+
+   /* closed while a disk save is in flight */
+   states_reset("Game");
+   test_settings.ints.state_slot = 2;
+   put_old("Game.state");
+   put_old("Game.state1");
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE));
+   test_settings.ints.state_slot = 0;
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE_TO_RAM));
+   runloop_get_current_savestate_path(path, sizeof(path));
+   assert(command_event_ram_state_to_file(path, false));
+   put("Game.state2");
+   save_finished(NULL);
+   assert(there("Game.state") && there("Game.state1")
+         && there("Game.state2"));
+
+   /* the in-flight save lands in the slot the RAM state picked */
+   states_reset("Game");
+   test_settings.ints.state_slot = 1;
+   put_old("Game.state1");
+   put_old("Game.state2");
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE));
+   test_settings.ints.state_slot = 0;
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE_TO_RAM));
+   runloop_get_current_savestate_path(path, sizeof(path));
+   ram_meanwhile = saved_path;
+   assert(command_event_ram_state_to_file(path, false));
+   save_finished(NULL);
+   assert(there("Game.state") && there("Game.state1")
+         && there("Game.state2"));
+}
+
+/* max_keep_exact_name: two names sharing their first 127 chars */
+static void lane_max_keep_exact_name(void)
+{
+   char game[160];
+
+   memset(game, 'T', 140);
+   strcpy(game + 140, " (A)");
+   states_reset(game);
+   strcpy(game + 140, " (B).state");
+   put(game);
+   strcpy(game + 140, " (B).state1");
+   put(game);
+   strcpy(game + 140, " (B).state2");
+   put(game);
+   strcpy(game + 140, " (A).state1");
+   put(game);
+   strcpy(game + 140, " (A).state2");
+   put(game);
+   strcpy(game + 140, " (A).state.auto");
+   put(game);
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE));
+   strcpy(game + 140, " (A).state");
+   put(game);
+   save_finished(NULL);
+   strcpy(game + 140, " (A).state1");
+   assert(!there(game));
+   strcpy(game + 140, " (A).state2");
+   assert(there(game));
+   strcpy(game + 140, " (A).state.auto");
+   assert(there(game));
+   strcpy(game + 140, " (B).state");
+   assert(there(game));
+   strcpy(game + 140, " (B).state1");
+   assert(there(game));
+   strcpy(game + 140, " (B).state2");
+   assert(there(game));
+}
+
+/* state_auto_index_unlisted: a state folder read only part-way keeps
+ * the slot, so the next save goes over no state */
+static void test_state_auto_index_unlisted(void)
+{
+   states_reset("Game");
+   test_settings.uints.savestate_max_keep = 0;
+   put("Game.state1");
+   put("Game.state2");
+   put("Game.state3");
+   command_event_set_savestate_auto_index(&test_settings);
+   assert(test_settings.ints.state_slot == 3);
+
+   fail_read_after = 1;
+   command_event_set_savestate_auto_index(&test_settings);
+   assert(read_failed);
+   fail_read_after = -1;
+   read_failed     = false;
+   assert(test_settings.ints.state_slot == 3);
+   /* the advance CMD_EVENT_SAVE_STATE makes first (retroarch.c) */
+   test_settings.ints.state_slot =
+      command_event_get_next_savestate_auto_index(&test_settings);
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE));
+   assert(string_ends_with(saved_path, "Game.state4"));
+   save_finished(NULL);
+   assert(there("Game.state1") && there("Game.state2")
+         && there("Game.state3"));
+   puts("state auto-index tests passed");
+}
+
+static int free_replay_slot(int slot)
+{
+   assert(command_event_free_replay_slot(&slot));
+   return slot;
+}
+
+static void test_replay_slots(void)
+{
+   char path[PATH_MAX_LENGTH];
+   int slot;
+   states_reset("Game");
+   fill_pathname_join(runloop_state.name.replay, STATES, "Game.replay",
+         sizeof(runloop_state.name.replay));
+   put("Game.replay1");
+   put("Game.replay2");
+   put("Game.replay3");
+   put("Game.replay3.png");
+
+   /* replay_auto_index: the highest number there */
+   test_settings.bools.replay_auto_index = true;
+   test_settings.ints.replay_slot        = 0;
+   command_event_set_replay_auto_index(&test_settings);
+   assert(test_settings.ints.replay_slot == 3);
+
+   /* the next free number from the one asked for */
+   assert(free_replay_slot(4) == 4);
+   put("Game.replay4");
+   assert(free_replay_slot(4) == 5);
+   assert(free_replay_slot(1) == 5);
+   assert(free_replay_slot(0) == 0);
+   /* the last slot, then none */
+   assert(free_replay_slot(999) == 999);
+   put("Game.replay999");
+   slot = 999;
+   assert(!command_event_free_replay_slot(&slot) && slot == 999);
+   /* past the last slot (auto index at 999): none */
+   slot = 1000;
+   assert(!command_event_free_replay_slot(&slot) && slot == 1000);
+
+   /* auto index off, the slot taken: the next free one, the setting
+    * follows it, one notice */
+   test_settings.bools.replay_auto_index = false;
+   test_settings.ints.replay_slot        = 2;
+   notices                               = 0;
+   slot = free_replay_slot(test_settings.ints.replay_slot);
+   assert(slot == 5);
+   assert(runloop_get_replay_path(path, sizeof(path), slot));
+   assert(string_is_equal(path_basename(path), "Game.replay5"));
+   put("Game.replay5");
+   command_event_set_replay_record_slot(&test_settings, 2, slot);
+   assert(test_settings.ints.replay_slot == 5 && notices == 1);
+   assert(string_is_equal(last_notice, "taken 5 2"));
+   /* a free slot asked for, and auto index: no notice */
+   test_settings.ints.replay_slot = 7;
+   command_event_set_replay_record_slot(&test_settings, 7,
+         free_replay_slot(7));
+   assert(test_settings.ints.replay_slot == 7 && notices == 1);
+   test_settings.bools.replay_auto_index = true;
+   command_event_set_replay_record_slot(&test_settings, 7,
+         free_replay_slot(8));
+   assert(test_settings.ints.replay_slot == 8 && notices == 1);
+
+   /* Auto (-1), auto index off: Game.replay while it is free */
+   test_settings.bools.replay_auto_index = false;
+   test_settings.ints.replay_slot        = -1;
+   slot = free_replay_slot(test_settings.ints.replay_slot);
+   assert(slot == -1);
+   assert(runloop_get_replay_path(path, sizeof(path), slot));
+   assert(string_is_equal(path_basename(path), "Game.replay"));
+   put("Game.replay");
+   command_event_set_replay_record_slot(&test_settings, -1, slot);
+   assert(test_settings.ints.replay_slot == -1 && notices == 1);
+   /* then the first free number from 0, with the Auto notice */
+   slot = free_replay_slot(test_settings.ints.replay_slot);
+   assert(slot == 0);
+   assert(runloop_get_replay_path(path, sizeof(path), slot));
+   assert(string_is_equal(path_basename(path), "Game.replay0"));
+   put("Game.replay0");
+   command_event_set_replay_record_slot(&test_settings, -1, slot);
+   assert(test_settings.ints.replay_slot == 0 && notices == 2);
+   assert(string_is_equal(last_notice, "taken auto 0"));
+   /* the setting moved before the start: the notice names the slot
+    * asked for */
+   test_settings.ints.replay_slot = 4;
+   command_event_set_replay_record_slot(&test_settings, 2, 6);
+   assert(test_settings.ints.replay_slot == 6 && notices == 3);
+   assert(string_is_equal(last_notice, "taken 6 2"));
+   /* the notice follows the slot asked for, never the setting */
+   test_settings.ints.replay_slot = 4;
+   command_event_set_replay_record_slot(&test_settings, 2, 2);
+   assert(test_settings.ints.replay_slot == 2 && notices == 3);
+   test_settings.ints.replay_slot = 0;
+   command_event_set_replay_record_slot(&test_settings, -1, 0);
+   assert(notices == 4 && string_is_equal(last_notice, "taken auto 0"));
+   test_settings.ints.replay_slot = 6;
+   command_event_set_replay_record_slot(&test_settings, 3, 6);
+   assert(notices == 5 && string_is_equal(last_notice, "taken 6 3"));
+   states_clear();
+   filestream_delete(STATES);
+   puts("replay slot tests passed");
+}
+
+/* The Auto slot saved or loaded by hand: the .auto is the session's
+ * once that is through */
+/* Each content load hands its .auto to the sweep, before any frame */
+static void test_content_load_sweep(void)
+{
+   reset(1, false);
+   test_settings.bools.savestate_auto_load = false;
+   sweeps = 0;
+   assert(event_init_content(&runloop_state, &test_settings, NULL));
+   assert(sweeps == 1 && runs == 0);
+   assert(event_init_content(&runloop_state, &test_settings, NULL));
+   assert(sweeps == 2);
+   /* no content, no sweep */
+   runloop_state.current_core_type = CORE_TYPE_DUMMY;
+   assert(event_init_content(&runloop_state, &test_settings, NULL));
+   assert(sweeps == 2);
+   puts("content load sweep tests passed");
+}
+
+/* The close leaves the .auto alone until the Auto slot is saved by
+ * hand */
+static void refused_close(void)
+{
+   assert(runloop_state.auto_state_save_ready);
+   assert(command_event_save_auto_state() == 0 && auto_saves == 0);
+   initialize_after              = 0;
+   test_settings.ints.state_slot = -1;
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE));
+   save_finished(NULL);
+   assert(command_event_save_auto_state() > 0 && auto_saves == 1);
+}
+
+/* auto_state_policy: an auto-load skipped by policy (an entry slot,
+ * netplay, hardcore) leaves the .auto it did not load as it is. A
+ * replay's skip is the same flag, not built here. */
+static void test_auto_state_refused(void)
+{
+   unsigned i;
+
+   reset(1, false);
+   entry_path = "test2.entry";
+   assert(filestream_write_file(entry_path, "e", 1));
+   runloop_state.entry_state_slot = 2;
+   runloop_content_saves_ready(&runloop_state);
+   assert(loads == 1 && runloop_state.entry_state_slot == 2);
+   refused_close();
+   filestream_delete(entry_path);
+   entry_path = NULL;
+#ifdef HAVE_NETWORKING
+   reset(1, false);
+   netplay_on = true;
+   runloop_content_saves_ready(&runloop_state);
+   assert(loads == 0);
+   refused_close();
+   netplay_on = false;
+#endif
+#ifdef HAVE_CHEEVOS
+   reset(1, false);
+   test_settings.bools.cheevos_enable               = true;
+   test_settings.bools.cheevos_hardcore_mode_enable = true;
+   runloop_content_saves_ready(&runloop_state);
+   assert(loads == 0);
+   refused_close();
+   /* on by the deferred auto-load */
+   reset(3, true);
+   runloop_content_saves_ready(&runloop_state);
+   hardcore = true;
+   for (i = 0; i < 3; i++)
+   {
+      core_run();
+      runloop_load_deferred_auto_state();
+   }
+   assert(loads == 0);
+   refused_close();
+   hardcore = false;
+#endif
+   (void)i;
+
+   /* a failed load, or Auto Load State off: the close saves */
+   reset(1, false);
+   runloop_content_saves_ready(&runloop_state);
+   load_finished("failed");
+   assert(command_event_save_auto_state() > 0 && auto_saves == 1);
+   reset(1, false);
+   test_settings.bools.savestate_auto_load = false;
+   entry_path = "test2.entry";
+   assert(filestream_write_file(entry_path, "e", 1));
+   runloop_state.entry_state_slot = 2;
+   runloop_content_saves_ready(&runloop_state);
+   assert(loads == 1);
+   assert(command_event_save_auto_state() > 0 && auto_saves == 1);
+   filestream_delete(entry_path);
+   entry_path = NULL;
+   puts("auto-state policy tests passed");
+}
+
+static void test_auto_slot_owned(void)
+{
+   reset(0, false);
+   test_settings.ints.state_slot = 0;
+   save_done = NULL;
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE));
+   save_finished(NULL);
+   assert(!runloop_state.auto_state_owned);
+   test_settings.ints.state_slot = -1;
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE));
+   assert(save_done && !runloop_state.auto_state_owned);
+   save_finished("failed");
+   assert(!runloop_state.auto_state_owned);
+   assert(command_event_main_state(CMD_EVENT_SAVE_STATE));
+   save_finished(NULL);
+   assert(runloop_state.auto_state_owned);
+   reset(0, false);
+   test_settings.ints.state_slot = -1;
+   manual_load = true;
+   assert(command_event_main_state(CMD_EVENT_LOAD_STATE));
+   assert(loads == 1 && !runloop_state.auto_state_owned);
+   load_finished("failed");
+   assert(!runloop_state.auto_state_owned);
+   assert(command_event_main_state(CMD_EVENT_LOAD_STATE));
+   load_finished(NULL);
+   assert(runloop_state.auto_state_owned);
+   assert(!runloop_state.auto_state_save_ready);
 }
 
 int main(void)
 {
    unsigned i;
+   for (mtime_mode = 0; mtime_mode < 3; mtime_mode++)
+   {
+      printf("max_keep, mtime mode %d\n", mtime_mode);
+      fflush(stdout);
+      lane_max_keep_on_success();
+      lane_max_keep_not_target();
+      lane_max_keep_victim_rewritten();
+      lane_max_keep_victim_fetched();
+      lane_max_keep_victim_resized();
+      lane_max_keep_refused();
+      lane_ram_state_max_keep();
+      lane_max_keep_exact_name();
+   }
+   mtime_mode = 0;
+   states_clear();
+   filestream_delete(STATES);
+   puts("max_keep tests passed");
+   test_state_auto_index_unlisted();
+   test_replay_slots();
+   test_auto_slot_owned();
+   test_auto_state_refused();
+   test_auto_state_order();
+   test_content_load_sweep();
    reset(3, true);
    assert(command_event_load_auto_state());
    runloop_load_deferred_auto_state();
@@ -124,6 +1026,7 @@ int main(void)
    core_run();
    runloop_load_deferred_auto_state();
    assert(runs == 0 && loads == 0 && !runloop_state.auto_state_load_pending);
+   assert(runloop_state.auto_state_save_ready);
 
    reset(3, true);
    assert(command_event_load_auto_state());
@@ -134,7 +1037,15 @@ int main(void)
    reset(3, true);
    assert(command_event_load_auto_state());
    core_run();
+   runloop_state.auto_state_save_ready       = true;
+   runloop_state.auto_state_owned            = true;
+   runloop_state.auto_state_interval_started = true;
+   runloop_state.auto_state_refused          = true;
    runloop_reset_auto_state_load(&runloop_state);
+   assert(!runloop_state.auto_state_refused);
+   assert(!runloop_state.auto_state_save_ready);
+   assert(!runloop_state.auto_state_owned);
+   assert(!runloop_state.auto_state_interval_started);
    assert(!runloop_state.auto_state_load_pending);
    assert(!runloop_state.auto_state_load_attempted);
    assert(!runloop_state.auto_state_load_ready);

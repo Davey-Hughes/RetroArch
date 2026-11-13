@@ -508,6 +508,16 @@ static void test_deletes(void)
          "non-destructive delete must keep the data as saves/a.srm-<yymmdd-hhmmss>");
 
    fresh_db();
+   server_put("saves/\xe6\x97\xa5\xe6\x9c\xac.srm", "OLD"); /* UTF-8 */
+   memset(&r, 0, sizeof(r));
+   icloud_delete("saves/\xe6\x97\xa5\xe6\x9c\xac.srm", on_report, &r);
+   wait_reports(&r);
+   check_once("non-destructive delete, UTF-8 name", &r, true);
+   CHECK(backups_of("saves/\xe6\x97\xa5\xe6\x9c\xac.srm", &bak) == 1
+         && [text_of(bak) isEqualToString:@"OLD"],
+         "a UTF-8 name must be kept under the same name");
+
+   fresh_db();
    config_get_ptr()->bools.cloud_sync_destructive = true;
    server_put("saves/a.srm", "OLD");
    db().failDelete = YES;

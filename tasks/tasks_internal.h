@@ -150,6 +150,8 @@ void *task_push_webdav_stat(const char *url, bool mute, const char *headers,
       retro_task_callback_t cb, void *userdata);
 void *task_push_webdav_mkdir(const char *url, bool mute, const char *headers,
       retro_task_callback_t cb, void *userdata);
+void *task_push_webdav_propfind(const char *url, bool mute, const char *headers,
+      retro_task_callback_t cb, void *userdata);
 /* PUT a body of @len bytes pulled from @source as the socket takes
  * them, holding one send buffer rather than the whole file. @rewind
  * restarts the body for a replay on a fresh connection; NULL means the
@@ -507,6 +509,10 @@ bool take_screenshot(
       const char *path, bool silence,
       bool has_valid_framebuffer, bool fullpath, bool use_thread);
 
+/* Cancels the screenshots of @path running or held; what one already
+ * wrote is deleted. Frame thread only. */
+void take_screenshot_cancel(const char *path);
+
 /* What take_screenshot_notify()'s callback is told, as its task_data */
 struct screenshot_result
 {
@@ -545,8 +551,39 @@ bool event_load_save_files(bool is_sram_load_disabled);
 
 bool content_savefile_is_live(const char *path);
 
-bool event_save_files(bool sram_used, bool compress_files,
-      const char *path_cheat_database);
+/* Changes whenever content is loaded or unloaded, so a check made
+ * across a gap can tell that ownership may have changed meanwhile. */
+unsigned content_savefile_lifetime(void);
+
+bool event_save_files(bool sram_used, bool compress_files, bool sync,
+      bool copy, const char *path_cheat_database);
+
+/* Writes each save file whose memory changed since it was last
+ * written, ahead of anything that changes it: with an autosave worker
+ * the main thread only copies the memory and the worker writes it
+ * before any later image; without one, or for memory that changed size
+ * under one, it is written here, not synced, after the copies the file
+ * owes. An image that cannot be written goes to a recovery file. Then
+ * each save RAM file owes @owed (1 << enum save_backup_reason each; 0
+ * for none). Never waits. */
+void event_flush_save_files(bool sram_used, bool compress_files,
+      int owed);
+
+/* As event_flush_save_files() with nothing owed, for memory that stays
+ * as it is (the game stopped running): an image that cannot be written
+ * is left to the next write rather than recovered, and with a worker a
+ * newer one replaces it if it has not been taken yet. With no worker it
+ * is written here synced, so this can wait on the disk. */
+void event_flush_kept_save_files(bool sram_used, bool compress_files);
+
+/* Saving is off for want of a folder: save RAM goes to recovery files
+ * outside it (save_backups_recover_away()), when it changed since the
+ * first frame, where event_seed_recovered_save_files() takes it. */
+void event_recover_save_files(bool sync);
+void event_seed_recovered_save_files(void);
+
+/* A recovery file holds the save RAM event_recover_save_files() saw */
+bool event_save_files_recovered(void);
 
 void path_init_savefile_rtc(const char *savefile_path);
 
@@ -648,8 +685,15 @@ void task_push_cloud_sync_update_driver(void);
  * Its error argument is non-NULL when the sync failed or finished with
  * failures or conflicts. Returns false if no sync was queued. */
 bool task_push_cloud_sync(retro_task_callback_t cb, void *user_data);
+/* No sync runs while set: a main config save or state folder is
+ * missing. */
+void task_cloud_sync_set_paused(bool paused);
+/* A sync was pushed and has not called back yet. Main thread. */
+bool task_cloud_sync_in_progress(void);
 void task_push_cloud_sync_resolve_keep_local(void);
 void task_push_cloud_sync_resolve_keep_server(void);
+void task_push_cloud_sync_upload_all(void);
+void task_push_cloud_sync_delete_missing(void);
 
 RETRO_END_DECLS
 

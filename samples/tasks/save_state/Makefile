@@ -29,6 +29,12 @@ LIBRETRO_COMM_DIR := $(REPO_ROOT)/libretro-common
 
 SOURCES := save_state_io_test.c \
            $(REPO_ROOT)/tasks/task_save.c \
+           $(REPO_ROOT)/save_backups.c \
+           $(LIBRETRO_COMM_DIR)/compat/compat_posix_string.c \
+           $(LIBRETRO_COMM_DIR)/compat/compat_strcasestr.c \
+           $(LIBRETRO_COMM_DIR)/file/retro_dirent.c \
+           $(LIBRETRO_COMM_DIR)/formats/json/rjson.c \
+           $(LIBRETRO_COMM_DIR)/lists/dir_list.c \
            $(LIBRETRO_COMM_DIR)/compat/compat_strl.c \
            $(LIBRETRO_COMM_DIR)/compat/compat_strldup.c \
            $(LIBRETRO_COMM_DIR)/compat/fopen_utf8.c \
@@ -63,7 +69,7 @@ CFLAGS  += -DHAVE_COMPRESSION
 endif
 
 CFLAGS  += -Wall -std=gnu99 -g1 -O1 \
-           -DHAVE_THREADS \
+           -DHAVE_THREADS -DHAVE_SCREENSHOTS \
            -I$(REPO_ROOT) \
            -I$(LIBRETRO_COMM_DIR)/include
 
@@ -75,7 +81,19 @@ CFLAGS  += -Wall -std=gnu99 -g1 -O1 \
 # --wrap=calloc so a lane can fail the allocations a finishing task
 # would make, to show the notified caller is told regardless.
 # --wrap=task_queue_park so a lane can count the load handler's parks.
+# --wrap=retro_vfs_file_rename_impl and its synced twin so a lane can
+# refuse a rename, as a move across drives fails, and
+# --wrap=retro_vfs_file_sync_impl and retro_vfs_dir_sync_impl so it can
+# count the syncs, and the opendir, mkdir and stat ones so it can count
+# what a thread does to folders.
 LDFLAGS += -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=task_queue_park \
+           -Wl,--wrap=retro_vfs_file_rename_impl \
+           -Wl,--wrap=retro_vfs_file_rename_synced_impl \
+           -Wl,--wrap=retro_vfs_file_sync_impl \
+           -Wl,--wrap=retro_vfs_dir_sync_impl \
+           -Wl,--wrap=retro_vfs_opendir_impl \
+           -Wl,--wrap=retro_vfs_mkdir_impl \
+           -Wl,--wrap=retro_vfs_stat_64_impl \
            -lpthread -lm
 
 # Extra flags for the caller; CFLAGS= on the command line would replace

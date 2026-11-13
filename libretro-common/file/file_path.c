@@ -364,6 +364,34 @@ size_t fill_pathname(char *s, const char *in_path,
    return _len;
 }
 
+/* Not ".old": retro_vfs_file_rename_impl() uses that as its own aside
+ * on several platforms. */
+size_t fill_pathname_aside(char *s, const char *in_path, unsigned n,
+      size_t len)
+{
+   char   suffix[PATH_ASIDE_SUFFIX_SIZE];
+   size_t suffix_len = 0;
+   size_t _len;
+
+   if (!s || !in_path || n < 1 || n > 99)
+      return 0;
+   if (n > 1)
+   {
+      suffix[suffix_len++] = '.';
+      if (n > 9)
+         suffix[suffix_len++] = (char)('0' + n / 10);
+      suffix[suffix_len++] = (char)('0' + n % 10);
+   }
+   memcpy(suffix + suffix_len, ".prev", sizeof(".prev"));
+   suffix_len += sizeof(".prev") - 1;
+   _len        = strlen(in_path);
+   if (_len + suffix_len >= len)
+      return 0;
+   memcpy(s, in_path, _len);
+   memcpy(s + _len, suffix, suffix_len + 1);
+   return _len + suffix_len;
+}
+
 
 /**
  * find_last_slash:

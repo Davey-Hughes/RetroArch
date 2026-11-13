@@ -66,7 +66,7 @@ static void stater(void *arg)
    int64_t size;
    (void)arg;
    for (i = 0; i < ROUNDS * 2; i++)
-      if (retro_vfs_stat_smb(url, &size) == 0)
+      if (retro_vfs_stat_smb(url, &size, NULL) == 0)
          stat_bad++;
 }
 

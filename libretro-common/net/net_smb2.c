@@ -60,6 +60,7 @@
 #define STATUS_MORE_PROCESSING_REQUIRED 0xc0000016
 #define STATUS_END_OF_FILE              0xc0000011
 #define STATUS_NO_MORE_FILES            0x80000006
+#define STATUS_NO_SUCH_FILE             0xc000000f
 #define STATUS_OBJECT_NAME_NOT_FOUND    0xc0000034
 #define STATUS_OBJECT_NAME_COLLISION    0xc0000035
 #define STATUS_LOGON_FAILURE            0xc000006d
@@ -148,6 +149,8 @@ struct rsmb_dir
    size_t    buf_off;
    uint8_t   fid[16];
    uint8_t   done;
+   uint8_t   failed;
+   uint8_t   started;   /* a page was taken */
 };
 
 struct rsmb_ctx
@@ -2277,7 +2280,9 @@ static int rsmb_query_dir(struct rsmb_ctx *c, struct rsmb_dir *d)
    smb_put16(b + 32, '*');
    if (rsmb_call(c, 34, &r, &rlen, 0) != 0)
       return -1;
-   if (c->status == STATUS_NO_MORE_FILES)
+   /* an empty folder may answer its first query with NO_SUCH_FILE */
+   if (     c->status == STATUS_NO_MORE_FILES
+         || (c->status == STATUS_NO_SUCH_FILE && !d->started))
    {
       d->done = 1;
       return 0;
@@ -2297,6 +2302,7 @@ static int rsmb_query_dir(struct rsmb_ctx *c, struct rsmb_dir *d)
    memcpy(d->buf, c->rx + ooff, olen);
    d->buf_len = olen;
    d->buf_off = 0;
+   d->started = 1;
    return 0;
 }
 
@@ -2310,22 +2316,27 @@ const struct rsmb_dirent *rsmb_readdir(struct rsmb_ctx *c, struct rsmb_dir *d)
 
       if (d->buf_off >= d->buf_len)
       {
-         if (d->done || rsmb_query_dir(c, d) != 0 || d->done)
+         if (d->done)
             return NULL;
+         if (rsmb_query_dir(c, d) != 0)
+            break;
+         if (d->done)
+            return NULL;
+         /* the end is STATUS_NO_MORE_FILES, not an empty page */
          if (d->buf_len == 0)
-            return NULL;
+            break;
       }
       e = d->buf + d->buf_off;
       remaining = d->buf_len - d->buf_off;
       if (remaining < 64)
-         return NULL;
+         break;
       next     = smb_get32(e);
       name_len = smb_get32(e + 60);
       if ((size_t)name_len > remaining - 64)
-         return NULL;
+         break;
       entry_len = 64 + (size_t)name_len;
       if (next && ((size_t)next < entry_len || (size_t)next > remaining))
-         return NULL;
+         break;
       d->ent.st.size   = smb_get64(e + 40);
       d->ent.st.mtime  = rsmb_filetime(smb_get64(e + 24));
       d->ent.st.is_dir = (smb_get32(e + 56) & SMB2_FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
@@ -2335,6 +2346,13 @@ const struct rsmb_dirent *rsmb_readdir(struct rsmb_ctx *c, struct rsmb_dir *d)
          continue;
       return &d->ent;
    }
+   d->failed = 1;
+   return NULL;
+}
+
+int rsmb_readdir_failed(const struct rsmb_dir *d)
+{
+   return d->failed;
 }
 
 void rsmb_closedir(struct rsmb_ctx *c, struct rsmb_dir *d)

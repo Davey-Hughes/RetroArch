@@ -836,6 +836,38 @@ void* task_push_webdav_mkdir(const char *url, bool mute,
    return task_push_http_transfer_generic(conn, url, mute, false, cb, user_data);
 }
 
+/* Depth: 0 asks about the resource itself, not its members. */
+void *task_push_webdav_propfind(const char *url, bool mute,
+      const char *headers,
+      retro_task_callback_t cb, void *user_data)
+{
+   struct http_connection_t *conn;
+   char  *s;
+   size_t _len;
+   size_t _size;
+
+   if (!url || !*url)
+      return NULL;
+
+   _size = sizeof("Depth: 0\r\n") + (headers ? strlen(headers) : 0);
+   if (!(s = (char*)malloc(_size)))
+      return NULL;
+
+   if (!(conn = net_http_connection_new(url, "PROPFIND", NULL)))
+   {
+      free(s);
+      return NULL;
+   }
+
+   _len = strlcpy_lit(s, "Depth: 0\r\n", _size);
+   if (headers)
+      strlcpy(s + _len, headers, _size - _len);
+   net_http_connection_set_headers(conn, s);
+   free(s);
+
+   return task_push_http_transfer_generic(conn, url, mute, false, cb, user_data);
+}
+
 void* task_push_webdav_put_stream(const char *url,
       net_http_source_t source, net_http_source_rewind_t rewind,
       void *source_data, size_t len, bool mute,

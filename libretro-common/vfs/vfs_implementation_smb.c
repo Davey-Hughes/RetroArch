@@ -1863,6 +1863,7 @@ smb_dir_handle* retro_vfs_opendir_smb(const char *path, bool include_hidden)
       handle->shares      = shares;
       handle->share_count = count;
       handle->share_index = 0;
+      handle->error       = false;
       return handle;
    }
 
@@ -1912,6 +1913,7 @@ smb_dir_handle* retro_vfs_opendir_smb(const char *path, bool include_hidden)
    handle->shares      = NULL;
    handle->share_count = 0;
    handle->share_index = 0;
+   handle->error       = false;
    return handle;
 }
 
@@ -1938,12 +1940,22 @@ struct smbc_dirent* retro_vfs_readdir_smb(smb_dir_handle* dh)
       return result;
    }
 
+   /* a dead transport took the listing with it: not its end */
    if (!dh->ctx || !dh->dir || !smb_ctx_active(dh->ctx))
+   {
+      dh->error = true;
       return NULL;
+   }
 
    ent = smb2_readdir(dh->ctx, dh->dir);
    if (!ent)
+   {
+#ifdef HAVE_RETROSMB
+      if (smb2_readdir_failed(dh->dir))
+         dh->error = true;
+#endif
       return NULL;
+   }
 
    memset(result, 0, sizeof(*result));
    strlcpy(result->name, ent->name ? ent->name : "", sizeof(result->name));
@@ -1977,7 +1989,7 @@ int retro_vfs_closedir_smb(smb_dir_handle* dh)
    return 0;
 }
 
-int retro_vfs_stat_smb(const char *path, int64_t *size)
+int retro_vfs_stat_smb(const char *path, int64_t *size, int64_t *mtime)
 {
    char rel_path[PATH_MAX_LENGTH];
    char share[256];
@@ -2031,6 +2043,10 @@ int retro_vfs_stat_smb(const char *path, int64_t *size)
       *size = (st.smb2_size > (uint64_t)INT64_MAX)
          ? INT64_MAX
          : (int64_t)st.smb2_size;
+
+   /* 0: no time reported */
+   if (mtime && st.smb2_mtime > 0 && st.smb2_mtime <= (uint64_t)INT64_MAX)
+      *mtime = (int64_t)st.smb2_mtime;
 
    return RETRO_VFS_STAT_IS_VALID |
          (st.smb2_type == SMB2_TYPE_DIRECTORY ? RETRO_VFS_STAT_IS_DIRECTORY : 0);

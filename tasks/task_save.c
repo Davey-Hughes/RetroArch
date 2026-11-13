@@ -26,10 +26,12 @@
 #include <streams/rzip_stream.h>
 #include <rthreads/rthreads.h>
 #include <file/file_path.h>
+#include <string/stdstring.h>
 #include <retro_miscellaneous.h>
 #include <retro_timers.h>
 #include <features/features_cpu.h>
 #include <time/rtime.h>
+#include <vfs/vfs_implementation.h>
 
 #ifdef HAVE_CONFIG_H
 #include "../config.h"
@@ -48,6 +50,7 @@
 #include "../gfx/video_driver.h"
 #include "../msg_hash.h"
 #include "../runloop.h"
+#include "../save_backups.h"
 #include "../verbosity.h"
 #include "tasks_internal.h"
 
@@ -144,7 +147,10 @@ enum save_task_state_flags
    SAVE_TASK_FLAG_MUTE                  = (1 << 4),
    SAVE_TASK_FLAG_THUMBNAIL_ENABLE      = (1 << 5),
    SAVE_TASK_FLAG_HAS_VALID_FB          = (1 << 6),
-   SAVE_TASK_FLAG_COMPRESS_FILES        = (1 << 7)
+   SAVE_TASK_FLAG_COMPRESS_FILES        = (1 << 7),
+   /* Over a .auto the session does not own: kept aside before the
+    * new one lands */
+   SAVE_TASK_FLAG_AUTO_ASIDE            = (1 << 8)
 };
 
 typedef struct
@@ -157,7 +163,9 @@ typedef struct
    ssize_t written;
    ssize_t bytes_read;
    int state_slot;
-   uint8_t flags;
+   /* The .auto's held name, SAVE_TASK_FLAG_AUTO_ASIDE */
+   unsigned held;
+   uint16_t flags;
    /* Frontend rastate blocks, captured on the main thread at push for
     * the background path: SET_SAVE_STATE_IN_BACKGROUND is the core's
     * promise about its own serialize, not about the frontend's replay
@@ -182,10 +190,14 @@ typedef save_task_state_t load_task_data_t;
 /* Holds the previous saved state
  * Can be restored to disk with undo_save_state(). */
 static struct save_state_buf undo_save_buf;
+/* The last state saved to disk: Undo Save reverts only that one */
+static char undo_save_last_path[PATH_MAX_LENGTH];
 
 /* Holds the data from before a load_state() operation
  * Can be restored with undo_load_state(). */
 static struct save_state_buf undo_load_buf;
+/* undo_load_buf was taken by a load of the .auto */
+static bool undo_load_auto = false;
 
 /* The allocation undo_load_buf handed back last time it was replaced,
  * kept rather than freed.  Retaking the undo snapshot is the hottest
@@ -217,7 +229,12 @@ static unsigned load_state_tasks_pending   = 0;
 /* How long a state load waiting for the core's second frame parks. */
 #define LOAD_STATE_FRAME_WAIT_USEC 8000
 static unsigned save_state_tasks_pending   = 0;
+/* Pending backup reads and undos: each frees or replaces
+ * undo_save_buf before an undo held behind it runs. */
+static unsigned undo_save_buf_tasks_pending = 0;
 static bool save_state_disable_undo        = false;
+/* A close or interval Auto save's failure was shown this session */
+static bool auto_state_failure_shown       = false;
 
 /* State tasks the queue turned away while another state task ran,
  * held here in order and pushed as each one ahead of them finishes.
@@ -285,6 +302,32 @@ typedef struct rastate_size_info
 } rastate_size_info_t;
 
 
+/* A user's state load is about to change save RAM: the save files are
+ * written as they are now, and the next write over each save RAM file
+ * backs it up first. A load that puts save RAM back changes nothing and
+ * skips this; so do run-ahead, rewind, netplay and replays. */
+static void content_flush_saves_before_load(void)
+{
+#if defined(HAVE_COMPRESSION)
+   bool compress = config_get_ptr()->bools.save_file_compression;
+#else
+   bool compress = false;
+#endif
+   event_flush_save_files(
+         (runloop_state_get_ptr()->flags & RUNLOOP_FLAG_USE_SRAM) != 0,
+         compress, 1 << SAVE_BACKUP_BEFORE_STATE_LOAD);
+}
+
+static bool content_is_auto_state(const char *path)
+{
+   bool ret = false;
+   char *s  = (char*)malloc(PATH_MAX_LENGTH);
+   if (s && runloop_get_savestate_path(s, PATH_MAX_LENGTH, -1))
+      ret = string_is_equal(path, s);
+   free(s);
+   return ret;
+}
+
 /**
  * undo_load_state:
  * Revert to the state before a state was loaded.
@@ -297,6 +340,7 @@ bool content_undo_load_state(void)
    bool ret                  = false;
    bool captured             = false;
    bool ramped               = false;
+   bool auto_undone          = undo_load_auto;
    unsigned num_blocks       = 0;
    void *restore_data        = NULL;
    size_t restore_size       = 0;
@@ -385,6 +429,9 @@ bool content_undo_load_state(void)
    undo_load_buf.size     = 0;
    undo_load_buf.capacity = 0;
 
+   if (restore_data && !config_get_ptr()->bools.block_sram_overwrite)
+      content_flush_saves_before_load();
+
    /* An undo jumps the game's state exactly as a load does. See
     * audio_driver_jump_fade_begin(). */
    ramped                 = audio_driver_jump_fade_begin();
@@ -446,6 +493,10 @@ bool content_undo_load_state(void)
    }
    free(blocks);
 
+   /* Backed out of the .auto: an automatic save keeps it again */
+   if (auto_undone)
+      runloop_state_get_ptr()->auto_state_owned = false;
+
    if (!ret)
    {
       RARCH_ERR("[State] %s \"%s\".\n",
@@ -457,6 +508,73 @@ bool content_undo_load_state(void)
    return true;
 }
 
+/* The synchronous writers' temporaries: a state task in flight writes
+ * "<path>.tmp", and the two never share one. */
+#define AUTO_STATE_TMP_SUFFIX ".auto.tmp"
+#define RAM_STATE_TMP_SUFFIX  ".ram.tmp"
+
+static bool content_state_tmp_name(char *s, size_t len, const char *path,
+      const char *suffix)
+{
+   size_t _len = strlcpy(s, path, len);
+   return _len < len && strlcpy(s + _len, suffix, len - _len) < len - _len;
+}
+
+/* Opens "<path><*suffix>" into @s to write. One that cannot be opened
+ * takes "<path>.tmp", unless a state task is in flight; *suffix says
+ * which. */
+static intfstream_t *content_open_state_tmp(char *s, size_t len,
+      const char *path, const char **suffix, bool compress, unsigned hint)
+{
+   intfstream_t *file = NULL;
+   if (content_state_tmp_name(s, len, path, *suffix))
+   {
+#if defined(HAVE_COMPRESSION)
+      if (compress)
+         file = intfstream_open_rzip_file(s, RETRO_VFS_FILE_ACCESS_WRITE);
+      else
+#endif
+         file = intfstream_open_file(s, RETRO_VFS_FILE_ACCESS_WRITE, hint);
+   }
+   if (     !file
+         && !string_is_equal(*suffix, ".tmp")
+         && !content_save_state_in_progress(NULL))
+   {
+      *suffix = ".tmp";
+      return content_open_state_tmp(s, len, path, suffix, compress, hint);
+   }
+   return file;
+}
+
+#ifdef HAVE_SCREENSHOTS
+/* A state of another moment than the slot's thumbnail: a picture of
+ * an older state is never left beside it. @shots: nor one still being
+ * taken for the slot. */
+static void content_drop_thumbnail(const char *path, bool shots)
+{
+   char png[PATH_MAX_LENGTH];
+   if (content_state_tmp_name(png, sizeof(png), path, ".png"))
+   {
+      if (shots)
+         take_screenshot_cancel(png);
+      filestream_delete(png);
+   }
+}
+#endif
+
+/* As content_finish_tmp(), for "<path><suffix>". @synced: its writer
+ * synced it, and the rename is synced too. */
+static bool content_finish_state_tmp(const char *path, const char *tmp_path,
+      const char *suffix, bool ok, bool synced)
+{
+   int ret = synced
+      ? filestream_finish_atomic_rename_synced(path, suffix, ok)
+      : filestream_finish_atomic_suffix(path, suffix, ok, false);
+   if (ret == 1 && path_is_valid(path))
+      filestream_delete(tmp_path);
+   return ret == 0;
+}
+
 static void undo_save_state_cb(retro_task_t *task,
       void *task_data,
       void *user_data, const char *error)
@@ -465,24 +583,43 @@ static void undo_save_state_cb(retro_task_t *task,
 
    if (save_state_tasks_pending)
       save_state_tasks_pending--;
+   if (undo_save_buf_tasks_pending)
+      undo_save_buf_tasks_pending--;
+   content_save_written();
 
-   /* Wipe the save file buffer as it's intended to be one use only */
-   undo_save_buf.path[0]  = '\0';
-   undo_save_buf.size     = 0;
-   undo_save_buf.capacity = 0;
-   if (undo_save_buf.data)
+   /* The .auto the save replaced is back, over any automatic save
+    * since the push: not the session's */
+   if (content_is_auto_state(state->path))
+      runloop_state_get_ptr()->auto_state_owned = false;
+
+#ifdef HAVE_SCREENSHOTS
+   if (!error && config_get_ptr()->bools.savestate_thumbnail_enable)
+      content_drop_thumbnail(state->path, true);
+#endif
+
+   /* Wipe the save file buffer as it's intended to be one use only;
+    * a failed undo keeps it for another try */
+   if (!error)
    {
-      free(undo_save_buf.data);
-      undo_save_buf.data = NULL;
+      undo_save_buf.path[0]  = '\0';
+      undo_save_buf.size     = 0;
+      undo_save_buf.capacity = 0;
+      if (undo_save_buf.data)
+      {
+         free(undo_save_buf.data);
+         undo_save_buf.data = NULL;
+      }
    }
 
    free(state);
    state_tasks_release();
 }
 
-bool content_finish_tmp(const char *path, bool ok)
+bool content_finish_tmp(const char *path, bool ok, bool sync)
 {
-   int ret = filestream_finish_atomic(path, ok);
+   int ret = sync
+      ? filestream_finish_atomic_synced(path, ok)
+      : filestream_finish_atomic(path, ok);
    if (ret == 1 && path_is_valid(path))
    {
       char tmp_path[PATH_MAX_LENGTH];
@@ -490,6 +627,55 @@ bool content_finish_tmp(const char *path, bool ok)
          filestream_delete(tmp_path);
    }
    return ret == 0;
+}
+
+static bool content_auto_state_move_aside(const char *path, unsigned *held,
+      char *moved, size_t len, bool sync);
+static void content_auto_state_put_back(const char *path, unsigned n,
+      const char *moved);
+
+/* fsync of the file at @path */
+static bool content_sync_file(const char *path)
+{
+   RFILE *file = filestream_open(path,
+         RETRO_VFS_FILE_ACCESS_WRITE | RETRO_VFS_FILE_ACCESS_UPDATE_EXISTING,
+         RETRO_VFS_FILE_ACCESS_HINT_NONE);
+   bool ok     = file && filestream_sync(file) == 0;
+   if (file && filestream_close(file) != 0)
+      ok = false;
+   return ok;
+}
+
+/* Whole and closed: as the automatic saves, the .auto the session does
+ * not own is kept first, or not saved over. A synced save syncs before
+ * the move, so only its rename is left before the new one lands. False
+ * with the task's error set. */
+static bool content_save_state_aside(retro_task_t *task,
+      save_task_state_t *state, const char *tmp_path, char *moved,
+      bool sync)
+{
+   char msg[128];
+   /* No room to record a move: one could not be put back */
+   if (!moved || (sync && !content_sync_file(tmp_path)))
+   {
+      task_set_error(task, strdup(
+            msg_hash_to_str(MSG_FAILED_TO_SAVE_STATE_TO)));
+      return false;
+   }
+   if (content_auto_state_move_aside(state->path, &state->held, moved,
+            PATH_MAX_LENGTH, sync))
+      return true;
+   snprintf(msg, sizeof(msg), "%s \"%s\".",
+         msg_hash_to_str(MSG_FAILED_TO_SAVE_STATE_TO),
+         path_basename(state->path));
+   task_set_error(task, strdup(msg));
+   /* Said in place of the "saved" title */
+   if (!(task_get_flags(task) & RETRO_TASK_FLG_MUTE))
+   {
+      task_free_title(task);
+      task_set_title(task, strdup(msg));
+   }
+   return false;
 }
 
 /**
@@ -539,18 +725,54 @@ static void task_save_handler_finished(retro_task_t *task,
             task_set_error(task, strdup(
                   msg_hash_to_str(MSG_FAILED_TO_SAVE_STATE_TO)));
       }
-      else if (!content_finish_tmp(state->path, !task_get_error(task))
-            && !task_get_error(task))
-         task_set_error(task, strdup(
-               msg_hash_to_str(MSG_FAILED_TO_SAVE_STATE_TO)));
+      else
+      {
+         bool landed;
+         bool ok     = !task_get_error(task);
+         /* Off the frame loop only on the threaded queue. */
+         bool sync   = task_queue_is_threaded();
+         char *moved = NULL;
+         if (     ok && (state->flags & SAVE_TASK_FLAG_AUTO_ASIDE)
+               && path_is_valid(state->path))
+         {
+            moved = (char*)calloc(1, PATH_MAX_LENGTH);
+            ok    = content_save_state_aside(task, state, tmp_path, moved,
+                  sync);
+         }
+         /* A synced aside synced the temporary */
+         landed = (moved && sync)
+            ? content_finish_state_tmp(state->path, tmp_path, ".tmp", ok,
+                  true)
+            : content_finish_tmp(state->path, ok, sync);
+         if (!landed && ok)
+         {
+            task_set_error(task, strdup(
+                  msg_hash_to_str(MSG_FAILED_TO_SAVE_STATE_TO)));
+            ok = false;
+         }
+         /* Not landed: the old one back in its slot, the new one gone */
+         if (!ok && (state->held || (moved && *moved)))
+         {
+            content_auto_state_put_back(state->path, state->held, moved);
+            state->held = 0;
+            if (path_is_valid(state->path))
+               filestream_delete(tmp_path);
+         }
+         free(moved);
+      }
    }
 
    if (state->data)
    {
-      if (     (state->flags & SAVE_TASK_FLAG_UNDO_SAVE)
-            && (state->data == undo_save_buf.data))
-         undo_save_buf.data = NULL;
-      free(state->data);
+      bool undo =    (state->flags & SAVE_TASK_FLAG_UNDO_SAVE)
+                  && (state->data == undo_save_buf.data);
+      /* A failed undo leaves it to undo_save_buf, for another try */
+      if (!undo || !task_get_error(task))
+      {
+         if (undo)
+            undo_save_buf.data = NULL;
+         free(state->data);
+      }
       state->data = NULL;
    }
    free(state->fe_replay);
@@ -1013,7 +1235,7 @@ static void task_save_handler(retro_task_t *task)
          const char *failed_undo_str = msg_hash_to_str(
                MSG_FAILED_TO_UNDO_SAVE_STATE);
          RARCH_ERR("[State] %s \"%s\".\n", failed_undo_str,
-               undo_save_buf.path);
+               state->path);
          snprintf(msg, sizeof(msg), "%s \"RAM\".", failed_undo_str);
       }
       else
@@ -1114,18 +1336,22 @@ static bool task_push_undo_save_state(const char *path, void *data, size_t len)
       if (state_task_push(task))
       {
          save_state_tasks_pending++;
+         undo_save_buf_tasks_pending++;
+         /* Not left to the callback: an automatic save could land
+          * between the write and it */
+         if (content_is_auto_state(path))
+            runloop_state_get_ptr()->auto_state_owned = false;
          return true;
       }
 
-      /* The hold is full: this one never runs, so nothing else frees
-       * what it holds */
+      /* The hold is full: this one never runs. The data stays
+       * undo_save_buf's, for another try. */
       task_free_title(task);
       free(task);
-      task = NULL;
+      free(state);
+      return false;
    }
 
-   if (data)
-      free(data);
    if (state)
       free(state);
    if (task)
@@ -1142,6 +1368,12 @@ static bool task_push_undo_save_state(const char *path, void *data, size_t len)
  **/
 bool content_undo_save_state(void)
 {
+   /* The undo borrows undo_save_buf: a pending backup read or undo
+    * frees or replaces it before a held undo would run */
+   if (undo_save_buf_tasks_pending)
+      return false;
+   if (content_undo_save_buf_is_empty())
+      return false;
    if (core_info_current_supports_savestate())
       return task_push_undo_save_state(
             undo_save_buf.path,
@@ -1561,6 +1793,9 @@ static void content_load_state_apply(retro_task_t *task,
     * whichever way this callback exits. */
    if (load_state_tasks_pending)
       load_state_tasks_pending--;
+   if (     (load_data->flags & SAVE_TASK_FLAG_LOAD_TO_BACKUP_BUFF)
+         && undo_save_buf_tasks_pending)
+      undo_save_buf_tasks_pending--;
 
    _len = load_data->size;
    buf  = load_data->data;
@@ -1598,6 +1833,9 @@ static void content_load_state_apply(retro_task_t *task,
       free(load_data);
       return;
    }
+
+   if (!config_get_ptr()->bools.block_sram_overwrite)
+      content_flush_saves_before_load();
 
    if (     savefile_list
          && savefile_list->size
@@ -1655,7 +1893,8 @@ static void content_load_state_apply(retro_task_t *task,
       bool ramped = audio_driver_jump_fade_begin();
 
       /* Backup the current state so we can undo this load */
-      content_save_state("RAM", false);
+      if (content_save_state("RAM", false))
+         undo_load_auto = content_is_auto_state(load_data->path);
 
       ret = content_deserialize_state(buf, _len);
 
@@ -1697,6 +1936,10 @@ error:
    RARCH_ERR("[State] %s \"%s\".\n",
          msg_hash_to_str(MSG_FAILED_TO_LOAD_STATE),
          load_data->path);
+   /* The save goes ahead without a backup: what the buffer holds is
+    * older. */
+   if (load_data->flags & SAVE_TASK_FLAG_LOAD_TO_BACKUP_BUFF)
+      undo_save_buf.path[0] = '\0';
    if (load_data->done_cb)
    {
       char msg[PATH_MAX_LENGTH + 64];
@@ -1732,15 +1975,26 @@ static void save_state_cb(retro_task_t *task,
    /* Out of the core whichever way this callback exits. */
    if (save_state_tasks_pending)
       save_state_tasks_pending--;
+   content_save_written();
+   /* As content_auto_state_set_aside(): the .auto is the session's */
+   if ((state->flags & SAVE_TASK_FLAG_AUTO_ASIDE) && !error)
+   {
+      runloop_state_get_ptr()->auto_state_owned = true;
+      if (state->held)
+         content_auto_state_keep(state->path);
+   }
    if (state->done_cb)
       state->done_cb(task, state->path, user_data, error);
 #ifdef HAVE_SCREENSHOTS
+   /* Only a written state gets its thumbnail */
+   if (!error && (state->flags & SAVE_TASK_FLAG_THUMBNAIL_ENABLE))
    {
       char               *path   = strdup(state->path);
-      if (state->flags & SAVE_TASK_FLAG_THUMBNAIL_ENABLE)
-         take_screenshot(config_get_ptr()->paths.directory_screenshot,
+      /* a shot that fails later drops it itself */
+      if (!take_screenshot(config_get_ptr()->paths.directory_screenshot,
                path, true,
-               state->flags & SAVE_TASK_FLAG_HAS_VALID_FB, false, true);
+               state->flags & SAVE_TASK_FLAG_HAS_VALID_FB, false, true))
+         content_drop_thumbnail(state->path, false);
       free(path);
    }
 #endif
@@ -1849,6 +2103,9 @@ static bool task_push_save_state(const char *path, void *data, size_t len,
 #endif
    if (!settings->bools.notification_show_save_state)
       state->flags              |= SAVE_TASK_FLAG_MUTE;
+   if (     !runloop_state_get_ptr()->auto_state_owned
+         && content_is_auto_state(path))
+      state->flags              |= SAVE_TASK_FLAG_AUTO_ASIDE;
 
    task->type                    = TASK_TYPE_BLOCKING;
    task->state                   = state;
@@ -2003,7 +2260,11 @@ static bool task_push_load_and_save_state(const char *path, void *data,
       task->flags              &= ~RETRO_TASK_FLG_MUTE;
 
    if (state_task_push(task))
+   {
       load_state_tasks_pending++;
+      if (load_to_backup_buffer)
+         undo_save_buf_tasks_pending++;
+   }
    else
    {
       /* The hold is full.  No callback will run for this task. */
@@ -2018,25 +2279,553 @@ static bool task_push_load_and_save_state(const char *path, void *data,
    return true;
 }
 
-/**
- * content_auto_save_state:
- * @path      : path of saved state that shall be written to.
- * Save a state from memory to disk. This is used for automatic saving right
- * before a core unload/deinit or content closing. The save is a blocking
- * operation (does not use the task queue).
- *
- * Returns: true if successful, false otherwise.
- **/
-bool content_auto_save_state(const char *path)
+/* A not-loaded .auto that cannot move into its backups (another drive,
+ * SAF) is held beside itself under a held name, on its own volume, and
+ * a task copies it there a piece at a time: the copy is synced and the
+ * held one deleted off the frame loop, or on the unthreaded queue the
+ * copy lands unsynced and a later load deletes the held one. */
+enum auto_state_keep_step
+{
+   AUTO_STATE_KEEP_NEXT = 0,
+   AUTO_STATE_KEEP_COMPARE,
+   AUTO_STATE_KEEP_COPY
+};
+
+typedef struct
+{
+   RFILE *in;
+   RFILE *out;    /* the copy's temp, or a copy compared */
+   uint8_t *buf;  /* SAVE_STATE_CHUNK */
+   char *core;
+   struct string_list *copies; /* to compare with, newest first */
+   size_t next;   /* in copies */
+   int64_t size;  /* the held one's */
+   unsigned n;    /* the held name in hand */
+   enum auto_state_keep_step step;
+   bool failed;
+   char path[PATH_MAX_LENGTH];
+   char dir[PATH_MAX_LENGTH];
+   char held[PATH_MAX_LENGTH];
+   char made[PATH_MAX_LENGTH];
+   char compared[PATH_MAX_LENGTH];
+   char recovery[2][PATH_MAX_LENGTH]; /* where no name fits in dir */
+} auto_state_keep_t;
+
+/* How old an unsynced copy is before it is taken to be on the disk */
+#define AUTO_STATE_KEEP_SETTLED_SEC 60
+
+/* One keep task at a time, so copy names and temp deletes never race;
+ * the paths owed wait here, each with its block as userdata. Main
+ * thread: push and callback only. */
+static unsigned            auto_state_keep_tasks = 0;
+static struct string_list *auto_state_keep_owed  = NULL;
+static size_t              auto_state_keep_next  = 0;
+
+static void auto_state_keep_close(auto_state_keep_t *keep)
+{
+   if (keep->in)
+      filestream_close(keep->in);
+   keep->in = NULL;
+   if (keep->out)
+   {
+      filestream_close(keep->out);
+      if (keep->step == AUTO_STATE_KEEP_COPY)
+         filestream_finish_atomic(keep->made, false);
+   }
+   keep->out  = NULL;
+   keep->step = AUTO_STATE_KEEP_NEXT;
+}
+
+/* Opens the next held name and lists the copies to compare it with.
+ * False when none is left. */
+static bool auto_state_keep_begin(auto_state_keep_t *keep)
+{
+   /* Where the set-aside went: off the main thread, it lists them */
+   if (!keep->n)
+      save_backups_recovery_pick(keep->dir, sizeof(keep->dir),
+            keep->recovery[0], keep->recovery[1], keep->path, keep->core,
+            SAVE_BACKUP_NOT_LOADED);
+   while (++keep->n <= SAVE_BACKUPS_HELD_MAX)
+      if (     save_backups_held_name(keep->held, sizeof(keep->held),
+                  keep->path, keep->n)
+            && path_is_valid(keep->held))
+         break;
+   if (keep->n > SAVE_BACKUPS_HELD_MAX)
+      return false;
+
+   string_list_free(keep->copies);
+   keep->next = 0;
+   if (     !(keep->copies = save_backups_delete_temps(keep->dir, keep->path,
+               keep->core, SAVE_BACKUP_NOT_LOADED))
+         || !(keep->in = filestream_open(keep->held,
+               RETRO_VFS_FILE_ACCESS_READ,
+               RETRO_VFS_FILE_ACCESS_HINT_SEQUENTIAL_BULK)))
+   {
+      keep->failed = true;
+      return true;
+   }
+   keep->size = filestream_get_size(keep->in);
+   keep->step = AUTO_STATE_KEEP_COMPARE;
+   return true;
+}
+
+/* Opens the next copy of the held one's size to compare, or else its
+ * own copy's temp, named only now so that temp holds the name. */
+static bool auto_state_keep_open(auto_state_keep_t *keep)
+{
+   while (keep->next < keep->copies->size)
+   {
+      const char *copy = keep->copies->elems[keep->next++].data;
+      if (     path_get_size(copy) == keep->size
+            && (keep->out = filestream_open(copy,
+                  RETRO_VFS_FILE_ACCESS_READ,
+                  RETRO_VFS_FILE_ACCESS_HINT_SEQUENTIAL_BULK)))
+      {
+         strlcpy(keep->compared, copy, sizeof(keep->compared));
+         return true;
+      }
+   }
+   if (     save_backups_name_copy(keep->made, sizeof(keep->made), keep->dir,
+               keep->path, keep->core, SAVE_BACKUP_NOT_LOADED)
+            == SAVE_BACKUP_MADE
+         && (keep->out = filestream_open_atomic(keep->made)))
+   {
+      keep->step = AUTO_STATE_KEEP_COPY;
+      return true;
+   }
+   return false;
+}
+
+/* The copy is written: in place, and the held one deleted once synced */
+static void auto_state_keep_land(auto_state_keep_t *keep, bool ok)
+{
+   int ret;
+   bool sync = task_queue_is_threaded();
+   filestream_close(keep->in);
+   keep->in = NULL;
+   if (filestream_close(keep->out) != 0)
+      ok = false;
+   keep->out  = NULL;
+   keep->step = AUTO_STATE_KEEP_NEXT;
+   ret        = sync
+      ? filestream_finish_atomic_synced(keep->made, ok)
+      : filestream_finish_atomic(keep->made, ok);
+   /* Written but not renamed into place */
+   if (     ret == 1
+         && filestream_atomic_temp_name(keep->compared,
+            sizeof(keep->compared), keep->made))
+      filestream_delete(keep->compared);
+   if (ret != 0)
+   {
+      keep->failed = true;
+      return;
+   }
+   save_backups_retain_made(keep->dir, keep->path, keep->core,
+         SAVE_BACKUP_NOT_LOADED, keep->made);
+   if (sync)
+      filestream_delete(keep->held);
+}
+
+/* A copy holds the held one: it goes once that copy is on the disk. An
+ * unthreaded session's copy may not be synced, so here it is, or past
+ * AUTO_STATE_KEEP_SETTLED_SEC it is taken to be. */
+static void auto_state_keep_settle(auto_state_keep_t *keep)
+{
+   int64_t mtime;
+   bool on_disk = false;
+   filestream_close(keep->in);
+   filestream_close(keep->out);
+   keep->in   = NULL;
+   keep->out  = NULL;
+   keep->step = AUTO_STATE_KEEP_NEXT;
+   if (task_queue_is_threaded())
+   {
+      RFILE *file = filestream_open(keep->compared,
+            RETRO_VFS_FILE_ACCESS_WRITE
+            | RETRO_VFS_FILE_ACCESS_UPDATE_EXISTING,
+            RETRO_VFS_FILE_ACCESS_HINT_NONE);
+      on_disk = file && filestream_sync(file) == 0;
+      if (file && filestream_close(file) != 0)
+         on_disk = false;
+      /* Its name too, as a synced write's rename */
+      if (on_disk)
+         retro_vfs_dir_sync_impl(keep->dir);
+      else
+         keep->failed = true;
+   }
+   else
+      on_disk =    path_get_mtime(keep->compared, &mtime)
+                && (int64_t)time(NULL) - mtime > AUTO_STATE_KEEP_SETTLED_SEC;
+   if (on_disk)
+      filestream_delete(keep->held);
+}
+
+/* One piece of the copy or the compare; false when this held one is
+ * done. */
+static bool auto_state_keep_piece(auto_state_keep_t *keep)
+{
+   int64_t got, other;
+   if (keep->step == AUTO_STATE_KEEP_COPY)
+   {
+      if (     (got = filestream_read(keep->in, keep->buf, SAVE_STATE_CHUNK))
+               > 0
+            && filestream_write(keep->out, keep->buf, got) == got)
+         return true;
+      auto_state_keep_land(keep, got == 0);
+      return false;
+   }
+   if (!keep->out)
+   {
+      if (auto_state_keep_open(keep))
+         return true;
+      auto_state_keep_close(keep);
+      keep->failed = true;
+      return false;
+   }
+   got   = filestream_read(keep->in, keep->buf, SAVE_STATE_CHUNK / 2);
+   other = got > 0 ? filestream_read(keep->out,
+         keep->buf + SAVE_STATE_CHUNK / 2, got) : got;
+   if (got > 0 && other == got
+         && !memcmp(keep->buf, keep->buf + SAVE_STATE_CHUNK / 2,
+            (size_t)got))
+      return true;
+   if (got == 0)
+   {
+      auto_state_keep_settle(keep);
+      return false;
+   }
+   /* Not the same: the next copy, or one of its own */
+   filestream_close(keep->out);
+   keep->out = NULL;
+   if (     got > 0 && other >= 0
+         && filestream_seek(keep->in, 0, RETRO_VFS_SEEK_POSITION_START) == 0)
+      return true;
+   auto_state_keep_close(keep);
+   keep->failed = true;
+   return false;
+}
+
+static void task_auto_state_keep_handler(retro_task_t *task)
+{
+   retro_time_t deadline;
+   auto_state_keep_t *keep = (auto_state_keep_t*)task->state;
+
+   if (task_get_flags(task) & RETRO_TASK_FLG_CANCELLED)
+   {
+      auto_state_keep_close(keep);
+      keep->n = SAVE_BACKUPS_HELD_MAX;
+   }
+   if (keep->step == AUTO_STATE_KEEP_NEXT)
+   {
+      if (!auto_state_keep_begin(keep))
+      {
+         task_set_data(task, keep);
+         task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
+      }
+      return;
+   }
+   deadline = cpu_features_get_time_usec() + SAVE_STATE_TICK_BUDGET_US;
+   while (     auto_state_keep_piece(keep)
+         && cpu_features_get_time_usec() < deadline);
+}
+
+static bool auto_state_keep_push(auto_state_keep_t *keep);
+
+static void task_auto_state_keep_cb(retro_task_t *task, void *task_data,
+      void *user_data, const char *error)
+{
+   auto_state_keep_t *keep = (auto_state_keep_t*)task_data;
+   if (keep->failed)
+      RARCH_ERR("[State] Could not copy the unloaded \"%s\" to the "
+            "backups: kept beside it for the next load.\n", keep->path);
+   string_list_free(keep->copies);
+   free(keep->buf);
+   free(keep);
+   auto_state_keep_tasks--;
+   /* At exit: the rest wait for their next load */
+   if (task_get_flags(task) & RETRO_TASK_FLG_CANCELLED)
+      auto_state_keep_next = auto_state_keep_owed
+         ? auto_state_keep_owed->size : 0;
+   while (     auto_state_keep_owed
+         && auto_state_keep_next < auto_state_keep_owed->size
+         && !auto_state_keep_tasks)
+   {
+      struct string_list_elem *elem =
+         &auto_state_keep_owed->elems[auto_state_keep_next++];
+      keep           = (auto_state_keep_t*)elem->userdata;
+      elem->userdata = NULL;
+      if (!auto_state_keep_push(keep))
+      {
+         RARCH_ERR("[State] Could not start copying the unloaded \"%s\" "
+               "to the backups: kept beside it for the next load.\n",
+               keep->path);
+         free(keep);
+      }
+   }
+   if (     auto_state_keep_owed
+         && auto_state_keep_next >= auto_state_keep_owed->size)
+   {
+      string_list_free(auto_state_keep_owed);
+      auto_state_keep_owed = NULL;
+      auto_state_keep_next = 0;
+   }
+}
+
+/* The piece buffer only once pushed: owed blocks are freed as a
+ * string_list's userdata. */
+static bool auto_state_keep_push(auto_state_keep_t *keep)
+{
+   retro_task_t *task;
+   if (!(keep->buf = (uint8_t*)malloc(SAVE_STATE_CHUNK)))
+      return false;
+   if (!(task = task_init()))
+   {
+      free(keep->buf);
+      keep->buf = NULL;
+      return false;
+   }
+   task->type     = TASK_TYPE_NONE;
+   task->state    = keep;
+   task->handler  = task_auto_state_keep_handler;
+   task->callback = task_auto_state_keep_cb;
+   task->flags   |= RETRO_TASK_FLG_MUTE;
+   if (!task_queue_push(task))
+   {
+      free(task);
+      free(keep->buf);
+      keep->buf = NULL;
+      return false;
+   }
+   auto_state_keep_tasks++;
+   return true;
+}
+
+void content_auto_state_keep(const char *path)
+{
+   union string_list_elem_attr attr;
+   const char *core        = runloop_state_get_ptr()->system.info.library_name;
+   size_t core_len         = core ? strlen(core) : 0;
+   auto_state_keep_t *keep = (auto_state_keep_t*)calloc(1,
+         sizeof(*keep) + core_len + 1);
+
+   if (!keep)
+      return;
+   /* The core field and folder as set for this content: the roots may
+    * change before the task runs */
+   keep->core = (char*)(keep + 1);
+   if (core_len)
+      memcpy(keep->core, core, core_len);
+   strlcpy(keep->path, path, sizeof(keep->path));
+   attr.i = 0;
+   save_backups_recovery_folder(keep->recovery[0],
+         sizeof(keep->recovery[0]), path, false);
+   save_backups_recovery_folder(keep->recovery[1],
+         sizeof(keep->recovery[1]), path, true);
+   if (save_backups_dir(keep->dir, sizeof(keep->dir), path))
+   {
+      if (!auto_state_keep_tasks)
+      {
+         if (auto_state_keep_push(keep))
+            return;
+      }
+      else if (   (  auto_state_keep_owed
+                  || (auto_state_keep_owed = string_list_new()))
+               && string_list_append(auto_state_keep_owed, path, attr))
+      {
+         auto_state_keep_owed->elems[
+            auto_state_keep_owed->size - 1].userdata = keep;
+         return;
+      }
+   }
+   RARCH_ERR("[State] Could not start copying the unloaded \"%s\" to the "
+         "backups: kept beside it for the next load.\n", path);
+   free(keep);
+}
+
+void content_auto_state_sweep(const char *path)
+{
+   if (save_backups_held(path))
+      content_auto_state_keep(path);
+}
+
+/* Moves @path to its first free held name, as @held. */
+static bool content_auto_state_hold(const char *path, unsigned *held)
+{
+   unsigned n;
+   bool ok = false;
+   char *s = (char*)malloc(PATH_MAX_LENGTH);
+   for (n = 1; s && n <= SAVE_BACKUPS_HELD_MAX; n++)
+   {
+      if (!save_backups_held_name(s, PATH_MAX_LENGTH, path, n))
+         break;
+      if (path_is_valid(s))
+         continue;
+      if ((ok = filestream_rename(path, s) == 0))
+         *held = n;
+      break;
+   }
+   free(s);
+   return ok;
+}
+
+/* The new state could not take @path's place: what the move took goes
+ * back, the copy @moved or held name @n. Files only, for any thread. */
+static void content_auto_state_put_back(const char *path, unsigned n,
+      const char *moved)
+{
+   char *s;
+   if (moved && *moved)
+   {
+      if (filestream_rename(moved, path) != 0)
+         RARCH_ERR("[State] Could not put the unloaded \"%s\" back: kept "
+               "in the backups.\n", path);
+      return;
+   }
+   s = (char*)malloc(PATH_MAX_LENGTH);
+   if (     !s
+         || !save_backups_held_name(s, PATH_MAX_LENGTH, path, n)
+         || filestream_rename(s, path) != 0)
+      RARCH_ERR("[State] Could not put the unloaded \"%s\" back: kept "
+            "beside it, copied to the backups at the next load.\n", path);
+   free(s);
+}
+
+static void content_auto_state_unhold(const char *path, unsigned n,
+      const char *moved)
+{
+   content_auto_state_put_back(path, n, moved);
+   runloop_state_get_ptr()->auto_state_owned = false;
+}
+
+/* content_auto_state_move_aside() into @dir, of PATH_MAX_LENGTH and
+ * as much again after it. */
+static enum save_backup_result content_auto_state_move_into(char *dir,
+      const char *path, unsigned *held, char *moved, size_t len, bool sync)
+{
+   /* A rename, else held for a task, else an unsynced copy the new
+    * state's rename replaces: no synced copy inside the frame. */
+   enum save_backup_result result = save_backups_move_begin(dir, path,
+         NULL, SAVE_BACKUP_NOT_LOADED, dir + PATH_MAX_LENGTH,
+         PATH_MAX_LENGTH, NULL, NULL);
+   if (result == SAVE_BACKUP_MADE)
+   {
+      if (len)
+         strlcpy(moved, dir + PATH_MAX_LENGTH, len);
+      if (sync)
+         retro_vfs_dir_sync_impl(dir);
+   }
+   else if (     result == SAVE_BACKUP_COPY_OWED
+         && content_auto_state_hold(path, held))
+      result = SAVE_BACKUP_MADE;
+   else
+      result = save_backups_copy_to(dir, path, NULL,
+            SAVE_BACKUP_NOT_LOADED, NULL, 0, sync);
+   return result;
+}
+
+/* Moves @path to the backups, or where no name fits there to its
+ * recovery folder, its copy's name into @moved; across drives holds it
+ * beside itself, as @held, until a task copies it there. @sync: a move
+ * or copy into the backups is on the disk before the slot's folder is.
+ * Files only, for any thread. */
+static bool content_auto_state_move_aside(const char *path, unsigned *held,
+      char *moved, size_t len, bool sync)
+{
+   enum save_backup_result result = SAVE_BACKUP_FAILED;
+   char *dir = (char*)malloc(2 * PATH_MAX_LENGTH);
+   if (len)
+      moved[0] = '\0';
+   if (dir && save_backups_dir(dir, PATH_MAX_LENGTH, path))
+      result = content_auto_state_move_into(dir, path, held, moved, len,
+            sync);
+   if (     result != SAVE_BACKUP_MADE && dir
+         && save_backups_recovery_dir(dir, PATH_MAX_LENGTH, path, NULL,
+            SAVE_BACKUP_NOT_LOADED))
+      result = content_auto_state_move_into(dir, path, held, moved, len,
+            sync);
+   free(dir);
+   if (result != SAVE_BACKUP_MADE)
+   {
+      RARCH_ERR("[State] Could not keep the unloaded \"%s\": not "
+            "saving over it.\n", path);
+      return false;
+   }
+   return true;
+}
+
+/* An .auto the session wanted and did not load (load failed, hardcore,
+ * netplay, a replay, an entry slot) goes to the backups before the
+ * first write over it: held as @held, or moved as @moved. */
+static bool content_auto_state_set_aside(const char *path, unsigned *held,
+      char *moved, size_t len, bool sync)
+{
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   settings_t *settings        = config_get_ptr();
+
+   if (     !runloop_st->auto_state_owned
+         && (   runloop_st->auto_state_wanted
+             || settings->bools.savestate_auto_load)
+         && path_is_valid(path)
+         && !content_auto_state_move_aside(path, held, moved, len, sync))
+      return false;
+   runloop_st->auto_state_owned = true;
+   return true;
+}
+
+/* A close or interval Auto save not written, the old .auto kept: at a
+ * close @data, the new one, goes to a recovery file. Shown once a
+ * session, and each time a recovery file is made. */
+static void content_auto_state_failed(const char *path, const void *data,
+      size_t len, bool closing)
+{
+   char msg[256];
+   char *rec = NULL;
+   bool made = false;
+   if (     closing
+         && (rec = (char*)malloc(PATH_MAX_LENGTH))
+         && save_backups_recover(rec, PATH_MAX_LENGTH, path, data, len,
+               true))
+   {
+      enum save_backups_place place = save_backups_place_of(rec);
+      made = true;
+      RARCH_WARN("[State] Unsaved progress: \"%s\".\n", rec);
+      /* No full path: just the folder's name */
+      if (!save_backups_place_dir(rec, PATH_MAX_LENGTH, path, place,
+               false))
+         strlcpy(rec, place == SAVE_BACKUPS_PLACE_COPIES
+               ? SAVE_BACKUPS_DIR : SAVE_BACKUPS_RECOVERY_DIR,
+               PATH_MAX_LENGTH);
+   }
+   if (auto_state_failure_shown && !made)
+   {
+      free(rec);
+      return;
+   }
+   auto_state_failure_shown = true;
+   snprintf(msg, sizeof(msg), msg_hash_to_str(made
+            ? MSG_SAVE_WRITE_RECOVERED : MSG_SAVE_WRITE_FAILED),
+         path_basename(path), made ? rec : "");
+   free(rec);
+   runloop_msg_queue_push(msg, strlen(msg), 1, 180, true, NULL,
+         MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+}
+
+/* The close's Auto save (@closing: synced) or the interval's. A
+ * blocking write, not a task. */
+static bool content_auto_state_write(const char *path, bool closing)
 {
    size_t _len;
    int _close_ret;
+   unsigned held        = 0;
    settings_t *settings = config_get_ptr();
    void *serial_data    = NULL;
    intfstream_t *file   = NULL;
+   char *moved          = NULL;
+   const char *suffix   = AUTO_STATE_TMP_SUFFIX;
    char tmp_path[PATH_MAX_LENGTH];
 
-   if (!core_info_current_supports_savestate())
+   if (     !runloop_state_get_ptr()->auto_state_bypass
+         && !core_info_current_supports_savestate())
    {
       RARCH_LOG("[State] %s\n",
             msg_hash_to_str(MSG_CORE_DOES_NOT_SUPPORT_SAVESTATES));
@@ -2051,44 +2840,63 @@ bool content_auto_save_state(const char *path)
    if (!serial_data)
       return false;
 
-   /* Write to "<path>.tmp" and move it into place, so a crash or power
-    * loss mid-save leaves the previous state intact. */
-   if (!filestream_atomic_temp_name(tmp_path, sizeof(tmp_path), path))
-   {
-      free(serial_data);
-      return false;
-   }
-
+   /* Write to "<path>.auto.tmp" and move it into place, so a crash or
+    * power loss mid-save leaves the previous state intact. */
+   if (!(file = content_open_state_tmp(tmp_path, sizeof(tmp_path), path,
+         &suffix,
 #if defined(HAVE_COMPRESSION)
-   if (settings->bools.savestate_file_compression)
-      file = intfstream_open_rzip_file(tmp_path, RETRO_VFS_FILE_ACCESS_WRITE);
-   else
+         settings->bools.savestate_file_compression,
+#else
+         false,
 #endif
-      file = intfstream_open_file(tmp_path, RETRO_VFS_FILE_ACCESS_WRITE,
-                                  RETRO_VFS_FILE_ACCESS_HINT_SEQUENTIAL_BULK);
-
-   if (!file)
-   {
-      free(serial_data);
-      return false;
-   }
+         RETRO_VFS_FILE_ACCESS_HINT_SEQUENTIAL_BULK)))
+      goto failed;
 
    if (_len != (size_t)intfstream_write(file, serial_data, _len))
    {
       intfstream_close(file);
-      free(serial_data);
       free(file);
       filestream_delete(tmp_path);
-      return false;
+      goto failed;
    }
 
    /* A failed close (rzip's last chunk, a full disk) is a failed save. */
    _close_ret = intfstream_close(file);
-   free(serial_data);
    free(file);
+   /* Kept for a recovery file at a close only */
+   if (!closing)
+   {
+      free(serial_data);
+      serial_data = NULL;
+   }
 
-   if (!content_finish_tmp(path, _close_ret == 0))
-      return false;
+   /* No room to record a move: one could not be put back. At a close
+    * the new one is synced before the old one moves, as Save State. */
+   moved = (char*)calloc(1, PATH_MAX_LENGTH);
+   if (     _close_ret == 0
+         && (   !moved
+             || (closing && !content_sync_file(tmp_path))
+             || !content_auto_state_set_aside(path, &held, moved,
+               PATH_MAX_LENGTH, closing)))
+      _close_ret = -1;
+   if (!content_finish_state_tmp(path, tmp_path, suffix, _close_ret == 0,
+            closing))
+   {
+      /* The old one back in its slot, the new one gone */
+      if (held || (moved && *moved))
+      {
+         content_auto_state_unhold(path, held, moved);
+         if (path_is_valid(path))
+            filestream_delete(tmp_path);
+      }
+      free(moved);
+      goto failed;
+   }
+   free(moved);
+   free(serial_data);
+   if (held)
+      content_auto_state_keep(path);
+   content_save_written();
 
 #ifdef HAVE_SCREENSHOTS
    if (settings->bools.savestate_thumbnail_enable)
@@ -2096,10 +2904,31 @@ bool content_auto_save_state(const char *path)
       const char *dir_screenshot = settings->paths.directory_screenshot;
       bool validfb = video_driver_cached_frame_is_hw_render();
 
-      take_screenshot(dir_screenshot, path, true, validfb, false, false);
+      if (!take_screenshot(dir_screenshot, path, true, validfb, false,
+               false))
+         content_drop_thumbnail(path, false);
    }
 #endif
    return true;
+
+failed:
+   content_auto_state_failed(path, serial_data, _len, closing);
+   free(serial_data);
+   return false;
+}
+
+/**
+ * content_auto_save_state:
+ * @path      : path of saved state that shall be written to.
+ * Save a state from memory to disk. This is used for automatic saving right
+ * before a core unload/deinit or content closing. The save is a blocking
+ * operation (does not use the task queue).
+ *
+ * Returns: true if successful, false otherwise.
+ **/
+bool content_auto_save_state(const char *path)
+{
+   return content_auto_state_write(path, true);
 }
 
 /**
@@ -2180,6 +3009,7 @@ bool content_save_state_notify(const char *path, bool save_to_disk,
       }
 
       undo_load_buf.size = _len;
+      undo_load_auto     = false;
       strlcpy(undo_load_buf.path, path, sizeof(undo_load_buf.path));
       return true;
    }
@@ -2201,6 +3031,8 @@ bool content_save_state_notify(const char *path, bool save_to_disk,
             msg_hash_to_str(MSG_BYTES));
    }
 
+   strlcpy(undo_save_last_path, path, sizeof(undo_save_last_path));
+
    if (!save_state_disable_undo && path_is_valid(path))
    {
       /* Before overwriting the savestate file, load it into a buffer
@@ -2211,6 +3043,8 @@ bool content_save_state_notify(const char *path, bool save_to_disk,
       return task_push_load_and_save_state(path, data, _len, true, false,
             cb, user_data);
    }
+   /* Nothing backs up the file this replaces: the buffer is older */
+   undo_save_buf.path[0] = '\0';
    return task_push_save_state(path, data, _len, false, false, cb, user_data);
 }
 
@@ -2352,7 +3186,11 @@ bool content_load_state_notify(const char *path,
    /* Held behind a state task in flight rather than dropped: Load State
     * pressed while a save was still writing did nothing. */
    if (state_task_push(task))
+   {
       load_state_tasks_pending++;
+      if (load_to_backup_buffer)
+         undo_save_buf_tasks_pending++;
+   }
    else
    {
       /* The hold is full. No callback will run for this task, so the
@@ -2415,6 +3253,10 @@ static void state_tasks_discard_held(void)
          save_state_tasks_pending--;
       if (state)
       {
+         if (     (state->flags & (SAVE_TASK_FLAG_LOAD_TO_BACKUP_BUFF
+                     | SAVE_TASK_FLAG_UNDO_SAVE))
+               && undo_save_buf_tasks_pending)
+            undo_save_buf_tasks_pending--;
          if (state->done_cb)
             state->done_cb(NULL, state->path, task->user_data,
                   msg_hash_to_str(is_load
@@ -2457,6 +3299,7 @@ void content_reset_savestate_backups(void)
    undo_load_buf.path[0]  = '\0';
    undo_load_buf.size     = 0;
    undo_load_buf.capacity = 0;
+   undo_load_auto         = false;
 
    /* The spare is an allocation nobody else knows about, so this is
     * the only place it can be released.  Resetting the backups is
@@ -2481,6 +3324,7 @@ void content_reset_savestate_backups(void)
    ram_buf.state_buf.size     = 0;
    ram_buf.state_buf.capacity = 0;
    ram_buf.to_write_file      = false;
+   auto_state_failure_shown   = false;
 }
 
 bool content_undo_load_buf_is_empty(void)
@@ -2490,7 +3334,13 @@ bool content_undo_load_buf_is_empty(void)
 
 bool content_undo_save_buf_is_empty(void)
 {
-   return undo_save_buf.data == NULL || undo_save_buf.size == 0;
+   return undo_save_buf.data == NULL || undo_save_buf.size == 0
+      || !string_is_equal(undo_save_buf.path, undo_save_last_path);
+}
+
+bool content_undo_save_buf_in_use(void)
+{
+   return undo_save_buf_tasks_pending != 0;
 }
 
 bool content_undo_save_disabled(void)
@@ -2523,6 +3373,9 @@ bool content_load_state_from_ram(void)
          msg_hash_to_str(MSG_LOADING_STATE),
          (unsigned)ram_buf.state_buf.size,
          msg_hash_to_str(MSG_BYTES));
+
+   /* Without block_sram_overwrite's put-back here. */
+   content_flush_saves_before_load();
 
    /* Same discontinuity as a load from disk, so the same bracket. See
     * audio_driver_jump_fade_begin(). */
@@ -2601,12 +3454,13 @@ bool content_save_state_to_ram(void)
 /**
  * content_ram_state_to_file:
  * @path             : path of RAM state that shall be written to.
+ * @sync             : synced, as at a close.
  *
  * Save a RAM state from memory to disk.
  *
  * @return true if successful, false otherwise.
  **/
-bool content_ram_state_to_file(const char *path)
+bool content_ram_state_to_file(const char *path, bool sync)
 {
    if (     path
          && ram_buf.state_buf.data
@@ -2614,29 +3468,73 @@ bool content_ram_state_to_file(const char *path)
    {
       /* Write via a temporary file, so a crash or power loss mid-save
        * leaves the previous file intact instead of a truncated one. */
-      bool written = false;
+      bool written       = false;
+      unsigned held      = 0;
+      char *moved        = NULL;
+      /* As Save State: an .auto the session does not own is kept first */
+      bool aside         = !runloop_state_get_ptr()->auto_state_owned
+         && content_is_auto_state(path);
+      const char *suffix = RAM_STATE_TMP_SUFFIX;
+      char tmp_path[PATH_MAX_LENGTH];
+      intfstream_t *file = content_open_state_tmp(tmp_path,
+            sizeof(tmp_path), path, &suffix,
 #if defined(HAVE_COMPRESSION)
-      settings_t *settings = config_get_ptr();
-      if (settings->bools.save_file_compression)
-      {
-         char tmp_path[PATH_MAX_LENGTH];
-         if (filestream_atomic_temp_name(tmp_path, sizeof(tmp_path), path))
-            written = content_finish_tmp(path, rzipstream_write_file(tmp_path,
-                  ram_buf.state_buf.data, ram_buf.state_buf.size));
-      }
-      else
+            config_get_ptr()->bools.save_file_compression,
+#else
+            false,
 #endif
-         written = filestream_write_file_atomic(path,
-               ram_buf.state_buf.data, ram_buf.state_buf.size);
+            RETRO_VFS_FILE_ACCESS_HINT_SEQUENTIAL_BULK);
+      if (file)
+      {
+         written = intfstream_write(file, ram_buf.state_buf.data,
+               ram_buf.state_buf.size) == (int64_t)ram_buf.state_buf.size;
+         if (intfstream_close(file) != 0)
+            written = false;
+         free(file);
+         if (written && sync && !content_sync_file(tmp_path))
+            written = false;
+         /* No room to record a move: one could not be put back */
+         if (     written && aside && path_is_valid(path)
+               && (   !(moved = (char*)calloc(1, PATH_MAX_LENGTH))
+                   || !content_auto_state_move_aside(path, &held, moved,
+                     PATH_MAX_LENGTH, sync)))
+            written = false;
+         if (!content_finish_state_tmp(path, tmp_path, suffix, written,
+                  sync))
+         {
+            /* The old one back in its slot, the new one gone */
+            if (held || (moved && *moved))
+            {
+               content_auto_state_put_back(path, held, moved);
+               if (path_is_valid(path))
+                  filestream_delete(tmp_path);
+            }
+            written = false;
+         }
+         free(moved);
+      }
 
       if (written)
+      {
+         if (aside)
+         {
+            runloop_state_get_ptr()->auto_state_owned = true;
+            if (held)
+               content_auto_state_keep(path);
+         }
          goto success;
+      }
    }
 
    return false;
 
 success:
    ram_buf.to_write_file = false;
+   content_save_written();
+#ifdef HAVE_SCREENSHOTS
+   if (config_get_ptr()->bools.savestate_thumbnail_enable)
+      content_drop_thumbnail(path, true);
+#endif
    return true;
 }
 
@@ -2653,6 +3551,7 @@ void set_save_state_disable_undo(bool disable)
 bool content_save_state_automatic(retro_time_t now_us)
 {
    char savestate_path[PATH_MAX_LENGTH];
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
    settings_t *settings = config_get_ptr();
    unsigned savestate_automatic_interval =
       settings->uints.savestate_automatic_interval;
@@ -2662,10 +3561,34 @@ bool content_save_state_automatic(retro_time_t now_us)
    if (savestate_automatic_interval == 0)
       return false;
 
+   /* Held: the session loaded no state to save over */
+   if (runloop_state_get_ptr()->save_load_hold)
+      return false;
+
+   /* The auto-load skipped by policy: the .auto stays as it is */
+   if (runloop_st->auto_state_refused && !runloop_st->auto_state_owned)
+      return false;
+
+   /* The interval counts from the auto-load, run or skipped */
+   if (     !runloop_st->auto_state_save_ready
+         || !runloop_st->auto_state_interval_started)
+   {
+      runloop_st->auto_state_interval_started = true;
+      last_savestate_automatic_time           = now_us;
+      return false;
+   }
+
    /* Check how long since last autosavestate, against the clock the
     * frame already read - no time() call of its own per frame. */
    if ((now_us - last_savestate_automatic_time)
          < (retro_time_t)savestate_automatic_interval * 1000000)
+      return false;
+
+   /* A state save still writing may land after this one and replace
+    * it, and a load may hold the .auto open: the next frame tries
+    * again */
+   if (     content_save_state_in_progress(NULL)
+         || content_load_state_in_progress(NULL))
       return false;
    
    /* Generate the savestate path */
@@ -2685,5 +3608,5 @@ bool content_save_state_automatic(retro_time_t now_us)
    /* Update the last savestate time, rinse/repeat */
    last_savestate_automatic_time = now_us;
    
-   return content_auto_save_state(savestate_path);
+   return content_auto_state_write(savestate_path, false);
 }

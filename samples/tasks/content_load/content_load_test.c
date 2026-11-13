@@ -63,6 +63,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #include <boolean.h>
 #include <dynamic/dylib.h>
@@ -105,8 +106,25 @@
 #endif
 #include <features/features_cpu.h>
 #include <string/stdstring.h>
+#include <formats/rpng.h>
 
 static unsigned failures = 0;
+
+#ifdef HAVE_RPNG
+/* Set: the PNG encoder's steps make no progress, so a thumbnail that
+ * has begun (its temporary open) cannot finish, whatever the window.
+ * build.sh links with -Wl,--wrap=rpng_encode_step. */
+static bool ss_encode_gate;
+int __real_rpng_encode_step(rpng_encoder_t *e,
+      bool (*within)(void *userdata), void *userdata);
+int __wrap_rpng_encode_step(rpng_encoder_t *e,
+      bool (*within)(void *userdata), void *userdata)
+{
+   if (ss_encode_gate)
+      return 0;
+   return __real_rpng_encode_step(e, within, userdata);
+}
+#endif
 
 #define CHECK(cond, ...) \
    do { \
@@ -3150,6 +3168,15 @@ static bool ss_png_complete(const char *path)
    return ok;
 }
 
+/* The task screenshot's outcome: 1 written, 0 failed */
+static int ss_task_written = -1;
+static void ss_task_done(retro_task_t *task, void *task_data,
+      void *user_data, const char *error)
+{
+   (void)task; (void)task_data; (void)user_data;
+   ss_task_written = error ? 0 : 1;
+}
+
 /* With Threaded Tasks off a screenshot is encoded a slice at a time
  * from the frame loop, not in one handler call that holds the frame
  * for the whole deflate; the file it leaves is whole.  Cancelled part
@@ -3229,6 +3256,43 @@ static void lane_screenshot_steps(const char *dir)
    CHECK(!ss_in_flight(), "the cancelled screenshot did not retire");
    CHECK(!path_is_valid(file), "a cancelled screenshot left a partial file");
 
+   /* One taken without a task while a task writes the same file: each
+    * through its own temporary, the file whole, neither failed */
+   for (attempt = 0; attempt < 3; attempt++)
+   {
+      unsigned n;
+      ss_task_written = -1;
+      CHECK(take_screenshot_notify(dir, path, false, false, true, true,
+               ss_task_done, NULL),
+            "the task screenshot was not started");
+      for (n = 0, late = 0; n < 20; n++)
+         late += ss_check_late();
+      if (ss_in_flight() || !late)
+         break;
+      remove(file);
+   }
+   CHECK(ss_in_flight(), "the task screenshot was already done");
+   CHECK(take_screenshot(dir, path, false, false, true, false),
+         "the screenshot without a task failed beside the task's");
+   {
+      unsigned n;
+      for (n = 0; n < 4 * rows && ss_in_flight(); n++)
+         task_queue_check();
+   }
+   CHECK(!ss_in_flight(), "the task screenshot did not finish");
+   CHECK(ss_task_written == 1,
+         "the task screenshot failed beside one without a task (%d)",
+         ss_task_written);
+   CHECK(ss_png_complete(file), "two writers left no whole PNG");
+   {
+      char tmp[700];
+      snprintf(tmp, sizeof(tmp), "%s.tmp", file);
+      CHECK(!path_is_valid(tmp), "the task's temporary was left");
+      snprintf(tmp, sizeof(tmp), "%s.direct.tmp", file);
+      CHECK(!path_is_valid(tmp), "the direct temporary was left");
+   }
+   remove(file);
+
    ss_hog_stop = true;
    pump(3);
 
@@ -3236,6 +3300,443 @@ static void lane_screenshot_steps(const char *dir)
       fprintf(stderr, "[pass] screenshot-steps lane (%u checks for %u rows)\n",
             checks, rows);
 }
+
+/* The longest file name @dir takes: 0 if none fits in the probe */
+static size_t ss_longest_name(const char *dir)
+{
+   char   path[1400];
+   size_t lo = 0, hi = 1023;
+   int    d  = snprintf(path, sizeof(path), "%s/", dir);
+   if (d < 0 || (size_t)d + hi >= sizeof(path))
+      return 0;
+   memset(path + d, 'n', hi);
+   /* @lo opens, @hi does not */
+   while (hi - lo > 1)
+   {
+      size_t mid = (lo + hi) / 2;
+      FILE  *f;
+      path[d + mid] = '\0';
+      if ((f = fopen(path, "wb")))
+      {
+         fclose(f);
+         remove(path);
+         lo = mid;
+      }
+      else
+         hi = mid;
+      path[d + mid] = 'n';
+   }
+   return lo;
+}
+
+/* A name too long for the screenshot's own temporary takes
+ * "<file>.tmp", then the file itself, as before temporaries */
+static void lane_screenshot_long_names(const char *dir)
+{
+   /* the name's length from the longest, and whether a task writes it */
+   static const struct { int over; bool task; } cases[] = {
+      { -4, false }, { 0, false }, { 0, true }
+   };
+   char     path[1400];
+   size_t   n   = ss_longest_name(dir);
+   unsigned had = failures, i, k;
+   int      d   = snprintf(path, sizeof(path), "%s/", dir);
+
+   CHECK(n > 16 && d > 0 && (size_t)d + n + 1 < sizeof(path),
+         "no name length limit found (%u)", (unsigned)n);
+   if (failures != had)
+      return;
+   for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+   {
+      struct stat was, now;
+      size_t len = n + cases[i].over;
+      FILE  *f;
+      memset(path + d, 'S', len - 4);
+      strcpy(path + d + len - 4, ".png");
+      if ((f = fopen(path, "wb")))
+         fclose(f);
+      CHECK(stat(path, &was) == 0, "the old file was not made");
+      CHECK(take_screenshot(dir, path, false, false, true, cases[i].task),
+            "a screenshot %u bytes long was not written (%s)",
+            (unsigned)len, cases[i].task ? "task" : "direct");
+      for (k = 0; k < 2000 && ss_in_flight(); k++)
+         task_queue_check();
+      CHECK(ss_png_complete(path),
+            "a screenshot %u bytes long is not a whole PNG (%s)",
+            (unsigned)len, cases[i].task ? "task" : "direct");
+      /* through "<file>.tmp" where that fits: the file replaced whole */
+      CHECK(     cases[i].over == 0
+            || (stat(path, &now) == 0 && now.st_ino != was.st_ino),
+            "a screenshot %u bytes long was written in place", (unsigned)len);
+      remove(path);
+   }
+
+   /* written in place and cancelled part way: no partial file is left */
+   {
+      retro_task_t *hog, *shot = NULL;
+      task_finder_data_t find;
+      unsigned late = 0, attempt;
+
+      configuration_set_bool(config_get_ptr(),
+            config_get_ptr()->bools.threaded_data_runloop_enable, false);
+      task_queue_unset_threaded();
+      ss_hog_stop  = false;
+      hog          = task_init();
+      hog->handler = ss_hog_handler;
+      hog->flags  |= RETRO_TASK_FLG_MUTE;
+      task_queue_push(hog);
+      memset(path + d, 'S', n - 4);
+      strcpy(path + d + n - 4, ".png");
+      for (attempt = 0; attempt < 3; attempt++)
+      {
+         remove(path);
+         CHECK(take_screenshot(dir, path, false, false, true, true),
+               "the in-place screenshot was not started");
+         for (k = 0, late = 0; k < 20; k++)
+            late += ss_check_late();
+         if (ss_in_flight() || !late)
+            break;
+      }
+      CHECK(ss_in_flight() && path_is_valid(path),
+            "the in-place screenshot was not being written");
+      find.func     = ss_is_screenshot;
+      find.userdata = &shot;
+      if (task_queue_find(&find) && shot)
+         task_queue_cancel_task(shot);
+      for (k = 0; k < 20 && ss_in_flight(); k++)
+         task_queue_check();
+      CHECK(!ss_in_flight(), "the cancelled in-place screenshot did not retire");
+      CHECK(!path_is_valid(path),
+            "a cancelled screenshot written in place left a partial file");
+      remove(path);
+      ss_hog_stop = true;
+      pump(3);
+   }
+   if (failures == had)
+      fprintf(stderr, "[pass] screenshot-long-names lane (longest %u)\n",
+            (unsigned)n);
+}
+
+#ifdef HAVE_DYNAMIC
+/* The thumbnail tasks: other tasks run beside them after a save */
+static retro_task_handler_t ss_thumb_handler;
+static bool ss_is_thumbnail(retro_task_t *task, void *user_data)
+{
+   if (     task->handler != ss_thumb_handler
+         || (task_get_flags(task) & RETRO_TASK_FLG_FINISHED))
+      return false;
+   *(retro_task_t**)user_data = task;
+   return true;
+}
+
+/* The unthreaded queue runs no handler before its 'when': a held
+ * thumbnail stays where it is, however late the checks come */
+static void ss_thumbnail_hold(retro_task_t *task, bool hold)
+{
+   ss_encode_gate = hold;
+   task->when     = hold ? cpu_features_get_time_usec() + 600000000 : 0;
+}
+
+/* Saves @mark with the encoder gated, then holds the thumbnail the
+ * save starts once it has begun encoding into @tmp */
+static retro_task_t *ss_save_thumbnail_held(unsigned mark,
+      retro_task_finder_t func, const char *tmp, const char *pass)
+{
+   retro_task_t *shot = NULL;
+   task_finder_data_t find;
+   unsigned n;
+
+   find.func      = func;
+   find.userdata  = &shot;
+   remove(tmp);
+   ss_encode_gate = true;
+   CHECK(state_save_marked(mark),
+         "the first save was not written (%s)", pass);
+   CHECK(task_queue_find(&find) && shot,
+         "the first thumbnail was not started (%s)", pass);
+   if (!shot)
+   {
+      ss_encode_gate = false;
+      return NULL;
+   }
+   ss_thumb_handler = shot->handler;
+   /* the hog may take the first check */
+   for (n = 0; n < 8 && !path_is_valid(tmp); n++)
+      task_queue_check();
+   ss_thumbnail_hold(shot, true);
+   return shot;
+}
+
+/* A state's thumbnail that is not written leaves the slot none: not
+ * the picture of the save before, written while this one waited */
+static void lane_thumbnail_not_written(void)
+{
+   settings_t *settings = config_get_ptr();
+   bool thumbnail       = settings->bools.savestate_thumbnail_enable;
+   char state[PATH_MAX_LENGTH], thumb[PATH_MAX_LENGTH + 8],
+        tmp[PATH_MAX_LENGTH + 16];
+   retro_task_t *hog, *held, *shot = NULL;
+   task_finder_data_t find;
+   uint32_t first = 0;
+   unsigned had   = failures, n;
+
+   run_harness_core();
+   configuration_set_bool(settings,
+         settings->bools.threaded_data_runloop_enable, false);
+   task_queue_unset_threaded();
+   pump(3);
+   configuration_set_bool(settings,
+         settings->bools.savestate_thumbnail_enable, true);
+   runloop_get_current_savestate_path(state, sizeof(state));
+   snprintf(thumb, sizeof(thumb), "%s.png", state);
+   snprintf(tmp, sizeof(tmp), "%s.tmp", thumb);
+   remove(thumb);
+
+   ss_hog_stop  = false;
+   hog          = task_init();
+   hog->handler = ss_hog_handler;
+   hog->flags  |= RETRO_TASK_FLG_MUTE;
+   task_queue_push(hog);
+   find.userdata = &shot;
+
+   /* the second save while the first's thumbnail encodes: the save
+    * leaves only that one beside the hog */
+   held = ss_save_thumbnail_held(0x51, ss_is_screenshot, tmp,
+         "the second save");
+   CHECK(held && path_is_valid(tmp) && !path_is_valid(thumb),
+         "the first thumbnail was not held encoding");
+   if (held)
+      first = held->ident;
+   find.func = ss_is_thumbnail;
+   core_mark_state(0x52);
+   CHECK(command_event(CMD_EVENT_SAVE_STATE, NULL),
+         "the second save was not taken");
+   for (n = 0; n < 5000 && content_save_state_in_progress(NULL); n++)
+      task_queue_check();
+   CHECK(!content_save_state_in_progress(NULL),
+         "the second save was not written");
+   shot = NULL;
+   CHECK(task_queue_find(&find) && shot && shot->ident == first,
+         "the first thumbnail was done before the second save");
+   if (held)
+      ss_thumbnail_hold(held, false);
+   /* the first lands, then the second, held behind it, starts */
+   for (n = 0; n < 2000; n++)
+   {
+      shot = NULL;
+      if (task_queue_find(&find) && shot && shot->ident != first)
+         break;
+      task_queue_check();
+   }
+   CHECK(path_is_valid(thumb), "the first thumbnail was not written");
+   CHECK(shot && shot->ident != first, "the second thumbnail did not start");
+   /* and fails */
+   if (shot && shot->ident != first)
+      task_queue_cancel_task(shot);
+   for (n = 0; n < 20 && task_queue_find(&find); n++)
+      task_queue_check();
+   shot = NULL;
+   CHECK(!task_queue_find(&find), "the cancelled thumbnail did not retire");
+   CHECK(!path_is_valid(thumb),
+         "the first save's picture was left beside the second");
+
+   ss_hog_stop = true;
+   pump(3);
+   remove(thumb);
+   remove(state);
+   configuration_set_bool(settings,
+         settings->bools.savestate_thumbnail_enable, thumbnail);
+   if (failures == had)
+      fprintf(stderr, "[pass] thumbnail-not-written lane\n");
+}
+
+/* Until its callback has run */
+static bool ss_thumbnail_live(retro_task_t *task, void *user_data)
+{
+   if (task->handler != ss_thumb_handler)
+      return false;
+   if (user_data)
+      *(retro_task_t**)user_data = task;
+   return true;
+}
+
+/* A hardware core's window twice its size, read back as GL and Vulkan
+ * do: a state's thumbnail is then scaled down to the core's size */
+#define SS_VP_DIMS VIDEO_SCALE_PACK(640, 480)
+static video_driver_t ss_vp_video;
+static unsigned ss_vp_reads;
+
+static void ss_vp_info(void *data, struct video_viewport *vp)
+{
+   vp->dims      = SS_VP_DIMS;
+   vp->full_dims = SS_VP_DIMS;
+}
+
+static bool ss_vp_read(void *data, uint8_t *buffer, bool is_idle)
+{
+   memset(buffer, 0x40, VIDEO_SCALE_AREA(SS_VP_DIMS) * 3);
+   ss_vp_reads++;
+   return true;
+}
+
+/* Undo Save State and the RAM state put a state of another moment in
+ * the slot: a thumbnail encoding or held for it does not land after */
+static void lane_thumbnail_dropped(void)
+{
+   static const char *what[] = { "Undo Save State", "the RAM state" };
+   settings_t *settings = config_get_ptr();
+   bool thumbnail       = settings->bools.savestate_thumbnail_enable;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   video_driver_t *vp_from;
+   unsigned out_dims;
+   int hw_type;
+   char state[PATH_MAX_LENGTH], thumb[PATH_MAX_LENGTH + 8],
+        tmp[PATH_MAX_LENGTH + 16], other[PATH_MAX_LENGTH + 16];
+   retro_task_t *hog, *shot = NULL;
+   task_finder_data_t find, live;
+   unsigned had = failures, i, n;
+
+   run_harness_core();
+   vp_from                    = video_st->current_video;
+   ss_vp_video                = *vp_from;
+   ss_vp_video.viewport_info  = ss_vp_info;
+   ss_vp_video.read_viewport  = ss_vp_read;
+   video_st->current_video    = &ss_vp_video;
+   out_dims                   = video_driver_get_output_dims();
+   video_driver_set_output_dims(SS_VP_DIMS);
+   hw_type = retro_atomic_load_acquire_int(&video_st->hw_context_type);
+   retro_atomic_store_release_int(&video_st->hw_context_type,
+         RETRO_HW_CONTEXT_OPENGL);
+   ss_vp_reads                = 0;
+   configuration_set_bool(settings,
+         settings->bools.savestate_thumbnail_enable, true);
+   runloop_get_current_savestate_path(state, sizeof(state));
+   snprintf(thumb, sizeof(thumb), "%s.png", state);
+   snprintf(tmp, sizeof(tmp), "%s.tmp", thumb);
+   snprintf(other, sizeof(other), "%s.other.png", state);
+   remove(thumb);
+   find.userdata = &shot;
+   live.func     = ss_thumbnail_live;
+   live.userdata = &shot;
+
+   configuration_set_bool(settings,
+         settings->bools.threaded_data_runloop_enable, false);
+   task_queue_unset_threaded();
+   pump(3);
+   ss_hog_stop  = false;
+   hog          = task_init();
+   hog->handler = ss_hog_handler;
+   hog->flags  |= RETRO_TASK_FLG_MUTE;
+   task_queue_push(hog);
+
+   for (i = 0; i < 2; i++)
+   {
+      uint32_t first;
+      retro_task_t *held;
+      /* one thumbnail held encoding, the next save's held behind it */
+      held = ss_save_thumbnail_held(0x61 + i,
+            i ? ss_is_thumbnail : ss_is_screenshot, tmp, what[i]);
+      CHECK(held && path_is_valid(tmp) && !path_is_valid(thumb),
+            "the first thumbnail was not held encoding (%s)", what[i]);
+      if (!held)
+         break;
+      first     = held->ident;
+      find.func = ss_is_thumbnail;
+      core_mark_state(0x71 + i);
+      CHECK(command_event(CMD_EVENT_SAVE_STATE, NULL),
+            "the second save was not taken");
+      /* the undo's copy of the slot is read first */
+      for (n = 0; n < 5000 && (content_undo_save_buf_in_use()
+               || content_save_state_in_progress(NULL)); n++)
+         task_queue_check();
+      CHECK(!content_save_state_in_progress(NULL),
+            "the second save was not written (%s)", what[i]);
+      shot = NULL;
+      CHECK(     task_queue_find(&find) && shot && shot->ident == first
+            && !path_is_valid(thumb),
+            "the first thumbnail was done before %s", what[i]);
+      if (i)
+         CHECK(content_save_state_to_ram()
+               && content_ram_state_to_file(state, false),
+               "%s was not written", what[i]);
+      else
+      {
+         CHECK(command_event(CMD_EVENT_UNDO_SAVE_STATE, NULL),
+               "Undo Save State was not taken");
+         for (n = 0; n < 5000 && content_save_state_in_progress(NULL); n++)
+            task_queue_check();
+         CHECK(!content_save_state_in_progress(NULL),
+               "Undo Save State was not written");
+      }
+      ss_thumbnail_hold(held, false);
+      /* it retires, and the held one is pushed */
+      for (n = 0; n < 2000; n++)
+      {
+         shot = NULL;
+         if (!task_queue_find(&live) || (shot && shot->ident != first))
+            break;
+         task_queue_check();
+      }
+      CHECK(shot && shot->ident != first,
+            "the second thumbnail was not held (%s)", what[i]);
+      CHECK(!path_is_valid(thumb),
+            "the thumbnail encoding landed after %s", what[i]);
+      for (n = 0; n < 2000 && task_queue_find(&live); n++)
+         task_queue_check();
+      CHECK(!task_queue_find(&live), "the thumbnails did not retire (%s)",
+            what[i]);
+      CHECK(!path_is_valid(thumb),
+            "the held thumbnail landed after %s", what[i]);
+      CHECK(!path_is_valid(tmp),
+            "a thumbnail's temporary was left (%s)", what[i]);
+      remove(thumb);
+   }
+   CHECK(ss_vp_reads, "the thumbnails were not read back from the viewport");
+   retro_atomic_store_release_int(&video_st->hw_context_type, hw_type);
+   video_driver_set_output_dims(out_dims);
+   if (video_st->current_video == &ss_vp_video)
+      video_st->current_video = vp_from;
+   ss_hog_stop = true;
+   pump(3);
+
+   /* threaded: one of the slot's picture held behind another shot, or
+    * started or written by the time the RAM state is */
+   configuration_set_bool(settings,
+         settings->bools.threaded_data_runloop_enable, true);
+   task_queue_set_threaded();
+   pump(4);
+   remove(other);
+   CHECK(content_save_state_to_ram(), "the threaded RAM state was not kept");
+   CHECK(take_screenshot("", other, true, false, true, true),
+         "the other shot was not taken");
+   CHECK(take_screenshot("", thumb, true, false, true, true),
+         "the slot's shot was not taken");
+   CHECK(content_ram_state_to_file(state, false),
+         "the threaded RAM state was not written");
+   for (n = 0; n < 2000 && task_queue_find(&live); n++)
+   {
+      task_queue_check();
+      retro_sleep(1);
+   }
+   CHECK(!task_queue_find(&live), "the threaded shots did not retire");
+   CHECK(path_is_valid(other), "the other shot was not written");
+   CHECK(!path_is_valid(thumb),
+         "the slot's shot landed after the RAM state (threaded)");
+   CHECK(!path_is_valid(tmp), "the slot's shot left its temporary");
+   remove(other);
+
+   configuration_set_bool(settings,
+         settings->bools.threaded_data_runloop_enable, false);
+   task_queue_unset_threaded();
+   pump(2);
+   remove(thumb);
+   remove(state);
+   configuration_set_bool(settings,
+         settings->bools.savestate_thumbnail_enable, thumbnail);
+   if (failures == had)
+      fprintf(stderr, "[pass] thumbnail-dropped lane\n");
+}
+#endif
 
 #if defined(HAVE_IMAGEVIEWER) || defined(HAVE_MENU)
 /* A screenshot lands on the image history, the Images tab's list, in
@@ -3581,6 +4082,111 @@ static void lane_not_a_core(void)
       fprintf(stderr, "[pass] not-a-core lane (%u presented)\n",
             presented_frames);
 }
+
+#ifdef HAVE_BSV_MOVIE
+/* ------------------------------------------------------------------ */
+/* Lane: replay start fails                                            */
+/* ------------------------------------------------------------------ */
+
+static unsigned rs_notified;
+static char     rs_error[128];
+
+/* The caller's notify, as command_reply_handler() passes it. */
+static void rs_notify(retro_task_t *task, void *task_data,
+      void *user_data, const char *error)
+{
+   (void)task; (void)task_data; (void)user_data;
+   rs_notified++;
+   strlcpy(rs_error, error ? error : "", sizeof(rs_error));
+}
+
+/* Record Replay passes over a taken slot, but the recording fails to
+ * start: the caller is told, the replay slot setting stays and no
+ * notice says it moved.
+ * Once a recording starts, the setting follows it with the notice. */
+static void lane_replay_start_fails(const char *dir)
+{
+   runloop_state_t      *runloop_st = runloop_state_get_ptr();
+   input_driver_state_t *input_st   = input_state_get_ptr();
+   settings_t           *settings   = config_get_ptr();
+   command_t cmd;
+   task_notify_t notify;
+   char taken[600], chosen[600];
+   unsigned had     = failures;
+   bool font_enable = settings->bools.video_font_enable;
+
+   run_harness_core();
+   snprintf(runloop_st->name.replay, sizeof(runloop_st->name.replay),
+         "%s/fails.replay", dir);
+   configuration_set_bool(settings, settings->bools.replay_auto_index, false);
+   configuration_set_int(settings, settings->ints.replay_slot, 2);
+   runloop_get_replay_path(taken, sizeof(taken), 2);
+   runloop_get_replay_path(chosen, sizeof(chosen), 3);
+   filestream_write_file(taken, "taken", 5);
+   queued_message("");
+   /* the OSD off, so frames leave the notices on the queue */
+   settings->bools.video_font_enable = false;
+
+   notify.cb        = rs_notify;
+   notify.user_data = NULL;
+   rs_notified      = 0;
+   rs_error[0]      = '\0';
+   CHECK(command_event(CMD_EVENT_RECORD_REPLAY, &notify),
+         "Record Replay was refused");
+   CHECK(!queued_message("has a replay"),
+         "the notice came before the recording started");
+   /* slot 3 taken before the recording opens it */
+   filestream_write_file(chosen, "taken", 5);
+   pump(10);
+   CHECK(!(input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_RECORDING),
+         "recording over %s", chosen);
+   CHECK(settings->ints.replay_slot == 2,
+         "a failed start moved the replay slot setting to %d",
+         settings->ints.replay_slot);
+   CHECK(!queued_message("has a replay"),
+         "a failed start said the slot was taken");
+   CHECK(rs_notified == 1 && *rs_error,
+         "a failed start was answered %u times, error \"%s\"",
+         rs_notified, rs_error);
+
+   /* again as a network command, answered once it has started */
+   remove(chosen);
+   memset(&cmd, 0, sizeof(cmd));
+   cmd.replier    = rr_replier;
+   cmd.reply_dest = rr_reply_dest;
+   cmd.reply_to   = rr_reply_to_cb;
+   rr_replies     = 0;
+   rr_reply[0]    = '\0';
+   rr_source      = 1;
+   CHECK(command_run(&cmd, "RECORD_REPLAY", ""),
+         "RECORD_REPLAY was refused");
+   CHECK(settings->ints.replay_slot == 2,
+         "the replay slot setting moved before the recording started");
+   CHECK(!queued_message("has a replay"),
+         "the notice came before the recording started");
+   pump(10);
+   CHECK(input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_RECORDING,
+         "the recording did not start");
+   CHECK(settings->ints.replay_slot == 3,
+         "the replay slot setting is %d, not the recording's 3",
+         settings->ints.replay_slot);
+   CHECK(queued_message("slot 2 has a replay"),
+         "no notice named the taken slot");
+   CHECK(rr_replies == 1 && strncmp(rr_reply, "RECORD_REPLAY ", 14) == 0
+         && !strstr(rr_reply, "ERROR"),
+         "RECORD_REPLAY was answered \"%s\" (%u replies)",
+         rr_reply, rr_replies);
+   command_event(CMD_EVENT_HALT_REPLAY, NULL);
+   pump(2);
+
+   settings->bools.video_font_enable = font_enable;
+   remove(taken);
+   remove(chosen);
+   runloop_st->name.replay[0] = '\0';
+   if (failures == had)
+      fprintf(stderr, "[pass] replay-start-fails lane\n");
+}
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Lane: close content                                                 */
@@ -3935,6 +4541,7 @@ int main(int argc, char *argv[])
    lane_acceptance(dir);
 #ifdef HAVE_BSV_MOVIE
    lane_replay_reply(dir);
+   lane_replay_start_fails(dir);
 #endif
    lane_state_slot_reply();
 #ifdef HAVE_DYNAMIC
@@ -3953,6 +4560,11 @@ int main(int argc, char *argv[])
    lane_content_reply(dir);
 #if defined(HAVE_SCREENSHOTS) && defined(HAVE_RPNG)
    lane_screenshot_steps(dir);
+   lane_screenshot_long_names(dir);
+#ifdef HAVE_DYNAMIC
+   lane_thumbnail_not_written();
+   lane_thumbnail_dropped();
+#endif
 #if defined(HAVE_IMAGEVIEWER) || defined(HAVE_MENU)
    lane_screenshot_history(dir);
 #endif

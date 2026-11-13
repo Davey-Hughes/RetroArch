@@ -125,18 +125,28 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <time.h>
 
 #include <retro_common_api.h>
+#include <compat/strl.h>
+#include <encodings/crc32.h>
 #include <queues/message_queue.h>
 #include <queues/task_queue.h>
 #include <streams/file_stream.h>
+#include <file/file_path.h>
+#include <lists/dir_list.h>
+#include <string/stdstring.h>
+#include <vfs/vfs_implementation.h>
 #include <retro_timers.h>
+#include <rthreads/rthreads.h>
 
 #include "../../../content.h"
 #include "../../../configuration.h"
 #include "../../../runloop.h"
 #include "../../../core.h"
 #include "../../../msg_hash.h"
+#include "../../../save_backups.h"
+#include "../../../tasks/tasks_internal.h"
 #include "../../../gfx/video_driver.h"
 
 /* Must match tasks/task_save.c.  Duplicated rather than exported: the
@@ -335,29 +345,219 @@ runloop_state_t *runloop_state_get_ptr(void) { return &stub_runloop; }
 video_driver_state_t *video_state_get_ptr(void) { return &stub_video; }
 bool video_driver_cached_frame_is_hw_render(void) { return false; }
 void *savefile_ptr_get(void) { return NULL; }
+
+/* The flushes asked for before state loads, and what they owed */
+static unsigned flushes;
+static int flushes_owed;
+void event_flush_save_files(bool sram_used, bool compress_files, int owed)
+{
+   (void)sram_used;
+   (void)compress_files;
+   flushes++;
+   flushes_owed |= owed;
+}
+/* Save writes that have landed, for cloud sync's copies */
+static unsigned save_writes;
+void content_save_written(void) { save_writes++; }
 bool audio_driver_jump_fade_begin(void) { return false; }
 void audio_driver_jump_fade_end(bool ramped) { (void)ramped; }
 
+/* The Auto slot's file, when a lane names one */
+static const char *auto_slot_path;
 bool runloop_get_savestate_path(char *path, size_t len, int slot)
 {
-   snprintf(path, len, "save_state_io_test_auto_%d.state", slot);
+   if (slot < 0 && auto_slot_path)
+      strlcpy(path, auto_slot_path, len);
+   else
+      snprintf(path, len, "save_state_io_test_auto_%d.state", slot);
    return true;
 }
 
+/* A translation a lane sets, else one short text for all */
+static const char *msg_text;
 const char *msg_hash_to_str(enum msg_hash_enums msg)
 {
    (void)msg;
-   return "state message";
+   return msg_text ? msg_text : "state message";
 }
 
 void RARCH_LOG(const char *fmt, ...)  { (void)fmt; }
 void RARCH_WARN(const char *fmt, ...) { (void)fmt; }
-void RARCH_ERR(const char *fmt, ...)  { (void)fmt; }
+static unsigned errors_logged;
+void RARCH_ERR(const char *fmt, ...)  { (void)fmt; errors_logged++; }
 
+/* A thumbnail: "<state>.png" holding "new"; none when @shot_fails.
+ * @png_at_shot: whether the slot still had one when it was taken. */
+static unsigned shots;
+static bool     shot_fails;
+static bool     png_at_shot;
+bool take_screenshot(const char *screenshot_dir, const char *path,
+      bool silence, bool has_valid_framebuffer, bool fullpath,
+      bool use_thread)
+{
+   char png[PATH_MAX_LENGTH];
+   (void)screenshot_dir; (void)silence; (void)has_valid_framebuffer;
+   (void)fullpath; (void)use_thread;
+   shots++;
+   snprintf(png, sizeof(png), "%s.png", path);
+   png_at_shot = path_is_valid(png);
+   if (shot_fails)
+      return false;
+   return filestream_write_file(png, "new", 3);
+}
+
+/* The shots asked to stop: the last one's file */
+static unsigned shots_cancelled;
+static char     shot_cancelled[PATH_MAX_LENGTH];
+void take_screenshot_cancel(const char *path)
+{
+   shots_cancelled++;
+   strlcpy(shot_cancelled, path, sizeof(shot_cancelled));
+}
+
+static unsigned msgs_pushed;
+static char     msg_last[256];
 static void msg_push_stub(retro_task_t *task, const char *msg,
       unsigned prio, unsigned dur, bool flush)
 {
-   (void)task; (void)msg; (void)prio; (void)dur; (void)flush;
+   (void)task; (void)prio; (void)dur; (void)flush;
+   /* Every finished task pushes, an empty one when it says nothing */
+   if (msg && *msg)
+   {
+      msgs_pushed++;
+      strlcpy(msg_last, msg, sizeof(msg_last));
+   }
+}
+
+/* The frontend's own notices */
+static unsigned notices_pushed;
+void runloop_msg_queue_push(const char *msg, size_t len, unsigned prio,
+      unsigned duration, bool flush, char *title,
+      enum message_queue_icon icon, enum message_queue_category category)
+{
+   (void)msg; (void)len; (void)prio; (void)duration; (void)flush;
+   (void)title; (void)icon; (void)category;
+   notices_pushed++;
+}
+
+/* Renames refused at the VFS: the .auto's move into its backups, as
+ * across drives; a copy landing there; the new state over the .auto;
+ * a held name or a moved one put back. */
+#define REFUSE_MOVE   1
+#define REFUSE_LAND   2
+#define REFUSE_FINISH 4
+#define REFUSE_BACK   8
+static int      refuse_renames;
+static unsigned file_syncs;
+/* The next temp move in waits here: 1 armed, 2 waiting, 0 let go */
+static int      hold_temp_move;
+/* Holds or refuses a rename as the lane asks; false to refuse */
+static bool rename_allowed(const char *old_path, const char *new_path)
+{
+   int    refuse = __atomic_load_n(&refuse_renames, __ATOMIC_RELAXED);
+   int    armed  = 1;
+   size_t _len   = strlen(old_path);
+   bool   temp   = _len > 4 && !strcmp(old_path + _len - 4, ".tmp");
+   bool   into   = strstr(new_path, "backups") != NULL;
+   bool   held   = _len > 5 && !strcmp(old_path + _len - 5, ".prev");
+   bool   out    = strstr(old_path, "backups") != NULL;
+   if (     temp
+         && __atomic_compare_exchange_n(&hold_temp_move, &armed, 2, false,
+               __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+      while (__atomic_load_n(&hold_temp_move, __ATOMIC_ACQUIRE) == 2)
+         retro_sleep(1);
+   if (     ((refuse & REFUSE_MOVE)   &&  into && !temp)
+         || ((refuse & REFUSE_LAND)   &&  into &&  temp)
+         || ((refuse & REFUSE_FINISH) && !into &&  temp)
+         || ((refuse & REFUSE_BACK)   && !into && (held || out)))
+      return false;
+   return true;
+}
+int __real_retro_vfs_file_rename_impl(const char *old_path,
+      const char *new_path);
+int __wrap_retro_vfs_file_rename_impl(const char *old_path,
+      const char *new_path)
+{
+   if (!rename_allowed(old_path, new_path))
+      return -1;
+   return __real_retro_vfs_file_rename_impl(old_path, new_path);
+}
+/* A synced write's rename (a threaded queue) */
+int __real_retro_vfs_file_rename_synced_impl(const char *old_path,
+      const char *new_path);
+int __wrap_retro_vfs_file_rename_synced_impl(const char *old_path,
+      const char *new_path)
+{
+   if (!rename_allowed(old_path, new_path))
+      return -1;
+   return __real_retro_vfs_file_rename_synced_impl(old_path, new_path);
+}
+int __real_retro_vfs_file_sync_impl(libretro_vfs_implementation_file *stream);
+/* Set: every sync fails, as on a full or failing disk */
+static int fail_syncs;
+/* Set when a sync, as a power cut there, finds sync_slot empty */
+static const char *sync_slot;
+static int         sync_slot_empty;
+int __wrap_retro_vfs_file_sync_impl(libretro_vfs_implementation_file *stream)
+{
+   const char *slot = __atomic_load_n(&sync_slot, __ATOMIC_RELAXED);
+   if (slot && !path_is_valid(slot))
+      __atomic_store_n(&sync_slot_empty, 1, __ATOMIC_RELAXED);
+   __atomic_fetch_add(&file_syncs, 1, __ATOMIC_RELAXED);
+   if (__atomic_load_n(&fail_syncs, __ATOMIC_RELAXED))
+      return -1;
+   return __real_retro_vfs_file_sync_impl(stream);
+}
+int __real_retro_vfs_dir_sync_impl(const char *dir);
+/* Syncs of a backups folder */
+static unsigned backups_syncs;
+int __wrap_retro_vfs_dir_sync_impl(const char *dir)
+{
+   if (dir && strstr(dir, "backups"))
+      __atomic_fetch_add(&backups_syncs, 1, __ATOMIC_RELAXED);
+   return __real_retro_vfs_dir_sync_impl(dir);
+}
+
+/* Listings, mkdirs and stats made on the thread fs_watch() started */
+static int       fs_watching;
+static uintptr_t fs_watcher;
+static unsigned  fs_calls;
+static void fs_count(void)
+{
+   if (     __atomic_load_n(&fs_watching, __ATOMIC_ACQUIRE)
+         && sthread_get_current_thread_id() == fs_watcher)
+      fs_calls++;
+}
+/* Starts counting on this thread; stopped, returns the count */
+static unsigned fs_watch(bool on)
+{
+   if (on)
+   {
+      fs_calls   = 0;
+      fs_watcher = sthread_get_current_thread_id();
+   }
+   __atomic_store_n(&fs_watching, on, __ATOMIC_RELEASE);
+   return fs_calls;
+}
+libretro_vfs_implementation_dir *__real_retro_vfs_opendir_impl(
+      const char *dir, bool include_hidden);
+libretro_vfs_implementation_dir *__wrap_retro_vfs_opendir_impl(
+      const char *dir, bool include_hidden)
+{
+   fs_count();
+   return __real_retro_vfs_opendir_impl(dir, include_hidden);
+}
+int __real_retro_vfs_mkdir_impl(const char *dir);
+int __wrap_retro_vfs_mkdir_impl(const char *dir)
+{
+   fs_count();
+   return __real_retro_vfs_mkdir_impl(dir);
+}
+int __real_retro_vfs_stat_64_impl(const char *path, int64_t *size);
+int __wrap_retro_vfs_stat_64_impl(const char *path, int64_t *size)
+{
+   fs_count();
+   return __real_retro_vfs_stat_64_impl(path, size);
 }
 
 static void frontend_reset(void)
@@ -431,12 +631,14 @@ static void test_budget_unlimited(void)
    core_fill(sz);
    filestream_delete(path);
    clock_step = 0;   /* clock never advances: budget never expires */
+   save_writes = 0;
 
    content_save_state(path, true);
    ticks = pump(1000);
 
    okf(ticks == 1,
        "unexpired budget writes a 64-quantum state in a single tick");
+   okf(save_writes == 1, "the state written counts as a save write");
    if (ticks != 1)
       printf("       (took %d ticks)\n", ticks);
 
@@ -554,6 +756,20 @@ static void test_serialize_failure(void)
  * save that fails over an existing state leaves that state as it was,
  * and none leaves its temporary file behind.
  * ----------------------------------------------------------------- */
+/* Temporaries left in @dir */
+static unsigned temps_in(const char *dir)
+{
+   unsigned i, n = 0;
+   struct string_list *list = dir_list_new(dir, NULL, false, true, false,
+         false);
+   for (i = 0; list && i < list->size; i++)
+      if (string_ends_with(list->elems[i].data, ".tmp"))
+         n++;
+   if (list)
+      dir_list_free(list);
+   return n;
+}
+
 static bool tmp_exists(const char *path)
 {
    char tmp[256];
@@ -1370,6 +1586,381 @@ static void test_load_held_behind_save(void)
    filestream_delete(path);
 }
 
+/* -----------------------------------------------------------------
+ * Undo Save reverts only the last save, in its own slot: a save to
+ * another slot leaves nothing to undo.
+ * ----------------------------------------------------------------- */
+static void test_undo_save_slot(void)
+{
+   const char *one = "sst_undo_one.state";
+   const char *two = "sst_undo_two.state";
+   void   *was = NULL, *now = NULL;
+   int64_t n_was = -1, n_now = -2;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(one);
+   filestream_delete(two);
+   core_fill(2 * TEST_SAVE_STATE_CHUNK + 7);
+   content_save_state(one, true);
+   pump(1000);
+   memset(core_mem, 0x33, core_len);
+   content_save_state(one, true);
+   pump(1000);
+   okf(!content_undo_save_buf_is_empty(),
+       "undo slot: a save over slot one can be undone");
+   if (!filestream_read_file(one, &was, &n_was))
+      n_was = -1;
+
+   memset(core_mem, 0x44, core_len);
+   content_save_state(two, true);
+   pump(1000);
+   okf(content_undo_save_buf_is_empty(),
+       "undo slot: after a save to slot two, nothing to undo");
+   okf(!content_undo_save_state(), "undo slot: the undo is refused");
+   pump(1000);
+   if (!filestream_read_file(one, &now, &n_now))
+      n_now = -2;
+   okf(n_was > 0 && n_now == n_was && !memcmp(was, now, (size_t)n_was),
+       "undo slot: slot one keeps the save made over it");
+
+   free(was);
+   free(now);
+   filestream_delete(one);
+   filestream_delete(two);
+}
+
+/* -----------------------------------------------------------------
+ * An Undo Save turned away (the hold behind a state task is full)
+ * keeps its buffer: twice, then the queue drains, under ASan, and the
+ * retry writes that buffer. Loads fill the hold: a save's backup read
+ * would turn the undo away before the hold, and replace the buffer.
+ * ----------------------------------------------------------------- */
+static void test_undo_save_refused_push(void)
+{
+   const char *path = "sst_undo_refused.state";
+   void   *was      = NULL;
+   int64_t n_was    = -1;
+   unsigned i;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(path);
+   core_fill(40 * TEST_SAVE_STATE_CHUNK);
+   content_save_state(path, true);
+   pump(1000);
+   if (!filestream_read_file(path, &was, &n_was))
+      n_was = -1;
+   memset(core_mem, 0x55, core_len);
+   content_save_state(path, true);
+   pump(1000);
+
+   /* one load in flight, four held behind it */
+   clock_step = TEST_TICK_BUDGET_US;
+   for (i = 0; i < 5; i++)
+   {
+      content_load_state(path, false, false);
+      task_queue_check();
+   }
+   okf(!content_undo_save_state(), "undo refused: turned away once");
+   okf(!content_undo_save_state(), "undo refused: turned away twice");
+   okf(!content_undo_save_buf_is_empty(),
+       "undo refused: the undo is still there");
+   pump(100000);
+   okf(!queue_busy(), "undo refused: the queue drains");
+   okf(content_undo_save_state(), "undo refused: taken once there is room");
+   pump(1000);
+   okf(n_was > 0 && !written_into(path, was, n_was),
+       "undo refused: the retry writes the buffer it kept");
+   clock_step = 0;
+   free(was);
+   filestream_delete(path);
+}
+
+/* -----------------------------------------------------------------
+ * Undo Save pressed while the save it undoes still writes waits
+ * behind it, and the slot ends with the file from before that save.
+ * ----------------------------------------------------------------- */
+static void test_undo_save_during_write(void)
+{
+   const char *path = "sst_undo_write.state";
+   void   *before   = NULL;
+   int64_t n_before = -1;
+   int i;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(path);
+   core_fill(40 * TEST_SAVE_STATE_CHUNK);
+   content_save_state(path, true);
+   pump(1000);
+   if (!filestream_read_file(path, &before, &n_before))
+      n_before = -1;
+
+   /* the save over it past its backup read, still writing */
+   clock_step = TEST_TICK_BUDGET_US;
+   memset(core_mem, 0x99, core_len);
+   content_save_state(path, true);
+   for (i = 0; i < 1000 && content_load_state_in_progress(NULL); i++)
+      task_queue_check();
+   okf(!content_load_state_in_progress(NULL)
+         && content_save_state_in_progress(NULL),
+       "undo during write: the save is writing");
+   okf(content_undo_save_state(), "undo during write: Undo Save is taken");
+   pump(1000);
+   okf(!queue_busy(), "undo during write: the queue drains");
+   okf(n_before > 0 && !written_into(path, before, n_before),
+       "undo during write: the slot holds the state from before the save");
+   okf(content_undo_save_buf_is_empty(),
+       "undo during write: nothing is left to undo");
+   clock_step = 0;
+   free(before);
+   filestream_delete(path);
+}
+
+/* -----------------------------------------------------------------
+ * undo_save_write_fails: an Undo Save whose write fails keeps the
+ * state it would have put back, and a second Undo puts it back.
+ * ----------------------------------------------------------------- */
+static void test_undo_save_write_fails(void)
+{
+   const char *path = "sst_undo_fails.state";
+   void   *was      = NULL, *over = NULL;
+   int64_t n_was    = -1, n_over = -2;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(path);
+   core_fill(3 * TEST_SAVE_STATE_CHUNK + 5);
+   content_save_state(path, true);
+   pump(1000);
+   if (!filestream_read_file(path, &was, &n_was))
+      n_was = -1;
+   memset(core_mem, 0x77, core_len);
+   content_save_state(path, true);
+   pump(1000);
+   if (!filestream_read_file(path, &over, &n_over))
+      n_over = -2;
+
+   /* the undo's own file is not moved into place */
+   __atomic_store_n(&refuse_renames, REFUSE_FINISH, __ATOMIC_RELAXED);
+   okf(content_undo_save_state(), "undo fails: the undo is pushed");
+   pump(1000);
+   __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+   okf(n_over > 0 && !written_into(path, over, n_over),
+       "undo fails: the slot keeps the save");
+   okf(!content_undo_save_buf_is_empty(),
+       "undo fails: the state it would put back is kept");
+   okf(content_undo_save_state(), "undo fails: a second Undo is taken");
+   pump(1000);
+   okf(n_was > 0 && !written_into(path, was, n_was),
+       "undo fails: the second Undo puts the state back");
+   okf(content_undo_save_buf_is_empty(),
+       "undo fails: then nothing is left to undo");
+
+   free(was);
+   free(over);
+   filestream_delete(path);
+   filestream_delete("sst_undo_fails.state.tmp");
+}
+
+/* -----------------------------------------------------------------
+ * A backup read counts against Undo Save until it is through: also
+ * one the reset discards while held, and one pushed through
+ * content_load_state().
+ * ----------------------------------------------------------------- */
+static void test_undo_save_count(void)
+{
+   const char *path = "sst_undo_count.state";
+   void   *before   = NULL;
+   int64_t n_before = -1;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(path);
+   core_fill(40 * TEST_SAVE_STATE_CHUNK);
+   content_save_state(path, true);
+   pump(1000);
+
+   /* a save's backup read held behind a load, then discarded */
+   clock_step = TEST_TICK_BUDGET_US;
+   content_load_state(path, false, false);
+   task_queue_check();
+   memset(core_mem, 0xAA, core_len);
+   content_save_state(path, true);
+   okf(content_undo_save_buf_in_use(), "undo count: the backup read is held");
+   content_reset_savestate_backups();
+   pump(1000);
+   clock_step = 0;
+   okf(!content_undo_save_buf_in_use(),
+       "undo count: the discarded one is let go");
+
+   if (!filestream_read_file(path, &before, &n_before))
+      n_before = -1;
+   memset(core_mem, 0xBB, core_len);
+   content_save_state(path, true);
+   pump(1000);
+   okf(content_undo_save_state(), "undo count: Undo Save is taken after it");
+   pump(1000);
+   okf(n_before > 0 && !written_into(path, before, n_before),
+       "undo count: and puts back the state from before the save");
+
+   content_load_state(path, true, false);
+   okf(content_undo_save_buf_in_use(),
+       "undo count: a backup read through content_load_state() counts");
+   pump(1000);
+   okf(!content_undo_save_buf_in_use(),
+       "undo count: and is let go once read");
+   free(before);
+   filestream_delete(path);
+}
+
+/* -----------------------------------------------------------------
+ * Undo Save pressed while a task that frees or replaces its buffer
+ * runs is turned away. Held behind the task, it wrote its buffer into
+ * the slot after the task had freed it: here the first of two undos
+ * in a row, below the backup read of a save over the slot.
+ * ----------------------------------------------------------------- */
+static void test_undo_save_twice(void)
+{
+   const char *path = "sst_undo_twice.state";
+   void   *was      = NULL;
+   int64_t n_was    = -1;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(path);
+   core_fill(40 * TEST_SAVE_STATE_CHUNK);
+   content_save_state(path, true);
+   pump(1000);
+   if (!filestream_read_file(path, &was, &n_was))
+      n_was = -1;
+   memset(core_mem, 0x66, core_len);
+   content_save_state(path, true);
+   pump(1000);
+
+   /* the first undo still writing */
+   clock_step = TEST_TICK_BUDGET_US;
+   okf(content_undo_save_state(), "undo twice: the first is pushed");
+   task_queue_check();
+   okf(!content_undo_save_state(),
+       "undo twice: the second, while the first writes, is turned away");
+   pump(1000);
+   okf(!queue_busy(), "undo twice: the queue drains");
+   okf(n_was > 0 && !written_into(path, was, n_was),
+       "undo twice: the slot holds the state from before the save");
+   okf(!content_undo_save_state(),
+       "undo twice: a retry finds the save already undone");
+   pump(1000);
+   okf(n_was > 0 && !written_into(path, was, n_was),
+       "undo twice: and the slot still holds it");
+   clock_step = 0;
+   free(was);
+   filestream_delete(path);
+}
+
+static void test_undo_save_during_backup(void)
+{
+   const char *path  = "sst_undo_backup.state";
+   const char *ref   = "sst_undo_backup_ref.state";
+   void   *before    = NULL, *last = NULL;
+   int64_t n_before  = -1, n_last = -2;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(path);
+   filestream_delete(ref);
+   core_fill(40 * TEST_SAVE_STATE_CHUNK);
+   content_save_state(path, true);
+   pump(1000);
+   /* what the save in flight below writes */
+   memset(core_mem, 0x88, core_len);
+   content_save_state(ref, true);
+   pump(1000);
+   if (!filestream_read_file(ref, &last, &n_last))
+      n_last = -2;
+   memset(core_mem, 0x77, core_len);
+   content_save_state(path, true);
+   pump(1000);
+   if (!filestream_read_file(path, &before, &n_before))
+      n_before = -1;
+
+   /* the next save's backup read of the slot still running */
+   clock_step = TEST_TICK_BUDGET_US;
+   memset(core_mem, 0x88, core_len);
+   content_save_state(path, true);
+   task_queue_check();
+   okf(content_load_state_in_progress(NULL),
+       "undo during save: the backup read is in flight");
+   okf(!content_undo_save_state(),
+       "undo during save: Undo Save is turned away");
+   pump(1000);
+   okf(!queue_busy(), "undo during save: the queue drains");
+   okf(n_last > 0 && !written_into(path, last, n_last),
+       "undo during save: the slot holds the save");
+   okf(content_undo_save_state(), "undo during save: a retry is taken");
+   pump(1000);
+   okf(n_before > 0 && !written_into(path, before, n_before),
+       "undo during save: and puts back the state from before it");
+   clock_step = 0;
+   free(before);
+   free(last);
+   filestream_delete(path);
+   filestream_delete(ref);
+}
+
+/* -----------------------------------------------------------------
+ * A save over a slot that backs nothing up (its backup read fails, or
+ * the core turned undo off) leaves nothing to undo: the buffer holds
+ * the file from before an earlier save, an older state.
+ * ----------------------------------------------------------------- */
+static void test_undo_save_not_backed_up(void)
+{
+   const char *path = "sst_undo_stale.state";
+   int k;
+
+   for (k = 0; k < 2; k++)
+   {
+      void   *last   = NULL;
+      int64_t n_last = -1;
+
+      frontend_reset();
+      content_reset_savestate_backups();
+      filestream_delete(path);
+      core_fill(4096);
+      content_save_state(path, true);
+      pump(1000);
+      memset(core_mem, 0x33, core_len);
+      content_save_state(path, true);
+      pump(1000);
+
+      memset(core_mem, 0x44, core_len);
+      if (k)
+         set_save_state_disable_undo(true);
+      content_save_state(path, true);
+      /* the backup read finds no file */
+      if (!k)
+         filestream_delete(path);
+      pump(1000);
+      set_save_state_disable_undo(false);
+      if (!filestream_read_file(path, &last, &n_last))
+         n_last = -1;
+
+      okf(content_undo_save_buf_is_empty(),
+          k ? "undo stale: after a save with undo off, nothing to undo"
+            : "undo stale: after a failed backup read, nothing to undo");
+      okf(!content_undo_save_state(),
+          k ? "undo stale: undo off, the undo is refused"
+            : "undo stale: failed read, the undo is refused");
+      pump(1000);
+      okf(n_last > 0 && !written_into(path, last, n_last),
+          k ? "undo stale: undo off, the slot keeps the last save"
+            : "undo stale: failed read, the slot keeps the last save");
+      free(last);
+   }
+   filestream_delete(path);
+}
+
 #ifdef HAVE_COMPRESSION
 /* -----------------------------------------------------------------
  * 13. Undo puts back the file a save replaced, as it was.
@@ -1429,6 +2020,2008 @@ static void test_undo_save_restores_file(void)
 }
 #endif
 
+/* -----------------------------------------------------------------
+ * The user's state loads (a file: hotkey, menu, entry slot, auto-load,
+ * the network command; Undo Load; a load from RAM) ask for a flush
+ * that owes a before-state-load copy. The backup load of a slot about
+ * to be saved over, a failed read, and the direct unserialize run-ahead,
+ * rewind, netplay and replays use do not.
+ * ----------------------------------------------------------------- */
+static void test_state_load_kinds(void)
+{
+   const char *path = "sst_kinds.state";
+   size_t sz        = 4096;
+   void *buf        = NULL;
+   int64_t len      = 0;
+   const int bsl    = 1 << SAVE_BACKUP_BEFORE_STATE_LOAD;
+
+   frontend_reset();
+   core_fill(sz);
+   filestream_delete(path);
+   content_save_state(path, true);
+   pump(1000);
+   flushes      = 0;
+   flushes_owed = 0;
+
+   content_load_state(path, false, false);
+   pump(1000);
+   okf(flushes == 1 && flushes_owed == bsl,
+         "kinds: a load from a file asks one before-state-load flush");
+   content_load_state(path, false, true);
+   pump(1000);
+   okf(flushes == 2, "kinds: the auto-load and entry-slot form flushes");
+   okf(content_undo_load_state() && flushes == 3, "kinds: Undo Load flushes");
+   okf(content_save_state_to_ram() && content_load_state_from_ram()
+         && flushes == 4, "kinds: a load from RAM flushes");
+
+   content_save_state(path, true);
+   pump(1000);
+   okf(flushes == 4, "kinds: the backup load before a save flushed");
+   content_load_state("sst_kinds_missing.state", false, false);
+   pump(1000);
+   okf(flushes == 4, "kinds: a load that read nothing flushed");
+   okf(filestream_read_file(path, &buf, &len)
+         && content_deserialize_state(buf, (size_t)len) && flushes == 4,
+         "kinds: a direct unserialize flushed");
+   free(buf);
+   filestream_delete(path);
+}
+
+/* -----------------------------------------------------------------
+ * A load that puts save RAM back (block_sram_overwrite: from a file
+ * and Undo Load) rolls nothing back and does not flush; a load from RAM
+ * does not put it back. Undo Load with nothing to undo flushes nothing.
+ * ----------------------------------------------------------------- */
+static void test_state_load_guards(void)
+{
+   const char *path = "sst_guards.state";
+   size_t sz        = 4096;
+   const int bsl    = 1 << SAVE_BACKUP_BEFORE_STATE_LOAD;
+
+   frontend_reset();
+   core_fill(sz);
+   filestream_delete(path);
+   content_reset_savestate_backups();
+   flushes = 0;
+   content_undo_load_state();
+   okf(flushes == 0, "guards: Undo Load with nothing to undo flushed");
+
+   content_save_state(path, true);
+   pump(1000);
+   stub_settings.bools.block_sram_overwrite = true;
+   flushes      = 0;
+   flushes_owed = 0;
+   content_load_state(path, false, false);
+   pump(1000);
+   okf(flushes == 0, "guards: a blocked load from a file flushed");
+   okf(content_undo_load_state() && flushes == 0,
+         "guards: a blocked Undo Load flushed");
+   okf(content_save_state_to_ram() && content_load_state_from_ram()
+         && flushes == 1 && flushes_owed == bsl,
+         "guards: a load from RAM owes its copy, blocked or not");
+   stub_settings.bools.block_sram_overwrite = false;
+   filestream_delete(path);
+}
+
+/* -----------------------------------------------------------------
+ * Undo Save State writing the slot back, and a RAM state written to
+ * its file, each count as one save write, as cloud sync's copies
+ * watch for.
+ * ----------------------------------------------------------------- */
+static void test_writes_counted(void)
+{
+   const char *path     = "sst_writes.state";
+   const char *ram_path = "sst_writes_ram.state";
+
+   frontend_reset();
+   core_fill(4096);
+   filestream_delete(path);
+   filestream_delete(ram_path);
+   content_save_state(path, true);
+   pump(1000);
+   memset(core_mem, 0x5A, core_len);
+   content_save_state(path, true);
+   pump(1000);
+   save_writes = 0;
+   okf(content_undo_save_state(), "writes: the undo of a save is pushed");
+   pump(1000);
+   okf(save_writes == 1, "writes: Undo Save State counts as a save write");
+
+   okf(content_save_state_to_ram(), "writes: a state is kept in RAM");
+   save_writes = 0;
+   okf(content_ram_state_to_file(ram_path, false) && save_writes == 1,
+         "writes: a RAM state written to file counts as a save write");
+   filestream_delete(path);
+   filestream_delete(ram_path);
+}
+
+/* -----------------------------------------------------------------
+ * Automatic state saves: the interval counts from the auto-load, and
+ * an .auto the session wanted and did not load goes to the backups
+ * before the first write over it.
+ * ----------------------------------------------------------------- */
+/* Not-loaded copies in @dir holding @want; NULL @want: any content */
+static unsigned auto_backups_in(const char *dir, const char *want)
+{
+   unsigned i, n = 0;
+   struct string_list *list;
+   struct save_backup_name name;
+
+   if (!(list = dir_list_new(dir, NULL, false, true, false, false)))
+      return 0;
+   for (i = 0; i < list->size; i++)
+   {
+      void   *data = NULL;
+      int64_t len  = 0;
+      if (     save_backups_parse(path_basename(list->elems[i].data), &name)
+            && name.reason == SAVE_BACKUP_NOT_LOADED
+            && (  !want
+               || (  filestream_read_file(list->elems[i].data, &data, &len)
+                  && len == (int64_t)strlen(want)
+                  && !memcmp(data, want, (size_t)len))))
+         n++;
+      free(data);
+   }
+   dir_list_free(list);
+   return n;
+}
+
+static unsigned auto_backups(const char *auto_path, const char *want)
+{
+   char dir[PATH_MAX_LENGTH];
+   if (!save_backups_dir(dir, sizeof(dir), auto_path))
+      return 0;
+   return auto_backups_in(dir, want);
+}
+
+static void auto_state_clear(const char *dir)
+{
+   unsigned i;
+   char backups[PATH_MAX_LENGTH];
+   struct string_list *list;
+   fill_pathname_join(backups, dir, "backups", sizeof(backups));
+   if ((list = dir_list_new(backups, NULL, false, true, false, false)))
+   {
+      for (i = 0; i < list->size; i++)
+         filestream_delete(list->elems[i].data);
+      dir_list_free(list);
+   }
+   filestream_delete(backups);
+   if ((list = dir_list_new(dir, NULL, false, true, false, false)))
+   {
+      for (i = 0; i < list->size; i++)
+         filestream_delete(list->elems[i].data);
+      dir_list_free(list);
+   }
+   filestream_delete(dir);
+}
+
+static void test_auto_state(void)
+{
+   const char *dir  = "sst_auto";
+   const char *path = "sst_auto/Game.state.auto";
+   const char *auto_slot = "save_state_io_test_auto_-1.state";
+
+   frontend_reset();
+   core_fill(TEST_SAVE_STATE_CHUNK);
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   save_backups_set_roots(NULL, dir, NULL, NULL, NULL, NULL, "Core");
+
+   /* interval_after_autoload: from the auto-load on, a whole interval */
+   stub_settings.uints.savestate_automatic_interval = 1;
+   okf(!content_save_state_automatic(10000000),
+       "auto state: no interval save before the auto-load");
+   stub_runloop.auto_state_save_ready = true;
+   okf(!content_save_state_automatic(10500000),
+       "auto state: none until an interval after it");
+   okf(content_save_state_automatic(11000000) && file_size(auto_slot) > 0,
+       "auto state: one an interval after it");
+   filestream_delete(auto_slot);
+
+   /* the next content, its auto-load skipped before any frame: the
+    * interval counts from its first frame, not the last content's */
+   stub_runloop.auto_state_interval_started = false;
+   okf(!content_save_state_automatic(20000000),
+       "auto state: skipped, no interval save on the first frame");
+   okf(!content_save_state_automatic(20500000),
+       "auto state: skipped, none until an interval after it");
+   okf(content_save_state_automatic(21000000) && file_size(auto_slot) > 0,
+       "auto state: skipped, one an interval after it");
+   filestream_delete(auto_slot);
+
+   /* auto_not_loaded_backed_up */
+   stub_runloop.auto_state_owned           = false;
+   stub_runloop.auto_state_wanted          = true;
+   filestream_write_file(path, "old", 3);
+   okf(content_auto_save_state(path), "auto state: the save is written");
+   okf(file_size(path) > (long)core_len, "auto state: holds the new state");
+   okf(auto_backups(path, "old") == 1,
+       "auto state: the unloaded one is in the backups, not-loaded");
+   okf(content_auto_save_state(path) && auto_backups(path, NULL) == 1,
+       "auto state: once a session");
+
+   /* auto_load_turned_on: off at the load, on at the close */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_owned           = false;
+   stub_runloop.auto_state_wanted          = false;
+   stub_settings.bools.savestate_auto_load = true;
+   filestream_write_file(path, "old", 3);
+   okf(content_auto_save_state(path) && file_size(path) > (long)core_len,
+       "auto state: turned on, the save is written");
+   okf(auto_backups(path, "old") == 1,
+       "auto state: turned on, the unloaded one is in the backups");
+   okf(content_auto_save_state(path) && auto_backups(path, NULL) == 1,
+       "auto state: turned on, once a session");
+   stub_settings.bools.savestate_auto_load = false;
+
+   /* loaded, or Auto Load State off: written over as it is */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_owned = false;
+   stub_runloop.auto_state_wanted = false;
+   filestream_write_file(path, "old", 3);
+   okf(content_auto_save_state(path) && auto_backups(path, "old") == 0,
+       "auto state: no copy without Auto Load State");
+   stub_runloop.auto_state_owned = true;
+   stub_runloop.auto_state_wanted = true;
+   filestream_write_file(path, "old", 3);
+   okf(content_auto_save_state(path) && auto_backups(path, "old") == 0,
+       "auto state: no copy of the one loaded");
+
+   /* no backups folder to keep it in: the unloaded one stays */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   filestream_write_file("sst_auto/backups", "file", 4);
+   stub_runloop.auto_state_owned = false;
+   filestream_write_file(path, "old", 3);
+   okf(!content_auto_save_state(path) && file_size(path) == 3,
+       "auto state: not kept, not written over");
+
+   auto_state_clear(dir);
+   save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+}
+
+static void deep_rm(const char *dir)
+{
+   unsigned i;
+   struct string_list *list = dir_list_new(dir, NULL, true, true, false,
+         false);
+   for (i = 0; list && i < list->size; i++)
+   {
+      if (path_is_directory(list->elems[i].data))
+         deep_rm(list->elems[i].data);
+      else
+         filestream_delete(list->elems[i].data);
+   }
+   if (list)
+      dir_list_free(list);
+   path_rmdir(dir);
+}
+
+/* auto_not_loaded_no_room: an .auto so deep that no copy name fits in
+ * its backups is set aside in its own folder in <config>/recovery */
+static void test_auto_state_no_room(void)
+{
+   unsigned k;
+   size_t _len;
+   static char path[PATH_MAX_LENGTH], dir[PATH_MAX_LENGTH];
+   static char held[PATH_MAX_LENGTH];
+
+   frontend_reset();
+   core_fill(TEST_SAVE_STATE_CHUNK);
+   deep_rm("sst_deep");
+   deep_rm("sst_deepcfg");
+   _len = strlcpy(path, "sst_deep", sizeof(path));
+   for (k = 0; k < 9; k++)
+   {
+      path[_len++] = '/';
+      memset(path + _len, 'd', 220);
+      _len        += 220;
+      path[_len]   = '\0';
+   }
+   path_mkdir(path);
+   strlcpy(path + _len, "/Game.state.auto", sizeof(path) - _len);
+   snprintf(dir, sizeof(dir), "sst_deepcfg/recovery/%08lx", (unsigned long)
+         encoding_crc32(0, (const uint8_t*)path, strlen(path)));
+   save_backups_set_roots(NULL, "sst_deep", NULL, NULL, "sst_deepcfg", NULL,
+         "Core");
+   stub_runloop.auto_state_owned  = false;
+   stub_runloop.auto_state_wanted = true;
+   filestream_write_file(path, "old", 3);
+   okf(content_auto_save_state(path) && file_size(path) > (long)core_len,
+       "auto state: no room, the save is written");
+   okf(auto_backups_in(dir, "old") == 1,
+       "auto state: no room, the unloaded one is in its recovery folder");
+
+   /* the new one not moved in: the old one back from there */
+   deep_rm("sst_deepcfg");
+   stub_runloop.auto_state_owned = false;
+   filestream_write_file(path, "old", 3);
+   __atomic_store_n(&refuse_renames, REFUSE_FINISH, __ATOMIC_RELAXED);
+   okf(!content_auto_save_state(path) && file_size(path) == 3
+         && auto_backups_in(dir, NULL) == 0,
+       "auto state: no room, a failed finish puts it back from there");
+   __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+
+   /* held beside it: its task copies it there */
+   deep_rm("sst_deepcfg");
+   save_backups_held_name(held, sizeof(held), path, 1);
+   filestream_write_file(held, "held", 4);
+   content_auto_state_keep(path);
+   pump(100);
+   okf(auto_backups_in(dir, "held") == 1,
+       "auto state: no room, a held one is copied to its recovery folder");
+   save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+   deep_rm("sst_deep");
+   deep_rm("sst_deepcfg");
+}
+
+/* auto_state_close_synced: the close's Auto save, the move of an
+ * unloaded .auto it makes and the RAM state written at a close are on
+ * the disk when they return; the interval's Auto save is not synced */
+static void test_auto_state_close_synced(void)
+{
+   const char *dir  = "sst_auto";
+   const char *path = "sst_auto/Game.state.auto";
+   const char *ram  = "sst_auto/Game.state";
+   unsigned syncs, dirs;
+   bool failed;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   core_fill(TEST_SAVE_STATE_CHUNK);
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   save_backups_set_roots(NULL, dir, NULL, NULL, NULL, NULL, "Core");
+   auto_slot_path = path;
+
+   stub_settings.uints.savestate_automatic_interval = 1;
+   stub_runloop.auto_state_save_ready = true;
+   stub_runloop.auto_state_owned      = true;
+   content_save_state_automatic(10000000);
+   syncs = file_syncs;
+   okf(     content_save_state_automatic(11000000)
+         && file_size(path) > (long)core_len && file_syncs == syncs,
+       "close synced: the interval's Auto save is not synced");
+
+   stub_runloop.auto_state_owned  = false;
+   stub_runloop.auto_state_wanted = true;
+   filestream_write_file(path, "old", 3);
+   syncs = file_syncs;
+   dirs  = backups_syncs;
+   okf(     content_auto_save_state(path) && auto_backups(path, "old") == 1
+         && file_syncs == syncs + 1 && backups_syncs > dirs,
+       "close synced: the close's Auto save, synced once, and its move");
+   syncs = file_syncs;
+   okf(content_auto_save_state(path) && file_syncs == syncs + 1,
+       "close synced: over its own .auto, synced once");
+
+   content_save_state_to_ram();
+   syncs = file_syncs;
+   okf(content_ram_state_to_file(ram, false) && file_syncs == syncs,
+       "close synced: a RAM state written in play is not synced");
+   content_save_state_to_ram();
+   syncs = file_syncs;
+   okf(content_ram_state_to_file(ram, true) && file_syncs == syncs + 1,
+       "close synced: a RAM state written at a close is synced once");
+   content_save_state_to_ram();
+   filestream_write_file(ram, "old", 3);
+   __atomic_store_n(&fail_syncs, 1, __ATOMIC_RELAXED);
+   failed = !content_ram_state_to_file(ram, true);
+   __atomic_store_n(&fail_syncs, 0, __ATOMIC_RELAXED);
+   okf(     failed && filestream_matches_buf(ram, "old", 3)
+         && file_size("sst_auto/Game.state.ram.tmp") < 0,
+       "close synced: a failed sync of the RAM state leaves the old one");
+   okf(content_ram_state_to_file(ram, true) && file_size(ram) > 3,
+       "close synced: the RAM state not written is written next time");
+
+   /* the new one synced before the unloaded one moves: a sync that
+    * fails, or a power cut there, finds the old one in its slot */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_owned = false;
+   filestream_write_file(path, "old", 3);
+   __atomic_store_n(&sync_slot_empty, 0, __ATOMIC_RELAXED);
+   __atomic_store_n(&sync_slot, path, __ATOMIC_RELAXED);
+   __atomic_store_n(&fail_syncs, 1, __ATOMIC_RELAXED);
+   failed = !content_auto_save_state(path);
+   __atomic_store_n(&fail_syncs, 0, __ATOMIC_RELAXED);
+   __atomic_store_n(&sync_slot, NULL, __ATOMIC_RELAXED);
+   okf(     failed && filestream_matches_buf(path, "old", 3)
+         && auto_backups(path, NULL) == 0
+         && !__atomic_load_n(&sync_slot_empty, __ATOMIC_RELAXED),
+       "close synced: a failed sync leaves the unloaded one in its slot");
+
+   auto_slot_path = NULL;
+   content_reset_savestate_backups();
+   auto_state_clear(dir);
+   save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+}
+
+/* The "unsaved" recovery files of @path holding a whole state */
+static unsigned unsaved_states(const char *path)
+{
+   char dir[PATH_MAX_LENGTH];
+   unsigned i, n = 0;
+   struct string_list *list;
+   struct save_backup_name name;
+   if (     !save_backups_dir(dir, sizeof(dir), path)
+         || !(list = dir_list_new(dir, NULL, false, true, false, false)))
+      return 0;
+   for (i = 0; i < list->size; i++)
+      if (     save_backups_parse(path_basename(list->elems[i].data), &name)
+            && name.reason == SAVE_BACKUP_UNSAVED
+            && file_size(list->elems[i].data) > (long)core_len)
+         n++;
+   dir_list_free(list);
+   return n;
+}
+
+/* auto_state_close_fail_notice: an interval or close Auto save that
+ * cannot be written keeps the old .auto and is shown once a session;
+ * at a close the new state goes to a recovery file */
+static void test_auto_state_close_fail_notice(void)
+{
+   const char *dir  = "sst_auto";
+   const char *path = "sst_auto/Game.state.auto";
+   unsigned notices;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   core_fill(TEST_SAVE_STATE_CHUNK);
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   save_backups_set_roots(NULL, dir, NULL, NULL, NULL, NULL, "Core");
+   auto_slot_path = path;
+   filestream_write_file(path, "old", 3);
+
+   stub_settings.uints.savestate_automatic_interval = 1;
+   stub_runloop.auto_state_save_ready = true;
+   stub_runloop.auto_state_owned      = true;
+   __atomic_store_n(&refuse_renames, REFUSE_FINISH, __ATOMIC_RELAXED);
+   content_save_state_automatic(10000000);
+   notices = notices_pushed;
+   okf(     !content_save_state_automatic(11000000)
+         && filestream_matches_buf(path, "old", 3) && notices_pushed == notices + 1
+         && !unsaved_states(path),
+       "close fail: the interval's failure is shown, the old one kept");
+   okf(     !content_save_state_automatic(12000000)
+         && notices_pushed == notices + 1,
+       "close fail: shown once a session");
+
+   /* the close, before the session's end resets: its recovery file is
+    * shown all the same */
+   okf(     !content_auto_save_state(path) && filestream_matches_buf(path, "old", 3)
+         && unsaved_states(path) == 1 && notices_pushed == notices + 2,
+       "close fail: the close's state goes to a recovery file, shown");
+   __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+
+   auto_slot_path = NULL;
+   content_reset_savestate_backups();
+   auto_state_clear(dir);
+   save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+}
+
+/* -----------------------------------------------------------------
+ * manual_auto_slot_sets_aside: Save State to the Auto slot over an
+ * .auto the session did not load keeps that one in the backups
+ * first, as the automatic saves do. Undo Save still puts it back. A
+ * RAM state written there does the same.
+ * ----------------------------------------------------------------- */
+static void test_manual_auto_slot_sets_aside(void)
+{
+   const char *dir  = "sst_auto";
+   const char *path = "sst_auto/Game.state.auto";
+   int d;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   core_fill(TEST_SAVE_STATE_CHUNK);
+   save_backups_set_roots(NULL, dir, NULL, NULL, NULL, NULL, "Core");
+   auto_slot_path = path;
+
+   /* with the backup read for Undo Save, and without */
+   for (d = 0; d < 2; d++)
+   {
+      auto_state_clear(dir);
+      retro_vfs_mkdir_impl(dir);
+      set_save_state_disable_undo(d);
+      stub_runloop.auto_state_owned  = false;
+      stub_runloop.auto_state_wanted = true;
+      filestream_write_file(path, "old", 3);
+      okf(content_save_state(path, true), d
+            ? "manual auto (no undo): pushed" : "manual auto: pushed");
+      pump(1000);
+      okf(file_size(path) > (long)core_len, d
+            ? "manual auto (no undo): the slot holds the new state"
+            : "manual auto: the slot holds the new state");
+      okf(auto_backups(path, "old") == 1, d
+            ? "manual auto (no undo): the unloaded one is in the backups"
+            : "manual auto: the unloaded one is in the backups");
+      okf(stub_runloop.auto_state_owned, d
+            ? "manual auto (no undo): the .auto is the session's"
+            : "manual auto: the .auto is the session's");
+      content_save_state(path, true);
+      pump(1000);
+      okf(auto_backups(path, NULL) == 1, d
+            ? "manual auto (no undo): the session's own is saved over"
+            : "manual auto: the session's own is saved over");
+   }
+   set_save_state_disable_undo(false);
+
+   /* across drives: held beside it, copied on a task */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_owned = false;
+   filestream_write_file(path, "old", 3);
+   __atomic_store_n(&refuse_renames, REFUSE_MOVE, __ATOMIC_RELAXED);
+   content_save_state(path, true);
+   pump(1000);
+   __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+   okf(file_size(path) > (long)core_len && auto_backups(path, "old") == 1,
+       "manual auto: across drives, the unloaded one is copied over");
+
+   /* Undo Save puts the unloaded one back */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   content_reset_savestate_backups();
+   stub_runloop.auto_state_owned = false;
+   filestream_write_file(path, "old", 3);
+   content_save_state(path, true);
+   pump(1000);
+   okf(content_undo_save_state(), "manual auto: Undo Save is pushed");
+   pump(1000);
+   okf(file_size(path) == 3 && auto_backups(path, "old") == 1,
+       "manual auto: Undo Save puts the unloaded one back");
+
+   /* Auto Load State off: kept all the same */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_owned  = false;
+   stub_runloop.auto_state_wanted = false;
+   filestream_write_file(path, "old", 3);
+   content_save_state(path, true);
+   pump(1000);
+   okf(file_size(path) > (long)core_len && auto_backups(path, "old") == 1,
+       "manual auto: kept with Auto Load State off too");
+
+   /* the write fails: nothing set aside, the old one in its slot */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_owned  = false;
+   stub_runloop.auto_state_wanted = true;
+   filestream_write_file(path, "old", 3);
+   set_save_state_in_background(true);
+   core_ser_fails = 1;
+   content_save_state(path, true);
+   pump(1000);
+   core_ser_fails = 0;
+   set_save_state_in_background(false);
+   okf(     file_size(path) == 3 && auto_backups(path, NULL) == 0
+         && !stub_runloop.auto_state_owned,
+       "manual auto: a failed write leaves the old one in place, no copy");
+
+   /* turned away, the hold full behind loads in flight */
+   for (d = 0; d < 2; d++)
+   {
+      unsigned i;
+      auto_state_clear(dir);
+      retro_vfs_mkdir_impl(dir);
+      core_fill(40 * TEST_SAVE_STATE_CHUNK);
+      content_save_state("sst_auto/hold.state", true);
+      pump(1000);
+      filestream_write_file(path, "old", 3);
+      stub_runloop.auto_state_owned = false;
+      set_save_state_disable_undo(d);
+      clock_step = TEST_TICK_BUDGET_US;
+      for (i = 0; i < 5; i++)
+      {
+         content_load_state("sst_auto/hold.state", false, false);
+         task_queue_check();
+      }
+      okf(!content_save_state(path, true), d
+            ? "manual auto (no undo): turned away"
+            : "manual auto: turned away");
+      pump(100000);
+      clock_step = 0;
+      okf(file_size(path) == 3 && auto_backups(path, NULL) == 0, d
+            ? "manual auto (no undo): turned away, the old one in place"
+            : "manual auto: turned away, the old one in place");
+   }
+   set_save_state_disable_undo(false);
+   core_fill(TEST_SAVE_STATE_CHUNK);
+
+   /* nowhere to keep it: not written over, and said */
+   stub_settings.bools.notification_show_save_state = true;
+   for (d = 0; d < 2; d++)
+   {
+      auto_state_clear(dir);
+      retro_vfs_mkdir_impl(dir);
+      filestream_write_file("sst_auto/backups", "file", 4);
+      stub_runloop.auto_state_owned  = false;
+      filestream_write_file(path, "old", 3);
+      set_save_state_disable_undo(d);
+      msg_last[0] = '\0';
+      content_save_state(path, true);
+      pump(1000);
+      okf(file_size(path) == 3, d
+            ? "manual auto (no undo): not kept, not written over"
+            : "manual auto: not kept, not written over");
+      okf(!strncmp(msg_last, "Task failed", 11), d
+            ? "manual auto (no undo): the failure is shown"
+            : "manual auto: the failure is shown");
+   }
+   set_save_state_disable_undo(false);
+
+   /* the new one not moved in after a same-drive move: the old one back */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_owned = false;
+   filestream_write_file(path, "old", 3);
+   msg_last[0] = '\0';
+   __atomic_store_n(&refuse_renames, REFUSE_FINISH, __ATOMIC_RELAXED);
+   content_save_state(path, true);
+   pump(1000);
+   __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+   okf(     file_size(path) == 3 && auto_backups(path, NULL) == 0
+         && !temps_in(dir) && !strncmp(msg_last, "Task failed", 11),
+       "manual auto: a refused rename puts the old one back, shown");
+
+   /* no room to record the move: not moved, not saved over */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_owned = false;
+   filestream_write_file(path, "old", 3);
+   content_save_state(path, true);
+   calloc_fail_big = 1;
+   pump(1000);
+   calloc_fail_big = 0;
+   okf(file_size(path) == 3 && auto_backups(path, NULL) == 0
+         && !temps_in(dir),
+       "manual auto: a move that cannot be recorded is not made");
+
+   /* a translation longer than the notice and the handler's frame */
+   {
+      char *text = (char*)malloc(3 * PATH_MAX_LENGTH);
+      memset(text, 'x', 3 * PATH_MAX_LENGTH - 1);
+      text[3 * PATH_MAX_LENGTH - 1] = '\0';
+      auto_state_clear(dir);
+      retro_vfs_mkdir_impl(dir);
+      filestream_write_file("sst_auto/backups", "file", 4);
+      stub_runloop.auto_state_owned = false;
+      filestream_write_file(path, "old", 3);
+      msg_last[0] = '\0';
+      msg_text    = text;
+      content_save_state(path, true);
+      pump(1000);
+      msg_text    = NULL;
+      free(text);
+      okf(file_size(path) == 3 && !strncmp(msg_last, "Task failed", 11),
+          "manual auto: a long translation is cut in the notice");
+   }
+   stub_settings.bools.notification_show_save_state = false;
+
+   /* a RAM state written to the Auto slot (3DS), unsynced and synced */
+   for (d = 0; d < 2; d++)
+   {
+      auto_state_clear(dir);
+      retro_vfs_mkdir_impl(dir);
+      stub_runloop.auto_state_owned = false;
+      filestream_write_file(path, "old", 3);
+      okf(     content_save_state_to_ram()
+            && content_ram_state_to_file(path, d)
+            && file_size(path) > (long)core_len
+            && auto_backups(path, "old") == 1
+            && stub_runloop.auto_state_owned, d
+            ? "manual auto (RAM, synced): the unloaded one is kept first"
+            : "manual auto (RAM): the unloaded one is kept first");
+   }
+
+   /* across drives: held beside it, copied on a task */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_owned = false;
+   filestream_write_file(path, "old", 3);
+   content_save_state_to_ram();
+   __atomic_store_n(&refuse_renames, REFUSE_MOVE, __ATOMIC_RELAXED);
+   okf(content_ram_state_to_file(path, false),
+       "manual auto (RAM): across drives, written");
+   pump(1000);
+   __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+   okf(file_size(path) > (long)core_len && auto_backups(path, "old") == 1,
+       "manual auto (RAM): across drives, the unloaded one is copied over");
+
+   /* the new one not moved in: the old one back, no copy */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_owned = false;
+   filestream_write_file(path, "old", 3);
+   content_save_state_to_ram();
+   __atomic_store_n(&refuse_renames, REFUSE_FINISH, __ATOMIC_RELAXED);
+   okf(     !content_ram_state_to_file(path, false)
+         && file_size(path) == 3 && auto_backups(path, NULL) == 0
+         && !temps_in(dir) && !stub_runloop.auto_state_owned,
+       "manual auto (RAM): a refused rename puts the old one back");
+   __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+
+   /* nowhere to keep it: not written over */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   filestream_write_file("sst_auto/backups", "file", 4);
+   filestream_write_file(path, "old", 3);
+   okf(     !content_ram_state_to_file(path, false)
+         && file_size(path) == 3 && !temps_in(dir),
+       "manual auto (RAM): not kept, not written over");
+
+   auto_slot_path = NULL;
+   content_reset_savestate_backups();
+   auto_state_clear(dir);
+   save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+}
+
+/* -----------------------------------------------------------------
+ * Undo Save or Undo Load of the .auto hands it back: the next
+ * automatic save keeps it again. An undo of another slot does not.
+ * ----------------------------------------------------------------- */
+static void test_auto_state_undo(void)
+{
+   const char *auto_slot = "save_state_io_test_auto_-1.state";
+   const char *other     = "sst_auto_undo.state";
+   void   *was = NULL, *back = NULL;
+   int64_t n_was = -1, n_back = -2;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(auto_slot);
+   filestream_delete(other);
+   core_fill(TEST_SAVE_STATE_CHUNK);
+
+   content_save_state(auto_slot, true);
+   pump(1000);
+   if (!filestream_read_file(auto_slot, &was, &n_was))
+      n_was = -1;
+   memset(core_mem, 0x33, core_len);
+   content_save_state(auto_slot, true);
+   pump(1000);
+   stub_runloop.auto_state_owned = true;
+   okf(content_undo_save_state(), "auto undo: Undo Save of the .auto is pushed");
+   okf(!stub_runloop.auto_state_owned,
+       "auto undo: the .auto is handed back at the push");
+   /* An automatic save before the write takes it again */
+   stub_runloop.auto_state_owned = true;
+   pump(1000);
+   if (!filestream_read_file(auto_slot, &back, &n_back))
+      n_back = -2;
+   okf(n_was > 0 && n_back == n_was && !memcmp(was, back, (size_t)n_was)
+         && !stub_runloop.auto_state_owned,
+       "auto undo: the .auto put back is not the session's");
+
+   stub_runloop.auto_state_owned = true;
+   content_load_state(auto_slot, false, false);
+   pump(1000);
+   stub_runloop.auto_state_owned = true;
+   okf(content_undo_load_state() && !stub_runloop.auto_state_owned,
+       "auto undo: Undo Load of the .auto hands it back");
+   stub_runloop.auto_state_owned = true;
+   okf(content_undo_load_state() && stub_runloop.auto_state_owned,
+       "auto undo: undoing that undo keeps the .auto the session's");
+
+   stub_runloop.auto_state_owned = true;
+   content_save_state(other, true);
+   pump(1000);
+   content_save_state(other, true);
+   pump(1000);
+   okf(content_undo_save_state(), "auto undo: Undo Save of a slot is pushed");
+   pump(1000);
+   okf(stub_runloop.auto_state_owned,
+       "auto undo: Undo Save of a slot keeps the .auto the session's");
+   content_load_state(auto_slot, false, false);
+   pump(1000);
+   content_load_state(other, false, false);
+   pump(1000);
+   okf(content_undo_load_state() && stub_runloop.auto_state_owned,
+       "auto undo: Undo Load of a slot keeps the .auto the session's");
+
+   free(was);
+   free(back);
+   filestream_delete(auto_slot);
+   filestream_delete(other);
+}
+
+/* -----------------------------------------------------------------
+ * The interval save skips its tick while another state save is still
+ * writing, as both write the .auto's temp, or a load reads it; the
+ * next frame tries again.
+ * ----------------------------------------------------------------- */
+static void test_auto_state_skip_tick(void)
+{
+   const char *auto_slot = "save_state_io_test_auto_-1.state";
+   const char *other     = "sst_skip_tick.state";
+   void   *before = NULL, *landed = NULL;
+   int64_t n_before = -1, n_landed = -1;
+   int i;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(auto_slot);
+   filestream_delete(other);
+   core_fill(40 * TEST_SAVE_STATE_CHUNK);
+   stub_settings.uints.savestate_automatic_interval = 1;
+   stub_runloop.auto_state_save_ready = true;
+   /* only the save is skipped: the interval starts on its frame */
+   content_save_state(other, true);
+   content_save_state_automatic(10000000);
+   pump(1000);
+   okf(content_save_state_automatic(11000000) && file_size(auto_slot) > 0,
+       "skip tick: nothing writing, the interval save writes");
+   if (!filestream_read_file(auto_slot, &before, &n_before))
+      n_before = -1;
+
+   /* a save to the Auto slot past its backup read, still writing */
+   clock_step = TEST_TICK_BUDGET_US;
+   memset(core_mem, 0x99, core_len);
+   content_save_state(auto_slot, true);
+   for (i = 0; i < 1000 && content_load_state_in_progress(NULL); i++)
+      task_queue_check();
+   task_queue_check();
+   okf(content_save_state_in_progress(NULL) && tmp_exists(auto_slot),
+       "skip tick: the Auto slot save is writing");
+   okf(!content_save_state_automatic(12000000)
+         && n_before > 0 && !written_into(auto_slot, before, n_before),
+       "skip tick: the interval save skips its tick");
+   pump(1000);
+   clock_step = 0;
+   if (!filestream_read_file(auto_slot, &landed, &n_landed))
+      n_landed = -1;
+   memset(core_mem, 0x55, core_len);
+   okf(content_save_state_automatic(12016000)
+         && n_landed > 0 && written_into(auto_slot, landed, n_landed),
+       "skip tick: the next frame saves");
+
+   /* a load of the Auto slot still reading it */
+   free(landed);
+   landed = NULL;
+   if (!filestream_read_file(auto_slot, &landed, &n_landed))
+      n_landed = -1;
+   clock_step = TEST_TICK_BUDGET_US;
+   content_load_state(auto_slot, false, false);
+   task_queue_check();
+   memset(core_mem, 0x66, core_len);
+   okf(     content_load_state_in_progress(NULL)
+         && !content_save_state_in_progress(NULL),
+       "skip tick: a load of the Auto slot is reading");
+   okf(!content_save_state_automatic(13016000)
+         && n_landed > 0 && !written_into(auto_slot, landed, n_landed),
+       "skip tick: the interval save skips its tick during a load");
+   pump(1000);
+   clock_step = 0;
+   memset(core_mem, 0x66, core_len);
+   okf(content_save_state_automatic(13032000)
+         && written_into(auto_slot, landed, n_landed),
+       "skip tick: the next frame saves after the load");
+
+   free(before);
+   free(landed);
+   filestream_delete(auto_slot);
+   filestream_delete(other);
+}
+
+/* -----------------------------------------------------------------
+ * A not-loaded .auto that cannot move into its backups (across drives)
+ * waits beside itself under a held name while a task copies it there.
+ * ----------------------------------------------------------------- */
+#define KEEP_DIR   "sst_keep"
+#define KEEP_AUTO  "sst_keep/Game.state.auto"
+#define KEEP_AUTO2 "sst_keep/Other.state.auto"
+
+static void keep_held(char *s, size_t len, const char *path, unsigned n)
+{
+   char base[256];
+   snprintf(base, sizeof(base), "%s.not-loaded", path);
+   fill_pathname_aside(s, base, n, len);
+}
+
+static bool keep_holds(const char *path, const char *text)
+{
+   return filestream_matches_buf(path, text, strlen(text));
+}
+
+static void keep_put(const char *path, const char *text)
+{
+   filestream_write_file(path, text, (int64_t)strlen(text));
+}
+
+static void keep_reset(void)
+{
+   frontend_reset();
+   core_fill(TEST_SAVE_STATE_CHUNK);
+   auto_state_clear(KEEP_DIR);
+   retro_vfs_mkdir_impl(KEEP_DIR);
+   save_backups_set_roots(NULL, KEEP_DIR, NULL, NULL, NULL, NULL, "Core");
+   stub_runloop.system.info.library_name   = "Core";
+   stub_runloop.auto_state_wanted          = true;
+   __atomic_store_n(&refuse_renames, REFUSE_MOVE, __ATOMIC_RELAXED);
+}
+
+/* Files in the backups whose names end ".tmp" */
+static unsigned keep_temps(void)
+{
+   unsigned i, n = 0;
+   struct string_list *list = dir_list_new(KEEP_DIR "/backups", NULL,
+         false, true, false, false);
+   for (i = 0; list && i < list->size; i++)
+      if (string_ends_with(list->elems[i].data, ".tmp"))
+         n++;
+   if (list)
+      dir_list_free(list);
+   return n;
+}
+
+/* The not-loaded copy of @path holding @text, into @s */
+static bool keep_copy(char *s, size_t len, const char *path,
+      const char *text)
+{
+   unsigned i;
+   bool found = false;
+   char dir[256];
+   struct string_list *list;
+   if (!save_backups_dir(dir, sizeof(dir), path)
+         || !(list = dir_list_new(dir, NULL, false, true, false, false)))
+      return false;
+   for (i = 0; !found && i < list->size; i++)
+      if (     !string_ends_with(list->elems[i].data, ".tmp")
+            && keep_holds(list->elems[i].data, text))
+      {
+         strlcpy(s, list->elems[i].data, len);
+         found = true;
+      }
+   dir_list_free(list);
+   return found;
+}
+
+/* Every file in the backups a minute old */
+static void keep_age(void)
+{
+   unsigned i;
+   struct string_list *list = dir_list_new(KEEP_DIR "/backups", NULL,
+         false, true, false, false);
+   for (i = 0; list && i < list->size; i++)
+      path_set_mtime(list->elems[i].data, (int64_t)time(NULL) - 61);
+   if (list)
+      dir_list_free(list);
+}
+
+static bool keep_count_task(retro_task_t *t, void *ud)
+{
+   (void)t;
+   (*(unsigned*)ud)++;
+   return false;
+}
+
+static unsigned keep_tasks(void)
+{
+   unsigned n = 0;
+   task_finder_data_t fd;
+   fd.func     = keep_count_task;
+   fd.userdata = &n;
+   task_queue_find(&fd);
+   return n;
+}
+
+/* -----------------------------------------------------------------
+ * auto_state_policy_chain: eleven sessions whose auto-load policy
+ * skipped (hardcore, netplay, a replay, an entry slot) write no
+ * interval save over the .auto and keep no copies of it.
+ * ----------------------------------------------------------------- */
+static void test_auto_state_policy_chain(void)
+{
+   const char *path = "save_state_io_test_auto_-1.state";
+   retro_time_t now = 10000000;
+   unsigned i;
+
+   frontend_reset();
+   core_fill(TEST_SAVE_STATE_CHUNK);
+   stub_settings.uints.savestate_automatic_interval = 1;
+   filestream_write_file(path, "old", 3);
+
+   for (i = 0; i < 11; i++)
+   {
+      stub_runloop.auto_state_save_ready       = true;
+      stub_runloop.auto_state_interval_started = false;
+      stub_runloop.auto_state_owned            = false;
+      stub_runloop.auto_state_wanted           = true;
+      stub_runloop.auto_state_refused          = true;
+      content_save_state_automatic(now);
+      content_save_state_automatic(now + 1000000);
+      now += 10000000;
+   }
+   okf(file_size(path) == 3 && auto_backups(path, NULL) == 0,
+       "policy chain: no interval save over it, no copies");
+
+   /* the Auto slot saved or loaded by hand: the session's */
+   stub_runloop.auto_state_owned = true;
+   content_save_state_automatic(now);
+   okf(content_save_state_automatic(now + 1000000)
+         && file_size(path) > (long)core_len,
+       "policy chain: the session's own .auto is saved at the interval");
+
+   filestream_delete(path);
+}
+
+/* keep_push_names_only: a held .auto's copy, pushed on the main thread,
+ * only names folders there: the task lists, makes and reads them,
+ * however full the backups */
+static void test_auto_state_keep_push(void)
+{
+   unsigned k, calls;
+   char h[256], name[256], copy[256];
+
+   keep_reset();
+   save_backups_set_roots(NULL, KEEP_DIR, NULL, NULL, KEEP_DIR "/cfg", NULL,
+         "Core");
+   retro_vfs_mkdir_impl(KEEP_DIR "/backups");
+   for (k = 0; k < 200; k++)
+   {
+      snprintf(name, sizeof(name), KEEP_DIR "/backups/Other %u - 2000-01-01 "
+            "00-00-00 - Core - not-loaded.state.auto", k);
+      keep_put(name, "x");
+   }
+   keep_held(h, sizeof(h), KEEP_AUTO, 1);
+   keep_put(h, "old");
+   fs_watch(true);
+   content_auto_state_keep(KEEP_AUTO);
+   calls = fs_watch(false);
+   okf(calls == 0,
+       "keep: the push lists, makes and reads no folder on the main thread");
+   pump(100);
+   okf(keep_copy(copy, sizeof(copy), KEEP_AUTO, "old"),
+       "keep: the task copies it into the backups");
+   auto_state_clear(KEEP_DIR);
+   save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+}
+
+static void test_auto_state_keep(void)
+{
+   unsigned k;
+   int ticks;
+   unsigned syncs, errors, msgs, finish_errors;
+   bool once;
+   char h[SAVE_BACKUPS_HELD_MAX + 1][256];
+   char copy[256], name[256], dir[256];
+   char *big = (char*)malloc(4 * TEST_SAVE_STATE_CHUNK + 2);
+
+   for (k = 1; k <= SAVE_BACKUPS_HELD_MAX; k++)
+      keep_held(h[k], sizeof(h[k]), KEEP_AUTO, k);
+   memset(big, 'b', 4 * TEST_SAVE_STATE_CHUNK + 1);
+   big[4 * TEST_SAVE_STATE_CHUNK + 1] = '\0';
+
+   /* across drives: the new state at once, the old one held beside it
+    * and copied on a task, which counts it in the newest 10 */
+   keep_reset();
+   retro_vfs_mkdir_impl(KEEP_DIR "/backups");
+   for (k = 0; k < 10; k++)
+   {
+      char text[4];
+      snprintf(name, sizeof(name), KEEP_DIR "/backups/Game - 2000-01-01 "
+            "00-00-0%u - Core - not-loaded.state.auto", k);
+      snprintf(text, sizeof(text), "p%u", k);
+      keep_put(name, text);
+   }
+   keep_put(KEEP_AUTO, "old");
+   errors = errors_logged;
+   msgs   = msgs_pushed;
+   okf(content_auto_save_state(KEEP_AUTO)
+         && file_size(KEEP_AUTO) > (long)core_len,
+       "keep: across drives, the new state is written at once");
+   syncs  = file_syncs;
+   okf(keep_holds(h[1], "old") && auto_backups(KEEP_AUTO, "old") == 0
+         && stub_runloop.auto_state_owned && keep_tasks() == 1,
+       "keep: the old one is held beside it, its copy on a task");
+   pump(100);
+   okf(keep_copy(copy, sizeof(copy), KEEP_AUTO, "old")
+         && auto_backups(KEEP_AUTO, NULL) == 10
+         && !path_is_valid(KEEP_DIR "/backups/Game - 2000-01-01 00-00-00 "
+            "- Core - not-loaded.state.auto"),
+       "keep: the copy lands, counted in the newest 10");
+   okf(keep_holds(h[1], "old") && file_syncs == syncs,
+       "keep: unthreaded, no sync, and the held one stays");
+   okf(errors_logged == errors && msgs_pushed == msgs && !keep_temps(),
+       "keep: nothing logged or shown, no temp left");
+
+   /* one piece a tick */
+   for (k = 0; k < 2; k++)
+   {
+      keep_reset();
+      keep_put(KEEP_AUTO, big);
+      clock_step = k ? TEST_TICK_BUDGET_US : 0;
+      content_auto_save_state(KEEP_AUTO);
+      ticks = pump(100);
+      okf(auto_backups(KEEP_AUTO, big) == 1 && (k ? ticks >= 7 : ticks <= 4),
+          k ? "keep: a spent budget copies one piece a tick"
+            : "keep: an open budget copies it in one tick");
+   }
+
+   /* a failed copy: the held one stays, the error logged, no notice */
+   keep_reset();
+   keep_put(KEEP_AUTO, "old");
+   __atomic_store_n(&refuse_renames, REFUSE_MOVE | REFUSE_LAND,
+         __ATOMIC_RELAXED);
+   errors = errors_logged;
+   msgs   = msgs_pushed;
+   content_auto_save_state(KEEP_AUTO);
+   pump(100);
+   okf(keep_holds(h[1], "old") && auto_backups(KEEP_AUTO, NULL) == 0
+         && !keep_temps(),
+       "keep: a failed copy keeps the held one");
+   okf(errors_logged > errors && msgs_pushed == msgs,
+       "keep: a failed copy is logged, not shown");
+
+   /* the new state could not take its place: the old one goes back */
+   keep_reset();
+   keep_put(KEEP_AUTO, "old");
+   __atomic_store_n(&refuse_renames, REFUSE_MOVE | REFUSE_FINISH,
+         __ATOMIC_RELAXED);
+   errors = errors_logged;
+   okf(!content_auto_save_state(KEEP_AUTO) && keep_holds(KEEP_AUTO, "old")
+         && !path_is_valid(h[1]) && !stub_runloop.auto_state_owned
+         && !keep_tasks(),
+       "keep: a failed finish puts the held one back");
+   finish_errors = errors_logged - errors;
+
+   /* nor put back: logged, held for the next load */
+   keep_reset();
+   keep_put(KEEP_AUTO, "old");
+   __atomic_store_n(&refuse_renames, REFUSE_MOVE | REFUSE_FINISH
+         | REFUSE_BACK, __ATOMIC_RELAXED);
+   errors = errors_logged;
+   okf(!content_auto_save_state(KEEP_AUTO) && keep_holds(h[1], "old")
+         && !path_is_valid(KEEP_AUTO) && !stub_runloop.auto_state_owned
+         && errors_logged - errors == finish_errors + 1,
+       "keep: a failed put-back is logged, the held one kept");
+
+   /* same drive: moved into the backups, then the new one not moved
+    * in: the old one back in its slot, no copy, no temporary */
+   keep_reset();
+   keep_put(KEEP_AUTO, "old");
+   __atomic_store_n(&refuse_renames, REFUSE_FINISH, __ATOMIC_RELAXED);
+   okf(!content_auto_save_state(KEEP_AUTO) && keep_holds(KEEP_AUTO, "old"),
+       "keep: same drive, a failed finish puts the moved one back");
+   okf(     auto_backups(KEEP_AUTO, NULL) == 0 && !temps_in(KEEP_DIR)
+         && !stub_runloop.auto_state_owned,
+       "keep: same drive, no copy and no temporary left");
+
+   /* nor put back: logged, the old one in the backups, the new one in
+    * its temporary */
+   keep_reset();
+   keep_put(KEEP_AUTO, "old");
+   __atomic_store_n(&refuse_renames, REFUSE_FINISH | REFUSE_BACK,
+         __ATOMIC_RELAXED);
+   errors = errors_logged;
+   okf(     !content_auto_save_state(KEEP_AUTO)
+         && auto_backups(KEEP_AUTO, "old") == 1 && !path_is_valid(KEEP_AUTO)
+         && temps_in(KEEP_DIR) == 1 && errors_logged > errors
+         && !stub_runloop.auto_state_owned,
+       "keep: same drive, a failed put-back is logged, the old one kept");
+
+   /* no room to record the move: not moved, not saved over */
+   keep_reset();
+   keep_put(KEEP_AUTO, "old");
+   __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+   calloc_fail_big = 1;
+   okf(     !content_auto_save_state(KEEP_AUTO)
+         && keep_holds(KEEP_AUTO, "old") && auto_backups(KEEP_AUTO, NULL) == 0
+         && !temps_in(KEEP_DIR),
+       "keep: a move that cannot be recorded is not made");
+   calloc_fail_big = 0;
+
+   /* the first free held name; all nine taken, an inline copy */
+   keep_reset();
+   keep_put(h[1], "held1");
+   keep_put(KEEP_AUTO, "old");
+   content_auto_save_state(KEEP_AUTO);
+   okf(keep_holds(h[1], "held1") && keep_holds(h[2], "old"),
+       "keep: a held name in use, the next one");
+   pump(100);
+   okf(auto_backups(KEEP_AUTO, "held1") == 1
+         && auto_backups(KEEP_AUTO, "old") == 1,
+       "keep: both held ones copied");
+   keep_reset();
+   for (k = 1; k <= SAVE_BACKUPS_HELD_MAX; k++)
+      keep_put(h[k], "held");
+   keep_put(KEEP_AUTO, "old");
+   okf(content_auto_save_state(KEEP_AUTO)
+         && file_size(KEEP_AUTO) > (long)core_len
+         && auto_backups(KEEP_AUTO, "old") == 1 && !keep_tasks()
+         && keep_holds(h[SAVE_BACKUPS_HELD_MAX], "held"),
+       "keep: all nine taken, copied inline and written");
+
+   /* one task at a time; a path asked for twice is copied once */
+   keep_reset();
+   keep_put(KEEP_AUTO, "old1");
+   keep_put(KEEP_AUTO2, "old2");
+   content_auto_save_state(KEEP_AUTO);
+   stub_runloop.auto_state_owned = false;
+   content_auto_save_state(KEEP_AUTO2);
+   content_auto_state_keep(KEEP_AUTO);
+   okf(keep_tasks() == 1, "keep: a second path waits its turn");
+   pump(100);
+   /* the folder's not-loaded copies, of either game */
+   okf(auto_backups(KEEP_AUTO, NULL) == 2
+         && auto_backups(KEEP_AUTO, "old1") == 1
+         && auto_backups(KEEP_AUTO2, "old2") == 1,
+       "keep: each copied once");
+
+   /* exit cancels: the temp goes, the held one stays */
+   keep_reset();
+   keep_put(KEEP_AUTO, big);
+   clock_step = TEST_TICK_BUDGET_US;
+   content_auto_save_state(KEEP_AUTO);
+   task_queue_check();
+   task_queue_check();
+   okf(keep_temps() == 1, "keep: cancel, the copy under way");
+   keep_held(name, sizeof(name), KEEP_AUTO2, 1);
+   keep_put(name, "old2");
+   content_auto_state_keep(KEEP_AUTO2);
+   task_queue_reset();
+   pump(100);
+   okf(!keep_temps() && !auto_backups(KEEP_AUTO, NULL)
+         && keep_holds(h[1], big),
+       "keep: cancel, the temp goes and the held one stays");
+   okf(keep_holds(name, "old2") && !keep_tasks(),
+       "keep: cancel, the path owed waits for its next load");
+
+   /* content load: nothing held, no task */
+   keep_reset();
+   content_auto_state_sweep(KEEP_AUTO);
+   okf(!keep_tasks(), "keep: nothing held, nothing to do");
+
+   /* left held, no copy; the .auto gone and never put back */
+   keep_put(h[1], "old");
+   content_auto_state_sweep(KEEP_AUTO);
+   pump(100);
+   okf(keep_copy(copy, sizeof(copy), KEEP_AUTO, "old")
+         && keep_holds(h[1], "old") && !path_is_valid(KEEP_AUTO),
+       "keep: a load copies one left held, never back as the .auto");
+
+   /* left held with its copy made: kept until that copy is a minute
+    * old, unthreaded, then deleted without another copy */
+   content_auto_state_sweep(KEEP_AUTO);
+   pump(100);
+   okf(keep_holds(h[1], "old") && auto_backups(KEEP_AUTO, NULL) == 1,
+       "keep: its copy too new, the held one stays");
+   path_set_mtime(copy, (int64_t)time(NULL) - 61);
+   content_auto_state_sweep(KEEP_AUTO);
+   pump(100);
+   okf(!path_is_valid(h[1]) && auto_backups(KEEP_AUTO, NULL) == 1,
+       "keep: its copy a minute old, the held one goes, no new copy");
+
+   /* a partial copy: its temp goes, a fresh copy */
+   snprintf(name, sizeof(name), KEEP_DIR "/backups/Game - 2001-01-01 "
+         "00-00-00 - Core - not-loaded.state.auto.tmp");
+   keep_put(name, "part");
+   keep_put(KEEP_DIR "/backups/Other - 2001-01-01 00-00-00 - Core - "
+         "not-loaded.state.auto.tmp", "part");
+   keep_put(h[1], "old2");
+   content_auto_state_sweep(KEEP_AUTO);
+   pump(100);
+   okf(!path_is_valid(name) && keep_temps() == 1
+         && keep_copy(copy, sizeof(copy), KEEP_AUTO, "old2"),
+       "keep: a partial copy's temp goes, copied afresh");
+
+   /* two left held: the one its newest copy holds goes, the other is
+    * copied */
+   path_set_mtime(copy, (int64_t)time(NULL) - 61);
+   keep_put(h[2], "new2");
+   content_auto_state_sweep(KEEP_AUTO);
+   pump(100);
+   okf(!path_is_valid(h[1]) && auto_backups(KEEP_AUTO, "old2") == 1
+         && auto_backups(KEEP_AUTO, "new2") == 1 && keep_holds(h[2], "new2"),
+       "keep: two left held, each taken in turn");
+
+   /* the lower held name newer than the higher, over several loads:
+    * each compared with all its copies, so none copied twice and both
+    * go once their copies are a minute old */
+   keep_reset();
+   retro_vfs_mkdir_impl(KEEP_DIR "/backups");
+   keep_put(KEEP_DIR "/backups/Game - 2000-01-01 00-00-00 - Core - "
+         "not-loaded.state.auto", "Y");
+   keep_put(h[1], "Z");
+   keep_put(h[2], "Y");
+   once = true;
+   for (k = 0; k < 4; k++)
+   {
+      keep_age();
+      content_auto_state_sweep(KEEP_AUTO);
+      pump(100);
+      if (     auto_backups(KEEP_AUTO, "Y") != 1
+            || auto_backups(KEEP_AUTO, "Z") != 1)
+         once = false;
+   }
+   okf(once, "keep: held ones older and newer, none copied twice");
+   okf(!path_is_valid(h[1]) && !path_is_valid(h[2]),
+       "keep: held ones older and newer, both go");
+
+   /* a longer copy that starts the same is no copy of it */
+   keep_reset();
+   retro_vfs_mkdir_impl(KEEP_DIR "/backups");
+   keep_put(KEEP_DIR "/backups/Game - 2000-01-01 00-00-00 - Core - "
+         "not-loaded.state.auto", "YY");
+   keep_put(h[1], "Y");
+   keep_age();
+   content_auto_state_sweep(KEEP_AUTO);
+   pump(100);
+   okf(auto_backups(KEEP_AUTO, "Y") == 1 && keep_holds(h[1], "Y"),
+       "keep: a longer copy that starts the same is no copy");
+
+   /* named as the copy starts, after a compare: never over a copy made
+    * meanwhile */
+   keep_reset();
+   retro_vfs_mkdir_impl(KEEP_DIR "/backups");
+   keep_put(KEEP_DIR "/backups/Game - 2000-01-01 00-00-00 - Core - "
+         "not-loaded.state.auto", big);
+   big[4 * TEST_SAVE_STATE_CHUNK] = 'c';
+   keep_put(h[1], big);
+   clock_step = TEST_TICK_BUDGET_US;
+   content_auto_state_sweep(KEEP_AUTO);
+   task_queue_check();
+   task_queue_check();
+   okf(save_backups_dir(dir, sizeof(dir), KEEP_AUTO)
+         && save_backups_name_copy(name, sizeof(name), dir, KEEP_AUTO,
+            "Core", SAVE_BACKUP_NOT_LOADED) == SAVE_BACKUP_MADE,
+       "keep: a copy named meanwhile");
+   keep_put(name, "made");
+   pump(100);
+   clock_step = 0;
+   okf(keep_holds(name, "made") && auto_backups(KEEP_AUTO, big) == 1,
+       "keep: the copy named as it starts, not over one made meanwhile");
+   big[4 * TEST_SAVE_STATE_CHUNK] = 'b';
+
+   __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+   clock_step = 0;
+   auto_state_clear(KEEP_DIR);
+   save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+   free(big);
+}
+
+/* manual_auto_slot_sets_aside on the threaded queue: the worker moves
+ * the .auto aside, the callback starts the cross-drive copy */
+static void test_manual_auto_slot_threaded(void)
+{
+   const char *dir  = "sst_auto";
+   const char *path = "sst_auto/Game.state.auto";
+   unsigned errors, syncs, files;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   core_fill(4 * TEST_SAVE_STATE_CHUNK);
+   save_backups_set_roots(NULL, dir, NULL, NULL, NULL, NULL, "Core");
+   auto_slot_path = path;
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_wanted = true;
+   filestream_write_file(path, "old", 3);
+   syncs = __atomic_load_n(&backups_syncs, __ATOMIC_RELAXED);
+   files = __atomic_load_n(&file_syncs, __ATOMIC_RELAXED);
+   okf(content_save_state(path, true), "threaded manual auto: pushed");
+   pump_threaded();
+   okf(     file_size(path) > (long)core_len
+         && auto_backups(path, "old") == 1 && stub_runloop.auto_state_owned,
+       "threaded manual auto: the unloaded one kept, the new one in place");
+   okf(__atomic_load_n(&backups_syncs, __ATOMIC_RELAXED) > syncs,
+       "threaded manual auto: the move is synced in the backups folder");
+   okf(__atomic_load_n(&file_syncs, __ATOMIC_RELAXED) == files + 1,
+       "threaded manual auto: the new one synced once");
+
+   /* across drives: held by the worker, copied on a task */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_owned = false;
+   filestream_write_file(path, "old", 3);
+   __atomic_store_n(&refuse_renames, REFUSE_MOVE, __ATOMIC_RELAXED);
+   content_save_state(path, true);
+   pump_threaded();
+   __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+   okf(file_size(path) > (long)core_len && auto_backups(path, "old") == 1,
+       "threaded manual auto: across drives, the unloaded one copied over");
+
+   /* same drive, then the sync fails, or the rename: the old one in
+    * its slot, no copy, no temporary, the failure shown */
+   stub_settings.bools.notification_show_save_state = true;
+   {
+      int k;
+      for (k = 0; k < 2; k++)
+      {
+         auto_state_clear(dir);
+         retro_vfs_mkdir_impl(dir);
+         stub_runloop.auto_state_owned = false;
+         filestream_write_file(path, "old", 3);
+         msg_last[0] = '\0';
+         if (k)
+            __atomic_store_n(&refuse_renames, REFUSE_FINISH,
+                  __ATOMIC_RELAXED);
+         else
+            __atomic_store_n(&fail_syncs, 1, __ATOMIC_RELAXED);
+         content_save_state(path, true);
+         pump_threaded();
+         __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+         __atomic_store_n(&fail_syncs, 0, __ATOMIC_RELAXED);
+         okf(     file_size(path) == 3 && auto_backups(path, NULL) == 0
+               && !temps_in(dir) && !strncmp(msg_last, "Task failed", 11),
+             k ? "threaded manual auto: a refused rename puts the old one back"
+               : "threaded manual auto: a failed sync leaves the old one");
+      }
+   }
+
+   /* nor put back: logged, the old one in the backups, the new one in
+    * its temporary, the failure shown */
+   auto_state_clear(dir);
+   retro_vfs_mkdir_impl(dir);
+   stub_runloop.auto_state_owned = false;
+   filestream_write_file(path, "old", 3);
+   msg_last[0] = '\0';
+   errors      = errors_logged;
+   __atomic_store_n(&refuse_renames, REFUSE_FINISH | REFUSE_BACK,
+         __ATOMIC_RELAXED);
+   content_save_state(path, true);
+   pump_threaded();
+   __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+   okf(     auto_backups(path, "old") == 1 && !path_is_valid(path)
+         && temps_in(dir) == 1 && errors_logged > errors
+         && !strncmp(msg_last, "Task failed", 11),
+       "threaded manual auto: a failed put-back is logged, the old one kept");
+   stub_settings.bools.notification_show_save_state = false;
+
+   auto_slot_path = NULL;
+   content_reset_savestate_backups();
+   auto_state_clear(dir);
+   save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+}
+
+/* Threaded: the copy is synced, then the held one goes. Asserted only
+ * once the queue has drained, or on what the worker cannot touch. */
+static void test_auto_state_keep_threaded(void)
+{
+   unsigned syncs;
+   char h1[256];
+
+   keep_held(h1, sizeof(h1), KEEP_AUTO, 1);
+   keep_reset();
+   keep_put(KEEP_AUTO, "old");
+   syncs = __atomic_load_n(&file_syncs, __ATOMIC_RELAXED);
+   okf(content_auto_save_state(KEEP_AUTO)
+         && file_size(KEEP_AUTO) > (long)core_len,
+       "threaded keep: the new state is written at once");
+   pump_threaded();
+   okf(auto_backups(KEEP_AUTO, "old") == 1 && !path_is_valid(h1)
+         && __atomic_load_n(&file_syncs, __ATOMIC_RELAXED) > syncs,
+       "threaded keep: the copy synced, the held one gone");
+
+   /* left held with its copy made by an unthreaded session */
+   keep_put(h1, "old");
+   syncs = __atomic_load_n(&file_syncs, __ATOMIC_RELAXED);
+   content_auto_state_sweep(KEEP_AUTO);
+   pump_threaded();
+   okf(!path_is_valid(h1) && auto_backups(KEEP_AUTO, NULL) == 1
+         && __atomic_load_n(&file_syncs, __ATOMIC_RELAXED) > syncs,
+       "threaded keep: its copy synced, the held one gone, no new copy");
+
+   __atomic_store_n(&refuse_renames, 0, __ATOMIC_RELAXED);
+   auto_state_clear(KEEP_DIR);
+   save_backups_set_roots(NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+}
+
+/* The worker waiting at its temp's move; the frame keeps gathering */
+static bool temp_move_waits(void)
+{
+   int spins = 0;
+   while (__atomic_load_n(&hold_temp_move, __ATOMIC_ACQUIRE) != 2)
+   {
+      if (spins++ >= 20000)
+         return false;
+      task_queue_check();
+      retro_sleep(1);
+   }
+   return true;
+}
+
+static void test_auto_state_skip_tick_threaded(void)
+{
+   const char *auto_slot = "save_state_io_test_auto_-1.state";
+   void   *was = NULL, *cur = NULL;
+   int64_t n_was = -1, n_cur = -1;
+   bool    waits;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(auto_slot);
+   core_fill(TEST_SAVE_STATE_CHUNK);
+   stub_settings.uints.savestate_automatic_interval = 1;
+   stub_runloop.auto_state_save_ready = true;
+   content_save_state_automatic(10000000);
+
+   memset(core_mem, 0x11, core_len);
+   content_save_state(auto_slot, true);
+   pump_threaded();
+   if (!filestream_read_file(auto_slot, &was, &n_was))
+      n_was = -1;
+   memset(core_mem, 0x33, core_len);
+   content_save_state(auto_slot, true);
+   pump_threaded();
+   if (!filestream_read_file(auto_slot, &cur, &n_cur))
+      n_cur = -1;
+
+   /* Undo Save of the .auto, held at its move into place */
+   __atomic_store_n(&hold_temp_move, 1, __ATOMIC_RELEASE);
+   okf(content_undo_save_state(), "threaded skip tick: Undo Save is pushed");
+   waits = temp_move_waits();
+   okf(waits && !content_save_state_automatic(11000000)
+         && n_cur > 0 && !written_into(auto_slot, cur, n_cur),
+       "threaded skip tick: no interval save during the undo");
+   __atomic_store_n(&hold_temp_move, 0, __ATOMIC_RELEASE);
+   pump_threaded();
+   okf(n_was > 0 && !written_into(auto_slot, was, n_was),
+       "threaded skip tick: the undo lands");
+   memset(core_mem, 0x55, core_len);
+   okf(content_save_state_automatic(11016000)
+         && written_into(auto_slot, was, n_was),
+       "threaded skip tick: the next frame saves after the undo");
+
+   /* Save State to the Auto slot, held the same way */
+   free(cur);
+   cur = NULL;
+   if (!filestream_read_file(auto_slot, &cur, &n_cur))
+      n_cur = -1;
+   memset(core_mem, 0x77, core_len);
+   __atomic_store_n(&hold_temp_move, 1, __ATOMIC_RELEASE);
+   content_save_state(auto_slot, true);
+   waits = temp_move_waits();
+   okf(waits && !content_save_state_automatic(12016000)
+         && n_cur > 0 && !written_into(auto_slot, cur, n_cur),
+       "threaded skip tick: no interval save during the Auto slot save");
+   __atomic_store_n(&hold_temp_move, 0, __ATOMIC_RELEASE);
+   pump_threaded();
+   free(was);
+   was = NULL;
+   if (!filestream_read_file(auto_slot, &was, &n_was))
+      n_was = -1;
+   memset(core_mem, 0x55, core_len);
+   okf(content_save_state_automatic(12032000)
+         && n_was > 0 && written_into(auto_slot, was, n_was),
+       "threaded skip tick: the next frame saves after the Auto slot save");
+
+   free(was);
+   free(cur);
+   filestream_delete(auto_slot);
+}
+
+/* -----------------------------------------------------------------
+ * A save that fails takes no thumbnail: the slot's old one stays.
+ * ----------------------------------------------------------------- */
+static void test_thumbnail_on_success(void)
+{
+   const char *path = "sst_thumb.state";
+   const char *png  = "sst_thumb.state.png";
+   void   *data     = NULL;
+   int64_t len      = 0;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   core_fill(TEST_SAVE_STATE_CHUNK);
+   filestream_delete(path);
+   filestream_write_file(png, "old", 3);
+   stub_settings.bools.savestate_thumbnail_enable = true;
+   shots = 0;
+   set_save_state_in_background(true);
+   core_ser_fails = 1;
+   content_save_state(path, true);
+   pump(1000);
+   core_ser_fails = 0;
+   set_save_state_in_background(false);
+   okf(shots == 0, "thumbnail: none for a save that failed");
+   okf(     filestream_read_file(png, &data, &len) && len == 3
+         && !memcmp(data, "old", 3), "thumbnail: the old one stays");
+   free(data);
+   content_save_state(path, true);
+   pump(1000);
+   okf(shots == 1, "thumbnail: one for a save that was written");
+   filestream_delete(path);
+   filestream_delete(png);
+}
+
+static bool holds_text(const char *path, const char *text)
+{
+   void   *data = NULL;
+   int64_t len  = 0;
+   bool    ok   = filestream_read_file(path, &data, &len)
+         && len == (int64_t)strlen(text) && !memcmp(data, text, (size_t)len);
+   free(data);
+   return ok;
+}
+
+/* -----------------------------------------------------------------
+ * A written state whose new thumbnail fails keeps none: never a
+ * picture of an older state beside it.
+ * ----------------------------------------------------------------- */
+static void test_thumbnail_fails(void)
+{
+   const char *path = "sst_thumbfail.state";
+   const char *png  = "sst_thumbfail.state.png";
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   core_fill(TEST_SAVE_STATE_CHUNK);
+   filestream_delete(path);
+
+   filestream_write_file(png, "old", 3);
+   content_save_state(path, true);
+   pump(1000);
+   okf(file_size(path) > 0 && holds_text(png, "old"),
+       "thumbnail: off, the slot's picture is left alone");
+
+   stub_settings.bools.savestate_thumbnail_enable = true;
+   shot_fails      = true;
+   shots_cancelled = 0;
+   content_save_state(path, true);
+   pump(1000);
+   okf(file_size(png) < 0,
+       "thumbnail: a failed one leaves none beside a written state");
+   filestream_write_file(png, "old", 3);
+   okf(content_auto_save_state(path) && file_size(png) < 0,
+       "thumbnail: a failed one leaves none beside an auto save");
+   okf(shots_cancelled == 0,
+       "thumbnail: a failed one stops no other shot of the slot");
+   shot_fails = false;
+   filestream_write_file(png, "old", 3);
+   okf(content_auto_save_state(path) && holds_text(png, "new"),
+       "thumbnail: an auto save's replaces the old one");
+   filestream_delete(path);
+   filestream_delete(png);
+}
+
+/* -----------------------------------------------------------------
+ * A written state's slot keeps its picture until the new one is
+ * taken: the old one goes only when that fails.
+ * ----------------------------------------------------------------- */
+static void test_thumbnail_kept_until_shot(void)
+{
+   const char *path = "sst_thumbkeep.state";
+   const char *png  = "sst_thumbkeep.state.png";
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   core_fill(TEST_SAVE_STATE_CHUNK);
+   filestream_delete(path);
+   filestream_write_file(png, "old", 3);
+   stub_settings.bools.savestate_thumbnail_enable = true;
+   shots       = 0;
+   png_at_shot = false;
+   content_save_state(path, true);
+   pump(1000);
+   okf(shots == 1 && png_at_shot,
+       "thumbnail: the old one stays until the new one is taken");
+   okf(holds_text(png, "new"), "thumbnail: the new one replaces it");
+   filestream_delete(path);
+   filestream_delete(png);
+}
+
+/* -----------------------------------------------------------------
+ * Undo Save and the RAM state written at close put a state of another
+ * moment in the slot: with thumbnails on, its picture goes once the
+ * state is written.
+ * ----------------------------------------------------------------- */
+static void test_thumbnail_other_moment(void)
+{
+   const char *path = "sst_thumbmoment.state";
+   const char *png  = "sst_thumbmoment.state.png";
+   const char *tmp  = "sst_thumbmoment.state.tmp";
+   const char *rtmp = "sst_thumbmoment.state.ram.tmp";
+   int i;
+
+   for (i = 0; i < 3; i++)
+   {
+      frontend_reset();
+      content_reset_savestate_backups();
+      core_fill(TEST_SAVE_STATE_CHUNK);
+      filestream_delete(path);
+      content_save_state(path, true);
+      pump(1000);
+      memset(core_mem, 0x33, core_len);
+      content_save_state(path, true);
+      pump(1000);
+      stub_settings.bools.savestate_thumbnail_enable = (i > 0);
+      filestream_write_file(png, "new", 3);
+      /* the third undo cannot write its temporary */
+      if (i == 2)
+         path_mkdir(tmp);
+      shots_cancelled = 0;
+      okf(content_undo_save_state(), "thumbnail: Undo Save is taken");
+      pump(1000);
+      if (i == 2)
+         path_rmdir(tmp);
+      okf(shots_cancelled == (i == 1)
+            && (i != 1 || string_is_equal(shot_cancelled, png)),
+          "thumbnail: Undo Save stops a shot of the slot only when it drops");
+      if (i == 0)
+         okf(holds_text(png, "new"),
+             "thumbnail: off, Undo Save leaves the picture alone");
+      else if (i == 1)
+         okf(file_size(png) < 0,
+             "thumbnail: Undo Save drops the undone save's picture");
+      else
+         okf(holds_text(png, "new"),
+             "thumbnail: an Undo Save that fails leaves the picture");
+   }
+
+   for (i = 0; i < 3; i++)
+   {
+      frontend_reset();
+      core_fill(TEST_SAVE_STATE_CHUNK);
+      stub_settings.bools.savestate_thumbnail_enable = (i > 0);
+      filestream_write_file(png, "new", 3);
+      okf(content_save_state_to_ram(), "thumbnail: the RAM state is kept");
+      /* the third cannot write either temporary */
+      if (i == 2)
+      {
+         path_mkdir(rtmp);
+         path_mkdir(tmp);
+      }
+      shots_cancelled = 0;
+      okf(content_ram_state_to_file(path, false) == (i < 2),
+          "thumbnail: the RAM state is written, or fails");
+      if (i == 2)
+      {
+         path_rmdir(rtmp);
+         path_rmdir(tmp);
+      }
+      okf(shots_cancelled == (i == 1)
+            && (i != 1 || string_is_equal(shot_cancelled, png)),
+          "thumbnail: the RAM state stops a shot of the slot only when it drops");
+      if (i == 0)
+         okf(holds_text(png, "new"),
+             "thumbnail: off, the RAM state leaves the picture alone");
+      else if (i == 1)
+         okf(file_size(png) < 0,
+             "thumbnail: the RAM state drops the slot's picture");
+      else
+         okf(holds_text(png, "new"),
+             "thumbnail: a RAM state that fails leaves the picture");
+   }
+   filestream_delete(path);
+   filestream_delete(png);
+}
+
+/* -----------------------------------------------------------------
+ * A state task and the synchronous auto save writing one file at once
+ * each write their own temporary: both files whole, none left.
+ * ----------------------------------------------------------------- */
+static void test_state_temps_distinct(void)
+{
+   const char *path = "sst_temps.state";
+   const char *ref  = "sst_temps_ref.state";
+   void   *a = NULL, *b = NULL;
+   int64_t n_a = -1, n_b = -2;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(path);
+   filestream_delete(ref);
+   core_fill(20 * TEST_SAVE_STATE_CHUNK);
+   content_save_state(ref, true);
+   pump(1000);
+
+   /* the task's temporary open, one quantum written */
+   clock_step = TEST_TICK_BUDGET_US;
+   content_save_state(path, true);
+   task_queue_check();
+   memset(core_mem, 0x77, core_len);
+   okf(content_auto_save_state(path),
+       "temps: the synchronous auto save is written");
+   pump(100000);
+   clock_step = 0;
+
+   if (!filestream_read_file(path, &a, &n_a))
+      n_a = -1;
+   if (!filestream_read_file(ref, &b, &n_b))
+      n_b = -2;
+   okf(n_a > 0 && n_a == n_b && !memcmp(a, b, (size_t)n_a),
+       "temps: the task's state is written whole");
+   okf(!tmp_exists(path) && file_size("sst_temps.state.auto.tmp") < 0,
+       "temps: no temporary left");
+   free(a);
+   free(b);
+   filestream_delete(path);
+   filestream_delete(ref);
+}
+
+/* -----------------------------------------------------------------
+ * A state task and the RAM state written at close, one file at once:
+ * each its own temporary, the task's state whole, none left.
+ * ----------------------------------------------------------------- */
+static void test_ram_state_temp_distinct(void)
+{
+   const char *path = "sst_ramtemps.state";
+   const char *ref  = "sst_ramtemps_ref.state";
+   void   *a = NULL, *b = NULL;
+   int64_t n_a = -1, n_b = -2;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(path);
+   filestream_delete(ref);
+   core_fill(20 * TEST_SAVE_STATE_CHUNK);
+   content_save_state(ref, true);
+   pump(1000);
+
+   /* the task's temporary open, one quantum written */
+   clock_step = TEST_TICK_BUDGET_US;
+   content_save_state(path, true);
+   task_queue_check();
+   memset(core_mem, 0x66, core_len);
+   okf(content_save_state_to_ram() && content_ram_state_to_file(path, false),
+       "ram temps: the RAM state is written");
+   pump(100000);
+   clock_step = 0;
+
+   if (!filestream_read_file(path, &a, &n_a))
+      n_a = -1;
+   if (!filestream_read_file(ref, &b, &n_b))
+      n_b = -2;
+   okf(n_a > 0 && n_a == n_b && !memcmp(a, b, (size_t)n_a),
+       "ram temps: the task's state is written whole");
+   okf(!tmp_exists(path) && file_size("sst_ramtemps.state.ram.tmp") < 0,
+       "ram temps: no temporary left");
+   free(a);
+   free(b);
+   filestream_delete(path);
+   filestream_delete(ref);
+}
+
+/* -----------------------------------------------------------------
+ * The RAM state written at close replaces the slot's file, whole,
+ * through its own temporary, with the state kept in RAM.
+ * ----------------------------------------------------------------- */
+static void test_ram_state_file(void)
+{
+   const char *path = "sst_ram.state";
+   const char *ref  = "sst_ram_ref.state";
+   void   *a = NULL, *b = NULL;
+   int64_t n_a = -1, n_b = -2;
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(ref);
+   filestream_write_file(path, "old", 3);
+   core_fill(4 * TEST_SAVE_STATE_CHUNK);
+   content_save_state(ref, true);
+   pump(1000);
+   okf(content_save_state_to_ram(), "ram state: kept in RAM");
+   memset(core_mem, 0x66, core_len);
+   okf(content_ram_state_to_file(path, false), "ram state: written to its file");
+
+   if (!filestream_read_file(path, &a, &n_a))
+      n_a = -1;
+   if (!filestream_read_file(ref, &b, &n_b))
+      n_b = -2;
+   okf(n_a > 0 && n_a == n_b && !memcmp(a, b, (size_t)n_a),
+       "ram state: the file holds the state kept in RAM");
+   okf(!tmp_exists(path) && file_size("sst_ram.state.ram.tmp") < 0,
+       "ram state: no temporary left");
+   free(a);
+   free(b);
+   filestream_delete(path);
+   filestream_delete(ref);
+}
+
+/* The longest name this directory takes: 0 if none fits in the probe */
+static size_t longest_name(void)
+{
+   char   name[1024];
+   size_t lo = 0, hi = sizeof(name) - 1;
+   memset(name, 'n', sizeof(name));
+   /* @lo opens, @hi does not */
+   while (hi - lo > 1)
+   {
+      size_t mid = (lo + hi) / 2;
+      RFILE *f;
+      name[mid] = '\0';
+      if ((f = filestream_open(name, RETRO_VFS_FILE_ACCESS_WRITE,
+            RETRO_VFS_FILE_ACCESS_HINT_NONE)))
+      {
+         filestream_close(f);
+         filestream_delete(name);
+         lo = mid;
+      }
+      else
+         hi = mid;
+      name[mid] = 'n';
+   }
+   return lo;
+}
+
+static bool files_equal(const char *a, const char *b)
+{
+   void   *x = NULL, *y = NULL;
+   int64_t n_x = -1, n_y = -2;
+   bool    ok;
+   if (!filestream_read_file(a, &x, &n_x))
+      n_x = -1;
+   if (!filestream_read_file(b, &y, &n_y))
+      n_y = -2;
+   ok = n_x > 0 && n_x == n_y && !memcmp(x, y, (size_t)n_x);
+   free(x);
+   free(y);
+   return ok;
+}
+
+/* -----------------------------------------------------------------
+ * A slot name too long for the auto save's or the RAM state's own
+ * temporary saves through "<path>.tmp", as before; the RAM state never
+ * while a state task writes that one.
+ * ----------------------------------------------------------------- */
+static void test_long_names(void)
+{
+   const char *ref = "sst_long_ref.state";
+   char   path[1024], tmp[1040], atmp[1040], rtmp[1040];
+   size_t n = longest_name();
+
+   if (n < 16 || n + 8 >= sizeof(path))
+   {
+      printf("       (longest name %u bytes)\n", (unsigned)n);
+      okf(false, "long names: no name length limit found");
+      return;
+   }
+   /* "<path>.tmp" is the longest name the directory takes */
+   memset(path, 'L', n - 4);
+   path[n - 4] = '\0';
+   snprintf(tmp,  sizeof(tmp),  "%s.tmp", path);
+   snprintf(atmp, sizeof(atmp), "%s.auto.tmp", path);
+   snprintf(rtmp, sizeof(rtmp), "%s.ram.tmp", path);
+   printf("       (longest name %u bytes)\n", (unsigned)n);
+
+   frontend_reset();
+   content_reset_savestate_backups();
+   filestream_delete(path);
+   filestream_delete(ref);
+   core_fill(4 * TEST_SAVE_STATE_CHUNK);
+   content_save_state(ref, true);
+   pump(1000);
+   okf(content_auto_save_state(path) && files_equal(path, ref),
+       "long names: the auto save is written");
+   okf(file_size(tmp) < 0 && file_size(atmp) < 0,
+       "long names: the auto save leaves no temporary");
+
+   filestream_delete(path);
+   okf(content_save_state_to_ram(), "long names: the RAM state is kept");
+   memset(core_mem, 0x66, core_len);
+   okf(content_ram_state_to_file(path, false) && files_equal(path, ref),
+       "long names: the RAM state is written");
+   okf(file_size(tmp) < 0 && file_size(rtmp) < 0,
+       "long names: the RAM state leaves no temporary");
+
+   /* the task's "<path>.tmp" open, one quantum written */
+   filestream_delete(path);
+   core_fill(20 * TEST_SAVE_STATE_CHUNK);
+   memset(core_mem, 0x66, core_len);
+   okf(content_save_state_to_ram(), "long names: the RAM state is kept");
+   core_fill(20 * TEST_SAVE_STATE_CHUNK);
+   content_save_state(ref, true);
+   pump(1000);
+   clock_step = TEST_TICK_BUDGET_US;
+   content_save_state(path, true);
+   task_queue_check();
+   okf(!content_ram_state_to_file(path, false),
+       "long names: the RAM state does not share a state task's temporary");
+   pump(100000);
+   clock_step = 0;
+   okf(files_equal(path, ref) && file_size(tmp) < 0,
+       "long names: the task's state is written whole");
+
+   filestream_delete(path);
+   filestream_delete(ref);
+}
+
 static int run_default_lane(void)
 {
    printf("== task_save.c I/O regression oracle ==\n");
@@ -1456,6 +4049,35 @@ static int run_default_lane(void)
    test_undo_allocates_nothing();
    test_notify_without_allocation();
    test_load_held_behind_save();
+   test_state_load_kinds();
+   test_state_load_guards();
+   test_writes_counted();
+   test_undo_save_slot();
+   test_undo_save_refused_push();
+   test_undo_save_during_write();
+   test_undo_save_write_fails();
+   test_undo_save_count();
+   test_undo_save_twice();
+   test_undo_save_during_backup();
+   test_undo_save_not_backed_up();
+   test_auto_state();
+   test_auto_state_no_room();
+   test_auto_state_close_synced();
+   test_auto_state_close_fail_notice();
+   test_auto_state_undo();
+   test_manual_auto_slot_sets_aside();
+   test_auto_state_skip_tick();
+   test_auto_state_keep_push();
+   test_auto_state_keep();
+   test_auto_state_policy_chain();
+   test_thumbnail_on_success();
+   test_thumbnail_fails();
+   test_thumbnail_kept_until_shot();
+   test_thumbnail_other_moment();
+   test_long_names();
+   test_state_temps_distinct();
+   test_ram_state_temp_distinct();
+   test_ram_state_file();
 #ifdef HAVE_COMPRESSION
    test_undo_save_restores_file();
 #endif
@@ -1475,6 +4097,9 @@ static int run_threaded_lane(void)
 
    test_threaded_roundtrip();
    test_threaded_load_waits_for_frames();
+   test_auto_state_keep_threaded();
+   test_manual_auto_slot_threaded();
+   test_auto_state_skip_tick_threaded();
 
    content_reset_savestate_backups();
    task_queue_deinit();

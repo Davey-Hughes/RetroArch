@@ -21,7 +21,7 @@ S_UINT_EX_H(autosave_interval, AUTOSAVE_INTERVAL,
       "autosave_interval",
       DEFAULT_AUTOSAVE_INTERVAL, SD_FLAG_CMD_APPLY_AUTO, (SDESC_FLG_HAS_RANGE | SDESC_FLG_ENFORCE_MIN), CMD_EVENT_AUTOSAVE_INIT, 0, 0, 1, 0, setting_action_ok_uint, setting_get_string_representation_uint_autosave_interval, NULL, NULL, NULL, NULL, 0,
       "Save File: SaveRAM Autosave Interval",
-      "Automatically save the non-volatile SaveRAM at a regular interval (in seconds).")
+      "Automatically save the non-volatile SaveRAM at a regular interval (in seconds). Changes are also saved when the menu opens, on pause and at close. On local folders each save goes to a temporary file first, so it is never left half-written.")
 #endif
 /* Descriptor and configuration rows are #ifdef HAVE_THREADS; the string
  * tables always carry this row via the strings pass. */

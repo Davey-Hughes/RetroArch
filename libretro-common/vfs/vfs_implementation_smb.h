@@ -56,6 +56,7 @@ typedef struct {
    unsigned share_index;
    struct smbc_dirent ent;   /* the entry readdir returns; per handle, so
                               * listings on different threads never share it */
+   bool error;               /* the listing stopped on a read error */
 } smb_dir_handle;
 
 /* Hands the client new settings: they are copied, strings included,
@@ -112,7 +113,7 @@ struct smbc_dirent* retro_vfs_readdir_smb(smb_dir_handle* dh);
 int                 retro_vfs_closedir_smb(smb_dir_handle* dh);
 
 /* Stat */
-int retro_vfs_stat_smb(const char *path, int64_t *size);
+int retro_vfs_stat_smb(const char *path, int64_t *size, int64_t *mtime);
 
 /* Errors */
 int retro_vfs_file_error_smb(libretro_vfs_implementation_file *stream);

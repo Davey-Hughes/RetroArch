@@ -31,7 +31,14 @@ enum rarch_dir_type
    RARCH_DIR_SAVESTATE,
    RARCH_DIR_CURRENT_SAVEFILE,
    RARCH_DIR_CURRENT_SAVESTATE,
-   RARCH_DIR_SYSTEM
+   RARCH_DIR_SYSTEM,
+   /* As the config file has them ("" = default), even when missing */
+   RARCH_DIR_SAVEFILE_CONFIGURED,
+   RARCH_DIR_SAVESTATE_CONFIGURED,
+   /* As the main config has them, before any override, "default"
+    * resolved: what cloud sync walks */
+   RARCH_DIR_SAVEFILE_BASE,
+   RARCH_DIR_SAVESTATE_BASE
 };
 
 enum rarch_content_type

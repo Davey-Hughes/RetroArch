@@ -29,6 +29,18 @@ on:
       - 'samples/menu/ozone_sublabel_scroll/**'
       - 'gfx/gfx_display.c'
       - 'runloop.c'
+      - 'save_backups.c'
+      - 'save_backups.h'
+      - 'samples/runloop/save_backups/**'
+      - 'samples/runloop/save_paths/**'
+      - 'save.c'
+      - 'autosave.h'
+      - 'config.def.h'
+      - 'tasks/task_save.c'
+      - 'samples/runloop/autosave_snapshot/**'
+      - 'samples/runloop/save_e2e/**'
+      - 'libretro-common/streams/file_stream.c'
+      - 'libretro-common/vfs/vfs_implementation.c'
       - 'samples/menu/network_settings/**'
       - 'intl/msg_hash_lbl.h'
       - 'msg_hash_lbl_str.h'
@@ -54,6 +66,18 @@ on:
       - 'samples/menu/ozone_sublabel_scroll/**'
       - 'gfx/gfx_display.c'
       - 'runloop.c'
+      - 'save_backups.c'
+      - 'save_backups.h'
+      - 'samples/runloop/save_backups/**'
+      - 'samples/runloop/save_paths/**'
+      - 'save.c'
+      - 'autosave.h'
+      - 'config.def.h'
+      - 'tasks/task_save.c'
+      - 'samples/runloop/autosave_snapshot/**'
+      - 'samples/runloop/save_e2e/**'
+      - 'libretro-common/streams/file_stream.c'
+      - 'libretro-common/vfs/vfs_implementation.c'
       - 'samples/menu/network_settings/**'
       - 'intl/msg_hash_lbl.h'
       - 'msg_hash_lbl_str.h'
@@ -76,7 +100,7 @@ jobs:
     name: Build and run the menu navigation harness
     runs-on: ubuntu-latest
     env:
-      APT_PKGS: build-essential zlib1g-dev ccache
+      APT_PKGS: build-essential zlib1g-dev ccache strace p7zip-full
     timeout-minutes: 25
 
     steps:
@@ -184,6 +208,112 @@ jobs:
           samples/runloop/cloudsync_unload/build.sh
           ./samples/runloop/cloudsync_unload/cloudsync_unload_test
           make -C samples/runloop/cloudsync_unload clean
+
+      - name: Build and run save_backups_test
+        shell: bash
+        run: |
+          set -eu
+          # save_backups.c: copy folders, names read back, copy
+          # numbers, the identical-copy skip, retention and the
+          # recovery-file chain, with and without HAVE_THREADS.
+          make -C samples/runloop/save_backups clean check
+          make -C samples/runloop/save_backups clean check SANITIZER=address,undefined
+          make -C samples/runloop/save_backups clean
+
+      - name: Build and run the autosave tests
+        shell: bash
+        run: |
+          set -eu
+          # save.c's autosave worker: snapshots taken on the main thread
+          # only; writes through a temporary of its own, so a full disk
+          # or a refused rename keeps the old save whole; nothing written
+          # for an unchanged save; memory a core moves or resizes
+          # followed.  The close write, with and without HAVE_THREADS.
+          # The cadence of a save that keeps changing, and config.def.h's
+          # default interval with and without threads.
+          make -C samples/runloop/autosave_snapshot clean check
+          make -C samples/runloop/autosave_snapshot clean check SANITIZER=address,undefined
+          make -C samples/runloop/autosave_snapshot clean
+
+      - name: Run the save end-to-end lanes
+        shell: bash
+        run: |
+          set -eu
+          # The binary built above, null drivers, every folder in a run
+          # folder: an autosave on a full disk (file size limit) keeps
+          # the old save whole, and a launch with an unchanged save
+          # writes nothing to it (strace); a save that does not read at
+          # load, that a core reports late or that is not loaded on
+          # request is copied before the first write over it, also by
+          # the network command's unsynced SAVE_FILES, and one longer
+          # than the core's memory before the first shorter write;
+          # unsaved progress from a failed write is announced at the
+          # next load, also when the session wrote the save after it;
+          # the progress a state load rolls back, and a save
+          # another RetroArch wrote meanwhile, are backed up; with saves
+          # off, a netplay host stopped in the game writes nothing;
+          # pausing and opening the menu write a changed save at once;
+          # a save folder missing at launch stays the configured one,
+          # and the default stands in for one gone at a content load,
+          # with a game override loaded too; with saving off for want
+          # of a folder, the session's save goes to a recovery file in
+          # the config folder once it changed from the first frame,
+          # and only once while unchanged; relative save and state
+          # folders are under the config file's folder, not the one
+          # RetroArch started in, also for the default config file and
+          # one named without a folder; an archive member sorted by
+          # content keeps the save in the folder it was sorted to before,
+          # and members with one name in two folders keep their folders,
+          # in a zip and in a 7z;
+          # a quit, Unload Core or another content's load writes the auto
+          # state once, after a state write still in flight, also with a
+          # quit during the close (auto save in a game override only
+          # too), and with the saves held by a cloud sync writes none
+          # and does not wait; Unload Core goes by the
+          # game override the content loaded with: the .auto it did not
+          # load is kept, and the savestate bypass still saves.
+          # The kill-mid-write lane and its runs under load stay local.
+          # The harness builds above removed the binary to read its link
+          # line.
+          make -j$(nproc)
+          make -C samples/runloop/save_e2e
+          python3 samples/runloop/save_e2e/run.py --retroarch ./retroarch \
+             --run-dir "$RUNNER_TEMP/save_e2e" \
+             --lane autosave_full_disk --lane no_rewrite_at_launch \
+             --lane unreadable_backed_up --lane late_core_backed_up \
+             --lane noload_save_backed_up --lane explicit_save_copies \
+             --lane cut_copy_old_core --lane recovery_announced \
+             --lane recovery_announced_after_write \
+             --lane state_load_copy --lane changed_elsewhere \
+             --lane nosave_netplay_disconnect --lane flush_points \
+             --lane config_keeps_folder --lane folder_check_each_load \
+             --lane folder_check_override --lane folder_off_recovers \
+             --lane folder_off_unchanged --lane relative_paths \
+             --lane relative_config_no_folder \
+             --lane relative_default_config \
+             --lane archive_member_old_folder \
+             --lane archive_member_same_name \
+             --lane archive_member_same_name_7z \
+             --lane quit_after_held_state --lane unload_after_held_state \
+             --lane load_after_held_state --lane close_while_held \
+             --lane quit_during_unload --lane quit_during_unload_override \
+             --lane unload_override_kept \
+             --lane unload_override_after_held \
+             --lane unload_bypass_after_held
+          make -C samples/runloop/save_e2e clean
+
+      - name: Build and run save_paths_test
+        shell: bash
+        run: |
+          set -eu
+          # runloop.c over a real folder: ROM folders named backups or
+          # records, a netplay client with no folder, a save folder
+          # gone at a load, an archive member named without its folders
+          # and the old save folders it keeps using, and a save asked
+          # for from another thread.
+          make -C samples/runloop/save_paths clean check
+          make -C samples/runloop/save_paths clean check SANITIZER=address,undefined
+          make -C samples/runloop/save_paths clean
 
       - name: Build and run menu_playlist_nav_test
         shell: bash

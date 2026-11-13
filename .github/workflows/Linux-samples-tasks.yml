@@ -344,6 +344,23 @@ jobs:
           TSAN_OPTIONS=halt_on_error=1 ./cloudsync_commit_test
           make clean CC=x86_64-w64-mingw32-gcc LDFLAGS=-static && make -j$(nproc) cloudsync_commit_test CC=x86_64-w64-mingw32-gcc LDFLAGS=-static
           WINEDEBUG=-all wine ./cloudsync_commit_test.exe
+          # as built without threads, where a backup's copy runs inline
+          make clean NOTHREADS=1 SANITIZER=address,undefined && make -j$(nproc) cloudsync_commit_test NOTHREADS=1 SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 ./cloudsync_commit_test
+          make clean
+
+      - name: Check what cloud sync deletes on the server
+        shell: bash
+        working-directory: samples/tasks/cloudsync
+        run: |
+          set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
+          make clean SANITIZER=address,undefined && make -j$(nproc) cloudsync_roots_test SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 ./cloudsync_roots_test
+          make clean SANITIZER=thread && make -j$(nproc) cloudsync_roots_test SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 ./cloudsync_roots_test
+          make clean CC=x86_64-w64-mingw32-gcc LDFLAGS=-static && make -j$(nproc) cloudsync_roots_test CC=x86_64-w64-mingw32-gcc LDFLAGS=-static
+          WINEDEBUG=-all wine ./cloudsync_roots_test.exe
           make clean
 
       - name: Build and run cloudsync_async_test (ASan + UBSan, TSan)

@@ -6654,6 +6654,34 @@ int action_ok_close_content(const char *path, const char *label, unsigned type, 
    return generic_action_ok_command(CMD_EVENT_CLOSE_CONTENT);
 }
 
+#ifdef HAVE_CLOUDSYNC
+static int action_ok_cloud_sync_upload_all(const char *path, const char *label, unsigned type, size_t idx, size_t entry_idx)
+{
+   settings_t *settings       = config_get_ptr();
+
+   if (settings->bools.menu_show_confirm)
+   {
+      struct menu_state *menu_st = menu_state_get_ptr();
+      menu_dialog_confirm_set(menu_st, MSG_PRESS_AGAIN_TO_UPLOAD_ALL, CMD_EVENT_CLOUD_SYNC_UPLOAD_ALL);
+      return action_ok_dialog_init(menu_st);
+   }
+   return generic_action_ok_command(CMD_EVENT_CLOUD_SYNC_UPLOAD_ALL);
+}
+
+static int action_ok_cloud_sync_delete_missing(const char *path, const char *label, unsigned type, size_t idx, size_t entry_idx)
+{
+   settings_t *settings       = config_get_ptr();
+
+   if (settings->bools.menu_show_confirm)
+   {
+      struct menu_state *menu_st = menu_state_get_ptr();
+      menu_dialog_confirm_set(menu_st, MSG_PRESS_AGAIN_TO_DELETE_MISSING, CMD_EVENT_CLOUD_SYNC_DELETE_MISSING);
+      return action_ok_dialog_init(menu_st);
+   }
+   return generic_action_ok_command(CMD_EVENT_CLOUD_SYNC_DELETE_MISSING);
+}
+#endif
+
 STATIC_DEFAULT_ACTION_OK_CMD_FUNC(action_ok_cheat_apply_changes,      CMD_EVENT_CHEATS_APPLY)
 STATIC_DEFAULT_ACTION_OK_CMD_FUNC(action_ok_save_new_config,          CMD_EVENT_MENU_SAVE_CONFIG)
 STATIC_DEFAULT_ACTION_OK_CMD_FUNC(action_ok_save_main_config,         CMD_EVENT_MENU_SAVE_MAIN_CONFIG)
@@ -7526,6 +7554,8 @@ static int action_ok_netplay_connect_room(const char *path, const char *label,
 
    if (netplay_driver_ctl(RARCH_NETPLAY_CTL_USE_CORE_PACKET_INTERFACE, NULL))
    {
+      if (command_state_held())
+         return -1;
       netplay_driver_ctl(RARCH_NETPLAY_CTL_ENABLE_CLIENT, NULL);
       command_event(CMD_EVENT_NETPLAY_INIT_DIRECT, (void*)hostname);
       menu_input_dialog_end();
@@ -9329,6 +9359,11 @@ static void action_ok_netplay_enable_client_hostname_cb(void *userdata,
    {
       if (netplay_driver_ctl(RARCH_NETPLAY_CTL_USE_CORE_PACKET_INTERFACE, NULL))
       {
+         if (command_state_held())
+         {
+            menu_input_dialog_end();
+            return;
+         }
          netplay_driver_ctl(RARCH_NETPLAY_CTL_ENABLE_CLIENT, NULL);
          command_event(CMD_EVENT_NETPLAY_INIT_DIRECT, (void*)line);
          menu_input_dialog_end();
@@ -10167,6 +10202,10 @@ static int menu_cbs_init_bind_ok_compare_label(menu_file_list_cbs_t *cbs,
          {MENU_ENUM_LABEL_RESET_CORE_ASSOCIATION,              action_ok_reset_core_association},
          {MENU_ENUM_LABEL_ADD_TO_FAVORITES,                    action_ok_add_to_favorites},
          {MENU_ENUM_LABEL_RESTART_CONTENT,                     action_ok_restart_content},
+#ifdef HAVE_CLOUDSYNC
+         {MENU_ENUM_LABEL_CLOUD_SYNC_UPLOAD_ALL,               action_ok_cloud_sync_upload_all},
+         {MENU_ENUM_LABEL_CLOUD_SYNC_DELETE_MISSING,           action_ok_cloud_sync_delete_missing},
+#endif
          {MENU_ENUM_LABEL_TAKE_SCREENSHOT,                     action_ok_screenshot},
          {MENU_ENUM_LABEL_RENAME_ENTRY,                        action_ok_rename_entry},
          {MENU_ENUM_LABEL_DELETE_ENTRY,                        action_ok_delete_entry},

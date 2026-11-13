@@ -449,8 +449,10 @@ static bool smb_write_file(const char *smb_path, const uint8_t *buf,
  * with destructive sync off it becomes <path>-<yymmdd-hhmmss>, the copy
  * a non-destructive delete keeps, so an upload no longer destroys the
  * server's copy either; with it on, it is removed.  If the final rename
- * fails, the old file is put back.  The server manifest is rewritten
- * every sync and is never kept. */
+ * fails, the old file is put back.  The server manifest is never kept,
+ * but it too is moved aside until the new one is in place: a failed
+ * rename puts the old one back, and a cut in between leaves it under
+ * the aside name. */
 static bool smb_update(const char *path, RFILE *rfile,
       cloud_sync_complete_handler_t cb, void *user_data)
 {
@@ -459,6 +461,7 @@ static bool smb_update(const char *path, RFILE *rfile,
    char backup_path[PATH_MAX_LENGTH];
    struct smb2_stat_64 st;
    bool keep_old;
+   bool aside;
    bool had_old;
    int64_t file_size;
    uint8_t *buf = NULL;
@@ -505,11 +508,13 @@ static bool smb_update(const char *path, RFILE *rfile,
    keep_old = had_old
            && !smb_set.destructive
            && !string_is_equal(path, CLOUD_SYNC_SERVER_MANIFEST);
+   aside    = had_old
+           && (keep_old || string_is_equal(path, CLOUD_SYNC_SERVER_MANIFEST));
 
    if (had_old)
    {
       int rc;
-      if (keep_old)
+      if (aside)
       {
          smb_backup_path(backup_path, sizeof(backup_path), smb_path);
          rc = smb2_rename(smb_st.ctx, smb_path, backup_path);
@@ -519,7 +524,7 @@ static bool smb_update(const char *path, RFILE *rfile,
       if (rc < 0)
       {
          RARCH_ERR(SMBPFX "Not replacing '%s': could not %s the old copy: %s\n",
-               smb_path, keep_old ? "back up" : "remove",
+               smb_path, aside ? "move aside" : "remove",
                smb2_get_error(smb_st.ctx));
          smb2_unlink(smb_st.ctx, tmp_path);
          cb(user_data, path, false, rfile);
@@ -533,12 +538,14 @@ static bool smb_update(const char *path, RFILE *rfile,
    {
       RARCH_ERR(SMBPFX "Rename '%s' -> '%s' failed: %s\n",
             tmp_path, smb_path, smb2_get_error(smb_st.ctx));
-      if (keep_old)
+      if (aside)
          smb2_rename(smb_st.ctx, backup_path, smb_path);
       smb2_unlink(smb_st.ctx, tmp_path);
       cb(user_data, path, false, rfile);
       return true;
    }
+   if (aside && !keep_old)
+      smb2_unlink(smb_st.ctx, backup_path);
 
    RARCH_DBG(SMBPFX "Updated %s (%u bytes)\n",
          smb_path, (unsigned)file_size);

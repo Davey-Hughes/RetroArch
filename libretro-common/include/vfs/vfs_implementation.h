@@ -84,9 +84,30 @@ int64_t retro_vfs_file_write_at_impl(libretro_vfs_implementation_file *stream,
 
 int retro_vfs_file_flush_impl(libretro_vfs_implementation_file *stream);
 
+/* Flushes @stream and asks the OS to put its data on the storage
+ * device before returning: fdatasync() on Linux and Android,
+ * fcntl(F_BARRIERFSYNC) on Apple (fsync() where that fails), fsync()
+ * on other POSIX systems, FlushFileBuffers() on Windows. Returns 0, or
+ * -1 on an error. Does nothing and returns 0 on the consoles, on
+ * cdrom://, smb:// and nfs://, and for a file that cannot be synced
+ * (a pipe). Blocks on the disk: not for the frame loop. */
+int retro_vfs_file_sync_impl(libretro_vfs_implementation_file *stream);
+
+/* Syncs the directory @dir, so a rename into it is on the storage
+ * device too (POSIX). Returns 0, or -1 when it could not be opened or
+ * synced. Does nothing and returns 0 on Windows, the consoles and SAF
+ * paths. Blocks on the disk: not for the frame loop. */
+int retro_vfs_dir_sync_impl(const char *dir);
+
 int retro_vfs_file_remove_impl(const char *path);
 
 int retro_vfs_file_rename_impl(const char *old_path, const char *new_path);
+
+/* As retro_vfs_file_rename_impl(), and on Windows the rename is on the
+ * storage device before this returns (MOVEFILE_WRITE_THROUGH). Blocks
+ * on the disk: not for the frame loop. */
+int retro_vfs_file_rename_synced_impl(const char *old_path,
+      const char *new_path);
 
 const char *retro_vfs_file_get_path_impl(libretro_vfs_implementation_file *stream);
 
@@ -173,6 +194,10 @@ int retro_vfs_dirent_stat_impl(libretro_vfs_implementation_dir *rdir, int64_t *s
 libretro_vfs_implementation_dir *retro_vfs_opendir_impl(const char *dir, bool include_hidden);
 
 bool retro_vfs_readdir_impl(libretro_vfs_implementation_dir *dirstream);
+
+/* True once a retro_vfs_readdir_impl() on @dirstream has failed with
+ * an error rather than at the end of the directory; it stays set. */
+bool retro_vfs_dirent_error_impl(libretro_vfs_implementation_dir *dirstream);
 
 const char *retro_vfs_dirent_get_name_impl(libretro_vfs_implementation_dir *dirstream);
 

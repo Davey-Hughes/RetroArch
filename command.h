@@ -165,6 +165,10 @@ enum event_command
    CMD_EVENT_CLOUD_SYNC_RESOLVE_KEEP_LOCAL,
    /* Resolve cloud sync conflicts by keeping server files */
    CMD_EVENT_CLOUD_SYNC_RESOLVE_KEEP_SERVER,
+   /* Upload the local files the server no longer lists */
+   CMD_EVENT_CLOUD_SYNC_UPLOAD_ALL,
+   /* Delete on the server the files cloud sync kept there */
+   CMD_EVENT_CLOUD_SYNC_DELETE_MISSING,
 #endif
    /* Shutdown the OS */
    CMD_EVENT_SHUTDOWN,
@@ -483,6 +487,15 @@ int command_event_get_next_savestate_auto_index(
 
 void command_event_set_replay_auto_index(
       settings_t *settings);
+
+/* @slot becomes the first replay slot from @slot up with no replay
+ * in it; false when there is none */
+bool command_event_free_replay_slot(int *slot);
+
+/* Record Replay asked for @asked started in @slot: the replay slot
+ * setting follows it, with a notice when it passed over a replay */
+void command_event_set_replay_record_slot(settings_t *settings,
+      int asked, int slot);
 
 void command_event_set_replay_garbage_collect(
       unsigned max_to_keep,
@@ -1441,6 +1454,13 @@ bool command_event_disk_control_append_image(const char *path);
 bool command_event_reinit(const int flags);
 
 bool command_event_main_state(unsigned cmd);
+
+/* content_ram_state_to_file(), under the state limit as a slot save */
+bool command_event_ram_state_to_file(const char *path, bool sync);
+
+/* True, with the waiting notice, while the content's saves wait
+ * (save_load_hold): no state, replay or netplay host may start then. */
+bool command_state_held(void);
 
 RETRO_END_DECLS
 

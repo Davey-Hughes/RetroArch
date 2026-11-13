@@ -710,6 +710,45 @@ int64_t retro_vfs_file_seek_internal(
    return retro_vfs_fd_seek64(stream->fd, offset, whence) == -1 ? -1 : 0;
 }
 
+/* The first aside name of @path (fill_pathname_aside()) that
+ * does not exist.  NULL when all do, or on OOM. */
+static char *retro_vfs_free_aside_name(const char *path)
+{
+   unsigned n;
+   size_t aside_size = strlen(path) + PATH_ASIDE_SUFFIX_SIZE;
+   char  *aside      = (char*)malloc(aside_size);
+
+   if (!aside)
+      return NULL;
+   for (n = 1; fill_pathname_aside(aside, path, n, aside_size); n++)
+      if (!retro_vfs_stat_impl(aside, NULL))
+         return aside;
+   free(aside);
+   return NULL;
+}
+
+/* iOS can refuse to open an existing file for writing with EEXIST.
+ * The file is moved aside for the reopen, removed once that succeeds
+ * and put back if it fails. */
+static FILE *retro_vfs_file_reopen_aside(const char *path,
+      const char *mode_str)
+{
+   FILE *fp    = NULL;
+   char *aside = retro_vfs_free_aside_name(path);
+
+   if (!aside)
+      return NULL;
+   if (retro_vfs_file_rename_impl(path, aside) == 0)
+   {
+      if ((fp = (FILE*)fopen_utf8(path, mode_str)))
+         retro_vfs_file_remove_impl(aside);
+      else
+         retro_vfs_file_rename_impl(aside, path);
+   }
+   free(aside);
+   return fp;
+}
+
 /**
  * retro_vfs_file_open_impl:
  * @path               : path to file
@@ -981,17 +1020,15 @@ libretro_vfs_implementation_file *retro_vfs_file_open_impl(
 #endif
 
          default:
+            errno = 0;
             if (!(fp = (FILE*)fopen_utf8(path, mode_str)))
             {
-#if TARGET_OS_IPHONE
-               if (errno == EEXIST)
-               {
-                  retro_vfs_file_remove_impl(path);
-                  fp = (FILE*)fopen_utf8(path, mode_str);
-               }
+               if (     errno == EEXIST
+                     && (mode & RETRO_VFS_FILE_ACCESS_WRITE)
+                     && !(mode & RETRO_VFS_FILE_ACCESS_UPDATE_EXISTING))
+                  fp = retro_vfs_file_reopen_aside(path, mode_str);
                if (!fp)
-#endif
-               goto error;
+                  goto error;
             }
             stream->fp  = fp;
             break;
@@ -2348,6 +2385,96 @@ int retro_vfs_file_flush_impl(libretro_vfs_implementation_file *stream)
    return -1;
 }
 
+/* The consoles' SDKs are not relied on for an fsync(); there a sync
+ * does nothing. */
+#if !defined(_WIN32) && !defined(VITA) && !defined(PSP) && !defined(PS2) \
+      && !defined(ORBIS) && !defined(GEKKO) && !defined(_3DS) \
+      && !defined(WIIU) && !defined(SWITCH) && !defined(__PSL1GHT__) \
+      && !defined(__PS3__)
+#define VFS_HAVE_FSYNC
+#endif
+
+int retro_vfs_file_sync_impl(libretro_vfs_implementation_file *stream)
+{
+   if (!stream)
+      return -1;
+#ifdef HAVE_CDROM
+   if (stream->scheme == VFS_SCHEME_CDROM)
+      return 0;
+#endif
+#ifdef HAVE_SMBCLIENT
+   if (stream->scheme == VFS_SCHEME_SMB)
+      return 0;
+#endif
+#ifdef HAVE_NFSCLIENT
+   if (stream->scheme == VFS_SCHEME_NFS)
+      return 0;
+#endif
+   if (stream->fp && fflush(stream->fp) != 0)
+      return -1;
+#if defined(_WIN32) && !defined(_XBOX)
+   {
+      HANDLE h;
+      int fd = stream->fp ? _fileno(stream->fp) : stream->fd;
+      if (fd < 0)
+         return -1;
+      h = (HANDLE)_get_osfhandle(fd);
+      if (h == INVALID_HANDLE_VALUE || !FlushFileBuffers(h))
+         return -1;
+   }
+#elif defined(VFS_HAVE_FSYNC)
+   {
+      int ret;
+      int fd = stream->fp ? fileno(stream->fp) : stream->fd;
+      if (fd < 0)
+         return -1;
+#if defined(__linux__)
+      ret = fdatasync(fd);
+#elif defined(F_BARRIERFSYNC)
+      /* Apple's fsync() lets the drive write the data after a later
+       * rename; the barrier keeps the order. */
+      if ((ret = fcntl(fd, F_BARRIERFSYNC)) != 0)
+         ret = fsync(fd);
+#else
+      ret = fsync(fd);
+#endif
+      /* EINVAL and EROFS: a pipe or the like, nothing to sync */
+      if (ret != 0 && errno != EINVAL && errno != EROFS)
+         return -1;
+   }
+#endif
+   return 0;
+}
+
+int retro_vfs_dir_sync_impl(const char *dir)
+{
+#if defined(VFS_HAVE_FSYNC)
+   int fd;
+   int ret;
+
+   if (!dir || !*dir)
+      return -1;
+#if defined(ANDROID) && defined(HAVE_SAF)
+   if (path_is_saf(dir))
+      return 0;
+#endif
+   if ((fd = open(dir, O_RDONLY)) < 0)
+      return -1;
+#if defined(F_BARRIERFSYNC)
+   if ((ret = fcntl(fd, F_BARRIERFSYNC)) != 0)
+      ret = fsync(fd);
+#else
+   ret = fsync(fd);
+#endif
+   if (ret != 0 && (errno == EINVAL || errno == EROFS))
+      ret = 0;
+   close(fd);
+   return ret == 0 ? 0 : -1;
+#else
+   return 0;
+#endif
+}
+
 int retro_vfs_file_remove_impl(const char *path)
 {
    if (path && *path)
@@ -2441,23 +2568,58 @@ int retro_vfs_file_remove_impl(const char *path)
 #endif
 
 #ifdef VFS_RENAME_ASIDE
-/* Where to move @new_path while @old_path takes its place: "<new>.old",
- * whose leftover from an interrupted run gets removed.  The source can
- * be the file of that very name, as when a backup is restored, and must
- * not be mistaken for a leftover.  Compared without regard to case for
- * the FAT volumes most of these targets use. */
-static char *rename_aside_path(const char *old_path, const char *new_path)
+/* Where to move @new_path while another file takes its place:
+ * "<new>.old".  A file already there may be the only copy left by an
+ * interrupted replace, or the user's own, so it is never deleted:
+ * rename_aside_free() finds the next free name instead.  @len is set
+ * to the length of @new_path. */
+static char *rename_aside_path(const char *new_path, size_t *len)
 {
    size_t _len = strlen(new_path);
-   char *aside = (char*)malloc(_len + sizeof(".old2"));
+   char *aside = (char*)malloc(_len + sizeof(".old99"));
 
    if (!aside)
       return NULL;
    memcpy(aside, new_path, _len);
    memcpy(aside + _len, ".old", sizeof(".old"));
-   if (string_is_equal_case_insensitive(aside, old_path))
-      memcpy(aside + _len, ".old2", sizeof(".old2"));
+   *len = _len;
    return aside;
+}
+
+static bool rename_aside_exists(const char *path)
+{
+#if defined(_XBOX)
+   return GetFileAttributes(path) != INVALID_FILE_ATTRIBUTES;
+#elif defined(_WIN32)
+   return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+#elif defined(VITA) || defined(PSP)
+   SceIoStat st;
+   return sceIoGetstat(path, &st) >= 0;
+#else
+   struct stat st;
+   return stat(path, &st) == 0;
+#endif
+}
+
+/* Writes the first free one of "<new>.old", "<new>.old2" ...
+ * "<new>.old99" after the @len characters of @aside, and returns
+ * which (1 to 99), or 0 when all are taken. */
+static unsigned rename_aside_free(char *aside, size_t len)
+{
+   unsigned n;
+
+   for (n = 1; n <= 99; n++)
+   {
+      char *s = aside + len + STRLEN_CONST(".old");
+      if (n > 9)
+         *s++ = (char)('0' + n / 10);
+      if (n > 1)
+         *s++ = (char)('0' + n % 10);
+      *s = '\0';
+      if (!rename_aside_exists(aside))
+         return n;
+   }
+   return 0;
 }
 #endif
 
@@ -2470,18 +2632,20 @@ static char *rename_aside_path(const char *old_path, const char *new_path)
 static int win32_rename_replace_local(const char *old_local,
       const char *new_local)
 {
+   size_t _len;
    char *aside;
    int ret;
 
    if (rename(old_local, new_local) == 0)
       return 0;
 
-   if (!(aside = rename_aside_path(old_local, new_local)))
+   if (!(aside = rename_aside_path(new_local, &_len)))
       return -1;
 
    ret = -1;
-   remove(aside);                      /* a leftover from an earlier run */
-   if (rename(new_local, aside) == 0)
+   if (     rename(new_local, aside) == 0
+         || (     rename_aside_free(aside, _len) > 1
+               && rename(new_local, aside) == 0))
    {
       if (rename(old_local, new_local) == 0)
       {
@@ -2497,7 +2661,10 @@ static int win32_rename_replace_local(const char *old_local,
 }
 #endif
 
-int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
+/* @write_through: on Windows, the rename is on the disk before this
+ * returns (MOVEFILE_WRITE_THROUGH), as a synced write needs. */
+static int retro_vfs_file_rename_flags(const char *old_path,
+      const char *new_path, bool write_through)
 {
 #if defined(ANDROID) && defined(HAVE_SAF)
       if (path_is_saf(old_path) && path_is_saf(new_path))
@@ -2563,7 +2730,8 @@ int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
          if (new_path_wide)
          {
             if (MoveFileExW(old_path_wide, new_path_wide,
-                  MOVEFILE_REPLACE_EXISTING))
+                  MOVEFILE_REPLACE_EXISTING
+                  | (write_through ? MOVEFILE_WRITE_THROUGH : 0)))
                ret = 0;
             free(new_path_wide);
          }
@@ -2599,7 +2767,8 @@ int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
          if (new_path_wide)
          {
             if (MoveFileExW(old_path_wide, new_path_wide,
-                  MOVEFILE_REPLACE_EXISTING))
+                  MOVEFILE_REPLACE_EXISTING
+                  | (write_through ? MOVEFILE_WRITE_THROUGH : 0)))
                ret = 0;
             free(new_path_wide);
          }
@@ -2617,6 +2786,7 @@ int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
     * moved-aside copy deleted only then - or put back if the second
     * move fails. */
    {
+      size_t _len;
       char *aside;
       int ret;
 
@@ -2626,12 +2796,13 @@ int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
       if (GetFileAttributes(new_path) == INVALID_FILE_ATTRIBUTES)
          return MoveFile(old_path, new_path) ? 0 : -1;
 
-      if (!(aside = rename_aside_path(old_path, new_path)))
+      if (!(aside = rename_aside_path(new_path, &_len)))
          return -1;
 
       ret = -1;
-      DeleteFile(aside);               /* a leftover from an earlier run */
-      if (MoveFile(new_path, aside))
+      if (     MoveFile(new_path, aside)
+            || (     rename_aside_free(aside, _len) > 1
+                  && MoveFile(new_path, aside)))
       {
          if (MoveFile(old_path, new_path))
          {
@@ -2664,6 +2835,7 @@ int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
     * the replacement cannot be. */
    {
       SceIoStat st;
+      size_t _len;
       char *aside;
       int ret;
 
@@ -2677,14 +2849,14 @@ int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
       if (sceIoGetstat(new_path, &st) < 0)
          return -1;
 
-      if (!(aside = rename_aside_path(old_path, new_path)))
+      if (!(aside = rename_aside_path(new_path, &_len)))
          return -1;
 
       ret = -1;
-      /* A leftover aside from an earlier run is removed only when it
-       * is in the way: a lookup of a missing name scans the directory. */
+      /* A free name is looked for only when "<new>.old" is taken: a
+       * lookup of a missing name scans the directory. */
       if (     sceIoRename(new_path, aside) >= 0
-            || (     sceIoRemove(aside) >= 0
+            || (     rename_aside_free(aside, _len) > 1
                   && sceIoRename(new_path, aside) >= 0))
       {
          if (sceIoRename(old_path, new_path) >= 0)
@@ -2712,6 +2884,7 @@ int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
     * if the replacement cannot be. */
    {
       struct stat st;
+      size_t _len;
       char *aside;
       int ret;
 
@@ -2721,15 +2894,22 @@ int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
       if (stat(new_path, &st) != 0)
          return rename(old_path, new_path) == 0 ? 0 : -1;
 
-      if (!(aside = rename_aside_path(old_path, new_path)))
+      if (!(aside = rename_aside_path(new_path, &_len)))
          return -1;
 
       ret = -1;
-      /* A leftover aside from an earlier run is removed only when it
-       * is in the way: a lookup of a missing name scans the directory. */
+#if defined(_3DS) || defined(WIIU)
+      /* libctru's rename() would delete a file at the aside name, and
+       * Wii U's FSRename() is not known to refuse one */
+      if (     rename_aside_free(aside, _len)
+            && rename(new_path, aside) == 0)
+#else
+      /* A free name is looked for only when "<new>.old" is taken: a
+       * lookup of a missing name scans the directory. */
       if (     rename(new_path, aside) == 0
-            || (     remove(aside) == 0
+            || (     rename_aside_free(aside, _len) > 1
                   && rename(new_path, aside) == 0))
+#endif
       {
          if (rename(old_path, new_path) == 0)
          {
@@ -2749,6 +2929,17 @@ int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
       return -1;
    return rename(old_path, new_path) == 0 ? 0 : -1;
 #endif
+}
+
+int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
+{
+   return retro_vfs_file_rename_flags(old_path, new_path, false);
+}
+
+int retro_vfs_file_rename_synced_impl(const char *old_path,
+      const char *new_path)
+{
+   return retro_vfs_file_rename_flags(old_path, new_path, true);
 }
 
 const char *retro_vfs_file_get_path_impl(
@@ -3168,9 +3359,7 @@ static int vfs_stat_win32_wide(const char *path,
 
 /* One platform ladder serves stat, stat_64, get_mtime and the POSIX
  * fallback of dirent_stat.  @mtime is filled (seconds since the Unix
- * epoch) where the platform reports one; the SMB and SAF backends do
- * not carry it through their stat helpers yet, so it is left untouched
- * there and callers treat -1 from get_mtime as "unavailable". */
+ * epoch) where the backend reports one, and left untouched otherwise. */
 static int retro_vfs_stat_full(const char *path, int64_t *size, int64_t *mtime)
 {
    int ret                   = RETRO_VFS_STAT_IS_VALID;
@@ -3180,11 +3369,11 @@ static int retro_vfs_stat_full(const char *path, int64_t *size, int64_t *mtime)
 
 #ifdef HAVE_SMBCLIENT
    if (path_is_smb(path))
-      return retro_vfs_stat_smb(path, size);
+      return retro_vfs_stat_smb(path, size, mtime);
 #endif
 #ifdef HAVE_NFSCLIENT
    if (path_is_nfs(path))
-      return retro_vfs_stat_nfs(path, size);
+      return retro_vfs_stat_nfs(path, size, mtime);
 #endif
 
 #if defined(ANDROID) && defined(HAVE_SAF)
@@ -3193,7 +3382,7 @@ static int retro_vfs_stat_full(const char *path, int64_t *size, int64_t *mtime)
       struct libretro_vfs_implementation_saf_path_split_result saf_split_result;
       if (!retro_vfs_path_split_saf(&saf_split_result, path))
          return 0;
-      ret = retro_vfs_stat_saf(saf_split_result.tree, saf_split_result.path, size);
+      ret = retro_vfs_stat_saf(saf_split_result.tree, saf_split_result.path, size, mtime);
       free(saf_split_result.path);
       free(saf_split_result.tree);
       return ret;
@@ -3371,9 +3560,8 @@ int retro_vfs_get_mtime_impl(const char *path, int64_t *mtime)
    if (!mtime)
       return -1;
 
-   /* The SMB/SAF stat helpers leave @mtime untouched; a sentinel that
-    * no real file system reports tells those cases apart from a genuine
-    * timestamp. */
+   /* A backend with no time for the file leaves @mtime untouched; a
+    * sentinel no real file system reports tells that apart. */
    t     = INT64_MIN;
    flags = retro_vfs_stat_full(path, NULL, &t);
    got_it = (flags != 0) && (t != INT64_MIN);
@@ -3582,6 +3770,7 @@ struct libretro_vfs_implementation_dir
 #endif
 {
    char* orig_path;
+   bool read_error;
 #if defined(_WIN32)
 #if defined(LEGACY_WIN32_RUNTIME)
    /* Unlike every other site, the difference here is a type, not a
@@ -4505,7 +4694,10 @@ bool retro_vfs_readdir_impl(libretro_vfs_implementation_dir *rdir)
    {
       struct smbc_dirent *de = retro_vfs_readdir_smb(rdir->smb_handle);
       if (!de)
+      {
+         rdir->read_error = rdir->smb_handle->error;
          return false;
+      }
       strlcpy(rdir->smb_path, de->name, sizeof(rdir->smb_path));
       rdir->smb_is_dir = (de->type == RETRO_SMB_DIRENT_DIR);
       return true;
@@ -4519,7 +4711,10 @@ bool retro_vfs_readdir_impl(libretro_vfs_implementation_dir *rdir)
    {
       struct nfs_dirent *de = retro_vfs_readdir_nfs(rdir->nfs_handle);
       if (!de)
+      {
+         rdir->read_error = rdir->nfs_handle->error;
          return false;
+      }
       rdir->nfs_name   = de->name;
       rdir->nfs_is_dir = (de->type == RETRO_NFS_DIRENT_DIR);
       return true;
@@ -4529,34 +4724,69 @@ bool retro_vfs_readdir_impl(libretro_vfs_implementation_dir *rdir)
 #endif
 #if defined(ANDROID) && defined(HAVE_SAF)
    if (rdir->saf_directory != NULL)
-      return retro_vfs_readdir_saf(rdir->saf_directory);
+   {
+      if (retro_vfs_readdir_saf(rdir->saf_directory))
+         return true;
+      rdir->read_error = rdir->saf_directory->error;
+      return false;
+   }
 #endif
 
 #if defined(_WIN32)
    if (rdir->next)
-#if defined(LEGACY_WIN32_RUNTIME)
    {
+      BOOL found;
+#if defined(LEGACY_WIN32_RUNTIME)
       if (win32_needs_local_encoding())
-         return (FindNextFileA(rdir->directory, &rdir->entry.a) != 0);
-      return (FindNextFileW(rdir->directory, &rdir->entry.w) != 0);
-   }
+         found = FindNextFileA(rdir->directory, &rdir->entry.a);
+      else
+         found = FindNextFileW(rdir->directory, &rdir->entry.w);
 #elif defined(LEGACY_WIN32)
-      return (FindNextFile(rdir->directory, &rdir->entry) != 0);
+      found = FindNextFile(rdir->directory, &rdir->entry);
 #else
-      return (FindNextFileW(rdir->directory, &rdir->entry) != 0);
+      found = FindNextFileW(rdir->directory, &rdir->entry);
 #endif
+      if (!found && GetLastError() != ERROR_NO_MORE_FILES)
+         rdir->read_error = true;
+      return (found != 0);
+   }
 
    rdir->next = true;
    return (rdir->directory != INVALID_HANDLE_VALUE);
 #elif defined(VITA)
-   return (sceIoDread(rdir->directory, &rdir->entry) > 0);
+   {
+      int ret = sceIoDread(rdir->directory, &rdir->entry);
+      if (ret < 0)
+         rdir->read_error = true;
+      return (ret > 0);
+   }
 #elif defined(__PSL1GHT__) || defined(__PS3__)
    uint64_t nread;
    rdir->error = sysFsReaddir(rdir->directory, &rdir->entry, &nread);
+   if (rdir->error)
+   {
+      rdir->read_error = true;
+      return false;
+   }
    return (nread != 0);
 #else
-   return ((rdir->entry = readdir(rdir->directory)) != NULL);
+   errno = 0;
+   if ((rdir->entry = readdir(rdir->directory)))
+      return true;
+#if defined(_3DS) || defined(SWITCH) || defined(GEKKO) || defined(WIIU)
+   /* some libsysbase builds leave dirnext's ENOENT at the end */
+   if (errno == ENOENT)
+      return false;
 #endif
+   if (errno)
+      rdir->read_error = true;
+   return false;
+#endif
+}
+
+bool retro_vfs_dirent_error_impl(libretro_vfs_implementation_dir *rdir)
+{
+   return rdir && rdir->read_error;
 }
 
 #if defined(_WIN32)

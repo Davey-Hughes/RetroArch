@@ -276,11 +276,15 @@ jobs:
           # delete kept the old file (renamed <name>-<time>) but an
           # upload replaced its content outright. An upload to an
           # existing file must now files.copy it to that name in the
-          # same folder before the PATCH. Covers the order and the copy
-          # request, a failed copy stopping the upload, a 401 on the
-          # copy and on the PATCH each refreshing the token once (the
-          # PATCH retry repeating only the PATCH, not the backup), and
-          # destructive sync, a new file and the manifest skipping it.
+          # oldest of its same-named folders before the PATCH. Covers
+          # the order and the copy request, a failed copy stopping the
+          # upload, a 401 on the copy and on the PATCH each refreshing
+          # the token once (the PATCH retry repeating only the PATCH,
+          # not the backup), and destructive sync, a new file and the
+          # manifest skipping it.
+          # With duplicate folders (#19244), lookups search every
+          # same-named folder (a name in several: the copy modified
+          # last) and new files go in the oldest.
           make clean SANITIZER=address,undefined && make -j$(nproc) all SANITIZER=address,undefined
           test -x gdrive_backup_test
           ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1 \

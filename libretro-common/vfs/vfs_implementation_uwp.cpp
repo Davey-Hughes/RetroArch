@@ -28,6 +28,7 @@
 #include <wrl/implements.h>
 #include <robuffer.h>
 #include <functional>
+#include <string>
 #include <fileapifromapp.h>
 #include <aclapi.h>
 #include <sddl.h>
@@ -297,6 +298,30 @@ int retro_vfs_file_flush_impl(libretro_vfs_implementation_file* stream)
     if (stream && fflush(stream->fp) == 0)
        return 0;
     return -1;
+}
+
+int retro_vfs_file_sync_impl(libretro_vfs_implementation_file* stream)
+{
+    if (!stream)
+        return -1;
+
+#ifdef HAVE_SMBCLIENT
+    if (stream->scheme == VFS_SCHEME_SMB)
+        return 0;
+#endif
+
+    if (stream->fp && fflush(stream->fp) != 0)
+        return -1;
+    if (!stream->fh || stream->fh == INVALID_HANDLE_VALUE
+          || !FlushFileBuffers(stream->fh))
+        return -1;
+    return 0;
+}
+
+int retro_vfs_dir_sync_impl(const char *dir)
+{
+    (void)dir;
+    return 0;
 }
 
 int retro_vfs_file_remove_impl(const char *path)
@@ -581,12 +606,14 @@ int retro_vfs_restrict_permissions_impl(const char* path)
 /* MoveFileFromAppW cannot replace an existing file, so a destination in
  * the way is moved aside, the source moved into place, and the moved-aside
  * copy deleted only then - or put back if the source could not be moved.
- * A leftover aside from an interrupted run is removed only when it is in
- * the way, and never if it is the source being restored. */
+ * The aside is "<new>.old".  A file already there may be the only copy
+ * left by an interrupted run, or the user's own, so it is never deleted:
+ * the first free of "<new>.old2" ... "<new>.old99" is taken instead. */
 static bool uwp_move_file_replacing(const std::wstring &old_path,
       const std::wstring &new_path)
 {
     WIN32_FILE_ATTRIBUTE_DATA target_info;
+    WIN32_FILE_ATTRIBUTE_DATA aside_info;
     std::wstring aside;
 
     /* Names differing only in case are one file here: moving it aside
@@ -599,13 +626,23 @@ static bool uwp_move_file_replacing(const std::wstring &old_path,
           && !(target_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
     {
         aside = new_path + L".old";
-        if (_wcsicmp(aside.c_str(), old_path.c_str()) == 0)
-            aside += L"2";
-        /* All three return nonzero on success. */
-        if (     !MoveFileFromAppW(new_path.c_str(), aside.c_str())
-              && (     !DeleteFileFromAppW(aside.c_str())
-                    || !MoveFileFromAppW(new_path.c_str(), aside.c_str())))
-            return false;
+        /* Both return nonzero on success. */
+        if (!MoveFileFromAppW(new_path.c_str(), aside.c_str()))
+        {
+            unsigned n = 1;
+
+            /* A free name is looked for only when "<new>.old" is taken */
+            while (GetFileAttributesExFromAppW(aside.c_str(),
+                     GetFileExInfoStandard, &aside_info))
+            {
+                if (++n > 99)
+                    return false;
+                aside = new_path + L".old" + std::to_wstring(n);
+            }
+            if (     n == 1
+                  || !MoveFileFromAppW(new_path.c_str(), aside.c_str()))
+                return false;
+        }
     }
 
     if (!MoveFileFromAppW(old_path.c_str(), new_path.c_str()))
@@ -747,6 +784,13 @@ int retro_vfs_file_rename_impl(const char* old_path, const char* new_path)
         return 0;
     return uwp_move_path(std::filesystem::path(old_path),
           std::filesystem::path(new_path), true);
+}
+
+/* MoveFileFromAppW takes no MOVEFILE_WRITE_THROUGH */
+int retro_vfs_file_rename_synced_impl(const char* old_path,
+      const char* new_path)
+{
+    return retro_vfs_file_rename_impl(old_path, new_path);
 }
 
 const char *retro_vfs_file_get_path_impl(libretro_vfs_implementation_file *stream)
@@ -1181,6 +1225,7 @@ struct libretro_vfs_implementation_dir
     WIN32_FIND_DATAW entry;
     HANDLE directory;
     bool next;
+    bool read_error;
     char path[PATH_MAX_LENGTH];
 #ifdef HAVE_SMBCLIENT
     smb_dir_handle* smb_handle;
@@ -1261,7 +1306,10 @@ bool retro_vfs_readdir_impl(libretro_vfs_implementation_dir* rdir)
     {
         struct smbc_dirent *de = retro_vfs_readdir_smb(rdir->smb_handle);
         if (!de)
+        {
+            rdir->read_error = rdir->smb_handle->error;
             return false;
+        }
 
         strlcpy(rdir->smb_path, de->name, sizeof(rdir->smb_path));
         rdir->smb_is_dir = (de->type == RETRO_SMB_DIRENT_DIR);
@@ -1275,10 +1323,20 @@ bool retro_vfs_readdir_impl(libretro_vfs_implementation_dir* rdir)
 #endif
 
     if (rdir->next)
-        return (FindNextFileW(rdir->directory, &rdir->entry) != 0);
+    {
+        BOOL found = FindNextFileW(rdir->directory, &rdir->entry);
+        if (!found && GetLastError() != ERROR_NO_MORE_FILES)
+            rdir->read_error = true;
+        return (found != 0);
+    }
 
     rdir->next = true;
     return (rdir->directory != INVALID_HANDLE_VALUE);
+}
+
+bool retro_vfs_dirent_error_impl(libretro_vfs_implementation_dir* rdir)
+{
+    return rdir && rdir->read_error;
 }
 
 const char* retro_vfs_dirent_get_name_impl(libretro_vfs_implementation_dir* rdir)
@@ -1320,8 +1378,7 @@ int retro_vfs_dirent_stat_impl(libretro_vfs_implementation_dir* rdir,
        if (!name)
           return 0;
        fill_pathname_join_special(full, rdir->orig_path, name, sizeof(full));
-       /* The SMB stat helper carries no mtime. */
-       return retro_vfs_stat_smb(full, size);
+       return retro_vfs_stat_smb(full, size, mtime);
     }
 #endif
     /* All of it is already in the find data: no I/O. */

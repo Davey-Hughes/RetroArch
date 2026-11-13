@@ -5,7 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <retro_timers.h>
+#include <time.h>
 #include <net/net_compat.h>
+#include <file/file_path.h>
+#include <streams/file_stream.h>
 #include <vfs/vfs.h>
 #include <vfs/vfs_implementation.h>
 #include "../../../libretro-common/vfs/vfs_implementation_smb.h"
@@ -31,7 +34,7 @@ static int expect_failure(struct smb_settings *cfg, const char *share,
    if (!smb_init_cfg(cfg))
       return 1;
    snprintf(url, sizeof(url), "smb://%s/%s", cfg->server_address, share);
-   if (retro_vfs_stat_smb(url, NULL) != 0)
+   if (retro_vfs_stat_smb(url, NULL, NULL) != 0)
    {
       fprintf(stderr, "FAIL: %s was reached\n", url);
       return 1;
@@ -48,13 +51,13 @@ static int expect_failure(struct smb_settings *cfg, const char *share,
       return 0;
    for (tries = atoi(getenv("SMB_WAIT_OK")) * 5; tries > 0; tries--)
    {
-      if (retro_vfs_stat_smb(url, NULL) != 0)
+      if (retro_vfs_stat_smb(url, NULL, NULL) != 0)
          break;
       retro_sleep(200);
    }
    snprintf(missing, sizeof(missing), "%s/rsmb_missing.bin", url);
    if (!tries || smb_url_failure(url) != SMB_FAILURE_CONNECTED
-         || retro_vfs_stat_smb(missing, NULL) != 0
+         || retro_vfs_stat_smb(missing, NULL, NULL) != 0
          || smb_url_failure(missing) != SMB_FAILURE_CONNECTED)
    {
       fprintf(stderr, "FAIL: %s: %s after the server came back, want connected\n",
@@ -172,8 +175,13 @@ int main(int argc, char **argv)
    libretro_vfs_implementation_dir *rdir;
    struct smbc_dirent *ent;
    char url[512];
+   char tmp[520];
    uint8_t buf[4096];
-   int64_t size = 0;
+   void *got      = NULL;
+   int64_t got_len = 0;
+   int64_t size  = 0;
+   int64_t mtime = 0;
+   time_t now;
    int found = 0;
    int i;
 
@@ -205,9 +213,24 @@ int main(int argc, char **argv)
       fprintf(stderr, "FAIL: a code before any connect\n");
       return 1;
    }
-   if (retro_vfs_stat_smb(url, &size) == 0 || size != 200000)
+   now = time(NULL);
+   if (retro_vfs_stat_smb(url, &size, &mtime) == 0 || size != 200000)
    {
       fprintf(stderr, "FAIL: stat (%lld)\n", (long long)size);
+      return 1;
+   }
+   if (mtime < (int64_t)now - 300 || mtime > (int64_t)now + 300)
+   {
+      fprintf(stderr, "FAIL: mtime %lld, now %lld\n",
+            (long long)mtime, (long long)now);
+      return 1;
+   }
+   mtime = 0;
+   if (     !path_get_mtime(url, &mtime)
+         || mtime < (int64_t)now - 300 || mtime > (int64_t)now + 300)
+   {
+      fprintf(stderr, "FAIL: path_get_mtime %lld, now %lld\n",
+            (long long)mtime, (long long)now);
       return 1;
    }
    if (smb_url_failure(url) != SMB_FAILURE_CONNECTED)
@@ -247,6 +270,29 @@ int main(int argc, char **argv)
       fprintf(stderr, "FAIL: readdir\n");
       return 1;
    }
+   /* smb:// has no rename: an atomic write goes in place, and a
+    * shorter one leaves no tail and no temporary */
+   snprintf(url, sizeof(url), "smb://%s/%s/rsmb_atomic.srm", argv[1], argv[2]);
+   snprintf(tmp, sizeof(tmp), "%s.tmp", url);
+   memset(buf, 0x11, 300);
+   if (!filestream_write_file_atomic(url, buf, 300))
+   {
+      fprintf(stderr, "FAIL: atomic write (temporary left: %d)\n",
+            path_is_valid(tmp));
+      return 1;
+   }
+   memset(buf, 0x22, 100);
+   if (     !filestream_write_file_atomic_synced(url, buf, 100)
+         || !filestream_read_file(url, &got, &got_len)
+         || got_len != 100 || memcmp(got, buf, 100)
+         || path_is_valid(tmp))
+   {
+      fprintf(stderr, "FAIL: synced atomic write (%lld bytes, "
+            "temporary left: %d)\n", (long long)got_len,
+            path_is_valid(tmp));
+      return 1;
+   }
+   free(got);
    /* both pool slots held by open files: a missing path's stat, open
     * and opendir each connect privately, and LSan sees any of those
     * connections a failure does not close */
@@ -260,7 +306,7 @@ int main(int argc, char **argv)
       }
    snprintf(url, sizeof(url), "smb://%s/%s/rsmb_missing.bin", argv[1], argv[2]);
    memset(&stream, 0, sizeof(stream));
-   if (     retro_vfs_stat_smb(url, NULL) != 0
+   if (     retro_vfs_stat_smb(url, NULL, NULL) != 0
          || retro_vfs_file_open_smb(&stream, url, RETRO_VFS_FILE_ACCESS_READ, 0)
          || retro_vfs_opendir_smb(url, false))
    {

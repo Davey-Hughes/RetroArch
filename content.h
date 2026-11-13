@@ -48,11 +48,12 @@ bool content_save_state_to_ram(void);
 
 /* Finishes a save written to filestream_atomic_temp_name(@path): moved
  * over @path if @ok, deleted otherwise. A temporary file that could not
- * be moved is kept only when it holds the one complete copy left. */
-bool content_finish_tmp(const char *path, bool ok);
+ * be moved is kept only when it holds the one complete copy left.
+ * @sync waits for the disk first (filestream_finish_atomic_synced). */
+bool content_finish_tmp(const char *path, bool ok, bool sync);
 
-/* Save a ram state from memory to disk. */
-bool content_ram_state_to_file(const char *path);
+/* Save a ram state from memory to disk; @sync, as at a close. */
+bool content_ram_state_to_file(const char *path, bool sync);
 
 /* Load a state from disk to memory. */
 bool content_load_state(const char* path, bool load_to_backup_buffer, bool autoload);
@@ -77,6 +78,14 @@ bool content_save_state_automatic(retro_time_t now_us);
 /* Save an automatic savestate to disk. */
 bool content_auto_save_state(const char *path);
 
+/* Copies the held names of the not-loaded @path (a ".state.auto") into
+ * its backups on a task, one path at a time. Main thread. */
+void content_auto_state_keep(const char *path);
+
+/* At a content load: held names of @path an earlier session left go to
+ * content_auto_state_keep(). Main thread. */
+void content_auto_state_sweep(const char *path);
+
 /* Check a ram state write to disk. */
 bool content_ram_state_pending(void);
 
@@ -95,6 +104,17 @@ bool content_deserialize_state(const void* serialized_data, size_t serialized_si
 /* True while a save state task is in progress, i.e. while
  * content_wait_for_save_state_task() would block. */
 bool content_save_state_in_progress(void* data);
+
+/* Changes as each save or state file the frontend writes lands, so a
+ * check made across a gap can tell one may have been written meanwhile.
+ * Main thread only. */
+unsigned content_save_writes(void);
+void content_save_written(void);
+
+/* Changes as each state file cloud sync downloads lands. Main thread
+ * only. */
+unsigned content_state_fetches(void);
+void content_state_fetched(void);
 
 /* Waits for any in-progress save state tasks to finish */
 void content_wait_for_save_state_task(void);
@@ -134,6 +154,10 @@ void content_reset_savestate_backups(void);
 bool content_undo_load_buf_is_empty(void);
 bool content_undo_save_buf_is_empty(void);
 bool content_undo_save_disabled(void);
+
+/* True while a backup read or an undo that frees or replaces the
+ * save undo buffer is pending: Undo Save is refused until it is through. */
+bool content_undo_save_buf_in_use(void);
 
 /* Clears the pending subsystem rom buffer */
 bool content_is_subsystem_pending_load(void);

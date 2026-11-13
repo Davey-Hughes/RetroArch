@@ -1198,8 +1198,16 @@ bool command_run(command_t *handle, const char *name, const char *arg)
 #endif
 #ifdef HAVE_BSV_MOVIE
          else if (map[i].id == RARCH_RECORD_REPLAY_KEY)
+         {
+            if (command_state_held())
+            {
+               command_reply_error(handle, map[i].str, "%s",
+                     msg_hash_to_str(MSG_CLOUD_SYNC_WAITING));
+               return false;
+            }
             return command_reply_event(handle,
                   CMD_EVENT_RECORD_REPLAY, map[i].str);
+         }
          else if (map[i].id == RARCH_SAVE_REPLAY_CHECKPOINT_KEY)
             return command_reply_event(handle,
                   CMD_EVENT_SAVE_REPLAY_CHECKPOINT, map[i].str);
@@ -2098,6 +2106,13 @@ static bool command_state_slot(command_t *cmd, const char *arg, bool load)
       return false;
    }
 
+   if (command_state_held())
+   {
+      command_reply_error(cmd, name, "%s",
+            msg_hash_to_str(MSG_CLOUD_SYNC_WAITING));
+      return false;
+   }
+
    if ((r = command_reply_new(name)))
    {
       runloop_get_savestate_path(r->path, sizeof(r->path), slot);
@@ -2304,6 +2319,12 @@ bool command_play_replay_slot(command_t *cmd, const char *arg)
             (arg && *arg) ? arg : "nothing");
       return false;
    }
+   if (command_state_held())
+   {
+      command_reply_error(cmd, "PLAY_REPLAY_SLOT", "%s",
+            msg_hash_to_str(MSG_CLOUD_SYNC_WAITING));
+      return false;
+   }
    if (     core_info_current_supports_savestate()
          && (r = command_reply_new("PLAY_REPLAY_SLOT")))
    {
@@ -2399,9 +2420,20 @@ bool command_save_savefiles(command_t *cmd, const char* arg)
       to the replier. */
    if (!command_event(CMD_EVENT_SAVE_FILES, NULL))
    {
-      command_reply_error(cmd, "SAVE_FILES",
-            "nothing to save: no content is loaded, or the core has no "
-            "save files");
+      if (command_state_held())
+         command_reply_error(cmd, "SAVE_FILES", "%s",
+               msg_hash_to_str(MSG_CLOUD_SYNC_WAITING));
+      else if (runloop_save_files_recovered())
+         command_reply_error(cmd, "SAVE_FILES",
+               "saving is off for this session; progress kept in a "
+               "recovery file");
+      else if (runloop_save_files_off())
+         command_reply_error(cmd, "SAVE_FILES",
+               "saving is off for this session");
+      else
+         command_reply_error(cmd, "SAVE_FILES",
+               "nothing to save: no content is loaded, or the core has no "
+               "save files");
       return false;
    }
    cmd->replier(cmd, "OK\n", 3);
@@ -2410,6 +2442,12 @@ bool command_save_savefiles(command_t *cmd, const char* arg)
 
 bool command_load_savefiles(command_t *cmd, const char* arg)
 {
+   if (command_state_held())
+   {
+      command_reply_error(cmd, "LOAD_FILES", "%s",
+            msg_hash_to_str(MSG_CLOUD_SYNC_WAITING));
+      return false;
+   }
    if (!command_event(CMD_EVENT_LOAD_FILES, NULL))
    {
       command_reply_error(cmd, "LOAD_FILES",
@@ -6230,6 +6268,20 @@ bool command_write_memory(command_t *cmd, const char *arg)
 }
 #endif
 
+/* Held (save_load_hold): a state or replay made now has none of the
+ * content's saves in it, one loaded now is loaded over when they load,
+ * and the netplay init that follows them ends a host started now. */
+bool command_state_held(void)
+{
+   const char *_msg;
+   if (!runloop_state_get_ptr()->save_load_hold)
+      return false;
+   _msg = msg_hash_to_str(MSG_CLOUD_SYNC_WAITING);
+   runloop_msg_queue_push(_msg, strlen(_msg), 1, 180, false, NULL,
+         MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+   return true;
+}
+
 void command_event_set_volume(
       settings_t *settings,
       float gain,
@@ -6395,6 +6447,9 @@ static size_t command_event_save_config(const char *config_path,
 
 static size_t command_event_undo_save_state(char *s, size_t len)
 {
+   if (content_undo_save_buf_in_use())
+      return strlcpy(s,
+         msg_hash_to_str(MSG_CANNOT_UNDO_SAVE_STATE_YET), len);
    if (content_undo_save_buf_is_empty())
    {
       enum msg_hash_enums msg = content_undo_save_disabled()
@@ -6465,7 +6520,15 @@ size_t command_event_save_auto_state(void)
    char savestate_name_auto[PATH_MAX_LENGTH];
    const char *a = NULL;
 
-   if (!core_info_current_supports_savestate())
+   /* Held, or the auto-load still to come: the session loaded no
+    * state to save over */
+   if (     runloop_st->save_load_hold
+         || !runloop_st->auto_state_save_ready
+         || (  !runloop_st->auto_state_bypass
+            && !core_info_current_supports_savestate()))
+      return 0;
+   /* The auto-load skipped by policy: the .auto stays as it is */
+   if (runloop_st->auto_state_refused && !runloop_st->auto_state_owned)
       return 0;
    a = path_basename(path_get(RARCH_PATH_BASENAME));
    if (!a || !*a)
@@ -6560,6 +6623,17 @@ bool command_event_load_entry_state(settings_t *settings)
    return ret;
 }
 
+/* The auto-load is through: automatic state saves may write, and
+ * over the .auto as it is only when it was loaded. */
+static void command_event_auto_state_loaded(retro_task_t *task,
+      void *task_data, void *user_data, const char *error)
+{
+   runloop_state_t *runloop_st       = runloop_state_get_ptr();
+   runloop_st->auto_state_save_ready = true;
+   if (!error)
+      runloop_st->auto_state_owned   = true;
+}
+
 bool command_event_load_auto_state(void)
 {
    size_t _len;
@@ -6575,11 +6649,17 @@ bool command_event_load_auto_state(void)
 
 #ifdef HAVE_CHEEVOS
    if (rcheevos_hardcore_active())
+   {
+      runloop_st->auto_state_refused = true;
       return false;
+   }
 #endif
 #ifdef HAVE_NETWORKING
    if (netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_ENABLED, NULL))
+   {
+      runloop_st->auto_state_refused = true;
       return false;
+   }
 #endif
 
    if (must_initialize
@@ -6612,7 +6692,8 @@ bool command_event_load_auto_state(void)
       runloop_st->auto_state_load_attempted = true;
    }
 
-   ret = content_load_state(savestate_name_auto, false, true);
+   ret = content_load_state_notify(savestate_name_auto, false, true,
+         command_event_auto_state_loaded, NULL);
 
    RARCH_LOG("[State] %s \"%s\".\n",
          msg_hash_to_str(MSG_FOUND_AUTO_SAVESTATE_IN),
@@ -6631,22 +6712,25 @@ bool command_event_load_auto_state(void)
  * enabled.
  *
  * @param settings The usual RetroArch settings ptr.
+ * @param written State being written, never the one to remove, or NULL.
  * @param last_index Return value for load slot.
  * @param @s Return value for file name that should be removed.
+ * @param len Size of @s.
+ * @return false when the folder could not be listed.
  */
-static void command_scan_states(
+static bool command_scan_states(
       bool show_hidden_files,
       unsigned savestate_max_keep,
       int curr_state_slot,
-      unsigned *last_index, char *s)
+      const char *written,
+      unsigned *last_index, char *s, size_t len)
 {
-   /* Base name of 128 may be too short for some (<<1%) of the
-      tosec-based file names, but in practice truncating will not
-      lead to mismatch */
-   char state_base[128];
    char state_dir[DIR_MAX_LENGTH];
    runloop_state_t *runloop_st        = runloop_state_get_ptr();
    const char *name_savestate         = runloop_st->name.savestate;
+   const char *state_base             = NULL;
+   size_t state_base_len              = 0;
+   int written_idx                    = -1;
 
    unsigned max_idx                   = 0;
    unsigned loa_idx                   = 0;
@@ -6656,8 +6740,6 @@ static void command_scan_states(
    retro_bits_512_t slot_mapping_high = {{0}};
 
    struct string_list *dir_list       = NULL;
-   const char *savefile_root          = NULL;
-   size_t savefile_root_length        = 0;
 
    size_t i, cnt                      = 0;
    size_t cnt_in_range                = 0;
@@ -6667,54 +6749,41 @@ static void command_scan_states(
 
    if (!(dir_list = dir_list_new_special(state_dir,
                DIR_LIST_PLAIN, NULL, show_hidden_files)))
-      return;
+      return false;
 
-   fill_pathname_base(state_base, name_savestate, sizeof(state_base));
+   state_base     = path_basename(name_savestate);
+   state_base_len = strlen(state_base);
+   if (written)
+      written     = path_basename(written);
 
    for (i = 0; i < dir_list->size; i++)
    {
       unsigned idx;
-      size_t _len;
-      char elem_base[128];
-      const char *ext      = NULL;
       const char *end      = NULL;
       const char *dir_elem = dir_list->elems[i].data;
+      const char *base     = NULL;
 
       if (!dir_elem || !*dir_elem)
          continue;
 
-      _len = strlen(dir_elem);
-      fill_pathname_base(elem_base, dir_elem, sizeof(elem_base));
-
-      /* Only consider files with a '.state' extension
-       * > i.e. Ignore '.state.auto', '.state.bak', etc. */
-      ext = path_get_extension(elem_base);
-      if (    (!ext || !*ext)
-          || !string_starts_with_size(ext, "state", STRLEN_CONST("state")))
+      /* Only this content's slots: its exact state name and a number
+       * > i.e. Ignore '.state.auto', '.png', another game's states */
+      base = path_basename(dir_elem);
+      if (!string_starts_with_size(base, state_base, state_base_len))
+         continue;
+      end  = base + state_base_len;
+      while (ISDIGIT((int)*end))
+         end++;
+      if (*end)
          continue;
 
-      /* Check whether this file is associated with
-       * the current content */
-      if (!string_starts_with(elem_base, state_base))
+      idx = string_to_unsigned(base + state_base_len);
+
+      if (written && string_is_equal(base, written))
+      {
+         written_idx = (int)idx;
          continue;
-
-      /* This looks like a valid savestate */
-      /* Save filename root and length (once) */
-      if (savefile_root_length == 0)
-      {
-         savefile_root        = dir_elem;
-         savefile_root_length = _len;
       }
-
-      /* Decode the savestate index */
-      end = dir_elem + _len;
-      while ((end > dir_elem) && ISDIGIT((int)end[-1]))
-      {
-         end--;
-         if (savefile_root == dir_elem)
-            savefile_root_length--;
-      }
-      idx = string_to_unsigned(end);
 
       /* Simple administration: max, total. */
       if (idx > max_idx)
@@ -6813,15 +6882,12 @@ static void command_scan_states(
          *last_index = loa_idx;
 
    if (     s
-         && cnt_in_range >= savestate_max_keep)
-   {
-      strlcpy(s, savefile_root, savefile_root_length + 1);
-      /* ".state0" is just ".state" instead, so don't print that. */
-      if (del_idx > 0)
-         snprintf(s + savefile_root_length, 5, "%d", del_idx);
-   }
+         && cnt_in_range >= savestate_max_keep
+         && (int)del_idx != written_idx)
+      runloop_get_savestate_path(s, len, (int)del_idx);
 
    dir_list_free(dir_list);
+   return true;
 }
 
 /**
@@ -6858,10 +6924,16 @@ void command_event_set_savestate_auto_index(settings_t *settings)
    if (savestate_auto_index)
    {
       int prev_slot          = settings->ints.state_slot;
-      command_scan_states(
+      /* Unlisted: from slot 0, the next save may overwrite a missed state */
+      if (!command_scan_states(
             settings->bools.show_hidden_files,
             settings->uints.savestate_max_keep,
-            settings->ints.state_slot, &max_idx, NULL);
+            settings->ints.state_slot, NULL, &max_idx, NULL, 0))
+      {
+         RARCH_WARN("[State] Could not list the state folder: "
+               "slot #%d kept.\n", prev_slot);
+         return;
+      }
       configuration_set_int(settings, settings->ints.state_slot, max_idx);
       RARCH_LOG("[State] %s: #%d (slot reset %d -> %u from on-disk scan, "
             "max_keep %u). If the previous slot was higher, earlier saves "
@@ -6875,34 +6947,128 @@ void command_event_set_savestate_auto_index(settings_t *settings)
       configuration_set_int(settings, settings->ints.state_slot, 0);
 }
 
+/* The state to delete once a save is written, as it was when picked */
+struct savestate_victim
+{
+   int64_t size;
+   int64_t mtime;
+   unsigned writes;
+   unsigned fetches;
+   unsigned max_keep;
+   char path[PATH_MAX_LENGTH];
+};
+
 /**
- * Deletes the oldest save state and its thumbnail, if needed.
+ * Picks the oldest save state to delete once @written is saved, if
+ * the limit needs one.
  *
  * @param settings The usual RetroArch settings ptr.
+ * @param written The state about to be written, never the one picked.
+ * @return The pick for command_event_set_savestate_garbage_collect(),
+ * to free, or NULL.
  */
-static void command_event_set_savestate_garbage_collect(settings_t *settings)
+static struct savestate_victim *command_event_savestate_victim(
+      settings_t *settings, const char *written)
 {
-   size_t i;
-   char state_to_delete[PATH_MAX_LENGTH] = {0};
+   struct savestate_victim *victim = NULL;
+   if (     !settings->bools.savestate_auto_index
+         || !settings->uints.savestate_max_keep
+         || !(victim = (struct savestate_victim*)
+            calloc(1, sizeof(*victim))))
+      return NULL;
    command_scan_states(
          settings->bools.show_hidden_files,
          settings->uints.savestate_max_keep,
-         settings->ints.state_slot, NULL, state_to_delete);
+         settings->ints.state_slot, written,
+         NULL, victim->path, sizeof(victim->path));
+   if (     !*victim->path
+         || (victim->size = path_get_size(victim->path)) < 0)
+   {
+      free(victim);
+      return NULL;
+   }
+   if (!path_get_mtime(victim->path, &victim->mtime))
+      victim->mtime = 0;
+   victim->writes   = content_save_writes();
+   victim->fetches  = content_state_fetches();
+   victim->max_keep = settings->uints.savestate_max_keep;
+   return victim;
+}
+
+/**
+ * Deletes the save state picked for a save and its thumbnail.
+ *
+ * @param settings The usual RetroArch settings ptr.
+ * @param victim The pick, or NULL.
+ */
+static void command_event_set_savestate_garbage_collect(settings_t *settings,
+      struct savestate_victim *victim)
+{
+   size_t i;
+   int64_t mtime = 0;
+   if (     !victim
+         || !settings->bools.savestate_auto_index
+         || settings->uints.savestate_max_keep != victim->max_keep
+         || path_get_size(victim->path) != victim->size)
+      return;
+   if (!path_get_mtime(victim->path, &mtime))
+      mtime = 0;
+   /* Another writer put a state there since: kept, one over the limit
+    * until the next save */
+   if (mtime > 0 && victim->mtime > 0)
+   {
+      if (mtime != victim->mtime)
+         return;
+   }
+   /* No mtime: only this save's own write since, no state download,
+    * and none in flight */
+   else if (   content_save_writes()   != victim->writes + 1
+            || content_state_fetches() != victim->fetches
+            || content_save_state_in_progress(NULL))
+      return;
    /* Only delete one save state per save action
     * > Conservative behaviour, designed to minimise
     *   the risk of deleting multiple incorrect files
     *   in case of accident */
-   if (*state_to_delete)
-   {
-      filestream_delete(state_to_delete);
-      RARCH_DBG("[State] Garbage collect, deleting \"%s\".\n",state_to_delete);
-      /* Construct the save state thumbnail name
-       * and delete that one as well. */
-      i = strlen(state_to_delete);
-      strlcpy_lit(state_to_delete + i,".png",STRLEN_CONST(".png")+1);
-      filestream_delete(state_to_delete);
-      RARCH_DBG("[State] Garbage collect, deleting \"%s\".\n",state_to_delete);
-   }
+   filestream_delete(victim->path);
+   RARCH_DBG("[State] Garbage collect, deleting \"%s\".\n",victim->path);
+   /* Construct the save state thumbnail name
+    * and delete that one as well. */
+   i = strlen(victim->path);
+   strlcpy_lit(victim->path + i,".png",STRLEN_CONST(".png")+1);
+   filestream_delete(victim->path);
+   RARCH_DBG("[State] Garbage collect, deleting \"%s\".\n",victim->path);
+}
+
+/* After a slot save: only a save that was written makes room. */
+static void command_event_save_state_done(retro_task_t *task,
+      void *task_data, void *user_data, const char *error)
+{
+   struct savestate_victim *victim = (struct savestate_victim*)user_data;
+   if (!error)
+      command_event_set_savestate_garbage_collect(config_get_ptr(), victim);
+   free(victim);
+}
+
+/* The Auto slot saved or loaded by hand: the .auto is this session's */
+static void command_event_auto_slot_done(retro_task_t *task,
+      void *task_data, void *user_data, const char *error)
+{
+   if (!error)
+      runloop_state_get_ptr()->auto_state_owned = true;
+   command_event_save_state_done(task, task_data, user_data, error);
+}
+
+bool command_event_ram_state_to_file(const char *path, bool sync)
+{
+   settings_t *settings            = config_get_ptr();
+   struct savestate_victim *victim = command_event_savestate_victim(
+         settings, path);
+   bool ret                        = content_ram_state_to_file(path, sync);
+   if (ret)
+      command_event_set_savestate_garbage_collect(settings, victim);
+   free(victim);
+   return ret;
 }
 
 void command_event_set_replay_auto_index(settings_t *settings)
@@ -6941,12 +7107,12 @@ void command_event_set_replay_auto_index(settings_t *settings)
       unsigned idx;
       const char *end                 = NULL;
       const char *dir_elem            = dir_list->elems[i].data;
-      size_t _len = fill_pathname_base(elem_base, dir_elem, sizeof(elem_base));
+      fill_pathname_base(elem_base, dir_elem, sizeof(elem_base));
 
       if (strstr(elem_base, state_base) != elem_base)
          continue;
 
-      end = dir_elem + _len;
+      end = dir_elem + strlen(dir_elem);
 
       while ((end > dir_elem) && ISDIGIT((int)end[-1]))
          end--;
@@ -6964,6 +7130,42 @@ void command_event_set_replay_auto_index(settings_t *settings)
       RARCH_LOG("[Replay] %s: #%d\n",
             msg_hash_to_str(MSG_FOUND_LAST_REPLAY_SLOT),
             max_idx);
+}
+
+bool command_event_free_replay_slot(int *slot)
+{
+   int i;
+   char path[PATH_MAX_LENGTH];
+   for (i = *slot; i <= 999; i++)
+   {
+      if (!runloop_get_replay_path(path, sizeof(path), i))
+         return false;
+      if (!path_is_valid(path))
+      {
+         *slot = i;
+         return true;
+      }
+   }
+   return false;
+}
+
+void command_event_set_replay_record_slot(settings_t *settings,
+      int asked, int slot)
+{
+   if (slot != asked && !settings->bools.replay_auto_index)
+   {
+      char msg[128];
+      if (asked < 0)
+         snprintf(msg, sizeof(msg),
+               msg_hash_to_str(MSG_REPLAY_SLOT_TAKEN_AUTO), slot);
+      else
+         snprintf(msg, sizeof(msg), msg_hash_to_str(MSG_REPLAY_SLOT_TAKEN),
+               slot, asked);
+      runloop_msg_queue_push(msg, strlen(msg), 1, 180, true, NULL,
+            MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+   }
+   if (slot != settings->ints.replay_slot)
+      configuration_set_int(settings, settings->ints.replay_slot, slot);
 }
 
 void command_event_set_replay_garbage_collect(
@@ -7369,7 +7571,11 @@ bool command_event_main_state(unsigned cmd)
    size_t _len                 = 0;
    settings_t *settings        = config_get_ptr();
    bool savestates_enabled     = core_info_current_supports_savestate();
+   bool auto_slot              = settings->ints.state_slot < 0;
    bool ret                    = false;
+
+   if (command_state_held())
+      return false;
 
    if (savestates_enabled)
    {
@@ -7412,7 +7618,14 @@ bool command_event_main_state(unsigned cmd)
 
                if (cmd == CMD_EVENT_SAVE_STATE)
                {
-                  queued = content_save_state(state_path, true);
+                  struct savestate_victim *victim =
+                     command_event_savestate_victim(settings, state_path);
+                  queued = content_save_state_notify(state_path, true,
+                        auto_slot ? command_event_auto_slot_done
+                        : victim ? command_event_save_state_done : NULL,
+                        victim);
+                  if (!queued)
+                     free(victim);
                   RARCH_LOG("[State] Save dispatch for slot %d, path "
                         "\"%s\": content_save_state queued=%s "
                         "(auto_index=%s, max_keep=%u). NOTE: actual disk "
@@ -7433,12 +7646,6 @@ bool command_event_main_state(unsigned cmd)
                else
                   content_save_state_to_ram();
 
-               /* Clean up excess savestates if necessary: not for a
-                * save that was turned away, which wrote nothing */
-               if (     queued
-                     && savestate_auto_index && (savestate_max_keep > 0))
-                  command_event_set_savestate_garbage_collect(settings);
-
                if (frame_time_counter_auto_reset)
                   video_st->frame_time_count = 0;
 
@@ -7452,7 +7659,9 @@ bool command_event_main_state(unsigned cmd)
             {
                bool res = false;
                if (cmd == CMD_EVENT_LOAD_STATE)
-                  res = content_load_state(state_path, false, false);
+                  res = content_load_state_notify(state_path, false, false,
+                        auto_slot ? command_event_auto_slot_done : NULL,
+                        NULL);
                else
                   res = content_load_state_from_ram();
 

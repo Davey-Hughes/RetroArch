@@ -120,7 +120,8 @@ static NSString *icloud_ck_backup_path(const char *path)
 
    localtime_r(&now, &tm_);
    strftime(ts, sizeof(ts), "-%y%m%d-%H%M%S", &tm_);
-   return [NSString stringWithFormat:@"%s%s", path, ts];
+   return [NSString stringWithFormat:@"%@%s",
+         [NSString stringWithUTF8String:path], ts];
 }
 
 static bool icloud_read(const char *p, const char *f, cloud_sync_complete_handler_t cb, void *user_data)

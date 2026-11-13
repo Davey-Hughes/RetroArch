@@ -93,6 +93,9 @@
 #include <retro_assert.h>
 #include <queues/message_queue.h>
 #include <lists/dir_list.h>
+#ifdef HAVE_COMPRESSION
+#include <file/archive_file.h>
+#endif
 #ifdef __MACH__
 #include <TargetConditionals.h>
 #endif
@@ -215,6 +218,7 @@ bool android_get_vfs_authorized_locations(
 #include "msg_hash.h"
 #include "paths.h"
 #include "file_path_special.h"
+#include "save_backups.h"
 #include "ui/ui_companion_driver.h"
 #include "verbosity.h"
 
@@ -432,6 +436,27 @@ static void runloop_game_ai_think_cb(void *userdata,
 #endif
 
 static runloop_state_t runloop_state;
+#ifdef HAVE_NETWORKING
+/* RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED is set for this content by the
+ * netplay block of runloop_path_set_redirect(), not by --sram-mode. */
+static bool runloop_netplay_saves_off = false;
+#endif
+/* How this content's save and state roots were found
+ * (runloop_path_set_redirect), and whether that turned saves off. */
+static enum runloop_save_root runloop_save_roots[2];
+static bool runloop_save_folder_off = false;
+/* Seed the recovery CRC at the next frame */
+static bool runloop_save_folder_seed = false;
+/* The main config file's folder, as last loaded */
+static char runloop_save_config_dir[PATH_MAX_LENGTH];
+/* The content's folders inside its archive ("" if none), which its
+ * kept name and the old-folder lookup use. */
+static char runloop_archive_dir[DIR_MAX_LENGTH];
+/* Kept in its name instead: its saves would be another game's
+ * without them */
+static bool runloop_archive_kept = false;
+/* Whether they would was not known: a listing failed */
+static bool runloop_archive_unlisted = false;
 
 /* Defined here, before its first user: the SET_MESSAGE_EXT STATUS
  * path in the environment callback defers through this machinery,
@@ -5565,6 +5590,12 @@ static void runloop_reset_auto_state_load(runloop_state_t *runloop_st)
    runloop_st->auto_state_load_ready     = false;
    runloop_st->auto_state_load_core_ran  = false;
    runloop_st->auto_state_load_asked     = false;
+   runloop_st->auto_state_save_ready     = false;
+   runloop_st->auto_state_owned          = false;
+   runloop_st->auto_state_wanted         = false;
+   runloop_st->auto_state_bypass         = false;
+   runloop_st->auto_state_refused        = false;
+   runloop_st->auto_state_interval_started = false;
 }
 
 static void runloop_apply_fastmotion_override(runloop_state_t *runloop_st,
@@ -5854,6 +5885,7 @@ void runloop_event_deinit_core(void)
 #ifdef HAVE_NETWORKING
    netplay_driver_ctl(RARCH_NETPLAY_CTL_SET_CORE_PACKET_INTERFACE, NULL);
 #endif
+   runloop_st->save_load_hold = 0;
 }
 
 static bool runloop_path_init_subsystem(runloop_state_t *runloop_st)
@@ -5950,11 +5982,94 @@ static void runloop_path_init_savefile_internal(runloop_state_t *runloop_st)
       path_init_savefile_rtc(runloop_st->name.savefile);
 }
 
+#ifdef HAVE_CLOUDSYNC
+/* A main config folder was the one not found: cloud sync waits for it.
+ * @s is room for a folder. */
+static bool runloop_save_base_replaced(char *s, size_t len)
+{
+   size_t i;
+   for (i = 0; i < 2; i++)
+   {
+      const char *configured = dir_get_ptr(i
+            ? RARCH_DIR_SAVESTATE_CONFIGURED : RARCH_DIR_SAVEFILE_CONFIGURED);
+      if (runloop_save_roots[i] == RUNLOOP_SAVE_ROOT_CONFIGURED)
+         continue;
+      strlcpy(s, *configured ? configured : g_defaults.dirs[i
+            ? DEFAULT_DIR_SAVESTATE : DEFAULT_DIR_SRAM], len);
+      if (*configured)
+         runloop_save_root_resolve(s, len);
+      if (string_is_equal(dir_get_ptr(i
+            ? RARCH_DIR_SAVESTATE_BASE : RARCH_DIR_SAVEFILE_BASE), s))
+         return true;
+   }
+   return false;
+}
+#endif
+
+/* Once per content load, for the first root not found. */
+static void runloop_save_folder_notice(void)
+{
+   char msg[DIR_MAX_LENGTH * 2 + 128];
+   char dir[DIR_MAX_LENGTH];
+   size_t i;
+   for (i = 0; i < 2; i++)
+   {
+      const char *configured = dir_get_ptr(i
+            ? RARCH_DIR_SAVESTATE_CONFIGURED : RARCH_DIR_SAVEFILE_CONFIGURED);
+      if (runloop_save_roots[i] == RUNLOOP_SAVE_ROOT_CONFIGURED)
+         continue;
+      strlcpy(dir, configured, sizeof(dir));
+      runloop_save_root_resolve(dir, sizeof(dir));
+      if (runloop_save_roots[i] == RUNLOOP_SAVE_ROOT_FALLBACK)
+         snprintf(msg, sizeof(msg),
+               msg_hash_to_str(i
+                  ? MSG_STATE_FOLDER_FALLBACK : MSG_SAVE_FOLDER_FALLBACK),
+               dir,
+               dir_get_ptr(i ? RARCH_DIR_SAVESTATE : RARCH_DIR_SAVEFILE));
+      else
+         snprintf(msg, sizeof(msg),
+               msg_hash_to_str(i
+                  ? MSG_STATE_FOLDER_MISSING : MSG_SAVE_FOLDER_MISSING),
+               *dir ? dir : dir_get_ptr(i
+                  ? RARCH_DIR_SAVESTATE : RARCH_DIR_SAVEFILE));
+      if (string_is_equal(dir, configured))
+         RARCH_WARN("[SRAM] %s\n", msg);
+      else
+         RARCH_WARN("[SRAM] %s (\"%s\" -> \"%s\")\n", msg, configured, dir);
+      runloop_msg_queue_push(msg, strlen(msg), 1, 180, true, NULL,
+            MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+#ifdef HAVE_CLOUDSYNC
+      if (     config_get_ptr()->bools.cloud_sync_enable
+            && runloop_save_base_replaced(dir, sizeof(dir)))
+      {
+         const char *_msg = msg_hash_to_str(MSG_CLOUD_SYNC_PAUSED_FALLBACK);
+         runloop_msg_queue_push(_msg, strlen(_msg), 1, 180, false, NULL,
+               MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+      }
+#endif
+      break;
+   }
+}
+
 static void runloop_path_init_savefile(runloop_state_t *runloop_st)
 {
    bool    should_sram_be_used =
           (runloop_st->flags & RUNLOOP_FLAG_USE_SRAM)
       && !(runloop_st->flags & RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED);
+
+   runloop_save_folder_notice();
+
+#ifdef HAVE_NETWORKING
+   /* With no save root, the folder's notice said so */
+   if (     runloop_netplay_saves_off
+         && runloop_save_roots[0] != RUNLOOP_SAVE_ROOT_NONE)
+   {
+      const char *_msg = msg_hash_to_str(MSG_NETPLAY_SAVES_OFF);
+      RARCH_WARN("[SRAM] %s\n", _msg);
+      runloop_msg_queue_push(_msg, strlen(_msg), 1, 180, true, NULL,
+            MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+   }
+#endif
 
    if (should_sram_be_used)
       runloop_st->flags |=  RUNLOOP_FLAG_USE_SRAM;
@@ -5962,13 +6077,150 @@ static void runloop_path_init_savefile(runloop_state_t *runloop_st)
       runloop_st->flags &= ~RUNLOOP_FLAG_USE_SRAM;
 
    if (!(runloop_st->flags & RUNLOOP_FLAG_USE_SRAM))
-   {
       RARCH_LOG("[SRAM] %s\n",
             msg_hash_to_str(MSG_SRAM_WILL_NOT_BE_SAVED));
-      return;
+}
+
+/* Where this content's safety copies and recovery files go. Set
+ * before the save load, while no autosave worker runs. */
+static void runloop_set_save_backup_roots(runloop_state_t *runloop_st,
+      settings_t *settings)
+{
+   char *content_dir = (char*)malloc(DIR_MAX_LENGTH);
+   char *config_dir  = (char*)malloc(DIR_MAX_LENGTH);
+   char *app_data    = (char*)malloc(DIR_MAX_LENGTH);
+   if (content_dir && config_dir && app_data)
+   {
+      const char *content = path_get(RARCH_PATH_CONTENT);
+      content_dir[0]      = '\0';
+      config_dir[0]       = '\0';
+      if (!string_is_empty(content))
+         fill_pathname_basedir(content_dir, content, DIR_MAX_LENGTH);
+      fill_pathname_application_special(config_dir, DIR_MAX_LENGTH,
+            APPLICATION_SPECIAL_DIRECTORY_CONFIG);
+      if (!fill_pathname_application_data(app_data, DIR_MAX_LENGTH))
+         app_data[0]      = '\0';
+      save_backups_set_roots(dir_get_ptr(RARCH_DIR_SAVEFILE),
+            dir_get_ptr(RARCH_DIR_SAVESTATE), content_dir,
+            settings->paths.directory_system, config_dir, app_data,
+            runloop_st->system.info.library_name);
+   }
+   free(content_dir);
+   free(config_dir);
+   free(app_data);
+}
+
+/* The rest of a content load, once nothing holds its saves
+ * (save_load_hold): from the frame loop when they were held. */
+static void runloop_content_saves_ready(runloop_state_t *runloop_st)
+{
+   settings_t *settings                         = config_get_ptr();
+#ifdef HAVE_BSV_MOVIE
+   input_driver_state_t *input_st               = input_state_get_ptr();
+#endif
+#ifdef HAVE_CHEEVOS
+   bool cheevos_enable                          =
+      settings->bools.cheevos_enable;
+   bool cheevos_hardcore_mode_enable            =
+      settings->bools.cheevos_hardcore_mode_enable;
+#endif
+   bool entry_state_load                        = runloop_st->entry_state_slot > -1;
+   bool auto_state_wait                         = false;
+
+   runloop_st->save_load_hold                   = 0;
+
+   if (!event_load_save_files(runloop_st->flags & RUNLOOP_FLAG_IS_SRAM_LOAD_DISABLED))
+      RARCH_LOG("[SRAM] %s\n", msg_hash_to_str(MSG_SKIPPING_SRAM_LOAD));
+
+   /* After the load, so the workers start from the loaded image and
+    * an unchanged save is not written back. */
+   if (runloop_st->flags & RUNLOOP_FLAG_USE_SRAM)
+      command_event(CMD_EVENT_AUTOSAVE_INIT, NULL);
+
+   runloop_st->auto_state_wanted =  settings->bools.savestate_auto_load
+                                 || runloop_st->auto_state_load_asked;
+   runloop_st->auto_state_bypass =  settings->bools.core_info_savestate_bypass;
+   /* Until the auto-load below is tried */
+   runloop_st->auto_state_refused = runloop_st->auto_state_wanted;
+
+   /*
+    * Since the operations are asynchronous we can't
+    * guarantee users will not use auto_load_state to cheat on
+    * achievements so we forbid auto_load_state from happening
+    * if cheevos_enable and cheevos_hardcode_mode_enable
+    * are true.
+    */
+#ifdef HAVE_CHEEVOS
+   if (     !cheevos_enable
+         || !cheevos_hardcore_mode_enable)
+#endif
+   {
+#ifdef HAVE_BSV_MOVIE
+      /* Ignore entry state if we're doing bsv playback (we do want it
+         for bsv recording though) */
+      if (!(input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_START_PLAYBACK))
+#endif
+      {
+         if (     entry_state_load
+               && !command_event_load_entry_state(settings))
+         {
+            /* Loading the state failed, reset entry slot */
+            runloop_st->entry_state_slot = -1;
+         }
+      }
+
+#ifdef HAVE_BSV_MOVIE
+      /* Ignore autoload state if we're doing bsv playback or recording */
+      if (!(input_st->bsv_movie_state.flags & (BSV_FLAG_MOVIE_START_RECORDING | BSV_FLAG_MOVIE_START_PLAYBACK)))
+#endif
+      {
+         if (     runloop_st->entry_state_slot < 0
+               && (     settings->bools.savestate_auto_load
+                     || runloop_st->auto_state_load_asked))
+         {
+            runloop_st->auto_state_refused = false;
+            auto_state_wait = command_event_load_auto_state();
+         }
+      }
    }
 
-   command_event(CMD_EVENT_AUTOSAVE_INIT, NULL);
+   /* Automatic state saves wait for the auto-load */
+   if (!auto_state_wait)
+      runloop_st->auto_state_save_ready = true;
+
+#ifdef HAVE_BSV_MOVIE
+   movie_stop(input_st);
+   if (input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_START_RECORDING)
+   {
+      configuration_set_uint(settings, settings->uints.rewind_granularity, 1);
+      /* The record task defers itself until any state load has been
+       * applied (task_moviectl_record_handler).  That guard must not
+       * ask a queue finder: the unthreaded gather lifts every
+       * running task off the queue before invoking any handler, so a
+       * sibling load task is invisible to a finder and recording
+       * starts first.  The
+       * guard now reads a main-thread flag instead, so no
+       * whole-queue wait is needed here to force the ordering. */
+      movie_start_record(input_st, input_st->bsv_movie_state.movie_start_path);
+   }
+   else if (input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_START_PLAYBACK)
+   {
+      configuration_set_uint(settings, settings->uints.rewind_granularity, 1);
+      movie_start_playback(input_st, input_st->bsv_movie_state.movie_start_path);
+   }
+#endif
+
+   command_event(CMD_EVENT_NETPLAY_INIT, NULL);
+}
+
+void runloop_save_load_hold(uint8_t bit)
+{
+   runloop_state.save_load_hold |= bit | SAVE_LOAD_HOLD_PENDING;
+}
+
+void runloop_save_load_release(uint8_t bit)
+{
+   runloop_state.save_load_hold &= (uint8_t)~bit;
 }
 
 static bool event_init_content(
@@ -5976,17 +6228,11 @@ static bool event_init_content(
       settings_t *settings,
       input_driver_state_t *input_st)
 {
-#ifdef HAVE_CHEEVOS
-   bool cheevos_enable                          =
-      settings->bools.cheevos_enable;
-   bool cheevos_hardcore_mode_enable            =
-      settings->bools.cheevos_hardcore_mode_enable;
-#endif
    const enum rarch_core_type current_core_type = runloop_st->current_core_type;
    uint8_t flags                                = content_get_flags();
-   bool entry_state_load                        = runloop_st->entry_state_slot > -1;
 
    runloop_reset_auto_state_load(runloop_st);
+   runloop_st->save_load_hold                   = 0;
 
    if (current_core_type == CORE_TYPE_PLAIN)
       runloop_st->flags |=  RUNLOOP_FLAG_USE_SRAM;
@@ -6023,9 +6269,28 @@ static bool event_init_content(
    command_event_set_replay_auto_index(settings);
 
    runloop_path_init_savefile(runloop_st);
-
-   if (!event_load_save_files(runloop_st->flags & RUNLOOP_FLAG_IS_SRAM_LOAD_DISABLED))
-      RARCH_LOG("[SRAM] %s\n", msg_hash_to_str(MSG_SKIPPING_SRAM_LOAD));
+   runloop_set_save_backup_roots(runloop_st, settings);
+   {
+      /* A not-loaded .auto an earlier session left held */
+      char *auto_path = (char*)malloc(PATH_MAX_LENGTH);
+      if (auto_path && runloop_get_savestate_path(auto_path,
+               PATH_MAX_LENGTH, -1))
+         content_auto_state_sweep(auto_path);
+      free(auto_path);
+   }
+   {
+      /* The folders list C2 reads; a fallback leaves a note there */
+      size_t i = runloop_save_roots[0] != RUNLOOP_SAVE_ROOT_CONFIGURED
+         ? 0 : 1;
+      if (runloop_save_roots[i] != RUNLOOP_SAVE_ROOT_CONFIGURED)
+         save_backups_note_folders(dir_get_ptr(i
+                  ? RARCH_DIR_SAVESTATE_CONFIGURED
+                  : RARCH_DIR_SAVEFILE_CONFIGURED),
+               dir_get_ptr(i ? RARCH_DIR_SAVESTATE : RARCH_DIR_SAVEFILE),
+               false);
+      else
+         save_backups_note_folders(NULL, NULL, false);
+   }
 
    /* Set entry slot from playlist entry if available */
    {
@@ -6042,8 +6307,6 @@ static bool event_init_content(
 
          if (entry && PLAYLIST_ENTRY_SLOT(entry) > 0)
             runloop_st->entry_state_slot = PLAYLIST_ENTRY_SLOT(entry);
-
-         entry_state_load = runloop_st->entry_state_slot > -1;
       }
 
       /* The slot picked from the entry's Load State list, captured
@@ -6051,7 +6314,6 @@ static bool event_init_content(
       if (menu && menu->state_slot_run_pending)
       {
          runloop_st->entry_state_slot      = menu->state_slot_run;
-         entry_state_load                  = menu->state_slot_run > -1;
          runloop_st->auto_state_load_asked = menu->state_slot_run < 0;
          menu->state_slot_run_pending      = false;
       }
@@ -6062,67 +6324,21 @@ static bool event_init_content(
          configuration_set_int(settings, settings->ints.state_slot, runloop_st->entry_state_slot);
    }
 
-   /*
-    * Since the operations are asynchronous we can't
-    * guarantee users will not use auto_load_state to cheat on
-    * achievements so we forbid auto_load_state from happening
-    * if cheevos_enable and cheevos_hardcode_mode_enable
-    * are true.
-    */
-#ifdef HAVE_CHEEVOS
-   if (     !cheevos_enable
-         || !cheevos_hardcore_mode_enable)
-#endif
+#ifdef HAVE_CLOUDSYNC
+   /* A sync in flight may replace these saves: they load once it ends
+    * (task_cloud_sync_cb), and the frame loop runs meanwhile. */
+   if (task_cloud_sync_in_progress())
    {
-#ifdef HAVE_BSV_MOVIE
-      /* Ignore entry state if we're doing bsv playback (we do want it
-         for bsv recording though) */
-      if (!(input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_START_PLAYBACK))
-#endif
-      {
-         if (     entry_state_load
-               && !command_event_load_entry_state(settings))
-         {
-            /* Loading the state failed, reset entry slot */
-            runloop_st->entry_state_slot = -1;
-         }
-      }
-
-#ifdef HAVE_BSV_MOVIE
-      /* Ignore autoload state if we're doing bsv playback or recording */
-      if (!(input_st->bsv_movie_state.flags & (BSV_FLAG_MOVIE_START_RECORDING | BSV_FLAG_MOVIE_START_PLAYBACK)))
-#endif
-      {
-         if (     runloop_st->entry_state_slot < 0
-               && (     settings->bools.savestate_auto_load
-                     || runloop_st->auto_state_load_asked))
-            command_event_load_auto_state();
-      }
-   }
-
-#ifdef HAVE_BSV_MOVIE
-   movie_stop(input_st);
-   if (input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_START_RECORDING)
-   {
-      configuration_set_uint(settings, settings->uints.rewind_granularity, 1);
-      /* The record task defers itself until any state load has been
-       * applied (task_moviectl_record_handler).  That guard must not
-       * ask a queue finder: the unthreaded gather lifts every
-       * running task off the queue before invoking any handler, so a
-       * sibling load task is invisible to a finder and recording
-       * starts first.  The
-       * guard now reads a main-thread flag instead, so no
-       * whole-queue wait is needed here to force the ordering. */
-      movie_start_record(input_st, input_st->bsv_movie_state.movie_start_path);
-   }
-   else if (input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_START_PLAYBACK)
-   {
-      configuration_set_uint(settings, settings->uints.rewind_granularity, 1);
-      movie_start_playback(input_st, input_st->bsv_movie_state.movie_start_path);
+      const char *_msg = msg_hash_to_str(MSG_CLOUD_SYNC_WAITING);
+      RARCH_LOG("[CloudSync] %s\n", _msg);
+      runloop_msg_queue_push(_msg, strlen(_msg), 1, 180, false, NULL,
+            MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+      runloop_save_load_hold(SAVE_LOAD_HOLD_CLOUD_SYNC);
    }
 #endif
 
-   command_event(CMD_EVENT_NETPLAY_INIT, NULL);
+   if (!runloop_st->save_load_hold)
+      runloop_content_saves_ready(runloop_st);
 
    return true;
 }
@@ -6618,6 +6834,9 @@ static void runloop_path_set_basename_to_archive(runloop_state_t *runloop_st)
       return;
    memcpy(runloop_st->runtime_content_path_basename, content, _len);
    runloop_st->runtime_content_path_basename[_len] = '\0';
+   runloop_archive_dir[0]  = '\0';
+   runloop_archive_kept    = false;
+   runloop_archive_unlisted = false;
    /* (without the archive's extension, as runloop_path_set_basename()
     * leaves a path) */
    if (     (dot = strrchr(runloop_st->runtime_content_path_basename, '.'))
@@ -6627,6 +6846,192 @@ static void runloop_path_set_basename_to_archive(runloop_state_t *runloop_st)
          && !strchr(dot, '\\')
 #endif
       )
+      *dot = '\0';
+   runloop_path_set_names();
+}
+#endif
+
+/* Whether @path has a ".." folder */
+static bool runloop_path_climbs(const char *path)
+{
+   const char *s = path;
+   while ((s = strstr(s, "..")))
+   {
+      if (     (s == path || PATH_CHAR_IS_SLASH(s[-1]))
+            && (!s[2] || PATH_CHAR_IS_SLASH(s[2])))
+         return true;
+      s += 2;
+   }
+   return false;
+}
+
+#ifdef HAVE_COMPRESSION
+/* Past this many archives beside a member's, none is listed */
+#define RUNLOOP_ARCHIVES_LISTED 32
+
+/* Whether @archive has a member named @name, extension and case aside,
+ * outside the first @dir_len bytes' folder of @member (if any).
+ * *@unlisted: @archive could not be listed. */
+static bool runloop_archive_has_name(const char *archive,
+      const char *name, const char *member, size_t dir_len, bool *unlisted)
+{
+   size_t i;
+   char other[NAME_MAX_LENGTH];
+   bool found               = false;
+   struct string_list *list = file_archive_get_file_list(archive, NULL);
+   if (!list)
+   {
+      if (unlisted)
+         *unlisted = true;
+      return false;
+   }
+   for (i = 0; i < list->size && !found; i++)
+   {
+      const char *entry = list->elems[i].data;
+      const char *ebase = path_basename_nocompression(entry);
+      if (     member
+            && (size_t)(ebase - entry) == dir_len
+            && !strncmp(entry, member, dir_len))
+         continue;
+      strlcpy(other, ebase, sizeof(other));
+      path_remove_extension(other);
+      found = string_is_equal_case_insensitive(name, other);
+   }
+   string_list_free(list);
+   return found;
+}
+
+/* Whether @ext is @own or one of @exts ("sfc|smc"), case aside */
+static bool runloop_ext_is_content(const char *ext, const char *own,
+      const char *exts)
+{
+   size_t _len = strlen(ext);
+   if (!_len)
+      return false;
+   if (string_is_equal_case_insensitive(ext, own))
+      return true;
+   while (exts && *exts)
+   {
+      size_t i        = 0;
+      const char *end = strchr(exts, '|');
+      size_t n        = end ? (size_t)(end - exts) : strlen(exts);
+      while (     i < n && i < _len
+            && tolower((unsigned char)exts[i])
+            == tolower((unsigned char)ext[i]))
+         i++;
+      if (i == n && n == _len)
+         return true;
+      exts = end ? end + 1 : NULL;
+   }
+   return false;
+}
+
+/* Whether @file is the member's own archive, named @arc */
+static bool runloop_archive_is_own(const char *file, const char *arc)
+{
+#ifdef _WIN32
+   return string_is_equal_case_insensitive(file, arc);
+#else
+   return string_is_equal(file, arc);
+#endif
+}
+
+/* Whether @path's member, named without its folders in the archive,
+ * would share its saves: with a member of its name in another folder
+ * there, a loose game of its name in @dir, the archive's folder (one
+ * the core takes, @exts, or of the member's extension), or a member of
+ * another archive there, or that archive's own name. Names are
+ * compared without extension, case aside. More than
+ * RUNLOOP_ARCHIVES_LISTED archives there are not listed: it would.
+ * *@unlisted: its own archive, or @dir while there, could not be
+ * listed. */
+static bool runloop_archive_name_shared(const char *path, const char *dir,
+      const char *exts, bool *unlisted)
+{
+   size_t i, dir_len;
+   char name[NAME_MAX_LENGTH];
+   char other[NAME_MAX_LENGTH];
+   char arc[NAME_MAX_LENGTH];
+   struct string_list *list;
+   unsigned archives  = 0;
+   bool shared        = false;
+   const char *delim  = path_get_archive_delim(path);
+   const char *base   = path_basename_nocompression(path);
+   const char *own    = path_get_extension(base);
+   const char *s      = path;
+   if (!delim || base <= delim)
+      return false;
+   for (i = 0; path + i < delim; i++)
+      if (PATH_CHAR_IS_SLASH(path[i]))
+         s = path + i + 1;
+   strlcpy(arc, s, MIN(sizeof(arc), (size_t)(delim - s) + 1));
+   dir_len = base - delim - 1;
+   strlcpy(name, base, sizeof(name));
+   path_remove_extension(name);
+   if (!*name)
+      return false;
+   if (runloop_archive_has_name(path, name, delim + 1, dir_len, unlisted))
+      return true;
+   if (!(list = dir_list_new(dir, NULL, false, false, false, false)))
+   {
+      if (path_is_directory(dir))
+         *unlisted = true;
+      return false;
+   }
+   for (i = 0; i < list->size && !shared; i++)
+   {
+      const char *entry = list->elems[i].data;
+      const char *ebase = path_basename_nocompression(entry);
+      if (path_is_compressed_file(entry))
+      {
+         archives++;
+         if (runloop_archive_is_own(ebase, arc))
+            continue;
+      }
+      else if (!runloop_ext_is_content(path_get_extension(entry), own, exts))
+         continue;
+      strlcpy(other, ebase, sizeof(other));
+      path_remove_extension(other);
+      shared = string_is_equal_case_insensitive(name, other);
+   }
+   if (archives > RUNLOOP_ARCHIVES_LISTED)
+      shared = true;
+   for (i = 0; i < list->size && !shared; i++)
+   {
+      const char *entry = list->elems[i].data;
+      if (     path_is_compressed_file(entry)
+            && !runloop_archive_is_own(path_basename_nocompression(entry), arc))
+         shared = runloop_archive_has_name(entry, name, NULL, 0, NULL);
+   }
+   string_list_free(list);
+   return shared;
+}
+
+/* Now that the core has said what content it takes: a member whose
+ * saves, named without its folders in the archive, would be another
+ * game's keeps them in its name, as before. */
+static void runloop_path_set_basename_kept(runloop_state_t *runloop_st,
+      const char *path, const char *exts)
+{
+   char dir[DIR_MAX_LENGTH];
+   char *dot;
+   if (     !*runloop_archive_dir
+         || runloop_archive_kept
+         || !path
+         || !path_get_archive_delim(path))
+      return;
+   fill_pathname_basedir(dir, runloop_st->runtime_content_path_basename,
+         sizeof(dir));
+   if (!runloop_archive_name_shared(path, dir, exts,
+            &runloop_archive_unlisted))
+      return;
+   runloop_archive_kept = true;
+   strlcpy(runloop_st->runtime_content_path_basename, dir,
+         sizeof(runloop_st->runtime_content_path_basename));
+   fill_pathname_dir(runloop_st->runtime_content_path_basename, path, "",
+         sizeof(runloop_st->runtime_content_path_basename));
+   if (     (dot = strrchr(runloop_st->runtime_content_path_basename, '.'))
+         && (dot - runloop_st->runtime_content_path_basename > 0))
       *dot = '\0';
    runloop_path_set_names();
 }
@@ -6744,6 +7149,9 @@ bool runloop_event_init_core(
    if (     sys_info->info.block_extract
          && path_is_empty(RARCH_PATH_SUBSYSTEM))
       runloop_path_set_basename_to_archive(runloop_st);
+   else if (path_is_empty(RARCH_PATH_SUBSYSTEM))
+      runloop_path_set_basename_kept(runloop_st,
+            path_get(RARCH_PATH_CONTENT), sys_info->info.valid_extensions);
 #endif
 
 #ifdef HAVE_CONFIGFILE
@@ -6869,6 +7277,53 @@ bool runloop_event_init_core(
    return true;
 }
 
+void runloop_flush_save_files(void)
+{
+   if (runloop_state.flags & RUNLOOP_FLAG_USE_SRAM)
+   {
+#if defined(HAVE_COMPRESSION)
+      settings_t *settings = config_get_ptr();
+      event_flush_kept_save_files(true,
+            settings->bools.save_file_compression);
+#else
+      event_flush_kept_save_files(true, false);
+#endif
+   }
+   else
+      runloop_recover_save_files(true);
+}
+
+void runloop_recover_save_files(bool sync)
+{
+   if (runloop_save_folder_off)
+      event_recover_save_files(sync);
+}
+
+bool runloop_save_files_recovered(void)
+{
+   return runloop_save_folder_off && event_save_files_recovered();
+}
+
+bool runloop_save_files_off(void)
+{
+   return runloop_save_folder_off;
+}
+
+static retro_atomic_int_t runloop_save_files_request
+   = RETRO_ATOMIC_INT_INITIALIZER(0);
+
+void runloop_request_save_files(void)
+{
+   retro_atomic_store_release_int(&runloop_save_files_request, 1);
+}
+
+/* Main thread, between frames */
+static void runloop_take_save_files_request(void)
+{
+   if (retro_atomic_fetch_and_int(&runloop_save_files_request, 0))
+      runloop_flush_save_files();
+}
+
 void runloop_pause_checks(void)
 {
 #ifdef HAVE_PRESENCE
@@ -6911,6 +7366,8 @@ void runloop_pause_checks(void)
       /* Same idea as the MIDI silence above, for the audio stream: end it on
        * a ramp rather than wherever the waveform happened to be. */
       audio_driver_pause_fade(true);
+
+      runloop_flush_save_files();
 
 #ifdef HAVE_PRESENCE
       userdata.status = PRESENCE_GAME_PAUSED;
@@ -7630,7 +8087,9 @@ static bool display_menu_libretro(
          input_st->flags |= INP_FLAG_BLOCK_LIBRETRO_INPUT;
 
       video_driver_ff_frameskip_decide(current_time);
+      runloop_st->in_core_frame = true;
       core_run();
+      runloop_st->in_core_frame = false;
       runloop_load_deferred_auto_state();
       runloop_st->core_runtime_usec       +=
          runloop_core_runtime_tick(runloop_st, slowmotion_ratio, current_time);
@@ -9869,6 +10328,9 @@ int runloop_iterate(void)
    android_input_flush_pending_haptics();
 #endif
 
+   /* A save asked for off the main thread or inside the core's frame */
+   runloop_take_save_files_request();
+
    /* Tick deferred shader compilation (one pass per frame) */
    video_driver_shader_deferred_tick();
 
@@ -10162,6 +10624,7 @@ int runloop_iterate(void)
     * fast-forward drops */
    video_driver_ff_frameskip_decide(runloop_st->core_run_time);
 
+   runloop_st->in_core_frame = true;
    {
 #ifdef HAVE_RUNAHEAD
       bool run_ahead_enabled            = settings->bools.run_ahead_enabled;
@@ -10176,7 +10639,10 @@ int runloop_iterate(void)
       want_runahead                     = want_runahead && !netplay_is_enabled;
 #endif
 
-      if (want_runahead)
+      /* core_run() alone knows the content's saves are held */
+      if (runloop_st->save_load_hold)
+         frame_advanced = core_run();
+      else if (want_runahead)
          frame_advanced = runahead_run(
                runloop_st,
                run_ahead_num_frames,
@@ -10188,8 +10654,15 @@ int runloop_iterate(void)
 #endif
          frame_advanced = core_run();
    }
+   runloop_st->in_core_frame = false;
 
    runloop_load_deferred_auto_state();
+
+   if (frame_advanced && runloop_save_folder_seed)
+   {
+      runloop_save_folder_seed = false;
+      event_seed_recovered_save_files();
+   }
 
 #ifdef HAVE_COMMAND
    if (frame_advanced && (runloop_st->frame_work & RUNLOOP_WORK_RUN_FRAMES))
@@ -11113,6 +11586,7 @@ static void runloop_load_deferred_auto_state(void)
       runloop_st->auto_state_load_ready     = false;
       runloop_st->auto_state_load_core_ran  = false;
       runloop_st->auto_state_load_attempted = true;
+      runloop_st->auto_state_save_ready     = true;
       RARCH_LOG("[State] Deferred auto-load canceled because Auto Load State is disabled.\n");
       return;
    }
@@ -11124,6 +11598,7 @@ static void runloop_load_deferred_auto_state(void)
       runloop_st->auto_state_load_ready     = false;
       runloop_st->auto_state_load_core_ran  = false;
       runloop_st->auto_state_load_attempted = true;
+      runloop_st->auto_state_save_ready     = true;
       return;
    }
 
@@ -11134,7 +11609,8 @@ static void runloop_load_deferred_auto_state(void)
    runloop_st->auto_state_load_pending   = false;
    runloop_st->auto_state_load_attempted = true;
    runloop_st->auto_state_load_ready     = true;
-   command_event_load_auto_state();
+   if (!command_event_load_auto_state())
+      runloop_st->auto_state_save_ready  = true;
    runloop_st->auto_state_load_ready     = false;
    runloop_st->auto_state_load_core_ran  = false;
 }
@@ -11174,6 +11650,17 @@ bool core_run(void)
     * reads as a hang. */
    if (runloop_st->content_closing || runloop_st->content_switching)
    {
+      input_driver_poll_between_frames(input_driver_poll);
+      video_driver_cached_frame();
+      return false;
+   }
+
+   /* Not before its saves load (save_load_hold); they load at the first
+    * frame nothing holds them, and the core runs from the next one. */
+   if (runloop_st->save_load_hold)
+   {
+      if (runloop_st->save_load_hold == SAVE_LOAD_HOLD_PENDING)
+         runloop_content_saves_ready(runloop_st);
       input_driver_poll_between_frames(input_driver_poll);
       video_driver_cached_frame();
       return false;
@@ -11303,9 +11790,20 @@ void runloop_path_set_basename(const char *path)
     *
     */
    path_basedir_wrapper(runloop_st->runtime_content_path_basename);
+   strlcpy(runloop_archive_dir, path_basename(path),
+         sizeof(runloop_archive_dir));
+   if ((dst = find_last_slash(runloop_archive_dir)))
+      *dst = '\0';
+   else
+      runloop_archive_dir[0] = '\0';
+   runloop_archive_kept    = false;
+   runloop_archive_unlisted = false;
+   /* A member's own folders in the archive are left out, unless its
+    * saves would then be another game's (runloop_event_init_core()) */
    if (*runloop_st->runtime_content_path_basename)
-      fill_pathname_dir(runloop_st->runtime_content_path_basename, path,
-            "", sizeof(runloop_st->runtime_content_path_basename));
+      fill_pathname_dir(runloop_st->runtime_content_path_basename,
+            path_basename_nocompression(path), "",
+            sizeof(runloop_st->runtime_content_path_basename));
 #endif
 
    /* Truncate path to last dot, but not when the path is
@@ -11352,6 +11850,187 @@ void runloop_path_set_names(void)
 #endif
 }
 
+static bool runloop_save_root_usable(const char *dir)
+{
+   char parent[DIR_MAX_LENGTH];
+   if (path_is_directory(dir))
+      return true;
+   /* One level only: never a chain under a missing mount point */
+   fill_pathname_parent_dir(parent, dir, sizeof(parent));
+   return *parent && path_is_directory(parent) && path_mkdir(dir);
+}
+
+#ifdef HAVE_CLOUDSYNC
+static const char *runloop_save_base_missing(void)
+{
+   const char *dir = dir_get_ptr(RARCH_DIR_SAVEFILE_BASE);
+   if (*dir && !path_is_directory(dir))
+      return dir;
+   dir = dir_get_ptr(RARCH_DIR_SAVESTATE_BASE);
+   if (*dir && !path_is_directory(dir))
+      return dir;
+   return NULL;
+}
+
+void runloop_save_base_check(void)
+{
+   /* Logged once per folder: a menu playlist redirects on each entry */
+   static char logged[DIR_MAX_LENGTH];
+   const char *missing = runloop_save_base_missing();
+   if (!missing)
+      *logged = '\0';
+   else if (!string_is_equal(missing, logged))
+   {
+      RARCH_WARN("[CloudSync] Paused: \"%s\" is not a directory.\n",
+            missing);
+      strlcpy(logged, missing, sizeof(logged));
+   }
+   task_cloud_sync_set_paused(missing != NULL);
+}
+#endif
+
+void runloop_save_root_set_config(const char *path)
+{
+   strlcpy(runloop_save_config_dir, path ? path : "",
+         sizeof(runloop_save_config_dir));
+   /* Absolute: a core's chdir() must not move it */
+   if (*runloop_save_config_dir)
+      path_resolve_realpath(runloop_save_config_dir,
+            sizeof(runloop_save_config_dir), false);
+   path_basedir(runloop_save_config_dir);
+}
+
+void runloop_save_root_resolve(char *s, size_t len)
+{
+   static bool logged = false;
+   char dir[DIR_MAX_LENGTH];
+   size_t _len = strlcpy(dir, s, sizeof(dir));
+   /* Not relative: "sd:/" (a console's device), "\saves" (a drive's root) */
+   if (     !*s
+         || !*runloop_save_config_dir
+         || path_is_absolute(s)
+         || PATH_CHAR_IS_SLASH(*s)
+         || strchr(s, ':')
+         || string_is_equal(s, "default"))
+      return;
+   /* Never a cut path */
+   if (     _len < sizeof(dir)
+         && strlen(runloop_save_config_dir) + _len + 1 < len)
+   {
+      fill_pathname_resolve_relative(s, runloop_save_config_dir, dir, len);
+      if (strlen(s) + 1 < len)
+         return;
+      strlcpy(s, dir, len);
+   }
+   if (!logged)
+      RARCH_WARN("[SRAM] Folder \"%s\" is too long under \"%s\"; "
+            "using it as written.\n", s, runloop_save_config_dir);
+   logged = true;
+}
+
+enum runloop_save_root runloop_save_root_check(char *s, size_t len,
+      const char *configured, const char *def)
+{
+   const char *dir = (configured && *configured) ? configured : def;
+   strlcpy(s, dir ? dir : "", len);
+   if (dir == configured)
+      runloop_save_root_resolve(s, len);
+   if (!*s || runloop_save_root_usable(s))
+      return RUNLOOP_SAVE_ROOT_CONFIGURED;
+   if (dir != def && def && *def && runloop_save_root_usable(def))
+   {
+      strlcpy(s, def, len);
+      return RUNLOOP_SAVE_ROOT_FALLBACK;
+   }
+   return RUNLOOP_SAVE_ROOT_NONE;
+}
+
+/* Folder names the save root keeps for itself */
+static bool runloop_save_dir_name_reserved(const char *name)
+{
+   return string_is_equal_noncase(name, SAVE_BACKUPS_DIR)
+       || string_is_equal_noncase(name, SAVE_BACKUPS_RECORDS_DIR)
+       || string_is_equal_noncase(name, SAVE_BACKUPS_SYSTEM_DIR)
+       || string_is_equal_noncase(name, SAVE_BACKUPS_CORE_CLOUD_SYNC);
+}
+
+/* Whether @dir has this content's save, or any of its states */
+static bool runloop_save_dir_has_saves(const char *dir, bool states)
+{
+   size_t i, _len;
+   bool found = false;
+   char path[PATH_MAX_LENGTH];
+   struct string_list *list;
+   const char *name = path_basename_nocompression(
+         runloop_state.runtime_content_path_basename);
+
+   _len = fill_pathname_join_special(path, dir, name, sizeof(path));
+   if (_len + STRLEN_CONST(".state.auto") >= sizeof(path))
+      return false;
+   if (!states)
+   {
+      strlcpy(path + _len, FILE_PATH_SRM_EXTENSION, sizeof(path) - _len);
+      return path_is_valid(path);
+   }
+   _len += strlcpy(path + _len, FILE_PATH_STATE_EXTENSION,
+         sizeof(path) - _len);
+   if (path_is_valid(path))
+      return true;
+   strlcpy(path + _len, ".auto", sizeof(path) - _len);
+   if (path_is_valid(path))
+      return true;
+
+   /* Numbered slots: listed, as command_scan_states() finds them */
+   if (!(list = dir_list_new(dir, NULL, false, true, false, false)))
+      return false;
+   path[_len] = '\0';
+   name       = path_basename_nocompression(path);
+   _len       = strlen(name);
+   for (i = 0; i < list->size && !found; i++)
+   {
+      const char *slot = path_basename_nocompression(list->elems[i].data);
+      if (strncmp(slot, name, _len) || !*(slot += _len))
+         continue;
+      while (*slot >= '0' && *slot <= '9')
+         slot++;
+      found = !*slot;
+   }
+   string_list_free(list);
+   return found;
+}
+
+/* An archive member's folders inside the archive were part of its
+ * name: folders beside the content, and the last one named the folder
+ * sorting by content made. @s, this root's folder now, becomes the
+ * folder that name gave while it has the game's saves and @s has none,
+ * or whenever it is there after a failed listing: it may be a kept
+ * name's. A name that keeps them has no other place: the name without
+ * them is another game's (or may be, past the archive cap). */
+static void runloop_save_dir_old(char *s, size_t len,
+      const char *root, bool in_content_dir, bool by_content,
+      const char *core, bool states)
+{
+   char dir[DIR_MAX_LENGTH];
+   const char *name = path_basename_nocompression(runloop_archive_dir);
+   if (     !*runloop_state.runtime_content_path_basename
+         || !*name
+         || runloop_archive_kept
+         || (!in_content_dir && !by_content)
+         || (by_content && runloop_save_dir_name_reserved(name)))
+      return;
+   fill_pathname_join_special_ext(dir, root,
+         in_content_dir ? runloop_archive_dir : "",
+         by_content ? name : "", "", sizeof(dir));
+   if (core)
+      fill_pathname_join(dir, dir, core, sizeof(dir));
+   if (     !string_is_equal(dir, s)
+         && path_is_directory(dir)
+         && (     runloop_archive_unlisted
+            || (   runloop_save_dir_has_saves(dir, states)
+               && !runloop_save_dir_has_saves(s, states))))
+      strlcpy(s, dir, len);
+}
+
 void runloop_path_set_redirect(settings_t *settings,
       const char *old_savefile_dir,
       const char *old_savestate_dir)
@@ -11377,18 +12056,71 @@ void runloop_path_set_redirect(settings_t *settings,
    strlcpy(intermediate_savefile_dir, old_savefile_dir, sizeof(intermediate_savefile_dir));
    strlcpy(intermediate_savestate_dir, old_savestate_dir, sizeof(intermediate_savestate_dir));
 
+#ifdef HAVE_NETWORKING
+   if (runloop_netplay_saves_off)
+   {
+      runloop_netplay_saves_off  = false;
+      runloop_st->flags         &= ~RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED;
+   }
+#endif
+
+   /* The configured roots are checked again at each load */
+   if (runloop_save_folder_off)
+   {
+      runloop_save_folder_off  = false;
+      runloop_save_folder_seed = false;
+      runloop_st->flags       &= ~RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED;
+   }
+   runloop_save_roots[0] = RUNLOOP_SAVE_ROOT_CONFIGURED;
+   runloop_save_roots[1] = RUNLOOP_SAVE_ROOT_CONFIGURED;
+   if (     !savefiles_in_content_dir
+         && !retroarch_override_setting_is_set(
+            RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL))
+   {
+      runloop_save_roots[0] = runloop_save_root_check(
+            intermediate_savefile_dir, sizeof(intermediate_savefile_dir),
+            dir_get_ptr(RARCH_DIR_SAVEFILE_CONFIGURED),
+            g_defaults.dirs[DEFAULT_DIR_SRAM]);
+      dir_set(RARCH_DIR_SAVEFILE, intermediate_savefile_dir);
+      if (     runloop_save_roots[0] == RUNLOOP_SAVE_ROOT_NONE
+            && !(runloop_st->flags & RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED))
+      {
+         runloop_save_folder_off  = true;
+         runloop_save_folder_seed = true;
+         runloop_st->flags       |= RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED;
+      }
+   }
+   if (     !savestates_in_content_dir
+         && !retroarch_override_setting_is_set(
+            RARCH_OVERRIDE_SETTING_STATE_PATH, NULL))
+   {
+      runloop_save_roots[1] = runloop_save_root_check(
+            intermediate_savestate_dir, sizeof(intermediate_savestate_dir),
+            dir_get_ptr(RARCH_DIR_SAVESTATE_CONFIGURED),
+            g_defaults.dirs[DEFAULT_DIR_SAVESTATE]);
+      dir_set(RARCH_DIR_SAVESTATE, intermediate_savestate_dir);
+   }
+#ifdef HAVE_CLOUDSYNC
+   runloop_save_base_check();
+#endif
+
    /* Get content directory name, if per-content-directory
     * saves/states are enabled */
    if (     (sort_savefiles_by_content || sort_savestates_by_content)
          && *runloop_st->runtime_content_path_basename)
+   {
       fill_pathname_parent_dir_name(content_dir_name,
             runloop_st->runtime_content_path_basename,
             sizeof(content_dir_name));
+      if (runloop_save_dir_name_reserved(content_dir_name))
+         content_dir_name[0] = '\0';
+   }
 
    /* Set savefile directory if empty to content directory */
    if (     !*intermediate_savefile_dir
          || savefiles_in_content_dir)
    {
+      savefiles_in_content_dir = true;
       fill_pathname_basedir(
             intermediate_savefile_dir,
             runloop_st->runtime_content_path_basename,
@@ -11402,12 +12134,23 @@ void runloop_path_set_redirect(settings_t *settings,
    if (     !*intermediate_savestate_dir
          || savestates_in_content_dir)
    {
+      savestates_in_content_dir = true;
       fill_pathname_basedir(intermediate_savestate_dir,
             runloop_st->runtime_content_path_basename,
             sizeof(intermediate_savestate_dir));
 
       if (!*intermediate_savestate_dir)
          RARCH_LOG("[Override] Cannot resolve save state file path.\n");
+   }
+
+   /* A member's folder kept in its name is made beside the archive,
+    * never outside it */
+   if (runloop_archive_kept && !runloop_path_climbs(runloop_archive_dir))
+   {
+      if (savefiles_in_content_dir)
+         path_mkdir(intermediate_savefile_dir);
+      if (savestates_in_content_dir)
+         path_mkdir(intermediate_savestate_dir);
    }
 
    strlcpy(new_savefile_dir, intermediate_savefile_dir,
@@ -11422,12 +12165,14 @@ void runloop_path_set_redirect(settings_t *settings,
             msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NO_CORE)))
 #endif
       {
-         /* Per-core and/or per-content-directory saves */
+         /* Per-core and/or per-content-directory saves, only
+          * under a root that is there */
          if (     (sort_savefiles || sort_savefiles_by_content)
-               && *new_savefile_dir)
+               && *new_savefile_dir
+               && runloop_save_roots[0] != RUNLOOP_SAVE_ROOT_NONE)
          {
             /* Append content directory name to save location */
-            if (sort_savefiles_by_content)
+            if (sort_savefiles_by_content && *content_dir_name)
                fill_pathname_join_special(
                      new_savefile_dir,
                      intermediate_savefile_dir,
@@ -11442,6 +12187,11 @@ void runloop_path_set_redirect(settings_t *settings,
                      sysinfo->library_name,
                      sizeof(new_savefile_dir));
 
+            runloop_save_dir_old(new_savefile_dir,
+                  sizeof(new_savefile_dir), intermediate_savefile_dir,
+                  savefiles_in_content_dir, sort_savefiles_by_content,
+                  sort_savefiles ? sysinfo->library_name : NULL, false);
+
             /* If path doesn't exist, try to create it,
              * if everything fails revert to the original path. */
             if (     !path_is_directory(new_savefile_dir)
@@ -11455,13 +12205,18 @@ void runloop_path_set_redirect(settings_t *settings,
                      sizeof(new_savefile_dir));
             }
          }
+         else if (!sort_savefiles && !sort_savefiles_by_content)
+            runloop_save_dir_old(new_savefile_dir,
+                  sizeof(new_savefile_dir), intermediate_savefile_dir,
+                  savefiles_in_content_dir, false, NULL, false);
 
          /* Per-core and/or per-content-directory savestates */
          if (     (sort_savestates || sort_savestates_by_content)
-               && *new_savestate_dir)
+               && *new_savestate_dir
+               && runloop_save_roots[1] != RUNLOOP_SAVE_ROOT_NONE)
          {
             /* Append content directory name to savestate location */
-            if (sort_savestates_by_content)
+            if (sort_savestates_by_content && *content_dir_name)
                fill_pathname_join_special(
                      new_savestate_dir,
                      intermediate_savestate_dir,
@@ -11476,6 +12231,11 @@ void runloop_path_set_redirect(settings_t *settings,
                      sysinfo->library_name,
                      sizeof(new_savestate_dir));
 
+            runloop_save_dir_old(new_savestate_dir,
+                  sizeof(new_savestate_dir), intermediate_savestate_dir,
+                  savestates_in_content_dir, sort_savestates_by_content,
+                  sort_savestates ? sysinfo->library_name : NULL, true);
+
             /* If path doesn't exist, try to create it.
              * If everything fails, revert to the original path. */
             if (     !path_is_directory(new_savestate_dir)
@@ -11489,13 +12249,29 @@ void runloop_path_set_redirect(settings_t *settings,
                      sizeof(new_savestate_dir));
             }
          }
+         else if (!sort_savestates && !sort_savestates_by_content)
+            runloop_save_dir_old(new_savestate_dir,
+                  sizeof(new_savestate_dir), intermediate_savestate_dir,
+                  savestates_in_content_dir, false, NULL, true);
       }
    }
 
 
 #ifdef HAVE_NETWORKING
+   /* A netplay client's save RAM is the host's: no recovery files */
+   if (      runloop_save_folder_off
+         &&  netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_ENABLED, NULL)
+         && !netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_SERVER, NULL)
+         && !netplay_driver_ctl(RARCH_NETPLAY_CTL_USE_CORE_PACKET_INTERFACE, NULL))
+   {
+      runloop_save_folder_off   = false;
+      runloop_save_folder_seed  = false;
+      runloop_netplay_saves_off = true;
+   }
+
    /* Special save directory for netplay clients. */
-   if (      netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_ENABLED, NULL)
+   if (      runloop_save_roots[0] != RUNLOOP_SAVE_ROOT_NONE
+         &&  netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_ENABLED, NULL)
          && !netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_SERVER, NULL)
          && !netplay_driver_ctl(RARCH_NETPLAY_CTL_USE_CORE_PACKET_INTERFACE, NULL))
    {
@@ -11505,7 +12281,16 @@ void runloop_path_set_redirect(settings_t *settings,
 
       if (     !path_is_directory(new_savefile_dir)
             && !path_mkdir(new_savefile_dir))
+      {
          path_basedir(new_savefile_dir);
+         /* The client's saves would land on the user's own: none are
+          * written this session. */
+         if (!(runloop_st->flags & RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED))
+         {
+            runloop_netplay_saves_off  = true;
+            runloop_st->flags         |= RUNLOOP_FLAG_IS_SRAM_SAVE_DISABLED;
+         }
+      }
    }
 #endif
 
@@ -11513,6 +12298,12 @@ void runloop_path_set_redirect(settings_t *settings,
    {
       bool savefile_is_dir  = path_is_directory(new_savefile_dir);
       bool savestate_is_dir = path_is_directory(new_savestate_dir);
+      /* A root that can't be used keeps the names in it, so
+       * nothing lands beside the content instead */
+      if (runloop_save_roots[0] == RUNLOOP_SAVE_ROOT_NONE)
+         savefile_is_dir  = true;
+      if (runloop_save_roots[1] == RUNLOOP_SAVE_ROOT_NONE)
+         savestate_is_dir = true;
       if (savefile_is_dir)
          strlcpy(runloop_st->name.savefile, new_savefile_dir,
                  sizeof(runloop_st->name.savefile));

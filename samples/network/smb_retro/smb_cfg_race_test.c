@@ -38,7 +38,7 @@ static void reader(void *arg)
    {
       int64_t         size = 0;
       smb_dir_handle *dh;
-      if (retro_vfs_stat_smb("smb://srv/share/roms/a.bin", &size))
+      if (retro_vfs_stat_smb("smb://srv/share/roms/a.bin", &size, NULL))
          retro_atomic_fetch_add_int(&answered, 1);
       if ((dh = retro_vfs_opendir_smb("smb://srv/share/roms", false)))
       {
@@ -91,7 +91,7 @@ int main(void)
       }
       free(sub);
       free(heap);
-      if (retro_vfs_stat_smb("smb://srv/share/a.bin", &size))
+      if (retro_vfs_stat_smb("smb://srv/share/a.bin", &size, NULL))
       {
          fprintf(stderr, "FAIL: a stat with no server set succeeded\n");
          failures++;

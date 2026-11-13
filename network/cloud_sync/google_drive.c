@@ -107,7 +107,8 @@ typedef struct
    char path[PATH_MAX_LENGTH];
    char file[PATH_MAX_LENGTH];
    char file_id[256];
-   char parent_id[256];
+   char parent_id[256];        /* oldest folder: new files go here */
+   char parent_ids[256];       /* every same-named folder (a list) */
    cloud_sync_complete_handler_t cb;
    void *user_data;
    RFILE *rfile;
@@ -128,7 +129,7 @@ typedef struct
 {
    char dir_path[PATH_MAX_LENGTH]; /* full dir path being resolved */
    const char *remaining;          /* pointer into dir_path: next segment */
-   char current_parent[256];       /* folder ID resolved so far */
+   char current_parent[256];       /* folder IDs resolved so far */
    gdrive_cb_state_t *cb_st;
    gdrive_op_fn_t op_fn;           /* operation to call when done */
 } gdrive_folder_walk_t;
@@ -402,12 +403,51 @@ static bool gdrive_json_int(const char *json_data, size_t json_len,
    return false;
 }
 
+/* Folder IDs are kept as lists: every folder of one name, oldest
+ * first, separated by commas.  Lookups search them all and new files
+ * and folders go in the first, so racing clients that each created a
+ * folder (#19244) converge and neither one's files hide.  A name in
+ * several of them is the file modified last.  An ID that does not fit
+ * whole is left out. */
+static void gdrive_list_add(char *list, size_t list_size, const char *id)
+{
+   size_t _len = strlen(list);
+   size_t sep  = _len ? 1 : 0;
+   if (_len + sep + strlen(id) >= list_size)
+      return;
+   if (sep)
+      list[_len++] = ',';
+   strlcpy(list + _len, id, list_size - _len);
+}
+
+/* Append "('A'+in+parents+or+'B'+in+parents)" for the list "A,B". */
+static void gdrive_append_parents(char *s, size_t len, const char *ids)
+{
+   size_t _len     = strlen(s);
+   const char *sep = "(";
+   if (!*ids)
+      return;
+   while (*ids && _len < len)
+   {
+      int id_len = (int)strcspn(ids, ",");
+      _len      += snprintf(s + _len, len - _len, "%s'%.*s'+in+parents",
+            sep, id_len, ids);
+      sep        = "+or+";
+      ids       += id_len;
+      if (*ids == ',')
+         ids++;
+   }
+   if (_len < len)
+      strlcat(s, ")", len);
+}
+
 /*
- * Extract the ID of the first file from a Google Drive file list response.
- * Sets id_out to empty string if the files array is empty.
+ * Extract the IDs from a Google Drive file list response as a list,
+ * in order: only the first unless all is set.
+ * Sets ids_out to empty string if the files array is empty.
  */
-static bool gdrive_extract_first_id(const char *data, size_t len,
-      char *id_out, size_t id_size)
+static bool gdrive_extract_ids(const char *data, size_t len,
+      char *ids_out, size_t ids_size, bool all)
 {
    rjson_t *json;
    enum rjson_type type;
@@ -417,8 +457,8 @@ static bool gdrive_extract_first_id(const char *data, size_t len,
    bool is_key      = true;
    char key[64];
 
-   id_out[0] = '\0';
-   key[0]    = '\0';
+   ids_out[0] = '\0';
+   key[0]     = '\0';
 
    if (!data || !len)
       return false;
@@ -439,8 +479,12 @@ static bool gdrive_extract_first_id(const char *data, size_t len,
             depth--;
             if (in_file_obj && depth == 2)
             {
-               rjson_free(json);
-               return true;
+               if (!all)
+               {
+                  rjson_free(json);
+                  return true;
+               }
+               in_file_obj = false;
             }
             is_key = true;
             break;
@@ -470,7 +514,7 @@ static bool gdrive_extract_first_id(const char *data, size_t len,
             else
             {
                if (in_file_obj && string_is_equal(key, "id"))
-                  strlcpy(id_out, str, id_size);
+                  gdrive_list_add(ids_out, ids_size, str);
                is_key = true;
             }
             break;
@@ -614,8 +658,8 @@ static void gdrive_find_folder_cb(retro_task_t *task, void *task_data,
       return;
    }
 
-   gdrive_extract_first_id(data->data, data->len,
-         gdrive_st.folder_id, sizeof(gdrive_st.folder_id));
+   gdrive_extract_ids(data->data, data->len,
+         gdrive_st.folder_id, sizeof(gdrive_st.folder_id), true);
 
    if (gdrive_st.folder_id[0])
    {
@@ -636,7 +680,7 @@ static void gdrive_find_folder(gdrive_begin_ctx_t *ctx)
          "q=name='" GDRIVE_FOLDER_NAME "'"
          "+and+mimeType='application/vnd.google-apps.folder'"
          "+and+trashed=false"
-         "&fields=files(id,name)",
+         "&fields=files(id,name)&orderBy=createdTime&pageSize=10",
          true, NULL, headers, gdrive_find_folder_cb, ctx))
    {
       RARCH_WARN(GDPFX "Could not search for folder\n");
@@ -735,15 +779,25 @@ static void gdrive_walk_cache_path(const gdrive_folder_walk_t *walk,
          (_len + 1 < out_size) ? _len + 1 : out_size);
 }
 
+static void gdrive_cb_state_set_parents(gdrive_cb_state_t *cb_st,
+      const char *ids)
+{
+   size_t _len = strcspn(ids, ",");
+   strlcpy(cb_st->parent_ids, ids, sizeof(cb_st->parent_ids));
+   strlcpy(cb_st->parent_id, ids,
+         (_len + 1 < sizeof(cb_st->parent_id))
+         ? _len + 1 : sizeof(cb_st->parent_id));
+}
+
 /* Called after a folder is found or created: cache, advance, continue */
 static void gdrive_folder_walk_resolved(gdrive_folder_walk_t *walk,
-      const char *folder_id)
+      const char *folder_ids)
 {
    char cache_path[PATH_MAX_LENGTH];
 
    gdrive_walk_cache_path(walk, cache_path, sizeof(cache_path));
-   gdrive_folder_cache_add(cache_path, folder_id);
-   strlcpy(walk->current_parent, folder_id,
+   gdrive_folder_cache_add(cache_path, folder_ids);
+   strlcpy(walk->current_parent, folder_ids,
          sizeof(walk->current_parent));
 
    gdrive_walk_advance(walk);
@@ -751,8 +805,7 @@ static void gdrive_folder_walk_resolved(gdrive_folder_walk_t *walk,
    if (!walk->remaining)
    {
       /* All segments resolved */
-      strlcpy(walk->cb_st->parent_id, walk->current_parent,
-            sizeof(walk->cb_st->parent_id));
+      gdrive_cb_state_set_parents(walk->cb_st, walk->current_parent);
       walk->op_fn(walk->cb_st);
       free(walk);
       return;
@@ -793,7 +846,7 @@ static void gdrive_folder_search_cb(retro_task_t *task, void *task_data,
 {
    gdrive_folder_walk_t *walk = (gdrive_folder_walk_t *)user_data;
    http_transfer_data_t *data = (http_transfer_data_t *)task_data;
-   char folder_id[256];
+   char folder_ids[256];
 
    if (!data || data->status < 200 || data->status >= 300)
    {
@@ -803,14 +856,13 @@ static void gdrive_folder_search_cb(retro_task_t *task, void *task_data,
       return;
    }
 
-   folder_id[0] = '\0';
-   gdrive_extract_first_id(data->data, data->len,
-         folder_id, sizeof(folder_id));
+   gdrive_extract_ids(data->data, data->len,
+         folder_ids, sizeof(folder_ids), true);
 
-   if (folder_id[0])
+   if (folder_ids[0])
    {
       /* Folder exists */
-      gdrive_folder_walk_resolved(walk, folder_id);
+      gdrive_folder_walk_resolved(walk, folder_ids);
    }
    else
    {
@@ -825,8 +877,9 @@ static void gdrive_folder_search_cb(retro_task_t *task, void *task_data,
       snprintf(json, sizeof(json),
             "{\"name\":\"%s\","
             "\"mimeType\":\"application/vnd.google-apps.folder\","
-            "\"parents\":[\"%s\"]}",
-            escaped_segment, walk->current_parent);
+            "\"parents\":[\"%.*s\"]}",
+            escaped_segment, (int)strcspn(walk->current_parent, ","),
+            walk->current_parent);
 
       headers = gdrive_get_headers("Content-Type: application/json\r\n");
       if (!task_push_http_post_transfer_with_headers(
@@ -851,12 +904,13 @@ static void gdrive_folder_walk_next(gdrive_folder_walk_t *walk)
    gdrive_walk_segment(walk, segment, sizeof(segment));
    gdrive_url_encode_name(encoded_segment, sizeof(encoded_segment), segment);
    snprintf(url, sizeof(url),
-         GDRIVE_API_BASE "/files?"
-         "q=name='%s'+and+'%s'+in+parents"
+         GDRIVE_API_BASE "/files?q=name='%s'+and+", encoded_segment);
+   gdrive_append_parents(url, sizeof(url), walk->current_parent);
+   strlcat(url,
          "+and+mimeType='application/vnd.google-apps.folder'"
          "+and+trashed=false"
-         "&fields=files(id)&pageSize=1",
-         encoded_segment, walk->current_parent);
+         "&fields=files(id)&orderBy=createdTime&pageSize=10",
+         sizeof(url));
 
    headers = gdrive_get_headers(NULL);
    if (!task_push_http_transfer_with_headers(url, true, NULL,
@@ -883,8 +937,7 @@ static void gdrive_resolve_parent(const char *path,
    if (!last_slash)
    {
       /* No directory component — file is in root folder */
-      strlcpy(cb_st->parent_id, gdrive_st.folder_id,
-            sizeof(cb_st->parent_id));
+      gdrive_cb_state_set_parents(cb_st, gdrive_st.folder_id);
       op_fn(cb_st);
       return;
    }
@@ -898,7 +951,7 @@ static void gdrive_resolve_parent(const char *path,
    cached_id = gdrive_folder_cache_lookup(dir_path);
    if (cached_id)
    {
-      strlcpy(cb_st->parent_id, cached_id, sizeof(cb_st->parent_id));
+      gdrive_cb_state_set_parents(cb_st, cached_id);
       op_fn(cb_st);
       return;
    }
@@ -943,8 +996,9 @@ static void gdrive_resolve_parent(const char *path,
 
 /* ========== Per-File Search ========== */
 
+/* The file of that name modified last, in any of the folders. */
 static bool gdrive_search_file(const char *name,
-      const char *parent_id,
+      const char *parent_ids,
       retro_task_callback_t cb, void *user_data)
 {
    bool pushed;
@@ -954,10 +1008,12 @@ static bool gdrive_search_file(const char *name,
 
    gdrive_url_encode_name(encoded_name, sizeof(encoded_name), name);
    snprintf(url, sizeof(url),
-         GDRIVE_API_BASE "/files?"
-         "q=name='%s'+and+'%s'+in+parents+and+trashed=false"
-         "&fields=files(id)&pageSize=1",
-         encoded_name, parent_id);
+         GDRIVE_API_BASE "/files?q=name='%s'+and+", encoded_name);
+   gdrive_append_parents(url, sizeof(url), parent_ids);
+   strlcat(url,
+         "+and+trashed=false"
+         "&fields=files(id)&orderBy=modifiedTime+desc&pageSize=10",
+         sizeof(url));
 
    headers = gdrive_get_headers(NULL);
    pushed  = (task_push_http_transfer_with_headers(url, true, NULL,
@@ -1361,8 +1417,8 @@ static void gdrive_read_search_cb(retro_task_t *task, void *task_data,
       return;
    }
 
-   gdrive_extract_first_id(data->data, data->len,
-         cb_st->file_id, sizeof(cb_st->file_id));
+   gdrive_extract_ids(data->data, data->len,
+         cb_st->file_id, sizeof(cb_st->file_id), false);
 
    if (!cb_st->file_id[0])
    {
@@ -1390,7 +1446,7 @@ static void gdrive_do_read_impl(gdrive_cb_state_t *cb_st)
 {
    cb_st->file_id[0] = '\0';
    if (!gdrive_search_file(path_basename(cb_st->path),
-         cb_st->parent_id, gdrive_read_search_cb, cb_st))
+         cb_st->parent_ids, gdrive_read_search_cb, cb_st))
    {
       RARCH_WARN(GDPFX "Could not search for %s\n", cb_st->path);
       gdrive_cb_state_finish(cb_st, false);
@@ -1542,9 +1598,9 @@ static void gdrive_create_cb(retro_task_t *task, void *task_data,
 /* With destructive sync off, a delete keeps the server's copy - renamed
  * in place to <name>-<yymmdd-hhmmss> - but an upload replaced its
  * content outright.  Before the PATCH, copy the file (files.copy, done
- * by Drive itself) to that name in the same folder, so an upload keeps
- * the copy a delete would have.  The server manifest is rewritten every
- * sync and is not backed up. */
+ * by Drive itself) to that name in the oldest of its same-named
+ * folders, so an upload keeps the copy a delete would have.  The
+ * server manifest is rewritten every sync and is not backed up. */
 static bool gdrive_wants_backup(const char *path)
 {
    settings_t *settings = config_get_ptr();
@@ -1635,8 +1691,8 @@ static void gdrive_update_search_cb(retro_task_t *task, void *task_data,
       return;
    }
 
-   gdrive_extract_first_id(data->data, data->len,
-         cb_st->file_id, sizeof(cb_st->file_id));
+   gdrive_extract_ids(data->data, data->len,
+         cb_st->file_id, sizeof(cb_st->file_id), false);
 
    if (cb_st->file_id[0])
    {
@@ -1675,7 +1731,7 @@ static void gdrive_do_update_impl(gdrive_cb_state_t *cb_st)
 {
    cb_st->file_id[0] = '\0';
    if (!gdrive_search_file(path_basename(cb_st->path),
-         cb_st->parent_id, gdrive_update_search_cb, cb_st))
+         cb_st->parent_ids, gdrive_update_search_cb, cb_st))
    {
       RARCH_WARN(GDPFX "Could not search for %s\n", cb_st->path);
       gdrive_cb_state_finish(cb_st, false);
@@ -1754,8 +1810,8 @@ static void gdrive_delete_search_cb(retro_task_t *task, void *task_data,
       return;
    }
 
-   gdrive_extract_first_id(data->data, data->len,
-         cb_st->file_id, sizeof(cb_st->file_id));
+   gdrive_extract_ids(data->data, data->len,
+         cb_st->file_id, sizeof(cb_st->file_id), false);
 
    if (!cb_st->file_id[0])
    {
@@ -1824,7 +1880,7 @@ static void gdrive_do_delete_impl(gdrive_cb_state_t *cb_st)
 {
    cb_st->file_id[0] = '\0';
    if (!gdrive_search_file(path_basename(cb_st->path),
-         cb_st->parent_id, gdrive_delete_search_cb, cb_st))
+         cb_st->parent_ids, gdrive_delete_search_cb, cb_st))
    {
       RARCH_WARN(GDPFX "Could not search for %s\n", cb_st->path);
       gdrive_cb_state_finish(cb_st, false);

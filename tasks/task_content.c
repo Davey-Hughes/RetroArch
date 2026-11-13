@@ -2576,11 +2576,15 @@ void menu_content_environment_get(int *argc, char *argv[],
 
    if (!path_is_empty(RARCH_PATH_CONFIG))
       wrap_args->config_path   = path_get(RARCH_PATH_CONFIG);
+   /* Only a command-line folder is passed on as one: a configured
+    * folder is checked again at each load */
    a = dir_get_ptr(RARCH_DIR_SAVEFILE);
-   if (a && *a)
+   if (a && *a && retroarch_override_setting_is_set(
+            RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL))
       wrap_args->sram_path     = dir_get_ptr(RARCH_DIR_SAVEFILE);
    a = dir_get_ptr(RARCH_DIR_SAVESTATE);
-   if (a && *a)
+   if (a && *a && retroarch_override_setting_is_set(
+            RARCH_OVERRIDE_SETTING_STATE_PATH, NULL))
       wrap_args->state_path    = dir_get_ptr(RARCH_DIR_SAVESTATE);
    if (!path_is_empty(RARCH_PATH_CONTENT))
       wrap_args->content_path  = path_get(RARCH_PATH_CONTENT);
@@ -3538,7 +3542,8 @@ static bool task_load_content_internal(
       bool loading_from_menu,
       bool loading_from_cli,
       bool loading_from_companion_ui,
-      unsigned after)
+      unsigned after,
+      bool staged)
 {
    content_information_ctx_t content_ctx;
    content_state_t *p_content              = content_state_get_ptr();
@@ -3562,15 +3567,15 @@ static bool task_load_content_internal(
 #endif
 
    /* Loads content into currently selected core.  From the command
-    * line this is startup itself: no frame loop runs yet to advance
-    * a staged load, so it runs in one go. */
+    * line at startup no frame loop runs yet to advance a staged load,
+    * so it runs in one go. */
    ret = content_load(content_info, p_content,
            CONTENT_LOAD_AFTER_HISTORY
          | CONTENT_LOAD_AFTER_HISTORY_MENU
          | (loading_from_cli          ? CONTENT_LOAD_AFTER_HISTORY_CLI : 0)
          | (loading_from_companion_ui ? CONTENT_LOAD_AFTER_HISTORY_UI  : 0)
          | after,
-         !loading_from_cli);
+         staged);
 
    content_information_ctx_free(&content_ctx);
 
@@ -3586,7 +3591,7 @@ static bool task_load_content_internal_wrap(
    if (task_load_content_internal(content_info, true, false,
             load_from_companion_ui,
               (type != CORE_TYPE_DUMMY ? CONTENT_LOAD_AFTER_QUICK_MENU : 0)
-            | CONTENT_LOAD_AFTER_MENU_ON_FAIL))
+            | CONTENT_LOAD_AFTER_MENU_ON_FAIL, true))
       return true;
 
 #ifdef HAVE_MENU
@@ -3644,7 +3649,14 @@ bool task_push_load_content_from_cli(
       retro_task_callback_t cb,
       void *user_data)
 {
-   return task_load_content_internal(content_info, true, true, false, 0);
+   return task_load_content_internal(content_info, true, true, false, 0,
+         false);
+}
+
+bool task_push_load_content_from_cli_staged(content_ctx_info_t *content_info)
+{
+   return task_load_content_internal(content_info, true, true, false,
+         CONTENT_LOAD_AFTER_MENU_ON_FAIL, true);
 }
 
 bool task_push_start_builtin_core(

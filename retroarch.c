@@ -212,6 +212,7 @@
 #include "msg_hash.h"
 #include "paths.h"
 #include "file_path_special.h"
+#include "save_backups.h"
 #include "ui/ui_companion_driver.h"
 #include "verbosity.h"
 
@@ -446,6 +447,10 @@ struct rarch_state
    char dir_system[DIR_MAX_LENGTH];
    char dir_savefile[DIR_MAX_LENGTH];
    char dir_savestate[DIR_MAX_LENGTH];
+   char dir_savefile_configured[DIR_MAX_LENGTH];
+   char dir_savestate_configured[DIR_MAX_LENGTH];
+   char dir_savefile_base[DIR_MAX_LENGTH];
+   char dir_savestate_base[DIR_MAX_LENGTH];
 };
 
 /* Forward declarations */
@@ -3228,8 +3233,9 @@ static void ram_state_to_file(void)
 
    state_path[0] = '\0';
 
+   /* At a close: synced */
    if (runloop_get_current_savestate_path(state_path, sizeof(state_path)))
-      command_event(CMD_EVENT_RAM_STATE_TO_FILE, state_path);
+      command_event_ram_state_to_file(state_path, true);
 }
 
 enum rarch_content_type path_is_media_type(const char *path)
@@ -3412,6 +3418,14 @@ size_t dir_get_size(enum rarch_dir_type type)
          return sizeof(p_rarch->dir_savefile);
       case RARCH_DIR_CURRENT_SAVEFILE:
          return sizeof(runloop_state_get_ptr()->savefile_dir);
+      case RARCH_DIR_SAVEFILE_CONFIGURED:
+         return sizeof(p_rarch->dir_savefile_configured);
+      case RARCH_DIR_SAVESTATE_CONFIGURED:
+         return sizeof(p_rarch->dir_savestate_configured);
+      case RARCH_DIR_SAVEFILE_BASE:
+         return sizeof(p_rarch->dir_savefile_base);
+      case RARCH_DIR_SAVESTATE_BASE:
+         return sizeof(p_rarch->dir_savestate_base);
       case RARCH_DIR_NONE:
          break;
    }
@@ -3437,6 +3451,18 @@ void dir_clear(enum rarch_dir_type type)
       case RARCH_DIR_SYSTEM:
          *p_rarch->dir_system = '\0';
          break;
+      case RARCH_DIR_SAVEFILE_CONFIGURED:
+         *p_rarch->dir_savefile_configured = '\0';
+         break;
+      case RARCH_DIR_SAVESTATE_CONFIGURED:
+         *p_rarch->dir_savestate_configured = '\0';
+         break;
+      case RARCH_DIR_SAVEFILE_BASE:
+         *p_rarch->dir_savefile_base = '\0';
+         break;
+      case RARCH_DIR_SAVESTATE_BASE:
+         *p_rarch->dir_savestate_base = '\0';
+         break;
       case RARCH_DIR_NONE:
          break;
       case RARCH_DIR_CURRENT_SAVEFILE:
@@ -3455,6 +3481,10 @@ static void dir_clear_all(void)
    dir_clear(RARCH_DIR_SYSTEM);
    dir_clear(RARCH_DIR_SAVEFILE);
    dir_clear(RARCH_DIR_SAVESTATE);
+   dir_clear(RARCH_DIR_SAVEFILE_CONFIGURED);
+   dir_clear(RARCH_DIR_SAVESTATE_CONFIGURED);
+   dir_clear(RARCH_DIR_SAVEFILE_BASE);
+   dir_clear(RARCH_DIR_SAVESTATE_BASE);
 }
 
 /* get ptr functions */
@@ -3475,6 +3505,14 @@ char *dir_get_ptr(enum rarch_dir_type type)
          return runloop_state_get_ptr()->savestate_dir;
       case RARCH_DIR_SYSTEM:
          return p_rarch->dir_system;
+      case RARCH_DIR_SAVEFILE_CONFIGURED:
+         return p_rarch->dir_savefile_configured;
+      case RARCH_DIR_SAVESTATE_CONFIGURED:
+         return p_rarch->dir_savestate_configured;
+      case RARCH_DIR_SAVEFILE_BASE:
+         return p_rarch->dir_savefile_base;
+      case RARCH_DIR_SAVESTATE_BASE:
+         return p_rarch->dir_savestate_base;
       case RARCH_DIR_NONE:
          break;
    }
@@ -3500,6 +3538,22 @@ void dir_set(enum rarch_dir_type type, const char *path)
       case RARCH_DIR_SYSTEM:
          strlcpy(p_rarch->dir_system, path,
                sizeof(p_rarch->dir_system));
+         break;
+      case RARCH_DIR_SAVEFILE_CONFIGURED:
+         strlcpy(p_rarch->dir_savefile_configured, path,
+               sizeof(p_rarch->dir_savefile_configured));
+         break;
+      case RARCH_DIR_SAVESTATE_CONFIGURED:
+         strlcpy(p_rarch->dir_savestate_configured, path,
+               sizeof(p_rarch->dir_savestate_configured));
+         break;
+      case RARCH_DIR_SAVEFILE_BASE:
+         strlcpy(p_rarch->dir_savefile_base, path,
+               sizeof(p_rarch->dir_savefile_base));
+         break;
+      case RARCH_DIR_SAVESTATE_BASE:
+         strlcpy(p_rarch->dir_savestate_base, path,
+               sizeof(p_rarch->dir_savestate_base));
          break;
       case RARCH_DIR_NONE:
          break;
@@ -3649,11 +3703,10 @@ static void command_event_core_deinit_begin(void)
     * ends and writes it to a file */
    ram_state_to_file();
 
-   /* Save auto state */
    if (     (runloop_st->flags & RUNLOOP_FLAG_CORE_RUNNING)
          && !(runloop_st->flags & RUNLOOP_FLAG_SHUTDOWN_INITIATED)
          && settings->bools.savestate_auto_save)
-      command_event_save_auto_state();
+      rarch_st.flags |= RARCH_FLAGS_AUTO_SAVE_ON_DEINIT;
 
    /* Closing content starts here: retro_run() is not entered again
     * (core_run's guard), whatever the frame loop does meanwhile. */
@@ -3677,8 +3730,7 @@ static void command_event_core_deinit_begin(void)
  * into core function pointers (retro_serialize via
  * content_get_serialized_data, retro_unserialize via core_unserialize)
  * from the task worker, and the deinit below unloads the library they
- * live in.  The auto-save just pushed is covered too: it runs against
- * the same condition. */
+ * live in. */
 static bool command_event_core_deinit_pending(void)
 {
    return content_save_state_in_progress(NULL)
@@ -3706,6 +3758,12 @@ static void command_event_log_readahead(const char *proto,
 static void command_event_core_deinit_finish(void)
 {
    runloop_state_t *runloop_st = runloop_state_get_ptr();
+   /* After the state writes waited for, so it is the last one */
+   if (rarch_st.flags & RARCH_FLAGS_AUTO_SAVE_ON_DEINIT)
+   {
+      rarch_st.flags &= ~RARCH_FLAGS_AUTO_SAVE_ON_DEINIT;
+      command_event_save_auto_state();
+   }
    command_event_finish_content_deinit();
 #ifdef HAVE_SMBCLIENT
    {
@@ -3875,6 +3933,29 @@ bool command_event_later(enum event_command cmd, const int *arg)
    return true;
 }
 
+#ifdef HAVE_BSV_MOVIE
+/* A Record Replay waiting for its recording to start */
+typedef struct
+{
+   task_notify_t notify;
+   int asked;
+   int slot;
+} replay_record_t;
+
+/* Only a recording that started moves the replay slot setting */
+static void command_event_record_replay_done(retro_task_t *task,
+      void *task_data, void *user_data, const char *error)
+{
+   replay_record_t *rec = (replay_record_t*)user_data;
+   if (!error)
+      command_event_set_replay_record_slot(config_get_ptr(),
+            rec->asked, rec->slot);
+   if (rec->notify.cb)
+      rec->notify.cb(task, task_data, rec->notify.user_data, error);
+   free(rec);
+}
+#endif
+
 bool command_event(enum event_command cmd, void *data)
 {
    struct rarch_state *p_rarch     = &rarch_st;
@@ -3903,19 +3984,27 @@ bool command_event(enum event_command cmd, void *data)
 #endif
          return event_load_save_files(runloop_st->flags & RUNLOOP_FLAG_IS_SRAM_LOAD_DISABLED);
       case CMD_EVENT_SAVE_FILES:
-         return event_save_files(
-               runloop_st->flags & RUNLOOP_FLAG_USE_SRAM,
+         {
+            /* NULL is an explicit save request (network command, web
+             * export): not synced, but it makes the copies owed. */
+            bool sync = data ? *(bool*)data : false;
+            runloop_recover_save_files(sync);
+            return event_save_files(
+                  runloop_st->flags & RUNLOOP_FLAG_USE_SRAM,
 #if defined(HAVE_COMPRESSION)
-               settings->bools.save_file_compression,
+                  settings->bools.save_file_compression,
 #else
-               false,
+                  false,
 #endif
+                  sync,
+                  sync || !data,
 #ifdef HAVE_CHEATS
-               settings->paths.path_cheat_database
+                  settings->paths.path_cheat_database
 #else
-               NULL
+                  NULL
 #endif
-         );
+            );
+         }
       case CMD_EVENT_OVERLAY_UNLOAD:
 #ifdef HAVE_OVERLAY
          input_overlay_unload();
@@ -4311,7 +4400,7 @@ bool command_event(enum event_command cmd, void *data)
             return false;
          break;
       case CMD_EVENT_RAM_STATE_TO_FILE:
-         if (!content_ram_state_to_file((char *) data))
+         if (!command_event_ram_state_to_file((const char*)data, false))
             return false;
          break;
       case CMD_EVENT_APPLY_WINDOWED_SCALE:
@@ -4403,6 +4492,8 @@ bool command_event(enum event_command cmd, void *data)
          input_driver_state_t *input_st = input_state_get_ptr();
          char replay_path[PATH_MAX_LENGTH];
          bool res = true;
+         if (command_state_held())
+            return false;
          /* TODO: Consider extending the current replay if we start recording during a playback */
          if (input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_RECORDING)
             res = false;
@@ -4432,6 +4523,8 @@ bool command_event(enum event_command cmd, void *data)
          bool res                       = true;
          input_driver_state_t *input_st = input_state_get_ptr();
          int replay_slot                = settings->ints.replay_slot;
+         if (command_state_held())
+            return false;
          if (settings->bools.replay_auto_index)
             replay_slot += 1;
          /* TODO: Consider cloning and extending the current replay if we start recording during a recording */
@@ -4439,16 +4532,29 @@ bool command_event(enum event_command cmd, void *data)
             res = false;
          else if (input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_PLAYBACK)
             res = movie_stop(input_st);
+         /* Never over a replay: the next free number */
+         if (res && !command_event_free_replay_slot(&replay_slot))
+            res = false;
          if (!runloop_get_replay_path(replay_path, sizeof(replay_path), replay_slot))
             res = false;
          if (res)
          {
             const task_notify_t *n = (const task_notify_t*)data;
-            res = movie_start_record_notify(input_st, replay_path,
-                  n ? n->cb : NULL, n ? n->user_data : NULL);
+            replay_record_t *rec   = (replay_record_t*)malloc(sizeof(*rec));
+            RARCH_LOG("[Replay] Recording to slot %d.\n", replay_slot);
+            if (!rec)
+               res = false;
+            else
+            {
+               rec->notify.cb        = n ? n->cb        : NULL;
+               rec->notify.user_data = n ? n->user_data : NULL;
+               rec->asked            = settings->ints.replay_slot;
+               rec->slot             = replay_slot;
+               if (!(res = movie_start_record_notify(input_st, replay_path,
+                     command_event_record_replay_done, rec)))
+                  free(rec);
+            }
          }
-         if (res && settings->bools.replay_auto_index)
-            configuration_set_int(settings, settings->ints.replay_slot, replay_slot);
          if (!res)
          {
             const char *_msg = msg_hash_to_str(MSG_FAILED_TO_START_MOVIE_RECORD);
@@ -4587,10 +4693,18 @@ bool command_event(enum event_command cmd, void *data)
              * ends and writes it to a file */
             ram_state_to_file();
 
-            /* Save auto state */
+            /* Save auto state.  A state write still in flight: the
+             * content's deinit saves it once that is through, a frame
+             * or more from now. */
             if (     settings->bools.savestate_auto_save
                   && runloop_st->current_core_type != CORE_TYPE_DUMMY)
-               command_event_save_auto_state();
+            {
+               if (     (flags & CONTENT_ST_FLAG_IS_INITED)
+                     && command_event_core_deinit_pending())
+                  rarch_st.flags |= RARCH_FLAGS_AUTO_SAVE_ON_DEINIT;
+               else
+                  command_event_save_auto_state();
+            }
 
             /* Save last selected disk index, if required */
             if (sys_info)
@@ -4885,6 +4999,13 @@ bool command_event(enum event_command cmd, void *data)
 #endif
             if (rewind_enable)
             {
+               /* Held: the buffer starts from the saves, once loaded */
+               if (runloop_st->save_load_hold)
+               {
+                  runloop_st->rewind_st.flags |=
+                     STATE_MGR_REWIND_ST_FLAG_INIT_PENDING;
+                  return false;
+               }
 #ifdef HAVE_NETWORKING
                /* Only enable state manager if netplay is not underway
                   TODO/FIXME: Add a setting for these tweaks */
@@ -4923,8 +5044,9 @@ bool command_event(enum event_command cmd, void *data)
          break;
       case CMD_EVENT_AUTOSAVE_INIT:
 #ifdef HAVE_THREADS
-         if (runloop_st->flags & RUNLOOP_FLAG_USE_SRAM)
-            autosave_deinit();
+         if (!(runloop_st->flags & RUNLOOP_FLAG_USE_SRAM))
+            break;
+         autosave_deinit();
          {
 #ifdef HAVE_NETWORKING
             unsigned autosave_interval =
@@ -5300,6 +5422,9 @@ bool command_event(enum event_command cmd, void *data)
             audio_driver_state_t *audio_st = audio_state_get_ptr();
 
             content_reset_savestate_backups();
+            /* An auto save-state a close never wrote is not this
+             * session's */
+            rarch_st.flags &= ~RARCH_FLAGS_AUTO_SAVE_ON_DEINIT;
 
             /* Ensure that disk control interface is reset */
             if (sys_info)
@@ -5658,6 +5783,12 @@ bool command_event(enum event_command cmd, void *data)
          break;
       case CMD_EVENT_CLOUD_SYNC_RESOLVE_KEEP_SERVER:
          task_push_cloud_sync_resolve_keep_server();
+         break;
+      case CMD_EVENT_CLOUD_SYNC_UPLOAD_ALL:
+         task_push_cloud_sync_upload_all();
+         break;
+      case CMD_EVENT_CLOUD_SYNC_DELETE_MISSING:
+         task_push_cloud_sync_delete_missing();
          break;
 #endif
       case CMD_EVENT_MENU_RESET_TO_DEFAULT_CONFIG:
@@ -6028,6 +6159,9 @@ bool command_event(enum event_command cmd, void *data)
          break;
       case CMD_EVENT_NETPLAY_ENABLE_HOST:
          {
+            if (command_state_held())
+               return false;
+
             /* Ask the lobby server for the tunnel address now.
              *
              * This is the point where the user has committed to
@@ -6958,6 +7092,15 @@ static void sdl_exit(void)
 }
 #endif
 
+void retroarch_save_files_for_suspend(void)
+{
+   if (runloop_content_loaded())
+   {
+      bool sync = true;
+      command_event(CMD_EVENT_SAVE_FILES, &sync);
+   }
+}
+
 /* The platform is taking the application away and may not give it
  * back - Android, when the activity is paused. Everything that would
  * otherwise only be written by retroarch_main_quit() is written now:
@@ -6982,8 +7125,7 @@ void retroarch_save_for_suspend(void)
     * transient state. There is nothing to save in either case:
     * CMD_EVENT_SAVE_FILES exists to persist SRAM and game-specific
     * cheats, both of which require loaded content. */
-   if (runloop_content_loaded())
-      command_event(CMD_EVENT_SAVE_FILES, NULL);
+   retroarch_save_files_for_suspend();
 
    /* Core options: written unconditionally on core unload, so not
     * gated on config_save_on_exit here either. Without this, option
@@ -7188,6 +7330,23 @@ static int mkdir_p(const char *path, mode_t mode)
 }
 #endif
 
+#ifdef HAVE_CLOUDSYNC
+/* The command line, kept for a launch that waits for the startup sync
+ * (retroarch_cli_sync_done), and where that launch is. */
+enum rarch_cli_wait
+{
+   RARCH_CLI_WAIT_NONE = 0,
+   RARCH_CLI_WAIT_SYNC,  /* until the sync ends; any load drops it */
+   RARCH_CLI_WAIT_LOAD   /* the next load is the command line's */
+};
+static int    rarch_cli_argc;
+static char **rarch_cli_argv;
+static void  *rarch_cli_args;
+static enum rarch_cli_wait rarch_cli_wait;
+/* That load failed: rarch_main returns 1, as at startup */
+static bool   rarch_cli_failed;
+#endif
+
 /**
  * main_entry:
  *
@@ -7340,6 +7499,12 @@ int rarch_main(int argc, char *argv[], void *data)
       info.argv            = argv;
       info.args            = data;
       info.environ_get     = frontend_state_get_ptr()->current_frontend_ctx->environment_get;
+#ifdef HAVE_CLOUDSYNC
+      rarch_cli_argc       = argc;
+      rarch_cli_argv       = argv;
+      rarch_cli_args       = data;
+      rarch_cli_failed     = false;
+#endif
 
       if (!task_push_load_content_from_cli(
                NULL,
@@ -7404,6 +7569,10 @@ int rarch_main(int argc, char *argv[], void *data)
    main_exit(data);
 #endif
 
+#ifdef HAVE_CLOUDSYNC
+   if (rarch_cli_failed)
+      return 1;
+#endif
    return 0;
 }
 
@@ -8601,6 +8770,68 @@ static void retroarch_cli_scan(task_dbscan_item_t *items, size_t count,
 #endif
 
 #ifdef HAVE_CLOUDSYNC
+/* The startup sync of a command-line launch ended, whatever its
+ * result: load the command line's content, unless the menu started
+ * other content meanwhile. */
+static void retroarch_cli_sync_done(retro_task_t *task,
+      void *task_data, void *user_data, const char *err)
+{
+   content_ctx_info_t info;
+   runloop_state_t *runloop_st     = runloop_state_get_ptr();
+   frontend_ctx_driver_t *frontend =
+      frontend_state_get_ptr()->current_frontend_ctx;
+
+   /* A quit cancels the sync: no load as it drains the tasks */
+   if (     rarch_cli_wait != RARCH_CLI_WAIT_SYNC
+         || runloop_st->current_core_type != CORE_TYPE_DUMMY
+         || (runloop_st->flags & RUNLOOP_FLAG_SHUTDOWN_INITIATED)
+         || task_content_load_pending())
+      return;
+   info.argc        = rarch_cli_argc;
+   info.argv        = rarch_cli_argv;
+   info.args        = rarch_cli_args;
+   info.environ_get = frontend ? frontend->environment_get : NULL;
+   rarch_cli_wait   = RARCH_CLI_WAIT_LOAD;
+   if (!task_push_load_content_from_cli_staged(&info))
+      rarch_cli_wait = RARCH_CLI_WAIT_NONE;
+}
+
+/* rarch_cli_argv in one block of its own: the caller's can be gone by
+ * the time the sync ends (UWP's returns with rarch_main). Kept until
+ * the next one, as the load reads it after the callback. */
+static bool retroarch_cli_keep_argv(void)
+{
+   static char **kept = NULL;
+   char **copy;
+   char *s;
+   int i;
+   size_t len = (rarch_cli_argc + 1) * sizeof(char*);
+
+   if (!rarch_cli_argv)
+      return false;
+   for (i = 0; i < rarch_cli_argc; i++)
+      if (rarch_cli_argv[i])
+         len += strlen(rarch_cli_argv[i]) + 1;
+   if (!(copy = (char**)malloc(len)))
+      return false;
+   s = (char*)(copy + rarch_cli_argc + 1);
+   for (i = 0; i < rarch_cli_argc; i++)
+   {
+      copy[i] = NULL;
+      if (rarch_cli_argv[i])
+      {
+         size_t _len = strlen(rarch_cli_argv[i]) + 1;
+         memcpy(s, rarch_cli_argv[i], _len);
+         copy[i] = s;
+         s      += _len;
+      }
+   }
+   copy[rarch_cli_argc] = NULL;
+   free(kept);
+   kept = rarch_cli_argv = copy;
+   return true;
+}
+
 /* The sync's verdict, where the waiting caller reads it. */
 static void retroarch_cloud_sync_finished(retro_task_t *task,
       void *task_data, void *user_data, const char *err)
@@ -9089,6 +9320,19 @@ static bool retroarch_parse_input_and_config(
           && path_is_empty(RARCH_PATH_CONFIG_DEFAULT))
          path_set(RARCH_PATH_CONFIG_DEFAULT,
                path_get(RARCH_PATH_CONFIG));
+   }
+
+   /* This device's tag, for copies a sync makes before any content */
+   {
+      char *config_dir = (char*)malloc(DIR_MAX_LENGTH);
+      if (config_dir)
+      {
+         config_dir[0] = '\0';
+         fill_pathname_application_special(config_dir, DIR_MAX_LENGTH,
+               APPLICATION_SPECIAL_DIRECTORY_CONFIG);
+         save_backups_device_load(config_dir);
+         free(config_dir);
+      }
    }
 
    verbosity_enabled = verbosity_is_enabled();
@@ -9771,6 +10015,11 @@ bool retroarch_main_init_core(int argc, char *argv[],
 #ifdef HAVE_MENU
    struct menu_state *menu_st    = menu_state_get_ptr();
 #endif
+#ifdef HAVE_CLOUDSYNC
+   /* Whatever loads now ends the command line's wait */
+   bool cli_load                 = rarch_cli_wait == RARCH_CLI_WAIT_LOAD;
+   rarch_cli_wait                = RARCH_CLI_WAIT_NONE;
+#endif
 
    core_info_set_savestate_probe(retroarch_core_info_savestate_probe);
 
@@ -9825,6 +10074,10 @@ bool retroarch_main_init_core(int argc, char *argv[],
     * want to do change the default directories.
     */
    dir_check_config();
+#ifdef HAVE_CLOUDSYNC
+   /* It may have made a folder the config load found missing */
+   runloop_save_base_check();
+#endif
 #endif
 
 #ifdef HAVE_ACCESSIBILITY
@@ -10069,16 +10322,29 @@ bool retroarch_main_init_core(int argc, char *argv[],
       retroarch_find_drivers(settings, verbosity_enabled, true);
 
 #ifdef HAVE_CLOUDSYNC
-   /* Content from the command line loads its save RAM below, before
-    * rarch_main() would push the startup sync. The sync runs first, so
-    * the core reads the save the server has. */
+   /* Content from the command line would load below, before rarch_main()
+    * pushes the startup sync: the sync is pushed here instead, the
+    * session starts on the dummy core, and the command line loads again
+    * once the sync ends, so a core reads even the save files it keeps
+    * itself after the sync. */
    if (      find_drivers
          && (rarch_st.flags & RARCH_FLAGS_LAUNCHED_FROM_CLI)
          && !string_is_empty(p_rarch->path_content)
          && settings->bools.cloud_sync_enable
          && settings->uints.cloud_sync_sync_mode == CLOUD_SYNC_MODE_AUTOMATIC)
    {
-      retroarch_cloud_sync_run();
+      bool defer = retroarch_cli_keep_argv();
+      if (     task_push_cloud_sync(defer ? retroarch_cli_sync_done : NULL, NULL)
+            && defer)
+      {
+         const char *_msg = msg_hash_to_str(MSG_CLOUD_SYNC_WAITING_CONTENT);
+         RARCH_LOG("[CloudSync] %s\n", _msg);
+         runloop_msg_queue_push(_msg, strlen(_msg), 1, 180, false, NULL,
+               MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+         path_clear(RARCH_PATH_CONTENT);
+         runloop_set_current_core_type(CORE_TYPE_DUMMY, true);
+         rarch_cli_wait = RARCH_CLI_WAIT_SYNC;
+      }
       rarch_st.flags |= RARCH_FLAGS_CLOUD_SYNC_AT_INIT;
    }
 #endif
@@ -10145,6 +10411,16 @@ bool retroarch_main_init_core(int argc, char *argv[],
          runloop_st->current_core_type = CORE_TYPE_DUMMY;
          if (!command_event(CMD_EVENT_CORE_INIT, &runloop_st->current_core_type))
             return retroarch_main_init_fail();
+#ifdef HAVE_CLOUDSYNC
+         /* The command line's load after the startup sync: quit as a
+          * failed load at startup does, unless the menu was asked for */
+         if (      cli_load
+               && !(rarch_st.flags & RARCH_FLAGS_CLI_LOAD_MENU_ON_ERR))
+         {
+            rarch_cli_failed   = true;
+            runloop_st->flags |= RUNLOOP_FLAG_SHUTDOWN_INITIATED;
+         }
+#endif
       }
 #ifdef HAVE_DYNAMIC
       else /* Fall back to regular error handling */
@@ -10531,7 +10807,11 @@ bool retroarch_main_deinit_begin(void)
 
    command_event(CMD_EVENT_RECORD_DEINIT, NULL);
 
-   command_event(CMD_EVENT_SAVE_FILES, NULL);
+   {
+      /* The session's last save write: worth waiting for the disk. */
+      bool sync = true;
+      command_event(CMD_EVENT_SAVE_FILES, &sync);
+   }
 
 #ifdef HAVE_REWIND
    command_event(CMD_EVENT_REWIND_DEINIT, NULL);
@@ -11012,14 +11292,15 @@ bool should_quit_on_close(void)
    return false;
 }
 
-/* Quitting, in two halves around the wait for the auto save-state the
- * first half pushes: the state file is only whole once its task is
- * through, and the runtime log, remaps and config written by the second
- * half are the quit's last word.  retroarch_main_quit() waits between
- * the halves in one go; a quit from inside the frame loop
- * (retroarch_main_quit_staged()) returns to the loop between them, which
- * presents the last frame and the "Saving state" notice while the state
- * is written and finishes the quit once it is.
+/* Quitting, in two halves around the wait for a state task still
+ * writing: the second half writes the auto save-state once that is
+ * through, so it is the last write of the .auto, and the runtime log,
+ * remaps and config it writes are the quit's last word.
+ * retroarch_main_quit() waits between the halves in one go; a quit
+ * from inside the frame loop (retroarch_main_quit_staged()) returns to
+ * the loop between them, which presents the last frame and the "Saving
+ * state" notice while the state is written and finishes the quit once
+ * it is.
  *
  * Returns whether this is the quit's first pass, the one that saves
  * what a quit saves; false once shutdown has already begun. */
@@ -11085,9 +11366,6 @@ static bool retroarch_main_quit_begin(void)
    recording_gpu_stop();
    if (recording_state_get_ptr()->start_pending)
       command_event(CMD_EVENT_RECORD_DEINIT, NULL);
-   if (   settings->bools.savestate_auto_save
-       && runloop_st->current_core_type != CORE_TYPE_DUMMY)
-      command_event_save_auto_state();
    return true;
 }
 
@@ -11103,6 +11381,14 @@ static void retroarch_main_quit_finish(bool first)
 
    if (first)
    {
+      if (   settings->bools.savestate_auto_save
+          && runloop_st->current_core_type != CORE_TYPE_DUMMY)
+      {
+         /* A close already under way does not save it again */
+         rarch_st.flags &= ~RARCH_FLAGS_AUTO_SAVE_ON_DEINIT;
+         command_event_save_auto_state();
+      }
+
       runloop_runtime_log_deinit(runloop_st,
             settings->bools.content_runtime_log,
             settings->bools.content_runtime_log_aggregate,
@@ -11187,8 +11473,8 @@ static bool retroarch_quit_state_task_pending(void *data)
 bool retroarch_main_quit(void)
 {
    bool first = retroarch_main_quit_begin();
-   /* A state task still writing - the auto-save just pushed, or one
-    * the user started - would leave a truncated file behind the exit. */
+   /* A state task still writing would leave a truncated file behind
+    * the exit, or land after the auto save-state. */
    if (first)
       task_queue_wait(retroarch_quit_state_task_pending, NULL);
    retroarch_main_quit_finish(first);

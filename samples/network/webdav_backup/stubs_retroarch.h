@@ -12,6 +12,7 @@ typedef struct
    char url[512];
    char dest[512];
    bool had_auth;
+   bool had_digest;
    bool overlapped;
    retro_task_callback_t cb;
    void *user_data;
@@ -19,5 +20,7 @@ typedef struct
 
 extern stub_request_t stub_pending;
 extern bool           stub_has_pending;
+/* A request of this method is refused: its push returns NULL */
+extern const char    *stub_refuse;
 
 #endif

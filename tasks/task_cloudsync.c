@@ -30,9 +30,13 @@
 #include <retro_inline.h>
 
 #include "../configuration.h"
+#include "../content.h"
 #include "../file_path_special.h"
+#include "../msg_hash.h"
 #include "../network/cloud_sync_driver.h"
 #include "../paths.h"
+#include "../runloop.h"
+#include "../save_backups.h"
 #include "../tasks/tasks_internal.h"
 #include "../verbosity.h"
 #include <compat/strl.h>
@@ -48,9 +52,17 @@
 #define TCS_LOCK_FREE 1
 #endif
 
+/* A backup copied across drives is copied on a thread of its own. Its
+ * hand-back needs a real exchange; without one the copy runs inline. */
+#if defined(HAVE_THREADS) && defined(RETRO_ATOMIC_LOCK_FREE)
+#define TCS_MOVE_WORKER 1
+#endif
+
 #define CSPFX "[CloudSync] "
 
 #define MANIFEST_FILENAME_LOCAL  "manifest.local"
+/* The folder each root was walked from, beside the local manifest */
+#define ROOTS_FILENAME_LOCAL     "manifest.local.roots"
 #define MANIFEST_FILENAME_SERVER CLOUD_SYNC_SERVER_MANIFEST
 
 #define CS_FILE_HASH(item_file) ((char*)((item_file) ? ((item_file)->userdata) : (NULL)))
@@ -76,6 +88,7 @@ typedef struct
 } tcs_hash_t;
 
 struct tcs_fetched;
+struct tcs_move;
 
 typedef struct
 {
@@ -131,6 +144,10 @@ typedef struct
    struct tcs_fetched *fetched_in;
 #endif
    struct tcs_fetched *fetched;
+#if defined(TCS_MOVE_WORKER)
+   /* Backups being copied across drives, oldest first */
+   struct tcs_move *moves;
+#endif
    /* The walk of the synced directories that builds current_manifest,
     * a few entries per run: the directories open from the root of
     * dirlist[walk_root_idx] down, each with the length of its path in
@@ -144,8 +161,12 @@ typedef struct
    bool need_manifest_uploaded;
    bool failures;
    bool conflicts;
+   /* An old backup due to go stayed; said once a sync */
+   bool unpruned;
    const char *fatal_error;
-   /* Conflict resolution mode: 0=none, 1=keep_local, 2=keep_server */
+   /* Conflict resolution mode: 0=none, 1=keep_local, 2=keep_server,
+    * 3=upload_all (files the server lost, changed here or not),
+    * 4=delete_missing (as 0, nothing held) */
    int conflict_resolution;
    uint32_t uploads;
    uint32_t downloads;
@@ -153,12 +174,30 @@ typedef struct
    /* Captured on the main thread when the task is pushed: the handler
     * runs on the threaded task queue's worker, and a worker takes what
     * it needs as arguments rather than reading the settings mid-sync. */
-   bool destructive;
    char dir_core_assets[DIR_MAX_LENGTH];
+   /* task_cloud_sync_server_id() */
+   char server_id[33];
    /* The directory map for this sync, built at push. Per task rather
     * than a process-wide cache: a fresh list per sync is a handful of
-    * strdups, and it cannot go stale against the sync toggles. */
+    * strdups, and it cannot go stale against the sync toggles. An
+    * element's attr.i holds its CS_ROOT_* flags. */
    struct string_list *dirlist;
+   /* The roots file as the last sync left it: data is a root's name,
+    * userdata the folder it was walked from. NULL when there is none. */
+   struct string_list *roots;
+   /* Keys this sync did not delete on the server (CS_ROOT_HELD), each
+    * with the server's hash as userdata, and how many: the list falls
+    * short when out of memory. */
+   struct string_list *held;
+   unsigned held_count;
+   /* Folders whose missing files are held, as "saves/Snes9x/" */
+   struct string_list *held_dirs;
+   /* task_cloud_sync_find_shadowed() */
+   struct string_list *shadowed;
+   /* Mode 4: the last sync's held list, from its roots file */
+   struct string_list *held_before;
+   /* files the server lost, not uploaded: unchanged here */
+   unsigned unsent_count;
    /* Whoever pushed the sync, told when it is done. */
    retro_task_callback_t cb;
    void *cb_data;
@@ -237,6 +276,7 @@ static INLINE enum task_cloud_sync_phase task_cloud_sync_phase_get(
 /* Forward declarations for conflict resolution */
 static void task_cloud_sync_upload_current_file(task_cloud_sync_state_t *sync_state);
 static void task_cloud_sync_fetch_server_file(task_cloud_sync_state_t *sync_state);
+static bool task_cloud_sync_delete_current_file(task_cloud_sync_state_t *sync_state);
 /* Defined below task_cloud_sync_write_updated_manifest(), used above it
  * by the server-manifest upload callback. */
 static void task_cloud_sync_commit_local_manifest(task_cloud_sync_state_t *sync_state);
@@ -438,9 +478,441 @@ static void task_cloud_sync_fetch_server_manifest(task_cloud_sync_state_t *sync_
    }
 }
 
+/* A root walked from another folder than the last sync's */
+#define CS_ROOT_CHANGED 1
+/* A root whose missing files are not deleted on the server */
+#define CS_ROOT_HELD    2
+/* More missing files than this, and more than half of a root's */
+#define CS_HOLD_MIN     10
+/* A folder with this many synced files or more, all missing */
+#define CS_HOLD_DIR_MIN 3
+/* Folder levels a key is checked at */
+#define CS_HOLD_DEPTH   32
+
+static void task_cloud_sync_roots_filename(char *s, size_t len,
+      const char *dir_core_assets)
+{
+   fill_pathname_join_special(s, dir_core_assets, ROOTS_FILENAME_LOCAL, len);
+}
+
+/* The roots file in @out, NULL when there is none or it can't be
+ * read, and then @unreadable; the server it names in @server (33
+ * bytes), and with @held the keys it held. False when out of memory. */
+static bool task_cloud_sync_read_roots(const char *dir_core_assets,
+      struct string_list **out, char *server, struct string_list **held,
+      bool *unreadable)
+{
+   char                path[PATH_MAX_LENGTH];
+   void               *buf   = NULL;
+   int64_t             len   = 0;
+   char               *name  = NULL;
+   rjson_t            *json  = NULL;
+   struct string_list *roots = NULL;
+   bool                ok    = true;
+   enum rjson_type     type;
+
+   *out = NULL;
+   task_cloud_sync_roots_filename(path, sizeof(path), dir_core_assets);
+   if (!path_is_valid(path))
+      return true;
+   if (!filestream_read_file(path, &buf, &len) || !len)
+      goto error;
+   if (     !(json  = rjson_open_buffer(buf, (size_t)len))
+         || !(roots = string_list_new()))
+      goto oom;
+
+   /* the root members' strings, and the "held_at" array's when asked */
+   while ((type = rjson_next(json)) != RJSON_DONE)
+   {
+      const char *str;
+      if (type == RJSON_ERROR)
+         goto error;
+      if (type != RJSON_STRING)
+         continue;
+      str = rjson_get_string(json, NULL);
+      if (rjson_get_context_type(json) == RJSON_ARRAY)
+      {
+         /* "held_at": each key, then the server's hash it was held
+          * at; an older "held" list of keys only is ignored */
+         if (held && name && string_is_equal(name, "held_at"))
+         {
+            if (rjson_get_context_count(json) & 1)
+            {
+               union string_list_elem_attr attr;
+               attr.i = 0;
+               if (     (!*held && !(*held = string_list_new()))
+                     || !string_list_append(*held, str, attr))
+                  goto oom;
+            }
+            else if (*held && (*held)->size
+                  && !(*held)->elems[(*held)->size - 1].userdata
+                  && !((*held)->elems[(*held)->size - 1].userdata
+                     = strdup(str)))
+               goto oom;
+         }
+         continue;
+      }
+      if (rjson_get_context_type(json) != RJSON_OBJECT)
+         continue;
+      if (rjson_get_context_count(json) & 1)
+      {
+         free(name);
+         if (!(name = strdup(str)))
+            goto oom;
+      }
+      else if (name && string_is_equal(name, "server"))
+         strlcpy(server, str, 33);
+      else if (name)
+      {
+         union string_list_elem_attr attr;
+         char *dir = strdup(str);
+         attr.i    = 0;
+         if (!dir || !string_list_append(roots, name, attr))
+         {
+            free(dir);
+            goto oom;
+         }
+         roots->elems[roots->size - 1].userdata = dir;
+      }
+   }
+
+   free(name);
+   rjson_free(json);
+   free(buf);
+   *out = roots;
+   return true;
+
+oom:
+   ok = false;
+error:
+   if (ok)
+   {
+      RARCH_WARN(CSPFX "Could not read \"%s\": syncing every folder as a first sync.\n", path);
+      *unreadable = true;
+   }
+   free(name);
+   if (json)
+      rjson_free(json);
+   string_list_free(roots);
+   if (held)
+   {
+      string_list_free(*held);
+      *held = NULL;
+   }
+   free(buf);
+   return ok;
+}
+
+/* The two folders are the same, but for trailing separators */
+static bool task_cloud_sync_same_dir(const char *a, const char *b)
+{
+   size_t la = strlen(a);
+   size_t lb = strlen(b);
+   while (la > 1 && (a[la - 1] == '/' || a[la - 1] == '\\'))
+      la--;
+   while (lb > 1 && (b[lb - 1] == '/' || b[lb - 1] == '\\'))
+      lb--;
+   return la == lb && !memcmp(a, b, la);
+}
+
+#define CS_IS_SEP(c) ((c) == '/' || (c) == '\\')
+
+/* The next folder name in @p, past separators of either kind and "."
+ * names; its length in @len, 0 at the end. */
+static const char *task_cloud_sync_next_name(const char *p, size_t *len)
+{
+   for (;;)
+   {
+      size_t n = 0;
+      while (CS_IS_SEP(*p))
+         p++;
+      while (p[n] && !CS_IS_SEP(p[n]))
+         n++;
+      if (n == 1 && *p == '.')
+      {
+         p++;
+         continue;
+      }
+      *len = n;
+      return p;
+   }
+}
+
+/* Where @dir goes on below @root, name by name: 0 when it is @root
+ * itself, -1 when it is not under it, else the offset of its first
+ * name below @root. */
+static int task_cloud_sync_dir_within(const char *root, const char *dir)
+{
+   const char *r = root;
+   const char *d = dir;
+   size_t      rn;
+   size_t      dn;
+   for (;;)
+   {
+      r = task_cloud_sync_next_name(r, &rn);
+      d = task_cloud_sync_next_name(d, &dn);
+      if (!rn)
+         return dn ? (int)(d - dir) : 0;
+      if (rn != dn || memcmp(r, d, rn))
+         return -1;
+      r += rn;
+      d += dn;
+   }
+}
+
+/* Whether @key lies under another root's folder within its own root
+ * (task_cloud_sync_find_shadowed()) */
+static bool task_cloud_sync_key_shadowed(
+      const task_cloud_sync_state_t *sync_state, const char *key)
+{
+   const struct string_list *shadowed = sync_state->shadowed;
+   size_t                    i;
+   for (i = 0; shadowed && i < shadowed->size; i++)
+      if (string_starts_with(key, shadowed->elems[i].data))
+         return true;
+   return false;
+}
+
+/* Whether @key is a copy save_backups made (a numbered name with a
+ * device tag) in a backups/ folder at any depth: it stays on its
+ * device, whichever save or state folder was in use for it. */
+static bool task_cloud_sync_key_is_copy(const char *key)
+{
+   struct save_backup_name name;
+   const char *base = strrchr(key, '/');
+   const char *p;
+   if (!base)
+      return false;
+   for (p = key; p < base; p = strchr(p, '/') + 1)
+      if (string_starts_with_case_insensitive(p, SAVE_BACKUPS_DIR "/"))
+         return save_backups_parse(base + 1, &name) && name.device[0];
+   return false;
+}
+
+/* The dirlist root @key lies under, or -1 */
+static int task_cloud_sync_key_root(const struct string_list *dirlist,
+      const char *key)
+{
+   size_t i;
+   for (i = 0; i < dirlist->size; i++)
+   {
+      size_t len = strlen(dirlist->elems[i].data);
+      if (!strncmp(key, dirlist->elems[i].data, len) && key[len] == '/')
+         return (int)i;
+   }
+   return -1;
+}
+
+/* A root walked from another folder than the last sync's leaves the
+ * local manifest, so the diff runs first-sync rules for its keys:
+ * fetch, upload or conflict, never a delete. False when out of
+ * memory. */
+static bool task_cloud_sync_drop_changed_roots(
+      task_cloud_sync_state_t *sync_state)
+{
+   struct string_list *dirlist = sync_state->dirlist;
+   file_list_t        *local   = sync_state->local_manifest;
+   file_list_t        *kept;
+   bool                changed = false;
+   size_t              i;
+
+   for (i = 0; i < dirlist->size; i++)
+   {
+      int at = string_list_find_elem(sync_state->roots,
+            dirlist->elems[i].data);
+      if (at && !task_cloud_sync_same_dir(
+               (const char*)sync_state->roots->elems[at - 1].userdata,
+               (const char*)dirlist->elems[i].userdata))
+      {
+         RARCH_WARN(CSPFX "\"%s\" is now \"%s\", was \"%s\": syncing it as a first sync.\n",
+               dirlist->elems[i].data,
+               (const char*)dirlist->elems[i].userdata,
+               (const char*)sync_state->roots->elems[at - 1].userdata);
+         dirlist->elems[i].attr.i |= CS_ROOT_CHANGED;
+         changed = true;
+      }
+   }
+   if (!changed || !local)
+      return true;
+
+   if (!(kept = (file_list_t*)calloc(1, sizeof(*kept))))
+      return false;
+   for (i = 0; i < local->size; i++)
+   {
+      const char *key = CS_FILE_KEY(&local->list[i]);
+      int         at  = task_cloud_sync_key_root(dirlist, key);
+      if (at >= 0 && (dirlist->elems[at].attr.i & CS_ROOT_CHANGED))
+         continue;
+      if (!file_list_append(kept, NULL, NULL, 0, 0, 0))
+      {
+         file_list_free(kept);
+         return false;
+      }
+      file_list_set_alt_at_offset(kept, kept->size - 1, key);
+      kept->list[kept->size - 1].userdata = local->list[i].userdata;
+      local->list[i].userdata             = NULL;
+   }
+   file_list_free(local);
+   sync_state->local_manifest = kept;
+   return true;
+}
+
+static void task_cloud_sync_write_root(rjsonwriter_t *writer,
+      const char *name, const char *dir, bool *first)
+{
+   if (!*first)
+      rjsonwriter_raw(writer, ",\n", 2);
+   *first = false;
+   rjsonwriter_add_spaces(writer, 2);
+   rjsonwriter_add_string(writer, name);
+   rjsonwriter_raw(writer, ": ", 2);
+   rjsonwriter_add_string(writer, dir);
+}
+
+/* A root with keys in the local manifest that this sync did not walk
+ * and no roots file named: its folder is unknown, so whichever folder
+ * it gets next is a change. */
+static void task_cloud_sync_write_unknown_roots(rjsonwriter_t *writer,
+      const task_cloud_sync_state_t *sync_state, bool *first)
+{
+   char               name[32];
+   char               last[32];
+   const file_list_t *local = sync_state->updated_local_manifest;
+   size_t             i;
+
+   last[0] = '\0';
+   for (i = 0; local && i < local->size; i++)
+   {
+      const char *key   = CS_FILE_KEY(&local->list[i]);
+      const char *slash = key ? strchr(key, '/') : NULL;
+      size_t      len   = slash ? (size_t)(slash - key) : 0;
+      if (!len || len >= sizeof(name))
+         continue;
+      memcpy(name, key, len);
+      name[len] = '\0';
+      /* sorted by key, so a root's keys are together */
+      if (string_is_equal(name, last))
+         continue;
+      strlcpy(last, name, sizeof(last));
+      if (     !string_list_find_elem(sync_state->dirlist, name)
+            && !string_list_find_elem(sync_state->roots, name))
+         task_cloud_sync_write_root(writer, name, "", first);
+   }
+}
+
+/* Written after the local manifest it describes: the folder each root
+ * was walked from, and the roots this sync did not cover as the last
+ * one left them. */
+static void task_cloud_sync_write_roots(task_cloud_sync_state_t *sync_state)
+{
+   char                path[PATH_MAX_LENGTH];
+   struct string_list *dirlist = sync_state->dirlist;
+   struct string_list *roots   = sync_state->roots;
+   rjsonwriter_t      *writer  = rjsonwriter_open_memory();
+   const char         *buf     = NULL;
+   bool                first   = true;
+   int                 len     = 0;
+   size_t              i;
+
+   task_cloud_sync_roots_filename(path, sizeof(path),
+         sync_state->dir_core_assets);
+   if (writer)
+   {
+      rjsonwriter_raw(writer, "{\n", 2);
+      if (*sync_state->server_id)
+         task_cloud_sync_write_root(writer, "server",
+               sync_state->server_id, &first);
+      for (i = 0; i < dirlist->size; i++)
+         task_cloud_sync_write_root(writer, dirlist->elems[i].data,
+               (const char*)dirlist->elems[i].userdata, &first);
+      for (i = 0; roots && i < roots->size; i++)
+         if (!string_list_find_elem(dirlist, roots->elems[i].data))
+            task_cloud_sync_write_root(writer, roots->elems[i].data,
+                  (const char*)roots->elems[i].userdata, &first);
+      task_cloud_sync_write_unknown_roots(writer, sync_state, &first);
+      if (!first)
+         rjsonwriter_raw(writer, ",\n", 2);
+      rjsonwriter_add_spaces(writer, 2);
+      rjsonwriter_add_string(writer, "held_at");
+      rjsonwriter_raw(writer, ": [", 3);
+      /* each key, then the server's hash it was held at */
+      for (i = 0; sync_state->held && i < sync_state->held->size; i++)
+      {
+         const char *hash = (const char*)sync_state->held->elems[i].userdata;
+         if (i)
+            rjsonwriter_raw(writer, ", ", 2);
+         rjsonwriter_add_string(writer, sync_state->held->elems[i].data);
+         rjsonwriter_raw(writer, ", ", 2);
+         rjsonwriter_add_string(writer, hash ? hash : "");
+      }
+      rjsonwriter_raw(writer, "]\n}\n", 4);
+      buf = rjsonwriter_get_memory_buffer(writer, &len);
+   }
+   if (!buf || !filestream_write_file_atomic(path, buf, len))
+   {
+      RARCH_ERR(CSPFX "Failed to write \"%s\".\n", path);
+      sync_state->failures = true;
+   }
+   if (writer)
+      rjsonwriter_free(writer);
+}
+
+/* Mode 4: the keys the last sync held back in the local manifest at
+ * the server's hash they were held at, so the diff takes them as
+ * deleted here: deleted on the server where it still has that copy, a
+ * conflict where another device has changed it since. False when out
+ * of memory. */
+static bool task_cloud_sync_restore_held(task_cloud_sync_state_t *sync_state)
+{
+   file_list_t              *local   = sync_state->local_manifest;
+   const struct string_list *held    = sync_state->held_before;
+   const struct string_list *dirlist = sync_state->dirlist;
+   /* sorted on alt up to here: a binary search for each key */
+   size_t                    sorted  = local->size;
+   size_t                    i;
+
+   for (i = 0; i < held->size; i++)
+   {
+      const char *key  = held->elems[i].data;
+      const char *hash = (const char*)held->elems[i].userdata;
+      size_t      lo   = 0;
+      size_t      hi   = sorted;
+      char       *copy;
+      /* a folder this sync leaves out keeps no record */
+      if (     string_is_empty(hash) || !dirlist
+            || task_cloud_sync_key_root(dirlist, key) < 0)
+         continue;
+      while (lo < hi)
+      {
+         size_t mid = lo + (hi - lo) / 2;
+         int    cmp = strcasecmp(local->list[mid].alt, key);
+         if (!cmp)
+            break;
+         if (cmp < 0)
+            lo = mid + 1;
+         else
+            hi = mid;
+      }
+      if (lo < hi)
+         continue;
+      if (     !(copy = strdup(hash))
+            || !file_list_append(local, NULL, NULL, 0, 0, 0))
+      {
+         free(copy);
+         return false;
+      }
+      file_list_set_alt_at_offset(local, local->size - 1, key);
+      local->list[local->size - 1].userdata = copy;
+   }
+   file_list_sort_on_alt(local);
+   return true;
+}
+
 static void task_cloud_sync_read_local_manifest(task_cloud_sync_state_t *sync_state)
 {
    char manifest_path[PATH_MAX_LENGTH];
+   char server[33];
+   bool unreadable = false;
 
    task_cloud_sync_manifest_filename(manifest_path, sizeof(manifest_path), false,
          sync_state->dir_core_assets);
@@ -477,12 +949,61 @@ static void task_cloud_sync_read_local_manifest(task_cloud_sync_state_t *sync_st
       }
    }
 
+   server[0] = '\0';
+   if (!task_cloud_sync_read_roots(sync_state->dir_core_assets,
+            &sync_state->roots, server,
+            sync_state->conflict_resolution == 4
+            ? &sync_state->held_before : NULL, &unreadable))
+   {
+      sync_state->failures = true;
+      task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_END);
+      return;
+   }
+
+   /* What the last sync left is another server's, or can't be told:
+    * a first sync */
+   if (     unreadable
+         || (    *server && *sync_state->server_id
+             && !string_is_equal(server, sync_state->server_id)))
+   {
+      if (!unreadable)
+         RARCH_WARN(CSPFX "The server changed since the last sync: syncing as a first sync.\n");
+      if (sync_state->local_manifest)
+         file_list_free(sync_state->local_manifest);
+      sync_state->local_manifest = NULL;
+      string_list_free(sync_state->roots);
+      sync_state->roots          = NULL;
+      string_list_free(sync_state->held_before);
+      sync_state->held_before    = NULL;
+   }
+
+   if (     sync_state->held_before && sync_state->local_manifest
+         && !task_cloud_sync_restore_held(sync_state))
+   {
+      sync_state->failures = true;
+      task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_END);
+      return;
+   }
+
+   /* A missing roots file, or a root it does not name, is unchanged */
+   if (      sync_state->roots
+         &&  sync_state->dirlist
+         && !task_cloud_sync_drop_changed_roots(sync_state))
+   {
+      sync_state->failures = true;
+      task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_END);
+      return;
+   }
+
    task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_BUILD_CURRENT_MANIFEST);
 }
 
 /* takes the filename in manifest format, e.g. "config/retroarch.cfg" */
 static bool task_cloud_sync_should_ignore_file(const char *filename)
 {
+   const char *base;
+   size_t      len;
+
    if (string_starts_with(filename, "config/"))
    {
       const char *path = filename + STRLEN_CONST("config/");
@@ -494,9 +1015,37 @@ static bool task_cloud_sync_should_ignore_file(const char *filename)
       /* ignore playlist files */
       if (string_starts_with(path, "content_") && string_ends_with(path, FILE_PATH_LPL_EXTENSION))
          return true;
+
+      /* this device's recovery files (save_backups.c) */
+      if (string_starts_with(path, SAVE_BACKUPS_RECOVERY_DIR "/"))
+         return true;
+
+      /* this device's save folders list (save_backups.c) */
+      if (string_is_equal(path, SAVE_BACKUPS_FOLDERS_FILE))
+         return true;
    }
 
+   /* safety copies stay on the device that made them (save_backups.c) */
+   if (     string_starts_with_case_insensitive(filename,
+               "saves/" SAVE_BACKUPS_DIR "/")
+         || string_starts_with_case_insensitive(filename,
+               "states/" SAVE_BACKUPS_DIR "/"))
+      return true;
+
    if (string_ends_with(filename, "/.DS_Store"))
+       return true;
+
+   /* other tools' files: folder metadata, Syncthing's old versions and
+    * sync tools' conflicted copies */
+   base = strrchr(filename, '/');
+   base = base ? base + 1 : filename;
+   if (     string_starts_with(base, "._")
+         || string_is_equal_case_insensitive(base, "Thumbs.db")
+         || string_is_equal_case_insensitive(base, "desktop.ini")
+         || string_is_equal(base, ".nomedia")
+         || strstr(filename, "/.stversions/")
+         || strstr(base, "conflicted copy")
+         || strstr(base, ".sync-conflict-"))
        return true;
 
    /* a download still being written, or left by one that never
@@ -509,8 +1058,27 @@ static bool task_cloud_sync_should_ignore_file(const char *filename)
    if (string_ends_with(filename, ".tmp"))
        return true;
 
+   /* the old file an atomic write moved aside, or left by one that
+    * never finished (filestream_finish_atomic) */
+   if (string_ends_with(filename, ".prev"))
+       return true;
+
+   /* the same, left by a rename that moves its destination aside as
+    * ".old", or ".old2" and so on, on some platforms
+    * (retro_vfs_file_rename_impl) */
+   len = strlen(filename);
+   while (len && ISDIGIT(filename[len - 1]))
+      len--;
+   if (string_ends_with_size(filename, ".old", len, STRLEN_CONST(".old")))
+       return true;
+
    return false;
 }
+
+/* Each overlap of synced folders is told once a session: the same
+ * folder twice (main thread), one inside another (the sync's handler) */
+static bool tcs_told_same_dir   = false;
+static bool tcs_told_nested_dir = false;
 
 /* A directory open in the walk, and the length of its path. */
 struct tcs_walk_dir
@@ -563,13 +1131,26 @@ static bool task_cloud_sync_walk_push(task_cloud_sync_state_t *sync_state,
    return true;
 }
 
+/* Ends the sync when a synced folder can't be read to its end: its
+ * files would look deleted, and the diff would delete the server's
+ * copies of them. */
+static void task_cloud_sync_walk_abort(task_cloud_sync_state_t *sync_state,
+      const char *path)
+{
+   RARCH_ERR(CSPFX "Could not read \"%s\".\n", path);
+   RARCH_ERR(CSPFX "Not syncing, the current state of the disk could not be established.\n");
+   task_cloud_sync_walk_free(sync_state);
+   sync_state->failures = true;
+   task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_END);
+}
+
 /* One entry of the walk: the next name in the deepest open directory,
  * which adds a file to current_manifest or opens a subdirectory, or
  * the end of that directory. Lists what dir_list_new() lists for the
  * root, recursively, hidden entries included and directories left
- * out; a subdirectory that cannot be opened is skipped as it skips
- * one. */
-static void task_cloud_sync_walk_step(task_cloud_sync_state_t *sync_state)
+ * out. False when a subdirectory can't be opened or read, which ends
+ * the sync. */
+static bool task_cloud_sync_walk_step(task_cloud_sync_state_t *sync_state)
 {
    struct tcs_walk_dir *top  = &sync_state->walk[sync_state->walk_depth - 1];
    char                *path = CS_WALK_PATH(sync_state);
@@ -580,21 +1161,27 @@ static void task_cloud_sync_walk_step(task_cloud_sync_state_t *sync_state)
 
    if (!retro_readdir(top->dir))
    {
+      if (retro_dirent_error(top->dir))
+      {
+         path[top->len] = '\0';
+         task_cloud_sync_walk_abort(sync_state, path);
+         return false;
+      }
       retro_closedir(top->dir);
       sync_state->walk_depth--;
-      return;
+      return true;
    }
    name = retro_dirent_get_name(top->dir);
    if (     (name[0] == '.' || name[0] == '$')
          && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')))
-      return;
+      return true;
 
    len = top->len;
    if (len && path[len - 1] != '/' && path[len - 1] != '\\')
       path[len++] = '/';
    len += strlcpy(path + len, name, PATH_MAX_LENGTH - len);
    if (len >= PATH_MAX_LENGTH)
-      return;
+      return true;
 
    is_dir = retro_dirent_is_dir(top->dir, NULL);
 #if TARGET_OS_IPHONE || TARGET_OS_OSX
@@ -604,8 +1191,42 @@ static void task_cloud_sync_walk_step(task_cloud_sync_state_t *sync_state)
 #endif
    if (is_dir)
    {
-      task_cloud_sync_walk_push(sync_state, len);
-      return;
+      /* another root's folder syncs once, as that root: the rule
+       * task_cloud_sync_key_in_scope() keeps for its keys */
+      if (sync_state->shadowed)
+      {
+         path_relative_to(CS_WALK_REL(sync_state), path,
+               CS_WALK_ROOT(sync_state), PATH_MAX_LENGTH);
+         fill_pathname_join_special(CS_WALK_ALT(sync_state),
+               sync_state->dirlist->elems[sync_state->walk_root_idx].data,
+               CS_WALK_REL(sync_state), PATH_MAX_LENGTH);
+         fill_pathname_slash(CS_WALK_ALT(sync_state), PATH_MAX_LENGTH);
+         pathname_make_slashes_portable(CS_WALK_ALT(sync_state));
+         if (task_cloud_sync_key_shadowed(sync_state,
+                  CS_WALK_ALT(sync_state)))
+         {
+            if (!tcs_told_nested_dir)
+               RARCH_WARN(CSPFX "\"%s\" syncs once, as its own folder, not as \"%s\".\n",
+                     path, CS_WALK_ALT(sync_state));
+            tcs_told_nested_dir = true;
+            return true;
+         }
+      }
+      /* a folder the sync ignores is not walked */
+      if (sync_state->walk_depth == 1)
+      {
+         snprintf(CS_WALK_ALT(sync_state), PATH_MAX_LENGTH, "%s/%s/",
+               sync_state->dirlist->elems[sync_state->walk_root_idx].data,
+               name);
+         if (task_cloud_sync_should_ignore_file(CS_WALK_ALT(sync_state)))
+            return true;
+      }
+      if (!task_cloud_sync_walk_push(sync_state, len))
+      {
+         task_cloud_sync_walk_abort(sync_state, path);
+         return false;
+      }
+      return true;
    }
 
    path_relative_to(CS_WALK_REL(sync_state), path, CS_WALK_ROOT(sync_state),
@@ -614,17 +1235,21 @@ static void task_cloud_sync_walk_step(task_cloud_sync_state_t *sync_state)
          sync_state->dirlist->elems[sync_state->walk_root_idx].data,
          CS_WALK_REL(sync_state), PATH_MAX_LENGTH);
    if (task_cloud_sync_should_ignore_file(CS_WALK_ALT(sync_state)))
-      return;
+      return true;
 
    /* The "alt" refers to the relative path of whatever we're syncing relative to the retroarch folder
     * whereas the full_path is the absolute disk path of the file. When building the manifest, adhere
     * to a portable standard, but use that as the portable representation of paths. While the actual
     * "manifest" is comprised of full, local-style paths associated with "alt"s which are portable. */
    pathname_make_slashes_portable(CS_WALK_ALT(sync_state));
+   /* out of scope (task_cloud_sync_key_in_scope()) */
+   if (task_cloud_sync_key_is_copy(CS_WALK_ALT(sync_state)))
+      return true;
    idx = sync_state->current_manifest->size;
    file_list_append(sync_state->current_manifest, path, NULL, 0, 0, 0);
    file_list_set_alt_at_offset(sync_state->current_manifest, idx,
          CS_WALK_ALT(sync_state));
+   return true;
 }
 
 /**
@@ -643,8 +1268,23 @@ static bool task_cloud_sync_directory_map_add(struct string_list *list,
       const char *name, size_t name_len, const char *dir)
 {
    union string_list_elem_attr attr = {0};
-   char *path = strdup(dir);
-   if (!path)
+   char  *path;
+   size_t i;
+   /* an unset folder is left out: not walked, its server keys kept */
+   if (string_is_empty(dir))
+      return true;
+   /* and so is a folder an earlier root syncs */
+   for (i = 0; i < list->size; i++)
+      if (!task_cloud_sync_dir_within(
+               (const char*)list->elems[i].userdata, dir))
+      {
+         if (!tcs_told_same_dir)
+            RARCH_WARN(CSPFX "\"%.*s\" is the same folder as \"%s\": syncing it once, as \"%s\".\n",
+                  (int)name_len, name, list->elems[i].data, list->elems[i].data);
+         tcs_told_same_dir = true;
+         return true;
+      }
+   if (!(path = strdup(dir)))
       return false;
    if (!string_list_append_n(list, name, name_len, attr))
    {
@@ -674,13 +1314,14 @@ static struct string_list *task_cloud_sync_directory_map_new(settings_t *setting
 
    if (settings->bools.cloud_sync_sync_saves)
    {
+      /* the main config's, not an override's or the command line's */
       if (!task_cloud_sync_directory_map_add(list,
                "saves", STRLEN_CONST("saves"),
-               dir_get_ptr(RARCH_DIR_SAVEFILE)))
+               dir_get_ptr(RARCH_DIR_SAVEFILE_BASE)))
          goto error;
       if (!task_cloud_sync_directory_map_add(list,
                "states", STRLEN_CONST("states"),
-               dir_get_ptr(RARCH_DIR_SAVESTATE)))
+               dir_get_ptr(RARCH_DIR_SAVESTATE_BASE)))
          goto error;
    }
 
@@ -708,11 +1349,66 @@ error:
    return NULL;
 }
 
-/* True when @key lies under one of the directories this sync covers. */
-static bool task_cloud_sync_key_in_scope(const struct string_list *dirlist,
-      const char *key)
+/* Keys of one root under another root's folder, as "config/saves/":
+ * that folder syncs once, as its own root, and what the outer root
+ * sent of it before is left alone, as keys out of scope are. False
+ * when out of memory. */
+static bool task_cloud_sync_find_shadowed(task_cloud_sync_state_t *sync_state)
 {
-   size_t i;
+   struct string_list *dirlist = sync_state->dirlist;
+   char               *prefix  = CS_WALK_ALT(sync_state);
+   size_t              o;
+   size_t              i;
+
+   for (o = 0; o < dirlist->size; o++)
+      for (i = 0; i < dirlist->size; i++)
+      {
+         union string_list_elem_attr attr;
+         const char *inner = (const char*)dirlist->elems[i].userdata;
+         int         at    = task_cloud_sync_dir_within(
+               (const char*)dirlist->elems[o].userdata, inner);
+         size_t      len;
+         size_t      n;
+         if (at <= 0)
+            continue;
+         /* its names below the outer root, as the walk names them */
+         len    = strlcpy(prefix, dirlist->elems[o].data, PATH_MAX_LENGTH);
+         inner += at;
+         for (;;)
+         {
+            inner = task_cloud_sync_next_name(inner, &n);
+            if (!n || len + n + 2 >= PATH_MAX_LENGTH)
+               break;
+            prefix[len++] = '/';
+            memcpy(prefix + len, inner, n);
+            len   += n;
+            inner += n;
+         }
+         if (n)
+            continue;
+         prefix[len++] = '/';
+         prefix[len]   = '\0';
+         attr.i = 0;
+         if (     !sync_state->shadowed
+               && !(sync_state->shadowed = string_list_new()))
+            return false;
+         if (!string_list_append(sync_state->shadowed, prefix, attr))
+            return false;
+      }
+   return true;
+}
+
+/* True when @key lies under one of the directories this sync covers,
+ * not under another root's folder within it, and is not a safety copy
+ * (task_cloud_sync_key_is_copy()). */
+static bool task_cloud_sync_key_in_scope(
+      const task_cloud_sync_state_t *sync_state, const char *key)
+{
+   const struct string_list *dirlist = sync_state->dirlist;
+   size_t                    i;
+   if (     task_cloud_sync_key_shadowed(sync_state, key)
+         || task_cloud_sync_key_is_copy(key))
+      return false;
    for (i = 0; i < dirlist->size; i++)
       if (string_starts_with(key, dirlist->elems[i].data))
          return true;
@@ -731,11 +1427,190 @@ static size_t task_cloud_sync_count_out_of_scope(
       return 0;
 
    for (i = 0; i < server->size; i++)
-      if (!task_cloud_sync_key_in_scope(dirlist,
+      if (!task_cloud_sync_key_in_scope(sync_state,
                CS_FILE_KEY(&server->list[i])))
          count++;
 
    return count;
+}
+
+/* Files missing here that the server still has, changed there or not,
+ * more than CS_HOLD_MIN of them and more than half of a root's: more
+ * likely gone missing (an unmounted card, an emptied folder) than
+ * deleted, so the diff deletes none of them on the server. The lists
+ * are in file_list_sort_on_alt() order. */
+static void task_cloud_sync_mark_held_roots(task_cloud_sync_state_t *sync_state)
+{
+   struct string_list *dirlist = sync_state->dirlist;
+   file_list_t        *local   = sync_state->local_manifest;
+   file_list_t        *current = sync_state->current_manifest;
+   file_list_t        *server  = sync_state->server_manifest;
+   size_t              r;
+
+   if (!local || !server || sync_state->conflict_resolution == 4)
+      return;
+
+   for (r = 0; r < dirlist->size; r++)
+   {
+      size_t total   = 0;
+      size_t missing = 0;
+      size_t c       = 0;
+      size_t s       = 0;
+      size_t i;
+
+      for (i = 0; i < local->size; i++)
+      {
+         struct item_file *local_file = &local->list[i];
+         const char       *key        = CS_FILE_KEY(local_file);
+         int               cmp        = 1;
+
+         if (     string_is_empty(CS_FILE_HASH(local_file))
+               || task_cloud_sync_key_root(dirlist, key) != (int)r
+               || !task_cloud_sync_key_in_scope(sync_state, key)
+               || task_cloud_sync_should_ignore_file(key))
+            continue;
+         total++;
+         while (c < current->size
+               && (cmp = strcasecmp(current->list[c].alt, key)) < 0)
+            c++;
+         if (c < current->size && !cmp)
+            continue;
+         cmp = 1;
+         while (s < server->size
+               && (cmp = strcasecmp(server->list[s].alt, key)) < 0)
+            s++;
+         if (     s < server->size && !cmp
+               && !string_is_empty(CS_FILE_HASH(&server->list[s])))
+            missing++;
+      }
+
+      if (missing > CS_HOLD_MIN && missing * 2 > total)
+      {
+         RARCH_WARN(CSPFX "%u of %u files under \"%s\" are missing here, not deleting them on the server.\n",
+               (unsigned)missing, (unsigned)total, dirlist->elems[r].data);
+         dirlist->elems[r].attr.i |= CS_ROOT_HELD;
+      }
+   }
+}
+
+/* A folder open in task_cloud_sync_mark_held_dirs(): its key prefix
+ * (the first @len of @key) and its synced files. */
+struct tcs_hold_dir
+{
+   const char *key;
+   size_t      len;
+   unsigned total;
+   unsigned missing;
+};
+
+static void task_cloud_sync_hold_dir(task_cloud_sync_state_t *sync_state,
+      const struct tcs_hold_dir *d)
+{
+   union string_list_elem_attr attr;
+   int root;
+   attr.i = 0;
+   RARCH_WARN(CSPFX "All %u files under \"%.*s\" are missing here, not deleting them on the server.\n",
+         d->total, (int)d->len, d->key);
+   if (!sync_state->held_dirs)
+      sync_state->held_dirs = string_list_new();
+   if (     sync_state->held_dirs
+         && string_list_append_n(sync_state->held_dirs, d->key, d->len, attr))
+      return;
+   /* out of memory: hold its root instead */
+   if ((root = task_cloud_sync_key_root(sync_state->dirlist, d->key)) >= 0)
+      sync_state->dirlist->elems[root].attr.i |= CS_ROOT_HELD;
+}
+
+/* Every synced file of a root or folder missing here that the server
+ * still has, CS_HOLD_DIR_MIN or more of them: a folder more likely
+ * lost than emptied, so the diff deletes none of them on the server.
+ * The lists are in file_list_sort_on_alt() order, so a folder's keys
+ * are together. */
+static void task_cloud_sync_mark_held_dirs(task_cloud_sync_state_t *sync_state)
+{
+   struct tcs_hold_dir dirs[CS_HOLD_DEPTH];
+   file_list_t        *local   = sync_state->local_manifest;
+   file_list_t        *current = sync_state->current_manifest;
+   file_list_t        *server  = sync_state->server_manifest;
+   size_t              depth   = 0;
+   size_t              c       = 0;
+   size_t              s       = 0;
+   size_t              i;
+
+   if (!local || !server || sync_state->conflict_resolution == 4)
+      return;
+
+   for (i = 0; i <= local->size; i++)
+   {
+      const char *key   = i < local->size ? CS_FILE_KEY(&local->list[i]) : "";
+      const char *slash;
+      bool        missing;
+      int         cmp;
+      size_t      d;
+
+      /* the folders this key is not under are complete */
+      while (depth && strncasecmp(key, dirs[depth - 1].key,
+               dirs[depth - 1].len))
+      {
+         depth--;
+         if (     dirs[depth].total >= CS_HOLD_DIR_MIN
+               && dirs[depth].missing == dirs[depth].total)
+            task_cloud_sync_hold_dir(sync_state, &dirs[depth]);
+      }
+      if (     i == local->size
+            || string_is_empty(CS_FILE_HASH(&local->list[i]))
+            || task_cloud_sync_key_root(sync_state->dirlist, key) < 0
+            || !task_cloud_sync_key_in_scope(sync_state, key)
+            || task_cloud_sync_should_ignore_file(key))
+         continue;
+
+      cmp = 1;
+      while (c < current->size
+            && (cmp = strcasecmp(current->list[c].alt, key)) < 0)
+         c++;
+      missing = !(c < current->size && !cmp);
+      if (missing)
+      {
+         cmp = 1;
+         while (s < server->size
+               && (cmp = strcasecmp(server->list[s].alt, key)) < 0)
+            s++;
+         missing = s < server->size && !cmp
+               && !string_is_empty(CS_FILE_HASH(&server->list[s]));
+      }
+
+      for (slash = strchr(key + (depth ? dirs[depth - 1].len : 0), '/');
+            slash && depth < CS_HOLD_DEPTH; slash = strchr(slash + 1, '/'))
+      {
+         dirs[depth].key     = key;
+         dirs[depth].len     = (size_t)(slash + 1 - key);
+         dirs[depth].total   = 0;
+         dirs[depth].missing = 0;
+         depth++;
+      }
+      for (d = 0; d < depth; d++)
+      {
+         dirs[d].total++;
+         if (missing)
+            dirs[d].missing++;
+      }
+   }
+}
+
+/* Whether a file missing here under @root is held on the server */
+static bool task_cloud_sync_key_held(
+      const task_cloud_sync_state_t *sync_state, int root, const char *key)
+{
+   const struct string_list *dirs = sync_state->held_dirs;
+   size_t                    i;
+   if (root < 0)
+      return false;
+   if (sync_state->dirlist->elems[root].attr.i & CS_ROOT_HELD)
+      return true;
+   for (i = 0; dirs && i < dirs->size; i++)
+      if (!strncasecmp(key, dirs->elems[i].data, strlen(dirs->elems[i].data)))
+         return true;
+   return false;
 }
 
 /**
@@ -764,7 +1639,8 @@ static void task_cloud_sync_build_current_manifest(
       if (     !(sync_state->current_manifest        = (file_list_t *)calloc(1, sizeof(file_list_t)))
             || !(sync_state->updated_server_manifest = (file_list_t *)calloc(1, sizeof(file_list_t)))
             || !(sync_state->updated_local_manifest  = (file_list_t *)calloc(1, sizeof(file_list_t)))
-            || !(sync_state->walk_bufs               = (char*)malloc(4 * PATH_MAX_LENGTH)))
+            || !(sync_state->walk_bufs               = (char*)malloc(4 * PATH_MAX_LENGTH))
+            || !task_cloud_sync_find_shadowed(sync_state))
       {
          task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_END);
          return;
@@ -776,7 +1652,8 @@ static void task_cloud_sync_build_current_manifest(
    {
       if (sync_state->walk_depth)
       {
-         task_cloud_sync_walk_step(sync_state);
+         if (!task_cloud_sync_walk_step(sync_state))
+            return;
          if (!sync_state->walk_depth)
             sync_state->walk_root_idx++;
          continue;
@@ -800,11 +1677,7 @@ static void task_cloud_sync_build_current_manifest(
        * happened. */
       if (!task_cloud_sync_walk_push(sync_state, strlen(CS_WALK_PATH(sync_state))))
       {
-         RARCH_ERR(CSPFX "Could not read \"%s\".\n", CS_WALK_ROOT(sync_state));
-         RARCH_ERR(CSPFX "Not syncing, the current state of the disk could not be established.\n");
-         task_cloud_sync_walk_free(sync_state);
-         sync_state->failures = true;
-         task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_END);
+         task_cloud_sync_walk_abort(sync_state, CS_WALK_ROOT(sync_state));
          return;
       }
    }
@@ -815,6 +1688,8 @@ static void task_cloud_sync_build_current_manifest(
    file_list_sort_on_alt(sync_state->current_manifest);
    sync_state->server_out_of_scope =
       task_cloud_sync_count_out_of_scope(sync_state);
+   task_cloud_sync_mark_held_roots(sync_state);
+   task_cloud_sync_mark_held_dirs(sync_state);
    task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_DIFF);
    RARCH_LOG(CSPFX "Created in-memory manifest of current disk state with %d files.\n", sync_state->current_manifest->size);
 }
@@ -1013,10 +1888,15 @@ static char *task_cloud_sync_md5_rfile(RFILE *file)
             free(hash);
             return NULL;
          }
-         n   = filestream_read(file, buf, CS_HASH_CHUNK);
+         if ((n = filestream_read(file, buf, CS_HASH_CHUNK)) < 0)
+         {
+            free(buf);
+            free(hash);
+            return NULL;
+         }
          ptr = buf;
       }
-      if (n <= 0)
+      if (!n)
          break;
       MD5_Update(&md5, ptr, (unsigned long)n);
    }
@@ -1035,9 +1915,10 @@ static void task_cloud_sync_hash_begin(tcs_hash_t *h, RFILE *file)
 }
 
 /* Hashes @h's file a chunk at a time while @b allows. True once it is
- * done, with the digest in @hash (33 bytes); the stream is left to its
- * owner. False when the budget ran out first: the next call carries on.
- * Reads and hashes the same bytes as task_cloud_sync_md5_rfile(). */
+ * done, with the digest in @hash (33 bytes), or an empty @hash when a
+ * read failed; the stream is left to its owner. False when the budget
+ * ran out first: the next call carries on. Reads and hashes the same
+ * bytes as task_cloud_sync_md5_rfile(). */
 static bool task_cloud_sync_hash_step(tcs_hash_t *h, uint8_t *buf,
       nbio_budget_t *b, char *hash)
 {
@@ -1052,7 +1933,13 @@ static bool task_cloud_sync_hash_step(tcs_hash_t *h, uint8_t *buf,
          n   = filestream_read(h->file, buf, CS_HASH_CHUNK);
          ptr = buf;
       }
-      if (n <= 0)
+      if (n < 0)
+      {
+         hash[0] = '\0';
+         h->file = NULL;
+         return true;
+      }
+      if (!n)
          break;
       MD5_Update(&h->md5, ptr, (unsigned long)n);
    }
@@ -1065,8 +1952,8 @@ static bool task_cloud_sync_hash_step(tcs_hash_t *h, uint8_t *buf,
  * over several runs of the handler instead of holding up one - the
  * frame loop's, with Threaded Tasks off. True once the diff step can
  * run: the hash is in ->userdata, or there is no current file, or it
- * could not be opened and the step that needs it will find that out
- * itself. False when the budget ran out first. */
+ * could not be opened or read and the step that needs it will find that
+ * out itself. False when the budget ran out first. */
 static bool task_cloud_sync_hash_current(task_cloud_sync_state_t *sync_state,
       nbio_budget_t *b)
 {
@@ -1095,68 +1982,100 @@ static bool task_cloud_sync_hash_current(task_cloud_sync_state_t *sync_state,
             sync_state->hash_buf, b, hash))
       return false;
    filestream_close(file);
-   item->userdata = strdup(hash);
+   if (*hash)
+      item->userdata = strdup(hash);
    return true;
 }
 
-/* don't pass a server/local item_file to this, only current has ->path set */
-/* Returns false when the local file is still where it was, which leaves
- * the caller holding a file it must not replace or remove: non-destructive
- * mode promises a local copy of anything it displaces, and without the
- * backup there is nothing to fall back on. */
-static bool task_cloud_sync_backup_file(struct item_file *file,
-      const char *dir_core_assets)
+/* Where this sync's backups go: under the synced save folder's
+ * backups/cloud-sync, which no sync walks; without one (false), under
+ * <core assets>/cloud_backups. */
+static bool task_cloud_sync_backup_root(task_cloud_sync_state_t *sync_state,
+      char *s, size_t len)
 {
-   struct tm   tm_;
-   size_t      len;
-   bool        ok                   = false;
-   /* one heap block for the three paths: the task runs on small stacks */
-   char       *new_dir              = (char*)malloc(2 * DIR_MAX_LENGTH + PATH_MAX_LENGTH);
-   char       *backup_dir           = new_dir + DIR_MAX_LENGTH;
-   char       *new_path             = backup_dir + DIR_MAX_LENGTH;
-   const char *path_dir_core_assets = dir_core_assets;
-   time_t      cur_time             = time(NULL);
+   size_t      i;
+   const char *saves = NULL;
 
-   if (!new_dir)
+   for (i = 0; sync_state->dirlist && i < sync_state->dirlist->size; i++)
+      if (string_is_equal(sync_state->dirlist->elems[i].data, "saves"))
+         saves = (const char*)sync_state->dirlist->elems[i].userdata;
+
+   if (string_is_empty(saves))
+   {
+      fill_pathname_join_special(s, sync_state->dir_core_assets,
+            "cloud_backups", len);
       return false;
-   rtime_localtime(&cur_time, &tm_);
+   }
+   fill_pathname_join_special(s, saves,
+         SAVE_BACKUPS_DIR "/" SAVE_BACKUPS_CORE_CLOUD_SYNC, len);
+   return true;
+}
 
-   fill_pathname_join_special(backup_dir,
-                              path_dir_core_assets,
-                              "cloud_backups",
-                              DIR_MAX_LENGTH);
-   len = fill_pathname_join_special(new_path,
-                                    backup_dir,
-                                    CS_FILE_KEY(file),
-                                    PATH_MAX_LENGTH);
-   if (len < PATH_MAX_LENGTH)
-      strftime(new_path + len, PATH_MAX_LENGTH - len, "-%y%m%d-%H%M%S", &tm_);
+/* Says once a sync that old backups of @path due to go stayed */
+static void task_cloud_sync_unpruned(task_cloud_sync_state_t *sync_state,
+      const char *path)
+{
+   if (sync_state->unpruned)
+      return;
+   sync_state->unpruned = true;
+   RARCH_WARN(CSPFX "Could not delete old backups of \"%s\".\n", path);
+}
+
+#if defined(TCS_MOVE_WORKER)
+static void task_cloud_sync_prune_push(task_cloud_sync_state_t *sync_state,
+      const char *path, struct string_list *due);
+#endif
+
+/* don't pass a server/local item_file to this, only current has ->path set */
+/* Anything but MADE leaves the caller holding a file it must not
+ * replace or remove: a sync promises a local copy of anything it
+ * displaces, and without the backup there is nothing to fall back
+ * on. With a move worker, COPY_OWED: the file is still in
+ * place and its copy is owed at *@owed (the caller frees it). */
+static enum save_backup_result task_cloud_sync_backup_file(
+      task_cloud_sync_state_t *sync_state, struct item_file *file,
+      enum save_backup_reason reason, char **owed)
+{
+   enum save_backup_result result = SAVE_BACKUP_FAILED;
+   bool unpruned  = false;
+#if defined(TCS_MOVE_WORKER)
+   struct string_list *due = NULL;
+#endif
+   /* one heap block for the two paths: the task runs on small stacks */
+   char *new_dir  = (char*)malloc(DIR_MAX_LENGTH + PATH_MAX_LENGTH);
+   char *new_path = new_dir + DIR_MAX_LENGTH;
+
+   *owed = NULL;
+   if (!new_dir)
+      return SAVE_BACKUP_FAILED;
+
+   task_cloud_sync_backup_root(sync_state, new_dir, DIR_MAX_LENGTH);
+   fill_pathname_join_special(new_path, new_dir, CS_FILE_KEY(file),
+         PATH_MAX_LENGTH);
    pathname_conform_slashes_to_os(new_path);
    fill_pathname_basedir(new_dir, new_path, DIR_MAX_LENGTH);
 
-   if (!path_mkdir(new_dir))
-      RARCH_ERR(CSPFX "Could not create backup directory \"%s\".\n", new_dir);
-   else if (filestream_rename(file->path, new_path) == 0)
-      ok = true;
-   /* A rename cannot cross volumes, or leave a SAF tree on Android, and
-    * the backups live under the assets directory wherever saves are.
-    * This runs on the task thread, so a blocking copy holds up nothing. */
-   else if (filestream_copy(file->path, new_path) != 0)
+#if defined(TCS_MOVE_WORKER)
+   result = save_backups_move_begin(new_dir, file->path,
+         SAVE_BACKUPS_CORE_CLOUD_SYNC, reason, new_path, PATH_MAX_LENGTH,
+         &due, &unpruned);
+   if (due)
+      task_cloud_sync_prune_push(sync_state, file->path, due);
+   if (     result == SAVE_BACKUP_COPY_OWED
+         && !(*owed = strdup(new_path)))
+      result = SAVE_BACKUP_FAILED;
+#else
+   result = save_backups_move_to(new_dir, file->path,
+         SAVE_BACKUPS_CORE_CLOUD_SYNC, reason, &unpruned);
+#endif
+   if (unpruned)
+      task_cloud_sync_unpruned(sync_state, file->path);
+   if (result != SAVE_BACKUP_MADE && result != SAVE_BACKUP_COPY_OWED)
       RARCH_ERR(CSPFX "Could not back \"%s\" up to \"%s\".\n",
-            file->path, new_path);
-   /* The caller needs the local file gone; a backup of a file that is
-    * still there would only pile up. */
-   else if (filestream_delete(file->path) != 0)
-   {
-      filestream_delete(new_path);
-      RARCH_ERR(CSPFX "Could not remove \"%s\" after backing it up.\n",
-            file->path);
-   }
-   else
-      ok = true;
+            file->path, new_dir);
 
    free(new_dir);
-   return ok;
+   return result;
 }
 
 /**
@@ -1180,9 +2099,40 @@ static void task_cloud_sync_carry_manifests_forward(
 
    task_cloud_sync_add_to_updated_manifest(sync_state, key, server_hash, true);
 
-   if (file_list_search(sync_state->local_manifest, key, &idx))
+   if (     file_list_search(sync_state->local_manifest, key, &idx)
+         && string_is_equal_noncase(
+            CS_FILE_KEY(&sync_state->local_manifest->list[idx]), key))
       task_cloud_sync_add_to_updated_manifest(sync_state, key,
             CS_FILE_HASH(&sync_state->local_manifest->list[idx]), false);
+}
+
+/* The local manifest keeps what the last sync left in it for @key.
+ * file_list_search() also matches a longer key sharing @key's start. */
+static void task_cloud_sync_keep_local_record(
+      task_cloud_sync_state_t *sync_state, const char *key)
+{
+   size_t idx;
+
+   if (     file_list_search(sync_state->local_manifest, key, &idx)
+         && string_is_equal_noncase(
+            CS_FILE_KEY(&sync_state->local_manifest->list[idx]), key))
+      task_cloud_sync_add_to_updated_manifest(sync_state, key,
+            CS_FILE_HASH(&sync_state->local_manifest->list[idx]), false);
+}
+
+/* Work on @key that did not happen: both manifests keep what the last
+ * sync left in them, so the next sync meets the same difference. */
+static void task_cloud_sync_keep_records(task_cloud_sync_state_t *sync_state,
+      const char *key)
+{
+   size_t idx;
+
+   task_cloud_sync_keep_local_record(sync_state, key);
+   if (     file_list_search(sync_state->server_manifest, key, &idx)
+         && string_is_equal_noncase(
+            CS_FILE_KEY(&sync_state->server_manifest->list[idx]), key))
+      task_cloud_sync_add_to_updated_manifest(sync_state, key,
+            CS_FILE_HASH(&sync_state->server_manifest->list[idx]), true);
 }
 
 /**
@@ -1224,6 +2174,8 @@ typedef struct
    /* Where the download goes once it is complete; the driver writes it
     * beside that, under CS_FETCHING_SUFFIX. */
    char                     local[PATH_MAX_LENGTH];
+   /* the last sync left the file here */
+   bool                     had_file;
 } task_cloud_sync_fetch_state_t;
 
 /* A download is written here first and moved into place only once it
@@ -1243,56 +2195,129 @@ static bool task_cloud_sync_fetching_path(char *s, size_t len,
                < len - _len;
 }
 
-/* Moves a whole download into place. A core that has taken the file
- * since the fetch began keeps it, and the download goes, as at the
- * start of the fetch. False when the download did not land. */
-static bool task_cloud_sync_fetch_commit(
-      task_cloud_sync_fetch_state_t *fetch_state, const char *key)
+/* What a fetch that never completed left beside its file. Kept while
+ * the file the last sync left here is gone: it may be in the backups
+ * already, and the leftover keeps the next sync from taking it for
+ * deleted here. */
+static void task_cloud_sync_fetch_discard(
+      task_cloud_sync_fetch_state_t *fetch_state)
+{
+   char tmp[PATH_MAX_LENGTH];
+   if (     (!fetch_state->had_file || path_is_valid(fetch_state->local))
+         && task_cloud_sync_fetching_path(tmp, sizeof(tmp),
+               fetch_state->local))
+      filestream_delete(tmp);
+}
+
+/* Moves @tmp, a whole download, into place. False when it did not
+ * land. */
+static bool task_cloud_sync_fetch_place(
+      task_cloud_sync_fetch_state_t *fetch_state, const char *key,
+      const char *tmp)
+{
+   task_cloud_sync_state_t *sync_state = fetch_state->sync_state;
+   if (filestream_rename(tmp, fetch_state->local) != 0)
+   {
+      RARCH_WARN(CSPFX "Could not move the download of \"%s\" into place.\n", key);
+      task_cloud_sync_fetch_discard(fetch_state);
+      task_cloud_sync_add_to_updated_manifest(sync_state, key,
+            CS_FILE_HASH(fetch_state->server_file), true);
+      sync_state->failures = true;
+      return false;
+   }
+   /* the state limit's check across a save (command.c) */
+   if (string_starts_with_case_insensitive(key, "states/"))
+      content_state_fetched();
+   return true;
+}
+
+enum tcs_commit
+{
+   TCS_COMMIT_LEFT = 0,
+   TCS_COMMIT_PLACED,
+   /* waits for its backup's copy, which then finishes the fetch */
+   TCS_COMMIT_OWED
+};
+
+#if defined(TCS_MOVE_WORKER)
+static bool task_cloud_sync_move_push(task_cloud_sync_state_t *sync_state,
+      task_cloud_sync_fetch_state_t *fetch_state,
+      struct item_file *server_file, const char *key, const char *path,
+      const char *to, const char *fetching, const char *hash);
+#endif
+
+/* Moves a whole download, of hash @hash, into place. A core that has
+ * taken the file since the fetch began keeps it, and the download goes,
+ * as at the start of the fetch. LEFT when the download did not land. */
+static enum tcs_commit task_cloud_sync_fetch_commit(
+      task_cloud_sync_fetch_state_t *fetch_state, const char *key,
+      const char *hash)
 {
    char tmp[PATH_MAX_LENGTH];
    task_cloud_sync_state_t *sync_state = fetch_state->sync_state;
    const char *server_hash = CS_FILE_HASH(fetch_state->server_file);
 
    if (!task_cloud_sync_fetching_path(tmp, sizeof(tmp), fetch_state->local))
-      return false;
+      return TCS_COMMIT_LEFT;
    if (content_savefile_is_live(fetch_state->local))
    {
       RARCH_LOG(CSPFX "Deferring \"%s\", the running core took it during the fetch.\n", key);
-      filestream_delete(tmp);
+      task_cloud_sync_fetch_discard(fetch_state);
       task_cloud_sync_carry_manifests_forward(sync_state, key, server_hash);
-      return false;
+      return TCS_COMMIT_LEFT;
    }
-   if (!sync_state->destructive && path_is_valid(fetch_state->local))
+   /* A body the server manifest does not list, or an empty one over a
+    * save, leaves the local copy: a conflict, recorded as any other.
+    * Keep Server takes the first, never the second. */
+   if (path_is_valid(fetch_state->local))
+   {
+      bool emptied = path_get_size(tmp) == 0
+            && path_get_size(fetch_state->local) > 0;
+      if (     emptied
+            || (   !string_is_equal(hash, server_hash)
+                && sync_state->conflict_resolution != 2))
+      {
+         RARCH_WARN(CSPFX "Not replacing \"%s\": the download is %s.\n",
+               key, emptied ? "empty" : "not what the server manifest lists");
+         filestream_delete(tmp);
+         task_cloud_sync_add_to_updated_manifest(sync_state, key,
+               server_hash, true);
+         sync_state->conflicts = true;
+         return TCS_COMMIT_LEFT;
+      }
+   }
+   if (path_is_valid(fetch_state->local))
    {
       struct item_file local_file = {0};
+      enum save_backup_result made;
+      char *owed      = NULL;
       local_file.alt  = (char*)key;
       local_file.path = fetch_state->local;
-      if (!task_cloud_sync_backup_file(&local_file, sync_state->dir_core_assets))
+      made = task_cloud_sync_backup_file(sync_state, &local_file,
+            SAVE_BACKUP_REPLACED, &owed);
+#if defined(TCS_MOVE_WORKER)
+      if (made == SAVE_BACKUP_COPY_OWED)
+      {
+         bool queued = task_cloud_sync_move_push(sync_state, fetch_state,
+               fetch_state->server_file, key, fetch_state->local, owed,
+               tmp, hash);
+         free(owed);
+         if (queued)
+            return TCS_COMMIT_OWED;
+      }
+#else
+      (void)hash;
+#endif
+      if (made != SAVE_BACKUP_MADE)
       {
          filestream_delete(tmp);
          task_cloud_sync_carry_manifests_forward(sync_state, key, server_hash);
          sync_state->failures = true;
-         return false;
+         return TCS_COMMIT_LEFT;
       }
    }
-   if (filestream_rename(tmp, fetch_state->local) != 0)
-   {
-      RARCH_WARN(CSPFX "Could not move the download of \"%s\" into place.\n", key);
-      filestream_delete(tmp);
-      task_cloud_sync_add_to_updated_manifest(sync_state, key, server_hash, true);
-      sync_state->failures = true;
-      return false;
-   }
-   return true;
-}
-
-/* What a fetch that never completed left beside its file. */
-static void task_cloud_sync_fetch_discard(
-      task_cloud_sync_fetch_state_t *fetch_state)
-{
-   char tmp[PATH_MAX_LENGTH];
-   if (task_cloud_sync_fetching_path(tmp, sizeof(tmp), fetch_state->local))
-      filestream_delete(tmp);
+   return task_cloud_sync_fetch_place(fetch_state, key, tmp)
+      ? TCS_COMMIT_PLACED : TCS_COMMIT_LEFT;
 }
 
 /* A download waiting to be hashed by the task thread. */
@@ -1315,6 +2340,389 @@ static void task_cloud_sync_fetched(task_cloud_sync_state_t *sync_state,
    if (!string_is_equal(hash, CS_FILE_HASH(server_file)))
       sync_state->need_manifest_uploaded = true;
    sync_state->downloads++;
+}
+
+/* A file's name ends in this while the atomic writer writes it. */
+#define CS_TEMP_SUFFIX ".tmp"
+
+#if defined(TCS_MOVE_WORKER)
+enum
+{
+   TCS_MOVE_QUEUED = 0,
+   TCS_MOVE_RUNNING,
+   TCS_MOVE_DONE,
+   TCS_MOVE_ABANDONED
+};
+
+/* A backup's copy across drives, or the delete of copies a rename's
+ * retention left (due), on a detached thread. The task thread fills it
+ * before the thread starts; the thread then reads only path, to,
+ * fetching and due and writes only ok and unpruned, and its exchange
+ * of state hands it back.
+ * A copy nobody polls for (ABANDONED) is the thread's to dispose of.
+ * Everything else is the task thread's. */
+typedef struct tcs_move
+{
+   struct tcs_move               *next;
+   retro_atomic_int_t             state;
+   bool                           ok;
+   bool                           unpruned;
+   unsigned                       lifetime;
+   unsigned                       writes;
+   int64_t                        size;
+   int64_t                        mtime;
+   char                          *path;
+   char                          *to;
+   char                          *key;
+   /* A fetch's download, placed once the file is moved; NULL for the
+    * server's deletion */
+   char                          *fetching;
+   struct string_list            *due;
+   task_cloud_sync_fetch_state_t *fetch_state;
+   struct item_file              *server_file;
+   char                           hash[33];
+} tcs_move_t;
+
+/* Copies in flight stay under both; a bigger copy runs alone. */
+#define TCS_MOVE_MAX     4
+#define TCS_MOVE_BUDGET  (16 * 1024 * 1024)
+
+/* The copy, then retention for the copies it joins, on the copy's
+ * thread; or a prune's deletes */
+static void task_cloud_sync_move_copy(tcs_move_t *mv)
+{
+   char *dir;
+   if (mv->due)
+   {
+      size_t i;
+      for (i = 0; i < mv->due->size; i++)
+         if (filestream_delete(mv->due->elems[i].data) != 0)
+            mv->unpruned = true;
+      return;
+   }
+   if (!(mv->ok = save_backups_copy_synced(mv->path, mv->to)))
+      return;
+   if (!(dir = (char*)malloc(DIR_MAX_LENGTH)))
+   {
+      mv->unpruned = true;
+      return;
+   }
+   fill_pathname_basedir(dir, mv->to, DIR_MAX_LENGTH);
+   mv->unpruned = !save_backups_retain_made(dir, mv->path,
+         SAVE_BACKUPS_CORE_CLOUD_SYNC,
+         mv->fetching ? SAVE_BACKUP_REPLACED : SAVE_BACKUP_DELETED, mv->to);
+   free(dir);
+}
+
+static void task_cloud_sync_move_free(tcs_move_t *mv)
+{
+   string_list_free(mv->due);
+   free(mv);
+}
+
+static void task_cloud_sync_move_worker(void *data)
+{
+   tcs_move_t *mv = (tcs_move_t*)data;
+   task_cloud_sync_move_copy(mv);
+   if (retro_atomic_exchange_int(&mv->state, TCS_MOVE_DONE)
+         == TCS_MOVE_ABANDONED)
+   {
+      /* its sync is gone: nobody else can say so */
+      if (mv->unpruned)
+         RARCH_WARN(CSPFX "Could not delete old backups of \"%s\".\n",
+               mv->path);
+      /* nobody deletes the original now */
+      if (mv->ok)
+         filestream_delete(mv->to);
+      task_cloud_sync_move_free(mv);
+   }
+}
+
+static void task_cloud_sync_move_start(tcs_move_t *mv)
+{
+   sthread_t *thread;
+   retro_atomic_store_release_int(&mv->state, TCS_MOVE_RUNNING);
+   if ((thread = sthread_create(task_cloud_sync_move_worker, mv)))
+   {
+      sthread_detach(thread);
+      return;
+   }
+   task_cloud_sync_move_copy(mv);
+   retro_atomic_store_release_int(&mv->state, TCS_MOVE_DONE);
+}
+
+/* Starts queued copies in order while the budget allows. */
+static void task_cloud_sync_moves_start(task_cloud_sync_state_t *sync_state)
+{
+   tcs_move_t *mv;
+   unsigned    running = 0;
+   int64_t     bytes   = 0;
+
+   for (mv = sync_state->moves; mv; mv = mv->next)
+   {
+      if (retro_atomic_load_acquire_int(&mv->state) == TCS_MOVE_QUEUED)
+      {
+         if (     running
+               && (   running + 1 >= TCS_MOVE_MAX
+                   || bytes + mv->size >= TCS_MOVE_BUDGET))
+            return;
+         task_cloud_sync_move_start(mv);
+      }
+      running++;
+      bytes += mv->size;
+   }
+}
+
+/* Queues the copy of @path to @to that its backup owes; until it is
+ * done the key is in flight (`waiting`). A fetch's own unit carries
+ * over. */
+static bool task_cloud_sync_move_push(task_cloud_sync_state_t *sync_state,
+      task_cloud_sync_fetch_state_t *fetch_state,
+      struct item_file *server_file, const char *key, const char *path,
+      const char *to, const char *fetching, const char *hash)
+{
+   tcs_move_t **tail;
+   RFILE *reserve;
+   size_t path_len     = strlen(path) + 1;
+   size_t to_len       = strlen(to) + 1;
+   size_t key_len      = strlen(key) + 1;
+   size_t fetching_len = fetching ? strlen(fetching) + 1 : 0;
+   tcs_move_t *mv      = (tcs_move_t*)calloc(1,
+         sizeof(*mv) + path_len + to_len + key_len + fetching_len);
+
+   /* The copy's temporary holds its name until the copy runs: a cut
+    * name may be another file's too */
+   if (!mv || !(reserve = filestream_open_atomic(to)))
+   {
+      free(mv);
+      return false;
+   }
+   filestream_close(reserve);
+   mv->path = (char*)(mv + 1);
+   memcpy(mv->path, path, path_len);
+   mv->to   = mv->path + path_len;
+   memcpy(mv->to, to, to_len);
+   mv->key  = mv->to + to_len;
+   memcpy(mv->key, key, key_len);
+   if (fetching)
+   {
+      mv->fetching = mv->key + key_len;
+      memcpy(mv->fetching, fetching, fetching_len);
+   }
+   if (hash)
+      strlcpy(mv->hash, hash, sizeof(mv->hash));
+   mv->fetch_state = fetch_state;
+   mv->server_file = server_file;
+   mv->lifetime    = content_savefile_lifetime();
+   mv->writes      = content_save_writes();
+   if ((mv->size = path_get_size(path)) < 0)
+      mv->size = TCS_MOVE_BUDGET;
+   if (!path_get_mtime(path, &mv->mtime))
+      mv->mtime = 0;
+   retro_atomic_int_init(&mv->state, TCS_MOVE_QUEUED);
+
+   for (tail = &sync_state->moves; *tail; tail = &(*tail)->next);
+   *tail = mv;
+   if (!fetch_state)
+      task_cloud_sync_waiting_inc(sync_state);
+   task_cloud_sync_moves_start(sync_state);
+   return true;
+}
+
+/* Queues the delete of @due, old copies of @path. Not in `waiting`: a
+ * sync never waits for it, and one released first drops it, as the
+ * next copy's retention deletes them too. */
+static void task_cloud_sync_prune_push(task_cloud_sync_state_t *sync_state,
+      const char *path, struct string_list *due)
+{
+   tcs_move_t **tail;
+   size_t path_len = strlen(path) + 1;
+   tcs_move_t *mv  = (tcs_move_t*)calloc(1, sizeof(*mv) + path_len);
+   if (!mv)
+   {
+      string_list_free(due);
+      task_cloud_sync_unpruned(sync_state, path);
+      return;
+   }
+   mv->path = (char*)(mv + 1);
+   memcpy(mv->path, path, path_len);
+   mv->due  = due;
+   retro_atomic_int_init(&mv->state, TCS_MOVE_QUEUED);
+   for (tail = &sync_state->moves; *tail; tail = &(*tail)->next);
+   *tail = mv;
+   task_cloud_sync_moves_start(sync_state);
+}
+
+/* The file may have been written after the copy read it: by content
+ * loaded or closed meanwhile, by a save or state write of the frontend
+ * (one still in flight may land yet), or by the core itself, which only
+ * its size and mtime tell. */
+static bool task_cloud_sync_move_touched(const tcs_move_t *mv)
+{
+   int64_t mtime = 0;
+   if (     content_savefile_is_live(mv->path)
+         || content_savefile_lifetime() != mv->lifetime
+         || content_save_writes()       != mv->writes
+         || content_save_state_in_progress(NULL)
+         || path_get_size(mv->path)     != mv->size)
+      return true;
+   if (!path_get_mtime(mv->path, &mtime))
+      mtime = 0;
+   return mtime != mv->mtime;
+}
+
+/* The original goes once its copy is on the disk. A file written during
+ * the copy stays, and the copy goes, for the next sync to see; the copy
+ * of a file gone meanwhile stays. */
+static void task_cloud_sync_move_finish(task_cloud_sync_state_t *sync_state,
+      tcs_move_t *mv)
+{
+   task_cloud_sync_fetch_state_t *fetch_state = mv->fetch_state;
+   const char *server_hash = CS_FILE_HASH(mv->server_file);
+
+   if (mv->unpruned)
+      task_cloud_sync_unpruned(sync_state, mv->path);
+   if (mv->due)
+   {
+      task_cloud_sync_move_free(mv);
+      return;
+   }
+   if (task_cloud_sync_move_touched(mv))
+   {
+      RARCH_LOG(CSPFX "Deferring \"%s\", it may have been written during its backup.\n",
+            mv->key);
+      if (mv->ok && path_is_valid(mv->path))
+         filestream_delete(mv->to);
+      if (mv->fetching)
+         filestream_delete(mv->fetching);
+      task_cloud_sync_carry_manifests_forward(sync_state, mv->key,
+            server_hash);
+   }
+   else if (!mv->ok || !save_backups_move_finish(mv->path, mv->to))
+   {
+      RARCH_ERR(CSPFX "Could not back \"%s\" up to \"%s\".\n",
+            mv->path, mv->to);
+      if (mv->fetching)
+         filestream_delete(mv->fetching);
+      else
+         RARCH_ERR(CSPFX "Keeping \"%s\", the local file could not be removed.\n",
+               mv->key);
+      task_cloud_sync_carry_manifests_forward(sync_state, mv->key,
+            server_hash);
+      sync_state->failures = true;
+   }
+   else if (!fetch_state)
+   {
+      task_cloud_sync_add_to_updated_manifest(sync_state, mv->key,
+            NULL, true);
+      task_cloud_sync_add_to_updated_manifest(sync_state, mv->key,
+            server_hash, false);
+   }
+   else if (task_cloud_sync_fetch_place(fetch_state, mv->key, mv->fetching))
+      task_cloud_sync_fetched(sync_state, fetch_state->server_file,
+            mv->key, mv->hash);
+
+   free(fetch_state);
+   free(mv);
+   task_cloud_sync_waiting_dec(sync_state);
+}
+
+/* Finishes the copies that are done and starts what the budget then
+ * allows. Never waits. */
+static void task_cloud_sync_moves_run(task_cloud_sync_state_t *sync_state)
+{
+   tcs_move_t **link = &sync_state->moves;
+   while (*link)
+   {
+      tcs_move_t *mv = *link;
+      if (retro_atomic_load_acquire_int(&mv->state) != TCS_MOVE_DONE)
+      {
+         link = &mv->next;
+         continue;
+      }
+      *link = mv->next;
+      task_cloud_sync_move_finish(sync_state, mv);
+   }
+   task_cloud_sync_moves_start(sync_state);
+}
+
+/* A sync released with copies in flight: each copy is undone and its
+ * original kept, by whichever side lets go of it last. */
+static void task_cloud_sync_moves_abandon(task_cloud_sync_state_t *sync_state)
+{
+   while (sync_state->moves)
+   {
+      tcs_move_t *mv    = sync_state->moves;
+      sync_state->moves = mv->next;
+      if (mv->fetching)
+         filestream_delete(mv->fetching);
+      free(mv->fetch_state);
+      switch (retro_atomic_exchange_int(&mv->state, TCS_MOVE_ABANDONED))
+      {
+         case TCS_MOVE_RUNNING:
+            break;
+         case TCS_MOVE_DONE:
+            if (mv->unpruned)
+               task_cloud_sync_unpruned(sync_state, mv->path);
+            if (mv->ok)
+               filestream_delete(mv->to);
+            task_cloud_sync_move_free(mv);
+            break;
+         default:
+            /* never started: its temporary only held the name */
+            if (mv->to)
+               filestream_finish_atomic(mv->to, false);
+            task_cloud_sync_move_free(mv);
+            break;
+      }
+   }
+}
+#endif
+
+/* Deletes the temporary files of backup copies in backups/cloud-sync
+ * that never finished, as the atomic writer names them. Only at the
+ * first sync of a process: each is from a process that ended mid-copy,
+ * and none of this one's copies can be in flight before that sync's
+ * diff. */
+static void task_cloud_sync_sweep_temps(task_cloud_sync_state_t *sync_state)
+{
+   static bool swept = false;
+   size_t i;
+   struct string_list *list = NULL;
+   char *dir;
+
+   if (swept)
+      return;
+   swept = true;
+   if (!(dir = (char*)malloc(DIR_MAX_LENGTH)))
+      return;
+   if (task_cloud_sync_backup_root(sync_state, dir, DIR_MAX_LENGTH))
+      list = dir_list_new(dir, "tmp", false, true, false, true);
+   free(dir);
+   for (i = 0; list && i < list->size; i++)
+   {
+      struct save_backup_name parsed;
+      char        name[256];
+      const char *base = path_basename_nocompression(list->elems[i].data);
+      size_t      _len = strlen(base);
+
+      if (     _len <= STRLEN_CONST(CS_TEMP_SUFFIX)
+            || !string_is_equal(base + _len - STRLEN_CONST(CS_TEMP_SUFFIX),
+                  CS_TEMP_SUFFIX))
+         continue;
+      _len -= STRLEN_CONST(CS_TEMP_SUFFIX);
+      if (_len >= sizeof(name))
+         continue;
+      memcpy(name, base, _len);
+      name[_len] = '\0';
+      if (     !save_backups_parse(name, &parsed)
+            || parsed.core_len != STRLEN_CONST(SAVE_BACKUPS_CORE_CLOUD_SYNC)
+            || strncmp(name + parsed.core_off, SAVE_BACKUPS_CORE_CLOUD_SYNC,
+                  parsed.core_len))
+         continue;
+      filestream_delete(list->elems[i].data);
+   }
+   string_list_free(list);
 }
 
 /* Hands a download to the task thread to hash a chunk at a time. The
@@ -1416,8 +2824,9 @@ static void task_cloud_sync_fetched_run(task_cloud_sync_state_t *sync_state,
    task_cloud_sync_fetched_take(sync_state);
    while (sync_state->fetched)
    {
-      tcs_fetched_t *rec = sync_state->fetched;
-      char           hash[33];
+      tcs_fetched_t  *rec = sync_state->fetched;
+      enum tcs_commit commit;
+      char            hash[33];
 
       if (!sync_state->hash_fetched.file)
       {
@@ -1442,13 +2851,29 @@ static void task_cloud_sync_fetched_run(task_cloud_sync_state_t *sync_state,
          free(h);
       }
       filestream_close(rec->file);
-      if (task_cloud_sync_fetch_commit(rec->fetch_state, rec->path))
+      if (!*hash)
+      {
+         /* the local file is untouched, as on a failed download */
+         RARCH_WARN(CSPFX "Could not hash the download of \"%s\".\n",
+               rec->path);
+         task_cloud_sync_fetch_discard(rec->fetch_state);
+         task_cloud_sync_keep_records(sync_state, rec->path);
+         sync_state->failures = true;
+         commit = TCS_COMMIT_LEFT;
+      }
+      else
+         commit = task_cloud_sync_fetch_commit(rec->fetch_state,
+               rec->path, hash);
+      if (commit == TCS_COMMIT_PLACED)
          task_cloud_sync_fetched(sync_state, rec->fetch_state->server_file,
                rec->path, hash);
       sync_state->fetched = rec->next;
-      free(rec->fetch_state);
+      if (commit != TCS_COMMIT_OWED)
+      {
+         free(rec->fetch_state);
+         task_cloud_sync_waiting_dec(sync_state);
+      }
       free(rec);
-      task_cloud_sync_waiting_dec(sync_state);
    }
 }
 
@@ -1481,21 +2906,23 @@ static void task_cloud_sync_fetch_cb(void *user_data, const char *path, bool suc
    {
       /* The drivers report success with no file only when the server
        * does not have it.  Keeping it in the server manifest would fail
-       * the same fetch on every sync, so drop it there and leave the
-       * local copy and local manifest alone: if this device has the
-       * file, the next sync sees it as new here and uploads it. */
+       * the same fetch on every sync, so drop it there; the local copy
+       * and its record stay, so the next sync uploads it only if it
+       * changed here. */
       RARCH_WARN(CSPFX "\"%s\" is in the server manifest but missing on the server, removing it from the manifest.\n", path);
+      task_cloud_sync_keep_local_record(sync_state, path);
       sync_state->need_manifest_uploaded = true;
       sync_state->failures               = true;
    }
    else
    {
-      /* on failure, don't add it to local manifest, that will cause a fetch again next time */
+      /* the local file is untouched: both records stay, so the next
+       * sync fetches it again */
       RARCH_WARN(CSPFX "Failed to fetch \"%s\".\n", path);
       if (file)
          filestream_close(file);
       task_cloud_sync_fetch_discard(fetch_state);
-      task_cloud_sync_add_to_updated_manifest(sync_state, path, CS_FILE_HASH(server_file), true);
+      task_cloud_sync_keep_records(sync_state, path);
       sync_state->failures = true;
    }
 
@@ -1506,7 +2933,7 @@ static void task_cloud_sync_fetch_cb(void *user_data, const char *path, bool suc
 
 static void task_cloud_sync_fetch_server_file(task_cloud_sync_state_t *sync_state)
 {
-   size_t                         i;
+   size_t                         i, idx;
    char                           filename[PATH_MAX_LENGTH];
    char                           fetching[PATH_MAX_LENGTH];
    char                           directory[DIR_MAX_LENGTH];
@@ -1535,7 +2962,9 @@ static void task_cloud_sync_fetch_server_file(task_cloud_sync_state_t *sync_stat
    /* there is a weird thing that can happen, where the server file changes but
     * the manifest does not have the updated hash. in that case when the file is
     * downloaded we have an opportunity to check that the hash matches and
-    * update the server manifest, and correct the issue. to do this the server
+    * update the server manifest, and correct the issue (over a local copy
+    * only under Keep Server: otherwise a conflict, see
+    * task_cloud_sync_fetch_commit()). to do this the server
     * manifest cannot be updated early; only on error or after the download is
     * successful. on error just add to the updated manifest without marking
     * need_manifest_uplaod. */
@@ -1579,12 +3008,18 @@ static void task_cloud_sync_fetch_server_file(task_cloud_sync_state_t *sync_stat
    if (!fetch_state)
    {
       RARCH_WARN(CSPFX "Wanted to fetch %s but failed to malloc.\n", key);
-      task_cloud_sync_add_to_updated_manifest(sync_state, key, CS_FILE_HASH(server_file), true);
+      task_cloud_sync_keep_records(sync_state, key);
       sync_state->failures = true;
       return;
    }
    fetch_state->sync_state  = sync_state;
    fetch_state->server_file = server_file;
+   fetch_state->had_file    =
+            file_list_search(sync_state->local_manifest, key, &idx)
+         && string_is_equal_noncase(
+            CS_FILE_KEY(&sync_state->local_manifest->list[idx]), key)
+         && !string_is_empty(
+            CS_FILE_HASH(&sync_state->local_manifest->list[idx]));
    strlcpy(fetch_state->local, filename, sizeof(fetch_state->local));
    if (     task_cloud_sync_fetching_path(fetching, sizeof(fetching), filename)
          && cloud_sync_read(key, fetching, task_cloud_sync_fetch_cb, fetch_state))
@@ -1592,7 +3027,7 @@ static void task_cloud_sync_fetch_server_file(task_cloud_sync_state_t *sync_stat
    else
    {
       RARCH_WARN(CSPFX "Wanted to fetch %s but failed.\n", key);
-      task_cloud_sync_add_to_updated_manifest(sync_state, key, CS_FILE_HASH(server_file), true);
+      task_cloud_sync_keep_records(sync_state, key);
       sync_state->failures = true;
       free(fetch_state);
    }
@@ -1610,9 +3045,17 @@ static void task_cloud_sync_resolve_conflict(task_cloud_sync_state_t *sync_state
    }
    else if (sync_state->conflict_resolution == 2)
    {
-      /* Keep server: download server file */
+      /* Keep server: download server file, or take its delete */
       RARCH_LOG(CSPFX "Conflict on %s, keeping server.\n", CS_FILE_KEY(server_file));
-      task_cloud_sync_fetch_server_file(sync_state);
+      if (!string_is_empty(CS_FILE_HASH(server_file)))
+         task_cloud_sync_fetch_server_file(sync_state);
+      else if (task_cloud_sync_delete_current_file(sync_state))
+      {
+         task_cloud_sync_add_to_updated_manifest(sync_state,
+               CS_FILE_KEY(server_file), NULL, true);
+         task_cloud_sync_add_to_updated_manifest(sync_state,
+               CS_FILE_KEY(server_file), CS_FILE_HASH(server_file), false);
+      }
    }
    else
    {
@@ -1650,12 +3093,7 @@ static void task_cloud_sync_upload_cb(void *user_data, const char *path, bool su
    }
    else
    {
-      /* if the upload fails, try to resurrect the hash from the last sync */
-      if (file_list_search(sync_state->local_manifest, path, &idx))
-      {
-         struct item_file *local_file = &sync_state->local_manifest->list[idx];
-         task_cloud_sync_add_to_updated_manifest(sync_state, path, CS_FILE_HASH(local_file), false);
-      }
+      task_cloud_sync_keep_records(sync_state, path);
       RARCH_WARN(CSPFX "Uploading \"%s\" failed.\n", path);
       sync_state->failures = true;
    }
@@ -1688,24 +3126,29 @@ static void task_cloud_sync_upload_current_file(task_cloud_sync_state_t *sync_st
    file = filestream_open(filename,
          RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_FREQUENT_ACCESS);
    if (!file)
+   {
+      task_cloud_sync_keep_records(sync_state, path);
+      RARCH_WARN(CSPFX "Could not read \"%s\".\n", filename);
+      sync_state->failures = true;
       return;
+   }
+
+   if (!item->userdata && !(item->userdata = task_cloud_sync_md5_rfile(file)))
+   {
+      task_cloud_sync_keep_records(sync_state, path);
+      filestream_close(file);
+      RARCH_WARN(CSPFX "Could not hash \"%s\".\n", filename);
+      sync_state->failures = true;
+      return;
+   }
 
    RARCH_LOG(CSPFX "Uploading \"%s\".\n", path);
-
-   if (!item->userdata)
-      item->userdata = task_cloud_sync_md5_rfile(file);
 
    filestream_seek(file, 0, SEEK_SET);
    task_cloud_sync_waiting_inc(sync_state);
    if (!cloud_sync_update(path, file, task_cloud_sync_upload_cb, sync_state))
    {
-      /* if the upload fails, try to resurrect the hash from the last sync */
-      size_t idx;
-      if (file_list_search(sync_state->local_manifest, path, &idx))
-      {
-         struct item_file *local_file = &sync_state->local_manifest->list[idx];
-         task_cloud_sync_add_to_updated_manifest(sync_state, path, CS_FILE_HASH(local_file), false);
-      }
+      task_cloud_sync_keep_records(sync_state, path);
       filestream_close(file);
       task_cloud_sync_waiting_dec(sync_state);
       sync_state->failures = true;
@@ -1714,12 +3157,14 @@ static void task_cloud_sync_upload_current_file(task_cloud_sync_state_t *sync_st
 }
 
 /* Returns false when the local file was left in place, in which case the
- * caller must not record the delete as sync'd. */
+ * caller must not record the delete as sync'd, or when its backup's copy
+ * records it once done. */
 static bool task_cloud_sync_delete_current_file(task_cloud_sync_state_t *sync_state)
 {
+   enum save_backup_result made;
+   char *owed                    = NULL;
    struct item_file *item        = &sync_state->current_manifest->list[sync_state->current_idx];
    struct item_file *server_file = &sync_state->server_manifest->list[sync_state->server_idx];
-   bool cloud_sync_destructive   = sync_state->destructive;
 
    if (task_cloud_sync_defer_live_savefile(sync_state, CS_FILE_KEY(item),
             item->path, CS_FILE_HASH(server_file)))
@@ -1727,9 +3172,21 @@ static bool task_cloud_sync_delete_current_file(task_cloud_sync_state_t *sync_st
 
    RARCH_WARN(CSPFX "Server has deleted \"%s\", so shall we.\n", CS_FILE_KEY(item));
 
-   if (cloud_sync_destructive
-         ? (filestream_delete(item->path) != 0)
-         : !task_cloud_sync_backup_file(item, sync_state->dir_core_assets))
+   made = task_cloud_sync_backup_file(sync_state, item, SAVE_BACKUP_DELETED,
+         &owed);
+#if defined(TCS_MOVE_WORKER)
+   if (made == SAVE_BACKUP_COPY_OWED)
+   {
+      bool queued = task_cloud_sync_move_push(sync_state, NULL,
+            server_file, CS_FILE_KEY(server_file), item->path, owed,
+            NULL, NULL);
+      free(owed);
+      if (queued)
+         return false;
+   }
+#endif
+
+   if (made != SAVE_BACKUP_MADE)
    {
       RARCH_ERR(CSPFX "Keeping \"%s\", the local file could not be removed.\n",
             CS_FILE_KEY(item));
@@ -1763,9 +3220,21 @@ static void task_cloud_sync_check_server_current(task_cloud_sync_state_t *sync_s
       file = filestream_open(filename,
             RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_FREQUENT_ACCESS);
       if (!file)
+      {
+         task_cloud_sync_keep_records(sync_state, CS_FILE_KEY(server_file));
+         RARCH_WARN(CSPFX "Could not read \"%s\".\n", filename);
+         sync_state->failures = true;
          return;
+      }
       current_file->userdata = task_cloud_sync_md5_rfile(file);
       filestream_close(file);
+      if (!current_file->userdata)
+      {
+         task_cloud_sync_keep_records(sync_state, CS_FILE_KEY(server_file));
+         RARCH_WARN(CSPFX "Could not hash \"%s\".\n", filename);
+         sync_state->failures = true;
+         return;
+      }
    }
 
    if (string_is_equal(CS_FILE_HASH(server_file), CS_FILE_HASH(current_file)))
@@ -1793,7 +3262,10 @@ static void task_cloud_sync_check_server_current(task_cloud_sync_state_t *sync_s
    else if (!string_is_empty(CS_FILE_HASH(server_file)))
       task_cloud_sync_fetch_server_file(sync_state);
    else if (task_cloud_sync_delete_current_file(sync_state))
+   {
+      task_cloud_sync_add_to_updated_manifest(sync_state, CS_FILE_KEY(server_file), NULL, true);
       task_cloud_sync_add_to_updated_manifest(sync_state, CS_FILE_KEY(server_file), CS_FILE_HASH(server_file), false);
+   }
 }
 
 static void task_cloud_sync_delete_cb(void *user_data, const char *path, bool success, RFILE *file)
@@ -1805,13 +3277,8 @@ static void task_cloud_sync_delete_cb(void *user_data, const char *path, bool su
 
    if (!success)
    {
-      /* if the delete fails, resurrect the hash from the last sync */
-      size_t idx;
-      if (file_list_search(sync_state->local_manifest, path, &idx))
-      {
-         struct item_file *local_file = &sync_state->local_manifest->list[idx];
-         task_cloud_sync_add_to_updated_manifest(sync_state, path, CS_FILE_HASH(local_file), false);
-      }
+      /* the next sync tries it again */
+      task_cloud_sync_keep_records(sync_state, path);
       RARCH_WARN(CSPFX "Deleting \"%s\" failed.\n", path);
       sync_state->failures = true;
       task_cloud_sync_waiting_dec(sync_state);
@@ -1871,7 +3338,7 @@ static void task_cloud_sync_maybe_ignore(task_cloud_sync_state_t *sync_state)
       {
          struct item_file *local_file  = &sync_state->local_manifest->list[sync_state->local_idx];
          const char *key = CS_FILE_KEY(local_file);
-         found = task_cloud_sync_key_in_scope(dirlist, key);
+         found = task_cloud_sync_key_in_scope(sync_state, key);
          /* we have a record of doing a sync for this file but now no longer
           * wish to sync it. keep the record? might as well, in case the option
           * gets turned back on later. */
@@ -1889,7 +3356,7 @@ static void task_cloud_sync_maybe_ignore(task_cloud_sync_state_t *sync_state)
       {
          struct item_file *server_file  = &sync_state->server_manifest->list[sync_state->server_idx];
          const char *key = CS_FILE_KEY(server_file);
-         found = task_cloud_sync_key_in_scope(dirlist, key);
+         found = task_cloud_sync_key_in_scope(sync_state, key);
          /* must keep the server's manifest complete */
          if (!found)
          {
@@ -1899,6 +3366,141 @@ static void task_cloud_sync_maybe_ignore(task_cloud_sync_state_t *sync_state)
          }
       }
    }
+}
+
+/* Kept on the server and left out of the local manifest, so the next
+ * sync fetches it back. */
+static void task_cloud_sync_hold_delete(task_cloud_sync_state_t *sync_state)
+{
+   struct item_file *server_file = &sync_state->server_manifest->list[sync_state->server_idx];
+   const char       *hash        = (const char*)server_file->userdata;
+   union string_list_elem_attr attr;
+
+   attr.i = 0;
+   task_cloud_sync_add_to_updated_manifest(sync_state,
+         CS_FILE_KEY(server_file), CS_FILE_HASH(server_file), true);
+   sync_state->held_count++;
+   if (!sync_state->held)
+      sync_state->held = string_list_new();
+   if (     !sync_state->held
+         || !string_list_append(sync_state->held, CS_FILE_KEY(server_file), attr))
+      sync_state->failures = true;
+   else
+      sync_state->held->elems[sync_state->held->size - 1].userdata =
+         hash ? strdup(hash) : NULL;
+}
+
+/* Whether @current_file differs from what the last sync left here
+ * (@local_file). Unchanged, its record stays for the next sync. */
+static bool task_cloud_sync_changed_here(task_cloud_sync_state_t *sync_state,
+      struct item_file *current_file, struct item_file *local_file)
+{
+   const char *key = CS_FILE_KEY(current_file);
+
+   if (!current_file->userdata)
+   {
+      RFILE *file = filestream_open(current_file->path,
+            RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_FREQUENT_ACCESS);
+      if (file)
+      {
+         current_file->userdata = task_cloud_sync_md5_rfile(file);
+         filestream_close(file);
+      }
+      if (!current_file->userdata)
+      {
+         task_cloud_sync_keep_records(sync_state, key);
+         RARCH_WARN(CSPFX "Could not hash \"%s\".\n", current_file->path);
+         sync_state->failures = true;
+         return false;
+      }
+   }
+   if (!string_is_equal(CS_FILE_HASH(current_file), CS_FILE_HASH(local_file)))
+      return true;
+   RARCH_LOG(CSPFX "\"%s\" is not on the server and has not changed here, not uploading.\n", key);
+   task_cloud_sync_add_to_updated_manifest(sync_state, key,
+         CS_FILE_HASH(local_file), false);
+   sync_state->unsent_count++;
+   return false;
+}
+
+/* @key's file under @root into @s. False when it has none. */
+static bool task_cloud_sync_root_path(
+      const task_cloud_sync_state_t *sync_state, int root, const char *key,
+      char *s, size_t len)
+{
+   const char *path = cloud_sync_manifest_key_path(key);
+
+   if (root < 0 || !path)
+      return false;
+   fill_pathname_join_special(s,
+         (const char*)sync_state->dirlist->elems[root].userdata,
+         path, len);
+   pathname_conform_slashes_to_os(s);
+   return true;
+}
+
+/* A download of @key cut off before it was moved in, its local copy
+ * maybe already in the backups: not a delete here. */
+static bool task_cloud_sync_fetch_left(
+      const task_cloud_sync_state_t *sync_state, int root, const char *key)
+{
+   char   local[PATH_MAX_LENGTH];
+   size_t _len;
+   if (!task_cloud_sync_root_path(sync_state, root, key,
+            local, sizeof(local)))
+      return false;
+   _len = strlen(local);
+   return    strlcpy(local + _len, CS_FETCHING_SUFFIX, sizeof(local) - _len)
+               < sizeof(local) - _len
+          && path_is_valid(local);
+}
+
+/* Whether @key's file is here after all. A save renames a state aside
+ * and back, and the walk can land in between: the file is back by now,
+ * still held (save_backups_held()), or in a writer's temp. */
+static bool task_cloud_sync_still_here(
+      const task_cloud_sync_state_t *sync_state, int root, const char *key)
+{
+   /* A state task's, the RAM state's, and for an ".auto" alone the
+    * synchronous auto save's: "G.state.auto.tmp" is not slot 0's */
+   static const char *const temps[] = { ".tmp", ".ram.tmp", ".auto.tmp" };
+   char        local[PATH_MAX_LENGTH];
+   size_t      _len;
+   size_t      i, n;
+
+   if (!task_cloud_sync_root_path(sync_state, root, key,
+            local, sizeof(local)))
+      return false;
+   if (path_is_valid(local) || save_backups_held(local))
+      return true;
+   _len = strlen(local);
+   n    = string_ends_with(local, ".auto") ? 3 : 2;
+   for (i = 0; i < n; i++)
+      if (     strlcpy(local + _len, temps[i], sizeof(local) - _len)
+                  < sizeof(local) - _len
+            && path_is_valid(local))
+         return true;
+   return false;
+}
+
+static void task_cloud_sync_held_notice(task_cloud_sync_state_t *sync_state)
+{
+   char msg[128];
+   snprintf(msg, sizeof(msg), msg_hash_to_str(MSG_CLOUD_SYNC_DELETIONS_HELD),
+         sync_state->held_count);
+   RARCH_WARN(CSPFX "%s\n", msg);
+   runloop_msg_queue_push(msg, strlen(msg), 1, 180, false, NULL,
+         MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+}
+
+static void task_cloud_sync_unsent_notice(task_cloud_sync_state_t *sync_state)
+{
+   char msg[192];
+   snprintf(msg, sizeof(msg), msg_hash_to_str(MSG_CLOUD_SYNC_UNCHANGED_NOT_SENT),
+         sync_state->unsent_count);
+   RARCH_WARN(CSPFX "%s\n", msg);
+   runloop_msg_queue_push(msg, strlen(msg), 1, 180, false, NULL,
+         MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
 }
 
 static void task_cloud_sync_diff_next(task_cloud_sync_state_t *sync_state)
@@ -1929,6 +3531,10 @@ static void task_cloud_sync_diff_next(task_cloud_sync_state_t *sync_state)
    if (!server_file && !local_file && !current_file)
    {
       RARCH_LOG(CSPFX "Finished processing manifests.\n");
+      if (sync_state->held_count)
+         task_cloud_sync_held_notice(sync_state);
+      if (sync_state->unsent_count)
+         task_cloud_sync_unsent_notice(sync_state);
       task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_UPDATE_MANIFESTS);
       return;
    }
@@ -1945,7 +3551,17 @@ static void task_cloud_sync_diff_next(task_cloud_sync_state_t *sync_state)
       {
          /* the server has a file we don't have, we check the hash */
          if (!string_is_empty(CS_FILE_HASH(server_file)))
-            task_cloud_sync_fetch_server_file(sync_state);
+         {
+            /* not over a file the walk missed: a conflict next time */
+            if (task_cloud_sync_still_here(sync_state,
+                     task_cloud_sync_key_root(sync_state->dirlist,
+                        CS_FILE_KEY(server_file)),
+                     CS_FILE_KEY(server_file)))
+               task_cloud_sync_carry_manifests_forward(sync_state,
+                     CS_FILE_KEY(server_file), CS_FILE_HASH(server_file));
+            else
+               task_cloud_sync_fetch_server_file(sync_state);
+         }
          else
          {
             /* it's deleted on the server, remember that and mark the sync of the delete */
@@ -1992,15 +3608,50 @@ static void task_cloud_sync_diff_next(task_cloud_sync_state_t *sync_state)
          /* the file has been deleted locally */
          if (!string_is_empty(CS_FILE_HASH(server_file)))
          {
+            int root = task_cloud_sync_key_root(sync_state->dirlist,
+                  CS_FILE_KEY(server_file));
             if (string_is_empty(CS_FILE_HASH(local_file)))
-               /* previously saw the delete, now it's resurrected */
+            {
+               /* previously saw the delete, now it's resurrected; not
+                * over a file the walk missed: a conflict next time */
+               if (task_cloud_sync_still_here(sync_state, root,
+                        CS_FILE_KEY(server_file)))
+                  task_cloud_sync_carry_manifests_forward(sync_state,
+                        CS_FILE_KEY(server_file), CS_FILE_HASH(server_file));
+               else
+                  task_cloud_sync_fetch_server_file(sync_state);
+            }
+            else if (   string_is_equal(CS_FILE_HASH(server_file), CS_FILE_HASH(local_file))
+                     || sync_state->conflict_resolution == 1)
+            {
+               /* server didn't change, or Keep Local keeps the
+                * delete: delete from the server, not over a cut fetch */
+               if (     task_cloud_sync_still_here(sync_state, root,
+                           CS_FILE_KEY(server_file))
+                     || task_cloud_sync_fetch_left(sync_state, root,
+                           CS_FILE_KEY(server_file)))
+                  task_cloud_sync_carry_manifests_forward(sync_state,
+                        CS_FILE_KEY(server_file), CS_FILE_HASH(server_file));
+               else if (task_cloud_sync_key_held(sync_state, root,
+                        CS_FILE_KEY(server_file)))
+                  task_cloud_sync_hold_delete(sync_state);
+               else
+                  task_cloud_sync_delete_server_file(sync_state);
+            }
+            else if (task_cloud_sync_fetch_left(sync_state, root,
+                        CS_FILE_KEY(server_file)))
+               /* not deleted: its fetch was cut off, finish it */
                task_cloud_sync_fetch_server_file(sync_state);
-            else if (string_is_equal(CS_FILE_HASH(server_file), CS_FILE_HASH(local_file)))
-               /* server didn't change, delete from the server */
-               task_cloud_sync_delete_server_file(sync_state);
             else
-               /* the server changed and local deleted, that's a conflict */
+            {
+               /* the server changed and local deleted, that's a conflict;
+                * unresolved, the local manifest keeps it too, so the
+                * next sync meets it again */
+               if (sync_state->conflict_resolution != 2)
+                  task_cloud_sync_add_to_updated_manifest(sync_state,
+                        CS_FILE_KEY(local_file), CS_FILE_HASH(local_file), false);
                task_cloud_sync_resolve_conflict(sync_state);
+            }
          }
          else
          {
@@ -2017,7 +3668,9 @@ static void task_cloud_sync_diff_next(task_cloud_sync_state_t *sync_state)
    {
       /* the server is missing a file that we've sync'd before? should have at
        * least had a deleted record? assume the server state got reset and treat
-       * as a missing file on the server */
+       * as a missing file on the server. A copy unchanged since the last
+       * sync may be older than the one the server lost: only Upload
+       * Local sends it. */
       current_local_key_cmp = task_cloud_sync_key_cmp(current_file, local_file);
       if (current_local_key_cmp < 0)
       {
@@ -2026,7 +3679,10 @@ static void task_cloud_sync_diff_next(task_cloud_sync_state_t *sync_state)
       }
       else if (current_local_key_cmp == 0)
       {
-         task_cloud_sync_upload_current_file(sync_state);
+         if (     sync_state->conflict_resolution == 3
+               || task_cloud_sync_changed_here(sync_state,
+                     current_file, local_file))
+            task_cloud_sync_upload_current_file(sync_state);
          sync_state->current_idx++;
          sync_state->local_idx++;
       }
@@ -2190,6 +3846,7 @@ static void task_cloud_sync_commit_local_manifest(task_cloud_sync_state_t *sync_
       filestream_close(file);
       if (filestream_rename(tmp_path, manifest_path) == 0)
       {
+         task_cloud_sync_write_roots(sync_state);
          free(manifest_path);
          return;
       }
@@ -2318,6 +3975,7 @@ static void task_cloud_sync_task_step(retro_task_t *task,
    switch (task_cloud_sync_phase_get(sync_state))
    {
       case CLOUD_SYNC_PHASE_BEGIN:
+         task_cloud_sync_sweep_temps(sync_state);
          task_cloud_sync_waiting_set(sync_state, 1);
          if (!cloud_sync_begin(task_cloud_sync_begin_handler, task))
          {
@@ -2395,6 +4053,9 @@ static void task_cloud_sync_task_handler(retro_task_t *task)
    task_nbio_slice_open(&b);
    cloud_sync_poll(task_nbio_slice_within_budget, &b);
    task_cloud_sync_fetched_run(sync_state, &b);
+#if defined(TCS_MOVE_WORKER)
+   task_cloud_sync_moves_run(sync_state);
+#endif
    task_cloud_sync_task_step(task, sync_state, &b);
    task_nbio_slice_close(&b);
 }
@@ -2411,6 +4072,11 @@ static void task_cloud_sync_task_handler(retro_task_t *task)
  * task's callback run there. */
 static int tcs_followup_mode = -1;
 
+/* Syncs set up that have not called back yet. A task finder cannot
+ * answer this from inside another task's handler on the unthreaded
+ * queue, where a content load runs. Frame thread only. */
+static unsigned tcs_in_flight = 0;
+
 static bool task_push_cloud_sync_with_mode(int conflict_resolution,
       retro_task_callback_t cb, void *cb_data);
 
@@ -2425,6 +4091,13 @@ static void task_cloud_sync_cb(retro_task_t *task, void *task_data,
          error = task->title ? task->title : "Cloud Sync failed";
       sync_state->cb(task, NULL, sync_state->cb_data, error);
    }
+
+   /* Whatever the result: the content's saves load from what is here,
+    * once no other sync can change it. */
+   if (tcs_in_flight)
+      tcs_in_flight--;
+   if (!tcs_in_flight)
+      runloop_save_load_release(SAVE_LOAD_HOLD_CLOUD_SYNC);
 
    if (tcs_followup_mode >= 0)
    {
@@ -2463,6 +4136,11 @@ static void task_cloud_sync_cleanup(retro_task_t *task)
     * elems[i].data, so the strdup'd directories go with it. */
    if (sync_state->dirlist)
       string_list_free(sync_state->dirlist);
+   string_list_free(sync_state->roots);
+   string_list_free(sync_state->held);
+   string_list_free(sync_state->held_dirs);
+   string_list_free(sync_state->shadowed);
+   string_list_free(sync_state->held_before);
    task_cloud_sync_walk_free(sync_state);
    if (sync_state->hash_cur.file)
       filestream_close(sync_state->hash_cur.file);
@@ -2476,6 +4154,9 @@ static void task_cloud_sync_cleanup(retro_task_t *task)
       free(rec->fetch_state);
       free(rec);
    }
+#if defined(TCS_MOVE_WORKER)
+   task_cloud_sync_moves_abandon(sync_state);
+#endif
    free(sync_state->hash_buf);
 
    free(sync_state);
@@ -2493,6 +4174,7 @@ static void task_cloud_sync_task_setup(retro_task_t *task,
    task->progress_cb = task_window_progress_cb;
    /* Save ownership and local mutations share the content thread. */
    task->flags     |= RETRO_TASK_FLG_MAIN_THREAD;
+   tcs_in_flight++;
 }
 
 static bool task_cloud_sync_task_finder(retro_task_t *task, void *user_data)
@@ -2506,6 +4188,93 @@ static bool task_cloud_sync_task_finder(retro_task_t *task, void *user_data)
           && !(task_get_flags(task) & RETRO_TASK_FLG_FINISHED);
 }
 
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
+/* @s into @md5 with its separators one way and none at either end,
+ * as a driver joins it into its paths */
+static void task_cloud_sync_id_path(MD5_CTX *md5, const char *s)
+{
+   size_t len;
+   size_t i;
+   while (*s == '/' || *s == '\\')
+      s++;
+   len = strlen(s);
+   while (len && (s[len - 1] == '/' || s[len - 1] == '\\'))
+      len--;
+   for (i = 0; i < len; i++)
+      MD5_Update(md5, (s[i] == '\\') ? "/" : s + i, 1);
+   MD5_Update(md5, "", 1);
+}
+#endif
+
+/* @url into @md5 as network/cloud_sync/webdav.c takes it: http:// when
+ * it names no scheme, and no trailing slash */
+static void task_cloud_sync_id_url(MD5_CTX *md5, const char *url)
+{
+   size_t len = strlen(url);
+   if (!strstr(url, "://"))
+      MD5_Update(md5, "http://", STRLEN_CONST("http://"));
+   while (len && url[len - 1] == '/')
+      len--;
+   MD5_Update(md5, url, (unsigned long)len);
+   MD5_Update(md5, "", 1);
+}
+
+/* The server and account the sync talks to, as its driver addresses
+ * them, hashed into @s (33 bytes): another one's files are not what
+ * the last sync left. A username names the account; passwords, keys
+ * and tokens are left out, so a new key or a new sign-in is the same
+ * server. Google Drive and iCloud keep no account id to tell another
+ * account by: the driver alone. */
+static void task_cloud_sync_server_id(char *s, const settings_t *settings)
+{
+   const char *drv = settings->arrays.cloud_sync_driver;
+   MD5_CTX     md5;
+
+   MD5_Init(&md5);
+   MD5_Update(&md5, drv, (unsigned long)strlen(drv) + 1);
+   if (string_is_equal(drv, "webdav"))
+   {
+      task_cloud_sync_id_url(&md5, settings->arrays.webdav_url);
+      MD5_Update(&md5, settings->arrays.webdav_username,
+            (unsigned long)strlen(settings->arrays.webdav_username) + 1);
+   }
+#ifdef HAVE_S3
+   else if (string_is_equal(drv, "s3"))
+      task_cloud_sync_id_url(&md5, settings->arrays.s3_url);
+#endif
+#ifdef HAVE_SMBCLIENT
+   else if (string_is_equal(drv, "smb"))
+   {
+      task_cloud_sync_id_path(&md5, settings->arrays.smb_client_server_address);
+      task_cloud_sync_id_path(&md5, settings->arrays.smb_client_share);
+      task_cloud_sync_id_path(&md5, settings->arrays.smb_client_subdir);
+      MD5_Update(&md5, settings->arrays.smb_client_username,
+            (unsigned long)strlen(settings->arrays.smb_client_username) + 1);
+   }
+#endif
+#ifdef HAVE_NFSCLIENT
+   else if (string_is_equal(drv, "nfs"))
+   {
+      task_cloud_sync_id_path(&md5, settings->arrays.nfs_server);
+      task_cloud_sync_id_path(&md5, settings->arrays.nfs_export);
+      /* as network/cloud_sync/nfs.c picks it */
+      task_cloud_sync_id_path(&md5,
+            string_is_empty(settings->arrays.cloud_sync_nfs_subdir)
+            ? settings->arrays.nfs_subdir
+            : settings->arrays.cloud_sync_nfs_subdir);
+   }
+#endif
+   task_cloud_sync_md5_hex(s, &md5);
+}
+
+/* Set while a main config save or state folder is missing (main thread) */
+static bool tcs_paused = false;
+
+void task_cloud_sync_set_paused(bool paused)
+{
+   tcs_paused = paused;
+}
+
 static bool task_push_cloud_sync_with_mode(int conflict_resolution,
       retro_task_callback_t cb, void *cb_data)
 {
@@ -2517,6 +4286,12 @@ static bool task_push_cloud_sync_with_mode(int conflict_resolution,
 
    if (!cloud_sync_enable)
       return false;
+
+   if (tcs_paused)
+   {
+      RARCH_WARN(CSPFX "Paused: the save or state folder is missing.\n");
+      return false;
+   }
 
 #if defined(HAVE_THREADS) && !defined(TCS_LOCK_FREE)
    if (!tcs_manifest_lock)
@@ -2545,10 +4320,10 @@ static bool task_push_cloud_sync_with_mode(int conflict_resolution,
    /* Keep this sync's settings across subsequent frames. */
    {
       settings_t *settings    = config_get_ptr();
-      sync_state->destructive = settings->bools.cloud_sync_destructive;
       strlcpy(sync_state->dir_core_assets,
             settings->paths.directory_core_assets,
             sizeof(sync_state->dir_core_assets));
+      task_cloud_sync_server_id(sync_state->server_id, settings);
       sync_state->dirlist     = task_cloud_sync_directory_map_new(settings);
    }
    cloud_sync_capture();
@@ -2585,6 +4360,11 @@ static bool task_push_cloud_sync_with_mode(int conflict_resolution,
    return true;
 }
 
+bool task_cloud_sync_in_progress(void)
+{
+   return tcs_in_flight > 0;
+}
+
 bool task_push_cloud_sync(retro_task_callback_t cb, void *cb_data)
 {
    return task_push_cloud_sync_with_mode(0, cb, cb_data);
@@ -2617,4 +4397,16 @@ void task_push_cloud_sync_resolve_keep_server(void)
 {
    RARCH_LOG(CSPFX "Starting sync with conflict resolution: keep server.\n");
    task_push_cloud_sync_with_mode(2, NULL, NULL);
+}
+
+void task_push_cloud_sync_upload_all(void)
+{
+   RARCH_LOG(CSPFX "Starting sync uploading every file the server lost.\n");
+   task_push_cloud_sync_with_mode(3, NULL, NULL);
+}
+
+void task_push_cloud_sync_delete_missing(void)
+{
+   RARCH_LOG(CSPFX "Starting sync deleting on the server every file missing here.\n");
+   task_push_cloud_sync_with_mode(4, NULL, NULL);
 }

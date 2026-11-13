@@ -5,7 +5,8 @@
  * local copy of the fake's sparse.img too, a file opened before the
  * settings change must read on with the settings it was opened with,
  * and with no export set and every slot busy, a file opened by URL must
- * keep the export its own connection found.
+ * keep the export its own connection found, and a folder listed through
+ * the VFS must end with a read error when the server loses a page.
  *
  * Usage: nfs_error_test [fake_nfs42.py port [local sparse.img]]
  * Exit status is the failure count. */
@@ -17,6 +18,7 @@
 #include <compat/strl.h>
 #include <file/file_path.h>
 #include <retro_dirent.h>
+#include <retro_miscellaneous.h>
 #include "../../../libretro-common/vfs/vfs_implementation_nfs.h"
 
 static struct nfs_settings cfg;
@@ -148,6 +150,44 @@ static int expect_private_open_keeps_export(const char *local)
    return fails;
 }
 
+/* Lists @name, made next to @local with five files: the fake answers
+ * two entries a page, and loses the second page of "broken". */
+static int expect_listing(const char *local, const char *name, bool broken)
+{
+   char base[PATH_MAX_LENGTH], dir[PATH_MAX_LENGTH], file[PATH_MAX_LENGTH];
+   char url[64], leaf[16];
+   struct RDIR *d;
+   unsigned i, n = 0;
+   bool err;
+   fill_pathname_basedir(base, local, sizeof(base));
+   fill_pathname_join_special(dir, base, name, sizeof(dir));
+   path_mkdir(dir);
+   for (i = 0; i < 5; i++)
+   {
+      snprintf(leaf, sizeof(leaf), "%u.bin", i);
+      fill_pathname_join_special(file, dir, leaf, sizeof(file));
+      filestream_write_file(file, "x", 1);
+   }
+   snprintf(url, sizeof(url), "nfs://127.0.0.1/%s", name);
+   if (!(d = retro_opendir(url)))
+   {
+      fprintf(stderr, "FAIL: list %s: %s\n", url, nfs_get_last_error());
+      return 1;
+   }
+   while (retro_readdir(d))
+      n++;
+   err = retro_dirent_error(d);
+   retro_closedir(d);
+   if (broken ? (n != 2 || !err) : (n != 5 || err))
+   {
+      fprintf(stderr, "FAIL: %s: %u entries, read error %d\n", url, n, (int)err);
+      return 1;
+   }
+   printf("ok:   %s: %u entries, %s\n", url, n,
+         broken ? "then a read error for the lost page" : "to its end");
+   return 0;
+}
+
 int main(int argc, char **argv)
 {
    int fails = 0;
@@ -194,6 +234,8 @@ int main(int argc, char **argv)
    {
       cfg.export_path = "/export";
       nfs_init_cfg(&cfg);
+      fails += expect_listing(argv[2], "whole", false);
+      fails += expect_listing(argv[2], "broken", true);
       fails += expect_open_file_kept(argv[2]);
       cfg.nfs_port   = (unsigned)atoi(argv[1]);
       cfg.mount_port = 0;

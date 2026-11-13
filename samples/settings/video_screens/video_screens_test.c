@@ -12,6 +12,7 @@
 #include <streams/file_stream.h>
 #include <time/rtime.h>
 #include <features/features_cpu.h>
+#include <queues/task_queue.h>
 #include <string/stdstring.h>
 
 #include "../../../configuration.h"
@@ -19,6 +20,7 @@
 #include "../../../retroarch.h"
 #include "../../../runloop.h"
 #include "../../../paths.h"
+#include "../../../defaults.h"
 #include "../../../frontend/frontend_driver.h"
 #include "../../../menu/menu_setting.h"
 #include "../../../menu/menu_driver.h"
@@ -369,6 +371,180 @@ static void test_xr_override_unload(void)
       CHECK(!settings->bools.video_screen_xr_visible[7]);
    }
    path_clear(RARCH_PATH_BASENAME);
+}
+
+/* A save or state folder that is missing at load stays the configured
+ * one: the config keeps it, "default" stays "default", and an override
+ * never records the folder used in its place. */
+static bool saved_dir_is(const char *path, const char *key, const char *want)
+{
+   char value[2048];
+   bool ok          = false;
+   config_file_t *conf = config_file_new_from_path_to_string(path);
+   if (conf)
+   {
+      ok = config_get_path(conf, key, value, sizeof(value))
+         && string_is_equal(value, want);
+      config_file_free(conf);
+   }
+   return ok;
+}
+
+/* As the file browser sets a folder row. */
+static void menu_set_dir(const char *name, const char *dir)
+{
+   rarch_setting_t *setting = menu_setting_find(name);
+   CHECK(setting != NULL);
+   if (setting)
+   {
+      strlcpy(setting->value.target.string, dir, setting->size);
+      menu_setting_generic(setting, 0, false);
+   }
+}
+
+static void test_save_dir_config(void)
+{
+   static rarch_system_info_t system_info;
+   char dir[2048];
+   char gone[2048];
+   char saves[2048];
+   char states[2048];
+   char picked[2048];
+   char text[4400];
+   config_file_t *conf;
+
+   memset(&system_info, 0, sizeof(system_info));
+   system_info.info.library_name = "save_dir_test";
+   fill_pathname_basedir(dir, fixture_path, sizeof(dir));
+   strlcpy(g_defaults.dirs[DEFAULT_DIR_SRAM], dir,
+         sizeof(g_defaults.dirs[DEFAULT_DIR_SRAM]));
+   strlcpy(g_defaults.dirs[DEFAULT_DIR_SAVESTATE], dir,
+         sizeof(g_defaults.dirs[DEFAULT_DIR_SAVESTATE]));
+   fill_pathname_join(gone, dir, "gone", sizeof(gone));
+   fill_pathname_join(saves, gone, "saves", sizeof(saves));
+   fill_pathname_join(states, gone, "states", sizeof(states));
+   snprintf(text, sizeof(text), "savefile_directory = \"%s\"\n"
+         "savestate_directory = \"%s\"\n", saves, states);
+
+   load_fixture(text);
+   CHECK(config_save_file(saved_path));
+   CHECK(saved_dir_is(saved_path, "savefile_directory", saves));
+   CHECK(saved_dir_is(saved_path, "savestate_directory", states));
+
+   load_fixture("savefile_directory = \"default\"\n"
+         "savestate_directory = \"default\"\n");
+   CHECK(config_save_file(saved_path));
+   CHECK(saved_dir_is(saved_path, "savefile_directory", "default"));
+   CHECK(saved_dir_is(saved_path, "savestate_directory", "default"));
+
+   load_fixture(text);
+   path_set(RARCH_PATH_BASENAME, "save_dir_game.rom");
+   /* The defaults this short fixture lacks are always written, so the
+    * override read back is this one. */
+   CHECK(config_save_overrides(OVERRIDE_GAME, &system_info, false, NULL)
+         == 1);
+   conf = config_file_new_from_path_to_string(
+         path_get(RARCH_PATH_CONFIG_OVERRIDE));
+   CHECK(conf != NULL);
+   if (conf)
+   {
+      CHECK(!config_get_entry(conf, "savefile_directory"));
+      CHECK(!config_get_entry(conf, "savestate_directory"));
+      config_file_free(conf);
+   }
+
+   /* A folder picked in the menu still lands in the override. */
+   fill_pathname_join(picked, dir, "picked", sizeof(picked));
+   CHECK(path_mkdir(picked));
+   load_fixture("savefile_directory = \"default\"\n"
+         "savestate_directory = \"default\"\n");
+   menu_set_dir("savefile_directory", picked);
+   menu_set_dir("savestate_directory", picked);
+   CHECK(config_save_overrides(OVERRIDE_GAME, &system_info, false, NULL)
+         == 1);
+   CHECK(saved_dir_is(path_get(RARCH_PATH_CONFIG_OVERRIDE),
+            "savefile_directory", picked));
+   CHECK(saved_dir_is(path_get(RARCH_PATH_CONFIG_OVERRIDE),
+            "savestate_directory", picked));
+   filestream_delete(path_get(RARCH_PATH_CONFIG_OVERRIDE));
+   path_clear(RARCH_PATH_BASENAME);
+   CHECK(!path_is_directory(gone));
+   *g_defaults.dirs[DEFAULT_DIR_SRAM]      = '\0';
+   *g_defaults.dirs[DEFAULT_DIR_SAVESTATE] = '\0';
+}
+
+void menu_content_environment_get(int *argc, char *argv[],
+      void *args, void *params_data);
+
+/* A load from the menu passes the folders in use on as -s/-S only
+ * when they came from the command line: a configured one is checked
+ * again at the load. */
+static void test_load_save_dir_args(void)
+{
+   struct rarch_main_wrap wrap;
+   char dir[2048];
+
+   fill_pathname_basedir(dir, fixture_path, sizeof(dir));
+   dir_set(RARCH_DIR_SAVEFILE, dir);
+   dir_set(RARCH_DIR_SAVESTATE, dir);
+   retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
+   retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL);
+   memset(&wrap, 0, sizeof(wrap));
+   menu_content_environment_get(NULL, NULL, NULL, &wrap);
+   CHECK(!wrap.sram_path);
+   CHECK(!wrap.state_path);
+
+   retroarch_override_setting_set(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
+   retroarch_override_setting_set(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL);
+   memset(&wrap, 0, sizeof(wrap));
+   menu_content_environment_get(NULL, NULL, NULL, &wrap);
+   CHECK(wrap.sram_path && string_is_equal(wrap.sram_path, dir));
+   CHECK(wrap.state_path && string_is_equal(wrap.state_path, dir));
+
+   retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
+   retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_STATE_PATH, NULL);
+   dir_clear(RARCH_DIR_SAVEFILE);
+   dir_clear(RARCH_DIR_SAVESTATE);
+}
+
+/* Loading or unloading an override leaves the save and state path
+ * flags as the command line set them (here: not), so the next config
+ * load and the next game's names follow the config again. */
+static void test_override_flags_reset(void)
+{
+   char dir[2048];
+   char a[2048];
+   char b[2048];
+   char text[2200];
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+
+   fill_pathname_basedir(dir, fixture_path, sizeof(dir));
+   fill_pathname_join(a, dir, "saves_a", sizeof(a));
+   fill_pathname_join(b, dir, "saves_b", sizeof(b));
+   path_mkdir(a);
+   path_mkdir(b);
+   snprintf(text, sizeof(text), "savefile_directory = \"%s\"\n", a);
+   load_fixture(text);
+   snprintf(text, sizeof(text), "savefile_directory = \"%s\"\n", b);
+   write_config(override_path, text);
+   CHECK(config_load_override_file(override_path));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE), b));
+   CHECK(config_unload_override());
+   CHECK(!retroarch_override_setting_is_set(
+            RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL));
+   CHECK(!retroarch_override_setting_is_set(
+            RARCH_OVERRIDE_SETTING_STATE_PATH, NULL));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE), a));
+
+   runloop_path_set_basename("/roms/GameB.sfc");
+   runloop_path_set_names();
+   CHECK(string_is_equal(path_basename(runloop_st->name.savefile),
+            "GameB.srm"));
+
+   /* "Load Configuration": the other config's folder */
+   load_fixture(text);
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE), b));
+   path_clear(RARCH_PATH_CONTENT);
 }
 
 static void test_xr_config_invalid(void)
@@ -4763,6 +4939,208 @@ static void test_plays_as_override_unplugged(void)
    load_fixture("");
 }
 
+/* The main config's save folders, which cloud sync walks: an override's
+ * folder, a menu edit made while it is loaded and the command line's
+ * folder leave them as the config file has them. */
+static void test_save_dir_base(void)
+{
+   char dir[2048];
+   char a[2048];
+   char b[2048];
+   char c[2048];
+   char text[4200];
+
+   fill_pathname_basedir(dir, fixture_path, sizeof(dir));
+   fill_pathname_join(a, dir, "base_a", sizeof(a));
+   fill_pathname_join(b, dir, "base_b", sizeof(b));
+   fill_pathname_join(c, dir, "base_c", sizeof(c));
+   path_mkdir(a);
+   path_mkdir(b);
+   path_mkdir(c);
+   snprintf(text, sizeof(text), "savefile_directory = \"%s\"\n"
+         "savestate_directory = \"%s\"\n", a, a);
+   load_fixture(text);
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE), a));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVESTATE_BASE), a));
+
+   snprintf(text, sizeof(text), "savefile_directory = \"%s\"\n"
+         "savestate_directory = \"%s\"\n", b, b);
+   write_config(override_path, text);
+   CHECK(config_load_override_file(override_path));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE), b));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE), a));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVESTATE_BASE), a));
+   menu_set_dir("savefile_directory", c);
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE), c));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE), a));
+   CHECK(config_unload_override());
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE), a));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE), a));
+
+   /* With no override, a menu edit is the main config's */
+   menu_set_dir("savefile_directory", c);
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE), c));
+
+   /* -s */
+   retroarch_override_setting_set(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
+   dir_set(RARCH_DIR_SAVEFILE, b);
+   snprintf(text, sizeof(text), "savefile_directory = \"%s\"\n", a);
+   load_fixture(text);
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE), b));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE), a));
+   retroarch_override_setting_unset(RARCH_OVERRIDE_SETTING_SAVE_PATH, NULL);
+
+   /* Relative: the folder saves go to, under the config file's */
+   load_fixture("savefile_directory = \"base_a\"\n"
+         "savestate_directory = \"base_a\"\n");
+   CHECK(path_is_directory(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE)));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE),
+         dir_get_ptr(RARCH_DIR_SAVEFILE)));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVESTATE_BASE),
+         dir_get_ptr(RARCH_DIR_SAVESTATE)));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_CONFIGURED),
+         "base_a"));
+
+   /* "./" and ".." folded */
+   strlcpy(text, "savefile_directory = \"./base_a\"\n"
+         "savestate_directory = \"../", sizeof(text));
+   fill_pathname_parent_dir_name(text + strlen(text), fixture_path,
+         sizeof(text) - strlen(text));
+   strlcat(text, "/base_a\"\n", sizeof(text));
+   load_fixture(text);
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE), a));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVESTATE_BASE), a));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE), a));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVESTATE), a));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_CONFIGURED),
+         "./base_a"));
+
+   strlcpy(g_defaults.dirs[DEFAULT_DIR_SRAM], b,
+         sizeof(g_defaults.dirs[DEFAULT_DIR_SRAM]));
+   strlcpy(g_defaults.dirs[DEFAULT_DIR_SAVESTATE], c,
+         sizeof(g_defaults.dirs[DEFAULT_DIR_SAVESTATE]));
+   load_fixture("savefile_directory = \"default\"\n"
+         "savestate_directory = \"default\"\n");
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE), b));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVESTATE_BASE), c));
+   load_fixture("savefile_directory = \"\"\n"
+         "savestate_directory = \"\"\n");
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE), b));
+   CHECK(string_is_equal(dir_get_ptr(RARCH_DIR_SAVESTATE_BASE), c));
+   *g_defaults.dirs[DEFAULT_DIR_SRAM]      = '\0';
+   *g_defaults.dirs[DEFAULT_DIR_SAVESTATE] = '\0';
+   load_fixture("");
+   CHECK(!*dir_get_ptr(RARCH_DIR_SAVEFILE_BASE));
+}
+
+static bool save_dirs_are(const char *dir)
+{
+   return string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE_BASE), dir)
+      && string_is_equal(dir_get_ptr(RARCH_DIR_SAVESTATE_BASE), dir)
+      && string_is_equal(dir_get_ptr(RARCH_DIR_SAVEFILE), dir)
+      && string_is_equal(dir_get_ptr(RARCH_DIR_SAVESTATE), dir);
+}
+
+/* Save As names a file without loading it: an override's re-read
+ * keeps the relative folders where they are, a load moves them. */
+static void test_save_dir_base_save_as(void)
+{
+   static rarch_system_info_t system_info;
+   char dir[2048];
+   char a[2048];
+   char cfg[2048];
+   char moved[2048];
+   char core_cfg[2048];
+   char text[4200];
+
+   memset(&system_info, 0, sizeof(system_info));
+   system_info.info.library_name = "save_as_core";
+   fill_pathname_basedir(dir, fixture_path, sizeof(dir));
+   fill_pathname_join(a, dir, "base_a", sizeof(a));
+   fill_pathname_join(moved, dir, "save_as", sizeof(moved));
+   fill_pathname_join(core_cfg, dir, "save_as_menu", sizeof(core_cfg));
+   path_mkdir(a);
+   path_mkdir(moved);
+   fill_pathname_join(cfg, moved, "mine.cfg", sizeof(cfg));
+   fill_pathname_join(moved, moved, "base_a", sizeof(moved));
+   snprintf(text, sizeof(text), "savefile_directory = \"base_a\"\n"
+         "savestate_directory = \"base_a\"\n"
+         "rgui_config_directory = \"%s\"\n", core_cfg);
+   fill_pathname_join(core_cfg, core_cfg, "save_as_core", sizeof(core_cfg));
+   path_mkdir(core_cfg);
+   fill_pathname_join(core_cfg, core_cfg, "save_as_core.cfg",
+         sizeof(core_cfg));
+   load_fixture(text);
+   CHECK(save_dirs_are(a));
+   CHECK(config_save_file(cfg));
+   path_set(RARCH_PATH_CONFIG, cfg);
+
+   write_config(override_path, "video_smooth = \"true\"\n");
+   CHECK(config_load_override_file(override_path));
+   CHECK(save_dirs_are(a));
+   path_mkdir(moved);
+   CHECK(config_unload_override());
+   CHECK(save_dirs_are(a));
+
+   /* The core override a content load reads */
+   write_config(core_cfg, "video_smooth = \"true\"\n");
+   CHECK(config_load_override(&system_info));
+   CHECK(save_dirs_are(a));
+   CHECK(config_unload_override());
+
+   config_load();
+   CHECK(save_dirs_are(moved));
+}
+
+#ifdef HAVE_CLOUDSYNC
+static void cloud_sync_done(retro_task_t *task, void *task_data,
+      void *user_data, const char *err)
+{
+   *(bool*)user_data = true;
+}
+
+/* With no driver, a sync that starts fails at once. */
+static bool cloud_sync_starts(void)
+{
+   bool done = false;
+   unsigned i;
+   config_get_ptr()->bools.cloud_sync_enable = true;
+   if (!task_push_cloud_sync(cloud_sync_done, &done))
+      return false;
+   for (i = 0; !done && i < 1000; i++)
+      task_queue_check();
+   CHECK(done);
+   return true;
+}
+
+/* Sync waits from the config load while a main config folder is
+ * missing, and a menu edit to a folder that exists ends the wait. */
+static void test_save_base_pause(void)
+{
+   char dir[2048];
+   char here[2048];
+   char gone[2048];
+   char text[4200];
+
+   fill_pathname_basedir(dir, fixture_path, sizeof(dir));
+   fill_pathname_join(here, dir, "pause_here", sizeof(here));
+   fill_pathname_join(gone, dir, "pause_gone", sizeof(gone));
+   path_mkdir(here);
+   task_queue_init(false, NULL);
+   snprintf(text, sizeof(text), "savefile_directory = \"%s\"\n"
+         "savestate_directory = \"%s\"\n", here, here);
+   load_fixture(text);
+   CHECK(cloud_sync_starts());
+   snprintf(text, sizeof(text), "savefile_directory = \"%s\"\n"
+         "savestate_directory = \"%s\"\n", gone, here);
+   load_fixture(text);
+   CHECK(!cloud_sync_starts());
+   menu_set_dir("savefile_directory", here);
+   CHECK(cloud_sync_starts());
+   task_queue_deinit();
+}
+#endif
+
 int main(int argc, char **argv)
 {
 #ifdef VIDEO_SCREENS_RUNTIME_TEST
@@ -4791,6 +5169,14 @@ int main(int argc, char **argv)
       test_xr_minimal_save();
       test_xr_override_unload();
       test_xr_config_invalid();
+      test_save_dir_config();
+      test_load_save_dir_args();
+      test_override_flags_reset();
+      test_save_dir_base();
+      test_save_dir_base_save_as();
+#ifdef HAVE_CLOUDSYNC
+      test_save_base_pause();
+#endif
       test_xr_menu_place_config();
    }
    test_window_layout();

@@ -62,11 +62,15 @@
  * path_init_savefile_new() creates at content load and
  * path_deinit_savefile() frees once save RAM has been written out. */
 static struct string_list *task_save_files = NULL;
+/* Stands in for runloop_state_get_ptr()->name.savestate. */
+static char name_savestate[64] = "/home/u/states/foo.state";
 
-/* Verbatim copy of save.c::content_savefile_is_live(). */
+/* Copy of save.c::content_savefile_is_live(), the state name read from
+ * the stand-in above. */
 static bool content_savefile_is_live(const char *path)
 {
-   size_t i;
+   size_t i, _len;
+   const char *state;
 
    if (!task_save_files || string_is_empty(path))
       return false;
@@ -75,7 +79,11 @@ static bool content_savefile_is_live(const char *path)
       if (string_is_equal_noncase(task_save_files->elems[i].data, path))
          return true;
 
-   return false;
+   state = name_savestate;
+   _len  = strlen(state);
+   return   _len
+         && string_starts_with_case_insensitive(path, state)
+         && string_is_equal_noncase(path + _len, ".auto");
 }
 
 static int failures = 0;
@@ -126,6 +134,14 @@ static void test_ownership_window(void)
    check(!content_savefile_is_live("/home/u/states/foo.state"),
          "save states are not owned");
    check(!content_savefile_is_live(""), "an empty path is not owned");
+   check(content_savefile_is_live("/home/u/states/foo.state.auto"),
+         "the session's auto state is owned");
+   check(content_savefile_is_live("/home/u/STATES/foo.state.AUTO"),
+         "the auto state differing only in case is owned");
+   check(!content_savefile_is_live("/home/u/states/foo.state1.auto"),
+         "another state's auto file is not owned");
+   check(!content_savefile_is_live("/home/u/states/foo.state.auto2"),
+         "the auto state extended is not owned");
 
    /* The deinit chain writes save RAM out and then frees the list, which
     * is what releases the files to the next sync. */
@@ -134,6 +150,8 @@ static void test_ownership_window(void)
 
    check(!content_savefile_is_live("/home/u/saves/foo.srm"),
          "ownership is released once the list is torn down");
+   check(!content_savefile_is_live("/home/u/states/foo.state.auto"),
+         "the auto state is released with it");
 }
 
 static void append_entry(file_list_t *list, size_t idx,

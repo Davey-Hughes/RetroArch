@@ -183,6 +183,7 @@ struct rnfs_dir
    uint64_t cookie;
    uint8_t  cookieverf[8];
    uint8_t  done;
+   uint8_t  failed;
    uint8_t  plain;       /* server has no READDIRPLUS: READDIR + LOOKUP */
 };
 
@@ -3505,19 +3506,23 @@ const struct rnfs_dirent *rnfs_readdir(struct rnfs_ctx *c, struct rnfs_dir *d)
       if (d->buf_off >= d->buf_len)
       {
          if ((c->version == 4 ? nfs4_readdir_fill(c, d) : rnfs_readdir_fill(c, d)) != 0)
-            return NULL;
+            break;
       }
       x.p = d->buf + d->buf_off; x.end = d->buf + d->buf_len; x.fail = 0;
       if (!xdr_get_u32(&x))                    /* value_follows */
       {
+         uint32_t eof;
          d->done = 1;                          /* then eof flag; either way the list ended */
-         if (!x.fail && xdr_get_u32(&x) == 0)
+         eof     = xdr_get_u32(&x);
+         if (x.fail)
+            break;
+         if (!eof)
          {
             /* eof false: more to fetch */
             d->done = 0;
             d->buf_off = d->buf_len;
             if ((c->version == 4 ? nfs4_readdir_fill(c, d) : rnfs_readdir_fill(c, d)) != 0)
-               return NULL;
+               break;
             continue;
          }
          return NULL;
@@ -3549,7 +3554,7 @@ const struct rnfs_dirent *rnfs_readdir(struct rnfs_ctx *c, struct rnfs_dir *d)
       if (x.fail || !name)
       {
          d->done = 1;
-         return NULL;
+         break;
       }
       d->buf_off = (size_t)(x.p - d->buf);
       if (name_len >= sizeof(d->ent.name))
@@ -3562,6 +3567,13 @@ const struct rnfs_dirent *rnfs_readdir(struct rnfs_ctx *c, struct rnfs_dir *d)
          rnfs_entry_attrs(c, d);
       return &d->ent;
    }
+   d->failed = 1;
+   return NULL;
+}
+
+int rnfs_readdir_failed(const struct rnfs_dir *d)
+{
+   return d->failed;
 }
 
 void rnfs_closedir(struct rnfs_ctx *c, struct rnfs_dir *d)

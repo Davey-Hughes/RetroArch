@@ -34,6 +34,8 @@ on:
       - 'libretro-common/vfs/**'
       - 'libretro-common/include/vfs/**'
       - 'libretro-common/include/streams/file_stream.h'
+      - 'libretro-common/lists/dir_list.c'
+      - 'libretro-common/lists/string_list.c'
       - 'libretro-common/samples/file/vfs/**'
       - 'libretro-common/fastjmp/**'
       - 'libretro-common/include/fastjmp.h'
@@ -45,6 +47,8 @@ on:
       - 'libretro-common/vfs/**'
       - 'libretro-common/include/vfs/**'
       - 'libretro-common/include/streams/file_stream.h'
+      - 'libretro-common/lists/dir_list.c'
+      - 'libretro-common/lists/string_list.c'
       - 'libretro-common/samples/file/vfs/**'
       - 'libretro-common/fastjmp/**'
       - 'libretro-common/include/fastjmp.h'
@@ -103,6 +107,8 @@ jobs:
             ./vfs_readahead_test
             ./vfs_close_result_test
             ./vfs_descriptor_rw_test
+            ./filestream_atomic_test
+            ./vfs_readdir_error_test
           }
           # Mapping on (what the platform actually ships), mapping off
           # with the descriptor path forced (what the consoles have),
@@ -229,6 +235,10 @@ jobs:
           # Read-write descriptor streams on the Windows C runtimes,
           # and that a file they create is writable afterwards.
           ./vfs_descriptor_rw_test.exe
+          # Refused renames keep the old file, a locked target included.
+          ./filestream_atomic_test.exe
+          # A failed FindNextFileW is a read error, not the end.
+          ./vfs_readdir_error_test.exe
 
       # The Win64 fastjmp_set stores xmm6-xmm15 with movaps and faults
       # on a misaligned buffer. Linux has no such stores, so the Linux

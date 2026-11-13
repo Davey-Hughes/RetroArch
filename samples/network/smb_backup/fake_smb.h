@@ -23,6 +23,7 @@ typedef struct
    /* Failure switches: -1 / 0 mean "never". */
    long     fail_write_after;   /* total bytes after which writes fail */
    unsigned fail_rename_number; /* 1-based: which rename call fails */
+   const char *fail_rename_from; /* renames of this path fail */
    bool     fail_unlink;        /* unlinks of real files fail */
    size_t   written;
    unsigned renames;

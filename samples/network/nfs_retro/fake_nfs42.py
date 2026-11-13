@@ -2,9 +2,10 @@
 """A minimal NFSv4.2 server for testing READ_PLUS (RFC 7862).
 
 It serves one directory as the export /export and answers only what the
-built-in client uses to read a file: the session operations, a walk to
-the file (PUTROOTFH, PUTFH, LOOKUP, GETFH, GETATTR), READ, and
-READ_PLUS. READ_PLUS reports the runs of the file the filesystem really
+built-in client uses to read a file or list a folder: the session
+operations, a walk to the file (PUTROOTFH, PUTFH, LOOKUP, GETFH,
+GETATTR), READ, READ_PLUS and READDIR. READDIR answers two entries a
+page, and a folder named "broken" fails its second page with NFS4ERR_IO. READ_PLUS reports the runs of the file the filesystem really
 holds as holes (SEEK_DATA / SEEK_HOLE), so the client under test sees a
 server's view of a sparse file, not one it was told to expect.
 
@@ -30,6 +31,8 @@ NFS4ERR_NOFILEHANDLE = 10020
 OP_GETATTR, OP_GETFH, OP_LOOKUP, OP_PUTFH, OP_PUTROOTFH = 9, 10, 15, 22, 24
 OP_READ, OP_EXCHANGE_ID, OP_CREATE_SESSION, OP_SEQUENCE = 25, 42, 43, 53
 OP_RECLAIM_COMPLETE, OP_READ_PLUS = 58, 68
+OP_READDIR = 26
+READDIR_PAGE = 2
 
 NF4REG, NF4DIR = 1, 2
 CONTENT_DATA, CONTENT_HOLE = 0, 1
@@ -241,6 +244,27 @@ class Server:
                                 body += u32(CONTENT_DATA) + u64(o) + opaque(d)
                             else:
                                 body += u32(CONTENT_HOLE) + u64(o) + u64(d)
+            elif op == OP_READDIR:
+                cookie = x.u64()
+                x.fixed(8)                    # cookie verifier
+                x.u32(); x.u32()              # dircount, maxcount
+                words = [x.u32() for _w in range(x.u32())]
+                full = self.path(cfh) if cfh not in (None, ROOT) else None
+                if full is None or not os.path.isdir(full):
+                    st = NFS4ERR_NOTDIR
+                elif cookie and os.path.basename(full) == "broken":
+                    st = NFS4ERR_IO           # a page lost mid-listing
+                else:
+                    # entry k's cookie is k + 3: 0 starts, 1 and 2 are reserved
+                    names = sorted(os.listdir(full))
+                    start = cookie - 2 if cookie else 0
+                    page = names[start:start + READDIR_PAGE]
+                    body = b"\0" * 8
+                    for i, name in enumerate(page):
+                        rel = os.path.normpath(os.path.join(cfh.decode(), name))
+                        body += (u32(1) + u64(start + i + 3) + opaque(name.encode())
+                                 + self.getattr(rel.encode(), words))
+                    body += u32(0) + u32(1 if start + len(page) >= len(names) else 0)
             else:
                 res.append(u32(NFS4ERR_OP_ILLEGAL) + u32(NFS4ERR_OP_ILLEGAL))
                 status = NFS4ERR_OP_ILLEGAL

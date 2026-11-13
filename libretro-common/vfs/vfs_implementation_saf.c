@@ -37,6 +37,7 @@ static jmethodID vfs_saf_saf_stat_init_method;
 static jmethodID vfs_saf_saf_stat_get_is_open_method;
 static jmethodID vfs_saf_saf_stat_get_is_directory_method;
 static jmethodID vfs_saf_saf_stat_get_size_method;
+static jmethodID vfs_saf_saf_stat_get_last_modified_method;
 static jmethodID vfs_saf_mkdir_saf_method;
 static jclass vfs_saf_saf_directory_class;
 static jmethodID vfs_saf_saf_directory_init_method;
@@ -147,6 +148,9 @@ bool retro_vfs_init_saf(JNIEnv *(*get_jni_env)(void), jobject activity_object)
    if ((*env)->ExceptionOccurred(env)) goto error;
 
    vfs_saf_saf_stat_get_size_method = (*env)->GetMethodID(env, vfs_saf_saf_stat_class, "getSize", "()J");
+   if ((*env)->ExceptionOccurred(env)) goto error;
+
+   vfs_saf_saf_stat_get_last_modified_method = (*env)->GetMethodID(env, vfs_saf_saf_stat_class, "getLastModified", "()J");
    if ((*env)->ExceptionOccurred(env)) goto error;
 
    vfs_saf_mkdir_saf_method = (*env)->GetStaticMethodID(env, vfs_saf_vfs_implementation_saf_class, "mkdirSaf", "(Landroid/content/ContentResolver;Ljava/lang/String;Ljava/lang/String;)I");
@@ -675,13 +679,14 @@ error:
    return -1;
 }
 
-int retro_vfs_stat_saf(const char *tree, const char *path, int64_t *size)
+int retro_vfs_stat_saf(const char *tree, const char *path, int64_t *size, int64_t *mtime)
 {
    JNIEnv *env;
    jstring tree_object;
    jstring path_object;
    jobject saf_stat;
    int64_t saf_stat_size;
+   int64_t saf_stat_mtime;
    bool saf_stat_is_directory;
 
    if (vfs_saf_get_jni_env == NULL)
@@ -730,6 +735,15 @@ int retro_vfs_stat_saf(const char *tree, const char *path, int64_t *size)
 
    saf_stat_is_directory = (*env)->CallBooleanMethod(env, saf_stat, vfs_saf_saf_stat_get_is_directory_method);
    if ((*env)->ExceptionOccurred(env)) goto error;
+
+   if (mtime != NULL)
+   {
+      /* milliseconds; 0 when the provider has none, and 0 s is unknown */
+      saf_stat_mtime = (*env)->CallLongMethod(env, saf_stat, vfs_saf_saf_stat_get_last_modified_method);
+      if ((*env)->ExceptionOccurred(env)) goto error;
+      if (saf_stat_mtime >= 1000)
+         *mtime = saf_stat_mtime / 1000;
+   }
 
    if (size != NULL)
       *size = saf_stat_size > INT64_MAX ? INT64_MAX : (int64_t)saf_stat_size;
@@ -827,6 +841,7 @@ libretro_vfs_implementation_saf_dir *retro_vfs_opendir_saf(const char *tree, con
    dirstream->batch_count   = 0;
    dirstream->batch_pos     = 0;
    dirstream->exhausted     = false;
+   dirstream->error         = false;
    dirstream->dirent_name   = NULL;
    dirstream->dirent_is_dir = false;
    (*env)->PopLocalFrame(env, NULL);
@@ -879,6 +894,7 @@ static bool saf_batch_fill(JNIEnv *env,
          (*env)->ExceptionDescribe(env);
          (*env)->ExceptionClear(env);
       }
+      dirstream->error = true;
       return false;
    }
 
@@ -935,6 +951,11 @@ static bool saf_batch_fill(JNIEnv *env,
             (flag_elems[i] != JNI_FALSE);
          dirstream->batch_count++;
       }
+      else
+      {
+         (*env)->DeleteLocalRef(env, jname);
+         break;
+      }
 
       (*env)->DeleteLocalRef(env, jname);
    }
@@ -945,9 +966,18 @@ static bool saf_batch_fill(JNIEnv *env,
    if (count < RETRO_VFS_SAF_DIRENT_BATCH)
       dirstream->exhausted = true;
 
+   /* An entry not copied ends the listing in an error, not short */
+   if (i < count)
+   {
+      dirstream->error     = true;
+      dirstream->exhausted = true;
+   }
+
    ok = (dirstream->batch_count > 0);
 
 done:
+   if (!ok)
+      dirstream->error = true;
    if ((*env)->ExceptionCheck(env))
    {
       (*env)->ExceptionDescribe(env);
@@ -961,11 +991,11 @@ bool retro_vfs_readdir_saf(libretro_vfs_implementation_saf_dir *dirstream)
 {
    JNIEnv *env;
 
-   if (vfs_saf_get_jni_env == NULL)
+   if (vfs_saf_get_jni_env == NULL || (env = vfs_saf_get_jni_env()) == NULL)
+   {
+      dirstream->error = true;
       return false;
-   env = vfs_saf_get_jni_env();
-   if (env == NULL)
-      return false;
+   }
 
    if (dirstream->batch_pos >= dirstream->batch_count)
    {
