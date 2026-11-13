@@ -9981,6 +9981,10 @@ unsigned menu_displaylist_build_list(
                           || key == RARCH_HEADSET_EDIT_SCREENS)
                   continue;
 #endif
+#if !(defined(ANDROID) && defined(HAVE_VIDEO_WINDOWS))
+               else if (key == RARCH_BLANK_UNUSED_TOGGLE)
+                  continue;
+#endif
                /* Show combo entries before normal binds */
                else if (key == RARCH_MENU_TOGGLE)
                {
