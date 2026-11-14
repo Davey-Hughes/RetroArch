@@ -3325,13 +3325,945 @@ static void lane_replay_swap_count(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* Lane: wrapper entry points called from inside frame()              */
-/*   The menu drivers call current_video->set_viewport() while they   */
-/*   draw, which under the wrapper is on the video thread. A blocking  */
-/*   command sent from there waits on itself. This wraps the driver   */
-/*   the wrapper wraps so its frame() does exactly that, plus the      */
-/*   other marshalled calls, while the main thread keeps sending its   */
-/*   own commands into the same mailbox.                               */
+/* Lane: geometry and AV-info changes                                 */
+/* ------------------------------------------------------------------ */
+
+static void lane_square_pixel_geometry(void)
+{
+   static const unsigned cases[][4] = {
+      {320, 240, 4, 3},
+      {320, 160, 2, 1},
+      {160, 320, 1, 2},
+      {1920, 1080, 16, 9},
+      {8191, 8190, 8191, 8190},
+      {8192, 8192, 1, 1},
+      {1, 1, 1, 1}
+   };
+   settings_t *settings = config_get_ptr();
+   video_driver_state_t *video_st = video_state_get_ptr();
+   struct retro_game_geometry saved = video_st->av_info.geometry;
+   struct retro_game_geometry geom = saved;
+   struct aspect_ratio_elem saved_square = aspectratio_lut[ASPECT_RATIO_SQUARE];
+   unsigned saved_aspect = settings->uints.video_aspect_ratio_idx;
+   unsigned saved_rotation = settings->uints.video_rotation;
+   bool saved_pause = video_st->frame_delay_pause;
+   unsigned had = failures;
+   unsigned i, rotation;
+   char expected[sizeof(aspectratio_lut[ASPECT_RATIO_SQUARE].name)];
+   retro_time_t start;
+
+   settings->uints.video_aspect_ratio_idx = ASPECT_RATIO_SQUARE;
+   for (rotation = 0; rotation < 4; rotation++)
+   {
+      settings->uints.video_rotation = rotation;
+      for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+      {
+         unsigned x = cases[i][2];
+         unsigned y = cases[i][3];
+         geom.base_width = cases[i][0];
+         geom.base_height = cases[i][1];
+         /* Rotation alone need not make SET_GEOMETRY notify the driver. */
+         runloop_environment_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &geom);
+         video_driver_set_aspect_ratio();
+         if (retroarch_get_rotation() % 2)
+         {
+            unsigned tmp = x;
+            x = y;
+            y = tmp;
+         }
+         snprintf(expected, sizeof(expected),
+               msg_hash_to_str(MENU_ENUM_LABEL_VALUE_VIDEO_ASPECT_RATIO_SQUARE_PIXEL),
+               x, y);
+         CHECK(!strcmp(aspectratio_lut[ASPECT_RATIO_SQUARE].name, expected),
+               "square pixels: %ux%u rotation %u label %s, expected %s",
+               geom.base_width, geom.base_height, rotation,
+               aspectratio_lut[ASPECT_RATIO_SQUARE].name, expected);
+         CHECK(fabs(aspectratio_lut[ASPECT_RATIO_SQUARE].value
+                  - (float)x / y) < 0.000001,
+               "square pixels: wrong aspect for %ux%u rotation %u",
+               geom.base_width, geom.base_height, rotation);
+      }
+   }
+   geom.base_width = 0;
+   runloop_environment_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &geom);
+   CHECK(!strcmp(aspectratio_lut[ASPECT_RATIO_SQUARE].name, expected),
+         "square pixels: zero width changed the aspect label");
+   geom.base_width = 1;
+   geom.base_height = 0;
+   runloop_environment_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &geom);
+   CHECK(!strcmp(aspectratio_lut[ASPECT_RATIO_SQUARE].name, expected),
+         "square pixels: zero height changed the aspect label");
+
+   geom.base_height = 8190;
+   start = cpu_features_get_time_usec();
+   for (i = 0; i < 1000; i++)
+   {
+      geom.base_width = 8191 + (i & 1);
+      runloop_environment_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &geom);
+   }
+   fprintf(stderr, "[info] square-pixel geometry %.3f us/call\n",
+         (double)(cpu_features_get_time_usec() - start) / 1000.0);
+
+   settings->uints.video_rotation = saved_rotation;
+   settings->uints.video_aspect_ratio_idx = saved_aspect;
+   runloop_environment_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &saved);
+   aspectratio_lut[ASPECT_RATIO_SQUARE] = saved_square;
+   video_driver_set_aspect_ratio();
+   video_st->frame_delay_pause = saved_pause;
+   if (failures == had)
+      fprintf(stderr, "[pass] square-pixel geometry: reduced ratios, rotation and zero sizes\n");
+}
+
+static unsigned avc_aspects;
+static unsigned avc_cursors;
+static unsigned avc_nonblocks;
+static int avc_viewport_x;
+static unsigned avc_inits;
+static void *(*avc_inner_init)(const video_info_t *video);
+
+static void *avc_init(const video_info_t *video)
+{
+   avc_inits++;
+   return avc_inner_init(video);
+}
+
+static void avc_aspect(void *data, unsigned index)
+{
+   struct video_viewport vp;
+   (void)data;
+   (void)index;
+   memset(&vp, 0, sizeof(vp));
+   video_viewport_get_scaled_aspect2(&vp, VIDEO_SCALE_PACK(1000, 1000),
+         true, 1.0f, 0.5f);
+   avc_viewport_x = VIDEO_POS_X(vp.pos);
+   avc_aspects++;
+}
+
+static void avc_cursor(void *data, bool state)
+{
+   (void)data;
+   (void)state;
+   avc_cursors++;
+}
+
+static void avc_nonblock(void *data, bool state, bool adaptive,
+      unsigned interval)
+{
+   (void)data;
+   (void)state;
+   (void)adaptive;
+   (void)interval;
+   avc_nonblocks++;
+}
+
+static void lane_aspect_hint_changes(void)
+{
+   static const struct {
+      unsigned index;
+      float configured;
+      bool automatic;
+      bool resize;
+   } modes[] = {
+      {ASPECT_RATIO_CORE, -1.0f, false, true},
+      {ASPECT_RATIO_CONFIG, -1.0f, true, true},
+      {ASPECT_RATIO_CONFIG, -1.0f, false, false},
+      {ASPECT_RATIO_CONFIG, 1.5f, true, false},
+      {ASPECT_RATIO_4_3, -1.0f, true, false},
+      {ASPECT_RATIO_SQUARE, -1.0f, true, false},
+      {ASPECT_RATIO_CUSTOM, -1.0f, true, false},
+      {ASPECT_RATIO_FULL, -1.0f, true, false}
+   };
+   settings_t *settings = config_get_ptr();
+   video_driver_state_t *video_st = video_state_get_ptr();
+   struct retro_system_av_info saved = video_st->av_info;
+   struct retro_system_av_info info;
+   const video_poke_interface_t *saved_poke = video_st->poke;
+   video_poke_interface_t poke;
+   unsigned saved_aspect = settings->uints.video_aspect_ratio_idx;
+   unsigned saved_crt = settings->uints.crt_switch_resolution;
+   unsigned saved_target = video_st->frame_delay_target;
+   float saved_configured = settings->floats.video_aspect_ratio;
+   bool saved_automatic = settings->bools.video_aspect_ratio_auto;
+   bool saved_delay_auto = settings->bools.video_frame_delay_auto;
+   bool saved_pause = video_st->frame_delay_pause;
+   unsigned had = failures;
+   unsigned mode, api;
+
+   memset(&poke, 0, sizeof(poke));
+   poke.set_aspect_ratio = avc_aspect;
+   video_st->poke = &poke;
+   settings->uints.crt_switch_resolution = 0;
+   settings->bools.video_frame_delay_auto = true;
+   for (mode = 0; mode < sizeof(modes) / sizeof(modes[0]); mode++)
+   {
+      settings->uints.video_aspect_ratio_idx = modes[mode].index;
+      settings->floats.video_aspect_ratio = modes[mode].configured;
+      settings->bools.video_aspect_ratio_auto = modes[mode].automatic;
+      for (api = 0; api < 2; api++)
+      {
+         unsigned cmd = api ? RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO
+                            : RETRO_ENVIRONMENT_SET_GEOMETRY;
+         runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &saved);
+         info = saved;
+         info.geometry.aspect_ratio = 1.75f;
+         if (info.geometry.aspect_ratio == saved.geometry.aspect_ratio)
+            info.geometry.aspect_ratio = 1.5f;
+         avc_aspects = 0;
+         video_st->frame_delay_pause = false;
+         video_st->frame_delay_target = 5;
+         CHECK(runloop_environment_cb(cmd, api ? (void*)&info : (void*)&info.geometry),
+               "aspect hint: mode %u API %u rejected", mode, api);
+         CHECK(video_st->av_info.geometry.aspect_ratio == info.geometry.aspect_ratio,
+               "aspect hint: mode %u API %u discarded metadata", mode, api);
+         CHECK(avc_aspects == (unsigned)modes[mode].resize
+                  && video_st->frame_delay_pause == modes[mode].resize
+                  && video_st->frame_delay_target == 5,
+               "aspect hint: mode %u API %u resize count %u, pause %u",
+               mode, api, avc_aspects, video_st->frame_delay_pause);
+
+         avc_aspects = 0;
+         video_st->frame_delay_pause = false;
+         info.geometry.base_width++;
+         CHECK(runloop_environment_cb(cmd, api ? (void*)&info : (void*)&info.geometry),
+               "aspect hint: base-size update rejected");
+         CHECK(avc_aspects == 1 && video_st->frame_delay_pause,
+               "aspect hint: mode %u API %u missed base-size resize", mode, api);
+      }
+   }
+   settings->uints.video_aspect_ratio_idx = saved_aspect;
+   settings->floats.video_aspect_ratio = saved_configured;
+   settings->bools.video_aspect_ratio_auto = saved_automatic;
+   runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &saved);
+   settings->uints.crt_switch_resolution = saved_crt;
+   settings->bools.video_frame_delay_auto = saved_delay_auto;
+   video_st->poke = saved_poke;
+   video_driver_set_aspect_ratio();
+   video_st->frame_delay_pause = saved_pause;
+   video_st->frame_delay_target = saved_target;
+   if (failures == had)
+      fprintf(stderr, "[pass] aspect hints: metadata retained, only dependent viewports resized\n");
+}
+
+static unsigned avr_inits, avr_frees, avr_finalizes;
+static unsigned avr_handles[32];
+static retro_atomic_int_t avr_frames;
+static double avr_fps, avr_rate;
+static unsigned avr_fb_dims;
+
+static void *avr_init(const struct record_params *params)
+{
+   avr_fps = params->fps;
+   avr_rate = params->samplerate;
+   avr_fb_dims = params->fb_dims;
+   return &avr_handles[avr_inits++];
+}
+
+static void avr_free(void *data)
+{
+   (void)data;
+   avr_frees++;
+}
+
+static bool avr_finalize(void *data)
+{
+   (void)data;
+   avr_finalizes++;
+   return true;
+}
+
+static bool avr_video(void *data, const struct record_video_data *frame)
+{
+   (void)data;
+   (void)frame;
+   retro_atomic_fetch_add_int(&avr_frames, 1);
+   return true;
+}
+
+static bool avr_audio(void *data, const struct record_audio_data *audio)
+{
+   (void)data;
+   (void)audio;
+   return true;
+}
+
+static const record_driver_t avr_driver = {
+   avr_init, avr_free, avr_video, avr_audio, avr_finalize, "av-info-test"
+};
+
+static void lane_av_info_recording(void)
+{
+   settings_t *settings = config_get_ptr();
+   video_driver_state_t *video_st = video_state_get_ptr();
+   recording_state_t *rec_st = recording_state_get_ptr();
+   recording_state_t *saved_rec;
+   struct retro_system_av_info saved_av = video_st->av_info;
+   struct retro_system_av_info info;
+   const record_driver_t *saved_driver = record_drivers[0];
+   unsigned saved_aspect = settings->uints.video_aspect_ratio_idx;
+   unsigned saved_crt = settings->uints.crt_switch_resolution;
+   unsigned saved_target = video_st->frame_delay_target;
+   bool saved_pause = video_st->frame_delay_pause;
+   bool saved_gpu = settings->bools.video_gpu_record;
+   bool saved_history = settings->bools.history_list_enable;
+   bool was_menu = menu_is_up();
+   char saved_ident[sizeof(settings->arrays.record_driver)];
+   unsigned had = failures;
+   unsigned stream, step;
+
+   CHECK(!rec_st->data && !rec_st->start_pending
+            && !video_st->record_gpu_buffer,
+         "AV-info recording: recorder already active");
+   if (rec_st->data || rec_st->start_pending || video_st->record_gpu_buffer)
+      return;
+   saved_rec = (recording_state_t*)malloc(sizeof(*saved_rec));
+   CHECK(saved_rec != NULL, "AV-info recording: state allocation failed");
+   if (!saved_rec)
+      return;
+   *saved_rec = *rec_st;
+   memcpy(saved_ident, settings->arrays.record_driver, sizeof(saved_ident));
+   record_drivers[0] = &avr_driver;
+   strcpy(settings->arrays.record_driver, avr_driver.ident);
+   settings->bools.video_gpu_record = false;
+   settings->bools.history_list_enable = false;
+   settings->uints.crt_switch_resolution = 0;
+   if (was_menu)
+      command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+
+   for (stream = 0; stream < 2; stream++)
+   {
+      void *owner;
+      int frames;
+      memset(rec_st, 0, sizeof(*rec_st));
+      strcpy(rec_st->output_dir, ".");
+      rec_st->enable = true;
+      rec_st->streaming_enable = stream != 0;
+      avr_inits = avr_frees = avr_finalizes = 0;
+      retro_atomic_store_relaxed_int(&avr_frames, 0);
+      settings->uints.video_aspect_ratio_idx = ASPECT_RATIO_4_3;
+      video_driver_set_aspect_ratio();
+      CHECK(recording_init(), "AV-info recording: fake encoder did not open");
+      owner = rec_st->data;
+      CHECK(owner != NULL, "AV-info recording: encoder has no owner");
+      run_frames(3);
+      frames = retro_atomic_load_acquire_int(&avr_frames);
+      CHECK(frames > 0, "AV-info recording: no frames reached the encoder");
+
+      info = saved_av;
+      info.geometry.aspect_ratio = saved_av.geometry.aspect_ratio == 1.75f
+         ? 1.5f : 1.75f;
+      CHECK(runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info),
+            "AV-info recording: ignored hint rejected");
+      CHECK(avr_inits == 1 && !avr_frees && !avr_finalizes
+               && rec_st->data == owner && rec_st->enable
+               && rec_st->streaming_enable == (stream != 0),
+            "AV-info recording: ignored hint restarted encoder (stream %u)", stream);
+      CHECK(video_st->av_info.geometry.aspect_ratio == info.geometry.aspect_ratio,
+            "AV-info recording: ignored hint discarded");
+      run_frames(3);
+      CHECK(retro_atomic_load_acquire_int(&avr_frames) > frames,
+            "AV-info recording: frames stopped after ignored hint");
+
+      for (step = 0; step < 5; step++)
+      {
+         unsigned before = avr_inits;
+         switch (step)
+         {
+            case 0: info.timing.fps *= 0.5; break;
+            case 1: info.timing.sample_rate *= 0.5; break;
+            case 2: info.geometry.base_width++; break;
+            case 3: info.geometry.max_width++; break;
+            default:
+               settings->uints.video_aspect_ratio_idx = ASPECT_RATIO_CORE;
+               video_driver_set_aspect_ratio();
+               info.geometry.aspect_ratio += 0.25f;
+               break;
+         }
+         CHECK(runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info),
+               "AV-info recording: parameter update rejected");
+         CHECK(avr_inits == before + 1 && avr_frees == avr_inits - 1
+                  && avr_finalizes == avr_frees && rec_st->data
+                  && rec_st->enable && rec_st->streaming_enable == (stream != 0),
+               "AV-info recording: stream %u step %u missed restart", stream, step);
+         CHECK(avr_fps == info.timing.fps && avr_rate == info.timing.sample_rate
+                  && avr_fb_dims == VIDEO_SCALE_PACK(info.geometry.max_width,
+                     info.geometry.max_height),
+               "AV-info recording: restart used stale parameters");
+      }
+      command_event(CMD_EVENT_RECORD_DEINIT, NULL);
+      CHECK(avr_frees == avr_inits && avr_finalizes == avr_inits && !rec_st->data,
+            "AV-info recording: final encoder was not retired");
+      runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &saved_av);
+   }
+   if (was_menu)
+      command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+   settings->uints.video_aspect_ratio_idx = saved_aspect;
+   settings->uints.crt_switch_resolution = saved_crt;
+   settings->bools.video_gpu_record = saved_gpu;
+   settings->bools.history_list_enable = saved_history;
+   memcpy(settings->arrays.record_driver, saved_ident, sizeof(saved_ident));
+   record_drivers[0] = saved_driver;
+   *rec_st = *saved_rec;
+   free(saved_rec);
+   video_driver_set_aspect_ratio();
+   video_st->frame_delay_pause = saved_pause;
+   video_st->frame_delay_target = saved_target;
+   if (failures == had)
+      fprintf(stderr, "[pass] AV-info recording: ignored hints retain encoder; parameter changes restart\n");
+}
+
+static void lane_av_info_changes(void)
+{
+   settings_t *settings            = config_get_ptr();
+   video_driver_state_t *video_st  = video_state_get_ptr();
+   struct retro_system_av_info orig = video_st->av_info;
+   struct retro_system_av_info info = orig;
+   const video_poke_interface_t *saved_poke = video_st->poke;
+   video_poke_interface_t poke;
+   video_driver_t *saved_video = video_st->current_video;
+   video_driver_t video = *saved_video;
+   bool saved_auto                 = settings->bools.video_frame_delay_auto;
+   bool saved_fullscreen           = settings->bools.video_fullscreen;
+   bool saved_pause                = video_st->frame_delay_pause;
+   unsigned saved_aspect           = settings->uints.video_aspect_ratio_idx;
+   unsigned saved_scale            = video_st->scale_dims;
+   unsigned saved_target           = video_st->frame_delay_target;
+   float saved_bias                = settings->floats.video_vp_bias_x;
+   float saved_hz                  = video_st->core_hz;
+   float marker                    = saved_hz + 7.0f;
+   unsigned had                    = failures;
+   unsigned before_nonblocks;
+   unsigned i;
+   retro_time_t start;
+   retro_time_t geometry_time;
+   retro_time_t av_time;
+
+   memset(&poke, 0, sizeof(poke));
+   poke.set_aspect_ratio           = avc_aspect;
+   poke.show_mouse                 = avc_cursor;
+   video_st->poke                 = &poke;
+   settings->bools.video_frame_delay_auto = true;
+   settings->bools.video_fullscreen = true;
+   settings->uints.video_aspect_ratio_idx = ASPECT_RATIO_CORE;
+   settings->floats.video_vp_bias_x = 0.75f;
+   video_driver_publish_vp_params();
+   avc_aspects = avc_cursors = avc_nonblocks = 0;
+   video.set_nonblock_state        = avc_nonblock;
+   video_st->current_video         = &video;
+   video_st->core_hz              = marker;
+   video_st->frame_delay_pause    = false;
+   video_st->frame_delay_target   = 5;
+
+   CHECK(runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info),
+         "av changes: duplicate AV info rejected");
+   CHECK(!avc_aspects && !avc_cursors && !video_st->frame_delay_pause,
+         "av changes: duplicate AV info touched video");
+   CHECK(video_st->core_hz == marker,
+         "av changes: duplicate AV info recalculated timing");
+
+   CHECK(runloop_environment_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &info.geometry),
+         "av changes: duplicate geometry rejected");
+   CHECK(!avc_aspects && !video_st->frame_delay_pause,
+         "av changes: duplicate geometry touched video");
+
+   start = cpu_features_get_time_usec();
+   for (i = 0; i < 10000; i++)
+      runloop_environment_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &info.geometry);
+   geometry_time = cpu_features_get_time_usec() - start;
+   start = cpu_features_get_time_usec();
+   for (i = 0; i < 10000; i++)
+      runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info);
+   av_time = cpu_features_get_time_usec() - start;
+   CHECK(!avc_aspects && !avc_cursors && video_st->core_hz == marker,
+         "av changes: duplicate burst did work");
+   fprintf(stderr, "[info] duplicate geometry %.3f us/call, AV info %.3f us/call\n",
+         (double)geometry_time / 10000.0, (double)av_time / 10000.0);
+
+   (void)driver_set_audio_input_rate(false);
+   CHECK(!avc_nonblocks && video_st->core_hz == marker,
+         "av changes: audio input update touched video timing");
+
+   info.timing.sample_rate *= 0.5;
+   CHECK(runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info),
+         "av changes: sample rate rejected");
+   CHECK(!avc_aspects && !avc_cursors && !video_st->frame_delay_pause
+         && video_st->frame_delay_target == 5,
+         "av changes: sample rate touched geometry or frame delay");
+   CHECK(video_st->av_info.timing.sample_rate == info.timing.sample_rate
+         && video_st->core_hz == (avc_nonblocks
+            ? (float)info.timing.fps : marker),
+         "av changes: sample rate did not update timing");
+   CHECK(avc_nonblocks <= 1,
+         "av changes: sample rate repeated video timing setup (%u calls)",
+         avc_nonblocks);
+
+   before_nonblocks = avc_nonblocks;
+   info.timing.fps *= 0.5;
+   CHECK(runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info),
+         "av changes: FPS rejected");
+   CHECK(!avc_aspects && !avc_cursors && video_st->frame_delay_pause,
+         "av changes: FPS touched geometry or missed frame delay");
+   CHECK(video_st->core_hz == (float)info.timing.fps,
+         "av changes: FPS did not update timing");
+   CHECK(avc_nonblocks > before_nonblocks,
+         "av changes: FPS did not update video pacing");
+
+   video_st->core_hz               = marker;
+   settings->floats.video_vp_bias_x = 0.25f;
+   info.geometry.base_width--;
+   CHECK(runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info),
+         "av changes: geometry rejected");
+   CHECK(avc_aspects == 1 && !avc_cursors && avc_viewport_x == 125,
+         "av changes: geometry missed resize or published after notification");
+   CHECK(video_st->core_hz == marker,
+         "av changes: geometry recalculated timing");
+
+   info.geometry.aspect_ratio = 1.5f;
+   CHECK(runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info),
+         "av changes: aspect ratio rejected");
+   CHECK(avc_aspects == 2 && video_st->core_hz == marker,
+         "av changes: aspect ratio missed resize or recalculated timing");
+
+   info.geometry.base_width++;
+   info.geometry.max_width++;
+   CHECK(runloop_environment_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &info.geometry),
+         "av changes: SET_GEOMETRY rejected");
+   CHECK(avc_aspects == 3 && video_st->core_hz == marker
+         && video_st->av_info.geometry.max_width == orig.geometry.max_width
+         && video_st->av_info.timing.fps == info.timing.fps,
+         "av changes: SET_GEOMETRY changed maxima or timing");
+
+   info.geometry.max_width = orig.geometry.max_width;
+   info.geometry.base_height--;
+   info.timing.fps = orig.timing.fps;
+   CHECK(runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info),
+         "av changes: combined update rejected");
+   CHECK(avc_aspects == 4 && video_st->core_hz == (float)info.timing.fps,
+         "av changes: combined update missed geometry or timing");
+
+   video_st->current_video         = saved_video;
+   video_st->poke                  = saved_poke;
+   settings->bools.video_fullscreen = saved_fullscreen;
+   settings->bools.video_frame_delay_auto = saved_auto;
+   settings->uints.video_aspect_ratio_idx = saved_aspect;
+   settings->floats.video_vp_bias_x = saved_bias;
+   runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &orig);
+   video_driver_set_aspect_ratio();
+
+   avc_inits                      = 0;
+   avc_inner_init                  = video_null.init;
+   video_null.init                = avc_init;
+   info                           = orig;
+   info.geometry.max_width++;
+   settings->bools.video_frame_delay_auto = true;
+   video_st->frame_delay_target    = 5;
+   CHECK(runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info),
+         "av changes: new maximum rejected");
+   CHECK(avc_inits == 1 && video_st->frame_delay_target == 0
+         && video_st->av_info.geometry.max_width == info.geometry.max_width,
+         "av changes: new maximum missed reinit or frame-delay reset");
+   runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &orig);
+   video_null.init                = avc_inner_init;
+   settings->bools.video_frame_delay_auto = saved_auto;
+   video_st->frame_delay_pause     = saved_pause;
+   video_st->frame_delay_target    = saved_target;
+   video_st->core_hz               = saved_hz;
+   video_st->scale_dims            = saved_scale;
+   if (failures == had)
+      printf("[pass] AV info changes: duplicates, geometry, timing, maxima, publish order\n");
+}
+
+static void lane_max_geometry_capacity(void)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   runloop_state_t *runloop_st    = runloop_state_get_ptr();
+   settings_t *settings          = config_get_ptr();
+   struct retro_system_av_info orig = video_st->av_info;
+   struct retro_system_av_info info;
+   bool saved_capability         = video_null.max_geometry_in_place;
+   bool saved_auto               = settings->bools.video_frame_delay_auto;
+   unsigned had                  = failures;
+   unsigned threaded;
+
+   if (     video_st->pix_fmt != RETRO_PIXEL_FORMAT_0RGB1555
+         && video_st->pix_fmt != RETRO_PIXEL_FORMAT_RGB565
+         && video_st->pix_fmt != RETRO_PIXEL_FORMAT_XRGB8888)
+      return;
+   video_null.max_geometry_in_place = true;
+   settings->bools.video_frame_delay_auto = true;
+   for (threaded = 0; threaded < 2; threaded++)
+   {
+      unsigned capacity;
+      void *driver_data;
+      set_threaded_via_setting(threaded != 0);
+      command_event(CMD_EVENT_REINIT, NULL);
+      run_frames(2);
+      video_thread_wait_idle();
+      capacity = video_st->max_geometry_capacity;
+      CHECK(capacity >= orig.geometry.max_width && capacity > 1,
+            "max geometry: backend capacity not captured");
+      driver_data    = video_st->data;
+      avc_inner_init = video_null.init;
+      video_null.init = avc_init;
+      avc_inits       = 0;
+      video_st->frame_delay_pause  = false;
+      video_st->frame_delay_target = 5;
+      info = orig;
+      info.geometry.max_width = capacity - 1;
+      CHECK(runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info),
+            "max geometry: fitting update rejected");
+      info.geometry.max_width = capacity;
+      CHECK(runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info),
+            "max geometry: regrow rejected");
+      CHECK(!avc_inits && video_st->data == driver_data
+            && video_st->max_geometry_capacity == capacity
+            && !video_st->frame_delay_pause && video_st->frame_delay_target == 5,
+            "max geometry: fitting maxima restarted video or disturbed pacing");
+
+      info.geometry.max_width = capacity + 1;
+      CHECK(runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info),
+            "max geometry: larger update rejected");
+      CHECK(avc_inits == 1 && video_st->frame_delay_target == 0,
+            "max geometry: insufficient capacity did not rebuild video");
+      video_null.init = avc_inner_init;
+      runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &orig);
+   }
+   set_threaded_via_setting(false);
+
+   /* Defer teardown so exclusion checks need no hardware/filter instance. */
+   {
+      enum retro_pixel_format format = video_st->pix_fmt;
+      struct retro_hw_render_callback *hw = VIDEO_DRIVER_GET_HW_CONTEXT_INTERNAL(video_st);
+      enum retro_hw_context_type context = hw->context_type;
+      int context_type = retro_atomic_load_acquire_int(&video_st->hw_context_type);
+      bool switching = runloop_st->content_switching;
+#ifdef HAVE_VIDEO_FILTER
+      void *filter = video_st->state_filter;
+      rarch_softfilter_t *filter_token = (rarch_softfilter_t*)calloc(1, sizeof(void*));
+#endif
+      unsigned exclusion;
+      runloop_st->content_switching = true;
+      for (exclusion = 0; exclusion < 5; exclusion++)
+      {
+         info = orig;
+         info.geometry.max_width = video_st->max_geometry_capacity - 1;
+         if (exclusion == 0)
+            video_st->pix_fmt = RETRO_PIXEL_FORMAT_XRGB2101010;
+         else if (exclusion == 1)
+         {
+            hw->context_type = RETRO_HW_CONTEXT_OPENGL;
+            retro_atomic_store_release_int(&video_st->hw_context_type,
+                  RETRO_HW_CONTEXT_OPENGL);
+         }
+         else if (exclusion == 2)
+            info.geometry.max_width = 0;
+         else if (exclusion == 3)
+            video_st->pix_fmt = format == RETRO_PIXEL_FORMAT_XRGB8888
+               ? RETRO_PIXEL_FORMAT_RGB565 : RETRO_PIXEL_FORMAT_XRGB8888;
+#ifdef HAVE_VIDEO_FILTER
+         else
+            video_st->state_filter = filter_token;
+#else
+         else
+            continue;
+#endif
+         video_st->frame_delay_pause = false;
+         video_st->frame_delay_target = 5;
+         runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info);
+         CHECK(video_st->frame_delay_target == 0,
+               "max geometry: exclusion %u reused incompatible storage", exclusion);
+         video_st->pix_fmt = format;
+         hw->context_type = context;
+         retro_atomic_store_release_int(&video_st->hw_context_type, context_type);
+#ifdef HAVE_VIDEO_FILTER
+         video_st->state_filter = filter;
+#endif
+         video_st->av_info = orig;
+      }
+      runloop_st->content_switching = switching;
+#ifdef HAVE_VIDEO_FILTER
+      free(filter_token);
+#endif
+   }
+   video_null.max_geometry_in_place = saved_capability;
+   settings->bools.video_frame_delay_auto = saved_auto;
+   command_event(CMD_EVENT_REINIT, NULL);
+   run_frames(2);
+   if (failures == had)
+      fprintf(stderr, "[pass] maximum geometry capacity: reuse, regrow, overflow and exclusions\n");
+}
+
+static void lane_max_geometry_live(void)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   struct retro_system_av_info orig = video_st->av_info;
+   struct retro_system_av_info info;
+   unsigned had = failures;
+   unsigned threaded;
+   unsigned loans = 0;
+   bool reopen_menu = menu_is_up();
+   if (reopen_menu)
+      command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+   for (threaded = 0; threaded < 2; threaded++)
+   {
+      video_driver_t *driver;
+      void *instance;
+      unsigned capacity;
+      struct retro_framebuffer fb;
+      unsigned bpp = video_st->pix_fmt == RETRO_PIXEL_FORMAT_XRGB8888 ? 4 : 2;
+      uint8_t *pixels;
+      size_t pitch;
+      set_threaded_via_setting(threaded != 0);
+      run_frames(2);
+      video_thread_wait_idle();
+      driver = video_st->current_video;
+      if (threaded)
+         driver = (video_driver_t*)((thread_video_t*)video_st->data)->driver;
+      capacity = video_st->max_geometry_capacity;
+      CHECK(capacity >= orig.geometry.max_width && capacity > 1,
+            "live max geometry: driver did not opt in");
+      if (!capacity)
+         break;
+      instance = video_st->data;
+      avc_inner_init = driver->init;
+      driver->init = avc_init;
+      avc_inits = 0;
+      info = orig;
+      info.geometry.max_width = capacity - 1;
+      runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info);
+      info.geometry.max_width = capacity;
+      runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info);
+      CHECK(!avc_inits && video_st->data == instance,
+            "live max geometry: fitting size restarted the driver");
+      memset(&fb, 0, sizeof(fb));
+      fb.width = capacity;
+      fb.height = orig.geometry.base_height;
+      fb.access_flags = RETRO_MEMORY_ACCESS_WRITE;
+      if (runloop_environment_cb(RETRO_ENVIRONMENT_GET_CURRENT_SOFTWARE_FRAMEBUFFER, &fb))
+      {
+         unsigned row;
+         uint64_t before = threaded
+            ? ((thread_video_t*)video_st->data)->frame.zero_copy_count : 0;
+         for (row = 0; row < fb.height; row++)
+            memset((uint8_t*)fb.data + row * fb.pitch, 0x55, fb.width * bpp);
+         video_driver_frame(fb.data, fb.width, fb.height, fb.pitch);
+         if (threaded)
+            CHECK(((thread_video_t*)video_st->data)->frame.zero_copy_count == before + 1,
+                  "live max geometry: lent frame was copied");
+         loans++;
+      }
+      video_thread_wait_idle();
+      info.geometry.max_width = capacity + 1;
+      runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info);
+      CHECK(avc_inits == 1 && video_st->max_geometry_capacity > capacity,
+            "live max geometry: growth did not rebuild storage");
+      driver->init = avc_inner_init;
+      pitch = (size_t)(capacity + 1) * bpp;
+      pixels = (uint8_t*)malloc(pitch * orig.geometry.base_height);
+      CHECK(pixels != NULL, "live max geometry: frame allocation failed");
+      if (pixels)
+      {
+         memset(pixels, 0x55, pitch * orig.geometry.base_height);
+         video_driver_frame(pixels, capacity + 1, orig.geometry.base_height, pitch);
+         run_frames(2);
+         video_thread_wait_idle();
+         free(pixels);
+      }
+      runloop_environment_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &orig);
+   }
+   set_threaded_via_setting(false);
+   if (reopen_menu)
+      command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+   if (failures == had)
+      fprintf(stderr, "[pass] live maximum geometry: kept instance, %u loans, safe growth\n", loans);
+}
+
+struct snapshot_identity
+{
+   const void *pixels;
+   unsigned dims;
+   unsigned first;
+};
+
+static void snapshot_identity_read(void *data, const void *pixels,
+      unsigned dims, size_t pitch)
+{
+   struct snapshot_identity *seen = (struct snapshot_identity*)data;
+   (void)pitch;
+   seen->pixels = pixels;
+   seen->dims = dims;
+   seen->first = pixels ? *(const uint16_t*)pixels : 0;
+}
+
+static void lane_reinit_frame_ownership(void)
+{
+   static const int partial[] = { DRIVER_LED_MASK, DRIVER_AUDIO_MASK, DRIVER_MENU_MASK };
+   struct snapshot_identity seen;
+   const void *owned;
+   enum retro_pixel_format format = video_state_get_ptr()->pix_fmt;
+   unsigned bpp = format == RETRO_PIXEL_FORMAT_SCRGB_RGBA16F ? 8
+      : (format == RETRO_PIXEL_FORMAT_RGB565 || format == RETRO_PIXEL_FORMAT_0RGB1555) ? 2 : 4;
+   uint8_t *pixels = (uint8_t*)calloc(320 * 240, bpp);
+   unsigned had = failures;
+   int flags;
+   unsigned i;
+   CHECK(pixels != NULL, "reinit ownership: allocation failed");
+   if (!pixels)
+      return;
+   set_threaded_via_setting(false);
+   *(uint16_t*)pixels = 0x1234;
+   video_driver_cached_frame_publish(pixels, VIDEO_SCALE_PACK(320, 240), 320 * bpp);
+   for (i = 0; i < sizeof(partial) / sizeof(partial[0]); i++)
+   {
+      flags = partial[i];
+      command_event(CMD_EVENT_REINIT, &flags);
+      memset(&seen, 0, sizeof(seen));
+      video_driver_cached_frame_read(&seen, snapshot_identity_read);
+      CHECK(seen.pixels == pixels && seen.first == 0x1234,
+            "reinit ownership: a non-video restart copied or lost the frame (%u)", i);
+   }
+   flags = DRIVER_VIDEO_AND_INPUT_MASK;
+   command_event(CMD_EVENT_REINIT, &flags);
+   memset(&seen, 0, sizeof(seen));
+   video_driver_cached_frame_read(&seen, snapshot_identity_read);
+   CHECK(seen.pixels && seen.pixels != pixels && seen.first == 0x1234
+         && seen.dims == VIDEO_SCALE_PACK(320, 240),
+         "reinit ownership: video teardown did not preserve owned pixels");
+   owned = seen.pixels;
+   free(pixels);
+   command_event(CMD_EVENT_REINIT, &flags);
+   memset(&seen, 0, sizeof(seen));
+   video_driver_cached_frame_read(&seen, snapshot_identity_read);
+   CHECK(seen.pixels == owned && seen.first == 0x1234,
+         "reinit ownership: repeated teardown lost the retained snapshot");
+   run_frames(2);
+   if (failures == had)
+      fprintf(stderr, "[pass] reinit frame ownership: borrow retained, teardown snapshot preserved\n");
+}
+
+typedef struct
+{
+   retro_eventcount_t event;
+   retro_atomic_int_t held;
+   retro_atomic_int_t done;
+   bool completed;
+} geometry_gate_t;
+
+static bool geometry_gate_wait(geometry_gate_t *gate, retro_atomic_int_t *value)
+{
+   retro_time_t end = cpu_features_get_time_usec() + 2000000;
+   while (!retro_atomic_load_acquire_int(value))
+   {
+      int key = retro_eventcount_prepare_wait(&gate->event);
+      retro_time_t left = end - cpu_features_get_time_usec();
+      if (retro_atomic_load_acquire_int(value) || left <= 0)
+      {
+         retro_eventcount_cancel_wait(&gate->event);
+         break;
+      }
+      retro_eventcount_commit_wait_timeout(&gate->event, key, left);
+   }
+   return retro_atomic_load_acquire_int(value) != 0;
+}
+
+static uintptr_t geometry_park(void *data)
+{
+   geometry_gate_t *gate = (geometry_gate_t*)data;
+   retro_atomic_store_release_int(&gate->held, 1);
+   retro_eventcount_notify(&gate->event);
+   gate->completed = geometry_gate_wait(gate, &gate->done);
+   return 0;
+}
+
+static unsigned geometry_aspects;
+static unsigned geometry_index;
+static uintptr_t geometry_thread;
+
+static void geometry_aspect(void *data, unsigned index)
+{
+   (void)data;
+   geometry_aspects++;
+   geometry_index  = index;
+   geometry_thread = sthread_get_current_thread_id();
+}
+
+static uintptr_t geometry_fence(void *data)
+{
+   (void)data;
+   return 0;
+}
+
+static void lane_geometry_burst(void)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   struct retro_game_geometry orig = video_st->av_info.geometry;
+   struct retro_game_geometry geom = orig;
+   const video_poke_interface_t *saved_poke;
+   video_poke_interface_t poke;
+   geometry_gate_t gate;
+   thread_video_t *thr;
+   unsigned had = failures;
+   unsigned i;
+   int head;
+
+   set_threaded_via_setting(true);
+   run_frames(3);
+   expect_wrapper(true, "geometry burst");
+   video_thread_wait_idle();
+   thr = (thread_video_t*)video_st->data;
+   saved_poke = thr->poke;
+   poke = *saved_poke;
+   poke.set_aspect_ratio = geometry_aspect;
+   set_poke(thr, &poke);
+   geometry_aspects = 0;
+   memset(&gate, 0, sizeof(gate));
+   retro_atomic_int_init(&gate.held, 0);
+   retro_atomic_int_init(&gate.done, 0);
+   if (!retro_eventcount_init(&gate.event))
+   {
+      CHECK(false, "geometry burst: eventcount allocation failed");
+      set_poke(thr, saved_poke);
+      set_threaded_via_setting(false);
+      return;
+   }
+   if (video_thread_run_queued(geometry_park, &gate))
+   {
+      CHECK(geometry_gate_wait(&gate, &gate.held),
+            "geometry burst: worker did not enter the gate");
+      for (i = 1; i < VIDEO_THREAD_DEFERRED_MAX; i++)
+         CHECK(video_thread_run_queued(geometry_fence, NULL),
+               "geometry burst: could not fill the command ring");
+      head = retro_atomic_load_acquire_int(&thr->deferred_head);
+      for (i = 0; i < VIDEO_THREAD_DEFERRED_MAX * 2; i++)
+      {
+         geom.base_width = orig.base_width - ((i + 1) & 1);
+         CHECK(runloop_environment_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &geom),
+               "geometry burst: update rejected");
+      }
+      CHECK(retro_atomic_load_acquire_int(&thr->deferred_head) == head,
+            "geometry burst: resize requests consumed command packets");
+      retro_atomic_store_release_int(&gate.done, 1);
+      retro_eventcount_notify(&gate.event);
+      video_thread_run_blocking(geometry_fence, NULL);
+      CHECK(gate.completed, "geometry burst: setter waited for the worker");
+      run_frames(3);
+      video_thread_wait_idle();
+      CHECK(geometry_aspects == 1,
+            "geometry burst: %u notifications instead of one", geometry_aspects);
+      CHECK(geometry_index == config_get_ptr()->uints.video_aspect_ratio_idx
+            && geometry_thread == sthread_get_thread_id(thr->thread),
+            "geometry burst: wrong index or callback thread");
+   }
+   else
+      CHECK(false, "geometry burst: could not queue worker gate");
+   set_poke(thr, saved_poke);
+   retro_eventcount_free(&gate.event);
+   set_threaded_via_setting(false);
+   if (failures == had)
+      fprintf(stderr, "[pass] geometry burst: coalesced without packets or waits\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* Lane: wrapper entry points called from inside frame()               */
 /* ------------------------------------------------------------------ */
 
 static video_driver_t reentrant_driver;
@@ -12645,6 +13577,24 @@ int main(int argc, char *argv[])
       record_gpu_stop_in_flight();
       goto shutdown;
    }
+   if (getenv("HARNESS_CAPACITY_ONLY"))
+   {
+      lane_max_geometry_live();
+      goto shutdown;
+   }
+   if (getenv("HARNESS_GEOMETRY_ONLY"))
+   {
+      set_threaded_via_setting(false);
+      lane_square_pixel_geometry();
+      lane_aspect_hint_changes();
+      lane_av_info_recording();
+      lane_av_info_changes();
+      lane_max_geometry_capacity();
+      lane_reinit_frame_ownership();
+      lane_geometry_burst();
+      lane_reentrant_from_frame();
+      goto shutdown;
+   }
    lane_line_separation();
    lane_vp_params_publish();
    lane_toggle_cycle(cycles);
@@ -12674,6 +13624,19 @@ int main(int argc, char *argv[])
       lane_present_repeat();
    lane_every_command_replies();
    lane_second_ring_waiter();
+   if (!real_driver())
+   {
+      set_threaded_via_setting(false);
+      lane_square_pixel_geometry();
+      lane_aspect_hint_changes();
+      lane_av_info_recording();
+      lane_av_info_changes();
+      lane_max_geometry_capacity();
+      lane_reinit_frame_ownership();
+   }
+   if (real_driver() && video_state_get_ptr()->max_geometry_capacity)
+      lane_max_geometry_live();
+   lane_geometry_burst();
    lane_reentrant_from_frame();
    lane_window_thread_present();
    lane_async_done_main_thread();

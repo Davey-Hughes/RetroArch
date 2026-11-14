@@ -3801,6 +3801,7 @@ void video_driver_free_internal(void)
    bool is_threaded               = VIDEO_DRIVER_IS_THREADED_INTERNAL(video_st);
 #endif
 
+   video_st->max_geometry_capacity = 0;
    command_event(CMD_EVENT_OVERLAY_UNLOAD, NULL);
    /* The next driver's window may be on another output */
    video_st->window_refresh_hint  = 0.0f;
@@ -3957,31 +3958,31 @@ static void video_driver_set_viewport_square_pixel(
    struct retro_game_geometry *geom,
    unsigned int rotation)
 {
-   unsigned _len, i, aspect_x, aspect_y;
-   unsigned highest                  = 1;
+   unsigned aspect_x, aspect_y;
    unsigned width                    = geom->base_width;
    unsigned height                   = geom->base_height;
+   unsigned divisor                  = width;
+   unsigned remainder                = height;
 
    if (width == 0 || height == 0)
       return;
 
-   _len                              = MIN(width, height);
-
-   for (i = 1; i < _len; i++)
+   while (remainder)
    {
-      if ((width % i) == 0 && (height % i) == 0)
-         highest = i;
+      unsigned next = divisor % remainder;
+      divisor       = remainder;
+      remainder     = next;
    }
 
    if (rotation % 2)
    {
-      aspect_x = height / highest;
-      aspect_y = width  / highest;
+      aspect_x = height / divisor;
+      aspect_y = width  / divisor;
    }
    else
    {
-      aspect_x = width  / highest;
-      aspect_y = height / highest;
+      aspect_x = width  / divisor;
+      aspect_y = height / divisor;
    }
 
    snprintf(aspectratio_lut[ASPECT_RATIO_SQUARE].name,
@@ -5301,13 +5302,11 @@ void video_driver_set_aspect_ratio(void)
    video_driver_aspect_ratio_put(&video_st->aspect_ratio_bits,
          aspectratio_lut[aspect_ratio_idx].value);
 
+   /* Publish before the video thread can take the resize request. */
+   video_driver_publish_vp_params();
+
    if (poke && poke->set_aspect_ratio)
       poke->set_aspect_ratio(video_st->data, aspect_ratio_idx);
-
-   /* The frame path's aspect snapshot follows the change before any
-    * consumer can run: the driver pokes below are blocking commands
-    * under the wrapper. */
-   video_driver_publish_vp_params();
 }
 
 void video_viewport_get_scaled_aspect2(struct video_viewport *vp,
@@ -8885,6 +8884,25 @@ bool video_driver_init_internal(bool *video_is_threaded, bool verbosity_enabled)
       return false;
    }
 
+   {
+      const video_driver_t *driver = video_st->current_video;
+#ifdef HAVE_THREADS
+      if (video_st->thread_wrapper_active)
+         driver = ((thread_video_t*)video_st->data)->driver;
+#endif
+      video_st->max_geometry_capacity = 0;
+      video_st->max_geometry_format = video_st->pix_fmt;
+      if (     driver->max_geometry_in_place
+            && !video_driver_is_hw_context()
+#ifdef HAVE_VIDEO_FILTER
+            && !video_st->state_filter
+#endif
+            && (video_st->pix_fmt == RETRO_PIXEL_FORMAT_0RGB1555
+               || video_st->pix_fmt == RETRO_PIXEL_FORMAT_RGB565
+               || video_st->pix_fmt == RETRO_PIXEL_FORMAT_XRGB8888))
+         video_st->max_geometry_capacity = RARCH_SCALE_BASE * scale;
+   }
+
    /* Create the OSD font for drivers that have handed the lifecycle
     * up. Threaded video is excluded: the wrapper creates it from
     * CMD_INIT on the video thread, where the graphics context lives.
@@ -10515,21 +10533,19 @@ static void video_driver_reinit_context(settings_t *settings, int flags)
       VIDEO_DRIVER_GET_HW_CONTEXT_INTERNAL(video_st);
    const struct retro_hw_render_context_negotiation_interface *iface =
       video_st->hw_render_context_negotiation;
-   memcpy(&hwr_copy, hwr, sizeof(hwr_copy));
+   if (flags & DRIVER_VIDEO_AND_INPUT_MASK)
+      memcpy(&hwr_copy, hwr, sizeof(hwr_copy));
 
    driver_uninit(flags, DRIVER_LIFETIME_RESET);
 
-   memcpy(hwr, &hwr_copy, sizeof(*hwr));
-   video_st->hw_render_context_negotiation = iface;
-   /* And the published type with it. The uninit clears both the
-    * struct and its mirror (video_driver_free_hw_context()), and
-    * video_driver_is_hw_context() reads only the mirror: put back
-    * without it, every restart under a core that renders with the
-    * GPU - a fullscreen toggle, a core option that changes the
-    * resolution - left the frontend believing it had a software core,
-    * drivers_init() below included. */
-   retro_atomic_store_release_int(&video_st->hw_context_type,
-         (int)hwr_copy.context_type);
+   if (flags & DRIVER_VIDEO_AND_INPUT_MASK)
+   {
+      memcpy(hwr, &hwr_copy, sizeof(*hwr));
+      video_st->hw_render_context_negotiation = iface;
+      /* Video teardown clears the type mirror too. */
+      retro_atomic_store_release_int(&video_st->hw_context_type,
+            (int)hwr_copy.context_type);
+   }
 
    drivers_init(settings, flags, DRIVER_LIFETIME_RESET, verbosity_is_enabled());
 }

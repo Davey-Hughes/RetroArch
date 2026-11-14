@@ -7599,7 +7599,10 @@ static void vulkan_free(void *data)
       if (vk->ngx)
       {
          video_upscaler_detach();
-         vulkan_upscaler_free(vk->ngx);
+         if (vk->context->session_upscaler == vk->ngx)
+            vulkan_upscaler_reset(vk->ngx);
+         else
+            vulkan_upscaler_free(vk->ngx);
          vk->ngx = NULL;
       }
 #endif
@@ -7963,10 +7966,37 @@ static void vulkan_init_hw_render(vk_t *vk)
       enum video_temporal_upscaler kind = (enum video_temporal_upscaler)
          config_get_ptr()->uints.video_temporal_upscaler;
       char dir[DIR_MAX_LENGTH];
+      unsigned attempts;
       video_upscaler_dir(kind, dir, sizeof(dir));
-      vk->ngx = vulkan_upscaler_init(kind, vk->context->instance, vk->context->gpu,
-            vk->context->device, vulkan_symbol_wrapper_instance_proc_addr(),
-            vkGetDeviceProcAddr, &vk->context->memory_properties, dir);
+      attempts = vulkan_context_session_cache_prune(
+            kind == VIDEO_TEMPORAL_UPSCALER_DLSS ? dir : NULL) ? 2 : 1;
+      if (vk->context->session_upscaler
+            && (kind != VIDEO_TEMPORAL_UPSCALER_DLSS
+               || strcmp(vk->context->session_upscaler_dir, dir)))
+      {
+         vulkan_upscaler_free(vk->context->session_upscaler);
+         vk->context->session_upscaler = NULL;
+         free(vk->context->session_upscaler_dir);
+         vk->context->session_upscaler_dir = NULL;
+      }
+      vk->ngx = vk->context->session_upscaler;
+      for (; !vk->ngx && attempts; attempts--)
+      {
+         vk->ngx = vulkan_upscaler_init(kind, vk->context->instance, vk->context->gpu,
+               vk->context->device, vulkan_symbol_wrapper_instance_proc_addr(),
+               vkGetDeviceProcAddr, &vk->context->memory_properties, dir);
+         vulkan_context_session_cache_prune(NULL);
+      }
+      if (vk->ngx && kind == VIDEO_TEMPORAL_UPSCALER_DLSS
+            && !vk->context->session_upscaler)
+      {
+         char *path = strdup(dir);
+         if (path)
+         {
+            vk->context->session_upscaler = vk->ngx;
+            vk->context->session_upscaler_dir = path;
+         }
+      }
       if (vk->ngx)
       {
          vulkan_upscaler_backend.data = vk;
@@ -7974,6 +8004,7 @@ static void vulkan_init_hw_render(vk_t *vk)
          video_upscaler_set_output(vk->vp.dims);
       }
    }
+   vulkan_context_session_cache_prune(NULL);
 #endif
 }
 
@@ -18127,7 +18158,8 @@ video_driver_t video_vulkan = {
 #ifdef HAVE_OPENXR
    vulkan_set_vr_content_info,
 #endif
-   vulkan_read_viewport_bgrx
+   vulkan_read_viewport_bgrx,
+   true /* max_geometry_in_place */
 };
 
 gfx_display_ctx_driver_t gfx_display_ctx_vulkan = {
