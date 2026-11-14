@@ -110,6 +110,10 @@ void win32_window_release_kept(void);
 
 #include "../command.h"
 #include "../core_info.h"
+#ifdef HAVE_CORE_LOAD_CHECK
+#include "../core_load_check.h"
+#include "../core_trust_runtime.h"
+#endif
 #include "../content.h"
 #include "../core.h"
 #include "../configuration.h"
@@ -2049,8 +2053,13 @@ enum content_load_after
    CONTENT_LOAD_AFTER_QUICK_MENU       = 1 << 4,
    CONTENT_LOAD_AFTER_QUICK_MENU_KEEP  = 1 << 5, /* without a menu flush */
    CONTENT_LOAD_AFTER_MENU_ON_FAIL     = 1 << 6, /* retroarch_menu_running */
-   CONTENT_LOAD_AFTER_DUMMY_IS_FAIL    = 1 << 7  /* the dummy core counts as failure */
+   CONTENT_LOAD_AFTER_DUMMY_IS_FAIL    = 1 << 7, /* the dummy core counts as failure */
+   CONTENT_LOAD_AFTER_QUIT_ON_FAIL     = 1 << 8  /* retroarch_main_quit_failure */
 };
+
+#ifdef HAVE_CORE_LOAD_CHECK
+struct content_load_parked;
+#endif
 
 struct content_load_job
 {
@@ -2067,6 +2076,9 @@ struct content_load_job
    bool verbosity;
    bool ok;
    bool fell_back;  /* the core failed; the dummy core took its place */
+#ifdef HAVE_CORE_LOAD_CHECK
+   struct content_load_parked *parked;   /* the stage refused the core */
+#endif
 };
 
 /* One load at a time: an entry point called while a job is in flight
@@ -2074,6 +2086,10 @@ struct content_load_job
 static struct content_load_job content_load_job;
 /* How the last job ended, for the unstaged caller's return value. */
 static bool content_load_job_result;
+
+#ifdef HAVE_CORE_LOAD_CHECK
+static void content_load_parked_free(void *ud);
+#endif
 
 static void content_load_job_free(struct content_load_job *job)
 {
@@ -2085,6 +2101,10 @@ static void content_load_job_free(struct content_load_job *job)
    }
    free(job->wrap_args);
    job->wrap_args = NULL;
+#ifdef HAVE_CORE_LOAD_CHECK
+   content_load_parked_free(job->parked);
+   job->parked    = NULL;
+#endif
    job->stage     = CONTENT_LOAD_STAGE_NONE;
 }
 
@@ -2306,6 +2326,9 @@ static void content_load_finish(struct content_load_job *job,
          && runloop_st->current_core_type == CORE_TYPE_DUMMY)
       ok = false;
 
+   if (!ok && (after & CONTENT_LOAD_AFTER_QUIT_ON_FAIL))
+      retroarch_main_quit_failure();
+
    if (ok)
    {
       if (after & CONTENT_LOAD_AFTER_HISTORY)
@@ -2336,6 +2359,284 @@ static void content_load_finish(struct content_load_job *job,
          : msg_hash_to_str(MSG_FAILED_TO_LOAD_CONTENT));
 }
 
+#ifdef HAVE_CORE_LOAD_CHECK
+static bool content_load(content_ctx_info_t *info,
+      content_state_t *p_content, unsigned after, bool staged);
+
+/* A staged load the check refused, kept to run again as it was asked */
+struct content_load_parked
+{
+   content_ctx_info_t info;
+   char *core_path;
+   char *content_path;
+   char *label;
+   char *db_name;
+   char *crc32;
+   char *subsystem_ident;
+   char *subsystem_roms[RARCH_MAX_SUBSYSTEM_ROMS];
+   unsigned after;
+   unsigned subsystem_rom_id;
+   int subsystem_id;
+   int subsystem_rom_num;
+   bool subsystem_init;
+};
+
+static void content_load_parked_free(void *ud)
+{
+   struct content_load_parked *d = (struct content_load_parked*)ud;
+   int i;
+   if (!d)
+      return;
+   free(d->core_path);
+   free(d->content_path);
+   free(d->label);
+   free(d->db_name);
+   free(d->crc32);
+   free(d->subsystem_ident);
+   for (i = 0; i < RARCH_MAX_SUBSYSTEM_ROMS; i++)
+      free(d->subsystem_roms[i]);
+   free(d);
+}
+
+static void content_load_parked_run(void *ud)
+{
+   struct content_load_parked *d = (struct content_load_parked*)ud;
+   runloop_state_t *runloop_st   = runloop_state_get_ptr();
+   content_state_t *p_content    = content_state_get_ptr();
+   int i;
+   path_set(RARCH_PATH_CORE, d->core_path);
+   if (d->content_path)
+      path_set(RARCH_PATH_CONTENT, d->content_path);
+   else
+      path_clear(RARCH_PATH_CONTENT);
+   strlcpy(runloop_st->name.label, d->label ? d->label : "",
+         sizeof(runloop_st->name.label));
+   strlcpy(p_content->companion_ui_db_name, d->db_name ? d->db_name : "",
+         sizeof(p_content->companion_ui_db_name));
+   strlcpy(p_content->companion_ui_crc32, d->crc32 ? d->crc32 : "",
+         sizeof(p_content->companion_ui_crc32));
+   content_clear_subsystem();
+   /* As it was: content_set_subsystem() would read the current core's
+    * subsystems, the dummy core's by now */
+   if (d->subsystem_init)
+   {
+      strlcpy(p_content->pending_subsystem_ident,
+            d->subsystem_ident ? d->subsystem_ident : "",
+            sizeof(p_content->pending_subsystem_ident));
+      p_content->pending_subsystem_id      = d->subsystem_id;
+      p_content->pending_subsystem_rom_num = d->subsystem_rom_num;
+      p_content->pending_subsystem_rom_id  = d->subsystem_rom_id;
+      for (i = 0; i < RARCH_MAX_SUBSYSTEM_ROMS; i++)
+      {
+         p_content->pending_subsystem_roms[i] = d->subsystem_roms[i];
+         d->subsystem_roms[i]                 = NULL;
+      }
+      p_content->flags |= CONTENT_ST_FLAG_PENDING_SUBSYSTEM_INIT;
+   }
+   runloop_set_current_core_type(CORE_TYPE_PLAIN, true);
+   if (!content_load(&d->info, p_content, d->after, true))
+   {
+      if (d->after & CONTENT_LOAD_AFTER_QUIT_ON_FAIL)
+         retroarch_main_quit_failure();
+#ifdef HAVE_MENU
+      else
+         retroarch_menu_running();
+#endif
+   }
+}
+
+/* What the re-run needs, taken before the core stage's dummy fallback
+ * changes it */
+static struct content_load_parked *content_load_parked_new(
+      struct content_load_job *job)
+{
+   struct content_load_parked *d = NULL;
+   runloop_state_t *runloop_st   = runloop_state_get_ptr();
+   content_state_t *p_content    = content_state_get_ptr();
+   const char *core_path         = path_get(RARCH_PATH_CORE);
+   const char *content_path      = path_get(RARCH_PATH_CONTENT);
+   int i;
+   if (!(d = (struct content_load_parked*)calloc(1, sizeof(*d))))
+      return NULL;
+   /* A menu load again: no startup argv */
+   d->info.environ_get   = job->info.environ_get;
+   d->after              = job->after;
+   d->core_path          = strdup(core_path ? core_path : "");
+   d->content_path       = (content_path && *content_path)
+      ? strdup(content_path) : NULL;
+   /* Else the re-run would start the core without its content */
+   if (content_path && *content_path && !d->content_path)
+   {
+      content_load_parked_free(d);
+      return NULL;
+   }
+   d->label              = strdup(runloop_st->name.label);
+   d->db_name            = strdup(p_content->companion_ui_db_name);
+   d->crc32              = strdup(p_content->companion_ui_crc32);
+   d->subsystem_init     = (p_content->flags
+         & CONTENT_ST_FLAG_PENDING_SUBSYSTEM_INIT) ? true : false;
+   d->subsystem_ident    = strdup(p_content->pending_subsystem_ident);
+   d->subsystem_id       = p_content->pending_subsystem_id;
+   d->subsystem_rom_num  = p_content->pending_subsystem_rom_num;
+   d->subsystem_rom_id   = p_content->pending_subsystem_rom_id;
+   for (i = 0; i < RARCH_MAX_SUBSYSTEM_ROMS; i++)
+      if (p_content->pending_subsystem_roms[i])
+         d->subsystem_roms[i] = strdup(p_content->pending_subsystem_roms[i]);
+   return d;
+}
+
+/* After the core stage: parks the snapshot if that stage's open of the
+ * core was refused, else drops it */
+static void content_load_park(struct content_load_job *job)
+{
+   struct content_load_parked *d = job->parked;
+   job->parked                   = NULL;
+   if (!d)
+      return;
+   if (     !core_load_check_refused(d->core_path)
+         || !core_load_check_park(d->core_path, content_load_parked_run,
+            content_load_parked_free, d))
+      content_load_parked_free(d);
+}
+
+static void content_load_core_rerun(void *ud)
+{
+   content_ctx_info_t content_info = {0};
+   task_push_load_new_core((const char*)ud, NULL, &content_info,
+         CORE_TYPE_PLAIN, NULL, NULL);
+#ifdef HAVE_MENU
+   menu_state_get_ptr()->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH
+                               |  MENU_ST_FLAG_PREVENT_POPULATE;
+#endif
+}
+
+/* As content_load_core_rerun(), then started if it runs without
+ * content, as the companion UI's Load Core starts it after a probe */
+static void content_load_core_start_rerun(void *ud)
+{
+   content_ctx_info_t content_info = {0};
+   rarch_system_info_t *sys_info   = &runloop_state_get_ptr()->system;
+   /* Set by the probe only when it succeeds */
+   sys_info->load_no_content       = false;
+   content_load_core_rerun(ud);
+   if (     sys_info->load_no_content
+         && config_get_ptr()->bools.set_supports_no_game_enable)
+   {
+      path_clear(RARCH_PATH_CONTENT);
+      task_push_load_content_with_current_core_from_companion_ui(NULL,
+            &content_info, CORE_TYPE_PLAIN, NULL, NULL);
+   }
+}
+
+static bool content_load_park_core(const char *core_path,
+      core_load_rerun_t rerun)
+{
+   char *d = NULL;
+   if (     !core_path
+         || !core_load_check_refused(core_path)
+         || !(d = strdup(core_path)))
+      return false;
+   if (core_load_check_park(d, rerun, free, d))
+      return true;
+   free(d);
+   return false;
+}
+
+bool task_content_park_core_load(const char *core_path)
+{
+   return content_load_park_core(core_path, content_load_core_rerun);
+}
+
+bool task_content_park_core_start(const char *core_path)
+{
+   return content_load_park_core(core_path, content_load_core_start_rerun);
+}
+
+bool task_content_core_refused_notify(const char *core_path)
+{
+   char msg[NAME_MAX_LENGTH + 128];
+   if (!core_path || !core_load_check_refused(core_path))
+      return false;
+   RARCH_WARN("[Core] Not loading \"%s\": not trusted. Load it from Load Core and choose Always Trust to approve it.\n",
+         core_path);
+   snprintf(msg, sizeof(msg),
+         msg_hash_to_str(MSG_CORE_LOAD_REFUSED_LOAD_CORE),
+         path_basename_nocompression(core_path));
+   runloop_msg_queue_push(msg, strlen(msg), 2, 360, false, NULL,
+         MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_WARNING);
+   return true;
+}
+
+#ifdef HAVE_MENU
+/* The startup load again, as a menu load: its startup-only options
+ * (-H, --record, --entryslot, subsystems) aren't replayed */
+static void content_load_startup_rerun(void *ud)
+{
+   struct content_load_parked *d   = (struct content_load_parked*)ud;
+   content_ctx_info_t content_info = {0};
+   rarch_system_info_t *sys_info   = &runloop_state_get_ptr()->system;
+   if (d->content_path)
+      task_push_load_content_with_new_core_from_menu(d->core_path,
+            d->content_path, &content_info, CORE_TYPE_PLAIN, NULL, NULL);
+   /* With no content, started only by a core that runs without it, as
+    * at startup; else loaded, waiting for content. On the probe's word
+    * alone (it sets the flag only when it succeeds): a core outside
+    * the core info list starts at startup too. */
+   else
+   {
+      sys_info->load_no_content = false;
+      task_push_load_new_core(d->core_path, NULL, &content_info,
+            CORE_TYPE_PLAIN, NULL, NULL);
+      if (     sys_info->load_no_content
+            && config_get_ptr()->bools.set_supports_no_game_enable)
+         task_push_load_contentless_core_from_menu(d->core_path);
+      else
+         menu_state_get_ptr()->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH
+                                     |  MENU_ST_FLAG_PREVENT_POPULATE;
+   }
+}
+#endif
+
+bool task_content_park_startup(const char *core_path,
+      const char *content_path)
+{
+   struct content_load_parked *d = NULL;
+   core_load_rerun_t rerun       = content_load_parked_run;
+   if (     !core_path || !*core_path
+         || !core_load_check_refused(core_path)
+         || !(d = (struct content_load_parked*)calloc(1, sizeof(*d))))
+      return false;
+   d->core_path    = strdup(core_path);
+   d->content_path = (content_path && *content_path)
+      ? strdup(content_path) : NULL;
+   if (content_path && *content_path && !d->content_path)
+   {
+      content_load_parked_free(d);
+      return false;
+   }
+#ifdef HAVE_MENU
+   if (menu_core_warning_can_open())
+      rerun = content_load_startup_rerun;
+   else
+#endif
+   {
+      /* No menu: a staged load, as the menu's are; failing, it ends
+       * RetroArch, as the startup load would have */
+      d->info.environ_get = menu_content_environment_get;
+      d->after            = CONTENT_LOAD_AFTER_HISTORY
+                          | CONTENT_LOAD_AFTER_HISTORY_MENU
+                          | CONTENT_LOAD_AFTER_HISTORY_CLI
+                          | CONTENT_LOAD_AFTER_DUMMY_IS_FAIL
+                          | CONTENT_LOAD_AFTER_QUIT_ON_FAIL;
+   }
+   if (core_load_check_park(d->core_path, rerun,
+            content_load_parked_free, d))
+      return true;
+   content_load_parked_free(d);
+   return false;
+}
+#endif
+
 /* Runs the job's current stage and moves it on. */
 static void content_load_step(struct content_load_job *job,
       content_state_t *p_content)
@@ -2364,10 +2665,22 @@ static void content_load_step(struct content_load_job *job,
       case CONTENT_LOAD_STAGE_CORE_PRELOAD:
          if (!runloop_core_preload_ready())
             break;
+#ifdef HAVE_CORE_LOAD_CHECK
+         /* Kept for a re-run if the core stage's open is refused too */
+         if (core_load_check_stage_refused())
+            job->parked = content_load_parked_new(job);
+#endif
          job->stage = CONTENT_LOAD_STAGE_CORE;
          break;
       case CONTENT_LOAD_STAGE_CORE:
          job->ok = content_load_stage_core(job);
+#ifdef HAVE_CORE_LOAD_CHECK
+         /* Refused: this load ends as a failed one does, and runs again
+          * once the user answers the Security Warning. Whatever job->ok
+          * says: a menu load's init falls back to the dummy core itself
+          * and succeeds. */
+         content_load_park(job);
+#endif
          if (!job->ok)
          {
             if (     !job->fell_back
@@ -2542,8 +2855,14 @@ static bool content_load(content_ctx_info_t *info,
       return true;
    }
 
+#ifdef HAVE_CORE_LOAD_CHECK
+   core_load_check_set_startup(true);
+#endif
    while (job->stage != CONTENT_LOAD_STAGE_NONE)
       content_load_step(job, p_content);
+#ifdef HAVE_CORE_LOAD_CHECK
+   core_load_check_set_startup(false);
+#endif
    return content_load_job_result;
 }
 

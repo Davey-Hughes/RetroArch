@@ -1048,15 +1048,19 @@ bool libretro_get_system_info(
  * previous core is closed; the core stage then takes the handle.
  * begin returns false when there is no worker to open it on (the core
  * stage opens it itself), ready is true once no open is in flight,
- * cancel drops an untaken handle. */
+ * cancel drops an untaken handle. With a trust store the stage is the
+ * core's check, worker or not (core_load_check_stage_begin). */
 bool runloop_core_preload_begin(void);
 bool runloop_core_preload_ready(void);
 void runloop_core_preload_cancel(void);
 
 #ifdef HAVE_DYNAMIC
 /* dylib_load() for a core; on Android only from the app's own folders.
- * @quiet: a worker's open, whose refusal the main thread's open logs */
+ * Main thread only: the load check comes first. */
 dylib_t runloop_core_dylib_load(const char *path, bool quiet);
+/* As above, unchecked, on any thread.
+ * @quiet: a worker's open, whose refusal the main thread's open logs */
+dylib_t runloop_core_dylib_open(const char *path, bool quiet);
 
 /* Frees the records libretro_get_system_info() keeps of the cores it
  * has asked; the next question reads them back from disk. */

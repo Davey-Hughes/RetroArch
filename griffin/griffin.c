@@ -1637,6 +1637,19 @@ FRONTEND
 
 #include "../core_info.c"
 #include "../core_backup.c"
+#ifdef HAVE_CORE_SIGNATURES
+/* Signatures verify with crypto/pk.c */
+#ifndef HAVE_CRYPTO
+#error "HAVE_CORE_SIGNATURES needs HAVE_CRYPTO"
+#endif
+#include "../core_signature.c"
+#include "../core_signature_io.c"
+#include "../core_trust_runtime.c"
+#ifdef HAVE_CORE_LOAD_CHECK
+#include "../core_load_file.c"
+#include "../core_load_check.c"
+#endif
+#endif
 #include "../core_option_manager.c"
 
 #if defined(HAVE_NETWORKING)

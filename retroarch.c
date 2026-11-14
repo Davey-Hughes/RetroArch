@@ -110,6 +110,7 @@
 
 #if defined(ANDROID)
 #include <android/api-level.h>
+#include "frontend/drivers/platform_unix.h"
 #endif
 
 #ifdef HAVE_PRESENCE
@@ -250,6 +251,13 @@
 
 #ifdef HAVE_GAME_AI
 #include "ai/game_ai.h"
+#endif
+
+#ifdef HAVE_CORE_SIGNATURES
+#include "core_trust_runtime.h"
+#endif
+#ifdef HAVE_CORE_LOAD_CHECK
+#include "core_load_check.h"
 #endif
 
 /* RetroArch provides its own entry point (main, below) and runloop,
@@ -5677,6 +5685,11 @@ bool command_event(enum event_command cmd, void *data)
          menu_first_run_download_start();
 #endif
          break;
+      case CMD_EVENT_CORE_SIGNATURE_CHECK_OFF:
+#ifdef HAVE_CORE_SIGNATURES
+         core_trust_runtime_set_checks(false);
+#endif
+         break;
       case CMD_EVENT_MENU_SAVE_CURRENT_CONFIG:
          /* Same as at quit: the companion's live layout first. */
          ui_companion_event_command(CMD_EVENT_MENU_SAVE_CURRENT_CONFIG);
@@ -7064,6 +7077,12 @@ void main_exit(void *args)
     * way out, so no driver call runs into the teardown below. */
    cloud_sync_deinit(1000);
 #endif
+#ifdef HAVE_CORE_LOAD_CHECK
+   core_load_check_deinit();
+#endif
+#ifdef HAVE_CORE_SIGNATURES
+   core_trust_runtime_deinit();
+#endif
 
    video_driver_restore_cached(settings);
 
@@ -7292,6 +7311,7 @@ int rarch_main(int argc, char *argv[], void *data)
    retroarch_deinit_drivers(&runloop_st->retro_ctx);
    retroarch_ctl(RARCH_CTL_STATE_FREE,  NULL);
    global_free(p_rarch);
+   p_rarch->flags &= ~RARCH_FLAGS_QUIT_FAILURE;
 
    frontend_driver_init_first(data);
 
@@ -7404,7 +7424,7 @@ int rarch_main(int argc, char *argv[], void *data)
    main_exit(data);
 #endif
 
-   return 0;
+   return (p_rarch->flags & RARCH_FLAGS_QUIT_FAILURE) ? 1 : 0;
 }
 
 #if defined(__EMSCRIPTEN__)
@@ -9990,6 +10010,22 @@ bool retroarch_main_init_core(int argc, char *argv[],
       retroarch_init_task_queue();
    else
       retroarch_task_queue_configure();
+#ifdef HAVE_CORE_SIGNATURES
+   /* Before the first core is opened, -L's and launcher intents' too */
+   {
+      char core_ext[16];
+#ifdef ANDROID
+      /* The app's own folder, never the one an intent extra names: none,
+       * and no seed this launch, when it couldn't be read */
+      const char *seed_dir = android_app_cores_dir();
+#else
+      const char *seed_dir = g_defaults.dirs[DEFAULT_DIR_CORE];
+#endif
+      if (!frontend_driver_get_core_extension(core_ext, sizeof(core_ext)))
+         core_ext[0] = '\0';
+      core_trust_runtime_init(NULL, seed_dir, core_ext);
+   }
+#endif
 
    {
       const char    *fullpath  = p_rarch->path_content;
@@ -10102,10 +10138,30 @@ bool retroarch_main_init_core(int argc, char *argv[],
    /* Handle core initialization failure */
    if (init_failed)
    {
+#ifdef HAVE_CORE_LOAD_CHECK
+      /* A startup core the check holds back falls back to the dummy
+       * core, parked to run again from there. Refused with no menu to
+       * ask on, it fails whatever --load-menu-on-error says. */
+      bool parked = false;
+      switch (core_load_check_startup_take())
+      {
+         case CORE_LOAD_STARTUP_NONE:
+            break;
+         case CORE_LOAD_STARTUP_FAILED:
+            return retroarch_main_init_fail();
+         default:
+            parked = task_content_park_startup(p_rarch->path_libretro,
+                  p_rarch->path_content);
+            break;
+      }
+#endif
 #ifdef HAVE_DYNAMIC
       /* Check if menu was active prior to core initialization */
       if (   (!(rarch_st.flags & RARCH_FLAGS_LAUNCHED_FROM_CLI))
           ||   (rarch_st.flags & RARCH_FLAGS_CLI_LOAD_MENU_ON_ERR)
+#ifdef HAVE_CORE_LOAD_CHECK
+          ||   parked
+#endif
 #ifdef HAVE_MENU
           ||  (menu_st->flags & MENU_ST_FLAG_ALIVE)
 #endif
@@ -10220,6 +10276,12 @@ bool retroarch_main_init_drivers(bool staged,
 
    drivers_init(settings, init_flags,
          (enum driver_lifetime_flags)init_lifetime, verbosity_enabled);
+#ifdef HAVE_CORE_SIGNATURES
+   core_trust_runtime_notify();
+#endif
+#ifdef HAVE_CORE_LOAD_CHECK
+   core_load_check_notify();
+#endif
 #ifdef HAVE_COMMAND
    input_driver_refresh_command(input_st, settings);
 #endif
@@ -11263,6 +11325,12 @@ bool retroarch_main_quit_poll(void)
    runloop_st->quit_pending = false;
    retroarch_main_quit_finish(true);
    return true;
+}
+
+void retroarch_main_quit_failure(void)
+{
+   rarch_st.flags                 |= RARCH_FLAGS_QUIT_FAILURE;
+   runloop_state_get_ptr()->flags |= RUNLOOP_FLAG_SHUTDOWN_INITIATED;
 }
 
 enum retro_language retroarch_get_language_from_iso(const char *iso639)

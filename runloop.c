@@ -240,6 +240,10 @@ bool android_get_vfs_authorized_locations(
 #include "configuration.h"
 #include "list_special.h"
 #include "core_option_manager.h"
+#ifdef HAVE_CORE_LOAD_CHECK
+#include "core_load_check.h"
+#include "core_trust_runtime.h"
+#endif
 #ifdef HAVE_CHEATS
 #include "cheat_manager.h"
 #endif
@@ -839,7 +843,9 @@ void libretro_get_environment_info(
    runloop_st->flags &= ~RUNLOOP_FLAG_IGNORE_ENVIRONMENT_CB;
 }
 
-dylib_t runloop_core_dylib_load(const char *path, bool quiet)
+/* No check: where there is no trust store or checks are off, or on a
+ * worker whose core the main thread found none for. Any thread. */
+dylib_t runloop_core_dylib_open(const char *path, bool quiet)
 {
 #if defined(ANDROID)
    /* Another app's intent can name the core.  The resolved path that
@@ -861,6 +867,32 @@ dylib_t runloop_core_dylib_load(const char *path, bool quiet)
 #endif
 }
 
+/* Main thread: every core is opened here, once it is checked */
+dylib_t runloop_core_dylib_load(const char *path, bool quiet)
+{
+#ifdef HAVE_CORE_LOAD_CHECK
+   dylib_t lib = NULL;
+#if defined(ANDROID)
+   /* The check reads the real path the open uses */
+   char real_path[PATH_MAX_LENGTH];
+   if (!android_core_path_resolve(path, real_path, sizeof(real_path)))
+      return runloop_core_dylib_open(path, quiet);
+   path = real_path;
+#endif
+   switch (core_load_check_open(path, &lib))
+   {
+      case CORE_LOAD_GATE_OPENED:
+         return lib;
+      case CORE_LOAD_GATE_REFUSED:
+         dylib_error();
+         return NULL;
+      case CORE_LOAD_GATE_OFF:
+         break;
+   }
+#endif
+   return runloop_core_dylib_open(path, quiet);
+}
+
 /* Whether the core path is resolved through symlinks before it is
  * opened (and saved to history) */
 static bool load_dynamic_core_resolves_symlinks(void)
@@ -876,6 +908,50 @@ static bool load_dynamic_core_resolves_symlinks(void)
    return true;
 #endif
 }
+
+#ifdef HAVE_CORE_LOAD_CHECK
+/* With a trust store the preload stage is the core's check, with or
+ * without a worker, and the open moves to a worker only from the file
+ * the check passed. Any core path but a built-in core's: a playlist
+ * Run sets no explicit core type, and only a refused open parks. */
+static bool runloop_core_check_begin(void)
+{
+   const char *path = path_get(RARCH_PATH_CORE);
+#if defined(ANDROID)
+   char real_path[PATH_MAX_LENGTH];
+#endif
+   if (     !path || !*path
+         || (     (runloop_state.flags & RUNLOOP_FLAG_HAS_SET_CORE)
+               &&  runloop_state.explicit_current_core_type
+                  != CORE_TYPE_PLAIN))
+      return false;
+   /* The path load_dynamic_core() opens, resolved the same way */
+   path_resolve_realpath(path_get_ptr(RARCH_PATH_CORE),
+         path_get_realsize(RARCH_PATH_CORE),
+         load_dynamic_core_resolves_symlinks());
+   path = path_get(RARCH_PATH_CORE);
+#if defined(ANDROID)
+   /* The check reads the real path, as the open does */
+   if (!android_core_path_resolve(path, real_path, sizeof(real_path)))
+      return false;
+   path = real_path;
+#endif
+   return core_load_check_stage_begin(path);
+}
+
+static dylib_t runloop_core_check_take(const char *path)
+{
+#if defined(ANDROID)
+   char real_path[PATH_MAX_LENGTH];
+   if (android_core_path_resolve(path, real_path, sizeof(real_path)))
+      return core_load_check_stage_take(real_path);
+   core_load_check_stage_cancel();
+   return NULL;
+#else
+   return core_load_check_stage_take(path);
+#endif
+}
+#endif
 
 /* ---- the core's library, opened ahead of the load ----
  *
@@ -912,7 +988,7 @@ static void core_preload_task_handler(retro_task_t *task)
    core_preload_handle_t *h = task ? (core_preload_handle_t*)task->state : NULL;
    /* The open: the one thing off the main thread */
    if (h && h->path)
-      h->lib = runloop_core_dylib_load(h->path, true);
+      h->lib = runloop_core_dylib_open(h->path, true);
    if (task)
       task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
 }
@@ -990,6 +1066,11 @@ bool runloop_core_preload_begin(void)
    core_preload_handle_t *h    = NULL;
    const char            *path = path_get(RARCH_PATH_CORE);
 
+#ifdef HAVE_CORE_LOAD_CHECK
+   if (core_trust_runtime_active())
+      return runloop_core_check_begin();
+#endif
+
    /* Only a plain core named by the push, and only with a worker to
     * open it on: inline, the open would run on this thread at the next
     * check, which is the synchronous path. */
@@ -1033,11 +1114,18 @@ bool runloop_core_preload_begin(void)
 
 bool runloop_core_preload_ready(void)
 {
+#ifdef HAVE_CORE_LOAD_CHECK
+   if (core_trust_runtime_active())
+      return core_load_check_stage_ready();
+#endif
    return !core_preload_pending;
 }
 
 void runloop_core_preload_cancel(void)
 {
+#ifdef HAVE_CORE_LOAD_CHECK
+   core_load_check_stage_cancel();
+#endif
    core_preload_reset();
 }
 #endif
@@ -1066,14 +1154,23 @@ static dylib_t load_dynamic_core(const char *path, char *s,
     * saved to content history, and a relative path would
     * break in that scenario. */
    path_resolve_realpath(s, len, resolve_symlinks);
-#if defined(HAVE_DYNAMIC) && defined(HAVE_THREADS)
    {
-      dylib_t pre = core_preload_take(path);
-      if (pre)
-         return pre;
-   }
+      dylib_t lib = NULL;
+#if defined(HAVE_DYNAMIC) && defined(HAVE_THREADS)
+      lib = core_preload_take(path);
 #endif
-   return runloop_core_dylib_load(path, false);
+#ifdef HAVE_CORE_LOAD_CHECK
+      if (!lib && core_trust_runtime_active())
+         lib = runloop_core_check_take(path);
+#endif
+      if (!lib)
+         lib = runloop_core_dylib_load(path, false);
+#ifdef HAVE_CORE_LOAD_CHECK
+      if (lib)
+         core_load_check_loaded();
+#endif
+      return lib;
+   }
 }
 
 /* @live is set when @path opened the library already loaded as the
@@ -1124,11 +1221,33 @@ static dylib_t libretro_get_system_info_lib(const char *path,
 #endif
 
 #if !(defined(HAVE_DYNAMIC) && defined(HAVE_THREADS))
-/* No worker to open the library on: the core stage loads it
- * (or links it statically), so the preload stage has nothing to do. */
-bool runloop_core_preload_begin(void)  { return false; }
-bool runloop_core_preload_ready(void)  { return true; }
-void runloop_core_preload_cancel(void) { }
+/* No worker to open the library on: the core stage loads it (or links
+ * it statically), so the preload stage has nothing to do but the
+ * core's check */
+bool runloop_core_preload_begin(void)
+{
+#ifdef HAVE_CORE_LOAD_CHECK
+   if (core_trust_runtime_active())
+      return runloop_core_check_begin();
+#endif
+   return false;
+}
+
+bool runloop_core_preload_ready(void)
+{
+#ifdef HAVE_CORE_LOAD_CHECK
+   if (core_trust_runtime_active())
+      return core_load_check_stage_ready();
+#endif
+   return true;
+}
+
+void runloop_core_preload_cancel(void)
+{
+#ifdef HAVE_CORE_LOAD_CHECK
+   core_load_check_stage_cancel();
+#endif
+}
 #endif
 
 static void runloop_update_runtime_log(
@@ -5078,7 +5197,13 @@ bool libretro_get_system_info(
       core_probe_capture = NULL;
       if (!lib)
       {
-         const char *err = dylib_error();
+         const char *err = NULL;
+#ifdef HAVE_CORE_LOAD_CHECK
+         /* Refused by the load check: already logged */
+         if (core_load_check_refused(path))
+            return false;
+#endif
+         err = dylib_error();
          RARCH_ERR("[Core] %s: \"%s\"\n",
                msg_hash_to_str(MSG_FAILED_TO_OPEN_LIBRETRO_CORE),
                path);
@@ -5436,6 +5561,9 @@ static void uninit_libretro_symbols(
 #ifdef HAVE_DYNAMIC
    if (lib_handle_local)
       dylib_close(lib_handle_local);
+#ifdef HAVE_CORE_LOAD_CHECK
+   core_load_check_unloaded();
+#endif
 #endif
 
 #ifdef HAVE_OPENXR
@@ -6676,6 +6804,11 @@ bool runloop_event_init_core(
    if (!runloop_init_libretro_symbols(runloop_st,
             type, &runloop_st->current_core, NULL, NULL))
       return false;
+#ifdef HAVE_CORE_LOAD_CHECK
+   /* A plain core's load tells the check itself */
+   if (type != CORE_TYPE_PLAIN && type != CORE_TYPE_DUMMY)
+      core_load_check_builtin_loaded();
+#endif
 #ifdef HAVE_RUNAHEAD
    /* Remember last core type created, so creating a
     * secondary core will know what core type to use. */
@@ -8762,6 +8895,12 @@ static enum runloop_state_enum runloop_check_state(
          return RUNLOOP_STATE_POLLED_AND_CONTINUE;
       }
 
+#ifdef HAVE_CORE_SIGNATURES
+      if (     !runloop_st->content_switching
+            && menu_core_warning_iterate(menu_st))
+         return RUNLOOP_STATE_POLLED_AND_CONTINUE;
+#endif
+
       if (focused || !(runloop_st->flags & RUNLOOP_FLAG_IDLE))
       {
 #ifdef HAVE_NETWORKING
@@ -9812,6 +9951,10 @@ int runloop_iterate(void)
 
    recording_gpu_poll();
    runloop_msg_queue_drain_deferred();
+#ifdef HAVE_CORE_LOAD_CHECK
+   if (!runloop_st->quit_pending)
+      core_load_check_iterate();
+#endif
 
    /* A quit waiting for its state to be written: the core is not run
     * and nothing is read but the input the window needs drained; the

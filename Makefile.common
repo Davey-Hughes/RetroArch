@@ -131,7 +131,8 @@ ifneq ($(findstring Darwin,$(OS)),)
    OSX := 1
    # IOKit for the power-source query in platform_darwin.m, which every
    # macOS build makes; the HID driver adds nothing beyond it.
-   LIBS += -framework AppKit -framework IOKit
+   # CoreFoundation for the app bundle lookup in core_signature_io.c.
+   LIBS += -framework AppKit -framework IOKit -framework CoreFoundation
    ARCHFLAGS=
    MINVERFLAGS=
    ifeq ($(shell uname -p),arm)
@@ -392,6 +393,27 @@ OBJ += \
        $(LIBRETRO_COMM_DIR)/file/config_file_userdata.o \
        runtime_file.o \
        disk_index_file.o
+
+# Core signatures: libretro's keys, the trust store and its warning.
+# HAVE_CORE_LOAD_CHECK adds the check at every core load.
+ifeq ($(HAVE_DYNAMIC), 1)
+   ifeq ($(HAVE_CRYPTO), 1)
+      ifeq ($(HAVE_CORE_SIGNATURES), 1)
+         DEFINES += -DHAVE_CORE_SIGNATURES
+         OBJ     += core_signature.o \
+                    core_signature_io.o \
+                    core_trust_runtime.o
+         ifeq ($(HAVE_CORE_LOAD_CHECK), 1)
+            DEFINES += -DHAVE_CORE_LOAD_CHECK
+            OBJ     += core_load_check.o \
+                       core_load_file.o
+         endif
+         ifeq ($(HAVE_CORE_SIGNING_TEST_KEY), 1)
+            DEFINES += -DHAVE_CORE_SIGNING_TEST_KEY
+         endif
+      endif
+   endif
+endif
 
 ifeq ($(HAVE_SCREENSHOTS), 1)
    DEFINES += -DHAVE_SCREENSHOTS
