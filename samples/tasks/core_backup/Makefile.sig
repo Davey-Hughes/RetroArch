@@ -65,6 +65,10 @@ CFLAGS += -Wall -g1 -O0 -I$(LIBRETRO_COMM_DIR)/include -I$(REPO_ROOT) \
 ifeq ($(TEST_KEY),1)
    CFLAGS += -DHAVE_CORE_SIGNING_TEST_KEY
 endif
+
+# No libretro keys on any host, as a Steam build
+$(call sample_objs,$(REPO_ROOT)/core_signature.o): CFLAGS += -DHAVE_STEAM
+
 LIBS += -lm
 # The slice clock, so a lane can cancel a restore part-way through its
 # check
