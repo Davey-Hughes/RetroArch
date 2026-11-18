@@ -124,7 +124,8 @@ jobs:
                       --disable-audiomixer --disable-translate \
                       --disable-accessibility --disable-crtswitchres \
                       --disable-langextra --disable-libretrodb \
-                      --disable-video_filter --disable-dsp_filter
+                      --disable-video_filter --disable-dsp_filter \
+                      --disable-core_load_check
           grep -q '^HAVE_OPENGL_CORE = 1' config.mk
           grep -q '^HAVE_SLANG = 0' config.mk
           make -j$(nproc)

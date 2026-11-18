@@ -192,11 +192,12 @@ jobs:
           # in ui_qt.o, and the harness replaces main().
           # Networking stays on: the network settings harness below
           # needs the SMB and NFS client screens compiled in.
+          # The harness cores are unsigned; core-load-check tests the check.
           ./configure --disable-qt --disable-x11 \
                       --disable-opengl --disable-opengl_core \
                       --disable-opengl1 --disable-vulkan \
                       --disable-cheevos \
-                      --disable-ffmpeg
+                      --disable-ffmpeg --disable-core_load_check
           make -j$(nproc)
 
       - name: Build and run content_closing_test
@@ -431,28 +432,6 @@ jobs:
           ./samples/menu/setting_command/setting_command_test
           make -C samples/menu/setting_command clean
 
-      - name: Hot function budget
-        shell: bash
-        run: |
-          set -eu
-          # Code size and stack frame of the functions that run every
-          # frame, against a checked-in reference: a change that doubles
-          # either passes every lane in the suite and shows up only as a
-          # slower frame on someone's machine. Uses the release objects
-          # this job already built.
-          .github/workflows/scripts/hot-function-budget.sh
-
-      - name: Lock budget
-        shell: bash
-        run: |
-          set -eu
-          # Lock acquisitions on the paths meant to take none, or a
-          # counted few, against tools/lock_acquire_budget.ref: a lock
-          # put back on a per-frame path passes every lane and shows up
-          # only as a slower frame. Same release objects as above; this
-          # build has no Vulkan, so the Vulkan entries report SKIP.
-          tools/lock_acquire_budget.sh
-
       - name: Wait budget
         run: |
           # Main-thread waits on the video thread, per file, against
@@ -535,6 +514,132 @@ jobs:
           ./samples/menu/load_content_filter/load_content_filter_test
           make -C samples/menu/load_content_filter clean
 
+      - name: Build and run explore_build_test
+        shell: bash
+        run: |
+          set -eu
+          # The Explore index built in steps: one item per step hashes
+          # the same as the build in one go, and the explore task returns
+          # unfinished across checks with Threaded Tasks off.
+          samples/menu/explore_build/build.sh
+          ./samples/menu/explore_build/explore_build_test
+          make -C samples/menu/explore_build clean
+
+      - name: Frame command progress through the real runloop
+        shell: bash
+        run: |
+          set -eu
+          make -C samples/network/command_frames check
+          make -C samples/network/command_frames clean
+
+      - name: Structured HDR queries through the real frontend
+        shell: bash
+        run: |
+          set -eu
+          make -j$(nproc)
+          python3 samples/gfx/hdr_metadata/live.py --retroarch ./retroarch --log-dir /tmp/hdr-metadata-live
+
+      - name: ccache statistics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache -sv
+
+      - name: Save ccache
+        # Only master's pushes keep a cache: pull requests restore
+        # master's, so one push does not evict the next one's.
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+
+  core-load-check:
+    name: Build and run the core load check harnesses
+    runs-on: ubuntu-latest
+    env:
+      APT_PKGS: build-essential zlib1g-dev ccache
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.workflow }}-${{ github.job }}-
+
+      - name: Enable ccache
+        run: |
+          set -eu
+          export CCACHE_DIR="$HOME/.ccache"
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          ccache -M 250M
+          ccache -z
+
+      - name: Build RetroArch headless with the core load check
+        shell: bash
+        run: |
+          set -eu
+          ./configure --disable-qt --disable-x11 \
+                      --disable-opengl --disable-opengl_core \
+                      --disable-opengl1 --disable-vulkan \
+                      --disable-cheevos \
+                      --disable-ffmpeg
+          grep -qx 'HAVE_CORE_LOAD_CHECK = 1' config.mk
+          make -j$(nproc)
+
+      - name: Hot function budget
+        shell: bash
+        run: |
+          set -eu
+          # Code size and stack frame of the functions that run every
+          # frame, against a checked-in reference: a change that doubles
+          # either passes every lane in the suite and shows up only as a
+          # slower frame on someone's machine. Uses the release objects
+          # this job already built.
+          .github/workflows/scripts/hot-function-budget.sh
+
+      - name: Lock budget
+        shell: bash
+        run: |
+          set -eu
+          # Lock acquisitions on the paths meant to take none, or a
+          # counted few, against tools/lock_acquire_budget.ref: a lock
+          # put back on a per-frame path passes every lane and shows up
+          # only as a slower frame. Same release objects as above; this
+          # build has no Vulkan, so the Vulkan entries report SKIP.
+          tools/lock_acquire_budget.sh
+
       - name: Build and run core_warning_test
         shell: bash
         run: |
@@ -570,31 +675,6 @@ jobs:
           # core's load, which ends a park as another core's load does.
           make -C samples/tasks/core_load_paths check
           make -C samples/tasks/core_load_paths clean
-
-      - name: Build and run explore_build_test
-        shell: bash
-        run: |
-          set -eu
-          # The Explore index built in steps: one item per step hashes
-          # the same as the build in one go, and the explore task returns
-          # unfinished across checks with Threaded Tasks off.
-          samples/menu/explore_build/build.sh
-          ./samples/menu/explore_build/explore_build_test
-          make -C samples/menu/explore_build clean
-
-      - name: Frame command progress through the real runloop
-        shell: bash
-        run: |
-          set -eu
-          make -C samples/network/command_frames check
-          make -C samples/network/command_frames clean
-
-      - name: Structured HDR queries through the real frontend
-        shell: bash
-        run: |
-          set -eu
-          make -j$(nproc)
-          python3 samples/gfx/hdr_metadata/live.py --retroarch ./retroarch --log-dir /tmp/hdr-metadata-live
 
       - name: ccache statistics
         if: ${{ !cancelled() }}

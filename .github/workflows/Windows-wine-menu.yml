@@ -144,7 +144,7 @@ jobs:
           ./configure --host=x86_64-w64-mingw32 \
                       --disable-qt --disable-vulkan --disable-ffmpeg \
                       --disable-cheevos --disable-discord --enable-d3d8 \
-                      --disable-sdl --disable-sdl2
+                      --disable-sdl --disable-sdl2 --disable-core_load_check
           make -j$(nproc) CC="ccache x86_64-w64-mingw32-gcc" \
                           CXX="ccache x86_64-w64-mingw32-g++"
           ccache -s
