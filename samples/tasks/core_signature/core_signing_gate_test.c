@@ -152,7 +152,7 @@ static void gate_cases(void)
 
    /* webOS */
 #define GATE_NAME "webOS armv7a"
-#define GATE_KEYS 0
+#define GATE_KEYS 2
 #define WEBOS 1
 #define __linux__ 1
 #define __arm__ 1

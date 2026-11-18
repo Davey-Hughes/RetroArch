@@ -24,6 +24,9 @@
       && (!defined(_MSC_VER) || (_MSC_VER != 1600 && _MSC_VER != 1400 \
       && _MSC_VER != 1310))
 #define CORE_SIGNING_HAS_KEYS
+/* webOS aarch64's default server has no signatures */
+#elif defined(WEBOS) && defined(__arm__)
+#define CORE_SIGNING_HAS_KEYS
 #endif
 
 /* libretro's core signing keys, current first: 65-byte P-256 points,
