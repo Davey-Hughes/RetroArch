@@ -167,16 +167,30 @@ static void gate_cases(void)
 
    /* Windows */
 #define GATE_NAME "Windows x86_64 mingw"
-#define GATE_KEYS 0
+#define GATE_KEYS 2
 #define _WIN32 1
 #define __x86_64__ 1
 #include "core_signing_gate_case.h"
 
 #define GATE_NAME "Windows x86_64 MSVC 2019"
-#define GATE_KEYS 0
+#define GATE_KEYS 2
 #define _WIN32 1
 #define _M_X64 1
 #define _MSC_VER 1929
+#include "core_signing_gate_case.h"
+
+#define GATE_NAME "Windows x86_64 MSVC 2017"
+#define GATE_KEYS 2
+#define _WIN32 1
+#define _M_X64 1
+#define _MSC_VER 1910
+#include "core_signing_gate_case.h"
+
+#define GATE_NAME "Windows x86_64 MSVC 2013"
+#define GATE_KEYS 2
+#define _WIN32 1
+#define _M_X64 1
+#define _MSC_VER 1800
 #include "core_signing_gate_case.h"
 
 #define GATE_NAME "Windows x86"

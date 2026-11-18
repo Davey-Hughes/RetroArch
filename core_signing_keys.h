@@ -18,6 +18,12 @@
       && !defined(WEBOS) && !defined(HAKCHI) \
       && !defined(HAVE_LAKKA) && !defined(HAVE_STEAM)
 #define CORE_SIGNING_HAS_KEYS
+/* MSVC 2010, 2005 and 2003 have their own servers */
+#elif defined(_WIN32) && (defined(__x86_64__) || defined(_M_X64)) \
+      && !defined(_XBOX) && !defined(__WINRT__) && !defined(HAVE_STEAM) \
+      && (!defined(_MSC_VER) || (_MSC_VER != 1600 && _MSC_VER != 1400 \
+      && _MSC_VER != 1310))
+#define CORE_SIGNING_HAS_KEYS
 #endif
 
 /* libretro's core signing keys, current first: 65-byte P-256 points,
