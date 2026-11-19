@@ -137,6 +137,22 @@ static int action_bind_label_video_screen_page(
       }
    return 0;
 }
+
+/* Game Screens' row for a screen, as the core names it */
+static int action_bind_label_video_screen_settings(
+      file_list_t *list,
+      unsigned type, unsigned i,
+      const char *label, const char *path,
+      char *s, size_t len)
+{
+   menu_file_list_cbs_t *cbs = (menu_file_list_cbs_t*)
+      list->list[i].actiondata;
+   video_driver_screen_label(
+         (unsigned)(cbs->enum_idx - MENU_ENUM_LABEL_VIDEO_SCREEN_SETTINGS),
+         msg_hash_to_str(MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_SETTINGS),
+         s, len);
+   return 0;
+}
 #endif
 
 #if defined(HAVE_VIDEO_WINDOWS) && defined(ANDROID)
@@ -149,9 +165,10 @@ static int action_bind_label_video_screen_android(
 {
    menu_file_list_cbs_t *cbs = (menu_file_list_cbs_t*)
       list->list[i].actiondata;
-   snprintf(s, len, msg_hash_to_str(
-            MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_SETTINGS),
-         (unsigned)(cbs->enum_idx - MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY) + 1);
+   video_driver_screen_label(
+         (unsigned)(cbs->enum_idx - MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY),
+         msg_hash_to_str(MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_SETTINGS),
+         s, len);
    return 0;
 }
 #endif
@@ -172,6 +189,12 @@ int menu_cbs_init_bind_label(menu_file_list_cbs_t *cbs,
          && cbs->enum_idx <= MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_HEIGHT_LAST)
    {
       BIND_ACTION_LABEL(cbs, action_bind_label_video_screen_page);
+      return 0;
+   }
+   if (     cbs->enum_idx >= MENU_ENUM_LABEL_VIDEO_SCREEN_SETTINGS
+         && cbs->enum_idx <= MENU_ENUM_LABEL_VIDEO_SCREEN_SETTINGS_LAST)
+   {
+      BIND_ACTION_LABEL(cbs, action_bind_label_video_screen_settings);
       return 0;
    }
 #endif

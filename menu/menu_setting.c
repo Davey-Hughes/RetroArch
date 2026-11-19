@@ -4003,8 +4003,8 @@ static size_t setting_get_string_representation_video_menu_follows(
    if (follows >= VIDEO_MENU_FOLLOWS_SEPARATE)
       return strlcpy(s, msg_hash_to_str(
                MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_SEPARATE), len);
-   return snprintf(s, len, msg_hash_to_str(
-            MENU_ENUM_LABEL_VALUE_VIDEO_MENU_FOLLOWS_SCREEN), follows + 1);
+   return video_driver_screen_label(follows, msg_hash_to_str(
+            MENU_ENUM_LABEL_VALUE_VIDEO_MENU_FOLLOWS_SCREEN), s, len);
 }
 
 static size_t setting_get_string_representation_video_notifications_window(
@@ -11070,7 +11070,8 @@ static size_t setting_video_screen_repr(rarch_setting_t *setting,
    if (!setting_video_screen_bind(setting))
       return strlcpy(s, "", len);
    if (setting->enum_idx == MENU_ENUM_LABEL_VIDEO_SCREEN_SELECTED)
-      return snprintf(s, len, "%u", menu_state_get_ptr()->video_screen_selected + 1);
+      return video_driver_screen_label(
+            menu_state_get_ptr()->video_screen_selected, "%u", s, len);
    if (setting->type == ST_FLOAT)
       return setting_get_string_representation_st_float(setting, s, len);
    if (setting->type == ST_BOOL)
