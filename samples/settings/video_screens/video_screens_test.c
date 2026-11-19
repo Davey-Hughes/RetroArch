@@ -695,9 +695,15 @@ static void menu_value(const char *name, const char *value)
    CHECK(!strcmp(text, value));
 }
 
+static void screens_test_full(struct retro_video_views *map,
+      struct retro_video_view *views, struct retro_video_screen *screens);
+
 static void test_xr_screen_menu(void)
 {
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
    settings_t *settings = config_get_ptr();
+   struct retro_video_views map;
    load_fixture("video_driver = \"glcore\"\n");
    set_menu_map(2);
 #ifdef HAVE_OPENXR
@@ -767,6 +773,10 @@ static void test_xr_screen_menu(void)
    menu_action("video_screen_xr_x", MENU_ACTION_START);
    CHECK(settings->floats.video_screen_xr_x[1] == 0.0f);
    CHECK(menu_state_get_ptr()->video_screen_selected == 1u);
+   screens_test_full(&map, views, screens);
+   CHECK(video_driver_set_views(&map));
+   menu_value("video_screen_selected", "Bottom");
+   video_driver_clear_views();
 }
 
 static void test_xr_menu_map_change(void)
@@ -6371,6 +6381,93 @@ static void test_window_menu_screen_page(void)
 #endif
 }
 
+/* Screen @screen's row in Game Screens, labelled as the list draws it */
+static void window_menu_screen_row(unsigned screen, char *s, size_t len)
+{
+#ifdef ANDROID
+   enum msg_hash_enums row = MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY;
+#else
+   enum msg_hash_enums row = MENU_ENUM_LABEL_VIDEO_SCREEN_SETTINGS;
+#endif
+   menu_file_list_cbs_t cbs;
+   struct item_file item;
+   file_list_t list;
+   memset(&cbs, 0, sizeof(cbs));
+   memset(&item, 0, sizeof(item));
+   memset(&list, 0, sizeof(list));
+   cbs.enum_idx    = (enum msg_hash_enums)(row + screen);
+   item.actiondata = &cbs;
+   list.list       = &item;
+   list.capacity   = 1;
+   list.size       = 1;
+   *s              = '\0';
+   menu_cbs_init_bind_label(&cbs, "", "", 0, 0);
+   CHECK(cbs.action_label != NULL);
+   if (cbs.action_label)
+      cbs.action_label(&list, 0, 0, "", "", s, len);
+}
+
+#ifndef ANDROID
+/* The title of screen @screen's page */
+static void window_menu_page_title(unsigned screen, char *s, size_t len)
+{
+   const char *label = msg_hash_to_str(
+         MENU_ENUM_LABEL_DEFERRED_VIDEO_SCREEN_SETTINGS_LIST);
+   menu_file_list_cbs_t cbs;
+   char path[64];
+   snprintf(path, sizeof(path), msg_hash_to_str(
+            MENU_ENUM_LABEL_VIDEO_SCREEN_SETTINGS), screen + 1);
+   memset(&cbs, 0, sizeof(cbs));
+   *s = '\0';
+   menu_cbs_init_bind_title(&cbs, path, label, 0, 0);
+   CHECK(cbs.action_get_title != NULL);
+   if (cbs.action_get_title)
+      cbs.action_get_title(path, label, 0, s, len);
+}
+#endif
+
+/* The rows, a page's title and Menu Follows name the screens as the
+ * core does, and as RetroArch does once content closes */
+static void test_window_menu_screen_names(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   settings_t *settings = config_get_ptr();
+   struct retro_video_views map;
+   rarch_setting_t *follows;
+   char s[64];
+
+   load_fixture("");
+   follows = menu_setting_find_enum(MENU_ENUM_LABEL_VIDEO_MENU_FOLLOWS);
+   CHECK(follows != NULL);
+   if (!follows)
+      return;
+   screens_test_full(&map, views, screens);
+   CHECK(video_driver_set_views(&map));
+   window_menu_screen_row(2, s, sizeof(s));
+   CHECK(string_is_equal(s, "VMU A1"));
+   window_menu_screen_row(0, s, sizeof(s));
+   CHECK(string_is_equal(s, "Top"));
+#ifndef ANDROID
+   window_menu_page_title(2, s, sizeof(s));
+   CHECK(string_is_equal(s, "VMU A1"));
+#endif
+   settings->uints.video_menu_follows = 1;
+   follows->actions->repr(follows, s, sizeof(s));
+   CHECK(string_is_equal(s, "Bottom"));
+
+   video_driver_clear_views();
+   window_menu_screen_row(2, s, sizeof(s));
+   CHECK(string_is_equal(s, "Screen 3"));
+#ifndef ANDROID
+   window_menu_page_title(2, s, sizeof(s));
+   CHECK(string_is_equal(s, "Screen 3"));
+#endif
+   follows->actions->repr(follows, s, sizeof(s));
+   CHECK(string_is_equal(s, "Game Screen 2"));
+   settings->uints.video_menu_follows = 0;
+}
+
 /* Each of these settings is listed in one list: Video's entries, Stereo
  * 3D, Game Screens, Headset and the Screen N pages */
 static void test_window_menu_one_place(void)
@@ -8331,6 +8428,7 @@ int main(int argc, char **argv)
    test_window_menu_rows_moved();
    test_window_menu_rows_redraw();
    test_window_menu_screen_page();
+   test_window_menu_screen_names();
    test_window_menu_one_place();
    test_blank_unused_strings();
    test_blank_unused_hotkey();
