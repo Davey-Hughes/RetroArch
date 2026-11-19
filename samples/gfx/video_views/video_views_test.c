@@ -1961,6 +1961,91 @@ static void test_layout_viewless(void)
          && l.placements[0].dst.dims == want.placements[0].dst.dims);
 }
 
+/* NO_INPUT: the DS map stacked in 1600x960, screen 0 at (480,0) and
+ * screen 1 at (480,480), each 640x480. */
+static void test_map_point_no_input(void)
+{
+   video_views_map_t map;
+   video_views_layout_params_t p;
+   video_views_layout_t l;
+   uint32_t pos, want;
+   unsigned frame = VIDEO_SCALE_PACK(256, 384);
+
+   map_ds(&map);
+   params_init(&p, &map, 1600, 960);
+   video_views_layout(&p, &l);
+   CHECK(rect_is(&l.placements[0].dst, 480,   0, 640, 480));
+   CHECK(rect_is(&l.placements[1].dst, 480, 480, 640, 480));
+
+   /* Control: the bottom screen's centre is packed pixel (128, 288). */
+   CHECK(video_views_map_point(&l, &map, frame, 800, 720, false, &pos));
+   CHECK(VIDEO_POS_X(pos) == 128 && VIDEO_POS_Y(pos) == 16511);
+
+   /* NO_INPUT on screen 1: its centre clamps into screen 0, to the same
+    * bottom-row point as (800, 479), packed pixel (128, 191). */
+   CHECK(video_views_map_point(&l, &map, frame, 800, 479, false, &want));
+   CHECK(VIDEO_POS_X(want) == 128 && VIDEO_POS_Y(want) == -87);
+   map.no_input = 0x2;
+   pos = 0;
+   CHECK(video_views_map_point(&l, &map, frame, 800, 720, false, &pos));
+   CHECK(pos == want);
+   CHECK(video_views_map_point(&l, &map, frame, 800, 720, true, &pos));
+   CHECK(pos == VIDEO_POS_PACK(-0x8000, -0x8000));
+
+   /* Screen 0 is as it was. */
+   map.no_input = 0;
+   CHECK(video_views_map_point(&l, &map, frame, 800, 240, true, &want));
+   map.no_input = 0x2;
+   pos = 0;
+   CHECK(video_views_map_point(&l, &map, frame, 800, 240, true, &pos));
+   CHECK(pos == want);
+
+   /* Only the NO_INPUT screen placed: off every view. */
+   p.exclude_screens = 0x1;
+   video_views_layout(&p, &l);
+   CHECK(l.num_placements == 1);
+   pos = 0;
+   CHECK(video_views_map_point(&l, &map, frame, 800, 720, false, &pos));
+   CHECK(pos == VIDEO_POS_PACK(-0x8000, -0x8000));
+   pos = 0;
+   CHECK(video_views_map_point(&l, &map, frame, 800, 720, true, &pos));
+   CHECK(pos == VIDEO_POS_PACK(-0x8000, -0x8000));
+}
+
+static void test_touch_no_input(void)
+{
+   video_views_map_t map, sub;
+   video_views_layout_params_t p;
+   video_views_layout_t l;
+   video_views_touch_t t;
+   unsigned index[RETRO_VIDEO_VIEWS_MAX];
+   int16_t x, y, top_x, top_y;
+   unsigned frame = VIDEO_SCALE_PACK(256, 384);
+
+   memset(&t, 0, sizeof(t));
+   map_ds(&map);
+   CHECK(video_views_select_screens(&map, 0, 2, &sub, index));
+   params_init(&p, &sub, 1600, 960);
+   video_views_layout(&p, &l);
+   CHECK(l.num_placements == 2);
+
+   /* Without the flag: the bottom screen's centre, and the top's. */
+   video_views_touch_publish(&t, &map, &l, index, p.dims, frame);
+   CHECK(video_views_touch_point(&t, 0, 16384, &x, &y));
+   CHECK(x != -0x8000 && y > 0);
+   CHECK(video_views_touch_point(&t, 0, -16384, &top_x, &top_y));
+   CHECK(top_x != -0x8000 && top_y < 0);
+
+   map.no_input = 0x2;
+   video_views_touch_publish(&t, &map, &l, index, p.dims, frame);
+   x = y = 0;
+   CHECK(video_views_touch_point(&t, 0, 16384, &x, &y));
+   CHECK(x == -0x8000 && y == -0x8000);
+   x = y = 0;
+   CHECK(video_views_touch_point(&t, 0, -16384, &x, &y));
+   CHECK(x == top_x && y == top_y);
+}
+
 int main(void)
 {
    test_screen_defaults();
@@ -1992,6 +2077,8 @@ int main(void)
    test_ui_helpers();
    test_screen_api();
    test_layout_viewless();
+   test_map_point_no_input();
+   test_touch_no_input();
 
    if (failures)
    {

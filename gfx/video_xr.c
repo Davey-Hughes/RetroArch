@@ -423,7 +423,7 @@ void video_xr_layout(const video_xr_params_t *p, video_xr_layout_t *out)
 static void video_xr_place_screens(const video_xr_params_t *p,
       const video_xr_layout_t *lay, video_xr_quad_set_t *out)
 {
-   unsigned s;
+   unsigned s, i;
    const video_views_map_t *map = p->map;
 
    for (s = 0; s < lay->count; s++)
@@ -471,6 +471,9 @@ static void video_xr_place_screens(const video_xr_params_t *p,
                0, &pose, (float)w, (float)h);
       }
    }
+   for (i = 0; i < out->num_quads; i++)
+      if (map->no_input & (1u << out->quads[i].screen))
+         out->quads[i].no_input = true;
 }
 
 /* The UI's image: its own size, but no more than VIDEO_XR_MENU_DENSITY
@@ -766,6 +769,8 @@ bool video_xr_quad_to_frame(const video_xr_quad_t *q, float u, float v,
       if ((r = video_views_find(map, q->screen,
                   RETRO_VIDEO_VIEW_EYE_NONE)) < 0)
          return false;
+      if (map->no_input & (1u << q->screen))
+         return false;
       x0 = map->views[r].x;
       y0 = map->views[r].y;
       w  = map->views[r].width;
@@ -873,7 +878,7 @@ bool video_xr_quad_live(const video_xr_quad_t *q, unsigned laser,
 {
    if (laser == VIDEO_XR_LIVE_EDIT)
       return true;
-   if (laser == VIDEO_OPENXR_LASER_OFF)
+   if (laser == VIDEO_OPENXR_LASER_OFF || q->no_input)
       return false;
    switch (q->kind)
    {

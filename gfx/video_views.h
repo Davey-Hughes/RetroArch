@@ -355,7 +355,8 @@ bool video_views_first_drawn(const video_views_layout_t *layout,
 /* Window point to packed-frame pointer coordinates, through @layout,
  * VIDEO_POS_PACK'd into @res_pos. @map and @frame_dims are the core's
  * own. A point on any copy of a screen lands in that screen's EYE_NONE
- * or left-eye rectangle. */
+ * or left-eye rectangle. NO_INPUT screens are not there: with only
+ * those placed, every point is off every view. */
 bool video_views_map_point(const video_views_layout_t *layout,
       const video_views_map_t *map, unsigned frame_dims,
       int x, int y, bool report_oob, uint32_t *res_pos);
@@ -376,6 +377,7 @@ typedef struct video_views_touch
    video_views_rect_t dst[RETRO_VIDEO_VIEWS_MAX];
    struct retro_video_view src[RETRO_VIDEO_VIEWS_MAX];
    unsigned count;
+   unsigned no_input;   /* bit i: entry i takes no input */
    unsigned dims;
    unsigned frame_dims;
    retro_atomic_int_t seq;
@@ -389,8 +391,8 @@ void video_views_touch_publish(video_views_touch_t *t,
       const unsigned *index, unsigned dims, unsigned frame_dims);
 
 /* A touch, -0x7fff to 0x7fff across the display, to the core's pointer
- * in its packed frame, -0x8000 off the views. False, with @res_x and
- * @res_y as they were, when the display shows no views. */
+ * in its packed frame, -0x8000 off the views that take input. False,
+ * with @res_x and @res_y as they were, when the display shows no views. */
 bool video_views_touch_point(video_views_touch_t *t, int x, int y,
       int16_t *res_x, int16_t *res_y);
 
