@@ -18,6 +18,7 @@
  * failure. */
 
 #include <stdio.h>
+#include <stddef.h>
 #include <string.h>
 #include <limits.h>
 #include <math.h>
@@ -1382,6 +1383,26 @@ static void test_ui_helpers(void)
    CHECK(dims == 11 && video_dims == 22);
 }
 
+static void test_screen_api(void)
+{
+   CHECK(RETRO_VIDEO_VIEWS_FLAG_SCREENS == 2);
+   CHECK(RETRO_VIDEO_VIEWS_STATUS_SCREENS == 8 && RETRO_VIDEO_VIEWS_STATUS_IMAGES == 16);
+   CHECK(RETRO_ENVIRONMENT_GET_VIDEO_SCREEN_BUFFER == (107 | RETRO_ENVIRONMENT_EXPERIMENTAL));
+   CHECK(RETRO_VIDEO_SCREEN_SHOW_OVER == 2 && RETRO_VIDEO_SCREEN_STATE_ABSENT == 2);
+   CHECK(RETRO_VIDEO_SCREEN_ANCHOR_DEFAULT == 0 && RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT == 8);
+   CHECK(RETRO_VIDEO_SCREEN_FLAG_NO_INPUT == 1 && RETRO_VIDEO_SCREEN_FLAG_GROUP_VERTICAL == 32);
+   CHECK(RETRO_VIDEO_SCREEN_FLAG_UPRIGHT == 64);
+   CHECK(RETRO_VIDEO_SCREENS_MAX == RETRO_VIDEO_VIEWS_MAX);
+   CHECK(offsetof(struct retro_video_views, screens)
+         > offsetof(struct retro_video_views, recommended_view_height));
+   CHECK(offsetof(struct retro_video_views, num_screens)
+         > offsetof(struct retro_video_views, screens));
+   CHECK(offsetof(struct retro_video_screen, image)
+         > offsetof(struct retro_video_screen, group));
+   CHECK(offsetof(struct retro_video_screen_buffer, pitch)
+         > offsetof(struct retro_video_screen_buffer, data));
+}
+
 int main(void)
 {
    test_screen_defaults();
@@ -1404,6 +1425,7 @@ int main(void)
    test_draw_placements();
    test_targets();
    test_ui_helpers();
+   test_screen_api();
 
    if (failures)
    {
