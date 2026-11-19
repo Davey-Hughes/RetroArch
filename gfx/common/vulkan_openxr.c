@@ -50,7 +50,14 @@ struct vulkan_openxr
    /* The driver shows the headset nothing (HDR output). */
    retro_atomic_int_t hidden;
    VkDevice device;
+   VkPhysicalDevice gpu;
+   uint32_t queue_family;
    slock_t *queue_lock;
+   /* A remade dot's staging, kept until its fence has signalled. */
+   VkBuffer cursor_buffer;
+   VkDeviceMemory cursor_memory;
+   VkCommandPool cursor_pool;
+   VkFence cursor_fence;
    /* A headset's own context: its hooks, and the frame it began. */
    vulkan_openxr_platform_t platform;
    openxr_frame_begun_t begun;
@@ -524,7 +531,9 @@ static bool vulkan_openxr_create_session(vulkan_openxr_t *xr,
    binding.queueIndex       = 0;
    if (!openxr_session_create(&xr->session, &binding))
       return false;
-   xr->device = device;
+   xr->device       = device;
+   xr->gpu          = gpu;
+   xr->queue_family = queue_family;
    openxr_swapchains_list_formats(&xr->sc);
    openxr_frame_session_created(&xr->frame);
    openxr_host_session_created(&xr->host);
@@ -566,6 +575,8 @@ struct vulkan_openxr_dot
    VkDevice device;
    uint32_t queue_family;
    VkImage images[OPENXR_MAX_IMAGES][2];
+   video_views_names_t names;
+   bool park;                     /* keep the staging, not wait */
 };
 
 /* The dot's image from a staging buffer, on the session's queue. */
@@ -633,7 +644,7 @@ static bool vulkan_openxr_cursor_fill(void *user, uint32_t index,
       goto end;
    }
    openxr_frame_cursor_pixels((uint8_t*)map,
-         openxr_frame_cursor_w(&dot->xr->frame), false);
+         openxr_frame_cursor_w(&dot->xr->frame), false, &dot->names);
    vkUnmapMemory(device, memory);
 
    pi.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -720,11 +731,20 @@ static bool vulkan_openxr_cursor_fill(void *user, uint32_t index,
    vk_res = vkQueueSubmit(queue, 1, &si, fence);
    slock_unlock(dot->xr->queue_lock);
    if (     vk_res != VK_SUCCESS
-         || vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX)
-         != VK_SUCCESS)
+         || (  !dot->park
+            && vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX)
+            != VK_SUCCESS))
    {
       failed = "submit";
       goto end;
+   }
+   if (dot->park)
+   {
+      dot->xr->cursor_buffer = buffer;
+      dot->xr->cursor_memory = memory;
+      dot->xr->cursor_pool   = pool;
+      dot->xr->cursor_fence  = fence;
+      return true;
    }
 
 end:
@@ -743,41 +763,99 @@ end:
    return false;
 }
 
-/* The laser's dot. A failure leaves none and changes nothing else. */
-static void vulkan_openxr_cursor_create(vulkan_openxr_t *xr,
-      VkPhysicalDevice gpu, VkDevice device, uint32_t queue_family)
+/* A remade dot's staging goes once its copy is done; false while it
+ * is not, unless wait, which only a stop may. */
+static bool vulkan_openxr_cursor_unpark(vulkan_openxr_t *xr, bool wait)
+{
+   if (xr->cursor_fence)
+   {
+      if (vkGetFenceStatus(xr->device, xr->cursor_fence) != VK_SUCCESS)
+      {
+         if (!wait)
+            return false;
+         vkWaitForFences(xr->device, 1, &xr->cursor_fence, VK_TRUE,
+               UINT64_MAX);
+      }
+      vkDestroyFence(xr->device, xr->cursor_fence, NULL);
+      xr->cursor_fence = VK_NULL_HANDLE;
+   }
+   if (xr->cursor_pool)
+   {
+      vkDestroyCommandPool(xr->device, xr->cursor_pool, NULL);
+      xr->cursor_pool = VK_NULL_HANDLE;
+   }
+   if (xr->cursor_memory)
+   {
+      vkFreeMemory(xr->device, xr->cursor_memory, NULL);
+      xr->cursor_memory = VK_NULL_HANDLE;
+   }
+   if (xr->cursor_buffer)
+   {
+      vkDestroyBuffer(xr->device, xr->cursor_buffer, NULL);
+      xr->cursor_buffer = VK_NULL_HANDLE;
+   }
+   return true;
+}
+
+/* The laser's dot with the screen names now. The session's waits for
+ * its copy; a remake, on the frame loop's thread, parks its staging
+ * instead and logs nothing. A new dot replaces the old; a failure
+ * keeps it. */
+static void vulkan_openxr_cursor_create(vulkan_openxr_t *xr, bool remake)
 {
    static const int64_t formats[4] = {
       VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_B8G8R8A8_SRGB,
       VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM };
    struct vulkan_openxr_images li;
    struct vulkan_openxr_dot dot;
+   XrSwapchain made;
    const char *step = NULL;
    int code         = 0;
 
    dot.xr           = xr;
-   dot.gpu          = gpu;
-   dot.device       = device;
-   dot.queue_family = queue_family;
+   dot.gpu          = xr->gpu;
+   dot.device       = xr->device;
+   dot.queue_family = xr->queue_family;
+   dot.park         = remake;
    li.xr            = xr;
    li.images        = dot.images;
-   xr->frame.cursor = openxr_swapchains_create_filled(&xr->sc, formats, 4,
+   xr->frame.names_baked = video_driver_get_screen_names(&dot.names);
+   made = openxr_swapchains_create_filled(&xr->sc, formats, 4,
          VIDEO_SCALE_PACK(openxr_frame_cursor_w(&xr->frame),
             VIDEO_XR_CURSOR_H),
          vulkan_openxr_list_images, &li, vulkan_openxr_cursor_fill, &dot,
          &step, &code);
-   if (xr->frame.cursor && xr->frame.rt->max_width)
+   if (made && xr->frame.cursor)
+   {
+      slock_lock(xr->queue_lock);
+      xr->sc.DestroySwapchain(xr->frame.cursor);
+      slock_unlock(xr->queue_lock);
+   }
+   if (made)
+      xr->frame.cursor = made;
+   if (remake)
+      return;
+   if (made && xr->frame.rt->max_width)
       RARCH_LOG("[OpenXR] Laser cursor ready: %u wide, with %s (the "
             "headset's widest %u).\n", openxr_frame_cursor_w(&xr->frame),
             openxr_frame_cursor_parts(&xr->frame),
             xr->frame.rt->max_width);
-   else if (xr->frame.cursor)
+   else if (made)
       RARCH_LOG("[OpenXR] Laser cursor ready: %u wide, with %s (the "
             "headset does not say its widest).\n",
             openxr_frame_cursor_w(&xr->frame),
             openxr_frame_cursor_parts(&xr->frame));
    else
       RARCH_WARN("[OpenXR] No laser cursor (%s, %d).\n", step, code);
+}
+
+/* The frame loop's: never waits for the last remake's copy. While it
+ * runs the names stay unbaked, for the next frame to try again. */
+static void vulkan_openxr_cursor_remake(void *user)
+{
+   vulkan_openxr_t *xr = (vulkan_openxr_t*)user;
+   if (vulkan_openxr_cursor_unpark(xr, false))
+      vulkan_openxr_cursor_create(xr, true);
 }
 
 bool vulkan_openxr_start(vulkan_openxr_t *xr, VkInstance instance,
@@ -801,8 +879,10 @@ bool vulkan_openxr_start(vulkan_openxr_t *xr, VkInstance instance,
    }
    /* Also marks the session started for vulkan_openxr_stop's keep. */
    xr->queue_lock = queue_lock;
+   xr->frame.cursor_remake = vulkan_openxr_cursor_remake;
+   xr->frame.cursor_user   = xr;
    if (!xr->frame.cursor)
-      vulkan_openxr_cursor_create(xr, gpu, device, queue_family);
+      vulkan_openxr_cursor_create(xr, false);
    if (xr->inline_host ? !openxr_frame_start_inline(&xr->frame)
                        : !openxr_frame_start(&xr->frame))
       return false;
@@ -852,6 +932,8 @@ void vulkan_openxr_stop(vulkan_openxr_t *xr)
    /* A kept session outlives the driver's views of its images. */
    for (s = 0; s < OPENXR_MAX_SLOTS; s++)
       vulkan_openxr_slot_destroy(xr, s);
+   /* The dot goes after a remake's copy into it. */
+   vulkan_openxr_cursor_unpark(xr, true);
    if (xr->frame.cursor)
    {
       slock_lock(xr->queue_lock);

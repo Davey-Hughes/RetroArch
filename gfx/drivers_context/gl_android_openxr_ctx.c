@@ -379,6 +379,7 @@ struct gl_xr_dot
 {
    uint32_t tex[OPENXR_MAX_IMAGES][2];
    unsigned w;
+   video_views_names_t names;
 };
 
 /* The dot's image, with the video context current. */
@@ -394,7 +395,7 @@ static bool gl_xr_cursor_fill(void *user, uint32_t index,
       *code = 0;
       return false;
    }
-   openxr_frame_cursor_pixels(px, dot->w, true);
+   openxr_frame_cursor_pixels(px, dot->w, true, &dot->names);
    glBindTexture(GL_TEXTURE_2D, (GLuint)dot->tex[index][0]);
    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, dot->w, VIDEO_XR_CURSOR_H,
          GL_RGBA, GL_UNSIGNED_BYTE, px);
@@ -405,34 +406,49 @@ static bool gl_xr_cursor_fill(void *user, uint32_t index,
    return true;
 }
 
-/* The laser's dot, as Vulkan's; none if the runtime will not make it. */
-static void gl_xr_cursor_create(gl_android_openxr_t *xr)
+/* The laser's dot, as Vulkan's, with the screen names now: at the
+ * session's start, and again as the frame loop's remake, which logs
+ * nothing. A new dot replaces the old; a failed remake keeps it. */
+static void gl_xr_cursor_create(gl_android_openxr_t *xr, bool remake)
 {
    static const int64_t formats[2] = {
       OPENXR_GLES_SRGB8_ALPHA8, OPENXR_GLES_RGBA8 };
    struct gl_xr_dot dot;
    openxr_gles_images_t li;
+   XrSwapchain made;
    const char *step = NULL;
    int code         = 0;
 
    dot.w            = openxr_frame_cursor_w(&xr->frame);
    li.sc            = &xr->sc;
    li.tex           = dot.tex;
-   xr->frame.cursor = openxr_swapchains_create_filled(&xr->sc, formats, 2,
+   xr->frame.names_baked = video_driver_get_screen_names(&dot.names);
+   made = openxr_swapchains_create_filled(&xr->sc, formats, 2,
          VIDEO_SCALE_PACK(dot.w, VIDEO_XR_CURSOR_H),
          openxr_binding_gles_images, &li, gl_xr_cursor_fill, &dot,
          &step, &code);
-   if (xr->frame.cursor && xr->frame.rt->max_width)
+   if (made && xr->frame.cursor)
+      xr->sc.DestroySwapchain(xr->frame.cursor);
+   if (made)
+      xr->frame.cursor = made;
+   if (remake)
+      return;
+   if (made && xr->frame.rt->max_width)
       RARCH_LOG("[XR] Laser cursor ready: %u wide, with %s (the "
             "headset's widest %u).\n", dot.w,
             openxr_frame_cursor_parts(&xr->frame),
             xr->frame.rt->max_width);
-   else if (xr->frame.cursor)
+   else if (made)
       RARCH_LOG("[XR] Laser cursor ready: %u wide, with %s (the "
             "headset does not say its widest).\n", dot.w,
             openxr_frame_cursor_parts(&xr->frame));
    else
       RARCH_WARN("[XR] No laser cursor (%s, %d).\n", step, code);
+}
+
+static void gl_xr_cursor_remake(void *user)
+{
+   gl_xr_cursor_create((gl_android_openxr_t*)user, true);
 }
 
 static bool gl_xr_start(gl_android_openxr_t *xr)
@@ -492,7 +508,9 @@ static bool gl_xr_start(gl_android_openxr_t *xr)
    openxr_host_session_created(&xr->host);
 
    openxr_frame_input_attach(&xr->frame);
-   gl_xr_cursor_create(xr);
+   xr->frame.cursor_remake = gl_xr_cursor_remake;
+   xr->frame.cursor_user   = xr;
+   gl_xr_cursor_create(xr, false);
    return openxr_frame_start_inline(&xr->frame);
 }
 

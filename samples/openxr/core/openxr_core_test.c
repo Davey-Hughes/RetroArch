@@ -729,6 +729,16 @@ XRAPI_ATTR XrResult XRAPI_CALL xrGetInstanceProcAddr(XrInstance i,
 #endif
 #include "../../../gfx/common/vulkan_openxr.c"
 
+/* The core's screen names, as video_driver.c gives them any thread. */
+static video_views_names_t t_names;
+static int t_names_stamp;
+int video_driver_get_screen_names(video_views_names_t *out)
+{
+   *out = t_names;
+   return t_names_stamp;
+}
+int video_driver_screen_names_stamp(void) { return t_names_stamp; }
+
 /* The input's hands: where and when the host had them located. */
 static XrSpace t_hands_in;
 static XrTime  t_hands_at;
@@ -832,13 +842,13 @@ static void test_cursor_tags(void)
    video_xr_cut_pixels(plain, false);
    t_font_drv = NULL;
    t_notified = 0;
-   openxr_frame_cursor_pixels(px, VIDEO_XR_CURSOR_W, false);
+   openxr_frame_cursor_pixels(px, VIDEO_XR_CURSOR_W, false, NULL);
    CHECK(!memcmp(px, plain, sizeof(px)) && !t_notified,
          "no font: the image changed, or a string was asked for");
    t_font_make();
    t_font_drv = &t_font;
-   openxr_frame_cursor_pixels(px, VIDEO_XR_CURSOR_W, false);
-   openxr_frame_cursor_pixels(up, VIDEO_XR_CURSOR_W, true);
+   openxr_frame_cursor_pixels(px, VIDEO_XR_CURSOR_W, false, NULL);
+   openxr_frame_cursor_pixels(up, VIDEO_XR_CURSOR_W, true, NULL);
    t_font_drv = NULL;
    for (k = 0; k < VIDEO_XR_TAGS; k++)
       for (y = 0; y < VIDEO_XR_TAG_ROWS; y++)
@@ -902,13 +912,13 @@ static void test_cursor_narrow(void)
          "untagged: %u wide", VIDEO_XR_CURSOR_UNTAGGED_W);
    t_font_make();
    t_font_drv = &t_font;
-   openxr_frame_cursor_pixels(plain, VIDEO_XR_CURSOR_W, false);
+   openxr_frame_cursor_pixels(plain, VIDEO_XR_CURSOR_W, false, NULL);
    for (k = 0; k < 2; k++)
    {
       unsigned w    = k ? VIDEO_XR_CURSOR_UNTAGGED_W : VIDEO_XR_CURSOR_TAGGED_W;
       unsigned same = 1;
       t_font_made   = 0;
-      openxr_frame_cursor_pixels(px, w, false);
+      openxr_frame_cursor_pixels(px, w, false, NULL);
       for (y = 0; y < VIDEO_XR_CURSOR_H; y++)
          same &= !memcmp(px + (size_t)y * w * 4,
                plain + (size_t)y * VIDEO_XR_CURSOR_W * 4, (size_t)w * 4);
@@ -952,7 +962,7 @@ static void test_cursor_tag_lines(void)
    t_font_asc              = 18.0f / 16.0f;
    t_font_dsc              = 5.0f / 16.0f;
    t_font_drv              = &t_font;
-   openxr_frame_cursor_pixels(px, VIDEO_XR_CURSOR_W, false);
+   openxr_frame_cursor_pixels(px, VIDEO_XR_CURSOR_W, false, NULL);
    CHECK(     t_font_num_drawn == n
          && !memcmp(t_font_drawn, want, n * sizeof(*want)),
          "the tags drew %u glyphs, not Lg S1 .. S8 Mer", t_font_num_drawn);
@@ -969,7 +979,7 @@ static void test_cursor_tag_lines(void)
    t_font.get_line_metrics = t_font_get_metrics;
    t_font_asc              = 1.25f;
    t_font_dsc              = 0.5f;
-   openxr_frame_cursor_pixels(px, VIDEO_XR_CURSOR_W, false);
+   openxr_frame_cursor_pixels(px, VIDEO_XR_CURSOR_W, false, NULL);
    t_font_drv = NULL;
    CHECK(     t_font_made == 2 && t_font_sizes[0] == VIDEO_XR_TAG_FONT
          && t_font_sizes[1] == VIDEO_XR_TAG_FONT
@@ -978,6 +988,60 @@ static void test_cursor_tag_lines(void)
          && t_tag_light(px, 0) == 6 * 10 + 6 * 14,
          "a tall line: %u fonts made, sizes %u then %u, %u laser texels",
          t_font_made, t_font_sizes[0], t_font_sizes[1], t_tag_light(px, 0));
+}
+
+/* A screen's tag shows its name, or its number where it has none: Lg
+ * S1 VMU A1 S3 .. S8 Mer for names "" and "VMU A1". No names, or none
+ * given, are the numbered image. A name as long as a copy keeps, wider
+ * than its cell, lights nothing outside it. */
+static void test_cursor_tag_names(void)
+{
+   static uint8_t px[VIDEO_XR_CURSOR_W * VIDEO_XR_CURSOR_H * 4];
+   static uint8_t plain[VIDEO_XR_CURSOR_W * VIDEO_XR_CURSOR_H * 4];
+   static const char *words[VIDEO_XR_TAGS - 1] = { "Lg", "S1", "VMU A1",
+      "S3", "S4", "S5", "S6", "S7", "S8" };
+   video_views_names_t names;
+   uint32_t want[64];
+   unsigned k, x, y, n = 0, outside = 0;
+   for (k = 0; k < VIDEO_XR_TAGS - 1; k++)
+   {
+      const char *w = words[k];
+      while (*w)
+         want[n++] = (uint32_t)(unsigned char)*w++;
+   }
+   want[n++] = 'M';
+   want[n++] = 0x440;
+   memset(&names, 0, sizeof(names));
+   t_font_make();
+   t_font_drv = &t_font;
+   openxr_frame_cursor_pixels(plain, VIDEO_XR_CURSOR_W, false, NULL);
+   openxr_frame_cursor_pixels(px, VIDEO_XR_CURSOR_W, false, &names);
+   CHECK(!memcmp(px, plain, sizeof(px)), "no names are not the numbers");
+
+   strlcpy(names.name[1], "VMU A1", sizeof(names.name[1]));
+   t_font_num_drawn = 0;
+   openxr_frame_cursor_pixels(px, VIDEO_XR_CURSOR_W, false, &names);
+   CHECK(     t_font_num_drawn == n
+         && !memcmp(t_font_drawn, want, n * sizeof(*want)),
+         "the tags drew %u glyphs, not Lg S1 VMU A1 S3 .. S8 Mer",
+         t_font_num_drawn);
+
+   memset(names.name[1], 'W', sizeof(names.name[1]) - 1);
+   names.name[1][sizeof(names.name[1]) - 1] = '\0';
+   openxr_frame_cursor_pixels(px, VIDEO_XR_CURSOR_W, false, &names);
+   t_font_drv = NULL;
+   for (y = 0; y < VIDEO_XR_CURSOR_H; y++)
+      for (x = 0; x < VIDEO_XR_CURSOR_W; x++)
+         if (     (   x < VIDEO_XR_TAG_X(2)
+                   || x >= VIDEO_XR_TAG_X(2) + VIDEO_XR_TAG_COLS
+                   || y < VIDEO_XR_TAG_Y
+                   || y >= VIDEO_XR_TAG_Y + VIDEO_XR_TAG_ROWS)
+               && memcmp(px + ((size_t)y * VIDEO_XR_CURSOR_W + x) * 4,
+                  plain + ((size_t)y * VIDEO_XR_CURSOR_W + x) * 4, 4))
+            outside++;
+   CHECK(!outside && t_tag_light(px, 2) > t_tag_light(plain, 2),
+         "a 31-byte name: %u texels outside its cell, %u light in it",
+         outside, t_tag_light(px, 2));
 }
 
 /* The input's hooks, stood in for. */
@@ -4499,6 +4563,7 @@ T_VK(vkDestroyCommandPool) T_VK(vkAllocateCommandBuffers)
 T_VK(vkBeginCommandBuffer) T_VK(vkEndCommandBuffer)
 T_VK(vkCmdPipelineBarrier) T_VK(vkCmdCopyBufferToImage) T_VK(vkQueueSubmit)
 T_VK(vkCreateFence) T_VK(vkDestroyFence) T_VK(vkWaitForFences)
+T_VK(vkGetFenceStatus)
 
 /* Any call here is a dot being filled: it fails at the first buffer. */
 static unsigned t_vk_calls;
@@ -4827,6 +4892,340 @@ done:
    t_views_tracked = false;
    t_head_tracked  = false;
    openxr_frame_set_input_hooks(NULL);
+   vulkan_openxr_set_platform(NULL);
+   slock_free(lock);
+}
+
+/* The frame loop's own check, at a frame's start before its wait: in
+ * edit mode, the only place the tags show, a dot whose names are older
+ * than the stamp is made again, then not until the stamp moves and a
+ * second has passed; outside edit mode, with a dot without tags, or no
+ * dot, never. The counting remake bakes the stamp, as the hosts' do. */
+static unsigned t_remakes, t_remake_waits;
+static bool t_remake_late;
+static void t_cursor_remake(void *user)
+{
+   openxr_frame_t *f = (openxr_frame_t*)user;
+   t_remakes++;
+   t_remake_waits = t_waits;
+   f->names_baked = video_driver_screen_names_stamp();
+}
+
+/* n in-line frames; t_remake_late once one remade after its wait */
+static void t_cursor_frames(openxr_frame_t *f, unsigned n)
+{
+   openxr_frame_begun_t b;
+   while (n--)
+   {
+      unsigned remakes = t_remakes;
+      unsigned waits   = t_waits;
+      openxr_frame_begin(f, &b);
+      if (t_remakes != remakes && t_remake_waits != waits)
+         t_remake_late = true;
+      openxr_frame_end(f, &b);
+   }
+}
+
+static void test_cursor_remake_once(void)
+{
+   openxr_runtime_t rt;
+   openxr_session_t s;
+   openxr_swapchains_t sc;
+   openxr_frame_t f;
+   openxr_grabs_t g;
+   retro_time_t at;
+
+   t_frame_fresh(&rt, &s, &sc, &f);
+   rt.max_width    = VIDEO_XR_CURSOR_W;
+   f.cursor        = (XrSwapchain)(uintptr_t)0x777;
+   f.cursor_remake = t_cursor_remake;
+   f.cursor_user   = &f;
+   t_remakes       = 0;
+   t_remake_late   = false;
+   t_names_stamp   = 2;
+   openxr_frame_start_inline(&f);
+   t_push_state(T_SESSION, XR_SESSION_STATE_READY);
+   t_cursor_frames(&f, 3);
+   CHECK(!t_remakes && !f.names_baked,
+         "out of edit mode, stamp 2, 3 frames: %u remakes, baked %d",
+         t_remakes, f.names_baked);
+
+   memset(&g, 0, sizeof(g));
+   g.editing = true;
+   openxr_frame_publish_grabs(&f, &g);
+   at = cpu_features_get_time_usec();
+   t_cursor_frames(&f, 3);
+   CHECK(     t_remakes == 1 && !t_remake_late && f.names_baked == 2
+         && f.cursor_retry_usec >= at + 1000000,
+         "edit mode, stamp 2, 3 frames: %u remakes, after the wait %d, "
+         "baked %d, the next held %lld us", t_remakes, (int)t_remake_late,
+         f.names_baked, (long long)(f.cursor_retry_usec - at));
+
+   /* Names that move again within the second wait it out. */
+   t_names_stamp = 4;
+   t_cursor_frames(&f, 3);
+   CHECK(t_remakes == 1 && f.names_baked == 2,
+         "stamp 4 within the second: %u remakes in all, baked %d",
+         t_remakes, f.names_baked);
+   f.cursor_retry_usec = 0;
+   t_cursor_frames(&f, 3);
+   CHECK(t_remakes == 2 && !t_remake_late && f.names_baked == 4,
+         "stamp 4 a second on: %u remakes in all, after the wait %d, "
+         "baked %d", t_remakes, (int)t_remake_late, f.names_baked);
+
+   /* Out of edit mode, however long since the last. */
+   g.editing = false;
+   openxr_frame_publish_grabs(&f, &g);
+   t_cursor_frames(&f, 1);
+   t_names_stamp       = 6;
+   f.cursor_retry_usec = 0;
+   t_cursor_frames(&f, 3);
+   CHECK(t_remakes == 2 && f.names_baked == 4,
+         "out of edit mode, stamp 6: %u remakes in all, baked %d",
+         t_remakes, f.names_baked);
+
+   rt.max_width = VIDEO_XR_CURSOR_TAGGED_W - 1;
+   g.editing    = true;
+   openxr_frame_publish_grabs(&f, &g);
+   t_cursor_frames(&f, 2);
+   rt.max_width = VIDEO_XR_CURSOR_W;
+   f.cursor     = XR_NULL_HANDLE;
+   t_cursor_frames(&f, 1);
+   CHECK(t_remakes == 2, "%u remakes in all without tags or a dot",
+         t_remakes);
+
+   openxr_frame_stop_inline(&f);
+   t_frame_free(&rt, &s, &f);
+   t_names_stamp = 0;
+}
+
+/* A dot filled all the way: every call succeeds, the staging maps to
+ * t_vk_mem and the fences answer t_vk_fence. The buffers, memory,
+ * pools and fences made are live until they go. */
+static uint8_t  t_vk_mem[VIDEO_XR_CURSOR_W * VIDEO_XR_CURSOR_H * 4];
+static VkResult t_vk_fence = VK_SUCCESS;
+static unsigned t_vk_waits, t_vk_live;
+static VkResult VKAPI_PTR t_vk_buffer(VkDevice d,
+      const VkBufferCreateInfo *i, const VkAllocationCallbacks *a,
+      VkBuffer *out)
+{ *out = (VkBuffer)(uintptr_t)0x1001; t_vk_live++; return VK_SUCCESS; }
+static void VKAPI_PTR t_vk_buffer_gone(VkDevice d, VkBuffer o,
+      const VkAllocationCallbacks *a) { t_vk_live--; }
+static void VKAPI_PTR t_vk_buffer_req(VkDevice d, VkBuffer o,
+      VkMemoryRequirements *req)
+{
+   req->size           = (VkDeviceSize)sizeof(t_vk_mem);
+   req->alignment      = 4;
+   req->memoryTypeBits = 1;
+}
+static void VKAPI_PTR t_vk_mem_props(VkPhysicalDevice g,
+      VkPhysicalDeviceMemoryProperties *p)
+{
+   memset(p, 0, sizeof(*p));
+   p->memoryTypeCount              = 1;
+   p->memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+      | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+}
+static VkResult VKAPI_PTR t_vk_alloc(VkDevice d,
+      const VkMemoryAllocateInfo *i, const VkAllocationCallbacks *a,
+      VkDeviceMemory *out)
+{ *out = (VkDeviceMemory)(uintptr_t)0x1002; t_vk_live++; return VK_SUCCESS; }
+static void VKAPI_PTR t_vk_free(VkDevice d, VkDeviceMemory o,
+      const VkAllocationCallbacks *a) { t_vk_live--; }
+static VkResult VKAPI_PTR t_vk_bind(VkDevice d, VkBuffer o,
+      VkDeviceMemory m, VkDeviceSize at) { return VK_SUCCESS; }
+static VkResult VKAPI_PTR t_vk_map(VkDevice d, VkDeviceMemory o,
+      VkDeviceSize at, VkDeviceSize n, VkMemoryMapFlags fl, void **out)
+{ *out = t_vk_mem; return VK_SUCCESS; }
+static void VKAPI_PTR t_vk_unmap(VkDevice d, VkDeviceMemory o) { }
+static VkResult VKAPI_PTR t_vk_pool(VkDevice d,
+      const VkCommandPoolCreateInfo *i, const VkAllocationCallbacks *a,
+      VkCommandPool *out)
+{ *out = (VkCommandPool)(uintptr_t)0x1003; t_vk_live++; return VK_SUCCESS; }
+static void VKAPI_PTR t_vk_pool_gone(VkDevice d, VkCommandPool o,
+      const VkAllocationCallbacks *a) { t_vk_live--; }
+static VkResult VKAPI_PTR t_vk_cmds(VkDevice d,
+      const VkCommandBufferAllocateInfo *i, VkCommandBuffer *out)
+{ *out = (VkCommandBuffer)(uintptr_t)0x1004; return VK_SUCCESS; }
+static VkResult VKAPI_PTR t_vk_begin(VkCommandBuffer c,
+      const VkCommandBufferBeginInfo *i) { return VK_SUCCESS; }
+static VkResult VKAPI_PTR t_vk_end(VkCommandBuffer c) { return VK_SUCCESS; }
+static void VKAPI_PTR t_vk_barrier(VkCommandBuffer c,
+      VkPipelineStageFlags from, VkPipelineStageFlags to,
+      VkDependencyFlags fl, uint32_t nm, const VkMemoryBarrier *m,
+      uint32_t nb, const VkBufferMemoryBarrier *bm, uint32_t ni,
+      const VkImageMemoryBarrier *im) { }
+static void VKAPI_PTR t_vk_copy(VkCommandBuffer c, VkBuffer o, VkImage im,
+      VkImageLayout l, uint32_t n, const VkBufferImageCopy *r) { }
+static VkResult VKAPI_PTR t_vk_submit(VkQueue q, uint32_t n,
+      const VkSubmitInfo *si, VkFence fe) { return VK_SUCCESS; }
+static VkResult VKAPI_PTR t_vk_fence_make(VkDevice d,
+      const VkFenceCreateInfo *i, const VkAllocationCallbacks *a,
+      VkFence *out)
+{ *out = (VkFence)(uintptr_t)0x1005; t_vk_live++; return VK_SUCCESS; }
+static void VKAPI_PTR t_vk_fence_gone(VkDevice d, VkFence o,
+      const VkAllocationCallbacks *a) { t_vk_live--; }
+static VkResult VKAPI_PTR t_vk_wait(VkDevice d, uint32_t n,
+      const VkFence *fe, VkBool32 all, uint64_t timeout)
+{ t_vk_waits++; return VK_SUCCESS; }
+static VkResult VKAPI_PTR t_vk_status(VkDevice d, VkFence fe)
+{ return t_vk_fence; }
+
+/* New names remake the dot at a frame's start: a new swapchain, then
+ * the old one goes, and nothing waits for the copy. Its staging is
+ * kept until its fence has signalled; a remake before then makes
+ * nothing and leaves the names unbaked, for the next frame to try
+ * again. The session's first dot waits for its copy, and so may the
+ * stop, which is no frame. */
+static void test_vulkan_cursor_remake_no_wait(void)
+{
+   static const uint32_t vmu[6] = { 'V', 'M', 'U', ' ', 'A', '1' };
+   vulkan_openxr_platform_t platform;
+   XrLoaderInitInfoBaseHeaderKHR loader;
+   vulkan_openxr_t *xr;
+   XrSwapchain old;
+   openxr_grabs_t g;
+   unsigned made, destroyed, waits;
+   VkInstance vk_inst   = (VkInstance)(uintptr_t)0x50;
+   VkPhysicalDevice gpu = (VkPhysicalDevice)(uintptr_t)0x58;
+   VkDevice dev         = (VkDevice)(uintptr_t)0x60;
+   slock_t *lock        = slock_new();
+
+   memset(&loader, 0, sizeof(loader));
+   loader.type = XR_TYPE_LOADER_INIT_INFO_ANDROID_KHR;
+   memset(&platform, 0, sizeof(platform));
+   platform.runtime.loader = &loader;
+   t_runtime_defaults();
+   t_sc_wait = XR_SUCCESS;
+   vulkan_symbol_wrapper_vkGetDeviceQueue     = t_vkGetDeviceQueue;
+   vulkan_symbol_wrapper_vkCreateBuffer       = t_vk_buffer;
+   vulkan_symbol_wrapper_vkDestroyBuffer      = t_vk_buffer_gone;
+   vulkan_symbol_wrapper_vkGetBufferMemoryRequirements = t_vk_buffer_req;
+   vulkan_symbol_wrapper_vkGetPhysicalDeviceMemoryProperties =
+      t_vk_mem_props;
+   vulkan_symbol_wrapper_vkAllocateMemory     = t_vk_alloc;
+   vulkan_symbol_wrapper_vkFreeMemory         = t_vk_free;
+   vulkan_symbol_wrapper_vkBindBufferMemory   = t_vk_bind;
+   vulkan_symbol_wrapper_vkMapMemory          = t_vk_map;
+   vulkan_symbol_wrapper_vkUnmapMemory        = t_vk_unmap;
+   vulkan_symbol_wrapper_vkCreateCommandPool  = t_vk_pool;
+   vulkan_symbol_wrapper_vkDestroyCommandPool = t_vk_pool_gone;
+   vulkan_symbol_wrapper_vkAllocateCommandBuffers = t_vk_cmds;
+   vulkan_symbol_wrapper_vkBeginCommandBuffer = t_vk_begin;
+   vulkan_symbol_wrapper_vkEndCommandBuffer   = t_vk_end;
+   vulkan_symbol_wrapper_vkCmdPipelineBarrier = t_vk_barrier;
+   vulkan_symbol_wrapper_vkCmdCopyBufferToImage = t_vk_copy;
+   vulkan_symbol_wrapper_vkQueueSubmit        = t_vk_submit;
+   vulkan_symbol_wrapper_vkCreateFence        = t_vk_fence_make;
+   vulkan_symbol_wrapper_vkDestroyFence       = t_vk_fence_gone;
+   vulkan_symbol_wrapper_vkWaitForFences      = t_vk_wait;
+   vulkan_symbol_wrapper_vkGetFenceStatus     = t_vk_status;
+   t_vk_fence = VK_SUCCESS;
+   t_vk_waits = t_vk_live = 0;
+   memset(&t_names, 0, sizeof(t_names));
+   t_names_stamp = 2;
+   t_reset_log();
+
+   vulkan_openxr_set_platform(&platform);
+   xr = vulkan_openxr_new(false, VK_API_VERSION_1_1);
+   CHECK(xr && vulkan_openxr_start(xr, vk_inst, gpu, dev, 0, lock),
+         "a remaking host did not start");
+   if (!xr)
+      goto done;
+   CHECK(     openxr_frame_cursor(&xr->frame) && t_vk_waits == 1
+         && !t_vk_live && xr->frame.names_baked == 2,
+         "the session's dot: %u waits, %u objects left, baked %d",
+         t_vk_waits, t_vk_live, xr->frame.names_baked);
+   CHECK(LOGGED("[OpenXR] Laser cursor ready: "), "log: %s", t_log);
+
+   /* Edit mode, which a frame reads. */
+   memset(&g, 0, sizeof(g));
+   g.editing = true;
+   openxr_frame_publish_grabs(&xr->frame, &g);
+   t_push_shown();
+   vulkan_openxr_begin_frame(xr);
+   vulkan_openxr_end_frame(xr, 1);
+
+   /* A failed remake keeps the dot and, like every remake on the frame
+    * loop's thread, logs nothing. */
+   vulkan_symbol_wrapper_vkCreateBuffer = t_vkCreateBuffer;
+   t_names_stamp = 3;
+   old           = openxr_frame_cursor(&xr->frame);
+   t_reset_log();
+   vulkan_openxr_begin_frame(xr);
+   vulkan_openxr_end_frame(xr, 1);
+   vulkan_symbol_wrapper_vkCreateBuffer = t_vk_buffer;
+   CHECK(     openxr_frame_cursor(&xr->frame) == old && !t_vk_live
+         && xr->frame.names_baked == 3 && !t_log[0],
+         "a failed remake: %u objects kept, baked %d, log: %s", t_vk_live,
+         xr->frame.names_baked, t_log);
+   xr->frame.cursor_retry_usec = 0;
+
+   strlcpy(t_names.name[1], "VMU A1", sizeof(t_names.name[1]));
+   t_names_stamp = 4;
+   old           = openxr_frame_cursor(&xr->frame);
+   made          = t_sc_made;
+   destroyed     = t_sc_destroyed;
+   waits         = t_vk_waits;
+   t_font_make();
+   t_font_drv    = &t_font;
+   t_reset_log();
+   vulkan_openxr_begin_frame(xr);
+   vulkan_openxr_end_frame(xr, 1);
+   t_font_drv    = NULL;
+   CHECK(     t_sc_made == made + 1 && t_sc_destroyed == destroyed + 1
+         && openxr_frame_cursor(&xr->frame) != old
+         && t_vk_waits == waits && t_vk_live == 4
+         && xr->frame.names_baked == 4,
+         "the remake: %u made, %u destroyed, %u waits, %u objects kept, "
+         "baked %d", t_sc_made - made, t_sc_destroyed - destroyed,
+         t_vk_waits - waits, t_vk_live, xr->frame.names_baked);
+   CHECK(     t_font_num_drawn > 10
+         && !memcmp(t_font_drawn + 4, vmu, sizeof(vmu)),
+         "the remade dot's second screen is not VMU A1");
+   CHECK(!t_log[0], "the remake logged: %s", t_log);
+
+   /* Each remake below a second on from the last. */
+   t_vk_fence    = VK_NOT_READY;
+   t_names_stamp = 6;
+   xr->frame.cursor_retry_usec = 0;
+   old           = openxr_frame_cursor(&xr->frame);
+   made          = t_sc_made;
+   destroyed     = t_sc_destroyed;
+   vulkan_openxr_begin_frame(xr);
+   vulkan_openxr_end_frame(xr, 1);
+   CHECK(     t_sc_made == made && t_sc_destroyed == destroyed
+         && openxr_frame_cursor(&xr->frame) == old
+         && t_vk_waits == waits && t_vk_live == 4
+         && xr->frame.names_baked == 4,
+         "a remake while the copy runs: %u made, %u destroyed, %u waits, "
+         "%u objects kept, baked %d", t_sc_made - made,
+         t_sc_destroyed - destroyed, t_vk_waits - waits, t_vk_live,
+         xr->frame.names_baked);
+
+   t_vk_fence = VK_SUCCESS;
+   xr->frame.cursor_retry_usec = 0;
+   vulkan_openxr_begin_frame(xr);
+   vulkan_openxr_end_frame(xr, 1);
+   CHECK(     t_sc_made == made + 1 && t_sc_destroyed == destroyed + 1
+         && t_vk_waits == waits && t_vk_live == 4
+         && xr->frame.names_baked == 6,
+         "the copy done: %u made, %u destroyed, %u waits, %u objects "
+         "kept, baked %d", t_sc_made - made, t_sc_destroyed - destroyed,
+         t_vk_waits - waits, t_vk_live, xr->frame.names_baked);
+
+   t_vk_fence = VK_NOT_READY;
+   vulkan_openxr_stop(xr);
+   CHECK(!t_vk_live && t_vk_waits == waits + 1,
+         "the stop: %u objects left, %u waits", t_vk_live,
+         t_vk_waits - waits);
+   vulkan_openxr_free(xr);
+
+done:
+   t_vk_fence    = VK_SUCCESS;
+   t_names_stamp = 0;
+   memset(&t_names, 0, sizeof(t_names));
+   vulkan_symbol_wrapper_vkCreateBuffer = t_vkCreateBuffer;
    vulkan_openxr_set_platform(NULL);
    slock_free(lock);
 }
@@ -7526,6 +7925,59 @@ static void test_gl_host_projection(void)
    t_gl_host_free(xr);
    t_gl_books_closed("projection");
 }
+
+/* The XR thread's dot made again for new names, then refused: only
+ * the session's dot says so. The names and the refusal change out of
+ * edit mode, where the XR thread does not read them. */
+static void test_gl_host_cursor_remake(void)
+{
+   openxr_grabs_t g;
+   XrSwapchain first, remade;
+   const char *at;
+   unsigned said   = 0;
+   gl_openxr_t *xr = t_gl_host_new();
+   CHECK(xr, "host");
+   if (!xr)
+      return;
+   t_reset_log();
+   t_names_stamp = 2;
+   CHECK(gl_openxr_start(xr) && t_gate_step(1), "start");
+   first = openxr_frame_cursor(&xr->frame);
+
+   t_names_stamp = 4;
+   memset(&g, 0, sizeof(g));
+   g.editing = true;
+   openxr_frame_publish_grabs(&xr->frame, &g);
+   CHECK(t_gate_step(2), "frames");
+   remade = openxr_frame_cursor(&xr->frame);
+   CHECK(     first && remade && remade != first
+         && xr->frame.names_baked == 4,
+         "the remake: made %d, baked %d", remade != first,
+         xr->frame.names_baked);
+
+   g.editing = false;
+   openxr_frame_publish_grabs(&xr->frame, &g);
+   CHECK(t_gate_step(2), "frames");
+   t_sc_refuse_width           = openxr_frame_cursor_w(&xr->frame);
+   t_names_stamp               = 6;
+   xr->frame.cursor_retry_usec = 0;
+   g.editing                   = true;
+   openxr_frame_publish_grabs(&xr->frame, &g);
+   CHECK(t_gate_step(2), "frames");
+   CHECK(     openxr_frame_cursor(&xr->frame) == remade
+         && xr->frame.names_baked == 6,
+         "the refused remake: kept %d, baked %d",
+         openxr_frame_cursor(&xr->frame) == remade,
+         xr->frame.names_baked);
+   t_gl_host_free(xr);
+   t_sc_refuse_width = 0;
+   t_names_stamp     = 0;
+   for (at = t_log; (at = strstr(at, "aser cursor")); at++)
+      said++;
+   CHECK(said == 1 && LOGGED("[OpenXR] Laser cursor ready: "),
+         "%u laser cursor lines: %s", said, t_log);
+   t_gl_books_closed("cursor remake");
+}
 #endif
 
 /* A frame with screen 0 a stereo pair 1.8 m ahead and screen 1 below
@@ -9615,7 +10067,7 @@ static void test_cursor_backs(void)
    {
       unsigned w   = (k & 1) ? VIDEO_XR_CURSOR_UNTAGGED_W : VIDEO_XR_CURSOR_W;
       unsigned bad = 0;
-      openxr_frame_cursor_pixels(px, w, k >= 2);
+      openxr_frame_cursor_pixels(px, w, k >= 2, NULL);
       for (y = y0; y < y0 + VIDEO_XR_BACK_DIM + 2; y++)
          for (x = x0; x < x0 + VIDEO_XR_BACK_DIM + 2; x++)
          {
@@ -9671,6 +10123,8 @@ int main(void)
    test_binding_gl_chain();
 #endif
    test_vulkan_inline();
+   test_cursor_remake_once();
+   test_vulkan_cursor_remake_no_wait();
    test_input_hooks();
    test_swapchain_filled();
    test_custom_screen_recenter();
@@ -9706,6 +10160,7 @@ int main(void)
    test_cursor_backs();
    test_cursor_tags();
    test_cursor_tag_lines();
+   test_cursor_tag_names();
    test_cursor_narrow();
 #ifdef HAVE_OPENXR_GL
    /* Last: they leave the stand-in's formats and extensions as GL's. */
@@ -9715,6 +10170,7 @@ int main(void)
    test_gl_host_empty_record();
    test_gl_host_projection();
    test_gl_host_yield();
+   test_gl_host_cursor_remake();
 #endif
    if (failures)
    {
