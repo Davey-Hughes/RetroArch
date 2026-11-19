@@ -2046,6 +2046,65 @@ static void test_touch_no_input(void)
    CHECK(x == top_x && y == top_y);
 }
 
+/* Every name of @n the letter @c plus its index, @len long. */
+static void t_names_fill(video_views_names_t *n, char c, size_t len)
+{
+   unsigned i;
+   memset(n, 0, sizeof(*n));
+   for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+      memset(n->name[i], c + (char)i, len);
+}
+
+static int t_names_are(const video_views_names_t *got,
+      const video_views_names_t *want)
+{
+   unsigned i;
+   for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+      if (strcmp(got->name[i], want->name[i]))
+         return 0;
+   return 1;
+}
+
+static void test_names_box(void)
+{
+   static video_views_names_box_t box;
+   video_views_names_t a, b, none, got;
+   unsigned i;
+
+   memset(&box, 0, sizeof(box));
+   memset(&none, 0, sizeof(none));
+   t_names_fill(&a, 'a', VIDEO_VIEWS_NAME_SIZE - 1);
+   t_names_fill(&b, 'A', 5);
+
+   memset(&got, 0xA5, sizeof(got));
+   CHECK(video_views_names_read(&box, &got) == 0);
+   CHECK(t_names_are(&got, &none));
+
+   video_views_names_publish(&box, &a);
+   CHECK(video_views_names_read(&box, &got) == 2);
+   CHECK(t_names_are(&got, &a));
+   video_views_names_publish(&box, &b);
+   CHECK(video_views_names_read(&box, &got) == 4);
+   CHECK(t_names_are(&got, &b));
+
+   /* Alternating: each read is one whole set. */
+   for (i = 0; i < 8; i++)
+   {
+      const video_views_names_t *want = (i & 1) ? &b : &a;
+      video_views_names_publish(&box, want);
+      CHECK(video_views_names_read(&box, &got) == (int)(6 + 2 * i));
+      CHECK(t_names_are(&got, want));
+   }
+
+   /* A writer stopped while it stores copy 0: a reader takes copy 1,
+    * the last whole set. */
+   retro_atomic_store_release_int(&box.seq, 21);
+   for (i = 0; i < VIDEO_VIEWS_NAMES_WORDS; i++)
+      retro_atomic_store_relaxed_int(&box.words[i], 0x5A5A5A5A);
+   CHECK(video_views_names_read(&box, &got) == 21);
+   CHECK(t_names_are(&got, &b));
+}
+
 int main(void)
 {
    test_screen_defaults();
@@ -2079,6 +2138,7 @@ int main(void)
    test_layout_viewless();
    test_map_point_no_input();
    test_touch_no_input();
+   test_names_box();
 
    if (failures)
    {

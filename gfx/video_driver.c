@@ -4382,16 +4382,72 @@ static void video_driver_views_to_headset(struct retro_video_views *views,
 }
 #endif
 
+/* Main thread: the names as other threads read them */
+static void video_driver_views_publish_names(video_driver_state_t *video_st)
+{
+   unsigned i;
+   video_views_names_t names;
+   for (i = 0; i < RETRO_VIDEO_SCREENS_MAX; i++)
+      memcpy(names.name[i], video_st->views_screens.screens[i].name,
+            sizeof(names.name[i]));
+   video_views_names_publish(&video_st->views_names, &names);
+}
+
+/* Main thread: keeps @screens. True when they describe something new;
+ * live state alone is not. The names go out only when one changed. */
+static bool video_driver_views_take_screens(video_driver_state_t *video_st,
+      const video_views_screens_t *screens)
+{
+   unsigned i;
+   video_views_screens_t *kept = &video_st->views_screens;
+   bool described              = screens->count != kept->count;
+   bool named                  = false;
+   if (!memcmp(screens, kept, sizeof(*screens)))
+      return false;
+   for (i = 0; i < RETRO_VIDEO_SCREENS_MAX; i++)
+   {
+      video_views_screen_t s = screens->screens[i];
+      s.state                = kept->screens[i].state;
+      if (memcmp(&s, &kept->screens[i], sizeof(s)))
+         described = true;
+      if (strcmp(s.name, kept->screens[i].name))
+         named = true;
+   }
+   *kept = *screens;
+   if (named)
+      video_driver_views_publish_names(video_st);
+   return described;
+}
+
+/* The views test core's e2e reads these lines. */
+static void video_driver_views_log_screens(
+      const video_views_screens_t *screens)
+{
+   unsigned i;
+   for (i = 0; i < screens->count; i++)
+   {
+      const video_views_screen_t *s = &screens->screens[i];
+      RARCH_LOG("[Video] Screen %u: \"%s\", flags 0x%x, state %u, "
+            "show %u, base %u, size %.3f, anchor %u, opacity %.3f, "
+            "order %u, owners 0x%x, swap with %u, group %u.\n",
+            i, s->name, s->flags, s->state, s->show, s->base, s->size,
+            s->anchor, s->opacity, s->order, s->owners, s->swap_with,
+            s->group);
+   }
+}
+
 bool video_driver_set_views(struct retro_video_views *views)
 {
+   bool described;
    video_views_map_t map;
+   video_views_screens_t screens;
    video_driver_state_t *video_st = &video_driver_st;
 #ifdef HAVE_OPENXR
    int eyes[2];
    bool tracking = (video_driver_xr_headset()
          & VIDEO_XR_HEADSET_TRACKING) != 0;
 #endif
-   if (!views || !video_views_validate(views->views, views->num_views, &map))
+   if (!views || !video_views_validate_map(views, &map, &screens))
       return false;
 #ifdef HAVE_OPENXR
    /* What a headset follows is one pair of eyes. */
@@ -4400,11 +4456,14 @@ bool video_driver_set_views(struct retro_video_views *views)
          && !video_views_eye_pair(&map, eyes))
       return false;
 #endif
-   if (memcmp(&map, &video_st->views, sizeof(map)))
+   described = video_driver_views_take_screens(video_st, &screens);
+   if (described || memcmp(&map, &video_st->views, sizeof(map)))
    {
       video_st->views = map;
       RARCH_LOG("[Video] View map: %u views, %u screens.\n",
             map.num_views, map.num_screens);
+      if (described)
+         video_driver_views_log_screens(&screens);
    }
 #ifdef HAVE_OPENXR
    video_driver_views_to_headset(views, tracking);
@@ -4441,6 +4500,8 @@ void video_driver_clear_views(void)
    memset(&video_st->views_core,   0, sizeof(video_st->views_core));
    memset(&video_st->views_frame,  0, sizeof(video_st->views_frame));
    memset(&video_st->views_layout, 0, sizeof(video_st->views_layout));
+   memset(&video_st->views_screens, 0, sizeof(video_st->views_screens));
+   video_driver_views_publish_names(video_st);
    video_st->views_frame_dims = 0;
    video_st->views_presented  = false;
    video_st->views_fallback   = false;
@@ -4454,6 +4515,25 @@ void video_driver_clear_views(void)
    video_st->windows_blank.flip_mode = 0;
    retro_atomic_store_release_int(&video_st->windows_blank_resend, 1);
 #endif
+}
+
+size_t video_driver_screen_label(unsigned screen, const char *fmt,
+      char *s, size_t len)
+{
+   const video_views_screens_t *screens = &video_driver_st.views_screens;
+   if (screen < screens->count && *screens->screens[screen].name)
+      return strlcpy(s, screens->screens[screen].name, len);
+   return (size_t)snprintf(s, len, fmt, screen + 1);
+}
+
+int video_driver_get_screen_names(video_views_names_t *out)
+{
+   return video_views_names_read(&video_driver_st.views_names, out);
+}
+
+int video_driver_screen_names_stamp(void)
+{
+   return retro_atomic_load_acquire_int(&video_driver_st.views_names.seq);
 }
 
 unsigned video_driver_views_status(void)

@@ -2219,6 +2219,9 @@ typedef struct
    video_views_map_t views_core;
    video_views_map_t views_frame;
    video_views_layout_t views_layout;
+   /* The core's screens, main thread, and their names for any thread */
+   video_views_screens_t views_screens;
+   video_views_names_box_t views_names;
    unsigned views_frame_dims;
    /* The view count the driver instance was last told. */
    unsigned views_driver_count;
@@ -2678,6 +2681,15 @@ bool video_driver_set_views(struct retro_video_views *views);
 /* A headset is showing the core's own stereo views. */
 bool video_driver_vr_content_active(void);
 void video_driver_clear_views(void);
+/* Main thread: screen @screen's name from the core, else @fmt with
+ * @screen + 1. */
+size_t video_driver_screen_label(unsigned screen, const char *fmt,
+      char *s, size_t len);
+/* Any thread: the core's screen names, "" where it gave none; returns
+ * the stamp they were read at. */
+int video_driver_get_screen_names(video_views_names_t *out);
+/* Any thread: moves when a name does. */
+int video_driver_screen_names_stamp(void);
 /* RETRO_VIDEO_VIEWS_STATUS_ flags for the current driver and settings. */
 unsigned video_driver_views_status(void);
 /* Main thread: true once after the status changes. */
