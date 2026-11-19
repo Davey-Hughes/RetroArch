@@ -159,7 +159,7 @@ static void gate_cases(void)
 #include "core_signing_gate_case.h"
 
 #define GATE_NAME "webOS aarch64"
-#define GATE_KEYS 0
+#define GATE_KEYS 2
 #define WEBOS 1
 #define __linux__ 1
 #define __aarch64__ 1
