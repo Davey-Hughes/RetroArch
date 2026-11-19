@@ -3,11 +3,34 @@
 #ifndef CORE_SIGNING_KEYS_H__
 #define CORE_SIGNING_KEYS_H__
 
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+/* Only builds whose default core server (DEFAULT_BUILDBOT_SERVER_URL,
+ * config.def.h) signs its cores get keys. Play and Steam builds get
+ * cores from the store, Lakka from its own server. */
+#if defined(ANDROID)
+#if !defined(ANDROID_PLAY_DELIVERY)
+#define CORE_SIGNING_HAS_KEYS
+#endif
+#elif defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__)) \
+      && !defined(WEBOS) && !defined(HAKCHI) \
+      && !defined(HAVE_LAKKA) && !defined(HAVE_STEAM)
+#define CORE_SIGNING_HAS_KEYS
+/* MSVC 2010, 2005 and 2003 have their own servers */
+#elif defined(_WIN32) && (defined(__x86_64__) || defined(_M_X64)) \
+      && !defined(_XBOX) && !defined(__WINRT__) && !defined(HAVE_STEAM) \
+      && (!defined(_MSC_VER) || (_MSC_VER != 1600 && _MSC_VER != 1400 \
+      && _MSC_VER != 1310))
+#define CORE_SIGNING_HAS_KEYS
+#elif defined(WEBOS)
+#define CORE_SIGNING_HAS_KEYS
+#endif
+
 /* libretro's core signing keys, current first: 65-byte P-256 points,
- * 0x04 || X || Y, each from tools/core_sign.py pubkey. Only Android
- * builds that install from the buildbot carry them: it signs only
- * Android cores, and Play Store builds get theirs through Play. */
-#if defined(ANDROID) && !defined(ANDROID_PLAY_DELIVERY)
+ * 0x04 || X || Y, each from tools/core_sign.py pubkey. */
+#ifdef CORE_SIGNING_HAS_KEYS
 #define CORE_SIGNING_KEYS_COUNT 2
 #define CORE_SIGNING_KEYS_LIST \
    /* d28989b6af403a92 */ \

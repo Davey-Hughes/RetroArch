@@ -123,7 +123,8 @@ jobs:
                       --disable-audiomixer --disable-translate \
                       --disable-accessibility --disable-crtswitchres \
                       --disable-langextra --disable-libretrodb \
-                      --disable-video_filter --disable-dsp_filter
+                      --disable-video_filter --disable-dsp_filter \
+                      --disable-core_load_check
           grep -q '^HAVE_OPENGL = 1' config.mk
           grep -q '^HAVE_EGL = 1' config.mk
           grep -q '^HAVE_X11 = 1' config.mk

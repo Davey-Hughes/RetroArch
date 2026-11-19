@@ -78,7 +78,8 @@ jobs:
           ./configure --disable-qt --disable-ffmpeg --disable-vulkan \
             --disable-wayland --disable-x11 --disable-opengl --disable-egl \
             --disable-kms --disable-sdl2 --disable-pulse --disable-alsa \
-            --disable-jack --disable-oss --disable-freetype --disable-menu
+            --disable-jack --disable-oss --disable-freetype --disable-menu \
+            --disable-core_load_check
           grep -q '^HAVE_NETWORKGAMEPAD = 1' config.mk
           make -j"$(nproc)" CC="ccache gcc" CXX="ccache g++"
 

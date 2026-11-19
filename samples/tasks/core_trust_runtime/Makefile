@@ -58,6 +58,9 @@ ifeq ($(LOAD_CHECK),1)
    CFLAGS += -DHAVE_CORE_LOAD_CHECK
 endif
 
+# No libretro keys on any host, as a Steam build
+$(call sample_objs,$(REPO_ROOT)/core_signature.o): CFLAGS += -DHAVE_STEAM
+
 OBJS := $(call sample_objs,$(SOURCES:.c=.o))
 
 # The tree's C89_BUILD holds core_trust_runtime.c to C89; the test is

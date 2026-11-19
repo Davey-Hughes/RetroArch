@@ -9,8 +9,8 @@
 #include "../../../core_signature.h"
 #include "../../../file_path_special.h"
 
-/* Linked with core_signature.c built for Android, the build with
- * libretro's keys */
+/* Linked with core_signature.c built for Android, which has libretro's
+ * keys on every host */
 
 static unsigned checks;
 static unsigned failures;

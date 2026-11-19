@@ -101,7 +101,8 @@ jobs:
                       --disable-audiomixer --disable-translate \
                       --disable-accessibility --disable-crtswitchres \
                       --disable-langextra --disable-libretrodb \
-                      --disable-video_filter --disable-dsp_filter
+                      --disable-video_filter --disable-dsp_filter \
+                      --disable-core_load_check
           grep -q '^HAVE_OPENGL1 = 1' config.mk
           make -j$(nproc)
           ccache -s

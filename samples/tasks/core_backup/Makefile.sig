@@ -65,6 +65,10 @@ CFLAGS += -Wall -g1 -O0 -I$(LIBRETRO_COMM_DIR)/include -I$(REPO_ROOT) \
 ifeq ($(TEST_KEY),1)
    CFLAGS += -DHAVE_CORE_SIGNING_TEST_KEY
 endif
+
+# No libretro keys on any host, as a Steam build
+$(call sample_objs,$(REPO_ROOT)/core_signature.o): CFLAGS += -DHAVE_STEAM
+
 LIBS += -lm
 # The slice clock, so a lane can cancel a restore part-way through its
 # check
@@ -77,8 +81,8 @@ ifneq ($(SANITIZER),)
    LDFLAGS := -fsanitize=$(SANITIZER) $(LDFLAGS)
 endif
 
-# Only these two, which share the menu's ANDROID layout; the others
-# hand msg_hash values only to the stand-in, which ignores them
+# Only these two, which share the menu's ANDROID layout; no test looks
+# at a msg_hash value the others hand the stand-in
 ifeq ($(PLAY),1)
 core_backup_sig_test.o $(call sample_objs,$(REPO_ROOT)/tasks/task_core_backup.o): \
    CFLAGS += -DANDROID

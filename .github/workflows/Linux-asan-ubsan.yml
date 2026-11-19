@@ -141,7 +141,7 @@ jobs:
             --disable-discord \
             --disable-cheevos \
             --disable-networking \
-            --enable-sdl2
+            --enable-sdl2 --disable-core_load_check
 
       - name: Build with -fsanitize=address,undefined
         # The top-level Makefile (line 153) propagates SANITIZER into
