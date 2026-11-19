@@ -16,7 +16,8 @@ SOURCES := android_second_surface_test.c \
            $(CORE_DIR)/gfx/video_views.c
 OBJS    := $(call sample_objs,$(SOURCES:.c=.o))
 CFLAGS  += -Wall -std=c89 -pedantic -Werror=declaration-after-statement \
-           -Wno-long-long -Wno-variadic-macros -g1 -O1 -I$(LRC)/include -I$(CORE_DIR) -I.
+           -Wno-long-long -Wno-variadic-macros -g1 -O1 -D_GNU_SOURCE \
+           -I$(LRC)/include -I$(CORE_DIR) -I.
 LDFLAGS += -lm
 
 ifneq ($(SANITIZER),)

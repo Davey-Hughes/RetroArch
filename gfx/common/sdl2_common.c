@@ -732,8 +732,7 @@ bool sdl2_video_window_create(void *owner, SDL_Window *primary,
       flags  |= SDL_WINDOW_FULLSCREEN_DESKTOP;
       rect.x  = rect.y = SDL_WINDOWPOS_CENTERED_DISPLAY(display);
    }
-   snprintf(title, sizeof(title), "RetroArch - Screen %u",
-         video_window_title_screen(request) + 1);
+   video_window_title(request, title, sizeof(title));
    if (!(state->win = SDL_CreateWindow(title, rect.x, rect.y, rect.w, rect.h,
                flags)))
    {

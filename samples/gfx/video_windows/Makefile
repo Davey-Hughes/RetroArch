@@ -5,7 +5,7 @@ RARCH_DIR := ../../..
 SOURCES := video_windows_test.c $(RARCH_DIR)/gfx/video_windows.c $(RARCH_DIR)/gfx/video_views.c
 OBJS := $(addprefix $(SAMPLE_OBJDIR)/,$(subst ../,__/,$(SOURCES:.c=.o)))
 CFLAGS += -Wall -std=c89 -pedantic -Werror=declaration-after-statement -g -O1 \
-          -I$(RARCH_DIR)/libretro-common/include -I$(RARCH_DIR)
+          -D_GNU_SOURCE -I$(RARCH_DIR)/libretro-common/include -I$(RARCH_DIR)
 LDFLAGS += -lm
 
 ifneq ($(SANITIZER),)

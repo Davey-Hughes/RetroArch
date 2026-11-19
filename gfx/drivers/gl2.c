@@ -7237,11 +7237,16 @@ static void gl2_window_request(gl2_t *gl, const video_windows_frame_t *f,
 static bool gl2_window_make(gl2_t *gl, const video_windows_frame_t *f,
       unsigned w)
 {
+   video_views_names_t names;
    video_window_request_t request;
    struct gl2_window *win = &gl->windows.win[w];
 
    memset(win, 0, sizeof(*win));
    gl2_window_request(gl, f, w, &request);
+   /* Read once: a rename shows when the window is made again */
+   video_driver_get_screen_names(&names);
+   strlcpy(request.name, names.name[video_window_title_screen(&request)],
+         sizeof(request.name));
    request.generation = video_driver_window_generation();
    if (     !request.generation
          || !gl->ctx_driver->windows->create(gl->ctx_data, &request,

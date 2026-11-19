@@ -3,6 +3,7 @@
  * #included there. */
 #ifdef NATIVE_WIN32
 #include <imm.h>
+#include <encodings/utf.h>
 
 #define NATIVE_W32_STYLE (WS_OVERLAPPEDWINDOW | WS_CLIPSIBLINGS \
       | WS_CLIPCHILDREN)
@@ -437,26 +438,37 @@ static bool native_w32_fullscreen_style(HWND hwnd)
    return (style & WS_POPUP) && !(style & WS_CAPTION);
 }
 
-/* Top-level windows named for 'screen', in any class */
-static unsigned native_w32_titled(unsigned screen)
+/* Top-level windows titled for 'request', in any class */
+static unsigned native_w32_titled(const video_window_request_t *request)
 {
    char want[64];
+   wchar_t *wide;
    HWND hwnd      = NULL;
    unsigned found = 0;
-   snprintf(want, sizeof(want), "RetroArch - Screen %u", screen + 1);
-   while ((hwnd = FindWindowEx(NULL, hwnd, NULL, want)))
+   video_window_title(request, want, sizeof(want));
+   wide = utf8_to_utf16_string_alloc(want);
+   CHECK(wide);
+   while (wide && (hwnd = FindWindowExW(NULL, hwnd, NULL, wide)))
       found++;
+   free(wide);
    return found;
 }
 
-/* The titles as Windows has them */
-static void native_w32_titles(HWND primary, HWND win, unsigned screen)
+/* The titles as Windows has them, in UTF-8 */
+static void native_w32_titles(HWND primary, HWND win,
+      const video_window_request_t *request)
 {
-   char title[128], main_title[128];
+   wchar_t wide[128];
+   char title[384], main_title[384];
    title[0] = main_title[0] = '\0';
-   GetWindowText(win, title, sizeof(title));
-   GetWindowText(primary, main_title, sizeof(main_title));
-   native_window_titles(title, main_title, screen);
+   wide[0]  = 0;
+   GetWindowTextW(win, wide, 128);
+   utf16_to_char_string((const uint16_t*)wide, title, sizeof(title));
+   wide[0]  = 0;
+   GetWindowTextW(primary, wide, 128);
+   utf16_to_char_string((const uint16_t*)wide, main_title,
+         sizeof(main_title));
+   native_window_titles(title, main_title, request);
 }
 
 /* The secondaries' class, as the first window had it */
@@ -469,7 +481,7 @@ static unsigned native_w32_kept_retry;
 
 /* Once the context is gone: no window left, and no class either. A
  * main window kept for the next driver keeps its monitors up. */
-static void native_w32_torn_down(unsigned screen)
+static void native_w32_torn_down(const video_window_request_t *request)
 {
    WNDCLASSEX has;
    native_w32_monitor_t monitors[VIDEO_WINDOW_DISPLAYS_MAX];
@@ -477,7 +489,7 @@ static void native_w32_torn_down(unsigned screen)
    unsigned n = window_test_displays(got,
          VIDEO_WINDOW_DISPLAYS_MAX);
    has.cbSize = sizeof(has);
-   CHECK(native_w32_titled(screen) == 0);
+   CHECK(native_w32_titled(request) == 0);
    CHECK(*native_w32_class);
    CHECK(!GetClassInfoEx(GetModuleHandle(NULL), native_w32_class, &has));
    if (native_w32_main_last && IsWindow(native_w32_main_last))
@@ -1494,9 +1506,8 @@ static void native_w32_lifecycle(const gfx_ctx_driver_t *ctx, void *data,
    CHECK(strcmp(native_w32_class, "RetroArch") != 0);
    CHECK(GetWindowLongPtr(secondary, GWLP_WNDPROC)
          != (LONG_PTR)win32_window_proc);
-   CHECK(native_w32_titled(video_window_title_screen(request)) == 1);
-   native_w32_titles(main_window.hwnd, secondary,
-         video_window_title_screen(request));
+   CHECK(native_w32_titled(request) == 1);
+   native_w32_titles(main_window.hwnd, secondary, request);
    /* Shown without taking the focus from the main window */
    CHECK(GetFocus() != secondary);
    /* After a restart, what was queued for the last lifetime's window
@@ -1809,15 +1820,18 @@ static void native_w32_lifecycle(const gfx_ctx_driver_t *ctx, void *data,
 
    /* Game Screen 1's window on a spare id: titled for its screen */
    {
-      video_window_request_t spare;
+      video_window_request_t spare, id;
       video_window_native_t one;
       native_window_spare(request, &spare);
+      id         = spare;
+      id.screens = 0;
       memset(&one, 0, sizeof(one));
       CHECK(ctx->windows->create(data, &spare, &one));
-      CHECK(native_w32_titled(0) == 1);
-      CHECK(native_w32_titled(spare.screen) == 0);
+      CHECK(native_w32_titled(&spare) == 1);
+      CHECK(native_w32_titled(&id) == 0);
       if (one.state)
-         native_w32_titles(main_window.hwnd, native_w32_window(&one), 0);
+         native_w32_titles(main_window.hwnd, native_w32_window(&one),
+               &spare);
       ctx->windows->destroy(data, &one);
       CHECK(!native_window_settle(ctx, data, &spare, 50000));
    }
@@ -1858,12 +1872,12 @@ static void native_w32_lifecycle(const gfx_ctx_driver_t *ctx, void *data,
 #endif
    CHECK(!invalid.state && !invalid.surface && !invalid.display);
    CHECK(!native_window_settle(ctx, data, request, 200000));
-   CHECK(native_w32_titled(video_window_title_screen(request)) == 0);
+   CHECK(native_w32_titled(request) == 0);
    CHECK(ctx->windows->create(data, request, window));
    CHECK(!ctx->windows->create(data, request, &invalid));
    CHECK(!invalid.state && !invalid.surface);
    native_window_wait(ctx, data, request, window, NATIVE_EVENT(RESUME), 0);
-   CHECK(native_w32_titled(video_window_title_screen(request)) == 1);
+   CHECK(native_w32_titled(request) == 1);
 
    /* Made fullscreen on a chosen monitor; then a window with automatic
     * bounds: the main window's size, centred on its monitor */

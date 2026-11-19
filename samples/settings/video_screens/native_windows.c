@@ -102,28 +102,25 @@ static bool native_window_has_focus(const gfx_ctx_driver_t *ctx,
 
 #define NATIVE_EVENT(kind) (1u << VIDEO_WINDOW_EVENT_##kind)
 
-#define NATIVE_TITLE "RetroArch - Screen "
-
-/* A finder takes a secondary by its exact title, and the main window
- * as the one without such a title: what the window system has for
- * screen 'screen''s window, and for the main window ("" for none), read
- * back. */
+/* A finder takes a secondary by its exact title, video_window_title()'s,
+ * and the main window as the one without it: what the window system
+ * has for 'request''s window, and for the main window ("" for none),
+ * read back. */
 static void native_window_titles(const char *title, const char *main_title,
-      unsigned screen)
+      const video_window_request_t *request)
 {
    char want[64];
-   snprintf(want, sizeof(want), NATIVE_TITLE "%u", screen + 1);
+   video_window_title(request, want, sizeof(want));
    if (!title || strcmp(title, want) != 0 || !main_title
-         || strncmp(main_title, NATIVE_TITLE, strlen(NATIVE_TITLE)) == 0)
+         || strcmp(main_title, want) == 0)
       fprintf(stderr, "native window: title \"%s\", main \"%s\"\n",
             title ? title : "(none)", main_title ? main_title : "(none)");
    CHECK(title && strcmp(title, want) == 0);
-   CHECK(main_title
-         && strncmp(main_title, NATIVE_TITLE, strlen(NATIVE_TITLE)) != 0);
+   CHECK(main_title && strcmp(main_title, want) != 0);
 }
 
 /* Game Screen 1's window as it comes on its own: an id past the
- * content's screens, showing screen 0 */
+ * content's screens, showing screen 0, which has no name */
 static void native_window_spare(const video_window_request_t *request,
       video_window_request_t *spare)
 {
@@ -131,6 +128,7 @@ static void native_window_spare(const video_window_request_t *request,
    spare->screen     = 2;
    spare->screens    = 1u;
    spare->generation = video_driver_window_generation();
+   spare->name[0]    = '\0';
 }
 
 #ifdef HAVE_VULKAN

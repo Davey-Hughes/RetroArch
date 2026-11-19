@@ -11561,11 +11561,16 @@ static void vulkan_window_request(vk_t *vk, const video_windows_frame_t *f,
 static bool vulkan_window_make(vk_t *vk, const video_windows_frame_t *f,
       unsigned w)
 {
+   video_views_names_t names;
    video_window_request_t request;
    struct vk_window *win = &vk->windows.win[w];
 
    memset(win, 0, sizeof(*win));
    vulkan_window_request(vk, f, w, &request);
+   /* Read once: a rename shows when the window is made again */
+   video_driver_get_screen_names(&names);
+   strlcpy(request.name, names.name[video_window_title_screen(&request)],
+         sizeof(request.name));
    request.generation = video_driver_window_generation();
    if (     !request.generation
          || !vk->ctx_driver->windows->create(vk->ctx_data, &request,
