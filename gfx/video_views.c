@@ -430,6 +430,7 @@ static void video_views_fit(const video_views_layout_params_t *p,
    unsigned cw   = VIDEO_SCALE_W(cdims);
    unsigned ch   = VIDEO_SCALE_H(cdims);
    bool vertical = (p->screen_layout != VIDEO_SCREEN_LAYOUT_HORIZONTAL);
+   unsigned skip = p->exclude_screens | map->viewless;
 
    if (count == 1 && p->stretch && !p->scale_integer)
    {
@@ -448,7 +449,7 @@ static void video_views_fit(const video_views_layout_params_t *p,
    {
       const struct retro_video_view *v;
       double w, h, aspect;
-      if (p->exclude_screens & (1u << s))
+      if (skip & (1u << s))
          continue;
       v      = &map->views[video_views_find(map, s, RETRO_VIDEO_VIEW_EYE_NONE)];
       w      = v->width;
@@ -490,7 +491,7 @@ static void video_views_fit(const video_views_layout_params_t *p,
       double x, y;
       int x0, y0;
       double w, h;
-      if (p->exclude_screens & (1u << s))
+      if (skip & (1u << s))
          continue;
       w = disp_w[s] * scale;
       h = disp_h[s] * scale;
@@ -536,7 +537,7 @@ void video_views_layout(const video_views_layout_params_t *p,
       video_views_layout_t *out)
 {
    unsigned a, s, count = 0, first = 0;
-   unsigned w, h, cdims;
+   unsigned w, h, cdims, skip;
    video_views_rect_t fit[RETRO_VIDEO_VIEWS_MAX];
    const video_views_map_t *map = p->map;
 
@@ -546,8 +547,9 @@ void video_views_layout(const video_views_layout_params_t *p,
    if (!map || !map->num_views || !w || !h)
       return;
 
+   skip = p->exclude_screens | map->viewless;
    for (s = 0; s < map->num_screens; s++)
-      if (!(p->exclude_screens & (1u << s)))
+      if (!(skip & (1u << s)))
       {
          first = s;
          count++;
@@ -605,7 +607,7 @@ void video_views_layout(const video_views_layout_params_t *p,
       for (s = 0; s < map->num_screens; s++)
       {
          video_views_placement_t *pl;
-         if (p->exclude_screens & (1u << s))
+         if (skip & (1u << s))
             continue;
          pl = &out->placements[out->num_placements++];
          pl->view = (unsigned)video_views_find(map, s, eye);

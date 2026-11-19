@@ -1895,6 +1895,72 @@ static void test_screen_api(void)
          > offsetof(struct retro_video_screen_buffer, data));
 }
 
+/* @num_scr screens around @views, those in @absent ABSENT, as
+ * video_views_validate_map makes them. */
+static void t_absent_map(const struct retro_video_view *views,
+      unsigned num_views, unsigned num_scr, unsigned absent,
+      video_views_map_t *map)
+{
+   struct retro_video_views in;
+   struct retro_video_screen scr[RETRO_VIDEO_VIEWS_MAX];
+   unsigned i;
+   memset(scr, 0, sizeof(scr));
+   for (i = 0; i < num_scr; i++)
+      if (absent & (1u << i))
+         scr[i].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
+   memset(&in, 0, sizeof(in));
+   in.views       = views;
+   in.num_views   = num_views;
+   in.flags       = RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   in.screens     = scr;
+   in.num_screens = num_scr;
+   CHECK(video_views_validate_map(&in, map, NULL));
+}
+
+/* A screen without views takes no place: the others lay out as if
+ * it were not there. */
+static void test_layout_viewless(void)
+{
+   struct retro_video_view v[2];
+   video_views_map_t map, plain;
+   video_views_layout_params_t p;
+   video_views_layout_t l, want;
+   unsigned layout, i;
+
+   v[0] = mkview(0,   0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_NONE);
+   v[1] = mkview(0, 192, 256, 192, 2, RETRO_VIDEO_VIEW_EYE_NONE);
+   t_absent_map(v, 2, 3, 0x2, &map);
+   CHECK(map.num_screens == 3 && map.viewless == 0x2);
+   map_ds(&plain);
+   for (layout = 0; layout < VIDEO_SCREEN_LAYOUT_LAST; layout++)
+   {
+      params_init(&p, &plain, 1600, 960);
+      p.screen_layout = layout;
+      video_views_layout(&p, &want);
+      p.map = &map;
+      video_views_layout(&p, &l);
+      CHECK(want.num_placements == 2 && l.num_placements == 2);
+      for (i = 0; i < 2; i++)
+         CHECK(   l.placements[i].dst.pos  == want.placements[i].dst.pos
+               && l.placements[i].dst.dims == want.placements[i].dst.dims);
+   }
+
+   /* Screen 0 without views: one placement, a one-screen map's. */
+   v[0] = mkview(0, 192, 256, 192, 1, RETRO_VIDEO_VIEW_EYE_NONE);
+   t_absent_map(v, 1, 2, 0x1, &map);
+   CHECK(map.num_screens == 2 && map.viewless == 0x1);
+   v[0].screen = 0;
+   CHECK(video_views_validate(v, 1, &plain));
+   params_init(&p, &plain, 1600, 960);
+   video_views_layout(&p, &want);
+   p.map = &map;
+   video_views_layout(&p, &l);
+   CHECK(want.num_placements == 1 && l.num_placements == 1);
+   CHECK(   l.placements[0].view     == 0
+         && l.placements[0].dst.pos  == want.placements[0].dst.pos
+         && l.placements[0].dst.dims == want.placements[0].dst.dims);
+}
+
 int main(void)
 {
    test_screen_defaults();
@@ -1925,6 +1991,7 @@ int main(void)
    test_targets();
    test_ui_helpers();
    test_screen_api();
+   test_layout_viewless();
 
    if (failures)
    {
