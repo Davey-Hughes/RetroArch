@@ -13,6 +13,9 @@ views filled with noise, drawn straight from the frame by the stock
 chain and for a preset copied out of it, on glcore once for each way it
 copies them, or a software frame's written straight in; and, on glcore,
 a frame drawn whole out of a core's larger framebuffer.
+The screens cases check what the frontend makes of the screens the
+core describes: which maps it accepts and the log of the screens it
+keeps, and a light gun kept off a screen that takes no input.
 In full it needs a GPU, gamescope and a RetroArch build.
 
 With RA_E2E_XVFB=1 each case runs on an Xvfb server of its own instead
@@ -416,6 +419,56 @@ COPY_RE = re.compile(r'\[GLCore\] Views copied by ([\w ]+)\.')
 STATUS_RE = re.compile(
     r'\[video_views\] presents=(\d) stereo=(\d) accepted=(\d)')
 
+# The core's rules cases (video_views_test_screens rules), each sent on
+# the ds map for a frame, with whether the frontend must accept it; then
+# the full map.
+SCREENS_RULES = [
+    ('no-flag', 1), ('zero-screens', 1), ('absent-viewless', 1),
+    ('swap-one-side', 1), ('swap-both', 1), ('unknown-flags', 1),
+    ('too-many', 0), ('null-screens', 0), ('view-past-count', 0),
+    ('image', 0), ('active-viewless', 0), ('blank-viewless', 0),
+    ('eye-unpaired', 0), ('base-past-count', 0), ('over-self', 0),
+    ('over-over', 0), ('size-negative', 0), ('anchor', 0),
+    ('over-size', 0), ('opacity', 0), ('private-owners', 0),
+    ('swap-self', 0), ('swap-past-count', 0), ('swap-disagree', 0),
+    ('show-unknown', 0), ('state-unknown', 0), ('state-unknown-viewed', 0),
+    ('order-mixed', 0), ('order-mixed-first', 0), ('full', 1)]
+SCREENS_CASE_RE = re.compile(
+    r'\[video_views\] screens case=([\w-]+) accepted=(\d)')
+SCREENS_FULL_RE = re.compile(r'\[video_views\] screens case=full ')
+SCREEN_BUFFER_RE = re.compile(r'\[video_views\] screen_buffer=(\d)')
+# The full map's screens as the frontend logs them.
+SCREENS_FULL_LOG = [
+    '[Video] Screen 0: "Top", flags 0x22, state 0, show 0, base 0, '
+    'size 0.000, anchor 0, opacity 0.000, order 2, owners 0x0, '
+    'swap with 2, group 1.',
+    '[Video] Screen 1: "Bottom", flags 0x19, state 1, show 0, base 0, '
+    'size 0.500, anchor 0, opacity 0.000, order 1, owners 0x0, '
+    'swap with 0, group 1.',
+    '[Video] Screen 2: "VMU A1", flags 0xd, state 2, show 2, base 0, '
+    'size 0.250, anchor 8, opacity 0.750, order 3, owners 0x1, '
+    'swap with 0, group 0.']
+SCREEN_LOG_RE = re.compile(r'\[Video\] Screen \d+: .*')
+# GET_VIDEO_SCREEN_BUFFER, which the frontend knows
+SCREEN_BUFFER_UNSUPPORTED_RE = re.compile(
+    r'\[Environ\] UNSUPPORTED \(#(?:107|65643)\)')
+# The light gun aimed, with the menu closed, at the top screen's centre
+# and then the bottom one's, as ds-horizontal lays them out. Aimed at
+# the top first, so the second aim reads differently whatever the
+# pointer's start. [(name, video_views_test_screens, whether the bottom
+# screen takes the gun)]
+SCREENS_AIM_CASES = [('screens-no-input', 'no_input', False),
+                     ('screens-no-input-off', 'no_input_off', True)]
+SCREENS_AIM_SETTINGS = {'video_stereo_mode': '0', 'video_screen_layout': '1'}
+SCREENS_AIM_POINTS = [(400, 480, GREEN), (1200, 480, YELLOW)]
+SCREENS_AIM = ((400, 480), (1200, 480))
+GUN_RE = re.compile(r'\[video_views\] lightgun x=(-?\d+) y=(-?\d+) '
+                    r'offscreen=(\d) trigger=(\d) '
+                    r'packed=\((-?\d+),(-?\d+)\)')
+# What the screens cases check is the frontend's, the same on every
+# driver: they run on those of Linux-vulkan-validation.yml's views step.
+SCREENS_DRIVERS = ('gl', 'glcore', 'vulkan', 'sdl2')
+
 
 # The last few files read_png() decoded on this thread, by path, with
 # the stat that says they are the same file: a pointer case reads each
@@ -614,15 +667,16 @@ def expected_status(driver, settings):
     return (1, 0 if settings.get('video_stereo_mode', '0') == '0' else 1)
 
 
-def wait_for_views(p, d, timeout=60):
-    """Wait for initialization to reach the core before timing the case."""
+def wait_for_views(p, d, timeout=60, regex=STATUS_RE):
+    """Wait for initialization to reach the core before timing the case,
+    or for the logs to have regex."""
     deadline = time.monotonic() + timeout
     while p.poll() is None:
         for name in ('run.log', 'retroarch.log'):
             path = os.path.join(d, name)
             if os.path.exists(path):
                 with open(path, errors='replace') as f:
-                    if STATUS_RE.search(f.read()):
+                    if regex.search(f.read()):
                         return True
         if time.monotonic() >= deadline:
             return False
@@ -1061,14 +1115,18 @@ def case_dir(root, driver, name, hw='off'):
 
 def run_case(retroarch, root, driver, case, hw='off', menu=False,
              opts=None, args=(), gpu=None, pointer=(), env_extra=None,
-             pointer_check=None):
+             pointer_check=None, until=None, aim=(), aimed=None):
     """gpu, a list, gets RetroArch's GPU memory in MiB sampled while it
     settles. pointer, window points, has the menu open with the pointer
     at each in turn, in d/pointer-N.png; pointer_check(d) gives the
     errors of a round of those, which is taken again, at most
     POINTER_ROUNDS times, until it has none: a frame the menu had not
     drawn the cursor in yet is not the code's failure. env_extra is
-    added to RetroArch's environment."""
+    added to RetroArch's environment. until, a regex, keeps the case
+    running until the logs have it. aim, window points, has the pointer
+    at each in turn with the menu closed, until the core logs a light
+    gun line after the move; aimed, a list, gets for each move made how
+    many light gun lines the core had logged before it."""
     name, mapopt, settings, points = case
     d = case_dir(root, driver, name, hw)
     if os.path.commonpath([root, d]) != root or d == root:
@@ -1091,7 +1149,7 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
     # RetroArch's Wayland at a socket that does not exist (unset,
     # libwayland falls back to wayland-0).
     helper = ''
-    if pointer:
+    if pointer or aim:
         helper = ' %s %s --pointer %s &' % (
             shlex.quote(sys.executable),
             shlex.quote(os.path.abspath(__file__)), shlex.quote(d))
@@ -1144,6 +1202,18 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
             startup_stack(p, d)
         if gpu is None:
             wait_settled(p, d, expected_status(driver, settings))
+        if until:
+            wait_for_views(p, d, 20, until)
+        for i, point in enumerate(aim):
+            before = len(GUN_RE.findall(log_text(d)))
+            if not move_pointer(d, i, point):
+                break
+            aimed.append(before)
+            # A slow frame logs late: the next move counts after it.
+            deadline = time.time() + 10
+            while (len(GUN_RE.findall(log_text(d))) <= before
+                   and time.time() < deadline and p.poll() is None):
+                time.sleep(0.2)
         settle = time.time() + 5
         while gpu is not None and time.time() < settle:
             time.sleep(0.5)
@@ -1186,7 +1256,7 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
         except subprocess.TimeoutExpired:
             pass
     finally:
-        if pointer:
+        if pointer or aim:
             open(os.path.join(d, 'pointer.quit'), 'w').close()
         if p.poll() is None:
             os.killpg(p.pid, signal.SIGTERM)
@@ -1312,6 +1382,17 @@ def exact_errors(rows, bpp, views):
     if not errors and tops != sorted(tops):
         errors.append('screens out of order: tops at %s' % tops)
     return errors
+
+
+def log_text(d):
+    """A case's logs, its run's and RetroArch's."""
+    text = ''
+    for name in ('run.log', 'retroarch.log'):
+        path = os.path.join(d, name)
+        if os.path.exists(path):
+            with open(path, errors='replace') as f:
+                text += f.read()
+    return text
 
 
 def copy_path(d):
@@ -1581,6 +1662,67 @@ def run_memory_case(retroarch, root, driver, case):
     return errors, peak
 
 
+def run_screens_rules_case(retroarch, root, driver):
+    """The rules cases: which maps the frontend accepts, the screens it
+    logs for the full map, and GET_VIDEO_SCREEN_BUFFER known."""
+    case = ('screens-rules', 'ds', {'video_stereo_mode': '0'}, [])
+    errors = run_case(retroarch, root, driver, case,
+                      opts={'video_views_test_screens': 'rules'},
+                      until=SCREENS_FULL_RE)
+    text = log_text(case_dir(root, driver, case[0]))
+    logged = {}
+    for name, accepted in SCREENS_CASE_RE.findall(text):
+        logged.setdefault(name, []).append(int(accepted))
+    for name, want in SCREENS_RULES:
+        if name not in logged:
+            errors.append('case %s not logged' % name)
+        elif any(a != want for a in logged[name]):
+            errors.append('case %s accepted=%s, want %d'
+                          % (name, logged[name], want))
+    known = set(name for name, _ in SCREENS_RULES)
+    for name in sorted(set(logged) - known):
+        errors.append('case %s not in SCREENS_RULES' % name)
+    answers = set(SCREEN_BUFFER_RE.findall(text))
+    if answers != {'0'}:
+        errors.append('screen_buffer=%s, want 0' % sorted(answers))
+    lines = SCREEN_LOG_RE.findall(text)[-3:]
+    if lines != SCREENS_FULL_LOG:
+        errors.append('the last screen lines are %s, want %s'
+                      % (lines, SCREENS_FULL_LOG))
+    if SCREEN_BUFFER_UNSUPPORTED_RE.search(text):
+        errors.append('GET_VIDEO_SCREEN_BUFFER logged as unsupported')
+    return errors
+
+
+def run_screens_aim_case(retroarch, root, driver, case):
+    """The light gun aimed at the bottom screen's centre with the menu
+    closed: on that screen only when it takes input."""
+    name, mode, takes = case
+    aimed = []
+    errors = run_case(retroarch, root, driver,
+                      (name, 'ds', SCREENS_AIM_SETTINGS, SCREENS_AIM_POINTS),
+                      opts={'video_views_test_screens': mode},
+                      aim=SCREENS_AIM, aimed=aimed)
+    guns = GUN_RE.findall(log_text(case_dir(root, driver, name)))
+    if len(aimed) < len(SCREENS_AIM):
+        return errors + ['the pointer did not move']
+    if len(guns) <= aimed[-1]:
+        return errors + ['no light gun line after the aim at the bottom '
+                         'screen']
+    gun = guns[aimed[-1]]
+    offscreen, px, py = int(gun[2]), int(gun[4]), int(gun[5])
+    if takes and not 192 <= py < 384:
+        errors.append('the gun at the bottom screen has packed y %d, '
+                      'want 192 to 383' % py)
+    # Off-screen, or at the top screen's right edge; not at its centre,
+    # where the first aim's line is.
+    if not takes and not (offscreen or px >= 250):
+        errors.append('the gun at the bottom screen is at packed '
+                      '(%d, %d), want x 250 or more, or off-screen'
+                      % (px, py))
+    return errors
+
+
 def gamescope_root(x11, dpy):
     """dpy's root window if this process runs inside the gamescope that
     owns it, else None: the server names its gamescope on its root."""
@@ -1829,6 +1971,18 @@ def driver_jobs(retroarch, root, driver):
         return report('%s/%s-%s' % (driver, case[0], menu), errors), \
             bool(errors)
 
+    def screens_rules():
+        errors = run_screens_rules_case(retroarch, root, driver)
+        return report('%s/screens-rules' % driver, errors), bool(errors)
+
+    def screens_aim():
+        lines, failed = [], 0
+        for case in SCREENS_AIM_CASES:
+            errors = run_screens_aim_case(retroarch, root, driver, case)
+            lines += report('%s/%s' % (driver, case[0]), errors)
+            failed += bool(errors)
+        return lines, failed
+
     runs = [(case, 'off') for case in CASES
             if not (driver in WHOLE_ANAGLYPH_DRIVERS and 'anaglyph' in case[0])]
     runs += [(case, hw) for name, hw in HW_CASES.get(driver, [])
@@ -1864,6 +2018,10 @@ def driver_jobs(retroarch, root, driver):
     jobs += [lambda m=m, c=c: pointer(m, c) for m in sorted(POINTER_MENUS)
              for c in POINTER_CASES
              if wanted(c[0]) and driver not in NO_POINTER_DRIVERS]
+    if driver in SCREENS_DRIVERS and wanted('screens-rules'):
+        jobs.append(screens_rules)
+    if driver in SCREENS_DRIVERS and wanted('screens-no-input'):
+        jobs.append(screens_aim)
     return jobs
 
 
