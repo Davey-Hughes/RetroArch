@@ -18,6 +18,7 @@
  * failure. */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
 #include <limits.h>
@@ -825,6 +826,497 @@ static void test_select_screens(void)
    }
 }
 
+/* The "full" map: two stacked screens and a VMU, screen 2, with no
+ * view. */
+static struct retro_video_view   t_full_views[2];
+static struct retro_video_screen t_full_screens[3];
+static struct retro_video_screen_image t_vmu_image;
+static uint32_t t_vmu_pixels[48 * 32];
+
+static struct retro_video_screen t_screen(const char *name,
+      unsigned flags, unsigned state, unsigned show, unsigned base,
+      float size, unsigned anchor, float opacity, unsigned order,
+      unsigned owners, unsigned swap_with, unsigned group)
+{
+   struct retro_video_screen s;
+   s.name      = name;
+   s.flags     = flags;
+   s.state     = state;
+   s.show      = show;
+   s.base      = base;
+   s.size      = size;
+   s.anchor    = anchor;
+   s.opacity   = opacity;
+   s.order     = order;
+   s.owners    = owners;
+   s.swap_with = swap_with;
+   s.group     = group;
+   s.image     = NULL;
+   return s;
+}
+
+static void t_screens_full(struct retro_video_views *in)
+{
+   t_full_views[0]   = mkview(0,   0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_NONE);
+   t_full_views[1]   = mkview(0, 192, 256, 192, 1, RETRO_VIDEO_VIEW_EYE_NONE);
+   t_full_screens[0] = t_screen("Top",
+         RETRO_VIDEO_SCREEN_FLAG_GROUP_VERTICAL
+         | RETRO_VIDEO_SCREEN_FLAG_EMPHASIS,
+         RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+         0, 0.0f, 0, 0.0f, 2, 0, 2, 1);
+   t_full_screens[1] = t_screen("Bottom",
+         RETRO_VIDEO_SCREEN_FLAG_NO_INPUT | RETRO_VIDEO_SCREEN_FLAG_SHARP
+         | RETRO_VIDEO_SCREEN_FLAG_INTEGER,
+         RETRO_VIDEO_SCREEN_STATE_BLANK, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+         0, 0.5f, 0, 0.0f, 1, 0, 0, 1);
+   t_full_screens[2] = t_screen("VMU A1",
+         RETRO_VIDEO_SCREEN_FLAG_PRIVATE | RETRO_VIDEO_SCREEN_FLAG_NO_INPUT
+         | RETRO_VIDEO_SCREEN_FLAG_SHARP,
+         RETRO_VIDEO_SCREEN_STATE_ABSENT, RETRO_VIDEO_SCREEN_SHOW_OVER,
+         0, 0.25f, 8, 0.75f, 3, 0x1, 0, 0);
+   memset(in, 0, sizeof(*in));
+   in->views       = t_full_views;
+   in->num_views   = 2;
+   in->flags       = RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   in->screens     = t_full_screens;
+   in->num_screens = 3;
+}
+
+static int t_screen_is(const video_views_screen_t *o,
+      const struct retro_video_screen *s)
+{
+   return o->flags == s->flags && o->state == s->state
+      && o->show == s->show && o->base == s->base
+      && o->size == s->size && o->anchor == s->anchor
+      && o->opacity == s->opacity && o->order == s->order
+      && o->owners == s->owners && o->swap_with == s->swap_with
+      && o->group == s->group && !strcmp(o->name, s->name);
+}
+
+static int t_all_a5(const void *p, size_t len)
+{
+   const unsigned char *b = (const unsigned char*)p;
+   size_t i;
+   for (i = 0; i < len; i++)
+      if (b[i] != 0xA5)
+         return 0;
+   return 1;
+}
+
+static void test_screens_full(void)
+{
+   struct retro_video_views in;
+   video_views_map_t map, plain;
+   video_views_screens_t scr;
+   unsigned i;
+
+   t_screens_full(&in);
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(scr.count == 3);
+   for (i = 0; i < 3; i++)
+      CHECK(t_screen_is(&scr.screens[i], &t_full_screens[i]));
+   CHECK(scr.screens[0].flags == 0x22 && scr.screens[1].flags == 0x19
+         && scr.screens[2].flags == 0xd);
+   CHECK(!strcmp(scr.screens[0].name, "Top")
+         && !strcmp(scr.screens[1].name, "Bottom")
+         && !strcmp(scr.screens[2].name, "VMU A1"));
+   CHECK(map.num_screens == 3);
+   CHECK(map.no_input == 0x6 && map.viewless == 0x4);
+   CHECK(video_views_validate(t_full_views, 2, &plain));
+   CHECK(map.num_views == plain.num_views);
+   CHECK(!memcmp(map.views, plain.views, sizeof(map.views)));
+}
+
+/* Without the flag, or with no screens, the screens are not read. */
+static void test_screens_absent_flag(void)
+{
+   struct retro_video_views in;
+   struct retro_video_screen junk[2];
+   video_views_map_t map;
+   video_views_screens_t scr;
+
+   memset(junk, 0, sizeof(junk));
+   junk[0].anchor = 99;
+   junk[1].anchor = 99;
+   t_screens_full(&in);
+   in.flags       = 0;
+   in.num_screens = 99;
+   in.screens     = junk;
+   memset(&scr, 0xA5, sizeof(scr));
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(scr.count == 0 && map.num_screens == 2);
+   CHECK(map.no_input == 0 && map.viewless == 0);
+
+   t_screens_full(&in);
+   in.num_screens = 0;
+   in.screens     = NULL;
+   memset(&scr, 0xA5, sizeof(scr));
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(scr.count == 0 && map.num_screens == 2);
+   CHECK(map.no_input == 0 && map.viewless == 0);
+}
+
+/* A core built with the earlier header: its struct ends before screens. */
+static void test_screens_old_struct(void)
+{
+   struct retro_video_views in;
+   struct retro_video_views *old;
+   video_views_map_t map;
+   video_views_screens_t scr;
+   size_t size = offsetof(struct retro_video_views, screens);
+
+   t_screens_full(&in);
+   in.flags = 0;
+   old      = (struct retro_video_views*)malloc(size);
+   CHECK(old != NULL);
+   if (!old)
+      return;
+   memcpy(old, &in, size);
+   CHECK(video_views_validate_map(old, &map, &scr));
+   CHECK(map.num_views == 2 && map.num_screens == 2 && scr.count == 0);
+   free(old);
+}
+
+static void t_too_many(struct retro_video_views *in)
+{
+   in->num_screens = RETRO_VIDEO_SCREENS_MAX + 1;
+}
+
+static void t_null_screens(struct retro_video_views *in)
+{
+   in->screens     = NULL;
+   in->num_screens = 2;
+}
+
+static void t_view_past_count(struct retro_video_views *in)
+{
+   in->num_screens             = 1;
+   t_full_screens[0].swap_with = 0;
+}
+
+static void t_image(struct retro_video_views *in)
+{
+   t_vmu_image.data         = t_vmu_pixels;
+   t_vmu_image.width        = 48;
+   t_vmu_image.height       = 32;
+   t_vmu_image.pitch        = 48 * sizeof(uint32_t);
+   t_vmu_image.format       = RETRO_PIXEL_FORMAT_XRGB8888;
+   t_vmu_image.aspect_ratio = 0.0f;
+   t_vmu_image.serial       = 1;
+   t_full_screens[2].image  = &t_vmu_image;
+}
+
+static void t_active_viewless(struct retro_video_views *in)
+{
+   t_full_screens[2].state = RETRO_VIDEO_SCREEN_STATE_ACTIVE;
+}
+
+static void t_blank_viewless(struct retro_video_views *in)
+{
+   t_full_screens[2].state = RETRO_VIDEO_SCREEN_STATE_BLANK;
+}
+
+static void t_eye_unpaired(struct retro_video_views *in)
+{
+   t_full_views[1].eye = RETRO_VIDEO_VIEW_EYE_LEFT;
+}
+
+static void t_base_past_count(struct retro_video_views *in)
+{
+   t_full_screens[1].base = 3;
+}
+
+static void t_over_self(struct retro_video_views *in)
+{
+   t_full_screens[2].base = 2;
+}
+
+static void t_over_over(struct retro_video_views *in)
+{
+   t_full_screens[0].show = RETRO_VIDEO_SCREEN_SHOW_OVER;
+   t_full_screens[0].base = 1;
+}
+
+static void t_size_negative(struct retro_video_views *in)
+{
+   t_full_screens[1].size = -0.5f;
+}
+
+static void t_size_nan(struct retro_video_views *in)
+{
+   t_full_screens[1].size = (float)sqrt(-1.0);
+}
+
+static void t_size_inf(struct retro_video_views *in)
+{
+   t_full_screens[1].size = (float)HUGE_VAL;
+}
+
+static void t_anchor(struct retro_video_views *in)
+{
+   t_full_screens[2].anchor = 9;
+}
+
+static void t_over_size(struct retro_video_views *in)
+{
+   t_full_screens[2].size = 1.5f;
+}
+
+static void t_opacity(struct retro_video_views *in)
+{
+   t_full_screens[2].opacity = 1.5f;
+}
+
+static void t_opacity_negative(struct retro_video_views *in)
+{
+   t_full_screens[2].opacity = -0.1f;
+}
+
+static void t_opacity_nan(struct retro_video_views *in)
+{
+   t_full_screens[2].opacity = (float)sqrt(-1.0);
+}
+
+static void t_private_owners(struct retro_video_views *in)
+{
+   t_full_screens[2].owners = 0;
+}
+
+static void t_swap_self(struct retro_video_views *in)
+{
+   t_full_screens[0].swap_with = 1;
+}
+
+static void t_swap_past_count(struct retro_video_views *in)
+{
+   t_full_screens[0].swap_with = 4;
+}
+
+static void t_swap_disagree(struct retro_video_views *in)
+{
+   t_full_screens[0].swap_with = 2;
+   t_full_screens[1].swap_with = 3;
+}
+
+static void t_show_unknown(struct retro_video_views *in)
+{
+   t_full_screens[2].show = 3;
+}
+
+static void t_state_unknown(struct retro_video_views *in)
+{
+   t_full_screens[2].state = 3;
+}
+
+/* Screen 2 has no view, so state-unknown breaks the viewless rule too. */
+static void t_state_unknown_viewed(struct retro_video_views *in)
+{
+   t_full_screens[0].state = 3;
+}
+
+static void t_order_mixed(struct retro_video_views *in)
+{
+   t_full_screens[2].order = 0;
+}
+
+static void t_order_mixed_first(struct retro_video_views *in)
+{
+   t_full_screens[0].order = 0;
+}
+
+/* The full map with one rule broken: refused, with out and screens
+ * untouched. */
+static void test_screens_refused(void)
+{
+   static const struct
+   {
+      const char *name;
+      void (*change)(struct retro_video_views *in);
+   } cases[] = {
+      { "too-many",             t_too_many             },
+      { "null-screens",         t_null_screens         },
+      { "view-past-count",      t_view_past_count      },
+      { "image",                t_image                },
+      { "active-viewless",      t_active_viewless      },
+      { "blank-viewless",       t_blank_viewless       },
+      { "eye-unpaired",         t_eye_unpaired         },
+      { "base-past-count",      t_base_past_count      },
+      { "over-self",            t_over_self            },
+      { "over-over",            t_over_over            },
+      { "size-negative",        t_size_negative        },
+      { "size-nan",             t_size_nan             },
+      { "size-inf",             t_size_inf             },
+      { "anchor",               t_anchor               },
+      { "over-size",            t_over_size            },
+      { "opacity",              t_opacity              },
+      { "opacity-negative",     t_opacity_negative     },
+      { "opacity-nan",          t_opacity_nan          },
+      { "private-owners",       t_private_owners       },
+      { "swap-self",            t_swap_self            },
+      { "swap-past-count",      t_swap_past_count      },
+      { "swap-disagree",        t_swap_disagree        },
+      { "show-unknown",         t_show_unknown         },
+      { "state-unknown",        t_state_unknown        },
+      { "state-unknown-viewed", t_state_unknown_viewed },
+      { "order-mixed",          t_order_mixed          },
+      { "order-mixed-first",    t_order_mixed_first    }
+   };
+   unsigned i;
+
+   for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+   {
+      struct retro_video_views in;
+      video_views_map_t map;
+      video_views_screens_t scr;
+      t_screens_full(&in);
+      cases[i].change(&in);
+      memset(&map, 0xA5, sizeof(map));
+      memset(&scr, 0xA5, sizeof(scr));
+      if (     video_views_validate_map(&in, &map, &scr)
+            || !t_all_a5(&map, sizeof(map))
+            || !t_all_a5(&scr, sizeof(scr)))
+      {
+         printf("  FAIL refused case %s\n", cases[i].name);
+         failures++;
+      }
+   }
+}
+
+static void test_screens_accepted(void)
+{
+   struct retro_video_views in;
+   video_views_map_t map;
+   video_views_screens_t scr;
+
+   /* An empty map clears, whatever its screens. */
+   t_screens_full(&in);
+   in.num_views = 0;
+   memset(&map, 0xA5, sizeof(map));
+   memset(&scr, 0xA5, sizeof(scr));
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(map.num_views == 0 && map.num_screens == 0 && scr.count == 0);
+   CHECK(map.no_input == 0 && map.viewless == 0);
+
+   /* Screen 0 absent, with no view. */
+   t_screens_full(&in);
+   t_full_screens[0].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
+   in.views     = &t_full_views[1];
+   in.num_views = 1;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(map.num_screens == 3 && map.viewless == 0x5);
+
+   /* An absent screen with no view between two with views. */
+   t_screens_full(&in);
+   t_full_views[1].screen  = 2;
+   t_full_screens[1].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
+   t_full_screens[2].state = RETRO_VIDEO_SCREEN_STATE_ACTIVE;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(map.num_screens == 3 && map.viewless == 0x2);
+
+   /* A swap declared by both sides. */
+   t_screens_full(&in);
+   t_full_screens[1].swap_with = 1;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(scr.screens[0].swap_with == 2 && scr.screens[1].swap_with == 1);
+
+   /* OVER a shown screen other than 0. */
+   t_screens_full(&in);
+   t_full_screens[2].base = 1;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(scr.screens[2].base == 1);
+
+   /* The bounds themselves. */
+   t_screens_full(&in);
+   t_full_screens[2].size = 1.0f;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   t_full_screens[2].opacity = 0.0f;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   t_full_screens[2].opacity = 1.0f;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(scr.screens[2].size == 1.0f && scr.screens[2].opacity == 1.0f);
+
+   /* order 0 on every screen, and ties. */
+   t_screens_full(&in);
+   t_full_screens[0].order = 0;
+   t_full_screens[1].order = 0;
+   t_full_screens[2].order = 0;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   t_full_screens[0].order = 1;
+   t_full_screens[1].order = 1;
+   t_full_screens[2].order = 1;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(scr.screens[2].order == 1);
+
+   /* Flag bits the frontend does not know are ignored; UPRIGHT is kept. */
+   t_screens_full(&in);
+   in.flags                |= 1u << 31;
+   t_full_screens[1].flags |= RETRO_VIDEO_SCREEN_FLAG_UPRIGHT | (1u << 31);
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(scr.count == 3 && map.no_input == 0x6);
+   CHECK(scr.screens[1].flags == (0x59u | (1u << 31)));
+}
+
+/* Screen 2's name as validate_map keeps it, or NULL if refused. */
+static const char *t_name_kept(const char *name, video_views_screens_t *scr)
+{
+   struct retro_video_views in;
+   video_views_map_t map;
+   t_screens_full(&in);
+   t_full_screens[2].name = name;
+   if (!video_views_validate_map(&in, &map, scr))
+      return NULL;
+   return scr->screens[2].name;
+}
+
+static void test_screens_names(void)
+{
+   video_views_screens_t scr;
+   char longer[41];
+   char cut[33];
+   const char *got;
+
+   got = t_name_kept(NULL, &scr);
+   CHECK(got && !strcmp(got, ""));
+   got = t_name_kept("VMU A1", &scr);
+   CHECK(got && !strcmp(got, "VMU A1"));
+
+   memset(longer, 'a', 40);
+   longer[40] = '\0';
+   got = t_name_kept(longer, &scr);
+   CHECK(got && strlen(got) == 31 && !strncmp(got, longer, 31));
+
+   /* 30 'a' then U+00E9: the cut lands inside it, so it goes. */
+   memset(cut, 'a', 30);
+   strcpy(cut + 30, "\xc3\xa9");
+   got = t_name_kept(cut, &scr);
+   CHECK(got && strlen(got) == 30 && !strncmp(got, cut, 30));
+   /* With one 'a' less it fits whole. */
+   got = t_name_kept(cut + 1, &scr);
+   CHECK(got && !strcmp(got, cut + 1));
+
+   got = t_name_kept("A\nB\tC\x7f", &scr);
+   CHECK(got && !strcmp(got, "A B C "));
+}
+
+static void test_screens_select_masks(void)
+{
+   struct retro_video_views in;
+   video_views_map_t full, sub;
+   video_views_screens_t scr;
+   unsigned index[RETRO_VIDEO_VIEWS_MAX];
+
+   t_screens_full(&in);
+   CHECK(video_views_validate_map(&in, &full, &scr));
+   CHECK(video_views_select_screens(&full, 1, 2, &sub, index));
+   CHECK(sub.num_screens == 2 && sub.num_views == 1);
+   CHECK(sub.no_input == 0x3 && sub.viewless == 0x2);
+   CHECK(video_views_select_screens(&full, 0, 2, &sub, index));
+   CHECK(sub.no_input == 0x2 && sub.viewless == 0);
+   /* A screen with no view, alone, selects nothing. */
+   CHECK(!video_views_select_screens(&full, 2, 1, &sub, index));
+   CHECK(sub.num_screens == 0 && sub.no_input == 0 && sub.viewless == 0);
+}
+
 /* A console's touchscreen through the views it shows: the 3DS's bottom
  * screen showing the DS map's second screen. */
 static void test_touch(void)
@@ -1411,6 +1903,13 @@ int main(void)
    test_frame_helpers();
    test_eye_pair();
    test_select_screens();
+   test_screens_full();
+   test_screens_absent_flag();
+   test_screens_old_struct();
+   test_screens_refused();
+   test_screens_accepted();
+   test_screens_names();
+   test_screens_select_masks();
    test_blend();
    test_cpu_compose();
    test_cut_source();
