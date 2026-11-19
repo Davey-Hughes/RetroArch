@@ -174,7 +174,35 @@ typedef struct video_views_map
    struct retro_video_view views[RETRO_VIDEO_VIEWS_MAX];
    unsigned num_views;
    unsigned num_screens;
+   /* Bit s is screen s. */
+   unsigned no_input;   /* RETRO_VIDEO_SCREEN_FLAG_NO_INPUT */
+   unsigned viewless;   /* below num_screens with no view */
 } video_views_map_t;
+
+#define VIDEO_VIEWS_NAME_SIZE 32   /* bytes kept of a screen's name, with its NUL */
+
+/* One validated retro_video_screen. */
+typedef struct video_views_screen
+{
+   unsigned flags;
+   unsigned state;
+   unsigned show;
+   unsigned base;
+   unsigned anchor;
+   unsigned order;
+   unsigned owners;
+   unsigned swap_with;
+   unsigned group;
+   float size;
+   float opacity;
+   char name[VIDEO_VIEWS_NAME_SIZE];   /* "" when the core gave none */
+} video_views_screen_t;
+
+typedef struct video_views_screens
+{
+   video_views_screen_t screens[RETRO_VIDEO_SCREENS_MAX];
+   unsigned count;                     /* 0: the map describes no screens */
+} video_views_screens_t;
 
 typedef struct video_screen_xr
 {
@@ -193,6 +221,12 @@ void video_views_xr_normalize(video_screen_xr_t *screen);
 
 bool video_views_validate(const struct retro_video_view *views,
       unsigned num_views, video_views_map_t *out);
+
+/* A whole SET_VIDEO_VIEWS argument: its views, and its screens when it
+ * sets RETRO_VIDEO_VIEWS_FLAG_SCREENS. Writes @out and @screens only
+ * when it returns true. */
+bool video_views_validate_map(const struct retro_video_views *in,
+      video_views_map_t *out, video_views_screens_t *screens);
 
 bool video_views_fit_frame(const video_views_map_t *map,
       unsigned frame_dims);
