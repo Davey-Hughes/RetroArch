@@ -22,6 +22,7 @@
 #include <boolean.h>
 #include <retro_inline.h>
 #include <retro_atomic.h>
+#include <rthreads/retro_seqlatch.h>
 #include <retro_common_api.h>
 #include <libretro.h>
 
@@ -203,6 +204,29 @@ typedef struct video_views_screens
    video_views_screen_t screens[RETRO_VIDEO_SCREENS_MAX];
    unsigned count;                     /* 0: the map describes no screens */
 } video_views_screens_t;
+
+/* Screen names crossing from the main thread, their one writer, to any
+ * thread (rthreads/retro_seqlatch.h). Zeroed: every name "", stamp 0. */
+typedef struct video_views_names
+{
+   char name[RETRO_VIDEO_SCREENS_MAX][VIDEO_VIEWS_NAME_SIZE];
+} video_views_names_t;
+
+#define VIDEO_VIEWS_NAMES_WORDS \
+   RETRO_SEQLATCH_WORDS(sizeof(video_views_names_t))
+
+typedef struct video_views_names_box
+{
+   retro_atomic_int_t seq;
+   retro_atomic_int_t words[2 * VIDEO_VIEWS_NAMES_WORDS];
+} video_views_names_box_t;
+
+void video_views_names_publish(video_views_names_box_t *box,
+      const video_views_names_t *names);
+
+/* Returns the stamp it read at. */
+int video_views_names_read(video_views_names_box_t *box,
+      video_views_names_t *out);
 
 typedef struct video_screen_xr
 {

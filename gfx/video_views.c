@@ -273,6 +273,18 @@ bool video_views_validate_map(const struct retro_video_views *in,
          in->screens, in->num_screens, out, screens);
 }
 
+void video_views_names_publish(video_views_names_box_t *box,
+      const video_views_names_t *names)
+{
+   retro_seqlatch_publish(&box->seq, box->words, names, sizeof(*names));
+}
+
+int video_views_names_read(video_views_names_box_t *box,
+      video_views_names_t *out)
+{
+   return retro_seqlatch_read(&box->seq, box->words, out, sizeof(*out));
+}
+
 bool video_views_fit_frame(const video_views_map_t *map,
       unsigned frame_dims)
 {

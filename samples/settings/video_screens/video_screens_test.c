@@ -3983,6 +3983,230 @@ static void test_window_pointer_mapping(void)
    CHECK(!video_driver_translate_window_point(1, gen, 400, 240, true, &pos));
 }
 
+/* window_test_views()'s map, with screen 1 NO_INPUT, in its own window:
+ * a point there is off every view, and the main window maps as before */
+static void test_window_pointer_no_input(void)
+{
+   static const int points[][2] = {
+      {0, 0}, {400, 240}, {799, 479}, {-5, 100}, {900, 600}, {120, 30}
+   };
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[2];
+   static video_views_layout_t layout;
+   const uint32_t oob = VIDEO_POS_PACK(-0x8000, -0x8000);
+   struct retro_video_views map;
+   uint32_t pos, before[ARRAY_SIZE(points)];
+   unsigned i, gen;
+
+   window_test_begin();
+   window_test_run();
+   CHECK(window_test_placements() == 1);
+   for (i = 0; i < ARRAY_SIZE(points); i++)
+      CHECK(video_driver_translate_window_point(0, 0, points[i][0],
+               points[i][1], true, &before[i]));
+   gen = video_driver_window_generation();
+   video_driver_window_layout(&window_test_seen, 1,
+         VIDEO_SCALE_PACK(800, 480), &layout);
+   CHECK(layout.num_placements == 1);
+   video_driver_publish_window_layout(1, gen, 2, &layout,
+         &window_test_seen.core, window_test_seen.core_dims,
+         VIDEO_SCALE_PACK(800, 480));
+   CHECK(video_driver_translate_window_point(1, gen, 400, 240, true, &pos));
+   CHECK(pos != oob);
+
+   memset(views, 0, sizeof(views));
+   views[0].width  = views[1].width  = 4;
+   views[0].height = views[1].height = 2;
+   views[1].x      = 4;
+   views[1].screen = 1;
+   memset(screens, 0, sizeof(screens));
+   screens[1].flags = RETRO_VIDEO_SCREEN_FLAG_NO_INPUT;
+   memset(&map, 0, sizeof(map));
+   map.views       = views;
+   map.num_views   = 2;
+   map.flags       = RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   map.screens     = screens;
+   map.num_screens = 2;
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   CHECK(window_test_placements() == 1);
+   CHECK(window_test_seen.core.no_input == 2u);
+   video_driver_window_layout(&window_test_seen, 1,
+         VIDEO_SCALE_PACK(800, 480), &layout);
+   CHECK(layout.num_placements == 1);
+   video_driver_publish_window_layout(1, gen, 2, &layout,
+         &window_test_seen.core, window_test_seen.core_dims,
+         VIDEO_SCALE_PACK(800, 480));
+   pos = 0;
+   CHECK(video_driver_translate_window_point(1, gen, 400, 240, true, &pos));
+   CHECK(pos == oob);
+   pos = 0;
+   CHECK(video_driver_translate_window_point(1, gen, 400, 240, false, &pos));
+   CHECK(pos == oob);
+   for (i = 0; i < ARRAY_SIZE(points); i++)
+   {
+      CHECK(video_driver_translate_window_point(0, 0, points[i][0],
+               points[i][1], true, &pos));
+      CHECK(pos == before[i]);
+   }
+   video_driver_publish_window_layout(1, gen, 0, NULL, NULL, 0, 0);
+   window_test_end();
+}
+
+/* Two stacked screens and a VMU, screen 2, with no view */
+static void screens_test_full(struct retro_video_views *map,
+      struct retro_video_view *views, struct retro_video_screen *screens)
+{
+   memset(views, 0, 2 * sizeof(*views));
+   views[0].width  = views[1].width  = 256;
+   views[0].height = views[1].height = 192;
+   views[1].y      = 192;
+   views[1].screen = 1;
+   memset(screens, 0, 3 * sizeof(*screens));
+   screens[0].name      = "Top";
+   screens[0].flags     = RETRO_VIDEO_SCREEN_FLAG_GROUP_VERTICAL
+                        | RETRO_VIDEO_SCREEN_FLAG_EMPHASIS;
+   screens[0].order     = 2;
+   screens[0].swap_with = 2;
+   screens[0].group     = 1;
+   screens[1].name      = "Bottom";
+   screens[1].flags     = RETRO_VIDEO_SCREEN_FLAG_NO_INPUT
+                        | RETRO_VIDEO_SCREEN_FLAG_SHARP
+                        | RETRO_VIDEO_SCREEN_FLAG_INTEGER;
+   screens[1].state     = RETRO_VIDEO_SCREEN_STATE_BLANK;
+   screens[1].size      = 0.5f;
+   screens[1].order     = 1;
+   screens[1].group     = 1;
+   screens[2].name      = "VMU A1";
+   screens[2].flags     = RETRO_VIDEO_SCREEN_FLAG_PRIVATE
+                        | RETRO_VIDEO_SCREEN_FLAG_NO_INPUT
+                        | RETRO_VIDEO_SCREEN_FLAG_SHARP;
+   screens[2].state     = RETRO_VIDEO_SCREEN_STATE_ABSENT;
+   screens[2].show      = RETRO_VIDEO_SCREEN_SHOW_OVER;
+   screens[2].size      = 0.25f;
+   screens[2].anchor    = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT;
+   screens[2].opacity   = 0.75f;
+   screens[2].order     = 3;
+   screens[2].owners    = 0x1;
+   memset(map, 0, sizeof(*map));
+   map->views       = views;
+   map->num_views   = 2;
+   map->flags       = RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   map->screens     = screens;
+   map->num_screens = 3;
+}
+
+static bool screens_test_label(unsigned screen, const char *want)
+{
+   char label[64];
+   size_t len = video_driver_screen_label(screen, "Screen %u", label,
+         sizeof(label));
+   return len == strlen(want) && string_is_equal(label, want);
+}
+
+static bool screens_test_unnamed(const video_views_names_t *names)
+{
+   unsigned i;
+   for (i = 0; i < RETRO_VIDEO_SCREENS_MAX; i++)
+      if (*names->name[i])
+         return false;
+   return true;
+}
+
+/* SET_VIDEO_VIEWS keeps the screens a core describes: their names label
+ * the screens and reach other threads, stamped, only when one changes */
+static void test_views_screens_frontend(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   video_driver_state_t *video_st = video_state_get_ptr();
+   struct retro_video_views map;
+   struct retro_video_screen_buffer buf;
+   video_views_names_t names;
+   video_views_map_t kept;
+   unsigned status;
+   int stamp;
+
+   video_driver_clear_views();
+   stamp = video_driver_screen_names_stamp();
+   screens_test_full(&map, views, screens);
+   CHECK(video_driver_set_views(&map));
+   CHECK(screens_test_label(2, "VMU A1"));
+   CHECK(screens_test_label(3, "Screen 4"));
+   CHECK(video_driver_get_screen_names(&names) != stamp);
+   CHECK(string_is_equal(names.name[0], "Top"));
+   CHECK(string_is_equal(names.name[1], "Bottom"));
+   CHECK(string_is_equal(names.name[2], "VMU A1"));
+   CHECK(!*names.name[3]);
+   CHECK(video_st->views_screens.screens[1].state
+         == RETRO_VIDEO_SCREEN_STATE_BLANK);
+   stamp = video_driver_screen_names_stamp();
+
+   /* The same map, and a live state change: the names stay out */
+   CHECK(video_driver_set_views(&map));
+   CHECK(video_driver_screen_names_stamp() == stamp);
+   screens[1].state = RETRO_VIDEO_SCREEN_STATE_ACTIVE;
+   CHECK(video_driver_set_views(&map));
+   CHECK(video_st->views_screens.screens[1].state
+         == RETRO_VIDEO_SCREEN_STATE_ACTIVE);
+   CHECK(video_driver_screen_names_stamp() == stamp);
+
+   /* Refused: nothing moves */
+   kept              = video_st->views;
+   screens[2].anchor = 9;
+   CHECK(!video_driver_set_views(&map));
+   screens[2].anchor = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT;
+   CHECK(!memcmp(&kept, &video_st->views, sizeof(kept)));
+   CHECK(screens_test_label(2, "VMU A1"));
+   CHECK(video_driver_screen_names_stamp() == stamp);
+
+   /* Without the flag the screens are RetroArch's to name */
+   map.flags = 0;
+   CHECK(video_driver_set_views(&map));
+   CHECK(screens_test_label(2, "Screen 3"));
+   CHECK(video_driver_get_screen_names(&names) != stamp);
+   CHECK(screens_test_unnamed(&names));
+
+   /* Two empty maps in a row: the names go once */
+   map.flags = RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   CHECK(video_driver_set_views(&map));
+   stamp         = video_driver_screen_names_stamp();
+   map.num_views = 0;
+   CHECK(video_driver_set_views(&map));
+   CHECK(video_driver_get_screen_names(&names) != stamp);
+   CHECK(screens_test_unnamed(&names));
+   stamp = video_driver_screen_names_stamp();
+   CHECK(video_driver_set_views(&map));
+   CHECK(video_driver_screen_names_stamp() == stamp);
+   CHECK(screens_test_label(0, "Screen 1"));
+
+   /* Content closing */
+   map.num_views = 2;
+   CHECK(video_driver_set_views(&map));
+   CHECK(screens_test_label(0, "Top"));
+   stamp = video_driver_screen_names_stamp();
+   video_driver_clear_views();
+   CHECK(screens_test_label(0, "Screen 1"));
+   CHECK(video_driver_get_screen_names(&names) != stamp);
+   CHECK(screens_test_unnamed(&names));
+
+   /* SCREENS and IMAGES stay unset, and no buffer is lent */
+   window_test_begin();
+   status = video_driver_views_status();
+   CHECK(status & RETRO_VIDEO_VIEWS_STATUS_PRESENTS);
+   CHECK(!(status & (RETRO_VIDEO_VIEWS_STATUS_SCREENS
+               | RETRO_VIDEO_VIEWS_STATUS_IMAGES)));
+   window_test_end();
+   memset(&buf, 0, sizeof(buf));
+   buf.screen = 1;
+   buf.width  = 48;
+   buf.height = 32;
+   buf.format = RETRO_PIXEL_FORMAT_XRGB8888;
+   CHECK(!runloop_environment_cb(RETRO_ENVIRONMENT_GET_VIDEO_SCREEN_BUFFER,
+            &buf));
+   CHECK(!buf.data && !buf.pitch);
+}
+
 /* Device @i's left button and motion, and the touches down in a list */
 #define WINDOW_TEST_LEFT(i) input_driver_device_state(i, RETRO_DEVICE_MOUSE, \
       0, RETRO_DEVICE_ID_MOUSE_LEFT)
@@ -8084,6 +8308,8 @@ int main(int argc, char **argv)
    test_window_turned_display();
    test_window_turned_waiting();
    test_window_pointer_mapping();
+   test_window_pointer_no_input();
+   test_views_screens_frontend();
    test_window_pointer_release();
    test_window_menu_touch_window();
    test_window_menu_mouse_kept();

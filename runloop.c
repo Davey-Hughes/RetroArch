@@ -4846,6 +4846,10 @@ bool runloop_environment_cb(unsigned cmd, void *data)
          *(unsigned*)data = video_driver_views_status();
          break;
 
+      /* No image screens: nothing to lend */
+      case RETRO_ENVIRONMENT_GET_VIDEO_SCREEN_BUFFER:
+         return false;
+
       case RETRO_ENVIRONMENT_GET_JIT_CAPABLE:
          {
 #if TARGET_OS_IPHONE
