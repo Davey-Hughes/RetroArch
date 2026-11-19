@@ -262,6 +262,21 @@ static void test_title_screen(void)
    CHECK(video_window_title_screen(&r) == 1);
 }
 
+static void test_title(void)
+{
+   char s[64];
+   video_window_request_t r;
+   memset(&r, 0, sizeof(r));
+   r.screen  = 3;
+   r.screens = 0x2;
+   strcpy(r.name, "VMU A1");
+   CHECK(video_window_title(&r, s, sizeof(s)) == strlen(s));
+   CHECK(!strcmp(s, "RetroArch - VMU A1"));
+   r.name[0] = '\0';
+   CHECK(video_window_title(&r, s, sizeof(s)) == strlen(s));
+   CHECK(!strcmp(s, "RetroArch - Screen 2"));
+}
+
 static void test_display_own(void)
 {
    char keys[RETRO_VIDEO_VIEWS_MAX][VIDEO_WINDOW_DISPLAY_NAME_SIZE];
@@ -2899,6 +2914,7 @@ int main(void)
    test_resolve();
    test_spare_window();
    test_title_screen();
+   test_title();
    test_display_own();
    test_display_key();
    test_display_key_unnamed();

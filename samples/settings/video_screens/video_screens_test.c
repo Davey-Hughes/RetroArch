@@ -7849,6 +7849,14 @@ static void test_window_native_lifecycle(const char *ident, bool core)
       request.generation    = video_driver_window_generation();
       request.settings.mode = VIDEO_WINDOW_SEPARATE;
       request.settings.dims = VIDEO_SCALE_PACK(320, 240);
+      /* Titled by the core's name for its screen the second time */
+      if (restart)
+         strlcpy(request.name, "VMU A1", sizeof(request.name));
+#ifdef NATIVE_WIN32
+      /* UTF-8, as a core gives it */
+      if (restart && native_w32_ident(ident))
+         strlcpy(request.name, "\xc3\x89" "cran A1", sizeof(request.name));
+#endif
       CHECK(request.generation > previous);
       strlcpy(config_get_ptr()->arrays.video_context_driver, ident,
             sizeof(config_get_ptr()->arrays.video_context_driver));
@@ -7991,7 +7999,7 @@ static void test_window_native_lifecycle(const char *ident, bool core)
          /* Focus as well, by the seat */
          if (!restart && window.state && native_wl_ident(ident))
          {
-            native_wl_kwin(video_window_title_screen(&request),
+            native_wl_kwin(&request,
                   "var g = w.frameGeometry;"
                   " w.frameGeometry = {x: g.x, y: g.y, width: 500,"
                   " height: 400}; w.closeWindow();");
@@ -8023,15 +8031,14 @@ static void test_window_native_lifecycle(const char *ident, bool core)
 #ifdef HAVE_X11
       if (native_x11_ident(ident))
       {
-         CHECK(native_x11_titled(g_x11_dpy,
-               video_window_title_screen(&request)) == 0);
+         CHECK(native_x11_titled(g_x11_dpy, &request) == 0);
          native_x11_torn_down(!restart);
       }
 #endif
 #ifdef NATIVE_WIN32
       if (native_w32_ident(ident))
       {
-         native_w32_torn_down(video_window_title_screen(&request));
+         native_w32_torn_down(&request);
          native_window_input = NULL;
       }
 #endif

@@ -2518,8 +2518,7 @@ bool wl_video_window_create(void *owner,
    retro_atomic_store_release_size(&ids->surface,
          (size_t)(uintptr_t)state->surface);
 
-   snprintf(title, sizeof(title), "RetroArch - Screen %u",
-         video_window_title_screen(request) + 1);
+   video_window_title(request, title, sizeof(title));
 #ifdef HAVE_LIBDECOR_H
    if (wl->libdecor)
    {

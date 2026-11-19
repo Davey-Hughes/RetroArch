@@ -2383,6 +2383,7 @@ static bool win32_window_create(void *data, unsigned style,
 
 #if defined(HAVE_VIDEO_WINDOWS) && !defined(__WINRT__)
 #define WIN32_VIDEO_WINDOW_CLASS "RetroArch Screen"
+#define WIN32_VIDEO_WINDOW_CLASS_W L"RetroArch Screen"
 /* The property an open one has */
 #define WIN32_VIDEO_WINDOW_OPEN  "RetroArch Screen open"
 #define WIN32_VIDEO_WINDOW_STYLE (WS_OVERLAPPEDWINDOW | WS_CLIPSIBLINGS \
@@ -2916,6 +2917,11 @@ bool win32_video_window_create(void *owner,
       const video_window_request_t *request, video_window_native_t *window)
 {
    char title[64];
+#ifdef LEGACY_WIN32
+   char *title_local;
+#else
+   wchar_t *title_local;
+#endif
    RECT rect, client;
    POINT origin;
    win32_video_window_t *state;
@@ -2960,15 +2966,22 @@ bool win32_video_window_create(void *owner,
    window->configured    = true;
 
    win32_video_window_place(&request->settings, NULL, &rect);
-   snprintf(title, sizeof(title), "RetroArch - Screen %u",
-         video_window_title_screen(request) + 1);
-   if (!(state->hwnd = CreateWindowEx(0, WIN32_VIDEO_WINDOW_CLASS, title,
-               state->fullscreen
-               ? WIN32_VIDEO_WINDOW_FULLSCREEN_STYLE
-               : WIN32_VIDEO_WINDOW_STYLE,
-               rect.left, rect.top,
-               rect.right - rect.left, rect.bottom - rect.top,
-               NULL, NULL, instance, NULL)))
+   video_window_title(request, title, sizeof(title));
+#ifdef LEGACY_WIN32
+   title_local = utf8_to_local_string_alloc(title);
+   state->hwnd = CreateWindowEx(0, WIN32_VIDEO_WINDOW_CLASS, title_local,
+#else
+   title_local = utf8_to_utf16_string_alloc(title);
+   state->hwnd = CreateWindowExW(0, WIN32_VIDEO_WINDOW_CLASS_W, title_local,
+#endif
+         state->fullscreen
+         ? WIN32_VIDEO_WINDOW_FULLSCREEN_STYLE
+         : WIN32_VIDEO_WINDOW_STYLE,
+         rect.left, rect.top,
+         rect.right - rect.left, rect.bottom - rect.top,
+         NULL, NULL, instance, NULL);
+   free(title_local);
+   if (!state->hwnd)
    {
       free(state);
       memset(window, 0, sizeof(*window));

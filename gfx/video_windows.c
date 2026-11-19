@@ -13,6 +13,7 @@
  *  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <stdio.h>
 #include <string.h>
 
 #include <retro_miscellaneous.h>
@@ -664,6 +665,15 @@ unsigned video_window_title_screen(const video_window_request_t *request)
       if (request->screens & (1u << s))
          return s;
    return request->screen;
+}
+
+size_t video_window_title(const video_window_request_t *request, char *s,
+      size_t len)
+{
+   if (*request->name)
+      return (size_t)snprintf(s, len, "RetroArch - %s", request->name);
+   return (size_t)snprintf(s, len, "RetroArch - Screen %u",
+         video_window_title_screen(request) + 1);
 }
 
 bool video_windows_blank_wanted(unsigned mode, bool game, bool flipped)
