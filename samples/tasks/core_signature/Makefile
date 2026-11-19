@@ -2,6 +2,7 @@ include ../../sample_objdir.mk
 
 TARGET := core_signature_test
 KEYS_TARGET := core_signing_keys_test
+GATE_TARGET := core_signing_gate_test
 
 # Core signature checks: .sig parsing and verification against
 # fixtures from tools/core_sign.py (gen_fixtures.py), file identity and
@@ -64,6 +65,7 @@ OBJS := $(call sample_objs,$(SOURCES:.c=.o))
 # the test as C89
 STRICT_OBJS  := core_signature_test.o \
                 core_signing_keys_test.o \
+                core_signing_gate_test.o \
                 $(call sample_objs,$(REPO_ROOT)/core_signature.o) \
                 $(SAMPLE_OBJDIR)/core_signature_android.o \
                 $(call sample_objs,$(REPO_ROOT)/core_signature_io.o) \
@@ -76,6 +78,11 @@ STRICT_FLAGS += -Wno-c99-extensions -Wno-c11-extensions
 endif
 $(STRICT_OBJS): CFLAGS += $(STRICT_FLAGS)
 
+# Keyless on every host, as a Steam build is: core_signing_keys_test and
+# core_signing_gate_test cover the keys
+core_signature_test.o $(call sample_objs,$(REPO_ROOT)/core_signature.o): \
+   CFLAGS += -DHAVE_STEAM
+
 ifneq ($(SANITIZER),)
    CFLAGS  := -fsanitize=$(SANITIZER) -fno-omit-frame-pointer $(CFLAGS)
    LDFLAGS := -fsanitize=$(SANITIZER) $(LDFLAGS)
@@ -84,7 +91,7 @@ endif
 # One library built twice, told apart by what core_load_test_id returns
 TEST_LIBS := core_load_test_a$(LIB_EXT) core_load_test_b$(LIB_EXT)
 
-all: $(TARGET)$(EXE) $(KEYS_TARGET)$(EXE) $(TEST_LIBS)
+all: $(TARGET)$(EXE) $(KEYS_TARGET)$(EXE) $(GATE_TARGET)$(EXE) $(TEST_LIBS)
 
 core_load_test_a$(LIB_EXT): core_load_lib.c
 	$(CC) -shared $(LIB_FLAGS) -DCORE_LOAD_ID=1 -o $@ $<
@@ -102,7 +109,7 @@ $(SAMPLE_OBJDIR)/%.o: $$(call sample_src,$$*).c
 $(TARGET)$(EXE): $(OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS) $(LIBS)
 
-# Only Android builds carry libretro's keys
+# An Android build has libretro's keys on every host
 $(SAMPLE_OBJDIR)/core_signature_android.o: $(REPO_ROOT)/core_signature.c
 	@mkdir -p $(@D)
 	$(CC) -c -o $@ $< $(CFLAGS) -DANDROID
@@ -113,13 +120,31 @@ $(KEYS_TARGET)$(EXE): core_signing_keys_test.o \
          $(call sample_objs,$(REPO_ROOT)/core_signature.o),$(OBJS))
 	$(CC) -o $@ $^ $(LDFLAGS) $(LIBS)
 
+# "config.h" resolves beside the header that includes it, so the gate is
+# compiled from a copy: a configured tree's own config.h stays out of it
+GATE_DIR := $(SAMPLE_OBJDIR)/gate
+
+$(GATE_DIR)/core_signing_keys.h: $(REPO_ROOT)/core_signing_keys.h
+	@mkdir -p $(@D)
+	cp $< $@
+	printf '#ifdef GATE_CONFIG_STEAM\n#define HAVE_STEAM 1\n#endif\n' > $(@D)/config.h
+
+core_signing_gate_test.o: core_signing_gate_test.c core_signing_gate_case.h \
+      $(GATE_DIR)/core_signing_keys.h
+	$(CC) -c -o $@ $< -I$(GATE_DIR) $(CFLAGS) -DHAVE_CONFIG_H
+
+$(GATE_TARGET)$(EXE): core_signing_gate_test.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
 check: all
 	$(RUNNER) ./$(TARGET)$(EXE)
 	$(RUNNER) ./$(KEYS_TARGET)$(EXE)
+	$(RUNNER) ./$(GATE_TARGET)$(EXE)
 
 clean:
 	rm -rf $(SAMPLE_OBJDIR) core_signature_test_tmp
 	rm -f $(TARGET) $(TARGET).exe $(OBJS) core_load_test_a.so core_load_test_b.so core_load_test_a.dll core_load_test_b.dll
 	rm -f $(KEYS_TARGET) $(KEYS_TARGET).exe core_signing_keys_test.o
+	rm -f $(GATE_TARGET) $(GATE_TARGET).exe core_signing_gate_test.o
 
 .PHONY: all check clean

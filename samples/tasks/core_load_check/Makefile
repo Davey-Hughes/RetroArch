@@ -70,6 +70,9 @@ CFLAGS += -Wall -g1 -O0 -I$(LIBRETRO_COMM_DIR)/include -I$(REPO_ROOT) \
           -DHAVE_DYNAMIC -DHAVE_MENU -DHAVE_CORE_SIGNATURES \
           -DHAVE_CORE_LOAD_CHECK -DHAVE_CORE_SIGNING_TEST_KEY
 
+# No libretro keys on any host, as a Steam build
+$(call sample_objs,$(REPO_ROOT)/core_signature.o): CFLAGS += -DHAVE_STEAM
+
 # Counts the hashes the check starts, and moves a core between its
 # check and its pass; Darwin's ld has no --wrap
 ifneq ($(shell uname -s),Darwin)
