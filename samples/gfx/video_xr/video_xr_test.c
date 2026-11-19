@@ -7833,6 +7833,117 @@ static void test_request_rate(void)
    CHECK(NEAR(video_xr_request_rate(10, e2e, 2, 10.0f, 16), 10.0));
 }
 
+/* @num_scr screens around @views, those in @absent ABSENT, as
+ * video_views_validate_map makes them. */
+static void absent_map(const struct retro_video_view *views,
+      unsigned num_views, unsigned num_scr, unsigned absent,
+      video_views_map_t *map)
+{
+   struct retro_video_views in;
+   struct retro_video_screen scr[RETRO_VIDEO_VIEWS_MAX];
+   unsigned i;
+   memset(scr, 0, sizeof(scr));
+   for (i = 0; i < num_scr; i++)
+      if (absent & (1u << i))
+         scr[i].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
+   memset(&in, 0, sizeof(in));
+   in.views       = views;
+   in.num_views   = num_views;
+   in.flags       = RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   in.screens     = scr;
+   in.num_screens = num_scr;
+   CHECK(video_views_validate_map(&in, map, NULL));
+}
+
+/* Neither NaN nor infinite. */
+static int xr_finite(double x)
+{
+   return fabs(x) < 1e30;
+}
+
+static int lay_finite(const video_xr_layout_t *lay)
+{
+   unsigned s;
+   for (s = 0; s < lay->count; s++)
+      if (     !xr_finite(lay->width[s]) || !xr_finite(lay->height[s])
+            || !xr_finite(lay->pos[s].x) || !xr_finite(lay->pos[s].y)
+            || !xr_finite(lay->pos[s].z))
+         return 0;
+   return 1;
+}
+
+static int quads_finite(const video_xr_quad_set_t *set)
+{
+   unsigned i;
+   for (i = 0; i < set->num_quads; i++)
+   {
+      const video_xr_quad_t *q = &set->quads[i];
+      if (     !xr_finite(q->width) || !xr_finite(q->height)
+            || !xr_finite(q->pose.position.x)
+            || !xr_finite(q->pose.position.y)
+            || !xr_finite(q->pose.position.z))
+         return 0;
+   }
+   return 1;
+}
+
+/* A screen without views takes no place and has no quad. */
+static void test_xr_viewless(void)
+{
+   struct retro_video_view v[2];
+   video_views_map_t map, one, plain;
+   video_xr_params_t p;
+   video_xr_layout_t lay, want;
+   video_xr_quad_set_t set;
+   unsigned layout, i;
+
+   v[0] = mkview(0,   0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_NONE);
+   v[1] = mkview(0, 192, 256, 192, 2, RETRO_VIDEO_VIEW_EYE_NONE);
+   absent_map(v, 2, 3, 0x2, &map);
+   CHECK(map.num_screens == 3 && map.viewless == 0x2);
+   v[0] = mkview(0, 192, 256, 192, 1, RETRO_VIDEO_VIEW_EYE_NONE);
+   absent_map(v, 1, 2, 0x1, &one);
+   CHECK(one.num_screens == 2 && one.viewless == 0x1);
+   map_ds(&plain);
+   for (layout = 0; layout < VIDEO_SCREEN_LAYOUT_LAST; layout++)
+   {
+      params_init(&p, &plain);
+      p.screen_layout = layout;
+      video_xr_layout(&p, &want);
+      p.map = &map;
+      video_xr_layout(&p, &lay);
+      CHECK(lay.count == 3 && lay_finite(&lay));
+      CHECK(   lay.width[1] == 0.0f && lay.height[1] == 0.0f
+            && lay.native[1] == 0);
+      /* Screen 2 where a plain map's screen 1 is. */
+      CHECK(vec_is(&lay.pos[0], want.pos[0].x, want.pos[0].y,
+               want.pos[0].z));
+      CHECK(vec_is(&lay.pos[2], want.pos[1].x, want.pos[1].y,
+               want.pos[1].z));
+      CHECK(   NEAR(lay.width[2], want.width[1])
+            && NEAR(lay.height[2], want.height[1]));
+      video_xr_place(&p, &set);
+      CHECK(set.num_quads == 2 && quads_finite(&set));
+      for (i = 0; i < set.num_quads; i++)
+         CHECK(set.quads[i].screen != 1);
+      CHECK(set.slots[1].dims == 0 && set.slots[1].layers == 0);
+
+      /* Screen 0 without views: screen 1 sits where it would. */
+      p.map = &one;
+      video_xr_layout(&p, &lay);
+      CHECK(lay.count == 2 && lay_finite(&lay));
+      CHECK(   lay.width[0] == 0.0f && lay.height[0] == 0.0f
+            && lay.native[0] == 0);
+      CHECK(lay.pos[1].x == 0.0f && lay.pos[1].y == 0.0f);
+      CHECK(NEAR(lay.width[1], p.width));
+      video_xr_place(&p, &set);
+      CHECK(set.num_quads == 1 && quads_finite(&set));
+      CHECK(set.quads[0].screen == 1 && pos_is(&set.quads[0], 0.0, 0.0, -1.8));
+      CHECK(NEAR(set.quads[0].width, p.width));
+      CHECK(set.slots[0].dims == 0 && set.slots[0].layers == 0);
+   }
+}
+
 int main(void)
 {
    test_screen_defaults();
@@ -7983,6 +8094,7 @@ int main(void)
    test_pace_interval();
    test_pick_rate();
    test_request_rate();
+   test_xr_viewless();
 
    if (failures)
    {

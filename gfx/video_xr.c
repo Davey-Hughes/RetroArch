@@ -344,6 +344,7 @@ void video_xr_layout(const video_xr_params_t *p, video_xr_layout_t *out)
       (p->screen_layout == VIDEO_SCREEN_LAYOUT_HORIZONTAL);
    double gap                   = VIDEO_XR_GAP * p->width;
    double edge                  = 0.0;
+   unsigned first               = RETRO_VIDEO_VIEWS_MAX;
 
    memset(out, 0, sizeof(*out));
    out->menu.z = -(p->distance - VIDEO_XR_MENU_LIFT);
@@ -365,10 +366,18 @@ void video_xr_layout(const video_xr_params_t *p, video_xr_layout_t *out)
 
    for (s = 0; s < map->num_screens; s++)
    {
-      const struct retro_video_view *v = &map->views[
+      const struct retro_video_view *v;
+      double h, aspect;
+      disp_w[s] = 0.0;
+      disp_h[s] = 0.0;
+      if (map->viewless & (1u << s))
+         continue;
+      if (first == RETRO_VIDEO_VIEWS_MAX)
+         first = s;
+      v      = &map->views[
          video_views_find(map, s, RETRO_VIDEO_VIEW_EYE_NONE)];
-      double h      = v->height;
-      double aspect = video_views_aspect(v);
+      h      = v->height;
+      aspect = video_views_aspect(v);
       if (p->rotation & 1)
       {
          h      = v->width;
@@ -377,7 +386,7 @@ void video_xr_layout(const video_xr_params_t *p, video_xr_layout_t *out)
       disp_h[s] = h;
       disp_w[s] = h * aspect;
    }
-   k = p->width / disp_w[0];
+   k = p->width / disp_w[first];
 
    for (s = 0; s < map->num_screens; s++)
    {
@@ -385,7 +394,10 @@ void video_xr_layout(const video_xr_params_t *p, video_xr_layout_t *out)
       double h = disp_h[s] * k;
       double x = 0.0;
       double y = 0.0;
-      if (s == 0)
+      out->pos[s].z = -p->distance;
+      if (map->viewless & (1u << s))
+         continue;
+      if (s == first)
          edge = horizontal ? w / 2.0 : -h / 2.0;
       else if (horizontal)
       {
@@ -399,7 +411,6 @@ void video_xr_layout(const video_xr_params_t *p, video_xr_layout_t *out)
       }
       out->pos[s].x  = (float)x;
       out->pos[s].y  = (float)y;
-      out->pos[s].z  = -p->distance;
       out->width[s]  = (float)w;
       out->height[s] = (float)h;
       out->native[s] = VIDEO_SCALE_PACK((unsigned)(disp_w[s] + 0.5),
@@ -429,7 +440,7 @@ static void video_xr_place_screens(const video_xr_params_t *p,
       video_xr_slot_t *slot = &out->slots[s];
 
       slot->base = lay->pos[s];
-      if (p->skip_screens & (1u << s))
+      if ((p->skip_screens | map->viewless) & (1u << s))
          continue;
       if (p->screens)
       {
