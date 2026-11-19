@@ -82,6 +82,10 @@ CFLAGS += -Wall -std=gnu99 -g1 -O1 -fno-omit-frame-pointer \
 ifeq ($(TEST_KEY),1)
    CFLAGS += -DHAVE_CORE_SIGNING_TEST_KEY
 endif
+
+# No libretro keys on any host, as a Steam build
+$(call sample_objs,$(CORE_DIR)/core_signature.o): CFLAGS += -DHAVE_STEAM
+
 ifeq ($(COMPRESSION),1)
    CFLAGS  += -DHAVE_COMPRESSION -DHAVE_ZLIB
    SOURCES += \

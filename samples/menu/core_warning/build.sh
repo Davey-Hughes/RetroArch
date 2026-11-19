@@ -86,7 +86,7 @@ if [ ! -s "$sig_line" ]; then
    echo "could not determine the compile command for core_signature.o" >&2
    exit 1
 fi
-sed "s#-o $objdir/core_signature\.o#-DHAVE_CORE_SIGNING_TEST_KEY -o $out/core_signature_testkey.o#" \
+sed "s#-o $objdir/core_signature\.o#-DHAVE_CORE_SIGNING_TEST_KEY -DHAVE_STEAM -o $out/core_signature_testkey.o#" \
    "$sig_line" | sh
 
 rm -f retroarch retroarch_debug

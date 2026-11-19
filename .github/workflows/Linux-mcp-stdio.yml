@@ -70,7 +70,8 @@ jobs:
         run: |
           set -eu
           ./configure --disable-qt --disable-ffmpeg --disable-vulkan \
-            --disable-wayland --disable-x11 --disable-opengl
+            --disable-wayland --disable-x11 --disable-opengl \
+            --disable-core_load_check
           grep -q '^HAVE_MCP = 1' config.mk
           make -j"$(nproc)" CC="ccache gcc" CXX="ccache g++"
           make -C samples/cores/video_views
