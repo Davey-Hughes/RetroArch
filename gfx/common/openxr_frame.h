@@ -160,9 +160,15 @@ typedef struct openxr_frame
    /* The hands; may be NULL. */
    bool (*locate_hands)(void *user, XrSpace base, XrTime time,
          struct retro_vr_controller_poses *out);
-   /* The laser's dot the host made for the input's layers, start to
-    * stop; the frame loop reads it. */
+   /* The laser's dot the host made for the input's layers, until stop;
+    * the frame loop reads it, and a remake replaces it there. */
    XrSwapchain cursor;
+   /* The host's: the dot made again, on the frame loop's thread, with
+    * the screen names that moved past names_baked; may be NULL. */
+   void (*cursor_remake)(void *user);
+   void *cursor_user;
+   int names_baked;                /* the frame loop's */
+   int64_t cursor_retry_usec;      /* the frame loop's: no remake before */
    /* From the input's attach to its detach. */
    bool input_attached;
    sthread_t *thread;
@@ -405,9 +411,11 @@ const char *openxr_frame_cursor_parts(const openxr_frame_t *f);
  * wide, as openxr_frame_cursor_w says, in px's VIDEO_XR_CURSOR_W by
  * VIDEO_XR_CURSOR_H texels; from VIDEO_XR_CURSOR_TAGGED_W wide with
  * edit mode's tags written in the default font and the interface
- * language as it is now; bottom_up for an image whose rows run bottom
- * up, as GL's. Without a font, the tags stay clear. */
-void openxr_frame_cursor_pixels(uint8_t *px, unsigned w, bool bottom_up);
+ * language as it is now, a screen's tag holding its name where names
+ * (may be NULL) gives one; bottom_up for an image whose rows run
+ * bottom up, as GL's. Without a font, the tags stay clear. */
+void openxr_frame_cursor_pixels(uint8_t *px, unsigned w, bool bottom_up,
+      const video_views_names_t *names);
 
 RETRO_END_DECLS
 

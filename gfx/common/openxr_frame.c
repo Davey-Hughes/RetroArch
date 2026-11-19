@@ -28,6 +28,7 @@
 #include "openxr_frame.h"
 
 #include "../video_defines.h"
+#include "../video_driver.h"
 #include "../font_driver.h"
 #include "../../msg_hash.h"
 
@@ -591,6 +592,23 @@ static void openxr_frame_ask_rate(openxr_frame_t *f)
             (int)res);
 }
 
+/* The dot made again once the screen names have moved past those its
+ * tags show: only in edit mode, where they show, and at most once a
+ * second, since a core may rename its screens every frame. */
+static void openxr_frame_cursor_due(openxr_frame_t *f)
+{
+   retro_time_t now;
+   if (     !f->cursor || !f->cursor_remake || !f->grabs.editing
+         || video_driver_screen_names_stamp() == f->names_baked
+         || openxr_frame_cursor_w(f) < VIDEO_XR_CURSOR_TAGGED_W)
+      return;
+   now = cpu_features_get_time_usec();
+   if (now < f->cursor_retry_usec)
+      return;
+   f->cursor_retry_usec = now + 1000000;
+   f->cursor_remake(f->cursor_user);
+}
+
 /* xrWaitFrame and what every headset frame keeps, then xrBeginFrame
  * under the graphics lock, which keep_lock leaves held for the end. */
 static bool openxr_frame_wait_begin(openxr_frame_t *f,
@@ -603,6 +621,7 @@ static bool openxr_frame_wait_begin(openxr_frame_t *f,
    XrFrameBeginInfo begin_info;
 
    memset(b, 0, sizeof(*b));
+   openxr_frame_cursor_due(f);
    wait_info.type = XR_TYPE_FRAME_WAIT_INFO;
    wait_info.next = NULL;
    state.type = XR_TYPE_FRAME_STATE;
@@ -1064,6 +1083,7 @@ bool openxr_frame_start(openxr_frame_t *f)
    f->asked_perf    = -1;
    f->perf_applied  = 0;
    f->perf_retry_usec = 0;
+   f->cursor_retry_usec = 0;
    f->frame_failed  = false;
    retro_atomic_store_release_int(&f->thread_started, 0);
    retro_atomic_store_release_int(&f->quit, 0);
@@ -1124,6 +1144,7 @@ bool openxr_frame_start_inline(openxr_frame_t *f)
    f->asked_perf     = -1;
    f->perf_applied   = 0;
    f->perf_retry_usec = 0;
+   f->cursor_retry_usec = 0;
    f->frame_failed   = false;
    f->pace_anchor_ns = 0;
    f->inline_host    = true;
@@ -1485,19 +1506,24 @@ static void openxr_frame_tag_line(const font_renderer_driver_t *drv,
 #include "../font_layout.h"
 }
 
-/* Tag tag's words: the laser's, a screen's by number, the menu's. */
-static void openxr_frame_tag_text(unsigned tag, char *s, size_t len)
+/* Tag tag's words: the laser's, a screen's name or number, the
+ * menu's. */
+static void openxr_frame_tag_text(unsigned tag,
+      const video_views_names_t *names, char *s, size_t len)
 {
    if (!tag)
       strlcpy(s, msg_hash_to_str(MSG_OPENXR_EDIT_TAG_LASER), len);
    else if (tag == VIDEO_XR_MENU_SLOT + 1)
       strlcpy(s, msg_hash_to_str(MSG_OPENXR_EDIT_TAG_MENU), len);
+   else if (names && *names->name[tag - 1])
+      strlcpy(s, names->name[tag - 1], len);
    else
       snprintf(s, len, msg_hash_to_str(MSG_OPENXR_EDIT_TAG_SCREEN), tag);
 }
 
 /* Edit mode's tags into px, in the default font. */
-static void openxr_frame_cursor_tags(uint8_t *px, bool bottom_up)
+static void openxr_frame_cursor_tags(uint8_t *px, bool bottom_up,
+      const video_views_names_t *names)
 {
    unsigned i;
    int asc, desc;
@@ -1527,7 +1553,7 @@ static void openxr_frame_cursor_tags(uint8_t *px, bool bottom_up)
       for (i = 0; i < VIDEO_XR_TAGS; i++)
       {
          char text[64];
-         openxr_frame_tag_text(i, text, sizeof(text));
+         openxr_frame_tag_text(i, names, text, sizeof(text));
          memset(cov, 0, VIDEO_XR_TAG_COLS * VIDEO_XR_TAG_ROWS);
          openxr_frame_tag_line(drv, font, asc, desc, text, cov);
          video_xr_tag_pixels(px, i, cov, bottom_up);
@@ -1538,14 +1564,15 @@ static void openxr_frame_cursor_tags(uint8_t *px, bool bottom_up)
       drv->free(font);
 }
 
-void openxr_frame_cursor_pixels(uint8_t *px, unsigned w, bool bottom_up)
+void openxr_frame_cursor_pixels(uint8_t *px, unsigned w, bool bottom_up,
+      const video_views_names_t *names)
 {
    unsigned i;
    video_xr_cursor_pixels(px);
    if (w == VIDEO_XR_CURSOR_W)
       video_xr_cut_pixels(px, bottom_up);
    if (w >= VIDEO_XR_CURSOR_TAGGED_W)
-      openxr_frame_cursor_tags(px, bottom_up);
+      openxr_frame_cursor_tags(px, bottom_up, names);
    if (w < VIDEO_XR_CURSOR_W)
       for (i = 1; i < VIDEO_XR_CURSOR_H; i++)
          memmove(px + (size_t)i * w * 4,
