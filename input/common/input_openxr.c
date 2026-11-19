@@ -1629,8 +1629,9 @@ static void input_openxr_frame_aims(input_openxr_t *st, int config,
 
 /* A point on a screen's quad as the core's pointer coordinates: into
  * the core's view map when it has one, over the whole frame when not.
- * A window has the frame where the video driver's viewport puts it, as
- * the window's own pointer does. */
+ * A window has the frame where the video driver's viewport puts it, or
+ * the core's views where their layout does, as the window's own pointer
+ * does; off them, or on NO_INPUT ones alone, it is off the screens. */
 static bool input_openxr_frame_point(const video_xr_quad_t *q, float u,
       float v, int16_t *x, int16_t *y)
 {
@@ -1639,8 +1640,23 @@ static bool input_openxr_frame_point(const video_xr_quad_t *q, float u,
    if (q->kind == VIDEO_XR_QUAD_WINDOW)
    {
       video_viewport_t vp;
-      if (     !video_driver_get_viewport_info(&vp)
-            || !video_xr_window_point(&vp, &u, &v))
+      const video_views_layout_t *layout = video_driver_get_views_layout();
+      if (!video_driver_get_viewport_info(&vp))
+         return false;
+      if (layout)
+      {
+         uint32_t pos;
+         if (     !video_driver_get_views_core(&map, &dims) || !map
+               || !video_views_map_point(layout, map, dims,
+                  (int)(u * VIDEO_SCALE_W(vp.full_dims)),
+                  (int)(v * VIDEO_SCALE_H(vp.full_dims)), true, &pos)
+               || pos == VIDEO_POS_PACK(-0x8000, -0x8000))
+            return false;
+         *x = (int16_t)VIDEO_POS_X(pos);
+         *y = (int16_t)VIDEO_POS_Y(pos);
+         return true;
+      }
+      if (!video_xr_window_point(&vp, &u, &v))
          return false;
    }
    if (!video_driver_get_views_core(&map, &dims))
