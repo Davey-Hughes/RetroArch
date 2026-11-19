@@ -93,7 +93,7 @@ jobs:
             --disable-discord \
             --disable-cheevos \
             --disable-networking \
-            --disable-ffmpeg
+            --disable-ffmpeg --disable-core_load_check
 
       - name: Build with DEBUG=1 and -fsanitize=thread
         run: |

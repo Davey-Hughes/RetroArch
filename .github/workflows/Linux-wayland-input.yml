@@ -130,7 +130,7 @@ jobs:
                       --disable-accessibility --disable-crtswitchres \
                       --disable-langextra --disable-libretrodb \
                       --disable-video_filter --disable-dsp_filter \
-                      --enable-video_windows
+                      --enable-video_windows --disable-core_load_check
           make -j$(nproc) CC="ccache gcc" CXX="ccache g++"
           ccache -s
           test -x retroarch

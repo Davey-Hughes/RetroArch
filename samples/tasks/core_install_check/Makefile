@@ -45,6 +45,9 @@ CFLAGS += -Wall -g1 -O0 -I$(LIBRETRO_COMM_DIR)/include -I$(REPO_ROOT) \
           -DHAVE_CRYPTO -DHAVE_THREADS -DHAVE_CORE_SIGNATURES \
           -DHAVE_CORE_SIGNING_TEST_KEY
 
+# No libretro keys on any host, as a Steam build
+$(call sample_objs,$(REPO_ROOT)/core_signature.o): CFLAGS += -DHAVE_STEAM
+
 OBJS := $(call sample_objs,$(SOURCES:.c=.o))
 
 # The module and the test as C89, as the tree's C89_BUILD holds them

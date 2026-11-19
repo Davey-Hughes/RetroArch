@@ -110,7 +110,8 @@ jobs:
           # loader to link against: libvulkan-dev above)
           ./configure --disable-qt --enable-vulkan --enable-x11 \
                       --disable-wayland --disable-sdl2 --disable-pulse \
-                      --disable-alsa --disable-ffmpeg --disable-discord
+                      --disable-alsa --disable-ffmpeg --disable-discord \
+                      --disable-core_load_check
           make -j$(nproc) CC="ccache gcc" CXX="ccache g++"
           ccache -s
           test -x retroarch

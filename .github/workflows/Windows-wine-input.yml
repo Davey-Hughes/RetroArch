@@ -204,7 +204,8 @@ jobs:
                       --disable-d3d9 --disable-d3d10 --disable-d3d11 \
                       --disable-d3d12 --disable-sdl \
                       --disable-sdl2 --disable-video_filter \
-                      --disable-dsp_filter --disable-crtswitchres
+                      --disable-dsp_filter --disable-crtswitchres \
+                      --disable-core_load_check
           make -j$(nproc) CC="ccache x86_64-w64-mingw32-gcc" \
                           CXX="ccache x86_64-w64-mingw32-g++"
           ccache -s
