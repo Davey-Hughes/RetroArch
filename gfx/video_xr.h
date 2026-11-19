@@ -94,6 +94,7 @@ typedef struct video_xr_quad
    unsigned screen;        /* the core's screen, for a SCREEN quad */
    unsigned slot;
    unsigned layer;         /* the slot's array layer it shows */
+   bool no_input;          /* a NO_INPUT screen's */
 } video_xr_quad_t;
 
 typedef struct video_xr_slot
@@ -678,8 +679,8 @@ void video_xr_turn_back(video_xr_pose_t *pose);
 /* A point on a quad as packed-frame pointer coordinates: any copy of a
  * screen lands in its EYE_NONE or left view at the same fraction, a
  * whole frame spreads over the frame. map and frame_dims are the
- * core's own. False for the menu. Rotated views map unrotated, as the
- * window's touch does. */
+ * core's own. False for the menu and a NO_INPUT screen. Rotated views
+ * map unrotated, as the window's touch does. */
 bool video_xr_quad_to_frame(const video_xr_quad_t *q, float u, float v,
       const video_views_map_t *map, unsigned frame_dims,
       int16_t *res_x, int16_t *res_y);
@@ -813,7 +814,8 @@ void video_xr_cut_pixels(uint8_t *px, bool bottom_up);
 /* Whether a laser (enum video_openxr_laser, or VIDEO_XR_LIVE_EDIT) can
  * point at q. Auto: the menu or a window while the menu is open, and
  * screens 1 and up. Always: every screen and a whole frame too. Off:
- * nothing. Edit mode's: every item. */
+ * nothing. Edit mode's: every item. A NO_INPUT screen: edit mode's
+ * only. */
 #define VIDEO_XR_LIVE_EDIT VIDEO_OPENXR_LASER_LAST
 bool video_xr_quad_live(const video_xr_quad_t *q, unsigned laser,
       bool menu_open);

@@ -7944,6 +7944,64 @@ static void test_xr_viewless(void)
    }
 }
 
+static void test_quad_to_frame_no_input(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   int16_t x, y, want_x, want_y;
+   unsigned frame = VIDEO_SCALE_PACK(800, 480);
+
+   map_3ds(&map);
+   params_init(&p, &map);
+   p.ui_dims = VIDEO_SCALE_PACK(1600, 960);
+   video_xr_place(&p, &set);
+   CHECK(set.quads[0].kind == VIDEO_XR_QUAD_SCREEN && set.quads[0].screen == 0);
+   CHECK(set.quads[2].kind == VIDEO_XR_QUAD_SCREEN && set.quads[2].screen == 1);
+   CHECK(video_xr_quad_to_frame(&set.quads[2], 0.5f, 0.5f, &map, frame, &x, &y));
+   CHECK(video_xr_quad_to_frame(&set.quads[0], 0.5f, 0.5f, &map, frame,
+            &want_x, &want_y));
+
+   map.no_input = 0x2;
+   CHECK(!video_xr_quad_to_frame(&set.quads[2], 0.5f, 0.5f, &map, frame, &x, &y));
+   x = y = 0;
+   CHECK(video_xr_quad_to_frame(&set.quads[0], 0.5f, 0.5f, &map, frame, &x, &y));
+   CHECK(x == want_x && y == want_y);
+}
+
+/* A NO_INPUT screen's quads are not there for the laser, edit mode's
+ * aside. */
+static void test_place_no_input(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   video_xr_vec3_t o, d;
+   float u, v, t;
+
+   map_ds(&map);
+   params_init(&p, &map);
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 2 && set.quads[1].screen == 1);
+   o   = set.quads[1].pose.position;
+   o.z = 0.0f;
+   d.x = d.y = 0.0f;
+   d.z = -1.0f;
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_ALWAYS, false, false,
+            &o, &d, &u, &v, &t) == 1);
+
+   map.no_input = 0x2;
+   video_xr_place(&p, &set);
+   CHECK(!set.quads[0].no_input && set.quads[1].no_input);
+   CHECK(!video_xr_quad_live(&set.quads[1], VIDEO_OPENXR_LASER_AUTO, false));
+   CHECK(!video_xr_quad_live(&set.quads[1], VIDEO_OPENXR_LASER_ALWAYS, false));
+   CHECK( video_xr_quad_live(&set.quads[1], VIDEO_XR_LIVE_EDIT, false));
+   CHECK( video_xr_quad_live(&set.quads[0], VIDEO_OPENXR_LASER_ALWAYS, false));
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_ALWAYS, false, false,
+            &o, &d, &u, &v, &t) == -1);
+   CHECK(video_xr_pick_edit(&set, false, &o, &d, &u, &v, &t, NULL) == 1);
+}
+
 int main(void)
 {
    test_screen_defaults();
@@ -8095,6 +8153,8 @@ int main(void)
    test_pick_rate();
    test_request_rate();
    test_xr_viewless();
+   test_quad_to_frame_no_input();
+   test_place_no_input();
 
    if (failures)
    {

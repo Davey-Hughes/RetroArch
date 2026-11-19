@@ -623,12 +623,15 @@ void video_views_touch_publish(video_views_touch_t *t,
 {
    unsigned i;
    retro_atomic_fetch_add_seq_cst_int(&t->seq, 1);
-   t->count = 0;
+   t->count    = 0;
+   t->no_input = 0;
    for (i = 0; layout && i < layout->num_placements
          && i < RETRO_VIDEO_VIEWS_MAX; i++)
    {
       t->dst[i] = layout->placements[i].dst;
       t->src[i] = map->views[index[layout->placements[i].view]];
+      if (map->no_input & (1u << t->src[i].screen))
+         t->no_input |= 1u << i;
       t->count++;
    }
    t->dims       = dims;
@@ -645,10 +648,11 @@ bool video_views_touch_point(video_views_touch_t *t, int x, int y,
       long px, py;
       video_views_rect_t dst[RETRO_VIDEO_VIEWS_MAX];
       struct retro_video_view src[RETRO_VIDEO_VIEWS_MAX];
-      int seq        = retro_atomic_load_acquire_int(&t->seq);
-      unsigned count = t->count;
-      unsigned dims  = t->dims;
-      unsigned fdims = t->frame_dims;
+      int seq           = retro_atomic_load_acquire_int(&t->seq);
+      unsigned count    = t->count;
+      unsigned no_input = t->no_input;
+      unsigned dims     = t->dims;
+      unsigned fdims    = t->frame_dims;
       if (seq & 1)
          continue;
       memcpy(dst, t->dst, sizeof(dst));
@@ -671,6 +675,8 @@ bool video_views_touch_point(video_views_touch_t *t, int x, int y,
          long dy = VIDEO_POS_Y(dst[i].pos);
          long dw = (long)VIDEO_SCALE_W(dst[i].dims);
          long dh = (long)VIDEO_SCALE_H(dst[i].dims);
+         if (no_input & (1u << i))
+            continue;
          if (px < dx || py < dy || px >= dx + dw || py >= dy + dh)
             continue;
          /* That point of the view, in the packed frame */
@@ -877,11 +883,14 @@ bool video_views_map_point(const video_views_layout_t *layout,
    unsigned i;
    int best      = -1;
    double best_d = 0.0;
+   bool no_input = false;
    const video_views_placement_t *pl;
    const struct retro_video_view *ref;
    int cx, cy, r, dst_w, dst_h;
    int16_t px, py;
 
+   if (!map->num_views)
+      return false;
    for (i = 0; i < layout->num_placements; i++)
    {
       const video_views_rect_t *d = &layout->placements[i].dst;
@@ -891,6 +900,12 @@ bool video_views_map_point(const video_views_layout_t *layout,
          continue;
       if (!VIDEO_SCALE_W(d->dims) || !VIDEO_SCALE_H(d->dims))
          continue;
+      if (map->no_input
+            & (1u << map->views[layout->placements[i].view].screen))
+      {
+         no_input = true;
+         continue;
+      }
       dist = video_views_rect_dist(d, x, y);
       if (best < 0 || dist < best_d)
       {
@@ -900,9 +915,10 @@ bool video_views_map_point(const video_views_layout_t *layout,
             break;
       }
    }
-   if (best < 0 || !map->num_views)
+   if (best < 0 && !no_input)
       return false;
-   if (best_d > 0.0 && report_oob)
+   /* Off every view, or only NO_INPUT screens placed */
+   if (best < 0 || (best_d > 0.0 && report_oob))
    {
       *res_pos = VIDEO_POS_PACK(-0x8000, -0x8000);
       return true;
