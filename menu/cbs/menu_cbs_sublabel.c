@@ -3297,13 +3297,19 @@ int menu_cbs_init_bind_sublabel(menu_file_list_cbs_t *cbs,
       else if (     cbs->enum_idx >= MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY
             && cbs->enum_idx <= MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY_LAST)
       {
+         /* Auto and Off alone without the screens' windows */
+         cbs->sublabel_enum = MENU_ENUM_SUBLABEL_VIDEO_SCREEN_DISPLAY_SHOWN;
+#ifdef HAVE_VIDEO_WINDOWS
+         if (     video_driver_test_all_flags(GFX_CTX_FLAGS_VIDEO_WINDOWS)
+               && config_get_ptr()->bools.video_windows_enable)
 #ifdef ANDROID
-         key = MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY;
+            cbs->sublabel_enum = MENU_ENUM_SUBLABEL_VIDEO_SCREEN_DISPLAY;
 #else
-         cbs->sublabel_enum = MENU_ENUM_SUBLABEL_VIDEO_SCREEN_DISPLAY_DESKTOP;
+            cbs->sublabel_enum = MENU_ENUM_SUBLABEL_VIDEO_SCREEN_DISPLAY_DESKTOP;
+#endif
+#endif
          BIND_ACTION_SUBLABEL(cbs, action_bind_sublabel_from_enum);
          return 0;
-#endif
       }
       else if (cbs->enum_idx >= MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_FULLSCREEN
             && cbs->enum_idx <= MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_HEIGHT_LAST)
