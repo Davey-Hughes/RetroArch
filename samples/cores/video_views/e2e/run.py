@@ -496,6 +496,12 @@ SCREENS_DRAW_CASES = [
      {'until': SCREENS_SWITCHED_RE}),
     ('screens-none-shown', 'none_shown', SCREENS_NONE, {}),
 ]
+# xvideo's interlaced path places and clears by itself: the late blank
+# again there, in each eye's rows. An entry as above.
+SCREENS_XV_INTERLACED_CASE = (
+    'screens-blank-late-interlaced', 'blank_late',
+    SCREENS_BOTTOM_BLANK + [(400, 481, GREEN), (1200, 481, BLACK)],
+    {'until': SCREENS_SWITCHED_RE, 'settings': {'video_stereo_mode': '5'}})
 # What the frontend makes of show, state, the user's setting and the
 # core's file: on SCREENS_DRIVERS. Each file a case starts with must be
 # the same after it. Entries as SCREENS_DRAW_CASES'.
@@ -2160,6 +2166,8 @@ def driver_jobs(retroarch, root, driver):
         jobs.append(screens_aim)
     jobs += [lambda c=c: screens_show(c) for c in SCREENS_DRAW_CASES
              if wanted(c[0])]
+    if driver == 'xvideo' and wanted(SCREENS_XV_INTERLACED_CASE[0]):
+        jobs.append(lambda: screens_show(SCREENS_XV_INTERLACED_CASE))
     jobs += [lambda c=c: screens_show(c)
              for c in (SCREENS_STATE_CASES if driver in SCREENS_DRIVERS
                        else []) if wanted(c[0])]
