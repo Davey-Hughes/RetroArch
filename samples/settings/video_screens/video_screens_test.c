@@ -7827,8 +7827,8 @@ static void test_screen_menu_page_label(void)
 }
 
 #ifdef HAVE_OPENXR
-/* A views core's headset rows write its store; Reset clears the
- * screen's entries and Reset All every screen's */
+/* A views core's headset rows write its store; Reset stores the
+ * defaults for the screen and Reset All for each screen the core has */
 static void test_xr_screen_menu_per_core(void)
 {
    unsigned s;
@@ -7886,17 +7886,19 @@ static void test_xr_screen_menu_per_core(void)
    menu_action("video_screen_xr_scale", MENU_ACTION_START);
    CHECK(prefs->set[1] == (VIDEO_SCREEN_PREF_XR_ALL & ~scale));
    menu_value("video_screen_xr_scale", "2.0");
-   /* Reset All: every screen's, and the menu's own place */
+   /* Reset All: the core's two screens, and the menu's own place */
    menu_action("video_screen_xr_visible", MENU_ACTION_RIGHT);
    CHECK(prefs->set[1] == (VIDEO_SCREEN_PREF_XR_ALL & ~scale));
    CHECK(!prefs->values[1].xr.visible);
    settings->floats.video_openxr_menu_xr_scale = 2.0f;
    menu_action("video_screen_xr_reset_all", MENU_ACTION_OK);
-   for (s = 0; s < RETRO_VIDEO_VIEWS_MAX; s++)
+   for (s = 0; s < 2; s++)
    {
       CHECK(prefs->set[s] == VIDEO_SCREEN_PREF_XR_ALL);
       CHECK(xr_is_default(&prefs->values[s].xr));
    }
+   for (s = 2; s < RETRO_VIDEO_VIEWS_MAX; s++)
+      CHECK(!prefs->set[s]);
    config_get_video_screen_xr(1, &got);
    CHECK(xr_is_default(&got));
    CHECK(settings->floats.video_screen_xr_x[1] == 0.5f);
