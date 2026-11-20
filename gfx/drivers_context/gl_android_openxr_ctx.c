@@ -627,12 +627,17 @@ static void gl_xr_draw(gl_android_openxr_t *xr)
    video_views_rect_t rects[VIDEO_XR_MAX_SLOTS][2];
    unsigned s, l;
    unsigned index[2];
+   int eyes[2];
    bool menu   = false;
    bool stereo = retro_atomic_load_acquire_int(&xr->stereo) != 0;
 
 #ifdef HAVE_MENU
    menu = (menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE) != 0;
 #endif
+   /* Eyes on a screen left out are not shown. */
+   if (     stereo && xr->views.num_views
+         && !video_views_eye_pair(&xr->views, eyes))
+      stereo = false;
    if (!stereo)
    {
       openxr_frame_clear_projection(&xr->frame);

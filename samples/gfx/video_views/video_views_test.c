@@ -790,6 +790,14 @@ static void test_eye_pair(void)
    v[1] = mkview(  0, 0, 400, 240, 0, RETRO_VIDEO_VIEW_EYE_LEFT);
    CHECK(video_views_validate(v, 2, &map));
    CHECK(video_views_eye_pair(&map, eyes) && eyes[0] == 1 && eyes[1] == 0);
+
+   /* Eyes on a screen left out are no pair; the other screen's Off
+    * leaves them. */
+   map_3ds(&map);
+   map.left_out = 0x1u;
+   CHECK(!video_views_eye_pair(&map, eyes) && eyes[0] == -1 && eyes[1] == -1);
+   map.left_out = 0x2u;
+   CHECK(video_views_eye_pair(&map, eyes) && eyes[0] == 0 && eyes[1] == 1);
 }
 
 /* A screen's views as a map of their own: the 3DS driver's top and

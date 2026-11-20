@@ -4205,6 +4205,32 @@ def check_screens_mode(blank):
     return check
 
 
+def check_tracked_screen_off(res):
+    """The tracked eyes' screen with Display Off is left out: its map is
+    taken, no projection is sent, and the bottom screen keeps its quad
+    where it is with both shown."""
+    errors = []
+    status = STATUS_RE.findall(res.log)
+    if not status or status[-1][2] != '1':
+        errors.append('the tracked map was not taken: %s' % status[-1:])
+    fr = None
+    for f in reversed(res.frames):
+        if f['snap'] and f['layers']:
+            fr = f
+            break
+    if not fr:
+        return errors + no_quads(res)
+    if projections(fr):
+        errors.append('the left-out screen is projected: %s'
+                      % [(x['space'], len(x['views']))
+                         for x in projections(fr)])
+    q = [x for x in quads(fr) if not x['flags'] & BLEND]
+    if len(q) != 1 or not at(q[0], (0.0, -0.992, -1.8)):
+        errors.append('want the bottom screen\'s quad alone, got %s'
+                      % [(x['pose'][:3], x['size']) for x in q])
+    return errors
+
+
 SCREENS_CASES = [
     {'name': 'screens-hidden', 'map': 'ds',
      'options': {'video_views_test_screens': 'hidden'}, 'steps': SETTLE,
@@ -4212,6 +4238,10 @@ SCREENS_CASES = [
     {'name': 'screens-blank', 'map': 'ds',
      'options': {'video_views_test_screens': 'blank'}, 'steps': SETTLE,
      'check': check_screens_mode(True)},
+    {'name': 'tracked-screen-off', 'map': '3ds',
+     'options': {'video_views_test_vr': 'local'},
+     'settings': {'video_screen1_display': 'off'}, 'steps': SETTLE,
+     'check': check_tracked_screen_off},
 ]
 
 
