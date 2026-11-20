@@ -90,8 +90,10 @@ unsigned video_screen_prefs_resolve(const video_screen_prefs_t *prefs,
       video_screen_values_t *out);
 
 /* Pure. Bit s of *left_out: screens' state ABSENT, or resolved[s]'s
- * display Off; of *blank: state BLANK and not left out. Bits at or past
- * @num_screens stay clear. @screens may be NULL (no screen information). */
+ * display Off; of *blank: state BLANK and not left out. state is read
+ * only below screens->count: a screen at or past it counts as ACTIVE.
+ * Bits at or past @num_screens stay clear. @screens may be NULL (no
+ * screen information). */
 void video_screen_prefs_masks(const video_screen_values_t *resolved,
       const video_views_screens_t *screens, unsigned num_screens,
       unsigned *left_out, unsigned *blank);

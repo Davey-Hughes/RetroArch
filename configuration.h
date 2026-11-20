@@ -1813,7 +1813,8 @@ bool config_load_video_screen_prefs(const char *library_name,
 
 /* @prefs to that file when dirty: only the entries set, making the
  * core's directory first; with none set, the file is removed. Clears
- * dirty once written. */
+ * dirty once written. True when that was done; false when not dirty or
+ * it failed. */
 bool config_save_video_screen_prefs(const char *library_name,
       struct video_screen_prefs *prefs);
 #endif
