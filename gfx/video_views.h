@@ -378,7 +378,7 @@ void video_views_cut_source(const struct retro_video_view *v,
 /* The rectangle of @view's first placement drawn into a target of
  * size @dims, which its shader passes are sized for; all_areas false
  * draws the first area only. False when no placement of the view
- * shows. */
+ * shows, a blank one showing nothing of it. */
 bool video_views_first_drawn(const video_views_layout_t *layout,
       unsigned view, bool all_areas, unsigned dims,
       video_views_rect_t *out);

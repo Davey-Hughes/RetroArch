@@ -6615,6 +6615,22 @@ static unsigned gl3_xr_eye_screens(const video_frame_info_t *video_info)
    return (1u << map->views[l].screen) | (1u << map->views[r].screen);
 }
 
+/* The tracked eyes' views the projection reads: none of a blank
+ * screen's. */
+static unsigned gl3_xr_eye_views(const video_frame_info_t *video_info)
+{
+   unsigned e;
+   unsigned views               = 0;
+   const video_views_map_t *map = &video_info->views;
+   for (e = 0; e < 2; e++)
+   {
+      int v = video_info->headset_eye[e];
+      if (!(map->blank & (1u << map->views[v].screen)))
+         views |= 1u << v;
+   }
+   return views;
+}
+
 /* Whether the projection can take the tracked eyes: at a size the
  * runtime has not refused, and on a repeat only once it has them, or on
  * a software repeat while none is shown, if the views the frame was
@@ -6805,8 +6821,8 @@ static void gl3_xr_copy_ui(gl3_t *gl, unsigned s, GLuint tex,
 /* The tracked eyes into the projection slot, a layer each, with no
  * chain: each from its image's origin at its own size, shrunk if it is
  * larger, the right way up, with the poses the core was given; a blank
- * screen's are only cleared. The views were copied out of this frame or
- * an earlier one. */
+ * screen's are only cleared. The views it reads were copied out of this
+ * frame or an earlier one. */
 static bool gl3_xr_draw_projection(gl3_t *gl,
       const video_frame_info_t *video_info)
 {
@@ -6827,10 +6843,10 @@ static bool gl3_xr_draw_projection(gl3_t *gl,
    /* View copies keep the frame's orientation. */
    const float *mvp = (gl->flags & GL3_FLAG_HW_RENDER_BOTTOM_LEFT)
       ? gl->mvp_no_rot.data : gl->mvp_no_rot_yflip.data;
+   unsigned reads   = gl3_xr_eye_views(video_info);
 
-   for (e = 0; e < 2; e++)
-      if (!(gl->views.copied & (1u << video_info->headset_eye[e])))
-         return false;
+   if ((gl->views.copied & reads) != reads)
+      return false;
    if (!dims || !gl_openxr_slot_target(xr, s, dims, 2, tex))
       return false;
    if (!gl->xr.samplers[0])
@@ -7380,8 +7396,7 @@ static bool gl3_frame(void *data, const void *frame,
          if (xr_chains[i])
             xr_views |= 1u << i;
    if (xr_eyes)
-      xr_views |= (1u << video_info->headset_eye[0])
-                | (1u << video_info->headset_eye[1]);
+      xr_views |= gl3_xr_eye_views(video_info);
 #endif
 #ifdef HAVE_SLANG
    views = gl3_views_setup(gl, video_info, frame, &texture,

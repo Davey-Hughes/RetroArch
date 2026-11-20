@@ -12435,6 +12435,22 @@ static unsigned vulkan_xr_eye_screens(const video_frame_info_t *video_info)
    return (1u << map->views[l].screen) | (1u << map->views[r].screen);
 }
 
+/* The tracked eyes' views the projection reads: none of a blank
+ * screen's. */
+static unsigned vulkan_xr_eye_views(const video_frame_info_t *video_info)
+{
+   unsigned e;
+   unsigned views               = 0;
+   const video_views_map_t *map = &video_info->views;
+   for (e = 0; e < 2; e++)
+   {
+      int v = video_info->headset_eye[e];
+      if (!(map->blank & (1u << map->views[v].screen)))
+         views |= 1u << v;
+   }
+   return views;
+}
+
 /* Whether the projection can take the tracked eyes: at a size the
  * runtime has not refused, and on a repeat only once it has them, or on
  * a software repeat while none is shown, if the views the frame was
@@ -12717,8 +12733,8 @@ static void vulkan_xr_copy_ui(vk_t *vk, unsigned s, unsigned ui_dims)
 
 /* The tracked eyes into the projection slot, one image each, with no
  * chain: each from its image's top-left at its own size, shrunk if it
- * is larger; a blank screen's are only cleared. The views were copied
- * out of this frame. */
+ * is larger; a blank screen's are only cleared. The views it reads
+ * were copied out of this frame. */
 static void vulkan_xr_draw_projection(vk_t *vk,
       const video_frame_info_t *video_info)
 {
@@ -12732,11 +12748,11 @@ static void vulkan_xr_draw_projection(vk_t *vk,
    struct vk_per_frame *vf           = &vk->swapchain[vk->views.last_index];
    const struct retro_video_view *rv =
       &video_info->views.views[video_info->headset_eye[0]];
+   unsigned reads                    = vulkan_xr_eye_views(video_info);
 
    vk->xr.slots[s].drawn = false;
-   for (e = 0; e < 2; e++)
-      if (!(vk->views.copied & (1u << video_info->headset_eye[e])))
-         return;
+   if ((vk->views.copied & reads) != reads)
+      return;
    if (!dims || !vulkan_xr_slot_ensure(vk, s, dims, 2))
       return;
 #ifdef HAVE_THREADS
@@ -13846,8 +13862,7 @@ static bool vulkan_frame(void *data, const void *frame,
    }
    xr_eyes = xr_eyes && views;
    if (xr_eyes)
-      copy_views |= (1u << video_info->headset_eye[0])
-                  | (1u << video_info->headset_eye[1]);
+      copy_views |= vulkan_xr_eye_views(video_info);
 #endif
    /* A view image that can't be made draws this frame whole. */
    if (     views && (frame || movie_frame) && !views_direct && !views_in_place

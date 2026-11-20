@@ -1904,8 +1904,11 @@ static void test_draw_placements_blank(void)
 {
    video_views_map_t map;
    video_views_layout_t l;
+   video_views_chains_t set;
    fake_drv_t d;
    fake_chain_t *chains[RETRO_VIDEO_VIEWS_MAX];
+   fake_chain_t *picked[RETRO_VIDEO_VIEWS_MAX];
+   video_views_rect_t rects[RETRO_VIDEO_VIEWS_MAX];
    unsigned full = VIDEO_SCALE_PACK(1600, 960);
 
    map_ds(&map);
@@ -1931,6 +1934,13 @@ static void test_draw_placements_blank(void)
    fake_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, true, false);
    CHECK(num_draws == 1 && draws[0].view == 0);
    CHECK(!bad_ctx);
+   /* Nor is its view given a chain: nothing reads its pixels */
+   memset(&set, 0, sizeof(set));
+   set.count = 2;
+   CHECK(fake_vv_pick_chains(&d, &set, &map, &l, true, true, full, picked,
+            rects));
+   CHECK(picked[0] && !picked[1] && d.stock_made == 1);
+   CHECK(!video_views_first_drawn(&l, 1, true, full, &rects[1]));
 }
 
 static void test_targets(void)
