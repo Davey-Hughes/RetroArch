@@ -38,7 +38,7 @@ RETRO_BEGIN_DECLS
 #define VIDEO_XR_MAX_QUADS (RETRO_VIDEO_VIEWS_MAX * 2 + 1)
 /* Gap between screens, as a fraction of screen 0's width. */
 #define VIDEO_XR_GAP       0.02f
-/* How far the UI floats in front of screen 0, in metres. */
+/* How far the UI floats in front of the first screen drawn, in metres. */
 #define VIDEO_XR_MENU_LIFT 0.10f
 /* Following a screen, the UI comes no nearer the anchor than this. */
 #define VIDEO_XR_MENU_NEAREST 0.40f

@@ -4053,6 +4053,8 @@ static size_t setting_get_string_representation_video_blank_unused_screens(
  * "|key" a display, then "|off"; the menu's row has no Main Window
  * or Off. Auto and Off alone without the screens' windows. */
 #ifdef HAVE_VIDEO_WINDOWS
+/* The rows' copy of the published list, about 1 KiB, kept off the
+ * stack; app thread */
 static char setting_video_screen_display_list[
       VIDEO_WINDOW_DISPLAYS_MAX * VIDEO_WINDOW_DISPLAY_NAME_SIZE
       + sizeof("|" VIDEO_WINDOW_DISPLAY_MAIN)
@@ -4117,8 +4119,6 @@ static void setting_video_screen_display_change(rarch_setting_t *setting)
 }
 
 #ifdef HAVE_VIDEO_WINDOWS
-/* The rows' copy of the published list, about 1 KiB, kept off the
- * stack; app thread */
 /* A key the values can hold: named, no '|' in it, and not Off's or
  * Main Window's */
 static bool setting_video_screen_display_offered(const char *key)
