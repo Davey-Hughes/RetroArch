@@ -4432,6 +4432,310 @@ static void test_screens_core_default_bits(void)
    screens_test_core_done();
 }
 
+/* $CONFIG for the per-core screen files, under the fixture dir */
+static char screens_config_dir[2048];
+static char screens_kept_config_dir[PATH_MAX_LENGTH];
+
+static void screens_file_path(const char *name, char *path, size_t len)
+{
+   char dir[2048];
+   char file_name[256];
+   fill_pathname_join(dir, screens_config_dir, name, sizeof(dir));
+   strlcpy(file_name, name, sizeof(file_name));
+   strlcat(file_name, ".screens.cfg", sizeof(file_name));
+   fill_pathname_join(path, dir, file_name, len);
+}
+
+/* $CONFIG pointed at screens_config_dir, @name's file not there */
+static void screens_file_begin(const char *name, char *path, size_t len)
+{
+   settings_t *settings = config_get_ptr();
+   strlcpy(screens_kept_config_dir, settings->paths.directory_menu_config,
+         sizeof(screens_kept_config_dir));
+   strlcpy(settings->paths.directory_menu_config, screens_config_dir,
+         sizeof(settings->paths.directory_menu_config));
+   path_mkdir(screens_config_dir);
+   screens_file_path(name, path, len);
+   filestream_delete(path);
+}
+
+static void screens_file_end(void)
+{
+   settings_t *settings = config_get_ptr();
+   strlcpy(settings->paths.directory_menu_config, screens_kept_config_dir,
+         sizeof(settings->paths.directory_menu_config));
+}
+
+static void screens_file_write(const char *path, const char *text)
+{
+   char dir[2048];
+   fill_pathname_basedir(dir, path, sizeof(dir));
+   path_mkdir(dir);
+   write_config(path, text);
+}
+
+/* The file's video_screen keys */
+static unsigned screens_file_keys(config_file_t *conf)
+{
+   unsigned keys = 0;
+   const struct config_entry_list *entry;
+   for (entry = conf->entries; entry; entry = entry->next)
+      if (string_starts_with(entry->key, "video_screen"))
+         keys++;
+   return keys;
+}
+
+/* Whether @path still holds @text, as the test wrote it */
+static bool screens_file_holds(const char *path, const char *text)
+{
+   void *buf    = NULL;
+   int64_t len  = 0;
+   bool same    = false;
+   if (filestream_read_file(path, &buf, &len))
+      same = len == (int64_t)strlen(text) && !memcmp(buf, text, (size_t)len);
+   free(buf);
+   return same;
+}
+
+/* A core's choices to its own file and back */
+static void test_screen_prefs_file_roundtrip(void)
+{
+   static video_screen_prefs_t prefs, got;
+   video_screen_values_t values;
+   config_file_t *conf;
+   char path[PATH_MAX_LENGTH];
+   char text[64];
+   int pos         = 0;
+   float scale     = 0.0f;
+   bool flag       = false;
+   unsigned i;
+   screens_file_begin("video_views test", path, sizeof(path));
+   memset(&prefs, 0, sizeof(prefs));
+   memset(&values, 0, sizeof(values));
+   prefs.core_loaded = prefs.in_use = true;
+   strlcpy(values.display, VIDEO_WINDOW_DISPLAY_OFF, sizeof(values.display));
+   video_screen_prefs_set(&prefs, 1,
+         VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY), &values);
+   values.window_pos     = VIDEO_POS_PACK(10, 20);
+   values.window_pos_set = true;
+   values.xr.scale       = 2.0f;
+   video_screen_prefs_set(&prefs, 2,
+           VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_X)
+         | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_Y)
+         | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_POS_SET)
+         | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_XR_SCALE), &values);
+   values.xr.visible = false;
+   video_screen_prefs_set(&prefs, 0,
+         VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_XR_VISIBLE), &values);
+   CHECK(prefs.dirty);
+   CHECK(config_save_video_screen_prefs("video_views test", &prefs));
+   CHECK(!prefs.dirty);
+   conf = config_file_new_from_path_to_string(path);
+   CHECK(conf != NULL);
+   if (conf)
+   {
+      CHECK(screens_file_keys(conf) == 6);
+      CHECK(config_get_array(conf, "video_screen2_display", text, sizeof(text)));
+      CHECK(string_is_equal(text, VIDEO_WINDOW_DISPLAY_OFF));
+      CHECK(config_get_int(conf, "video_screen3_window_x", &pos) && pos == 10);
+      CHECK(config_get_int(conf, "video_screen3_window_y", &pos) && pos == 20);
+      CHECK(config_get_bool(conf, "video_screen3_window_pos_set", &flag) && flag);
+      CHECK(config_get_float(conf, "video_screen3_xr_scale", &scale) && scale == 2.0f);
+      CHECK(config_get_bool(conf, "video_screen1_xr_visible", &flag) && !flag);
+      config_file_free(conf);
+   }
+   memset(&got, 0, sizeof(got));
+   CHECK(config_load_video_screen_prefs("video_views test", &got));
+   CHECK(got.in_use && !got.dirty);
+   for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+      CHECK(got.set[i] == prefs.set[i]);
+   CHECK(string_is_equal(got.values[1].display, VIDEO_WINDOW_DISPLAY_OFF));
+   CHECK(got.values[2].window_pos == VIDEO_POS_PACK(10, 20));
+   CHECK(got.values[2].window_pos_set);
+   CHECK(got.values[2].xr.scale == 2.0f);
+   CHECK(!got.values[0].xr.visible);
+   screens_file_end();
+}
+
+/* One core's choice is not another's */
+static void test_screen_prefs_two_cores(void)
+{
+   static video_screen_prefs_t prefs;
+   video_screen_values_t values;
+   char path[PATH_MAX_LENGTH];
+   unsigned i;
+   screens_file_begin("Core A", path, sizeof(path));
+   screens_file_path("Core B", path, sizeof(path));
+   filestream_delete(path);
+   memset(&prefs, 0, sizeof(prefs));
+   memset(&values, 0, sizeof(values));
+   prefs.core_loaded = prefs.in_use = true;
+   strlcpy(values.display, VIDEO_WINDOW_DISPLAY_OFF, sizeof(values.display));
+   video_screen_prefs_set(&prefs, 1,
+         VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY), &values);
+   CHECK(config_save_video_screen_prefs("Core A", &prefs));
+   memset(&prefs, 0, sizeof(prefs));
+   CHECK(!config_load_video_screen_prefs("Core B", &prefs));
+   for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+      CHECK(!prefs.set[i]);
+   CHECK(!prefs.in_use && !prefs.dirty);
+   CHECK(!config_save_video_screen_prefs("Core B", &prefs));
+   CHECK(!path_is_valid(path));
+   memset(&prefs, 0, sizeof(prefs));
+   CHECK(config_load_video_screen_prefs("Core A", &prefs));
+   CHECK(prefs.set[1] == VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY));
+   CHECK(string_is_equal(prefs.values[1].display, VIDEO_WINDOW_DISPLAY_OFF));
+   screens_file_end();
+}
+
+/* Nothing changed, nothing written */
+static void test_screen_prefs_clean_not_written(void)
+{
+   static const char sentinel[] = "# sentinel\n";
+   static video_screen_prefs_t prefs;
+   char path[PATH_MAX_LENGTH];
+   screens_file_begin("video_views test", path, sizeof(path));
+   memset(&prefs, 0, sizeof(prefs));
+   CHECK(!config_load_video_screen_prefs("video_views test", &prefs));
+   config_save_video_screen_prefs("video_views test", &prefs);
+   CHECK(!path_is_valid(path));
+   screens_file_write(path, "video_screen2_display = \"off\"\n");
+   memset(&prefs, 0, sizeof(prefs));
+   CHECK(config_load_video_screen_prefs("video_views test", &prefs));
+   write_config(path, sentinel);
+   config_save_video_screen_prefs("video_views test", &prefs);
+   CHECK(screens_file_holds(path, sentinel));
+   screens_file_end();
+}
+
+/* With every entry cleared the file goes */
+static void test_screen_prefs_all_unset_removes(void)
+{
+   static video_screen_prefs_t prefs;
+   char path[PATH_MAX_LENGTH];
+   unsigned i;
+   screens_file_begin("video_views test", path, sizeof(path));
+   screens_file_write(path,
+         "video_screen1_xr_scale = \"2\"\n"
+         "video_screen2_display = \"off\"\n");
+   memset(&prefs, 0, sizeof(prefs));
+   CHECK(config_load_video_screen_prefs("video_views test", &prefs));
+   for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+      video_screen_prefs_set(&prefs, i, prefs.set[i], NULL);
+   CHECK(prefs.dirty);
+   CHECK(config_save_video_screen_prefs("video_views test", &prefs));
+   CHECK(!prefs.dirty);
+   CHECK(!path_is_valid(path));
+   screens_file_end();
+}
+
+/* Bad entries are left unset, good ones kept */
+static void test_screen_prefs_invalid_entries(void)
+{
+   static video_screen_prefs_t prefs;
+   video_screen_values_t global, out;
+   char path[PATH_MAX_LENGTH];
+   unsigned i;
+   screens_file_begin("video_views test", path, sizeof(path));
+   screens_file_write(path,
+         "video_screen2_window_width = \"0\"\n"
+         "video_screen9_display = \"off\"\n"
+         "video_screen1_xr_scale = \"nan\"\n"
+         "video_screen3_window_x = \"999999\"\n"
+         "video_screen2_display = \"off\"\n"
+         "video_screen4_window_width = \"320\"\n");
+   memset(&prefs, 0, sizeof(prefs));
+   CHECK(config_load_video_screen_prefs("video_views test", &prefs));
+   CHECK(prefs.set[1] == VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY));
+   CHECK(string_is_equal(prefs.values[1].display, VIDEO_WINDOW_DISPLAY_OFF));
+   /* A width alone is kept, and resolves to an automatic size */
+   CHECK(prefs.set[3] == VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_WIDTH));
+   memset(&global, 0, sizeof(global));
+   video_screen_prefs_resolve(&prefs, NULL, &global, 3, &out);
+   CHECK(out.window_dims == 0);
+   for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+      if (i != 1 && i != 3)
+         CHECK(!prefs.set[i]);
+   CHECK(!prefs.dirty);
+   screens_file_end();
+}
+
+/* Window entries survive a save, whatever the build */
+static void test_screen_prefs_window_keys_kept(void)
+{
+   static video_screen_prefs_t prefs;
+   video_screen_values_t values;
+   config_file_t *conf;
+   char path[PATH_MAX_LENGTH];
+   unsigned size = 0;
+   screens_file_begin("video_views test", path, sizeof(path));
+   screens_file_write(path,
+         "video_screen2_window_width = \"320\"\n"
+         "video_screen2_window_height = \"240\"\n");
+   memset(&prefs, 0, sizeof(prefs));
+   memset(&values, 0, sizeof(values));
+   CHECK(config_load_video_screen_prefs("video_views test", &prefs));
+   strlcpy(values.display, VIDEO_WINDOW_DISPLAY_OFF, sizeof(values.display));
+   video_screen_prefs_set(&prefs, 0,
+         VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY), &values);
+   CHECK(config_save_video_screen_prefs("video_views test", &prefs));
+   conf = config_file_new_from_path_to_string(path);
+   CHECK(conf != NULL);
+   if (conf)
+   {
+      CHECK(screens_file_keys(conf) == 3);
+      CHECK(config_get_uint(conf, "video_screen2_window_width", &size)
+            && size == 320);
+      CHECK(config_get_uint(conf, "video_screen2_window_height", &size)
+            && size == 240);
+      CHECK(config_get_entry(conf, "video_screen1_display") != NULL);
+      config_file_free(conf);
+   }
+   screens_file_end();
+}
+
+/* Save Core Overrides leaves a views core's own choices out */
+static void test_screen_prefs_not_in_override(void)
+{
+   static rarch_system_info_t system_info;
+   settings_t *settings = config_get_ptr();
+   video_screen_values_t values, got;
+   config_file_t *conf;
+   char path[PATH_MAX_LENGTH];
+   char text[64];
+   load_fixture("");
+   screens_file_begin("video_views override", path, sizeof(path));
+   memset(&system_info, 0, sizeof(system_info));
+   system_info.info.library_name = "video_views override";
+   memset(&values, 0, sizeof(values));
+   screens_test_core();
+   video_state_get_ptr()->screen_prefs.in_use = true;
+   strlcpy(values.display, VIDEO_WINDOW_DISPLAY_OFF, sizeof(values.display));
+   video_driver_screen_set(1,
+         VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY), &values);
+   video_driver_screen_get(1, &got);
+   CHECK(string_is_equal(got.display, VIDEO_WINDOW_DISPLAY_OFF));
+   /* A global change is captured, the core's own is not */
+   strlcpy(settings->arrays.video_screen_display[2], VIDEO_WINDOW_DISPLAY_OFF,
+         sizeof(settings->arrays.video_screen_display[2]));
+   CHECK(config_save_overrides(OVERRIDE_CORE, &system_info, false, NULL) == 1);
+   strlcpy(generated_path, path_get(RARCH_PATH_CONFIG_OVERRIDE),
+         sizeof(generated_path));
+   conf = config_file_new_from_path_to_string(generated_path);
+   CHECK(conf != NULL);
+   if (conf)
+   {
+      CHECK(screens_file_keys(conf) == 1);
+      CHECK(config_get_array(conf, "video_screen3_display", text, sizeof(text)));
+      CHECK(string_is_equal(text, VIDEO_WINDOW_DISPLAY_OFF));
+      config_file_free(conf);
+   }
+   CHECK(config_unload_override());
+   filestream_delete(generated_path);
+   screens_test_core_done();
+   screens_file_end();
+}
+
 /* An absent screen's window goes, and comes back where it was; nothing
  * of the user's is written */
 static void test_window_absent_back(void)
@@ -8884,6 +9188,7 @@ int main(int argc, char **argv)
    fill_pathname_join(fixture_path, argv[1], "fixture.cfg", sizeof(fixture_path));
    fill_pathname_join(saved_path, argv[1], "saved.cfg", sizeof(saved_path));
    fill_pathname_join(override_path, argv[1], "override.cfg", sizeof(override_path));
+   fill_pathname_join(screens_config_dir, argv[1], "screens", sizeof(screens_config_dir));
    config_file_set_io_default(config_file_io_filestream());
    rtime_init();
    retroarch_config_init();
@@ -8902,6 +9207,13 @@ int main(int argc, char **argv)
       test_xr_override_unload();
       test_xr_config_invalid();
       test_xr_menu_place_config();
+      test_screen_prefs_file_roundtrip();
+      test_screen_prefs_two_cores();
+      test_screen_prefs_clean_not_written();
+      test_screen_prefs_all_unset_removes();
+      test_screen_prefs_invalid_entries();
+      test_screen_prefs_window_keys_kept();
+      test_screen_prefs_not_in_override();
    }
    test_window_layout();
    test_window_frame();
