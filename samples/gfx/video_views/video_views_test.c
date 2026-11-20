@@ -27,6 +27,7 @@
 #include "gfx/video_views.h"
 #include "gfx/video_defines.h"
 #include "gfx/video_views_cpu.h"
+#include "gfx/video_screen_prefs.h"
 
 static int failures = 0;
 
@@ -2333,6 +2334,204 @@ static void test_names_box(void)
    CHECK(t_names_are(&got, &b));
 }
 
+/* Resolved and global values start as the built-in defaults. */
+static void t_prefs_values(video_screen_values_t *v)
+{
+   memset(v, 0, sizeof(*v));
+   video_views_xr_reset(&v->xr, 1);
+}
+
+#define T_PREF(p) VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_##p)
+
+static void test_prefs_resolve_order(void)
+{
+   video_screen_prefs_t prefs;
+   video_views_screens_t scr;
+   video_screen_values_t global, mine, out;
+
+   memset(&prefs, 0, sizeof(prefs));
+   memset(&scr, 0, sizeof(scr));
+   t_prefs_values(&global);
+   scr.count             = 2;
+   scr.screens[1].show   = RETRO_VIDEO_SCREEN_SHOW_HIDDEN;
+   /* The core's default beats the global setting. */
+   CHECK(video_screen_prefs_resolve(&prefs, &scr, &global, 1, &out)
+         == T_PREF(DISPLAY));
+   CHECK(!strcmp(out.display, VIDEO_WINDOW_DISPLAY_OFF));
+   /* The user's choice beats the core's. */
+   t_prefs_values(&mine);
+   video_screen_prefs_set(&prefs, 1, T_PREF(DISPLAY), &mine);
+   CHECK(video_screen_prefs_resolve(&prefs, &scr, &global, 1, &out) == 0);
+   CHECK(!strcmp(out.display, ""));
+   /* SHOWN gives no default. */
+   memset(&prefs, 0, sizeof(prefs));
+   scr.screens[1].show = RETRO_VIDEO_SCREEN_SHOW_SHOWN;
+   strcpy(global.display, VIDEO_WINDOW_DISPLAY_OFF);
+   CHECK(video_screen_prefs_resolve(&prefs, &scr, &global, 1, &out) == 0);
+   CHECK(!strcmp(out.display, VIDEO_WINDOW_DISPLAY_OFF));
+   /* No screen information, and a stale entry past count. */
+   scr.screens[1].show = RETRO_VIDEO_SCREEN_SHOW_HIDDEN;
+   global.display[0]   = '\0';
+   CHECK(video_screen_prefs_resolve(NULL, NULL, &global, 1, &out) == 0);
+   CHECK(!strcmp(out.display, ""));
+   scr.count = 1;
+   CHECK(video_screen_prefs_resolve(&prefs, &scr, &global, 1, &out) == 0);
+   CHECK(!strcmp(out.display, ""));
+}
+
+static void test_prefs_resolve_over(void)
+{
+   video_views_screens_t scr;
+   video_screen_values_t global, out;
+
+   memset(&scr, 0, sizeof(scr));
+   t_prefs_values(&global);
+   scr.count           = 2;
+   scr.screens[1].show = RETRO_VIDEO_SCREEN_SHOW_OVER;
+   CHECK(video_screen_prefs_resolve(NULL, &scr, &global, 1, &out)
+         == T_PREF(DISPLAY));
+   CHECK(!strcmp(out.display, VIDEO_WINDOW_DISPLAY_OFF));
+}
+
+static void test_prefs_resolve_fields(void)
+{
+   video_screen_prefs_t prefs;
+   video_screen_values_t global, mine, out;
+
+   memset(&prefs, 0, sizeof(prefs));
+   t_prefs_values(&global);
+   t_prefs_values(&mine);
+   global.window_pos   = VIDEO_POS_PACK(5, 6);
+   global.window_dims  = VIDEO_SCALE_PACK(320, 240);
+   global.xr.x         = 0.5f;
+   global.xr.pitch     = 10.0f;
+   mine.window_pos     = VIDEO_POS_PACK(100, 77);
+   mine.window_dims    = VIDEO_SCALE_PACK(640, 480);
+   mine.xr.x           = 9.0f;
+   mine.xr.scale       = 2.0f;
+   mine.xr.visible     = false;
+   /* X and Y, width and height, each from its own layer. */
+   video_screen_prefs_set(&prefs, 0, T_PREF(WINDOW_X) | T_PREF(WINDOW_WIDTH),
+         &mine);
+   CHECK(video_screen_prefs_resolve(&prefs, NULL, &global, 0, &out) == 0);
+   CHECK(out.window_pos == VIDEO_POS_PACK(100, 6));
+   CHECK(out.window_dims == VIDEO_SCALE_PACK(640, 240));
+   /* A lone width is no saved size. */
+   global.window_dims = 0;
+   video_screen_prefs_resolve(&prefs, NULL, &global, 0, &out);
+   CHECK(out.window_dims == 0);
+
+   video_screen_prefs_set(&prefs, 0, T_PREF(XR_SCALE), &mine);
+   video_screen_prefs_resolve(&prefs, NULL, &global, 0, &out);
+   CHECK(out.xr.scale == 2.0f);
+   CHECK(out.xr.x == 0.5f && out.xr.y == 0.0f && out.xr.z == 0.0f);
+   CHECK(out.xr.yaw == 0.0f && out.xr.pitch == 10.0f && out.xr.roll == 0.0f);
+   CHECK(out.xr.visible);
+   video_screen_prefs_set(&prefs, 0, T_PREF(XR_VISIBLE), &mine);
+   video_screen_prefs_resolve(&prefs, NULL, &global, 0, &out);
+   CHECK(!out.xr.visible && out.xr.scale == 2.0f);
+}
+
+static void test_prefs_masks(void)
+{
+   video_views_screens_t scr;
+   video_screen_values_t resolved[RETRO_VIDEO_VIEWS_MAX];
+   unsigned left_out = ~0u, blank = ~0u, i;
+
+   memset(&scr, 0, sizeof(scr));
+   for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+      t_prefs_values(&resolved[i]);
+   scr.count            = 4;
+   scr.screens[1].state = RETRO_VIDEO_SCREEN_STATE_BLANK;
+   scr.screens[2].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
+   scr.screens[3].state = RETRO_VIDEO_SCREEN_STATE_BLANK;
+   strcpy(resolved[3].display, VIDEO_WINDOW_DISPLAY_OFF);
+   video_screen_prefs_masks(resolved, &scr, 4, &left_out, &blank);
+   CHECK(left_out == 0xC && blank == 0x2);
+   video_screen_prefs_masks(resolved, &scr, 2, &left_out, &blank);
+   CHECK(left_out == 0 && blank == 0x2);
+   /* Entries past count are stale. */
+   scr.count            = 2;
+   scr.screens[3].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
+   resolved[3].display[0] = '\0';
+   video_screen_prefs_masks(resolved, &scr, 4, &left_out, &blank);
+   CHECK(left_out == 0 && blank == 0x2);
+   /* No screen information. */
+   strcpy(resolved[1].display, VIDEO_WINDOW_DISPLAY_OFF);
+   video_screen_prefs_masks(resolved, NULL, 4, &left_out, &blank);
+   CHECK(left_out == 0x2 && blank == 0);
+   scr.count = 0;
+   video_screen_prefs_masks(resolved, &scr, 4, &left_out, &blank);
+   CHECK(left_out == 0x2 && blank == 0);
+}
+
+static void test_prefs_set(void)
+{
+   video_screen_prefs_t prefs;
+   video_screen_values_t v;
+   unsigned both = T_PREF(WINDOW_FULLSCREEN) | T_PREF(XR_SCALE);
+
+   CHECK(VIDEO_SCREEN_PREF_XR_PLACE == (T_PREF(XR_X) | T_PREF(XR_Y)
+         | T_PREF(XR_Z) | T_PREF(XR_YAW) | T_PREF(XR_PITCH)
+         | T_PREF(XR_ROLL) | T_PREF(XR_SCALE)));
+   CHECK(VIDEO_SCREEN_PREF_XR_ALL
+         == (VIDEO_SCREEN_PREF_XR_PLACE | T_PREF(XR_VISIBLE)));
+
+   memset(&prefs, 0, sizeof(prefs));
+   t_prefs_values(&v);
+   v.window_fullscreen = true;
+   video_screen_prefs_set(&prefs, 2, both, &v);
+   CHECK(prefs.set[2] == both && prefs.dirty);
+   CHECK(prefs.values[2].window_fullscreen && prefs.values[2].xr.scale == 1.0f);
+   CHECK(!prefs.set[0] && !prefs.set[1] && !prefs.set[3]);
+   /* The same values again change nothing. */
+   prefs.dirty = false;
+   video_screen_prefs_set(&prefs, 2, both, &v);
+   CHECK(!prefs.dirty);
+   v.xr.scale = 3.0f;
+   video_screen_prefs_set(&prefs, 2, T_PREF(XR_SCALE), &v);
+   CHECK(prefs.dirty && prefs.values[2].xr.scale == 3.0f);
+   /* Clearing an unset bit changes nothing; a set one is cleared. */
+   prefs.dirty = false;
+   video_screen_prefs_set(&prefs, 2, T_PREF(DISPLAY), NULL);
+   CHECK(!prefs.dirty && prefs.set[2] == both);
+   video_screen_prefs_set(&prefs, 2, T_PREF(XR_SCALE), NULL);
+   CHECK(prefs.dirty && prefs.set[2] == T_PREF(WINDOW_FULLSCREEN));
+}
+
+static void test_prefs_key(void)
+{
+   static const char *const suffix[VIDEO_SCREEN_PREF_COUNT] = {
+      "display", "window_fullscreen", "window_x", "window_y",
+      "window_width", "window_height", "window_pos_set", "xr_x", "xr_y",
+      "xr_z", "xr_yaw", "xr_pitch", "xr_roll", "xr_scale", "xr_visible"
+   };
+   char key[64], want[64];
+   unsigned p;
+
+   CHECK(video_screen_prefs_key(1, VIDEO_SCREEN_PREF_XR_VISIBLE, key,
+         sizeof(key)) == strlen("video_screen2_xr_visible"));
+   CHECK(!strcmp(key, "video_screen2_xr_visible"));
+   video_screen_prefs_key(0, VIDEO_SCREEN_PREF_WINDOW_POS_SET, key, sizeof(key));
+   CHECK(!strcmp(key, "video_screen1_window_pos_set"));
+   video_screen_prefs_key(7, VIDEO_SCREEN_PREF_DISPLAY, key, sizeof(key));
+   CHECK(!strcmp(key, "video_screen8_display"));
+   video_screen_prefs_key(0, VIDEO_SCREEN_PREF_WINDOW_WIDTH, key, sizeof(key));
+   CHECK(!strcmp(key, "video_screen1_window_width"));
+   /* Every key as configuration.c names it. */
+   for (p = 0; p < VIDEO_SCREEN_PREF_COUNT; p++)
+   {
+      strcpy(want, "video_screen3_");
+      strcat(want, suffix[p]);
+      video_screen_prefs_key(2, p, key, sizeof(key));
+      CHECK(!strcmp(key, want));
+   }
+   CHECK(video_screen_prefs_key(0, VIDEO_SCREEN_PREF_COUNT, key,
+         sizeof(key)) == 0 && !*key);
+}
+
+#undef T_PREF
+
 int main(void)
 {
    test_screen_defaults();
@@ -2374,6 +2573,12 @@ int main(void)
    test_map_point_blank();
    test_touch_no_input();
    test_names_box();
+   test_prefs_resolve_order();
+   test_prefs_resolve_over();
+   test_prefs_resolve_fields();
+   test_prefs_masks();
+   test_prefs_set();
+   test_prefs_key();
 
    if (failures)
    {
