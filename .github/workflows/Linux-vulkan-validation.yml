@@ -1007,6 +1007,7 @@ jobs:
         # the renderer the driver draws through.
         run: |
           set -eu
+          # configure's SDL3 minimum (qb/config.libs.sh).
           SDL3_VER=3.2.20
           curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 --connect-timeout 10 \
              -o /tmp/sdl3.tar.gz \
