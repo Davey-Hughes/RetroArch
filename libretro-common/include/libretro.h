@@ -3200,8 +3200,9 @@ struct retro_video_view
 #define RETRO_VIDEO_SCREEN_FLAG_UPRIGHT        (1 << 6)
 
 /**
- * The pixels of a screen that is not in the frame. Rows run top to
- * bottom; RGB565 is in native byte order, as for retro_video_refresh_t.
+ * The pixels of a screen that is not in the frame, as the player sees
+ * the screen: the first row is its top. RGB565 is in native byte order,
+ * as for retro_video_refresh_t.
  * @see RETRO_ENVIRONMENT_GET_VIDEO_SCREEN_BUFFER
  */
 struct retro_video_screen_image
@@ -3232,7 +3233,8 @@ struct retro_video_screen
    float opacity;         /* SHOW_OVER: 0 = the frontend's default */
    unsigned order;        /* layout position, 1 and up; 0 on every screen =
                              screen number */
-   unsigned owners;       /* bit n: input port n; 0 = none */
+   unsigned owners;       /* bit n: on input port n (a VMU: its
+                             controller's port); 0 = none */
    unsigned swap_with;    /* screen + 1; 0 = none */
    unsigned group;        /* panorama group, 1 and up; 0 = none */
    const struct retro_video_screen_image *image; /* NULL: from views */
