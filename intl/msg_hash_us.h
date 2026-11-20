@@ -7979,7 +7979,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_VIDEO_SCREEN_DISPLAY_SHOWN,
-   "Off leaves this game screen out. Auto shows it unless the core hides it. Chosen while a core runs, it is kept for that core."
+   "Off leaves this game screen out. Auto shows it; until you choose, a core can hide it. Chosen while a core runs, it is kept for that core."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_CORE_DEFAULT,
