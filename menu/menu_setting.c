@@ -11385,8 +11385,14 @@ static int setting_video_screen_reset(rarch_setting_t *setting,
    struct menu_state *menu_st = menu_state_get_ptr();
    if (setting->enum_idx == MENU_ENUM_LABEL_VIDEO_SCREEN_XR_RESET_ALL)
    {
-      unsigned screen;
-      for (screen = 0; screen < RETRO_VIDEO_VIEWS_MAX; screen++)
+      video_driver_state_t *video_st = video_state_get_ptr();
+      unsigned screen, count         = RETRO_VIDEO_VIEWS_MAX;
+      /* A views core's file holds only the screens it has */
+      if (video_st->screen_prefs.in_use)
+         count = video_st->views_presented
+            ? video_st->views_core.num_screens : 1;
+      for (screen = 0; screen < count && screen < RETRO_VIDEO_VIEWS_MAX;
+            screen++)
          config_set_video_screen_xr(screen, NULL);
       config_reset_video_menu_xr(settings);
       settings->flags |= SETTINGS_FLG_MODIFIED;
