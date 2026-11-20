@@ -518,10 +518,16 @@ SCREENS_STATE_CASES = [
      {'files': CORE_FILE_OFF,
       'env_extra': {'VIDEO_VIEWS_TEST_LIBRARY_NAME': 'video_views test B'}}),
 ]
-# With no screen placed the menu still lays out over the whole window.
+# With no screen placed the menu still lays out over the whole window,
+# as it does over a frame without views: the second case, which the
+# first one's menu must match. Opaque, so the frame behind is not seen.
+SCREENS_MENU_SETTINGS = dict(SCREENS_AIM_SETTINGS, menu_driver='ozone',
+                             menu_timedate_enable='false',
+                             menu_framebuffer_opacity='1.000000')
 SCREENS_MENU_CASE = ('screens-none-shown-menu', 'ds',
-                     dict(SCREENS_AIM_SETTINGS, menu_driver='ozone',
-                          menu_timedate_enable='false'), [])
+                     SCREENS_MENU_SETTINGS, [])
+SCREENS_MENU_REF = ('screens-none-shown-menu-ref', 'none',
+                    SCREENS_MENU_SETTINGS, [])
 
 
 # The last few files read_png() decoded on this thread, by path, with
@@ -1547,6 +1553,25 @@ def rows_differ(a, b, tolerance):
     return bad
 
 
+def menu_diff(ref, shot):
+    """How many pixels of two menu screenshots, as read_png() gives
+    them, differ."""
+    w, h, bpp, rows_a = ref
+    sw, sh, sbpp, rows_b = shot
+    if (sw, sh) != (w, h):
+        return w * h
+    diff = 0
+    for y in range(h):
+        if rows_b[y] == rows_a[y] and sbpp == bpp:
+            continue
+        for x in range(w):
+            a = rows_a[y][x * bpp:x * bpp + 3]
+            b = rows_b[y][x * sbpp:x * sbpp + 3]
+            if any(abs(p - q) > TOLERANCE for p, q in zip(a, b)):
+                diff += 1
+    return diff
+
+
 def run_menu_case(retroarch, root, driver, case):
     """The case with the menu open in each of its stereo modes; each
     mode's screen must match the first's."""
@@ -1564,17 +1589,8 @@ def run_menu_case(retroarch, root, driver, case):
             images.append(None)
     if errors or None in images:
         return errors or ['no menu screenshot']
-    w, h, bpp, ref = images[0]
-    for mode, (_, _, mbpp, rows) in zip(modes[1:], images[1:]):
-        diff = 0
-        for y in range(h):
-            if rows[y] == ref[y] and mbpp == bpp:
-                continue
-            for x in range(w):
-                a = ref[y][x * bpp:x * bpp + 3]
-                b = rows[y][x * mbpp:x * mbpp + 3]
-                if any(abs(p - q) > TOLERANCE for p, q in zip(a, b)):
-                    diff += 1
+    for mode, image in zip(modes[1:], images[1:]):
+        diff = menu_diff(images[0], image)
         if diff > MENU_DIFF_MAX:
             errors.append('stereo mode %s: %d pixels differ from mode %s'
                           % (mode, diff, modes[0]))
@@ -1810,14 +1826,22 @@ def run_screens_show_case(retroarch, root, driver, case):
 
 def run_screens_menu_case(retroarch, root, driver):
     """The menu with no screen placed: drawn in the window's left third
-    and in its right one."""
+    and in its right one, and the same as over a frame without views."""
     errors = run_case(retroarch, root, driver, SCREENS_MENU_CASE, menu=True,
                       opts={'video_views_test_screens': 'none_shown'})
-    path = os.path.join(case_dir(root, driver, SCREENS_MENU_CASE[0]),
-                        'menu.png')
-    if errors or not os.path.exists(path):
+    errors += run_case(retroarch, root, driver, SCREENS_MENU_REF, menu=True)
+    paths = [os.path.join(case_dir(root, driver, c[0]), 'menu.png')
+             for c in (SCREENS_MENU_CASE, SCREENS_MENU_REF)]
+    if errors or not all(os.path.exists(p) for p in paths):
         return errors or ['no menu screenshot']
-    w, h, bpp, rows = read_png(path)
+    try:
+        shot, ref = [read_png(p) for p in paths]
+    except ValueError:
+        return ['no menu screenshot']
+    w, h, bpp, rows = shot
+    diff = menu_diff(ref, shot)
+    if diff > MENU_DIFF_MAX:
+        errors.append('%d pixels differ from the menu without views' % diff)
     for side, x0 in (('left', 0), ('right', w - w // 3)):
         if not any(max(rows[y][x * bpp:x * bpp + 3]) > TOLERANCE
                    for y in range(0, h, 4)
