@@ -713,6 +713,10 @@ static int16_t dinput_input_state(
 #define WM_POINTERUP                    0x0247
 #endif
 
+#ifndef WM_POINTERCAPTURECHANGED
+#define WM_POINTERCAPTURECHANGED        0x024C
+#endif
+
 #ifndef GET_POINTERID_WPARAM
 #define GET_POINTERID_WPARAM(wParam)   (LOWORD(wParam))
 #endif
@@ -755,10 +759,12 @@ static void dinput_pointer_down(struct dinput_input *di, int pointer_id,
       WPARAM lParam)
 {
    unsigned i;
-   if (dinput_pointer_find(di, pointer_id))
-      return;
+   /* one still held never had its lift: it goes down again here */
+   struct dinput_pointer_slot *held = dinput_pointer_find(di, pointer_id);
    for (i = 0; i < DINPUT_MAX_POINTERS; i++)
-      if (!retro_atomic_load_relaxed_int(&di->pointers[i].id_plus1))
+      if (held
+            ? held == &di->pointers[i]
+            : !retro_atomic_load_relaxed_int(&di->pointers[i].id_plus1))
       {
          unsigned window     = 0;
          unsigned generation = 0;
@@ -815,6 +821,8 @@ bool dinput_handle_message(void *data,
          dinput_pointer_down(di, GET_POINTERID_WPARAM(wParam), lParam);
          return true;
       case WM_POINTERUP:
+      /* its window gone or the touch taken from it: no lift comes */
+      case WM_POINTERCAPTURECHANGED:
          {
             struct dinput_pointer_slot *slot = dinput_pointer_find(di,
                   GET_POINTERID_WPARAM(wParam));

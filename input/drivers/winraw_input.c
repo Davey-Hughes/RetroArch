@@ -2459,6 +2459,10 @@ static int16_t winraw_input_state(
 #define WM_POINTERUP                    0x0247
 #endif
 
+#ifndef WM_POINTERCAPTURECHANGED
+#define WM_POINTERCAPTURECHANGED        0x024C
+#endif
+
 #ifndef GET_POINTERID_WPARAM
 #define GET_POINTERID_WPARAM(wParam)   (LOWORD(wParam))
 #endif
@@ -2499,10 +2503,12 @@ static struct winraw_pointer_slot *winraw_pointer_find(int pointer_id)
 static void winraw_pointer_down(int pointer_id, LPARAM lpar)
 {
    unsigned i;
-   if (winraw_pointer_find(pointer_id))
-      return;
+   /* one still held never had its lift: it goes down again here */
+   struct winraw_pointer_slot *held = winraw_pointer_find(pointer_id);
    for (i = 0; i < WINRAW_MAX_POINTERS; i++)
-      if (!retro_atomic_load_relaxed_int(&winraw_pointers[i].id_plus1))
+      if (held
+            ? held == &winraw_pointers[i]
+            : !retro_atomic_load_relaxed_int(&winraw_pointers[i].id_plus1))
       {
          unsigned window     = 0;
          unsigned generation = 0;
@@ -2536,6 +2542,8 @@ bool winraw_handle_message(UINT msg,
          winraw_pointer_down(GET_POINTERID_WPARAM(wpar), lpar);
          return true;
       case WM_POINTERUP:
+      /* its window gone or the touch taken from it: no lift comes */
+      case WM_POINTERCAPTURECHANGED:
          {
             struct winraw_pointer_slot *slot = winraw_pointer_find(
                   GET_POINTERID_WPARAM(wpar));
