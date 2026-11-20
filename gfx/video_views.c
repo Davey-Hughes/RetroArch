@@ -855,6 +855,7 @@ bool video_views_first_drawn(const video_views_layout_t *layout,
       video_views_rect_t r;
       const video_views_placement_t *p = &layout->placements[i];
       if (     p->view == view
+            && !(p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
             && (all_areas || p->area == 0)
             && video_views_visible(layout, p, dims, &r))
       {
