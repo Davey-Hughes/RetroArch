@@ -8130,6 +8130,15 @@ static void test_xr_menu_follows_first_placed(void)
    video_xr_place(&p, &set);
    CHECK(set.num_quads == 2 && set.quads[0].screen == 2);
    CHECK(pose_same(&set.quads[1].pose, &spot));
+
+   /* The projection's screen hidden in the headset: still at its spot,
+    * not on to screen 2. */
+   three.left_out     = 0;
+   p.skip_screens     = 0x1u;
+   screens[0].visible = false;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 3 && set.quads[0].screen == 1);
+   CHECK(pose_same(&set.quads[2].pose, &spot));
 }
 
 /* No screen placed: nothing read past the screens, no screen quad, and
