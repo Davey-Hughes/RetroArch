@@ -1529,7 +1529,7 @@ static void t_latch_writer(void *data)
    {
       for (i = 0; i < T_LATCH_N; i++)
          v[i] = n;
-      openxr_seq_publish(&t_latch_seq, t_latch_words, v, sizeof(v));
+      retro_seqlatch_publish(&t_latch_seq, t_latch_words, v, sizeof(v));
    }
    retro_atomic_store_release_int(&t_latch_done, 1);
 }
@@ -1542,7 +1542,7 @@ static void t_latch_reader(void *data)
    {
       int v[T_LATCH_N];
       int i;
-      openxr_seq_read(&t_latch_seq, t_latch_words, v, sizeof(v));
+      retro_seqlatch_read(&t_latch_seq, t_latch_words, v, sizeof(v));
       for (i = 1; i < T_LATCH_N; i++)
          if (v[i] != v[0])
             t_latch_mixed[who]++;
@@ -1563,8 +1563,8 @@ static void test_seq_latch(void)
       a[i] = (int)i + 1;
       b[i] = (int)i + 100;
    }
-   openxr_seq_publish(&t_latch_seq, t_latch_words, a, sizeof(a));
-   openxr_seq_read(&t_latch_seq, t_latch_words, got, sizeof(got));
+   retro_seqlatch_publish(&t_latch_seq, t_latch_words, a, sizeof(a));
+   retro_seqlatch_read(&t_latch_seq, t_latch_words, got, sizeof(got));
    CHECK(!memcmp(a, got, sizeof(a)), "latch: a publication not read back");
 
    /* a writer stopped half way through copy 0: the reader goes on with
@@ -1574,19 +1574,19 @@ static void test_seq_latch(void)
       retro_atomic_store_release_int(&t_latch_seq, s + 1);
       for (i = 0; i < T_LATCH_N / 2; i++)
          retro_atomic_store_relaxed_int(&t_latch_words[i], -1);
-      openxr_seq_read(&t_latch_seq, t_latch_words, got, sizeof(got));
+      retro_seqlatch_read(&t_latch_seq, t_latch_words, got, sizeof(got));
       CHECK(!memcmp(a, got, sizeof(a)),
             "latch: a writer stopped part way through was read");
       retro_atomic_store_release_int(&t_latch_seq, s);
    }
-   openxr_seq_publish(&t_latch_seq, t_latch_words, b, sizeof(b));
-   openxr_seq_read(&t_latch_seq, t_latch_words, got, sizeof(got));
+   retro_seqlatch_publish(&t_latch_seq, t_latch_words, b, sizeof(b));
+   retro_seqlatch_read(&t_latch_seq, t_latch_words, got, sizeof(got));
    CHECK(!memcmp(b, got, sizeof(b)), "latch: the next publication not read back");
 
    /* one writer, two readers */
    for (i = 0; i < T_LATCH_N; i++)
       a[i] = 0;
-   openxr_seq_publish(&t_latch_seq, t_latch_words, a, sizeof(a));
+   retro_seqlatch_publish(&t_latch_seq, t_latch_words, a, sizeof(a));
    retro_atomic_store_release_int(&t_latch_done, 0);
    r0 = sthread_create(t_latch_reader, &who[0]);
    r1 = sthread_create(t_latch_reader, &who[1]);
@@ -1605,7 +1605,7 @@ static void test_seq_latch(void)
          t_latch_mixed[0], t_latch_mixed[1]);
    CHECK(!t_latch_back[0] && !t_latch_back[1],
          "latch: a read went back to an older publication");
-   openxr_seq_read(&t_latch_seq, t_latch_words, got, sizeof(got));
+   retro_seqlatch_read(&t_latch_seq, t_latch_words, got, sizeof(got));
    CHECK(got[0] == 100000 && got[T_LATCH_N - 1] == 100000,
          "latch: the newest was not read once the writer stopped");
 }
@@ -2486,7 +2486,7 @@ static void test_host(void)
          && p.track_seq == retro_atomic_load_acquire_int(&s.track_seq)
          && t_near(p.pose[0].position.x, -0.032f),
          "the views the core was given did not go on in the new space");
-   openxr_seq_read(&f.proj_seq, f.proj_words, &p, sizeof(p));
+   retro_seqlatch_read(&f.proj_seq, f.proj_words, &p, sizeof(p));
    CHECK(     p.active
          && openxr_frame_track_shows((const openxr_track_t*)
                retro_atomic_load_acquire_ptr(&s.track), p.track_seq)
@@ -2755,7 +2755,7 @@ static void test_host_recenter_paused(void)
          && t_near(t_space_pose.orientation.y, anchor.orientation.y),
          "the seated space did not follow a recenter while paused");
    openxr_host_projection(&h, 400, 240, &p);
-   openxr_seq_read(&f.proj_seq, f.proj_words, &shown, sizeof(shown));
+   retro_seqlatch_read(&f.proj_seq, f.proj_words, &shown, sizeof(shown));
    CHECK(     openxr_host_has_given(&h) && p.track_seq == seq
          && t_near(p.pose[0].position.x, -0.25f)
          && openxr_frame_track_shows((const openxr_track_t*)
@@ -2790,7 +2790,7 @@ static void test_host_recenter_paused(void)
    t_host_recenter_at(&f, 0.25f);
    t_space_fail_at = t_spaces_made + 1;
    openxr_host_place_kept(&h);
-   openxr_seq_read(&f.proj_seq, f.proj_words, &shown, sizeof(shown));
+   retro_seqlatch_read(&f.proj_seq, f.proj_words, &shown, sizeof(shown));
    CHECK(     retro_atomic_load_acquire_int(&s.track_seq) == seq
          && openxr_host_has_given(&h) && shown.track_seq == seq,
          "a failed remake moved the paused frame");
@@ -2816,7 +2816,7 @@ static void test_host_recenter_paused(void)
    openxr_host_set_space(&h, &space, &w, &ht);
    t_host_recenter_at(&f, 0.5f);
    openxr_host_place_kept(&h);
-   openxr_seq_read(&f.proj_seq, f.proj_words, &shown, sizeof(shown));
+   retro_seqlatch_read(&f.proj_seq, f.proj_words, &shown, sizeof(shown));
    CHECK(     !openxr_host_has_given(&h)
          && shown.track_seq == p.track_seq
          && shown.track_seq != retro_atomic_load_acquire_int(&s.track_seq),
@@ -6240,7 +6240,7 @@ static void test_frame_carried_seq(void)
    openxr_session_swap_track_space(&s, &space, &origin, t_carry_noted, NULL);
    openxr_session_swap_track_space(&s, &space, &origin, t_carry_noted, NULL);
    CHECK(t_carry_shown(&f, &s), "not carried through two recenters");
-   openxr_seq_read(&f.proj_seq, f.proj_words, &got, sizeof(got));
+   retro_seqlatch_read(&f.proj_seq, f.proj_words, &got, sizeof(got));
    CHECK(!memcmp(&p, &got, sizeof(p)) && got.track_seq == drawn,
          "the carry rewrote the projection: seq %d", got.track_seq);
 
@@ -7466,7 +7466,7 @@ static void test_gl_host_projection(void)
             t_gl_carry, NULL), "recenters");
    t_sc_wait = XR_SUCCESS;
    CHECK(t_gate_step(1), "frame");
-   openxr_seq_read(&xr->frame.proj_seq, xr->frame.proj_words, &got,
+   retro_seqlatch_read(&xr->frame.proj_seq, xr->frame.proj_words, &got,
          sizeof(got));
    CHECK(     got.track_seq == seq && got.pose[0].position.x == -0.07f
          && t_layer_types[0] == XR_TYPE_COMPOSITION_LAYER_PROJECTION
