@@ -9402,13 +9402,15 @@ static unsigned menu_displaylist_video_screen_window_rows(
       { MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_X,          PARSE_ONLY_INT,  true  },
       { MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_Y,          PARSE_ONLY_INT,  true  },
    };
+   video_screen_values_t values;
    unsigned i;
    unsigned count = 0;
    if (!menu_setting_video_screen_window_own(screen))
       return 0;
+   video_driver_screen_get(screen, &values);
    for (i = 0; i < ARRAY_SIZE(rows); i++)
    {
-      if (rows[i].sized && !settings->uints.video_screen_window_dims[screen])
+      if (rows[i].sized && !values.window_dims)
          continue;
       if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
                (enum msg_hash_enums)(rows[i].first + screen),
@@ -13422,12 +13424,32 @@ unsigned menu_displaylist_build_list(
 #endif
             }
          }
-#ifdef ANDROID
+         if (     !video_driver_test_all_flags(GFX_CTX_FLAGS_VIDEO_WINDOWS)
+               || !settings->bools.video_windows_enable)
+#endif
+         {
+            /* The screens in one window: a Display row each, the
+             * running views core's, or with no content everyone's */
+            const video_screen_prefs_t *prefs =
+               &video_state_get_ptr()->screen_prefs;
+            if (!prefs->core_loaded || prefs->in_use)
+            {
+               unsigned screens = menu_setting_video_screens();
+               unsigned screen;
+               menu_setting_video_screen_display_values();
+               for (screen = 0; screen < screens; screen++)
+                  if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                           (enum msg_hash_enums)
+                           (MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY + screen),
+                           PARSE_ONLY_STRING_OPTIONS, false) == 0)
+                     count++;
+            }
+         }
+#if defined(HAVE_VIDEO_WINDOWS) && defined(ANDROID)
          if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
                   MENU_ENUM_LABEL_VIDEO_BLANK_UNUSED_SCREENS,
                   PARSE_ONLY_UINT, false) == 0)
             count++;
-#endif
 #endif
          break;
       case DISPLAYLIST_VIDEO_HEADSET_SETTINGS_LIST:
