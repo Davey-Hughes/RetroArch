@@ -3297,7 +3297,7 @@ struct retro_video_views
  * passes its own pixels, which the frontend copies.
  * @see retro_video_screen_image
  */
-#define RETRO_ENVIRONMENT_GET_VIDEO_SCREEN_BUFFER (107 | RETRO_ENVIRONMENT_EXPERIMENTAL)
+#define RETRO_ENVIRONMENT_GET_VIDEO_SCREEN_BUFFER (108 | RETRO_ENVIRONMENT_EXPERIMENTAL)
 
 /**
  * The argument of \c RETRO_ENVIRONMENT_GET_VIDEO_SCREEN_BUFFER.
