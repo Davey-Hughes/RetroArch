@@ -26,6 +26,7 @@ libretro-common/samples/queues/task_queue_title_error_test task_queue_title_erro
 libretro-common/samples/rthreads/fast_cores_test fast_cores_test
 libretro-common/samples/rthreads/retro_asym_eventcount_test retro_asym_eventcount_test
 libretro-common/samples/rthreads/retro_procbarrier_test retro_procbarrier_test
+libretro-common/samples/rthreads/retro_seqlatch_test retro_seqlatch_test
 libretro-common/samples/rthreads/sthread_ex_test sthread_ex_test
 libretro-common/samples/rthreads/tpool_parallel_test tpool_parallel_test
 libretro-common/samples/rthreads/tpool_wait_test tpool_wait_test
