@@ -502,7 +502,8 @@ static unsigned video_xr_menu_dims(const video_xr_params_t *p,
 }
 
 /* The first screen shown, past those left out or hidden; or
- * RETRO_VIDEO_VIEWS_MAX for none, or when the projection shows it. */
+ * RETRO_VIDEO_VIEWS_MAX for none, or when it is the projection's,
+ * hidden or not. */
 static unsigned video_xr_first_placed(const video_xr_params_t *p,
       const video_xr_layout_t *lay)
 {
@@ -512,9 +513,12 @@ static unsigned video_xr_first_placed(const video_xr_params_t *p,
       gone = p->map->viewless | p->map->left_out;
    for (s = 0; s < lay->count; s++)
    {
-      if ((gone & (1u << s)) || (p->screens && !p->screens[s].visible))
+      if (gone & (1u << s))
          continue;
-      return (p->skip_screens & (1u << s)) ? RETRO_VIDEO_VIEWS_MAX : s;
+      if (p->skip_screens & (1u << s))
+         break;
+      if (!p->screens || p->screens[s].visible)
+         return s;
    }
    return RETRO_VIDEO_VIEWS_MAX;
 }
