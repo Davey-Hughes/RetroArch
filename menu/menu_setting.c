@@ -4034,8 +4034,11 @@ static char setting_video_menu_display_list[
 static char setting_video_screen_display_list[
       sizeof("|" VIDEO_WINDOW_DISPLAY_OFF)];
 #endif
-/* The Display rows step a copy of what RetroArch uses for each screen */
+/* The Display rows step a copy of what RetroArch uses for each screen;
+ * _seen is what each last read: a value that differs is a candidate */
 static char setting_video_screen_display_value[RETRO_VIDEO_VIEWS_MAX]
+      [VIDEO_WINDOW_DISPLAY_NAME_SIZE];
+static char setting_video_screen_display_seen[RETRO_VIDEO_VIEWS_MAX]
       [VIDEO_WINDOW_DISPLAY_NAME_SIZE];
 
 #ifdef HAVE_VIDEO_WINDOWS
@@ -4054,6 +4057,8 @@ static void setting_video_screen_display_read(rarch_setting_t *setting)
    video_driver_screen_get(s, &values);
    strlcpy(setting_video_screen_display_value[s], values.display,
          sizeof(setting_video_screen_display_value[s]));
+   strlcpy(setting_video_screen_display_seen[s], values.display,
+         sizeof(setting_video_screen_display_seen[s]));
 }
 
 /* Only a new choice is written: the menu's change follows a step and
@@ -4062,6 +4067,9 @@ static void setting_video_screen_display_write(unsigned s)
 {
    video_screen_values_t values;
    video_driver_screen_get(s, &values);
+   strlcpy(setting_video_screen_display_seen[s],
+         setting_video_screen_display_value[s],
+         sizeof(setting_video_screen_display_seen[s]));
    if (string_is_equal(values.display, setting_video_screen_display_value[s]))
       return;
    strlcpy(values.display, setting_video_screen_display_value[s],
@@ -4268,17 +4276,25 @@ static size_t setting_video_screen_display_text(rarch_setting_t *setting,
    return _len;
 }
 
-/* A screen's value that is its core's default says so */
+/* A screen's value that is its core's default says so. A row still
+ * holding what it last read follows a change made under the list; a
+ * candidate value, as a dropdown puts in the row, is left alone. */
 static size_t setting_get_string_representation_video_screen_display(
       rarch_setting_t *setting, char *s, size_t len)
 {
    char text[128];
    video_screen_values_t values;
+   unsigned core;
    if (!setting)
       return 0;
-   if (     setting->enum_idx == MENU_ENUM_LABEL_VIDEO_MENU_DISPLAY
-         || !(  video_driver_screen_get(setting->index_offset, &values)
-              & VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY))
+   if (setting->enum_idx == MENU_ENUM_LABEL_VIDEO_MENU_DISPLAY)
+      return setting_video_screen_display_text(setting, s, len);
+   core = video_driver_screen_get(setting->index_offset, &values);
+   if (     !string_is_equal(values.display, setting->value.target.string)
+         && string_is_equal(setting->value.target.string,
+               setting_video_screen_display_seen[setting->index_offset]))
+      setting_video_screen_display_read(setting);
+   if (     !(core & VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY))
          || !string_is_equal(values.display, setting->value.target.string))
       return setting_video_screen_display_text(setting, s, len);
    setting_video_screen_display_text(setting, text, sizeof(text));
