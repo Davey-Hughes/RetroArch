@@ -23,6 +23,7 @@
 #include <retro_common_api.h>
 #include <rthreads/rthreads.h>
 #include <rthreads/retro_eventcount.h>
+#include <rthreads/retro_seqlatch.h>
 #include <retro_spsc.h>
 
 #include <openxr/openxr.h>
@@ -105,7 +106,7 @@ typedef struct openxr_screens
    int view;
 } openxr_screens_t;
 
-#define OPENXR_WORDS(t) ((sizeof(t) + sizeof(int) - 1) / sizeof(int))
+#define OPENXR_WORDS(t) RETRO_SEQLATCH_WORDS(sizeof(t))
 
 /* The tracked eyes as the drawing thread drew them: each eye's pose and
  * field of view in the session's track space as track_seq numbered it,
@@ -173,8 +174,8 @@ typedef struct openxr_frame
     * frame, no XR thread. */
    bool inline_host;
    bool repeating;                 /* inside openxr_frame_repeat */
-   /* A latched seqlock over two copies of its words (openxr_frame.c):
-    * the writer's own copy, the stamp and the words. */
+   /* A latched seqlock (rthreads/retro_seqlatch.h): the writer's own
+    * copy, the stamp and the words. */
    openxr_tracked_t tracked;       /* the frame loop's thread */
    retro_atomic_int_t tracked_seq;
    retro_atomic_int_t tracked_words[2 * OPENXR_WORDS(openxr_tracked_t)];
