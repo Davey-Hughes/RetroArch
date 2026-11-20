@@ -11367,13 +11367,11 @@ static int setting_video_screen_reset(rarch_setting_t *setting,
 {
    settings_t *settings = config_get_ptr();
    struct menu_state *menu_st = menu_state_get_ptr();
-   /* A views core's entries go, placement and Visible; with none the
-    * global values are reset */
    if (setting->enum_idx == MENU_ENUM_LABEL_VIDEO_SCREEN_XR_RESET_ALL)
    {
       unsigned screen;
       for (screen = 0; screen < RETRO_VIDEO_VIEWS_MAX; screen++)
-         video_driver_screen_set(screen, VIDEO_SCREEN_PREF_XR_ALL, NULL);
+         config_set_video_screen_xr(screen, NULL);
       config_reset_video_menu_xr(settings);
       settings->flags |= SETTINGS_FLG_MODIFIED;
    }
@@ -11381,8 +11379,7 @@ static int setting_video_screen_reset(rarch_setting_t *setting,
    {
       if (!setting_video_screen_bind(setting))
          return -1;
-      video_driver_screen_set(menu_st->video_screen_selected,
-            VIDEO_SCREEN_PREF_XR_ALL, NULL);
+      config_set_video_screen_xr(menu_st->video_screen_selected, NULL);
    }
    menu_st->flags |= MENU_ST_FLAG_PREVENT_POPULATE
       | MENU_ST_FLAG_ENTRIES_NEED_REFRESH;

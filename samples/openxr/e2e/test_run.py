@@ -119,7 +119,7 @@ class GlLanes(unittest.TestCase):
     def test_extra_cases_gl_only(self):
         names = {c['name'] for c in run.CASES}
         self.assertTrue(all(c['name'] not in names for c in run.GL_EXTRA))
-        self.assertEqual(len(run.CASES), 218)
+        self.assertEqual(len(run.CASES), 217)
 
     def test_screens_lanes(self):
         # A hidden, a blank and a left-out tracked screen on each driver,
@@ -136,9 +136,7 @@ class GlLanes(unittest.TestCase):
         for n in ('edit-grab', 'edit-reset', 'edit-menu-front',
                   'edit-follow', 'edit-no-map', 'edit-fallback'):
             self.assertIn('glcore-egl-' + n, names)
-        for n in ('edit-grab', 'edit-reset', 'edit-reset-default',
-                  'edit-outlines'):
-            self.assertIn('glcore-egl-' + n, names)
+        for n in ('edit-grab', 'edit-reset', 'edit-outlines'):
             self.assertIn('gl-egl-' + n, names)
         self.assertIn('glcore-egl-edit-beam', names)
         self.assertIn('gl-egl-edit-beam', names)
@@ -147,7 +145,6 @@ class GlLanes(unittest.TestCase):
         self.assertIn('gl-glx-edit-grab', names)
         self.assertIn('glcore-glx-edit-command', names)
         self.assertNotIn('glcore-glx-edit-reset', names)
-        self.assertNotIn('glcore-glx-edit-reset-default', names)
         self.assertNotIn('gl-egl-edit-menu-front', names)
         self.assertNotIn('gl-egl-edit-menu-size', names)
         self.assertNotIn('glcore-egl-edit-tilt', names)

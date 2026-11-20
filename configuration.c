@@ -5989,15 +5989,20 @@ void config_set_video_screen_xr(unsigned screen,
       const video_screen_xr_t *values)
 {
    video_screen_values_t s;
-   if (!values)
-   {
-      video_driver_screen_set(screen, VIDEO_SCREEN_PREF_XR_ALL, NULL);
-      return;
-   }
+   unsigned bits = VIDEO_SCREEN_PREF_XR_PLACE;
    memset(&s, 0, sizeof(s));
-   s.xr = *values;
-   video_views_xr_normalize(&s.xr);
-   video_driver_screen_set(screen, VIDEO_SCREEN_PREF_XR_PLACE, &s);
+   if (values)
+   {
+      s.xr = *values;
+      video_views_xr_normalize(&s.xr);
+   }
+   else
+   {
+      /* Written, not cleared: a views core's entry beats the global one */
+      video_views_xr_reset(&s.xr, 1);
+      bits = VIDEO_SCREEN_PREF_XR_ALL;
+   }
+   video_driver_screen_set(screen, bits, &s);
 }
 
 void config_set_video_menu_xr(const video_screen_xr_t *values)

@@ -5091,8 +5091,16 @@ static void test_window_fullscreen_hotkey_per_core(void)
 }
 
 #ifdef HAVE_OPENXR
+/* video_views_xr_reset()'s values */
+static bool xr_is_default(const video_screen_xr_t *xr)
+{
+   return xr->x == 0.0f && xr->y == 0.0f && xr->z == 0.0f
+      && xr->yaw == 0.0f && xr->pitch == 0.0f && xr->roll == 0.0f
+      && xr->scale == 1.0f && xr->visible;
+}
+
 /* Edit mode's place for a views core's screen goes to its store; its
- * reset clears the core's entries */
+ * reset stores the built-in placement and Visible there */
 static void test_xr_edit_per_core(void)
 {
    video_screen_values_t values;
@@ -5122,16 +5130,19 @@ static void test_xr_edit_per_core(void)
          && got.yaw == moved.yaw && got.pitch == moved.pitch
          && got.roll == moved.roll && got.scale == moved.scale);
    CHECK(got.visible);
-   /* Reset clears the core's Visible too */
+   /* Reset covers Visible too, and beats a global placement */
    memset(&values, 0, sizeof(values));
    video_driver_screen_set(1,
          VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_XR_VISIBLE), &values);
    config_get_video_screen_xr(1, &got);
    CHECK(!got.visible);
+   settings->floats.video_screen_xr_x[1] = 0.5f;
    config_set_video_screen_xr(1, NULL);
-   CHECK(!prefs->set[1]);
+   CHECK(prefs->set[1] == VIDEO_SCREEN_PREF_XR_ALL);
    config_get_video_screen_xr(1, &got);
-   CHECK(got.x == 0.0f && got.scale == 1.0f && got.visible);
+   CHECK(xr_is_default(&got));
+   CHECK(settings->floats.video_screen_xr_x[1] == 0.5f);
+   CHECK(!(settings->flags & SETTINGS_FLG_MODIFIED));
    video_driver_clear_views();
    screens_test_core_done();
 }
@@ -7772,6 +7783,7 @@ static void test_screen_menu_page_label(void)
 static void test_xr_screen_menu_per_core(void)
 {
    unsigned s;
+   video_screen_xr_t got;
    settings_t *settings              = config_get_ptr();
    const video_screen_prefs_t *prefs = &video_state_get_ptr()->screen_prefs;
    const unsigned scale              =
@@ -7806,20 +7818,40 @@ static void test_xr_screen_menu_per_core(void)
    menu_action("video_screen_xr_x", MENU_ACTION_RIGHT);
    CHECK(prefs->set[0] == x);
    menu_state_get_ptr()->video_screen_selected = 1;
-   /* Reset: placement and Visible, this screen's */
+   /* Reset: the built-in placement and Visible as this core's, over the
+    * global values, which stay */
+   settings->floats.video_screen_xr_x[1]     = 0.5f;
+   settings->floats.video_screen_xr_scale[1] = 2.0f;
    menu_action("video_screen_xr_reset", MENU_ACTION_OK);
-   CHECK(!prefs->set[1]);
+   CHECK(prefs->set[1] == VIDEO_SCREEN_PREF_XR_ALL);
    CHECK(prefs->set[0] == x);
+   CHECK(xr_is_default(&prefs->values[1].xr));
+   config_get_video_screen_xr(1, &got);
+   CHECK(xr_is_default(&got));
+   CHECK(settings->floats.video_screen_xr_x[1] == 0.5f);
+   CHECK(settings->floats.video_screen_xr_scale[1] == 2.0f);
    menu_value("video_screen_xr_scale", "1.0");
    menu_value("video_screen_xr_visible", "ON");
    CHECK(!(settings->flags & SETTINGS_FLG_MODIFIED));
+   /* Start on a row still clears its entry: the global value again */
+   menu_action("video_screen_xr_scale", MENU_ACTION_START);
+   CHECK(prefs->set[1] == (VIDEO_SCREEN_PREF_XR_ALL & ~scale));
+   menu_value("video_screen_xr_scale", "2.0");
    /* Reset All: every screen's, and the menu's own place */
    menu_action("video_screen_xr_visible", MENU_ACTION_RIGHT);
-   CHECK(prefs->set[1] == visible);
+   CHECK(prefs->set[1] == (VIDEO_SCREEN_PREF_XR_ALL & ~scale));
+   CHECK(!prefs->values[1].xr.visible);
    settings->floats.video_openxr_menu_xr_scale = 2.0f;
    menu_action("video_screen_xr_reset_all", MENU_ACTION_OK);
    for (s = 0; s < RETRO_VIDEO_VIEWS_MAX; s++)
-      CHECK(!prefs->set[s]);
+   {
+      CHECK(prefs->set[s] == VIDEO_SCREEN_PREF_XR_ALL);
+      CHECK(xr_is_default(&prefs->values[s].xr));
+   }
+   config_get_video_screen_xr(1, &got);
+   CHECK(xr_is_default(&got));
+   CHECK(settings->floats.video_screen_xr_x[1] == 0.5f);
+   CHECK(settings->floats.video_screen_xr_scale[1] == 2.0f);
    CHECK(settings->floats.video_openxr_menu_xr_scale == 1.0f);
    CHECK(settings->flags & SETTINGS_FLG_MODIFIED);
    menu_state_get_ptr()->video_screen_selected = 0;
