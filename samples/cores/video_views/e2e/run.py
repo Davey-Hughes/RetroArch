@@ -13,6 +13,11 @@ views filled with noise, drawn straight from the frame by the stock
 chain and for a preset copied out of it, on glcore once for each way it
 copies them, or a software frame's written straight in; and, on glcore,
 a frame drawn whole out of a core's larger framebuffer.
+The screens cases check what the frontend makes of the screens the
+core describes: which maps it accepts and the log of the screens it
+keeps, a light gun kept off a screen that takes no input, and which
+screens it lays out, leaves out or draws black by the core's show and
+state, the user's setting and the core's own file of choices.
 In full it needs a GPU, gamescope and a RetroArch build.
 
 With RA_E2E_XVFB=1 each case runs on an Xvfb server of its own instead
@@ -416,6 +421,120 @@ COPY_RE = re.compile(r'\[GLCore\] Views copied by ([\w ]+)\.')
 STATUS_RE = re.compile(
     r'\[video_views\] presents=(\d) stereo=(\d) accepted=(\d)')
 
+# The core's rules cases (video_views_test_screens rules), each sent on
+# the ds map for a frame, with whether the frontend must accept it; then
+# the full map.
+SCREENS_RULES = [
+    ('no-flag', 1), ('zero-screens', 1), ('absent-viewless', 1),
+    ('swap-one-side', 1), ('swap-both', 1), ('unknown-flags', 1),
+    ('too-many', 0), ('null-screens', 0), ('view-past-count', 0),
+    ('image', 0), ('active-viewless', 0), ('blank-viewless', 0),
+    ('eye-unpaired', 0), ('base-past-count', 0), ('over-self', 0),
+    ('over-over', 0), ('size-negative', 0), ('anchor', 0),
+    ('over-size', 0), ('opacity', 0), ('private-owners', 0),
+    ('swap-self', 0), ('swap-past-count', 0), ('swap-disagree', 0),
+    ('show-unknown', 0), ('state-unknown', 0), ('state-unknown-viewed', 0),
+    ('order-mixed', 0), ('order-mixed-first', 0), ('full', 1)]
+SCREENS_CASE_RE = re.compile(
+    r'\[video_views\] screens case=([\w-]+) accepted=(\d)')
+SCREENS_FULL_RE = re.compile(r'\[video_views\] screens case=full ')
+SCREEN_BUFFER_RE = re.compile(r'\[video_views\] screen_buffer=(\d)')
+# The full map's screens as the frontend logs them.
+SCREENS_FULL_LOG = [
+    '[Video] Screen 0: "Top", flags 0x22, state 0, show 0, base 0, '
+    'size 0.000, anchor 0, opacity 0.000, order 2, owners 0x0, '
+    'swap with 2, group 1.',
+    '[Video] Screen 1: "Bottom", flags 0x19, state 1, show 0, base 0, '
+    'size 0.500, anchor 0, opacity 0.000, order 1, owners 0x0, '
+    'swap with 0, group 1.',
+    '[Video] Screen 2: "VMU A1", flags 0xd, state 2, show 2, base 0, '
+    'size 0.250, anchor 8, opacity 0.750, order 3, owners 0x1, '
+    'swap with 0, group 0.']
+SCREEN_LOG_RE = re.compile(r'\[Video\] Screen \d+: .*')
+# GET_VIDEO_SCREEN_BUFFER, which the frontend knows
+SCREEN_BUFFER_UNSUPPORTED_RE = re.compile(
+    r'\[Environ\] UNSUPPORTED \(#(?:108|65644)\)')
+# The light gun aimed, with the menu closed, at the top screen's centre
+# and then the bottom one's, as ds-horizontal lays them out. Aimed at
+# the top first, so the second aim reads differently whatever the
+# pointer's start. A blank screen still takes the gun.
+# [(name, video_views_test_screens, whether the bottom screen takes the
+# gun, points)]
+SCREENS_AIM_SETTINGS = {'video_stereo_mode': '0', 'video_screen_layout': '1'}
+SCREENS_AIM_POINTS = [(400, 480, GREEN), (1200, 480, YELLOW)]
+# The bottom screen blank: black, in its place.
+SCREENS_BOTTOM_BLANK = [(400, 480, GREEN), (1200, 480, BLACK)]
+SCREENS_AIM_CASES = [
+    ('screens-no-input', 'no_input', False, SCREENS_AIM_POINTS),
+    ('screens-no-input-off', 'no_input_off', True, SCREENS_AIM_POINTS),
+    ('screens-blank-aim', 'blank', True, SCREENS_BOTTOM_BLANK)]
+SCREENS_AIM = ((400, 480), (1200, 480))
+GUN_RE = re.compile(r'\[video_views\] lightgun x=(-?\d+) y=(-?\d+) '
+                    r'offscreen=(\d) trigger=(\d) '
+                    r'packed=\((-?\d+),(-?\d+)\)')
+# What the screens cases check is the frontend's, the same on every
+# driver: they run on those of Linux-vulkan-validation.yml's views step.
+SCREENS_DRIVERS = ('gl', 'glcore', 'vulkan', 'sdl2')
+# What the window shows of the ds map's two screens, laid out as
+# SCREENS_AIM_SETTINGS has them. Screen 0 alone is 4:3, 1280 wide from
+# x 160.
+SCREENS_BOTH = SCREENS_AIM_POINTS
+SCREENS_TOP_ALONE = [(800, 480, GREEN), (1200, 480, GREEN),
+                     (100, 480, BLACK)]
+SCREENS_NONE = [(400, 480, BLACK), (800, 480, BLACK), (1200, 480, BLACK)]
+SCREENS_SWITCHED_RE = re.compile(r'\[video_views\] screens switched')
+# The core's own screen choices, under the case directory. A file the
+# frontend wrote again would have lost the comment.
+CORE_FILE = os.path.join('video_views test', 'video_views test.screens.cfg')
+CORE_FILE_OFF = {CORE_FILE: '# kept\nvideo_screen2_display = "off"\n'}
+# A screen left out or blanked, drawn by the driver: on every driver.
+# [(name, video_views_test_screens, points, what run_case() is given
+# besides, with 'settings' added to SCREENS_AIM_SETTINGS)]
+SCREENS_DRAW_CASES = [
+    ('screens-hidden', 'hidden', SCREENS_TOP_ALONE, {}),
+    ('screens-blank-late', 'blank_late', SCREENS_BOTTOM_BLANK,
+     {'until': SCREENS_SWITCHED_RE}),
+    ('screens-none-shown', 'none_shown', SCREENS_NONE, {}),
+]
+# xvideo's interlaced path places and clears by itself: the late blank
+# again there, in each eye's rows. An entry as above.
+SCREENS_XV_INTERLACED_CASE = (
+    'screens-blank-late-interlaced', 'blank_late',
+    SCREENS_BOTTOM_BLANK + [(400, 481, GREEN), (1200, 481, BLACK)],
+    {'until': SCREENS_SWITCHED_RE, 'settings': {'video_stereo_mode': '5'}})
+# What the frontend makes of show, state, the user's setting and the
+# core's file: on SCREENS_DRIVERS. Each file a case starts with must be
+# the same after it. Entries as SCREENS_DRAW_CASES'.
+SCREENS_STATE_CASES = [
+    ('screens-shown', 'shown', SCREENS_BOTH, {}),
+    ('screens-over', 'over', SCREENS_TOP_ALONE, {}),
+    ('screens-absent', 'absent', SCREENS_TOP_ALONE, {}),
+    ('screens-blank', 'blank', SCREENS_BOTTOM_BLANK, {}),
+    ('screens-absent-back', 'absent_back', SCREENS_BOTH,
+     {'until': SCREENS_SWITCHED_RE}),
+    ('screens-user-off', 'shown', SCREENS_TOP_ALONE,
+     {'settings': {'video_screen2_display': 'off'}}),
+    # The user's Auto in the core's file beats the core's HIDDEN.
+    ('screens-core-beaten', 'hidden', SCREENS_BOTH,
+     {'files': {CORE_FILE: '# kept\nvideo_screen2_display = ""\n'}}),
+    ('screens-per-core-own', 'shown', SCREENS_TOP_ALONE,
+     {'files': CORE_FILE_OFF}),
+    # A core of another name does not read it.
+    ('screens-per-core-other', 'shown', SCREENS_BOTH,
+     {'files': CORE_FILE_OFF,
+      'env_extra': {'VIDEO_VIEWS_TEST_LIBRARY_NAME': 'video_views test B'}}),
+]
+# With no screen placed the menu still lays out over the whole window,
+# as it does over a frame without views: the second case, which the
+# first one's menu must match. Opaque, so the frame behind is not seen.
+SCREENS_MENU_SETTINGS = dict(SCREENS_AIM_SETTINGS, menu_driver='ozone',
+                             menu_timedate_enable='false',
+                             menu_framebuffer_opacity='1.000000')
+SCREENS_MENU_CASE = ('screens-none-shown-menu', 'ds',
+                     SCREENS_MENU_SETTINGS, [])
+SCREENS_MENU_REF = ('screens-none-shown-menu-ref', 'none',
+                    SCREENS_MENU_SETTINGS, [])
+
 
 # The last few files read_png() decoded on this thread, by path, with
 # the stat that says they are the same file: a pointer case reads each
@@ -550,6 +669,8 @@ def write_cfg(path, d, driver, settings, port):
         'microphone_enable': 'false',
         'microphone_driver': 'null',
         'pause_nonactive': 'false',
+        'gamemode_enable': 'false',
+        'suspend_screensaver_enable': 'false',
         'confirm_quit': 'false',
         'quit_press_twice': 'false',
         'config_save_on_exit': 'false',
@@ -614,15 +735,16 @@ def expected_status(driver, settings):
     return (1, 0 if settings.get('video_stereo_mode', '0') == '0' else 1)
 
 
-def wait_for_views(p, d, timeout=60):
-    """Wait for initialization to reach the core before timing the case."""
+def wait_for_views(p, d, timeout=60, regex=STATUS_RE):
+    """Wait for initialization to reach the core before timing the case,
+    or for the logs to have regex."""
     deadline = time.monotonic() + timeout
     while p.poll() is None:
         for name in ('run.log', 'retroarch.log'):
             path = os.path.join(d, name)
             if os.path.exists(path):
                 with open(path, errors='replace') as f:
-                    if STATUS_RE.search(f.read()):
+                    if regex.search(f.read()):
                         return True
         if time.monotonic() >= deadline:
             return False
@@ -1061,14 +1183,20 @@ def case_dir(root, driver, name, hw='off'):
 
 def run_case(retroarch, root, driver, case, hw='off', menu=False,
              opts=None, args=(), gpu=None, pointer=(), env_extra=None,
-             pointer_check=None):
+             pointer_check=None, until=None, aim=(), aimed=None,
+             files=None):
     """gpu, a list, gets RetroArch's GPU memory in MiB sampled while it
     settles. pointer, window points, has the menu open with the pointer
     at each in turn, in d/pointer-N.png; pointer_check(d) gives the
     errors of a round of those, which is taken again, at most
     POINTER_ROUNDS times, until it has none: a frame the menu had not
     drawn the cursor in yet is not the code's failure. env_extra is
-    added to RetroArch's environment."""
+    added to RetroArch's environment. until, a regex, keeps the case
+    running until the logs have it. aim, window points, has the pointer
+    at each in turn with the menu closed, until the core logs a light
+    gun line after the move; aimed, a list, gets for each move made how
+    many light gun lines the core had logged before it. files,
+    {path under the case directory: text}, are there when it starts."""
     name, mapopt, settings, points = case
     d = case_dir(root, driver, name, hw)
     if os.path.commonpath([root, d]) != root or d == root:
@@ -1083,6 +1211,10 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
         f.write('video_views_test_hw = "%s"\n' % hw)
         for k in sorted(opts or {}):
             f.write('%s = "%s"\n' % (k, opts[k]))
+    for path in sorted(files or {}):
+        os.makedirs(os.path.dirname(os.path.join(d, path)), exist_ok=True)
+        with open(os.path.join(d, path), 'w', newline='') as f:
+            f.write(files[path])
 
     # gamescope runs under isolated_env() below, so it can't probe the
     # desktop's display, bus or PipeWire. RetroArch, run as its child,
@@ -1091,7 +1223,7 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
     # RetroArch's Wayland at a socket that does not exist (unset,
     # libwayland falls back to wayland-0).
     helper = ''
-    if pointer:
+    if pointer or aim:
         helper = ' %s %s --pointer %s &' % (
             shlex.quote(sys.executable),
             shlex.quote(os.path.abspath(__file__)), shlex.quote(d))
@@ -1144,6 +1276,19 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
             startup_stack(p, d)
         if gpu is None:
             wait_settled(p, d, expected_status(driver, settings))
+        if until and wait_for_views(p, d, 20, until):
+            # The frames after the line take up what it logged.
+            time.sleep(SETTLE)
+        for i, point in enumerate(aim):
+            before = len(GUN_RE.findall(log_text(d)))
+            if not move_pointer(d, i, point):
+                break
+            aimed.append(before)
+            # A slow frame logs late: the next move counts after it.
+            deadline = time.time() + 10
+            while (len(GUN_RE.findall(log_text(d))) <= before
+                   and time.time() < deadline and p.poll() is None):
+                time.sleep(0.2)
         settle = time.time() + 5
         while gpu is not None and time.time() < settle:
             time.sleep(0.5)
@@ -1186,7 +1331,7 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
         except subprocess.TimeoutExpired:
             pass
     finally:
-        if pointer:
+        if pointer or aim:
             open(os.path.join(d, 'pointer.quit'), 'w').close()
         if p.poll() is None:
             os.killpg(p.pid, signal.SIGTERM)
@@ -1314,6 +1459,17 @@ def exact_errors(rows, bpp, views):
     return errors
 
 
+def log_text(d):
+    """A case's logs, its run's and RetroArch's."""
+    text = ''
+    for name in ('run.log', 'retroarch.log'):
+        path = os.path.join(d, name)
+        if os.path.exists(path):
+            with open(path, errors='replace') as f:
+                text += f.read()
+    return text
+
+
 def copy_path(d):
     """How glcore's log says it copies views out of the frame."""
     found = None
@@ -1403,6 +1559,25 @@ def rows_differ(a, b, tolerance):
     return bad
 
 
+def menu_diff(ref, shot):
+    """How many pixels of two menu screenshots, as read_png() gives
+    them, differ."""
+    w, h, bpp, rows_a = ref
+    sw, sh, sbpp, rows_b = shot
+    if (sw, sh) != (w, h):
+        return w * h
+    diff = 0
+    for y in range(h):
+        if rows_b[y] == rows_a[y] and sbpp == bpp:
+            continue
+        for x in range(w):
+            a = rows_a[y][x * bpp:x * bpp + 3]
+            b = rows_b[y][x * sbpp:x * sbpp + 3]
+            if any(abs(p - q) > TOLERANCE for p, q in zip(a, b)):
+                diff += 1
+    return diff
+
+
 def run_menu_case(retroarch, root, driver, case):
     """The case with the menu open in each of its stereo modes; each
     mode's screen must match the first's."""
@@ -1420,17 +1595,8 @@ def run_menu_case(retroarch, root, driver, case):
             images.append(None)
     if errors or None in images:
         return errors or ['no menu screenshot']
-    w, h, bpp, ref = images[0]
-    for mode, (_, _, mbpp, rows) in zip(modes[1:], images[1:]):
-        diff = 0
-        for y in range(h):
-            if rows[y] == ref[y] and mbpp == bpp:
-                continue
-            for x in range(w):
-                a = ref[y][x * bpp:x * bpp + 3]
-                b = rows[y][x * mbpp:x * mbpp + 3]
-                if any(abs(p - q) > TOLERANCE for p, q in zip(a, b)):
-                    diff += 1
+    for mode, image in zip(modes[1:], images[1:]):
+        diff = menu_diff(images[0], image)
         if diff > MENU_DIFF_MAX:
             errors.append('stereo mode %s: %d pixels differ from mode %s'
                           % (mode, diff, modes[0]))
@@ -1579,6 +1745,115 @@ def run_memory_case(retroarch, root, driver, case):
         errors.append('GPU memory peaked at %d MiB, limit %d'
                       % (peak, limit))
     return errors, peak
+
+
+def run_screens_rules_case(retroarch, root, driver):
+    """The rules cases: which maps the frontend accepts, the screens it
+    logs for the full map, and GET_VIDEO_SCREEN_BUFFER known."""
+    case = ('screens-rules', 'ds', {'video_stereo_mode': '0'}, [])
+    errors = run_case(retroarch, root, driver, case,
+                      opts={'video_views_test_screens': 'rules'},
+                      until=SCREENS_FULL_RE)
+    text = log_text(case_dir(root, driver, case[0]))
+    logged = {}
+    for name, accepted in SCREENS_CASE_RE.findall(text):
+        logged.setdefault(name, []).append(int(accepted))
+    for name, want in SCREENS_RULES:
+        if name not in logged:
+            errors.append('case %s not logged' % name)
+        elif any(a != want for a in logged[name]):
+            errors.append('case %s accepted=%s, want %d'
+                          % (name, logged[name], want))
+    known = set(name for name, _ in SCREENS_RULES)
+    for name in sorted(set(logged) - known):
+        errors.append('case %s not in SCREENS_RULES' % name)
+    answers = set(SCREEN_BUFFER_RE.findall(text))
+    if answers != {'0'}:
+        errors.append('screen_buffer=%s, want 0' % sorted(answers))
+    lines = SCREEN_LOG_RE.findall(text)[-3:]
+    if lines != SCREENS_FULL_LOG:
+        errors.append('the last screen lines are %s, want %s'
+                      % (lines, SCREENS_FULL_LOG))
+    if SCREEN_BUFFER_UNSUPPORTED_RE.search(text):
+        errors.append('GET_VIDEO_SCREEN_BUFFER logged as unsupported')
+    return errors
+
+
+def run_screens_aim_case(retroarch, root, driver, case):
+    """The light gun aimed at the bottom screen's centre with the menu
+    closed: on that screen only when it takes input."""
+    name, mode, takes, points = case
+    aimed = []
+    errors = run_case(retroarch, root, driver,
+                      (name, 'ds', SCREENS_AIM_SETTINGS, points),
+                      opts={'video_views_test_screens': mode},
+                      aim=SCREENS_AIM, aimed=aimed)
+    guns = GUN_RE.findall(log_text(case_dir(root, driver, name)))
+    if len(aimed) < len(SCREENS_AIM):
+        return errors + ['the pointer did not move']
+    if len(guns) <= aimed[-1]:
+        return errors + ['no light gun line after the aim at the bottom '
+                         'screen']
+    gun = guns[aimed[-1]]
+    offscreen, px, py = int(gun[2]), int(gun[4]), int(gun[5])
+    if takes and not 192 <= py < 384:
+        errors.append('the gun at the bottom screen has packed y %d, '
+                      'want 192 to 383' % py)
+    # Off-screen, or at the top screen's right edge; not at its centre,
+    # where the first aim's line is.
+    if not takes and not (offscreen or px >= 250):
+        errors.append('the gun at the bottom screen is at packed '
+                      '(%d, %d), want x 250 or more, or off-screen'
+                      % (px, py))
+    return errors
+
+
+def run_screens_show_case(retroarch, root, driver, case):
+    """A screens draw or state case: the window's points, and each file
+    the case started with left as it was."""
+    name, mode, points, extra = case
+    extra = dict(extra)
+    settings = dict(SCREENS_AIM_SETTINGS, **extra.pop('settings', {}))
+    errors = run_case(retroarch, root, driver,
+                      (name, 'ds', settings, points),
+                      opts={'video_views_test_screens': mode}, **extra)
+    d = case_dir(root, driver, name)
+    for path in sorted(extra.get('files', {})):
+        try:
+            with open(os.path.join(d, path), newline='') as f:
+                found = f.read()
+        except OSError:
+            found = None
+        if found != extra['files'][path]:
+            errors.append('%s is %r after the run, want %r'
+                          % (path, found, extra['files'][path]))
+    return errors
+
+
+def run_screens_menu_case(retroarch, root, driver):
+    """The menu with no screen placed: drawn in the window's left third
+    and in its right one, and the same as over a frame without views."""
+    errors = run_case(retroarch, root, driver, SCREENS_MENU_CASE, menu=True,
+                      opts={'video_views_test_screens': 'none_shown'})
+    errors += run_case(retroarch, root, driver, SCREENS_MENU_REF, menu=True)
+    paths = [os.path.join(case_dir(root, driver, c[0]), 'menu.png')
+             for c in (SCREENS_MENU_CASE, SCREENS_MENU_REF)]
+    if errors or not all(os.path.exists(p) for p in paths):
+        return errors or ['no menu screenshot']
+    try:
+        shot, ref = [read_png(p) for p in paths]
+    except ValueError:
+        return ['no menu screenshot']
+    w, h, bpp, rows = shot
+    diff = menu_diff(ref, shot)
+    if diff > MENU_DIFF_MAX:
+        errors.append('%d pixels differ from the menu without views' % diff)
+    for side, x0 in (('left', 0), ('right', w - w // 3)):
+        if not any(max(rows[y][x * bpp:x * bpp + 3]) > TOLERANCE
+                   for y in range(0, h, 4)
+                   for x in range(x0, x0 + w // 3, 4)):
+            errors.append('nothing drawn in the %s third of the menu' % side)
+    return errors
 
 
 def gamescope_root(x11, dpy):
@@ -1829,6 +2104,27 @@ def driver_jobs(retroarch, root, driver):
         return report('%s/%s-%s' % (driver, case[0], menu), errors), \
             bool(errors)
 
+    def screens_rules():
+        errors = run_screens_rules_case(retroarch, root, driver)
+        return report('%s/screens-rules' % driver, errors), bool(errors)
+
+    def screens_aim():
+        lines, failed = [], 0
+        for case in SCREENS_AIM_CASES:
+            errors = run_screens_aim_case(retroarch, root, driver, case)
+            lines += report('%s/%s' % (driver, case[0]), errors)
+            failed += bool(errors)
+        return lines, failed
+
+    def screens_show(case):
+        errors = run_screens_show_case(retroarch, root, driver, case)
+        return report('%s/%s' % (driver, case[0]), errors), bool(errors)
+
+    def screens_menu():
+        errors = run_screens_menu_case(retroarch, root, driver)
+        return report('%s/%s' % (driver, SCREENS_MENU_CASE[0]), errors), \
+            bool(errors)
+
     runs = [(case, 'off') for case in CASES
             if not (driver in WHOLE_ANAGLYPH_DRIVERS and 'anaglyph' in case[0])]
     runs += [(case, hw) for name, hw in HW_CASES.get(driver, [])
@@ -1864,6 +2160,19 @@ def driver_jobs(retroarch, root, driver):
     jobs += [lambda m=m, c=c: pointer(m, c) for m in sorted(POINTER_MENUS)
              for c in POINTER_CASES
              if wanted(c[0]) and driver not in NO_POINTER_DRIVERS]
+    if driver in SCREENS_DRIVERS and wanted('screens-rules'):
+        jobs.append(screens_rules)
+    if driver in SCREENS_DRIVERS and wanted('screens-no-input'):
+        jobs.append(screens_aim)
+    jobs += [lambda c=c: screens_show(c) for c in SCREENS_DRAW_CASES
+             if wanted(c[0])]
+    if driver == 'xvideo' and wanted(SCREENS_XV_INTERLACED_CASE[0]):
+        jobs.append(lambda: screens_show(SCREENS_XV_INTERLACED_CASE))
+    jobs += [lambda c=c: screens_show(c)
+             for c in (SCREENS_STATE_CASES if driver in SCREENS_DRIVERS
+                       else []) if wanted(c[0])]
+    if driver in SCREENS_DRIVERS and wanted(SCREENS_MENU_CASE[0]):
+        jobs.append(screens_menu)
     return jobs
 
 

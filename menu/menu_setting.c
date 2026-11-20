@@ -3918,7 +3918,6 @@ static size_t setting_get_string_representation_video_screen_layout(
    return 0;
 }
 
-#ifdef HAVE_VIDEO_WINDOWS
 unsigned menu_setting_video_screens(void)
 {
    video_driver_state_t *video_st = video_state_get_ptr();
@@ -3931,6 +3930,7 @@ unsigned menu_setting_video_screens(void)
    return screens;
 }
 
+#ifdef HAVE_VIDEO_WINDOWS
 bool menu_setting_video_menu_follows_offered(unsigned follows)
 {
    return follows < menu_setting_video_screens()
@@ -3979,8 +3979,8 @@ static size_t setting_get_string_representation_video_menu_follows(
    if (follows >= VIDEO_MENU_FOLLOWS_SEPARATE)
       return strlcpy(s, msg_hash_to_str(
                MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_SEPARATE), len);
-   return snprintf(s, len, msg_hash_to_str(
-            MENU_ENUM_LABEL_VALUE_VIDEO_MENU_FOLLOWS_SCREEN), follows + 1);
+   return video_driver_screen_label(follows, msg_hash_to_str(
+            MENU_ENUM_LABEL_VALUE_VIDEO_MENU_FOLLOWS_SCREEN), s, len);
 }
 
 static size_t setting_get_string_representation_video_notifications_window(
@@ -4023,18 +4023,81 @@ static size_t setting_get_string_representation_video_blank_unused_screens(
    return 0;
 }
 #endif
+#endif
 
 /* The display rows' values: "" for Auto, "|main" on the desktop,
  * "|key" a display, then "|off"; the menu's row has no Main Window
- * or Off */
+ * or Off. Auto and Off alone without the screens' windows. */
+#ifdef HAVE_VIDEO_WINDOWS
+/* The rows' copy of the published list, about 1 KiB, kept off the
+ * stack; app thread */
 static char setting_video_screen_display_list[
       VIDEO_WINDOW_DISPLAYS_MAX * VIDEO_WINDOW_DISPLAY_NAME_SIZE
       + sizeof("|" VIDEO_WINDOW_DISPLAY_MAIN)
       + sizeof("|" VIDEO_WINDOW_DISPLAY_OFF)];
 static char setting_video_menu_display_list[
       VIDEO_WINDOW_DISPLAYS_MAX * VIDEO_WINDOW_DISPLAY_NAME_SIZE + 1];
-/* The rows' copy of the published list, about 1 KiB, kept off the
- * stack; app thread */
+#else
+static char setting_video_screen_display_list[
+      sizeof("|" VIDEO_WINDOW_DISPLAY_OFF)];
+#endif
+/* The Display rows step a copy of what RetroArch uses for each screen;
+ * _seen is what each last read: a value that differs is a candidate */
+static char setting_video_screen_display_value[RETRO_VIDEO_VIEWS_MAX]
+      [VIDEO_WINDOW_DISPLAY_NAME_SIZE];
+static char setting_video_screen_display_seen[RETRO_VIDEO_VIEWS_MAX]
+      [VIDEO_WINDOW_DISPLAY_NAME_SIZE];
+
+#ifdef HAVE_VIDEO_WINDOWS
+/* The screens have windows or displays of their own to go to */
+static bool setting_video_screen_display_full(void)
+{
+   return video_driver_test_all_flags(GFX_CTX_FLAGS_VIDEO_WINDOWS)
+       && config_get_ptr()->bools.video_windows_enable;
+}
+#endif
+
+static void setting_video_screen_display_read(rarch_setting_t *setting)
+{
+   video_screen_values_t values;
+   unsigned s = setting->index_offset;
+   video_driver_screen_get(s, &values);
+   strlcpy(setting_video_screen_display_value[s], values.display,
+         sizeof(setting_video_screen_display_value[s]));
+   strlcpy(setting_video_screen_display_seen[s], values.display,
+         sizeof(setting_video_screen_display_seen[s]));
+}
+
+/* Only a new choice is written: the menu's change follows a step and
+ * a Start too */
+static void setting_video_screen_display_write(unsigned s)
+{
+   video_screen_values_t values;
+   char display[VIDEO_WINDOW_DISPLAY_NAME_SIZE];
+   strlcpy(display, setting_video_screen_display_value[s], sizeof(display));
+   video_driver_screen_get(s, &values);
+   if (!string_is_equal(values.display, display))
+   {
+      strlcpy(values.display, display, sizeof(values.display));
+      video_driver_screen_set(s,
+            VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY), &values);
+   }
+   /* After the write: a row drawn on the video thread re-reads one that
+    * equals _seen and is not in force yet */
+   strlcpy(setting_video_screen_display_seen[s], display,
+         sizeof(setting_video_screen_display_seen[s]));
+}
+
+static void setting_video_screen_display_change(rarch_setting_t *setting)
+{
+   setting_video_screen_display_write(setting->index_offset);
+#ifdef HAVE_VIDEO_WINDOWS
+   /* Its window follows, after a close too */
+   video_driver_edit_window(setting->index_offset);
+#endif
+}
+
+#ifdef HAVE_VIDEO_WINDOWS
 /* A key the values can hold: named, no '|' in it, and not Off's or
  * Main Window's */
 static bool setting_video_screen_display_offered(const char *key)
@@ -4047,11 +4110,13 @@ static bool setting_video_screen_display_offered(const char *key)
 #ifndef ANDROID
 bool menu_setting_video_screen_window_own(unsigned screen)
 {
+   video_screen_values_t values;
    unsigned count;
    const video_window_display_t *displays =
       video_driver_borrow_window_displays(&count);
-   return video_windows_display_own(displays, count,
-         config_get_ptr()->arrays.video_screen_display[screen], screen);
+   video_driver_screen_get(screen, &values);
+   return video_windows_display_own(displays, count, values.display,
+         screen);
 }
 
 unsigned menu_setting_video_screen_page(const char *label)
@@ -4128,9 +4193,11 @@ void menu_setting_video_screen_windows_moved(void)
                          | MENU_ST_FLAG_PREVENT_POPULATE;
 }
 #endif
+#endif
 
 void menu_setting_video_screen_display_values(void)
 {
+#ifdef HAVE_VIDEO_WINDOWS
    char key[VIDEO_WINDOW_DISPLAY_NAME_SIZE];
    unsigned i, count;
    size_t keys;
@@ -4160,14 +4227,21 @@ void menu_setting_video_screen_display_values(void)
    strlcpy(setting_video_screen_display_list + len,
          "|" VIDEO_WINDOW_DISPLAY_OFF,
          sizeof(setting_video_screen_display_list) - len);
+   if (setting_video_screen_display_full())
+      return;
+#endif
+   strlcpy(setting_video_screen_display_list, "|" VIDEO_WINDOW_DISPLAY_OFF,
+         sizeof(setting_video_screen_display_list));
 }
 
-static size_t setting_get_string_representation_video_screen_display(
-      rarch_setting_t *setting, char *s, size_t len)
+static size_t setting_video_screen_display_text(rarch_setting_t *setting,
+      char *s, size_t len)
 {
+#ifdef HAVE_VIDEO_WINDOWS
    const video_window_display_t *displays;
    char key[VIDEO_WINDOW_DISPLAY_NAME_SIZE];
    unsigned i, count;
+#endif
    size_t _len;
    const char *value;
    if (!setting)
@@ -4185,6 +4259,7 @@ static size_t setting_get_string_representation_video_screen_display(
       return strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_AUTO), len);
    _len = snprintf(s, len, msg_hash_to_str(
             MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_DISPLAY), value);
+#ifdef HAVE_VIDEO_WINDOWS
    if (_len >= len)
       return _len;
    displays = video_driver_borrow_window_displays(&count);
@@ -4205,38 +4280,77 @@ static size_t setting_get_string_representation_video_screen_display(
          return _len + snprintf(s + _len, len - _len, " (%ux%u)", w, h);
       break;
    }
+#endif
    return _len;
+}
+
+/* A screen's value that is its core's default says so. A row still
+ * holding what it last read follows a change made under the list; a
+ * candidate value, as a dropdown puts in the row, is left alone. */
+static size_t setting_get_string_representation_video_screen_display(
+      rarch_setting_t *setting, char *s, size_t len)
+{
+   char text[128];
+   video_screen_values_t values;
+   unsigned core;
+   if (!setting)
+      return 0;
+   if (setting->enum_idx == MENU_ENUM_LABEL_VIDEO_MENU_DISPLAY)
+      return setting_video_screen_display_text(setting, s, len);
+   core = video_driver_screen_get(setting->index_offset, &values);
+   if (     !string_is_equal(values.display, setting->value.target.string)
+         && string_is_equal(setting->value.target.string,
+               setting_video_screen_display_seen[setting->index_offset]))
+      setting_video_screen_display_read(setting);
+   if (     !(core & VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY))
+         || !string_is_equal(values.display, setting->value.target.string))
+      return setting_video_screen_display_text(setting, s, len);
+   setting_video_screen_display_text(setting, text, sizeof(text));
+   return snprintf(s, len, msg_hash_to_str(
+            MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_CORE_DEFAULT), text);
 }
 
 /* Left and right go through Auto, Main Window on a screen's row on the
  * desktop, the displays listed and, on a screen's row, Off; one no
- * longer listed goes to Auto on the right and the last on the left */
+ * longer listed goes to Auto on the right and the last on the left. A
+ * screen's row has Auto and Off alone without the screens' windows. */
 static int setting_video_screen_display_step(rarch_setting_t *setting,
       bool right)
 {
-   const video_window_display_t *displays;
+#ifdef HAVE_VIDEO_WINDOWS
+   const video_window_display_t *displays = NULL;
    char key[VIDEO_WINDOW_DISPLAY_NAME_SIZE];
    unsigned listed[VIDEO_WINDOW_DISPLAYS_MAX];
-   unsigned i, count, pos, last, m;
+   unsigned i, count;
+#endif
+   unsigned pos, last;
+   unsigned m = 0;
    unsigned n = 0;
    bool off;
    char *value;
    if (!setting)
       return -1;
-   value = setting->value.target.string;
    off   = setting->enum_idx != MENU_ENUM_LABEL_VIDEO_MENU_DISPLAY;
-   displays = video_driver_borrow_window_displays(&count);
-   m        = (off && video_windows_offer_main(displays, count)) ? 1 : 0;
+   if (off)
+      setting_video_screen_display_read(setting);
+   value = setting->value.target.string;
    pos   = value[0] ? VIDEO_WINDOW_DISPLAYS_MAX + 3 : 0;
-   for (i = 0; i < count; i++)
+#ifdef HAVE_VIDEO_WINDOWS
+   if (!off || setting_video_screen_display_full())
    {
-      video_windows_display_key(displays, i, key, sizeof(key));
-      if (!setting_video_screen_display_offered(key))
-         continue;
-      if (value[0] && string_is_equal(key, value))
-         pos = n + 1 + m;
-      listed[n++] = i;
+      displays = video_driver_borrow_window_displays(&count);
+      m        = (off && video_windows_offer_main(displays, count)) ? 1 : 0;
+      for (i = 0; i < count; i++)
+      {
+         video_windows_display_key(displays, i, key, sizeof(key));
+         if (!setting_video_screen_display_offered(key))
+            continue;
+         if (value[0] && string_is_equal(key, value))
+            pos = n + 1 + m;
+         listed[n++] = i;
+      }
    }
+#endif
    last = off ? n + m + 1 : n;
    if (m && string_is_equal(value, VIDEO_WINDOW_DISPLAY_MAIN))
       pos = 1;
@@ -4248,15 +4362,20 @@ static int setting_video_screen_display_step(rarch_setting_t *setting,
       pos = right ? (pos + 1) % (last + 1) : (pos + last) % (last + 1);
    if (!pos)
       value[0] = '\0';
-   else if (pos <= m)
-      strlcpy(value, VIDEO_WINDOW_DISPLAY_MAIN, setting->size);
    else if (pos > n + m)
       strlcpy(value, VIDEO_WINDOW_DISPLAY_OFF, setting->size);
+#ifdef HAVE_VIDEO_WINDOWS
+   else if (pos <= m)
+      strlcpy(value, VIDEO_WINDOW_DISPLAY_MAIN, setting->size);
    else
       video_windows_display_key(displays, listed[pos - 1 - m], value,
             setting->size);
-   config_get_ptr()->flags |= SETTINGS_FLG_MODIFIED;
-#ifndef ANDROID
+#endif
+   if (off)
+      setting_video_screen_display_write(setting->index_offset);
+   else
+      config_get_ptr()->flags |= SETTINGS_FLG_MODIFIED;
+#if defined(HAVE_VIDEO_WINDOWS) && !defined(ANDROID)
    /* A screen's window rows follow its choice */
    menu_state_get_ptr()->flags |= MENU_ST_FLAG_PREVENT_POPULATE
                                |  MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
@@ -4285,13 +4404,16 @@ static int setting_string_action_ok_video_screen_display(
    return setting_action_ok_uint(setting, idx, wraparound);
 }
 
+/* Start: this core's choice goes, or the global one is reset */
 static int setting_string_action_start_video_screen_display(
       rarch_setting_t *setting)
 {
    if (!setting)
       return -1;
-   setting->value.target.string[0] = '\0';
-#ifndef ANDROID
+   video_driver_screen_set(setting->index_offset,
+         VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY), NULL);
+   setting_video_screen_display_read(setting);
+#if defined(HAVE_VIDEO_WINDOWS) && !defined(ANDROID)
    /* A screen's window rows follow its choice */
    menu_state_get_ptr()->flags |= MENU_ST_FLAG_PREVENT_POPULATE
                                |  MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
@@ -4299,48 +4421,80 @@ static int setting_string_action_start_video_screen_display(
    return 0;
 }
 
-#ifndef ANDROID
-/* The window rows step these; the settings keep both axes in a word.
- * Read again on each use: a moved window changes only the settings. */
+#if defined(HAVE_VIDEO_WINDOWS) && !defined(ANDROID)
+/* The window rows step these; a screen's values keep both axes in a
+ * word. Read again on each use: a moved window changes only those. */
 static int setting_video_screen_window_xy[RETRO_VIDEO_VIEWS_MAX][2];
 static unsigned setting_video_screen_window_wh[RETRO_VIDEO_VIEWS_MAX][2];
+static bool setting_video_screen_window_pos_set[RETRO_VIDEO_VIEWS_MAX];
+static bool setting_video_screen_fullscreen_value[RETRO_VIDEO_VIEWS_MAX];
 
 static void setting_video_screen_window_read(rarch_setting_t *setting)
 {
-   settings_t *settings = config_get_ptr();
-   unsigned s           = setting->index_offset;
-   unsigned pos         = settings->uints.video_screen_window_pos[s];
-   unsigned dims        = settings->uints.video_screen_window_dims[s];
-   setting_video_screen_window_xy[s][0] = VIDEO_POS_X(pos);
-   setting_video_screen_window_xy[s][1] = VIDEO_POS_Y(pos);
-   setting_video_screen_window_wh[s][0] = VIDEO_SCALE_W(dims);
-   setting_video_screen_window_wh[s][1] = VIDEO_SCALE_H(dims);
+   video_screen_values_t values;
+   unsigned s = setting->index_offset;
+   video_driver_screen_get(s, &values);
+   setting_video_screen_window_xy[s][0]     = VIDEO_POS_X(values.window_pos);
+   setting_video_screen_window_xy[s][1]     = VIDEO_POS_Y(values.window_pos);
+   setting_video_screen_window_wh[s][0]     = VIDEO_SCALE_W(values.window_dims);
+   setting_video_screen_window_wh[s][1]     = VIDEO_SCALE_H(values.window_dims);
+   setting_video_screen_window_pos_set[s]   = values.window_pos_set;
+   setting_video_screen_fullscreen_value[s] = values.window_fullscreen;
+}
+
+/* The change handlers write only a new value: the menu calls them
+ * again after every action, a Start included */
+static void setting_video_screen_window_fullscreen_change(
+      rarch_setting_t *setting)
+{
+   video_screen_values_t values;
+   unsigned s = setting->index_offset;
+   video_driver_screen_get(s, &values);
+   if (values.window_fullscreen != setting_video_screen_fullscreen_value[s])
+   {
+      values.window_fullscreen = setting_video_screen_fullscreen_value[s];
+      video_driver_screen_set(s, VIDEO_SCREEN_PREF_BIT(
+               VIDEO_SCREEN_PREF_WINDOW_FULLSCREEN), &values);
+   }
+   video_driver_edit_window(s);
 }
 
 static void setting_video_screen_window_xy_change(rarch_setting_t *setting)
 {
-   settings_t *settings = config_get_ptr();
-   unsigned s           = setting->index_offset;
-   unsigned pos         = VIDEO_POS_PACK(
+   video_screen_values_t values;
+   unsigned s   = setting->index_offset;
+   unsigned pos = VIDEO_POS_PACK(
          setting_video_screen_window_xy[s][0],
          setting_video_screen_window_xy[s][1]);
-   /* Only a new position places the window: the menu calls this again
-    * after a Start */
-   if (pos != settings->uints.video_screen_window_pos[s])
-      settings->bools.video_screen_window_pos_set[s] = true;
-   settings->uints.video_screen_window_pos[s] = pos;
-   settings->flags |= SETTINGS_FLG_MODIFIED;
+   video_driver_screen_get(s, &values);
+   /* A new position places the window */
+   if (pos != values.window_pos)
+   {
+      unsigned axis         =
+         setting->enum_idx >= MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_Y
+         ? VIDEO_SCREEN_PREF_WINDOW_Y : VIDEO_SCREEN_PREF_WINDOW_X;
+      values.window_pos     = pos;
+      values.window_pos_set = true;
+      video_driver_screen_set(s, VIDEO_SCREEN_PREF_BIT(axis)
+            | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_POS_SET),
+            &values);
+   }
    setting_video_screen_window_read(setting);
    video_driver_edit_window(s);
 }
 
 static void setting_video_screen_window_wh_change(rarch_setting_t *setting)
 {
-   settings_t *settings = config_get_ptr();
-   unsigned s           = setting->index_offset;
-   unsigned was         = settings->uints.video_screen_window_dims[s];
-   unsigned w           = setting_video_screen_window_wh[s][0];
-   unsigned h           = setting_video_screen_window_wh[s][1];
+   video_screen_values_t values;
+   unsigned was, now;
+   unsigned s    = setting->index_offset;
+   unsigned w    = setting_video_screen_window_wh[s][0];
+   unsigned h    = setting_video_screen_window_wh[s][1];
+   /* Both axes at once: one alone is no size */
+   unsigned bits = VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_WIDTH)
+                 | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_HEIGHT);
+   video_driver_screen_get(s, &values);
+   was = values.window_dims;
    if (!was && (w || h))
    {
       /* From Auto: a size to start from */
@@ -4349,20 +4503,35 @@ static void setting_video_screen_window_wh_change(rarch_setting_t *setting)
    }
    else if (!w || !h)
       w = h = 0;
-   settings->uints.video_screen_window_dims[s] =
-      (w && h && VIDEO_SCALE_FITS(w, h)) ? VIDEO_SCALE_PACK(w, h)
+   now = (w && h && VIDEO_SCALE_FITS(w, h)) ? VIDEO_SCALE_PACK(w, h)
       : (w || h) ? was : 0;
-   /* A position means nothing with an automatic size */
-   if (!settings->uints.video_screen_window_dims[s])
-      settings->bools.video_screen_window_pos_set[s] = false;
-   settings->flags |= SETTINGS_FLG_MODIFIED;
+   if (now != was)
+   {
+      values.window_dims = now;
+      /* A position means nothing with an automatic size */
+      if (!now)
+      {
+         values.window_pos_set = false;
+         bits |= VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_POS_SET);
+      }
+      video_driver_screen_set(s, bits, &values);
+   }
    /* Both rows step from what is stored, 640x480 after a jump */
    setting_video_screen_window_read(setting);
    video_driver_edit_window(s);
    /* X and Y are listed only with a size */
-   if (!was != !settings->uints.video_screen_window_dims[s])
+   if (!was != !now)
       menu_state_get_ptr()->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH
                                   |  MENU_ST_FLAG_PREVENT_POPULATE;
+}
+
+static size_t setting_get_string_representation_video_screen_window_fullscreen(
+      rarch_setting_t *setting, char *s, size_t len)
+{
+   if (!setting)
+      return 0;
+   setting_video_screen_window_read(setting);
+   return setting_get_string_representation_st_bool(setting, s, len);
 }
 
 static size_t setting_get_string_representation_video_screen_window_size(
@@ -4376,29 +4545,52 @@ static size_t setting_get_string_representation_video_screen_window_size(
    return snprintf(s, len, "%u", *setting->value.target.unsigned_integer);
 }
 
-/* Start: placed automatically again */
-static int setting_video_screen_window_xy_start(rarch_setting_t *setting)
+/* Start: this core's choice goes, or the global value is reset. A
+ * position is placed automatically again. */
+static int setting_video_screen_window_start(rarch_setting_t *setting)
 {
-   settings_t *settings = config_get_ptr();
-   if (setting_generic_action_start_default(setting) != 0)
+   unsigned bits;
+   const unsigned xy = VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_X)
+                     | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_Y);
+   if (!setting)
       return -1;
-   settings->bools.video_screen_window_pos_set[setting->index_offset] = false;
+   if (setting->enum_idx <= MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_FULLSCREEN_LAST)
+      bits = VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_FULLSCREEN);
+   else
+   {
+      bits = VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_POS_SET);
+      if (setting->enum_idx >= MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_WIDTH)
+         bits |= VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_WIDTH)
+               | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_HEIGHT);
+      else if (setting->enum_idx >= MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_Y)
+         bits |= VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_Y);
+      else
+         bits |= VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_X);
+      /* A core's position goes whole; the global one keeps the axes
+       * the row is not */
+      if (video_state_get_ptr()->screen_prefs.in_use)
+         bits |= xy;
+   }
+   video_driver_screen_set(setting->index_offset, bits, NULL);
+   setting_video_screen_window_read(setting);
+   menu_state_get_ptr()->flags |= MENU_ST_FLAG_PREVENT_POPULATE
+                               |  MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
    return 0;
 }
 
 static size_t setting_get_string_representation_video_screen_window_pos(
       rarch_setting_t *setting, char *s, size_t len)
 {
-   settings_t *settings = config_get_ptr();
    if (!setting)
       return 0;
    setting_video_screen_window_read(setting);
-   if (!settings->bools.video_screen_window_pos_set[setting->index_offset])
+   if (!setting_video_screen_window_pos_set[setting->index_offset])
       return strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_AUTO), len);
    return snprintf(s, len, "%d", setting_int_get(setting));
 }
 #endif
 
+#ifdef HAVE_VIDEO_WINDOWS
 static int setting_action_video_screen_windows_restore(
       rarch_setting_t *setting, size_t idx, bool wraparound)
 {
@@ -10989,9 +11181,50 @@ static unsigned setting_video_screen_mask(void)
    return mask;
 }
 
+/* The selected screen's headset rows step a copy of its values */
+static video_screen_xr_t setting_video_screen_xr_value;
+
+/* @xr's member for a headset row, and its setting in @pref */
+static void *setting_video_screen_xr_member(enum msg_hash_enums row,
+      video_screen_xr_t *xr, unsigned *pref)
+{
+   switch (row)
+   {
+      case MENU_ENUM_LABEL_VIDEO_SCREEN_XR_X:
+         *pref = VIDEO_SCREEN_PREF_XR_X;
+         return &xr->x;
+      case MENU_ENUM_LABEL_VIDEO_SCREEN_XR_Y:
+         *pref = VIDEO_SCREEN_PREF_XR_Y;
+         return &xr->y;
+      case MENU_ENUM_LABEL_VIDEO_SCREEN_XR_Z:
+         *pref = VIDEO_SCREEN_PREF_XR_Z;
+         return &xr->z;
+      case MENU_ENUM_LABEL_VIDEO_SCREEN_XR_YAW:
+         *pref = VIDEO_SCREEN_PREF_XR_YAW;
+         return &xr->yaw;
+      case MENU_ENUM_LABEL_VIDEO_SCREEN_XR_PITCH:
+         *pref = VIDEO_SCREEN_PREF_XR_PITCH;
+         return &xr->pitch;
+      case MENU_ENUM_LABEL_VIDEO_SCREEN_XR_ROLL:
+         *pref = VIDEO_SCREEN_PREF_XR_ROLL;
+         return &xr->roll;
+      case MENU_ENUM_LABEL_VIDEO_SCREEN_XR_SCALE:
+         *pref = VIDEO_SCREEN_PREF_XR_SCALE;
+         return &xr->scale;
+      case MENU_ENUM_LABEL_VIDEO_SCREEN_XR_VISIBLE:
+         *pref = VIDEO_SCREEN_PREF_XR_VISIBLE;
+         return &xr->visible;
+      default:
+         break;
+   }
+   return NULL;
+}
+
 static unsigned setting_video_screen_bind(rarch_setting_t *setting)
 {
-   settings_t *settings = config_get_ptr();
+   video_screen_values_t values;
+   void *member;
+   unsigned pref;
    struct menu_state *menu_st = menu_state_get_ptr();
    unsigned screen = menu_st->video_screen_selected;
    unsigned mask = setting_video_screen_mask();
@@ -11013,33 +11246,14 @@ static unsigned setting_video_screen_bind(rarch_setting_t *setting)
       return 0;
    screen = menu_st->video_screen_selected;
    setting->index_offset = screen;
-   switch (setting->enum_idx)
-   {
-      case MENU_ENUM_LABEL_VIDEO_SCREEN_XR_X:
-         setting->value.target.fraction = &settings->floats.video_screen_xr_x[screen];
-         break;
-      case MENU_ENUM_LABEL_VIDEO_SCREEN_XR_Y:
-         setting->value.target.fraction = &settings->floats.video_screen_xr_y[screen];
-         break;
-      case MENU_ENUM_LABEL_VIDEO_SCREEN_XR_Z:
-         setting->value.target.fraction = &settings->floats.video_screen_xr_z[screen];
-         break;
-      case MENU_ENUM_LABEL_VIDEO_SCREEN_XR_YAW:
-         setting->value.target.fraction = &settings->floats.video_screen_xr_yaw[screen];
-         break;
-      case MENU_ENUM_LABEL_VIDEO_SCREEN_XR_PITCH:
-         setting->value.target.fraction = &settings->floats.video_screen_xr_pitch[screen];
-         break;
-      case MENU_ENUM_LABEL_VIDEO_SCREEN_XR_ROLL:
-         setting->value.target.fraction = &settings->floats.video_screen_xr_roll[screen];
-         break;
-      case MENU_ENUM_LABEL_VIDEO_SCREEN_XR_SCALE:
-         setting->value.target.fraction = &settings->floats.video_screen_xr_scale[screen];
-         break;
-      case MENU_ENUM_LABEL_VIDEO_SCREEN_XR_VISIBLE:
-         setting->value.target.boolean = &settings->bools.video_screen_xr_visible[screen];
-         break;
-   }
+   video_driver_screen_get(screen, &values);
+   setting_video_screen_xr_value = values.xr;
+   member = setting_video_screen_xr_member(setting->enum_idx,
+         &setting_video_screen_xr_value, &pref);
+   if (member && setting->type == ST_BOOL)
+      setting->value.target.boolean  = (bool*)member;
+   else if (member)
+      setting->value.target.fraction = (float*)member;
    return mask;
 }
 
@@ -11048,10 +11262,30 @@ static void setting_video_screen_read(rarch_setting_t *setting)
    setting_video_screen_bind(setting);
 }
 
+/* Writes only a new value: the menu calls this after a Start too */
 static void setting_video_screen_change(rarch_setting_t *setting)
 {
-   if (setting->enum_idx != MENU_ENUM_LABEL_VIDEO_SCREEN_SELECTED)
-      config_get_ptr()->flags |= SETTINGS_FLG_MODIFIED;
+   video_screen_values_t values;
+   unsigned pref;
+   void *member = setting_video_screen_xr_member(setting->enum_idx,
+         &values.xr, &pref);
+   if (!member)
+      return;
+   video_driver_screen_get(setting->index_offset, &values);
+   if (setting->type == ST_BOOL)
+   {
+      if (*(bool*)member == *setting->value.target.boolean)
+         return;
+      *(bool*)member = *setting->value.target.boolean;
+   }
+   else
+   {
+      if (*(float*)member == *setting->value.target.fraction)
+         return;
+      *(float*)member = *setting->value.target.fraction;
+   }
+   video_driver_screen_set(setting->index_offset,
+         VIDEO_SCREEN_PREF_BIT(pref), &values);
 }
 
 static size_t setting_video_screen_repr(rarch_setting_t *setting,
@@ -11060,7 +11294,8 @@ static size_t setting_video_screen_repr(rarch_setting_t *setting,
    if (!setting_video_screen_bind(setting))
       return strlcpy(s, "", len);
    if (setting->enum_idx == MENU_ENUM_LABEL_VIDEO_SCREEN_SELECTED)
-      return snprintf(s, len, "%u", menu_state_get_ptr()->video_screen_selected + 1);
+      return video_driver_screen_label(
+            menu_state_get_ptr()->video_screen_selected, "%u", s, len);
    if (setting->type == ST_FLOAT)
       return setting_get_string_representation_st_float(setting, s, len);
    if (setting->type == ST_BOOL)
@@ -11114,15 +11349,26 @@ static int setting_video_screen_right(rarch_setting_t *setting,
 
 static int setting_video_screen_start(rarch_setting_t *setting)
 {
+   unsigned pref;
+   struct menu_state *menu_st = menu_state_get_ptr();
    if (!setting_video_screen_bind(setting))
       return -1;
    if (setting->enum_idx == MENU_ENUM_LABEL_VIDEO_SCREEN_SELECTED)
    {
-      menu_state_get_ptr()->video_screen_selected = RETRO_VIDEO_VIEWS_MAX;
+      menu_st->video_screen_selected = RETRO_VIDEO_VIEWS_MAX;
       setting_video_screen_bind(setting);
       return 0;
    }
-   return setting_generic_action_start_default(setting);
+   if (!setting_video_screen_xr_member(setting->enum_idx,
+            &setting_video_screen_xr_value, &pref))
+      return -1;
+   /* This core's choice goes, or the global value is reset */
+   video_driver_screen_set(setting->index_offset,
+         VIDEO_SCREEN_PREF_BIT(pref), NULL);
+   setting_video_screen_bind(setting);
+   menu_st->flags |= MENU_ST_FLAG_PREVENT_POPULATE
+      | MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+   return 0;
 }
 
 static int setting_video_screen_reset(rarch_setting_t *setting,
@@ -11132,16 +11378,24 @@ static int setting_video_screen_reset(rarch_setting_t *setting,
    struct menu_state *menu_st = menu_state_get_ptr();
    if (setting->enum_idx == MENU_ENUM_LABEL_VIDEO_SCREEN_XR_RESET_ALL)
    {
-      config_reset_video_screen_xr(settings, 0, RETRO_VIDEO_VIEWS_MAX);
+      video_driver_state_t *video_st = video_state_get_ptr();
+      unsigned screen, count         = RETRO_VIDEO_VIEWS_MAX;
+      /* A views core's file holds only the screens it has */
+      if (video_st->screen_prefs.in_use)
+         count = video_st->views_presented
+            ? video_st->views_core.num_screens : 1;
+      for (screen = 0; screen < count && screen < RETRO_VIDEO_VIEWS_MAX;
+            screen++)
+         config_set_video_screen_xr(screen, NULL);
       config_reset_video_menu_xr(settings);
+      settings->flags |= SETTINGS_FLG_MODIFIED;
    }
    else
    {
       if (!setting_video_screen_bind(setting))
          return -1;
-      config_reset_video_screen_xr(settings, menu_st->video_screen_selected, 1);
+      config_set_video_screen_xr(menu_st->video_screen_selected, NULL);
    }
-   settings->flags |= SETTINGS_FLG_MODIFIED;
    menu_st->flags |= MENU_ST_FLAG_PREVENT_POPULATE
       | MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
    return 0;
@@ -11277,17 +11531,7 @@ static void general_write_handler(rarch_setting_t *setting)
          && setting->enum_idx <= MENU_ENUM_LABEL_INPUT_DEVICE_INDEX_LAST)
       input_driver_ports_user_set(setting->index_offset);
 #ifdef HAVE_VIDEO_WINDOWS
-   /* a screen's window rows: its window follows them, after a close
-    * too */
-   if (     setting->enum_idx >= MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY
-         && setting->enum_idx <= MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY_LAST)
-      video_driver_edit_window(setting->enum_idx
-            - MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY);
-   else if (setting->enum_idx >= MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_FULLSCREEN
-         && setting->enum_idx <= MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_FULLSCREEN_LAST)
-      video_driver_edit_window(setting->enum_idx
-            - MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_FULLSCREEN);
-   else if (setting->enum_idx == MENU_ENUM_LABEL_VIDEO_WINDOWS_ENABLE)
+   if (setting->enum_idx == MENU_ENUM_LABEL_VIDEO_WINDOWS_ENABLE)
       video_driver_restore_windows();
    /* a screen sent back to the main window gets another try at the
     * window or display it is now given */
@@ -17161,10 +17405,8 @@ static void settings_build_cheat_search(
    }
 }
 
-#ifdef HAVE_VIDEO_WINDOWS
-/* Each screen's display, then the menu's */
-static void setting_append_list_video_screen_windows(
-      settings_t *settings,
+/* Each screen's Display */
+static void setting_append_list_video_screen_display(
       rarch_setting_t **list, rarch_setting_info_t *list_info,
       rarch_setting_group_info_t *group_info,
       rarch_setting_group_info_t *subgroup_info,
@@ -17182,16 +17424,16 @@ static void setting_append_list_video_screen_windows(
                MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_DISPLAY), screen + 1);
       CONFIG_STRING_ALT(
             list, list_info,
-            settings->arrays.video_screen_display[screen],
-            sizeof(settings->arrays.video_screen_display[screen]),
+            setting_video_screen_display_value[screen],
+            sizeof(setting_video_screen_display_value[screen]),
             name,
             label,
             "",
             group_info,
             subgroup_info,
             parent_group,
-            general_write_handler,
-            general_read_handler);
+            setting_video_screen_display_change,
+            setting_video_screen_display_read);
       /* Values from the platform's list, as the theme row has its own */
       (*list)[list_info->index - 1].type         = ST_STRING_OPTIONS;
       (*list)[list_info->index - 1].ui_type      = ST_UI_TYPE_STRING_COMBOBOX;
@@ -17204,8 +17446,25 @@ static void setting_append_list_video_screen_windows(
       SETTINGS_ACTION_SET(repr, &(*list)[list_info->index - 1], &setting_get_string_representation_video_screen_display)
       MENU_SETTINGS_LIST_CURRENT_ADD_ENUM_IDX_PTR(list, list_info,
             (enum msg_hash_enums)(MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY + screen));
+   }
+}
 
+#ifdef HAVE_VIDEO_WINDOWS
+/* Each screen's window rows on the desktop, then the menu's display */
+static void setting_append_list_video_screen_windows(
+      settings_t *settings,
+      rarch_setting_t **list, rarch_setting_info_t *list_info,
+      rarch_setting_group_info_t *group_info,
+      rarch_setting_group_info_t *subgroup_info,
+      const char *parent_group)
+{
 #ifndef ANDROID
+   unsigned screen;
+   for (screen = 0; screen < RETRO_VIDEO_VIEWS_MAX; screen++)
+   {
+      char name[64];
+      char label[64];
+
       snprintf(name, sizeof(name),
             MENU_ENUM_LABEL_VIDEO_SCREEN_SETTINGS_STR, screen + 1);
       snprintf(label, sizeof(label), msg_hash_to_str(
@@ -17224,7 +17483,7 @@ static void setting_append_list_video_screen_windows(
             screen + 1);
       CONFIG_BOOL_ALT(
             list, list_info,
-            &settings->bools.video_screen_window_fullscreen[screen],
+            &setting_video_screen_fullscreen_value[screen],
             name,
             label,
             false,
@@ -17233,10 +17492,12 @@ static void setting_append_list_video_screen_windows(
             group_info,
             subgroup_info,
             parent_group,
-            general_write_handler,
-            general_read_handler,
+            setting_video_screen_window_fullscreen_change,
+            setting_video_screen_window_read,
             SD_FLAG_NONE);
       (*list)[list_info->index - 1].index_offset = screen;
+      SETTINGS_ACTION_SET(start, &(*list)[list_info->index - 1], &setting_video_screen_window_start)
+      SETTINGS_ACTION_SET(repr, &(*list)[list_info->index - 1], &setting_get_string_representation_video_screen_window_fullscreen)
       MENU_SETTINGS_LIST_CURRENT_ADD_ENUM_IDX_PTR(list, list_info,
             (enum msg_hash_enums)
             (MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_FULLSCREEN + screen));
@@ -17259,6 +17520,7 @@ static void setting_append_list_video_screen_windows(
       (*list)[list_info->index - 1].index_offset = screen;
       menu_settings_list_current_add_range(list, list_info,
             0, VIDEO_SCALE_DIM_MAX, 10, true, true);
+      SETTINGS_ACTION_SET(start, &(*list)[list_info->index - 1], &setting_video_screen_window_start)
       SETTINGS_ACTION_SET(repr, &(*list)[list_info->index - 1], &setting_get_string_representation_video_screen_window_size)
       MENU_SETTINGS_LIST_CURRENT_ADD_ENUM_IDX_PTR(list, list_info,
             (enum msg_hash_enums)
@@ -17282,6 +17544,7 @@ static void setting_append_list_video_screen_windows(
       (*list)[list_info->index - 1].index_offset = screen;
       menu_settings_list_current_add_range(list, list_info,
             0, VIDEO_SCALE_DIM_MAX, 10, true, true);
+      SETTINGS_ACTION_SET(start, &(*list)[list_info->index - 1], &setting_video_screen_window_start)
       SETTINGS_ACTION_SET(repr, &(*list)[list_info->index - 1], &setting_get_string_representation_video_screen_window_size)
       MENU_SETTINGS_LIST_CURRENT_ADD_ENUM_IDX_PTR(list, list_info,
             (enum msg_hash_enums)
@@ -17305,7 +17568,7 @@ static void setting_append_list_video_screen_windows(
       (*list)[list_info->index - 1].index_offset = screen;
       menu_settings_list_current_add_range(list, list_info,
             VIDEO_POS_MIN, VIDEO_POS_MAX, 10, true, true);
-      SETTINGS_ACTION_SET(start, &(*list)[list_info->index - 1], &setting_video_screen_window_xy_start)
+      SETTINGS_ACTION_SET(start, &(*list)[list_info->index - 1], &setting_video_screen_window_start)
       SETTINGS_ACTION_SET(repr, &(*list)[list_info->index - 1], &setting_get_string_representation_video_screen_window_pos)
       MENU_SETTINGS_LIST_CURRENT_ADD_ENUM_IDX_PTR(list, list_info,
             (enum msg_hash_enums)
@@ -17329,13 +17592,13 @@ static void setting_append_list_video_screen_windows(
       (*list)[list_info->index - 1].index_offset = screen;
       menu_settings_list_current_add_range(list, list_info,
             VIDEO_POS_MIN, VIDEO_POS_MAX, 10, true, true);
-      SETTINGS_ACTION_SET(start, &(*list)[list_info->index - 1], &setting_video_screen_window_xy_start)
+      SETTINGS_ACTION_SET(start, &(*list)[list_info->index - 1], &setting_video_screen_window_start)
       SETTINGS_ACTION_SET(repr, &(*list)[list_info->index - 1], &setting_get_string_representation_video_screen_window_pos)
       MENU_SETTINGS_LIST_CURRENT_ADD_ENUM_IDX_PTR(list, list_info,
             (enum msg_hash_enums)
             (MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_Y + screen));
-#endif
    }
+#endif
 
    CONFIG_STRING(
          list, list_info,
@@ -17665,6 +17928,8 @@ static void settings_build_video(
          START_SUB_GROUP(list, list_info, "Stereo 3D & Screens", &group_info, &subgroup_info, parent_group);
 
          ADD_DESC(stereo_desc);
+         setting_append_list_video_screen_display(list, list_info,
+               &group_info, &subgroup_info, parent_group);
 #ifdef HAVE_VIDEO_WINDOWS
          setting_append_list_video_screen_windows(settings, list, list_info,
                &group_info, &subgroup_info, parent_group);

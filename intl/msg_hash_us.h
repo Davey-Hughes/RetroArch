@@ -8034,6 +8034,14 @@ MSG_HASH(
    "Where this game screen appears: in the main window, in a window of its own on a monitor, or nowhere. Auto keeps Game Screen 1 in the main window and gives the others a window on another monitor."
    )
 MSG_HASH(
+   MENU_ENUM_SUBLABEL_VIDEO_SCREEN_DISPLAY_SHOWN,
+   "Off leaves this game screen out. Auto shows it; until you choose, a core can hide it. Chosen while a core runs, it is kept for that core."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_CORE_DEFAULT,
+   "%s (core default)"
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_WINDOW_FULLSCREEN,
    "Game Screen %u Fullscreen"
    )

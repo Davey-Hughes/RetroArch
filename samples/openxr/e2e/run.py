@@ -154,6 +154,8 @@ class Result(object):
         self.screen_frames = {}
         self.shot = None
         self.events = []
+        # The settings the case's retroarch.cfg was written with.
+        self.settings = {}
         # What each 'until' step that timed out waited for.
         self.missed = []
         # A pixel of the window inside the 2D map's top screen.
@@ -399,6 +401,7 @@ def run_case(retroarch, root, monado, case, validate):
     env = isolated_env()
     svc = svc_log = log = p = None
     res = Result(d)
+    res.settings = settings
     res.top_px = case.get('top_px', res.top_px)
     res.reinit_grace = case.get('reinit_grace', res.reinit_grace)
     try:
@@ -4158,6 +4161,93 @@ CUSTOM_CASES = [
 ]
 
 
+# The ds map's screens, each 1.6 m wide, the bottom one under the top.
+DS_SIZE = (1.6, 1.2)
+DS_TOP = (0.0, 0.0, -1.8)
+DS_BOTTOM = (0.0, -1.232, -1.8)
+
+
+def check_screens_mode(blank):
+    """The ds map's screen 1 sent HIDDEN has no quad; sent BLANK (blank)
+    it keeps its quad, whose image is black. Screen 0 is where it is
+    with both shown, in its colour."""
+    def check(res):
+        fr = last_snap(res)
+        if not fr:
+            return no_quads(res)
+        q = [x for x in quads(fr) if not x['flags'] & BLEND]
+        top = [x for x in q if at(x, DS_TOP)]
+        rest = [x for x in q if not at(x, DS_TOP)]
+        errors = []
+        if len(top) != 1 or not sized(top[0], DS_SIZE):
+            errors.append('screen 0: %s, want one quad at %s size %s'
+                          % ([(x['pose'][:3], x['size']) for x in top],
+                             DS_TOP, DS_SIZE))
+        else:
+            c, _ = colour(image(res, fr, top[0]), 0.5, 0.5)
+            if not near(c, GREEN):
+                errors.append('screen 0 shows %s, want %s' % (c, GREEN))
+        if not blank:
+            if rest:
+                errors.append('the hidden screen 1 has a quad: %s'
+                              % [(x['pose'][:3], x['size']) for x in rest])
+            return errors
+        if (len(rest) != 1 or not at(rest[0], DS_BOTTOM)
+                or not sized(rest[0], DS_SIZE)):
+            return errors + ['the blank screen 1: %s, want one quad at %s '
+                             'size %s'
+                             % ([(x['pose'][:3], x['size']) for x in rest],
+                                DS_BOTTOM, DS_SIZE)]
+        # Its centre, and its top-left where a drawn view has its marker.
+        for fx, fy, what in ((0.5, 0.5, 'centre'), (0.01, 0.015, 'top-left')):
+            c, _ = colour(image(res, fr, rest[0]), fx, fy)
+            if not near(c, BLACK):
+                errors.append('the blank screen 1\'s %s shows %s, want black'
+                              % (what, c))
+        return errors
+    return check
+
+
+def check_tracked_screen_off(res):
+    """The tracked eyes' screen with Display Off is left out: its map is
+    taken, no projection is sent, and the bottom screen keeps its quad
+    where it is with both shown."""
+    errors = []
+    status = STATUS_RE.findall(res.log)
+    if not status or status[-1][2] != '1':
+        errors.append('the tracked map was not taken: %s' % status[-1:])
+    fr = None
+    for f in reversed(res.frames):
+        if f['snap'] and f['layers']:
+            fr = f
+            break
+    if not fr:
+        return errors + no_quads(res)
+    if projections(fr):
+        errors.append('the left-out screen is projected: %s'
+                      % [(x['space'], len(x['views']))
+                         for x in projections(fr)])
+    q = [x for x in quads(fr) if not x['flags'] & BLEND]
+    if len(q) != 1 or not at(q[0], (0.0, -0.992, -1.8)):
+        errors.append('want the bottom screen\'s quad alone, got %s'
+                      % [(x['pose'][:3], x['size']) for x in q])
+    return errors
+
+
+SCREENS_CASES = [
+    {'name': 'screens-hidden', 'map': 'ds',
+     'options': {'video_views_test_screens': 'hidden'}, 'steps': SETTLE,
+     'check': check_screens_mode(False)},
+    {'name': 'screens-blank', 'map': 'ds',
+     'options': {'video_views_test_screens': 'blank'}, 'steps': SETTLE,
+     'check': check_screens_mode(True)},
+    {'name': 'tracked-screen-off', 'map': '3ds',
+     'options': {'video_views_test_vr': 'local'},
+     'settings': {'video_screen1_display': 'off'}, 'steps': SETTLE,
+     'check': check_tracked_screen_off},
+]
+
+
 # ---- Edit Screens ----
 # The 3DS quads as in the laser cases. While editing, the menu's quad is
 # up 10 cm in front of screen 1 and as large: it is taken only by its
@@ -4575,10 +4665,14 @@ def stereo_errors(frames):
     return []
 
 
-def saved(res):
-    """The configuration RetroArch saved at exit."""
+# The test core's library name, which names its directory and files,
+# and the keys an edit of a screen's placement writes.
+CORE_NAME = 'video_views test'
+XR_PLACE = ('x', 'y', 'z', 'yaw', 'pitch', 'roll', 'scale')
+
+
+def read_saved(path):
     cfg = {}
-    path = os.path.join(res.dir, 'retroarch.cfg')
     if os.path.exists(path):
         with open(path) as f:
             for line in f:
@@ -4588,11 +4682,63 @@ def saved(res):
     return cfg
 
 
+def saved_global(res):
+    """The configuration RetroArch saved at exit: the global settings."""
+    return read_saved(os.path.join(res.dir, 'retroarch.cfg'))
+
+
+def saved_core(res):
+    """The test core's screens file: the per-screen settings set while
+    it ran with a view map, under their global names."""
+    return read_saved(os.path.join(res.dir, CORE_NAME,
+                                   CORE_NAME + '.screens.cfg'))
+
+
+def saved(res):
+    """What RetroArch saved, as the core's next start resolves it: the
+    core's entry for a per-screen setting, else the global value."""
+    cfg = saved_global(res)
+    cfg.update(saved_core(res))
+    return cfg
+
+
+def has_views(res):
+    """The core set a view map: what is set for a screen is the core's."""
+    return re.search(r'\[Video\] View map: [1-9]\d* views', res.log) \
+        is not None
+
+
+def core_file_errors(res, what, prefix, edited=True):
+    """Where a screen's placement went: a core with a view map keeps an
+    edit in its own file and leaves the global values as the case gave
+    them; without an edit, or without a map, its file has none of it."""
+    core, cfg = saved_core(res), saved_global(res)
+    held = [k for k in XR_PLACE if prefix + k in core]
+    own = edited and has_views(res)
+    errors = []
+    if own and len(held) != len(XR_PLACE):
+        errors.append('%s\'s edit is not in the core\'s file: it holds %s '
+                      'of %s' % (what, held, prefix))
+    if held and not own:
+        errors.append('the core\'s file holds %s of %s, want none'
+                      % (held, prefix))
+    if has_views(res):
+        for k in XR_PLACE:
+            default = '1' if k == 'scale' else '0'
+            given = float(res.settings.get(prefix + k, default))
+            got = float(cfg.get(prefix + k, default))
+            if abs(got - given) > 1e-6:
+                errors.append('the global %s%s saved as %g, want it left '
+                              'at %g' % (prefix, k, got, given))
+    return errors
+
+
 def saved_errors(res, what, prefix, base, want, size, last=None,
-                 anchor=None):
+                 anchor=None, edited=True):
     """The saved settings put the item where want is, its width and
     height at scale 1 size, from anchor (the identity unless given),
-    and where the headset last showed it."""
+    and where the headset last showed it. A screen's are held to
+    core_file_errors() too, edited if this case placed it."""
     cfg = saved(res)
     v = [float(cfg.get(prefix + k, '0'))
          for k in ('x', 'y', 'z', 'yaw', 'pitch', 'roll')]
@@ -4607,6 +4753,8 @@ def saved_errors(res, what, prefix, base, want, size, last=None,
     if last is not None:
         errors += pose_errors('%s last shown' % what, [last], pose[0],
                               pose[1], q['size'])
+    if prefix.startswith('video_screen'):
+        errors += core_file_errors(res, what, prefix, edited)
     return errors
 
 
@@ -4961,10 +5109,11 @@ def check_edit_stick(res):
 
 def check_edit_reset(menu=True):
     def check(res):
-        """Screen 1 from its offsets, grabbed and moved, then reset as
-        Reset Screen does, and the menu with it; the menu taken by its
-        handle and moved, screen 1 staying, then back in front of screen
-        1 on its own reset, unplaced."""
+        """Screen 1 from its global offsets, grabbed and moved, then
+        reset as Reset Screen does: at the built-in spot, kept in the
+        core's file with the global offsets as given, and the menu with
+        it; the menu taken by its handle and moved, screen 1 staying,
+        then back in front of screen 1 on its own reset, unplaced."""
         errors = edit_log_errors(res, ['on', 'off'])
         errors += pose_errors('screen 1 at its offsets',
                               [last_before(res, 'offset', screen1_left)],
@@ -4995,6 +5144,15 @@ def check_edit_reset(menu=True):
                 MENU_SPOT, ID, (MENU_W, MENU_H))
             if saved(res).get('video_openxr_menu_placed') != 'false':
                 errors.append('the menu\'s reset left it placed')
+        core = saved_core(res)
+        held = [core.get('video_screen1_xr_' + k) for k in XR_PLACE]
+        shown = core.get('video_screen1_xr_visible')
+        if shown != 'true' or any(
+                v is None or abs(float(v) - (k == 'scale')) > 1e-6
+                for k, v in zip(XR_PLACE, held)):
+            errors.append('the core\'s file holds %s and visible %s for '
+                          'screen 1, want the default placement, shown'
+                          % (held, shown))
         return errors + saved_errors(res, 'screen 1', 'video_screen1_xr_',
                                      S0, (S0, ID), (1.6, 0.96),
                                      screen1_left(late[-1]) if late
@@ -7001,7 +7159,8 @@ EDIT_CASES += [
          ('mark', 'grown'), ('script', aim_line(*A0)), ('wait', 1),
          ('mark', 'off'), ('send', EDIT), ('wait', 1)],
      'check': check_edit_stick},
-    # Screen 1 from 0.25,0.1,-1.5, the menu following it until the reset.
+    # Screen 1 from the global 0.25,0.1,-1.5, the menu following it until
+    # the reset, which puts it at the built-in spot for this core.
     {'name': 'edit-reset', 'map': '3ds', 'settings': dict(SAVE,
                                                           **EDIT_OFFSET),
      'steps': edit_start(edit_aim(0.25, 0.1), 1) + [
@@ -8712,6 +8871,7 @@ GL_EXTRA = [
      'check': check_tracked_busy},
 ]
 CASES += CUSTOM_CASES
+CASES += SCREENS_CASES
 CASES += EDIT_CASES
 
 # The cases each GL driver's lanes run, by name in CASES or GL_EXTRA.
@@ -8789,6 +8949,7 @@ GL_EDIT = ['edit-grab', 'edit-grab-threaded', 'edit-command', 'edit-follow',
 GL_EDIT_MENU = ['edit-menu-front', 'edit-menu-size']
 for custom_driver in GL_BASE:
     GL_BASE[custom_driver] += [c['name'] for c in CUSTOM_CASES] + GL_EDIT
+    GL_BASE[custom_driver] += [c['name'] for c in SCREENS_CASES]
 GL_BASE['glcore'] += GL_EDIT_MENU
 
 # Where a GL host's answer is its own, by driver.

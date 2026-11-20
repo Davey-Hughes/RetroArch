@@ -1782,7 +1782,7 @@ static void ctr_views_place(ctr_video_t *ctr, const video_views_map_t *map,
       {
          const video_views_placement_t *p = &layout.placements[i];
          int k = video_views_find(&sub, sub.views[p->view].screen, eyes[e]);
-         if (k >= 0)
+         if (k >= 0 && !(p->flags & VIDEO_VIEWS_PLACEMENT_BLANK))
             ctr_views_quad(&q[(*n)++], ctr->rotation, &p->dst,
                   &map->views[index[k]]);
       }

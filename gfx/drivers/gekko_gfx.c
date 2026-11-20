@@ -500,6 +500,8 @@ static void draw_views(gekko_video_t *gx, const video_frame_info_t *info)
       float u[4], v[4];
       const video_views_placement_t *p = &layout->placements[i];
       const struct retro_video_view *rv = &info->views.views[p->view];
+      if (p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
+         continue;
       corners(gx,
             (float)rv->x / gx->tex_w, (float)rv->y / gx->tex_h,
             (float)(rv->x + rv->width)  / gx->tex_w,

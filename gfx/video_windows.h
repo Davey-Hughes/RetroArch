@@ -94,6 +94,8 @@ typedef struct video_window_request
    /* The display it goes on: an ordinal of the published list, 0 where
     * the native layer places it */
    unsigned display;
+   /* The title screen's name, "" for none */
+   char name[VIDEO_VIEWS_NAME_SIZE];
 } video_window_request_t;
 
 typedef struct video_window_native
@@ -163,6 +165,11 @@ typedef struct gfx_ctx_window_driver
 
 /* The screen a window's title names: its first, else its id's */
 unsigned video_window_title_screen(const video_window_request_t *request);
+
+/* "RetroArch - " and @request's name, else "Screen N" for its title
+ * screen */
+size_t video_window_title(const video_window_request_t *request, char *s,
+      size_t len);
 
 /* What a context's native layer keeps of each window it makes, first
  * in its own window->state, on the thread that runs the context */
@@ -543,7 +550,7 @@ unsigned video_driver_window_generation(void);
 
 /* Without @route, screen 0 stays in the main window whatever its mode
  * and the others go by theirs; with one, a screen goes where @route
- * puts it. */
+ * puts it. A left-out screen is hidden, screen 0 too. */
 void video_windows_plan(const video_views_map_t *map,
       const video_window_settings_t *settings, bool enabled,
       bool supported, unsigned forced_attached,

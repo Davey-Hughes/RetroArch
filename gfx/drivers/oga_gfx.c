@@ -617,6 +617,8 @@ static void *oga_init(const video_info_t *video)
     * views frame allocates nothing. Without it views are drawn whole. */
    vid->views_surface = oga_create_surface(vid->fd, vid->drm_width,
          vid->drm_height, RK_FORMAT_BGRA_8888, false);
+   /* Not cleared yet: the first views frame does it */
+   vid->views_cut_count = (unsigned)-1;
 
    /* What views are laid out on: the screen as it is seen */
    video_driver_set_output_dims(VIDEO_SCALE_PACK(vid->drm_width,
@@ -929,7 +931,8 @@ static bool oga_views_frame(oga_video_t *vid, const void *frame,
    for (i = 0, n = 0; i < layout->num_placements
          && i < VIDEO_VIEWS_MAX_PLACEMENTS; i++)
    {
-      if (!video_views_visible(layout, &layout->placements[i], screen,
+      if (     (layout->placements[i].flags & VIDEO_VIEWS_PLACEMENT_BLANK)
+            || !video_views_visible(layout, &layout->placements[i], screen,
                &cuts[n]))
          continue;
       which[n++] = (unsigned char)i;

@@ -1621,6 +1621,8 @@ static void gx_views_draw(gx_video_t *gx, const video_frame_info_t *info,
       float v0 = (float)rv->y / th;
       float u1 = (float)(rv->x + rv->width)  / tw;
       float v1 = (float)(rv->y + rv->height) / th;
+      if (p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
+         continue;
       gx_views_viewport(gx, &p->dst);
       GX_Begin(GX_TRIANGLESTRIP, GX_VTXFMT0, 4);
       GX_Position3f32(-1,  1, -0.5);
@@ -1763,7 +1765,11 @@ static bool gx_frame(void *data, const void *frame,
    GX_SetCurrentMtx(GX_PNMTX0);
    GX_LoadTexObj(&g_tex.obj, GX_TEXMAP0);
    if (views)
+   {
       gx_views_draw(gx, video_info, frame_dims);
+      /* The placements need not cover what the last frame drew */
+      clear_efb = GX_TRUE;
+   }
    else
       GX_CallDispList(display_list, display_list_size);
 

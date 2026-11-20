@@ -22,6 +22,7 @@
 #include <boolean.h>
 #include <retro_inline.h>
 #include <retro_atomic.h>
+#include <rthreads/retro_seqlatch.h>
 #include <retro_common_api.h>
 #include <libretro.h>
 
@@ -174,7 +175,61 @@ typedef struct video_views_map
    struct retro_video_view views[RETRO_VIDEO_VIEWS_MAX];
    unsigned num_views;
    unsigned num_screens;
+   /* Bit s is screen s. */
+   unsigned no_input;   /* RETRO_VIDEO_SCREEN_FLAG_NO_INPUT */
+   unsigned viewless;   /* below num_screens with no view */
+   /* The frontend's, set per frame; validation leaves them 0. */
+   unsigned left_out;   /* ABSENT, or its Display resolved to Off: no place */
+   unsigned blank;      /* BLANK and not left out: a place, drawn black */
 } video_views_map_t;
+
+#define VIDEO_VIEWS_NAME_SIZE 32   /* bytes kept of a screen's name, with its NUL */
+
+/* One validated retro_video_screen. */
+typedef struct video_views_screen
+{
+   unsigned flags;
+   unsigned state;
+   unsigned show;
+   unsigned base;
+   unsigned anchor;
+   unsigned order;
+   unsigned owners;
+   unsigned swap_with;
+   unsigned group;
+   float size;
+   float opacity;
+   char name[VIDEO_VIEWS_NAME_SIZE];   /* "" when the core gave none */
+} video_views_screen_t;
+
+typedef struct video_views_screens
+{
+   video_views_screen_t screens[RETRO_VIDEO_SCREENS_MAX];
+   unsigned count;                     /* 0: the map describes no screens */
+} video_views_screens_t;
+
+/* Screen names crossing from the main thread, their one writer, to any
+ * thread (rthreads/retro_seqlatch.h). Zeroed: every name "", stamp 0. */
+typedef struct video_views_names
+{
+   char name[RETRO_VIDEO_SCREENS_MAX][VIDEO_VIEWS_NAME_SIZE];
+} video_views_names_t;
+
+#define VIDEO_VIEWS_NAMES_WORDS \
+   RETRO_SEQLATCH_WORDS(sizeof(video_views_names_t))
+
+typedef struct video_views_names_box
+{
+   retro_atomic_int_t seq;
+   retro_atomic_int_t words[2 * VIDEO_VIEWS_NAMES_WORDS];
+} video_views_names_box_t;
+
+void video_views_names_publish(video_views_names_box_t *box,
+      const video_views_names_t *names);
+
+/* Returns the stamp it read at. */
+int video_views_names_read(video_views_names_box_t *box,
+      video_views_names_t *out);
 
 typedef struct video_screen_xr
 {
@@ -194,6 +249,12 @@ void video_views_xr_normalize(video_screen_xr_t *screen);
 bool video_views_validate(const struct retro_video_view *views,
       unsigned num_views, video_views_map_t *out);
 
+/* A whole SET_VIDEO_VIEWS argument: its views, and its screens when it
+ * sets RETRO_VIDEO_VIEWS_FLAG_SCREENS. Writes @out and @screens only
+ * when it returns true. */
+bool video_views_validate_map(const struct retro_video_views *in,
+      video_views_map_t *out, video_views_screens_t *screens);
+
 bool video_views_fit_frame(const video_views_map_t *map,
       unsigned frame_dims);
 
@@ -212,7 +273,8 @@ int video_views_find(const video_views_map_t *map,
       unsigned screen, unsigned eye);
 
 /* A tracked map's eyes: true when the map holds exactly one LEFT and
- * one RIGHT view, their indices in eyes[0] and eyes[1]; else -1. */
+ * one RIGHT view, neither on a screen left out, their indices in
+ * eyes[0] and eyes[1]; else -1. */
 bool video_views_eye_pair(const video_views_map_t *map, int eyes[2]);
 
 /* The views of screens [@first, @first + @count) of @map as a map of
@@ -233,12 +295,15 @@ bool video_views_snapshot(const video_views_map_t *map,
 
 #define VIDEO_VIEWS_MAX_PLACEMENTS (RETRO_VIDEO_VIEWS_MAX * 2)
 
+#define VIDEO_VIEWS_PLACEMENT_BLANK (1u << 0)   /* drawn black */
+
 /* One view drawn into one eye's area. */
 typedef struct video_views_placement
 {
    video_views_rect_t dst;   /* canvas pixels, top-left origin */
    unsigned view;            /* index into the map's views */
    unsigned area;            /* 0: left eye or the only area, 1: right eye */
+   unsigned flags;           /* VIDEO_VIEWS_PLACEMENT_* */
 } video_views_placement_t;
 
 typedef struct video_views_layout
@@ -313,7 +378,7 @@ void video_views_cut_source(const struct retro_video_view *v,
 /* The rectangle of @view's first placement drawn into a target of
  * size @dims, which its shader passes are sized for; all_areas false
  * draws the first area only. False when no placement of the view
- * shows. */
+ * shows, a blank one showing nothing of it. */
 bool video_views_first_drawn(const video_views_layout_t *layout,
       unsigned view, bool all_areas, unsigned dims,
       video_views_rect_t *out);
@@ -321,7 +386,8 @@ bool video_views_first_drawn(const video_views_layout_t *layout,
 /* Window point to packed-frame pointer coordinates, through @layout,
  * VIDEO_POS_PACK'd into @res_pos. @map and @frame_dims are the core's
  * own. A point on any copy of a screen lands in that screen's EYE_NONE
- * or left-eye rectangle. */
+ * or left-eye rectangle. NO_INPUT screens are not there: with only
+ * those placed, every point is off every view. */
 bool video_views_map_point(const video_views_layout_t *layout,
       const video_views_map_t *map, unsigned frame_dims,
       int x, int y, bool report_oob, uint32_t *res_pos);
@@ -342,6 +408,7 @@ typedef struct video_views_touch
    video_views_rect_t dst[RETRO_VIDEO_VIEWS_MAX];
    struct retro_video_view src[RETRO_VIDEO_VIEWS_MAX];
    unsigned count;
+   unsigned no_input;   /* bit i: entry i takes no input */
    unsigned dims;
    unsigned frame_dims;
    retro_atomic_int_t seq;
@@ -355,8 +422,8 @@ void video_views_touch_publish(video_views_touch_t *t,
       const unsigned *index, unsigned dims, unsigned frame_dims);
 
 /* A touch, -0x7fff to 0x7fff across the display, to the core's pointer
- * in its packed frame, -0x8000 off the views. False, with @res_x and
- * @res_y as they were, when the display shows no views. */
+ * in its packed frame, -0x8000 off the views that take input. False,
+ * with @res_x and @res_y as they were, when the display shows no views. */
 bool video_views_touch_point(video_views_touch_t *t, int x, int y,
       int16_t *res_x, int16_t *res_y);
 

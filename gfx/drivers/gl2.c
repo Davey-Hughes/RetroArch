@@ -5237,7 +5237,8 @@ static retro_time_t gl2_get_last_present_time(void *data)
  * origin, at the left eye's size within dims, shrunk if larger, as
  * Vulkan draws them. Sampled, so any format gl2 draws will do; each
  * image is cleared whole, as the compositor may read past the
- * rectangle. The framebuffer to draw through is bound. */
+ * rectangle, and a blank screen's is left so. The framebuffer to draw
+ * through is bound. */
 static void gl2_xr_draw_eye_images(gl2_t *gl,
       const video_frame_info_t *video_info, const uint32_t *dst,
       unsigned dims, unsigned *width, unsigned *height)
@@ -5299,6 +5300,8 @@ static void gl2_xr_draw_eye_images(gl2_t *gl,
       glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
             GL_TEXTURE_2D, (GLuint)dst[e], 0);
       glClear(GL_COLOR_BUFFER_BIT);
+      if (map->blank & (1u << v->screen))
+         continue;
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
       gl->shader->set_coords(gl->shader_data, &gl->coords);
@@ -5473,8 +5476,9 @@ static void gl2_desktop_xr_plan(gl2_t *gl,
 
 /* The plan's rectangles out of the window's back buffer, which is
  * bottom up, into each slot's textures, scaled to the slot's size; what
- * lies past the window stays black. A slot the plan leaves out shows
- * nothing more: at once, or with eyes once the projection shows. */
+ * lies past the window, and a blank screen, stay black. A slot the plan
+ * leaves out shows nothing more: at once, or with eyes once the
+ * projection shows. */
 static void gl2_desktop_xr_draw(gl2_t *gl, bool eyes)
 {
    unsigned s, l;
@@ -5512,6 +5516,8 @@ static void gl2_desktop_xr_draw(gl2_t *gl, bool eyes)
          glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                GL_TEXTURE_2D, (GLuint)tex[l], 0);
          glClear(GL_COLOR_BUFFER_BIT);
+         if (plan->blank)
+            continue;
          glBlitFramebuffer(x, y, x + (GLint)VIDEO_SCALE_W(r->dims),
                y + (GLint)VIDEO_SCALE_H(r->dims), 0, 0,
                (GLint)VIDEO_SCALE_W(plan->dims),
@@ -7237,11 +7243,16 @@ static void gl2_window_request(gl2_t *gl, const video_windows_frame_t *f,
 static bool gl2_window_make(gl2_t *gl, const video_windows_frame_t *f,
       unsigned w)
 {
+   video_views_names_t names;
    video_window_request_t request;
    struct gl2_window *win = &gl->windows.win[w];
 
    memset(win, 0, sizeof(*win));
    gl2_window_request(gl, f, w, &request);
+   /* Read once: a rename shows when the window is made again */
+   video_driver_get_screen_names(&names);
+   strlcpy(request.name, names.name[video_window_title_screen(&request)],
+         sizeof(request.name));
    request.generation = video_driver_window_generation();
    if (     !request.generation
          || !gl->ctx_driver->windows->create(gl->ctx_data, &request,

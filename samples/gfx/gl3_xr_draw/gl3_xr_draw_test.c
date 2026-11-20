@@ -2,11 +2,14 @@
  * runtime's textures and the chain's passes stubbed: each screen is
  * drawn straight into the texture the runtime gives, a new frame ends
  * the chain's frame, and a repeat draws a screen again only when it
- * moved or changed size, by replaying the last frame's final pass. */
+ * moved or changed size, by replaying the last frame's final pass. A
+ * blank screen's texture is only cleared, and so are the tracked eyes'
+ * of a blank screen, whose views are not read. */
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 #include <boolean.h>
+#include <retro_miscellaneous.h>
 #include "gfx/video_views.h"
 #include "gfx/video_defines.h"
 #include "gfx/video_xr.h"
@@ -27,6 +30,32 @@ typedef unsigned GLbitfield;
 #define GL_COLOR_ATTACHMENT0         0x8CE0
 #define GL_TEXTURE_2D                0x0DE1
 #define GL_COLOR_BUFFER_BIT          0x00004000
+#define GL_TEXTURE0                  0x84C0
+#define GL_NEAREST                   0x2600
+#define GL_LINEAR                    0x2601
+#define GL_TEXTURE_MAG_FILTER        0x2800
+#define GL_TEXTURE_MIN_FILTER        0x2801
+#define GL_TEXTURE_WRAP_S            0x2802
+#define GL_TEXTURE_WRAP_T            0x2803
+#define GL_CLAMP_TO_EDGE             0x812F
+
+#define GL3_FLAG_HW_RENDER_BOTTOM_LEFT (1 << 0)
+
+struct gl3_buffer_locations
+{
+   int mvp;
+};
+
+typedef struct
+{
+   float data[16];
+} math_matrix_4x4;
+
+typedef struct
+{
+   unsigned width;
+   unsigned height;
+} openxr_projection_t;
 
 struct gl3_filter_chain_texture
 {
@@ -49,6 +78,7 @@ typedef struct gl_openxr gl_openxr_t;
 typedef struct
 {
    video_views_map_t views;
+   int headset_eye[2];
    bool frame_repeat;
 } video_frame_info_t;
 
@@ -59,7 +89,13 @@ typedef struct gl3
       GLuint tex[RETRO_VIDEO_VIEWS_MAX];
       unsigned tex_dims[RETRO_VIDEO_VIEWS_MAX];
       GLenum tex_format[RETRO_VIDEO_VIEWS_MAX];
+      unsigned copied;
    } views;
+   struct
+   {
+      GLuint alpha_blend;
+      struct gl3_buffer_locations alpha_blend_loc;
+   } pipelines;
    struct
    {
       gl_openxr_t *host;
@@ -73,12 +109,18 @@ typedef struct gl3
       } shown[VIDEO_XR_MAX_SLOTS];
       float mvp[16];
       GLuint fbo;
+      GLuint samplers[2];
       bool proj_shown;
    } xr;
+   math_matrix_4x4 mvp_no_rot;
+   math_matrix_4x4 mvp_no_rot_yflip;
    unsigned rotation_raw;
+   unsigned flags;
 } gl3_t;
 
 static unsigned failures;
+
+#define OPENXR_PROJECTION_SLOT VIDEO_XR_MAX_SLOTS
 
 /* The runtime's textures are 0x100 + slot * 2 + layer; any other name
  * attached is an image of the driver's own. */
@@ -87,8 +129,9 @@ static unsigned failures;
 static unsigned offscreen_passes, viewport_passes, replays;
 static unsigned frames_ended, last_pass_dims;
 static bool chain_drawn = true;
-static unsigned runtime_attaches, own_attaches;
-static unsigned published[VIDEO_XR_MAX_SLOTS];
+static unsigned runtime_attaches, own_attaches, clears;
+static unsigned tex_binds, quads_drawn, eye_dims;
+static unsigned published[OPENXR_PROJECTION_SLOT + 1];
 static video_xr_quad_set_t planned;
 
 static void glGetIntegerv(GLenum pname, GLint *v)
@@ -121,7 +164,7 @@ static void glFramebufferTexture2D(GLenum target, GLenum att,
    if (!tex)
       return;
    if (tex >= RUNTIME_TEX(0, 0)
-         && tex <= RUNTIME_TEX(VIDEO_XR_MAX_SLOTS - 1, 1))
+         && tex <= RUNTIME_TEX(OPENXR_PROJECTION_SLOT, 1))
       runtime_attaches++;
    else
       own_attaches++;
@@ -140,7 +183,42 @@ static void glClearColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a)
    (void)b;
    (void)a;
 }
-static void glClear(GLbitfield mask) { (void)mask; }
+static void glClear(GLbitfield mask) { (void)mask; clears++; }
+static void glGenSamplers(GLsizei n, GLuint *samplers)
+{
+   (void)n;
+   samplers[0] = 1;
+   samplers[1] = 2;
+}
+static void glSamplerParameteri(GLuint sampler, GLenum pname, GLint param)
+{
+   (void)sampler;
+   (void)pname;
+   (void)param;
+}
+static void glBindSampler(GLuint unit, GLuint sampler)
+{
+   (void)unit;
+   (void)sampler;
+}
+static void glActiveTexture(GLenum unit) { (void)unit; }
+static void glBindTexture(GLenum target, GLuint tex)
+{
+   (void)target;
+   if (tex)
+      tex_binds++;
+}
+static void gl3_draw_textured_quad(gl3_t *gl, GLuint prog,
+      const struct gl3_buffer_locations *loc, const float *mvp,
+      const float *vbo_data)
+{
+   (void)gl;
+   (void)prog;
+   (void)loc;
+   (void)mvp;
+   (void)vbo_data;
+   quads_drawn++;
+}
 
 static void gl3_filter_chain_set_input_texture(gl3_filter_chain_t *chain,
       const struct gl3_filter_chain_texture *in)
@@ -250,15 +328,18 @@ static void gl3_xr_copy_ui(gl3_t *gl, unsigned s, GLuint tex,
    (void)tex;
    (void)ui_dims;
 }
-static bool gl3_xr_draw_projection(gl3_t *gl,
-      const video_frame_info_t *video_info)
+unsigned gl_openxr_eye_dims(const gl_openxr_t *xr)
 {
-   (void)gl;
-   (void)video_info;
-   return true;
+   (void)xr;
+   return eye_dims;
 }
-
-#define OPENXR_PROJECTION_SLOT VIDEO_XR_MAX_SLOTS
+void gl_openxr_projection(gl_openxr_t *xr, unsigned width,
+      unsigned height, openxr_projection_t *out)
+{
+   (void)xr;
+   out->width  = width;
+   out->height = height;
+}
 
 #include "driver_code.inc"
 
@@ -304,7 +385,9 @@ static void reset(gl3_t *gl)
    offscreen_passes = viewport_passes = replays = 0;
    frames_ended = last_pass_dims = 0;
    chain_drawn = true;
-   runtime_attaches = own_attaches = 0;
+   runtime_attaches = own_attaches = clears = 0;
+   tex_binds = quads_drawn = 0;
+   eye_dims = VIDEO_SCALE_PACK(64, 32);
    memset(published, 0, sizeof(published));
 }
 
@@ -381,12 +464,70 @@ static void test_repeat_unready(void)
    CHECK(replays == 0 && frames_ended == 0);
 }
 
+/* A blank screen's texture is cleared: no pass runs and no frame ends.
+ * Going blank on a repeat clears it then, with no replay. */
+static void test_blank(void)
+{
+   gl3_t gl;
+   unsigned dims = VIDEO_SCALE_PACK(64, 32);
+   reset(&gl);
+   plan(dims, 2, 0.0f);
+   planned.slots[1].blank = true;
+   draw(&gl, true);
+   CHECK(offscreen_passes == 1 && viewport_passes == 1);
+   CHECK(frames_ended == 1 && replays == 0);
+   CHECK(runtime_attaches == 2 && clears == 2);
+   CHECK(published[0] == 1 && published[1] == 1);
+   viewport_passes = clears = 0;
+   planned.slots[0].blank = true;
+   draw(&gl, false);
+   CHECK(replays == 0 && viewport_passes == 0 && frames_ended == 1);
+   CHECK(clears == 1 && published[0] == 2 && published[1] == 1);
+}
+
+/* The tracked eyes wait for their views' copies and are drawn from
+ * them. A blank screen's are cleared with nothing read, and wait for no
+ * copy: none is made. */
+static void test_projection_blank(void)
+{
+   gl3_t gl;
+   video_frame_info_t info;
+   const unsigned s = OPENXR_PROJECTION_SLOT;
+   reset(&gl);
+   memset(&info, 0, sizeof(info));
+   info.views.num_views       = 2;
+   info.views.views[0].screen = 1;
+   info.views.views[0].width  = 64;
+   info.views.views[0].height = 32;
+   info.views.views[1]        = info.views.views[0];
+   info.headset_eye[0]        = 0;
+   info.headset_eye[1]        = 1;
+   gl.views.tex[0]            = 0x20;
+   gl.views.tex[1]            = 0x21;
+   gl.views.copied            = 0x1;
+   CHECK(!gl3_xr_draw_projection(&gl, &info));
+   CHECK(clears == 0 && published[s] == 0);
+   gl.views.copied            = 0x3;
+   CHECK(gl3_xr_draw_projection(&gl, &info));
+   CHECK(clears == 2 && quads_drawn == 2 && tex_binds == 2);
+   CHECK(runtime_attaches == 2 && published[s] == 1);
+
+   reset(&gl);
+   info.views.blank           = 1u << 1;
+   CHECK(gl3_xr_eye_views(&info) == 0);
+   CHECK(gl3_xr_draw_projection(&gl, &info));
+   CHECK(clears == 2 && quads_drawn == 0 && tex_binds == 0);
+   CHECK(runtime_attaches == 2 && published[s] == 1 && gl.xr.proj_shown);
+}
+
 int main(void)
 {
    test_direct();
    test_repeat_same();
    test_repeat_changed();
    test_repeat_unready();
-   printf("%u failed (4 GL3 headset draw cases)\n", failures);
+   test_blank();
+   test_projection_blank();
+   printf("%u failed (6 GL3 headset draw cases)\n", failures);
    return failures ? 1 : 0;
 }

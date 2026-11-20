@@ -192,24 +192,27 @@ static const char *native_wl_kwin_dir(void)
 }
 
 /* Runs 'body' as a script of the nested KWin the harness runs this
- * under, with 'w' this process's window captioned exactly for 'screen',
- * 'm' its main window and 'n' its windows captioned for any screen,
- * and returns once it has run (the script object's run replies
- * then; Scripting.start does not wait). VIDEO_SCREENS_KWIN names the
- * scratch directory the script goes in; without it there is no KWin to
- * ask, and this is false. */
-static bool native_wl_kwin(unsigned screen, const char *body)
+ * under, with 'w' this process's window captioned exactly
+ * video_window_title(request), 'n' its windows captioned so and 'm' its
+ * main window, the one captioned otherwise, and returns once it has run
+ * (the script object's run replies then; Scripting.start does not
+ * wait). VIDEO_SCREENS_KWIN names the scratch directory the script goes
+ * in; without it there is no KWin to ask, and this is false. */
+static bool native_wl_kwin(const video_window_request_t *request,
+      const char *body)
 {
    static char path[1024];
    static char arg[1100];
    char reply[128];
    char object[64];
+   char title[64];
    const char *args[5];
    FILE *file;
    int id          = -1;
    const char *dir = native_wl_kwin_dir();
    if (!dir)
       return false;
+   video_window_title(request, title, sizeof(title));
    snprintf(path, sizeof(path), "%s/video_screens_kwin.js", dir);
    if (!(file = fopen(path, "w")))
    {
@@ -220,12 +223,10 @@ static bool native_wl_kwin(unsigned screen, const char *body)
          "var w = null, m = null, n = 0, l = workspace.windowList();\n"
          "for (var i = 0; i < l.length; i++) {\n"
          "   if (l[i].pid != %d) continue;\n"
-         "   if (l[i].caption.indexOf(\"" NATIVE_TITLE "\") == 0) n++;\n"
-         "   if (l[i].caption == \"" NATIVE_TITLE "%u\") w = l[i];\n"
-         "   else if (l[i].caption.indexOf(\"" NATIVE_TITLE "\") != 0)"
-         " m = l[i];\n"
+         "   if (l[i].caption == \"%s\") { w = l[i]; n++; }\n"
+         "   else m = l[i];\n"
          "}\n"
-         "if (w) { %s }\n", (int)getpid(), screen + 1, body);
+         "if (w) { %s }\n", (int)getpid(), title, body);
    fclose(file);
    snprintf(arg, sizeof(arg), "string:%s", path);
    args[0] = "/Scripting";
@@ -579,7 +580,7 @@ static void native_wl_wait_focus(const gfx_ctx_driver_t *ctx, void *data,
       : NATIVE_EVENT(FOCUS_LOSS);
    retro_time_t deadline;
    if (script)
-      native_wl_kwin(video_window_title_screen(request), script);
+      native_wl_kwin(request, script);
    deadline = cpu_features_get_time_usec() + 3000000;
    for (;;)
    {
@@ -660,8 +661,7 @@ static void native_wl_close(gfx_ctx_wayland_data_t *wl,
 {
    const struct xdg_toplevel_listener *listener;
    struct xdg_toplevel *toplevel = state->xdg_toplevel;
-   if (native_wl_kwin(video_window_title_screen(&state->common.request),
-            "w.closeWindow();"))
+   if (native_wl_kwin(&state->common.request, "w.closeWindow();"))
       return;
 #ifdef HAVE_LIBDECOR_H
    if (state->libdecor_frame)
@@ -941,7 +941,7 @@ static void native_wl_maximise(const gfx_ctx_driver_t *ctx, void *data,
    wl_video_window_t *state   = (wl_video_window_t*)window->state;
    retro_time_t deadline      = cpu_features_get_time_usec() + 3000000;
    if (by_kwin)
-      native_wl_kwin(video_window_title_screen(request), on
+      native_wl_kwin(request, on
             ? "w.setMaximize(true, true);" : "w.setMaximize(false, false);");
 #ifdef HAVE_LIBDECOR_H
    else if (state->libdecor_frame)
@@ -971,7 +971,8 @@ static void native_wl_maximise(const gfx_ctx_driver_t *ctx, void *data,
 }
 
 /* Resized by the user, through KWin */
-static void native_wl_kwin_size(unsigned screen, unsigned w, unsigned h)
+static void native_wl_kwin_size(const video_window_request_t *request,
+      unsigned w, unsigned h)
 {
    char body[192];
    snprintf(body, sizeof(body),
@@ -979,7 +980,7 @@ static void native_wl_kwin_size(unsigned screen, unsigned w, unsigned h)
          " w.frameGeometry = {x: g.x, y: g.y,"
          " width: %u + g.width - c.width,"
          " height: %u + g.height - c.height};", w, h);
-   native_wl_kwin(screen, body);
+   native_wl_kwin(request, body);
 }
 
 /* Pumps until the compositor has it fullscreen or not and, with 'dims',
@@ -1063,7 +1064,7 @@ static void native_wl_updates(const gfx_ctx_driver_t *ctx, void *data,
    wl_video_window_t *state;
    retro_time_t settle;
    void *surface;
-   unsigned dims, saves, screen;
+   unsigned dims, saves;
 
    if (done)
       return;
@@ -1074,7 +1075,6 @@ static void native_wl_updates(const gfx_ctx_driver_t *ctx, void *data,
    r.settings.pos        = 0;
    r.settings.pos_set    = false;
    r.settings.dims       = VIDEO_SCALE_PACK(360, 270);
-   screen                = video_window_title_screen(&r);
    native_wl_replace(ctx, data, &r, window);
    state = (wl_video_window_t*)window->state;
    native_window_settle(ctx, data, &r, VIDEO_WINDOW_SETTLE_USEC + 100000);
@@ -1083,7 +1083,7 @@ static void native_wl_updates(const gfx_ctx_driver_t *ctx, void *data,
    /* Resized by the user, so the next requests carry its saved size */
    if (kwin)
    {
-      native_wl_kwin_size(screen, 400, 300);
+      native_wl_kwin_size(&r, 400, 300);
       CHECK(native_wl_wait_save(ctx, data, &r));
       CHECK(native_window_saved.save_dims == VIDEO_SCALE_PACK(400, 300));
       r.settings.dims = native_window_saved.save_dims;
@@ -1153,7 +1153,7 @@ static void native_wl_updates(const gfx_ctx_driver_t *ctx, void *data,
    if (kwin)
    {
       /* A resize not yet out when an edit comes: the edit stands */
-      native_wl_kwin_size(screen, 460, 340);
+      native_wl_kwin_size(&r, 460, 340);
       CHECK(native_wl_wait_judged(ctx, data, window,
                VIDEO_SCALE_PACK(460, 340)));
       r.settings.dims = VIDEO_SCALE_PACK(410, 305);
@@ -1164,7 +1164,7 @@ static void native_wl_updates(const gfx_ctx_driver_t *ctx, void *data,
       CHECK(state->common.request.settings.dims == r.settings.dims);
 
       /* Its own size back is no edit: that resize still goes out */
-      native_wl_kwin_size(screen, 470, 350);
+      native_wl_kwin_size(&r, 470, 350);
       CHECK(native_wl_wait_judged(ctx, data, window,
                VIDEO_SCALE_PACK(470, 350)));
       r.settings.dims = VIDEO_SCALE_PACK(470, 350);
@@ -1245,6 +1245,7 @@ static void native_wl_saves(const gfx_ctx_driver_t *ctx, void *data,
    /* The first configure is the compositor's, however late it is taken.
     * The harness's KWin has a rule that sizes Screen 7's window then. */
    r.screens    = 1u << 6;
+   r.name[0]    = '\0';
    ctx->windows->destroy(data, window);
    r.generation = video_driver_window_generation();
    CHECK(ctx->windows->create(data, &r, window));
@@ -1259,6 +1260,7 @@ static void native_wl_saves(const gfx_ctx_driver_t *ctx, void *data,
 
    /* Mapped and settled: nothing */
    r.screens = request->screens;
+   strlcpy(r.name, request->name, sizeof(r.name));
    native_wl_replace(ctx, data, &r, window);
    state     = (wl_video_window_t*)window->state;
    native_window_settle(ctx, data, &r, VIDEO_WINDOW_SETTLE_USEC + 100000);
@@ -1272,7 +1274,7 @@ static void native_wl_saves(const gfx_ctx_driver_t *ctx, void *data,
       native_wl_rescale(state, 2);
       native_window_settle(ctx, data, &r, 50000);
       native_wl_no_save("rescaled", &saves);
-      native_wl_kwin(video_window_title_screen(&r),
+      native_wl_kwin(&r,
             "var g = w.frameGeometry, c = w.clientGeometry;"
             " w.frameGeometry = {x: g.x, y: g.y,"
             " width: 390 + g.width - c.width,"
@@ -1319,7 +1321,7 @@ static void native_wl_saves(const gfx_ctx_driver_t *ctx, void *data,
    /* Settled again, the user's size is saved */
    native_window_settle(ctx, data, &r, VIDEO_WINDOW_SETTLE_USEC + 100000);
    native_wl_no_save("settling again", &saves);
-   native_wl_kwin(video_window_title_screen(&r),
+   native_wl_kwin(&r,
          "var g = w.frameGeometry, c = w.clientGeometry;"
          " w.frameGeometry = {x: g.x, y: g.y,"
          " width: 400 + g.width - c.width,"
@@ -1347,7 +1349,7 @@ static void native_wl_saves(const gfx_ctx_driver_t *ctx, void *data,
    oi      = native_wl_output(wl, 1);
    ((const struct wl_output_listener*)wl_proxy_get_listener(
          (struct wl_proxy*)oi->output))->done(oi, oi->output);
-   native_wl_kwin(video_window_title_screen(&r),
+   native_wl_kwin(&r,
          "var g = w.frameGeometry, c = w.clientGeometry;"
          " w.frameGeometry = {x: g.x, y: g.y,"
          " width: 380 + g.width - c.width,"
@@ -1366,7 +1368,7 @@ static void native_wl_saves(const gfx_ctx_driver_t *ctx, void *data,
             " KWin's resize came after the settle\n");
    native_window_settle(ctx, data, &r, VIDEO_WINDOW_SETTLE_USEC + 100000);
    saves = native_window_saves;
-   native_wl_kwin(video_window_title_screen(&r),
+   native_wl_kwin(&r,
          "var g = w.frameGeometry, c = w.clientGeometry;"
          " w.frameGeometry = {x: g.x, y: g.y,"
          " width: 370 + g.width - c.width,"
@@ -1388,6 +1390,7 @@ static void native_wl_lifecycle(const gfx_ctx_driver_t *ctx, void *data,
    gfx_ctx_wayland_data_t *wl = (gfx_ctx_wayland_data_t*)data;
    wl_video_window_t *state   = (wl_video_window_t*)window->state;
    unsigned count             = (unsigned)wl_list_length(&wl->all_outputs);
+   char title[64];
    bool kwin                  = native_wl_kwin_dir() != NULL;
    bool decorated             = false;
 #ifdef HAVE_THREADS
@@ -1446,7 +1449,7 @@ static void native_wl_lifecycle(const gfx_ctx_driver_t *ctx, void *data,
 
    /* The title as the compositor has it: exactly this screen's, on one
     * window only, which KWin then sizes to say so */
-   if (native_wl_kwin(video_window_title_screen(request),
+   if (native_wl_kwin(request,
             "if (n == 1) { var g = w.frameGeometry, c = w.clientGeometry;"
             " w.frameGeometry = {x: g.x, y: g.y,"
             " width: 380 + g.width - c.width,"
@@ -1455,16 +1458,18 @@ static void native_wl_lifecycle(const gfx_ctx_driver_t *ctx, void *data,
       if (!(native_window_wait(ctx, data, request, window,
                   NATIVE_EVENT(GEOMETRY), native_wl_buffer(state, 380, 290))
                & NATIVE_EVENT(GEOMETRY)))
-         fprintf(stderr, "native wayland: no window captioned \""
-               NATIVE_TITLE "%u\" alone\n",
-               video_window_title_screen(request) + 1);
+      {
+         video_window_title(request, title, sizeof(title));
+         fprintf(stderr, "native wayland: no window captioned \"%s\""
+               " alone\n", title);
+      }
    }
    else
       fprintf(stderr, "native wayland: titles not readable without"
             " KWin\n");
 
    /* Resized by the compositor, then by the frontend */
-   if (native_wl_kwin(video_window_title_screen(request),
+   if (native_wl_kwin(request,
             "var g = w.frameGeometry, c = w.clientGeometry;"
             " w.frameGeometry = {x: g.x, y: g.y,"
             " width: 400 + g.width - c.width,"
@@ -1526,8 +1531,7 @@ static void native_wl_lifecycle(const gfx_ctx_driver_t *ctx, void *data,
       CHECK(!window->presentable);
       CHECK(!ctx->windows->present_gl
             || !ctx->windows->present_gl(data, window));
-      native_wl_kwin(video_window_title_screen(request),
-            "w.minimized = false;");
+      native_wl_kwin(request, "w.minimized = false;");
       native_window_wait(ctx, data, request, window,
             NATIVE_EVENT(RESUME), 0);
       CHECK(window->presentable);
@@ -1565,8 +1569,7 @@ static void native_wl_lifecycle(const gfx_ctx_driver_t *ctx, void *data,
       {
          native_wl_wait_focus(ctx, data, request, window, false,
                "w.minimized = true;");
-         native_wl_kwin(video_window_title_screen(request),
-               "w.minimized = false;");
+         native_wl_kwin(request, "w.minimized = false;");
          native_window_wait(ctx, data, request, window,
                NATIVE_EVENT(RESUME), 0);
       }
@@ -1628,7 +1631,7 @@ static void native_wl_lifecycle(const gfx_ctx_driver_t *ctx, void *data,
    /* What is still queued for the closed window - a resize and a close
     * by the compositor, focus by the seat - cannot reach the one that
     * replaces it */
-   native_wl_kwin(video_window_title_screen(request),
+   native_wl_kwin(request,
          "var g = w.frameGeometry;"
          " w.frameGeometry = {x: g.x, y: g.y, width: 500, height: 400};"
          " w.closeWindow();");
@@ -1673,7 +1676,7 @@ static void native_wl_lifecycle(const gfx_ctx_driver_t *ctx, void *data,
       native_wl_map(ctx, data, &one);
       native_window_settle(ctx, data, &spare, 100000);
       if (     one.state
-            && native_wl_kwin(0,
+            && native_wl_kwin(&spare,
                "if (n == 1) { var g = w.frameGeometry, c = w.clientGeometry;"
                " w.frameGeometry = {x: g.x, y: g.y,"
                " width: 390 + g.width - c.width,"
@@ -1682,8 +1685,11 @@ static void native_wl_lifecycle(const gfx_ctx_driver_t *ctx, void *data,
                   NATIVE_EVENT(GEOMETRY),
                   native_wl_buffer((wl_video_window_t*)one.state, 390, 280))
                & NATIVE_EVENT(GEOMETRY)))
-         fprintf(stderr, "native wayland: no window captioned \""
-               NATIVE_TITLE "1\" alone\n");
+      {
+         video_window_title(&spare, title, sizeof(title));
+         fprintf(stderr, "native wayland: no window captioned \"%s\""
+               " alone\n", title);
+      }
       ctx->windows->destroy(data, &one);
       CHECK(!native_window_settle(ctx, data, &spare, 50000));
    }

@@ -61,24 +61,66 @@ void video_views_xr_normalize(video_screen_xr_t *screen)
    screen->scale = video_views_xr_value(screen->scale, 0.1f, 10.0f, 1.0f);
 }
 
-bool video_views_validate(const struct retro_video_view *views,
-      unsigned num_views, video_views_map_t *out)
+/* A core's screen name: cut to fit without splitting a UTF-8
+ * sequence, control characters as spaces. */
+static void video_views_screen_name(char *s, const char *name)
+{
+   size_t i;
+   size_t len = 0;
+   if (name)
+   {
+      while (len < VIDEO_VIEWS_NAME_SIZE - 1 && name[len])
+         len++;
+      if (((unsigned char)name[len] & 0xC0) == 0x80)
+      {
+         while (len && ((unsigned char)name[len - 1] & 0xC0) == 0x80)
+            len--;
+         if (len && (unsigned char)name[len - 1] >= 0xC0)
+            len--;
+      }
+   }
+   for (i = 0; i < len; i++)
+   {
+      unsigned char c = (unsigned char)name[i];
+      s[i]            = (c < 0x20 || c == 0x7f) ? ' ' : (char)c;
+   }
+   s[len] = '\0';
+}
+
+/* Screen-indexed arrays across the views code are RETRO_VIDEO_VIEWS_MAX
+ * long. */
+typedef char video_views_screens_fit[
+   (RETRO_VIDEO_SCREENS_MAX <= RETRO_VIDEO_VIEWS_MAX) ? 1 : -1];
+
+/* The map's rules, with screen information when @num_scr is not 0. */
+static bool video_views_screen_validate(
+      const struct retro_video_view *views, unsigned num_views,
+      const struct retro_video_screen *scr, unsigned num_scr,
+      video_views_map_t *out, video_views_screens_t *screens)
 {
    unsigned i;
-   unsigned num_screens = 0;
+   unsigned num_screens = num_scr;
+   unsigned max_screen  = num_scr ? num_scr : RETRO_VIDEO_VIEWS_MAX;
+   unsigned no_input    = 0;
+   unsigned viewless    = 0;
    unsigned count_none[RETRO_VIDEO_VIEWS_MAX];
    unsigned count_left[RETRO_VIDEO_VIEWS_MAX];
    unsigned count_right[RETRO_VIDEO_VIEWS_MAX];
    int left[RETRO_VIDEO_VIEWS_MAX];
    int right[RETRO_VIDEO_VIEWS_MAX];
+   int partner[RETRO_VIDEO_VIEWS_MAX];
 
    if (num_views == 0)
    {
       if (out)
          memset(out, 0, sizeof(*out));
+      if (screens)
+         memset(screens, 0, sizeof(*screens));
       return true;
    }
    if (!views || num_views > RETRO_VIDEO_VIEWS_MAX)
+      return false;
+   if (num_scr > RETRO_VIDEO_SCREENS_MAX || (num_scr && !scr))
       return false;
 
    for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
@@ -86,6 +128,7 @@ bool video_views_validate(const struct retro_video_view *views,
       count_none [i] = 0;
       count_left [i] = 0;
       count_right[i] = 0;
+      partner    [i] = -1;
    }
 
    for (i = 0; i < num_views; i++)
@@ -95,7 +138,7 @@ bool video_views_validate(const struct retro_video_view *views,
          return false;
       if (v->x > UINT_MAX - v->width || v->y > UINT_MAX - v->height)
          return false;
-      if (v->screen >= RETRO_VIDEO_VIEWS_MAX)
+      if (v->screen >= max_screen)
          return false;
       /* Rejects infinities too; NaN falls through to width / height. */
       if (     v->aspect_ratio > 0.0f
@@ -117,8 +160,48 @@ bool video_views_validate(const struct retro_video_view *views,
          default:
             return false;
       }
-      if (v->screen + 1 > num_screens)
+      if (!num_scr && v->screen + 1 > num_screens)
          num_screens = v->screen + 1;
+   }
+
+   for (i = 0; i < num_scr; i++)
+   {
+      const struct retro_video_screen *s = &scr[i];
+      if (s->image)
+         return false;
+      if (     s->show   > RETRO_VIDEO_SCREEN_SHOW_OVER
+            || s->state  > RETRO_VIDEO_SCREEN_STATE_ABSENT
+            || s->base  >= num_scr
+            || s->anchor > RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT)
+         return false;
+      /* Written so NaN fails. */
+      if (!(s->size >= 0.0f) || s->size > FLT_MAX)
+         return false;
+      if (!(s->opacity >= 0.0f && s->opacity <= 1.0f))
+         return false;
+      /* A base that is not OVER is not the screen itself. */
+      if (     s->show == RETRO_VIDEO_SCREEN_SHOW_OVER
+            && (   scr[s->base].show == RETRO_VIDEO_SCREEN_SHOW_OVER
+                || s->size > 1.0f))
+         return false;
+      if ((s->flags & RETRO_VIDEO_SCREEN_FLAG_PRIVATE) && !s->owners)
+         return false;
+      /* order is 0 on every screen or on none. */
+      if (!s->order != !scr[0].order)
+         return false;
+      if (s->swap_with)
+      {
+         unsigned t = s->swap_with - 1;
+         if (s->swap_with > num_scr || t == i)
+            return false;
+         if (     (partner[i] >= 0 && partner[i] != (int)t)
+               || (partner[t] >= 0 && partner[t] != (int)i))
+            return false;
+         partner[i] = (int)t;
+         partner[t] = (int)i;
+      }
+      if (s->flags & RETRO_VIDEO_SCREEN_FLAG_NO_INPUT)
+         no_input |= 1u << i;
    }
 
    for (i = 0; i < num_screens; i++)
@@ -129,6 +212,12 @@ bool video_views_validate(const struct retro_video_view *views,
             && views[left[i]].width  == views[right[i]].width
             && views[left[i]].height == views[right[i]].height)
          continue;
+      if (     !count_none[i] && !count_left[i] && !count_right[i]
+            && num_scr && scr[i].state == RETRO_VIDEO_SCREEN_STATE_ABSENT)
+      {
+         viewless |= 1u << i;
+         continue;
+      }
       return false;
    }
 
@@ -138,8 +227,62 @@ bool video_views_validate(const struct retro_video_view *views,
       memcpy(out->views, views, num_views * sizeof(*views));
       out->num_views   = num_views;
       out->num_screens = num_screens;
+      out->no_input    = no_input;
+      out->viewless    = viewless;
+   }
+   if (screens)
+   {
+      memset(screens, 0, sizeof(*screens));
+      for (i = 0; i < num_scr; i++)
+      {
+         const struct retro_video_screen *s = &scr[i];
+         video_views_screen_t *d            = &screens->screens[i];
+         d->flags     = s->flags;
+         d->state     = s->state;
+         d->show      = s->show;
+         d->base      = s->base;
+         d->anchor    = s->anchor;
+         d->order     = s->order;
+         d->owners    = s->owners;
+         d->swap_with = s->swap_with;
+         d->group     = s->group;
+         d->size      = s->size;
+         d->opacity   = s->opacity;
+         video_views_screen_name(d->name, s->name);
+      }
+      screens->count = num_scr;
    }
    return true;
+}
+
+bool video_views_validate(const struct retro_video_view *views,
+      unsigned num_views, video_views_map_t *out)
+{
+   return video_views_screen_validate(views, num_views, NULL, 0,
+         out, NULL);
+}
+
+bool video_views_validate_map(const struct retro_video_views *in,
+      video_views_map_t *out, video_views_screens_t *screens)
+{
+   /* Without the flag, the struct may end at recommended_view_height. */
+   if (!(in->flags & RETRO_VIDEO_VIEWS_FLAG_SCREENS))
+      return video_views_screen_validate(in->views, in->num_views,
+            NULL, 0, out, screens);
+   return video_views_screen_validate(in->views, in->num_views,
+         in->screens, in->num_screens, out, screens);
+}
+
+void video_views_names_publish(video_views_names_box_t *box,
+      const video_views_names_t *names)
+{
+   retro_seqlatch_publish(&box->seq, box->words, names, sizeof(*names));
+}
+
+int video_views_names_read(video_views_names_box_t *box,
+      video_views_names_t *out)
+{
+   return retro_seqlatch_read(&box->seq, box->words, out, sizeof(*out));
 }
 
 bool video_views_fit_frame(const video_views_map_t *map,
@@ -229,7 +372,9 @@ bool video_views_eye_pair(const video_views_map_t *map, int eyes[2])
          break;
       eyes[e] = (int)i;
    }
-   if (i < map->num_views || eyes[0] < 0 || eyes[1] < 0)
+   if (     i < map->num_views || eyes[0] < 0 || eyes[1] < 0
+         || (map->left_out & (  (1u << map->views[eyes[0]].screen)
+                              | (1u << map->views[eyes[1]].screen))))
    {
       eyes[0] = -1;
       eyes[1] = -1;
@@ -242,7 +387,7 @@ bool video_views_select_screens(const video_views_map_t *map,
       unsigned first, unsigned count, video_views_map_t *out,
       unsigned *index)
 {
-   unsigned i;
+   unsigned i, mask;
    memset(out, 0, sizeof(*out));
    if (!map || first >= map->num_screens || !count)
       return false;
@@ -257,9 +402,16 @@ bool video_views_select_screens(const video_views_map_t *map,
       out->views[out->num_views]          = *v;
       out->views[out->num_views++].screen = v->screen - first;
    }
-   /* Every screen of a validated map has a view. */
+   if (!out->num_views)
+      return false;
+   /* Selected screens with no view count too; viewless marks them. */
+   mask             = (1u << count) - 1;
    out->num_screens = count;
-   return out->num_views != 0;
+   out->no_input    = (map->no_input >> first) & mask;
+   out->viewless    = (map->viewless >> first) & mask;
+   out->left_out    = (map->left_out >> first) & mask;
+   out->blank       = (map->blank    >> first) & mask;
+   return true;
 }
 
 bool video_views_snapshot(const video_views_map_t *map,
@@ -294,6 +446,7 @@ static void video_views_fit(const video_views_layout_params_t *p,
    unsigned cw   = VIDEO_SCALE_W(cdims);
    unsigned ch   = VIDEO_SCALE_H(cdims);
    bool vertical = (p->screen_layout != VIDEO_SCREEN_LAYOUT_HORIZONTAL);
+   unsigned skip = p->exclude_screens | map->viewless | map->left_out;
 
    if (count == 1 && p->stretch && !p->scale_integer)
    {
@@ -312,7 +465,7 @@ static void video_views_fit(const video_views_layout_params_t *p,
    {
       const struct retro_video_view *v;
       double w, h, aspect;
-      if (p->exclude_screens & (1u << s))
+      if (skip & (1u << s))
          continue;
       v      = &map->views[video_views_find(map, s, RETRO_VIDEO_VIEW_EYE_NONE)];
       w      = v->width;
@@ -354,7 +507,7 @@ static void video_views_fit(const video_views_layout_params_t *p,
       double x, y;
       int x0, y0;
       double w, h;
-      if (p->exclude_screens & (1u << s))
+      if (skip & (1u << s))
          continue;
       w = disp_w[s] * scale;
       h = disp_h[s] * scale;
@@ -400,7 +553,7 @@ void video_views_layout(const video_views_layout_params_t *p,
       video_views_layout_t *out)
 {
    unsigned a, s, count = 0, first = 0;
-   unsigned w, h, cdims;
+   unsigned w, h, cdims, skip;
    video_views_rect_t fit[RETRO_VIDEO_VIEWS_MAX];
    const video_views_map_t *map = p->map;
 
@@ -410,8 +563,9 @@ void video_views_layout(const video_views_layout_params_t *p,
    if (!map || !map->num_views || !w || !h)
       return;
 
+   skip = p->exclude_screens | map->viewless | map->left_out;
    for (s = 0; s < map->num_screens; s++)
-      if (!(p->exclude_screens & (1u << s)))
+      if (!(skip & (1u << s)))
       {
          first = s;
          count++;
@@ -469,11 +623,13 @@ void video_views_layout(const video_views_layout_params_t *p,
       for (s = 0; s < map->num_screens; s++)
       {
          video_views_placement_t *pl;
-         if (p->exclude_screens & (1u << s))
+         if (skip & (1u << s))
             continue;
          pl = &out->placements[out->num_placements++];
          pl->view = (unsigned)video_views_find(map, s, eye);
          pl->area = a;
+         if (map->blank & (1u << s))
+            pl->flags = VIDEO_VIEWS_PLACEMENT_BLANK;
          video_views_place(&fit[s], cdims, &out->areas[a], &pl->dst);
       }
    }
@@ -485,12 +641,15 @@ void video_views_touch_publish(video_views_touch_t *t,
 {
    unsigned i;
    retro_atomic_fetch_add_seq_cst_int(&t->seq, 1);
-   t->count = 0;
+   t->count    = 0;
+   t->no_input = 0;
    for (i = 0; layout && i < layout->num_placements
          && i < RETRO_VIDEO_VIEWS_MAX; i++)
    {
       t->dst[i] = layout->placements[i].dst;
       t->src[i] = map->views[index[layout->placements[i].view]];
+      if (map->no_input & (1u << t->src[i].screen))
+         t->no_input |= 1u << i;
       t->count++;
    }
    t->dims       = dims;
@@ -507,10 +666,11 @@ bool video_views_touch_point(video_views_touch_t *t, int x, int y,
       long px, py;
       video_views_rect_t dst[RETRO_VIDEO_VIEWS_MAX];
       struct retro_video_view src[RETRO_VIDEO_VIEWS_MAX];
-      int seq        = retro_atomic_load_acquire_int(&t->seq);
-      unsigned count = t->count;
-      unsigned dims  = t->dims;
-      unsigned fdims = t->frame_dims;
+      int seq           = retro_atomic_load_acquire_int(&t->seq);
+      unsigned count    = t->count;
+      unsigned no_input = t->no_input;
+      unsigned dims     = t->dims;
+      unsigned fdims    = t->frame_dims;
       if (seq & 1)
          continue;
       memcpy(dst, t->dst, sizeof(dst));
@@ -533,6 +693,8 @@ bool video_views_touch_point(video_views_touch_t *t, int x, int y,
          long dy = VIDEO_POS_Y(dst[i].pos);
          long dw = (long)VIDEO_SCALE_W(dst[i].dims);
          long dh = (long)VIDEO_SCALE_H(dst[i].dims);
+         if (no_input & (1u << i))
+            continue;
          if (px < dx || py < dy || px >= dx + dw || py >= dy + dh)
             continue;
          /* That point of the view, in the packed frame */
@@ -693,6 +855,7 @@ bool video_views_first_drawn(const video_views_layout_t *layout,
       video_views_rect_t r;
       const video_views_placement_t *p = &layout->placements[i];
       if (     p->view == view
+            && !(p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
             && (all_areas || p->area == 0)
             && video_views_visible(layout, p, dims, &r))
       {
@@ -739,11 +902,14 @@ bool video_views_map_point(const video_views_layout_t *layout,
    unsigned i;
    int best      = -1;
    double best_d = 0.0;
+   bool no_input = false;
    const video_views_placement_t *pl;
    const struct retro_video_view *ref;
    int cx, cy, r, dst_w, dst_h;
    int16_t px, py;
 
+   if (!map->num_views)
+      return false;
    for (i = 0; i < layout->num_placements; i++)
    {
       const video_views_rect_t *d = &layout->placements[i].dst;
@@ -753,6 +919,12 @@ bool video_views_map_point(const video_views_layout_t *layout,
          continue;
       if (!VIDEO_SCALE_W(d->dims) || !VIDEO_SCALE_H(d->dims))
          continue;
+      if (map->no_input
+            & (1u << map->views[layout->placements[i].view].screen))
+      {
+         no_input = true;
+         continue;
+      }
       dist = video_views_rect_dist(d, x, y);
       if (best < 0 || dist < best_d)
       {
@@ -762,9 +934,10 @@ bool video_views_map_point(const video_views_layout_t *layout,
             break;
       }
    }
-   if (best < 0 || !map->num_views)
+   if (best < 0 && !no_input)
       return false;
-   if (best_d > 0.0 && report_oob)
+   /* Off every view, or only NO_INPUT screens placed */
+   if (best < 0 || (best_d > 0.0 && report_oob))
    {
       *res_pos = VIDEO_POS_PACK(-0x8000, -0x8000);
       return true;

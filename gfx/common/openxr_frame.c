@@ -28,85 +28,23 @@
 #include "openxr_frame.h"
 
 #include "../video_defines.h"
+#include "../video_driver.h"
 #include "../font_driver.h"
 #include "../../msg_hash.h"
 
 #include "../../runloop.h"
 #include "../../verbosity.h"
 
-/* The seqlock's copy holds the largest thing it publishes. */
-#define OPENXR_SEQ_WORDS \
-   ((OPENXR_WORDS(openxr_grabs_t) > OPENXR_WORDS(video_xr_quad_set_t)) \
-    ? OPENXR_WORDS(openxr_grabs_t) : OPENXR_WORDS(video_xr_quad_set_t))
-typedef char openxr_seq_fits[
-      (   OPENXR_WORDS(openxr_tracked_t)    <= OPENXR_SEQ_WORDS
-       && OPENXR_WORDS(openxr_screens_t)    <= OPENXR_SEQ_WORDS
-       && OPENXR_WORDS(openxr_projection_t) <= OPENXR_SEQ_WORDS
-       && OPENXR_WORDS(openxr_aims_t)       <= OPENXR_SEQ_WORDS)
-      ? 1 : -1];
-
-/* A latched seqlock: two copies of the words, one writer, any number
- * of readers. The writer stamps odd and stores copy 0, stamps even and
- * stores copy 1; a reader reads the copy the stamp says is not being
- * stored - copy 1 while it is odd, copy 0 while it is even - so a
- * writer stopped part way through holds no reader up. A reader starts
- * over only when the writer has got through a whole copy during its
- * read, which is the writer going on, never waiting for it. */
-static void openxr_seq_store(retro_atomic_int_t *words,
-      const int *tmp, size_t n)
-{
-   size_t i;
-   for (i = 0; i < n; i++)
-      retro_atomic_store_relaxed_int(&words[i], tmp[i]);
-}
-
-static void openxr_seq_publish(retro_atomic_int_t *seq,
-      retro_atomic_int_t *words, const void *src, size_t len)
-{
-   int tmp[OPENXR_SEQ_WORDS];
-   size_t n = (len + sizeof(int) - 1) / sizeof(int);
-   int s    = retro_atomic_load_relaxed_int(seq);
-
-   tmp[n - 1] = 0;
-   memcpy(tmp, src, len);
-   retro_atomic_store_release_int(seq, (int)((unsigned)s + 1u));
-   retro_atomic_thread_fence_release();
-   openxr_seq_store(words, tmp, n);
-   retro_atomic_store_release_int(seq, (int)((unsigned)s + 2u));
-   retro_atomic_thread_fence_release();
-   openxr_seq_store(words + n, tmp, n);
-}
-
-static void openxr_seq_read(retro_atomic_int_t *seq,
-      retro_atomic_int_t *words, void *dst, size_t len)
-{
-   int tmp[OPENXR_SEQ_WORDS];
-   size_t n = (len + sizeof(int) - 1) / sizeof(int);
-   for (;;)
-   {
-      size_t i;
-      int s1                         = retro_atomic_load_acquire_int(seq);
-      const retro_atomic_int_t *copy = words + ((s1 & 1) ? n : 0);
-      for (i = 0; i < n; i++)
-         tmp[i] = retro_atomic_load_relaxed_int(
-               (retro_atomic_int_t*)&copy[i]);
-      retro_atomic_thread_fence_acquire();
-      if (retro_atomic_load_relaxed_int(seq) == s1)
-         break;
-   }
-   memcpy(dst, tmp, len);
-}
-
 static void openxr_frame_publish_tracked(openxr_frame_t *f)
 {
-   openxr_seq_publish(&f->tracked_seq, f->tracked_words,
+   retro_seqlatch_publish(&f->tracked_seq, f->tracked_words,
          &f->tracked, sizeof(f->tracked));
 }
 
 static void openxr_frame_read_tracked(openxr_frame_t *f,
       openxr_tracked_t *out)
 {
-   openxr_seq_read(&f->tracked_seq, f->tracked_words,
+   retro_seqlatch_read(&f->tracked_seq, f->tracked_words,
          out, sizeof(*out));
 }
 
@@ -283,7 +221,7 @@ static unsigned openxr_frame_layers(openxr_frame_t *f, XrTime time,
    unsigned n                 = 0;
    bool seen                  = false;
    video_xr_quad_set_t *quads = &f->shown;
-   openxr_seq_read(&f->quads_seq, f->quads_words,
+   retro_seqlatch_read(&f->quads_seq, f->quads_words,
          quads, sizeof(*quads));
    openxr_frame_hold(f, time, quads);
    f->backs      = 0;
@@ -385,7 +323,7 @@ static bool openxr_frame_projection(openxr_frame_t *f,
    openxr_projection_t p;
    openxr_slot_t *slot       = &f->sc->slots[OPENXR_PROJECTION_SLOT];
    const openxr_track_t *t   = f->track;
-   openxr_seq_read(&f->proj_seq, f->proj_words, &p, sizeof(p));
+   retro_seqlatch_read(&f->proj_seq, f->proj_words, &p, sizeof(p));
    if (     !p.active
          || !(chains = openxr_frame_chains(slot, &dims, &count))
          || count < 2
@@ -499,7 +437,7 @@ static void openxr_frame_place_screens(openxr_frame_t *f, XrTime time)
    /* Outside edit mode nothing is published: no copy. */
    if (grabs != f->grabs_read)
    {
-      openxr_seq_read(&f->grabs_seq, f->grabs_words, &f->grabs,
+      retro_seqlatch_read(&f->grabs_seq, f->grabs_words, &f->grabs,
             sizeof(f->grabs));
       f->grabs_read = grabs;
    }
@@ -547,7 +485,7 @@ static void openxr_frame_place_screens(openxr_frame_t *f, XrTime time)
       f->lazy_time    = time;
       f->screens.pose = f->lazy;
    }
-   openxr_seq_publish(&f->screens_seq, f->screens_words,
+   retro_seqlatch_publish(&f->screens_seq, f->screens_words,
          &f->screens, sizeof(f->screens));
 }
 
@@ -654,6 +592,23 @@ static void openxr_frame_ask_rate(openxr_frame_t *f)
             (int)res);
 }
 
+/* The dot made again once the screen names have moved past those its
+ * tags show: only in edit mode, where they show, and at most once a
+ * second, since a core may rename its screens every frame. */
+static void openxr_frame_cursor_due(openxr_frame_t *f)
+{
+   retro_time_t now;
+   if (     !f->cursor || !f->cursor_remake || !f->grabs.editing
+         || video_driver_screen_names_stamp() == f->names_baked
+         || openxr_frame_cursor_w(f) < VIDEO_XR_CURSOR_TAGGED_W)
+      return;
+   now = cpu_features_get_time_usec();
+   if (now < f->cursor_retry_usec)
+      return;
+   f->cursor_retry_usec = now + 1000000;
+   f->cursor_remake(f->cursor_user);
+}
+
 /* xrWaitFrame and what every headset frame keeps, then xrBeginFrame
  * under the graphics lock, which keep_lock leaves held for the end. */
 static bool openxr_frame_wait_begin(openxr_frame_t *f,
@@ -666,6 +621,7 @@ static bool openxr_frame_wait_begin(openxr_frame_t *f,
    XrFrameBeginInfo begin_info;
 
    memset(b, 0, sizeof(*b));
+   openxr_frame_cursor_due(f);
    wait_info.type = XR_TYPE_FRAME_WAIT_INFO;
    wait_info.next = NULL;
    state.type = XR_TYPE_FRAME_STATE;
@@ -1021,11 +977,11 @@ void openxr_frame_session_created(openxr_frame_t *f)
    f->lazy_valid   = false;
    f->track        = NULL;
    openxr_frame_publish_tracked(f);
-   openxr_seq_publish(&f->screens_seq, f->screens_words,
+   retro_seqlatch_publish(&f->screens_seq, f->screens_words,
          &f->screens, sizeof(f->screens));
    f->grabs      = openxr_frame_no_grabs;
    f->grabs_read = retro_atomic_load_acquire_int(&f->grabs_seq);
-   openxr_seq_publish(&f->aims_seq, f->aims_words,
+   retro_seqlatch_publish(&f->aims_seq, f->aims_words,
          &openxr_frame_no_aims, sizeof(openxr_frame_no_aims));
    retro_atomic_store_release_int(&f->recenter, 0);
    openxr_frame_list_rates(f);
@@ -1127,6 +1083,7 @@ bool openxr_frame_start(openxr_frame_t *f)
    f->asked_perf    = -1;
    f->perf_applied  = 0;
    f->perf_retry_usec = 0;
+   f->cursor_retry_usec = 0;
    f->frame_failed  = false;
    retro_atomic_store_release_int(&f->thread_started, 0);
    retro_atomic_store_release_int(&f->quit, 0);
@@ -1187,6 +1144,7 @@ bool openxr_frame_start_inline(openxr_frame_t *f)
    f->asked_perf     = -1;
    f->perf_applied   = 0;
    f->perf_retry_usec = 0;
+   f->cursor_retry_usec = 0;
    f->frame_failed   = false;
    f->pace_anchor_ns = 0;
    f->inline_host    = true;
@@ -1262,7 +1220,7 @@ void openxr_frame_clear_quads(openxr_frame_t *f)
 {
    video_xr_quad_set_t none;
    memset(&none, 0, sizeof(none));
-   openxr_seq_publish(&f->quads_seq, f->quads_words, &none, sizeof(none));
+   retro_seqlatch_publish(&f->quads_seq, f->quads_words, &none, sizeof(none));
 }
 
 XrTime openxr_frame_predicted_time(openxr_frame_t *f)
@@ -1390,30 +1348,30 @@ void openxr_frame_request_rate(openxr_frame_t *f, float hz)
 
 void openxr_frame_publish(openxr_frame_t *f, const video_xr_quad_set_t *set)
 {
-   openxr_seq_publish(&f->quads_seq, f->quads_words, set, sizeof(*set));
+   retro_seqlatch_publish(&f->quads_seq, f->quads_words, set, sizeof(*set));
 }
 
 void openxr_frame_publish_grabs(openxr_frame_t *f, const openxr_grabs_t *g)
 {
-   openxr_seq_publish(&f->grabs_seq, f->grabs_words, g, sizeof(*g));
+   retro_seqlatch_publish(&f->grabs_seq, f->grabs_words, g, sizeof(*g));
 }
 
 void openxr_frame_publish_aims(openxr_frame_t *f, const openxr_aims_t *a)
 {
-   openxr_seq_publish(&f->aims_seq, f->aims_words, a, sizeof(*a));
+   retro_seqlatch_publish(&f->aims_seq, f->aims_words, a, sizeof(*a));
 }
 
 void openxr_frame_publish_projection(openxr_frame_t *f,
       const openxr_projection_t *p)
 {
-   openxr_seq_publish(&f->proj_seq, f->proj_words, p, sizeof(*p));
+   retro_seqlatch_publish(&f->proj_seq, f->proj_words, p, sizeof(*p));
 }
 
 void openxr_frame_clear_projection(openxr_frame_t *f)
 {
    openxr_projection_t none;
    memset(&none, 0, sizeof(none));
-   openxr_seq_publish(&f->proj_seq, f->proj_words, &none, sizeof(none));
+   retro_seqlatch_publish(&f->proj_seq, f->proj_words, &none, sizeof(none));
 }
 
 void openxr_frame_get_anchor(openxr_frame_t *f, video_xr_pose_t *anchor)
@@ -1425,7 +1383,7 @@ void openxr_frame_get_anchor(openxr_frame_t *f, video_xr_pose_t *anchor)
 
 void openxr_frame_get_quads(openxr_frame_t *f, video_xr_quad_set_t *out)
 {
-   openxr_seq_read(&f->quads_seq, f->quads_words, out, sizeof(*out));
+   retro_seqlatch_read(&f->quads_seq, f->quads_words, out, sizeof(*out));
 }
 
 void openxr_frame_set_placement(openxr_frame_t *f, unsigned placement)
@@ -1439,7 +1397,7 @@ void openxr_frame_get_shown_quads(openxr_frame_t *f,
    unsigned i;
    openxr_screens_t at;
    openxr_frame_get_quads(f, out);
-   openxr_seq_read(&f->screens_seq, f->screens_words, &at, sizeof(at));
+   retro_seqlatch_read(&f->screens_seq, f->screens_words, &at, sizeof(at));
    for (i = 0; i < out->num_quads; i++)
       video_xr_compose(&at.pose, &out->quads[i].pose,
             &out->quads[i].pose);
@@ -1450,14 +1408,14 @@ void openxr_frame_get_screens(openxr_frame_t *f, video_xr_pose_t *pose,
       XrSpace *space)
 {
    openxr_screens_t at;
-   openxr_seq_read(&f->screens_seq, f->screens_words, &at, sizeof(at));
+   retro_seqlatch_read(&f->screens_seq, f->screens_words, &at, sizeof(at));
    *pose  = at.pose;
    *space = at.view ? f->session->view_space : f->session->local_space;
 }
 
 void openxr_frame_get_aims(openxr_frame_t *f, openxr_aims_t *out)
 {
-   openxr_seq_read(&f->aims_seq, f->aims_words, out, sizeof(*out));
+   retro_seqlatch_read(&f->aims_seq, f->aims_words, out, sizeof(*out));
 }
 
 void openxr_frame_request_recenter(openxr_frame_t *f)
@@ -1548,19 +1506,24 @@ static void openxr_frame_tag_line(const font_renderer_driver_t *drv,
 #include "../font_layout.h"
 }
 
-/* Tag tag's words: the laser's, a screen's by number, the menu's. */
-static void openxr_frame_tag_text(unsigned tag, char *s, size_t len)
+/* Tag tag's words: the laser's, a screen's name or number, the
+ * menu's. */
+static void openxr_frame_tag_text(unsigned tag,
+      const video_views_names_t *names, char *s, size_t len)
 {
    if (!tag)
       strlcpy(s, msg_hash_to_str(MSG_OPENXR_EDIT_TAG_LASER), len);
    else if (tag == VIDEO_XR_MENU_SLOT + 1)
       strlcpy(s, msg_hash_to_str(MSG_OPENXR_EDIT_TAG_MENU), len);
+   else if (names && *names->name[tag - 1])
+      strlcpy(s, names->name[tag - 1], len);
    else
       snprintf(s, len, msg_hash_to_str(MSG_OPENXR_EDIT_TAG_SCREEN), tag);
 }
 
 /* Edit mode's tags into px, in the default font. */
-static void openxr_frame_cursor_tags(uint8_t *px, bool bottom_up)
+static void openxr_frame_cursor_tags(uint8_t *px, bool bottom_up,
+      const video_views_names_t *names)
 {
    unsigned i;
    int asc, desc;
@@ -1590,7 +1553,7 @@ static void openxr_frame_cursor_tags(uint8_t *px, bool bottom_up)
       for (i = 0; i < VIDEO_XR_TAGS; i++)
       {
          char text[64];
-         openxr_frame_tag_text(i, text, sizeof(text));
+         openxr_frame_tag_text(i, names, text, sizeof(text));
          memset(cov, 0, VIDEO_XR_TAG_COLS * VIDEO_XR_TAG_ROWS);
          openxr_frame_tag_line(drv, font, asc, desc, text, cov);
          video_xr_tag_pixels(px, i, cov, bottom_up);
@@ -1601,14 +1564,15 @@ static void openxr_frame_cursor_tags(uint8_t *px, bool bottom_up)
       drv->free(font);
 }
 
-void openxr_frame_cursor_pixels(uint8_t *px, unsigned w, bool bottom_up)
+void openxr_frame_cursor_pixels(uint8_t *px, unsigned w, bool bottom_up,
+      const video_views_names_t *names)
 {
    unsigned i;
    video_xr_cursor_pixels(px);
    if (w == VIDEO_XR_CURSOR_W)
       video_xr_cut_pixels(px, bottom_up);
    if (w >= VIDEO_XR_CURSOR_TAGGED_W)
-      openxr_frame_cursor_tags(px, bottom_up);
+      openxr_frame_cursor_tags(px, bottom_up, names);
    if (w < VIDEO_XR_CURSOR_W)
       for (i = 1; i < VIDEO_XR_CURSOR_H; i++)
          memmove(px + (size_t)i * w * 4,

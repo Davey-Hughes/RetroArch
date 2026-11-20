@@ -13,6 +13,7 @@
  *  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <stdio.h>
 #include <string.h>
 
 #include <retro_miscellaneous.h>
@@ -34,7 +35,11 @@ void video_windows_plan(const video_views_map_t *map,
       unsigned mode = settings ? settings[s].mode : VIDEO_WINDOW_ATTACHED;
       bool separate = route ? (route->screens & bit) != 0
          : mode == VIDEO_WINDOW_SEPARATE;
-      if (!enabled || (!route && !s))
+      if (map->viewless & bit)
+         continue;
+      if (map->left_out & bit)
+         out->hidden_mask |= bit;
+      else if (!enabled || (!route && !s))
          out->main_mask |= bit;
       else if (mode == VIDEO_WINDOW_HIDDEN)
          out->hidden_mask |= bit;
@@ -662,6 +667,15 @@ unsigned video_window_title_screen(const video_window_request_t *request)
       if (request->screens & (1u << s))
          return s;
    return request->screen;
+}
+
+size_t video_window_title(const video_window_request_t *request, char *s,
+      size_t len)
+{
+   if (*request->name)
+      return (size_t)snprintf(s, len, "RetroArch - %s", request->name);
+   return (size_t)snprintf(s, len, "RetroArch - Screen %u",
+         video_window_title_screen(request) + 1);
 }
 
 bool video_windows_blank_wanted(unsigned mode, bool game, bool flipped)

@@ -5,11 +5,13 @@ TARGET := video_views_test
 RARCH_DIR         := ../../..
 LIBRETRO_COMM_DIR := $(RARCH_DIR)/libretro-common
 
-# gfx/video_views.c is pure logic, so it builds alone; the CPU drivers'
-# composer (gfx/video_views_cpu.h) takes the scaler.
+# gfx/video_views.c and gfx/video_screen_prefs.c are pure logic, so they
+# build alone; the CPU drivers' composer (gfx/video_views_cpu.h) takes the
+# scaler.
 SOURCES := \
 	video_views_test.c \
 	$(RARCH_DIR)/gfx/video_views.c \
+	$(RARCH_DIR)/gfx/video_screen_prefs.c \
 	$(LIBRETRO_COMM_DIR)/gfx/scaler/scaler.c \
 	$(LIBRETRO_COMM_DIR)/gfx/scaler/scaler_filter.c \
 	$(LIBRETRO_COMM_DIR)/gfx/scaler/scaler_int.c \
@@ -18,7 +20,7 @@ SOURCES := \
 OBJS := $(call sample_objs,$(SOURCES:.c=.o))
 
 CFLAGS  += -Wall -std=c89 -pedantic -Werror=declaration-after-statement -g1 -O1 \
-           -I$(LIBRETRO_COMM_DIR)/include -I$(RARCH_DIR)
+           -D_GNU_SOURCE -I$(LIBRETRO_COMM_DIR)/include -I$(RARCH_DIR)
 LDFLAGS += -lm
 
 ifneq ($(SANITIZER),)

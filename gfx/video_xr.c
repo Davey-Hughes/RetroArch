@@ -344,6 +344,7 @@ void video_xr_layout(const video_xr_params_t *p, video_xr_layout_t *out)
       (p->screen_layout == VIDEO_SCREEN_LAYOUT_HORIZONTAL);
    double gap                   = VIDEO_XR_GAP * p->width;
    double edge                  = 0.0;
+   unsigned first               = RETRO_VIDEO_VIEWS_MAX;
 
    memset(out, 0, sizeof(*out));
    out->menu.z = -(p->distance - VIDEO_XR_MENU_LIFT);
@@ -365,10 +366,18 @@ void video_xr_layout(const video_xr_params_t *p, video_xr_layout_t *out)
 
    for (s = 0; s < map->num_screens; s++)
    {
-      const struct retro_video_view *v = &map->views[
+      const struct retro_video_view *v;
+      double h, aspect;
+      disp_w[s] = 0.0;
+      disp_h[s] = 0.0;
+      if (map->viewless & (1u << s))
+         continue;
+      if (first == RETRO_VIDEO_VIEWS_MAX)
+         first = s;
+      v      = &map->views[
          video_views_find(map, s, RETRO_VIDEO_VIEW_EYE_NONE)];
-      double h      = v->height;
-      double aspect = video_views_aspect(v);
+      h      = v->height;
+      aspect = video_views_aspect(v);
       if (p->rotation & 1)
       {
          h      = v->width;
@@ -377,7 +386,9 @@ void video_xr_layout(const video_xr_params_t *p, video_xr_layout_t *out)
       disp_h[s] = h;
       disp_w[s] = h * aspect;
    }
-   k = p->width / disp_w[0];
+   if (first == RETRO_VIDEO_VIEWS_MAX)
+      return;
+   k = p->width / disp_w[first];
 
    for (s = 0; s < map->num_screens; s++)
    {
@@ -385,7 +396,10 @@ void video_xr_layout(const video_xr_params_t *p, video_xr_layout_t *out)
       double h = disp_h[s] * k;
       double x = 0.0;
       double y = 0.0;
-      if (s == 0)
+      out->pos[s].z = -p->distance;
+      if (map->viewless & (1u << s))
+         continue;
+      if (s == first)
          edge = horizontal ? w / 2.0 : -h / 2.0;
       else if (horizontal)
       {
@@ -399,7 +413,6 @@ void video_xr_layout(const video_xr_params_t *p, video_xr_layout_t *out)
       }
       out->pos[s].x  = (float)x;
       out->pos[s].y  = (float)y;
-      out->pos[s].z  = -p->distance;
       out->width[s]  = (float)w;
       out->height[s] = (float)h;
       out->native[s] = VIDEO_SCALE_PACK((unsigned)(disp_w[s] + 0.5),
@@ -412,7 +425,7 @@ void video_xr_layout(const video_xr_params_t *p, video_xr_layout_t *out)
 static void video_xr_place_screens(const video_xr_params_t *p,
       const video_xr_layout_t *lay, video_xr_quad_set_t *out)
 {
-   unsigned s;
+   unsigned s, i;
    const video_views_map_t *map = p->map;
 
    for (s = 0; s < lay->count; s++)
@@ -429,7 +442,7 @@ static void video_xr_place_screens(const video_xr_params_t *p,
       video_xr_slot_t *slot = &out->slots[s];
 
       slot->base = lay->pos[s];
-      if (p->skip_screens & (1u << s))
+      if ((p->skip_screens | map->viewless | map->left_out) & (1u << s))
          continue;
       if (p->screens)
       {
@@ -443,6 +456,7 @@ static void video_xr_place_screens(const video_xr_params_t *p,
 
       slot->dims    = video_xr_screen_dims(p, (float)w, (float)h, distance,
             lay->native[s]);
+      slot->blank   = (map->blank & (1u << s)) != 0;
       slot->view[0] = left;
       if (left != right)
       {
@@ -460,6 +474,9 @@ static void video_xr_place_screens(const video_xr_params_t *p,
                0, &pose, (float)w, (float)h);
       }
    }
+   for (i = 0; i < out->num_quads; i++)
+      if (map->no_input & (1u << out->quads[i].screen))
+         out->quads[i].no_input = true;
 }
 
 /* The UI's image: its own size, but no more than VIDEO_XR_MENU_DENSITY
@@ -484,8 +501,30 @@ static unsigned video_xr_menu_dims(const video_xr_params_t *p,
          VIDEO_SCALE_PACK(w, h), p->max_dim);
 }
 
+/* The first screen shown, past those left out or hidden; or
+ * RETRO_VIDEO_VIEWS_MAX for none, or when it is the projection's,
+ * hidden or not. */
+static unsigned video_xr_first_placed(const video_xr_params_t *p,
+      const video_xr_layout_t *lay)
+{
+   unsigned s;
+   unsigned gone = 0;
+   if (p->map && p->map->num_views)
+      gone = p->map->viewless | p->map->left_out;
+   for (s = 0; s < lay->count; s++)
+   {
+      if (gone & (1u << s))
+         continue;
+      if (p->skip_screens & (1u << s))
+         break;
+      if (!p->screens || p->screens[s].visible)
+         return s;
+   }
+   return RETRO_VIDEO_VIEWS_MAX;
+}
+
 /* At its own spot; or with menu_follow VIDEO_XR_MENU_LIFT in front of
- * screen 0, facing as it does, while screen 0 floats and shows. Following, it
+ * the first screen shown, facing as it does. Following, it
  * comes no nearer than VIDEO_XR_MENU_NEAREST, and w and h scale with
  * its distance so it looks as large as at its spot; facing away from
  * the anchor, where no laser reaches it, it stays at its spot. */
@@ -495,20 +534,20 @@ static void video_xr_menu_spot(const video_xr_params_t *p,
 {
    video_xr_pose_t local, lift;
    video_screen_xr_t screen;
-   bool follow = p->menu_follow && lay->count && !(p->skip_screens & 1u);
-   if (follow && p->screens)
-   {
-      screen = p->screens[0];
-      video_views_xr_normalize(&screen);
-      follow = screen.visible;
-   }
-   if (!follow)
+   unsigned first = video_xr_first_placed(p, lay);
+   if (!p->menu_follow || first == RETRO_VIDEO_VIEWS_MAX)
    {
       video_xr_item_pose(&lay->menu, NULL, &local);
       video_xr_compose(&p->anchor, &local, pose);
       return;
    }
-   video_xr_item_pose(&lay->pos[0], p->screens ? &screen : NULL, &local);
+   if (p->screens)
+   {
+      screen = p->screens[first];
+      video_views_xr_normalize(&screen);
+   }
+   video_xr_item_pose(&lay->pos[first], p->screens ? &screen : NULL,
+         &local);
    video_xr_pose_identity(&lift);
    lift.position.z = VIDEO_XR_MENU_LIFT;
    video_xr_compose(&local, &lift, &local);
@@ -755,6 +794,8 @@ bool video_xr_quad_to_frame(const video_xr_quad_t *q, float u, float v,
       if ((r = video_views_find(map, q->screen,
                   RETRO_VIDEO_VIEW_EYE_NONE)) < 0)
          return false;
+      if (map->no_input & (1u << q->screen))
+         return false;
       x0 = map->views[r].x;
       y0 = map->views[r].y;
       w  = map->views[r].width;
@@ -862,7 +903,7 @@ bool video_xr_quad_live(const video_xr_quad_t *q, unsigned laser,
 {
    if (laser == VIDEO_XR_LIVE_EDIT)
       return true;
-   if (laser == VIDEO_OPENXR_LASER_OFF)
+   if (laser == VIDEO_OPENXR_LASER_OFF || q->no_input)
       return false;
    switch (q->kind)
    {

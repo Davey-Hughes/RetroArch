@@ -4865,6 +4865,10 @@ bool runloop_environment_cb(unsigned cmd, void *data)
          *(unsigned*)data = video_driver_views_status();
          break;
 
+      /* No image screens: nothing to lend */
+      case RETRO_ENVIRONMENT_GET_VIDEO_SCREEN_BUFFER:
+         return false;
+
       case RETRO_ENVIRONMENT_GET_JIT_CAPABLE:
          {
 #if TARGET_OS_IPHONE
@@ -6112,6 +6116,11 @@ void runloop_event_deinit_core(void)
 
    video_driver_cached_frame_retire();
    video_driver_clear_views();
+#ifdef HAVE_CONFIGFILE
+   config_save_video_screen_prefs(video_st->screen_prefs.library_name,
+         &video_st->screen_prefs);
+#endif
+   memset(&video_st->screen_prefs, 0, sizeof(video_st->screen_prefs));
    /* The next content gets its own headset notice. */
    video_st->headset_notice_hz = 0;
 
@@ -7091,6 +7100,20 @@ bool runloop_event_init_core(
       config_load_override(&runloop_st->system);
 #endif
 
+   /* The core's own screen choices, over its overrides */
+   memset(&video_st->screen_prefs, 0, sizeof(video_st->screen_prefs));
+   video_st->screen_prefs.core_loaded = (type != CORE_TYPE_DUMMY);
+   if (video_st->screen_prefs.core_loaded)
+   {
+      strlcpy(video_st->screen_prefs.library_name,
+            sys_info->info.library_name,
+            sizeof(video_st->screen_prefs.library_name));
+#ifdef HAVE_CONFIGFILE
+      config_load_video_screen_prefs(video_st->screen_prefs.library_name,
+            &video_st->screen_prefs);
+#endif
+   }
+
    /* Cannot access these settings-related parameters
     * until *after* config overrides have been loaded */
 #ifdef HAVE_CONFIGFILE
@@ -7183,6 +7206,7 @@ bool runloop_event_init_core(
    if (!event_init_content(runloop_st, settings, input_st))
    {
       runloop_st->flags &= ~RUNLOOP_FLAG_CORE_RUNNING;
+      memset(&video_st->screen_prefs, 0, sizeof(video_st->screen_prefs));
       return false;
    }
 
@@ -7193,6 +7217,7 @@ bool runloop_event_init_core(
    if (!runloop_event_load_core(runloop_st, poll_type_behavior))
    {
       runloop_reset_auto_state_load(runloop_st);
+      memset(&video_st->screen_prefs, 0, sizeof(video_st->screen_prefs));
       return false;
    }
 

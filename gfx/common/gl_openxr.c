@@ -397,6 +397,7 @@ struct gl_openxr_dot
 {
    gl_openxr_t *xr;
    uint32_t images[OPENXR_MAX_IMAGES][2];
+   video_views_names_t names;
 };
 
 static bool gl_openxr_cursor_fill(void *user, uint32_t index,
@@ -414,7 +415,7 @@ static bool gl_openxr_cursor_fill(void *user, uint32_t index,
       *code = 0;
       return false;
    }
-   openxr_frame_cursor_pixels(px, w, true);
+   openxr_frame_cursor_pixels(px, w, true, &dot->names);
    while (xr->gl.GetError() != GL_NO_ERROR) { }
    xr->gl.BindTexture(GL_TEXTURE_2D, dot->images[index][0]);
    xr->gl.PixelStorei(GL_UNPACK_ALIGNMENT, 4);
@@ -429,34 +430,50 @@ static bool gl_openxr_cursor_fill(void *user, uint32_t index,
    return false;
 }
 
-static void gl_openxr_cursor_create(gl_openxr_t *xr)
+/* The laser's dot with the screen names now, on the XR thread: at the
+ * session's start, and again as the frame loop's remake, which logs
+ * nothing. A new dot replaces the old; a failed remake keeps it. */
+static void gl_openxr_cursor_create(gl_openxr_t *xr, bool remake)
 {
    static const int64_t formats[2] = {
       OPENXR_GL_SRGB8_ALPHA8, OPENXR_GL_RGBA8 };
    struct gl_openxr_dot dot;
    openxr_gl_images_t li;
+   XrSwapchain made;
    const char *step = NULL;
    int code         = 0;
    dot.xr           = xr;
    li.sc            = &xr->sc;
    li.tex           = dot.images;
-   xr->frame.cursor = openxr_swapchains_create_filled(&xr->sc, formats, 2,
+   xr->frame.names_baked = video_driver_get_screen_names(&dot.names);
+   made = openxr_swapchains_create_filled(&xr->sc, formats, 2,
          VIDEO_SCALE_PACK(openxr_frame_cursor_w(&xr->frame),
             VIDEO_XR_CURSOR_H),
          openxr_binding_gl_images, &li, gl_openxr_cursor_fill, &dot,
          &step, &code);
-   if (xr->frame.cursor && xr->frame.rt->max_width)
+   if (made && xr->frame.cursor)
+      xr->sc.DestroySwapchain(xr->frame.cursor);
+   if (made)
+      xr->frame.cursor = made;
+   if (remake)
+      return;
+   if (made && xr->frame.rt->max_width)
       RARCH_LOG("[OpenXR] Laser cursor ready: %u wide, with %s (the "
             "headset's widest %u).\n", openxr_frame_cursor_w(&xr->frame),
             openxr_frame_cursor_parts(&xr->frame),
             xr->frame.rt->max_width);
-   else if (xr->frame.cursor)
+   else if (made)
       RARCH_LOG("[OpenXR] Laser cursor ready: %u wide, with %s (the "
             "headset does not say its widest).\n",
             openxr_frame_cursor_w(&xr->frame),
             openxr_frame_cursor_parts(&xr->frame));
    else
       RARCH_WARN("[OpenXR] No laser cursor (%s, %d).\n", step, code);
+}
+
+static void gl_openxr_cursor_remake(void *user)
+{
+   gl_openxr_cursor_create((gl_openxr_t*)user, true);
 }
 
 /* The XR thread's start: its context for good, then the session. */
@@ -481,7 +498,9 @@ static bool gl_openxr_thread_start(void *user)
    openxr_host_session_created(&xr->host);
    RARCH_LOG("[OpenXR] Session created.\n");
    openxr_frame_input_attach(&xr->frame);
-   gl_openxr_cursor_create(xr);
+   xr->frame.cursor_remake = gl_openxr_cursor_remake;
+   xr->frame.cursor_user   = xr;
+   gl_openxr_cursor_create(xr, false);
    /* The copy keeps the stored values; the compositor decodes them. */
    xr->gl.Disable(GL_FRAMEBUFFER_SRGB);
    if (!xr->copy_image)

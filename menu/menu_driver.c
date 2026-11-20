@@ -2262,10 +2262,15 @@ MENU_NOINLINE static bool menu_input_get_headset_hw_state(
       /* With views the quad is the UI, one eye's when that is drawn
        * per eye; without, the whole window. */
       if (layout)
+      {
+         /* A window that shows no screen has no ui_dims */
+         unsigned ui_dims = layout->num_placements
+            ? layout->ui_dims : video_driver_get_output_dims();
          menu_input_views_fb_point(p_disp, layout,
-               u * (float)VIDEO_SCALE_W(layout->ui_dims),
-               v * (float)VIDEO_SCALE_H(layout->ui_dims),
+               u * (float)VIDEO_SCALE_W(ui_dims),
+               v * (float)VIDEO_SCALE_H(ui_dims),
                &x, &y);
+      }
       else
       {
          struct video_viewport vp = {0};

@@ -6669,6 +6669,22 @@ static unsigned gl3_xr_eye_screens(const video_frame_info_t *video_info)
    return (1u << map->views[l].screen) | (1u << map->views[r].screen);
 }
 
+/* The tracked eyes' views the projection reads: none of a blank
+ * screen's. */
+static unsigned gl3_xr_eye_views(const video_frame_info_t *video_info)
+{
+   unsigned e;
+   unsigned views               = 0;
+   const video_views_map_t *map = &video_info->views;
+   for (e = 0; e < 2; e++)
+   {
+      int v = video_info->headset_eye[e];
+      if (!(map->blank & (1u << map->views[v].screen)))
+         views |= 1u << v;
+   }
+   return views;
+}
+
 /* Whether the projection can take the tracked eyes: at a size the
  * runtime has not refused, and on a repeat only once it has them, or on
  * a software repeat while none is shown, if the views the frame was
@@ -6775,10 +6791,10 @@ static void gl3_xr_forget(gl3_t *gl, unsigned s, bool yield)
 }
 
 /* Each layer of a screen slot drawn whole into tex by its view's
- * headset chain or the whole frame's: its passes at the image's size. A
- * repeat - a screen moved, resized or not yet shown while no new frame
- * came - replays the last frame's final pass, so feedback and history
- * stay where that frame left them. */
+ * headset chain or the whole frame's: its passes at the image's size; a
+ * blank screen's is only cleared. A repeat - a screen moved, resized or
+ * not yet shown while no new frame came - replays the last frame's
+ * final pass, so feedback and history stay where that frame left them. */
 static void gl3_xr_draw_screen(gl3_t *gl, unsigned s, const uint32_t *tex,
       gl3_filter_chain_t **chains, gl3_filter_chain_t *frame_chain,
       const struct gl3_filter_chain_texture *frame_tex, bool new_frame)
@@ -6793,7 +6809,8 @@ static void gl3_xr_draw_screen(gl3_t *gl, unsigned s, const uint32_t *tex,
    {
       struct gl3_filter_chain_texture in;
       int v                    = plan->view[l];
-      gl3_filter_chain_t *chain = (v >= 0) ? chains[v] : frame_chain;
+      gl3_filter_chain_t *chain = plan->blank ? NULL
+         : ((v >= 0) ? chains[v] : frame_chain);
       bool replay              = chain && !new_frame
          && gl3_filter_chain_replay_ready(chain);
 
@@ -6857,8 +6874,9 @@ static void gl3_xr_copy_ui(gl3_t *gl, unsigned s, GLuint tex,
 
 /* The tracked eyes into the projection slot, a layer each, with no
  * chain: each from its image's origin at its own size, shrunk if it is
- * larger, the right way up, with the poses the core was given. The
- * views were copied out of this frame or an earlier one. */
+ * larger, the right way up, with the poses the core was given; a blank
+ * screen's are only cleared. The views it reads were copied out of this
+ * frame or an earlier one. */
 static bool gl3_xr_draw_projection(gl3_t *gl,
       const video_frame_info_t *video_info)
 {
@@ -6879,10 +6897,10 @@ static bool gl3_xr_draw_projection(gl3_t *gl,
    /* View copies keep the frame's orientation. */
    const float *mvp = (gl->flags & GL3_FLAG_HW_RENDER_BOTTOM_LEFT)
       ? gl->mvp_no_rot.data : gl->mvp_no_rot_yflip.data;
+   unsigned reads   = gl3_xr_eye_views(video_info);
 
-   for (e = 0; e < 2; e++)
-      if (!(gl->views.copied & (1u << video_info->headset_eye[e])))
-         return false;
+   if ((gl->views.copied & reads) != reads)
+      return false;
    if (!dims || !gl_openxr_slot_target(xr, s, dims, 2, tex))
       return false;
    if (!gl->xr.samplers[0])
@@ -6911,6 +6929,9 @@ static bool gl3_xr_draw_projection(gl3_t *gl,
       /* Cleared whole: the compositor may read past the rectangle. */
       glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
       glClear(GL_COLOR_BUFFER_BIT);
+      if (video_info->views.blank & (1u << video_info->views.views[
+               video_info->headset_eye[e]].screen))
+         continue;
       glViewport(0, 0, w, h);
       glActiveTexture(GL_TEXTURE0 + 1);
       glBindTexture(GL_TEXTURE_2D,
@@ -7429,7 +7450,7 @@ static bool gl3_frame(void *data, const void *frame,
          {
             int v = gl->xr.set.slots[s].view[l];
             const struct retro_video_view *rv;
-            if (v < 0)
+            if (v < 0 || gl->xr.set.slots[s].blank)
                continue;
             /* A view larger than its image is shrunk smoothly. */
             rv = &video_info->views.views[v];
@@ -7447,8 +7468,7 @@ static bool gl3_frame(void *data, const void *frame,
          if (xr_chains[i])
             xr_views |= 1u << i;
    if (xr_eyes)
-      xr_views |= (1u << video_info->headset_eye[0])
-                | (1u << video_info->headset_eye[1]);
+      xr_views |= gl3_xr_eye_views(video_info);
 #endif
 #ifdef HAVE_SLANG
    views = gl3_views_setup(gl, video_info, frame, &texture,

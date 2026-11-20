@@ -540,6 +540,28 @@ static void test_xr_draw_repeat_unready(void)
    CHECK(replays == 0 && frames_ended == 0);
 }
 
+/* A blank screen's image is cleared and no more: no pass runs and no
+ * frame ends. Going blank makes no new swapchain. */
+static void test_xr_draw_blank(void)
+{
+   vk_t vk;
+   test_context_t context;
+   test_chain_t chain;
+   unsigned dims = VIDEO_SCALE_PACK(64, 32);
+   init(&vk, &context, &chain);
+   acquire_fails = 0;
+   xr_plan(dims, 2);
+   xr_draw(&vk, dims);
+   xr_release(&vk);
+   offscreen_passes = viewport_passes = render_passes = frames_ended = 0;
+   planned.slots[1].blank = true;
+   xr_draw(&vk, dims);
+   CHECK(vk.xr.slots[0].drawn && vk.xr.slots[1].drawn);
+   CHECK(offscreen_passes == 1 && viewport_passes == 1);
+   CHECK(frames_ended == 1 && replays == 0);
+   CHECK(render_passes == 2 && slot_creates[1] == 1);
+}
+
 /* Model completed frame slots freeing the retire ring. */
 static void xr_retired(vk_t *vk)
 {
@@ -613,8 +635,9 @@ int main(void)
    test_xr_draw_movie_frame();
    test_xr_draw_resize_repeat();
    test_xr_draw_repeat_unready();
+   test_xr_draw_blank();
    test_xr_draw_slot_refused();
    test_xr_draw_slot_unmade();
-   printf("%u failed (10 Vulkan target cases)\n", failures);
+   printf("%u failed (11 Vulkan target cases)\n", failures);
    return failures ? 1 : 0;
 }

@@ -262,6 +262,21 @@ static void test_title_screen(void)
    CHECK(video_window_title_screen(&r) == 1);
 }
 
+static void test_title(void)
+{
+   char s[64];
+   video_window_request_t r;
+   memset(&r, 0, sizeof(r));
+   r.screen  = 3;
+   r.screens = 0x2;
+   strcpy(r.name, "VMU A1");
+   CHECK(video_window_title(&r, s, sizeof(s)) == strlen(s));
+   CHECK(!strcmp(s, "RetroArch - VMU A1"));
+   r.name[0] = '\0';
+   CHECK(video_window_title(&r, s, sizeof(s)) == strlen(s));
+   CHECK(!strcmp(s, "RetroArch - Screen 2"));
+}
+
 static void test_display_own(void)
 {
    char keys[RETRO_VIDEO_VIEWS_MAX][VIDEO_WINDOW_DISPLAY_NAME_SIZE];
@@ -2856,6 +2871,72 @@ static void test_window_ui_drawn(void)
    CHECK(widgets_asked == 1);
 }
 
+/* A screen without views goes in no window, whatever its mode. */
+static void test_plan_viewless(void)
+{
+   struct retro_video_view v[2];
+   struct retro_video_screen scr[3];
+   struct retro_video_views in;
+   video_views_map_t map;
+   video_window_settings_t screens[RETRO_VIDEO_VIEWS_MAX];
+   video_windows_plan_t plan;
+   unsigned mode;
+   memset(v, 0, sizeof(v));
+   memset(scr, 0, sizeof(scr));
+   memset(&in, 0, sizeof(in));
+   memset(screens, 0, sizeof(screens));
+   /* Views on screens 0 and 2; screen 1 ABSENT with none */
+   v[0].width     = v[0].height = 100;
+   v[1]           = v[0];
+   v[1].y         = 100;
+   v[1].screen    = 2;
+   scr[1].state   = RETRO_VIDEO_SCREEN_STATE_ABSENT;
+   in.views       = v;
+   in.num_views   = 2;
+   in.flags       = RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   in.screens     = scr;
+   in.num_screens = 3;
+   CHECK(video_views_validate_map(&in, &map, NULL));
+   CHECK(map.num_screens == 3 && map.viewless == 0x2u);
+   for (mode = VIDEO_WINDOW_ATTACHED; mode <= VIDEO_WINDOW_HIDDEN; mode++)
+   {
+      screens[1].mode = mode;
+      video_windows_plan(&map, screens, true, true, 0, NULL, &plan);
+      CHECK(!((plan.main_mask | plan.separate_mask | plan.hidden_mask) & 0x2u));
+      CHECK(plan.main_mask == 5u);
+   }
+}
+
+/* A left-out screen is hidden, screen 0 too. */
+static void test_plan_left_out(void)
+{
+   struct retro_video_view v[2];
+   struct retro_video_views in;
+   video_views_map_t map;
+   video_window_settings_t screens[RETRO_VIDEO_VIEWS_MAX];
+   video_windows_plan_t plan;
+   memset(v, 0, sizeof(v));
+   memset(&in, 0, sizeof(in));
+   memset(screens, 0, sizeof(screens));
+   v[0].width      = v[0].height = 100;
+   v[1]            = v[0];
+   v[1].y          = 100;
+   v[1].screen     = 1;
+   in.views        = v;
+   in.num_views    = 2;
+   CHECK(video_views_validate_map(&in, &map, NULL));
+   CHECK(map.num_screens == 2);
+   screens[1].mode = VIDEO_WINDOW_SEPARATE;
+   map.left_out    = 0x3u;
+   video_windows_plan(&map, screens, true, true, 0, NULL, &plan);
+   CHECK(plan.hidden_mask == 0x3u);
+   CHECK(plan.main_mask == 0u && plan.separate_mask == 0u);
+   map.left_out    = 0x2u;
+   video_windows_plan(&map, screens, true, true, 0, NULL, &plan);
+   CHECK(plan.main_mask == 0x1u && plan.hidden_mask == 0x2u);
+   CHECK(plan.separate_mask == 0u);
+}
+
 int main(void)
 {
    test_windows_policy();
@@ -2863,6 +2944,7 @@ int main(void)
    test_resolve();
    test_spare_window();
    test_title_screen();
+   test_title();
    test_display_own();
    test_display_key();
    test_display_key_unnamed();
@@ -2890,6 +2972,8 @@ int main(void)
    test_windows_held_saved();
    test_windows_steps_ui();
    test_window_ui_drawn();
+   test_plan_viewless();
+   test_plan_left_out();
    if (failures)
       return 1;
    puts("video_windows: ok");

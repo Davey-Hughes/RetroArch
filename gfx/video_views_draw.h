@@ -116,6 +116,7 @@ static void VV_FN(draw_placements)(VV_DRV *drv, const VV_DRAW *ctx,
       video_views_rect_t dst, cut;
       const video_views_placement_t *p = &layout->placements[i];
       if (     (!all_areas && p->area != 0)
+            || (p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
             || !chains[p->view]
             || !video_views_visible(layout, p, dims, &cut))
          continue;
