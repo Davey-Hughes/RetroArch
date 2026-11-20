@@ -178,6 +178,9 @@ typedef struct video_views_map
    /* Bit s is screen s. */
    unsigned no_input;   /* RETRO_VIDEO_SCREEN_FLAG_NO_INPUT */
    unsigned viewless;   /* below num_screens with no view */
+   /* The frontend's, set per frame; validation leaves them 0. */
+   unsigned left_out;   /* ABSENT, or its Display resolved to Off: no place */
+   unsigned blank;      /* BLANK and not left out: a place, drawn black */
 } video_views_map_t;
 
 #define VIDEO_VIEWS_NAME_SIZE 32   /* bytes kept of a screen's name, with its NUL */
@@ -291,12 +294,15 @@ bool video_views_snapshot(const video_views_map_t *map,
 
 #define VIDEO_VIEWS_MAX_PLACEMENTS (RETRO_VIDEO_VIEWS_MAX * 2)
 
+#define VIDEO_VIEWS_PLACEMENT_BLANK (1u << 0)   /* drawn black */
+
 /* One view drawn into one eye's area. */
 typedef struct video_views_placement
 {
    video_views_rect_t dst;   /* canvas pixels, top-left origin */
    unsigned view;            /* index into the map's views */
    unsigned area;            /* 0: left eye or the only area, 1: right eye */
+   unsigned flags;           /* VIDEO_VIEWS_PLACEMENT_* */
 } video_views_placement_t;
 
 typedef struct video_views_layout

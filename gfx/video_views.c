@@ -407,6 +407,8 @@ bool video_views_select_screens(const video_views_map_t *map,
    out->num_screens = count;
    out->no_input    = (map->no_input >> first) & mask;
    out->viewless    = (map->viewless >> first) & mask;
+   out->left_out    = (map->left_out >> first) & mask;
+   out->blank       = (map->blank    >> first) & mask;
    return true;
 }
 
@@ -442,7 +444,7 @@ static void video_views_fit(const video_views_layout_params_t *p,
    unsigned cw   = VIDEO_SCALE_W(cdims);
    unsigned ch   = VIDEO_SCALE_H(cdims);
    bool vertical = (p->screen_layout != VIDEO_SCREEN_LAYOUT_HORIZONTAL);
-   unsigned skip = p->exclude_screens | map->viewless;
+   unsigned skip = p->exclude_screens | map->viewless | map->left_out;
 
    if (count == 1 && p->stretch && !p->scale_integer)
    {
@@ -559,7 +561,7 @@ void video_views_layout(const video_views_layout_params_t *p,
    if (!map || !map->num_views || !w || !h)
       return;
 
-   skip = p->exclude_screens | map->viewless;
+   skip = p->exclude_screens | map->viewless | map->left_out;
    for (s = 0; s < map->num_screens; s++)
       if (!(skip & (1u << s)))
       {
@@ -624,6 +626,8 @@ void video_views_layout(const video_views_layout_params_t *p,
          pl = &out->placements[out->num_placements++];
          pl->view = (unsigned)video_views_find(map, s, eye);
          pl->area = a;
+         if (map->blank & (1u << s))
+            pl->flags = VIDEO_VIEWS_PLACEMENT_BLANK;
          video_views_place(&fit[s], cdims, &out->areas[a], &pl->dst);
       }
    }
