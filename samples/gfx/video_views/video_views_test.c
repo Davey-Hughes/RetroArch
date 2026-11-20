@@ -277,6 +277,24 @@ static int rect_is(const video_views_rect_t *r, int x, int y,
    return 0;
 }
 
+/* @map side by side in 1600x960. The DS map's screens land at (0,180)
+ * and (800,180), each 800x600. */
+static void t_side_layout(const video_views_map_t *map, unsigned mode,
+      video_views_layout_t *l)
+{
+   video_views_layout_params_t p;
+   params_init(&p, map, 1600, 960);
+   p.screen_layout = VIDEO_SCREEN_LAYOUT_HORIZONTAL;
+   p.stereo_mode   = mode;
+   video_views_layout(&p, l);
+}
+
+static int t_dst_same(const video_views_placement_t *a,
+      const video_views_placement_t *b)
+{
+   return a->dst.pos == b->dst.pos && a->dst.dims == b->dst.dims;
+}
+
 static void test_layout_screens(void)
 {
    video_views_map_t map;
@@ -1317,6 +1335,23 @@ static void test_screens_select_masks(void)
    CHECK(sub.num_screens == 0 && sub.no_input == 0 && sub.viewless == 0);
 }
 
+/* The frontend's masks follow the selected screens too. */
+static void test_select_screens_left_out(void)
+{
+   struct retro_video_views in;
+   video_views_map_t full, out;
+   video_views_screens_t scr;
+   unsigned index[RETRO_VIDEO_VIEWS_MAX];
+
+   t_screens_full(&in);
+   CHECK(video_views_validate_map(&in, &full, &scr));
+   CHECK(full.left_out == 0 && full.blank == 0);
+   full.left_out = 0x5;
+   full.blank    = 0x2;
+   CHECK(video_views_select_screens(&full, 1, 2, &out, index));
+   CHECK(out.left_out == 0x2 && out.blank == 0x1);
+}
+
 /* A console's touchscreen through the views it shows: the 3DS's bottom
  * screen showing the DS map's second screen. */
 static void test_touch(void)
@@ -1497,6 +1532,68 @@ static void test_cpu_compose(void)
    video_views_layout(&p, &l);
    CHECK(video_views_cpu_scale(&map, &l) == 1.0f);
    video_views_cpu_free(&cpu);
+}
+
+/* A blank screen's place is cleared and nothing drawn in it. */
+static void test_cpu_draw_blank(void)
+{
+   unsigned i, x, y;
+   video_views_map_t map;
+   video_views_layout_t l;
+   video_views_cpu_t cpu;
+   const video_views_rect_t *r;
+   static uint32_t frame[256 * 384];
+   static uint32_t out[1600 * 960];
+   bool ok = true;
+
+   memset(&cpu, 0, sizeof(cpu));
+   for (i = 0; i < 256 * 384; i++)
+      frame[i] = (i < 256 * 192) ? 0x336699 : 0xcc9966;
+   for (i = 0; i < 1600 * 960; i++)
+      out[i] = 0xffffffff;
+   map_ds(&map);
+   map.blank = 0x2;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(l.num_placements == 2);
+   video_views_cpu_compose(&cpu, &map, &l, frame, 256 * 4,
+         SCALER_FMT_ARGB8888, SCALER_TYPE_POINT, 1.0f,
+         VIDEO_SCALE_PACK(1600, 960), out, 1600, NULL);
+   r = &l.placements[1].dst;
+   for (y = 0; y < VIDEO_SCALE_H(r->dims); y++)
+      for (x = 0; x < VIDEO_SCALE_W(r->dims); x++)
+         if (out[(size_t)(VIDEO_POS_Y(r->pos) + y) * 1600
+               + VIDEO_POS_X(r->pos) + x])
+            ok = false;
+   CHECK(ok);
+   r = &l.placements[0].dst;
+   CHECK((out[(size_t)(VIDEO_POS_Y(r->pos) + VIDEO_SCALE_H(r->dims) / 2)
+            * 1600 + VIDEO_POS_X(r->pos) + VIDEO_SCALE_W(r->dims) / 2]
+         & 0xffffff) == 0x336699);
+   video_views_cpu_free(&cpu);
+}
+
+/* Nothing drawn: composed at the window's size. */
+static void test_cpu_scale_none(void)
+{
+   video_views_map_t map;
+   video_views_layout_t l;
+   float scale;
+
+   map_ds(&map);
+   map.left_out = 0x3;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(l.num_placements == 0);
+   CHECK(video_views_cpu_scale(&map, &l) == 1.0f);
+
+   /* The only placement blank. */
+   map.left_out = 0x2;
+   map.blank    = 0x1;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(l.num_placements == 1);
+   scale = video_views_cpu_scale(&map, &l);
+   CHECK(scale == 1.0f);
+   CHECK(video_views_cpu_dims(VIDEO_SCALE_PACK(1600, 960), scale)
+         == VIDEO_SCALE_PACK(1600, 960));
 }
 
 /* The CPU drivers' blend of a canvas's halves. */
@@ -1793,6 +1890,40 @@ static void test_draw_placements(void)
    CHECK(!bad_ctx);
 }
 
+/* A blank screen is not drawn, through its chain or straight. */
+static void test_draw_placements_blank(void)
+{
+   video_views_map_t map;
+   video_views_layout_t l;
+   fake_drv_t d;
+   fake_chain_t *chains[RETRO_VIDEO_VIEWS_MAX];
+   unsigned full = VIDEO_SCALE_PACK(1600, 960);
+
+   map_ds(&map);
+   memset(&d, 0, sizeof(d));
+   memset(chains, 0, sizeof(chains));
+   chains[0] = &chain_objs[0];
+   chains[1] = &chain_objs[1];
+
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   num_draws = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, false, false);
+   CHECK(num_draws == 2);
+   num_draws = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, true, false);
+   CHECK(num_draws == 2);
+
+   map.blank = 0x2;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   num_draws = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, false, false);
+   CHECK(num_draws == 1 && draws[0].chain == chains[0] && !draws[0].again);
+   num_draws = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, true, false);
+   CHECK(num_draws == 1 && draws[0].view == 0);
+   CHECK(!bad_ctx);
+}
+
 static void test_targets(void)
 {
    video_views_target_t t;
@@ -1961,6 +2092,84 @@ static void test_layout_viewless(void)
          && l.placements[0].dst.dims == want.placements[0].dst.dims);
 }
 
+/* A screen left out takes no place: the others lay out as a map of
+ * their own. */
+static void test_layout_left_out(void)
+{
+   struct retro_video_view v;
+   video_views_map_t map, alone;
+   video_views_layout_t l, want;
+
+   map_ds(&map);
+   v = mkview(0, 0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_NONE);
+   CHECK(video_views_validate(&v, 1, &alone));
+   t_side_layout(&alone, VIDEO_STEREO_MODE_2D, &want);
+   CHECK(rect_is(&want.placements[0].dst, 160, 0, 1280, 960));
+   map.left_out = 0x2;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(want.num_placements == 1 && l.num_placements == 1);
+   CHECK(l.placements[0].view == 0
+         && t_dst_same(&l.placements[0], &want.placements[0]));
+
+   v = mkview(0, 192, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_NONE);
+   CHECK(video_views_validate(&v, 1, &alone));
+   t_side_layout(&alone, VIDEO_STEREO_MODE_2D, &want);
+   map.left_out = 0x1;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(want.num_placements == 1 && l.num_placements == 1);
+   CHECK(l.placements[0].view == 1
+         && t_dst_same(&l.placements[0], &want.placements[0]));
+
+   /* Every screen left out: a window that shows no screen. */
+   map.left_out = 0x3;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(l.num_placements == 0 && l.ui_dims == 0 && l.num_areas == 0);
+
+   /* Side by side, full: screen 0 in each eye. */
+   v = mkview(0, 0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_NONE);
+   CHECK(video_views_validate(&v, 1, &alone));
+   t_side_layout(&alone, VIDEO_STEREO_MODE_SBS_FULL, &want);
+   map.left_out = 0x2;
+   t_side_layout(&map, VIDEO_STEREO_MODE_SBS_FULL, &l);
+   CHECK(want.num_placements == 2 && l.num_placements == 2);
+   CHECK(   l.placements[0].view == 0 && l.placements[0].area == 0
+         && l.placements[1].view == 0 && l.placements[1].area == 1);
+   CHECK(   t_dst_same(&l.placements[0], &want.placements[0])
+         && t_dst_same(&l.placements[1], &want.placements[1]));
+}
+
+/* A blank screen keeps its place, marked to be drawn black. */
+static void test_layout_blank(void)
+{
+   video_views_map_t map;
+   video_views_layout_t l, want;
+   unsigned i;
+
+   map_ds(&map);
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &want);
+   map.blank = 0x2;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(want.num_placements == 2 && l.num_placements == 2);
+   for (i = 0; i < 2; i++)
+      CHECK(t_dst_same(&l.placements[i], &want.placements[i]));
+   CHECK(l.placements[0].flags == 0);
+   CHECK(l.placements[1].flags == VIDEO_VIEWS_PLACEMENT_BLANK);
+
+   /* In each eye. */
+   t_side_layout(&map, VIDEO_STEREO_MODE_SBS_FULL, &l);
+   CHECK(l.num_placements == 4);
+   CHECK(   l.placements[0].flags == 0
+         && l.placements[1].flags == VIDEO_VIEWS_PLACEMENT_BLANK
+         && l.placements[2].flags == 0
+         && l.placements[3].flags == VIDEO_VIEWS_PLACEMENT_BLANK);
+
+   /* Left out wins. */
+   map.left_out = 0x2;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(l.num_placements == 1 && l.placements[0].view == 0
+         && l.placements[0].flags == 0);
+}
+
 /* NO_INPUT: the DS map stacked in 1600x960, screen 0 at (480,0) and
  * screen 1 at (480,480), each 640x480. */
 static void test_map_point_no_input(void)
@@ -2010,6 +2219,25 @@ static void test_map_point_no_input(void)
    pos = 0;
    CHECK(video_views_map_point(&l, &map, frame, 800, 720, true, &pos));
    CHECK(pos == VIDEO_POS_PACK(-0x8000, -0x8000));
+}
+
+/* A blank screen still takes input. */
+static void test_map_point_blank(void)
+{
+   video_views_map_t map;
+   video_views_layout_t l;
+   uint32_t pos, want;
+   unsigned frame = VIDEO_SCALE_PACK(256, 384);
+
+   map_ds(&map);
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(video_views_map_point(&l, &map, frame, 1200, 480, true, &want));
+   CHECK(VIDEO_POS_X(want) == 128 && VIDEO_POS_Y(want) == 16511);
+   map.blank = 0x2;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   pos = 0;
+   CHECK(video_views_map_point(&l, &map, frame, 1200, 480, true, &pos));
+   CHECK(pos == want);
 }
 
 static void test_touch_no_input(void)
@@ -2120,8 +2348,11 @@ int main(void)
    test_screens_accepted();
    test_screens_names();
    test_screens_select_masks();
+   test_select_screens_left_out();
    test_blend();
    test_cpu_compose();
+   test_cpu_draw_blank();
+   test_cpu_scale_none();
    test_cut_source();
    test_touch();
    test_layout_screens();
@@ -2132,11 +2363,15 @@ int main(void)
    test_ui_point();
    test_pick_chains();
    test_draw_placements();
+   test_draw_placements_blank();
    test_targets();
    test_ui_helpers();
    test_screen_api();
    test_layout_viewless();
+   test_layout_left_out();
+   test_layout_blank();
    test_map_point_no_input();
+   test_map_point_blank();
    test_touch_no_input();
    test_names_box();
 
