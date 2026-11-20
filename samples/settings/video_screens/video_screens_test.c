@@ -4938,6 +4938,119 @@ static void test_window_bounds_per_core(void)
    screens_test_core_done();
 }
 
+/* Screen 1's window as a context keeps it, for the geometry below */
+static video_window_common_t screens_test_window;
+static video_window_native_t screens_test_native;
+
+static video_window_common_t *screens_test_window_at(unsigned screen)
+{
+   return screen == 1 ? &screens_test_window : NULL;
+}
+
+/* A geometry change of that window as a context reports it: judged by
+ * video_window_moved(), drained, and its bounds published as the
+ * drivers publish them; then a frame */
+static void screens_test_geometry(unsigned pos, unsigned dims,
+      retro_time_t now)
+{
+   video_window_event_t events[4];
+   unsigned i, count;
+   video_window_moved(&screens_test_window, pos, true, dims, true, now);
+   screens_test_window.pos      = pos;
+   screens_test_native.dims     = dims;
+   screens_test_window.pending |= VIDEO_WINDOW_EVENT_BIT(GEOMETRY);
+   count = video_windows_drain(&screens_test_window, screens_test_window_at,
+         events, sizeof(events) / sizeof(events[0]));
+   for (i = 0; i < count; i++)
+      if (     events[i].kind == VIDEO_WINDOW_EVENT_GEOMETRY
+            && events[i].save_dims)
+         video_driver_publish_window_bounds(1, 2u,
+               video_state_get_ptr()->windows_edit[1], events[i].save_pos,
+               events[i].save_dims, events[i].save_moved);
+   window_test_run();
+}
+
+/* Where RetroArch and the window manager put a views core's window is
+ * not the user's choice: quitting leaves no window entry in the core's
+ * file. A resize by the user is one. */
+static void test_window_placement_not_per_core(void)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   settings_t *settings           = config_get_ptr();
+   video_screen_prefs_t *prefs    = &video_st->screen_prefs;
+   unsigned kept_pos              = settings->uints.video_screen_window_pos[1];
+   unsigned kept_dims             = settings->uints.video_screen_window_dims[1];
+   bool kept_pos_set              = settings->bools.video_screen_window_pos_set[1];
+   bool kept_save_on_exit         = settings->bools.config_save_on_exit;
+   const retro_time_t opened      = 10000000;
+   const retro_time_t settled     = opened + VIDEO_WINDOW_SETTLE_USEC + 1000;
+   const unsigned window_bits     =
+        VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_X)
+      | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_Y)
+      | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_WIDTH)
+      | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_HEIGHT)
+      | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_POS_SET);
+   char path[PATH_MAX_LENGTH];
+   unsigned size = 0;
+   int x         = 0;
+   config_file_t *conf;
+   screens_file_begin("video_views window", path, sizeof(path));
+   settings->uints.video_screen_window_pos[1]     = 0;
+   settings->uints.video_screen_window_dims[1]    = 0;
+   settings->bools.video_screen_window_pos_set[1] = false;
+   settings->bools.config_save_on_exit            = false;
+   screens_test_core();
+   strlcpy(prefs->library_name, "video_views window",
+         sizeof(prefs->library_name));
+   window_test_begin();
+   window_test_run();
+   CHECK(prefs->in_use);
+   CHECK(window_test_seen.window_screens[1] == 2u);
+   /* Opened at the automatic size; the window manager decorates and
+    * confirms it, then repeats it once settled */
+   memset(&screens_test_window, 0, sizeof(screens_test_window));
+   memset(&screens_test_native, 0, sizeof(screens_test_native));
+   screens_test_window.owner          = &screens_test_window;
+   screens_test_window.native         = &screens_test_native;
+   screens_test_window.request.screen = 1;
+   video_window_placed(&screens_test_window, VIDEO_POS_PACK(100, 80),
+         VIDEO_SCALE_PACK(640, 480), opened);
+   screens_test_geometry(VIDEO_POS_PACK(102, 110),
+         VIDEO_SCALE_PACK(640, 480), opened + 1000);
+   screens_test_geometry(VIDEO_POS_PACK(102, 110),
+         VIDEO_SCALE_PACK(640, 480), settled);
+   /* Quit: the bounds are taken, then the core's file is saved */
+   video_driver_take_window_bounds();
+   retroarch_save_for_suspend();
+   CHECK(!(prefs->set[1] & window_bits));
+   CHECK(!path_is_valid(path));
+   /* The user resizes it */
+   screens_test_geometry(VIDEO_POS_PACK(102, 110),
+         VIDEO_SCALE_PACK(800, 600), settled + 1000);
+   video_driver_take_window_bounds();
+   retroarch_save_for_suspend();
+   conf = config_file_new_from_path_to_string(path);
+   CHECK(conf != NULL);
+   if (conf)
+   {
+      CHECK(config_get_uint(conf, "video_screen2_window_width", &size)
+            && size == 800);
+      CHECK(config_get_uint(conf, "video_screen2_window_height", &size)
+            && size == 600);
+      CHECK(!config_get_int(conf, "video_screen2_window_x", &x));
+      config_file_free(conf);
+   }
+   CHECK(settings->uints.video_screen_window_dims[1] == 0);
+   window_test_end();
+   screens_test_core_done();
+   filestream_delete(path);
+   settings->uints.video_screen_window_pos[1]     = kept_pos;
+   settings->uints.video_screen_window_dims[1]    = kept_dims;
+   settings->bools.video_screen_window_pos_set[1] = kept_pos_set;
+   settings->bools.config_save_on_exit            = kept_save_on_exit;
+   screens_file_end();
+}
+
 /* The fullscreen hotkey on a views core's screen window flips the
  * core's choice */
 static void test_window_fullscreen_hotkey_per_core(void)
@@ -9290,6 +9403,7 @@ int main(int argc, char **argv)
    test_window_absent_back();
    test_window_screen0_left_out();
    test_window_bounds_per_core();
+   test_window_placement_not_per_core();
    test_window_fullscreen_hotkey_per_core();
    test_window_pointer_release();
    test_window_menu_touch_window();
