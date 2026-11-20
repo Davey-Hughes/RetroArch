@@ -2907,6 +2907,36 @@ static void test_plan_viewless(void)
    }
 }
 
+/* A left-out screen is hidden, screen 0 too. */
+static void test_plan_left_out(void)
+{
+   struct retro_video_view v[2];
+   struct retro_video_views in;
+   video_views_map_t map;
+   video_window_settings_t screens[RETRO_VIDEO_VIEWS_MAX];
+   video_windows_plan_t plan;
+   memset(v, 0, sizeof(v));
+   memset(&in, 0, sizeof(in));
+   memset(screens, 0, sizeof(screens));
+   v[0].width      = v[0].height = 100;
+   v[1]            = v[0];
+   v[1].y          = 100;
+   v[1].screen     = 1;
+   in.views        = v;
+   in.num_views    = 2;
+   CHECK(video_views_validate_map(&in, &map, NULL));
+   CHECK(map.num_screens == 2);
+   screens[1].mode = VIDEO_WINDOW_SEPARATE;
+   map.left_out    = 0x3u;
+   video_windows_plan(&map, screens, true, true, 0, NULL, &plan);
+   CHECK(plan.hidden_mask == 0x3u);
+   CHECK(plan.main_mask == 0u && plan.separate_mask == 0u);
+   map.left_out    = 0x2u;
+   video_windows_plan(&map, screens, true, true, 0, NULL, &plan);
+   CHECK(plan.main_mask == 0x1u && plan.hidden_mask == 0x2u);
+   CHECK(plan.separate_mask == 0u);
+}
+
 int main(void)
 {
    test_windows_policy();
@@ -2943,6 +2973,7 @@ int main(void)
    test_windows_steps_ui();
    test_window_ui_drawn();
    test_plan_viewless();
+   test_plan_left_out();
    if (failures)
       return 1;
    puts("video_windows: ok");

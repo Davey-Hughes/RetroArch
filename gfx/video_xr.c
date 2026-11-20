@@ -386,6 +386,8 @@ void video_xr_layout(const video_xr_params_t *p, video_xr_layout_t *out)
       disp_h[s] = h;
       disp_w[s] = h * aspect;
    }
+   if (first == RETRO_VIDEO_VIEWS_MAX)
+      return;
    k = p->width / disp_w[first];
 
    for (s = 0; s < map->num_screens; s++)
@@ -440,7 +442,7 @@ static void video_xr_place_screens(const video_xr_params_t *p,
       video_xr_slot_t *slot = &out->slots[s];
 
       slot->base = lay->pos[s];
-      if ((p->skip_screens | map->viewless) & (1u << s))
+      if ((p->skip_screens | map->viewless | map->left_out) & (1u << s))
          continue;
       if (p->screens)
       {
@@ -454,6 +456,7 @@ static void video_xr_place_screens(const video_xr_params_t *p,
 
       slot->dims    = video_xr_screen_dims(p, (float)w, (float)h, distance,
             lay->native[s]);
+      slot->blank   = (map->blank & (1u << s)) != 0;
       slot->view[0] = left;
       if (left != right)
       {
@@ -498,8 +501,22 @@ static unsigned video_xr_menu_dims(const video_xr_params_t *p,
          VIDEO_SCALE_PACK(w, h), p->max_dim);
 }
 
+/* The first screen with a quad, RETRO_VIDEO_VIEWS_MAX for none. */
+static unsigned video_xr_first_placed(const video_xr_params_t *p,
+      const video_xr_layout_t *lay)
+{
+   unsigned s;
+   unsigned skip = p->skip_screens;
+   if (p->map && p->map->num_views)
+      skip |= p->map->viewless | p->map->left_out;
+   for (s = 0; s < lay->count; s++)
+      if (!(skip & (1u << s)) && (!p->screens || p->screens[s].visible))
+         return s;
+   return RETRO_VIDEO_VIEWS_MAX;
+}
+
 /* At its own spot; or with menu_follow VIDEO_XR_MENU_LIFT in front of
- * screen 0, facing as it does, while screen 0 floats and shows. Following, it
+ * the first screen with a quad, facing as it does. Following, it
  * comes no nearer than VIDEO_XR_MENU_NEAREST, and w and h scale with
  * its distance so it looks as large as at its spot; facing away from
  * the anchor, where no laser reaches it, it stays at its spot. */
@@ -509,20 +526,20 @@ static void video_xr_menu_spot(const video_xr_params_t *p,
 {
    video_xr_pose_t local, lift;
    video_screen_xr_t screen;
-   bool follow = p->menu_follow && lay->count && !(p->skip_screens & 1u);
-   if (follow && p->screens)
-   {
-      screen = p->screens[0];
-      video_views_xr_normalize(&screen);
-      follow = screen.visible;
-   }
-   if (!follow)
+   unsigned first = video_xr_first_placed(p, lay);
+   if (!p->menu_follow || first == RETRO_VIDEO_VIEWS_MAX)
    {
       video_xr_item_pose(&lay->menu, NULL, &local);
       video_xr_compose(&p->anchor, &local, pose);
       return;
    }
-   video_xr_item_pose(&lay->pos[0], p->screens ? &screen : NULL, &local);
+   if (p->screens)
+   {
+      screen = p->screens[first];
+      video_views_xr_normalize(&screen);
+   }
+   video_xr_item_pose(&lay->pos[first], p->screens ? &screen : NULL,
+         &local);
    video_xr_pose_identity(&lift);
    lift.position.z = VIDEO_XR_MENU_LIFT;
    video_xr_compose(&local, &lift, &local);
