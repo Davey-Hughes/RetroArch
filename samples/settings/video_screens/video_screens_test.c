@@ -7561,6 +7561,7 @@ static void test_screen_menu_dropdown(void)
    static struct retro_video_view views[2];
    static struct retro_video_screen screens[3];
    struct retro_video_views map;
+   video_screen_values_t values;
    file_list_t list;
    menu_file_list_cbs_t *cbs;
    rarch_setting_t *row;
@@ -7607,6 +7608,20 @@ static void test_screen_menu_dropdown(void)
       file_list_deinitialize(&list);
       menu_value("video_screen2_display", "OFF");
       CHECK(!settings->arrays.video_screen_display[1][0]);
+      /* A value changed since the row was drawn: OK lists from it */
+      memset(&values, 0, sizeof(values));
+      video_driver_screen_set(1, display, &values);
+      CHECK(window_display_ok(row) == 1);
+      CHECK(window_display_dropdown(&list, row) == 2);
+      if (list.size == 2)
+      {
+         CHECK(string_is_equal(list.list[0].path, "Auto"));
+         CHECK(string_is_equal(list.list[1].path, "OFF"));
+         cbs = (menu_file_list_cbs_t*)list.list[0].actiondata;
+         CHECK(cbs && cbs->checked);
+      }
+      file_list_deinitialize(&list);
+      menu_value("video_screen2_display", "Auto");
    }
    menu_st->driver_ctx = NULL;
    screen_menu_end();
