@@ -7612,6 +7612,55 @@ static void test_screen_menu_dropdown(void)
    screen_menu_end();
 }
 
+/* A Display row left listed follows a core's default as it comes and
+ * goes; a candidate value put in the row is labelled as itself */
+static void test_screen_menu_row_follows(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   video_screen_values_t values;
+   rarch_setting_t *row;
+   char s[64];
+   screen_menu_begin(&map, views, screens);
+   row = menu_setting_find("video_screen2_display");
+   CHECK(row != NULL && row->actions->repr != NULL);
+   if (row && row->actions->repr)
+   {
+      row->actions->repr(row, s, sizeof(s));
+      CHECK(string_is_equal(s, "OFF (core default)"));
+      screens[1].show = RETRO_VIDEO_SCREEN_SHOW_SHOWN;
+      CHECK(video_driver_set_views(&map));
+      window_test_run();
+      row->actions->repr(row, s, sizeof(s));
+      CHECK(string_is_equal(s, "Auto"));
+      screens[1].show = RETRO_VIDEO_SCREEN_SHOW_HIDDEN;
+      CHECK(video_driver_set_views(&map));
+      window_test_run();
+      row->actions->repr(row, s, sizeof(s));
+      CHECK(string_is_equal(s, "OFF (core default)"));
+      row->value.target.string[0] = '\0';
+      row->actions->repr(row, s, sizeof(s));
+      CHECK(string_is_equal(s, "Auto"));
+      CHECK(!row->value.target.string[0]);
+      strlcpy(row->value.target.string, VIDEO_WINDOW_DISPLAY_OFF, row->size);
+      row->actions->repr(row, s, sizeof(s));
+      CHECK(string_is_equal(s, "OFF (core default)"));
+      /* A row the user stepped follows a later write too */
+      menu_action("video_screen2_display", MENU_ACTION_RIGHT);
+      row->actions->repr(row, s, sizeof(s));
+      CHECK(string_is_equal(s, "Auto"));
+      memset(&values, 0, sizeof(values));
+      strlcpy(values.display, VIDEO_WINDOW_DISPLAY_OFF,
+            sizeof(values.display));
+      video_driver_screen_set(1,
+            VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY), &values);
+      row->actions->repr(row, s, sizeof(s));
+      CHECK(string_is_equal(s, "OFF"));
+   }
+   screen_menu_end();
+}
+
 /* With no content the rows are listed too, and edit the global values */
 static void test_screen_menu_no_content_rows(void)
 {
@@ -9902,6 +9951,7 @@ int main(int argc, char **argv)
    test_screen_menu_basic_rows();
    test_screen_menu_core_default_start();
    test_screen_menu_dropdown();
+   test_screen_menu_row_follows();
    test_screen_menu_no_content_rows();
    test_screen_menu_no_views_core();
    test_screen_menu_window_rows_per_core();
