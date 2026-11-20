@@ -101,6 +101,22 @@ static uint32_t input_pointer_windows_set(input_video_window_t *kept,
          in_window |= (uint32_t)1 << i;
    return in_window;
 }
+
+/* Of @in, the bits of @count windows closed or made again since: a
+ * generation never comes back, so what a driver still holds pressed in
+ * one stays let go */
+static uint32_t input_pointer_windows_gone(
+      const input_video_window_t *windows, unsigned count, uint32_t in)
+{
+   unsigned i;
+   uint32_t gone = 0;
+   for (i = 0; i < count; i++)
+      if (     (in & ((uint32_t)1 << i))
+            && !video_driver_window_live(windows[i].window,
+               windows[i].generation))
+         gone |= (uint32_t)1 << i;
+   return gone;
+}
 #endif
 
 static void input_pointer_frames_set(const input_pointer_frame_t *frames,
@@ -114,18 +130,20 @@ static void input_pointer_frames_set(const input_pointer_frame_t *frames,
 #ifdef HAVE_VIDEO_WINDOWS
    input_pointers.in_window     = (uint16_t)input_pointer_windows_set(
          input_pointers.window, windows, count);
-#if defined(HAVE_MENU) && !defined(ANDROID)
-   /* While the menu is up, nothing presses in a screen's own window it
-    * is not in */
+   /* Nothing presses in a window gone, nor, while the menu is up, in a
+    * screen's own window it is not in */
    {
       unsigned i;
-      uint32_t muted = input_pointer_windows_muted(input_pointers.window,
+      uint32_t muted = input_pointer_windows_gone(input_pointers.window,
             count, input_pointers.in_window);
+#if defined(HAVE_MENU) && !defined(ANDROID)
+      muted |= input_pointer_windows_muted(input_pointers.window,
+            count, input_pointers.in_window);
+#endif
       for (i = 0; muted; i++, muted >>= 1)
          if (muted & 1)
             input_pointers.frame[i].buttons = 0;
    }
-#endif
 #else
    (void)windows;
 #endif
@@ -154,6 +172,8 @@ static void input_pointer_touches_set(const uint32_t *pos,
 #ifdef HAVE_VIDEO_WINDOWS
    input_pointers.touch_in_window = input_pointer_windows_set(
          input_pointers.touch_window, windows, count);
+   down &= ~input_pointer_windows_gone(input_pointers.touch_window, count,
+         input_pointers.touch_in_window);
 #if defined(HAVE_MENU) && !defined(ANDROID)
    down &= ~input_pointer_windows_muted(input_pointers.touch_window, count,
          input_pointers.touch_in_window);
