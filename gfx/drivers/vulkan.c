@@ -14108,10 +14108,11 @@ static vulkan_filter_chain_t *vulkan_xr_chain(vk_t *vk,
 }
 
 /* Slot s's layers, each through its view's headset chain or the whole
- * frame's, straight into the runtime's acquired images. A repeat - a
- * screen resized, made again or not yet shown while no new frame came -
- * replays the last frame's final pass at the image's size, so feedback
- * and history stay where that frame left them. */
+ * frame's, straight into the runtime's acquired images; a blank
+ * screen's are only cleared. A repeat - a screen resized, made again or
+ * not yet shown while no new frame came - replays the last frame's
+ * final pass at the image's size, so feedback and history stay where
+ * that frame left them. */
 static void vulkan_xr_draw_screen(vk_t *vk, unsigned s,
       vulkan_filter_chain_t **xr_chains, vulkan_filter_chain_t *xr_frame,
       bool new_frame)
@@ -14147,8 +14148,8 @@ static void vulkan_xr_draw_screen(vk_t *vk, unsigned s,
 
    for (l = 0; l < plan->layers; l++)
    {
-      vulkan_filter_chain_t *chain = (plan->view[l] >= 0)
-         ? xr_chains[plan->view[l]] : xr_frame;
+      vulkan_filter_chain_t *chain = plan->blank ? NULL
+         : ((plan->view[l] >= 0) ? xr_chains[plan->view[l]] : xr_frame);
 
       bool replay                  = false;
 
@@ -14248,7 +14249,8 @@ static void vulkan_xr_copy_ui(vk_t *vk, unsigned s, unsigned ui_dims)
 
 /* The tracked eyes into the projection slot, one image each, with no
  * chain: each from its image's top-left at its own size, shrunk if it
- * is larger. The views were copied out of this frame. */
+ * is larger; a blank screen's are only cleared. The views were copied
+ * out of this frame. */
 static void vulkan_xr_draw_projection(vk_t *vk,
       const video_frame_info_t *video_info)
 {
@@ -14291,6 +14293,8 @@ static void vulkan_xr_draw_projection(vk_t *vk,
       VkRenderPassBeginInfo rp;
       struct vk_draw_quad quad;
       unsigned index = vk->xr.slots[s].index[e];
+      unsigned screen =
+         video_info->views.views[video_info->headset_eye[e]].screen;
 
       /* As vulkan_xr_draw_screen: the runtime's acquire barrier ends at
        * colour output, and what the image held goes. */
@@ -14325,16 +14329,19 @@ static void vulkan_xr_draw_projection(vk_t *vk,
       vk->vk_vp.maxDepth = 1.0f;
       vk->tracker.dirty |= VULKAN_DIRTY_DYNAMIC_BIT;
 
-      /* Over the cleared image this writes the frame as it is, alpha
-       * too, as an opaque draw would: a core's frame may carry any
-       * alpha. alpha_premult is the one pipeline made for this pass. */
-      quad.texture  = &vf->view_images[video_info->headset_eye[e]];
-      quad.mvp      = &vk->mvp_no_rot;
-      quad.pipeline = vulkan_views_target_premult(vk, vk->xr.view_format);
-      quad.sampler  = (w == rv->width && h == rv->height)
-         ? vk->samplers.nearest : vk->samplers.linear;
-      quad.color    = RGBA16_WHITE;
-      vulkan_draw_quad(vk, &quad);
+      if (!(video_info->views.blank & (1u << screen)))
+      {
+         /* Over the cleared image this writes the frame as it is, alpha
+          * too, as an opaque draw would: a core's frame may carry any
+          * alpha. alpha_premult is the one pipeline made for this pass. */
+         quad.texture  = &vf->view_images[video_info->headset_eye[e]];
+         quad.mvp      = &vk->mvp_no_rot;
+         quad.pipeline = vulkan_views_target_premult(vk, vk->xr.view_format);
+         quad.sampler  = (w == rv->width && h == rv->height)
+            ? vk->samplers.nearest : vk->samplers.linear;
+         quad.color    = RGBA16_WHITE;
+         vulkan_draw_quad(vk, &quad);
+      }
       vkCmdEndRenderPass(vk->cmd);
    }
    vk->vp                = vp;
@@ -15359,7 +15366,7 @@ static bool vulkan_frame(void *data, const void *frame,
          {
             int v = vk->xr.set.slots[s].view[l];
             const struct retro_video_view *rv;
-            if (v < 0)
+            if (v < 0 || vk->xr.set.slots[s].blank)
                continue;
             /* A view larger than its image is shrunk smoothly. */
             rv = &video_info->views.views[v];

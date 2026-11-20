@@ -619,8 +619,8 @@ static unsigned gl_xr_eye_dims(const gl_android_openxr_t *xr)
 
 /* The window as a screen in the room, or an untracked map's screens
  * cut from it, unless a tracked map's eyes fill the headset and the
- * menu is closed. An image the compositor still holds keeps the last
- * one shown. */
+ * menu is closed. A blank screen's image stays black. An image the
+ * compositor still holds keeps the last one shown. */
 static void gl_xr_draw(gl_android_openxr_t *xr)
 {
    video_xr_params_t p;
@@ -695,6 +695,8 @@ static void gl_xr_draw(gl_android_openxr_t *xr)
          glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                GL_TEXTURE_2D, (GLuint)xr->images[s][index[l]][l], 0);
          glClear(GL_COLOR_BUFFER_BIT);
+         if (xr->set.slots[s].blank)
+            continue;
          glBlitFramebuffer(x, y, x + (GLint)VIDEO_SCALE_W(r->dims),
                y + (GLint)VIDEO_SCALE_H(r->dims), 0, 0,
                (GLint)VIDEO_SCALE_W(dims), (GLint)VIDEO_SCALE_H(dims),

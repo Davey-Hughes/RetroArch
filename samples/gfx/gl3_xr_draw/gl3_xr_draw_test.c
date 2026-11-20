@@ -2,7 +2,8 @@
  * runtime's textures and the chain's passes stubbed: each screen is
  * drawn straight into the texture the runtime gives, a new frame ends
  * the chain's frame, and a repeat draws a screen again only when it
- * moved or changed size, by replaying the last frame's final pass. */
+ * moved or changed size, by replaying the last frame's final pass. A
+ * blank screen's texture is only cleared. */
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -87,7 +88,7 @@ static unsigned failures;
 static unsigned offscreen_passes, viewport_passes, replays;
 static unsigned frames_ended, last_pass_dims;
 static bool chain_drawn = true;
-static unsigned runtime_attaches, own_attaches;
+static unsigned runtime_attaches, own_attaches, clears;
 static unsigned published[VIDEO_XR_MAX_SLOTS];
 static video_xr_quad_set_t planned;
 
@@ -140,7 +141,7 @@ static void glClearColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a)
    (void)b;
    (void)a;
 }
-static void glClear(GLbitfield mask) { (void)mask; }
+static void glClear(GLbitfield mask) { (void)mask; clears++; }
 
 static void gl3_filter_chain_set_input_texture(gl3_filter_chain_t *chain,
       const struct gl3_filter_chain_texture *in)
@@ -304,7 +305,7 @@ static void reset(gl3_t *gl)
    offscreen_passes = viewport_passes = replays = 0;
    frames_ended = last_pass_dims = 0;
    chain_drawn = true;
-   runtime_attaches = own_attaches = 0;
+   runtime_attaches = own_attaches = clears = 0;
    memset(published, 0, sizeof(published));
 }
 
@@ -381,12 +382,34 @@ static void test_repeat_unready(void)
    CHECK(replays == 0 && frames_ended == 0);
 }
 
+/* A blank screen's texture is cleared: no pass runs and no frame ends.
+ * Going blank on a repeat clears it then, with no replay. */
+static void test_blank(void)
+{
+   gl3_t gl;
+   unsigned dims = VIDEO_SCALE_PACK(64, 32);
+   reset(&gl);
+   plan(dims, 2, 0.0f);
+   planned.slots[1].blank = true;
+   draw(&gl, true);
+   CHECK(offscreen_passes == 1 && viewport_passes == 1);
+   CHECK(frames_ended == 1 && replays == 0);
+   CHECK(runtime_attaches == 2 && clears == 2);
+   CHECK(published[0] == 1 && published[1] == 1);
+   viewport_passes = clears = 0;
+   planned.slots[0].blank = true;
+   draw(&gl, false);
+   CHECK(replays == 0 && viewport_passes == 0 && frames_ended == 1);
+   CHECK(clears == 1 && published[0] == 2 && published[1] == 1);
+}
+
 int main(void)
 {
    test_direct();
    test_repeat_same();
    test_repeat_changed();
    test_repeat_unready();
-   printf("%u failed (4 GL3 headset draw cases)\n", failures);
+   test_blank();
+   printf("%u failed (5 GL3 headset draw cases)\n", failures);
    return failures ? 1 : 0;
 }
