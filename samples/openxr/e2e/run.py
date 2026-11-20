@@ -4158,6 +4158,63 @@ CUSTOM_CASES = [
 ]
 
 
+# The ds map's screens, each 1.6 m wide, the bottom one under the top.
+DS_SIZE = (1.6, 1.2)
+DS_TOP = (0.0, 0.0, -1.8)
+DS_BOTTOM = (0.0, -1.232, -1.8)
+
+
+def check_screens_mode(blank):
+    """The ds map's screen 1 sent HIDDEN has no quad; sent BLANK (blank)
+    it keeps its quad, whose image is black. Screen 0 is where it is
+    with both shown, in its colour."""
+    def check(res):
+        fr = last_snap(res)
+        if not fr:
+            return no_quads(res)
+        q = [x for x in quads(fr) if not x['flags'] & BLEND]
+        top = [x for x in q if at(x, DS_TOP)]
+        rest = [x for x in q if not at(x, DS_TOP)]
+        errors = []
+        if len(top) != 1 or not sized(top[0], DS_SIZE):
+            errors.append('screen 0: %s, want one quad at %s size %s'
+                          % ([(x['pose'][:3], x['size']) for x in top],
+                             DS_TOP, DS_SIZE))
+        else:
+            c, _ = colour(image(res, fr, top[0]), 0.5, 0.5)
+            if not near(c, GREEN):
+                errors.append('screen 0 shows %s, want %s' % (c, GREEN))
+        if not blank:
+            if rest:
+                errors.append('the hidden screen 1 has a quad: %s'
+                              % [(x['pose'][:3], x['size']) for x in rest])
+            return errors
+        if (len(rest) != 1 or not at(rest[0], DS_BOTTOM)
+                or not sized(rest[0], DS_SIZE)):
+            return errors + ['the blank screen 1: %s, want one quad at %s '
+                             'size %s'
+                             % ([(x['pose'][:3], x['size']) for x in rest],
+                                DS_BOTTOM, DS_SIZE)]
+        # Its centre, and its top-left where a drawn view has its marker.
+        for fx, fy, what in ((0.5, 0.5, 'centre'), (0.01, 0.015, 'top-left')):
+            c, _ = colour(image(res, fr, rest[0]), fx, fy)
+            if not near(c, BLACK):
+                errors.append('the blank screen 1\'s %s shows %s, want black'
+                              % (what, c))
+        return errors
+    return check
+
+
+SCREENS_CASES = [
+    {'name': 'screens-hidden', 'map': 'ds',
+     'options': {'video_views_test_screens': 'hidden'}, 'steps': SETTLE,
+     'check': check_screens_mode(False)},
+    {'name': 'screens-blank', 'map': 'ds',
+     'options': {'video_views_test_screens': 'blank'}, 'steps': SETTLE,
+     'check': check_screens_mode(True)},
+]
+
+
 # ---- Edit Screens ----
 # The 3DS quads as in the laser cases. While editing, the menu's quad is
 # up 10 cm in front of screen 1 and as large: it is taken only by its
@@ -8712,6 +8769,7 @@ GL_EXTRA = [
      'check': check_tracked_busy},
 ]
 CASES += CUSTOM_CASES
+CASES += SCREENS_CASES
 CASES += EDIT_CASES
 
 # The cases each GL driver's lanes run, by name in CASES or GL_EXTRA.
@@ -8789,6 +8847,7 @@ GL_EDIT = ['edit-grab', 'edit-grab-threaded', 'edit-command', 'edit-follow',
 GL_EDIT_MENU = ['edit-menu-front', 'edit-menu-size']
 for custom_driver in GL_BASE:
     GL_BASE[custom_driver] += [c['name'] for c in CUSTOM_CASES] + GL_EDIT
+    GL_BASE[custom_driver] += [c['name'] for c in SCREENS_CASES]
 GL_BASE['glcore'] += GL_EDIT_MENU
 
 # Where a GL host's answer is its own, by driver.
