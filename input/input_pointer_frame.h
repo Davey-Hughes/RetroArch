@@ -710,7 +710,6 @@ static bool input_pointer_frame_read(unsigned port, unsigned device,
             bool screen = (device == RARCH_DEVICE_POINTER_SCREEN);
             int slot;
             bool real;
-            /* how many are down needs no place for them */
             if (id == RETRO_DEVICE_ID_POINTER_COUNT)
             {
                *out = (int16_t)input_pointer_count(i, second);

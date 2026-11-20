@@ -131,8 +131,9 @@ typedef struct
 
 /* Touches, as WM_POINTER* hands them: the window procedure fills a
  * slot and publishes it by storing its id (plus one, so 0 is free),
- * and the poll reads them, with no lock, as dinput.c does. Here rather
- * than in winraw_input_t: the window procedure has no driver to hand. */
+ * frees the slot of an id that goes down again first, and the poll
+ * reads them, with no lock, as dinput.c does. Here rather than in
+ * winraw_input_t: the window procedure has no driver to hand. */
 #define WINRAW_MAX_POINTERS 16
 
 struct winraw_pointer_slot
@@ -2503,12 +2504,12 @@ static struct winraw_pointer_slot *winraw_pointer_find(int pointer_id)
 static void winraw_pointer_down(int pointer_id, LPARAM lpar)
 {
    unsigned i;
-   /* one still held never had its lift: it goes down again here */
+   /* one still held never had its lift: lifted first */
    struct winraw_pointer_slot *held = winraw_pointer_find(pointer_id);
+   if (held)
+      retro_atomic_store_release_int(&held->id_plus1, 0);
    for (i = 0; i < WINRAW_MAX_POINTERS; i++)
-      if (held
-            ? held == &winraw_pointers[i]
-            : !retro_atomic_load_relaxed_int(&winraw_pointers[i].id_plus1))
+      if (!retro_atomic_load_relaxed_int(&winraw_pointers[i].id_plus1))
       {
          unsigned window     = 0;
          unsigned generation = 0;

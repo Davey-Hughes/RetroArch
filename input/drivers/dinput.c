@@ -68,10 +68,11 @@ LPDIRECTINPUT8 g_dinput_ctx;
  *
  * One writer, the window procedure: it fills a slot's position and
  * order and then publishes the slot by storing its id (plus one, so 0
- * is a free slot); it frees one by storing 0. The poll reads the id
- * with acquire and then the rest. A touch's position and its id can be
- * a frame apart at worst. Touches are given out in the order they went
- * down, as the list kept them. */
+ * is a free slot); it frees one by storing 0, and frees the slot of an
+ * id that goes down again before filling one, as a lift and a new down.
+ * The poll reads the id with acquire and then the rest. A touch's
+ * position and its id can be a frame apart at worst. Touches are given
+ * out in the order they went down, as the list kept them. */
 #define DINPUT_MAX_POINTERS 16
 
 struct dinput_pointer_slot
@@ -759,12 +760,12 @@ static void dinput_pointer_down(struct dinput_input *di, int pointer_id,
       WPARAM lParam)
 {
    unsigned i;
-   /* one still held never had its lift: it goes down again here */
+   /* one still held never had its lift: lifted first */
    struct dinput_pointer_slot *held = dinput_pointer_find(di, pointer_id);
+   if (held)
+      retro_atomic_store_release_int(&held->id_plus1, 0);
    for (i = 0; i < DINPUT_MAX_POINTERS; i++)
-      if (held
-            ? held == &di->pointers[i]
-            : !retro_atomic_load_relaxed_int(&di->pointers[i].id_plus1))
+      if (!retro_atomic_load_relaxed_int(&di->pointers[i].id_plus1))
       {
          unsigned window     = 0;
          unsigned generation = 0;
