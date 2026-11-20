@@ -2523,10 +2523,11 @@ static LRESULT CALLBACK win32_video_window_proc(HWND hwnd, UINT message,
 
    win32_foreground_message(&win32_foreground, message);
 
-   /* A touch that will not be lifted here, handed on whatever the
-    * window's state: it can come as the window goes, after destroy()
-    * has taken it out */
-   if (message == WM_POINTERCAPTURECHANGED)
+   /* A touch's end, handed on whatever the window's state: a lift can
+    * come once its user has closed it, and a lost touch as it goes,
+    * after destroy() has taken it out */
+   if (     message == WM_POINTERUP
+         || message == WM_POINTERCAPTURECHANGED)
       return win32_wnd_proc_route(hwnd, message, wparam, lparam);
 
    if (!state)
@@ -2586,7 +2587,6 @@ static LRESULT CALLBACK win32_video_window_proc(HWND hwnd, UINT message,
       case WM_IME_COMPOSITION:
       case WM_IME_ENDCOMPOSITION:
       case WM_POINTERDOWN:
-      case WM_POINTERUP:
       case WM_POINTERUPDATE:
       case WM_MOUSEWHEEL:
       case WM_MOUSEHWHEEL:
