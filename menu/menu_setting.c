@@ -4038,16 +4038,14 @@ static char setting_video_screen_display_list[
 static char setting_video_screen_display_value[RETRO_VIDEO_VIEWS_MAX]
       [VIDEO_WINDOW_DISPLAY_NAME_SIZE];
 
+#ifdef HAVE_VIDEO_WINDOWS
 /* The screens have windows or displays of their own to go to */
 static bool setting_video_screen_display_full(void)
 {
-#ifdef HAVE_VIDEO_WINDOWS
    return video_driver_test_all_flags(GFX_CTX_FLAGS_VIDEO_WINDOWS)
        && config_get_ptr()->bools.video_windows_enable;
-#else
-   return false;
-#endif
 }
+#endif
 
 static void setting_video_screen_display_read(rarch_setting_t *setting)
 {
