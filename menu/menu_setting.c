@@ -4068,19 +4068,18 @@ static void setting_video_screen_display_read(rarch_setting_t *setting)
 static void setting_video_screen_display_write(unsigned s)
 {
    video_screen_values_t values;
+   char display[VIDEO_WINDOW_DISPLAY_NAME_SIZE];
+   strlcpy(display, setting_video_screen_display_value[s], sizeof(display));
    video_driver_screen_get(s, &values);
-   if (!string_is_equal(values.display,
-            setting_video_screen_display_value[s]))
+   if (!string_is_equal(values.display, display))
    {
-      strlcpy(values.display, setting_video_screen_display_value[s],
-            sizeof(values.display));
+      strlcpy(values.display, display, sizeof(values.display));
       video_driver_screen_set(s,
             VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY), &values);
    }
    /* After the write: a row drawn on the video thread re-reads one that
     * equals _seen and is not in force yet */
-   strlcpy(setting_video_screen_display_seen[s],
-         setting_video_screen_display_value[s],
+   strlcpy(setting_video_screen_display_seen[s], display,
          sizeof(setting_video_screen_display_seen[s]));
 }
 
