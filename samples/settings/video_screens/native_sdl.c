@@ -2840,6 +2840,89 @@ static void native_sdl_fullscreen_move(const gfx_ctx_driver_t *ctx,
          false);
    XCloseDisplay(fix);
 }
+
+/* Edits with the fixture as the window manager: X asks it for a move
+ * alone and Size for a size alone. After a size it never makes, an X
+ * edit asks for the move alone, not that size again, which SDL 2's x11
+ * would wait up to 100 ms on. No manager may be running. */
+static void native_sdl_asked(const gfx_ctx_driver_t *ctx, void *data,
+      video_window_request_t *r, video_window_native_t *window,
+      SDL_Rect want, float density)
+{
+   Display *dpy;
+   Window xwin;
+   unsigned i;
+   SDL_Window *win;
+   native_sdl_wm_t wm;
+   Display *fix = NULL;
+
+   r->settings.monitor    = 0;
+   r->settings.fullscreen = false;
+   r->settings.pos        = VIDEO_POS_PACK(want.x, want.y);
+   r->settings.dims       = VIDEO_SCALE_PACK(400, 300);
+   r->settings.pos_set    = true;
+   native_sdl_replace(ctx, data, r, window);
+   win = (SDL_Window*)window->surface;
+   native_sdl_wait_rect_at(ctx, data, r, window, want, false, 0, NULL);
+   native_window_settle(ctx, data, r, VIDEO_WINDOW_SETTLE_USEC + 100000);
+   if (native_sdl_x11(win, &dpy, &xwin))
+      fix = XOpenDisplay(DisplayString(dpy));
+   CHECK(fix != NULL);
+   if (!fix)
+      return;
+   XSelectInput(fix, DefaultRootWindow(fix), SubstructureRedirectMask);
+   XSync(fix, False);
+
+   /* X, Size, a Size the manager never makes, then X */
+   for (i = 0; i < 4; i++)
+   {
+      retro_time_t start;
+      unsigned long other;
+      bool move = i == 0 || i == 3;
+      memset(&wm, 0, sizeof(wm));
+      other = move ? (CWWidth | CWHeight) : (CWX | CWY);
+      if (move)
+      {
+         want.x          += 40;
+         r->settings.pos  = VIDEO_POS_PACK(want.x, want.y);
+      }
+      else
+         r->settings.dims = i == 1 ? VIDEO_SCALE_PACK(420, 310)
+            : VIDEO_SCALE_PACK(440, 330);
+      if (i == 1)
+      {
+         want.w = (int)(420 / density);
+         want.h = (int)(310 / density);
+      }
+      start = cpu_features_get_time_usec();
+      ctx->windows->update(data, window, r);
+      if (i == 3)
+         fprintf(stderr, "native sdl: an X edit after a size never made "
+               "took %d ms\n",
+               (int)((cpu_features_get_time_usec() - start) / 1000));
+      XSync(dpy, False);
+      XSync(fix, False);
+      native_sdl_wm_moves(fix, xwin, &wm, false);
+      if (wm.mask & other)
+         fprintf(stderr, "native sdl: edit %u asked for %s too\n", i,
+               move ? "a size" : "a move");
+      CHECK(wm.mask & (move ? (CWX | CWY) : (CWWidth | CWHeight)));
+      CHECK(!(wm.mask & other));
+      if (i == 2)
+      {
+         native_window_settle(ctx, data, r,
+               VIDEO_WINDOW_SETTLE_USEC + 100000);
+         continue;
+      }
+      native_sdl_wm_moves(fix, xwin, &wm, true);
+      if (i < 2)
+         native_sdl_wait_rect_at(ctx, data, r, window, want, false, 0,
+               NULL);
+   }
+   XSelectInput(fix, DefaultRootWindow(fix), NoEventMask);
+   XSync(fix, False);
+   XCloseDisplay(fix);
+}
 #endif
 
 /* Pumps, with nothing polled, until a drag's bounds wait for the next
@@ -3138,6 +3221,15 @@ static void native_sdl_updates(const gfx_ctx_driver_t *ctx, void *data,
       want.w          = (int)(400 / density);
       want.h          = (int)(300 / density);
       native_sdl_kept_max(ctx, data, &r, window, want, i == 1);
+   }
+   /* One that answers each edit's asks, then keeps it from a size */
+   if (!managed && native_sdl_driver("x11"))
+   {
+      want.x = x + 200;
+      want.y = y + 150;
+      want.w = (int)(400 / density);
+      want.h = (int)(300 / density);
+      native_sdl_asked(ctx, data, &r, window, want, density);
    }
    /* One slow to take it out of fullscreen */
    for (i = 0; !managed && native_sdl_driver("x11") && i < 3; i++)
