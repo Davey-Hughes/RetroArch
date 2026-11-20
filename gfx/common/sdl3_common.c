@@ -36,6 +36,9 @@
 #include "../../input/input_driver.h"
 #include "../../retroarch.h"
 #include "../../version.h"
+#if defined(_WIN32) && defined(HAVE_VIDEO_WINDOWS) && defined(HAVE_THREADS)
+#include "../video_thread_wrapper.h"
+#endif
 
 /* 16x16 ARGB8888 window icon, matching x_ctx.c, wayland_common.c, ui_qt.cpp. */
 static const uint32_t sdl3_icon_data[16 * 16] = {
@@ -1102,6 +1105,7 @@ static void sdl3_video_windows_lost(bool removed)
                (unsigned)(rect.h * density + 0.5f)), now);
       SDL_SetWindowSize(state->win, rect.w, rect.h);
       SDL_SetWindowPosition(state->win, rect.x, rect.y);
+      state->put_dims = 0;
    }
 }
 
@@ -1128,6 +1132,49 @@ static bool sdl3_video_window_framed(SDL_Window *win)
       && (top || left);
 }
 
+/* Puts it at @rect as a window. What it was put at last is asked for
+ * again only where SDL has it neither there nor where it was before or
+ * after it was last asked, which is an ask still out or one the window
+ * manager kept it from: SDL's x11 can wait up to 100 ms on each of
+ * those, and has the manager's answer after it if one came. */
+static void sdl3_video_window_put(sdl3_video_window_t *state,
+      const SDL_Rect *rect, float density)
+{
+   unsigned pos, dims, at, size;
+   int x         = 0;
+   int y         = 0;
+   int w         = 0;
+   int h         = 0;
+   /* nothing to go by once the user's bounds are saved */
+   bool known    = state->put_dims && state->common.placed_dims;
+   SDL_GetWindowPosition(state->win, &x, &y);
+   SDL_GetWindowSizeInPixels(state->win, &w, &h);
+   at   = VIDEO_POS_PACK(x, y);
+   size = VIDEO_SCALE_PACK(w, h);
+   sdl3_video_window_placing(state, rect, density);
+   pos  = state->common.placed_pos;
+   dims = state->common.placed_dims;
+   if (     !known || dims != state->put_dims
+         || (     size != dims && size != state->had_dims
+               && size != state->got_dims))
+   {
+      SDL_SetWindowSize(state->win, rect->w, rect->h);
+      SDL_GetWindowSizeInPixels(state->win, &w, &h);
+      state->had_dims = size;
+      state->got_dims = VIDEO_SCALE_PACK(w, h);
+   }
+   if (     !known || pos != state->put_pos
+         || (at != pos && at != state->had_pos && at != state->got_pos))
+   {
+      SDL_SetWindowPosition(state->win, rect->x, rect->y);
+      SDL_GetWindowPosition(state->win, &x, &y);
+      state->had_pos = at;
+      state->got_pos = VIDEO_POS_PACK(x, y);
+   }
+   state->put_pos  = pos;
+   state->put_dims = dims;
+}
+
 /* Puts the window where its request has it */
 static void sdl3_video_window_apply(sdl3_video_window_t *state)
 {
@@ -1152,6 +1199,7 @@ static void sdl3_video_window_apply(sdl3_video_window_t *state)
       if (state->fullscreen && SDL_GetDisplayForWindow(win) == display)
          return;
       sdl3_video_window_placing(state, &rect, density);
+      state->put_dims = 0;
       /* window managers keep a fullscreen window where it is, so it
        * moves by way of a window, a step at a time: SDL's x11 waits for
        * a step to be answered before it takes the next */
@@ -1218,9 +1266,7 @@ static void sdl3_video_window_apply(sdl3_video_window_t *state)
                &place, 0, now->dims ? density : 1.0f, &rect);
       }
       state->windowed_set = false;
-      sdl3_video_window_placing(state, &rect, density);
-      SDL_SetWindowSize(win, rect.w, rect.h);
-      SDL_SetWindowPosition(win, rect.x, rect.y);
+      sdl3_video_window_put(state, &rect, density);
    }
    state->fullscreen = now->fullscreen;
 }
@@ -1382,6 +1428,15 @@ bool sdl3_video_window_create(void *owner, SDL_WindowFlags flags,
       window->dims = VIDEO_SCALE_PACK(w, h);
    video_window_placed(&state->common, state->common.pos, window->dims,
          cpu_features_get_time_usec());
+   if (!request->settings.fullscreen)
+   {
+      state->put_pos  = state->common.pos;
+      state->put_dims = window->dims;
+      state->had_pos  = state->put_pos;
+      state->had_dims = state->put_dims;
+      state->got_pos  = state->put_pos;
+      state->got_dims = state->put_dims;
+   }
    sdl3_video_window_check(state);
    return true;
 }
@@ -1519,14 +1574,29 @@ unsigned sdl3_video_window_screen(const SDL_Window *win, SDL_WindowID id,
 }
 
 /* On Windows a window is its thread's, which alone takes it or lets it
- * go; only the main thread keeps one, as that outlasts the driver */
+ * go */
 static bool sdl3_video_window_foreign(const sdl3_video_window_t *state)
 {
 #ifdef _WIN32
-   return state->thread != SDL_GetCurrentThreadID() || !task_is_on_main_thread();
+   return state->thread != SDL_GetCurrentThreadID();
 #else
    return false;
 #endif
+}
+
+/* and it goes with its thread: off the main thread the video thread is
+ * held for the next driver */
+static bool sdl3_video_window_outlasts(void)
+{
+#ifdef _WIN32
+   if (!task_is_on_main_thread())
+#ifdef HAVE_THREADS
+      return video_thread_host_hold(sdl3_video_windows_release_kept);
+#else
+      return false;
+#endif
+#endif
+   return true;
 }
 
 static void sdl3_video_window_let_go(sdl3_video_window_t *state)
@@ -1555,6 +1625,7 @@ void sdl3_video_window_keep(void *owner, video_window_native_t *window)
    if (!state || state->common.owner != owner)
       return;
    if (     sdl3_video_window_foreign(state)
+         || !sdl3_video_window_outlasts()
          || !SDL_InitSubSystem(SDL_INIT_VIDEO))
       sdl3_video_window_destroy(owner, window);
    else
