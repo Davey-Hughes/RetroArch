@@ -4736,6 +4736,51 @@ static void test_screen_prefs_not_in_override(void)
    screens_file_end();
 }
 
+/* The file is the loaded core's, whatever the system info says later
+ * (Load Core rewrites it while content is still loaded) */
+static void test_screen_prefs_saved_for_loaded_core(void)
+{
+   static const char sentinel[] = "# sentinel\n";
+   settings_t *settings        = config_get_ptr();
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   video_screen_prefs_t *prefs = &video_state_get_ptr()->screen_prefs;
+   const char *kept_name       = runloop_st->system.info.library_name;
+   bool kept_save_on_exit      = settings->bools.config_save_on_exit;
+   video_screen_values_t values;
+   char path[PATH_MAX_LENGTH];
+   char text[64];
+   config_file_t *conf;
+   screens_file_begin("Core B", path, sizeof(path));
+   screens_file_write(path, sentinel);
+   screens_file_path("Core A", path, sizeof(path));
+   filestream_delete(path);
+   screens_test_core();
+   strlcpy(prefs->library_name, "Core A", sizeof(prefs->library_name));
+   prefs->in_use = true;
+   memset(&values, 0, sizeof(values));
+   strlcpy(values.display, VIDEO_WINDOW_DISPLAY_OFF, sizeof(values.display));
+   video_driver_screen_set(1,
+         VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY), &values);
+   runloop_st->system.info.library_name   = "Core B";
+   settings->bools.config_save_on_exit   = false;
+   retroarch_save_for_suspend();
+   CHECK(!prefs->dirty);
+   conf = config_file_new_from_path_to_string(path);
+   CHECK(conf != NULL);
+   if (conf)
+   {
+      CHECK(config_get_array(conf, "video_screen2_display", text, sizeof(text)));
+      CHECK(string_is_equal(text, VIDEO_WINDOW_DISPLAY_OFF));
+      config_file_free(conf);
+   }
+   screens_file_path("Core B", path, sizeof(path));
+   CHECK(screens_file_holds(path, sentinel));
+   runloop_st->system.info.library_name = kept_name;
+   settings->bools.config_save_on_exit  = kept_save_on_exit;
+   screens_test_core_done();
+   screens_file_end();
+}
+
 /* An absent screen's window goes, and comes back where it was; nothing
  * of the user's is written */
 static void test_window_absent_back(void)
@@ -9214,6 +9259,7 @@ int main(int argc, char **argv)
       test_screen_prefs_invalid_entries();
       test_screen_prefs_window_keys_kept();
       test_screen_prefs_not_in_override();
+      test_screen_prefs_saved_for_loaded_core();
    }
    test_window_layout();
    test_window_frame();

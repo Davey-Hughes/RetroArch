@@ -20,6 +20,7 @@
 
 #include <boolean.h>
 #include <retro_common_api.h>
+#include <retro_miscellaneous.h>
 #include <libretro.h>
 
 #include "video_views.h"
@@ -73,6 +74,7 @@ typedef struct video_screen_prefs
 {
    video_screen_values_t values[RETRO_VIDEO_VIEWS_MAX];
    unsigned set[RETRO_VIDEO_VIEWS_MAX];  /* VIDEO_SCREEN_PREF_BIT()s */
+   char library_name[NAME_MAX_LENGTH];   /* the core loaded, whose file it is */
    bool core_loaded;  /* a core, not the dummy, is loaded: the store is its */
    bool in_use;       /* it uses views: it sent a map since loading, or had a file */
    bool dirty;        /* changed since loaded or saved */

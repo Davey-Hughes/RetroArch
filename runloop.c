@@ -6163,7 +6163,7 @@ void runloop_event_deinit_core(void)
    video_driver_cached_frame_retire();
    video_driver_clear_views();
 #ifdef HAVE_CONFIGFILE
-   config_save_video_screen_prefs(runloop_st->system.info.library_name,
+   config_save_video_screen_prefs(video_st->screen_prefs.library_name,
          &video_st->screen_prefs);
 #endif
    memset(&video_st->screen_prefs, 0, sizeof(video_st->screen_prefs));
@@ -7139,11 +7139,16 @@ bool runloop_event_init_core(
    /* The core's own screen choices, over its overrides */
    memset(&video_st->screen_prefs, 0, sizeof(video_st->screen_prefs));
    video_st->screen_prefs.core_loaded = (type != CORE_TYPE_DUMMY);
-#ifdef HAVE_CONFIGFILE
    if (video_st->screen_prefs.core_loaded)
-      config_load_video_screen_prefs(sys_info->info.library_name,
+   {
+      strlcpy(video_st->screen_prefs.library_name,
+            sys_info->info.library_name,
+            sizeof(video_st->screen_prefs.library_name));
+#ifdef HAVE_CONFIGFILE
+      config_load_video_screen_prefs(video_st->screen_prefs.library_name,
             &video_st->screen_prefs);
 #endif
+   }
 
    /* Cannot access these settings-related parameters
     * until *after* config overrides have been loaded */
