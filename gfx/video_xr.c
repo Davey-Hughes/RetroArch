@@ -501,22 +501,26 @@ static unsigned video_xr_menu_dims(const video_xr_params_t *p,
          VIDEO_SCALE_PACK(w, h), p->max_dim);
 }
 
-/* The first screen with a quad, RETRO_VIDEO_VIEWS_MAX for none. */
+/* The first screen shown, past those left out or hidden; or
+ * RETRO_VIDEO_VIEWS_MAX for none, or when the projection shows it. */
 static unsigned video_xr_first_placed(const video_xr_params_t *p,
       const video_xr_layout_t *lay)
 {
    unsigned s;
-   unsigned skip = p->skip_screens;
+   unsigned gone = 0;
    if (p->map && p->map->num_views)
-      skip |= p->map->viewless | p->map->left_out;
+      gone = p->map->viewless | p->map->left_out;
    for (s = 0; s < lay->count; s++)
-      if (!(skip & (1u << s)) && (!p->screens || p->screens[s].visible))
-         return s;
+   {
+      if ((gone & (1u << s)) || (p->screens && !p->screens[s].visible))
+         continue;
+      return (p->skip_screens & (1u << s)) ? RETRO_VIDEO_VIEWS_MAX : s;
+   }
    return RETRO_VIDEO_VIEWS_MAX;
 }
 
 /* At its own spot; or with menu_follow VIDEO_XR_MENU_LIFT in front of
- * the first screen with a quad, facing as it does. Following, it
+ * the first screen shown, facing as it does. Following, it
  * comes no nearer than VIDEO_XR_MENU_NEAREST, and w and h scale with
  * its distance so it looks as large as at its spot; facing away from
  * the anchor, where no laser reaches it, it stays at its spot. */

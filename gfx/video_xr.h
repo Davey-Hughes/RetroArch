@@ -126,7 +126,7 @@ typedef struct video_xr_params
    /* Floating-screen adjustments by screen ID; NULL uses defaults. */
    const video_screen_xr_t *screens;
    /* The menu's own place from its spot; NULL: at its spot, or with
-    * menu_follow in front of the first screen with a quad. */
+    * menu_follow in front of the first screen shown. */
    const video_screen_xr_t *menu;
    float frame_aspect;
    unsigned frame_dims;
@@ -148,8 +148,8 @@ typedef struct video_xr_params
     * the others keep their places. */
    unsigned skip_screens;
    bool swap_eyes;
-   /* An unplaced menu opens in front of the first screen with a quad
-    * and moves with it. */
+   /* An unplaced menu opens in front of the first screen shown and
+    * moves with it; at its spot when the projection shows that one. */
    bool menu_follow;
    /* The whole frame is the window, with the menu drawn in it. */
    bool window;
