@@ -40,7 +40,7 @@ RETRO_BEGIN_DECLS
 #define VIDEO_XR_GAP       0.02f
 /* How far the UI floats in front of screen 0, in metres. */
 #define VIDEO_XR_MENU_LIFT 0.10f
-/* Following screen 0, the UI comes no nearer the anchor than this. */
+/* Following a screen, the UI comes no nearer the anchor than this. */
 #define VIDEO_XR_MENU_NEAREST 0.40f
 /* The UI's quad fits in screen 0's width by this much of it. */
 #define VIDEO_XR_MENU_MAX_H 0.75f
@@ -107,6 +107,8 @@ typedef struct video_xr_slot
    /* A frame shown whole without the screens' settings (a views core's
     * fallback): their edits would not move it, so it is no item. */
    bool fixed;
+   /* A BLANK screen's: it keeps its place and is drawn black. */
+   bool blank;
 } video_xr_slot_t;
 
 typedef struct video_xr_quad_set
@@ -124,7 +126,7 @@ typedef struct video_xr_params
    /* Floating-screen adjustments by screen ID; NULL uses defaults. */
    const video_screen_xr_t *screens;
    /* The menu's own place from its spot; NULL: at its spot, or with
-    * menu_follow in front of screen 0. */
+    * menu_follow in front of the first screen with a quad. */
    const video_screen_xr_t *menu;
    float frame_aspect;
    unsigned frame_dims;
@@ -146,7 +148,8 @@ typedef struct video_xr_params
     * the others keep their places. */
    unsigned skip_screens;
    bool swap_eyes;
-   /* An unplaced menu opens in front of screen 0 and moves with it. */
+   /* An unplaced menu opens in front of the first screen with a quad
+    * and moves with it. */
    bool menu_follow;
    /* The whole frame is the window, with the menu drawn in it. */
    bool window;

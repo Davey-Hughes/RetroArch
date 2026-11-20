@@ -37,7 +37,9 @@ void video_windows_plan(const video_views_map_t *map,
          : mode == VIDEO_WINDOW_SEPARATE;
       if (map->viewless & bit)
          continue;
-      if (!enabled || (!route && !s))
+      if (map->left_out & bit)
+         out->hidden_mask |= bit;
+      else if (!enabled || (!route && !s))
          out->main_mask |= bit;
       else if (mode == VIDEO_WINDOW_HIDDEN)
          out->hidden_mask |= bit;

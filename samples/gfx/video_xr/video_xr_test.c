@@ -1850,17 +1850,23 @@ static void test_menu_spot(void)
    CHECK(NEAR(set.quads[set.num_quads - 1].width, 16.0));
    p.menu = NULL;
 
-   /* Screen 1 hidden or the projection's: the menu at its spot. */
+   /* Screen 1 hidden or the projection's: the menu goes with screen 2. */
    screens[0].visible = false;
    screens[0].x       = 3.0f;
    video_xr_place(&p, &set);
    m = &set.quads[set.num_quads - 1];
-   CHECK(m->kind == VIDEO_XR_QUAD_MENU && pos_is(m, 0.0, 0.0, -1.7));
+   CHECK(set.num_quads == 2 && set.quads[0].screen == 1);
+   CHECK(m->kind == VIDEO_XR_QUAD_MENU && pos_is(m,
+            set.quads[0].pose.position.x, set.quads[0].pose.position.y,
+            -1.7));
    screens[0].visible = true;
    p.skip_screens     = 1u;
    video_xr_place(&p, &set);
    m = &set.quads[set.num_quads - 1];
-   CHECK(m->kind == VIDEO_XR_QUAD_MENU && pos_is(m, 0.0, 0.0, -1.7));
+   CHECK(set.num_quads == 2 && set.quads[0].screen == 1);
+   CHECK(m->kind == VIDEO_XR_QUAD_MENU && pos_is(m,
+            set.quads[0].pose.position.x, set.quads[0].pose.position.y,
+            -1.7));
    p.skip_screens = 0;
 
    /* A whole frame is screen 1: the menu goes with it. */
@@ -8002,6 +8008,142 @@ static void test_place_no_input(void)
    CHECK(video_xr_pick_edit(&set, false, &o, &d, &u, &v, &t, NULL) == 1);
 }
 
+/* map_ds through video_views_validate_map. */
+static void map_ds_screens(video_views_map_t *map)
+{
+   struct retro_video_view v[2];
+   v[0] = mkview(0,   0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_NONE);
+   v[1] = mkview(0, 192, 256, 192, 1, RETRO_VIDEO_VIEW_EYE_NONE);
+   absent_map(v, 2, 2, 0, map);
+}
+
+/* A left-out screen has no quad, and the others keep their places. */
+static void test_xr_left_out(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t want, set;
+   unsigned layout, i;
+
+   map_ds_screens(&map);
+   for (layout = 0; layout < VIDEO_SCREEN_LAYOUT_LAST; layout++)
+   {
+      params_init(&p, &map);
+      p.screen_layout = layout;
+      map.left_out    = 0;
+      video_xr_place(&p, &want);
+      CHECK(want.num_quads == 2 && want.quads[1].screen == 1);
+      map.left_out    = 0x1u;
+      video_xr_place(&p, &set);
+      CHECK(set.num_quads == 1 && quads_finite(&set));
+      for (i = 0; i < set.num_quads; i++)
+         CHECK(set.quads[i].kind != VIDEO_XR_QUAD_SCREEN
+               || set.quads[i].screen != 0);
+      CHECK(   set.quads[0].kind == VIDEO_XR_QUAD_SCREEN
+            && set.quads[0].screen == 1);
+      CHECK(pose_same(&set.quads[0].pose, &want.quads[1].pose));
+      CHECK(   set.quads[0].width  == want.quads[1].width
+            && set.quads[0].height == want.quads[1].height);
+      CHECK(set.slots[0].dims == 0 && set.slots[0].layers == 0);
+   }
+}
+
+/* A blank screen keeps its quad and its slot, which says it is blank. */
+static void test_xr_blank_slot(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+
+   map_ds_screens(&map);
+   params_init(&p, &map);
+   map.blank = 0x2u;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 2);
+   CHECK(   set.quads[1].kind == VIDEO_XR_QUAD_SCREEN
+         && set.quads[1].screen == 1);
+   CHECK(set.slots[1].blank && !set.slots[0].blank);
+   CHECK(set.slots[1].dims && set.slots[1].layers == 1);
+}
+
+/* The menu, set's last quad, at quad i's x and y. */
+static int menu_over(const video_xr_quad_set_t *set, unsigned i)
+{
+   const video_xr_quad_t *m = &set->quads[set->num_quads - 1];
+   return m->kind == VIDEO_XR_QUAD_MENU
+      && NEAR(m->pose.position.x, set->quads[i].pose.position.x)
+      && NEAR(m->pose.position.y, set->quads[i].pose.position.y);
+}
+
+/* A following menu goes with the first screen placed, and stays at its
+ * own spot with none. */
+static void test_xr_menu_follows_first_placed(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   video_screen_xr_t screens[RETRO_VIDEO_VIEWS_MAX];
+   video_xr_pose_t spot;
+
+   map_ds_screens(&map);
+   params_init(&p, &map);
+   p.ui_dims = VIDEO_SCALE_PACK(1600, 960);
+   video_views_xr_reset(screens, RETRO_VIDEO_VIEWS_MAX);
+   /* Moved: a menu following it is off its own spot. */
+   screens[0].x = 0.5f;
+   p.screens    = screens;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 3 && set.quads[2].kind == VIDEO_XR_QUAD_MENU);
+   spot = set.quads[2].pose;
+
+   p.menu_follow = true;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 3 && set.quads[0].screen == 0);
+   CHECK(menu_over(&set, 0));
+   CHECK(!pose_same(&set.quads[2].pose, &spot));
+
+   map.left_out = 0x1u;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 2 && set.quads[0].screen == 1);
+   CHECK(menu_over(&set, 0));
+   map.left_out = 0;
+
+   screens[0].visible = false;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 2 && set.quads[0].screen == 1);
+   CHECK(menu_over(&set, 0));
+   screens[0].visible = true;
+
+   map.left_out = 0x3u;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 1 && set.quads[0].kind == VIDEO_XR_QUAD_MENU);
+   CHECK(pose_same(&set.quads[0].pose, &spot));
+}
+
+/* No screen placed: nothing read past the screens, no screen quad, and
+ * a following menu at its own spot. */
+static void test_xr_all_skipped(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_layout_t lay;
+   video_xr_quad_set_t set;
+   unsigned i;
+
+   map_ds_screens(&map);
+   map.viewless  = 0x3u;
+   params_init(&p, &map);
+   p.ui_dims     = VIDEO_SCALE_PACK(1600, 960);
+   p.menu_follow = true;
+   video_xr_layout(&p, &lay);
+   CHECK(lay.count == 0);
+   video_xr_place(&p, &set);
+   for (i = 0; i < set.num_quads; i++)
+      CHECK(set.quads[i].kind != VIDEO_XR_QUAD_SCREEN);
+   CHECK(set.num_quads == 1 && set.quads[0].kind == VIDEO_XR_QUAD_MENU);
+   CHECK(quads_finite(&set) && pos_is(&set.quads[0], 0.0, 0.0, -1.7));
+}
+
 int main(void)
 {
    test_screen_defaults();
@@ -8155,6 +8297,10 @@ int main(void)
    test_xr_viewless();
    test_quad_to_frame_no_input();
    test_place_no_input();
+   test_xr_left_out();
+   test_xr_blank_slot();
+   test_xr_menu_follows_first_placed();
+   test_xr_all_skipped();
 
    if (failures)
    {
