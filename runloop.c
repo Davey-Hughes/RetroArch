@@ -6162,6 +6162,11 @@ void runloop_event_deinit_core(void)
 
    video_driver_cached_frame_retire();
    video_driver_clear_views();
+#ifdef HAVE_CONFIGFILE
+   config_save_video_screen_prefs(runloop_st->system.info.library_name,
+         &video_st->screen_prefs);
+#endif
+   memset(&video_st->screen_prefs, 0, sizeof(video_st->screen_prefs));
    /* The next content gets its own headset notice. */
    video_st->headset_notice_hz = 0;
 
@@ -7131,6 +7136,15 @@ bool runloop_event_init_core(
       config_load_override(&runloop_st->system);
 #endif
 
+   /* The core's own screen choices, over its overrides */
+   memset(&video_st->screen_prefs, 0, sizeof(video_st->screen_prefs));
+   video_st->screen_prefs.core_loaded = (type != CORE_TYPE_DUMMY);
+#ifdef HAVE_CONFIGFILE
+   if (video_st->screen_prefs.core_loaded)
+      config_load_video_screen_prefs(sys_info->info.library_name,
+            &video_st->screen_prefs);
+#endif
+
    /* Cannot access these settings-related parameters
     * until *after* config overrides have been loaded */
 #ifdef HAVE_CONFIGFILE
@@ -7223,6 +7237,7 @@ bool runloop_event_init_core(
    if (!event_init_content(runloop_st, settings, input_st))
    {
       runloop_st->flags &= ~RUNLOOP_FLAG_CORE_RUNNING;
+      memset(&video_st->screen_prefs, 0, sizeof(video_st->screen_prefs));
       return false;
    }
 
@@ -7233,6 +7248,7 @@ bool runloop_event_init_core(
    if (!runloop_event_load_core(runloop_st, poll_type_behavior))
    {
       runloop_reset_auto_state_load(runloop_st);
+      memset(&video_st->screen_prefs, 0, sizeof(video_st->screen_prefs));
       return false;
    }
 

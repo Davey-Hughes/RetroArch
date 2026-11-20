@@ -1831,6 +1831,22 @@ void config_set_video_screen_xr(unsigned screen,
       const struct video_screen_xr *values);
 void config_set_video_menu_xr(const struct video_screen_xr *values);
 
+#ifdef HAVE_CONFIGFILE
+struct video_screen_prefs;
+/* $CONFIG/<library_name>/<library_name>.screens.cfg, $CONFIG as
+ * overrides and core options find it, into @prefs, which the caller has
+ * cleared: each valid entry marked set; in_use when the file was there.
+ * False with no file or no name. */
+bool config_load_video_screen_prefs(const char *library_name,
+      struct video_screen_prefs *prefs);
+
+/* @prefs to that file when dirty: only the entries set, making the
+ * core's directory first; with none set, the file is removed. Clears
+ * dirty once written. */
+bool config_save_video_screen_prefs(const char *library_name,
+      struct video_screen_prefs *prefs);
+#endif
+
 void config_set_defaults(settings_t *target);
 
 #ifdef ANDROID
