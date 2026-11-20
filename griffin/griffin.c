@@ -309,6 +309,7 @@ CRYPTO
 #include "../gfx/video_driver.c"
 #include "../gfx/common/video_mode_select.c"
 #include "../gfx/video_views.c"
+#include "../gfx/video_screen_prefs.c"
 #if defined(HAVE_VIDEO_WINDOWS)
 #include "../gfx/video_windows.c"
 #endif
