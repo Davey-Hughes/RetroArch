@@ -75,7 +75,15 @@
  * logs whether it was accepted; after the last, the full map every
  * frame. no_input names the two screens and marks the bottom one
  * NO_INPUT, for e2e/run.py's light gun check; no_input_off only names
- * them. */
+ * them. The other modes name them too and send the bottom one as:
+ * shown, SHOWN; hidden, HIDDEN; over, OVER the top one's bottom right
+ * corner at a quarter of its height; blank, BLANK; absent, ABSENT with
+ * its view kept. blank_late sends it ACTIVE and from frame 60 BLANK,
+ * absent_back ABSENT and from frame 60 ACTIVE, each logging the switch
+ * once. none_shown sends both screens HIDDEN.
+ *
+ * VIDEO_VIEWS_TEST_LIBRARY_NAME in the environment replaces the library
+ * name, so one build can load as a second core. */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -161,8 +169,7 @@ enum screens_kind
 {
    SCREENS_OFF = 0,
    SCREENS_RULES,
-   SCREENS_NO_INPUT,
-   SCREENS_NO_INPUT_OFF
+   SCREENS_MODE
 };
 
 /* The GL the hardware mode uses, loaded through the frontend's
@@ -330,6 +337,9 @@ static enum screens_kind screens_kind = SCREENS_OFF;
 static unsigned screens_next;
 static const char *screens_logged;
 static int screens_logged_accepted = -1;
+/* With SCREENS_MODE, the scr_modes entry, and whether it has switched. */
+static unsigned screens_mode;
+static bool screens_switched;
 
 static void fallback_log(enum retro_log_level level, const char *fmt, ...)
 {
@@ -507,6 +517,7 @@ static void context_reset(void)
 }
 
 static long long now_us(void);
+static bool screens_mode_named(const char *name);
 
 /* When, for a test that orders it against the headset's session. */
 static void context_destroy(void)
@@ -1046,14 +1057,13 @@ static void read_options(void)
    var.value    = NULL;
    screens_kind = SCREENS_OFF;
    screens_next = 0;
+   screens_switched = false;
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
       if (!strcmp(var.value, "rules"))
          screens_kind = SCREENS_RULES;
-      else if (!strcmp(var.value, "no_input"))
-         screens_kind = SCREENS_NO_INPUT;
-      else if (!strcmp(var.value, "no_input_off"))
-         screens_kind = SCREENS_NO_INPUT_OFF;
+      else if (screens_mode_named(var.value))
+         screens_kind = SCREENS_MODE;
    }
 
    var.key   = "video_views_test_map";
@@ -1117,7 +1127,9 @@ void retro_set_environment(retro_environment_t cb)
       { "video_views_test_vr_scene_size",
         "Grid eye size, at most; 512|384|768|1024" },
       { "video_views_test_screens",
-        "Screens the ds map describes; off|rules|no_input|no_input_off" },
+        "Screens the ds map describes; off|rules|no_input|no_input_off"
+        "|shown|hidden|over|blank|blank_late|absent|absent_back"
+        "|none_shown" },
       { NULL, NULL }
    };
    struct retro_log_callback logging;
@@ -1147,8 +1159,9 @@ unsigned retro_api_version(void) { return RETRO_API_VERSION; }
 
 void retro_get_system_info(struct retro_system_info *info)
 {
+   const char *name = getenv("VIDEO_VIEWS_TEST_LIBRARY_NAME");
    memset(info, 0, sizeof(*info));
-   info->library_name     = "video_views test";
+   info->library_name     = (name && *name) ? name : "video_views test";
    info->library_version  = "1";
    info->valid_extensions = "";
    info->need_fullpath    = false;
@@ -2296,6 +2309,68 @@ static const struct
    { "order-mixed-first",    scr_order_mixed_first    }
 };
 
+/* A mode whose @late differs from its @state switches at this frame. */
+#define SCR_SWITCH_FRAME 60
+
+/* video_views_test_screens' modes besides rules: how the ds map's
+ * screen 1 is sent, @late being its state from SCR_SWITCH_FRAME on.
+ * @both gives screen 0 the same show. */
+static const struct
+{
+   const char *name;
+   unsigned flags;
+   unsigned show;
+   unsigned state;
+   unsigned late;
+   bool both;
+} scr_modes[] = {
+   { "no_input",     RETRO_VIDEO_SCREEN_FLAG_NO_INPUT,
+      RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false },
+   { "no_input_off", 0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false },
+   { "shown",        0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false },
+   { "hidden",       0, RETRO_VIDEO_SCREEN_SHOW_HIDDEN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false },
+   { "over",         0, RETRO_VIDEO_SCREEN_SHOW_OVER,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false },
+   { "blank",        0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_BLANK,  RETRO_VIDEO_SCREEN_STATE_BLANK,
+      false },
+   { "blank_late",   0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_BLANK,
+      false },
+   { "absent",       0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ABSENT, RETRO_VIDEO_SCREEN_STATE_ABSENT,
+      false },
+   { "absent_back",  0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ABSENT, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false },
+   { "none_shown",   0, RETRO_VIDEO_SCREEN_SHOW_HIDDEN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      true }
+};
+
+static bool screens_mode_named(const char *name)
+{
+   unsigned i;
+   for (i = 0; i < sizeof(scr_modes) / sizeof(scr_modes[0]); i++)
+   {
+      if (!strcmp(name, scr_modes[i].name))
+      {
+         screens_mode = i;
+         return true;
+      }
+   }
+   return false;
+}
+
 /* The screens video_views_test_screens adds to @in, the ds map. In the
  * rules mode this frame's case, whose name it returns. */
 static const char *screens_add(struct retro_video_views *in)
@@ -2303,12 +2378,25 @@ static const char *screens_add(struct retro_video_views *in)
    const char *name = "full";
    if (screens_kind != SCREENS_RULES)
    {
-      scr_screens[0]  = mkscreen("Top", 0, 0, 0, 0, 0.0f, 0, 0.0f, 0, 0,
-            0, 0);
-      scr_screens[1]  = mkscreen("Bottom",
-            (screens_kind == SCREENS_NO_INPUT)
-            ? RETRO_VIDEO_SCREEN_FLAG_NO_INPUT : 0,
-            0, 0, 0, 0.0f, 0, 0.0f, 0, 0, 0, 0);
+      unsigned show  = scr_modes[screens_mode].show;
+      unsigned state = scr_modes[screens_mode].state;
+      bool over      = (show == RETRO_VIDEO_SCREEN_SHOW_OVER);
+      /* retro_run() has counted this frame. */
+      if (     scr_modes[screens_mode].late != state
+            && frames_run > SCR_SWITCH_FRAME)
+      {
+         state = scr_modes[screens_mode].late;
+         if (!screens_switched)
+            log_cb(RETRO_LOG_INFO, "[video_views] screens switched\n");
+         screens_switched = true;
+      }
+      scr_screens[0]  = mkscreen("Top", 0, 0,
+            scr_modes[screens_mode].both ? show : 0,
+            0, 0.0f, 0, 0.0f, 0, 0, 0, 0);
+      scr_screens[1]  = mkscreen("Bottom", scr_modes[screens_mode].flags,
+            state, show, 0, over ? 0.25f : 0.0f,
+            over ? RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT : 0,
+            0.0f, 0, 0, 0, 0);
       in->flags      |= RETRO_VIDEO_VIEWS_FLAG_SCREENS;
       in->screens     = scr_screens;
       in->num_screens = 2;
