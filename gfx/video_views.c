@@ -372,7 +372,9 @@ bool video_views_eye_pair(const video_views_map_t *map, int eyes[2])
          break;
       eyes[e] = (int)i;
    }
-   if (i < map->num_views || eyes[0] < 0 || eyes[1] < 0)
+   if (     i < map->num_views || eyes[0] < 0 || eyes[1] < 0
+         || (map->left_out & (  (1u << map->views[eyes[0]].screen)
+                              | (1u << map->views[eyes[1]].screen))))
    {
       eyes[0] = -1;
       eyes[1] = -1;

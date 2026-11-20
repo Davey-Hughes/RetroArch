@@ -273,7 +273,8 @@ int video_views_find(const video_views_map_t *map,
       unsigned screen, unsigned eye);
 
 /* A tracked map's eyes: true when the map holds exactly one LEFT and
- * one RIGHT view, their indices in eyes[0] and eyes[1]; else -1. */
+ * one RIGHT view, neither on a screen left out, their indices in
+ * eyes[0] and eyes[1]; else -1. */
 bool video_views_eye_pair(const video_views_map_t *map, int eyes[2]);
 
 /* The views of screens [@first, @first + @count) of @map as a map of

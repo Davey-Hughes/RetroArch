@@ -119,12 +119,13 @@ class GlLanes(unittest.TestCase):
     def test_extra_cases_gl_only(self):
         names = {c['name'] for c in run.CASES}
         self.assertTrue(all(c['name'] not in names for c in run.GL_EXTRA))
-        self.assertEqual(len(run.CASES), 216)
+        self.assertEqual(len(run.CASES), 217)
 
     def test_screens_lanes(self):
-        # A hidden and a blank screen on each driver, once per GL driver.
+        # A hidden, a blank and a left-out tracked screen on each driver,
+        # once per GL driver.
         names = [c['name'] for c in self.gl_cases]
-        for n in ('screens-hidden', 'screens-blank'):
+        for n in ('screens-hidden', 'screens-blank', 'tracked-screen-off'):
             self.assertIn(n, [c['name'] for c in run.CASES])
             for lane in ('glcore-egl', 'glcore-glx', 'gl-egl'):
                 self.assertIn(lane + '-' + n, names)
