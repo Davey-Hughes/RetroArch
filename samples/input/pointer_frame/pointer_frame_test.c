@@ -34,7 +34,8 @@
  *     once the window is gone; motion, buttons and ports as on the
  *     main window; while the menu is up they press nothing, the main
  *     window's still do, and so do those of a window the menu is in;
- *     the menu in the main window reads that window's first touch;
+ *     the menu in the main window reads that window's first touch
+ *     slot, 0 with no screen windows;
  * 16. the flags that keep a driver's own answers (Android's), each off
  *     and on: pressed only inside, the second list, the mouse and
  *     the ids left to the driver, touch slots; and a touch read over
@@ -1269,6 +1270,9 @@ int main(void)
          CHECK( rd(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X) == 60
             &&  input_pointer_main_window_touch() == 0,
                "touches published with no windows are the main window's");
+         input_pointer_touches_set(touch, NULL, 2, 2, 2);
+         CHECK( input_pointer_main_window_touch() == 0,
+               "with no windows the menu reads slot 0, empty or not");
          /* the menu up: nothing in a screen's window presses */
          tw[0].generation = 5;
          menu_up          = true;
