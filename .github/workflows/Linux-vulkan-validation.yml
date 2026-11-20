@@ -349,7 +349,7 @@ jobs:
           make -C samples/cores/video_views
           export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
           export LIBGL_ALWAYS_SOFTWARE=1
-          RA_E2E_XVFB=1 RA_E2E_ONLY='^(3ds-sbs-full|3ds-sbs-half|3ds-top-bottom|3ds-anaglyph|3ds-interlaced|ds-horizontal|exact-3ds|crop-threaded-menu|pointer-sbs-full|screens-rules|screens-no-input)$' \
+          RA_E2E_XVFB=1 RA_E2E_ONLY='^(3ds-sbs-full|3ds-sbs-half|3ds-top-bottom|3ds-anaglyph|3ds-interlaced|ds-horizontal|exact-3ds|crop-threaded-menu|pointer-sbs-full|screens-rules|screens-no-input|screens-blank-aim|screens-hidden|screens-blank-late|screens-none-shown|screens-shown|screens-over|screens-absent|screens-blank|screens-absent-back|screens-user-off|screens-core-beaten|screens-per-core-own|screens-per-core-other|screens-none-shown-menu)$' \
             python3 samples/cores/video_views/e2e/run.py ./retroarch \
             "$RUNNER_TEMP/views-e2e" gl glcore vulkan sdl2
 
@@ -1042,11 +1042,12 @@ jobs:
           # The views compositor as the SDL3 driver instantiates it: each
           # view written straight into a texture of its own, the
           # interlaced canvas, views read exactly out of the frame, the
-          # UI layer per eye with the menu open, and a pointer mapped
-          # back through it. Anaglyph draws the frame whole there.
+          # UI layer per eye with the menu open, a pointer mapped back
+          # through it, and screens left out or drawn blank. Anaglyph
+          # draws the frame whole there.
           export LIBGL_ALWAYS_SOFTWARE=1
           export LD_LIBRARY_PATH=/opt/sdl3/lib
-          RA_E2E_XVFB=1 RA_E2E_ONLY='^(3ds-sbs-full|3ds-sbs-half|3ds-top-bottom|3ds-interlaced|ds-horizontal|exact-3ds|exact-3ds-rgb565|crop-threaded-menu|pointer-sbs-full)$' \
+          RA_E2E_XVFB=1 RA_E2E_ONLY='^(3ds-sbs-full|3ds-sbs-half|3ds-top-bottom|3ds-interlaced|ds-horizontal|exact-3ds|exact-3ds-rgb565|crop-threaded-menu|pointer-sbs-full|screens-hidden|screens-blank-late|screens-none-shown)$' \
             python3 samples/cores/video_views/e2e/run.py ./retroarch \
             "$RUNNER_TEMP/views-e2e" sdl3
 
