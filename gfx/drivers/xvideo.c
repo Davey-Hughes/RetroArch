@@ -1362,7 +1362,9 @@ static unsigned xv_views_frame(xv_t *xv, const void *frame,
       {
          video_views_rect_t dst, cut;
          const video_views_placement_t *p = &layout->placements[i];
-         if (video_views_cpu_cut(layout, p, scale, cdims, true, &dst, &cut))
+         if (     !(p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
+               && video_views_cpu_cut(layout, p, scale, cdims, true,
+                  &dst, &cut))
             xv_views_place(xv, frame, pitch, rgb32,
                   &info->views.views[p->view], &dst, &cut,
                   p->area ? (int)VIDEO_SCALE_W(cdims) : 0, (int)p->area);
@@ -1421,7 +1423,9 @@ static unsigned xv_views_frame(xv_t *xv, const void *frame,
    {
       video_views_rect_t dst, cut;
       const video_views_placement_t *p = &layout->placements[i];
-      if (video_views_cpu_cut(layout, p, scale, cdims, false, &dst, &cut))
+      if (     !(p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
+            && video_views_cpu_cut(layout, p, scale, cdims, false,
+               &dst, &cut))
          xv_views_place(xv, frame, pitch, rgb32,
                &info->views.views[p->view], &dst, &cut, 0, -1);
    }

@@ -1276,7 +1276,8 @@ static int exynos_blit_views(
       video_views_rect_t cut, from;
       const video_views_placement_t *p = &layout->placements[i];
 
-      if (!video_views_visible(layout, p, pdata->dims, &cut))
+      if (     (p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
+            || !video_views_visible(layout, p, pdata->dims, &cut))
          continue;
       video_views_cut_source(&map->views[p->view], &p->dst, &cut, &from);
 
