@@ -1435,10 +1435,10 @@ typedef struct settings
       char input_keyboard_device[MAX_USERS][64];
       /* and the mouse */
       char input_mouse_device[MAX_USERS][64];
-#ifdef HAVE_VIDEO_WINDOWS
       /* Each screen's display, by video_windows_display_key(); empty
        * for Auto, VIDEO_WINDOW_DISPLAY_OFF for none */
       char video_screen_display[RETRO_VIDEO_VIEWS_MAX][64];
+#ifdef HAVE_VIDEO_WINDOWS
       /* The menu's display when it follows no screen; empty for Auto */
       char video_menu_display[64];
 #endif
@@ -1792,9 +1792,10 @@ void config_reset_video_menu_xr(settings_t *settings);
 struct video_screen_xr;
 /* Edit Screens' reads and writes of a screen's place, or the menu's,
  * as the Headset rows keep them. A write normalises, marks
- * the settings modified and leaves Visible alone; NULL resets a screen
- * as Reset Screen does, or puts the menu back in front of screen 1. The
- * menu's read is false while it follows screen 1. */
+ * the settings modified (a views core's screen: its own store) and
+ * leaves Visible alone; NULL resets a screen as Reset Screen does, or
+ * puts the menu back in front of screen 1. The menu's read is false
+ * while it follows screen 1. */
 void config_get_video_screen_xr(unsigned screen, struct video_screen_xr *out);
 bool config_get_video_menu_xr(struct video_screen_xr *out);
 void config_set_video_screen_xr(unsigned screen,
