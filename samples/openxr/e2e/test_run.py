@@ -137,6 +137,7 @@ class GlLanes(unittest.TestCase):
                   'edit-follow', 'edit-no-map', 'edit-fallback'):
             self.assertIn('glcore-egl-' + n, names)
         for n in ('edit-grab', 'edit-reset', 'edit-outlines'):
+            self.assertIn('glcore-egl-' + n, names)
             self.assertIn('gl-egl-' + n, names)
         self.assertIn('glcore-egl-edit-beam', names)
         self.assertIn('gl-egl-edit-beam', names)
