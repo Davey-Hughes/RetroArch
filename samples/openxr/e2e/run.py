@@ -5107,47 +5107,84 @@ def check_edit_stick(res):
                                  last_before(res, 'off', screen1_left))
 
 
-def check_edit_reset(menu=True):
+def check_edit_reset(menu=True, offset=(0.25, 0.1, 0.3)):
+    home = tuple(b + o for b, o in zip(S0, offset))
+    spot = (home[0], home[1], home[2] + 0.1)
+    d = math.sqrt(sum(v * v for v in spot)) / 1.7
+    size = (MENU_W * d, MENU_H * d)
+    # Without a menu quad there is no handle: a grip where it would be
+    # takes screen 1 if that lies behind, so it is held only until then.
+    stay = 'off' if menu or handle_y(spot[1], size[1]) < home[1] - 0.48 \
+        else 'handle'
+
     def check(res):
-        """Screen 1 from its offsets, grabbed and moved, then reset as
-        Reset Screen does, and the menu with it; the menu taken by its
-        handle and moved, screen 1 staying, then back in front of screen
-        1 on its own reset, unplaced."""
+        """Screen 1 at the global offsets, grabbed and moved, then reset
+        as Reset Screen does: the core's entry cleared, it is back where
+        the global offsets put it, and the menu with it; the menu taken
+        by its handle and moved, screen 1 staying, then back in front of
+        screen 1 on its own reset, unplaced."""
         errors = edit_log_errors(res, ['on', 'off'])
         errors += pose_errors('screen 1 at its offsets',
                               [last_before(res, 'offset', screen1_left)],
-                              (0.25, 0.1, -1.5), ID)
+                              home, ID)
         errors += pose_errors('screen 1 moved',
                               [screen1_left(f) for f in
                                between(res, 'moved', 'reset', edit_screen0,
-                                       1.0)], (0.55, 0.1, -1.5), ID)
+                                       1.0)],
+                              (home[0] + 0.3, home[1], home[2]), ID)
         late = between(res, 'reset', 'off', edit_screen0, 1.0)
         errors += pose_errors('screen 1 reset',
-                              [screen1_left(f) for f in late], S0, ID,
-                              (1.6, 0.96))
+                              [screen1_left(f) for f in
+                               between(res, 'reset', stay, edit_screen0,
+                                       1.0)], home, ID, (1.6, 0.96))
         if menu:
             errors += pose_errors(
                 'the menu after the screen\'s reset',
                 [menu_quad(f) for f in between(res, 'reset', 'handle',
                                                delay=1.0)],
-                MENU_SPOT, ID, (MENU_W, MENU_H))
+                spot, ID, size)
             errors += pose_errors(
                 'the menu taken by its handle',
                 [menu_quad(f) for f in between(res, 'placed', 'back',
                                                delay=1.0)],
-                (0.5, 0.0, -1.7), ID, (MENU_W, MENU_H))
+                (spot[0] + 0.5, spot[1], spot[2]), ID, size)
             errors += pose_errors(
                 'its reset',
                 [menu_quad(f) for f in between(res, 'back', 'off',
                                                delay=1.0)],
-                MENU_SPOT, ID, (MENU_W, MENU_H))
+                spot, ID, size)
             if saved(res).get('video_openxr_menu_placed') != 'false':
                 errors.append('the menu\'s reset left it placed')
         return errors + saved_errors(res, 'screen 1', 'video_screen1_xr_',
-                                     S0, (S0, ID), (1.6, 0.96),
+                                     S0, (home, ID), (1.6, 0.96),
                                      screen1_left(late[-1]) if late
-                                     else None)
+                                     else None, edited=False)
     return check
+
+
+def edit_reset_steps(offset):
+    """check_edit_reset()'s steps for screen 1 at the global offsets."""
+    x, y = offset[0], offset[1]
+    z = S0[2] + offset[2] + 0.1
+    handle = handle_y(y, MENU_H * math.sqrt(x * x + y * y + z * z) / 1.7)
+    return edit_start(edit_aim(x, y), 1) + [
+        ('mark', 'offset'),
+        ('script', script(edit_aim(x, y), EDIT_GRIP)), ('wait', 1),
+        ('script', script(edit_aim(x + 0.3, y), EDIT_GRIP)), ('wait', 1),
+        ('script', edit_aim(x + 0.3, y)), ('wait', 0.5), ('mark', 'moved'),
+        ('wait', 1.5), ('mark', 'reset'),
+        ('script', script(edit_aim(x + 0.3, y), EDIT_RESET)),
+        ('wait', 0.5), ('script', edit_aim(x + 0.3, y)), ('wait', 1.5),
+        ('script', edit_aim(x, handle, z=z)), ('wait', 1),
+        ('mark', 'handle'),
+        ('script', script(edit_aim(x, handle, z=z), EDIT_GRIP)),
+        ('wait', 1),
+        ('script', script(edit_aim(x + 0.5, handle, z=z), EDIT_GRIP)),
+        ('wait', 1), ('script', edit_aim(x + 0.5, handle, z=z)),
+        ('mark', 'placed'), ('wait', 1.5), ('mark', 'back'),
+        ('script', script(edit_aim(x + 0.5, handle, z=z), EDIT_RESET)),
+        ('wait', 0.5), ('script', ''), ('wait', 1.5), ('mark', 'off'),
+        ('send', EDIT), ('wait', 1)]
 
 
 def check_edit_menu_front(res):
@@ -7149,28 +7186,15 @@ EDIT_CASES += [
          ('mark', 'grown'), ('script', aim_line(*A0)), ('wait', 1),
          ('mark', 'off'), ('send', EDIT), ('wait', 1)],
      'check': check_edit_stick},
-    # Screen 1 from 0.25,0.1,-1.5, the menu following it until the reset.
+    # Reset with global offsets (0.25,0.1,-1.5) and without: screen 1
+    # goes back to the global placement, the menu following it.
     {'name': 'edit-reset', 'map': '3ds', 'settings': dict(SAVE,
                                                           **EDIT_OFFSET),
-     'steps': edit_start(edit_aim(0.25, 0.1), 1) + [
-         ('mark', 'offset'),
-         ('script', script(edit_aim(0.25, 0.1), EDIT_GRIP)), ('wait', 1),
-         ('script', script(edit_aim(0.55, 0.1), EDIT_GRIP)), ('wait', 1),
-         ('script', edit_aim(0.55, 0.1)), ('wait', 0.5), ('mark', 'moved'),
-         ('wait', 1.5), ('mark', 'reset'),
-         ('script', script(edit_aim(0.55, 0.1), EDIT_RESET)),
-         ('wait', 0.5), ('script', edit_aim(0.55, 0.1)), ('wait', 1.5),
-         ('script', edit_aim(0.0, EDIT_HANDLE, z=-1.7)), ('wait', 1),
-         ('mark', 'handle'),
-         ('script', script(edit_aim(0.0, EDIT_HANDLE, z=-1.7), EDIT_GRIP)),
-         ('wait', 1),
-         ('script', script(edit_aim(0.5, EDIT_HANDLE, z=-1.7), EDIT_GRIP)),
-         ('wait', 1), ('script', edit_aim(0.5, EDIT_HANDLE, z=-1.7)),
-         ('mark', 'placed'), ('wait', 1.5), ('mark', 'back'),
-         ('script', script(edit_aim(0.5, EDIT_HANDLE, z=-1.7), EDIT_RESET)),
-         ('wait', 0.5), ('script', ''), ('wait', 1.5), ('mark', 'off'),
-         ('send', EDIT), ('wait', 1)],
+     'steps': edit_reset_steps((0.25, 0.1, 0.3)),
      'check': check_edit_reset()},
+    {'name': 'edit-reset-default', 'map': '3ds', 'settings': SAVE,
+     'steps': edit_reset_steps((0.0, 0.0, 0.0)),
+     'check': check_edit_reset(offset=(0.0, 0.0, 0.0))},
     {'name': 'edit-menu-front', 'map': '3ds',
      'settings': {'video_screen1_xr_z': '0.6', 'menu_driver': 'ozone'},
      'steps': [('wait', 6), ('send', 'MENU_TOGGLE'), ('wait', 4)],
@@ -8930,11 +8954,11 @@ GL_BASE = {
 GL_EDIT = ['edit-grab', 'edit-grab-threaded', 'edit-command', 'edit-follow',
            'edit-release-threaded', 'edit-release-moving',
            'edit-regrab-threaded', 'edit-handover-threaded', 'edit-reset',
-           'edit-outlines', 'edit-outlines-flush', 'edit-beam',
-           'edit-fallback', 'edit-no-map', 'edit-lazy', 'edit-two-hands',
-           'edit-choose', 'edit-snap', 'edit-tag', 'edit-tag-narrow',
-           'edit-back', 'edit-hinge-3ds', 'edit-hinge-shaken',
-           'edit-hinge-3ds-narrow']
+           'edit-reset-default', 'edit-outlines', 'edit-outlines-flush',
+           'edit-beam', 'edit-fallback', 'edit-no-map', 'edit-lazy',
+           'edit-two-hands', 'edit-choose', 'edit-snap', 'edit-tag',
+           'edit-tag-narrow', 'edit-back', 'edit-hinge-3ds',
+           'edit-hinge-shaken', 'edit-hinge-3ds-narrow']
 GL_EDIT_MENU = ['edit-menu-front', 'edit-menu-size']
 for custom_driver in GL_BASE:
     GL_BASE[custom_driver] += [c['name'] for c in CUSTOM_CASES] + GL_EDIT
@@ -8985,6 +9009,8 @@ GL_CHECKS = {
            'edit-grab-threaded': threaded(check_edit_grab(menu=False)),
            'edit-command': check_edit_command(menu=False),
            'edit-reset': check_edit_reset(menu=False),
+           'edit-reset-default':
+               check_edit_reset(menu=False, offset=(0.0, 0.0, 0.0)),
            'edit-outlines': check_edit_outlines(menu=False),
            'edit-fallback': threaded(check_edit_fallback(menu=False)),
            'edit-choose': check_edit_choose(menu=False)},
