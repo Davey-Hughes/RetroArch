@@ -453,7 +453,7 @@ SCREENS_FULL_LOG = [
 SCREEN_LOG_RE = re.compile(r'\[Video\] Screen \d+: .*')
 # GET_VIDEO_SCREEN_BUFFER, which the frontend knows
 SCREEN_BUFFER_UNSUPPORTED_RE = re.compile(
-    r'\[Environ\] UNSUPPORTED \(#(?:107|65643)\)')
+    r'\[Environ\] UNSUPPORTED \(#(?:108|65644)\)')
 # The light gun aimed, with the menu closed, at the top screen's centre
 # and then the bottom one's, as ds-horizontal lays them out. Aimed at
 # the top first, so the second aim reads differently whatever the
