@@ -1850,7 +1850,8 @@ static void test_menu_spot(void)
    CHECK(NEAR(set.quads[set.num_quads - 1].width, 16.0));
    p.menu = NULL;
 
-   /* Screen 1 hidden or the projection's: the menu goes with screen 2. */
+   /* Screen 1 hidden: the menu goes with screen 2; the projection's: at
+    * its spot. */
    screens[0].visible = false;
    screens[0].x       = 3.0f;
    video_xr_place(&p, &set);
@@ -1863,10 +1864,7 @@ static void test_menu_spot(void)
    p.skip_screens     = 1u;
    video_xr_place(&p, &set);
    m = &set.quads[set.num_quads - 1];
-   CHECK(set.num_quads == 2 && set.quads[0].screen == 1);
-   CHECK(m->kind == VIDEO_XR_QUAD_MENU && pos_is(m,
-            set.quads[0].pose.position.x, set.quads[0].pose.position.y,
-            -1.7));
+   CHECK(m->kind == VIDEO_XR_QUAD_MENU && pos_is(m, 0.0, 0.0, -1.7));
    p.skip_screens = 0;
 
    /* A whole frame is screen 1: the menu goes with it. */
@@ -8079,7 +8077,8 @@ static int menu_over(const video_xr_quad_set_t *set, unsigned i)
  * own spot with none. */
 static void test_xr_menu_follows_first_placed(void)
 {
-   video_views_map_t map;
+   struct retro_video_view v[3];
+   video_views_map_t map, three;
    video_xr_params_t p;
    video_xr_quad_set_t set;
    video_screen_xr_t screens[RETRO_VIDEO_VIEWS_MAX];
@@ -8118,6 +8117,19 @@ static void test_xr_menu_follows_first_placed(void)
    video_xr_place(&p, &set);
    CHECK(set.num_quads == 1 && set.quads[0].kind == VIDEO_XR_QUAD_MENU);
    CHECK(pose_same(&set.quads[0].pose, &spot));
+
+   /* The first screen shown is the projection's: at its spot, though
+    * screen 2 has a quad. */
+   v[0] = mkview(0,   0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_NONE);
+   v[1] = mkview(0, 192, 256, 192, 1, RETRO_VIDEO_VIEW_EYE_NONE);
+   v[2] = mkview(0, 384, 256, 192, 2, RETRO_VIDEO_VIEW_EYE_NONE);
+   absent_map(v, 3, 3, 0, &three);
+   three.left_out = 0x1u;
+   p.map          = &three;
+   p.skip_screens = 0x2u;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 2 && set.quads[0].screen == 2);
+   CHECK(pose_same(&set.quads[1].pose, &spot));
 }
 
 /* No screen placed: nothing read past the screens, no screen quad, and
