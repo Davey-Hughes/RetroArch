@@ -1885,13 +1885,18 @@ static void gx2_views_place(wiiu_video_t *wiiu, const video_views_map_t *map,
    for (i = 0; i < layout.num_placements
          && wiiu->views.count[d] < RETRO_VIDEO_VIEWS_MAX; i++)
    {
-      frame_vertex_t *q                = v + wiiu->views.count[d]++ * 4;
-      const struct retro_video_view *rv = &map->views[
-         index[layout.placements[i].view]];
+      frame_vertex_t *q;
+      const video_views_placement_t *p  = &layout.placements[i];
+      const struct retro_video_view *rv = &map->views[index[p->view]];
       float u0 = (float)rv->x / tex->width;
       float v0 = (float)rv->y / tex->height;
       float u1 = (float)(rv->x + rv->width)  / tex->width;
       float v1 = (float)(rv->y + rv->height) / tex->height;
+      if (p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
+         continue;
+      /* The placement's rectangle goes with its quad */
+      wiiu->views.dst[d][wiiu->views.count[d]] = p->dst;
+      q            = v + wiiu->views.count[d]++ * 4;
       q[0].pos.x   = 0.0f; q[0].pos.y   = 0.0f;
       q[1].pos.x   = 1.0f; q[1].pos.y   = 0.0f;
       q[2].pos.x   = 1.0f; q[2].pos.y   = 1.0f;
@@ -1901,9 +1906,6 @@ static void gx2_views_place(wiiu_video_t *wiiu, const video_views_map_t *map,
       q[2].coord.u = u1;   q[2].coord.v = v1;
       q[3].coord.u = u0;   q[3].coord.v = v1;
    }
-   /* The placements' rectangles go with their quads */
-   for (i = 0; i < wiiu->views.count[d]; i++)
-      wiiu->views.dst[d][i] = layout.placements[i].dst;
    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, v,
          wiiu->views.count[d] * 4 * sizeof(*v));
    if (touch)
