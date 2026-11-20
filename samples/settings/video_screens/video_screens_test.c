@@ -7503,8 +7503,8 @@ static void test_screen_menu_basic_rows(void)
    menu_cbs_sublabel_for_enum((enum msg_hash_enums)
          (MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY + 1), 0, 0, s, sizeof(s));
    CHECK(string_is_equal(s, "Off leaves this game screen out. Auto shows "
-            "it unless the core hides it. Chosen while a core runs, it is "
-            "kept for that core."));
+            "it; until you choose, a core can hide it. Chosen while a core "
+            "runs, it is kept for that core."));
 
    settings->flags &= ~SETTINGS_FLG_MODIFIED;
    menu_action("video_screen1_display", MENU_ACTION_RIGHT);
