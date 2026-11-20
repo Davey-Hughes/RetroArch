@@ -46,6 +46,7 @@
 #include "video_defines.h"
 #include "video_views.h"
 #include "video_windows.h"
+#include "video_screen_prefs.h"
 
 #ifdef HAVE_MODELINE
 #include "video_crt_switch.h"
@@ -2222,6 +2223,11 @@ typedef struct
    /* The core's screens, main thread, and their names for any thread */
    video_views_screens_t views_screens;
    video_views_names_box_t views_names;
+   /* The running core's per-screen choices, and each screen's values
+    * as RetroArch uses them. Main thread; a redraw reads the values
+    * the last main-thread frame left, as it reads views_core. */
+   video_screen_prefs_t screen_prefs;
+   video_screen_values_t screens_resolved[RETRO_VIDEO_VIEWS_MAX];
    unsigned views_frame_dims;
    /* The view count the driver instance was last told. */
    unsigned views_driver_count;
@@ -2301,6 +2307,9 @@ typedef struct
    unsigned windows_retry;
    /* Each screen's video_window_settings_t::edit */
    unsigned windows_edit[RETRO_VIDEO_VIEWS_MAX];
+   /* What display routing reads: the resolved Display, "off" when left
+    * out */
+   char screens_routed[RETRO_VIDEO_VIEWS_MAX][VIDEO_WINDOW_DISPLAY_NAME_SIZE];
 #ifdef HAVE_MENU
    /* A bit a screen: rows a take changed, and of them those that had
     * no size before, until the menu reads them; main thread */
@@ -2685,6 +2694,16 @@ void video_driver_clear_views(void);
  * @screen + 1. */
 size_t video_driver_screen_label(unsigned screen, const char *fmt,
       char *s, size_t len);
+/* Main thread. @screen's values as RetroArch uses them; returns the
+ * VIDEO_SCREEN_PREF_BIT()s that are the core's default. */
+unsigned video_driver_screen_get(unsigned screen, video_screen_values_t *out);
+/* Main thread. Writes the @bits of @values: to the running core's store
+ * while screen_prefs.in_use, else to the global settings, marking them
+ * modified. NULL @values clears the core's entries, or, with no views
+ * core running, sets the global ones to their built-in defaults
+ * ("" Auto, off, 0, video_views_xr_reset()). */
+void video_driver_screen_set(unsigned screen, unsigned bits,
+      const video_screen_values_t *values);
 /* Any thread: the core's screen names, "" where it gave none; returns
  * the stamp they were read at. */
 int video_driver_get_screen_names(video_views_names_t *out);
