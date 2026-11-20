@@ -2213,6 +2213,7 @@ jobs:
           # built from a pinned release (the runner image ships no
           # libsdl3-dev): video, events and the dummy audio device, X11
           # backend.
+          # configure's SDL3 minimum (qb/config.libs.sh).
           SDL3_VER=3.2.20
           if [ ! -f /opt/sdl3/lib/pkgconfig/sdl3.pc ]; then
              curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 --connect-timeout 10 \
