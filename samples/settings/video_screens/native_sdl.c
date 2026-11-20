@@ -1769,6 +1769,18 @@ static bool native_sdl_no_windows(const gfx_ctx_driver_t *ctx, void *data)
    return true;
 }
 
+#ifndef HAVE_SDL3
+/* bind_api runs with SDL video down, which drops what it sets: the
+ * first window has to have the profile asked for all the same */
+static void native_sdl_profile(enum gfx_ctx_api api)
+{
+   int profile = 0;
+   CHECK(SDL_GL_GetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, &profile) == 0);
+   CHECK(profile == (api == GFX_CTX_OPENGL_ES_API
+         ? SDL_GL_CONTEXT_PROFILE_ES : SDL_GL_CONTEXT_PROFILE_COMPATIBILITY));
+}
+#endif
+
 /* Once the context is gone, its list is too. Then another driver's
  * goes up, which the next context's must replace. */
 static void native_sdl_torn_down(const gfx_ctx_driver_t *ctx, bool again)
