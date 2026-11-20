@@ -154,6 +154,8 @@ class Result(object):
         self.screen_frames = {}
         self.shot = None
         self.events = []
+        # The settings the case's retroarch.cfg was written with.
+        self.settings = {}
         # What each 'until' step that timed out waited for.
         self.missed = []
         # A pixel of the window inside the 2D map's top screen.
@@ -399,6 +401,7 @@ def run_case(retroarch, root, monado, case, validate):
     env = isolated_env()
     svc = svc_log = log = p = None
     res = Result(d)
+    res.settings = settings
     res.top_px = case.get('top_px', res.top_px)
     res.reinit_grace = case.get('reinit_grace', res.reinit_grace)
     try:
@@ -4662,10 +4665,14 @@ def stereo_errors(frames):
     return []
 
 
-def saved(res):
-    """The configuration RetroArch saved at exit."""
+# The test core's library name, which names its directory and files,
+# and the keys an edit of a screen's placement writes.
+CORE_NAME = 'video_views test'
+XR_PLACE = ('x', 'y', 'z', 'yaw', 'pitch', 'roll', 'scale')
+
+
+def read_saved(path):
     cfg = {}
-    path = os.path.join(res.dir, 'retroarch.cfg')
     if os.path.exists(path):
         with open(path) as f:
             for line in f:
@@ -4675,11 +4682,63 @@ def saved(res):
     return cfg
 
 
+def saved_global(res):
+    """The configuration RetroArch saved at exit: the global settings."""
+    return read_saved(os.path.join(res.dir, 'retroarch.cfg'))
+
+
+def saved_core(res):
+    """The test core's screens file: the per-screen settings set while
+    it ran with a view map, under their global names."""
+    return read_saved(os.path.join(res.dir, CORE_NAME,
+                                   CORE_NAME + '.screens.cfg'))
+
+
+def saved(res):
+    """What RetroArch saved, as the core's next start resolves it: the
+    core's entry for a per-screen setting, else the global value."""
+    cfg = saved_global(res)
+    cfg.update(saved_core(res))
+    return cfg
+
+
+def has_views(res):
+    """The core set a view map: what is set for a screen is the core's."""
+    return re.search(r'\[Video\] View map: [1-9]\d* views', res.log) \
+        is not None
+
+
+def core_file_errors(res, what, prefix, edited=True):
+    """Where a screen's placement went: a core with a view map keeps an
+    edit in its own file and leaves the global values as the case gave
+    them; without an edit, or without a map, its file has none of it."""
+    core, cfg = saved_core(res), saved_global(res)
+    held = [k for k in XR_PLACE if prefix + k in core]
+    own = edited and has_views(res)
+    errors = []
+    if own and len(held) != len(XR_PLACE):
+        errors.append('%s\'s edit is not in the core\'s file: it holds %s '
+                      'of %s' % (what, held, prefix))
+    if held and not own:
+        errors.append('the core\'s file holds %s of %s, want none'
+                      % (held, prefix))
+    if has_views(res):
+        for k in XR_PLACE:
+            default = '1' if k == 'scale' else '0'
+            given = float(res.settings.get(prefix + k, default))
+            got = float(cfg.get(prefix + k, default))
+            if abs(got - given) > 1e-6:
+                errors.append('the global %s%s saved as %g, want it left '
+                              'at %g' % (prefix, k, got, given))
+    return errors
+
+
 def saved_errors(res, what, prefix, base, want, size, last=None,
-                 anchor=None):
+                 anchor=None, edited=True):
     """The saved settings put the item where want is, its width and
     height at scale 1 size, from anchor (the identity unless given),
-    and where the headset last showed it."""
+    and where the headset last showed it. A screen's are held to
+    core_file_errors() too, edited if this case placed it."""
     cfg = saved(res)
     v = [float(cfg.get(prefix + k, '0'))
          for k in ('x', 'y', 'z', 'yaw', 'pitch', 'roll')]
@@ -4694,6 +4753,8 @@ def saved_errors(res, what, prefix, base, want, size, last=None,
     if last is not None:
         errors += pose_errors('%s last shown' % what, [last], pose[0],
                               pose[1], q['size'])
+    if prefix.startswith('video_screen'):
+        errors += core_file_errors(res, what, prefix, edited)
     return errors
 
 
