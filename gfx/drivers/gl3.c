@@ -6721,10 +6721,10 @@ static void gl3_xr_forget(gl3_t *gl, unsigned s, bool yield)
 }
 
 /* Each layer of a screen slot drawn whole into tex by its view's
- * headset chain or the whole frame's: its passes at the image's size. A
- * repeat - a screen moved, resized or not yet shown while no new frame
- * came - replays the last frame's final pass, so feedback and history
- * stay where that frame left them. */
+ * headset chain or the whole frame's: its passes at the image's size; a
+ * blank screen's is only cleared. A repeat - a screen moved, resized or
+ * not yet shown while no new frame came - replays the last frame's
+ * final pass, so feedback and history stay where that frame left them. */
 static void gl3_xr_draw_screen(gl3_t *gl, unsigned s, const uint32_t *tex,
       gl3_filter_chain_t **chains, gl3_filter_chain_t *frame_chain,
       const struct gl3_filter_chain_texture *frame_tex, bool new_frame)
@@ -6739,7 +6739,8 @@ static void gl3_xr_draw_screen(gl3_t *gl, unsigned s, const uint32_t *tex,
    {
       struct gl3_filter_chain_texture in;
       int v                    = plan->view[l];
-      gl3_filter_chain_t *chain = (v >= 0) ? chains[v] : frame_chain;
+      gl3_filter_chain_t *chain = plan->blank ? NULL
+         : ((v >= 0) ? chains[v] : frame_chain);
       bool replay              = chain && !new_frame
          && gl3_filter_chain_replay_ready(chain);
 
@@ -6803,8 +6804,9 @@ static void gl3_xr_copy_ui(gl3_t *gl, unsigned s, GLuint tex,
 
 /* The tracked eyes into the projection slot, a layer each, with no
  * chain: each from its image's origin at its own size, shrunk if it is
- * larger, the right way up, with the poses the core was given. The
- * views were copied out of this frame or an earlier one. */
+ * larger, the right way up, with the poses the core was given; a blank
+ * screen's are only cleared. The views were copied out of this frame or
+ * an earlier one. */
 static bool gl3_xr_draw_projection(gl3_t *gl,
       const video_frame_info_t *video_info)
 {
@@ -6857,6 +6859,9 @@ static bool gl3_xr_draw_projection(gl3_t *gl,
       /* Cleared whole: the compositor may read past the rectangle. */
       glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
       glClear(GL_COLOR_BUFFER_BIT);
+      if (video_info->views.blank & (1u << video_info->views.views[
+               video_info->headset_eye[e]].screen))
+         continue;
       glViewport(0, 0, w, h);
       glActiveTexture(GL_TEXTURE0 + 1);
       glBindTexture(GL_TEXTURE_2D,
@@ -7357,7 +7362,7 @@ static bool gl3_frame(void *data, const void *frame,
          {
             int v = gl->xr.set.slots[s].view[l];
             const struct retro_video_view *rv;
-            if (v < 0)
+            if (v < 0 || gl->xr.set.slots[s].blank)
                continue;
             /* A view larger than its image is shrunk smoothly. */
             rv = &video_info->views.views[v];
