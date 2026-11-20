@@ -218,14 +218,17 @@ static unsigned input_pointer_of_port(unsigned port, unsigned device)
 #ifdef HAVE_VIDEO_WINDOWS
 /* @pos in a screen's own window, through the layout it last published:
  * off-screen once the window is gone, and nowhere on the main window's
- * screen. */
-static void input_pointer_window_place(const input_video_window_t *w,
+ * screen. False once it is gone, which under threaded video can be
+ * after the poll. */
+static bool input_pointer_window_place(const input_video_window_t *w,
       uint32_t pos, bool confined, uint32_t *place, uint32_t *screen_pos)
 {
    *screen_pos = VIDEO_POS_PACK(-0x8000, -0x8000);
-   if (!video_driver_translate_window_point(w->window, w->generation,
+   if (video_driver_translate_window_point(w->window, w->generation,
             VIDEO_POS_X(pos), VIDEO_POS_Y(pos), !confined, place))
-      *place   = VIDEO_POS_PACK(-0x8000, -0x8000);
+      return true;
+   *place      = VIDEO_POS_PACK(-0x8000, -0x8000);
+   return video_driver_window_live(w->window, w->generation);
 }
 #endif
 
@@ -250,9 +253,12 @@ static bool input_pointer_place(unsigned i, bool confined,
       uint32_t place = 0;
 #ifdef HAVE_VIDEO_WINDOWS
       if (in_window)
-         input_pointer_window_place(&input_pointers.window[i],
-               input_pointers.frame[i].pos, confined,
-               &place, &input_pointers.screen_pos[i]);
+      {
+         if (!input_pointer_window_place(&input_pointers.window[i],
+                  input_pointers.frame[i].pos, confined,
+                  &place, &input_pointers.screen_pos[i]))
+            input_pointers.frame[i].buttons = 0;
+      }
       else
 #endif
       if (!video_driver_translate_coord_viewport(&input_pointers.vp,
@@ -299,9 +305,12 @@ static bool input_touch_place(unsigned t, bool confined,
    {
 #ifdef HAVE_VIDEO_WINDOWS
       if (in_window)
-         input_pointer_window_place(&input_pointers.touch_window[t],
-               input_pointers.touch_pos[t], confined,
-               kept, &input_pointers.touch_screen_pos[t]);
+      {
+         if (!input_pointer_window_place(&input_pointers.touch_window[t],
+                  input_pointers.touch_pos[t], confined,
+                  kept, &input_pointers.touch_screen_pos[t]))
+            input_pointers.touch_down &= ~bit;
+      }
       else
 #endif
       if (!video_driver_translate_coord_viewport(&input_pointers.vp,

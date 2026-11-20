@@ -4009,7 +4009,6 @@ static void test_window_pointer_release(void)
    frames[0].buttons     = INPUT_POINTER_LEFT;
    frames[1]             = frames[0];
    windows[1].window     = 1;
-   windows[1].generation = video_driver_window_generation();
    touches[0]            = VIDEO_POS_PACK(10, 10);
    touches[1]            = VIDEO_POS_PACK(10, 10);
 
@@ -4021,6 +4020,7 @@ static void test_window_pointer_release(void)
       settings->bools.video_windows_enable        = true;
       window_test_run();
       CHECK(video_st->windows_wanted == 2u);
+      windows[1].generation = video_driver_window_generation();
       window_test_draw_window(1, windows[1].generation);
       input_driver_publish_window_pointers(frames, windows, 2,
             INPUT_POINTERS_WINDOWS_SECOND);
