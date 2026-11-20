@@ -540,9 +540,10 @@ static bool sdl2_video_window_framed(SDL_Window *win)
 }
 
 /* Puts it at @rect as a window. What it was put at last is asked for
- * again only where SDL has it neither there nor where it was when last
- * asked, which is an ask still out or one the window manager kept it
- * from: SDL 2.26+'s x11 waits up to 100 ms on each of those. */
+ * again only where SDL has it neither there nor where it was before or
+ * after it was last asked, which is an ask still out or one the window
+ * manager kept it from: SDL 2.26+'s x11 waits up to 100 ms on each of
+ * those, and has the manager's answer after it if one came. */
 static void sdl2_video_window_put(sdl2_video_window_t *state,
       const SDL_Rect *rect)
 {
@@ -559,16 +560,21 @@ static void sdl2_video_window_put(sdl2_video_window_t *state,
    video_window_placed(&state->common, pos, dims,
          cpu_features_get_time_usec());
    if (     !known || dims != state->put_dims
-         || (size != dims && size != state->had_dims))
+         || (     size != dims && size != state->had_dims
+               && size != state->got_dims))
    {
-      state->had_dims = size;
       SDL_SetWindowSize(state->win, rect->w, rect->h);
+      SDL_GetWindowSize(state->win, &w, &h);
+      state->had_dims = size;
+      state->got_dims = VIDEO_SCALE_PACK(w, h);
    }
    if (     !known || pos != state->put_pos
-         || (at != pos && at != state->had_pos))
+         || (at != pos && at != state->had_pos && at != state->got_pos))
    {
-      state->had_pos = at;
       SDL_SetWindowPosition(state->win, rect->x, rect->y);
+      SDL_GetWindowPosition(state->win, &x, &y);
+      state->had_pos = at;
+      state->got_pos = VIDEO_POS_PACK(x, y);
    }
    state->put_pos  = pos;
    state->put_dims = dims;
@@ -830,6 +836,8 @@ bool sdl2_video_window_create(void *owner, SDL_Window *primary,
       state->put_dims = window->dims;
       state->had_pos  = state->put_pos;
       state->had_dims = state->put_dims;
+      state->got_pos  = state->put_pos;
+      state->got_dims = state->put_dims;
    }
    sdl2_video_window_check(state);
    return true;

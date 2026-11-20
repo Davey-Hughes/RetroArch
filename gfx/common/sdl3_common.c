@@ -1130,40 +1130,46 @@ static bool sdl3_video_window_framed(SDL_Window *win)
 }
 
 /* Puts it at @rect as a window. What it was put at last is asked for
- * again only where SDL has it neither there nor where it was when last
- * asked, which is an ask still out or one the window manager kept it
- * from: SDL's x11 can wait up to 100 ms on each of those. */
+ * again only where SDL has it neither there nor where it was before or
+ * after it was last asked, which is an ask still out or one the window
+ * manager kept it from: SDL's x11 can wait up to 100 ms on each of
+ * those, and has the manager's answer after it if one came. */
 static void sdl3_video_window_put(sdl3_video_window_t *state,
       const SDL_Rect *rect, float density)
 {
-   unsigned at, size;
+   unsigned pos, dims, at, size;
    int x         = 0;
    int y         = 0;
    int w         = 0;
    int h         = 0;
-   unsigned pos  = state->put_pos;
-   unsigned dims = state->put_dims;
    /* nothing to go by once the user's bounds are saved */
-   bool known    = dims && state->common.placed_dims;
+   bool known    = state->put_dims && state->common.placed_dims;
    SDL_GetWindowPosition(state->win, &x, &y);
    SDL_GetWindowSizeInPixels(state->win, &w, &h);
    at   = VIDEO_POS_PACK(x, y);
    size = VIDEO_SCALE_PACK(w, h);
    sdl3_video_window_placing(state, rect, density);
-   state->put_pos  = state->common.placed_pos;
-   state->put_dims = state->common.placed_dims;
+   pos  = state->common.placed_pos;
+   dims = state->common.placed_dims;
    if (     !known || dims != state->put_dims
-         || (size != dims && size != state->had_dims))
+         || (     size != dims && size != state->had_dims
+               && size != state->got_dims))
    {
-      state->had_dims = size;
       SDL_SetWindowSize(state->win, rect->w, rect->h);
+      SDL_GetWindowSizeInPixels(state->win, &w, &h);
+      state->had_dims = size;
+      state->got_dims = VIDEO_SCALE_PACK(w, h);
    }
    if (     !known || pos != state->put_pos
-         || (at != pos && at != state->had_pos))
+         || (at != pos && at != state->had_pos && at != state->got_pos))
    {
-      state->had_pos = at;
       SDL_SetWindowPosition(state->win, rect->x, rect->y);
+      SDL_GetWindowPosition(state->win, &x, &y);
+      state->had_pos = at;
+      state->got_pos = VIDEO_POS_PACK(x, y);
    }
+   state->put_pos  = pos;
+   state->put_dims = dims;
 }
 
 /* Puts the window where its request has it */
@@ -1425,6 +1431,8 @@ bool sdl3_video_window_create(void *owner, SDL_WindowFlags flags,
       state->put_dims = window->dims;
       state->had_pos  = state->put_pos;
       state->had_dims = state->put_dims;
+      state->got_pos  = state->put_pos;
+      state->got_dims = state->put_dims;
    }
    sdl3_video_window_check(state);
    return true;
