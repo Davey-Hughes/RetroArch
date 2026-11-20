@@ -381,6 +381,26 @@ static uint32_t input_pointer_screen_place(unsigned i)
    return input_pointers.frame[i].pos;
 }
 
+#ifdef HAVE_VIDEO_WINDOWS
+/* Device @i and the touches down, placed if in a screen's own window,
+ * before a press is read without a place: placing lets go of one
+ * whose window went since the poll. */
+static void input_pointer_place_windows(unsigned i, bool touches)
+{
+   uint32_t pos, screen_pos;
+   unsigned t;
+   if (     i < input_pointers.count
+         && (input_pointers.in_window & (1 << i))
+         && input_pointers.frame[i].buttons)
+      input_pointer_place(i, true, &pos, &screen_pos);
+   if (touches)
+      for (t = 0; t < input_pointers.touch_count; t++)
+         if (     input_pointers.touch_in_window & input_pointers.touch_down
+               & ((uint32_t)1 << t))
+            input_touch_place(t, true, &pos, &screen_pos);
+}
+#endif
+
 /* Whether mouse @f, standing for touch @idx, is down. */
 static bool input_pointer_mouse_down(const input_pointer_frame_t *f,
       unsigned idx)
@@ -433,6 +453,9 @@ static unsigned input_pointer_count(unsigned i, bool second)
    unsigned n = 0;
    unsigned t;
    int first;
+#ifdef HAVE_VIDEO_WINDOWS
+   input_pointer_place_windows(i, true);
+#endif
    for (t = 0; t < input_pointers.touch_count; t++)
       if (     input_touch_in_list(t, second)
             && (input_pointers.touch_down & ((uint32_t)1 << t)))
@@ -635,6 +658,9 @@ static bool input_pointer_frame_read(unsigned port, unsigned device,
       case RARCH_DEVICE_MOUSE_SCREEN:
          pos = (device == RETRO_DEVICE_MOUSE)
             ? f->rel : input_pointer_screen_place(i);
+#ifdef HAVE_VIDEO_WINDOWS
+         input_pointer_place_windows(i, false);
+#endif
          switch (id)
          {
             case RETRO_DEVICE_ID_MOUSE_X:

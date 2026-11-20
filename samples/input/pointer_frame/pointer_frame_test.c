@@ -1203,6 +1203,17 @@ int main(void)
       CHECK( rd(1, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_PRESSED) == 0
          &&  rd(1, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X) == -0x8000,
             "a window gone between the poll and the read: its button presses nothing");
+      /* ... and the count, or the mouse's button, read before any place */
+      window_generation = 5;
+      input_pointer_frames_set(f, w, 2, INPUT_POINTERS_MOUSE_3_TOUCHES);
+      window_generation = 0;
+      CHECK( rd(1, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_COUNT) == 0,
+            "a window gone between the poll and the count: its button counts for nothing");
+      window_generation = 5;
+      input_pointer_frames_set(f, w, 2, INPUT_POINTERS_MOUSE_3_TOUCHES);
+      window_generation = 0;
+      CHECK( rd(1, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_LEFT) == 0,
+            "a window gone between the poll and the mouse's read: its button is not held");
       window_generation = 5;
       /* touches: 0 in window 1, 1 in the main window */
       touch[0] = VIDEO_POS_PACK(60, 70);
@@ -1226,6 +1237,11 @@ int main(void)
             &&  rd(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X) == -0x8000
             &&  rd(0, RETRO_DEVICE_POINTER, 1, RETRO_DEVICE_ID_POINTER_PRESSED) == 1,
                "a touch whose window goes between the poll and the read presses nothing");
+         window_generation = 5;
+         input_pointer_touches_set(touch, tw, 2, 3, 3);
+         window_generation = 0;
+         CHECK( rd(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_COUNT) == 1,
+               "and counted before any place: only the main window's touch is");
          window_generation = 5;
          tw[0].generation = 9;
          input_pointer_touches_set(touch, tw, 2, 3, 3);
