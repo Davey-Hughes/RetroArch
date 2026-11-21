@@ -216,8 +216,8 @@ typedef struct gl3
       /* Whether views may be drawn, for get_flags on the main thread:
        * the scRGB fallback clears scrgb.active mid-frame. */
       retro_atomic_int_t allowed;
-      /* Whether the last frame with a map was drawn whole, for
-       * get_flags on the main thread. */
+      /* Whether a map is drawn whole: the last frame's, or with none
+       * whether one would be. For get_flags on the main thread. */
       retro_atomic_int_t fallback;
       bool stock_failed;
       /* The stereo blend programs were asked for. */
@@ -231,6 +231,8 @@ typedef struct gl3
       /* Drawing into the UI layer. */
       bool ui_pass;
       bool copy_image;
+      /* gl3_views_alpha's blend is on, and stock rects keep it. */
+      bool alpha_blend;
    } views;
 #ifdef HAVE_GL3_XR
    /* Headset output: the host, and the headset's own chains, one per
@@ -561,6 +563,9 @@ static void gl3_views_draw_direct(gl3_t *gl,
 static void gl3_views_draw_pass(gl3_t *gl, const struct gl3_views_draw *d,
       gl3_filter_chain_t *fc, const video_views_rect_t *dst,
       const video_views_rect_t *cut, bool again);
+static void gl3_views_alpha(gl3_t *gl, unsigned alpha);
+static void gl3_views_fill(gl3_t *gl, const struct gl3_views_draw *d,
+      const video_views_rect_t *cut, unsigned alpha);
 static bool gl3_views_target_make(gl3_t *gl, struct gl3_views_fbo *t,
       unsigned dims);
 static bool gl3_views_target_retire(gl3_t *gl, struct gl3_views_fbo *t);
@@ -574,6 +579,8 @@ static bool gl3_views_target_retire(gl3_t *gl, struct gl3_views_fbo *t);
 #define VV_DRAW                         struct gl3_views_draw
 #define VV_DIRECT(p, d, v, r, c)        gl3_views_draw_direct(p, d, v, r, c)
 #define VV_PASS(p, d, f, r, c, a)       gl3_views_draw_pass(p, d, f, r, c, a)
+#define VV_ALPHA(p, d, a)               gl3_views_alpha(p, a)
+#define VV_FILL(p, d, c, a)             gl3_views_fill(p, d, c, a)
 #define VV_TARGET                       struct gl3_views_fbo
 #define VV_TARGET_MAKE(drv, t, dims)    gl3_views_target_make(drv, t, dims)
 #define VV_TARGET_RETIRE(drv, t)        gl3_views_target_retire(drv, t)
@@ -6593,7 +6600,8 @@ static void gl3_stock_rect_draw(gl3_t *gl,
    glEnable(GL_SCISSOR_TEST);
    glScissor(VIDEO_POS_X(cut->pos), VIDEO_POS_Y(cut->pos),
          VIDEO_SCALE_W(cut->dims), VIDEO_SCALE_H(cut->dims));
-   glDisable(GL_BLEND);
+   if (!gl->views.alpha_blend)
+      glDisable(GL_BLEND);
    glDisable(GL_CULL_FACE);
    glDisable(GL_DEPTH_TEST);
 #if !defined(HAVE_OPENGLES)
@@ -6643,6 +6651,52 @@ static void gl3_views_draw_pass(gl3_t *gl, const struct gl3_views_draw *d,
    else
       gl3_filter_chain_build_viewport_pass(fc, &vp, d->mvp);
    gl3_filter_chain_set_scissor(fc, NULL);
+}
+
+/* The draws that follow at @alpha, by a constant blend the shaders' own
+ * alpha takes no part in; at 255 not blended */
+static void gl3_views_alpha(gl3_t *gl, unsigned alpha)
+{
+   gl->views.alpha_blend = alpha < 255;
+   if (gl->views.alpha_blend)
+   {
+      glBlendColor(0.0f, 0.0f, 0.0f, (GLfloat)alpha / 255.0f);
+      glBlendFunc(GL_CONSTANT_ALPHA, GL_ONE_MINUS_CONSTANT_ALPHA);
+      glEnable(GL_BLEND);
+   }
+   else
+      glDisable(GL_BLEND);
+}
+
+/* @cut black at @alpha, for a blank inset: cleared when solid, else
+ * darkened under a quad whose colour the blend takes none of, at the
+ * constant gl3_views_alpha set. A preset's last pass turns the blend
+ * off, so it goes on again here. */
+static void gl3_views_fill(gl3_t *gl, const struct gl3_views_draw *d,
+      const video_views_rect_t *cut, unsigned alpha)
+{
+   struct gl3_viewport sc;
+   gl3_views_vp(cut, d->target_height, &sc);
+   glBindFramebuffer(GL_FRAMEBUFFER, d->target);
+   glEnable(GL_SCISSOR_TEST);
+   glScissor(VIDEO_POS_X(sc.pos), VIDEO_POS_Y(sc.pos),
+         VIDEO_SCALE_W(sc.dims), VIDEO_SCALE_H(sc.dims));
+   if (alpha >= 255)
+   {
+      glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+      glClear(GL_COLOR_BUFFER_BIT);
+   }
+   else
+   {
+      glViewport(VIDEO_POS_X(sc.pos), VIDEO_POS_Y(sc.pos),
+            VIDEO_SCALE_W(sc.dims), VIDEO_SCALE_H(sc.dims));
+      glEnable(GL_BLEND);
+      glBlendFunc(GL_ZERO, GL_ONE_MINUS_CONSTANT_ALPHA);
+      gl3_views_quad(gl, gl->pipelines.alpha_blend,
+            &gl->pipelines.alpha_blend_loc, gl->white_texture);
+      glBlendFunc(GL_CONSTANT_ALPHA, GL_ONE_MINUS_CONSTANT_ALPHA);
+   }
+   glDisable(GL_SCISSOR_TEST);
 }
 
 /* Shades every drawn view and draws its placements into the frame
@@ -7685,8 +7739,10 @@ static bool gl3_frame(void *data, const void *frame,
       gl->views.active = views;
       gl3_set_viewport(gl, video_info->dims, false, true);
    }
+   /* With no map: whether one would be drawn whole */
    retro_atomic_store_release_int(&gl->views.fallback,
-         (video_info->views.num_views && !views) ? 1 : 0);
+         (video_info->views.num_views ? !views : !gl3_views_allowed(gl))
+         ? 1 : 0);
 #endif
 #ifdef HAVE_GL3_XR
    /* A view only the headset shows waits for a real frame, rather than

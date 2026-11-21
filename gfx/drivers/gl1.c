@@ -386,8 +386,11 @@ typedef struct gl1
       GLuint                    blend_prog;
       GLint                     loc_mode;
       GLint                     loc_height;
+      /* The vertex alpha views are drawn at, gl1_views_alpha's */
+      GLfloat                   alpha;
       /* For get_flags on the main thread: whether views may be drawn,
-       * and whether the last frame with a map was drawn whole. */
+       * and whether a map is drawn whole: the last frame's, or with
+       * none whether one would be. */
       retro_atomic_int_t        allowed;
       retro_atomic_int_t        fallback;
       bool                      tried;
@@ -2386,6 +2389,9 @@ struct gl1_views_draw
 static void gl1_views_draw_direct(gl1_t *gl1,
       const struct gl1_views_draw *d, unsigned view,
       const video_views_rect_t *dst, const video_views_rect_t *cut);
+static void gl1_views_alpha(gl1_t *gl1, unsigned alpha);
+static void gl1_views_fill(gl1_t *gl1, const struct gl1_views_draw *d,
+      const video_views_rect_t *cut, unsigned alpha);
 static bool gl1_views_target_make(gl1_t *gl1, struct gl1_views_fbo *t,
       unsigned dims);
 static bool gl1_views_target_retire(gl1_t *gl1, struct gl1_views_fbo *t);
@@ -2401,6 +2407,8 @@ static bool gl1_views_target_retire(gl1_t *gl1, struct gl1_views_fbo *t);
 #define VV_DRAW                         struct gl1_views_draw
 #define VV_DIRECT(p, d, v, r, c)        gl1_views_draw_direct(p, d, v, r, c)
 #define VV_PASS(p, d, f, r, c, a)       ((void)0)
+#define VV_ALPHA(p, d, a)               gl1_views_alpha(p, a)
+#define VV_FILL(p, d, c, a)             gl1_views_fill(p, d, c, a)
 #define VV_TARGET                       struct gl1_views_fbo
 #define VV_TARGET_MAKE(drv, t, dims)    gl1_views_target_make(drv, t, dims)
 #define VV_TARGET_RETIRE(drv, t)        gl1_views_target_retire(drv, t)
@@ -2566,25 +2574,24 @@ static void gl1_views_release(gl1_t *gl1)
    gl1->views.blend_prog = 0;
 }
 
-/* @tex over the whole viewport, unblended: s and t to @s1 and @t1, with
- * @flip its first row at the top, as a frame's is uploaded, else at the
- * bottom, as a framebuffer's is drawn. @rotate: as the frame is. */
+/* @tex over the whole viewport at vertex alpha @alpha, or with no @tex
+ * black: s and t to @s1 and @t1, with @flip its first row at the top,
+ * as a frame's is uploaded, else at the bottom, as a framebuffer's is
+ * drawn. @rotate: as the frame is. */
 static void gl1_views_quad(gl1_t *gl1, GLuint tex, float s1, float t1,
-      bool flip, bool rotate)
+      bool flip, bool rotate, float alpha)
 {
+   unsigned i;
    static const float vertices[] = {
       -1.0f, -1.0f, 0.0f,
       -1.0f,  1.0f, 0.0f,
        1.0f, -1.0f, 0.0f,
        1.0f,  1.0f, 0.0f,
    };
-   static const float colors[]   = {
-      1.0f, 1.0f, 1.0f, 1.0f,
-      1.0f, 1.0f, 1.0f, 1.0f,
-      1.0f, 1.0f, 1.0f, 1.0f,
-      1.0f, 1.0f, 1.0f, 1.0f
-   };
+   float colors[16];
    float texcoords[8];
+   for (i = 0; i < 16; i++)
+      colors[i] = ((i & 3) == 3) ? alpha : (tex ? 1.0f : 0.0f);
    texcoords[0] = 0.0f;
    texcoords[1] = flip ? t1 : 0.0f;
    texcoords[2] = 0.0f;
@@ -2597,8 +2604,13 @@ static void gl1_views_quad(gl1_t *gl1, GLuint tex, float s1, float t1,
    glDisable(GL_DEPTH_TEST);
    glDisable(GL_CULL_FACE);
    glDisable(GL_STENCIL_TEST);
-   glEnable(GL_TEXTURE_2D);
-   glBindTexture(GL_TEXTURE_2D, tex);
+   if (tex)
+   {
+      glEnable(GL_TEXTURE_2D);
+      glBindTexture(GL_TEXTURE_2D, tex);
+   }
+   else
+      glDisable(GL_TEXTURE_2D);
 
    glMatrixMode(GL_PROJECTION);
    glPushMatrix();
@@ -2619,6 +2631,8 @@ static void gl1_views_quad(gl1_t *gl1, GLuint tex, float s1, float t1,
    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
    glDisableClientState(GL_VERTEX_ARRAY);
    glDisableClientState(GL_COLOR_ARRAY);
+   if (!tex)
+      glEnable(GL_TEXTURE_2D);
 
    glMatrixMode(GL_MODELVIEW);
    glPopMatrix();
@@ -2655,21 +2669,57 @@ static void gl1_views_draw_direct(gl1_t *gl1,
    glEnable(GL_SCISSOR_TEST);
    glScissor(sc[0], sc[1], sc[2], sc[3]);
    gl1_views_quad(gl1, gl1->views.tex[view], (float)v->width / pot_w,
-         (float)v->height / pot_h, true, true);
+         (float)v->height / pot_h, true, true, gl1->views.alpha);
+   glDisable(GL_SCISSOR_TEST);
+}
+
+/* The views drawn after at @alpha: vertex alpha, blended as the
+ * overlay is; at 255 not blended */
+static void gl1_views_alpha(gl1_t *gl1, unsigned alpha)
+{
+   gl1->views.alpha = (GLfloat)alpha / 255.0f;
+   if (alpha < 255)
+   {
+      glEnable(GL_BLEND);
+      glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+   }
+   else
+      glDisable(GL_BLEND);
+}
+
+/* @cut black at @alpha, for a blank inset: cleared to the views' clear
+ * colour when solid, else an untextured quad under gl1_views_alpha's
+ * blend */
+static void gl1_views_fill(gl1_t *gl1, const struct gl1_views_draw *d,
+      const video_views_rect_t *cut, unsigned alpha)
+{
+   GLint sc[4];
+   gl1_views_gl_rect(cut, d->target_height, sc);
+   glEnable(GL_SCISSOR_TEST);
+   glScissor(sc[0], sc[1], sc[2], sc[3]);
+   if (alpha >= 255)
+      glClear(GL_COLOR_BUFFER_BIT);
+   else
+   {
+      glViewport(sc[0], sc[1], sc[2], sc[3]);
+      gl1_views_quad(gl1, 0, 1.0f, 1.0f, false, false, gl1->views.alpha);
+   }
    glDisable(GL_SCISSOR_TEST);
 }
 
 /* Whether this frame draws its views, with each drawn view's chain
- * picked and the rectangle its first placement takes, and in *blend
- * whether into the canvas. Drawn whole when the stereo mode or the UI
+ * picked and the rectangle its first placement takes, in *blend
+ * whether into the canvas, and in *fallback whether a map, sent or
+ * not, is drawn whole. Drawn whole when the stereo mode or the UI
  * would need a canvas or layer the GL can't make. */
 static bool gl1_views_setup(gl1_t *gl1, video_frame_info_t *video_info,
-      const void *frame, const char *msg, bool *blend,
+      const void *frame, const char *msg, bool *blend, bool *fallback,
       gl1_t **chains, video_views_rect_t *rects)
 {
-   bool views, per_eye, ui;
+   bool views, per_eye, ui, whole;
    const video_views_layout_t *layout = &video_info->views_layout;
-   bool offscreen = video_info->views.num_views && layout->offscreen;
+   bool offscreen  = video_info->views.num_views && layout->offscreen;
+   unsigned stereo = video_info->views_settings.stereo_mode;
 
    if (video_info->views.num_views && !gl1->views.tried)
       gl1_views_init(gl1);
@@ -2695,6 +2745,13 @@ static bool gl1_views_setup(gl1_t *gl1, video_frame_info_t *video_info,
             layout, true, *blend || !layout->offscreen,
             *blend ? layout->canvas_dims : video_info->dims, chains, rects);
    *blend = views && *blend;
+   /* Without a map, what one would get: drawn whole under scRGB, and
+    * in anaglyph or interlaced once the canvas's blend is known missing */
+   whole  = !gl1_views_allowed(gl1)
+      || (   (   stereo == VIDEO_STEREO_MODE_ANAGLYPH
+              || stereo == VIDEO_STEREO_MODE_INTERLACED)
+          && gl1->views.tried && !gl1->views.blend_prog);
+   *fallback = video_info->views.num_views ? !views : whole;
    if (views && !gl1->views.direct_seen)
    {
       gl1->views.direct_seen = true;
@@ -2739,6 +2796,7 @@ static void gl1_views_render(gl1_t *gl1, const video_frame_info_t *video_info,
       gl1->scrgb.BindFramebuffer(GL_FRAMEBUFFER, gl1->views.canvas.fbo);
    glDisable(GL_SCISSOR_TEST);
    glDisable(GL_BLEND);
+   gl1->views.alpha = 1.0f;
    glViewport(0, 0, VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims));
    glClearColor(0.0f, 0.0f, 0.0f, blend ? 0.0f : 1.0f);
    glClear(GL_COLOR_BUFFER_BIT);
@@ -2764,7 +2822,8 @@ static void gl1_views_render(gl1_t *gl1, const video_frame_info_t *video_info,
       if (gl1->views.loc_height >= 0)
          gl1->scrgb.Uniform1f(gl1->views.loc_height,
                (float)VIDEO_SCALE_H(layout->canvas_dims));
-      gl1_views_quad(gl1, gl1->views.canvas.tex, 1.0f, 1.0f, false, false);
+      gl1_views_quad(gl1, gl1->views.canvas.tex, 1.0f, 1.0f, false, false,
+            1.0f);
       gl1->scrgb.UseProgram(0);
    }
    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -2819,7 +2878,8 @@ static void gl1_views_ui_end(gl1_t *gl1, video_frame_info_t *video_info)
       gl1_views_gl_rect(&layout->areas[a], VIDEO_SCALE_H(video_info->dims),
             vp);
       glViewport(vp[0], vp[1], vp[2], vp[3]);
-      gl1_views_quad(gl1, gl1->views.ui.tex, 1.0f, 1.0f, false, false);
+      gl1_views_quad(gl1, gl1->views.ui.tex, 1.0f, 1.0f, false, false,
+            1.0f);
    }
    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
    gl1_set_viewport(gl1, video_info->dims, gl1->views.active, true);
@@ -2883,6 +2943,7 @@ static bool gl1_frame(void *data, const void *frame,
    video_views_rect_t view_rects[RETRO_VIDEO_VIEWS_MAX];
    bool views                       = false;
    bool views_blend                 = false;
+   bool views_fallback              = false;
    bool views_ui                    = false;
 #endif
 
@@ -3030,7 +3091,7 @@ static bool gl1_frame(void *data, const void *frame,
 
 #ifdef GL1_VIEWS
    views = gl1_views_setup(gl1, video_info, frame, msg, &views_blend,
-         view_chains, view_rects);
+         &views_fallback, view_chains, view_rects);
    /* gl1->vp is the whole window while views draw. */
    if (views != gl1->views.active)
    {
@@ -3038,7 +3099,7 @@ static bool gl1_frame(void *data, const void *frame,
       gl1_set_viewport(gl1, video_info->dims, views, true);
    }
    retro_atomic_store_release_int(&gl1->views.fallback,
-         (video_info->views.num_views && !views) ? 1 : 0);
+         views_fallback ? 1 : 0);
    gl1_views_publish(gl1);
 #endif
 
