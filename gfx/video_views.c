@@ -463,33 +463,51 @@ bool video_views_eye_pair(const video_views_map_t *map, int eyes[2])
 }
 
 bool video_views_select_screens(const video_views_map_t *map,
-      unsigned first, unsigned count, video_views_map_t *out,
-      unsigned *index)
+      unsigned roots, video_views_map_t *out, unsigned *index)
 {
-   unsigned i, mask;
+   unsigned i, s, sel, n = 0;
+   unsigned num[RETRO_VIDEO_VIEWS_MAX];
    memset(out, 0, sizeof(*out));
-   if (!map || first >= map->num_screens || !count)
+   if (!map)
       return false;
-   if (count > map->num_screens - first)
-      count = map->num_screens - first;
+   /* An inset only with its base */
+   sel = video_views_with_insets(map, roots & ~map->over)
+         & ((1u << map->num_screens) - 1);
+   for (s = 0; s < map->num_screens; s++)
+      if (sel & (1u << s))
+         num[s] = n++;
    for (i = 0; i < map->num_views; i++)
    {
       const struct retro_video_view *v = &map->views[i];
-      if (v->screen < first || v->screen - first >= count)
+      if (!(sel & (1u << v->screen)))
          continue;
       index[out->num_views]               = i;
       out->views[out->num_views]          = *v;
-      out->views[out->num_views++].screen = v->screen - first;
+      out->views[out->num_views++].screen = num[v->screen];
    }
    if (!out->num_views)
       return false;
    /* Selected screens with no view count too; viewless marks them. */
-   mask             = (1u << count) - 1;
-   out->num_screens = count;
-   out->no_input    = (map->no_input >> first) & mask;
-   out->viewless    = (map->viewless >> first) & mask;
-   out->left_out    = (map->left_out >> first) & mask;
-   out->blank       = (map->blank    >> first) & mask;
+   out->num_screens = n;
+   for (s = 0; s < map->num_screens; s++)
+   {
+      unsigned j, b;
+      if (!(sel & (1u << s)))
+         continue;
+      j              = num[s];
+      b              = VIDEO_VIEWS_NIBBLE(map->base, s);
+      out->no_input |= ((map->no_input >> s) & 1u) << j;
+      out->viewless |= ((map->viewless >> s) & 1u) << j;
+      out->left_out |= ((map->left_out >> s) & 1u) << j;
+      out->blank    |= ((map->blank    >> s) & 1u) << j;
+      out->over     |= ((map->over     >> s) & 1u) << j;
+      /* A sized root's base on another display: it sizes itself. */
+      out->base     |= (uint32_t)((sel & (1u << b)) ? num[b] : j) << (j * 4);
+      out->anchor   |= (uint32_t)VIDEO_VIEWS_NIBBLE(map->anchor, s)
+            << (j * 4);
+      out->opacity[j] = map->opacity[s];
+      out->size[j]    = map->size[s];
+   }
    return true;
 }
 
@@ -820,7 +838,8 @@ bool video_views_touch_point(video_views_touch_t *t, int x, int y,
       py     = ((long)y + 0x7fff) * (long)VIDEO_SCALE_H(dims) / 0xfffe;
       *res_x = -0x8000;
       *res_y = -0x8000;
-      for (i = 0; i < count; i++)
+      /* Topmost first */
+      for (i = count; i-- > 0; )
       {
          long fx, fy;
          long dx = VIDEO_POS_X(dst[i].pos);
@@ -1044,7 +1063,8 @@ bool video_views_map_point(const video_views_layout_t *layout,
 
    if (!map->num_views)
       return false;
-   for (i = 0; i < layout->num_placements; i++)
+   /* Topmost first; it keeps a tie. */
+   for (i = layout->num_placements; i-- > 0; )
    {
       const video_views_rect_t *d = &layout->placements[i].dst;
       double dist;

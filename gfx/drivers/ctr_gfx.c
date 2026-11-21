@@ -1748,12 +1748,12 @@ static void ctr_views_quad(ctr_vertex_t *q, unsigned rotation,
    q->v1 = (s16)(v->y + v->height);
 }
 
-/* Screens [@first, @first + @screens) of @map laid out on a display of
- * size @dims, their left eye's quads into target @left and, unless it
- * is CTR_VIEWS_TARGETS, their right eye's into @right. @window: the
+/* The screens of @roots of @map and their insets laid out on a display
+ * of size @dims, their left eye's quads into target @left and, unless
+ * it is CTR_VIEWS_TARGETS, their right eye's into @right. @window: the
  * display the custom viewport is in. */
 static void ctr_views_place(ctr_video_t *ctr, const video_views_map_t *map,
-      unsigned first, unsigned screens, unsigned dims, bool window,
+      unsigned roots, unsigned dims, bool window,
       unsigned left, unsigned right)
 {
    unsigned i, e;
@@ -1766,8 +1766,13 @@ static void ctr_views_place(ctr_video_t *ctr, const video_views_map_t *map,
 
    targets[0] = left;
    targets[1] = right;
-   if (!video_views_select_screens(map, first, screens, &sub, index))
+   if (!video_views_select_screens(map, roots, &sub, index))
+   {
+      if (left == CTR_VIEWS_BOTTOM)
+         video_views_touch_publish(&ctr_views_touch_map, NULL, NULL, NULL,
+               0, 0);
       return;
+   }
    video_driver_views_layout_flat(&sub, dims, window, &layout);
    if (left == CTR_VIEWS_BOTTOM)
       video_views_touch_publish(&ctr_views_touch_map, map, &layout, index,
@@ -1846,18 +1851,18 @@ static bool ctr_views_setup(ctr_video_t *ctr,
 static void ctr_views_draw(ctr_video_t *ctr, const video_views_map_t *map)
 {
    unsigned i, t;
-   unsigned top_screens = ctr->views.bottom ? 1 : map->num_screens;
-   bool stereo          = ctr->video_mode == CTR_VIDEO_MODE_3D;
+   unsigned roots = video_views_roots(map);
+   bool stereo    = ctr->video_mode == CTR_VIDEO_MODE_3D;
 
    for (t = 0; t < CTR_VIEWS_TARGETS; t++)
       ctr->views.count[t] = 0;
-   ctr_views_place(ctr, map, 0, top_screens,
+   ctr_views_place(ctr, map, ctr->views.bottom ? (roots & 1u) : roots,
          VIDEO_SCALE_PACK(CTR_TOP_FRAMEBUFFER_WIDTH,
             CTR_TOP_FRAMEBUFFER_HEIGHT), true,
          CTR_VIEWS_TOP_LEFT,
          stereo ? CTR_VIEWS_TOP_RIGHT : CTR_VIEWS_TARGETS);
    if (ctr->views.bottom)
-      ctr_views_place(ctr, map, 1, map->num_screens - 1,
+      ctr_views_place(ctr, map, roots & ~1u,
             VIDEO_SCALE_PACK(CTR_BOTTOM_FRAMEBUFFER_WIDTH,
                CTR_BOTTOM_FRAMEBUFFER_HEIGHT), false,
             CTR_VIEWS_BOTTOM, CTR_VIEWS_TARGETS);

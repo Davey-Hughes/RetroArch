@@ -2064,12 +2064,11 @@ static void gx2_views_drc_free(wiiu_video_t *wiiu)
    wiiu->views.drc.surface.image = NULL;
 }
 
-/* Screens [@first, @first + @screens) of @map laid out on display @d
- * of size @dims, a quad each; published for touches when the GamePad
+/* The screens of @roots of @map and their insets laid out on display
+ * @d of size @dims, a quad each; published for touches when the GamePad
  * shows it (@touch) */
 static void gx2_views_place(wiiu_video_t *wiiu, const video_views_map_t *map,
-      unsigned first, unsigned screens, unsigned dims, unsigned d,
-      bool touch)
+      unsigned roots, unsigned dims, unsigned d, bool touch)
 {
    unsigned i;
    video_views_map_t sub;
@@ -2079,8 +2078,13 @@ static void gx2_views_place(wiiu_video_t *wiiu, const video_views_map_t *map,
    GX2Surface *tex   = &wiiu->texture.surface;
 
    wiiu->views.count[d] = 0;
-   if (!video_views_select_screens(map, first, screens, &sub, index))
+   if (!video_views_select_screens(map, roots, &sub, index))
+   {
+      if (touch)
+         video_views_touch_publish(&gx2_views_touch_map, NULL, NULL, NULL,
+               0, 0);
       return;
+   }
    /* The custom viewport is the TV's */
    video_driver_views_layout_flat(&sub, dims, d == GX2_VIEWS_TV, &layout);
    for (i = 0; i < layout.num_placements
@@ -2768,15 +2772,16 @@ static bool gx2_frame(void *data, const void *frame,
    if (views)
    {
       const video_views_map_t *map = &video_info->views;
+      unsigned roots               = video_views_roots(map);
       unsigned tv_dims             = VIDEO_SCALE_PACK(
             wiiu->color_buffer.surface.width,
             wiiu->color_buffer.surface.height);
       /* The GamePad's touches land on what it shows */
-      gx2_views_place(wiiu, map, 0,
-            wiiu->views.split ? 1 : map->num_screens, tv_dims,
+      gx2_views_place(wiiu, map,
+            wiiu->views.split ? (roots & 1u) : roots, tv_dims,
             GX2_VIEWS_TV, !wiiu->views.split);
       if (wiiu->views.split)
-         gx2_views_place(wiiu, map, 1, map->num_screens - 1,
+         gx2_views_place(wiiu, map, roots & ~1u,
                VIDEO_SCALE_PACK(GX2_VIEWS_DRC_WIDTH, GX2_VIEWS_DRC_HEIGHT),
                GX2_VIEWS_DRC, true);
    }
