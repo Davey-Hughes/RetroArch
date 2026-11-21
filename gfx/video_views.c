@@ -512,9 +512,10 @@ static int video_views_round(double v)
    return (int)floor(v + 0.5);
 }
 
-/* Screen rectangles within an area of size cdims, in screen order. */
+/* Rectangles of the screens not in @skip within an area of size cdims,
+ * in screen order. */
 static void video_views_fit(const video_views_layout_params_t *p,
-      unsigned cdims, unsigned count, unsigned first,
+      unsigned cdims, unsigned count, unsigned first, unsigned skip,
       video_views_rect_t *fit)
 {
    unsigned s;
@@ -525,7 +526,6 @@ static void video_views_fit(const video_views_layout_params_t *p,
    unsigned cw   = VIDEO_SCALE_W(cdims);
    unsigned ch   = VIDEO_SCALE_H(cdims);
    bool vertical = (p->screen_layout != VIDEO_SCREEN_LAYOUT_HORIZONTAL);
-   unsigned skip = p->exclude_screens | map->viewless | map->left_out;
 
    if (count == 1 && p->stretch && !p->scale_integer)
    {
@@ -599,6 +599,34 @@ static void video_views_fit(const video_views_layout_params_t *p,
    }
 }
 
+/* Inset @s's rectangle over its base's, both in fit's units. */
+static void video_views_fit_inset(const video_views_layout_params_t *p,
+      unsigned s, video_views_rect_t *fit)
+{
+   int x0, y0, x1, y1;
+   video_views_frect_t b, r;
+   double w = 1.0, h = 1.0;
+   const video_views_map_t *map = p->map;
+   const video_views_rect_t *br = &fit[VIDEO_VIEWS_NIBBLE(map->base, s)];
+   b.x = VIDEO_POS_X(br->pos);
+   b.y = VIDEO_POS_Y(br->pos);
+   b.w = VIDEO_SCALE_W(br->dims);
+   b.h = VIDEO_SCALE_H(br->dims);
+   video_views_extent(map, s, p->rotation, &w, &h);
+   video_views_inset(&b, VIDEO_VIEWS_NIBBLE(map->anchor, s), map->size[s],
+         w / h, &r);
+   x0 = video_views_round(r.x);
+   y0 = video_views_round(r.y);
+   x1 = video_views_round(r.x + r.w);
+   y1 = video_views_round(r.y + r.h);
+   if (x1 <= x0)
+      x1 = x0 + 1;
+   if (y1 <= y0)
+      y1 = y0 + 1;
+   fit[s].pos  = VIDEO_POS_PACK(x0, y0);
+   fit[s].dims = VIDEO_SCALE_PACK(x1 - x0, y1 - y0);
+}
+
 /* Map r from an area of size cdims into area, scaling as needed. */
 static void video_views_place(const video_views_rect_t *r,
       unsigned cdims, const video_views_rect_t *area,
@@ -617,11 +645,31 @@ static void video_views_place(const video_views_rect_t *r,
    out->dims = VIDEO_SCALE_PACK(x1 - x0, y1 - y0);
 }
 
+unsigned video_views_roots(const video_views_map_t *map)
+{
+   return ((1u << map->num_screens) - 1)
+         & ~(map->viewless | map->left_out | map->over);
+}
+
+unsigned video_views_with_insets(const video_views_map_t *map,
+      unsigned roots)
+{
+   unsigned s;
+   unsigned out    = roots;
+   unsigned insets = map->over & ~(map->viewless | map->left_out);
+   for (s = 0; s < map->num_screens; s++)
+      if (     (insets & (1u << s))
+            && (roots & (1u << VIDEO_VIEWS_NIBBLE(map->base, s))))
+         out |= 1u << s;
+   return out;
+}
+
 void video_views_layout(const video_views_layout_params_t *p,
       video_views_layout_t *out)
 {
-   unsigned a, s, count = 0, first = 0;
-   unsigned w, h, cdims, skip;
+   unsigned a, i, s, n = 0, count = 0, first = 0;
+   unsigned w, h, cdims, roots, insets;
+   unsigned order[RETRO_VIDEO_VIEWS_MAX];
    video_views_rect_t fit[RETRO_VIDEO_VIEWS_MAX];
    const video_views_map_t *map = p->map;
 
@@ -631,9 +679,9 @@ void video_views_layout(const video_views_layout_params_t *p,
    if (!map || !map->num_views || !w || !h)
       return;
 
-   skip = p->exclude_screens | map->viewless | map->left_out;
+   roots = video_views_roots(map) & ~p->exclude_screens;
    for (s = 0; s < map->num_screens; s++)
-      if (!(skip & (1u << s)))
+      if (roots & (1u << s))
       {
          first = s;
          count++;
@@ -681,23 +729,41 @@ void video_views_layout(const video_views_layout_params_t *p,
          break;
    }
 
-   video_views_fit(p, cdims, count, first, fit);
+   video_views_fit(p, cdims, count, first, ~roots, fit);
+
+   /* Each root, then the insets over it in screen order. */
+   insets = video_views_with_insets(map, roots) & ~roots;
+   for (s = 0; s < map->num_screens; s++)
+   {
+      if (!(roots & (1u << s)))
+         continue;
+      order[n++] = s;
+      for (i = 0; i < map->num_screens; i++)
+         if (     (insets & (1u << i))
+               && VIDEO_VIEWS_NIBBLE(map->base, i) == s)
+         {
+            video_views_fit_inset(p, i, fit);
+            order[n++] = i;
+         }
+   }
 
    for (a = 0; a < out->num_areas; a++)
    {
       unsigned eye = RETRO_VIDEO_VIEW_EYE_LEFT;
       if (out->num_areas == 2 && ((a == 1) != p->swap_eyes))
          eye = RETRO_VIDEO_VIEW_EYE_RIGHT;
-      for (s = 0; s < map->num_screens; s++)
+      for (i = 0; i < n; i++)
       {
-         video_views_placement_t *pl;
-         if (skip & (1u << s))
-            continue;
-         pl = &out->placements[out->num_placements++];
+         video_views_placement_t *pl =
+               &out->placements[out->num_placements++];
+         s        = order[i];
          pl->view = (unsigned)video_views_find(map, s, eye);
          pl->area = a;
          if (map->blank & (1u << s))
             pl->flags = VIDEO_VIEWS_PLACEMENT_BLANK;
+         if (insets & (1u << s))
+            pl->flags |= VIDEO_VIEWS_PLACEMENT_INSET
+                  | VIDEO_VIEWS_PLACEMENT_ALPHA_BITS(map->opacity[s]);
          video_views_place(&fit[s], cdims, &out->areas[a], &pl->dst);
       }
    }

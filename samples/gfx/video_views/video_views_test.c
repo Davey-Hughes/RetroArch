@@ -2734,6 +2734,272 @@ static void test_inset_shrink(void)
    CHECK(frect_is(&out, 0.0, 100.0, 400.0, 200.0));
 }
 
+/* The ds map with screen 1 an inset over screen 0's bottom right, a
+ * quarter of its height. */
+static void map_ds_inset(video_views_map_t *map)
+{
+   map_ds(map);
+   map->over       = 0x2;
+   map->base       = 0;
+   map->anchor     = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT << 4;
+   map->size[1]    = 0.25f;
+   map->opacity[1] = 255;
+}
+
+/* @in sits in @base's bottom-right corner. */
+static int t_bottom_right(const video_views_rect_t *in,
+      const video_views_rect_t *base)
+{
+   return VIDEO_POS_X(in->pos) + (int)VIDEO_SCALE_W(in->dims)
+         == VIDEO_POS_X(base->pos) + (int)VIDEO_SCALE_W(base->dims)
+      && VIDEO_POS_Y(in->pos) + (int)VIDEO_SCALE_H(in->dims)
+         == VIDEO_POS_Y(base->pos) + (int)VIDEO_SCALE_H(base->dims);
+}
+
+static void test_layout_inset(void)
+{
+   video_views_map_t map;
+   video_views_layout_t l, want;
+
+   map_ds_inset(&map);
+   map.left_out = 0x2;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &want);
+   CHECK(want.num_placements == 1
+         && rect_is(&want.placements[0].dst, 160, 0, 1280, 960));
+   map.left_out = 0;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(l.num_placements == 2);
+   CHECK(   l.placements[0].view == 0 && l.placements[0].flags == 0
+         && t_dst_same(&l.placements[0], &want.placements[0]));
+   CHECK(   l.placements[1].view == 1
+         && rect_is(&l.placements[1].dst, 1120, 720, 320, 240));
+   CHECK(l.placements[1].flags == VIDEO_VIEWS_PLACEMENT_INSET);
+   CHECK(VIDEO_VIEWS_PLACEMENT_ALPHA(l.placements[1].flags) == 255);
+}
+
+/* The one-screen rules see the base alone. */
+static void test_layout_inset_rules(void)
+{
+   video_views_map_t map;
+   video_views_layout_params_t p;
+   video_views_layout_t l;
+   video_views_rect_t vp;
+
+   map_ds_inset(&map);
+   params_init(&p, &map, 1600, 960);
+   p.screen_layout = VIDEO_SCREEN_LAYOUT_HORIZONTAL;
+   p.stretch       = true;
+   video_views_layout(&p, &l);
+   CHECK(l.num_placements == 2);
+   CHECK(rect_is(&l.placements[0].dst,    0,   0, 1600, 960));
+   CHECK(rect_is(&l.placements[1].dst, 1280, 720,  320, 240));
+
+   p.stretch   = false;
+   vp.pos      = VIDEO_POS_PACK(100, 100);
+   vp.dims     = VIDEO_SCALE_PACK(800, 600);
+   p.custom_vp = &vp;
+   video_views_layout(&p, &l);
+   CHECK(l.num_placements == 2);
+   CHECK(rect_is(&l.placements[0].dst, 100, 100, 800, 600));
+   CHECK(rect_is(&l.placements[1].dst, 700, 550, 200, 150));
+
+   /* The inset keeps its own aspect. */
+   p.custom_vp     = NULL;
+   p.single_aspect = 16.0f / 9.0f;
+   video_views_layout(&p, &l);
+   CHECK(l.num_placements == 2);
+   CHECK(rect_is(&l.placements[0].dst,    0,  30, 1600, 900));
+   CHECK(rect_is(&l.placements[1].dst, 1300, 705,  300, 225));
+}
+
+static void test_layout_inset_exclude(void)
+{
+   video_views_map_t map;
+   video_views_layout_params_t p;
+   video_views_layout_t l;
+
+   map_ds_inset(&map);
+   params_init(&p, &map, 1600, 960);
+   p.screen_layout   = VIDEO_SCREEN_LAYOUT_HORIZONTAL;
+   p.exclude_screens = 0x1;
+   video_views_layout(&p, &l);
+   CHECK(l.num_placements == 0);
+   /* An inset goes where its base goes. */
+   p.exclude_screens = 0x2;
+   video_views_layout(&p, &l);
+   CHECK(l.num_placements == 2);
+   CHECK(   l.placements[1].view == 1
+         && rect_is(&l.placements[1].dst, 1120, 720, 320, 240));
+}
+
+static void test_layout_inset_order(void)
+{
+   video_views_map_t map;
+   video_views_layout_t l;
+
+   map_three(&map);
+   map.over       = 0x6;
+   map.base       = 0;
+   map.anchor     = (RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT << 4)
+                  | (RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_LEFT  << 8);
+   map.size[1]    = 0.25f;
+   map.size[2]    = 0.25f;
+   map.opacity[1] = 255;
+   map.opacity[2] = 255;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(l.num_placements == 3);
+   CHECK(   l.placements[0].view == 0 && l.placements[1].view == 1
+         && l.placements[2].view == 2);
+
+   /* 2 over 0, 1 beside 0: 2 comes right after its base. */
+   map.over    = 0x4;
+   map.size[1] = 0.0f;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(l.num_placements == 3);
+   CHECK(   l.placements[0].view == 0 && l.placements[1].view == 2
+         && l.placements[2].view == 1);
+   CHECK(   l.placements[1].flags == VIDEO_VIEWS_PLACEMENT_INSET
+         && l.placements[2].flags == 0);
+}
+
+static void test_layout_inset_alpha(void)
+{
+   video_views_map_t map;
+   video_views_layout_t l;
+
+   map_ds_inset(&map);
+   map.opacity[0] = 10;
+   map.opacity[1] = 128;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(l.num_placements == 2);
+   CHECK(   l.placements[0].flags == 0
+         && VIDEO_VIEWS_PLACEMENT_ALPHA(l.placements[0].flags) == 255);
+   CHECK(VIDEO_VIEWS_PLACEMENT_ALPHA(l.placements[1].flags) == 128);
+
+   map.blank = 0x2;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(l.num_placements == 2);
+   CHECK(l.placements[1].flags == (VIDEO_VIEWS_PLACEMENT_BLANK
+         | VIDEO_VIEWS_PLACEMENT_INSET
+         | VIDEO_VIEWS_PLACEMENT_ALPHA_BITS(128)));
+   CHECK(VIDEO_VIEWS_PLACEMENT_ALPHA(l.placements[1].flags) == 128);
+}
+
+/* A mono inset over a stereo base: once in each eye, after the base. */
+static void test_layout_inset_stereo(void)
+{
+   struct retro_video_view v[3];
+   video_views_map_t map;
+   video_views_layout_t l;
+   unsigned i;
+
+   v[0] = mkview(  0,   0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_LEFT);
+   v[1] = mkview(256,   0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_RIGHT);
+   v[2] = mkview(  0, 192, 256, 192, 1, RETRO_VIDEO_VIEW_EYE_NONE);
+   CHECK(video_views_validate(v, 3, &map));
+   map.over       = 0x2;
+   map.base       = 0;
+   map.anchor     = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT << 4;
+   map.size[1]    = 0.25f;
+   map.opacity[1] = 255;
+   t_side_layout(&map, VIDEO_STEREO_MODE_SBS_FULL, &l);
+   CHECK(l.num_placements == 4);
+   CHECK(   l.placements[0].view == 0 && l.placements[0].area == 0
+         && l.placements[1].view == 2 && l.placements[1].area == 0
+         && l.placements[2].view == 1 && l.placements[2].area == 1
+         && l.placements[3].view == 2 && l.placements[3].area == 1);
+   for (i = 0; i < 4; i += 2)
+   {
+      CHECK(l.placements[i].flags == 0);
+      CHECK(l.placements[i + 1].flags == VIDEO_VIEWS_PLACEMENT_INSET);
+      CHECK(t_bottom_right(&l.placements[i + 1].dst,
+               &l.placements[i].dst));
+   }
+   CHECK(rect_is(&l.placements[0].dst,    0, 180, 800, 600));
+   CHECK(rect_is(&l.placements[1].dst,  600, 630, 200, 150));
+   CHECK(rect_is(&l.placements[2].dst,  800, 180, 800, 600));
+   CHECK(rect_is(&l.placements[3].dst, 1400, 630, 200, 150));
+
+   /* Half width: squeezed with its base. */
+   t_side_layout(&map, VIDEO_STEREO_MODE_SBS_HALF, &l);
+   CHECK(l.num_placements == 4);
+   CHECK(rect_is(&l.placements[0].dst,   80,   0, 640, 960));
+   CHECK(rect_is(&l.placements[1].dst,  560, 720, 160, 240));
+   CHECK(rect_is(&l.placements[2].dst,  880,   0, 640, 960));
+   CHECK(rect_is(&l.placements[3].dst, 1360, 720, 160, 240));
+}
+
+/* A quarter turn: the inset turns too and stays in the turned base's
+ * corner. */
+static void test_layout_inset_rotated(void)
+{
+   video_views_map_t map;
+   video_views_layout_params_t p;
+   video_views_layout_t l;
+
+   map_ds_inset(&map);
+   params_init(&p, &map, 1600, 960);
+   p.screen_layout = VIDEO_SCREEN_LAYOUT_HORIZONTAL;
+   p.rotation      = 1;
+   video_views_layout(&p, &l);
+   CHECK(l.num_placements == 2);
+   CHECK(rect_is(&l.placements[0].dst, 440,   0, 720, 960));
+   CHECK(rect_is(&l.placements[1].dst, 980, 720, 180, 240));
+   CHECK(   VIDEO_SCALE_W(l.placements[1].dst.dims) * 4
+         == VIDEO_SCALE_H(l.placements[1].dst.dims) * 3);
+   CHECK(t_bottom_right(&l.placements[1].dst, &l.placements[0].dst));
+}
+
+static void test_layout_inset_integer(void)
+{
+   video_views_map_t map;
+   video_views_layout_params_t p;
+   video_views_layout_t l;
+   video_views_frect_t base, in;
+   const video_views_rect_t *d;
+
+   map_ds_inset(&map);
+   params_init(&p, &map, 1600, 1000);
+   p.screen_layout = VIDEO_SCREEN_LAYOUT_HORIZONTAL;
+   p.scale_integer = true;
+   video_views_layout(&p, &l);
+   CHECK(l.num_placements == 2);
+   d = &l.placements[0].dst;
+   CHECK(VIDEO_SCALE_H(d->dims) % 192 == 0);
+   CHECK(rect_is(d, 160, 20, 1280, 960));
+   base.x = VIDEO_POS_X(d->pos);
+   base.y = VIDEO_POS_Y(d->pos);
+   base.w = VIDEO_SCALE_W(d->dims);
+   base.h = VIDEO_SCALE_H(d->dims);
+   video_views_inset(&base, RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT, 0.25,
+         4.0 / 3.0, &in);
+   CHECK(rect_is(&l.placements[1].dst, (int)in.x, (int)in.y,
+            (unsigned)in.w, (unsigned)in.h));
+}
+
+static void test_roots_with_insets(void)
+{
+   struct retro_video_view v[4];
+   video_views_map_t map;
+
+   v[0] = mkview(0,   0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_NONE);
+   v[1] = mkview(0, 192, 256, 192, 1, RETRO_VIDEO_VIEW_EYE_NONE);
+   v[2] = mkview(0, 384, 256, 192, 3, RETRO_VIDEO_VIEW_EYE_NONE);
+   v[3] = mkview(0, 576, 256, 192, 4, RETRO_VIDEO_VIEW_EYE_NONE);
+   t_absent_map(v, 4, 5, 0x4, &map);
+   CHECK(map.num_screens == 5 && map.viewless == 0x4);
+   map.left_out = 0x8;
+   map.over     = 0x2;
+   map.base     = 0;
+   CHECK(video_views_roots(&map) == 0x11);
+   CHECK(video_views_with_insets(&map, 0x1)  == 0x3);
+   CHECK(video_views_with_insets(&map, 0x10) == 0x10);
+   /* A left-out inset is not taken along. */
+   map.over = 0xa;
+   CHECK(video_views_roots(&map) == 0x11);
+   CHECK(video_views_with_insets(&map, 0x1) == 0x3);
+}
+
 int main(void)
 {
    test_screen_defaults();
@@ -2778,6 +3044,15 @@ int main(void)
    test_extent_chain_cycle();
    test_inset_anchors();
    test_inset_shrink();
+   test_layout_inset();
+   test_layout_inset_rules();
+   test_layout_inset_exclude();
+   test_layout_inset_order();
+   test_layout_inset_alpha();
+   test_layout_inset_stereo();
+   test_layout_inset_rotated();
+   test_layout_inset_integer();
+   test_roots_with_insets();
    test_map_point_no_input();
    test_map_point_blank();
    test_touch_no_input();

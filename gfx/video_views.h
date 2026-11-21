@@ -327,6 +327,10 @@ bool video_views_snapshot(const video_views_map_t *map,
 #define VIDEO_VIEWS_MAX_PLACEMENTS (RETRO_VIDEO_VIEWS_MAX * 2)
 
 #define VIDEO_VIEWS_PLACEMENT_BLANK (1u << 0)   /* drawn black */
+#define VIDEO_VIEWS_PLACEMENT_INSET (1u << 1)   /* drawn over its base's */
+/* Bits 8-15 hold 255 minus the opacity, so flags 0 is solid. */
+#define VIDEO_VIEWS_PLACEMENT_ALPHA_BITS(a) ((255u - (a)) << 8)
+#define VIDEO_VIEWS_PLACEMENT_ALPHA(flags)  (255u - (((flags) >> 8) & 0xffu))
 
 /* One view drawn into one eye's area. */
 typedef struct video_views_placement
@@ -360,9 +364,9 @@ typedef struct video_views_layout
 typedef struct video_views_layout_params
 {
    const video_views_map_t *map;
-   /* One included screen only. custom_vp is the custom viewport in window
-    * pixels, or NULL; single_aspect is the aspect ratio setting's value,
-    * or 0 for the view's own; stretch fills the area instead. */
+   /* One root only, insets aside. custom_vp is the custom viewport in
+    * window pixels, or NULL; single_aspect is the aspect ratio setting's
+    * value, or 0 for the view's own; stretch fills the area instead. */
    const video_views_rect_t *custom_vp;
    float single_aspect;
    bool stretch;
@@ -377,6 +381,14 @@ typedef struct video_views_layout_params
 
 void video_views_layout(const video_views_layout_params_t *params,
       video_views_layout_t *out);
+
+/* Screens below num_screens with a place of their own: not viewless,
+ * left out or an inset. */
+unsigned video_views_roots(const video_views_map_t *map);
+
+/* @roots and the insets over them. */
+unsigned video_views_with_insets(const video_views_map_t *map,
+      unsigned roots);
 
 /* The size the menu and widgets lay out at: one eye's UI size when
  * @layout draws the UI per eye, else @dims. NULL is a frame drawn
