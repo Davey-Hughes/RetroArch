@@ -2937,6 +2937,98 @@ static void test_plan_left_out(void)
    CHECK(plan.separate_mask == 0u);
 }
 
+/* @num_screens screens of a view each, screen 1 Separate */
+static void plan_inset_map(video_views_map_t *map,
+      video_window_settings_t *screens, unsigned num_screens)
+{
+   struct retro_video_view v[3];
+   struct retro_video_views in;
+   unsigned i;
+   memset(v, 0, sizeof(v));
+   memset(&in, 0, sizeof(in));
+   memset(screens, 0, RETRO_VIDEO_VIEWS_MAX * sizeof(*screens));
+   for (i = 0; i < num_screens; i++)
+   {
+      v[i].y      = i * 100;
+      v[i].width  = v[i].height = 100;
+      v[i].screen = i;
+   }
+   in.views     = v;
+   in.num_views = num_screens;
+   CHECK(video_views_validate_map(&in, map, NULL));
+   CHECK(map->num_screens == num_screens);
+   screens[1].mode = VIDEO_WINDOW_SEPARATE;
+}
+
+/* An inset goes in no mask, and screen 0 stays in the main window only
+ * while it is a root */
+static void test_plan_inset(void)
+{
+   video_views_map_t map;
+   video_window_settings_t screens[RETRO_VIDEO_VIEWS_MAX];
+   video_windows_plan_t plan;
+   plan_inset_map(&map, screens, 2);
+   map.over = 0x2u;
+   map.base = 0u;
+   video_windows_plan(&map, screens, true, true, 0, NULL, &plan);
+   CHECK(plan.separate_mask == 0u && plan.main_mask == 0x1u);
+   CHECK(plan.hidden_mask == 0u);
+   map.over = 0x1u;
+   map.base = 1u;
+   video_windows_plan(&map, screens, true, true, 0, NULL, &plan);
+   CHECK(plan.separate_mask == 0x2u && plan.main_mask == 0u);
+   CHECK(plan.hidden_mask == 0u);
+}
+
+/* A window forced back to the main window takes its base's inset in
+ * with it, and out again */
+static void test_plan_inset_forced_attached(void)
+{
+   video_views_map_t map;
+   video_window_settings_t screens[RETRO_VIDEO_VIEWS_MAX];
+   video_windows_plan_t plan;
+   plan_inset_map(&map, screens, 3);
+   /* As routed: with its base's value */
+   screens[2].mode = VIDEO_WINDOW_SEPARATE;
+   map.over        = 0x4u;
+   map.base        = 1u << 8;
+   video_windows_plan(&map, screens, true, true, 0x2u, NULL, &plan);
+   CHECK(plan.main_mask == 0x3u && plan.separate_mask == 0u);
+   CHECK(video_views_with_insets(&map, plan.main_mask) == 0x7u);
+   video_windows_plan(&map, screens, true, true, 0, NULL, &plan);
+   CHECK(plan.main_mask == 0x1u && plan.separate_mask == 0x2u);
+   CHECK(video_views_with_insets(&map, plan.main_mask) == 0x1u);
+   CHECK(video_views_with_insets(&map, plan.separate_mask) == 0x6u);
+}
+
+/* An inset joining a window keeps it: it was made for its roots */
+static void test_windows_steps_inset(void)
+{
+   video_windows_frame_t frame;
+   video_windows_held_t held;
+   unsigned retire, create;
+   memset(&frame, 0, sizeof(frame));
+   memset(&held, 0, sizeof(held));
+   frame.monitors          = true;
+   frame.core.num_screens  = 3;
+   frame.core.over         = 0x4u;
+   frame.core.base         = 1u << 8;
+   frame.window_screens[1] = 0x6u;
+   video_windows_steps(&held, &frame, &retire, &create);
+   CHECK(retire == 0 && create == 0x2u);
+   CHECK(held.made_screens[1] == 0x2u);
+   held.live               = 0x2u;
+   /* ... and leaving it */
+   frame.core.over         = 0;
+   frame.window_screens[1] = 0x2u;
+   video_windows_steps(&held, &frame, &retire, &create);
+   CHECK(retire == 0 && create == 0);
+   /* Another root is another window */
+   frame.window_screens[1] = 0x6u;
+   video_windows_steps(&held, &frame, &retire, &create);
+   CHECK(retire == 0x2u);
+}
+
 int main(void)
 {
    test_windows_policy();
@@ -2974,6 +3066,9 @@ int main(void)
    test_window_ui_drawn();
    test_plan_viewless();
    test_plan_left_out();
+   test_plan_inset();
+   test_plan_inset_forced_attached();
+   test_windows_steps_inset();
    if (failures)
       return 1;
    puts("video_windows: ok");

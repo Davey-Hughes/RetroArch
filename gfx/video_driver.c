@@ -1384,7 +1384,8 @@ bool video_driver_window_fullscreen_toggle(void)
       unsigned s;
       video_screen_values_t now;
       const video_window_layout_t *slot;
-      unsigned screens = video_st->windows.window_screens[w];
+      unsigned screens = video_st->windows.window_screens[w]
+         & ~video_st->windows.core.over;
       if (     !screens
             || !(video_st->windows_wanted & (1u << w))
             || !(slot = video_driver_window_drawn(w))
@@ -5458,14 +5459,16 @@ static VIDEO_NOINLINE const video_windows_frame_t *video_driver_windows_frame(
       : video_driver_windows_logo_texture(out->logo);
 #endif
    memset(out->window_screens, 0, sizeof(out->window_screens));
-   /* With a display, its one window, whatever it shows */
+   /* With a display, its one window, whatever it shows; each window
+    * with its screens' insets */
    if (out->display)
       out->window_screens[VIDEO_WINDOWS_PRESENTATION] =
-         out->plan.separate_mask;
+         video_views_with_insets(&out->core, out->plan.separate_mask);
    else
       for (i = 1; i < RETRO_VIDEO_VIEWS_MAX; i++)
          if (out->plan.separate_mask & (1u << i))
-            out->window_screens[i] = 1u << i;
+            out->window_screens[i] =
+               video_views_with_insets(&out->core, 1u << i);
    /* Game Screen 1's own window takes an id no screen's window has */
    if (route->monitors && (out->plan.separate_mask & 1u))
    {
@@ -5473,7 +5476,7 @@ static VIDEO_NOINLINE const video_windows_frame_t *video_driver_windows_frame(
             out->core.num_screens);
       if (w)
       {
-         out->window_screens[w] = 1u;
+         out->window_screens[w] = video_views_with_insets(&out->core, 1u);
          out->settings[w]       = out->settings[0];
       }
       else
@@ -5491,19 +5494,25 @@ static VIDEO_NOINLINE const video_windows_frame_t *video_driver_windows_frame(
    return out;
 }
 
-/* Main thread: what routing reads. Left out only by a map presented: a
- * cleared one hides nothing. Not inlined: the frame's stack has no room
- * to spare. */
+/* Main thread: what routing reads, an inset taking its base's. Left out
+ * or an inset only by a map presented: a cleared one hides nothing. Not
+ * inlined: the frame's stack has no room to spare. */
 static VIDEO_NOINLINE void video_driver_screens_route(
       video_driver_state_t *video_st, bool presented)
 {
    unsigned s;
-   unsigned left_out = presented ? video_st->views_core.left_out : 0;
+   const video_views_map_t *core = &video_st->views_core;
+   unsigned left_out             = presented ? core->left_out : 0;
+   unsigned over                 = presented ? core->over     : 0;
    for (s = 0; s < RETRO_VIDEO_VIEWS_MAX; s++)
+   {
+      unsigned from = (over & (1u << s))
+         ? VIDEO_VIEWS_NIBBLE(core->base, s) : s;
       strlcpy(video_st->screens_routed[s], (left_out & (1u << s))
             ? VIDEO_WINDOW_DISPLAY_OFF
-            : video_st->screens_resolved[s].display,
+            : video_st->screens_resolved[from].display,
             sizeof(video_st->screens_routed[s]));
+   }
 }
 #endif
 

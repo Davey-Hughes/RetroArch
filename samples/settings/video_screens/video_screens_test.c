@@ -5075,6 +5075,204 @@ static void test_window_screen0_left_out(void)
    screens_test_core_done();
 }
 
+/* Three 4x1 screens in window_test_run()'s 8x2 frame: 0 and 1 side by
+ * side, 2 under 0 */
+static void screens_test_three(struct retro_video_views *map,
+      struct retro_video_view *views, struct retro_video_screen *screens)
+{
+   unsigned i;
+   memset(views, 0, 3 * sizeof(*views));
+   memset(screens, 0, 3 * sizeof(*screens));
+   for (i = 0; i < 3; i++)
+   {
+      views[i].x      = (i & 1) * 4;
+      views[i].y      = i / 2;
+      views[i].width  = 4;
+      views[i].height = 1;
+      views[i].screen = i;
+   }
+   memset(map, 0, sizeof(*map));
+   map->views       = views;
+   map->num_views   = 3;
+   map->flags       = RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   map->screens     = screens;
+   map->num_screens = 3;
+}
+
+/* An inset goes in its base's window, after it, and has none of its
+ * own */
+static void test_window_inset_with_base(void)
+{
+   static struct retro_video_view views[3];
+   static struct retro_video_screen screens[3];
+   static video_views_layout_t layout;
+   struct retro_video_views map;
+   settings_t *settings = config_get_ptr();
+   screens_test_core();
+   window_test_begin();
+   screens_test_monitors();
+   strlcpy(settings->arrays.video_screen_display[2], "over:2",
+         sizeof(settings->arrays.video_screen_display[2]));
+   screens_test_three(&map, views, screens);
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   CHECK(window_test_seen.plan.separate_mask == 0x2u);
+   CHECK(window_test_seen.window_screens[1] == 0x6u);
+   CHECK(!window_test_seen.window_screens[2]);
+   video_driver_window_layout_screens(&window_test_seen,
+         &window_test_settings, window_test_seen.window_screens[1],
+         VIDEO_SCALE_PACK(800, 480), &layout);
+   CHECK(layout.num_placements == 2);
+   CHECK(layout.placements[0].view == 1 && !layout.placements[0].flags);
+   CHECK(   layout.placements[1].view  == 2
+         && layout.placements[1].flags == VIDEO_VIEWS_PLACEMENT_INSET);
+   CHECK(window_test_placements() == 1);
+   CHECK(window_test_seen_layout.placements[0].view == 0);
+   settings->arrays.video_screen_display[2][0] = '\0';
+   screens_test_monitors_done();
+   window_test_end();
+   screens_test_core_done();
+}
+
+/* Screen 0 an inset of a windowed screen: the main window shows none,
+ * and its base's window shows both, as its base's */
+static void test_window_screen0_inset(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   static video_views_layout_t layout;
+   struct retro_video_views map;
+   unsigned gen;
+   video_driver_state_t *video_st    = video_state_get_ptr();
+   settings_t *settings              = config_get_ptr();
+   const video_screen_prefs_t *prefs = &video_st->screen_prefs;
+   screens_test_core();
+   window_test_begin();
+   screens_test_monitors();
+   strlcpy(settings->arrays.video_screen_display[0], "over:2",
+         sizeof(settings->arrays.video_screen_display[0]));
+   strlcpy(settings->arrays.video_screen_display[1], "HDMI-A-1",
+         sizeof(settings->arrays.video_screen_display[1]));
+   screens_test_map(&map, views, screens, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+         RETRO_VIDEO_SCREEN_STATE_ACTIVE);
+   screens[1].size = 0.0f;
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   CHECK(window_test_placements() == 0);
+   CHECK(window_test_seen.plan.main_mask == 0u);
+   CHECK(window_test_seen.window_screens[1] == 0x3u);
+   video_driver_window_layout_screens(&window_test_seen,
+         &window_test_settings, window_test_seen.window_screens[1],
+         VIDEO_SCALE_PACK(800, 480), &layout);
+   CHECK(   layout.num_placements == 2 && layout.placements[0].view == 1
+         && layout.placements[1].view  == 0
+         && layout.placements[1].flags == VIDEO_VIEWS_PLACEMENT_INSET);
+   CHECK(string_is_equal(video_st->screens_routed[0],
+            video_st->screens_routed[1]));
+   CHECK(string_is_equal(video_st->screens_routed[0], "HDMI-A-1"));
+   /* The fullscreen hotkey flips its base's */
+   window_test_driver.focus = window_test_focus;
+   window_test_has_focus    = true;
+   gen = video_driver_window_generation();
+   video_driver_publish_window_focus(1, gen, true);
+   window_test_draw_window(1, gen);
+   CHECK(video_driver_window_fullscreen_toggle());
+   CHECK(prefs->values[1].window_fullscreen);
+   CHECK(!prefs->values[0].window_fullscreen);
+   video_driver_publish_window_layout(1, 0, 0, NULL, NULL, 0, 0);
+   settings->arrays.video_screen_display[0][0] = '\0';
+   settings->arrays.video_screen_display[1][0] = '\0';
+   screens_test_monitors_done();
+   input_driver_hold_clear();
+   window_test_end();
+   screens_test_core_done();
+}
+
+/* On a platform's display list an inset is routed as its base, and
+ * goes on its base's Presentation */
+static void test_route_inset_as_base(void)
+{
+   static struct retro_video_view views[3];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   video_window_display_t displays[2];
+   video_driver_state_t *video_st = video_state_get_ptr();
+   settings_t *settings           = config_get_ptr();
+   screens_test_core();
+   window_test_begin();
+   screens_test_kept_count = window_test_displays(screens_test_kept,
+         VIDEO_WINDOW_DISPLAYS_MAX);
+   window_test_display(&displays[0], 1, VIDEO_WINDOW_CONNECTION_UNKNOWN,
+         true, "Built-in Screen");
+   window_test_display(&displays[1], 2, VIDEO_WINDOW_CONNECTION_UNKNOWN,
+         false, "Screen-2");
+   video_driver_publish_window_displays(displays, 2);
+   strlcpy(settings->arrays.video_screen_display[1], "Screen-2",
+         sizeof(settings->arrays.video_screen_display[1]));
+   strlcpy(settings->arrays.video_screen_display[2], "over:2",
+         sizeof(settings->arrays.video_screen_display[2]));
+   screens_test_three(&map, views, screens);
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   CHECK(string_is_equal(video_st->screens_routed[2], "Screen-2"));
+   CHECK(window_test_seen.display == 2);
+   CHECK(window_test_seen.window_screens[VIDEO_WINDOWS_PRESENTATION]
+         == 0x6u);
+   CHECK(window_test_placements() == 1);
+   settings->arrays.video_screen_display[1][0] = '\0';
+   settings->arrays.video_screen_display[2][0] = '\0';
+   screens_test_monitors_done();
+   window_test_end();
+   screens_test_core_done();
+}
+
+/* In its base's window a point on the inset is the inset's, or with
+ * the inset NO_INPUT its base's */
+static void test_window_pointer_inset(void)
+{
+   static struct retro_video_view views[3];
+   static struct retro_video_screen screens[3];
+   static video_views_layout_t layout;
+   struct retro_video_views map;
+   const video_views_rect_t *in = &layout.placements[1].dst;
+   settings_t *settings         = config_get_ptr();
+   uint32_t pos;
+   unsigned i, gen;
+   screens_test_core();
+   window_test_begin();
+   screens_test_monitors();
+   strlcpy(settings->arrays.video_screen_display[2], "over:2",
+         sizeof(settings->arrays.video_screen_display[2]));
+   gen = video_driver_window_generation();
+   for (i = 0; i < 2; i++)
+   {
+      screens_test_three(&map, views, screens);
+      if (i)
+         screens[2].flags = RETRO_VIDEO_SCREEN_FLAG_NO_INPUT;
+      CHECK(video_driver_set_views(&map));
+      window_test_run();
+      CHECK(window_test_seen.window_screens[1] == 0x6u);
+      video_driver_window_layout_screens(&window_test_seen,
+            &window_test_settings, window_test_seen.window_screens[1],
+            VIDEO_SCALE_PACK(800, 480), &layout);
+      CHECK(layout.num_placements == 2);
+      video_driver_publish_window_layout(1, gen, window_test_seen.display,
+            &layout, &window_test_seen.core, window_test_seen.core_dims,
+            VIDEO_SCALE_PACK(800, 480));
+      pos = 0;
+      CHECK(video_driver_translate_window_point(1, gen,
+               VIDEO_POS_X(in->pos) + (int)VIDEO_SCALE_W(in->dims) / 2,
+               VIDEO_POS_Y(in->pos) + (int)VIDEO_SCALE_H(in->dims) / 2,
+               true, &pos));
+      CHECK(window_test_pixel(VIDEO_POS_Y(pos), 2) == (i ? 0 : 1));
+   }
+   video_driver_publish_window_layout(1, 0, 0, NULL, NULL, 0, 0);
+   settings->arrays.video_screen_display[2][0] = '\0';
+   screens_test_monitors_done();
+   window_test_end();
+   screens_test_core_done();
+}
+
 /* A views core's window bounds go to its store, not the settings */
 static void test_window_bounds_per_core(void)
 {
@@ -10178,6 +10376,10 @@ int main(int argc, char **argv)
    test_screens_core_default_bits();
    test_window_absent_back();
    test_window_screen0_left_out();
+   test_window_inset_with_base();
+   test_window_screen0_inset();
+   test_route_inset_as_base();
+   test_window_pointer_inset();
    test_window_bounds_per_core();
    test_window_placement_not_per_core();
    test_window_fullscreen_hotkey_per_core();

@@ -39,6 +39,9 @@ void video_windows_plan(const video_views_map_t *map,
          continue;
       if (map->left_out & bit)
          out->hidden_mask |= bit;
+      /* An inset goes with its base */
+      else if (map->over & bit)
+         continue;
       else if (!enabled || (!route && !s))
          out->main_mask |= bit;
       else if (mode == VIDEO_WINDOW_HIDDEN)
@@ -989,7 +992,7 @@ static void video_windows_held_made(video_windows_held_t *held,
 {
    unsigned bit           = 1u << w;
    held->made[w]          = frame->settings[w];
-   held->made_screens[w]  = frame->window_screens[w];
+   held->made_screens[w]  = frame->window_screens[w] & ~frame->core.over;
    held->made_known      |= bit;
    held->made_named       = (held->made_named & ~bit)
       | (frame->window_named & bit);
@@ -1009,7 +1012,8 @@ static enum video_windows_change video_windows_made_change(
    const video_window_settings_t *a = &held->made[w];
    const video_window_settings_t *b = &frame->settings[w];
    if (     a->mode != b->mode
-         || held->made_screens[w] != frame->window_screens[w])
+         ||    held->made_screens[w]
+            != (frame->window_screens[w] & ~frame->core.over))
       return VIDEO_WINDOWS_REMAKE;
    if (a->edit != b->edit)
    {

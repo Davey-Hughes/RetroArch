@@ -6889,14 +6889,18 @@ static void gl2_views_render(gl2_t *gl,
 #ifdef HAVE_VIDEO_WINDOWS
       /* The screens' own windows' views too, as the frame was not */
       if (sw && video_info->windows)
+      {
+         unsigned windowed = video_views_with_insets(&video_info->views,
+               video_info->windows->plan.separate_mask)
+            & ~video_info->views.blank;
          for (i = 0; i < video_info->views.num_views; i++)
          {
             const struct retro_video_view *v = &video_info->views.views[i];
             if (     !chains[i] && v->screen < RETRO_VIDEO_VIEWS_MAX
-                  && (video_info->windows->plan.separate_mask
-                     & (1u << v->screen)))
+                  && (windowed & (1u << v->screen)))
                gl2_views_write(gl, i, v, depth, sw, pitch, use_rgba);
          }
+      }
 #endif
       gl->coords.vertex    = gl->vertex_ptr;
       gl->coords.tex_coord = gl->tex_info.coord;
@@ -7310,7 +7314,7 @@ static void gl2_window_request(gl2_t *gl, const video_windows_frame_t *f,
 {
    memset(out, 0, sizeof(*out));
    out->screen     = w;
-   out->screens    = f->window_screens[w];
+   out->screens    = f->window_screens[w] & ~f->core.over;
    out->generation = gl->windows.win[w].native.generation;
    out->settings   = f->settings[w];
    out->display    = f->display;

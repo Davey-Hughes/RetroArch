@@ -12621,7 +12621,7 @@ static void vulkan_window_request(vk_t *vk, const video_windows_frame_t *f,
 {
    memset(out, 0, sizeof(*out));
    out->screen     = w;
-   out->screens    = f->window_screens[w];
+   out->screens    = f->window_screens[w] & ~f->core.over;
    out->generation = vk->windows.win[w].native.generation;
    out->settings   = f->settings[w];
    out->display    = f->display;
@@ -13383,9 +13383,12 @@ static VIDEO_NOINLINE void vulkan_windows_prepare(vk_t *vk,
       {
          if (screens && new_frame)
             for (i = 0; i < video_info->views.num_views; i++)
-               if (f->window_screens[w]
-                     & (1u << video_info->views.views[i].screen))
+            {
+               unsigned bit = 1u << video_info->views.views[i].screen;
+               if (     (f->window_screens[w] & bit)
+                     && !(video_info->views.blank & bit))
                   vk->windows.copy |= 1u << i;
+            }
          continue;
       }
 

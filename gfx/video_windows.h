@@ -92,7 +92,8 @@ enum video_window_event_kind
 typedef struct video_window_request
 {
    unsigned screen;
-   /* The screens it shows, a bit each; 0 for screen @screen alone */
+   /* The screens it shows, insets aside, a bit each; 0 for screen
+    * @screen alone */
    unsigned screens;
    unsigned generation;
    video_window_settings_t settings;
@@ -525,8 +526,8 @@ typedef struct video_windows_frame
    /* Where the platform puts the windows: a display's ordinal, 0 where
     * the native layer places each one itself */
    unsigned display;
-   /* The screens each window shows, by window id; [0] is the main
-    * window's and stays 0 */
+   /* The screens each window shows, insets with their base, by window
+    * id; [0] is the main window's and stays 0 */
    unsigned window_screens[RETRO_VIDEO_VIEWS_MAX];
    /* Each UI layer's window and size */
    video_window_ui_target_t ui[VIDEO_WINDOW_UI_LAYERS];
@@ -554,7 +555,8 @@ unsigned video_driver_window_generation(void);
 
 /* Without @route, screen 0 stays in the main window whatever its mode
  * and the others go by theirs; with one, a screen goes where @route
- * puts it. A left-out screen is hidden, screen 0 too. */
+ * puts it. A left-out screen is hidden, screen 0 too. An inset is in
+ * no mask: it goes with its base. */
 void video_windows_plan(const video_views_map_t *map,
       const video_window_settings_t *settings, bool enabled,
       bool supported, unsigned forced_attached,
@@ -787,7 +789,7 @@ typedef struct video_windows_held
    /* Each live id's video_window_request_t::display */
    unsigned display[RETRO_VIDEO_VIEWS_MAX];
    /* With video_windows_frame_t::monitors: what each id was made for,
-    * and the ids that have it */
+    * its screens insets aside, and the ids that have it */
    video_window_settings_t made[RETRO_VIDEO_VIEWS_MAX];
    unsigned made_screens[RETRO_VIDEO_VIEWS_MAX];
    unsigned made_known;
