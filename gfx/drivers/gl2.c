@@ -6881,6 +6881,7 @@ static void gl2_views_render(gl2_t *gl,
    {
       unsigned i, j, k;
       void *one[RETRO_VIDEO_VIEWS_MAX];
+      unsigned n                  = layout->num_placements;
       unsigned started            = 0;
       bool filled                 = false;
       struct video_tex_info frame = gl->tex_info;
@@ -6891,12 +6892,17 @@ static void gl2_views_render(gl2_t *gl,
          && (gl->flags & GL2_FLAG_FBO_FEEDBACK_ENABLE);
       bool in_place  = gl2_views_in_place(gl, depth, sw);
       (void)in_place;
-      /* In placement order: at a view's first placement its passes and
-       * its placements, at the first blank inset's every fill */
-      for (k = 0; k < layout->num_placements; k++)
+      /* The bases, then the insets in placement order, as one eye's
+       * inset is placed before the other eye's base: at a view's first
+       * placement its passes and its placements, at the first blank
+       * inset's every fill */
+      for (k = 0; k < 2 * n; k++)
       {
-         const video_views_placement_t *p = &layout->placements[k];
+         const video_views_placement_t *p =
+               &layout->placements[k < n ? k : k - n];
          i = p->view;
+         if ((k < n) == ((p->flags & VIDEO_VIEWS_PLACEMENT_INSET) != 0))
+            continue;
          if (     (p->flags & (VIDEO_VIEWS_PLACEMENT_BLANK
                      | VIDEO_VIEWS_PLACEMENT_INSET))
                == (VIDEO_VIEWS_PLACEMENT_BLANK | VIDEO_VIEWS_PLACEMENT_INSET))

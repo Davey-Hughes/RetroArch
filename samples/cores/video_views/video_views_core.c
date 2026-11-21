@@ -69,7 +69,8 @@
  * floor grid, axes and a wall ahead from their own poses, instead of
  * a solid colour, for checking by eye that the world holds still.
  *
- * With video_views_test_screens the ds map describes its screens. rules
+ * With video_views_test_screens the ds map describes its screens, as
+ * does the 3ds map in the modes besides rules. rules
  * asks for a screen buffer on its first frame, then sends one map a
  * frame, each keeping or breaking one of the header's screen rules, and
  * logs whether it was accepted; after the last, the full map every
@@ -2589,7 +2590,8 @@ void retro_run(void)
             ? RETRO_VR_REFERENCE_SPACE_STAGE
             : RETRO_VR_REFERENCE_SPACE_LOCAL;
       }
-      if (screens_kind != SCREENS_OFF && map_kind == MAP_DS)
+      if (     (screens_kind != SCREENS_OFF && map_kind == MAP_DS)
+            || (screens_kind == SCREENS_MODE && map_kind == MAP_3DS))
          screens_case = screens_add(&views);
       accepted        = environ_cb(RETRO_ENVIRONMENT_SET_VIDEO_VIEWS,
             &views) ? 1 : 0;

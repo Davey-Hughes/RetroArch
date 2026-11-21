@@ -674,8 +674,8 @@ CORE_FILE_OFF = {CORE_FILE: '# kept\nvideo_screen2_display = "off"\n'}
 # A screen left out, blanked or drawn over another, drawn by the driver:
 # on every driver. [(name, video_views_test_screens, points, what
 # run_case() is given besides, with 'settings' added to
-# SCREENS_AIM_SETTINGS and 'solid' the points instead on a driver not in
-# OPACITY_DRIVERS)]
+# SCREENS_AIM_SETTINGS, 'solid' the points instead on a driver not in
+# OPACITY_DRIVERS and 'map' the map option instead of ds)]
 SCREENS_DRAW_CASES = [
     ('screens-hidden', 'hidden', SCREENS_TOP_ALONE, {}),
     ('screens-blank-late', 'blank_late', SCREENS_BOTTOM_BLANK,
@@ -695,13 +695,27 @@ SCREENS_XV_INTERLACED_CASE = (
     SCREENS_BOTTOM_BLANK + [(400, 481, GREEN), (1200, 481, BLACK)],
     {'until': SCREENS_SWITCHED_RE, 'settings': {'video_stereo_mode': '5'}})
 # gl's preset draws one view's passes after another: Top (view 0), made
-# Bottom's inset by the user, must still go over it. An entry as above.
-SCREENS_GL_PRESET_CASE = (
-    'screens-user-over-preset', 'shown',
-    [(800, 480, YELLOW), (1280, 840, GREEN)],
-    {'files': {CORE_FILE: 'video_screen1_display = "over:2"\n'},
-     'args': ('--set-shader=' + os.path.join(HERE, 'pass.glslp'),),
-     'settings': {'video_shader_enable': 'true'}})
+# Bottom's inset by the user, must still go over it; on the 3ds map side
+# by side, Bottom made Top's inset goes over each eye's Top, blank too.
+# Entries as above.
+SCREENS_PRESET_ARGS = ('--set-shader=' + os.path.join(HERE, 'pass.glslp'),)
+SCREENS_STEREO_OVER = {
+    'map': '3ds', 'args': SCREENS_PRESET_ARGS,
+    'files': {CORE_FILE: 'video_screen2_display = "over:1"\n'},
+    'settings': {'video_shader_enable': 'true', 'video_stereo_mode': '1'}}
+SCREENS_GL_PRESET_CASES = [
+    ('screens-user-over-preset', 'shown',
+     [(800, 480, YELLOW), (1280, 840, GREEN)],
+     {'files': {CORE_FILE: 'video_screen1_display = "over:2"\n'},
+      'args': SCREENS_PRESET_ARGS,
+      'settings': {'video_shader_enable': 'true'}}),
+    ('screens-user-over-stereo-preset', 'shown',
+     [(400, 480, RED), (1200, 480, BLUE), (720, 840, YELLOW),
+      (1520, 840, YELLOW)], SCREENS_STEREO_OVER),
+    ('screens-user-over-blank-stereo-preset', 'blank',
+     [(400, 480, RED), (1200, 480, BLUE), (720, 840, BLACK),
+      (1520, 840, BLACK)], SCREENS_STEREO_OVER),
+]
 # What the frontend makes of show, state, the user's setting and the
 # core's file: on SCREENS_DRIVERS. Each file a case starts with must be
 # the same after it. Entries as SCREENS_DRAW_CASES'.
@@ -2332,9 +2346,10 @@ def run_screens_show_case(retroarch, root, driver, case):
     solid = extra.pop('solid', points)
     if driver not in OPACITY_DRIVERS:
         points = solid
+    mapopt = extra.pop('map', 'ds')
     settings = dict(SCREENS_AIM_SETTINGS, **extra.pop('settings', {}))
     errors = run_case(retroarch, root, driver,
-                      (name, 'ds', settings, points),
+                      (name, mapopt, settings, points),
                       opts={'video_views_test_screens': mode}, **extra)
     d = case_dir(root, driver, name)
     for path in sorted(extra.get('files', {})):
@@ -2703,8 +2718,9 @@ def driver_jobs(retroarch, root, driver):
              if wanted(c[0])]
     if driver == 'xvideo' and wanted(SCREENS_XV_INTERLACED_CASE[0]):
         jobs.append(lambda: screens_show(SCREENS_XV_INTERLACED_CASE))
-    if driver == 'gl' and wanted(SCREENS_GL_PRESET_CASE[0]):
-        jobs.append(lambda: screens_preset(SCREENS_GL_PRESET_CASE))
+    jobs += [lambda c=c: screens_preset(c)
+             for c in (SCREENS_GL_PRESET_CASES if driver == 'gl' else [])
+             if wanted(c[0])]
     jobs += [lambda c=c: screens_show(c)
              for c in (SCREENS_STATE_CASES if driver in SCREENS_DRIVERS
                        else []) if wanted(c[0])]
