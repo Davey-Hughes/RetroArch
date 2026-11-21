@@ -2550,6 +2550,190 @@ static void test_prefs_key(void)
 
 #undef T_PREF
 
+/* On a quarter turn a view's width stands tall at the inverse aspect:
+ * a 256x224 view at 4:3 takes the place of a 256x192 one. */
+static void test_layout_rotated_nonsquare(void)
+{
+   video_views_map_t map;
+   video_views_layout_params_t p;
+   video_views_layout_t l;
+   struct retro_video_view v[2];
+
+   v[0] = mkview(0,   0, 256, 224, 0, RETRO_VIDEO_VIEW_EYE_NONE);
+   v[1] = mkview(0, 224, 256, 192, 1, RETRO_VIDEO_VIEW_EYE_NONE);
+   v[0].aspect_ratio = 4.0f / 3.0f;
+   CHECK(video_views_validate(v, 2, &map));
+   params_init(&p, &map, 1024, 768);
+   p.screen_layout = VIDEO_SCREEN_LAYOUT_HORIZONTAL;
+   p.rotation      = 1;
+   video_views_layout(&p, &l);
+   CHECK(l.num_placements == 2);
+   CHECK(rect_is(&l.placements[0].dst,   0, 43, 512, 682));
+   CHECK(rect_is(&l.placements[1].dst, 512, 43, 512, 682));
+
+   /* One screen: the aspect setting turns with it. */
+   map.num_views   = 1;
+   map.num_screens = 1;
+   p.single_aspect = 16.0f / 9.0f;
+   video_views_layout(&p, &l);
+   CHECK(l.num_placements == 1
+         && rect_is(&l.placements[0].dst, 296, 0, 432, 768));
+}
+
+/* A shown screen with a size is a root sized off its base. */
+static void test_layout_shown_sized(void)
+{
+   video_views_map_t map;
+   video_views_layout_t l;
+
+   map_ds(&map);
+   map.over    = 0;
+   map.base    = 0;
+   map.size[1] = 0.25f;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(l.num_placements == 2);
+   CHECK(rect_is(&l.placements[0].dst,    0,   0, 1280, 960));
+   CHECK(rect_is(&l.placements[1].dst, 1280, 360,  320, 240));
+}
+
+static int extent_is(const video_views_map_t *map, unsigned screen,
+      unsigned rotation, double w, double h)
+{
+   double gw = 0.0, gh = 0.0;
+   if (     video_views_extent(map, screen, rotation, &gw, &gh)
+         && fabs(gw - w) < 1e-9 && fabs(gh - h) < 1e-9)
+      return 1;
+   printf("    screen %u: got %gx%g, want %gx%g\n", screen, gw, gh, w, h);
+   return 0;
+}
+
+/* Three 256x192 screens. */
+static void map_three(video_views_map_t *map)
+{
+   struct retro_video_view v[3];
+   v[0] = mkview(0,   0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_NONE);
+   v[1] = mkview(0, 192, 256, 192, 1, RETRO_VIDEO_VIEW_EYE_NONE);
+   v[2] = mkview(0, 384, 256, 192, 2, RETRO_VIDEO_VIEW_EYE_NONE);
+   video_views_validate(v, 3, map);
+}
+
+static void test_extent_view_rule(void)
+{
+   video_views_map_t map;
+   double w, h;
+
+   map_ds(&map);
+   CHECK(extent_is(&map, 0, 0, 256.0, 192.0));
+   CHECK(extent_is(&map, 0, 1, 192.0, 256.0));
+   map.num_views = 1;
+   CHECK(!video_views_extent(&map, 1, 0, &w, &h));
+}
+
+static void test_extent_base_size(void)
+{
+   video_views_map_t map;
+
+   map_ds(&map);
+   map.base    = 0;
+   map.size[1] = 0.25f;
+   CHECK(extent_is(&map, 1, 0, 64.0, 48.0));
+   /* Turned: a quarter of the base's turned height, at its own turned
+    * aspect. */
+   CHECK(extent_is(&map, 1, 1, 48.0, 64.0));
+   /* An inset is sized by the inset rule, not here. */
+   map.over = 0x2;
+   CHECK(extent_is(&map, 1, 0, 256.0, 192.0));
+   /* A base with no view, or the screen itself, gives the view rule. */
+   map.over = 0;
+   map.base = 0x30;
+   CHECK(extent_is(&map, 1, 0, 256.0, 192.0));
+   map.base = 0x10;
+   CHECK(extent_is(&map, 1, 0, 256.0, 192.0));
+}
+
+static void test_extent_chain_cycle(void)
+{
+   video_views_map_t map;
+
+   /* 2 at half of 1, 1 at half of 0. */
+   map_three(&map);
+   map.base    = 0x100;
+   map.size[1] = 0.5f;
+   map.size[2] = 0.5f;
+   CHECK(extent_is(&map, 2, 0, 64.0, 48.0));
+   CHECK(extent_is(&map, 1, 0, 128.0, 96.0));
+   CHECK(extent_is(&map, 0, 0, 256.0, 192.0));
+
+   /* 0 and 1 at half of each other: 0, the lowest, takes the view rule. */
+   map.base    = 0x101;
+   map.size[0] = 0.5f;
+   CHECK(extent_is(&map, 0, 0, 256.0, 192.0));
+   CHECK(extent_is(&map, 1, 0, 128.0, 96.0));
+   /* 2 leads into the cycle. */
+   CHECK(extent_is(&map, 2, 0, 64.0, 48.0));
+}
+
+static int frect_is(const video_views_frect_t *r, double x, double y,
+      double w, double h)
+{
+   if (     fabs(r->x - x) < 1e-9 && fabs(r->y - y) < 1e-9
+         && fabs(r->w - w) < 1e-9 && fabs(r->h - h) < 1e-9)
+      return 1;
+   printf("    got (%g,%g %gx%g), want (%g,%g %gx%g)\n",
+         r->x, r->y, r->w, r->h, x, y, w, h);
+   return 0;
+}
+
+static void test_inset_anchors(void)
+{
+   /* Top left to bottom right, as libretro.h numbers them. */
+   static const double at[8][2] = {
+      {  0.0,   0.0 }, { 480.0,   0.0 }, { 960.0,   0.0 },
+      {  0.0, 360.0 },                   { 960.0, 360.0 },
+      {  0.0, 720.0 }, { 480.0, 720.0 }, { 960.0, 720.0 }
+   };
+   video_views_frect_t base, out;
+   unsigned a;
+
+   base.x = 0.0;
+   base.y = 0.0;
+   base.w = 1280.0;
+   base.h = 960.0;
+   for (a = RETRO_VIDEO_SCREEN_ANCHOR_TOP_LEFT;
+         a <= RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT; a++)
+   {
+      video_views_inset(&base, a, 0.25, 4.0 / 3.0, &out);
+      CHECK(frect_is(&out, at[a - 1][0], at[a - 1][1], 320.0, 240.0));
+   }
+   video_views_inset(&base, RETRO_VIDEO_SCREEN_ANCHOR_DEFAULT, 0.25,
+         4.0 / 3.0, &out);
+   CHECK(frect_is(&out, 960.0, 720.0, 320.0, 240.0));
+   video_views_inset(&base, 9, 0.25, 4.0 / 3.0, &out);
+   CHECK(frect_is(&out, 960.0, 720.0, 320.0, 240.0));
+   /* In the base's units, from its origin. */
+   base.x = 100.0;
+   base.y = 50.0;
+   video_views_inset(&base, RETRO_VIDEO_SCREEN_ANCHOR_TOP, 0.25,
+         4.0 / 3.0, &out);
+   CHECK(frect_is(&out, 580.0, 50.0, 320.0, 240.0));
+}
+
+static void test_inset_shrink(void)
+{
+   video_views_frect_t base, out;
+
+   base.x = 0.0;
+   base.y = 0.0;
+   base.w = 400.0;
+   base.h = 300.0;
+   video_views_inset(&base, RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT, 1.0,
+         2.0, &out);
+   CHECK(frect_is(&out, 0.0, 100.0, 400.0, 200.0));
+   video_views_inset(&base, RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT, 1.5,
+         2.0, &out);
+   CHECK(frect_is(&out, 0.0, 100.0, 400.0, 200.0));
+}
+
 int main(void)
 {
    test_screen_defaults();
@@ -2587,6 +2771,13 @@ int main(void)
    test_layout_viewless();
    test_layout_left_out();
    test_layout_blank();
+   test_layout_rotated_nonsquare();
+   test_layout_shown_sized();
+   test_extent_view_rule();
+   test_extent_base_size();
+   test_extent_chain_cycle();
+   test_inset_anchors();
+   test_inset_shrink();
    test_map_point_no_input();
    test_map_point_blank();
    test_touch_no_input();

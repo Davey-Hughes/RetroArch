@@ -181,7 +181,24 @@ typedef struct video_views_map
    /* The frontend's, set per frame; validation leaves them 0. */
    unsigned left_out;   /* ABSENT, or its Display resolved to Off: no place */
    unsigned blank;      /* BLANK and not left out: a place, drawn black */
+   /* The frontend's arrangement, set with the masks; validation leaves
+    * it 0. */
+   unsigned over;       /* screens drawn as insets this frame */
+   uint32_t base;       /* 4 bits a screen: an inset's base, a sized screen's */
+   uint32_t anchor;     /* 4 bits a screen: an inset's anchor, 1-8 */
+   uint8_t opacity[RETRO_VIDEO_VIEWS_MAX];  /* an inset's; 255 solid */
+   float size[RETRO_VIDEO_VIEWS_MAX];       /* of its base's height; 0 none */
 } video_views_map_t;
+
+#define VIDEO_VIEWS_NIBBLE(bits, s) (((bits) >> ((s) * 4)) & 0xfu)
+
+typedef struct video_views_frect
+{
+   double x;
+   double y;
+   double w;
+   double h;
+} video_views_frect_t;
 
 #define VIDEO_VIEWS_NAME_SIZE 32   /* bytes kept of a screen's name, with its NUL */
 
@@ -266,6 +283,20 @@ void video_views_scale(video_views_map_t *map,
 
 /* A view's display aspect ratio: its own, or width / height. */
 double video_views_aspect(const struct retro_video_view *v);
+
+/* Screen @screen's display size in source units: its EYE_NONE (or
+ * left) view's height times its aspect; on an odd @rotation, the view's
+ * width tall at the inverse aspect. A screen that is not an inset and
+ * has a size is size times its base's extent tall, at its own (turned)
+ * aspect. False without a view. */
+bool video_views_extent(const video_views_map_t *map, unsigned screen,
+      unsigned rotation, double *w, double *h);
+
+/* An inset's rectangle in @base's units: at @anchor inside @base,
+ * @size of its height tall at @aspect (w / h), shrunk to fit inside
+ * @base with the aspect kept. */
+void video_views_inset(const video_views_frect_t *base, unsigned anchor,
+      double size, double aspect, video_views_frect_t *out);
 
 /* Index of the view showing @screen to @eye: its EYE_NONE view if it has
  * one, else the matching eye, and for EYE_NONE the left. -1 if none. */

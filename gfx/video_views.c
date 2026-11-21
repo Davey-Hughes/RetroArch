@@ -354,6 +354,85 @@ int video_views_find(const video_views_map_t *map,
    return (eye == RETRO_VIDEO_VIEW_EYE_NONE) ? left : -1;
 }
 
+/* The screen whose view sets @screen's height: the end of its chain of
+ * sized bases, or the lowest-numbered screen of a cycle in it. */
+static unsigned video_views_extent_root(const video_views_map_t *map,
+      unsigned screen)
+{
+   unsigned seen = 0;
+   unsigned s    = screen;
+   for (;;)
+   {
+      unsigned b, c, low;
+      seen |= 1u << s;
+      if ((map->over & (1u << s)) || !(map->size[s] > 0.0f))
+         return s;
+      b = VIDEO_VIEWS_NIBBLE(map->base, s);
+      if (video_views_find(map, b, RETRO_VIDEO_VIEW_EYE_NONE) < 0)
+         return s;
+      if (!(seen & (1u << b)))
+      {
+         s = b;
+         continue;
+      }
+      low = b;
+      for (c = b; c != s; )
+      {
+         c = VIDEO_VIEWS_NIBBLE(map->base, c);
+         if (c < low)
+            low = c;
+      }
+      return low;
+   }
+}
+
+bool video_views_extent(const video_views_map_t *map, unsigned screen,
+      unsigned rotation, double *w, double *h)
+{
+   unsigned s, root;
+   double aspect;
+   const struct retro_video_view *v;
+   int i = video_views_find(map, screen, RETRO_VIDEO_VIEW_EYE_NONE);
+   if (i < 0)
+      return false;
+   root = video_views_extent_root(map, screen);
+   v    = &map->views[video_views_find(map, root,
+         RETRO_VIDEO_VIEW_EYE_NONE)];
+   *h   = (rotation & 1) ? v->width : v->height;
+   for (s = screen; s != root; s = VIDEO_VIEWS_NIBBLE(map->base, s))
+      *h *= map->size[s];
+   aspect = video_views_aspect(&map->views[i]);
+   if (rotation & 1)
+      aspect = 1.0 / aspect;
+   *w = *h * aspect;
+   return true;
+}
+
+void video_views_inset(const video_views_frect_t *base, unsigned anchor,
+      double size, double aspect, video_views_frect_t *out)
+{
+   unsigned cell;
+   double w, h;
+   if (!(size <= 1.0))   /* NaN too */
+      size = 1.0;
+   h = base->h * size;
+   w = h * aspect;
+   if (w > base->w)
+   {
+      w = base->w;
+      h = w / aspect;
+   }
+   if (     anchor < RETRO_VIDEO_SCREEN_ANCHOR_TOP_LEFT
+         || anchor > RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT)
+      anchor = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT;
+   /* The anchors run through a 3x3 grid's cells, skipping its centre. */
+   cell   = (anchor < RETRO_VIDEO_SCREEN_ANCHOR_RIGHT) ? anchor - 1 : anchor;
+   out->x = base->x + (base->w - w) * (cell % 3) / 2.0;
+   out->y = base->y + (base->h - h) * (cell / 3) / 2.0;
+   out->w = w;
+   out->h = h;
+}
+
 bool video_views_eye_pair(const video_views_map_t *map, int eyes[2])
 {
    unsigned i;
@@ -463,23 +542,12 @@ static void video_views_fit(const video_views_layout_params_t *p,
 
    for (s = 0; s < map->num_screens; s++)
    {
-      const struct retro_video_view *v;
-      double w, h, aspect;
       if (skip & (1u << s))
          continue;
-      v      = &map->views[video_views_find(map, s, RETRO_VIDEO_VIEW_EYE_NONE)];
-      w      = v->width;
-      h      = v->height;
-      aspect = video_views_aspect(v);
+      video_views_extent(map, s, p->rotation, &disp_w[s], &disp_h[s]);
       if (count == 1 && p->single_aspect > 0.0f)
-         aspect = p->single_aspect;
-      if (p->rotation & 1)
-      {
-         h      = w;
-         aspect = 1.0 / aspect;
-      }
-      disp_h[s] = h;
-      disp_w[s] = h * aspect;
+         disp_w[s] = disp_h[s] * ((p->rotation & 1)
+               ? 1.0 / p->single_aspect : p->single_aspect);
       if (vertical)
       {
          if (disp_w[s] > tw)
