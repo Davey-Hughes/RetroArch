@@ -371,6 +371,13 @@ static bool video_windows_place_targets(const video_windows_place_in_t *in,
       return false;
    for (s = 0; s < RETRO_VIDEO_VIEWS_MAX; s++)
       want[s] = video_windows_place_screen(in, r->own, s ? want[0] : 0, s);
+   /* An inset goes on its base's display, not on Auto's by its number */
+   for (s = 0; s < RETRO_VIDEO_VIEWS_MAX; s++)
+   {
+      unsigned b = VIDEO_VIEWS_NIBBLE(in->base, s);
+      if (want[s] && (in->over & (1u << s)) && b < RETRO_VIDEO_VIEWS_MAX)
+         want[s] = want[b];
+   }
    for (s = 0; s < screens; s++)
       r->target[s] = want[s];
    /* A game without a map is shown even when its screen is Off */

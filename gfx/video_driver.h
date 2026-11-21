@@ -2312,6 +2312,8 @@ typedef struct
    /* What display routing reads: the resolved Display, "off" when left
     * out */
    char screens_routed[RETRO_VIDEO_VIEWS_MAX][VIDEO_WINDOW_DISPLAY_NAME_SIZE];
+   /* The screens routed as their base (views_core's base) */
+   unsigned screens_routed_over;
 #ifdef HAVE_MENU
    /* A bit a screen: rows a take changed, and of them those that had
     * no size before, until the menu reads them; main thread */

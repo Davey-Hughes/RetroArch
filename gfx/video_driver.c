@@ -5035,6 +5035,8 @@ static void video_driver_windows_place(video_driver_state_t *video_st,
    in->num_screens    = !running ? 0
       : video_st->views.num_views ? video_st->views.num_screens : 1;
    in->mapless        = running && !video_st->views.num_views;
+   in->over           = video_st->screens_routed_over;
+   in->base           = video_st->views_core.base;
    in->switching      = runloop_st->content_switching;
    in->failed_move    = 0;
 #ifdef ANDROID
@@ -5504,6 +5506,7 @@ static VIDEO_NOINLINE void video_driver_screens_route(
    const video_views_map_t *core = &video_st->views_core;
    unsigned left_out             = presented ? core->left_out : 0;
    unsigned over                 = presented ? core->over     : 0;
+   video_st->screens_routed_over = over;
    for (s = 0; s < RETRO_VIDEO_VIEWS_MAX; s++)
    {
       unsigned from = (over & (1u << s))

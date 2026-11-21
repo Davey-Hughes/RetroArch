@@ -1488,6 +1488,46 @@ static void test_place_no_ordinal(void)
    CHECK(place_r.menu == 2);
 }
 
+/* An inset is placed as its base: no display or Presentation of its
+ * own, its Auto its base's */
+static void test_place_inset(void)
+{
+   /* The core's Game Screen 2 over Game Screen 1 on the panels: both in
+    * the main window, the bottom panel left to blank */
+   place_reset(1, 2);
+   place_d[0].type = VIDEO_WINDOW_TYPE_INTERNAL;
+   place_d[1].type = VIDEO_WINDOW_TYPE_INTERNAL;
+   place_game(2, false);
+   place_in.over   = 0x2u;
+   place_in.base   = 0u;
+   place_at(0);
+   CHECK(placed(0, 0u, 3u, 0u, 0));
+   CHECK(place_r.target[0] == 1 && place_r.target[1] == 1);
+   CHECK(video_windows_blank_ids(place_d, 2, place_r.display, NULL) == 1);
+   /* The user's Game Screen 1 over Game Screen 2: RetroArch goes where
+    * Game Screen 2 is */
+   place_reset(1, 2);
+   place_game(2, false);
+   place_in.over   = 0x1u;
+   place_in.base   = 1u;
+   place_at(0);
+   CHECK(placed(0, 0u, 3u, 0u, 2));
+   CHECK(place_r.target[0] == 2 && place_r.target[1] == 2);
+   place_own(2);
+   place_at(100000);
+   CHECK(placed(0, 0u, 3u, 0u, 0) && !place_host.moving);
+   /* ... and stays off a monitor Game Screen 1 alone would have had */
+   place_reset(1, 3);
+   place_d[2].type = VIDEO_WINDOW_TYPE_EXTERNAL;
+   place_game(2, false);
+   place_in.over   = 0x1u;
+   place_in.base   = 1u;
+   place_at(0);
+   CHECK(placed(0, 0u, 3u, 0u, 0));
+   CHECK(place_r.target[0] == 1 && place_r.target[1] == 1);
+   CHECK(!place_host.make && !place_host.moving);
+}
+
 /* The Thor as Android 12 and later types it, with its display ids */
 static void blank_thor(video_window_display_t *d, unsigned own)
 {
@@ -3046,6 +3086,7 @@ int main(void)
    test_place_external();
    test_place_moves();
    test_place_no_ordinal();
+   test_place_inset();
    test_blank_wanted();
    test_blank_ids();
    test_blank_state();

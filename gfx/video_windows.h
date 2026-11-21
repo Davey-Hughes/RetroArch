@@ -402,6 +402,10 @@ typedef struct video_windows_place_in
    /* The running content's screens, 0 with none; a core with no views
     * map has 1, and mapless */
    unsigned num_screens;
+   /* The screens routed as their base, and the bases, as in
+    * video_views_map_t: an inset is placed as its base */
+   unsigned over;
+   uint32_t base;
    /* The display the Presentation's window has drawn on since it was
     * made, 0 for none (video_driver_window_shown()) */
    unsigned shown;

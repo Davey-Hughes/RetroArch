@@ -5226,6 +5226,38 @@ static void test_route_inset_as_base(void)
    screens_test_core_done();
 }
 
+/* The core's OVER on two panels, both screens on Auto: no Presentation
+ * for the inset, which stays with its base */
+static void test_route_core_over_auto(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   video_window_display_t displays[2];
+   video_driver_state_t *video_st = video_state_get_ptr();
+   screens_test_core();
+   window_test_begin();
+   screens_test_kept_count = window_test_displays(screens_test_kept,
+         VIDEO_WINDOW_DISPLAYS_MAX);
+   window_test_display(&displays[0], 1, VIDEO_WINDOW_CONNECTION_UNKNOWN,
+         true, "Built-in Screen");
+   window_test_display(&displays[1], 2, VIDEO_WINDOW_CONNECTION_UNKNOWN,
+         false, "Screen-2");
+   video_driver_publish_window_displays(displays, 2);
+   screens_test_map(&map, views, screens, RETRO_VIDEO_SCREEN_SHOW_OVER,
+         RETRO_VIDEO_SCREEN_STATE_ACTIVE);
+   screens[1].size = 0.0f;
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   CHECK(video_st->views_core.over == 0x2u);
+   CHECK(window_test_seen.display == 0);
+   CHECK(window_test_seen.plan.main_mask == 0x1u);
+   CHECK(window_test_placements() == 2);
+   screens_test_monitors_done();
+   window_test_end();
+   screens_test_core_done();
+}
+
 /* In its base's window a point on the inset is the inset's, or with
  * the inset NO_INPUT its base's */
 static void test_window_pointer_inset(void)
@@ -10379,6 +10411,7 @@ int main(int argc, char **argv)
    test_window_inset_with_base();
    test_window_screen0_inset();
    test_route_inset_as_base();
+   test_route_core_over_auto();
    test_window_pointer_inset();
    test_window_bounds_per_core();
    test_window_placement_not_per_core();
