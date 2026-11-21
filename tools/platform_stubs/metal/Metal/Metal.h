@@ -52,7 +52,9 @@ typedef NS_ENUM(NSUInteger, MTLBlendFactor) {
    MTLBlendFactorOneMinusSourceAlpha,
    MTLBlendFactorSourceAlpha,
    MTLBlendFactorZero,
-   MTLBlendFactorOneMinusBlendColor
+   MTLBlendFactorOneMinusBlendColor,
+   MTLBlendFactorBlendAlpha,
+   MTLBlendFactorOneMinusBlendAlpha
 };
 typedef NS_ENUM(NSUInteger, MTLLoadAction) {
    MTLLoadActionClear,

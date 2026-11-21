@@ -6183,13 +6183,18 @@ typedef struct metal_views
    __unsafe_unretained id<MTLSamplerState>         nearest;
    __unsafe_unretained id<MTLSamplerState>         linear;
    __unsafe_unretained id<MTLRenderPipelineState>  rect;
+   __unsafe_unretained id<MTLRenderPipelineState>  rect_blend;
+   __unsafe_unretained id<MTLRenderPipelineState>  fill;
    __unsafe_unretained id<MTLRenderPipelineState>  layer;
    __unsafe_unretained id<MTLRenderPipelineState>  anaglyph;
    __unsafe_unretained id<MTLRenderPipelineState>  interlaced;
    /* For get_flags on the main thread: whether views may be drawn,
-    * and whether the last frame with a map was drawn whole. */
+    * and whether a map is drawn whole: the last frame's, or with none
+    * whether one would be. */
    retro_atomic_int_t    allowed;
    retro_atomic_int_t    fallback;
+   /* VV_ALPHA's alpha below 255, which rects are drawn at; 0 solid */
+   unsigned              alpha;
    bool                  tried;
    bool                  failed;
    bool                  active;
@@ -6220,6 +6225,11 @@ static void metal_views_draw_direct(metal_views_t *vs,
 static void metal_views_draw_pass(metal_views_t *vs,
       const struct metal_views_draw *d, metal_view_chain_t *c,
       const video_views_rect_t *dst, const video_views_rect_t *cut);
+static void metal_views_alpha(metal_views_t *vs,
+      const struct metal_views_draw *d, unsigned alpha);
+static void metal_views_fill(metal_views_t *vs,
+      const struct metal_views_draw *d, const video_views_rect_t *cut,
+      unsigned alpha);
 static bool metal_views_make(metal_views_t *vs, metal_views_texture_t *t,
       unsigned dims);
 static bool metal_views_retire(metal_views_t *vs, metal_views_texture_t *t);
@@ -6236,6 +6246,8 @@ static bool metal_views_retire(metal_views_t *vs, metal_views_texture_t *t);
 #define VV_DRAW                         struct metal_views_draw
 #define VV_DIRECT(p, d, v, r, c)        metal_views_draw_direct(p, d, v, r, c)
 #define VV_PASS(p, d, f, r, c, a)       metal_views_draw_pass(p, d, f, r, c)
+#define VV_ALPHA(p, d, a)               metal_views_alpha(p, d, a)
+#define VV_FILL(p, d, c, a)             metal_views_fill(p, d, c, a)
 #define VV_TARGET                       metal_views_texture_t
 #define VV_TARGET_MAKE(drv, t, dims)    metal_views_make(drv, t, dims)
 #define VV_TARGET_RETIRE(drv, t)        metal_views_retire(drv, t)
@@ -6251,6 +6263,8 @@ static void metal_views_release(metal_views_t *vs)
 {
    RARCH_STRUCT_ASSIGN(vs->media_rect16, nil);
    RARCH_STRUCT_ASSIGN(vs->rect,       nil);
+   RARCH_STRUCT_ASSIGN(vs->rect_blend, nil);
+   RARCH_STRUCT_ASSIGN(vs->fill,       nil);
    RARCH_STRUCT_ASSIGN(vs->layer,      nil);
    RARCH_STRUCT_ASSIGN(vs->anaglyph,   nil);
    RARCH_STRUCT_ASSIGN(vs->interlaced, nil);
@@ -6258,9 +6272,11 @@ static void metal_views_release(metal_views_t *vs)
    RARCH_STRUCT_ASSIGN(vs->ui.tex,     nil);
 }
 
-/* @fn's pipeline into BGRA8, with blending premultiplied */
+/* @fn's pipeline into @format, blended by @src and @dst unless they are
+ * One and Zero */
 static id<MTLRenderPipelineState> metal_views_pipeline_format(id<MTLDevice> device,
-      id<MTLLibrary> lib, NSString *fn, bool blend, MTLPixelFormat format)
+      id<MTLLibrary> lib, NSString *fn, MTLBlendFactor src,
+      MTLBlendFactor dst, MTLPixelFormat format)
 {
    NSError *err = nil;
    MTLRenderPipelineDescriptor *psd = RARCH_AUTORELEASE_R(
@@ -6272,11 +6288,12 @@ static id<MTLRenderPipelineState> metal_views_pipeline_format(id<MTLDevice> devi
    psd.fragmentFunction           = RARCH_AUTORELEASE_R([lib
          newFunctionWithName:fn]);
    ca.pixelFormat                 = format;
-   ca.blendingEnabled             = blend ? YES : NO;
-   ca.sourceRGBBlendFactor        = MTLBlendFactorOne;
-   ca.destinationRGBBlendFactor   = MTLBlendFactorOneMinusSourceAlpha;
-   ca.sourceAlphaBlendFactor      = MTLBlendFactorOne;
-   ca.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+   ca.blendingEnabled             = (   src != MTLBlendFactorOne
+                                     || dst != MTLBlendFactorZero) ? YES : NO;
+   ca.sourceRGBBlendFactor        = src;
+   ca.destinationRGBBlendFactor   = dst;
+   ca.sourceAlphaBlendFactor      = src;
+   ca.destinationAlphaBlendFactor = dst;
    if (!psd.vertexFunction || !psd.fragmentFunction)
       return nil;
    return RARCH_AUTORELEASE_R([device
@@ -6284,9 +6301,11 @@ static id<MTLRenderPipelineState> metal_views_pipeline_format(id<MTLDevice> devi
 }
 
 static id<MTLRenderPipelineState> metal_views_pipeline(id<MTLDevice> device,
-      id<MTLLibrary> lib, NSString *fn, bool blend)
+      id<MTLLibrary> lib, NSString *fn, MTLBlendFactor src,
+      MTLBlendFactor dst)
 {
-   return metal_views_pipeline_format(device, lib, fn, blend, MTLPixelFormatBGRA8Unorm);
+   return metal_views_pipeline_format(device, lib, fn, src, dst,
+         MTLPixelFormatBGRA8Unorm);
 }
 
 /* The pipelines views draw with, made on first use: most sessions never
@@ -6379,17 +6398,29 @@ static void metal_views_init(metal_views_t *vs)
    if (lib)
    {
       RARCH_STRUCT_ASSIGN(vs->rect, metal_views_pipeline(vs->device, lib,
-               @"views_rect", false));
+               @"views_rect", MTLBlendFactorOne, MTLBlendFactorZero));
       RARCH_STRUCT_ASSIGN(vs->media_rect16, metal_views_pipeline_format(vs->device, lib,
-               @"views_media", false, MTLPixelFormatRGBA16Float));
+               @"views_media", MTLBlendFactorOne, MTLBlendFactorZero,
+               MTLPixelFormatRGBA16Float));
       RARCH_STRUCT_ASSIGN(vs->anaglyph, metal_views_pipeline(vs->device, lib,
-               @"views_anaglyph", false));
+               @"views_anaglyph", MTLBlendFactorOne, MTLBlendFactorZero));
       RARCH_STRUCT_ASSIGN(vs->interlaced, metal_views_pipeline(vs->device,
-               lib, @"views_interlaced", false));
+               lib, @"views_interlaced", MTLBlendFactorOne,
+               MTLBlendFactorZero));
       RARCH_STRUCT_ASSIGN(vs->layer, metal_views_pipeline(vs->device, lib,
-               @"views_layer", true));
+               @"views_layer", MTLBlendFactorOne,
+               MTLBlendFactorOneMinusSourceAlpha));
+      /* A rect at the blend colour's alpha, and a blank inset's black:
+       * a rect whose colour the blend takes none of */
+      RARCH_STRUCT_ASSIGN(vs->rect_blend, metal_views_pipeline(vs->device,
+               lib, @"views_rect", MTLBlendFactorBlendAlpha,
+               MTLBlendFactorOneMinusBlendAlpha));
+      RARCH_STRUCT_ASSIGN(vs->fill, metal_views_pipeline(vs->device, lib,
+               @"views_rect", MTLBlendFactorZero,
+               MTLBlendFactorOneMinusBlendAlpha));
    }
-   if (vs->rect && vs->anaglyph && vs->interlaced && vs->layer)
+   if (     vs->rect && vs->rect_blend && vs->fill && vs->anaglyph
+         && vs->interlaced && vs->layer)
       return;
    RARCH_WARN("[Metal] Views can't be drawn: their shaders failed: %s.\n",
          err ? err.localizedDescription.UTF8String : "");
@@ -6495,7 +6526,7 @@ static void metal_views_draw_pass(metal_views_t *vs,
    {
       float tw = (float)final.width;
       float th = (float)final.height;
-      [d->rce setRenderPipelineState:vs->rect];
+      [d->rce setRenderPipelineState:vs->alpha ? vs->rect_blend : vs->rect];
       [d->rce setFragmentTexture:final atIndex:0];
       [d->rce setFragmentSamplerState:d->sampler atIndex:0];
       metal_views_ubo(d->rce, &vs->context.uniforms->projectionMatrix,
@@ -6509,6 +6540,40 @@ static void metal_views_draw_pass(metal_views_t *vs,
    [d->rce setScissorRect:metal_views_sc(cut)];
    [d->rce drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0
               vertexCount:4];
+}
+
+/* The rects that follow at @alpha, by the blend colour's; at 255 not
+ * blended */
+static void metal_views_alpha(metal_views_t *vs,
+      const struct metal_views_draw *d, unsigned alpha)
+{
+   vs->alpha = (alpha < 255) ? alpha : 0;
+   if (vs->alpha)
+      [d->rce setBlendColorRed:0.0f green:0.0f blue:0.0f
+                         alpha:(float)alpha / 255.0f];
+   [d->rce setRenderPipelineState:vs->alpha ? vs->rect_blend : vs->rect];
+}
+
+/* @cut black at @alpha, for a blank inset: the fill pipeline darkens
+ * what is under it by the blend colour's alpha. The frame's texture and
+ * sampler are those the direct draws have bound. */
+static void metal_views_fill(metal_views_t *vs,
+      const struct metal_views_draw *d, const video_views_rect_t *cut,
+      unsigned alpha)
+{
+   simd_float4 unit = simd_make_float4(0.0f, 0.0f, 1.0f, 1.0f);
+   [d->rce setRenderPipelineState:vs->fill];
+   [d->rce setBlendColorRed:0.0f green:0.0f blue:0.0f
+                      alpha:(float)alpha / 255.0f];
+   [d->rce setFragmentTexture:vs->frameView.frameTexture atIndex:0];
+   [d->rce setFragmentSamplerState:d->sampler atIndex:0];
+   metal_views_ubo(d->rce, &vs->context.uniforms->projectionMatrix,
+         unit, unit);
+   [d->rce setViewport:metal_views_vp(cut)];
+   [d->rce setScissorRect:metal_views_sc(cut)];
+   [d->rce drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0
+              vertexCount:4];
+   [d->rce setRenderPipelineState:vs->alpha ? vs->rect_blend : vs->rect];
 }
 
 /* @set's preset chains from index @first on freed */
@@ -7337,8 +7402,10 @@ static void metal_views_render(metal_views_t *vs,
          _context.viewport = _viewport;
          [_frameView syncViewport];
       }
+      /* With no map: whether one would be drawn whole */
       retro_atomic_store_release_int(&_views.fallback,
-            (video_info->views.num_views && !views) ? 1 : 0);
+            (video_info->views.num_views ? !views
+             : !metal_views_allowed(&_views)) ? 1 : 0);
       retro_atomic_store_release_int(&_views.allowed,
             metal_views_allowed(&_views) ? 1 : 0);
 
