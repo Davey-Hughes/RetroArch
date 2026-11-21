@@ -11468,10 +11468,13 @@ recording_resize_deferred:;
       d3d12->views.active = views;
       d3d12_update_viewport(d3d12, views);
    }
-   /* With no map: whether one would be drawn whole */
+   /* With no map: whether one would be drawn whole, by what
+    * d3d12_views_setup tests besides the map */
    retro_atomic_store_release_int(&d3d12->views.fallback,
-         (video_info->views.num_views ? !views : !d3d12_views_allowed(d3d12))
-         ? 1 : 0);
+         (video_info->views.num_views ? !views
+          : (   !d3d12_views_allowed(d3d12)
+             || (   video_info->shader_subframes > 1
+                 && video_info->scan_subframes))) ? 1 : 0);
    d3d12_views_publish(d3d12);
 
    texture = d3d12->filter.history;
