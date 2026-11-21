@@ -560,10 +560,14 @@ typedef struct
        * over the frame premultiplied. */
       D3D11BlendState       blend_ui;
       D3D11BlendState       blend_layer;
+      /* By the blend factor: an inset at its opacity, a blank one black */
+      D3D11BlendState       blend_alpha;
+      D3D11BlendState       blend_fill;
       unsigned              src_dims;
       unsigned              frame_dims;
       /* For get_flags on the main thread: whether views may be drawn,
-       * and whether the last frame with a map was drawn whole. */
+       * and whether a map is drawn whole: the last frame's, or with
+       * none whether one would be. */
       retro_atomic_int_t    allowed;
       retro_atomic_int_t    fallback;
       bool                  tried;
@@ -7387,6 +7391,7 @@ struct d3d11_views_draw
 {
    const video_frame_info_t *video_info;
    D3D11RenderTargetView target;
+   D3D11ShaderResourceView src;
    unsigned src_dims;
 };
 
@@ -7396,6 +7401,10 @@ static void d3d11_views_draw_direct(d3d11_video_t *d3d11,
 static void d3d11_views_draw_pass(d3d11_video_t *d3d11,
       const struct d3d11_views_draw *d, d3d11_chain_t *c,
       const video_views_rect_t *dst, const video_views_rect_t *cut);
+static void d3d11_views_alpha(d3d11_video_t *d3d11, unsigned alpha);
+static void d3d11_views_fill(d3d11_video_t *d3d11,
+      const struct d3d11_views_draw *d, const video_views_rect_t *cut,
+      unsigned alpha);
 static bool d3d11_views_make(d3d11_video_t *d3d11, d3d11_texture_t *t,
       unsigned dims);
 static bool d3d11_views_retire(d3d11_video_t *d3d11, d3d11_texture_t *t);
@@ -7412,6 +7421,8 @@ static bool d3d11_views_retire(d3d11_video_t *d3d11, d3d11_texture_t *t);
 #define VV_DRAW                         struct d3d11_views_draw
 #define VV_DIRECT(p, d, v, r, c)        d3d11_views_draw_direct(p, d, v, r, c)
 #define VV_PASS(p, d, f, r, c, a)       d3d11_views_draw_pass(p, d, f, r, c)
+#define VV_ALPHA(p, d, a)               d3d11_views_alpha(p, a)
+#define VV_FILL(p, d, c, a)             d3d11_views_fill(p, d, c, a)
 #define VV_TARGET                       d3d11_texture_t
 #define VV_TARGET_MAKE(drv, t, dims)    d3d11_views_make(drv, t, dims)
 #define VV_TARGET_RETIRE(drv, t)        d3d11_views_retire(drv, t)
@@ -7446,6 +7457,8 @@ static void d3d11_views_release(d3d11_video_t *d3d11)
    Release(d3d11->views.ubo);
    Release(d3d11->views.blend_ui);
    Release(d3d11->views.blend_layer);
+   Release(d3d11->views.blend_alpha);
+   Release(d3d11->views.blend_fill);
    d3d11_release_texture(&d3d11->views.canvas);
    d3d11_release_texture(&d3d11->views.ui);
 }
@@ -7512,13 +7525,22 @@ static void d3d11_views_init(d3d11_video_t *d3d11)
    dev->lpVtbl->CreateBlendState(dev, &blend_desc, &d3d11->views.blend_ui);
    blend_desc.RenderTarget[0].SrcBlend              = D3D11_BLEND_ONE;
    dev->lpVtbl->CreateBlendState(dev, &blend_desc, &d3d11->views.blend_layer);
+   blend_desc.RenderTarget[0].SrcBlend              = D3D11_BLEND_BLEND_FACTOR;
+   blend_desc.RenderTarget[0].DestBlend             = D3D11_BLEND_INV_BLEND_FACTOR;
+   blend_desc.RenderTarget[0].SrcBlendAlpha         = D3D11_BLEND_BLEND_FACTOR;
+   blend_desc.RenderTarget[0].DestBlendAlpha        = D3D11_BLEND_INV_BLEND_FACTOR;
+   dev->lpVtbl->CreateBlendState(dev, &blend_desc, &d3d11->views.blend_alpha);
+   blend_desc.RenderTarget[0].SrcBlend              = D3D11_BLEND_ZERO;
+   blend_desc.RenderTarget[0].SrcBlendAlpha         = D3D11_BLEND_ZERO;
+   dev->lpVtbl->CreateBlendState(dev, &blend_desc, &d3d11->views.blend_fill);
 
    if (     ok
          && d3d11->views.rect.vs && d3d11->views.rect.ps
          && d3d11->views.rect.layout
          && d3d11->views.layer.ps && d3d11->views.anaglyph.ps
          && d3d11->views.interlaced.ps && d3d11->views.ubo
-         && d3d11->views.blend_ui && d3d11->views.blend_layer)
+         && d3d11->views.blend_ui && d3d11->views.blend_layer
+         && d3d11->views.blend_alpha && d3d11->views.blend_fill)
       return;
    RARCH_WARN("[D3D11] Views can't be drawn: their shaders failed.\n");
    d3d11_views_release(d3d11);
@@ -7529,6 +7551,8 @@ static void d3d11_views_init(d3d11_video_t *d3d11)
    d3d11->views.ubo         = NULL;
    d3d11->views.blend_ui    = NULL;
    d3d11->views.blend_layer = NULL;
+   d3d11->views.blend_alpha = NULL;
+   d3d11->views.blend_fill  = NULL;
    d3d11->views.failed      = true;
 }
 
@@ -7654,6 +7678,50 @@ static void d3d11_views_bind(d3d11_video_t *d3d11)
    ctx->lpVtbl->GSSetShader(ctx, NULL, NULL, 0);
    ctx->lpVtbl->VSSetConstantBuffers(ctx, 0, 1, &d3d11->views.ubo);
    ctx->lpVtbl->PSSetConstantBuffers(ctx, 0, 1, &d3d11->views.ubo);
+}
+
+/* The draws that follow at @alpha, by a constant blend the shaders' own
+ * alpha takes no part in; at 255 not blended */
+static void d3d11_views_alpha(d3d11_video_t *d3d11, unsigned alpha)
+{
+   float factor[4];
+   D3D11DeviceContext ctx = d3d11->context;
+   if (alpha >= 255)
+   {
+      ctx->lpVtbl->OMSetBlendState(ctx, d3d11->blend_disable, NULL,
+            D3D11_DEFAULT_SAMPLE_MASK);
+      return;
+   }
+   factor[0] = factor[1] = factor[2] = factor[3] = (float)alpha / 255.0f;
+   ctx->lpVtbl->OMSetBlendState(ctx, d3d11->views.blend_alpha, factor,
+         D3D11_DEFAULT_SAMPLE_MASK);
+}
+
+/* @cut black at @alpha, for a blank inset: darkened under a quad whose
+ * colour the blend takes none of, then d3d11_views_alpha's blend again.
+ * The quad samples the frame, not a pass's float target, whose NaN a
+ * zero factor would not hide. */
+static void d3d11_views_fill(d3d11_video_t *d3d11,
+      const struct d3d11_views_draw *d, const video_views_rect_t *cut,
+      unsigned alpha)
+{
+   D3D11_VIEWPORT vp;
+   D3D11_RECT sc;
+   float factor[4];
+   D3D11DeviceContext ctx = d3d11->context;
+   factor[0] = factor[1] = factor[2] = factor[3] = (float)alpha / 255.0f;
+   d3d11_views_bind(d3d11);
+   ctx->lpVtbl->OMSetBlendState(ctx, d3d11->views.blend_fill, factor,
+         D3D11_DEFAULT_SAMPLE_MASK);
+   d3d11_views_vp(cut, &vp);
+   sc.left   = VIDEO_POS_X(cut->pos);
+   sc.top    = VIDEO_POS_Y(cut->pos);
+   sc.right  = sc.left + (LONG)VIDEO_SCALE_W(cut->dims);
+   sc.bottom = sc.top  + (LONG)VIDEO_SCALE_H(cut->dims);
+   ctx->lpVtbl->RSSetScissorRects(ctx, 1, &sc);
+   d3d11_views_quad(d3d11, &d3d11->views.rect, d->src,
+         d3d11->samplers[RARCH_FILTER_UNSPEC][RARCH_WRAP_EDGE], &vp);
+   d3d11_views_alpha(d3d11, alpha);
 }
 
 /* A COM reference more, where there is the object */
@@ -8085,6 +8153,7 @@ static void d3d11_views_render(d3d11_video_t *d3d11,
 
    d.video_info = video_info;
    d.target     = target;
+   d.src        = src;
    d.src_dims   = d3d11->views.src_dims;
    d3d11_vv_draw_placements(d3d11, &d, layout, chains,
          blend || !layout->offscreen,
@@ -8842,8 +8911,10 @@ static bool d3d11_gfx_frame_body(
       d3d11->views.active = views;
       d3d11_update_viewport(d3d11, views);
    }
+   /* With no map: whether one would be drawn whole */
    retro_atomic_store_release_int(&d3d11->views.fallback,
-         (video_info->views.num_views && !views) ? 1 : 0);
+         (video_info->views.num_views ? !views : !d3d11_views_allowed(d3d11))
+         ? 1 : 0);
    d3d11_views_publish(d3d11);
 
 #ifdef D3D11_ROLLING_SCANLINE_SIMULATION
