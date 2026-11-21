@@ -310,12 +310,24 @@ static INLINE void video_views_cpu_draw_placements(video_views_cpu_t *cpu,
    {
       video_views_rect_t dst, cut;
       const video_views_placement_t *p = &layout->placements[i];
-      if (     !(p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
-            && video_views_cpu_cut(layout, p, scale, dims, offscreen,
+      /* A blank root's place is black already; a blank inset's is over
+       * its base */
+      if (     ((p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
+               && !(p->flags & VIDEO_VIEWS_PLACEMENT_INSET))
+            || !video_views_cpu_cut(layout, p, scale, dims, offscreen,
                &dst, &cut))
+         continue;
+      if (!(p->flags & VIDEO_VIEWS_PLACEMENT_BLANK))
+      {
          video_views_cpu_draw_view(cpu, fmt, type, &map->views[p->view],
                frame, pitch, (uint8_t*)target, tstride * sizeof(uint32_t),
                &dst, &cut);
+         continue;
+      }
+      for (y = 0; y < VIDEO_SCALE_H(cut.dims); y++)
+         memset(target + (size_t)(VIDEO_POS_Y(cut.pos) + y) * tstride
+               + VIDEO_POS_X(cut.pos), 0,
+               VIDEO_SCALE_W(cut.dims) * sizeof(uint32_t));
    }
 }
 

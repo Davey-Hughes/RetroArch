@@ -1581,6 +1581,56 @@ static void test_cpu_draw_blank(void)
    video_views_cpu_free(&cpu);
 }
 
+static void map_ds_inset(video_views_map_t *map);
+static void map_three(video_views_map_t *map);
+
+/* A blank inset is black over its base. */
+static void test_cpu_draw_blank_inset(void)
+{
+   unsigned i, x, y;
+   video_views_map_t map;
+   video_views_layout_t l;
+   video_views_cpu_t cpu;
+   const video_views_rect_t *base, *in;
+   static uint32_t frame[256 * 384];
+   static uint32_t out[1600 * 960];
+   bool black = true, around = true;
+
+   memset(&cpu, 0, sizeof(cpu));
+   for (i = 0; i < 256 * 384; i++)
+      frame[i] = (i < 256 * 192) ? 0x336699 : 0xcc9966;
+   map_ds_inset(&map);
+   map.blank = 0x2;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(l.num_placements == 2);
+   video_views_cpu_compose(&cpu, &map, &l, frame, 256 * 4,
+         SCALER_FMT_ARGB8888, SCALER_TYPE_POINT, 1.0f,
+         VIDEO_SCALE_PACK(1600, 960), out, 1600, NULL);
+   base = &l.placements[0].dst;
+   in   = &l.placements[1].dst;
+   CHECK(rect_is(in, 1120, 720, 320, 240));
+   for (y = 0; y < VIDEO_SCALE_H(base->dims); y++)
+      for (x = 0; x < VIDEO_SCALE_W(base->dims); x++)
+      {
+         int px     = VIDEO_POS_X(base->pos) + (int)x;
+         int py     = VIDEO_POS_Y(base->pos) + (int)y;
+         uint32_t c = out[(size_t)py * 1600 + px];
+         if (     px >= VIDEO_POS_X(in->pos)
+               && px <  VIDEO_POS_X(in->pos) + (int)VIDEO_SCALE_W(in->dims)
+               && py >= VIDEO_POS_Y(in->pos)
+               && py <  VIDEO_POS_Y(in->pos) + (int)VIDEO_SCALE_H(in->dims))
+         {
+            if (c)
+               black = false;
+         }
+         else if ((c & 0xffffff) != 0x336699)
+            around = false;
+      }
+   CHECK(black);
+   CHECK(around);
+   video_views_cpu_free(&cpu);
+}
+
 /* Nothing drawn: composed at the window's size. */
 static void test_cpu_scale_none(void)
 {
@@ -1669,10 +1719,12 @@ static int bad_ctx;
 #define MAX_DRAWS 16
 static struct
 {
+   char kind;             /* D direct, P pass, A alpha, F fill */
    int view;              /* -1: a pass */
    fake_chain_t *chain;
    video_views_rect_t dst, cut;
    int again;
+   unsigned alpha;
 } draws[MAX_DRAWS];
 static int num_draws;
 static fake_chain_t chain_objs[RETRO_VIDEO_VIEWS_MAX * 2];
@@ -1698,6 +1750,7 @@ static void fake_direct(fake_drv_t *d, const fake_ctx_t *x, unsigned view,
       bad_ctx++;
    if (num_draws >= MAX_DRAWS)
       return;
+   draws[num_draws].kind  = 'D';
    draws[num_draws].view  = (int)view;
    draws[num_draws].chain = NULL;
    draws[num_draws].dst   = *dst;
@@ -1715,12 +1768,51 @@ static void fake_pass(fake_drv_t *d, const fake_ctx_t *x, fake_chain_t *c,
       bad_ctx++;
    if (num_draws >= MAX_DRAWS)
       return;
+   draws[num_draws].kind  = 'P';
    draws[num_draws].view  = -1;
    draws[num_draws].chain = c;
    draws[num_draws].dst   = *dst;
    draws[num_draws].cut   = *cut;
    draws[num_draws].again = again ? 1 : 0;
    num_draws++;
+}
+
+static void fake_alpha(fake_drv_t *d, const fake_ctx_t *x, unsigned alpha)
+{
+   (void)d;
+   if (x != &fake_ctx)
+      bad_ctx++;
+   if (num_draws >= MAX_DRAWS)
+      return;
+   draws[num_draws].kind  = 'A';
+   draws[num_draws].alpha = alpha;
+   num_draws++;
+}
+
+static void fake_fill(fake_drv_t *d, const fake_ctx_t *x,
+      const video_views_rect_t *cut, unsigned alpha)
+{
+   (void)d;
+   if (x != &fake_ctx)
+      bad_ctx++;
+   if (num_draws >= MAX_DRAWS)
+      return;
+   draws[num_draws].kind  = 'F';
+   draws[num_draws].cut   = *cut;
+   draws[num_draws].alpha = alpha;
+   num_draws++;
+}
+
+/* The calls logged, one letter each, are @want */
+static int t_calls_are(const char *want)
+{
+   int i;
+   if ((int)strlen(want) != num_draws)
+      return 0;
+   for (i = 0; i < num_draws; i++)
+      if (draws[i].kind != want[i])
+         return 0;
+   return 1;
 }
 
 static bool fake_make(fake_drv_t *d, fake_target_t *t, unsigned dims)
@@ -1741,6 +1833,23 @@ static bool fake_retire(fake_drv_t *d, fake_target_t *t)
 }
 
 #define VV_FN(name)                     fake_vv_##name
+#define VV_DRV                          fake_drv_t
+#define VV_CHAIN                        fake_chain_t
+#define VV_CREATE_STOCK(drv)            fake_stock(drv)
+#define VV_SYNC_PARAMS(drv, c)          fake_sync(drv, c)
+#define VV_DRAW                         fake_ctx_t
+#define VV_DIRECT(drv, x, v, dst, cut)  fake_direct(drv, x, v, dst, cut)
+#define VV_PASS(drv, x, c, dst, cut, a) fake_pass(drv, x, c, dst, cut, a)
+#define VV_ALPHA(drv, x, a)             fake_alpha(drv, x, a)
+#define VV_FILL(drv, x, cut, a)         fake_fill(drv, x, cut, a)
+#define VV_TARGET                       fake_target_t
+#define VV_TARGET_MAKE(drv, t, dims)    fake_make(drv, t, dims)
+#define VV_TARGET_RETIRE(drv, t)        fake_retire(drv, t)
+#define VV_ROWS_UP
+#include "gfx/video_views_draw.h"
+
+/* The same driver without the alpha and fill hooks */
+#define VV_FN(name)                     plain_vv_##name
 #define VV_DRV                          fake_drv_t
 #define VV_CHAIN                        fake_chain_t
 #define VV_CREATE_STOCK(drv)            fake_stock(drv)
@@ -1941,6 +2050,175 @@ static void test_draw_placements_blank(void)
             rects));
    CHECK(picked[0] && !picked[1] && d.stock_made == 1);
    CHECK(!video_views_first_drawn(&l, 1, true, full, &rects[1]));
+}
+
+/* An inset drawn at its opacity, and the driver left solid after. */
+static void test_draw_placements_alpha(void)
+{
+   video_views_map_t map;
+   video_views_layout_t l;
+   fake_drv_t d;
+   fake_chain_t *chains[RETRO_VIDEO_VIEWS_MAX];
+   unsigned full = VIDEO_SCALE_PACK(1600, 960);
+
+   memset(&d, 0, sizeof(d));
+   memset(chains, 0, sizeof(chains));
+   chains[0] = &chain_objs[0];
+   chains[1] = &chain_objs[1];
+   chains[2] = &chain_objs[2];
+
+   map_ds_inset(&map);
+   map.opacity[1] = 128;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   num_draws = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, true, false);
+   CHECK(t_calls_are("DADA"));
+   CHECK(   draws[0].view == 0 && draws[1].alpha == 128
+         && draws[2].view == 1 && draws[3].alpha == 255);
+   num_draws = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, false, false);
+   CHECK(t_calls_are("PAPA"));
+   CHECK(   draws[0].chain == chains[0] && draws[1].alpha == 128
+         && draws[2].chain == chains[1] && draws[3].alpha == 255);
+
+   /* Two insets at one opacity: set once. */
+   map_three(&map);
+   map.over       = 0x6;
+   map.base       = 0;
+   map.anchor     = (RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT << 4)
+                  | (RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_LEFT  << 8);
+   map.size[1]    = 0.25f;
+   map.size[2]    = 0.25f;
+   map.opacity[1] = 128;
+   map.opacity[2] = 128;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   num_draws = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, true, false);
+   CHECK(t_calls_are("DADDA"));
+   CHECK(draws[1].alpha == 128 && draws[4].alpha == 255);
+
+   /* All solid: no alpha set. */
+   map_ds_inset(&map);
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   num_draws = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, true, false);
+   CHECK(t_calls_are("DD"));
+   num_draws = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, false, false);
+   CHECK(t_calls_are("PP"));
+   CHECK(!bad_ctx);
+}
+
+/* A blank inset filled black at its opacity, without a chain; a blank
+ * root left alone. */
+static void test_draw_placements_fill(void)
+{
+   video_views_map_t map;
+   video_views_layout_t l;
+   video_views_rect_t want;
+   fake_drv_t d;
+   fake_chain_t *chains[RETRO_VIDEO_VIEWS_MAX];
+   unsigned full = VIDEO_SCALE_PACK(1600, 960);
+
+   memset(&d, 0, sizeof(d));
+   memset(chains, 0, sizeof(chains));
+   chains[0] = &chain_objs[0];
+
+   map_ds_inset(&map);
+   map.blank      = 0x2;
+   map.opacity[1] = 128;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(   video_views_visible(&l, &l.placements[1], full, &want)
+         && rect_is(&want, 1120, 720, 320, 240));
+   num_draws = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, true, false);
+   CHECK(t_calls_are("DAFA"));
+   CHECK(   draws[0].view == 0 && draws[1].alpha == 128
+         && draws[2].alpha == 128
+         && rect_is(&draws[2].cut, 1120, 720, 320, 240)
+         && draws[3].alpha == 255);
+   num_draws = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, false, false);
+   CHECK(t_calls_are("PAFA"));
+   CHECK(draws[2].alpha == 128 && rect_is(&draws[2].cut, 1120, 720, 320, 240));
+
+   /* Solid: filled with no alpha set. */
+   map.opacity[1] = 255;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   num_draws = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, true, false);
+   CHECK(t_calls_are("DF") && draws[1].alpha == 255);
+
+   /* Interlaced from the bottom: the fill trades halves with its eye. */
+   {
+      video_views_layout_params_t p;
+      int shift;
+      params_init(&p, &map, 1600, 960);
+      p.screen_layout = VIDEO_SCREEN_LAYOUT_HORIZONTAL;
+      p.stereo_mode   = VIDEO_STEREO_MODE_INTERLACED;
+      video_views_layout(&p, &l);
+      shift = (int)VIDEO_SCALE_W(l.canvas_dims) / 2;
+      num_draws = 0;
+      fake_vv_draw_placements(&d, &fake_ctx, &l,
+            chains, true, l.canvas_dims, false, true);
+      CHECK(t_calls_are("PFPF"));
+      CHECK(l.placements[1].area == 0 && l.placements[3].area == 1);
+      CHECK(video_views_visible(&l, &l.placements[1], l.canvas_dims, &want));
+      CHECK(VIDEO_POS_X(draws[1].cut.pos) == VIDEO_POS_X(want.pos) + shift);
+      CHECK(video_views_visible(&l, &l.placements[3], l.canvas_dims, &want));
+      CHECK(VIDEO_POS_X(draws[3].cut.pos) == VIDEO_POS_X(want.pos) - shift);
+   }
+
+   /* A blank root is not filled. */
+   map_ds_inset(&map);
+   map.blank = 0x1;
+   chains[1] = &chain_objs[1];
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   num_draws = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, true, false);
+   CHECK(t_calls_are("D") && draws[0].view == 1);
+   CHECK(!bad_ctx);
+}
+
+/* Without the hooks an inset is drawn solid and a blank one not at all. */
+static void test_draw_placements_no_hooks(void)
+{
+   video_views_map_t map;
+   video_views_layout_t l;
+   fake_drv_t d;
+   fake_chain_t *chains[RETRO_VIDEO_VIEWS_MAX];
+   unsigned full = VIDEO_SCALE_PACK(1600, 960);
+
+   /* Only draw_placements is wanted of this instantiation */
+   (void)plain_vv_pick_chains;
+   (void)plain_vv_target_ensure;
+   (void)plain_vv_target_drop;
+   memset(&d, 0, sizeof(d));
+   memset(chains, 0, sizeof(chains));
+   chains[0] = &chain_objs[0];
+   chains[1] = &chain_objs[1];
+
+   map_ds_inset(&map);
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   num_draws = 0;
+   plain_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, true, false);
+   CHECK(t_calls_are("DD") && draws[0].view == 0 && draws[1].view == 1);
+   map.opacity[1] = 128;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   num_draws = 0;
+   plain_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, false, false);
+   CHECK(   t_calls_are("PP") && draws[0].chain == chains[0]
+         && draws[1].chain == chains[1]);
+
+   map.blank = 0x2;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   num_draws = 0;
+   plain_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, true, false);
+   CHECK(t_calls_are("D") && draws[0].view == 0);
+   num_draws = 0;
+   plain_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, false, false);
+   CHECK(t_calls_are("P") && draws[0].chain == chains[0]);
+   CHECK(!bad_ctx);
 }
 
 static void test_targets(void)
@@ -3019,6 +3297,7 @@ int main(void)
    test_blend();
    test_cpu_compose();
    test_cpu_draw_blank();
+   test_cpu_draw_blank_inset();
    test_cpu_scale_none();
    test_cut_source();
    test_touch();
@@ -3031,6 +3310,9 @@ int main(void)
    test_pick_chains();
    test_draw_placements();
    test_draw_placements_blank();
+   test_draw_placements_alpha();
+   test_draw_placements_fill();
+   test_draw_placements_no_hooks();
    test_targets();
    test_ui_helpers();
    test_screen_api();
