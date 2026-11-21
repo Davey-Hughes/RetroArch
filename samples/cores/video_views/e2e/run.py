@@ -647,19 +647,37 @@ SCREENS_BOTH = SCREENS_AIM_POINTS
 SCREENS_TOP_ALONE = [(800, 480, GREEN), (1200, 480, GREEN),
                      (100, 480, BLACK)]
 SCREENS_NONE = [(400, 480, BLACK), (800, 480, BLACK), (1200, 480, BLACK)]
+# Screen 1 over screen 0's bottom right corner at a quarter of its
+# height (x 1120-1440, y 720-960), and blank there.
+SCREENS_INSET = [(800, 480, GREEN), (1000, 840, GREEN), (1280, 840, YELLOW)]
+SCREENS_INSET_BLANK = [(1000, 840, GREEN), (1280, 840, BLACK)]
+# Drivers that draw an inset at its opacity; the rest draw it solid.
+OPACITY_DRIVERS = ('gl', 'glcore', 'gl1', 'vulkan', 'd3d8', 'd3d9_hlsl',
+                   'd3d10', 'd3d11', 'sdl', 'sdl2', 'sdl3')
 SCREENS_SWITCHED_RE = re.compile(r'\[video_views\] screens switched')
 # The core's own screen choices, under the case directory. A file the
 # frontend wrote again would have lost the comment.
 CORE_FILE = os.path.join('video_views test', 'video_views test.screens.cfg')
 CORE_FILE_OFF = {CORE_FILE: '# kept\nvideo_screen2_display = "off"\n'}
-# A screen left out or blanked, drawn by the driver: on every driver.
-# [(name, video_views_test_screens, points, what run_case() is given
-# besides, with 'settings' added to SCREENS_AIM_SETTINGS)]
+# A screen left out, blanked or drawn over another, drawn by the driver:
+# on every driver. [(name, video_views_test_screens, points, what
+# run_case() is given besides, with 'settings' added to
+# SCREENS_AIM_SETTINGS and 'solid' the points instead on a driver not in
+# OPACITY_DRIVERS)]
 SCREENS_DRAW_CASES = [
     ('screens-hidden', 'hidden', SCREENS_TOP_ALONE, {}),
     ('screens-blank-late', 'blank_late', SCREENS_BOTTOM_BLANK,
      {'until': SCREENS_SWITCHED_RE}),
     ('screens-none-shown', 'none_shown', SCREENS_NONE, {}),
+    ('screens-over', 'over', SCREENS_INSET, {}),
+    ('screens-over-blank', 'over_blank', SCREENS_INSET_BLANK, {}),
+    # Half the inset's colour over GREEN.
+    ('screens-over-half', 'over_half',
+     SCREENS_INSET[:2] + [(1280, 840, (128, 255, 0))],
+     {'solid': SCREENS_INSET}),
+    ('screens-over-blank-half', 'over_blank_half',
+     SCREENS_INSET_BLANK[:1] + [(1280, 840, (0, 128, 0))],
+     {'solid': SCREENS_INSET_BLANK}),
 ]
 # xvideo's interlaced path places and clears by itself: the late blank
 # again there, in each eye's rows. An entry as above.
@@ -672,7 +690,6 @@ SCREENS_XV_INTERLACED_CASE = (
 # the same after it. Entries as SCREENS_DRAW_CASES'.
 SCREENS_STATE_CASES = [
     ('screens-shown', 'shown', SCREENS_BOTH, {}),
-    ('screens-over', 'over', SCREENS_TOP_ALONE, {}),
     ('screens-absent', 'absent', SCREENS_TOP_ALONE, {}),
     ('screens-blank', 'blank', SCREENS_BOTTOM_BLANK, {}),
     ('screens-absent-back', 'absent_back', SCREENS_BOTH,
@@ -2295,6 +2312,9 @@ def run_screens_show_case(retroarch, root, driver, case):
     the case started with left as it was."""
     name, mode, points, extra = case
     extra = dict(extra)
+    solid = extra.pop('solid', points)
+    if driver not in OPACITY_DRIVERS:
+        points = solid
     settings = dict(SCREENS_AIM_SETTINGS, **extra.pop('settings', {}))
     errors = run_case(retroarch, root, driver,
                       (name, 'ds', settings, points),

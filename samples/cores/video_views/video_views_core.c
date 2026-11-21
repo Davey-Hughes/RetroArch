@@ -77,10 +77,12 @@
  * NO_INPUT, for e2e/run.py's light gun check; no_input_off only names
  * them. The other modes name them too and send the bottom one as:
  * shown, SHOWN; hidden, HIDDEN; over, OVER the top one's bottom right
- * corner at a quarter of its height; blank, BLANK; absent, ABSENT with
- * its view kept. blank_late sends it ACTIVE and from frame 60 BLANK,
- * absent_back ABSENT and from frame 60 ACTIVE, each logging the switch
- * once. none_shown sends both screens HIDDEN.
+ * corner at a quarter of its height; over_half, the same at half
+ * opacity; over_blank, the same BLANK; over_blank_half, BLANK at half
+ * opacity; blank, BLANK; absent, ABSENT with its view kept. blank_late
+ * sends it ACTIVE and from frame 60 BLANK, absent_back ABSENT and from
+ * frame 60 ACTIVE, each logging the switch once. none_shown sends both
+ * screens HIDDEN.
  *
  * VIDEO_VIEWS_TEST_LIBRARY_NAME in the environment replaces the library
  * name, so one build can load as a second core. */
@@ -1128,8 +1130,8 @@ void retro_set_environment(retro_environment_t cb)
         "Grid eye size, at most; 512|384|768|1024" },
       { "video_views_test_screens",
         "Screens the ds map describes; off|rules|no_input|no_input_off"
-        "|shown|hidden|over|blank|blank_late|absent|absent_back"
-        "|none_shown" },
+        "|shown|hidden|over|over_half|over_blank|over_blank_half|blank"
+        "|blank_late|absent|absent_back|none_shown" },
       { NULL, NULL }
    };
    struct retro_log_callback logging;
@@ -2314,7 +2316,7 @@ static const struct
 
 /* video_views_test_screens' modes besides rules: how the ds map's
  * screen 1 is sent, @late being its state from SCR_SWITCH_FRAME on.
- * @both gives screen 0 the same show. */
+ * @both gives screen 0 the same show. @opacity is screen 1's. */
 static const struct
 {
    const char *name;
@@ -2323,38 +2325,48 @@ static const struct
    unsigned state;
    unsigned late;
    bool both;
+   float opacity;
 } scr_modes[] = {
    { "no_input",     RETRO_VIDEO_SCREEN_FLAG_NO_INPUT,
       RETRO_VIDEO_SCREEN_SHOW_SHOWN,
       RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
-      false },
+      false, 0.0f },
    { "no_input_off", 0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
       RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
-      false },
+      false, 0.0f },
    { "shown",        0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
       RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
-      false },
+      false, 0.0f },
    { "hidden",       0, RETRO_VIDEO_SCREEN_SHOW_HIDDEN,
       RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
-      false },
+      false, 0.0f },
    { "over",         0, RETRO_VIDEO_SCREEN_SHOW_OVER,
       RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
-      false },
+      false, 0.0f },
+   { "over_half",    0, RETRO_VIDEO_SCREEN_SHOW_OVER,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.5f },
+   { "over_blank",   0, RETRO_VIDEO_SCREEN_SHOW_OVER,
+      RETRO_VIDEO_SCREEN_STATE_BLANK,  RETRO_VIDEO_SCREEN_STATE_BLANK,
+      false, 0.0f },
+   { "over_blank_half", 0, RETRO_VIDEO_SCREEN_SHOW_OVER,
+      RETRO_VIDEO_SCREEN_STATE_BLANK,  RETRO_VIDEO_SCREEN_STATE_BLANK,
+      false, 0.5f },
    { "blank",        0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
       RETRO_VIDEO_SCREEN_STATE_BLANK,  RETRO_VIDEO_SCREEN_STATE_BLANK,
-      false },
+      false, 0.0f },
    { "blank_late",   0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
       RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_BLANK,
-      false },
+      false, 0.0f },
    { "absent",       0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
       RETRO_VIDEO_SCREEN_STATE_ABSENT, RETRO_VIDEO_SCREEN_STATE_ABSENT,
-      false },
+      false, 0.0f },
    { "absent_back",  0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
       RETRO_VIDEO_SCREEN_STATE_ABSENT, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
-      false },
+      false, 0.0f },
    { "none_shown",   0, RETRO_VIDEO_SCREEN_SHOW_HIDDEN,
       RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
-      true }
+      true, 0.0f }
 };
 
 static bool screens_mode_named(const char *name)
@@ -2396,7 +2408,7 @@ static const char *screens_add(struct retro_video_views *in)
       scr_screens[1]  = mkscreen("Bottom", scr_modes[screens_mode].flags,
             state, show, 0, over ? 0.25f : 0.0f,
             over ? RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT : 0,
-            0.0f, 0, 0, 0, 0);
+            scr_modes[screens_mode].opacity, 0, 0, 0, 0);
       in->flags      |= RETRO_VIDEO_VIEWS_FLAG_SCREENS;
       in->screens     = scr_screens;
       in->num_screens = 2;
