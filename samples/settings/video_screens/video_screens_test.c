@@ -1291,6 +1291,7 @@ static video_windows_frame_t window_test_seen;
 /* The map and the placement count the driver was handed */
 static video_views_map_t window_test_seen_views;
 static unsigned window_test_seen_placed;
+static video_views_layout_t window_test_seen_layout;
 static video_driver_t window_test_driver;
 static video_poke_interface_t window_test_poke;
 static video_driver_t *window_test_saved_video;
@@ -1317,6 +1318,7 @@ static bool window_test_frame(void *data, const void *frame, unsigned dims,
       window_test_seen = *info->windows;
    window_test_seen_views  = info->views;
    window_test_seen_placed = info->views_layout.num_placements;
+   window_test_seen_layout = info->views_layout;
    return true;
 }
 
@@ -4276,25 +4278,23 @@ static void screens_test_monitors_done(void)
    window_test_run();
 }
 
-/* A core's Hidden, Over and Absent leave its screen out of what the
- * driver draws; Blank keeps the place, flagged */
+/* A core's Hidden and Absent leave its screen out of what the driver
+ * draws; Over draws it over its base; Blank keeps the place, flagged */
 static void test_screens_core_show(void)
 {
    static struct retro_video_view views[2];
    static struct retro_video_screen screens[3];
-   static const unsigned show[3]  = {
-      RETRO_VIDEO_SCREEN_SHOW_HIDDEN, RETRO_VIDEO_SCREEN_SHOW_OVER,
-      RETRO_VIDEO_SCREEN_SHOW_SHOWN };
-   static const unsigned state[3] = {
-      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
-      RETRO_VIDEO_SCREEN_STATE_ABSENT };
+   static const unsigned show[2]  = {
+      RETRO_VIDEO_SCREEN_SHOW_HIDDEN, RETRO_VIDEO_SCREEN_SHOW_SHOWN };
+   static const unsigned state[2] = {
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ABSENT };
    struct retro_video_views map;
    const video_views_layout_t *layout;
    unsigned i;
    screens_test_core();
    window_test_begin();
    config_get_ptr()->bools.video_windows_enable = false;
-   for (i = 0; i < 3; i++)
+   for (i = 0; i < 2; i++)
    {
       screens_test_map(&map, views, screens, show[i], state[i]);
       CHECK(video_driver_set_views(&map));
@@ -4305,6 +4305,17 @@ static void test_screens_core_show(void)
       CHECK(window_test_seen_views.left_out == 0x2u);
       CHECK(window_test_seen_views.blank == 0u);
    }
+   screens_test_map(&map, views, screens, RETRO_VIDEO_SCREEN_SHOW_OVER,
+         RETRO_VIDEO_SCREEN_STATE_ACTIVE);
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   layout = video_driver_get_views_layout();
+   CHECK(window_test_placements() == 2);
+   CHECK(layout && !layout->placements[0].flags
+         && layout->placements[1].view == 1
+         && layout->placements[1].flags == VIDEO_VIEWS_PLACEMENT_INSET);
+   CHECK(window_test_seen_views.over == 0x2u);
+   CHECK(window_test_seen_views.left_out == 0u);
    screens_test_map(&map, views, screens, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
          RETRO_VIDEO_SCREEN_STATE_BLANK);
    CHECK(video_driver_set_views(&map));
@@ -4316,6 +4327,95 @@ static void test_screens_core_show(void)
          && layout->placements[1].flags == VIDEO_VIEWS_PLACEMENT_BLANK);
    CHECK(window_test_seen_views.blank == 0x2u);
    CHECK(window_test_seen_views.left_out == 0u);
+   window_test_end();
+   screens_test_core_done();
+}
+
+/* The driver drew screen 0, and screen 1 over its bottom-right corner
+ * at a quarter of its height */
+static bool screens_test_inset(void)
+{
+   const video_views_layout_t *l = &window_test_seen_layout;
+   const video_views_rect_t *b   = &l->placements[0].dst;
+   const video_views_rect_t *in  = &l->placements[1].dst;
+   return l->num_placements == 2
+      && l->placements[0].view == 0 && !l->placements[0].flags
+      && l->placements[1].view == 1
+      && l->placements[1].flags == VIDEO_VIEWS_PLACEMENT_INSET
+      && VIDEO_SCALE_H(in->dims) * 4 == VIDEO_SCALE_H(b->dims)
+      &&    VIDEO_POS_X(in->pos) + (int)VIDEO_SCALE_W(in->dims)
+         == VIDEO_POS_X(b->pos)  + (int)VIDEO_SCALE_W(b->dims)
+      &&    VIDEO_POS_Y(in->pos) + (int)VIDEO_SCALE_H(in->dims)
+         == VIDEO_POS_Y(b->pos)  + (int)VIDEO_SCALE_H(b->dims);
+}
+
+/* A core's Over with no size, anchor or opacity of its own */
+static void test_screens_core_over_inset(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   screens_test_core();
+   window_test_begin();
+   config_get_ptr()->bools.video_windows_enable = false;
+   screens_test_map(&map, views, screens, RETRO_VIDEO_SCREEN_SHOW_OVER,
+         RETRO_VIDEO_SCREEN_STATE_ACTIVE);
+   screens[1].size = 0.0f;
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   CHECK(screens_test_inset());
+   CHECK(window_test_seen_views.left_out == 0u);
+   window_test_end();
+   screens_test_core_done();
+}
+
+/* The user's Over Screen 1 on a shown screen; Over itself is no inset */
+static void test_screens_user_over(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   settings_t *settings = config_get_ptr();
+   screens_test_core();
+   window_test_begin();
+   settings->bools.video_windows_enable = false;
+   strlcpy(settings->arrays.video_screen_display[1], "over:1",
+         sizeof(settings->arrays.video_screen_display[1]));
+   screens_test_map(&map, views, screens, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+         RETRO_VIDEO_SCREEN_STATE_ACTIVE);
+   screens[1].size = 0.0f;
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   CHECK(screens_test_inset());
+   CHECK(window_test_seen_views.left_out == 0u);
+   strlcpy(settings->arrays.video_screen_display[1], "over:2",
+         sizeof(settings->arrays.video_screen_display[1]));
+   window_test_run();
+   CHECK(window_test_seen_layout.num_placements == 2);
+   CHECK(!window_test_seen_layout.placements[0].flags
+         && !window_test_seen_layout.placements[1].flags);
+   CHECK(!window_test_seen_views.over);
+   settings->arrays.video_screen_display[1][0] = '\0';
+   window_test_end();
+   screens_test_core_done();
+}
+
+/* A core's Over goes with its hidden base */
+static void test_screens_over_base_hidden(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   screens_test_core();
+   window_test_begin();
+   config_get_ptr()->bools.video_windows_enable = false;
+   screens_test_map(&map, views, screens, RETRO_VIDEO_SCREEN_SHOW_OVER,
+         RETRO_VIDEO_SCREEN_STATE_ACTIVE);
+   screens[0].show = RETRO_VIDEO_SCREEN_SHOW_HIDDEN;
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   CHECK(window_test_placements() == 0);
+   CHECK(window_test_seen_views.left_out == 0x3u);
    window_test_end();
    screens_test_core_done();
 }
@@ -4424,8 +4524,10 @@ static void test_screens_core_default_bits(void)
          RETRO_VIDEO_SCREEN_STATE_ACTIVE);
    CHECK(video_driver_set_views(&map));
    CHECK(video_driver_screen_get(1, &got)
-         == VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY));
+         == (  VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY)
+             | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_SIZE)));
    CHECK(string_is_equal(got.display, VIDEO_WINDOW_DISPLAY_OFF));
+   CHECK(got.size == 50);
    CHECK(video_driver_screen_get(0, &got) == 0);
    CHECK(!*got.display);
    video_driver_clear_views();
@@ -8706,6 +8808,55 @@ static void test_screens_redraw_masks(void)
 #endif
 }
 
+/* Review Focus 5: a redraw draws the inset where the frame did */
+static void test_screens_redraw_inset(void)
+{
+#ifdef HAVE_THREADS
+   static video_driver_t driver;
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   static video_views_layout_t drawn;
+   struct retro_video_views map;
+   const video_driver_t *threaded = NULL;
+   void *data                     = NULL;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   video_info_t info;
+   memset(&driver, 0, sizeof(driver));
+   memset(&info, 0, sizeof(info));
+   driver.init          = snapshot_init;
+   driver.frame         = window_test_frame;
+   driver.free          = snapshot_free;
+   driver.viewport_info = redraw_viewport;
+   driver.read_viewport = redraw_read_viewport;
+   driver.ident         = "redraw";
+   info.input_scale     = 1;
+   info.rgb32           = true;
+   screens_test_core();
+   window_test_begin();
+   screens_test_map(&map, views, screens, RETRO_VIDEO_SCREEN_SHOW_OVER,
+         RETRO_VIDEO_SCREEN_STATE_ACTIVE);
+   screens[1].size = 0.0f;
+   CHECK(video_driver_set_views(&map));
+   if (video_init_thread(&threaded, &data, &driver, info))
+   {
+      video_st->thread_wrapper_active = false;
+      window_test_run();
+      CHECK(screens_test_inset());
+      drawn = window_test_seen_layout;
+      memset(&window_test_seen_layout, 0, sizeof(window_test_seen_layout));
+      window_test_redraw(threaded, data);
+      CHECK(screens_test_inset());
+      CHECK(!memcmp(window_test_seen_layout.placements, drawn.placements,
+            2 * sizeof(drawn.placements[0])));
+      threaded->free(data);
+   }
+   else
+      CHECK(false);
+   window_test_end();
+   screens_test_core_done();
+#endif
+}
+
 /* A UI layer in another window lays out at its target's size, waiting
  * or not; one in the main window at the main window's UI size */
 static void test_window_ui_layer_dims(void)
@@ -9934,6 +10085,9 @@ int main(int argc, char **argv)
    test_window_pointer_no_input();
    test_views_screens_frontend();
    test_screens_core_show();
+   test_screens_core_over_inset();
+   test_screens_user_over();
+   test_screens_over_base_hidden();
    test_screens_user_off_windows_off();
    test_screens_none_placed_pointer();
    test_screens_writes_per_core();
@@ -9980,6 +10134,7 @@ int main(int argc, char **argv)
    test_window_redraw_own_moved();
    test_window_redraw_edit();
    test_screens_redraw_masks();
+   test_screens_redraw_inset();
    test_screen_frame_snapshot();
    test_xr_screen_menu();
    test_xr_menu_map_change();

@@ -2716,16 +2716,89 @@ static void test_prefs_resolve_order(void)
 
 static void test_prefs_resolve_over(void)
 {
+   video_screen_prefs_t prefs;
    video_views_screens_t scr;
-   video_screen_values_t global, out;
+   video_screen_values_t global, mine, out;
+   const unsigned all = T_PREF(DISPLAY) | T_PREF(CORNER) | T_PREF(SIZE)
+      | T_PREF(OPACITY);
 
+   memset(&prefs, 0, sizeof(prefs));
    memset(&scr, 0, sizeof(scr));
    t_prefs_values(&global);
-   scr.count           = 2;
+   scr.count           = 3;
    scr.screens[1].show = RETRO_VIDEO_SCREEN_SHOW_OVER;
    CHECK(video_screen_prefs_resolve(NULL, &scr, &global, 1, &out)
          == T_PREF(DISPLAY));
-   CHECK(!strcmp(out.display, VIDEO_WINDOW_DISPLAY_OFF));
+   CHECK(!strcmp(out.display, "over:1"));
+   CHECK(!out.corner && !out.size && !out.opacity);
+   scr.screens[1].base = 2;
+   video_screen_prefs_resolve(NULL, &scr, &global, 1, &out);
+   CHECK(!strcmp(out.display, "over:3"));
+   /* The global values where the core gives none */
+   global.corner  = RETRO_VIDEO_SCREEN_ANCHOR_LEFT;
+   global.size    = 30;
+   global.opacity = 20;
+   video_screen_prefs_resolve(NULL, &scr, &global, 1, &out);
+   CHECK(out.corner == RETRO_VIDEO_SCREEN_ANCHOR_LEFT && out.size == 30
+         && out.opacity == 20);
+   /* The core's, as rounded percents */
+   scr.screens[1].base    = 0;
+   scr.screens[1].anchor  = RETRO_VIDEO_SCREEN_ANCHOR_TOP_LEFT;
+   scr.screens[1].size    = 0.5f;
+   scr.screens[1].opacity = 0.75f;
+   CHECK(video_screen_prefs_resolve(NULL, &scr, &global, 1, &out) == all);
+   CHECK(out.corner == RETRO_VIDEO_SCREEN_ANCHOR_TOP_LEFT && out.size == 50
+         && out.opacity == 75);
+   scr.screens[1].opacity = 0.334f;
+   video_screen_prefs_resolve(NULL, &scr, &global, 1, &out);
+   CHECK(out.opacity == 33);
+   /* A non-zero value stays non-zero */
+   scr.screens[1].opacity = 0.001f;
+   video_screen_prefs_resolve(NULL, &scr, &global, 1, &out);
+   CHECK(out.opacity == 1);
+   /* A store entry beats each */
+   t_prefs_values(&mine);
+   strcpy(mine.display, VIDEO_WINDOW_DISPLAY_MAIN);
+   mine.corner  = RETRO_VIDEO_SCREEN_ANCHOR_TOP_RIGHT;
+   mine.size    = 40;
+   mine.opacity = 60;
+   video_screen_prefs_set(&prefs, 1, T_PREF(DISPLAY), &mine);
+   CHECK(video_screen_prefs_resolve(&prefs, &scr, &global, 1, &out)
+         == (all & ~T_PREF(DISPLAY)));
+   CHECK(!strcmp(out.display, VIDEO_WINDOW_DISPLAY_MAIN));
+   video_screen_prefs_set(&prefs, 1, T_PREF(CORNER), &mine);
+   CHECK(video_screen_prefs_resolve(&prefs, &scr, &global, 1, &out)
+         == (T_PREF(SIZE) | T_PREF(OPACITY)));
+   CHECK(out.corner == RETRO_VIDEO_SCREEN_ANCHOR_TOP_RIGHT && out.size == 50);
+   video_screen_prefs_set(&prefs, 1, T_PREF(SIZE), &mine);
+   CHECK(video_screen_prefs_resolve(&prefs, &scr, &global, 1, &out)
+         == T_PREF(OPACITY));
+   CHECK(out.size == 40 && out.opacity == 1);
+   video_screen_prefs_set(&prefs, 1, T_PREF(OPACITY), &mine);
+   CHECK(video_screen_prefs_resolve(&prefs, &scr, &global, 1, &out) == 0);
+   CHECK(out.opacity == 60);
+}
+
+static void test_prefs_over_value(void)
+{
+   static const char *const bad[] = {
+      "over:0", "over:9", "over:x", "over:", "off", "", "main",
+      "over:01", "over:1x", "over:-1", "over:10", "over: 1", "Over:1"
+   };
+   char s[16];
+   unsigned i;
+
+   CHECK(video_screen_prefs_over_base("over:1") == 0);
+   CHECK(video_screen_prefs_over_base("over:8") == 7);
+   for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+      CHECK(video_screen_prefs_over_base(bad[i]) == -1);
+   CHECK(video_screen_prefs_over_value(0, s, sizeof(s)) == strlen("over:1"));
+   CHECK(!strcmp(s, "over:1"));
+   for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+   {
+      video_screen_prefs_over_value(i, s, sizeof(s));
+      CHECK(video_screen_prefs_over_base(s) == (int)i);
+   }
 }
 
 static void test_prefs_resolve_fields(void)
@@ -2767,13 +2840,90 @@ static void test_prefs_resolve_fields(void)
    CHECK(!out.xr.visible && out.xr.scale == 2.0f);
 }
 
-static void test_prefs_masks(void)
+/* The arrange step's inputs: the core's screens, the user's store for
+ * this core and the global values, resolved as the frame resolves them */
+typedef struct
 {
    video_views_screens_t scr;
+   video_screen_prefs_t prefs;
+   video_screen_values_t global[RETRO_VIDEO_VIEWS_MAX];
    video_screen_values_t resolved[RETRO_VIDEO_VIEWS_MAX];
-   unsigned left_out = ~0u, blank = ~0u, i;
+   unsigned defaults[RETRO_VIDEO_VIEWS_MAX];
+   video_views_map_t map;
+} t_arrange_t;
+
+/* @n screens, each SHOWN and ACTIVE, nothing set */
+static void t_arrange_begin(t_arrange_t *a, unsigned n)
+{
+   unsigned i;
+   memset(a, 0, sizeof(*a));
+   for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+      t_prefs_values(&a->global[i]);
+   a->scr.count       = n;
+   a->map.num_screens = n;
+}
+
+static void t_arrange_user(t_arrange_t *a, unsigned s, const char *display)
+{
+   video_screen_values_t v;
+   t_prefs_values(&v);
+   strcpy(v.display, display);
+   video_screen_prefs_set(&a->prefs, s, T_PREF(DISPLAY), &v);
+}
+
+static void t_arrange_core_over(t_arrange_t *a, unsigned s, unsigned base)
+{
+   a->scr.screens[s].show = RETRO_VIDEO_SCREEN_SHOW_OVER;
+   a->scr.screens[s].base = base;
+}
+
+/* Junk in every field the step writes, so it must write them all */
+static void t_arrange_junk(video_views_map_t *map)
+{
+   unsigned i;
+   map->left_out = map->blank = map->over = ~0u;
+   map->base     = map->anchor = 0xffffffffu;
+   memset(map->opacity, 0xa5, sizeof(map->opacity));
+   for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+      map->size[i] = 9.0f;
+}
+
+static void t_arrange_run(t_arrange_t *a)
+{
+   unsigned s;
+   for (s = 0; s < RETRO_VIDEO_VIEWS_MAX; s++)
+      a->defaults[s] = video_screen_prefs_resolve(&a->prefs, &a->scr,
+            &a->global[s], s, &a->resolved[s]);
+   t_arrange_junk(&a->map);
+   video_screen_prefs_arrange(a->resolved, a->defaults, &a->scr, &a->map);
+}
+
+/* Nothing at or past @n */
+static int t_arrange_clear_past(const video_views_map_t *map, unsigned n)
+{
+   unsigned s;
+   unsigned high = ~((1u << n) - 1u);
+   if ((map->over | map->left_out | map->blank) & high)
+      return 0;
+   for (s = n; s < RETRO_VIDEO_VIEWS_MAX; s++)
+      if (     VIDEO_VIEWS_NIBBLE(map->base, s)
+            || VIDEO_VIEWS_NIBBLE(map->anchor, s)
+            || map->opacity[s] || map->size[s] != 0.0f)
+         return 0;
+   return 1;
+}
+
+static void test_arrange_masks(void)
+{
+   video_views_screens_t scr;
+   video_views_map_t map;
+   video_screen_values_t resolved[RETRO_VIDEO_VIEWS_MAX];
+   unsigned defaults[RETRO_VIDEO_VIEWS_MAX];
+   unsigned i;
 
    memset(&scr, 0, sizeof(scr));
+   memset(&map, 0, sizeof(map));
+   memset(defaults, 0, sizeof(defaults));
    for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
       t_prefs_values(&resolved[i]);
    scr.count            = 4;
@@ -2781,23 +2931,34 @@ static void test_prefs_masks(void)
    scr.screens[2].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
    scr.screens[3].state = RETRO_VIDEO_SCREEN_STATE_BLANK;
    strcpy(resolved[3].display, VIDEO_WINDOW_DISPLAY_OFF);
-   video_screen_prefs_masks(resolved, &scr, 4, &left_out, &blank);
-   CHECK(left_out == 0xC && blank == 0x2);
-   video_screen_prefs_masks(resolved, &scr, 2, &left_out, &blank);
-   CHECK(left_out == 0 && blank == 0x2);
+   map.num_screens = 4;
+   t_arrange_junk(&map);
+   video_screen_prefs_arrange(resolved, defaults, &scr, &map);
+   CHECK(map.left_out == 0xC && map.blank == 0x2 && !map.over);
+   CHECK(t_arrange_clear_past(&map, 4));
+   map.num_screens = 2;
+   t_arrange_junk(&map);
+   video_screen_prefs_arrange(resolved, defaults, &scr, &map);
+   CHECK(map.left_out == 0 && map.blank == 0x2);
+   CHECK(t_arrange_clear_past(&map, 2));
    /* Entries past count are stale. */
-   scr.count            = 2;
-   scr.screens[3].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
+   map.num_screens        = 4;
+   scr.count              = 2;
+   scr.screens[3].state   = RETRO_VIDEO_SCREEN_STATE_ABSENT;
    resolved[3].display[0] = '\0';
-   video_screen_prefs_masks(resolved, &scr, 4, &left_out, &blank);
-   CHECK(left_out == 0 && blank == 0x2);
+   t_arrange_junk(&map);
+   video_screen_prefs_arrange(resolved, defaults, &scr, &map);
+   CHECK(map.left_out == 0 && map.blank == 0x2);
    /* No screen information. */
    strcpy(resolved[1].display, VIDEO_WINDOW_DISPLAY_OFF);
-   video_screen_prefs_masks(resolved, NULL, 4, &left_out, &blank);
-   CHECK(left_out == 0x2 && blank == 0);
+   t_arrange_junk(&map);
+   video_screen_prefs_arrange(resolved, defaults, NULL, &map);
+   CHECK(map.left_out == 0x2 && map.blank == 0);
    scr.count = 0;
-   video_screen_prefs_masks(resolved, &scr, 4, &left_out, &blank);
-   CHECK(left_out == 0x2 && blank == 0);
+   t_arrange_junk(&map);
+   video_screen_prefs_arrange(resolved, defaults, &scr, &map);
+   CHECK(map.left_out == 0x2 && map.blank == 0);
+   CHECK(t_arrange_clear_past(&map, 4));
 }
 
 static void test_prefs_set(void)
@@ -2839,7 +3000,8 @@ static void test_prefs_key(void)
    static const char *const suffix[VIDEO_SCREEN_PREF_COUNT] = {
       "display", "window_fullscreen", "window_x", "window_y",
       "window_width", "window_height", "window_pos_set", "xr_x", "xr_y",
-      "xr_z", "xr_yaw", "xr_pitch", "xr_roll", "xr_scale", "xr_visible"
+      "xr_z", "xr_yaw", "xr_pitch", "xr_roll", "xr_scale", "xr_visible",
+      "corner", "size", "opacity"
    };
    char key[64], want[64];
    unsigned p;
@@ -2853,6 +3015,10 @@ static void test_prefs_key(void)
    CHECK(!strcmp(key, "video_screen8_display"));
    video_screen_prefs_key(0, VIDEO_SCREEN_PREF_WINDOW_WIDTH, key, sizeof(key));
    CHECK(!strcmp(key, "video_screen1_window_width"));
+   video_screen_prefs_key(0, VIDEO_SCREEN_PREF_CORNER, key, sizeof(key));
+   CHECK(!strcmp(key, "video_screen1_corner"));
+   video_screen_prefs_key(7, VIDEO_SCREEN_PREF_OPACITY, key, sizeof(key));
+   CHECK(!strcmp(key, "video_screen8_opacity"));
    /* Every key as configuration.c names it. */
    for (p = 0; p < VIDEO_SCREEN_PREF_COUNT; p++)
    {
@@ -2864,6 +3030,263 @@ static void test_prefs_key(void)
    CHECK(video_screen_prefs_key(0, VIDEO_SCREEN_PREF_COUNT, key,
          sizeof(key)) == 0 && !*key);
 }
+
+#define T_NIB(bits, s) VIDEO_VIEWS_NIBBLE(bits, s)
+
+static void test_arrange_core_over(void)
+{
+   static t_arrange_t a;
+
+   t_arrange_begin(&a, 2);
+   t_arrange_core_over(&a, 1, 0);
+   t_arrange_run(&a);
+   CHECK(a.map.over == 0x2 && !a.map.left_out && !a.map.blank);
+   CHECK(T_NIB(a.map.base, 1) == 0);
+   CHECK(T_NIB(a.map.anchor, 1) == RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT);
+   CHECK(a.map.size[1] == 0.25f && a.map.opacity[1] == 255);
+   /* The root has none of an inset's fields */
+   CHECK(!T_NIB(a.map.anchor, 0) && !a.map.opacity[0] && !a.map.size[0]);
+   CHECK(t_arrange_clear_past(&a.map, 2));
+   a.scr.screens[1].anchor  = RETRO_VIDEO_SCREEN_ANCHOR_TOP_LEFT;
+   a.scr.screens[1].size    = 0.5f;
+   a.scr.screens[1].opacity = 0.75f;
+   t_arrange_run(&a);
+   CHECK(a.map.over == 0x2);
+   CHECK(T_NIB(a.map.anchor, 1) == RETRO_VIDEO_SCREEN_ANCHOR_TOP_LEFT);
+   CHECK(a.map.size[1] == 0.5f && a.map.opacity[1] == 191);
+   /* The core's own opacity, not its rounded percent (33 %: 84) */
+   a.scr.screens[1].opacity = 0.334f;
+   t_arrange_run(&a);
+   CHECK(a.map.opacity[1] == 85);
+   /* Sent with opacity 0: the default */
+   a.scr.screens[1].opacity = 0.0f;
+   t_arrange_run(&a);
+   CHECK(a.map.opacity[1] == 255);
+   /* Never invisible */
+   a.scr.screens[1].opacity = 0.001f;
+   t_arrange_run(&a);
+   CHECK(a.map.opacity[1] == 1);
+}
+
+static void test_arrange_user_values(void)
+{
+   static t_arrange_t a;
+   video_screen_values_t v;
+   const unsigned three = T_PREF(CORNER) | T_PREF(SIZE) | T_PREF(OPACITY);
+
+   t_arrange_begin(&a, 2);
+   t_arrange_core_over(&a, 1, 0);
+   a.scr.screens[1].anchor  = RETRO_VIDEO_SCREEN_ANCHOR_TOP_LEFT;
+   a.scr.screens[1].size    = 0.5f;
+   a.scr.screens[1].opacity = 0.75f;
+   t_prefs_values(&v);
+   v.corner  = RETRO_VIDEO_SCREEN_ANCHOR_TOP_RIGHT;
+   v.size    = 40;
+   v.opacity = 50;
+   video_screen_prefs_set(&a.prefs, 1, three, &v);
+   t_arrange_run(&a);
+   CHECK(a.map.over == 0x2);
+   CHECK(T_NIB(a.map.anchor, 1) == RETRO_VIDEO_SCREEN_ANCHOR_TOP_RIGHT);
+   CHECK(a.map.size[1] == 0.40f && a.map.opacity[1] == 128);
+   v.size = 150;
+   video_screen_prefs_set(&a.prefs, 1, T_PREF(SIZE), &v);
+   t_arrange_run(&a);
+   CHECK(a.map.size[1] == 1.0f);
+   /* The global values where neither the user nor the core gives one */
+   video_screen_prefs_set(&a.prefs, 1, three, NULL);
+   a.scr.screens[1].anchor  = 0;
+   a.scr.screens[1].size    = 0.0f;
+   a.scr.screens[1].opacity = 0.0f;
+   a.global[1].corner       = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_LEFT;
+   a.global[1].size         = 30;
+   a.global[1].opacity      = 20;
+   t_arrange_run(&a);
+   CHECK(T_NIB(a.map.anchor, 1) == RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_LEFT);
+   CHECK(a.map.size[1] == 0.3f && a.map.opacity[1] == 51);
+}
+
+static void test_arrange_user_over(void)
+{
+   static t_arrange_t a;
+
+   t_arrange_begin(&a, 2);
+   t_arrange_user(&a, 1, "over:1");
+   t_arrange_run(&a);
+   CHECK(a.map.over == 0x2 && !a.map.left_out);
+   CHECK(T_NIB(a.map.base, 1) == 0);
+   CHECK(T_NIB(a.map.anchor, 1) == RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT);
+   CHECK(a.map.size[1] == 0.25f && a.map.opacity[1] == 255);
+   CHECK(t_arrange_clear_past(&a.map, 2));
+   /* The global setting too */
+   memset(&a.prefs, 0, sizeof(a.prefs));
+   strcpy(a.global[1].display, "over:1");
+   t_arrange_run(&a);
+   CHECK(a.map.over == 0x2 && T_NIB(a.map.base, 1) == 0);
+}
+
+/* Review Focus 3: a hand-edited or stale Over value is laid out as on
+ * Auto */
+static void test_arrange_user_over_invalid(void)
+{
+   static t_arrange_t a;
+   static const char *const bad[] = { "over:2", "over:9", "over:3", "over:x" };
+   unsigned i;
+
+   for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+   {
+      t_arrange_begin(&a, 2);
+      t_arrange_user(&a, 1, bad[i]);
+      t_arrange_run(&a);
+      CHECK(a.map.over == 0 && !a.map.left_out);
+      CHECK(!T_NIB(a.map.anchor, 1) && !a.map.opacity[1] && !a.map.size[1]);
+      CHECK(!strcmp(a.resolved[1].display, bad[i]));
+   }
+   /* A base with no view */
+   t_arrange_begin(&a, 2);
+   t_arrange_user(&a, 1, "over:1");
+   a.map.viewless = 0x1;
+   t_arrange_run(&a);
+   CHECK(a.map.over == 0);
+   /* Auto is the core's own show: its OVER, its HIDDEN */
+   t_arrange_begin(&a, 2);
+   t_arrange_core_over(&a, 1, 0);
+   t_arrange_user(&a, 1, "over:2");
+   t_arrange_run(&a);
+   CHECK(a.map.over == 0x2 && T_NIB(a.map.base, 1) == 0);
+   CHECK(a.map.size[1] == 0.25f && a.map.opacity[1] == 255);
+   a.scr.screens[1].show = RETRO_VIDEO_SCREEN_SHOW_HIDDEN;
+   t_arrange_run(&a);
+   CHECK(a.map.over == 0 && a.map.left_out == 0x2);
+   /* A stale entry past count is SHOWN */
+   a.scr.screens[1].show = RETRO_VIDEO_SCREEN_SHOW_OVER;
+   a.scr.count           = 1;
+   t_arrange_run(&a);
+   CHECK(a.map.over == 0 && !a.map.left_out);
+}
+
+/* One level: an inset over an inset goes over that one's root */
+static void test_arrange_flatten(void)
+{
+   static t_arrange_t a;
+
+   t_arrange_begin(&a, 3);
+   t_arrange_core_over(&a, 1, 0);
+   t_arrange_user(&a, 0, "over:3");
+   t_arrange_run(&a);
+   CHECK(a.map.over == 0x3 && !a.map.left_out);
+   CHECK(T_NIB(a.map.base, 0) == 2 && T_NIB(a.map.base, 1) == 2);
+   CHECK(a.map.opacity[0] == 255 && a.map.opacity[1] == 255);
+   /* A chain of the user's own */
+   t_arrange_begin(&a, 3);
+   t_arrange_user(&a, 0, "over:2");
+   t_arrange_user(&a, 1, "over:3");
+   t_arrange_run(&a);
+   CHECK(a.map.over == 0x3);
+   CHECK(T_NIB(a.map.base, 0) == 2 && T_NIB(a.map.base, 1) == 2);
+}
+
+static void test_arrange_mutual(void)
+{
+   static t_arrange_t a;
+
+   t_arrange_begin(&a, 2);
+   t_arrange_user(&a, 0, "over:2");
+   t_arrange_user(&a, 1, "over:1");
+   t_arrange_run(&a);
+   CHECK(a.map.over == 0 && !a.map.left_out);
+   /* Both on Auto: the core's OVER, flattened again */
+   t_arrange_core_over(&a, 1, 0);
+   t_arrange_run(&a);
+   CHECK(a.map.over == 0x2 && T_NIB(a.map.base, 1) == 0);
+   /* A chain into a loop has no root */
+   t_arrange_begin(&a, 3);
+   t_arrange_user(&a, 0, "over:2");
+   t_arrange_user(&a, 1, "over:3");
+   t_arrange_user(&a, 2, "over:2");
+   t_arrange_run(&a);
+   CHECK(a.map.over == 0);
+}
+
+static void test_arrange_user_wins(void)
+{
+   static t_arrange_t a;
+
+   t_arrange_begin(&a, 2);
+   t_arrange_user(&a, 0, "over:2");
+   t_arrange_core_over(&a, 1, 0);
+   t_arrange_run(&a);
+   CHECK(a.map.over == 0x1 && T_NIB(a.map.base, 0) == 1);
+   CHECK(!T_NIB(a.map.anchor, 1) && !a.map.opacity[1]);
+}
+
+static void test_arrange_base_left_out(void)
+{
+   static t_arrange_t a;
+
+   t_arrange_begin(&a, 2);
+   t_arrange_core_over(&a, 1, 0);
+   a.scr.screens[0].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
+   t_arrange_run(&a);
+   CHECK(a.map.left_out == 0x3 && a.map.over == 0x2);
+   a.scr.screens[0].state = RETRO_VIDEO_SCREEN_STATE_ACTIVE;
+   a.scr.screens[0].show  = RETRO_VIDEO_SCREEN_SHOW_HIDDEN;
+   t_arrange_run(&a);
+   CHECK(a.map.left_out == 0x3);
+   t_arrange_begin(&a, 2);
+   t_arrange_user(&a, 0, VIDEO_WINDOW_DISPLAY_OFF);
+   t_arrange_user(&a, 1, "over:1");
+   t_arrange_run(&a);
+   CHECK(a.map.left_out == 0x3 && a.map.over == 0x2);
+   /* Re-based past a base left out: still left out with it */
+   t_arrange_begin(&a, 3);
+   t_arrange_core_over(&a, 1, 0);
+   t_arrange_user(&a, 0, "over:3");
+   a.scr.screens[0].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
+   t_arrange_run(&a);
+   CHECK(a.map.left_out == 0x3 && T_NIB(a.map.base, 1) == 2);
+}
+
+static void test_arrange_blank_inset(void)
+{
+   static t_arrange_t a;
+
+   t_arrange_begin(&a, 2);
+   t_arrange_core_over(&a, 1, 0);
+   a.scr.screens[1].state = RETRO_VIDEO_SCREEN_STATE_BLANK;
+   t_arrange_run(&a);
+   CHECK(a.map.over == 0x2 && a.map.blank == 0x2 && !a.map.left_out);
+   /* Over a blank base, drawn */
+   a.scr.screens[0].state = RETRO_VIDEO_SCREEN_STATE_BLANK;
+   a.scr.screens[1].state = RETRO_VIDEO_SCREEN_STATE_ACTIVE;
+   t_arrange_run(&a);
+   CHECK(a.map.over == 0x2 && a.map.blank == 0x1 && !a.map.left_out);
+}
+
+/* A shown screen keeps the core's base and size; the user's Size is an
+ * inset's */
+static void test_arrange_shown_sized(void)
+{
+   static t_arrange_t a;
+   video_screen_values_t v;
+
+   t_arrange_begin(&a, 3);
+   a.scr.screens[1].size = 0.25f;
+   t_arrange_run(&a);
+   CHECK(a.map.over == 0 && T_NIB(a.map.base, 1) == 0);
+   CHECK(a.map.size[1] == 0.25f && !a.map.opacity[1]);
+   CHECK(!T_NIB(a.map.anchor, 1));
+   a.scr.screens[1].base = 2;
+   t_prefs_values(&v);
+   v.size = 40;
+   video_screen_prefs_set(&a.prefs, 1, T_PREF(SIZE), &v);
+   video_screen_prefs_set(&a.prefs, 0, T_PREF(SIZE), &v);
+   t_arrange_run(&a);
+   CHECK(T_NIB(a.map.base, 1) == 2 && a.map.size[1] == 0.25f);
+   CHECK(!a.map.size[0] && !a.map.size[2]);
+   CHECK(t_arrange_clear_past(&a.map, 3));
+}
+
+#undef T_NIB
 
 #undef T_PREF
 
@@ -3544,10 +3967,21 @@ int main(void)
    test_names_box();
    test_prefs_resolve_order();
    test_prefs_resolve_over();
+   test_prefs_over_value();
    test_prefs_resolve_fields();
-   test_prefs_masks();
+   test_arrange_masks();
    test_prefs_set();
    test_prefs_key();
+   test_arrange_core_over();
+   test_arrange_user_values();
+   test_arrange_user_over();
+   test_arrange_user_over_invalid();
+   test_arrange_flatten();
+   test_arrange_mutual();
+   test_arrange_user_wins();
+   test_arrange_base_left_out();
+   test_arrange_blank_inset();
+   test_arrange_shown_sized();
 
    if (failures)
    {

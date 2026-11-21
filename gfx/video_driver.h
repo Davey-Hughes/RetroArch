@@ -2224,10 +2224,12 @@ typedef struct
    video_views_screens_t views_screens;
    video_views_names_box_t views_names;
    /* The running core's per-screen choices, and each screen's values
-    * as RetroArch uses them. Main thread; a redraw reads the values
-    * the last main-thread frame left, as it reads views_core. */
+    * as RetroArch uses them, with the VIDEO_SCREEN_PREF_BIT()s of those
+    * that are the core's defaults. Main thread; a redraw reads the
+    * values the last main-thread frame left, as it reads views_core. */
    video_screen_prefs_t screen_prefs;
    video_screen_values_t screens_resolved[RETRO_VIDEO_VIEWS_MAX];
+   unsigned screens_defaults[RETRO_VIDEO_VIEWS_MAX];
    unsigned views_frame_dims;
    /* The view count the driver instance was last told. */
    unsigned views_driver_count;

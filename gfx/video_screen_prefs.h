@@ -46,6 +46,9 @@ enum video_screen_pref
    VIDEO_SCREEN_PREF_XR_ROLL,
    VIDEO_SCREEN_PREF_XR_SCALE,
    VIDEO_SCREEN_PREF_XR_VISIBLE,
+   VIDEO_SCREEN_PREF_CORNER,
+   VIDEO_SCREEN_PREF_SIZE,
+   VIDEO_SCREEN_PREF_OPACITY,
    VIDEO_SCREEN_PREF_COUNT
 };
 
@@ -58,11 +61,17 @@ enum video_screen_pref
    (  VIDEO_SCREEN_PREF_XR_PLACE \
     | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_XR_VISIBLE))
 
+#define VIDEO_SCREEN_SIZE_DEFAULT    25
+#define VIDEO_SCREEN_OPACITY_DEFAULT 100
+
 /* One screen's per-screen settings, in the forms settings_t keeps */
 typedef struct video_screen_values
 {
    unsigned window_pos;    /* VIDEO_POS_PACK */
    unsigned window_dims;   /* VIDEO_SCALE_PACK; 0 automatic */
+   unsigned corner;        /* 0 Default, else RETRO_VIDEO_SCREEN_ANCHOR_ 1-8 */
+   unsigned size;          /* percent of the base's shown height; 0 Default */
+   unsigned opacity;       /* percent; 0 Default */
    video_screen_xr_t xr;   /* headset placement and visible */
    char display[VIDEO_WINDOW_DISPLAY_NAME_SIZE]; /* "" Auto, "off", "main", a key */
    bool window_fullscreen;
@@ -81,22 +90,29 @@ typedef struct video_screen_prefs
 } video_screen_prefs_t;
 
 /* Pure. @screen's values: each from @prefs where set, else the core's
- * default from @screens (Display only: show HIDDEN or OVER gives Off),
- * else @global. Returns the VIDEO_SCREEN_PREF_BIT()s whose value is the
- * core's default. @prefs and @screens may be NULL. */
+ * default from @screens, else @global. The core's defaults: Display
+ * Off for show HIDDEN and the Over value of its base for OVER; Corner,
+ * Size and Opacity its non-zero anchor, size and opacity, the last two
+ * as rounded percents. Returns the VIDEO_SCREEN_PREF_BIT()s whose value
+ * is the core's default. @prefs and @screens may be NULL. */
 unsigned video_screen_prefs_resolve(const video_screen_prefs_t *prefs,
       const video_views_screens_t *screens,
       const video_screen_values_t *global, unsigned screen,
       video_screen_values_t *out);
 
-/* Pure. Bit s of *left_out: screens' state ABSENT, or resolved[s]'s
- * display Off; of *blank: state BLANK and not left out. state is read
- * only below screens->count: a screen at or past it counts as ACTIVE.
- * Bits at or past @num_screens stay clear. @screens may be NULL (no
- * screen information). */
-void video_screen_prefs_masks(const video_screen_values_t *resolved,
-      const video_views_screens_t *screens, unsigned num_screens,
-      unsigned *left_out, unsigned *blank);
+/* Pure. The base an Over value names, from 0; -1 for any other string. */
+int video_screen_prefs_over_base(const char *display);
+
+/* Pure. The Over value naming @base into @s. */
+size_t video_screen_prefs_over_value(unsigned base, char *s, size_t len);
+
+/* Pure. @map's left_out, blank, over, base, anchor, opacity and size for
+ * its num_screens screens, from each screen's @resolved values,
+ * @defaults (resolve()'s return per screen) and the core's @screens
+ * (NULL: none). Reads @map's num_screens and viewless. */
+void video_screen_prefs_arrange(const video_screen_values_t *resolved,
+      const unsigned *defaults, const video_views_screens_t *screens,
+      video_views_map_t *map);
 
 /* Takes @bits of @values for @screen, marking them set; NULL @values
  * clears those entries. dirty only when something changed. */

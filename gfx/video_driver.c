@@ -4576,8 +4576,8 @@ static void video_driver_screens_resolve(video_driver_state_t *video_st,
 {
    unsigned s;
    for (s = 0; s < RETRO_VIDEO_VIEWS_MAX; s++)
-      video_driver_screen_resolve(video_st, settings, s,
-            &video_st->screens_resolved[s]);
+      video_st->screens_defaults[s] = video_driver_screen_resolve(video_st,
+            settings, s, &video_st->screens_resolved[s]);
 }
 
 unsigned video_driver_screen_get(unsigned screen, video_screen_values_t *out)
@@ -4656,8 +4656,8 @@ void video_driver_screen_set(unsigned screen, unsigned bits,
       settings->flags |= SETTINGS_FLG_MODIFIED;
    }
    /* A write within a frame, as a bounds take is, reaches its windows */
-   video_driver_screen_resolve(video_st, settings, screen,
-         &video_st->screens_resolved[screen]);
+   video_st->screens_defaults[screen] = video_driver_screen_resolve(
+         video_st, settings, screen, &video_st->screens_resolved[screen]);
 }
 
 int video_driver_get_screen_names(video_views_names_t *out)
@@ -5527,6 +5527,21 @@ static VIDEO_NOINLINE void video_driver_screens_route(
 }
 #endif
 
+/* @from's masks and arrangement, without its views */
+static void video_driver_views_take_arrangement(video_views_map_t *to,
+      const video_views_map_t *from)
+{
+   to->no_input = from->no_input;
+   to->viewless = from->viewless;
+   to->left_out = from->left_out;
+   to->blank    = from->blank;
+   to->over     = from->over;
+   to->base     = from->base;
+   to->anchor   = from->anchor;
+   memcpy(to->opacity, from->opacity, sizeof(to->opacity));
+   memcpy(to->size,    from->size,    sizeof(to->size));
+}
+
 /* Fills the frame's views and layout. A repeated frame (no data), or one
  * that will not be presented (frameskip), reuses the last map, since the
  * driver's last presented (or repeated) textures still match it. @now
@@ -5571,11 +5586,9 @@ static void video_driver_views_frame(video_driver_state_t *video_st,
          *core                      = video_st->views;
          video_st->views_frame_dims = core_dims;
          /* Not in views: set_views compares each map with it */
-         video_screen_prefs_masks(video_st->screens_resolved,
-               &video_st->views_screens, core->num_screens,
-               &core->left_out, &core->blank);
-         video_st->views_frame.left_out = core->left_out;
-         video_st->views_frame.blank    = core->blank;
+         video_screen_prefs_arrange(video_st->screens_resolved,
+               video_st->screens_defaults, &video_st->views_screens, core);
+         video_driver_views_take_arrangement(&video_st->views_frame, core);
       }
    }
 #ifdef HAVE_VIDEO_WINDOWS

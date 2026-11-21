@@ -30,6 +30,11 @@ enum video_window_mode
 /* video_screen%u_display's value for a screen that is not shown */
 #define VIDEO_WINDOW_DISPLAY_OFF "off"
 
+/* video_screen%u_display's value for a screen drawn over another:
+ * "over:N", N the base's number from 1, as the video_screenN_ keys
+ * count */
+#define VIDEO_WINDOW_DISPLAY_OVER "over:"
+
 /* video_screen%u_display's value for a screen shown in the main window,
  * on the desktop */
 #define VIDEO_WINDOW_DISPLAY_MAIN "main"
