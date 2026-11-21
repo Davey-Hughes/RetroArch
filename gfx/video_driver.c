@@ -10733,6 +10733,33 @@ VIDEO_NOINLINE static void video_driver_frame_statistics(
    }
 }
 
+#if defined(HAVE_GFX_WIDGETS)
+/* The queue's first message to the widgets. Not inlined: the entry's
+ * two 1 KiB strings would sit in the frame's stack. */
+static VIDEO_NOINLINE void video_driver_msg_queue_to_widgets(
+      runloop_state_t *runloop_st, bool menu_is_alive)
+{
+   msg_queue_entry_t msg_entry;
+   bool msg_found             = msg_queue_extract(
+         &runloop_st->msg_queue, &msg_entry);
+   runloop_st->msg_queue_size = msg_queue_size(&runloop_st->msg_queue);
+
+   if (msg_found)
+      gfx_widgets_msg_queue_push(
+            NULL,
+            msg_entry.msg,
+            strlen(msg_entry.msg),
+            roundf((float)msg_entry.duration / 60.0f * 1000.0f),
+            msg_entry.title,
+            msg_entry.icon,
+            msg_entry.category,
+            msg_entry.prio,
+            false,
+            menu_is_alive
+      );
+}
+#endif
+
 void video_driver_frame(const void *data, unsigned width,
       unsigned height, size_t pitch)
 {
@@ -11451,29 +11478,7 @@ void video_driver_frame(const void *data, unsigned width,
        * queue instead */
 #if defined(HAVE_GFX_WIDGETS)
       if (widgets_active)
-      {
-         msg_queue_entry_t msg_entry;
-         bool msg_found                  = false;
-
-         msg_found                       = msg_queue_extract(
-               &runloop_st->msg_queue, &msg_entry);
-         runloop_st->msg_queue_size      = msg_queue_size(
-               &runloop_st->msg_queue);
-
-         if (msg_found)
-            gfx_widgets_msg_queue_push(
-                  NULL,
-                  msg_entry.msg,
-                  strlen(msg_entry.msg),
-                  roundf((float)msg_entry.duration / 60.0f * 1000.0f),
-                  msg_entry.title,
-                  msg_entry.icon,
-                  msg_entry.category,
-                  msg_entry.prio,
-                  false,
-                  menu_is_alive
-            );
-      }
+         video_driver_msg_queue_to_widgets(runloop_st, menu_is_alive);
       /* ...otherwise, just output message via
        * regular OSD notification text (if enabled) */
       else if (video_info.font_enable)
