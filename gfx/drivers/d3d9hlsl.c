@@ -7131,6 +7131,10 @@ static void d3d9_hlsl_views_draw_pass(d3d9_video_t *d3d,
                &c->view_vp);
          c->sized_dims     = size;
       }
+      /* Only the last pass is blended at the view's opacity */
+      if (d3d->views.alpha < 255)
+         IDirect3DDevice9_SetRenderState(d3d->dev,
+               D3DRS_ALPHABLENDENABLE, FALSE);
 #ifdef D3D9_HW_RENDER
       /* Read as it was copied: nothing to upload */
       if (c->hw)
@@ -7146,6 +7150,9 @@ static void d3d9_hlsl_views_draw_pass(d3d9_video_t *d3d,
       d3d9_hlsl_renderchain_run(d3d, c, (const uint8_t*)d->frame
             + (size_t)v->y * d->pitch + (size_t)v->x * c->chain.pixel_size,
             v->width, v->height, d->pitch, &c->last_dims);
+      if (d3d->views.alpha < 255)
+         IDirect3DDevice9_SetRenderState(d3d->dev,
+               D3DRS_ALPHABLENDENABLE, TRUE);
       c->ran = true;
    }
    else if (!c->ran)
@@ -8810,6 +8817,9 @@ static bool d3d9_hlsl_frame_body(void *data, const void *frame,
    bool views                          = false;
    bool views_blend                    = false;
    bool views_direct                   = false;
+   /* Kept where a core's texture, not handed over, leaves nothing to
+    * draw views from */
+   bool views_fallback                 = true;
    bool views_ui                       = false;
 #endif
 
@@ -8930,7 +8940,7 @@ static bool d3d9_hlsl_frame_body(void *data, const void *frame,
 #endif
    views = d3d9_hlsl_views_setup(d3d, video_info, msg,
          d3d->menu && d3d->menu->enabled, &views_blend, &views_direct,
-         view_chains, view_rects);
+         &views_fallback, view_chains, view_rects);
    /* The viewport is the whole window while views draw. */
    if (views != d3d->views.active)
    {
@@ -8938,7 +8948,7 @@ static bool d3d9_hlsl_frame_body(void *data, const void *frame,
       d3d->should_resize = true;
    }
    retro_atomic_store_release_int(&d3d->views.fallback,
-         (video_info->views.num_views && !views) ? 1 : 0);
+         views_fallback ? 1 : 0);
    d3d9_hlsl_views_publish(d3d);
 #endif
 

@@ -208,9 +208,12 @@ typedef struct d3d8_video
       bool                 blend;
       unsigned             frame_dims;
       /* For get_flags on the main thread: whether views may be drawn,
-       * and whether the last frame with a map drew it whole */
+       * and whether a map is drawn whole: the last frame's, or with
+       * none what one would get */
       retro_atomic_int_t   allowed;
       retro_atomic_int_t   fallback;
+      /* The diffuse alpha views are drawn at, d3d8_views_alpha's */
+      unsigned             alpha;
       bool                 active;
       bool                 direct_seen;
       /* A second texture stage, for the UI layer, and whether the UI
@@ -2972,12 +2975,16 @@ struct d3d8_views_draw
 struct d3d8_views_vertex
 {
    float x, y, z, rhw;
+   DWORD color;
    float u, v;
 };
 
 static void d3d8_views_draw_direct(d3d8_video_t *d3d,
       const struct d3d8_views_draw *d, unsigned view,
       const video_views_rect_t *dst, const video_views_rect_t *cut);
+static void d3d8_views_alpha(d3d8_video_t *d3d, unsigned alpha);
+static void d3d8_views_fill(d3d8_video_t *d3d,
+      const video_views_rect_t *cut, unsigned alpha);
 static bool d3d8_views_target_make(d3d8_video_t *d3d,
       LPDIRECT3DTEXTURE8 *t, unsigned dims);
 static bool d3d8_views_target_retire(d3d8_video_t *d3d,
@@ -2994,6 +3001,8 @@ static bool d3d8_views_target_retire(d3d8_video_t *d3d,
 #define VV_DRAW                         struct d3d8_views_draw
 #define VV_DIRECT(p, d, v, r, c)        d3d8_views_draw_direct(p, d, v, r, c)
 #define VV_PASS(p, d, f, r, c, a)       ((void)0)
+#define VV_ALPHA(p, d, a)               d3d8_views_alpha(p, a)
+#define VV_FILL(p, d, c, a)             d3d8_views_fill(p, c, a)
 #define VV_TARGET                       LPDIRECT3DTEXTURE8
 #define VV_TARGET_MAKE(drv, t, dims)    d3d8_views_target_make(drv, t, dims)
 #define VV_TARGET_RETIRE(drv, t)        d3d8_views_target_retire(drv, t)
@@ -3039,11 +3048,12 @@ static void d3d8_views_release(d3d8_video_t *d3d)
 }
 
 /* @r's part @cut of a quad textured from @uv, left, top, right and
- * bottom, turned @rotation quarter turns as the frame is. D3D8 has no
- * scissor, so the quad itself is cut. Pixel centres are a half pixel in
- * from a pretransformed quad's edges. */
+ * bottom, turned @rotation quarter turns as the frame is, its diffuse
+ * @color. D3D8 has no scissor, so the quad itself is cut. Pixel centres
+ * are a half pixel in from a pretransformed quad's edges. */
 static void d3d8_views_quad(d3d8_video_t *d3d, const video_views_rect_t *r,
-      const video_views_rect_t *cut, const float *uv, unsigned rotation)
+      const video_views_rect_t *cut, const float *uv, unsigned rotation,
+      DWORD color)
 {
    unsigned k;
    struct d3d8_views_vertex v[4];
@@ -3080,10 +3090,12 @@ static void d3d8_views_quad(d3d8_video_t *d3d, const video_views_rect_t *r,
       v[k].y     = py - 0.5f;
       v[k].z     = 0.0f;
       v[k].rhw   = 1.0f;
+      v[k].color = color;
       v[k].u     = tl[0] + fs * (tr[0] - tl[0]) + ft * (bl[0] - tl[0]);
       v[k].v     = tl[1] + fs * (tr[1] - tl[1]) + ft * (bl[1] - tl[1]);
    }
-   IDirect3DDevice8_SetVertexShader(d3d->dev, D3DFVF_XYZRHW | D3DFVF_TEX1);
+   IDirect3DDevice8_SetVertexShader(d3d->dev,
+         D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
    IDirect3DDevice8_DrawPrimitiveUP(d3d->dev, D3DPT_TRIANGLESTRIP, 2, v,
          sizeof(v[0]));
 }
@@ -3120,17 +3132,77 @@ static void d3d8_views_draw_direct(d3d8_video_t *d3d,
    uv[2] = (float)v->width  / (float)next_pow2(v->width);
    uv[3] = (float)v->height / (float)next_pow2(v->height);
    d3d8_views_sample(d3d, d3d->views.tex[view], d->filter);
-   d3d8_views_quad(d3d, dst, cut, uv, d3d->dev_rotation);
+   d3d8_views_quad(d3d, dst, cut, uv, d3d->dev_rotation,
+         ((DWORD)d3d->views.alpha << 24) | 0xFFFFFF);
+}
+
+/* The views drawn after at @alpha: diffuse alpha, blended as the
+ * overlay is; at 255 not blended. A view's texture has no alpha of its
+ * own. */
+static void d3d8_views_alpha(d3d8_video_t *d3d, unsigned alpha)
+{
+   LPDIRECT3DDEVICE8 dev = d3d->dev;
+   d3d->views.alpha      = alpha;
+   if (alpha < 255)
+   {
+      IDirect3DDevice8_SetRenderState(dev, D3DRS_SRCBLEND,
+            D3DBLEND_SRCALPHA);
+      IDirect3DDevice8_SetRenderState(dev, D3DRS_DESTBLEND,
+            D3DBLEND_INVSRCALPHA);
+      IDirect3DDevice8_SetTextureStageState(dev, 0, D3DTSS_ALPHAOP,
+            D3DTOP_MODULATE);
+      IDirect3DDevice8_SetTextureStageState(dev, 0, D3DTSS_ALPHAARG1,
+            D3DTA_TEXTURE);
+      IDirect3DDevice8_SetTextureStageState(dev, 0, D3DTSS_ALPHAARG2,
+            D3DTA_DIFFUSE);
+   }
+   IDirect3DDevice8_SetRenderState(dev, D3DRS_ALPHABLENDENABLE,
+         alpha < 255);
+}
+
+/* @cut black at @alpha, for a blank inset: cleared when solid, else a
+ * quad of black diffuse under d3d8_views_alpha's blend */
+static void d3d8_views_fill(d3d8_video_t *d3d,
+      const video_views_rect_t *cut, unsigned alpha)
+{
+   LPDIRECT3DDEVICE8 dev = d3d->dev;
+   if (alpha >= 255)
+   {
+      D3DRECT rect;
+      rect.x1 = VIDEO_POS_X(cut->pos);
+      rect.y1 = VIDEO_POS_Y(cut->pos);
+      rect.x2 = rect.x1 + (LONG)VIDEO_SCALE_W(cut->dims);
+      rect.y2 = rect.y1 + (LONG)VIDEO_SCALE_H(cut->dims);
+      IDirect3DDevice8_Clear(dev, 1, &rect, D3DCLEAR_TARGET, 0, 1.0f, 0);
+   }
+   else
+   {
+      float uv[4];
+      uv[0] = 0.0f;
+      uv[1] = 0.0f;
+      uv[2] = 0.0f;
+      uv[3] = 0.0f;
+      IDirect3DDevice8_SetTextureStageState(dev, 0, D3DTSS_COLOROP,
+            D3DTOP_SELECTARG2);
+      IDirect3DDevice8_SetTextureStageState(dev, 0, D3DTSS_COLORARG2,
+            D3DTA_DIFFUSE);
+      IDirect3DDevice8_SetTextureStageState(dev, 0, D3DTSS_ALPHAOP,
+            D3DTOP_SELECTARG2);
+      d3d8_views_quad(d3d, cut, cut, uv, 0, (DWORD)alpha << 24);
+      /* As d3d8_views_sample and d3d8_views_alpha left them */
+      IDirect3DDevice8_SetTextureStageState(dev, 0, D3DTSS_COLOROP,
+            D3DTOP_SELECTARG1);
+      IDirect3DDevice8_SetTextureStageState(dev, 0, D3DTSS_ALPHAOP,
+            D3DTOP_MODULATE);
+   }
 }
 
 /* Whether the UI is drawn this frame once, into the layer placed in
- * each eye */
+ * each eye: @per_eye, the layout puts it there */
 static bool d3d8_views_ui_wanted(d3d8_video_t *d3d,
-      video_frame_info_t *video_info, const char *msg)
+      video_frame_info_t *video_info, const char *msg, bool per_eye)
 {
    bool ui;
-   bool per_eye = video_views_ui_per_eye(&video_info->views,
-         &video_info->views_layout, true);
    ui = VIDEO_VIEWS_UI_WANTED(per_eye, d3d->menu && d3d->menu->enabled,
          msg, video_info->statistics_show,
          video_info->widgets_visible);
@@ -3142,17 +3214,19 @@ static bool d3d8_views_ui_wanted(d3d8_video_t *d3d,
 }
 
 /* Whether this frame draws its views, with each drawn view's chain
- * picked and the rectangle its first placement takes, and in *blend
- * whether into the canvas. Drawn whole for anaglyph, whose colours a
+ * picked and the rectangle its first placement takes, in *blend
+ * whether into the canvas, and in *fallback whether a map, sent or
+ * not, is drawn whole. Drawn whole for anaglyph, whose colours a
  * fixed pipeline can't make, and while the UI would be drawn per eye
  * without the second texture stage its layer takes. */
 static bool d3d8_views_setup(d3d8_video_t *d3d,
       video_frame_info_t *video_info, const char *msg, bool *blend,
-      void **chains, video_views_rect_t *rects)
+      bool *fallback, void **chains, video_views_rect_t *rects)
 {
-   bool views;
+   bool views, whole;
    const video_views_layout_t *layout = &video_info->views_layout;
-   bool offscreen = video_info->views.num_views && layout->offscreen;
+   bool offscreen  = video_info->views.num_views && layout->offscreen;
+   unsigned stereo = video_info->views_settings.stereo_mode;
 
    if (video_info->views.num_views && !d3d->views.tried)
    {
@@ -3178,12 +3252,23 @@ static bool d3d8_views_setup(d3d8_video_t *d3d,
             &d3d->views.canvas);
    views = video_info->views.num_views
       && (!offscreen || *blend)
-      && (d3d->views.layer || !d3d8_views_ui_wanted(d3d, video_info, msg))
+      && (d3d->views.layer || !d3d8_views_ui_wanted(d3d, video_info, msg,
+               layout->ui_per_eye))
       && video_views_fit_frame(&video_info->views, d3d->views.frame_dims)
       && d3d8_vv_pick_chains(d3d, &d3d->views.chains, &video_info->views,
             layout, true, *blend || !layout->offscreen,
             *blend ? layout->canvas_dims : video_info->dims, chains, rects);
    *blend = views && *blend;
+   /* Without a map, what one would get: drawn whole in anaglyph, and
+    * with UI in a stereo mode that puts it in each eye once the layer
+    * is known missing */
+   whole  = stereo == VIDEO_STEREO_MODE_ANAGLYPH
+      || (   d3d->views.tried && !d3d->views.layer
+          && d3d8_views_ui_wanted(d3d, video_info, msg,
+                stereo == VIDEO_STEREO_MODE_SBS_HALF
+             || stereo == VIDEO_STEREO_MODE_SBS_FULL
+             || stereo == VIDEO_STEREO_MODE_TOP_BOTTOM));
+   *fallback = video_info->views.num_views ? !views : whole;
    if (views && !d3d->views.direct_seen)
    {
       d3d->views.direct_seen = true;
@@ -3266,8 +3351,9 @@ static void d3d8_views_render(d3d8_video_t *d3d, DWORD filter)
    unsigned dims = blend ? layout->canvas_dims : win;
    void **chains = d3d->views.drawn;
 
-   d.map        = &d3d->views.map;
-   d.filter     = filter;
+   d.map            = &d3d->views.map;
+   d.filter         = filter;
+   d3d->views.alpha = 255;
    IDirect3DDevice8_SetRenderState(dev, D3DRS_ALPHABLENDENABLE, FALSE);
    IDirect3DDevice8_SetRenderState(dev, D3DRS_ZENABLE, FALSE);
    if (blend)
@@ -3312,7 +3398,7 @@ static void d3d8_views_render(d3d8_video_t *d3d, DWORD filter)
       uv[2]      = half;
       uv[3]      = 1.0f;
       d3d8_views_sample(d3d, d3d->views.canvas, D3DTEXF_POINT);
-      d3d8_views_quad(d3d, &whole, &whole, uv, 0);
+      d3d8_views_quad(d3d, &whole, &whole, uv, 0, 0xFFFFFFFF);
       uv[0]      = half;
       uv[2]      = 2.0f * half;
       for (y = 1; y < (unsigned)h; y += 2)
@@ -3322,7 +3408,7 @@ static void d3d8_views_render(d3d8_video_t *d3d, DWORD filter)
          row.dims = VIDEO_SCALE_PACK(w, 1);
          uv[1]    = (float)y / (float)h;
          uv[3]    = (float)(y + 1) / (float)h;
-         d3d8_views_quad(d3d, &row, &row, uv, 0);
+         d3d8_views_quad(d3d, &row, &row, uv, 0, 0xFFFFFFFF);
       }
    }
    IDirect3DDevice8_EndScene(dev);
@@ -3436,7 +3522,8 @@ static void d3d8_views_ui_end(d3d8_video_t *d3d,
    uv[3] = 1.0f;
    IDirect3DDevice8_BeginScene(dev);
    for (a = 0; a < layout->num_areas; a++)
-      d3d8_views_quad(d3d, &layout->areas[a], &layout->areas[a], uv, 0);
+      d3d8_views_quad(d3d, &layout->areas[a], &layout->areas[a], uv, 0,
+            0xFFFFFFFF);
    IDirect3DDevice8_EndScene(dev);
    IDirect3DDevice8_SetRenderState(dev, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
    IDirect3DDevice8_SetRenderState(dev, D3DRS_ALPHABLENDENABLE, FALSE);
@@ -3497,6 +3584,7 @@ static bool d3d8_frame(void *data, const void *frame,
    video_views_rect_t view_rects[RETRO_VIDEO_VIEWS_MAX];
    bool views                          = false;
    bool views_blend                    = false;
+   bool views_fallback                 = false;
    bool views_ui                       = false;
 #endif
 
@@ -3522,7 +3610,7 @@ static bool d3d8_frame(void *data, const void *frame,
 #ifdef D3D8_VIEWS
    d3d->views.frame_dims = dims;
    views = d3d8_views_setup(d3d, video_info, msg, &views_blend,
-         view_chains, view_rects);
+         &views_fallback, view_chains, view_rects);
    /* The out viewport is the whole window while views draw. */
    if (views != d3d->views.active)
    {
@@ -3530,7 +3618,7 @@ static bool d3d8_frame(void *data, const void *frame,
       d3d->should_resize = true;
    }
    retro_atomic_store_release_int(&d3d->views.fallback,
-         (video_info->views.num_views && !views) ? 1 : 0);
+         views_fallback ? 1 : 0);
    /* As the main thread laid the UI out: overlays are hidden. */
    views_per_eye = video_views_ui_per_eye(&video_info->views,
          &video_info->views_layout, true);
@@ -3603,7 +3691,7 @@ static bool d3d8_frame(void *data, const void *frame,
    if (!views_per_eye)
       d3d8_vv_target_drop(d3d, &d3d->views.ui_target, &d3d->views.ui);
    views_ui = d3d->views.layer
-      && d3d8_views_ui_wanted(d3d, video_info, msg)
+      && d3d8_views_ui_wanted(d3d, video_info, msg, views_per_eye)
       && d3d8_vv_target_ensure(d3d, &d3d->views.ui_target,
             &d3d->views.ui, video_info->views_layout.ui_dims);
    if (views_ui)

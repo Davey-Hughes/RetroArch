@@ -47,7 +47,8 @@
 
 /* What a frame's placement draws read: the frame, @pitch bytes a row,
  * its texture, that's size, filter and rotation, and the rectangle each
- * view's chain is sized for */
+ * view's chain is sized for. views_render adds the size of what they
+ * are drawn into, and whether straight from the frame. */
 struct d3d9_views_draw
 {
    const video_frame_info_t *video_info;
@@ -58,6 +59,8 @@ struct d3d9_views_draw
    unsigned tex_dims;
    DWORD filter;
    unsigned rotation;
+   unsigned dims;
+   bool direct;
 };
 
 struct d3d9_views_vertex
@@ -69,6 +72,9 @@ struct d3d9_views_vertex
 static void D3D9V_FN(views_draw_direct)(d3d9_video_t *d3d,
       const struct d3d9_views_draw *d, unsigned view,
       const video_views_rect_t *dst, const video_views_rect_t *cut);
+static void D3D9V_FN(views_alpha)(d3d9_video_t *d3d, unsigned alpha);
+static void D3D9V_FN(views_fill)(d3d9_video_t *d3d,
+      const struct d3d9_views_draw *d, const video_views_rect_t *cut);
 static bool D3D9V_FN(views_target_make)(d3d9_video_t *d3d,
       d3d9_views_target_t *t, unsigned dims);
 static bool D3D9V_FN(views_target_retire)(d3d9_video_t *d3d,
@@ -86,6 +92,8 @@ static bool D3D9V_FN(views_target_retire)(d3d9_video_t *d3d,
 #define VV_DRAW                         struct d3d9_views_draw
 #define VV_DIRECT(p, d, v, r, c)        D3D9V_FN(views_draw_direct)(p, d, v, r, c)
 #define VV_PASS(p, d, f, r, c, a)       D3D9V_PASS(p, d, f, r, c, a)
+#define VV_ALPHA(p, d, a)               D3D9V_FN(views_alpha)(p, a)
+#define VV_FILL(p, d, c, a)             D3D9V_FN(views_fill)(p, d, c)
 #define VV_TARGET                       d3d9_views_target_t
 #define VV_TARGET_MAKE(drv, t, dims)    D3D9V_FN(views_target_make)(drv, t, dims)
 #define VV_TARGET_RETIRE(drv, t)        D3D9V_FN(views_target_retire)(drv, t)
@@ -202,6 +210,8 @@ static void D3D9V_FN(views_init)(d3d9_video_t *d3d)
       && d3d->views.ps_reg[D3D9_VIEWS_PS_BLEND] >= 0;
    d3d->views.layer = (caps.PrimitiveMiscCaps & D3DPMISCCAPS_SEPARATEALPHABLEND)
       && D3D9V_PS_MAKE(d3d, D3D9_VIEWS_PS_LAYER, d3d9_views_ps_layer);
+   d3d->views.factor = (caps.SrcBlendCaps & D3DPBLENDCAPS_BLENDFACTOR)
+      && (caps.DestBlendCaps & D3DPBLENDCAPS_BLENDFACTOR);
 }
 
 /* A scissor rectangle from a top-left one */
@@ -292,17 +302,20 @@ static void D3D9V_FN(views_draw_direct)(d3d9_video_t *d3d,
 
 /* Whether this frame draws its views, with each drawn view's chain
  * picked and the rectangle its first placement takes, in *blend
- * whether into the canvas, and in *direct whether straight from the
- * frame. Drawn whole when the stereo mode or the UI would need a canvas
- * or layer that can't be had. @menu: the menu is up. */
+ * whether into the canvas, in *direct whether straight from the
+ * frame, and in *fallback whether a map, sent or not, is drawn whole.
+ * Drawn whole when the stereo mode or the UI would need a canvas or
+ * layer that can't be had. @menu: the menu is up. */
 static bool D3D9V_FN(views_setup)(d3d9_video_t *d3d,
       video_frame_info_t *video_info, const char *msg, bool menu,
-      bool *blend, bool *direct, void **chains, video_views_rect_t *rects)
+      bool *blend, bool *direct, bool *fallback, void **chains,
+      video_views_rect_t *rects)
 {
-   bool views, per_eye, ui;
+   bool views, per_eye, ui, whole;
    bool stock = !D3D9V_FN(views_preset)(d3d);
    const video_views_layout_t *layout = &video_info->views_layout;
-   bool offscreen = video_info->views.num_views && layout->offscreen;
+   bool offscreen  = video_info->views.num_views && layout->offscreen;
+   unsigned stereo = video_info->views_settings.stereo_mode;
 
    if (video_info->views.num_views && !d3d->views.tried)
       D3D9V_FN(views_init)(d3d);
@@ -333,6 +346,23 @@ static bool D3D9V_FN(views_setup)(d3d9_video_t *d3d,
             *blend ? layout->canvas_dims : video_info->dims, chains, rects);
    *blend  = views && *blend;
    *direct = views && stock;
+   /* Without a map, what one would get: drawn whole where views aren't
+    * allowed, and once the canvas's blend or the UI's layer is known
+    * missing, in the stereo modes that take the one, or with UI the
+    * other */
+   whole   = !D3D9V_FN(views_allowed)(d3d)
+      || (   d3d->views.tried
+          && (   (   !d3d->views.blend
+                  && (   stereo == VIDEO_STEREO_MODE_ANAGLYPH
+                      || stereo == VIDEO_STEREO_MODE_INTERLACED))
+              || (   !d3d->views.layer
+                  && VIDEO_VIEWS_UI_WANTED(
+                        stereo == VIDEO_STEREO_MODE_SBS_HALF
+                     || stereo == VIDEO_STEREO_MODE_SBS_FULL
+                     || stereo == VIDEO_STEREO_MODE_TOP_BOTTOM,
+                        menu, msg, video_info->statistics_show,
+                        video_info->widgets_visible))));
+   *fallback = video_info->views.num_views ? !views : whole;
    if (*direct && !d3d->views.direct_seen)
    {
       d3d->views.direct_seen = true;
@@ -363,12 +393,70 @@ static void D3D9V_FN(views_viewport)(d3d9_video_t *d3d, unsigned dims)
    IDirect3DDevice9_SetViewport(d3d->dev, &vp);
 }
 
+/* The views drawn after blended at @alpha by the blend factor, which
+ * a preset's last pass is too; at 255, or without the factor, not
+ * blended */
+static void D3D9V_FN(views_alpha)(d3d9_video_t *d3d, unsigned alpha)
+{
+   if (!d3d->views.factor)
+      alpha = 255;
+   d3d->views.alpha = alpha;
+   if (alpha < 255)
+   {
+      IDirect3DDevice9_SetRenderState(d3d->dev, D3DRS_BLENDFACTOR,
+            D3DCOLOR_ARGB(alpha, alpha, alpha, alpha));
+      IDirect3DDevice9_SetRenderState(d3d->dev, D3DRS_SRCBLEND,
+            D3DBLEND_BLENDFACTOR);
+      IDirect3DDevice9_SetRenderState(d3d->dev, D3DRS_DESTBLEND,
+            D3DBLEND_INVBLENDFACTOR);
+   }
+   IDirect3DDevice9_SetRenderState(d3d->dev, D3DRS_ALPHABLENDENABLE,
+         alpha < 255);
+}
+
+/* @cut black at views_alpha's alpha, for a blank inset: cleared when
+ * solid, else a quad that leaves the factor's rest of what it covers.
+ * A preset's pass before it left its own viewport and shaders, and one
+ * after it is cut by its viewport alone. */
+static void D3D9V_FN(views_fill)(d3d9_video_t *d3d,
+      const struct d3d9_views_draw *d, const video_views_rect_t *cut)
+{
+   video_views_rect_t whole;
+   whole.pos  = 0;
+   whole.dims = d->dims;
+   D3D9V_FN(views_viewport)(d3d, d->dims);
+   D3D9V_FN(views_cut)(d3d, cut);
+   if (d3d->views.alpha >= 255)
+      IDirect3DDevice9_Clear(d3d->dev, 0, NULL, D3DCLEAR_TARGET, 0, 1.0f, 0);
+   else
+   {
+      float uv[4];
+      uv[0] = 0.0f;
+      uv[1] = 0.0f;
+      uv[2] = 0.0f;
+      uv[3] = 0.0f;
+      if (!d->direct)
+         IDirect3DDevice9_BeginScene(d3d->dev);
+      IDirect3DDevice9_SetVertexShader(d3d->dev, NULL);
+      D3D9V_PS_BIND(d3d, D3D9_VIEWS_PS_RECT);
+      D3D9V_FN(views_sample)(d3d, d->tex, d->filter);
+      IDirect3DDevice9_SetRenderState(d3d->dev, D3DRS_SRCBLEND,
+            D3DBLEND_ZERO);
+      D3D9V_FN(views_quad)(d3d, cut, uv, 0);
+      IDirect3DDevice9_SetRenderState(d3d->dev, D3DRS_SRCBLEND,
+            D3DBLEND_BLENDFACTOR);
+      if (!d->direct)
+         IDirect3DDevice9_EndScene(d3d->dev);
+   }
+   D3D9V_FN(views_cut)(d3d, &whole);
+}
+
 /* Draws the views into the back buffer, or with @blend into the canvas,
  * whose halves one pass then blends into the back buffer: with @direct
  * each straight from the frame, else through its chain. Leaves the
  * driver's shaders to be bound again. */
 static void D3D9V_FN(views_render)(d3d9_video_t *d3d,
-      const struct d3d9_views_draw *d, void **chains, bool blend,
+      struct d3d9_views_draw *d, void **chains, bool blend,
       bool direct)
 {
    video_views_rect_t whole;
@@ -377,6 +465,9 @@ static void D3D9V_FN(views_render)(d3d9_video_t *d3d,
    const video_views_layout_t *layout = &info->views_layout;
    unsigned dims = blend ? layout->canvas_dims : info->dims;
 
+   d->dims          = dims;
+   d->direct        = direct;
+   d3d->views.alpha = 255;
    IDirect3DDevice9_SetRenderState(d3d->dev, D3DRS_ALPHABLENDENABLE, FALSE);
    IDirect3DDevice9_SetRenderState(d3d->dev, D3DRS_ZENABLE, FALSE);
    IDirect3DDevice9_SetVertexShader(d3d->dev, NULL);

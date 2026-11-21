@@ -4724,6 +4724,7 @@ static bool d3d9_cg_frame(void *data, const void *frame,
    bool views                          = false;
    bool views_blend                    = false;
    bool views_direct                   = false;
+   bool views_fallback                 = false;
    bool views_ui                       = false;
 #endif
 
@@ -4774,7 +4775,7 @@ static bool d3d9_cg_frame(void *data, const void *frame,
    d3d->views.frame_dims = VIDEO_SCALE_PACK(frame_width, frame_height);
    views = d3d9_cg_views_setup(d3d, video_info, msg,
          d3d->menu && d3d->menu->enabled, &views_blend, &views_direct,
-         view_chains, view_rects);
+         &views_fallback, view_chains, view_rects);
    /* The viewport is the whole window while views draw. */
    if (views != d3d->views.active)
    {
@@ -4782,7 +4783,7 @@ static bool d3d9_cg_frame(void *data, const void *frame,
       d3d->should_resize = true;
    }
    retro_atomic_store_release_int(&d3d->views.fallback,
-         (video_info->views.num_views && !views) ? 1 : 0);
+         views_fallback ? 1 : 0);
    d3d9_cg_views_publish(d3d);
 #endif
 
