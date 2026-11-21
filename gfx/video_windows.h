@@ -547,14 +547,6 @@ typedef struct video_windows_frame
     * place, or made again for another monitor, mode or screens), and
     * is made again when its monitor goes or its named one comes back */
    bool monitors;
-   /* The main window's layout parameters, for a window's own */
-   float single_aspect;
-   unsigned stereo_mode;
-   unsigned screen_layout;
-   unsigned rotation;
-   bool stretch;
-   bool scale_integer;
-   bool swap_eyes;
 } video_windows_frame_t;
 
 /* Any thread; zero means the lifetime counter is exhausted. */
@@ -653,11 +645,6 @@ bool video_windows_blank_update(video_windows_blank_t *blank,
 /* A host that decides afresh on its next call */
 void video_windows_host_reset(video_windows_host_t *host);
 
-/* Screen @screen's own window at @dims, from a frame's snapshot: its
- * map with every other screen left out. */
-void video_driver_window_layout(const video_windows_frame_t *frame,
-      unsigned screen, unsigned dims, video_views_layout_t *out);
-
 /* App thread: closed and failed screens get their windows again, each
  * at its saved settings (a restore-windows action, a content change) */
 void video_driver_restore_windows(void);
@@ -705,10 +692,12 @@ const video_window_display_t *video_driver_borrow_window_displays(
 void video_driver_blank_unused_resend(void);
 #endif
 
-/* A window showing @screens, from @frame's snapshot at @dims: the map
- * with every screen outside @screens left out. Any thread. */
+/* A window showing @screens, from @frame's snapshot at @dims by
+ * @settings (its frame's, without the custom viewport): the map with
+ * every screen outside @screens left out. Any thread. */
 void video_driver_window_layout_screens(const video_windows_frame_t *frame,
-      unsigned screens, unsigned dims, video_views_layout_t *out);
+      const video_views_layout_settings_t *settings, unsigned screens,
+      unsigned dims, video_views_layout_t *out);
 
 /* Any thread: the screens in @screens go back to the main window until
  * the next retry. For a window the renderer could not make or keep, in

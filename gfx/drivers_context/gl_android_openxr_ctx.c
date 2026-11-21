@@ -119,8 +119,7 @@ typedef struct gl_android_openxr
    unsigned edit_seq;
    unsigned views_dims;
    unsigned rotation;
-   unsigned screen_layout;
-   bool swap_eyes;
+   video_views_layout_settings_t settings;
    /* An sRGB swapchain filled with GL_FRAMEBUFFER_SRGB_EXT off around
     * the copy (EXT_sRGB_write_control). */
    bool srgb_copy;
@@ -656,9 +655,9 @@ static void gl_xr_draw(gl_android_openxr_t *xr)
       p.width         = xr->width;
       p.px_per_rad    = openxr_frame_pixels_per_radian(&xr->frame);
       p.max_dim       = xr->rt.max_dim;
-      p.screen_layout = xr->screen_layout;
+      p.screen_layout = xr->settings.screen_layout;
       p.rotation      = xr->rotation;
-      p.swap_eyes     = xr->swap_eyes;
+      p.swap_eyes     = xr->settings.swap_eyes;
       p.window        = true;
    }
    /* With no width, an empty set: the eyes are all there is. */
@@ -747,7 +746,7 @@ void gl_android_openxr_set_placement(unsigned placement, float distance,
 
 void gl_android_openxr_set_views(const video_views_map_t *map,
       unsigned frame_dims, const video_viewport_t *vp, unsigned rotation,
-      unsigned screen_layout, bool swap_eyes,
+      const video_views_layout_settings_t *settings,
       const video_screen_xr_t *screens, unsigned edit_seq, bool editing)
 {
    gl_android_openxr_t *xr = &gl_xr;
@@ -761,8 +760,7 @@ void gl_android_openxr_set_views(const video_views_map_t *map,
    xr->views_dims          = frame_dims;
    xr->views_vp            = *vp;
    xr->rotation            = rotation;
-   xr->screen_layout       = screen_layout;
-   xr->swap_eyes           = swap_eyes;
+   xr->settings            = *settings;
 }
 
 void gl_android_openxr_set_pacing(unsigned interval, float hz)

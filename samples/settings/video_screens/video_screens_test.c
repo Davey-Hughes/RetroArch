@@ -1288,6 +1288,7 @@ static uint32_t window_test_flags;
 static unsigned window_test_frames;
 static const video_windows_frame_t *window_test_handed;
 static video_windows_frame_t window_test_seen;
+static video_views_layout_settings_t window_test_settings;
 /* The map and the placement count the driver was handed */
 static video_views_map_t window_test_seen_views;
 static unsigned window_test_seen_placed;
@@ -1316,6 +1317,7 @@ static bool window_test_frame(void *data, const void *frame, unsigned dims,
    window_test_handed = info->windows;
    if (info->windows)
       window_test_seen = *info->windows;
+   window_test_settings    = info->views_settings;
    window_test_seen_views  = info->views;
    window_test_seen_placed = info->views_layout.num_placements;
    window_test_seen_layout = info->views_layout;
@@ -1681,9 +1683,11 @@ static void test_window_menu_config(void)
 static void test_window_layout(void)
 {
    video_windows_frame_t frame;
+   video_views_layout_settings_t settings;
    video_views_layout_t layout;
    unsigned i;
    memset(&frame, 0, sizeof(frame));
+   memset(&settings, 0, sizeof(settings));
    /* Three 100x100 screens stacked, screen 2 a stereo pair with its
     * right eye first */
    for (i = 0; i < 3; i++)
@@ -1699,30 +1703,35 @@ static void test_window_layout(void)
    frame.core.num_views    = 4;
    frame.core.num_screens  = 3;
    frame.core_dims         = VIDEO_SCALE_PACK(200, 300);
-   video_driver_window_layout(&frame, 2, VIDEO_SCALE_PACK(300, 200), &layout);
+   video_driver_window_layout_screens(&frame, &settings, 4u,
+         VIDEO_SCALE_PACK(300, 200), &layout);
    CHECK(layout.num_placements == 1 && layout.placements[0].view == 2);
    CHECK(layout.placements[0].dst.dims == VIDEO_SCALE_PACK(200, 200));
    CHECK(layout.placements[0].dst.pos == VIDEO_POS_PACK(50, 0));
    /* One window for screens 1 and 2, stacked */
-   video_driver_window_layout_screens(&frame, 6u,
+   video_driver_window_layout_screens(&frame, &settings, 6u,
          VIDEO_SCALE_PACK(300, 200), &layout);
    CHECK(layout.num_placements == 2);
    CHECK(layout.placements[0].view == 3 && layout.placements[1].view == 2);
    CHECK(layout.placements[0].dst.pos == VIDEO_POS_PACK(100, 0));
    CHECK(layout.placements[1].dst.pos == VIDEO_POS_PACK(100, 100));
    CHECK(layout.placements[1].dst.dims == VIDEO_SCALE_PACK(100, 100));
-   frame.stretch = true;
-   video_driver_window_layout(&frame, 2, VIDEO_SCALE_PACK(300, 200), &layout);
+   settings.stretch = true;
+   video_driver_window_layout_screens(&frame, &settings, 4u,
+         VIDEO_SCALE_PACK(300, 200), &layout);
    CHECK(layout.placements[0].dst.dims == VIDEO_SCALE_PACK(300, 200));
-   frame.stretch     = false;
-   frame.stereo_mode = VIDEO_STEREO_MODE_SBS_FULL;
-   video_driver_window_layout(&frame, 1, VIDEO_SCALE_PACK(400, 200), &layout);
+   settings.stretch     = false;
+   settings.stereo_mode = VIDEO_STEREO_MODE_SBS_FULL;
+   video_driver_window_layout_screens(&frame, &settings, 2u,
+         VIDEO_SCALE_PACK(400, 200), &layout);
    CHECK(layout.num_placements == 2);
    CHECK(layout.placements[0].view == 3 && layout.placements[1].view == 1);
-   frame.swap_eyes = true;
-   video_driver_window_layout(&frame, 1, VIDEO_SCALE_PACK(400, 200), &layout);
+   settings.swap_eyes = true;
+   video_driver_window_layout_screens(&frame, &settings, 2u,
+         VIDEO_SCALE_PACK(400, 200), &layout);
    CHECK(layout.placements[0].view == 1 && layout.placements[1].view == 3);
-   video_driver_window_layout(&frame, 5, VIDEO_SCALE_PACK(400, 200), &layout);
+   video_driver_window_layout_screens(&frame, &settings, 32u,
+         VIDEO_SCALE_PACK(400, 200), &layout);
    CHECK(layout.num_placements == 0);
 }
 
@@ -1791,10 +1800,10 @@ static void test_window_frame(void)
    settings->bools.video_stereo_swap_eyes      = true;
    window_test_run();
    CHECK(window_test_placements() == 2);
-   CHECK(window_test_seen.scale_integer);
-   CHECK(window_test_seen.stretch);
-   CHECK(window_test_seen.stereo_mode == VIDEO_STEREO_MODE_TOP_BOTTOM);
-   CHECK(window_test_seen.swap_eyes);
+   CHECK(window_test_settings.scale_integer);
+   CHECK(window_test_settings.stretch);
+   CHECK(window_test_settings.stereo_mode == VIDEO_STEREO_MODE_TOP_BOTTOM);
+   CHECK(window_test_settings.swap_eyes);
    settings->bools.video_scale_integer         = false;
    settings->bools.video_force_aspect          = true;
    settings->uints.video_stereo_mode           = VIDEO_STEREO_MODE_2D;
@@ -1850,6 +1859,74 @@ static void test_window_frame(void)
    CHECK(video_st->windows_forced_attached == 0u);
    CHECK(video_st->windows_closed_attached == 0u);
    CHECK(video_st->windows_restore == restore + 1);
+}
+
+/* The frame carries the layout's settings by value: a screen's window
+ * lays out with the ones of the frame it draws */
+static void test_window_layout_frame_settings(void)
+{
+   settings_t *settings     = config_get_ptr();
+   unsigned aspect_idx      = settings->uints.video_aspect_ratio_idx;
+   unsigned screen_layout   = settings->uints.video_screen_layout;
+   unsigned dims            = VIDEO_SCALE_PACK(642, 480);
+   video_views_layout_settings_t first;
+   video_views_layout_t layout;
+   video_views_layout_t *lent;
+   const video_window_layout_t *published;
+   video_window_layouts_t *box;
+   window_test_begin();
+   settings->uints.video_aspect_ratio_idx = ASPECT_RATIO_CORE;
+   settings->uints.video_screen_layout    = VIDEO_SCREEN_LAYOUT_VERTICAL;
+   settings->bools.video_scale_integer    = true;
+   settings->bools.video_force_aspect     = true;
+   window_test_run();
+   CHECK(window_test_seen.plan.separate_mask == 2u);
+   CHECK(window_test_settings.screen_layout == VIDEO_SCREEN_LAYOUT_VERTICAL);
+   CHECK(window_test_settings.scale_integer);
+   first = window_test_settings;
+   /* Laid out and published as screen 1's renderer does */
+   lent = video_driver_lend_window_layout(1);
+   CHECK(lent != NULL);
+   video_driver_window_layout_screens(&window_test_seen,
+         &window_test_settings, window_test_seen.window_screens[1], dims,
+         lent);
+   video_driver_publish_window_layout(1, video_driver_window_generation(),
+         window_test_seen.display, lent, &window_test_seen.core,
+         window_test_seen.core_dims, dims);
+   box       = &video_state_get_ptr()->window_layouts[0];
+   CHECK(box->last != 0);
+   published = &box->slot[box->last - 1];
+   video_driver_window_layout_screens(&window_test_seen,
+         &window_test_settings, 0x2, dims, &layout);
+   CHECK(layout.num_placements == 1 && layout.placements[0].view == 1);
+   CHECK(layout.placements[0].dst.dims == VIDEO_SCALE_PACK(640, 320));
+   CHECK(layout.placements[0].dst.pos == VIDEO_POS_PACK(1, 80));
+   CHECK(published->layout.num_placements == 1);
+   CHECK(published->layout.placements[0].view == 1);
+   CHECK(published->layout.placements[0].dst.dims
+         == layout.placements[0].dst.dims);
+   CHECK(published->layout.placements[0].dst.pos
+         == layout.placements[0].dst.pos);
+
+   /* Settings changed between frames reach only the next one */
+   settings->uints.video_screen_layout = VIDEO_SCREEN_LAYOUT_HORIZONTAL;
+   settings->bools.video_scale_integer = false;
+   video_driver_window_layout_screens(&window_test_seen, &first, 0x2, dims,
+         &layout);
+   CHECK(layout.placements[0].dst.dims == VIDEO_SCALE_PACK(640, 320));
+   window_test_run();
+   CHECK(first.screen_layout == VIDEO_SCREEN_LAYOUT_VERTICAL);
+   CHECK(window_test_settings.screen_layout
+         == VIDEO_SCREEN_LAYOUT_HORIZONTAL);
+   CHECK(!window_test_settings.scale_integer);
+   video_driver_window_layout_screens(&window_test_seen,
+         &window_test_settings, 0x2, dims, &layout);
+   CHECK(layout.num_placements == 1);
+   CHECK(layout.placements[0].dst.dims == VIDEO_SCALE_PACK(642, 321));
+
+   settings->uints.video_aspect_ratio_idx = aspect_idx;
+   settings->uints.video_screen_layout    = screen_layout;
+   window_test_end();
 }
 
 /* Desktop monitors: each screen's window where its Display puts it,
@@ -1963,6 +2040,7 @@ static void window_test_draw_window(unsigned window, unsigned generation)
 {
    video_views_layout_t layout;
    video_driver_window_layout_screens(&window_test_seen,
+         &window_test_settings,
          window_test_seen.window_screens[window],
          VIDEO_SCALE_PACK(640, 480), &layout);
    video_driver_publish_window_layout(window, generation,
@@ -2122,11 +2200,11 @@ static void test_window_displays(void)
    CHECK(window_test_seen.retry == retry + 1);
    CHECK(window_test_seen.restore == restore);
    CHECK(window_test_placements() == 1);
-   video_driver_window_layout_screens(&window_test_seen, 2u,
-         VIDEO_SCALE_PACK(400, 200), &layout);
+   video_driver_window_layout_screens(&window_test_seen,
+         &window_test_settings, 2u, VIDEO_SCALE_PACK(400, 200), &layout);
    CHECK(layout.num_placements == 1 && layout.placements[0].view == 1);
-   video_driver_window_layout_screens(&window_test_seen, 3u,
-         VIDEO_SCALE_PACK(400, 200), &layout);
+   video_driver_window_layout_screens(&window_test_seen,
+         &window_test_settings, 3u, VIDEO_SCALE_PACK(400, 200), &layout);
    CHECK(layout.num_placements == 2);
    CHECK(window_test_displays(got, VIDEO_WINDOW_DISPLAYS_MAX)
          == 2);
@@ -2855,8 +2933,8 @@ static void test_window_moves(void)
    CHECK(video_st->windows_host.make == 2);
    CHECK(!video_st->windows_host.moving);
    /* It drew there: the move is asked once, and not kept for a redraw */
-   video_driver_window_layout_screens(&window_test_seen, 2u,
-         VIDEO_SCALE_PACK(1240, 1080), &layout);
+   video_driver_window_layout_screens(&window_test_seen,
+         &window_test_settings, 2u, VIDEO_SCALE_PACK(1240, 1080), &layout);
    video_driver_publish_window_layout(VIDEO_WINDOWS_PRESENTATION, 1, 2,
          &layout, &window_test_seen.core, window_test_seen.core_dims,
          VIDEO_SCALE_PACK(1240, 1080));
@@ -2915,6 +2993,7 @@ static void window_test_draw(unsigned generation)
 {
    video_views_layout_t layout;
    video_driver_window_layout_screens(&window_test_seen,
+         &window_test_settings,
          window_test_seen.window_screens[VIDEO_WINDOWS_PRESENTATION],
          VIDEO_SCALE_PACK(1240, 1080), &layout);
    video_driver_publish_window_layout(VIDEO_WINDOWS_PRESENTATION,
@@ -3126,8 +3205,8 @@ static void test_window_bounds_saved(void)
    CHECK(window_test_seen.window_screens[2] == 4u);
    CHECK(window_test_seen.settings[2].monitor == 2);
    gen = video_driver_window_generation();
-   video_driver_window_layout(&window_test_seen, 2,
-         VIDEO_SCALE_PACK(800, 480), &layout);
+   video_driver_window_layout_screens(&window_test_seen,
+         &window_test_settings, 4u, VIDEO_SCALE_PACK(800, 480), &layout);
    video_driver_publish_window_layout(2, gen, 2, &layout,
          &window_test_seen.core, window_test_seen.core_dims,
          VIDEO_SCALE_PACK(800, 480));
@@ -3617,8 +3696,8 @@ static void test_window_ui_targets(void)
    CHECK(video_st->windows_ui[VIDEO_WINDOW_UI_MENU].wait);
    /* Its window drew there: the menu lays out at its client size, and
     * the snapshot carries what the frame was laid out with */
-   video_driver_window_layout_screens(&window_test_seen, 0,
-         VIDEO_SCALE_PACK(1000, 900), &layout);
+   video_driver_window_layout_screens(&window_test_seen,
+         &window_test_settings, 0, VIDEO_SCALE_PACK(1000, 900), &layout);
    video_driver_publish_window_layout(VIDEO_WINDOWS_PRESENTATION, 7, 2,
          &layout, &window_test_seen.core, window_test_seen.core_dims,
          VIDEO_SCALE_PACK(1000, 900));
@@ -3704,8 +3783,8 @@ static void test_window_ui_wait_moved(void)
    window_test_run();
    CHECK(window_test_seen.display == 2);
    CHECK(video_st->windows_ui[VIDEO_WINDOW_UI_MENU].wait);
-   video_driver_window_layout_screens(&window_test_seen, 0,
-         VIDEO_SCALE_PACK(1000, 900), &layout);
+   video_driver_window_layout_screens(&window_test_seen,
+         &window_test_settings, 0, VIDEO_SCALE_PACK(1000, 900), &layout);
    video_driver_publish_window_layout(VIDEO_WINDOWS_PRESENTATION, 7, 2,
          &layout, &window_test_seen.core, window_test_seen.core_dims,
          VIDEO_SCALE_PACK(1000, 900));
@@ -3772,6 +3851,7 @@ static void test_window_pointer_mapping(void)
    const uint32_t oob = VIDEO_POS_PACK(-0x8000, -0x8000);
    settings_t *settings = config_get_ptr();
    video_windows_frame_t snap;
+   video_views_layout_settings_t layout_settings;
    struct retro_video_view v[3];
    struct video_viewport vp;
    uint32_t pos, main_pos, main_screen, win_pos;
@@ -3779,6 +3859,7 @@ static void test_window_pointer_mapping(void)
    unsigned saved_index[2];
 
    memset(&snap, 0, sizeof(snap));
+   memset(&layout_settings, 0, sizeof(layout_settings));
    memset(v, 0, sizeof(v));
    /* 3DS: the upper screen's eyes side by side, the lower one centred
     * under them, in an 800x480 frame */
@@ -3796,10 +3877,10 @@ static void test_window_pointer_mapping(void)
    snap.core_dims = VIDEO_SCALE_PACK(800, 480);
    /* The lower screen's window, 800x480 client pixels drawn at 1600x960
     * on a 2x display, and at 800x480 on a 1x one */
-   video_driver_window_layout(&snap, 1, VIDEO_SCALE_PACK(1600, 960),
-         &window_test_layouts[0]);
-   video_driver_window_layout(&snap, 1, VIDEO_SCALE_PACK(800, 480),
-         &window_test_layouts[1]);
+   video_driver_window_layout_screens(&snap, &layout_settings, 2u,
+         VIDEO_SCALE_PACK(1600, 960), &window_test_layouts[0]);
+   video_driver_window_layout_screens(&snap, &layout_settings, 2u,
+         VIDEO_SCALE_PACK(800, 480), &window_test_layouts[1]);
    CHECK(window_test_layouts[0].num_placements == 1);
    CHECK(window_test_layouts[0].placements[0].view == 2);
    window_test_map        = snap.core;
@@ -4022,8 +4103,8 @@ static void test_window_pointer_no_input(void)
       CHECK(video_driver_translate_window_point(0, 0, points[i][0],
                points[i][1], true, &before[i]));
    gen = video_driver_window_generation();
-   video_driver_window_layout(&window_test_seen, 1,
-         VIDEO_SCALE_PACK(800, 480), &layout);
+   video_driver_window_layout_screens(&window_test_seen,
+         &window_test_settings, 2u, VIDEO_SCALE_PACK(800, 480), &layout);
    CHECK(layout.num_placements == 1);
    video_driver_publish_window_layout(1, gen, 2, &layout,
          &window_test_seen.core, window_test_seen.core_dims,
@@ -4048,8 +4129,8 @@ static void test_window_pointer_no_input(void)
    window_test_run();
    CHECK(window_test_placements() == 1);
    CHECK(window_test_seen.core.no_input == 2u);
-   video_driver_window_layout(&window_test_seen, 1,
-         VIDEO_SCALE_PACK(800, 480), &layout);
+   video_driver_window_layout_screens(&window_test_seen,
+         &window_test_settings, 2u, VIDEO_SCALE_PACK(800, 480), &layout);
    CHECK(layout.num_placements == 1);
    video_driver_publish_window_layout(1, gen, 2, &layout,
          &window_test_seen.core, window_test_seen.core_dims,
@@ -5340,8 +5421,8 @@ static void test_window_turned(void)
    menu_st->flags |= MENU_ST_FLAG_ALIVE;
    window_test_run();
    CHECK(window_test_seen.display == 2);
-   video_driver_window_layout_screens(&window_test_seen, 0,
-         VIDEO_SCALE_PACK(1240, 1080), &layout);
+   video_driver_window_layout_screens(&window_test_seen,
+         &window_test_settings, 0, VIDEO_SCALE_PACK(1240, 1080), &layout);
    video_driver_publish_window_layout(VIDEO_WINDOWS_PRESENTATION, 7, 2,
          &layout, &window_test_seen.core, window_test_seen.core_dims,
          VIDEO_SCALE_PACK(1240, 1080));
@@ -5349,8 +5430,8 @@ static void test_window_turned(void)
    CHECK(video_driver_get_ui_layer_dims(VIDEO_WINDOW_UI_MENU)
          == VIDEO_SCALE_PACK(1240, 1080));
    /* Turned: the same window drawn at 1080x1240 */
-   video_driver_window_layout_screens(&window_test_seen, 0,
-         VIDEO_SCALE_PACK(1080, 1240), &layout);
+   video_driver_window_layout_screens(&window_test_seen,
+         &window_test_settings, 0, VIDEO_SCALE_PACK(1080, 1240), &layout);
    video_driver_publish_window_layout(VIDEO_WINDOWS_PRESENTATION, 7, 2,
          &layout, &window_test_seen.core, window_test_seen.core_dims,
          VIDEO_SCALE_PACK(1080, 1240));
@@ -5380,6 +5461,7 @@ static void test_window_turned_touch(void)
 {
    const uint32_t oob = VIDEO_POS_PACK(-0x8000, -0x8000);
    video_windows_frame_t snap;
+   video_views_layout_settings_t layout_settings;
    struct retro_video_view v[3];
    video_views_layout_t wide;
    video_views_layout_t tall;
@@ -5388,6 +5470,7 @@ static void test_window_turned_touch(void)
    unsigned gen;
    int x, y;
    memset(&snap, 0, sizeof(snap));
+   memset(&layout_settings, 0, sizeof(layout_settings));
    memset(v, 0, sizeof(v));
    /* The 3DS map of test_window_pointer_mapping(): the lower screen,
     * 320x240 at (240, 240) of an 800x480 frame */
@@ -5403,10 +5486,10 @@ static void test_window_turned_touch(void)
    v[2].screen = 1;
    CHECK(video_views_validate(v, 3, &snap.core));
    snap.core_dims = VIDEO_SCALE_PACK(800, 480);
-   video_driver_window_layout(&snap, 1, VIDEO_SCALE_PACK(1240, 1080),
-         &wide);
-   video_driver_window_layout(&snap, 1, VIDEO_SCALE_PACK(1080, 1240),
-         &tall);
+   video_driver_window_layout_screens(&snap, &layout_settings, 2u,
+         VIDEO_SCALE_PACK(1240, 1080), &wide);
+   video_driver_window_layout_screens(&snap, &layout_settings, 2u,
+         VIDEO_SCALE_PACK(1080, 1240), &tall);
    CHECK(wide.num_placements == 1 && tall.num_placements == 1);
    /* Above the tall layout's screen, on the wide one's */
    x = (int)VIDEO_SCALE_W(dst->dims) / 2;
@@ -5454,8 +5537,8 @@ static void test_window_turned_display(void)
    window_test_begin();
    video_driver_publish_window_displays(displays, 2);
    window_test_run();
-   video_driver_window_layout_screens(&window_test_seen, 2u,
-         VIDEO_SCALE_PACK(1240, 1080), &layout);
+   video_driver_window_layout_screens(&window_test_seen,
+         &window_test_settings, 2u, VIDEO_SCALE_PACK(1240, 1080), &layout);
    video_driver_publish_window_layout(VIDEO_WINDOWS_PRESENTATION, 1, 2,
          &layout, &window_test_seen.core, window_test_seen.core_dims,
          VIDEO_SCALE_PACK(1240, 1080));
@@ -10065,6 +10148,7 @@ int main(int argc, char **argv)
    }
    test_window_layout();
    test_window_frame();
+   test_window_layout_frame_settings();
    test_window_monitors_frame();
    test_window_fullscreen_hotkey();
    test_window_bounds_saved();

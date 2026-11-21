@@ -13391,8 +13391,8 @@ static VIDEO_NOINLINE void vulkan_windows_prepare(vk_t *vk,
 
       if (screens)
       {
-         video_driver_window_layout_screens(f, f->window_screens[w],
-               out->dims, win->layout);
+         video_driver_window_layout_screens(f, &video_info->views_settings,
+               f->window_screens[w], out->dims, win->layout);
          screens = vulkan_vv_pick_chains(vk, &vk->views.chains,
                &video_info->views, win->layout, window_stock,
                !win->layout->offscreen, out->dims, win->chains, rects);
@@ -14070,7 +14070,7 @@ static void vulkan_xr_plan(vk_t *vk, const video_frame_info_t *video_info,
    p.width         = video_info->headset_width;
    p.px_per_rad    = vulkan_openxr_pixels_per_radian(xr);
    p.max_dim       = vulkan_openxr_max_dim(xr);
-   p.screen_layout = video_info->screen_layout;
+   p.screen_layout = video_info->views_settings.screen_layout;
    p.rotation      = vk->rotation_raw;
    p.ui_dims       = ui_dims;
    p.swap_eyes     = video_info->stereo_swap_eyes;

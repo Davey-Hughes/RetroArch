@@ -6901,7 +6901,7 @@ static void gl3_xr_plan(gl3_t *gl, const video_frame_info_t *video_info,
    p.width         = video_info->headset_width;
    p.px_per_rad    = gl_openxr_pixels_per_radian(xr);
    p.max_dim       = gl_openxr_max_dim(xr);
-   p.screen_layout = video_info->screen_layout;
+   p.screen_layout = video_info->views_settings.screen_layout;
    p.rotation      = gl->rotation_raw;
    p.ui_dims       = ui_dims;
    p.swap_eyes     = video_info->stereo_swap_eyes;

@@ -5537,7 +5537,7 @@ static void gl2_desktop_xr_plan(gl2_t *gl,
       p.width         = video_info->headset_width;
       p.px_per_rad    = gl_openxr_pixels_per_radian(xr->host);
       p.max_dim       = gl_openxr_max_dim(xr->host);
-      p.screen_layout = video_info->screen_layout;
+      p.screen_layout = video_info->views_settings.screen_layout;
       p.rotation      = gl->rotation / 90;
       p.swap_eyes     = video_info->stereo_swap_eyes;
       p.window        = true;
@@ -7390,8 +7390,8 @@ static bool gl2_window_draw(gl2_t *gl,
       return false;
    if (screens)
    {
-      video_driver_window_layout_screens(f, f->window_screens[w], dims,
-            layout);
+      video_driver_window_layout_screens(f, &video_info->views_settings,
+            f->window_screens[w], dims, layout);
       blend = layout->offscreen
          && gl2_vv_target_ensure(gl, &win->canvas_target, &win->canvas,
                layout->canvas_dims);
@@ -8255,9 +8255,9 @@ static bool gl2_frame(void *data, const void *frame,
    gl_android_openxr_set_pacing(video_info->input_driver_nonblock_state
          ? 0 : video_info->headset_interval, video_info->headset_request_hz);
    gl_android_openxr_set_views(&video_info->views, dims, &xr_vp,
-         gl->rotation / 90, video_info->screen_layout,
-         video_info->stereo_swap_eyes, video_info->headset_screens,
-         video_info->headset_edit_seq, video_info->headset_editing);
+         gl->rotation / 90, &video_info->views_settings,
+         video_info->headset_screens, video_info->headset_edit_seq,
+         video_info->headset_editing);
    if (gl_android_openxr_active())
    {
       bool new_frame = (frame || movie_frame) && !video_info->frame_repeat;

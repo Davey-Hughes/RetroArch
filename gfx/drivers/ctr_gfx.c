@@ -1749,12 +1749,12 @@ static void ctr_views_quad(ctr_vertex_t *q, unsigned rotation,
 }
 
 /* The screens of @roots of @map and their insets laid out on a display
- * of size @dims, their left eye's quads into target @left and, unless
- * it is CTR_VIEWS_TARGETS, their right eye's into @right. @window: the
- * display the custom viewport is in. */
+ * of size @dims by @settings, their left eye's quads into target @left
+ * and, unless it is CTR_VIEWS_TARGETS, their right eye's into @right.
+ * @window: the display the custom viewport is in. */
 static void ctr_views_place(ctr_video_t *ctr, const video_views_map_t *map,
-      unsigned roots, unsigned dims, bool window,
-      unsigned left, unsigned right)
+      const video_views_layout_settings_t *settings, unsigned roots,
+      unsigned dims, bool window, unsigned left, unsigned right)
 {
    unsigned i, e;
    video_views_map_t sub;
@@ -1773,7 +1773,7 @@ static void ctr_views_place(ctr_video_t *ctr, const video_views_map_t *map,
                0, 0);
       return;
    }
-   video_driver_views_layout_flat(&sub, dims, window, &layout);
+   video_driver_views_layout_flat(&sub, settings, dims, window, &layout);
    if (left == CTR_VIEWS_BOTTOM)
       video_views_touch_publish(&ctr_views_touch_map, map, &layout, index,
             dims, ctr->views.frame_dims);
@@ -1848,7 +1848,8 @@ static bool ctr_views_setup(ctr_video_t *ctr,
  * shader state set: the bottom screen's, then the top screen's eyes,
  * leaving the top screen's scale and viewport as the frame's draw
  * does. */
-static void ctr_views_draw(ctr_video_t *ctr, const video_views_map_t *map)
+static void ctr_views_draw(ctr_video_t *ctr, const video_views_map_t *map,
+      const video_views_layout_settings_t *settings)
 {
    unsigned i, t;
    unsigned roots = video_views_roots(map);
@@ -1856,13 +1857,14 @@ static void ctr_views_draw(ctr_video_t *ctr, const video_views_map_t *map)
 
    for (t = 0; t < CTR_VIEWS_TARGETS; t++)
       ctr->views.count[t] = 0;
-   ctr_views_place(ctr, map, ctr->views.bottom ? (roots & 1u) : roots,
+   ctr_views_place(ctr, map, settings,
+         ctr->views.bottom ? (roots & 1u) : roots,
          VIDEO_SCALE_PACK(CTR_TOP_FRAMEBUFFER_WIDTH,
             CTR_TOP_FRAMEBUFFER_HEIGHT), true,
          CTR_VIEWS_TOP_LEFT,
          stereo ? CTR_VIEWS_TOP_RIGHT : CTR_VIEWS_TARGETS);
    if (ctr->views.bottom)
-      ctr_views_place(ctr, map, roots & ~1u,
+      ctr_views_place(ctr, map, settings, roots & ~1u,
             VIDEO_SCALE_PACK(CTR_BOTTOM_FRAMEBUFFER_WIDTH,
                CTR_BOTTOM_FRAMEBUFFER_HEIGHT), false,
             CTR_VIEWS_BOTTOM, CTR_VIEWS_TARGETS);
@@ -2503,7 +2505,7 @@ static bool ctr_frame(void* data, const void* frame,
    }
 
    if (views)
-      ctr_views_draw(ctr, &video_info->views);
+      ctr_views_draw(ctr, &video_info->views, &video_info->views_settings);
    else
    {
       GPU_SetViewport(NULL,

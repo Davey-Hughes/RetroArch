@@ -820,6 +820,7 @@ typedef struct video_frame_info
     * when the frame is drawn whole. */
    video_views_map_t views;
    video_views_layout_t views_layout;
+   video_views_layout_settings_t views_settings;
    /* The screens' own windows: NULL while they are off or the driver
     * has none. Owned by video_driver_state_t, or under the threaded
     * wrapper by the frame's slot. */
@@ -843,7 +844,6 @@ typedef struct video_frame_info
    unsigned headset_interval;
    /* The rate to ask the headset for, 0 for none. */
    float headset_request_hz;
-   unsigned screen_layout;
    bool stereo_swap_eyes;
    bool headset_menu_placed;
    /* An unplaced menu opens in front of screen 1, not at its spot. */
@@ -2738,12 +2738,13 @@ float video_driver_ui_display_aspect(void);
 /* Main thread: the layout the last frame presented a core's views
  * with, or NULL when it was drawn whole. */
 const video_views_layout_t *video_driver_get_views_layout(void);
-/* @map laid out flat into a display of size @dims by the user's
- * aspect, scaling and rotation settings, for a driver that places views
- * on displays of its own (GFX_CTX_FLAGS_VIDEO_VIEWS_OWN_EYES); @window:
- * the display the custom viewport is in. */
+/* @map laid out flat into a display of size @dims by @settings (the
+ * frame's), for a driver that places views on displays of its own
+ * (GFX_CTX_FLAGS_VIDEO_VIEWS_OWN_EYES); @window: the display the custom
+ * viewport is in. */
 void video_driver_views_layout_flat(const video_views_map_t *map,
-      unsigned dims, bool window, video_views_layout_t *out);
+      const video_views_layout_settings_t *settings, unsigned dims,
+      bool window, video_views_layout_t *out);
 #ifdef _3DS
 /* A bottom screen touch, -0x7fff to 0x7fff across it, to the core's
  * pointer in its packed frame, while it shows the core's screens;

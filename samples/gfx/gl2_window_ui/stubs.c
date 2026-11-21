@@ -113,8 +113,9 @@ unsigned video_driver_window_generation(void) { return 0; }
 int video_driver_get_screen_names(video_views_names_t *out)
 { memset(out, 0, sizeof(*out)); return 0; }
 void video_driver_window_layout_screens(const video_windows_frame_t *frame,
-      unsigned screens, unsigned dims, video_views_layout_t *out)
-{ (void)frame; (void)screens; (void)dims; (void)out; }
+      const video_views_layout_settings_t *settings, unsigned screens,
+      unsigned dims, video_views_layout_t *out)
+{ (void)frame; (void)settings; (void)screens; (void)dims; (void)out; }
 const char *video_shader_get_current_shader_preset(void) { return NULL; }
 enum rarch_shader_type video_shader_get_type_from_ext(const char *ext, bool *is_preset)
 { (void)ext; (void)is_preset; return RARCH_SHADER_NONE; }

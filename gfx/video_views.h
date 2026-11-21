@@ -360,6 +360,20 @@ typedef struct video_views_layout
    bool ui_per_eye;
 } video_views_layout_t;
 
+/* What the settings give every layout, filled once a frame on the main
+ * thread */
+typedef struct video_views_layout_settings
+{
+   video_views_rect_t custom_vp;   /* window pixels; dims 0: none */
+   float single_aspect;
+   unsigned stereo_mode;
+   unsigned screen_layout;
+   unsigned rotation;
+   bool stretch;
+   bool swap_eyes;
+   bool scale_integer;
+} video_views_layout_settings_t;
+
 typedef struct video_views_layout_params
 {
    const video_views_map_t *map;

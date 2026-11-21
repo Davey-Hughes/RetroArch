@@ -2065,10 +2065,11 @@ static void gx2_views_drc_free(wiiu_video_t *wiiu)
 }
 
 /* The screens of @roots of @map and their insets laid out on display
- * @d of size @dims, a quad each; published for touches when the GamePad
- * shows it (@touch) */
+ * @d of size @dims by @settings, a quad each; published for touches
+ * when the GamePad shows it (@touch) */
 static void gx2_views_place(wiiu_video_t *wiiu, const video_views_map_t *map,
-      unsigned roots, unsigned dims, unsigned d, bool touch)
+      const video_views_layout_settings_t *settings, unsigned roots,
+      unsigned dims, unsigned d, bool touch)
 {
    unsigned i;
    video_views_map_t sub;
@@ -2086,7 +2087,8 @@ static void gx2_views_place(wiiu_video_t *wiiu, const video_views_map_t *map,
       return;
    }
    /* The custom viewport is the TV's */
-   video_driver_views_layout_flat(&sub, dims, d == GX2_VIEWS_TV, &layout);
+   video_driver_views_layout_flat(&sub, settings, dims, d == GX2_VIEWS_TV,
+         &layout);
    for (i = 0; i < layout.num_placements
          && wiiu->views.count[d] < RETRO_VIDEO_VIEWS_MAX; i++)
    {
@@ -2777,11 +2779,12 @@ static bool gx2_frame(void *data, const void *frame,
             wiiu->color_buffer.surface.width,
             wiiu->color_buffer.surface.height);
       /* The GamePad's touches land on what it shows */
-      gx2_views_place(wiiu, map,
+      gx2_views_place(wiiu, map, &video_info->views_settings,
             wiiu->views.split ? (roots & 1u) : roots, tv_dims,
             GX2_VIEWS_TV, !wiiu->views.split);
       if (wiiu->views.split)
-         gx2_views_place(wiiu, map, roots & ~1u,
+         gx2_views_place(wiiu, map, &video_info->views_settings,
+               roots & ~1u,
                VIDEO_SCALE_PACK(GX2_VIEWS_DRC_WIDTH, GX2_VIEWS_DRC_HEIGHT),
                GX2_VIEWS_DRC, true);
    }
