@@ -5858,6 +5858,7 @@ struct gl2_views_draw
    GLuint target;
    unsigned target_height;
    unsigned frame_count;
+   bool fill; /* blank insets filled */
 };
 
 static void gl2_views_draw_direct(gl2_t *gl,
@@ -5865,9 +5866,27 @@ static void gl2_views_draw_direct(gl2_t *gl,
       const video_views_rect_t *dst, const video_views_rect_t *cut);
 static void gl2_views_draw_pass(gl2_t *gl, const struct gl2_views_draw *d,
       const video_views_rect_t *dst, const video_views_rect_t *cut);
+static void gl2_views_fill(gl2_t *gl, const struct gl2_views_draw *d,
+      const video_views_rect_t *cut, unsigned alpha);
 static bool gl2_views_target_make(gl2_t *gl, struct gl2_views_fbo *t,
       unsigned dims);
 static bool gl2_views_target_retire(gl2_t *gl, struct gl2_views_fbo *t);
+
+/* The draws that follow at @alpha, by a constant blend the shaders' own
+ * alpha takes no part in; at 255 not blended, with the func the
+ * overlay's blending assumes */
+static void gl2_views_alpha(unsigned alpha)
+{
+   if (alpha < 255)
+   {
+      glBlendColor(0.0f, 0.0f, 0.0f, (GLfloat)alpha / 255.0f);
+      glBlendFunc(GL_CONSTANT_ALPHA, GL_ONE_MINUS_CONSTANT_ALPHA);
+      glEnable(GL_BLEND);
+      return;
+   }
+   glDisable(GL_BLEND);
+   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+}
 
 /* The views compositor, with these calls bound in. A view's chain is
  * the driver: with a preset its passes are drawn for one view at a
@@ -5880,6 +5899,8 @@ static bool gl2_views_target_retire(gl2_t *gl, struct gl2_views_fbo *t);
 #define VV_DRAW                         struct gl2_views_draw
 #define VV_DIRECT(p, d, v, r, c)        gl2_views_draw_direct(p, d, v, r, c)
 #define VV_PASS(p, d, f, r, c, a)       gl2_views_draw_pass(p, d, r, c)
+#define VV_ALPHA(p, d, a)               gl2_views_alpha(a)
+#define VV_FILL(p, d, c, a)             gl2_views_fill(p, d, c, a)
 #define VV_TARGET                       struct gl2_views_fbo
 #define VV_TARGET_MAKE(drv, t, dims)    gl2_views_target_make(drv, t, dims)
 #define VV_TARGET_RETIRE(drv, t)        gl2_views_target_retire(drv, t)
@@ -6252,6 +6273,37 @@ static void gl2_views_draw_direct(gl2_t *gl,
             s0 + 0.5f / tw, MIN(t0, t1) + 0.5f / th,
             s1 - 0.5f / tw, MAX(t0, t1) - 0.5f / th);
    gl2_views_quad(gl, &gl->views.rect, &gl->mvp, coords);
+   glDisable(GL_SCISSOR_TEST);
+}
+
+/* @cut black at @alpha, for a blank inset: cleared when solid, else
+ * darkened under a quad whose colour the blend takes none of, at the
+ * constant gl2_views_alpha set */
+static void gl2_views_fill(gl2_t *gl, const struct gl2_views_draw *d,
+      const video_views_rect_t *cut, unsigned alpha)
+{
+   GLint sc[4];
+   if (!d->fill)
+      return;
+   if (d->target)
+      gl2_bind_fb(d->target);
+   else
+      gl2_renderchain_bind_backbuffer();
+   gl2_views_gl_rect(cut, d->target_height, sc);
+   glEnable(GL_SCISSOR_TEST);
+   glScissor(sc[0], sc[1], sc[2], sc[3]);
+   if (alpha >= 255)
+   {
+      glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+      glClear(GL_COLOR_BUFFER_BIT);
+   }
+   else
+   {
+      glViewport(sc[0], sc[1], sc[2], sc[3]);
+      glBlendFunc(GL_ZERO, GL_ONE_MINUS_CONSTANT_ALPHA);
+      gl2_views_quad(gl, &gl->views.rect, &gl->mvp_no_rot, tex_coords);
+      glBlendFunc(GL_CONSTANT_ALPHA, GL_ONE_MINUS_CONSTANT_ALPHA);
+   }
    glDisable(GL_SCISSOR_TEST);
 }
 
@@ -6700,13 +6752,14 @@ static void gl2_views_preset_view(gl2_t *gl,
 /* Whether this frame draws its views, with each drawn view's chain
  * picked and the rectangle its first placement takes; in *blend
  * whether they draw into the canvas, in *direct whether straight from
- * the frame, else through the preset. */
+ * the frame, else through the preset; in *fallback whether a map, sent
+ * or not, is drawn whole. */
 static bool gl2_views_setup(gl2_t *gl, const video_frame_info_t *video_info,
-      const void *frame, bool *blend, bool *direct, void **chains,
-      video_views_rect_t *rects)
+      const void *frame, bool *blend, bool *direct, bool *fallback,
+      void **chains, video_views_rect_t *rects)
 {
    unsigned i;
-   bool views;
+   bool views, whole;
    const video_views_layout_t *layout = &video_info->views_layout;
    bool offscreen = video_info->views.num_views && layout->offscreen;
    bool stock     = !video_info->shader_active || !gl->views.preset;
@@ -6723,10 +6776,10 @@ static bool gl2_views_setup(gl2_t *gl, const video_frame_info_t *video_info,
       gl2_vv_target_drop(gl, &gl->views.canvas_target, &gl->views.canvas);
    /* A preset that keeps frames from one draw to the next draws the
     * frame whole. */
-   views = video_info->views.num_views
-      && gl2_views_allowed(gl)
-      && (stock ? !(gl->flags & GL2_FLAG_FBO_INITED)
-                : gl2_views_preset_ok(gl))
+   whole = !gl2_views_allowed(gl)
+      || (stock ? (gl->flags & GL2_FLAG_FBO_INITED) != 0
+                : !gl2_views_preset_ok(gl));
+   views = video_info->views.num_views && !whole
       && video_views_fit_frame(&video_info->views, VIDEO_SCALE_PACK(
                (unsigned)gl->tex_info.input_size[0],
                (unsigned)gl->tex_info.input_size[1]));
@@ -6736,8 +6789,9 @@ static bool gl2_views_setup(gl2_t *gl, const video_frame_info_t *video_info,
       && gl2_vv_pick_chains(gl, &gl->views.chains, &video_info->views,
             layout, stock, *blend || !layout->offscreen,
             *blend ? layout->canvas_dims : video_info->dims, chains, rects);
-   *blend  = views && *blend;
-   *direct = views && stock;
+   *blend    = views && *blend;
+   *direct   = views && stock;
+   *fallback = video_info->views.num_views ? !views : whole;
    if (*direct && !gl->views.direct_seen)
    {
       gl->views.direct_seen = true;
@@ -6805,6 +6859,7 @@ static void gl2_views_render(gl2_t *gl,
    d.target        = blend ? canvas->fbo : 0;
    d.target_height = VIDEO_SCALE_H(target_dims);
    d.frame_count   = frame_count;
+   d.fill          = direct;
 
    if (blend)
       gl2_bind_fb(canvas->fbo);
@@ -6824,8 +6879,10 @@ static void gl2_views_render(gl2_t *gl,
    }
    else
    {
-      unsigned i, j;
+      unsigned i, j, k;
       void *one[RETRO_VIDEO_VIEWS_MAX];
+      unsigned started            = 0;
+      bool filled                 = false;
       struct video_tex_info frame = gl->tex_info;
       /* The copies a preset reading earlier frames keeps: the newest
        * and as many as it reads before it */
@@ -6834,10 +6891,31 @@ static void gl2_views_render(gl2_t *gl,
          && (gl->flags & GL2_FLAG_FBO_FEEDBACK_ENABLE);
       bool in_place  = gl2_views_in_place(gl, depth, sw);
       (void)in_place;
-      for (i = 0; i < video_info->views.num_views; i++)
+      /* In placement order: at a view's first placement its passes and
+       * its placements, at the first blank inset's every fill */
+      for (k = 0; k < layout->num_placements; k++)
       {
-         if (!chains[i])
+         const video_views_placement_t *p = &layout->placements[k];
+         i = p->view;
+         if (     (p->flags & (VIDEO_VIEWS_PLACEMENT_BLANK
+                     | VIDEO_VIEWS_PLACEMENT_INSET))
+               == (VIDEO_VIEWS_PLACEMENT_BLANK | VIDEO_VIEWS_PLACEMENT_INSET))
+         {
+            if (filled)
+               continue;
+            filled = true;
+            for (j = 0; j < RETRO_VIDEO_VIEWS_MAX; j++)
+               one[j] = NULL;
+            d.fill = true;
+            gl2_vv_draw_placements(gl, &d, layout, one,
+                  blend || !layout->offscreen, target_dims, false, blend);
+            d.fill = false;
             continue;
+         }
+         if (     i >= video_info->views.num_views || !chains[i]
+               || (started & (1u << i)))
+            continue;
+         started |= 1u << i;
          if (sw)
             gl2_views_write(gl, i, &video_info->views.views[i], depth,
                   sw, pitch, use_rgba);
@@ -7685,6 +7763,7 @@ static bool gl2_frame(void *data, const void *frame,
    bool views                          = false;
    bool views_blend                    = false;
    bool views_direct                   = false;
+   bool views_fallback                 = false;
    /* A software frame put off until the views are known */
    const void *views_sw                = NULL;
    bool views_ui                       = false;
@@ -7921,7 +8000,7 @@ static bool gl2_frame(void *data, const void *frame,
 #ifdef GL2_VIEWS
    gl->views.written = 0;
    views = gl2_views_setup(gl, video_info, frame, &views_blend,
-         &views_direct, view_chains, view_rects);
+         &views_direct, &views_fallback, view_chains, view_rects);
    /* Views through the preset have theirs written straight in; drawn
     * any other way the frame is written now. */
    if (views_sw && (!views || views_direct))
@@ -7944,7 +8023,7 @@ static bool gl2_frame(void *data, const void *frame,
       gl2_set_viewport(gl, VIDEO_SCALE_PACK(width, height), false, true);
    }
    retro_atomic_store_release_int(&gl->views.fallback,
-         (video_info->views.num_views && !views) ? 1 : 0);
+         views_fallback ? 1 : 0);
    gl2_views_publish(gl);
    if (views)
       gl2_views_render(gl, video_info, &video_info->views_layout,

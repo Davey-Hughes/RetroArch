@@ -694,6 +694,14 @@ SCREENS_XV_INTERLACED_CASE = (
     'screens-blank-late-interlaced', 'blank_late',
     SCREENS_BOTTOM_BLANK + [(400, 481, GREEN), (1200, 481, BLACK)],
     {'until': SCREENS_SWITCHED_RE, 'settings': {'video_stereo_mode': '5'}})
+# gl's preset draws one view's passes after another: Top (view 0), made
+# Bottom's inset by the user, must still go over it. An entry as above.
+SCREENS_GL_PRESET_CASE = (
+    'screens-user-over-preset', 'shown',
+    [(800, 480, YELLOW), (1280, 840, GREEN)],
+    {'files': {CORE_FILE: 'video_screen1_display = "over:2"\n'},
+     'args': ('--set-shader=' + os.path.join(HERE, 'pass.glslp'),),
+     'settings': {'video_shader_enable': 'true'}})
 # What the frontend makes of show, state, the user's setting and the
 # core's file: on SCREENS_DRIVERS. Each file a case starts with must be
 # the same after it. Entries as SCREENS_DRAW_CASES'.
@@ -2635,6 +2643,12 @@ def driver_jobs(retroarch, root, driver):
         errors = run_screens_show_case(retroarch, root, driver, case)
         return report('%s/%s' % (driver, case[0]), errors), bool(errors)
 
+    def screens_preset(case):
+        errors = run_screens_show_case(retroarch, root, driver, case)
+        if not direct_drawn(case_dir(root, driver, case[0]), PRESET_RE):
+            errors.append('views not drawn through the preset')
+        return report('%s/%s' % (driver, case[0]), errors), bool(errors)
+
     def screens_menu():
         errors = run_screens_menu_case(retroarch, root, driver)
         return report('%s/%s' % (driver, SCREENS_MENU_CASE[0]), errors), \
@@ -2689,6 +2703,8 @@ def driver_jobs(retroarch, root, driver):
              if wanted(c[0])]
     if driver == 'xvideo' and wanted(SCREENS_XV_INTERLACED_CASE[0]):
         jobs.append(lambda: screens_show(SCREENS_XV_INTERLACED_CASE))
+    if driver == 'gl' and wanted(SCREENS_GL_PRESET_CASE[0]):
+        jobs.append(lambda: screens_preset(SCREENS_GL_PRESET_CASE))
     jobs += [lambda c=c: screens_show(c)
              for c in (SCREENS_STATE_CASES if driver in SCREENS_DRIVERS
                        else []) if wanted(c[0])]

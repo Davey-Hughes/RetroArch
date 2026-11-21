@@ -168,7 +168,10 @@ static void test_views_written(void)
       vi.views.views[i].width  = 16;
       vi.views.views[i].height = 16;
       vi.views.views[i].screen = i;
+      layout.placements[i].view = i;
    }
+   /* Each view placed, in areas of no size: nothing is drawn */
+   layout.num_placements    = 2;
    frame.plan.separate_mask = 1u << 1;
    memset(main_chains, 0, sizeof(main_chains));
    memset(win_chains, 0, sizeof(win_chains));
@@ -242,7 +245,10 @@ static void test_views_in_place(void)
       vi.views.views[i].width  = 32;
       vi.views.views[i].height = 16;
       vi.views.views[i].screen = i;
+      layout.placements[i].view = i;
    }
+   /* Each view placed, in areas of no size: nothing is drawn */
+   layout.num_placements = 2;
    memset(chains, 0, sizeof(chains));
    memset(rects, 0, sizeof(rects));
    chains[0] = chains[1] = &chain;
