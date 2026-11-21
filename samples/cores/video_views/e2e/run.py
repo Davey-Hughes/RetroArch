@@ -648,9 +648,21 @@ SCREENS_TOP_ALONE = [(800, 480, GREEN), (1200, 480, GREEN),
                      (100, 480, BLACK)]
 SCREENS_NONE = [(400, 480, BLACK), (800, 480, BLACK), (1200, 480, BLACK)]
 # Screen 1 over screen 0's bottom right corner at a quarter of its
-# height (x 1120-1440, y 720-960), and blank there.
-SCREENS_INSET = [(800, 480, GREEN), (1000, 840, GREEN), (1280, 840, YELLOW)]
-SCREENS_INSET_BLANK = [(1000, 840, GREEN), (1280, 840, BLACK)]
+# height (x 1120-1440, y 720-960): points 20 pixels either side of its
+# edges, and its centre. Those in it take the colour it is drawn in.
+SCREENS_INSET_AROUND = [(800, 480, GREEN), (1000, 840, GREEN),
+                        (1100, 840, GREEN), (1280, 700, GREEN),
+                        (1460, 840, BLACK)]
+SCREENS_INSET_IN = [(1140, 840), (1280, 740), (1280, 840)]
+SCREENS_INSET = SCREENS_INSET_AROUND + [
+    (x, y, YELLOW) for x, y in SCREENS_INSET_IN]
+SCREENS_INSET_BLANK = SCREENS_INSET_AROUND + [
+    (x, y, BLACK) for x, y in SCREENS_INSET_IN]
+# At half opacity, over GREEN.
+SCREENS_INSET_HALF = SCREENS_INSET_AROUND + [
+    (x, y, (128, 255, 0)) for x, y in SCREENS_INSET_IN]
+SCREENS_INSET_BLANK_HALF = SCREENS_INSET_AROUND + [
+    (x, y, (0, 128, 0)) for x, y in SCREENS_INSET_IN]
 # Drivers that draw an inset at its opacity; the rest draw it solid.
 OPACITY_DRIVERS = ('gl', 'glcore', 'gl1', 'vulkan', 'd3d8', 'd3d9_hlsl',
                    'd3d10', 'd3d11', 'sdl', 'sdl2', 'sdl3')
@@ -671,12 +683,9 @@ SCREENS_DRAW_CASES = [
     ('screens-none-shown', 'none_shown', SCREENS_NONE, {}),
     ('screens-over', 'over', SCREENS_INSET, {}),
     ('screens-over-blank', 'over_blank', SCREENS_INSET_BLANK, {}),
-    # Half the inset's colour over GREEN.
-    ('screens-over-half', 'over_half',
-     SCREENS_INSET[:2] + [(1280, 840, (128, 255, 0))],
+    ('screens-over-half', 'over_half', SCREENS_INSET_HALF,
      {'solid': SCREENS_INSET}),
-    ('screens-over-blank-half', 'over_blank_half',
-     SCREENS_INSET_BLANK[:1] + [(1280, 840, (0, 128, 0))],
+    ('screens-over-blank-half', 'over_blank_half', SCREENS_INSET_BLANK_HALF,
      {'solid': SCREENS_INSET_BLANK}),
 ]
 # xvideo's interlaced path places and clears by itself: the late blank
