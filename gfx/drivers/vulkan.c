@@ -7554,7 +7554,6 @@ static void vulkan_views_free_chains(vk_t *vk, unsigned first, bool frame)
    }
    vk->xr.shrink_failed = false;
 #endif
-   vk->views.chains.stock_failed = false;
 }
 
 /* Whether the views' preset chains draw straight into the swapchain
@@ -7760,6 +7759,7 @@ static void vulkan_views_build_chains(vk_t *vk)
    unsigned i;
    struct vulkan_filter_chain_create_info info, view_info;
 
+   vk->views.chains.preset_failed = false;
    if (!*vk->views.preset)
       return;
    vulkan_views_chain_info(vk, &info);
@@ -7776,8 +7776,11 @@ static void vulkan_views_build_chains(vk_t *vk)
             ? GLSLANG_FILTER_CHAIN_LINEAR
             : GLSLANG_FILTER_CHAIN_NEAREST);
       if (!vk->views.chains.preset[i])
+      {
+         vk->views.chains.preset_failed = true;
          RARCH_ERR("[Vulkan] Failed to create view %u's preset: \"%s\".\n",
                i, vk->views.preset);
+      }
       else
          vulkan_views_hdr_semantics(vk,
                (vulkan_filter_chain_t*)vk->views.chains.preset[i]);
@@ -7814,6 +7817,7 @@ static void vulkan_views_set_preset(vk_t *vk, const char *path)
    strlcpy(vk->views.preset, path ? path : "", sizeof(vk->views.preset));
    vulkan_views_fp16_update(vk);
    vulkan_views_free_chains(vk, 0, true);
+   vk->views.chains.stock_failed = false;
    vulkan_views_build_chains(vk);
    for (i = 0; i < 2; i++)
    {
@@ -11481,6 +11485,24 @@ static void vulkan_apply_pending_resize(vk_t *vk,
 
 }
 
+static bool vulkan_views_stock(const vk_t *vk,
+      const video_frame_info_t *video_info)
+{
+   return !video_info->shader_active
+      || !vk->filter_chain
+      || vk->filter_chain == vk->filter_chain_default;
+}
+
+/* Without a map, whether one would be drawn whole: views not allowed,
+ * or the chains its views would take could not be made */
+static bool vulkan_views_whole(const vk_t *vk,
+      const video_frame_info_t *video_info)
+{
+   return !vulkan_views_allowed(vk)
+      || (vulkan_views_stock(vk, video_info)
+         ? vk->views.chains.stock_failed : vk->views.chains.preset_failed);
+}
+
 /* Each drawn view's chain, as pick_chains (video_views_draw.h), and in
  * *stock whether they are the stock chains. Preset chains come from
  * vulkan_views_build_chains() only. */
@@ -11490,9 +11512,7 @@ static bool vulkan_views_prepare(vk_t *vk,
 {
    unsigned i;
    bool drawable = vulkan_views_allowed(vk);
-   *stock = !video_info->shader_active
-      || !vk->filter_chain
-      || vk->filter_chain == vk->filter_chain_default;
+   *stock = vulkan_views_stock(vk, video_info);
 #ifdef VULKAN_HDR_SWAPCHAIN
    /* With HDR output, views drawn straight into the swapchain need
     * their preset chains, and FP16 needs the HDR game pass's buffer. */
@@ -15151,6 +15171,7 @@ static bool vulkan_frame(void *data, const void *frame,
    bool views_direct                             = false;
    bool views_stock                              = false;
    bool views_in_place                           = false;
+   bool views_held                               = false;
    bool views                                    = false;
    bool views_blend                              = false;
    bool views_per_eye                            = false;
@@ -15705,12 +15726,17 @@ static bool vulkan_frame(void *data, const void *frame,
       views_in_place = vulkan_hw_level_view(vk, chain);
    /* A hardware frame needs the core's image, and to be copied, in a
     * format a view image can take: vulkan_create_texture() widens
-    * R5G6B5. */
+    * R5G6B5. A frame without the image keeps the last answer. */
    if (     views && (vk->flags & VK_FLAG_HW_ENABLE)
-         && (!(vk->hw.image && vk->hw.image->create_info.image)
-            || (!views_direct && !views_in_place
-               && VK_REMAP_TO_TEXFMT(vk->hw.image->create_info.format)
-                  != vk->hw.image->create_info.format)))
+         && !(vk->hw.image && vk->hw.image->create_info.image))
+   {
+      views      = false;
+      views_held = true;
+   }
+   else if (views && (vk->flags & VK_FLAG_HW_ENABLE)
+         && !views_direct && !views_in_place
+         && VK_REMAP_TO_TEXFMT(vk->hw.image->create_info.format)
+            != vk->hw.image->create_info.format)
       views = false;
    /* The map was checked against the core's frame; threaded video can
     * crop it. A repeat drawn straight from the frame checks it again. */
@@ -15787,7 +15813,8 @@ static bool vulkan_frame(void *data, const void *frame,
                continue;
             }
 #endif
-            views = false;
+            views      = false;
+            views_held = true;
          }
    }
 #ifdef HAVE_OPENXR
@@ -15811,10 +15838,12 @@ static bool vulkan_frame(void *data, const void *frame,
    views_in_place   = views && views_in_place;
    views_blend      = views && views_blend;
    vk->views.active = views;
-   /* With no map: whether one would be drawn whole */
-   retro_atomic_store_release_int(&vk->views.fallback,
-         (video_info->views.num_views ? !views : !vulkan_views_allowed(vk))
-         ? 1 : 0);
+   /* With no map: whether one would be drawn whole. A repeat before its
+    * views were copied keeps the last answer. */
+   if (!views_held)
+      retro_atomic_store_release_int(&vk->views.fallback,
+            (video_info->views.num_views ? !views
+             : vulkan_views_whole(vk, video_info)) ? 1 : 0);
 #ifdef VULKAN_HDR_SWAPCHAIN
    /* Stock views straight from the frame draw into the swapchain,
     * encoded as they go, as the stock chain draws a frame; other views

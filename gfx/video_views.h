@@ -508,13 +508,16 @@ void video_views_blend_xrgb8888(const uint32_t *canvas,
 
 /* Per-view shader chains, the driver's, as video_views_draw.h's
  * pick_chains takes them: one set for the preset, one for the stock
- * shader. count is the views the driver last made room for. */
+ * shader. count is the views the driver last made room for. A chain
+ * that could not be made is remembered, with or without a map, until
+ * the preset changes. */
 typedef struct video_views_chains
 {
    void *preset[RETRO_VIDEO_VIEWS_MAX];
    void *stock[RETRO_VIDEO_VIEWS_MAX];
    unsigned count;
    bool stock_failed;
+   bool preset_failed;
 } video_views_chains_t;
 
 /* A render target the views draw into: the size it was made at, kept

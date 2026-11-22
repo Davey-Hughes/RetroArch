@@ -3328,7 +3328,6 @@ static void gl3_views_free_chains(gl3_t *gl, unsigned first, bool frame)
    gl->xr.stock_failed  = false;
    gl->xr.shrink_failed = false;
 #endif
-   set->stock_failed = false;
    gl->views.copy_failed  = 0;
 }
 
@@ -3352,10 +3351,10 @@ static void gl3_views_free_copies(gl3_t *gl, unsigned first)
 static void gl3_views_build_chains(gl3_t *gl)
 {
    unsigned i;
-   video_views_chains_t *set;
+   video_views_chains_t *set = &gl->views.chains;
+   set->preset_failed        = false;
    if (!*gl->views.preset)
       return;
-   set = &gl->views.chains;
    for (i = 0; i < set->count; i++)
    {
       if (set->preset[i])
@@ -3366,8 +3365,11 @@ static void gl3_views_build_chains(gl3_t *gl)
             ? GLSLANG_FILTER_CHAIN_LINEAR
             : GLSLANG_FILTER_CHAIN_NEAREST, true, false, false);
       if (!set->preset[i])
+      {
+         set->preset_failed = true;
          RARCH_ERR("[GLCore] Failed to create view %u's preset: \"%s\".\n",
                i, gl->views.preset);
+      }
    }
 #ifdef HAVE_GL3_XR
    /* With a headset, its own: one per view and one for the whole frame,
@@ -3397,6 +3399,7 @@ static void gl3_views_set_preset(gl3_t *gl, const char *path)
 {
    strlcpy(gl->views.preset, path ? path : "", sizeof(gl->views.preset));
    gl3_views_free_chains(gl, 0, true);
+   gl->views.chains.stock_failed = false;
    gl3_views_build_chains(gl);
    gl3_filter_chain_free(gl->media_shader_chain);
    gl->media_shader_chain = NULL;
@@ -6069,6 +6072,24 @@ static void gl3_views_sync_params(gl3_t *gl, gl3_filter_chain_t *fc)
                video_shader_param_get(&live->parameters[j]));
 }
 
+static bool gl3_views_stock(const gl3_t *gl,
+      const video_frame_info_t *video_info)
+{
+   return !video_info->shader_active
+      || !gl->filter_chain
+      || gl->filter_chain == gl->filter_chain_default;
+}
+
+/* Without a map, whether one would be drawn whole: views not allowed,
+ * or the chains its views would take could not be made */
+static bool gl3_views_whole(const gl3_t *gl,
+      const video_frame_info_t *video_info)
+{
+   return !gl3_views_allowed(gl)
+      || (gl3_views_stock(gl, video_info)
+         ? gl->views.chains.stock_failed : gl->views.chains.preset_failed);
+}
+
 /* Each drawn view's chain, as pick_chains (video_views_draw.h), and in
  * *stock whether they are the stock chains. Preset chains come from
  * gl3_views_build_chains() only. */
@@ -6077,9 +6098,7 @@ static bool gl3_views_prepare(gl3_t *gl,
       gl3_filter_chain_t **chains, video_views_rect_t *rects, bool *stock)
 {
    unsigned i;
-   *stock = !video_info->shader_active
-      || !gl->filter_chain
-      || gl->filter_chain == gl->filter_chain_default;
+   *stock = gl3_views_stock(gl, video_info);
    if (     gl3_views_allowed(gl)
          && gl3_vv_pick_chains(gl, &gl->views.chains, &video_info->views,
             &video_info->views_layout, *stock, all_areas, dims, chains,
@@ -6382,7 +6401,7 @@ static bool gl3_views_setup(gl3_t *gl, const video_frame_info_t *video_info,
       const void *frame, const struct gl3_filter_chain_texture *texture,
       unsigned dims, bool *blend, bool *direct, bool *in_place,
       gl3_filter_chain_t **chains, video_views_rect_t *rects,
-      unsigned xr_views, const void *sw, unsigned pitch)
+      unsigned xr_views, const void *sw, unsigned pitch, bool *held)
 {
    unsigned i;
    bool views;
@@ -6435,7 +6454,10 @@ static bool gl3_views_setup(gl3_t *gl, const video_frame_info_t *video_info,
       else
          for (i = 0; i < video_info->views.num_views; i++)
             if (chains[i] && !(gl->views.copied & (1u << i)))
+            {
                views = false;
+               *held = true;
+            }
    }
    /* A later repeat must not draw copies this frame outdates, and
     * views read in place keep none. */
@@ -7457,6 +7479,7 @@ static bool gl3_frame(void *data, const void *frame,
    bool views_blend                        = false;
    bool views_direct                       = false;
    bool views_in_place                     = false;
+   bool views_held                         = false;
    bool views_ui                           = false;
    bool views_ui_menu                      = false;
    unsigned ui_layer_dims                  = 0;
@@ -7818,7 +7841,7 @@ static bool gl3_frame(void *data, const void *frame,
 #else
          0,
 #endif
-         views_sw, pitch);
+         views_sw, pitch, &views_held);
    /* Views that would have been copied have theirs written straight
     * in; drawn any other way the frame is written now. */
    if (views_sw && !(views && !views_direct && !views_in_place))
@@ -7832,10 +7855,12 @@ static bool gl3_frame(void *data, const void *frame,
       gl->views.active = views;
       gl3_set_viewport(gl, video_info->dims, false, true);
    }
-   /* With no map: whether one would be drawn whole */
-   retro_atomic_store_release_int(&gl->views.fallback,
-         (video_info->views.num_views ? !views : !gl3_views_allowed(gl))
-         ? 1 : 0);
+   /* With no map: whether one would be drawn whole. A repeat before its
+    * views were copied keeps the last answer. */
+   if (!views_held)
+      retro_atomic_store_release_int(&gl->views.fallback,
+            (video_info->views.num_views ? !views
+             : gl3_views_whole(gl, video_info)) ? 1 : 0);
 #endif
 #ifdef HAVE_GL3_XR
    /* A view only the headset shows waits for a real frame, rather than

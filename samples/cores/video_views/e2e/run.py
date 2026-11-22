@@ -763,11 +763,16 @@ SCREENS_MENU_REF = ('screens-none-shown-menu-ref', 'none',
                     SCREENS_MENU_SETTINGS, [])
 # With no map set, SCREENS says whether one sent now would have its
 # views drawn: on SCREENS_DRIVERS, unset on the drivers that would draw
-# it whole. [(name, settings, those drivers)]
+# it whole. [(name, settings, those drivers, RetroArch's arguments)]
 SCREENS_STATUS_CASES = [
-    ('screens-status-no-map', {'video_stereo_mode': '0'}, ()),
+    ('screens-status-no-map', {'video_stereo_mode': '0'}, (), ()),
     ('screens-status-no-map-anaglyph', {'video_stereo_mode': '4'},
-     WHOLE_ANAGLYPH_DRIVERS),
+     WHOLE_ANAGLYPH_DRIVERS, ()),
+]
+# gl draws a map whole under a preset that mipmaps the frame.
+SCREENS_GL_STATUS_CASES = [
+    ('screens-status-no-map-mipmap', {'video_shader_enable': 'true'},
+     ('gl',), ('--set-shader=' + os.path.join(HERE, 'mipmap.glslp'),)),
 ]
 
 
@@ -1071,15 +1076,15 @@ def startup_stack(p, d):
             log.write(str(error) + '\n')
 
 
-def last_status(d):
-    """The last views status the core logged, or None."""
-    found = None
+def statuses(d):
+    """Every views status the core logged, in order."""
+    found = []
     for name in ('run.log', 'retroarch.log'):
         path = os.path.join(d, name)
         if os.path.exists(path):
             with open(path, errors='replace') as f:
-                for m in STATUS_RE.finditer(f.read()):
-                    found = tuple(int(g) for g in m.groups())
+                found += [tuple(int(g) for g in m.groups())
+                          for m in STATUS_RE.finditer(f.read())]
     return found
 
 
@@ -1092,6 +1097,12 @@ def wait_logged(p, d, line, timeout=20):
             time.sleep(SETTLE)
             return
         time.sleep(0.05)
+
+
+def last_status(d):
+    """The last views status the core logged, or None."""
+    found = statuses(d)
+    return found[-1] if found else None
 
 
 def wait_settled(p, d, want, timeout=20):
@@ -1123,8 +1134,9 @@ MISSING_DRIVER_RE = re.compile(r"Couldn't find any video driver named")
 
 
 def status_errors(d, driver, settings, screens=None):
-    """Check the last views status the core logged, and its SCREENS bit
-    when screens is given."""
+    """Check the last views status the core logged, and when screens is
+    given the SCREENS bit of every status it logged: one that went on
+    and off at load is wrong too."""
     found = last_status(d)
     if direct_drawn(d, MISSING_DRIVER_RE):
         return ['video driver "%s" is not in this build' % driver]
@@ -1135,9 +1147,10 @@ def status_errors(d, driver, settings, screens=None):
     if found[:2] != want:
         errors.append('status presents=%d stereo=%d, want presents=%d '
                       'stereo=%d' % (found[0], found[1], want[0], want[1]))
-    if screens is not None and found[3] != screens:
-        errors.append('status screens=%d, want screens=%d'
-                      % (found[3], screens))
+    seen = [s[3] for s in statuses(d)]
+    if screens is not None and any(s != screens for s in seen):
+        errors.append('status screens=%s, want screens=%d'
+                      % (','.join(str(s) for s in seen), screens))
     return errors
 
 
@@ -1684,7 +1697,7 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
     move; aimed, a list, gets for each move made how many light gun lines
     the core had logged before it. files, {path under the case directory:
     text}, are there when it starts. screens, given, is the SCREENS bit
-    the last status must have."""
+    every status must have."""
     name, mapopt, settings, points = case
     hdr = HDR and driver == 'vulkan'
     d = case_dir(root, driver, name, hw)
@@ -2690,9 +2703,9 @@ def driver_jobs(retroarch, root, driver):
         return report('%s/%s' % (driver, case[0]), errors), bool(errors)
 
     def screens_status(case):
-        name, settings, whole = case
+        name, settings, whole, args = case
         errors = run_case(retroarch, root, driver,
-                          (name, 'none', settings, []),
+                          (name, 'none', settings, []), args=args,
                           screens=0 if driver in whole else 1)
         return report('%s/%s' % (driver, name), errors), bool(errors)
 
@@ -2769,7 +2782,9 @@ def driver_jobs(retroarch, root, driver):
         jobs.append(screens_menu)
     jobs += [lambda c=c: screens_status(c)
              for c in (SCREENS_STATUS_CASES if driver in SCREENS_DRIVERS
-                       else []) if wanted(c[0])]
+                       else [])
+             + (SCREENS_GL_STATUS_CASES if driver == 'gl' else [])
+             if wanted(c[0])]
     return jobs
 
 

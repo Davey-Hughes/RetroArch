@@ -1391,6 +1391,8 @@ static void gl1_overlay_tex_geom(void *data,
 
 #ifdef GL1_VIEWS
 static void gl1_views_publish(gl1_t *gl1);
+static void gl1_views_init(gl1_t *gl1);
+static bool gl1_views_whole(const gl1_t *gl1, unsigned stereo, bool ui);
 #endif
 
 static void *gl1_init(const video_info_t *video)
@@ -1633,6 +1635,12 @@ static void *gl1_init(const video_info_t *video)
 
 #ifdef GL1_VIEWS
    gl1_views_publish(gl1);
+   /* Read before the first frame */
+   if (settings->uints.video_stereo_mode != VIDEO_STEREO_MODE_2D)
+      gl1_views_init(gl1);
+   retro_atomic_store_release_int(&gl1->views.fallback,
+         gl1_views_whole(gl1, settings->uints.video_stereo_mode, false)
+         ? 1 : 0);
 #endif
    return gl1;
 
@@ -2468,7 +2476,8 @@ static const char *gl1_views_blend_frag_src[] = {
 };
 
 /* The framebuffer objects, blending and program the canvas and the UI
- * layer take, found on first use: most sessions never draw views */
+ * layer take, found on first use or in a stereo mode: most sessions
+ * never draw views */
 static void gl1_views_init(gl1_t *gl1)
 {
    GLint status = 0;
@@ -2707,6 +2716,19 @@ static void gl1_views_fill(gl1_t *gl1, const struct gl1_views_draw *d,
    glDisable(GL_SCISSOR_TEST);
 }
 
+/* Without a map, whether one would be drawn whole: under scRGB, and
+ * once the GL is known to lack them, in anaglyph or interlaced without
+ * the canvas's blend and with @ui in each eye without the layer */
+static bool gl1_views_whole(const gl1_t *gl1, unsigned stereo, bool ui)
+{
+   return !gl1_views_allowed(gl1)
+      || (   gl1->views.tried
+          && (   (   !gl1->views.blend_prog
+                  && (   stereo == VIDEO_STEREO_MODE_ANAGLYPH
+                      || stereo == VIDEO_STEREO_MODE_INTERLACED))
+              || (!gl1->views.fbo && ui)));
+}
+
 /* Whether this frame draws its views, with each drawn view's chain
  * picked and the rectangle its first placement takes, in *blend
  * whether into the canvas, and in *fallback whether a map, sent or
@@ -2721,7 +2743,8 @@ static bool gl1_views_setup(gl1_t *gl1, video_frame_info_t *video_info,
    bool offscreen  = video_info->views.num_views && layout->offscreen;
    unsigned stereo = video_info->views_settings.stereo_mode;
 
-   if (video_info->views.num_views && !gl1->views.tried)
+   if (     (video_info->views.num_views || stereo != VIDEO_STEREO_MODE_2D)
+         && !gl1->views.tried)
       gl1_views_init(gl1);
    *blend = offscreen && gl1->views.blend_prog
       && gl1_vv_target_ensure(gl1, &gl1->views.canvas_target,
@@ -2745,12 +2768,15 @@ static bool gl1_views_setup(gl1_t *gl1, video_frame_info_t *video_info,
             layout, true, *blend || !layout->offscreen,
             *blend ? layout->canvas_dims : video_info->dims, chains, rects);
    *blend = views && *blend;
-   /* Without a map, what one would get: drawn whole under scRGB, and
-    * in anaglyph or interlaced once the canvas's blend is known missing */
-   whole  = !gl1_views_allowed(gl1)
-      || (   (   stereo == VIDEO_STEREO_MODE_ANAGLYPH
-              || stereo == VIDEO_STEREO_MODE_INTERLACED)
-          && gl1->views.tried && !gl1->views.blend_prog);
+   /* Without a map, what one would get */
+   ui = VIDEO_VIEWS_UI_WANTED(
+            stereo == VIDEO_STEREO_MODE_SBS_HALF
+         || stereo == VIDEO_STEREO_MODE_SBS_FULL
+         || stereo == VIDEO_STEREO_MODE_TOP_BOTTOM,
+         (gl1->flags & GL1_FLAG_MENU_TEXTURE_ENABLE), msg,
+         video_info->statistics_show,
+         video_info->widgets_visible);
+   whole  = gl1_views_whole(gl1, stereo, ui);
    *fallback = video_info->views.num_views ? !views : whole;
    if (views && !gl1->views.direct_seen)
    {

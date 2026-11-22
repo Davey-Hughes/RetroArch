@@ -6509,6 +6509,15 @@ static bool gl2_views_preset_ok(const gl2_t *gl)
          < GL2_VIEWS_HISTORY;
 }
 
+/* Whether a map, sent or not, is drawn whole: also under a preset that
+ * keeps frames from one draw to the next */
+static bool gl2_views_whole(const gl2_t *gl, bool stock)
+{
+   return !gl2_views_allowed(gl)
+      || (stock ? (gl->flags & GL2_FLAG_FBO_INITED) != 0
+                : !gl2_views_preset_ok(gl));
+}
+
 /* View i's copy just drawn, as the preset reads earlier frames: as the
  * frame's are, pushed every draw, dupes too */
 static void gl2_views_push_prev(gl2_t *gl, unsigned i)
@@ -6801,11 +6810,7 @@ static bool gl2_views_setup(gl2_t *gl, const video_frame_info_t *video_info,
    /* A real frame without the blend modes frees the canvas. */
    if (frame && !offscreen)
       gl2_vv_target_drop(gl, &gl->views.canvas_target, &gl->views.canvas);
-   /* A preset that keeps frames from one draw to the next draws the
-    * frame whole. */
-   whole = !gl2_views_allowed(gl)
-      || (stock ? (gl->flags & GL2_FLAG_FBO_INITED) != 0
-                : !gl2_views_preset_ok(gl));
+   whole = gl2_views_whole(gl, stock);
    views = video_info->views.num_views && !whole
       && video_views_fit_frame(&video_info->views, VIDEO_SCALE_PACK(
                (unsigned)gl->tex_info.input_size[0],
@@ -9700,8 +9705,10 @@ static void *gl2_init(const video_info_t *video)
       gl->desktop_xr->window_interval = interval;
 #endif
 #ifdef GL2_VIEWS
-   /* get_flags reads it before the first frame too */
+   /* get_flags reads them before the first frame too */
    gl2_views_publish(gl);
+   retro_atomic_store_release_int(&gl->views.fallback,
+         gl2_views_whole(gl, !gl->views.preset) ? 1 : 0);
 #ifdef HAVE_VIDEO_WINDOWS
    gl2_windows_take(gl);
 #endif
@@ -9956,6 +9963,10 @@ static bool gl2_set_shader(void *data,
    gl2_fbo_settings_latch(gl);
    gl2_renderchain_init(gl,
          (gl2_renderchain_data_t*)gl->renderchain_data);
+#ifdef GL2_VIEWS
+   retro_atomic_store_release_int(&gl->views.fallback,
+         gl2_views_whole(gl, !gl->views.preset) ? 1 : 0);
+#endif
 
    /* Apparently need to set viewport for passes when we aren't using FBOs. */
    gl2_set_shader_viewports(gl, video_scale_integer);

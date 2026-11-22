@@ -433,6 +433,12 @@ static void *sdl2_get_menu_framebuffer(void *data, bool rgb32,
    return vid->menu_lend.pixels;
 }
 
+#ifdef SDL2_VIEWS
+static void sdl2_views_init(sdl2_video_t *vid);
+static bool sdl2_views_whole(const sdl2_video_t *vid, unsigned stereo,
+      bool ui);
+#endif
+
 static void *sdl2_gfx_init(const video_info_t *video)
 {
    int i;
@@ -622,6 +628,12 @@ static void *sdl2_gfx_init(const video_info_t *video)
 #endif
 
 #ifdef SDL2_VIEWS
+   /* Read before the first frame */
+   if (settings->uints.video_stereo_mode != VIDEO_STEREO_MODE_2D)
+      sdl2_views_init(vid);
+   retro_atomic_store_release_int(&vid->views.fallback,
+         sdl2_views_whole(vid, settings->uints.video_stereo_mode, false)
+         ? 1 : 0);
    retro_atomic_store_release_int(&vid->views.allowed, 1);
 #endif
 
@@ -738,8 +750,8 @@ static bool sdl2_views_target_retire(sdl2_video_t *vid, SDL_Texture **t);
 #define VV_TARGET_RETIRE(drv, t)        sdl2_views_target_retire(drv, t)
 #include "../video_views_draw.h"
 
-/* Render targets and the premultiplied blend, found on first use: most
- * sessions never draw views */
+/* Render targets and the premultiplied blend, found on first use or in
+ * a stereo mode: most sessions never draw views */
 static void sdl2_views_init(sdl2_video_t *vid)
 {
    SDL_Texture *probe;
@@ -767,6 +779,19 @@ static void sdl2_views_init(sdl2_video_t *vid)
    if (!vid->views.layer)
       RARCH_LOG("[SDL2] Views drawn without the UI layer: the renderer "
             "blends no premultiplied colour.\n");
+}
+
+/* Without a map, whether one would be drawn whole: in anaglyph, and
+ * once the renderer is known to lack them, interlaced without targets
+ * and @ui in each eye without the layer */
+static bool sdl2_views_whole(const sdl2_video_t *vid, unsigned stereo,
+      bool ui)
+{
+   return stereo == VIDEO_STEREO_MODE_ANAGLYPH
+      || (   vid->views.tried
+          && (   (   !vid->views.targets
+                  && stereo == VIDEO_STEREO_MODE_INTERLACED)
+              || (!vid->views.layer && ui)));
 }
 
 static bool sdl2_views_target_retire(sdl2_video_t *vid, SDL_Texture **t)
@@ -876,7 +901,8 @@ static bool sdl2_views_setup(sdl2_video_t *vid,
    bool offscreen  = video_info->views.num_views && layout->offscreen;
    unsigned stereo = video_info->views_settings.stereo_mode;
 
-   if (video_info->views.num_views && !vid->views.tried)
+   if (     (video_info->views.num_views || stereo != VIDEO_STEREO_MODE_2D)
+         && !vid->views.tried)
       sdl2_views_init(vid);
    *blend = offscreen
       && layout->stereo_mode == VIDEO_STEREO_MODE_INTERLACED
@@ -902,9 +928,7 @@ static bool sdl2_views_setup(sdl2_video_t *vid,
             layout, true, *blend || !layout->offscreen,
             *blend ? layout->canvas_dims : video_info->dims, chains, rects);
    *blend = views && *blend;
-   /* Without a map, what one would get: drawn whole in anaglyph, and
-    * once the renderer is known to lack them, interlaced without
-    * targets and with UI in each eye without the layer */
+   /* Without a map, what one would get */
    per_eye = stereo == VIDEO_STEREO_MODE_SBS_HALF
       || stereo == VIDEO_STEREO_MODE_SBS_FULL
       || stereo == VIDEO_STEREO_MODE_TOP_BOTTOM;
@@ -915,11 +939,7 @@ static bool sdl2_views_setup(sdl2_video_t *vid,
    ui = ui || (per_eye
          && (video_info->menu_st_flags & MENU_ST_FLAG_ALIVE));
 #endif
-   whole = stereo == VIDEO_STEREO_MODE_ANAGLYPH
-      || (   vid->views.tried
-          && (   (   !vid->views.targets
-                  && stereo == VIDEO_STEREO_MODE_INTERLACED)
-              || (!vid->views.layer && ui)));
+   whole = sdl2_views_whole(vid, stereo, ui);
    *fallback = video_info->views.num_views ? !views : whole;
    if (views && !vid->views.direct_seen)
    {
