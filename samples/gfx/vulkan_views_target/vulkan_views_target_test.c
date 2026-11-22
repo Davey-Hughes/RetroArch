@@ -185,6 +185,9 @@ typedef struct
          unsigned index[2];
          bool drawn;
          bool released;
+         video_xr_slot_t plan;
+         video_xr_inset_t insets[RETRO_VIDEO_VIEWS_MAX];
+         unsigned num_insets;
       } slots[OPENXR_MAX_SLOTS];
       video_xr_quad_set_t set;
       unsigned ui_dims;
@@ -1591,6 +1594,41 @@ static void test_xr_draw_inset_repeat(void)
    CHECK(last_pass_w == 20 && last_pass_h == 10);
 }
 
+/* A repeat draws a slot again where its plan changed since it was last
+ * drawn - the screen or an inset gone blank - and nowhere else. */
+static void test_xr_draw_repeat_changed(void)
+{
+   vk_t vk;
+   test_context_t context;
+   test_chain_t chain;
+   vulkan_filter_chain_t *chains[RETRO_VIDEO_VIEWS_MAX];
+   unsigned dims = VIDEO_SCALE_PACK(64, 32);
+   memset(chains, 0, sizeof(chains));
+   chains[1] = XR_FRAME_CHAIN;
+   init(&vk, &context, &chain);
+   acquire_fails = 0;
+   xr_plan(dims, 2);
+   xr_plan_inset(1);
+   xr_draw_views(&vk, dims, true, chains);
+   xr_release(&vk);
+   offscreen_passes = viewport_passes = render_passes = frames_ended = 0;
+   planned.slots[1].blank = true;
+   xr_draw_views(&vk, dims, false, chains);
+   CHECK(!vk.xr.slots[0].drawn && vk.xr.slots[1].drawn);
+   CHECK(render_passes == 1 && replays == 0 && viewport_passes == 0);
+   CHECK(offscreen_passes == 0 && frames_ended == 0);
+   xr_release(&vk);
+   render_passes = 0;
+   xr_draw_views(&vk, dims, false, chains);
+   CHECK(!vk.xr.slots[0].drawn && !vk.xr.slots[1].drawn);
+   CHECK(render_passes == 0);
+   planned.insets[0].blank = true;
+   xr_draw_views(&vk, dims, false, chains);
+   CHECK(vk.xr.slots[0].drawn && !vk.xr.slots[1].drawn);
+   CHECK(render_passes == 1 && replays == 1 && fills == 1);
+   CHECK(frames_ended == 0 && slot_creates[0] == 1);
+}
+
 int main(void)
 {
    test_desktop_failure(false);
@@ -1617,6 +1655,7 @@ int main(void)
    test_xr_draw_inset();
    test_xr_draw_inset_stereo();
    test_xr_draw_inset_repeat();
-   printf("%u failed (24 Vulkan target cases)\n", failures);
+   test_xr_draw_repeat_changed();
+   printf("%u failed (25 Vulkan target cases)\n", failures);
    return failures ? 1 : 0;
 }

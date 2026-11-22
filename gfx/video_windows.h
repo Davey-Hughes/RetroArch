@@ -733,6 +733,11 @@ void video_driver_publish_window_layout(unsigned window,
  * for that window, bounds and focus included; NULL for no window. */
 video_views_layout_t *video_driver_lend_window_layout(unsigned window);
 
+/* As the publisher: window @window's layout as last published. Valid
+ * until any publish for that window; NULL for none or a cleared one. */
+const video_views_layout_t *video_driver_published_window_layout(
+      unsigned window);
+
 /* The context's thread: window @window, showing @screens, was left at
  * @dims, and at @pos where @moved, while made for edit count @edit;
  * latest wins. The main thread drops it after a later edit. */

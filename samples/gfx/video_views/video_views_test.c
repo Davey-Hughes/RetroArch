@@ -357,6 +357,34 @@ static void test_layout_screens(void)
    CHECK(l.num_placements == 0);
 }
 
+/* The same views in the same places with the same flags, whatever lies
+ * past the count; a blank screen, one left out or another size is
+ * another layout. */
+static void test_layout_same(void)
+{
+   video_views_map_t map;
+   video_views_layout_params_t p;
+   video_views_layout_t a, b;
+
+   map_ds(&map);
+   params_init(&p, &map, 1024, 768);
+   video_views_layout(&p, &a);
+   video_views_layout(&p, &b);
+   b.placements[2].flags = VIDEO_VIEWS_PLACEMENT_BLANK;
+   CHECK(video_views_layout_same(&a, &b));
+   map.blank = 1u << 1;
+   video_views_layout(&p, &b);
+   CHECK(!video_views_layout_same(&a, &b));
+   map.blank    = 0;
+   map.left_out = 1u << 1;
+   video_views_layout(&p, &b);
+   CHECK(!video_views_layout_same(&a, &b));
+   map.left_out = 0;
+   p.dims       = VIDEO_SCALE_PACK(1100, 800);
+   video_views_layout(&p, &b);
+   CHECK(!video_views_layout_same(&a, &b));
+}
+
 static void test_layout_stereo(void)
 {
    video_views_map_t map;
@@ -3949,6 +3977,7 @@ int main(void)
    test_cut_source();
    test_touch();
    test_layout_screens();
+   test_layout_same();
    test_layout_stereo();
    test_layout_one_screen();
    test_clip();

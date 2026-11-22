@@ -610,6 +610,10 @@ typedef struct vk
          unsigned index[2];
          bool drawn;      /* acquired and drawn; released after submit */
          bool released;   /* the runtime has had an image of it */
+         /* The plan its last image was drawn from, kept as it changes */
+         video_xr_slot_t plan;
+         video_xr_inset_t insets[RETRO_VIDEO_VIEWS_MAX];
+         unsigned num_insets;
       } slots[OPENXR_MAX_SLOTS];
       video_xr_quad_set_t set;
       math_matrix_4x4 mvp;
@@ -13430,7 +13434,7 @@ static VIDEO_NOINLINE void vulkan_windows_prepare(vk_t *vk,
    for (w = 1; w < RETRO_VIDEO_VIEWS_MAX; w++)
    {
       int state;
-      bool screens;
+      bool screens, laid;
       struct vk_window *win = &vk->windows.win[w];
       vulkan_output_t *out  = &win->output;
 
@@ -13456,11 +13460,21 @@ static VIDEO_NOINLINE void vulkan_windows_prepare(vk_t *vk,
             || !VIDEO_SCALE_W(win->native.dims)
             || !VIDEO_SCALE_H(win->native.dims))
          continue;
-      /* Views the main window draws whole are not drawn here either; a
-       * repeat keeps the last image unless the UI is drawn there */
-      screens = views && f->window_screens[w]
-         && (new_frame || f->window_ui[w]);
-      state   = vulkan_window_output(vk, win, video_info);
+      /* Views the main window draws whole are not drawn here either */
+      screens     = views && f->window_screens[w];
+      state       = vulkan_window_output(vk, win, video_info);
+      win->layout = video_driver_lend_window_layout(w);
+      /* A repeat keeps the last image unless the UI is drawn there or
+       * the screens are laid out otherwise than it was drawn */
+      laid        = state > 0 && screens && !new_frame && !f->window_ui[w];
+      if (laid)
+      {
+         const video_views_layout_t *drawn =
+            video_driver_published_window_layout(w);
+         video_driver_window_layout_screens(f, &video_info->views_settings,
+               f->window_screens[w], out->dims, win->layout);
+         screens = !drawn || !video_views_layout_same(win->layout, drawn);
+      }
       if (state > 0 && !screens && !f->window_ui[w])
          state = 0;
       /* Once a frame, not again from the BFI, sub-frame and swap
@@ -13479,7 +13493,6 @@ static VIDEO_NOINLINE void vulkan_windows_prepare(vk_t *vk,
       }
       /* No free image is no failure: its last image stays */
       win->flags |= VK_WINDOW_FLAG_UP;
-      win->layout = video_driver_lend_window_layout(w);
       if (!state)
       {
          if (screens && new_frame)
@@ -13495,8 +13508,10 @@ static VIDEO_NOINLINE void vulkan_windows_prepare(vk_t *vk,
 
       if (screens)
       {
-         video_driver_window_layout_screens(f, &video_info->views_settings,
-               f->window_screens[w], out->dims, win->layout);
+         if (!laid)
+            video_driver_window_layout_screens(f,
+                  &video_info->views_settings, f->window_screens[w],
+                  out->dims, win->layout);
          screens = vulkan_vv_pick_chains(vk, &vk->views.chains,
                &video_info->views, win->layout, window_stock,
                !win->layout->offscreen, out->dims, win->chains, rects);
@@ -14245,9 +14260,9 @@ static bool vulkan_xr_inset(const vk_t *vk, unsigned s, unsigned l,
  * frame's, straight into the runtime's acquired images; a blank
  * screen's are only cleared. Then the slot's insets, each through its
  * view's chain into its rect, or cleared there. A repeat - a screen
- * resized, made again or not yet shown while no new frame came -
- * replays the last frame's final pass at the image's size, so feedback
- * and history stay where that frame left them. */
+ * resized, made again, not yet shown or planned otherwise while no new
+ * frame came - replays the last frame's final pass at the image's size,
+ * so feedback and history stay where that frame left them. */
 static void vulkan_xr_draw_screen(vk_t *vk, unsigned s,
       vulkan_filter_chain_t **xr_chains, vulkan_filter_chain_t *xr_frame,
       bool new_frame)
@@ -14526,8 +14541,42 @@ static void vulkan_xr_draw_projection(vk_t *vk,
    vk->xr.slots[s].drawn = true;
 }
 
+/* Whether slot s's plan, its fields and its insets, is the one its last
+ * image was drawn from */
+static bool vulkan_xr_same(const vk_t *vk, unsigned s)
+{
+   unsigned i;
+   unsigned n                     = 0;
+   const video_xr_quad_set_t *set = &vk->xr.set;
+   if (memcmp(&set->slots[s], &vk->xr.slots[s].plan, sizeof(set->slots[s])))
+      return false;
+   for (i = 0; i < set->num_insets; i++)
+      if (set->insets[i].slot == s)
+      {
+         if (     n >= vk->xr.slots[s].num_insets
+               || memcmp(&set->insets[i], &vk->xr.slots[s].insets[n],
+                  sizeof(set->insets[i])))
+            return false;
+         n++;
+      }
+   return n == vk->xr.slots[s].num_insets;
+}
+
+static void vulkan_xr_keep(vk_t *vk, unsigned s)
+{
+   unsigned i;
+   const video_xr_quad_set_t *set = &vk->xr.set;
+   memcpy(&vk->xr.slots[s].plan, &set->slots[s], sizeof(set->slots[s]));
+   vk->xr.slots[s].num_insets = 0;
+   for (i = 0; i < set->num_insets; i++)
+      if (set->insets[i].slot == s)
+         memcpy(&vk->xr.slots[s].insets[vk->xr.slots[s].num_insets++],
+               &set->insets[i], sizeof(set->insets[i]));
+}
+
 /* Draws this frame into the headset's slots, outside any render pass:
- * screens when a core frame arrived, the UI when this frame drew any.
+ * screens when a core frame arrived or their plan changed, the UI when
+ * this frame drew any.
  * xr_shrink, if set, draws a whole frame larger than its image; eyes:
  * the map's tracked eyes go to the projection. */
 static void vulkan_xr_draw(vk_t *vk, const video_frame_info_t *video_info,
@@ -14550,7 +14599,7 @@ static void vulkan_xr_draw(vk_t *vk, const video_frame_info_t *video_info,
       xr_frame = xr_shrink;
    for (s = 0; s < VIDEO_XR_MAX_SLOTS; s++)
    {
-      bool ok;
+      bool ok, same;
       vk->xr.slots[s].drawn = false;
       /* A menu that comes back must not show the last one's image. */
       if (     s == VIDEO_XR_MENU_SLOT && !vk->xr.set.slots[s].dims
@@ -14570,9 +14619,10 @@ static void vulkan_xr_draw(vk_t *vk, const video_frame_info_t *video_info,
             omit |= 1u << s;
          continue;
       }
-      /* A swapchain made again for a new size is not released. */
-      if (     s != VIDEO_XR_MENU_SLOT && !new_frame
-            && vk->xr.slots[s].released)
+      same = s != VIDEO_XR_MENU_SLOT && vulkan_xr_same(vk, s);
+      /* A swapchain made again for a new size is not released, and a
+       * plan that changed is drawn again. */
+      if (!new_frame && vk->xr.slots[s].released && same)
          continue;
       if (s == VIDEO_XR_MENU_SLOT && !window_drawn)
          continue;
@@ -14591,7 +14641,12 @@ static void vulkan_xr_draw(vk_t *vk, const video_frame_info_t *video_info,
       if (s == VIDEO_XR_MENU_SLOT)
          vulkan_xr_copy_ui(vk, s, ui_dims);
       else
+      {
          vulkan_xr_draw_screen(vk, s, xr_chains, xr_frame, new_frame);
+         /* Copied only when it changes: a frame costs the compare */
+         if (!same)
+            vulkan_xr_keep(vk, s);
+      }
       vk->xr.slots[s].drawn = true;
    }
    for (s = 0, q = 0; q < vk->xr.set.num_quads; q++)

@@ -4208,6 +4208,16 @@ def check_screens_mode(blank):
     return check
 
 
+def check_screens_null(check):
+    """check, for a core that switched its screens on a refresh with NULL
+    data and only repeated after: the last snapshot is seconds later."""
+    def run(res):
+        if '[video_views] screens switched' not in res.log:
+            return ['the core never switched its screens']
+        return check(res)
+    return run
+
+
 # Screen 1 over screen 0's bottom right corner at a quarter of its
 # height: screen 0's image from 0.75 on, both ways. Points either side of
 # its edges, and its centre.
@@ -4291,6 +4301,11 @@ SCREENS_CASES = [
     {'name': 'screens-blank', 'map': 'ds',
      'options': {'video_views_test_screens': 'blank'}, 'steps': SETTLE,
      'check': check_screens_mode(True)},
+    # Screen 1 sent BLANK on a refresh with NULL data: its slot is drawn
+    # again, black, with no frame.
+    {'name': 'screens-blank-null', 'map': 'ds',
+     'options': {'video_views_test_screens': 'blank_null'}, 'steps': SETTLE,
+     'check': check_screens_null(check_screens_mode(True))},
     {'name': 'screens-over', 'map': 'ds',
      'options': {'video_views_test_screens': 'over'}, 'steps': SETTLE,
      'check': check_screens_over(False)},

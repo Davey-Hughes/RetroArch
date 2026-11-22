@@ -787,6 +787,21 @@ void video_views_layout(const video_views_layout_params_t *p,
    }
 }
 
+bool video_views_layout_same(const video_views_layout_t *a,
+      const video_views_layout_t *b)
+{
+   return a->num_placements == b->num_placements
+      && a->num_areas       == b->num_areas
+      && a->canvas_dims     == b->canvas_dims
+      && a->ui_dims         == b->ui_dims
+      && a->stereo_mode     == b->stereo_mode
+      && a->offscreen       == b->offscreen
+      && a->ui_per_eye      == b->ui_per_eye
+      && !memcmp(a->placements, b->placements,
+            a->num_placements * sizeof(a->placements[0]))
+      && !memcmp(a->areas, b->areas, a->num_areas * sizeof(a->areas[0]));
+}
+
 void video_views_touch_publish(video_views_touch_t *t,
       const video_views_map_t *map, const video_views_layout_t *layout,
       const unsigned *index, unsigned dims, unsigned frame_dims)

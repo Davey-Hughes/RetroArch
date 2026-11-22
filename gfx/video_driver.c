@@ -1226,6 +1226,20 @@ video_views_layout_t *video_driver_lend_window_layout(unsigned window)
    return &box->slot[box->next].layout;
 }
 
+const video_views_layout_t *video_driver_published_window_layout(
+      unsigned window)
+{
+   video_window_layouts_t *box;
+   const video_window_layout_t *slot;
+   if (!window || window >= RETRO_VIDEO_VIEWS_MAX)
+      return NULL;
+   box = &video_driver_st.window_layouts[window - 1];
+   if (!box->last)
+      return NULL;
+   slot = &box->slot[box->last - 1];
+   return slot->generation ? &slot->layout : NULL;
+}
+
 /* The publisher's bounds and focus with the last layout, so input keeps
  * mapping it */
 static void video_window_layout_republish(video_window_layouts_t *box)

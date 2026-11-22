@@ -1912,6 +1912,13 @@ static void test_window_layout_frame_settings(void)
          == layout.placements[0].dst.dims);
    CHECK(published->layout.placements[0].dst.pos
          == layout.placements[0].dst.pos);
+   /* As the publisher sees it, also once a focus change republishes */
+   CHECK(video_driver_published_window_layout(1) == &published->layout);
+   CHECK(video_views_layout_same(&published->layout, &layout));
+   video_driver_publish_window_focus(1, 0, false);
+   CHECK(video_driver_published_window_layout(1) != &published->layout);
+   CHECK(video_views_layout_same(video_driver_published_window_layout(1),
+         &layout));
 
    /* Settings changed between frames reach only the next one */
    settings->uints.video_screen_layout = VIDEO_SCREEN_LAYOUT_HORIZONTAL;
@@ -1928,6 +1935,8 @@ static void test_window_layout_frame_settings(void)
          &window_test_settings, 0x2, dims, &layout);
    CHECK(layout.num_placements == 1);
    CHECK(layout.placements[0].dst.dims == VIDEO_SCALE_PACK(642, 321));
+   video_driver_publish_window_layout(1, 0, 0, NULL, NULL, 0, 0);
+   CHECK(!video_driver_published_window_layout(1));
 
    settings->uints.video_aspect_ratio_idx = aspect_idx;
    settings->uints.video_screen_layout    = screen_layout;

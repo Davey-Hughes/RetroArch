@@ -395,6 +395,11 @@ typedef struct video_views_layout_params
 void video_views_layout(const video_views_layout_params_t *params,
       video_views_layout_t *out);
 
+/* Whether @a and @b draw the same views in the same places with the
+ * same flags. */
+bool video_views_layout_same(const video_views_layout_t *a,
+      const video_views_layout_t *b);
+
 /* Screens below num_screens with a place of their own: not viewless,
  * left out or an inset. */
 unsigned video_views_roots(const video_views_map_t *map);
