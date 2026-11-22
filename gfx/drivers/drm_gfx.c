@@ -2256,10 +2256,10 @@ static bool drm_views_frame(struct drm_video *v, const void *frame,
    bool views = info && frame && info->views.num_views
       && video_views_fit_frame(&info->views, dims);
 
-   retro_atomic_store_release_int(&v->views_fallback,
-         (info && info->views.num_views && !views) ? 1 : 0);
    if (!views)
    {
+      retro_atomic_store_release_int(&v->views_fallback,
+            (info && info->views.num_views) ? 1 : 0);
       if (v->views_surface)
       {
          /* The plane goes back to the frame before the surface goes */
@@ -2283,13 +2283,13 @@ static bool drm_views_frame(struct drm_video *v, const void *frame,
                3, 0, &v->views_surface))
       {
          v->views_surface = old;
-         return false;
+         goto whole;
       }
       if (!v->menu_active && !drm_plane_setup(v->views_surface))
       {
          drm_surface_free(v, &v->views_surface);
          v->views_surface = old;
-         return false;
+         goto whole;
       }
       drm_surface_free(v, &old);
    }
@@ -2300,11 +2300,12 @@ static bool drm_views_frame(struct drm_video *v, const void *frame,
       {
          uint32_t *grown = (uint32_t*)realloc(v->views_canvas, size);
          if (!grown)
-            return false;
+            goto whole;
          v->views_canvas      = grown;
          v->views_canvas_size = size;
       }
    }
+   retro_atomic_store_release_int(&v->views_fallback, 0);
    if (!v->views_seen)
    {
       v->views_seen = true;
@@ -2333,6 +2334,11 @@ static bool drm_views_frame(struct drm_video *v, const void *frame,
    if (!v->menu_active)
       drm_page_flip(v->views_surface);
    return true;
+
+whole:
+   /* The surface or the canvas could not be had */
+   retro_atomic_store_release_int(&v->views_fallback, 1);
+   return false;
 }
 
 static bool drm_frame(void *data, const void *frame,

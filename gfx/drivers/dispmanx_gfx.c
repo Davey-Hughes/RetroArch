@@ -1418,10 +1418,10 @@ static bool dispmanx_views_frame(struct dispmanx_video *_dispvars,
    bool views = info && frame && info->views.num_views
       && video_views_fit_frame(&info->views, dims);
 
-   retro_atomic_store_release_int(&_dispvars->views_fallback,
-         (info && info->views.num_views && !views) ? 1 : 0);
    if (!views)
    {
+      retro_atomic_store_release_int(&_dispvars->views_fallback,
+            (info && info->views.num_views) ? 1 : 0);
       if (_dispvars->views_surface)
       {
          dispmanx_surface_free(_dispvars, &_dispvars->views_surface);
@@ -1454,18 +1454,19 @@ static bool dispmanx_views_frame(struct dispmanx_video *_dispvars,
             VC_IMAGE_XRGB8888, &alpha, 0, DISPMANX_NO_ROTATE, &vp,
             info->max_swapchain_images, 0, &_dispvars->views_surface);
       if (!_dispvars->views_surface)
-         return false;
+         goto whole;
       _dispvars->views_dims = cdims;
    }
    if (!dispmanx_views_grow(&_dispvars->views_pixels,
             &_dispvars->views_pixels_size,
             (size_t)cpitch * VIDEO_SCALE_H(cdims)))
-      return false;
+      goto whole;
    if (     layout->offscreen
          && !dispmanx_views_grow(&_dispvars->views_canvas,
             &_dispvars->views_canvas_size,
             (size_t)2 * VIDEO_SCALE_AREA(cdims) * sizeof(uint32_t)))
-      return false;
+      goto whole;
+   retro_atomic_store_release_int(&_dispvars->views_fallback, 0);
    if (!_dispvars->views_seen)
    {
       _dispvars->views_seen = true;
@@ -1483,6 +1484,11 @@ static bool dispmanx_views_frame(struct dispmanx_video *_dispvars,
    dispmanx_surface_update(_dispvars, _dispvars->views_pixels, cpitch,
          _dispvars->views_surface);
    return true;
+
+whole:
+   /* The surface or a buffer could not be had */
+   retro_atomic_store_release_int(&_dispvars->views_fallback, 1);
+   return false;
 }
 
 static bool dispmanx_frame(void *data, const void *frame,

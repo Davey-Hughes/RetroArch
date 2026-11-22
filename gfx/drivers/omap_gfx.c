@@ -811,7 +811,8 @@ typedef struct omap_video
    /* Both eyes side by side, for anaglyph and interlaced */
    uint32_t *views_canvas;
    size_t views_canvas_size;
-   /* For get_flags: the last frame with a map was drawn whole */
+   /* For get_flags: a map is drawn whole: the last frame's, or with
+    * none what one would get */
    retro_atomic_int_t views_fallback;
    bool views_seen;
    bool views_on;
@@ -1049,6 +1050,7 @@ static bool omap_views_dims(omap_video_t *vid, const void *frame,
       float *scale, unsigned *cdims)
 {
    omapfb_data_t *omap = vid->omap;
+   bool whole          = false;
    bool views          = info && frame && info->views.num_views
       && video_views_fit_frame(&info->views, dims);
 
@@ -1076,8 +1078,16 @@ static bool omap_views_dims(omap_video_t *vid, const void *frame,
                (size_t)2 * VIDEO_SCALE_AREA(*cdims) * sizeof(uint32_t)))
          views    = false;
    }
+   else if (info && !info->views.num_views
+         && info->views_settings.stereo_mode == VIDEO_STEREO_MODE_INTERLACED)
+      /* Without a map: interlaced is composed at the screen's size,
+       * which the plane's memory may not hold */
+      whole = VIDEO_SCALE_W(info->dims) <= 4
+         || VIDEO_SCALE_H(info->dims) <= 4
+         || (double)VIDEO_SCALE_AREA(info->dims) * omap->bpp
+            * omap->num_pages > omap->current_state->mi.size;
    retro_atomic_store_release_int(&vid->views_fallback,
-         (info && info->views.num_views && !views) ? 1 : 0);
+         (info && (info->views.num_views ? !views : whole)) ? 1 : 0);
    return views;
 }
 

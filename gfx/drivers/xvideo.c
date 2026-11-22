@@ -147,7 +147,11 @@ typedef struct xv
    /* The part of the image last put to the window */
    unsigned put_width;
    unsigned put_height;
-   /* For get_flags: the last frame with a map was drawn whole */
+   /* The window's size at which the last map's views could not be
+    * drawn: the adaptor's image too small, or no canvas; 0 for none */
+   unsigned views_failed;
+   /* For get_flags: a map is drawn whole: the last frame's, or with
+    * none what one would get */
    retro_atomic_int_t views_fallback;
    bool views_on;
    bool views_seen;
@@ -1192,6 +1196,20 @@ static void xv_views_place(xv_t *xv, const void *frame, unsigned pitch,
    }
 }
 
+/* @cut black in the image, as xv_views_place lays it: a blank inset
+ * over its base */
+static void xv_views_black(xv_t *xv, const video_views_rect_t *cut,
+      int shift_x, int parity)
+{
+   struct retro_video_view v;
+   uint32_t black = 0;
+   memset(&v, 0, sizeof(v));
+   v.width  = 1;
+   v.height = 1;
+   xv_views_place(xv, &black, sizeof(black), true, &v, cut, cut, shift_x,
+         parity);
+}
+
 /* The menu's texture scaled over the @w x @h rectangle of the canvas
  * at @x0, @y0 and blended by its alpha into the image, each canvas
  * pixel a 2x2 block of it */
@@ -1316,8 +1334,15 @@ static unsigned xv_views_frame(xv_t *xv, const void *frame,
    bool views = frame && info->views.num_views && xv->yuv_table
       && video_views_fit_frame(&info->views, dims);
 
-   retro_atomic_store_release_int(&xv->views_fallback,
-         (info->views.num_views && !views) ? 1 : 0);
+   /* The menu with no frame under it draws no map: the flag stays.
+    * What failed at this size holds until it works, with or without
+    * a map. */
+   if (frame)
+      retro_atomic_store_release_int(&xv->views_fallback,
+            (   (info->views.num_views && !views)
+             || !xv->yuv_table
+             || (xv->views_failed && xv->views_failed == info->dims))
+            ? 1 : 0);
    xv->views_on = views;
    if (!views)
       return 0;
@@ -1330,13 +1355,27 @@ static unsigned xv_views_frame(xv_t *xv, const void *frame,
       *skip = xv->width != 0;
       return 0;
    }
-   /* An adaptor that gave a smaller image draws the frame whole */
+   /* An adaptor that gave a smaller image draws the frame whole, and
+    * so does anaglyph without its canvas and row */
    if (     xv->width  != VIDEO_SCALE_W(cdims) << 1
-         || xv->height != VIDEO_SCALE_H(cdims) << 1)
+         || xv->height != VIDEO_SCALE_H(cdims) << 1
+         || (   layout->offscreen
+             && layout->stereo_mode != VIDEO_STEREO_MODE_INTERLACED
+             && (   !xv_grow(&xv->views_canvas, &xv->views_canvas_size,
+                       (size_t)2 * VIDEO_SCALE_AREA(cdims)
+                       * sizeof(uint32_t))
+                 || !xv_grow(&xv->views_row, &xv->views_row_size,
+                       VIDEO_SCALE_W(cdims) * sizeof(uint32_t)))))
    {
       retro_atomic_store_release_int(&xv->views_fallback, 1);
-      xv->views_on = false;
+      xv->views_on     = false;
+      xv->views_failed = info->dims;
       return 0;
+   }
+   if (xv->views_failed)
+   {
+      xv->views_failed = 0;
+      retro_atomic_store_release_int(&xv->views_fallback, 0);
    }
    if (!xv->views_seen)
    {
@@ -1362,12 +1401,20 @@ static unsigned xv_views_frame(xv_t *xv, const void *frame,
       {
          video_views_rect_t dst, cut;
          const video_views_placement_t *p = &layout->placements[i];
-         if (     !(p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
-               && video_views_cpu_cut(layout, p, scale, cdims, true,
+         int shift = p->area ? (int)VIDEO_SCALE_W(cdims) : 0;
+         /* A blank root's place is black already; a blank inset's is
+          * over its base */
+         if (     (   (p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
+                   && !(p->flags & VIDEO_VIEWS_PLACEMENT_INSET))
+               || !video_views_cpu_cut(layout, p, scale, cdims, true,
                   &dst, &cut))
+            continue;
+         if (p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
+            xv_views_black(xv, &cut, shift, (int)p->area);
+         else
             xv_views_place(xv, frame, pitch, rgb32,
-                  &info->views.views[p->view], &dst, &cut,
-                  p->area ? (int)VIDEO_SCALE_W(cdims) : 0, (int)p->area);
+                  &info->views.views[p->view], &dst, &cut, shift,
+                  (int)p->area);
       }
       return cdims;
    }
@@ -1379,12 +1426,6 @@ static unsigned xv_views_frame(xv_t *xv, const void *frame,
       struct retro_video_view row;
       video_views_rect_t at;
       unsigned y, w = VIDEO_SCALE_W(cdims);
-      size_t size   = (size_t)VIDEO_SCALE_AREA(cdims) * sizeof(uint32_t);
-      if (     !xv_grow(&xv->views_canvas, &xv->views_canvas_size,
-               2 * size)
-            || !xv_grow(&xv->views_row, &xv->views_row_size,
-               w * sizeof(uint32_t)))
-         return 0;
       video_views_cpu_draw_placements(&xv->views_cpu, &info->views, layout,
             frame, pitch, rgb32 ? SCALER_FMT_ARGB8888 : SCALER_FMT_RGB565,
             info->video_smooth ? SCALER_TYPE_BILINEAR : SCALER_TYPE_POINT,
@@ -1423,9 +1464,14 @@ static unsigned xv_views_frame(xv_t *xv, const void *frame,
    {
       video_views_rect_t dst, cut;
       const video_views_placement_t *p = &layout->placements[i];
-      if (     !(p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
-            && video_views_cpu_cut(layout, p, scale, cdims, false,
+      if (     (   (p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
+                && !(p->flags & VIDEO_VIEWS_PLACEMENT_INSET))
+            || !video_views_cpu_cut(layout, p, scale, cdims, false,
                &dst, &cut))
+         continue;
+      if (p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
+         xv_views_black(xv, &cut, 0, -1);
+      else
          xv_views_place(xv, frame, pitch, rgb32,
                &info->views.views[p->view], &dst, &cut, 0, -1);
    }
