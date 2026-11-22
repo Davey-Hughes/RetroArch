@@ -448,6 +448,10 @@ bool video_views_map_point(const video_views_layout_t *layout,
       const video_views_map_t *map, unsigned frame_dims,
       int x, int y, bool report_oob, uint32_t *res_pos);
 
+/* A packed-frame point, in frame pixels, that lies in a view of a
+ * NO_INPUT screen and in no view of a screen that takes input. */
+bool video_views_point_no_input(const video_views_map_t *map, int x, int y);
+
 /* Window point to the coordinates the menu and widgets lay out in,
  * through @layout. A per-eye UI: through the area the point is in, or
  * the nearer one, so a point outside both stays outside the UI. NULL,

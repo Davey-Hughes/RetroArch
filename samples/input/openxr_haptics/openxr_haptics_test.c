@@ -117,6 +117,8 @@ bool video_views_map_point(const video_views_layout_t *layout,
       bool report_oob, uint32_t *res_pos)
 { (void)layout; (void)map; (void)frame_dims; (void)x; (void)y;
   (void)report_oob; (void)res_pos; return false; }
+bool video_views_point_no_input(const video_views_map_t *map, int x, int y)
+{ (void)map; (void)x; (void)y; return false; }
 bool video_xr_quad_live(const video_xr_quad_set_t *set,
       const video_xr_quad_t *q, unsigned laser, bool menu)
 { (void)set; (void)q; (void)laser; (void)menu; return false; }

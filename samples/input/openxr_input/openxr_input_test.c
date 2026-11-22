@@ -11664,6 +11664,48 @@ static void test_window_views_no_input(void)
    t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
 }
 
+/* A window with the core's views and no layout draws the frame whole
+ * (views fallback): a NO_INPUT screen's part of it is off every view. */
+static void test_window_quad_no_input(void)
+{
+   int16_t x = 0;
+   int16_t y = 0;
+
+   t_let_go();
+   t_forget_devices();
+   t_fresh_session();
+   t_aim_at_screen_1();
+   t_quads.quads[0].kind   = VIDEO_XR_QUAD_WINDOW;
+   t_quads.quads[0].screen = 0;
+   t_quads.quads[0].height = 0.96f;
+
+   /* Screen 1's part, frame pixel 400,360. */
+   t_aim[1].position.y = t_aim[2].position.y = -0.24f;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(t_gun_at(&x, &y) && abs(x - 40) < 300 && abs(y - 16485) < 300,
+         "screen 1 in the whole frame: the gun at %d,%d, want 40,16485",
+         x, y);
+
+   t_two_screens.no_input = 0x2;
+   x = 12345;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(!t_gun_at(&x, &y)
+         && input_openxr_pointer(t_on(0), RETRO_DEVICE_LIGHTGUN, 0,
+            RETRO_DEVICE_ID_LIGHTGUN_SCREEN_X, &x) && x == -0x8000,
+         "a NO_INPUT screen in the whole frame: the gun at %d", x);
+   /* Screen 0's part, frame pixel 400,120. */
+   t_aim[1].position.y = t_aim[2].position.y = 0.24f;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(t_gun_at(&x, &y) && abs(x - 40) < 300 && abs(y + 16351) < 300,
+         "screen 0 in the whole frame: the gun at %d,%d, want 40,-16351",
+         x, y);
+
+   t_hooks.session_destroying(t_hooks.user);
+   t_touch_reset();
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+}
+
 int main(void)
 {
    t_forget_devices();
@@ -11815,6 +11857,7 @@ int main(void)
    test_laser_no_input();
    test_laser_inset();
    test_window_views_no_input();
+   test_window_quad_no_input();
    if (failures)
    {
       printf("%d failure(s)\n", failures);

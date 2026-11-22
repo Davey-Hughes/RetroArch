@@ -1662,6 +1662,17 @@ static bool input_openxr_frame_point(const video_xr_quad_set_t *set,
    }
    if (!video_driver_get_views_core(&map, &dims))
       return false;
+   /* Views and no layout: the window draws the packed frame whole */
+   if (q->kind == VIDEO_XR_QUAD_WINDOW && map)
+   {
+      int fw = (int)VIDEO_SCALE_W(dims);
+      int fh = (int)VIDEO_SCALE_H(dims);
+      int fx = (int)(u * fw);
+      int fy = (int)(v * fh);
+      if (video_views_point_no_input(map,
+               fx < fw ? fx : fw - 1, fy < fh ? fy : fh - 1))
+         return false;
+   }
    return video_xr_quad_to_frame(set, q, u, v, laser, map, dims, x, y);
 }
 

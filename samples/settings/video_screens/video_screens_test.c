@@ -4156,6 +4156,66 @@ static void test_window_pointer_no_input(void)
    window_test_end();
 }
 
+/* A driver in views fallback draws window_test_views()'s frame whole in
+ * the 800x480 viewport: a point on screen 1's half, with screen 1
+ * NO_INPUT, is off every view, and one on screen 0's maps as before */
+static void test_fallback_no_input(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[2];
+   const uint32_t oob = VIDEO_POS_PACK(-0x8000, -0x8000);
+   struct retro_video_views map;
+   struct video_viewport vp;
+   uint32_t pos, screen_pos, top, top_screen;
+
+   window_test_begin();
+   window_test_flags = (1u << GFX_CTX_FLAGS_VIDEO_VIEWS)
+                     | (1u << GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK);
+   /* The flag holds for the frames after the one that reports it */
+   window_test_run();
+   window_test_run();
+   CHECK(video_driver_get_views_layout() == NULL);
+   CHECK(video_driver_get_viewport_info(&vp));
+   CHECK(video_driver_translate_coord_viewport(&vp, 200, 240, &top,
+            &top_screen, true));
+   CHECK(top != oob);
+   CHECK(video_driver_translate_coord_viewport(&vp, 600, 240, &pos,
+            &screen_pos, true));
+   CHECK(pos != oob);
+
+   memset(views, 0, sizeof(views));
+   views[0].width  = views[1].width  = 4;
+   views[0].height = views[1].height = 2;
+   views[1].x      = 4;
+   views[1].screen = 1;
+   memset(screens, 0, sizeof(screens));
+   screens[1].flags = RETRO_VIDEO_SCREEN_FLAG_NO_INPUT;
+   memset(&map, 0, sizeof(map));
+   map.views       = views;
+   map.num_views   = 2;
+   map.flags       = RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   map.screens     = screens;
+   map.num_screens = 2;
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   window_test_run();
+   CHECK(video_driver_get_views_layout() == NULL);
+   CHECK(video_state_get_ptr()->views_core.no_input == 2u);
+   pos = 0;
+   CHECK(video_driver_translate_coord_viewport(&vp, 600, 240, &pos,
+            &screen_pos, true));
+   CHECK(pos == oob);
+   pos = 0;
+   CHECK(video_driver_translate_coord_viewport(&vp, 600, 240, &pos,
+            &screen_pos, false));
+   CHECK(pos == oob);
+   pos = 0;
+   CHECK(video_driver_translate_coord_viewport(&vp, 200, 240, &pos,
+            &screen_pos, true));
+   CHECK(pos == top && screen_pos == top_screen);
+   window_test_end();
+}
+
 /* Two stacked screens and a VMU, screen 2, with no view */
 static void screens_test_full(struct retro_video_views *map,
       struct retro_video_view *views, struct retro_video_screen *screens)
@@ -11433,6 +11493,7 @@ int main(int argc, char **argv)
    test_window_turned_waiting();
    test_window_pointer_mapping();
    test_window_pointer_no_input();
+   test_fallback_no_input();
    test_views_screens_frontend();
    test_screens_core_show();
    test_screens_core_over_inset();

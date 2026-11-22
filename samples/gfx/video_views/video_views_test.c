@@ -2610,6 +2610,33 @@ static void test_touch_no_input(void)
    CHECK(x == top_x && y == top_y);
 }
 
+/* A packed-frame point on a NO_INPUT screen, the DS map's bottom one. */
+static void test_point_no_input(void)
+{
+   video_views_map_t map;
+
+   map_ds(&map);
+   CHECK(!video_views_point_no_input(&map, 128, 288));
+   map.no_input = 0x2;
+   CHECK(video_views_point_no_input(&map, 128, 288));
+   CHECK(video_views_point_no_input(&map, 0, 192));
+   CHECK(video_views_point_no_input(&map, 255, 383));
+   CHECK(!video_views_point_no_input(&map, 128, 96));
+   CHECK(!video_views_point_no_input(&map, 128, 191));
+   /* Off both */
+   CHECK(!video_views_point_no_input(&map, 256, 288));
+   CHECK(!video_views_point_no_input(&map, 128, 384));
+   CHECK(!video_views_point_no_input(&map, -1, 288));
+
+   /* Over a view that takes input, in either order. */
+   map.views[1].y = 96;
+   CHECK(!video_views_point_no_input(&map, 128, 150));
+   CHECK(video_views_point_no_input(&map, 128, 200));
+   map.no_input = 0x1;
+   CHECK(!video_views_point_no_input(&map, 128, 150));
+   CHECK(video_views_point_no_input(&map, 128, 50));
+}
+
 /* Every name of @n the letter @c plus its index, @len long. */
 static void t_names_fill(video_views_names_t *n, char c, size_t len)
 {
@@ -3964,6 +3991,7 @@ int main(void)
    test_map_point_no_input();
    test_map_point_blank();
    test_touch_no_input();
+   test_point_no_input();
    test_names_box();
    test_prefs_resolve_order();
    test_prefs_resolve_over();

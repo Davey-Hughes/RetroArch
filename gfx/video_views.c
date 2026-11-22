@@ -1127,6 +1127,23 @@ bool video_views_map_point(const video_views_layout_t *layout,
    return true;
 }
 
+bool video_views_point_no_input(const video_views_map_t *map, int x, int y)
+{
+   unsigned i;
+   bool no_input = false;
+   for (i = 0; i < map->num_views; i++)
+   {
+      const struct retro_video_view *v = &map->views[i];
+      if (     x <  (int)v->x || y <  (int)v->y
+            || x >= (int)(v->x + v->width) || y >= (int)(v->y + v->height))
+         continue;
+      if (!(map->no_input & (1u << v->screen)))
+         return false;
+      no_input = true;
+   }
+   return no_input;
+}
+
 void video_views_ui_point(const video_views_layout_t *layout,
       int x, int y, int *res_x, int *res_y)
 {
