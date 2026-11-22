@@ -119,7 +119,7 @@ class GlLanes(unittest.TestCase):
     def test_extra_cases_gl_only(self):
         names = {c['name'] for c in run.CASES}
         self.assertTrue(all(c['name'] not in names for c in run.GL_EXTRA))
-        self.assertEqual(len(run.CASES), 217)
+        self.assertEqual(len(run.CASES), 221)
 
     def test_screens_lanes(self):
         # A hidden, a blank and a left-out tracked screen on each driver,
