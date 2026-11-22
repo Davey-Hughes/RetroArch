@@ -86,6 +86,8 @@
  * and blank_null send it SHOWN and from frame 60 HIDDEN, NO_INPUT or
  * BLANK, that frame and every one after it as a NULL refresh, each
  * logging the switch once. none_shown sends both screens HIDDEN.
+ * over_no_input sends the bottom one as over does, NO_INPUT;
+ * shown_sized, SHOWN at a quarter of the top one's height.
  *
  * VIDEO_VIEWS_TEST_LIBRARY_NAME in the environment replaces the library
  * name, so one build can load as a second core. */
@@ -1137,7 +1139,7 @@ void retro_set_environment(retro_environment_t cb)
         "Screens the ds map describes; off|rules|no_input|no_input_off"
         "|shown|hidden|over|over_half|over_blank|over_blank_half|blank"
         "|blank_late|absent|absent_back|none_shown|hide_null"
-        "|no_input_null|blank_null" },
+        "|no_input_null|blank_null|over_no_input|shown_sized" },
       { NULL, NULL }
    };
    struct retro_log_callback logging;
@@ -2324,7 +2326,8 @@ static const struct
  * screen 1 is sent, @late being its state from SCR_SWITCH_FRAME on.
  * @both gives screen 0 the same show. @opacity is screen 1's. A @null
  * mode switches there with a NULL refresh and sends every refresh after
- * it NULL, screen 1 from then @null_show with @null_flags. */
+ * it NULL, screen 1 from then @null_show with @null_flags. @size is
+ * screen 1's when it is not OVER. */
 static const struct
 {
    const char *name;
@@ -2337,6 +2340,7 @@ static const struct
    bool null;
    unsigned null_show;
    unsigned null_flags;
+   float size;
 } scr_modes[] = {
    { "no_input",     RETRO_VIDEO_SCREEN_FLAG_NO_INPUT,
       RETRO_VIDEO_SCREEN_SHOW_SHOWN,
@@ -2387,7 +2391,14 @@ static const struct
       RETRO_VIDEO_SCREEN_FLAG_NO_INPUT },
    { "blank_null",   0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
       RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_BLANK,
-      false, 0.0f, true, RETRO_VIDEO_SCREEN_SHOW_SHOWN, 0 }
+      false, 0.0f, true, RETRO_VIDEO_SCREEN_SHOW_SHOWN, 0 },
+   { "over_no_input", RETRO_VIDEO_SCREEN_FLAG_NO_INPUT,
+      RETRO_VIDEO_SCREEN_SHOW_OVER,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f },
+   { "shown_sized",  0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f, false, 0, 0, 0.25f }
 };
 
 /* A null mode from its switch on: each refresh repeats the last frame */
@@ -2442,7 +2453,7 @@ static const char *screens_add(struct retro_video_views *in)
             scr_modes[screens_mode].both ? show : 0,
             0, 0.0f, 0, 0.0f, 0, 0, 0, 0);
       scr_screens[1]  = mkscreen("Bottom", flags, state, show, 0,
-            over ? 0.25f : 0.0f,
+            over ? 0.25f : scr_modes[screens_mode].size,
             over ? RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT : 0,
             scr_modes[screens_mode].opacity, 0, 0, 0, 0);
       in->flags      |= RETRO_VIDEO_VIEWS_FLAG_SCREENS;

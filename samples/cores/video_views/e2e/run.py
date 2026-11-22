@@ -625,18 +625,20 @@ SCREENS_SWITCHED_RE = re.compile(r'\[video_views\] screens switched')
 # and then the bottom one's, as ds-horizontal lays them out. Aimed at
 # the top first, so the second aim reads differently whatever the
 # pointer's start. A blank screen still takes the gun.
-# [(name, video_views_test_screens, whether the bottom screen takes the
-# gun, points, what run_case() is given besides)]
+# [(name, video_views_test_screens, the screen the second aim lands
+# in: 'bottom', 'top' or None, points, what run_case() is given
+# besides, with 'aim' the two points instead)]
 SCREENS_AIM_SETTINGS = {'video_stereo_mode': '0', 'video_screen_layout': '1'}
 SCREENS_AIM_POINTS = [(400, 480, GREEN), (1200, 480, YELLOW)]
 # The bottom screen blank: black, in its place.
 SCREENS_BOTTOM_BLANK = [(400, 480, GREEN), (1200, 480, BLACK)]
 SCREENS_AIM_CASES = [
-    ('screens-no-input', 'no_input', False, SCREENS_AIM_POINTS, {}),
-    ('screens-no-input-off', 'no_input_off', True, SCREENS_AIM_POINTS, {}),
-    ('screens-blank-aim', 'blank', True, SCREENS_BOTTOM_BLANK, {}),
+    ('screens-no-input', 'no_input', None, SCREENS_AIM_POINTS, {}),
+    ('screens-no-input-off', 'no_input_off', 'bottom', SCREENS_AIM_POINTS,
+     {}),
+    ('screens-blank-aim', 'blank', 'bottom', SCREENS_BOTTOM_BLANK, {}),
     # NO_INPUT sent with a NULL refresh, aimed after it
-    ('screens-no-input-null', 'no_input_null', False, SCREENS_AIM_POINTS,
+    ('screens-no-input-null', 'no_input_null', None, SCREENS_AIM_POINTS,
      {'until': SCREENS_SWITCHED_RE})]
 SCREENS_AIM = ((400, 480), (1200, 480))
 GUN_RE = re.compile(r'\[video_views\] lightgun x=(-?\d+) y=(-?\d+) '
@@ -672,6 +674,36 @@ SCREENS_INSET_HALF = SCREENS_INSET_AROUND + [
     (x, y, (128, 255, 0)) for x, y in SCREENS_INSET_IN]
 SCREENS_INSET_BLANK_HALF = SCREENS_INSET_AROUND + [
     (x, y, (0, 128, 0)) for x, y in SCREENS_INSET_IN]
+# Aimed at the inset's centre: it takes the gun, or with NO_INPUT the
+# top screen under it does.
+SCREENS_INSET_AIM = ((400, 480), (1280, 840))
+SCREENS_AIM_CASES += [
+    ('screens-over-aim', 'over', 'bottom', SCREENS_INSET,
+     {'aim': SCREENS_INSET_AIM}),
+    ('screens-over-no-input-aim', 'over_no_input', 'top', SCREENS_INSET,
+     {'aim': SCREENS_INSET_AIM})]
+
+
+def screens_over_points(stereo, colour):
+    """The over cases' points, the inset's in @colour: in one picture
+    ('0'), side by side ('1') or interlaced ('5', each again a row down,
+    in the other eye's rows)."""
+    if stereo == '1':
+        inside = [(640, 840), (1440, 840), (640, 760), (1440, 760)]
+        return [(300, 480, GREEN), (1100, 480, GREEN), (540, 840, GREEN),
+                (1340, 840, GREEN)] + [(x, y, colour) for x, y in inside]
+    points = SCREENS_INSET_AROUND + [
+        (x, y, colour) for x, y in SCREENS_INSET_IN]
+    if stereo == '5':
+        points += [(x, y + 1, c) for x, y, c in points]
+    return points
+
+
+# The over modes: the inset's colour, and solid where the driver draws
+# it so.
+SCREENS_OVER_MODES = [('over', YELLOW, YELLOW), ('over_blank', BLACK, BLACK),
+                      ('over_half', (128, 255, 0), YELLOW),
+                      ('over_blank_half', (0, 128, 0), BLACK)]
 # Drivers that draw an inset at its opacity; the rest draw it solid.
 OPACITY_DRIVERS = ('gl', 'glcore', 'gl1', 'vulkan', 'd3d8', 'd3d9_hlsl',
                    'd3d10', 'd3d11', 'sdl', 'sdl2', 'sdl3')
@@ -700,7 +732,15 @@ SCREENS_DRAW_CASES = [
      {'solid': SCREENS_INSET}),
     ('screens-over-blank-half', 'over_blank_half', SCREENS_INSET_BLANK_HALF,
      {'solid': SCREENS_INSET_BLANK}),
-]
+] + [
+    # The over cases side by side and interlaced: an inset in each eye's
+    # area, after its base there.
+    ('screens-%s-%s' % (mode.replace('_', '-'), kind), mode,
+     screens_over_points(stereo, colour),
+     {'solid': screens_over_points(stereo, solid),
+      'settings': {'video_stereo_mode': stereo}})
+    for kind, stereo in (('sbs', '1'), ('interlaced', '5'))
+    for mode, colour, solid in SCREENS_OVER_MODES]
 # Not on the drivers that draw views straight from the frame and keep
 # nothing to draw them again from: a NULL refresh leaves their last
 # picture, or on XShm black.
@@ -712,20 +752,23 @@ SCREENS_XV_INTERLACED_CASE = (
     'screens-blank-late-interlaced', 'blank_late',
     SCREENS_BOTTOM_BLANK + [(400, 481, GREEN), (1200, 481, BLACK)],
     {'until': SCREENS_SWITCHED_RE, 'settings': {'video_stereo_mode': '5'}})
-# gl's preset draws one view's passes after another: Top (view 0), made
-# Bottom's inset by the user, must still go over it; on the 3ds map side
-# by side, Bottom made Top's inset goes over each eye's Top, blank too.
-# Entries as above.
-SCREENS_PRESET_ARGS = ('--set-shader=' + os.path.join(HERE, 'pass.glslp'),)
+# Through the pass preset of each driver whose views take one, which
+# draws one view's passes after another: Top (view 0), made Bottom's
+# inset by the user, must still go over it; on the 3ds map side by
+# side, Bottom made Top's inset goes over each eye's Top, blank too;
+# and the over cases. Entries as above.
+SCREENS_PRESETS = {'gl': 'pass.glslp', 'glcore': 'pass.slangp',
+                   'vulkan': 'pass.slangp', 'd3d9_hlsl': 'pass.cgp',
+                   'd3d10': 'pass.slangp', 'd3d11': 'pass.slangp',
+                   'd3d12': 'pass.slangp'}
 SCREENS_STEREO_OVER = {
-    'map': '3ds', 'args': SCREENS_PRESET_ARGS,
+    'map': '3ds',
     'files': {CORE_FILE: 'video_screen2_display = "over:1"\n'},
     'settings': {'video_shader_enable': 'true', 'video_stereo_mode': '1'}}
-SCREENS_GL_PRESET_CASES = [
+SCREENS_PRESET_CASES = [
     ('screens-user-over-preset', 'shown',
      [(800, 480, YELLOW), (1280, 840, GREEN)],
      {'files': {CORE_FILE: 'video_screen1_display = "over:2"\n'},
-      'args': SCREENS_PRESET_ARGS,
       'settings': {'video_shader_enable': 'true'}}),
     ('screens-user-over-stereo-preset', 'shown',
      [(400, 480, RED), (1200, 480, BLUE), (720, 840, YELLOW),
@@ -733,7 +776,19 @@ SCREENS_GL_PRESET_CASES = [
     ('screens-user-over-blank-stereo-preset', 'blank',
      [(400, 480, RED), (1200, 480, BLUE), (720, 840, BLACK),
       (1520, 840, BLACK)], SCREENS_STEREO_OVER),
-]
+] + [
+    (name + '-preset', mode, points,
+     dict(extra, settings=dict(extra.get('settings', {}),
+                               video_shader_enable='true')))
+    for name, mode, points, extra in SCREENS_DRAW_CASES
+    if mode in [m for m, _, _ in SCREENS_OVER_MODES]]
+# Not on glcore and vulkan: their preset's last pass draws a translucent
+# inset solid until the follow-up that keeps it blended.
+SCREENS_PRESET_HALF = ('screens-over-half-preset',
+                       'screens-over-half-sbs-preset',
+                       'screens-over-half-interlaced-preset')
+SCREENS_PRESET_SOLID = {'glcore': SCREENS_PRESET_HALF,
+                        'vulkan': SCREENS_PRESET_HALF}
 # What the frontend makes of show, state, the user's setting and the
 # core's file: on SCREENS_DRIVERS. Each file a case starts with must be
 # the same after it. Entries as SCREENS_DRAW_CASES'.
@@ -754,6 +809,18 @@ SCREENS_STATE_CASES = [
     ('screens-per-core-other', 'shown', SCREENS_BOTH,
      {'files': CORE_FILE_OFF,
       'env_extra': {'VIDEO_VIEWS_TEST_LIBRARY_NAME': 'video_views test B'}}),
+    # Bottom made Top's inset by the user, at the default corner and
+    # size, then at the top left at half Top's height.
+    ('screens-user-over', 'shown', SCREENS_INSET,
+     {'files': {CORE_FILE: 'video_screen2_display = "over:1"\n'}}),
+    ('screens-user-over-corner', 'shown',
+     [(480, 240, YELLOW), (1000, 700, GREEN)],
+     {'files': {CORE_FILE: 'video_screen2_display = "over:1"\n'
+                           'video_screen2_corner = "1"\n'
+                           'video_screen2_size = "50"\n'}}),
+    # Bottom SHOWN at a quarter of Top's height, beside it.
+    ('screens-shown-sized', 'shown_sized',
+     [(1440, 480, YELLOW), (640, 480, GREEN), (1440, 200, BLACK)], {}),
 ]
 # With no screen placed the menu still lays out over the whole window,
 # as it does over a frame without views: the second case, which the
@@ -2363,26 +2430,32 @@ def run_screens_rules_case(retroarch, root, driver):
 def run_screens_aim_case(retroarch, root, driver, case):
     """The light gun aimed at the bottom screen's centre with the menu
     closed: on that screen only when it takes input."""
-    name, mode, takes, points, extra = case
+    name, mode, lands, points, extra = case
+    extra = dict(extra)
+    aim = extra.pop('aim', SCREENS_AIM)
     aimed = []
     errors = run_case(retroarch, root, driver,
                       (name, 'ds', SCREENS_AIM_SETTINGS, points),
                       opts={'video_views_test_screens': mode},
-                      aim=SCREENS_AIM, aimed=aimed, **extra)
+                      aim=aim, aimed=aimed, **extra)
     guns = GUN_RE.findall(log_text(case_dir(root, driver, name)))
-    if len(aimed) < len(SCREENS_AIM):
+    if len(aimed) < len(aim):
         return errors + ['the pointer did not move']
     if len(guns) <= aimed[-1]:
         return errors + ['no light gun line after the aim at the bottom '
                          'screen']
     gun = guns[aimed[-1]]
     offscreen, px, py = int(gun[2]), int(gun[4]), int(gun[5])
-    if takes and not 192 <= py < 384:
+    if lands == 'bottom' and not 192 <= py < 384:
         errors.append('the gun at the bottom screen has packed y %d, '
                       'want 192 to 383' % py)
+    if lands == 'top' and (offscreen or not 0 <= py < 192):
+        errors.append('the gun at the bottom screen is at packed '
+                      '(%d, %d) offscreen=%d, want y below 192 on-screen'
+                      % (px, py, offscreen))
     # Off-screen, or at the top screen's right edge; not at its centre,
     # where the first aim's line is.
-    if not takes and not (offscreen or px >= 250):
+    if lands is None and not (offscreen or px >= 250):
         errors.append('the gun at the bottom screen is at packed '
                       '(%d, %d), want x 250 or more, or off-screen'
                       % (px, py))
@@ -2699,13 +2772,9 @@ def driver_jobs(retroarch, root, driver):
         errors = run_screens_rules_case(retroarch, root, driver)
         return report('%s/screens-rules' % driver, errors), bool(errors)
 
-    def screens_aim():
-        lines, failed = [], 0
-        for case in SCREENS_AIM_CASES:
-            errors = run_screens_aim_case(retroarch, root, driver, case)
-            lines += report('%s/%s' % (driver, case[0]), errors)
-            failed += bool(errors)
-        return lines, failed
+    def screens_aim(case):
+        errors = run_screens_aim_case(retroarch, root, driver, case)
+        return report('%s/%s' % (driver, case[0]), errors), bool(errors)
 
     def screens_show(case, screens=None):
         errors = run_screens_show_case(retroarch, root, driver, case,
@@ -2721,10 +2790,17 @@ def driver_jobs(retroarch, root, driver):
         return report('%s/%s' % (driver, name), errors), bool(errors)
 
     def screens_preset(case):
-        errors = run_screens_show_case(retroarch, root, driver, case)
-        if not direct_drawn(case_dir(root, driver, case[0]), PRESET_RE):
+        name, mode, points, extra = case
+        preset = os.path.join(HERE, SCREENS_PRESETS[driver])
+        extra = dict(extra, args=('--set-shader=' + preset,))
+        errors = run_screens_show_case(retroarch, root, driver,
+                                       (name, mode, points, extra))
+        d = case_dir(root, driver, name)
+        if driver in DRIVER_PRESETS and not direct_drawn(d, PRESET_RE):
             errors.append('views not drawn through the preset')
-        return report('%s/%s' % (driver, case[0]), errors), bool(errors)
+        if direct_drawn(d, DIRECT_RE):
+            errors.append('views drawn straight from the frame')
+        return report('%s/%s' % (driver, name), errors), bool(errors)
 
     def screens_menu():
         errors = run_screens_menu_case(retroarch, root, driver)
@@ -2774,8 +2850,9 @@ def driver_jobs(retroarch, root, driver):
              if wanted(c[0]) and driver not in NO_POINTER_DRIVERS]
     if driver in SCREENS_DRIVERS and wanted('screens-rules'):
         jobs.append(screens_rules)
-    if driver in SCREENS_DRIVERS and wanted('screens-no-input'):
-        jobs.append(screens_aim)
+    jobs += [lambda c=c: screens_aim(c)
+             for c in (SCREENS_AIM_CASES if driver in SCREENS_DRIVERS
+                       else []) if wanted(c[0])]
     jobs += [lambda c=c: screens_show(
                  c, 1 if driver in SCREENS_STATUS_DRIVERS else None)
              for c in SCREENS_DRAW_CASES
@@ -2784,8 +2861,10 @@ def driver_jobs(retroarch, root, driver):
     if driver == 'xvideo' and wanted(SCREENS_XV_INTERLACED_CASE[0]):
         jobs.append(lambda: screens_show(SCREENS_XV_INTERLACED_CASE))
     jobs += [lambda c=c: screens_preset(c)
-             for c in (SCREENS_GL_PRESET_CASES if driver == 'gl' else [])
-             if wanted(c[0])]
+             for c in (SCREENS_PRESET_CASES if driver in SCREENS_PRESETS
+                       else [])
+             if wanted(c[0])
+             and c[0] not in SCREENS_PRESET_SOLID.get(driver, ())]
     jobs += [lambda c=c: screens_show(c)
              for c in (SCREENS_STATE_CASES if driver in SCREENS_DRIVERS
                        else []) if wanted(c[0])]
