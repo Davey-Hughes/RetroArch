@@ -704,6 +704,7 @@ static void test_xr_screen_menu(void)
    static struct retro_video_screen screens[3];
    settings_t *settings = config_get_ptr();
    struct retro_video_views map;
+   video_screen_values_t values;
    load_fixture("video_driver = \"glcore\"\n");
    set_menu_map(2);
 #ifdef HAVE_OPENXR
@@ -718,7 +719,11 @@ static void test_xr_screen_menu(void)
    CHECK(settings->floats.video_screen_xr_x[1] == 0.1f);
    CHECK(settings->flags & SETTINGS_FLG_MODIFIED);
    menu_value("video_screen_xr_x", "0.1 m");
-   settings->floats.video_screen_xr_y[1] = -1.5f;
+   video_driver_screen_get(1, &values);
+   values.xr.y = -1.5f;
+   video_driver_screen_set(1, VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_XR_Y),
+         &values);
+   CHECK(settings->floats.video_screen_xr_y[1] == -1.5f);
    menu_value("video_screen_xr_y", "-1.5 m");
    menu_action("video_screen_xr_z", MENU_ACTION_LEFT);
    CHECK(settings->floats.video_screen_xr_z[1] == -0.1f);
@@ -9099,22 +9104,34 @@ static void test_screen_menu_repr_writes_nothing(void)
    struct retro_video_views map;
    video_screen_values_t values;
    rarch_setting_t *display, *corner, *size, *opacity;
+   rarch_setting_t *selected, *xr_x, *xr_visible;
 #if defined(HAVE_VIDEO_WINDOWS) && !defined(ANDROID)
    rarch_setting_t *fullscreen, *width, *height, *x, *y;
 #endif
    char s[64];
+   struct menu_state *menu_st  = menu_state_get_ptr();
    video_screen_prefs_t *prefs = &video_state_get_ptr()->screen_prefs;
    unsigned bits               =
         VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY)
       | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_CORNER)
       | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_SIZE)
-      | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_OPACITY);
+      | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_OPACITY)
+      | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_XR_X)
+      | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_XR_VISIBLE);
    screen_menu_begin(&map, views, screens);
    display = menu_setting_find("video_screen2_display");
    corner  = menu_setting_find("video_screen2_corner");
    size    = menu_setting_find("video_screen2_size");
    opacity = menu_setting_find("video_screen2_opacity");
    CHECK(display && corner && size && opacity);
+   /* The headset rows, bound to screen 2 */
+   menu_st->video_screen_selected = 1;
+   selected   = menu_setting_find("video_screen_selected");
+   xr_x       = menu_setting_find("video_screen_xr_x");
+   xr_visible = menu_setting_find("video_screen_xr_visible");
+   CHECK(selected && xr_x && xr_visible);
+   if (!selected || !xr_x || !xr_visible)
+      display = NULL;
 #if defined(HAVE_VIDEO_WINDOWS) && !defined(ANDROID)
    fullscreen = menu_setting_find("video_screen2_window_fullscreen");
    width      = menu_setting_find("video_screen2_window_width");
@@ -9147,7 +9164,13 @@ static void test_screen_menu_repr_writes_nothing(void)
    values.window_pos        = VIDEO_POS_PACK(12, 34);
    values.window_pos_set    = true;
    values.window_fullscreen = true;
+   values.xr.x              = 1.5f;
+   values.xr.visible        = false;
    video_driver_screen_set(1, bits, &values);
+   *xr_x->value.target.fraction            = 7.0f;
+   *xr_visible->value.target.boolean       = true;
+   xr_x->index_offset                      = 7;
+   xr_visible->index_offset                = 7;
    *corner->value.target.unsigned_integer  = 77;
    *size->value.target.unsigned_integer    = 77;
    *opacity->value.target.unsigned_integer = 77;
@@ -9187,15 +9210,42 @@ static void test_screen_menu_repr_writes_nothing(void)
    CHECK(*corner->value.target.unsigned_integer == 77);
    CHECK(*size->value.target.unsigned_integer == 77);
    CHECK(*opacity->value.target.unsigned_integer == 77);
+   selected->actions->repr(selected, s, sizeof(s));
+   CHECK(string_is_equal(s, "VMU A1"));
+   xr_x->actions->repr(xr_x, s, sizeof(s));
+   CHECK(string_is_equal(s, "1.5 m"));
+   xr_visible->actions->repr(xr_visible, s, sizeof(s));
+   CHECK(string_is_equal(s, "OFF"));
+   CHECK(*xr_x->value.target.fraction == 7.0f);
+   CHECK(*xr_visible->value.target.boolean);
+   CHECK(xr_x->index_offset == 7 && xr_visible->index_offset == 7);
+   CHECK(menu_st->video_screen_selected == 1);
    /* A value changed with no write through the driver shows from the
     * next frame: the text calls no resolver */
    prefs->values[1].size = 55;
+   prefs->values[1].xr.x = 2.5f;
    size->actions->repr(size, s, sizeof(s));
    CHECK(string_is_equal(s, "40%"));
+   xr_x->actions->repr(xr_x, s, sizeof(s));
+   CHECK(string_is_equal(s, "1.5 m"));
    window_test_run();
    size->actions->repr(size, s, sizeof(s));
    CHECK(string_is_equal(s, "55%"));
+   xr_x->actions->repr(xr_x, s, sizeof(s));
+   CHECK(string_is_equal(s, "2.5 m"));
    CHECK(*size->value.target.unsigned_integer == 77);
+   CHECK(*xr_x->value.target.fraction == 7.0f);
+   /* The menu's iterate takes them, and moves a selection the screens
+    * left; the text moves neither */
+   menu_setting_video_screens_shown();
+   CHECK(*xr_x->value.target.fraction == 2.5f);
+   CHECK(!*xr_visible->value.target.boolean);
+   menu_st->video_screen_selected = 5;
+   selected->actions->repr(selected, s, sizeof(s));
+   xr_x->actions->repr(xr_x, s, sizeof(s));
+   CHECK(menu_st->video_screen_selected == 5);
+   menu_setting_video_screens_shown();
+   CHECK(menu_st->video_screen_selected == 0);
    screen_menu_end();
 }
 

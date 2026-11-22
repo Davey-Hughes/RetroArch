@@ -4870,10 +4870,12 @@ static size_t setting_get_string_representation_video_screen_window_pos(
 /* The stamp of each screen's published values its rows last took */
 static int setting_video_screen_shown_stamp[RETRO_VIDEO_VIEWS_MAX];
 
+static bool setting_video_screen_xr_take(unsigned moved);
+
 void menu_setting_video_screens_shown(void)
 {
    unsigned s;
-   bool moved = false;
+   unsigned moved = 0;
    for (s = 0; s < RETRO_VIDEO_VIEWS_MAX; s++)
    {
       video_screen_shown_t shown;
@@ -4894,9 +4896,9 @@ void menu_setting_video_screens_shown(void)
 #if defined(HAVE_VIDEO_WINDOWS) && !defined(ANDROID)
       setting_video_screen_window_take(s, &shown.values);
 #endif
-      moved = true;
+      moved |= 1u << s;
    }
-   if (moved)
+   if (setting_video_screen_xr_take(moved) || moved)
       disp_get_ptr()->flags |= GFX_DISP_FLAG_FB_DIRTY;
 }
 
@@ -11483,6 +11485,8 @@ static unsigned setting_video_screen_mask(void)
 
 /* The selected screen's headset rows step a copy of its values */
 static video_screen_xr_t setting_video_screen_xr_value;
+/* The screens they offer, as the main thread last found them */
+static unsigned setting_video_screen_xr_mask;
 
 /* @xr's member for a headset row, and its setting in @pref */
 static void *setting_video_screen_xr_member(enum msg_hash_enums row,
@@ -11520,11 +11524,9 @@ static void *setting_video_screen_xr_member(enum msg_hash_enums row,
    return NULL;
 }
 
-static unsigned setting_video_screen_bind(rarch_setting_t *setting)
+/* Main thread: the selection moved into the screens offered now */
+static unsigned setting_video_screen_select(void)
 {
-   video_screen_values_t values;
-   void *member;
-   unsigned pref;
    struct menu_state *menu_st = menu_state_get_ptr();
    unsigned screen = menu_st->video_screen_selected;
    unsigned mask = setting_video_screen_mask();
@@ -11536,6 +11538,37 @@ static unsigned setting_video_screen_bind(rarch_setting_t *setting)
       menu_st->video_screen_selected = screen < RETRO_VIDEO_VIEWS_MAX
          ? screen : 0;
    }
+   setting_video_screen_xr_mask = mask;
+   return mask;
+}
+
+/* Main thread, as the menu iterates: the selection moves into the
+ * screens offered now, and the rows take its screen's values when it
+ * moved or that screen's bit is in @moved. Returns whether the rows'
+ * text can have changed. */
+static bool setting_video_screen_xr_take(unsigned moved)
+{
+   video_screen_shown_t shown;
+   struct menu_state *menu_st = menu_state_get_ptr();
+   unsigned was               = menu_st->video_screen_selected;
+   unsigned mask              = setting_video_screen_xr_mask;
+   bool offered               = setting_video_screen_select() != mask;
+   if (     menu_st->video_screen_selected == was
+         && !(moved & (1u << was)))
+      return offered;
+   video_driver_screen_shown_read(menu_st->video_screen_selected, &shown);
+   setting_video_screen_xr_value = shown.values.xr;
+   return true;
+}
+
+static unsigned setting_video_screen_bind(rarch_setting_t *setting)
+{
+   video_screen_values_t values;
+   void *member;
+   unsigned pref;
+   struct menu_state *menu_st = menu_state_get_ptr();
+   unsigned screen;
+   unsigned mask = setting_video_screen_select();
    if (setting->enum_idx == MENU_ENUM_LABEL_VIDEO_SCREEN_SELECTED)
    {
       setting->value.target.unsigned_integer = mask
@@ -11588,18 +11621,27 @@ static void setting_video_screen_change(rarch_setting_t *setting)
          VIDEO_SCREEN_PREF_BIT(pref), &values);
 }
 
+/* Formats what the main thread published and selected; moves neither */
 static size_t setting_video_screen_repr(rarch_setting_t *setting,
       char *s, size_t len)
 {
-   if (!setting_video_screen_bind(setting))
+   video_screen_shown_t shown;
+   void *member;
+   unsigned pref;
+   unsigned screen = menu_state_get_ptr()->video_screen_selected;
+   if (!setting_video_screen_xr_mask)
       return strlcpy(s, "", len);
    if (setting->enum_idx == MENU_ENUM_LABEL_VIDEO_SCREEN_SELECTED)
-      return video_driver_screen_label(
-            menu_state_get_ptr()->video_screen_selected, "%u", s, len);
-   if (setting->type == ST_FLOAT)
-      return setting_get_string_representation_st_float(setting, s, len);
-   if (setting->type == ST_BOOL)
-      return setting_get_string_representation_st_bool(setting, s, len);
+      return video_driver_screen_label(screen, "%u", s, len);
+   video_driver_screen_shown_read(screen, &shown);
+   member = setting_video_screen_xr_member(setting->enum_idx,
+         &shown.values.xr, &pref);
+   if (member && setting->type == ST_FLOAT)
+      return snprintf(s, len, setting->aux.rounding_fraction,
+            *(float*)member);
+   if (member && setting->type == ST_BOOL)
+      return strlcpy(s, msg_hash_to_str(*(bool*)member
+               ? MENU_ENUM_LABEL_VALUE_ON : MENU_ENUM_LABEL_VALUE_OFF), len);
    return strlcpy(s, "", len);
 }
 
