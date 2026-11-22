@@ -464,6 +464,14 @@ static float views_sx(const gekko_video_t *gx)
    return (float)gx->mode.fb_width / (float)VIDEO_SCALE_W(gx->out_dims);
 }
 
+/* Without a map, whether one would be drawn whole: anaglyph and
+ * interlaced need a canvas */
+static bool gekko_views_whole(unsigned stereo)
+{
+   return stereo == VIDEO_STEREO_MODE_ANAGLYPH
+      || stereo == VIDEO_STEREO_MODE_INTERLACED;
+}
+
 /* Whether this frame draws its views: a map that fits the frame the
  * texture holds, laid out without a canvas - anaglyph and interlaced
  * draw the frame whole. */
@@ -480,11 +488,12 @@ static bool views_setup(gekko_video_t *gx, const video_frame_info_t *info)
       gx->views_active  = views;
       gx->should_resize = true;
    }
-   /* Without a map: anaglyph and interlaced would draw one whole */
-   retro_atomic_store_release_int(&gx->views_fallback,
-         (info->views.num_views ? !views
-          : (   stereo == VIDEO_STEREO_MODE_ANAGLYPH
-             || stereo == VIDEO_STEREO_MODE_INTERLACED)) ? 1 : 0);
+   /* Without a map, what one would get; a map with no frame texture
+    * yet to fit it to keeps the last value */
+   if (!info->views.num_views || layout->offscreen || gx->tex_w)
+      retro_atomic_store_release_int(&gx->views_fallback,
+            (info->views.num_views ? !views : gekko_views_whole(stereo))
+            ? 1 : 0);
    if (views && !gx->views_seen)
    {
       gx->views_seen = true;
@@ -691,6 +700,9 @@ static void *gekko_init(const video_info_t *video)
    gekko_set_video_mode(gx,
          gx_modes_dims(gx_display_server_current_id()), true);
    setup_gx(gx);
+   /* Read before the first frame */
+   retro_atomic_store_release_int(&gx->views_fallback,
+         gekko_views_whole(settings->uints.video_stereo_mode) ? 1 : 0);
    return gx;
 }
 

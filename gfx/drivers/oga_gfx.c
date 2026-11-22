@@ -506,11 +506,14 @@ static void oga_free(void *data)
    vid = NULL;
 }
 
+static bool oga_views_packed(const oga_video_t *vid, bool turned);
+
 static void *oga_init(const video_info_t *video)
 {
    int i;
    oga_video_t *vid                     = NULL;
    settings_t *settings                 = config_get_ptr();
+   unsigned stereo                      = settings->uints.video_stereo_mode;
    video_driver_state_t *video_st       = video_state_get_ptr();
    struct retro_system_av_info *av_info = &video_st->av_info;
    struct retro_game_geometry  *geom    = &av_info->geometry;
@@ -635,6 +638,11 @@ static void *oga_init(const video_info_t *video)
    video_driver_set_output_dims(VIDEO_SCALE_PACK(vid->drm_width,
             vid->drm_height));
 
+   /* Read before the first frame, at the turn set_rotation gives next */
+   retro_atomic_store_release_int(&vid->views_fallback,
+         (   oga_views_packed(vid, retroarch_get_rotation() % 4 != 0)
+          || stereo == VIDEO_STEREO_MODE_ANAGLYPH
+          || stereo == VIDEO_STEREO_MODE_INTERLACED) ? 1 : 0);
    return vid;
 }
 
@@ -899,6 +907,13 @@ static void oga_prepare_page(oga_video_t *vid, oga_framebuf_t *page,
    page->dirty     = false;
 }
 
+/* What draws any map whole, whatever its frame: the surfaces made at
+ * init missing, or a core @turned from the panel's own turn */
+static bool oga_views_packed(const oga_video_t *vid, bool turned)
+{
+   return !vid->views_surface || !vid->views_black || turned;
+}
+
 /* A core's views: each placement scaled by the RGA straight from the
  * frame's surface into an upright surface the size of the screen, cut
  * to its own eye's area and the screen, which one more blit turns onto
@@ -921,8 +936,8 @@ static bool oga_views_frame(oga_video_t *vid, const void *frame,
    bool blended    = false;
    /* What draws any map whole: the surfaces made at init missing, a
     * turned core, or not all of the frame in its surface */
-   bool packed     = !vid->views_surface || !vid->views_black
-      || vid->rotation != HAL_TRANSFORM_ROT_270
+   bool packed     = oga_views_packed(vid,
+            vid->rotation != HAL_TRANSFORM_ROT_270)
       || width != VIDEO_SCALE_W(dims) || height != VIDEO_SCALE_H(dims);
    bool views      = info && frame && info->views.num_views && !packed
       && !info->views_layout.offscreen

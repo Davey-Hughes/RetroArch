@@ -975,6 +975,9 @@ static void omap_render_msg(omap_video_t *vid, const char *msg)
    }
 }
 
+static bool omap_views_whole(const omap_video_t *vid, unsigned stereo,
+      unsigned dims);
+
 /* FIXME/TODO: Filters not supported. */
 static void *omap_init(const video_info_t *video)
 {
@@ -1017,6 +1020,10 @@ static void *omap_init(const video_info_t *video)
    vid->menu.scaler.out_fmt = (vid->bytes_per_pixel == 4)
       ? SCALER_FMT_ARGB8888 : SCALER_FMT_RGB565;
 
+   /* Read before the first frame */
+   retro_atomic_store_release_int(&vid->views_fallback,
+         omap_views_whole(vid, config_get_ptr()->uints.video_stereo_mode,
+            vid->omap->nat_dims) ? 1 : 0);
    return vid;
 
 fail_omapfb:
@@ -1039,6 +1046,18 @@ static bool omap_views_grow(uint32_t **buf, size_t *have, size_t size)
    *buf  = grown;
    *have = size;
    return true;
+}
+
+/* Without a map, whether one would be drawn whole: interlaced composes
+ * at the screen's size @dims, which the plane's memory may not hold */
+static bool omap_views_whole(const omap_video_t *vid, unsigned stereo,
+      unsigned dims)
+{
+   const omapfb_data_t *omap = vid->omap;
+   return stereo == VIDEO_STEREO_MODE_INTERLACED
+      && (   VIDEO_SCALE_W(dims) <= 4 || VIDEO_SCALE_H(dims) <= 4
+          || (double)VIDEO_SCALE_AREA(dims) * omap->bpp
+             * omap->num_pages > omap->current_state->mi.size);
 }
 
 /* Whether a core's views draw, and the scale and size they are composed
@@ -1078,14 +1097,9 @@ static bool omap_views_dims(omap_video_t *vid, const void *frame,
                (size_t)2 * VIDEO_SCALE_AREA(*cdims) * sizeof(uint32_t)))
          views    = false;
    }
-   else if (info && !info->views.num_views
-         && info->views_settings.stereo_mode == VIDEO_STEREO_MODE_INTERLACED)
-      /* Without a map: interlaced is composed at the screen's size,
-       * which the plane's memory may not hold */
-      whole = VIDEO_SCALE_W(info->dims) <= 4
-         || VIDEO_SCALE_H(info->dims) <= 4
-         || (double)VIDEO_SCALE_AREA(info->dims) * omap->bpp
-            * omap->num_pages > omap->current_state->mi.size;
+   else if (info && !info->views.num_views)
+      whole = omap_views_whole(vid, info->views_settings.stereo_mode,
+            info->dims);
    retro_atomic_store_release_int(&vid->views_fallback,
          (info && (info->views.num_views ? !views : whole)) ? 1 : 0);
    return views;

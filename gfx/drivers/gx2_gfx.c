@@ -1467,6 +1467,7 @@ static void gx2_set_aspect_ratio(void *data, unsigned aspect_ratio_idx)
 }
 
 static uint32_t gx2_get_flags(void *data);
+static void gx2_views_seed(const wiiu_video_t *wiiu);
 static uintptr_t gx2_load_texture(void *video_data, void *data,
       bool threaded, enum texture_filter_type filter_type);
 
@@ -1771,6 +1772,7 @@ static void *gx2_init(const video_info_t *video)
       type                        = video_shader_parse_type(shader_preset);
       gx2_set_shader(wiiu, type, shader_preset);
    }
+   gx2_views_seed(wiiu);
 
    return wiiu;
 }
@@ -2129,6 +2131,20 @@ static void gx2_views_place(wiiu_video_t *wiiu, const video_views_map_t *map,
             dims, wiiu->views.frame_dims);
 }
 
+/* Without a map, whether one would be drawn whole: under a preset, or
+ * once the views' vertices could not be had */
+static bool gx2_views_whole(const wiiu_video_t *wiiu)
+{
+   return wiiu->shader_preset || wiiu->views.failed;
+}
+
+/* Read before the first frame */
+static void gx2_views_seed(const wiiu_video_t *wiiu)
+{
+   retro_atomic_store_release_int(&gx2_views_fallback,
+         gx2_views_whole(wiiu) ? 1 : 0);
+}
+
 /* Whether this frame draws its views: no preset, and the map fits the
  * frame. Sets views.split, the GamePad taking the screens after the
  * first. */
@@ -2161,10 +2177,9 @@ static bool gx2_views_setup(wiiu_video_t *wiiu,
          video_views_touch_publish(&gx2_views_touch_map, map, NULL, NULL,
                0, 0);
    }
-   /* Without a map: a preset would draw one whole */
+   /* Without a map, what one would get */
    retro_atomic_store_release_int(&gx2_views_fallback,
-         (map->num_views ? !views
-          : (wiiu->shader_preset || wiiu->views.failed)) ? 1 : 0);
+         (map->num_views ? !views : gx2_views_whole(wiiu)) ? 1 : 0);
    if (views && !wiiu->views.direct_seen)
    {
       wiiu->views.direct_seen = true;

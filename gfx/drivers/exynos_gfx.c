@@ -2011,6 +2011,8 @@ static void exynos_get_overlay_interface(void *data,
 }
 #endif
 
+static bool exynos_views_whole(bool turned, unsigned stereo);
+
 static void *exynos_init(const video_info_t *video)
 {
    struct exynos_video *vid;
@@ -2081,6 +2083,10 @@ static void *exynos_init(const video_info_t *video)
    video_driver_set_output_dims(vid->data->dims);
    video_driver_display_type_set(RARCH_DISPLAY_KMS);
 
+   /* Read before the first frame, at the turn set_rotation gives next */
+   retro_atomic_store_release_int(&vid->views_fallback,
+         exynos_views_whole(retroarch_get_rotation() % 4 != 0,
+            config_get_ptr()->uints.video_stereo_mode) ? 1 : 0);
    return vid;
 
 fail_font:
@@ -2138,6 +2144,15 @@ static void exynos_free(void *data)
    free(vid);
 }
 
+/* Without a map, whether one would be drawn whole: a @turned frame, and
+ * anaglyph and interlaced, which blend the eyes */
+static bool exynos_views_whole(bool turned, unsigned stereo)
+{
+   return turned
+      || stereo == VIDEO_STEREO_MODE_ANAGLYPH
+      || stereo == VIDEO_STEREO_MODE_INTERLACED;
+}
+
 /* Whether a core's views draw this frame: each placement blitted by the
  * G2D. Anaglyph and interlaced, which blend the eyes, draw the frame
  * whole, and so does a turned frame, which comes with @frame NULL. */
@@ -2152,12 +2167,10 @@ static bool exynos_views_frame(struct exynos_video *vid,
       && !info->views_layout.offscreen
       && video_views_fit_frame(&info->views, dims);
 
-   /* Without a map: what would draw one whole */
+   /* Without a map, what one would get */
    retro_atomic_store_release_int(&vid->views_fallback,
          (info && (info->views.num_views ? !views
-            : (   !frame
-               || stereo == VIDEO_STEREO_MODE_ANAGLYPH
-               || stereo == VIDEO_STEREO_MODE_INTERLACED))) ? 1 : 0);
+            : exynos_views_whole(!frame, stereo))) ? 1 : 0);
    if (views != pdata->views_on)
    {
       /* What the last one drew outside the other's rectangle goes */

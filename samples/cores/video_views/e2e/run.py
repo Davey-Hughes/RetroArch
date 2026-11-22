@@ -648,7 +648,7 @@ SCREENS_DRIVERS = ('gl', 'glcore', 'vulkan', 'sdl2')
 # Those and the drivers whose SCREENS bit the draw and status cases
 # check on every status line: the bit comes from each driver's FALLBACK.
 SCREENS_STATUS_DRIVERS = SCREENS_DRIVERS + (
-    'sdl3', 'gdi', 'd3d8', 'd3d9_hlsl', 'd3d10', 'd3d11', 'd3d12')
+    'sdl3', 'gdi', 'd3d8', 'd3d9_hlsl', 'd3d10', 'd3d11', 'd3d12', 'xvideo')
 # What the window shows of the ds map's two screens, laid out as
 # SCREENS_AIM_SETTINGS has them. Screen 0 alone is 4:3, 1280 wide from
 # x 160.
