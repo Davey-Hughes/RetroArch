@@ -440,7 +440,8 @@ NO_COPY_IMAGE = {'MESA_GL_VERSION_OVERRIDE': '4.2',
 COPY_RE = re.compile(r'\[GLCore\] Views copied by ([\w ]+)\.')
 
 STATUS_RE = re.compile(
-    r'\[video_views\] presents=(\d) stereo=(\d) accepted=(\d)')
+    r'\[video_views\] presents=(\d) stereo=(\d) accepted=(\d) views=\d+ '
+    r'screens=(\d)')
 
 # RA_E2E_HDR=1: the vulkan cases with HDR10 output, and HDR_CASES too.
 HDR = os.environ.get('RA_E2E_HDR') == '1'
@@ -760,6 +761,14 @@ SCREENS_MENU_CASE = ('screens-none-shown-menu', 'ds',
                      SCREENS_MENU_SETTINGS, [])
 SCREENS_MENU_REF = ('screens-none-shown-menu-ref', 'none',
                     SCREENS_MENU_SETTINGS, [])
+# With no map set, SCREENS says whether one sent now would have its
+# views drawn: on SCREENS_DRIVERS, unset on the drivers that would draw
+# it whole. [(name, settings, those drivers)]
+SCREENS_STATUS_CASES = [
+    ('screens-status-no-map', {'video_stereo_mode': '0'}, ()),
+    ('screens-status-no-map-anaglyph', {'video_stereo_mode': '4'},
+     WHOLE_ANAGLYPH_DRIVERS),
+]
 
 
 # The last few files read_png() decoded on this thread, by path, with
@@ -1113,8 +1122,9 @@ def png_done(path):
 MISSING_DRIVER_RE = re.compile(r"Couldn't find any video driver named")
 
 
-def status_errors(d, driver, settings):
-    """Check the last views status the core logged."""
+def status_errors(d, driver, settings, screens=None):
+    """Check the last views status the core logged, and its SCREENS bit
+    when screens is given."""
     found = last_status(d)
     if direct_drawn(d, MISSING_DRIVER_RE):
         return ['video driver "%s" is not in this build' % driver]
@@ -1125,6 +1135,9 @@ def status_errors(d, driver, settings):
     if found[:2] != want:
         errors.append('status presents=%d stereo=%d, want presents=%d '
                       'stereo=%d' % (found[0], found[1], want[0], want[1]))
+    if screens is not None and found[3] != screens:
+        errors.append('status screens=%d, want screens=%d'
+                      % (found[3], screens))
     return errors
 
 
@@ -1652,7 +1665,8 @@ def case_dir(root, driver, name, hw='off'):
 def run_case(retroarch, root, driver, case, hw='off', menu=False,
              opts=None, args=(), gpu=None, pointer=(), env_extra=None,
              pointer_check=None, raw=False, passes=None, after=None,
-             window=(), until=None, aim=(), aimed=None, files=None):
+             window=(), until=None, aim=(), aimed=None, files=None,
+             screens=None):
     """gpu, a list, gets RetroArch's GPU memory in MiB sampled while it
     settles. pointer, window points, has the menu open with the pointer
     at each in turn, in d/pointer-N.png; pointer_check(d) gives the
@@ -1669,7 +1683,8 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
     with the menu closed, until the core logs a light gun line after the
     move; aimed, a list, gets for each move made how many light gun lines
     the core had logged before it. files, {path under the case directory:
-    text}, are there when it starts."""
+    text}, are there when it starts. screens, given, is the SCREENS bit
+    the last status must have."""
     name, mapopt, settings, points = case
     hdr = HDR and driver == 'vulkan'
     d = case_dir(root, driver, name, hw)
@@ -1840,7 +1855,7 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
         if os.path.basename(runtime_dir).startswith('ra-e2e-'):
             shutil.rmtree(runtime_dir, ignore_errors=True)
 
-    errors = status_errors(d, driver, settings) + window_got
+    errors = status_errors(d, driver, settings, screens) + window_got
     if hdr:
         errors += hdr_errors(d, *(passes or hdr_passes(name)))
     if not shot:
@@ -2351,9 +2366,10 @@ def run_screens_aim_case(retroarch, root, driver, case):
     return errors
 
 
-def run_screens_show_case(retroarch, root, driver, case):
-    """A screens draw or state case: the window's points, and each file
-    the case started with left as it was."""
+def run_screens_show_case(retroarch, root, driver, case, screens=None):
+    """A screens draw or state case: the window's points, each file the
+    case started with left as it was, and screens as run_case() has
+    it."""
     name, mode, points, extra = case
     extra = dict(extra)
     solid = extra.pop('solid', points)
@@ -2363,7 +2379,8 @@ def run_screens_show_case(retroarch, root, driver, case):
     settings = dict(SCREENS_AIM_SETTINGS, **extra.pop('settings', {}))
     errors = run_case(retroarch, root, driver,
                       (name, mapopt, settings, points),
-                      opts={'video_views_test_screens': mode}, **extra)
+                      opts={'video_views_test_screens': mode},
+                      screens=screens, **extra)
     d = case_dir(root, driver, name)
     for path in sorted(extra.get('files', {})):
         try:
@@ -2667,9 +2684,17 @@ def driver_jobs(retroarch, root, driver):
             failed += bool(errors)
         return lines, failed
 
-    def screens_show(case):
-        errors = run_screens_show_case(retroarch, root, driver, case)
+    def screens_show(case, screens=None):
+        errors = run_screens_show_case(retroarch, root, driver, case,
+                                       screens)
         return report('%s/%s' % (driver, case[0]), errors), bool(errors)
+
+    def screens_status(case):
+        name, settings, whole = case
+        errors = run_case(retroarch, root, driver,
+                          (name, 'none', settings, []),
+                          screens=0 if driver in whole else 1)
+        return report('%s/%s' % (driver, name), errors), bool(errors)
 
     def screens_preset(case):
         errors = run_screens_show_case(retroarch, root, driver, case)
@@ -2727,7 +2752,9 @@ def driver_jobs(retroarch, root, driver):
         jobs.append(screens_rules)
     if driver in SCREENS_DRIVERS and wanted('screens-no-input'):
         jobs.append(screens_aim)
-    jobs += [lambda c=c: screens_show(c) for c in SCREENS_DRAW_CASES
+    jobs += [lambda c=c: screens_show(
+                 c, 1 if driver in SCREENS_DRIVERS else None)
+             for c in SCREENS_DRAW_CASES
              if wanted(c[0]) and not (driver in NO_REDRAW_DRIVERS
                                       and c[0] in SCREENS_NULL_CASES)]
     if driver == 'xvideo' and wanted(SCREENS_XV_INTERLACED_CASE[0]):
@@ -2740,6 +2767,9 @@ def driver_jobs(retroarch, root, driver):
                        else []) if wanted(c[0])]
     if driver in SCREENS_DRIVERS and wanted(SCREENS_MENU_CASE[0]):
         jobs.append(screens_menu)
+    jobs += [lambda c=c: screens_status(c)
+             for c in (SCREENS_STATUS_CASES if driver in SCREENS_DRIVERS
+                       else []) if wanted(c[0])]
     return jobs
 
 

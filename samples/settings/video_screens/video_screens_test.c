@@ -4249,6 +4249,46 @@ static void test_fallback_no_input(void)
    window_test_end();
 }
 
+/* SCREENS while the driver would draw a map's views, set or not, and the
+ * core's own rotation is 0; the user's rotation does not count */
+static void test_status_screens(void)
+{
+   const unsigned both         = RETRO_VIDEO_VIEWS_STATUS_PRESENTS
+                               | RETRO_VIDEO_VIEWS_STATUS_SCREENS;
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   settings_t *settings        = config_get_ptr();
+   unsigned core_rotation      = runloop_st->system.rotation;
+   unsigned user_rotation      = settings->uints.video_rotation;
+
+   window_test_begin();
+   window_test_flags = 1u << GFX_CTX_FLAGS_VIDEO_VIEWS;
+   CHECK((video_driver_views_status() & both) == both);
+   video_driver_clear_views();
+   CHECK((video_driver_views_status() & both) == both);
+   settings->uints.video_rotation = 1;
+   CHECK((video_driver_views_status() & both) == both);
+   settings->uints.video_rotation = user_rotation;
+
+   window_test_flags |= 1u << GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK;
+   CHECK((video_driver_views_status() & both)
+         == RETRO_VIDEO_VIEWS_STATUS_PRESENTS);
+   window_test_views();
+   CHECK((video_driver_views_status() & both)
+         == RETRO_VIDEO_VIEWS_STATUS_PRESENTS);
+
+   window_test_flags = 1u << GFX_CTX_FLAGS_VIDEO_VIEWS;
+   video_driver_views_status_changed();
+   runloop_st->system.rotation = 1;
+   CHECK((video_driver_views_status() & both)
+         == RETRO_VIDEO_VIEWS_STATUS_PRESENTS);
+   CHECK(video_driver_views_status_changed());
+   CHECK(!video_driver_views_status_changed());
+   runloop_st->system.rotation = core_rotation;
+   CHECK(video_driver_views_status_changed());
+   CHECK((video_driver_views_status() & both) == both);
+   window_test_end();
+}
+
 /* Two stacked screens and a VMU, screen 2, with no view */
 static void screens_test_full(struct retro_video_views *map,
       struct retro_video_view *views, struct retro_video_screen *screens)
@@ -4386,12 +4426,11 @@ static void test_views_screens_frontend(void)
    CHECK(video_driver_get_screen_names(&names) != stamp);
    CHECK(screens_test_unnamed(&names));
 
-   /* SCREENS and IMAGES stay unset, and no buffer is lent */
+   /* IMAGES stays unset, and no buffer is lent */
    window_test_begin();
    status = video_driver_views_status();
    CHECK(status & RETRO_VIDEO_VIEWS_STATUS_PRESENTS);
-   CHECK(!(status & (RETRO_VIDEO_VIEWS_STATUS_SCREENS
-               | RETRO_VIDEO_VIEWS_STATUS_IMAGES)));
+   CHECK(!(status & RETRO_VIDEO_VIEWS_STATUS_IMAGES));
    window_test_end();
    memset(&buf, 0, sizeof(buf));
    buf.screen = 1;
@@ -11716,6 +11755,7 @@ int main(int argc, char **argv)
    test_window_pointer_mapping();
    test_window_pointer_no_input();
    test_fallback_no_input();
+   test_status_screens();
    test_views_screens_frontend();
    test_screens_core_show();
    test_screens_core_over_inset();

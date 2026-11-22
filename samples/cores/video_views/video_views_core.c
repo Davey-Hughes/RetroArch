@@ -846,9 +846,11 @@ static void log_status(unsigned status, int accepted, unsigned n)
    if ((int)status == last_status && accepted == last_accepted)
       return;
    log_cb(RETRO_LOG_INFO,
-         "[video_views] presents=%d stereo=%d accepted=%d views=%u\n",
+         "[video_views] presents=%d stereo=%d accepted=%d views=%u "
+         "screens=%d\n",
          (status & RETRO_VIDEO_VIEWS_STATUS_PRESENTS) ? 1 : 0,
-         (status & RETRO_VIDEO_VIEWS_STATUS_STEREO) ? 1 : 0, accepted, n);
+         (status & RETRO_VIDEO_VIEWS_STATUS_STEREO) ? 1 : 0, accepted, n,
+         (status & RETRO_VIDEO_VIEWS_STATUS_SCREENS) ? 1 : 0);
    last_status   = (int)status;
    last_accepted = accepted;
 }

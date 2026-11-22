@@ -4841,6 +4841,10 @@ unsigned video_driver_views_status(void)
    if (BIT32_GET(flags.flags, GFX_CTX_FLAGS_VIDEO_VIEWS))
    {
       status |= RETRO_VIDEO_VIEWS_STATUS_PRESENTS;
+      /* Not while the core is turned: UPRIGHT is not drawn */
+      if (     !BIT32_GET(flags.flags, GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK)
+            && !runloop_state_get_ptr()->system.rotation)
+         status |= RETRO_VIDEO_VIEWS_STATUS_SCREENS;
       /* A display of the driver's own per eye shows both while the
        * driver says so (the 3DS's 3D slider); a headset whatever the
        * window's mode. */
