@@ -11480,6 +11480,44 @@ static void test_laser_no_input(void)
    t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
 }
 
+/* The laser on an inset is the inset's, at the same fraction of its
+ * view; a NO_INPUT inset passes it to its base. Screen 1 over screen
+ * 0's bottom right, a quarter of its height. */
+static void test_laser_inset(void)
+{
+   int16_t x = 0;
+   int16_t y = 0;
+
+   t_let_go();
+   t_forget_devices();
+   t_fresh_session();
+   t_aim_at_screen_1();
+   t_quads.quads[0].screen = 0;
+   t_two_screens.over      = 0x2;
+   t_two_screens.anchor    = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT << 4;
+   t_two_screens.size[1]   = 0.25f;
+   /* The inset's middle, 7/8 across and down the quad: packed pixel
+    * 400,360. */
+   t_aim[1].position.x = t_aim[2].position.x = 0.6f;
+   t_aim[1].position.y = t_aim[2].position.y = -0.18f;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(t_gun_at(&x, &y) && abs(x - 40) < 300 && abs(y - 16485) < 300,
+         "on the inset: the gun at %d,%d, want 40,16485", x, y);
+
+   /* NO_INPUT: screen 0 there, packed pixel 700,210. */
+   t_two_screens.no_input = 0x2;
+   x = y = 0;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(t_gun_at(&x, &y) && abs(x - 24647) < 300 && abs(y + 4037) < 300,
+         "through a NO_INPUT inset: the gun at %d,%d, want 24647,-4037",
+         x, y);
+
+   t_hooks.session_destroying(t_hooks.user);
+   t_touch_reset();
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+}
+
 /* A window that draws the core's views: the laser's point goes through
  * the window's layout, as the window's own pointer does, and a NO_INPUT
  * screen there is off every view. The screens side by side in the
@@ -11693,6 +11731,7 @@ int main(void)
    test_touch_hold_back();
    test_touch_offered();
    test_laser_no_input();
+   test_laser_inset();
    test_window_views_no_input();
    if (failures)
    {

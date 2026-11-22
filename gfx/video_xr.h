@@ -31,8 +31,8 @@ RETRO_BEGIN_DECLS
  * quad's swapchain image holds, and how a point on a quad maps back to
  * the core's frame. A quad faces +Z of its pose. */
 
-/* Slot s < num_screens holds screen s; the UI has its own slot; a
- * whole frame uses slot 0. */
+/* Slot s < num_screens holds screen s and the insets over it; the UI
+ * has its own slot; a whole frame uses slot 0. */
 #define VIDEO_XR_MENU_SLOT RETRO_VIDEO_VIEWS_MAX
 #define VIDEO_XR_MAX_SLOTS (RETRO_VIDEO_VIEWS_MAX + 1)
 #define VIDEO_XR_MAX_QUADS (RETRO_VIDEO_VIEWS_MAX * 2 + 1)
@@ -111,11 +111,27 @@ typedef struct video_xr_slot
    bool blank;
 } video_xr_slot_t;
 
+/* An inset drawn into its base's slot, after the base */
+typedef struct video_xr_inset
+{
+   /* Fractions of the slot's image, from its top left */
+   video_views_frect_t rect;
+   /* video_xr_place_window only: its view in the window, per layer */
+   video_views_rect_t src[2];
+   int view[2];                /* per layer of the base's slot; -1 none */
+   unsigned slot;              /* its base's */
+   unsigned screen;
+   bool blank;
+   bool no_input;
+} video_xr_inset_t;
+
 typedef struct video_xr_quad_set
 {
    video_xr_quad_t quads[VIDEO_XR_MAX_QUADS];
    video_xr_slot_t slots[VIDEO_XR_MAX_SLOTS];
+   video_xr_inset_t insets[RETRO_VIDEO_VIEWS_MAX];   /* in draw order */
    unsigned num_quads;
+   unsigned num_insets;
 } video_xr_quad_set_t;
 
 typedef struct video_xr_params
@@ -682,8 +698,10 @@ void video_xr_turn_back(video_xr_pose_t *pose);
 /* A point on a quad as packed-frame pointer coordinates: any copy of a
  * screen lands in its EYE_NONE or left view at the same fraction, a
  * whole frame spreads over the frame. map and frame_dims are the
- * core's own. False for the menu and a NO_INPUT screen. Rotated views
- * map unrotated, as the window's touch does. */
+ * core's own. A point on one of the screen's insets lands in the
+ * inset's view, unless that is NO_INPUT. False for the menu and a
+ * NO_INPUT screen. Rotated views map unrotated, as the window's touch
+ * does. */
 bool video_xr_quad_to_frame(const video_xr_quad_t *q, float u, float v,
       const video_views_map_t *map, unsigned frame_dims,
       int16_t *res_x, int16_t *res_y);
@@ -704,8 +722,9 @@ void video_xr_window_rect(const video_viewport_t *vp, unsigned frame_dims,
 /* The quads of a window that holds the frame, the menu and all, as
  * the Quest's GL host shows it: p's map as video_xr_place puts its screens
  * while it is untracked and the menu is closed, each slot's layers cut
- * from the window at rects; else the window whole, its rect the window.
- * vp and frame_dims as video_xr_window_rect's, turned p->rotation. */
+ * from the window at rects and each inset's at its src; else the window
+ * whole, its rect the window. vp and frame_dims as
+ * video_xr_window_rect's, turned p->rotation. */
 void video_xr_place_window(const video_xr_params_t *p, bool menu,
       bool tracked, const video_viewport_t *vp, unsigned frame_dims,
       video_xr_quad_set_t *out,

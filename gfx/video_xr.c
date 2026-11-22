@@ -366,25 +366,13 @@ void video_xr_layout(const video_xr_params_t *p, video_xr_layout_t *out)
 
    for (s = 0; s < map->num_screens; s++)
    {
-      const struct retro_video_view *v;
-      double h, aspect;
       disp_w[s] = 0.0;
       disp_h[s] = 0.0;
       if (map->viewless & (1u << s))
          continue;
       if (first == RETRO_VIDEO_VIEWS_MAX)
          first = s;
-      v      = &map->views[
-         video_views_find(map, s, RETRO_VIDEO_VIEW_EYE_NONE)];
-      h      = v->height;
-      aspect = video_views_aspect(v);
-      if (p->rotation & 1)
-      {
-         h      = v->width;
-         aspect = 1.0 / aspect;
-      }
-      disp_h[s] = h;
-      disp_w[s] = h * aspect;
+      video_views_extent(map, s, p->rotation, &disp_w[s], &disp_h[s]);
    }
    if (first == RETRO_VIDEO_VIEWS_MAX)
       return;
@@ -421,11 +409,68 @@ void video_xr_layout(const video_xr_params_t *p, video_xr_layout_t *out)
    out->count = map->num_screens;
 }
 
-/* Screens from their layout spots, each moved by its adjustments. */
+/* Inset s's rectangle, as fractions of its base's image. */
+static void video_xr_inset_rect(const video_views_map_t *map, unsigned s,
+      unsigned rotation, video_views_frect_t *out)
+{
+   video_views_frect_t b;
+   double w = 1.0;
+   double h = 1.0;
+   b.x      = 0.0;
+   b.y      = 0.0;
+   b.w      = 1.0;
+   b.h      = 1.0;
+   video_views_extent(map, VIDEO_VIEWS_NIBBLE(map->base, s), rotation,
+         &b.w, &b.h);
+   video_views_extent(map, s, rotation, &w, &h);
+   video_views_inset(&b, VIDEO_VIEWS_NIBBLE(map->anchor, s), map->size[s],
+         w / h, out);
+   out->x  /= b.w;
+   out->y  /= b.h;
+   out->w  /= b.w;
+   out->h  /= b.h;
+}
+
+/* The insets over the screens of placed, in the main window's order:
+ * a base's in screen order. */
+static void video_xr_place_insets(const video_xr_params_t *p,
+      unsigned placed, video_xr_quad_set_t *out)
+{
+   unsigned s, i;
+   const video_views_map_t *map = p->map;
+   unsigned insets              = video_views_with_insets(map, placed)
+      & ~(placed | p->skip_screens);
+
+   for (s = 0; s < map->num_screens; s++)
+   {
+      if (!(placed & (1u << s)))
+         continue;
+      for (i = 0; i < map->num_screens; i++)
+      {
+         video_xr_inset_t *in;
+         if (     !(insets & (1u << i))
+               || VIDEO_VIEWS_NIBBLE(map->base, i) != s)
+            continue;
+         in           = &out->insets[out->num_insets++];
+         video_xr_inset_rect(map, i, p->rotation, &in->rect);
+         in->view[0]  = video_views_find(map, i, RETRO_VIDEO_VIEW_EYE_LEFT);
+         in->view[1]  = (out->slots[s].layers == 2)
+            ? video_views_find(map, i, RETRO_VIDEO_VIEW_EYE_RIGHT) : -1;
+         in->slot     = s;
+         in->screen   = i;
+         in->blank    = (map->blank & (1u << i)) != 0;
+         in->no_input = (map->no_input & (1u << i)) != 0;
+      }
+   }
+}
+
+/* Screens from their layout spots, each moved by its adjustments. An
+ * inset has no quad: it goes into its base's slot. */
 static void video_xr_place_screens(const video_xr_params_t *p,
       const video_xr_layout_t *lay, video_xr_quad_set_t *out)
 {
    unsigned s, i;
+   unsigned placed              = 0;
    const video_views_map_t *map = p->map;
 
    for (s = 0; s < lay->count; s++)
@@ -442,7 +487,8 @@ static void video_xr_place_screens(const video_xr_params_t *p,
       video_xr_slot_t *slot = &out->slots[s];
 
       slot->base = lay->pos[s];
-      if ((p->skip_screens | map->viewless | map->left_out) & (1u << s))
+      if ((p->skip_screens | map->viewless | map->left_out | map->over)
+            & (1u << s))
          continue;
       if (p->screens)
       {
@@ -451,6 +497,7 @@ static void video_xr_place_screens(const video_xr_params_t *p,
          if (!screen.visible)
             continue;
       }
+      placed |= 1u << s;
       video_xr_adjust(p, &lay->pos[s], p->screens ? &screen : NULL,
             &pose, &w, &h, &distance);
 
@@ -477,6 +524,7 @@ static void video_xr_place_screens(const video_xr_params_t *p,
    for (i = 0; i < out->num_quads; i++)
       if (map->no_input & (1u << out->quads[i].screen))
          out->quads[i].no_input = true;
+   video_xr_place_insets(p, placed, out);
 }
 
 /* The UI's image: its own size, but no more than VIDEO_XR_MENU_DENSITY
@@ -501,16 +549,16 @@ static unsigned video_xr_menu_dims(const video_xr_params_t *p,
          VIDEO_SCALE_PACK(w, h), p->max_dim);
 }
 
-/* The first screen shown, past those left out or hidden; or
- * RETRO_VIDEO_VIEWS_MAX for none, or when it is the projection's,
- * hidden or not. */
+/* The first screen shown, past those left out, hidden or drawn as
+ * insets; or RETRO_VIDEO_VIEWS_MAX for none, or when it is the
+ * projection's, hidden or not. */
 static unsigned video_xr_first_placed(const video_xr_params_t *p,
       const video_xr_layout_t *lay)
 {
    unsigned s;
    unsigned gone = 0;
    if (p->map && p->map->num_views)
-      gone = p->map->viewless | p->map->left_out;
+      gone = p->map->viewless | p->map->left_out | p->map->over;
    for (s = 0; s < lay->count; s++)
    {
       if (gone & (1u << s))
@@ -789,12 +837,35 @@ bool video_xr_quad_to_frame(const video_xr_quad_t *q, float u, float v,
    if (q->kind == VIDEO_XR_QUAD_SCREEN)
    {
       int r;
+      unsigned i, insets;
+      unsigned s = q->screen;
       if (!map || !map->num_views)
          return false;
-      if ((r = video_views_find(map, q->screen,
-                  RETRO_VIDEO_VIEW_EYE_NONE)) < 0)
+      /* Its insets, topmost first; a NO_INPUT one passes the point on. */
+      insets = video_views_with_insets(map, 1u << s)
+         & ~((1u << s) | map->no_input);
+      for (i = map->num_screens; i-- > 0; )
+      {
+         double fu, fv;
+         video_views_frect_t in;
+         if (!(insets & (1u << i)))
+            continue;
+         video_xr_inset_rect(map, i, 0, &in);
+         if (!(in.w > 0.0) || !(in.h > 0.0))
+            continue;
+         fu = ((double)u - in.x) / in.w;
+         fv = ((double)v - in.y) / in.h;
+         /* An inset at the quad's edge takes the edge. */
+         if (fu < -1e-6 || fu > 1.0 + 1e-6 || fv < -1e-6 || fv > 1.0 + 1e-6)
+            continue;
+         u = (float)fu;
+         v = (float)fv;
+         s = i;
+         break;
+      }
+      if ((r = video_views_find(map, s, RETRO_VIDEO_VIEW_EYE_NONE)) < 0)
          return false;
-      if (map->no_input & (1u << q->screen))
+      if (map->no_input & (1u << s))
          return false;
       x0 = map->views[r].x;
       y0 = map->views[r].y;
@@ -895,6 +966,14 @@ void video_xr_place_window(const video_xr_params_t *p, bool menu,
             rects[s][l].dims = vp->full_dims;
          }
       }
+   }
+   for (s = 0; s < out->num_insets; s++)
+   {
+      video_xr_inset_t *in = &out->insets[s];
+      for (l = 0; l < 2; l++)
+         if (in->view[l] >= 0)
+            video_xr_window_rect(vp, frame_dims, q.rotation,
+                  &q.map->views[in->view[l]], &in->src[l]);
    }
 }
 
