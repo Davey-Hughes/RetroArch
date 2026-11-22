@@ -1968,12 +1968,14 @@ def check_options_follow(res):
     errors = []
     if '[OpenXR] The headset session ended' not in res.log:
         errors.append('no "[OpenXR] The headset session ended" in the log')
-    seen = re.findall(r'\[video_views\] options display status=(\d+)',
-                      res.log)
-    # Status 7 (HMD) while the headset tracks; 1 only after it ended.
-    if '7' not in seen or '1' not in seen[seen.index('7'):]:
+    raw = re.findall(r'\[video_views\] options display status=(\d+)',
+                     res.log)
+    # 7 (PRESENTS, STEREO, HMD) while the headset tracks; 1 only after it
+    # ended. SCREENS and IMAGES are the driver's.
+    seen = [int(s) & 7 for s in raw]
+    if 7 not in seen or 1 not in seen[seen.index(7):]:
         errors.append('no options display update from status 7 to 1 (2D) '
-                      'after the session ended: %s' % seen)
+                      'after the session ended: %s' % raw)
     return errors
 
 
