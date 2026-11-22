@@ -7857,7 +7857,8 @@ static bool gl3_frame(void *data, const void *frame,
    }
    /* With no map: whether one would be drawn whole. A repeat before its
     * views were copied keeps the last answer. */
-   if (!views_held)
+   if (     !views_held
+         && !video_views_chains_behind(&gl->views.chains, &video_info->views))
       retro_atomic_store_release_int(&gl->views.fallback,
             (video_info->views.num_views ? !views
              : gl3_views_whole(gl, video_info)) ? 1 : 0);

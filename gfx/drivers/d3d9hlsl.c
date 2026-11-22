@@ -6944,6 +6944,7 @@ static void d3d9_hlsl_views_build_chains(d3d9_video_t *d3d,
       const video_views_map_t *map)
 {
    unsigned i;
+   d3d->views.chains.preset_failed = false;
    for (i = 0; i < d3d->views.chains.count && i < map->num_views; i++)
    {
       hlsl_renderchain_t *c = (hlsl_renderchain_t*)
@@ -6953,9 +6954,10 @@ static void d3d9_hlsl_views_build_chains(d3d9_video_t *d3d,
          hlsl_d3d9_renderchain_free(c);
          d3d->views.chains.preset[i] = NULL;
       }
-      if (!d3d->views.chains.preset[i])
-         d3d->views.chains.preset[i] = d3d9_hlsl_views_chain_new(d3d, i,
-               map->views[i].width, map->views[i].height);
+      if (     !d3d->views.chains.preset[i]
+            && !(d3d->views.chains.preset[i] = d3d9_hlsl_views_chain_new(d3d,
+               i, map->views[i].width, map->views[i].height)))
+         d3d->views.chains.preset_failed = true;
    }
 }
 
@@ -8326,6 +8328,7 @@ static void *d3d9_hlsl_init(const video_info_t *info)
 
    d3d->keep_aspect       = info->force_aspect;
 #ifdef D3D9_VIEWS
+   d3d9_hlsl_views_seed(d3d);
    d3d9_hlsl_views_publish(d3d);
 #endif
 
@@ -8818,9 +8821,7 @@ static bool d3d9_hlsl_frame_body(void *data, const void *frame,
    bool views                          = false;
    bool views_blend                    = false;
    bool views_direct                   = false;
-   /* Kept where a core's texture, not handed over, leaves nothing to
-    * draw views from */
-   bool views_fallback                 = true;
+   bool views_fallback                 = false;
    bool views_ui                       = false;
 #endif
 
@@ -8942,20 +8943,25 @@ static bool d3d9_hlsl_frame_body(void *data, const void *frame,
       RARCH_LOG("[D3D9 HLSL] Views' presets have each view of a hardware "
             "frame copied out of the core's texture.\n");
    }
-   /* None handed over: nothing to draw them from */
+   /* None handed over: nothing to draw them from, and FALLBACK keeps
+    * the last frame's answer */
    if (!hw_frame || d3d->hw.tex)
 #endif
-   views = d3d9_hlsl_views_setup(d3d, video_info, msg,
-         d3d->menu && d3d->menu->enabled, &views_blend, &views_direct,
-         &views_fallback, view_chains, view_rects);
+   {
+      views = d3d9_hlsl_views_setup(d3d, video_info, msg,
+            d3d->menu && d3d->menu->enabled, &views_blend, &views_direct,
+            &views_fallback, view_chains, view_rects);
+      if (!video_views_chains_behind(&d3d->views.chains,
+               &video_info->views))
+         retro_atomic_store_release_int(&d3d->views.fallback,
+               views_fallback ? 1 : 0);
+   }
    /* The viewport is the whole window while views draw. */
    if (views != d3d->views.active)
    {
       d3d->views.active  = views;
       d3d->should_resize = true;
    }
-   retro_atomic_store_release_int(&d3d->views.fallback,
-         views_fallback ? 1 : 0);
    d3d9_hlsl_views_publish(d3d);
    /* Nothing to draw the frame whole from */
    if (!frame && !views)

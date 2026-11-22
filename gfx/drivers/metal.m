@@ -6604,6 +6604,7 @@ static void metal_views_build_chains(metal_views_t *vs)
       if (     !vs->chains.preset[i]
             && !(vs->chains.preset[i] = [vs->frameView makeViewChain]))
          break;
+   vs->chains.preset_failed = i < vs->chains.count;
 }
 
 static void metal_views_set_count(metal_views_t *vs, unsigned count)
@@ -6613,6 +6614,23 @@ static void metal_views_set_count(metal_views_t *vs, unsigned count)
    for (i = vs->chains.count; i < RETRO_VIDEO_VIEWS_MAX; i++)
       vs->chains.stock[i] = NULL;
    metal_views_free_chains(vs, vs->chains.count);
+}
+
+static bool metal_views_stock(const metal_views_t *vs,
+      const video_frame_info_t *video_info)
+{
+   struct video_shader *shader = vs->frameView.shader;
+   return !video_info->shader_active || !shader || !shader->passes;
+}
+
+/* Without a map, whether one would be drawn whole: views not allowed,
+ * or a view's preset chain that could not be made while the views take
+ * the preset's */
+static bool metal_views_whole(const metal_views_t *vs,
+      const video_frame_info_t *video_info)
+{
+   return !metal_views_allowed(vs)
+      || (!metal_views_stock(vs, video_info) && vs->chains.preset_failed);
 }
 
 /* Whether this frame draws its views, with each drawn view's chain
@@ -6626,9 +6644,8 @@ static bool metal_views_setup(metal_views_t *vs,
 {
    bool views;
    const video_views_layout_t *layout = &video_info->views_layout;
-   struct video_shader *shader        = vs->frameView.shader;
    bool offscreen = video_info->views.num_views && layout->offscreen;
-   bool stock     = !video_info->shader_active || !shader || !shader->passes;
+   bool stock     = metal_views_stock(vs, video_info);
 
    if (video_info->views.num_views && !vs->tried)
       metal_views_init(vs);
@@ -7403,9 +7420,10 @@ static void metal_views_render(metal_views_t *vs,
          [_frameView syncViewport];
       }
       /* With no map: whether one would be drawn whole */
-      retro_atomic_store_release_int(&_views.fallback,
-            (video_info->views.num_views ? !views
-             : !metal_views_allowed(&_views)) ? 1 : 0);
+      if (!video_views_chains_behind(&_views.chains, &video_info->views))
+         retro_atomic_store_release_int(&_views.fallback,
+               (video_info->views.num_views ? !views
+                : metal_views_whole(&_views, video_info)) ? 1 : 0);
       retro_atomic_store_release_int(&_views.allowed,
             metal_views_allowed(&_views) ? 1 : 0);
 
@@ -10363,6 +10381,7 @@ static bool metal_set_shader(void *data,
 
          /* The views' chains read the preset */
          metal_views_free_chains(md.views, 0);
+         md.views->chains.preset_failed = false;
 
          if (!path || !*path)
          {

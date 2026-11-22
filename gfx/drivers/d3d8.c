@@ -2633,9 +2633,18 @@ static void d3d8_set_rotation(void *data, unsigned rot)
    d3d->should_resize = true;
 }
 
+#ifdef D3D8_VIEWS
+static void d3d8_views_init(d3d8_video_t *d3d);
+static bool d3d8_views_whole(const d3d8_video_t *d3d, unsigned stereo,
+      bool ui);
+#endif
+
 static void *d3d8_init(const video_info_t *info)
 {
    d3d8_video_t *d3d = (d3d8_video_t*)calloc(1, sizeof(*d3d));
+#ifdef D3D8_VIEWS
+   unsigned stereo;
+#endif
 
    if (!d3d)
       return NULL;
@@ -2670,6 +2679,12 @@ static void *d3d8_init(const video_info_t *info)
 
    d3d->keep_aspect       = info->force_aspect;
 #ifdef D3D8_VIEWS
+   /* Read before the first frame */
+   stereo = config_get_ptr()->uints.video_stereo_mode;
+   if (stereo != VIDEO_STEREO_MODE_2D)
+      d3d8_views_init(d3d);
+   retro_atomic_store_release_int(&d3d->views.fallback,
+         d3d8_views_whole(d3d, stereo, false) ? 1 : 0);
    retro_atomic_store_release_int(&d3d->views.allowed, 1);
 #endif
 
@@ -3213,6 +3228,31 @@ static bool d3d8_views_ui_wanted(d3d8_video_t *d3d,
    return ui;
 }
 
+/* The second texture stage the UI layer takes, found on first use or
+ * in a stereo mode: most sessions never draw views */
+static void d3d8_views_init(d3d8_video_t *d3d)
+{
+   D3DCAPS8 caps;
+   memset(&caps, 0, sizeof(caps));
+   d3d->views.tried = true;
+   d3d->views.layer =
+         SUCCEEDED(IDirect3DDevice8_GetDeviceCaps(d3d->dev, &caps))
+      && caps.MaxTextureBlendStages >= 2
+      && (caps.TextureOpCaps & D3DTEXOPCAPS_MODULATE);
+   if (!d3d->views.layer)
+      RARCH_LOG("[D3D8] Views drawn without the UI layer: the device "
+            "has one texture stage.\n");
+}
+
+/* Without a map, whether one would be drawn whole: in anaglyph, and
+ * with @ui in each eye once the layer is known missing */
+static bool d3d8_views_whole(const d3d8_video_t *d3d, unsigned stereo,
+      bool ui)
+{
+   return stereo == VIDEO_STEREO_MODE_ANAGLYPH
+      || (d3d->views.tried && !d3d->views.layer && ui);
+}
+
 /* Whether this frame draws its views, with each drawn view's chain
  * picked and the rectangle its first placement takes, in *blend
  * whether into the canvas, and in *fallback whether a map, sent or
@@ -3228,19 +3268,9 @@ static bool d3d8_views_setup(d3d8_video_t *d3d,
    bool offscreen  = video_info->views.num_views && layout->offscreen;
    unsigned stereo = video_info->views_settings.stereo_mode;
 
-   if (video_info->views.num_views && !d3d->views.tried)
-   {
-      D3DCAPS8 caps;
-      memset(&caps, 0, sizeof(caps));
-      d3d->views.tried = true;
-      d3d->views.layer =
-            SUCCEEDED(IDirect3DDevice8_GetDeviceCaps(d3d->dev, &caps))
-         && caps.MaxTextureBlendStages >= 2
-         && (caps.TextureOpCaps & D3DTEXOPCAPS_MODULATE);
-      if (!d3d->views.layer)
-         RARCH_LOG("[D3D8] Views drawn without the UI layer: the device "
-               "has one texture stage.\n");
-   }
+   if (     (video_info->views.num_views || stereo != VIDEO_STEREO_MODE_2D)
+         && !d3d->views.tried)
+      d3d8_views_init(d3d);
 
    *blend = offscreen
       && layout->stereo_mode == VIDEO_STEREO_MODE_INTERLACED
@@ -3259,15 +3289,12 @@ static bool d3d8_views_setup(d3d8_video_t *d3d,
             layout, true, *blend || !layout->offscreen,
             *blend ? layout->canvas_dims : video_info->dims, chains, rects);
    *blend = views && *blend;
-   /* Without a map, what one would get: drawn whole in anaglyph, and
-    * with UI in a stereo mode that puts it in each eye once the layer
-    * is known missing */
-   whole  = stereo == VIDEO_STEREO_MODE_ANAGLYPH
-      || (   d3d->views.tried && !d3d->views.layer
-          && d3d8_views_ui_wanted(d3d, video_info, msg,
-                stereo == VIDEO_STEREO_MODE_SBS_HALF
-             || stereo == VIDEO_STEREO_MODE_SBS_FULL
-             || stereo == VIDEO_STEREO_MODE_TOP_BOTTOM));
+   /* Without a map, what one would get */
+   whole  = d3d8_views_whole(d3d, stereo, d3d8_views_ui_wanted(d3d,
+            video_info, msg,
+               stereo == VIDEO_STEREO_MODE_SBS_HALF
+            || stereo == VIDEO_STEREO_MODE_SBS_FULL
+            || stereo == VIDEO_STEREO_MODE_TOP_BOTTOM));
    *fallback = video_info->views.num_views ? !views : whole;
    if (views && !d3d->views.direct_seen)
    {
@@ -3625,8 +3652,9 @@ static bool d3d8_frame(void *data, const void *frame,
       d3d->views.active  = views;
       d3d->should_resize = true;
    }
-   retro_atomic_store_release_int(&d3d->views.fallback,
-         views_fallback ? 1 : 0);
+   if (!video_views_chains_behind(&d3d->views.chains, &video_info->views))
+      retro_atomic_store_release_int(&d3d->views.fallback,
+            views_fallback ? 1 : 0);
    /* As the main thread laid the UI out: overlays are hidden. */
    views_per_eye = video_views_ui_per_eye(&video_info->views,
          &video_info->views_layout, true);

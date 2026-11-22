@@ -15840,7 +15840,8 @@ static bool vulkan_frame(void *data, const void *frame,
    vk->views.active = views;
    /* With no map: whether one would be drawn whole. A repeat before its
     * views were copied keeps the last answer. */
-   if (!views_held)
+   if (     !views_held
+         && !video_views_chains_behind(&vk->views.chains, &video_info->views))
       retro_atomic_store_release_int(&vk->views.fallback,
             (video_info->views.num_views ? !views
              : vulkan_views_whole(vk, video_info)) ? 1 : 0);

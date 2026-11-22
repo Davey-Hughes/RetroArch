@@ -1268,8 +1268,9 @@ static bool sdl2_gfx_frame(void *data, const void *frame,
       vid->views.active = views;
       vid->flags       |= SDL2_FLAG_SHOULD_RESIZE;
    }
-   retro_atomic_store_release_int(&vid->views.fallback,
-         views_whole ? 1 : 0);
+   if (!video_views_chains_behind(&vid->views.chains, &video_info->views))
+      retro_atomic_store_release_int(&vid->views.fallback,
+            views_whole ? 1 : 0);
 #endif
 
    if (vid->flags & SDL2_FLAG_SHOULD_RESIZE)

@@ -346,9 +346,14 @@ static void *sdl3_get_menu_framebuffer(void *data, bool rgb32,
    return vid->menu_lend.pixels;
 }
 
+static void sdl3_views_init(sdl3_video_t *vid);
+static bool sdl3_views_whole(const sdl3_video_t *vid, unsigned stereo,
+      bool ui);
+
 static void *sdl3_gfx_init(const video_info_t *video)
 {
    int i;
+   unsigned stereo;
    sdl3_video_t *vid = NULL;
 
    sdl3_set_app_metadata();
@@ -399,6 +404,12 @@ static void *sdl3_gfx_init(const video_info_t *video)
 
    sdl3_input_driver(config_get_ptr()->arrays.input_joypad_driver);
 
+   /* Read before the first frame */
+   stereo = config_get_ptr()->uints.video_stereo_mode;
+   if (stereo != VIDEO_STEREO_MODE_2D)
+      sdl3_views_init(vid);
+   retro_atomic_store_release_int(&vid->views.fallback,
+         sdl3_views_whole(vid, stereo, false) ? 1 : 0);
    retro_atomic_store_release_int(&vid->views.allowed, 1);
 
    return vid;
@@ -573,8 +584,8 @@ static bool sdl3_display_geometry_reserve(sdl3_video_t *vid,
 #define VV_TARGET_RETIRE(drv, t)        sdl3_views_target_retire(drv, t)
 #include "../video_views_draw.h"
 
-/* The premultiplied blend, found on first use: most sessions never
- * draw views */
+/* The premultiplied blend, found on first use or in a stereo mode:
+ * most sessions never draw views */
 static void sdl3_views_init(sdl3_video_t *vid)
 {
    SDL_Texture *probe;
@@ -594,6 +605,17 @@ static void sdl3_views_init(sdl3_video_t *vid)
    if (!vid->views.layer)
       RARCH_LOG("[SDL3] Views drawn without the UI layer: the renderer "
             "blends no premultiplied colour.\n");
+}
+
+/* Without a map, whether one would be drawn whole: in anaglyph, after
+ * a view could not be written, and with @ui in each eye once the layer
+ * is known missing */
+static bool sdl3_views_whole(const sdl3_video_t *vid, unsigned stereo,
+      bool ui)
+{
+   return vid->views.write_failed
+      || stereo == VIDEO_STEREO_MODE_ANAGLYPH
+      || (vid->views.tried && !vid->views.layer && ui);
 }
 
 static bool sdl3_views_target_retire(sdl3_video_t *vid, SDL_Texture **t)
@@ -769,7 +791,8 @@ static bool sdl3_views_setup(sdl3_video_t *vid,
    bool offscreen  = video_info->views.num_views && layout->offscreen;
    unsigned stereo = video_info->views_settings.stereo_mode;
 
-   if (video_info->views.num_views && !vid->views.tried)
+   if (     (video_info->views.num_views || stereo != VIDEO_STEREO_MODE_2D)
+         && !vid->views.tried)
       sdl3_views_init(vid);
    *blend = offscreen
       && layout->stereo_mode == VIDEO_STEREO_MODE_INTERLACED
@@ -789,16 +812,12 @@ static bool sdl3_views_setup(sdl3_video_t *vid,
             layout, true, *blend || !layout->offscreen,
             *blend ? layout->canvas_dims : video_info->dims, chains, rects);
    *blend = views && *blend;
-   /* Without a map, what one would get: drawn whole in anaglyph, after
-    * a view could not be written, and with UI in each eye once the
-    * layer is known missing */
-   whole = vid->views.write_failed
-      || stereo == VIDEO_STEREO_MODE_ANAGLYPH
-      || (   vid->views.tried && !vid->views.layer
-          && sdl3_views_ui_wanted(vid, video_info, msg,
-                   stereo == VIDEO_STEREO_MODE_SBS_HALF
-                || stereo == VIDEO_STEREO_MODE_SBS_FULL
-                || stereo == VIDEO_STEREO_MODE_TOP_BOTTOM));
+   /* Without a map, what one would get */
+   whole = sdl3_views_whole(vid, stereo, sdl3_views_ui_wanted(vid,
+            video_info, msg,
+               stereo == VIDEO_STEREO_MODE_SBS_HALF
+            || stereo == VIDEO_STEREO_MODE_SBS_FULL
+            || stereo == VIDEO_STEREO_MODE_TOP_BOTTOM));
    *fallback = video_info->views.num_views ? !views : whole;
    if (views && !vid->views.direct_seen)
    {
@@ -1272,8 +1291,9 @@ static bool sdl3_gfx_frame(void *data, const void *frame,
       if (!views && !video_info->views.num_views)
          sdl3_views_release_textures(vid);
    }
-   retro_atomic_store_release_int(&vid->views.fallback,
-         views_whole ? 1 : 0);
+   if (!video_views_chains_behind(&vid->views.chains, &video_info->views))
+      retro_atomic_store_release_int(&vid->views.fallback,
+            views_whole ? 1 : 0);
 
    if (vid->flags & SDL3_FLAG_SHOULD_RESIZE)
       sdl3_refresh_viewport(vid);

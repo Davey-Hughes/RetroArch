@@ -881,6 +881,8 @@ static void d3d11_views_release(d3d11_video_t *d3d11);
 static void d3d11_sw_lend_release(d3d11_video_t *d3d11);
 static void d3d11_frame_mem_free(void *data, uintptr_t id);
 static void d3d11_views_publish(d3d11_video_t *d3d11);
+static bool d3d11_views_whole(const d3d11_video_t *d3d11,
+      bool shader_active, bool rolling);
 
 /* Sprite/font shader selection: HDR output uses the encoding
  * entries (driven by sprites.hdr_cb at PS slot b1); SDR uses the
@@ -3712,6 +3714,7 @@ static void d3d11_free_shader_preset(d3d11_video_t* d3d11)
       d3d11->media_shader_chain = NULL;
    }
    d3d11->media_shader_attempted = false;
+   d3d11->views.chains.preset_failed = false;
    d3d11_chain_free(&d3d11->chain, false);
    d3d11->flags &= ~(D3D11_ST_FLAG_INIT_HISTORY | D3D11_ST_FLAG_RESIZE_RTS);
 }
@@ -6046,6 +6049,11 @@ static void *d3d11_gfx_init(const video_info_t* video)
 #ifdef D3D11_FRAME_IMPORT
    d3d11_frame_import_init(d3d11);
 #endif
+   /* Read before the first frame */
+   retro_atomic_store_release_int(&d3d11->views.fallback,
+         d3d11_views_whole(d3d11, true,
+               settings->uints.video_shader_subframes > 1
+            && settings->bools.video_scan_subframes) ? 1 : 0);
    d3d11_views_publish(d3d11);
    return d3d11;
 
@@ -7448,6 +7456,18 @@ static void d3d11_views_publish(d3d11_video_t *d3d11)
          d3d11_views_allowed(d3d11) ? 1 : 0);
 }
 
+/* Without a map, whether one would be drawn whole: views not allowed,
+ * a @rolling scanline, or a view's preset chain that could not be made
+ * while the views take the preset's */
+static bool d3d11_views_whole(const d3d11_video_t *d3d11,
+      bool shader_active, bool rolling)
+{
+   return !d3d11_views_allowed(d3d11) || rolling
+      || (   shader_active && d3d11->chain.shader_preset
+          && d3d11->chain.shader_preset->passes
+          && d3d11->views.chains.preset_failed);
+}
+
 static void d3d11_views_release(d3d11_video_t *d3d11)
 {
    d3d11_release_shader(&d3d11->views.rect);
@@ -7849,6 +7869,7 @@ static void d3d11_views_build_chains(d3d11_video_t *d3d11)
             && !(d3d11->views.chains.preset[i] =
                d3d11_chain_clone(d3d11, &d3d11->chain, false)))
          break;
+   d3d11->views.chains.preset_failed = i < d3d11->views.chains.count;
 }
 
 /* View @v's chain made ready and its passes drawn into their render
@@ -8911,13 +8932,13 @@ static bool d3d11_gfx_frame_body(
       d3d11->views.active = views;
       d3d11_update_viewport(d3d11, views);
    }
-   /* With no map: whether one would be drawn whole, by what
-    * d3d11_views_setup tests besides the map */
-   retro_atomic_store_release_int(&d3d11->views.fallback,
-         (video_info->views.num_views ? !views
-          : (   !d3d11_views_allowed(d3d11)
-             || (   video_info->shader_subframes > 1
-                 && video_info->scan_subframes))) ? 1 : 0);
+   /* With no map: whether one would be drawn whole */
+   if (!video_views_chains_behind(&d3d11->views.chains, &video_info->views))
+      retro_atomic_store_release_int(&d3d11->views.fallback,
+            (video_info->views.num_views ? !views
+             : d3d11_views_whole(d3d11, video_info->shader_active,
+                     video_info->shader_subframes > 1
+                  && video_info->scan_subframes)) ? 1 : 0);
    d3d11_views_publish(d3d11);
 
 #ifdef D3D11_ROLLING_SCANLINE_SIMULATION

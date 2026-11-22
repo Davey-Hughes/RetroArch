@@ -4268,6 +4268,7 @@ static void *d3d9_cg_init(const video_info_t *info)
 
    d3d->keep_aspect       = info->force_aspect;
 #ifdef D3D9_VIEWS
+   d3d9_cg_views_seed(d3d);
    d3d9_cg_views_publish(d3d);
 #endif
 
@@ -4788,8 +4789,9 @@ static bool d3d9_cg_frame(void *data, const void *frame,
       d3d->views.active  = views;
       d3d->should_resize = true;
    }
-   retro_atomic_store_release_int(&d3d->views.fallback,
-         views_fallback ? 1 : 0);
+   if (!video_views_chains_behind(&d3d->views.chains, &video_info->views))
+      retro_atomic_store_release_int(&d3d->views.fallback,
+            views_fallback ? 1 : 0);
    d3d9_cg_views_publish(d3d);
    /* Nothing to draw the frame whole from */
    if (!frame && !views)

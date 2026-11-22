@@ -510,7 +510,7 @@ void video_views_blend_xrgb8888(const uint32_t *canvas,
  * pick_chains takes them: one set for the preset, one for the stock
  * shader. count is the views the driver last made room for. A chain
  * that could not be made is remembered, with or without a map, until
- * the preset changes. */
+ * the preset changes or the chains are made again. */
 typedef struct video_views_chains
 {
    void *preset[RETRO_VIDEO_VIEWS_MAX];
@@ -519,6 +519,15 @@ typedef struct video_views_chains
    bool stock_failed;
    bool preset_failed;
 } video_views_chains_t;
+
+/* Whether @map has views past @set's count, which pick_chains can't
+ * draw: a frame queued before the count shrank, or a dupe laid out
+ * from the map before it. Such a frame keeps the last FALLBACK. */
+static INLINE bool video_views_chains_behind(
+      const video_views_chains_t *set, const video_views_map_t *map)
+{
+   return map->num_views > set->count;
+}
 
 /* A render target the views draw into: the size it was made at, kept
  * when making it failed so it isn't retried every frame. */

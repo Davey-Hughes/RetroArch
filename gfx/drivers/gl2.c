@@ -8060,8 +8060,9 @@ static bool gl2_frame(void *data, const void *frame,
       gl->views.active = views;
       gl2_set_viewport(gl, VIDEO_SCALE_PACK(width, height), false, true);
    }
-   retro_atomic_store_release_int(&gl->views.fallback,
-         views_fallback ? 1 : 0);
+   if (!video_views_chains_behind(&gl->views.chains, &video_info->views))
+      retro_atomic_store_release_int(&gl->views.fallback,
+            views_fallback ? 1 : 0);
    gl2_views_publish(gl);
    if (views)
       gl2_views_render(gl, video_info, &video_info->views_layout,
@@ -9964,8 +9965,10 @@ static bool gl2_set_shader(void *data,
    gl2_renderchain_init(gl,
          (gl2_renderchain_data_t*)gl->renderchain_data);
 #ifdef GL2_VIEWS
-   retro_atomic_store_release_int(&gl->views.fallback,
-         gl2_views_whole(gl, !gl->views.preset) ? 1 : 0);
+   /* With a map set, its next frame answers */
+   if (!gl->views.chains.count)
+      retro_atomic_store_release_int(&gl->views.fallback,
+            gl2_views_whole(gl, !gl->views.preset) ? 1 : 0);
 #endif
 
    /* Apparently need to set viewport for passes when we aren't using FBOs. */

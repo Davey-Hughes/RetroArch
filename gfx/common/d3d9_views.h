@@ -193,11 +193,12 @@ static void D3D9V_FN(views_release)(d3d9_video_t *d3d)
    d3d->views.failed      = false;
    d3d->views.blend       = false;
    d3d->views.layer       = false;
+   d3d->views.chains.preset_failed = false;
 }
 
-/* The shaders views draw with, made on first use: most sessions never
- * draw views. Without the rect shader views aren't drawn; without the
- * others, not into the canvas or UI layer. */
+/* The shaders views draw with, made on first use or in a stereo mode:
+ * most sessions never draw views. Without the rect shader views aren't
+ * drawn; without the others, not into the canvas or UI layer. */
 static void D3D9V_FN(views_init)(d3d9_video_t *d3d)
 {
    D3DCAPS9 caps;
@@ -227,6 +228,34 @@ static void D3D9V_FN(views_init)(d3d9_video_t *d3d)
       && D3D9V_PS_MAKE(d3d, D3D9_VIEWS_PS_LAYER, d3d9_views_ps_layer);
    d3d->views.factor = (caps.SrcBlendCaps & D3DPBLENDCAPS_BLENDFACTOR)
       && (caps.DestBlendCaps & D3DPBLENDCAPS_BLENDFACTOR);
+}
+
+/* Without a map, whether one would be drawn whole: where views aren't
+ * allowed, after a view's preset chain could not be made, and once the
+ * canvas's blend or the UI's layer is known missing, in the stereo
+ * modes that take the one, or with @ui in each eye the other */
+static bool D3D9V_FN(views_whole)(const d3d9_video_t *d3d, unsigned stereo,
+      bool ui)
+{
+   return !D3D9V_FN(views_allowed)(d3d)
+#ifdef D3D9V_PRESETS
+      || (D3D9V_FN(views_preset)(d3d) && d3d->views.chains.preset_failed)
+#endif
+      || (   d3d->views.tried
+          && (   (   !d3d->views.blend
+                  && (   stereo == VIDEO_STEREO_MODE_ANAGLYPH
+                      || stereo == VIDEO_STEREO_MODE_INTERLACED))
+              || (!d3d->views.layer && ui)));
+}
+
+/* The FALLBACK a core reads before the first frame */
+static void D3D9V_FN(views_seed)(d3d9_video_t *d3d)
+{
+   unsigned stereo = config_get_ptr()->uints.video_stereo_mode;
+   if (stereo != VIDEO_STEREO_MODE_2D)
+      D3D9V_FN(views_init)(d3d);
+   retro_atomic_store_release_int(&d3d->views.fallback,
+         D3D9V_FN(views_whole)(d3d, stereo, false) ? 1 : 0);
 }
 
 /* A scissor rectangle from a top-left one */
@@ -332,7 +361,8 @@ static bool D3D9V_FN(views_setup)(d3d9_video_t *d3d,
    bool offscreen  = video_info->views.num_views && layout->offscreen;
    unsigned stereo = video_info->views_settings.stereo_mode;
 
-   if (video_info->views.num_views && !d3d->views.tried)
+   if (     (video_info->views.num_views || stereo != VIDEO_STEREO_MODE_2D)
+         && !d3d->views.tried)
       D3D9V_FN(views_init)(d3d);
    *blend = offscreen && d3d->views.blend
       && D3D9V_FN(vv_target_ensure)(d3d, &d3d->views.canvas_target,
@@ -361,22 +391,13 @@ static bool D3D9V_FN(views_setup)(d3d9_video_t *d3d,
             *blend ? layout->canvas_dims : video_info->dims, chains, rects);
    *blend  = views && *blend;
    *direct = views && stock;
-   /* Without a map, what one would get: drawn whole where views aren't
-    * allowed, and once the canvas's blend or the UI's layer is known
-    * missing, in the stereo modes that take the one, or with UI the
-    * other */
-   whole   = !D3D9V_FN(views_allowed)(d3d)
-      || (   d3d->views.tried
-          && (   (   !d3d->views.blend
-                  && (   stereo == VIDEO_STEREO_MODE_ANAGLYPH
-                      || stereo == VIDEO_STEREO_MODE_INTERLACED))
-              || (   !d3d->views.layer
-                  && VIDEO_VIEWS_UI_WANTED(
-                        stereo == VIDEO_STEREO_MODE_SBS_HALF
-                     || stereo == VIDEO_STEREO_MODE_SBS_FULL
-                     || stereo == VIDEO_STEREO_MODE_TOP_BOTTOM,
-                        menu, msg, video_info->statistics_show,
-                        video_info->widgets_visible))));
+   /* Without a map, what one would get */
+   whole   = D3D9V_FN(views_whole)(d3d, stereo, VIDEO_VIEWS_UI_WANTED(
+            stereo == VIDEO_STEREO_MODE_SBS_HALF
+         || stereo == VIDEO_STEREO_MODE_SBS_FULL
+         || stereo == VIDEO_STEREO_MODE_TOP_BOTTOM,
+         menu, msg, video_info->statistics_show,
+         video_info->widgets_visible));
    *fallback = video_info->views.num_views ? !views : whole;
    if (*direct && !d3d->views.direct_seen)
    {

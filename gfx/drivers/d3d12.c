@@ -1110,6 +1110,8 @@ static void d3d12_record_teardown(d3d12_video_t *d3d12);
 static void d3d12_views_release(d3d12_video_t *d3d12);
 static void d3d12_bloom_free(d3d12_video_t *d3d12);
 static void d3d12_views_publish(d3d12_video_t *d3d12);
+static bool d3d12_views_whole(const d3d12_video_t *d3d12,
+      bool shader_active, bool rolling);
 
 #define D3D12_ROLLING_SCANLINE_SIMULATION
 
@@ -4504,6 +4506,7 @@ static void d3d12_free_shader_preset(d3d12_video_t* d3d12)
       d3d12->media_shader_chain = NULL;
    }
    d3d12->media_shader_attempted = false;
+   d3d12->views.chains.preset_failed = false;
    d3d12_chain_free(&d3d12->filter, false);
    d3d12->flags &= ~(D3D12_ST_FLAG_INIT_HISTORY | D3D12_ST_FLAG_RESIZE_RTS);
 }
@@ -7797,6 +7800,11 @@ static void *d3d12_gfx_init(const video_info_t* video)
 #ifdef D3D12_FRAME_IMPORT
    d3d12_frame_import_init(d3d12);
 #endif
+   /* Read before the first frame */
+   retro_atomic_store_release_int(&d3d12->views.fallback,
+         d3d12_views_whole(d3d12, true,
+               settings->uints.video_shader_subframes > 1
+            && settings->bools.video_scan_subframes) ? 1 : 0);
    d3d12_views_publish(d3d12);
 #ifdef HAVE_PYROWAVE
    retro_atomic_int_init(&d3d12->pyrowave_format, (int)d3d12->chain.formats[d3d12->chain.bit_depth]);
@@ -9218,6 +9226,18 @@ static void d3d12_views_publish(d3d12_video_t *d3d12)
          d3d12_views_allowed(d3d12) ? 1 : 0);
 }
 
+/* Without a map, whether one would be drawn whole: views not allowed,
+ * a @rolling scanline, or a view's preset chain that could not be made
+ * while the views take the preset's */
+static bool d3d12_views_whole(const d3d12_video_t *d3d12,
+      bool shader_active, bool rolling)
+{
+   return !d3d12_views_allowed(d3d12) || rolling
+      || (   shader_active && d3d12->filter.shader_preset
+          && d3d12->filter.shader_preset->passes
+          && d3d12->views.chains.preset_failed);
+}
+
 static void d3d12_views_release_pipes(d3d12_video_t *d3d12)
 {
    Release(d3d12->views.rect);
@@ -10131,6 +10151,7 @@ static void d3d12_views_build_chains(d3d12_video_t *d3d12)
             && !(d3d12->views.chains.preset[i] =
                d3d12_chain_clone(d3d12, &d3d12->filter, false)))
          break;
+   d3d12->views.chains.preset_failed = i < d3d12->views.chains.count;
 }
 
 /* Where a software frame is, until the views say where it goes: a
@@ -11468,13 +11489,13 @@ recording_resize_deferred:;
       d3d12->views.active = views;
       d3d12_update_viewport(d3d12, views);
    }
-   /* With no map: whether one would be drawn whole, by what
-    * d3d12_views_setup tests besides the map */
-   retro_atomic_store_release_int(&d3d12->views.fallback,
-         (video_info->views.num_views ? !views
-          : (   !d3d12_views_allowed(d3d12)
-             || (   video_info->shader_subframes > 1
-                 && video_info->scan_subframes))) ? 1 : 0);
+   /* With no map: whether one would be drawn whole */
+   if (!video_views_chains_behind(&d3d12->views.chains, &video_info->views))
+      retro_atomic_store_release_int(&d3d12->views.fallback,
+            (video_info->views.num_views ? !views
+             : d3d12_views_whole(d3d12, video_info->shader_active,
+                     video_info->shader_subframes > 1
+                  && video_info->scan_subframes)) ? 1 : 0);
    d3d12_views_publish(d3d12);
 
    texture = d3d12->filter.history;

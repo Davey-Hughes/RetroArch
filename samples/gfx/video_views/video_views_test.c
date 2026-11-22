@@ -1979,11 +1979,14 @@ static void test_pick_chains(void)
    CHECK(fake_vv_pick_chains(&d, &set, &map, &l, false, true, full, chains,
             rects));
    CHECK(d.synced == 3 && chains[2] == &chain_objs[2] && d.stock_made == 3);
+   CHECK(!video_views_chains_behind(&set, &map));
 
-   /* A frame queued before the count shrank. */
+   /* A frame queued before the count shrank: behind, so it keeps the
+    * last FALLBACK. */
    set.count = 2;
    CHECK(!fake_vv_pick_chains(&d, &set, &map, &l, false, true, full, chains,
             rects));
+   CHECK(video_views_chains_behind(&set, &map));
 
    /* A stock chain that can't be made is not tried every frame. */
    memset(&set, 0, sizeof(set));

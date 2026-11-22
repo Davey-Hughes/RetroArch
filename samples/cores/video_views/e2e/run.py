@@ -645,6 +645,10 @@ GUN_RE = re.compile(r'\[video_views\] lightgun x=(-?\d+) y=(-?\d+) '
 # What the screens cases check is the frontend's, the same on every
 # driver: they run on those of Linux-vulkan-validation.yml's views step.
 SCREENS_DRIVERS = ('gl', 'glcore', 'vulkan', 'sdl2')
+# Those and the drivers whose SCREENS bit the draw and status cases
+# check on every status line: the bit comes from each driver's FALLBACK.
+SCREENS_STATUS_DRIVERS = SCREENS_DRIVERS + (
+    'sdl3', 'gdi', 'd3d8', 'd3d9_hlsl', 'd3d10', 'd3d11', 'd3d12')
 # What the window shows of the ds map's two screens, laid out as
 # SCREENS_AIM_SETTINGS has them. Screen 0 alone is 4:3, 1280 wide from
 # x 160.
@@ -762,12 +766,15 @@ SCREENS_MENU_CASE = ('screens-none-shown-menu', 'ds',
 SCREENS_MENU_REF = ('screens-none-shown-menu-ref', 'none',
                     SCREENS_MENU_SETTINGS, [])
 # With no map set, SCREENS says whether one sent now would have its
-# views drawn: on SCREENS_DRIVERS, unset on the drivers that would draw
-# it whole. [(name, settings, those drivers, RetroArch's arguments)]
+# views drawn: on SCREENS_STATUS_DRIVERS, unset on the drivers that
+# would draw it whole. [(name, settings, those drivers, RetroArch's arguments)]
 SCREENS_STATUS_CASES = [
     ('screens-status-no-map', {'video_stereo_mode': '0'}, (), ()),
     ('screens-status-no-map-anaglyph', {'video_stereo_mode': '4'},
      WHOLE_ANAGLYPH_DRIVERS, ()),
+    ('screens-status-no-map-rolling',
+     {'video_shader_subframes': '2', 'video_scan_subframes': 'true'},
+     ('d3d10', 'd3d11', 'd3d12'), ()),
 ]
 # gl draws a map whole under a preset that mipmaps the frame.
 SCREENS_GL_STATUS_CASES = [
@@ -1679,7 +1686,7 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
              opts=None, args=(), gpu=None, pointer=(), env_extra=None,
              pointer_check=None, raw=False, passes=None, after=None,
              window=(), until=None, aim=(), aimed=None, files=None,
-             screens=None):
+             screens=None, screenshot=True):
     """gpu, a list, gets RetroArch's GPU memory in MiB sampled while it
     settles. pointer, window points, has the menu open with the pointer
     at each in turn, in d/pointer-N.png; pointer_check(d) gives the
@@ -1697,7 +1704,8 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
     move; aimed, a list, gets for each move made how many light gun lines
     the core had logged before it. files, {path under the case directory:
     text}, are there when it starts. screens, given, is the SCREENS bit
-    every status must have."""
+    every status must have. screenshot False takes none: the statuses
+    alone are checked."""
     name, mapopt, settings, points = case
     hdr = HDR and driver == 'vulkan'
     d = case_dir(root, driver, name, hw)
@@ -1823,10 +1831,10 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
             send('MENU_TOGGLE', port)
             time.sleep(3)
             shot = gamescope_shot(d, env)
-        else:
+        elif screenshot:
             send('SCREENSHOT', port)
         deadline = time.time() + 10
-        while time.time() < deadline and not shot:
+        while screenshot and time.time() < deadline and not shot:
             time.sleep(0.05)
             pngs = [x for x in os.listdir(os.path.join(d, 'shots'))
                     if x.endswith('.png')]
@@ -1871,6 +1879,8 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
     errors = status_errors(d, driver, settings, screens) + window_got
     if hdr:
         errors += hdr_errors(d, *(passes or hdr_passes(name)))
+    if not screenshot:
+        return errors
     if not shot:
         return errors + ['no screenshot (see %s)'
                          % os.path.join(d, 'run.log')]
@@ -2706,7 +2716,8 @@ def driver_jobs(retroarch, root, driver):
         name, settings, whole, args = case
         errors = run_case(retroarch, root, driver,
                           (name, 'none', settings, []), args=args,
-                          screens=0 if driver in whole else 1)
+                          screens=0 if driver in whole else 1,
+                          screenshot=False)
         return report('%s/%s' % (driver, name), errors), bool(errors)
 
     def screens_preset(case):
@@ -2766,7 +2777,7 @@ def driver_jobs(retroarch, root, driver):
     if driver in SCREENS_DRIVERS and wanted('screens-no-input'):
         jobs.append(screens_aim)
     jobs += [lambda c=c: screens_show(
-                 c, 1 if driver in SCREENS_DRIVERS else None)
+                 c, 1 if driver in SCREENS_STATUS_DRIVERS else None)
              for c in SCREENS_DRAW_CASES
              if wanted(c[0]) and not (driver in NO_REDRAW_DRIVERS
                                       and c[0] in SCREENS_NULL_CASES)]
@@ -2781,8 +2792,8 @@ def driver_jobs(retroarch, root, driver):
     if driver in SCREENS_DRIVERS and wanted(SCREENS_MENU_CASE[0]):
         jobs.append(screens_menu)
     jobs += [lambda c=c: screens_status(c)
-             for c in (SCREENS_STATUS_CASES if driver in SCREENS_DRIVERS
-                       else [])
+             for c in (SCREENS_STATUS_CASES
+                       if driver in SCREENS_STATUS_DRIVERS else [])
              + (SCREENS_GL_STATUS_CASES if driver == 'gl' else [])
              if wanted(c[0])]
     return jobs

@@ -2986,6 +2986,7 @@ static void d3d10_chain_free(d3d10_chain_t *c, bool shared)
 static void d3d10_views_free_chains(d3d10_video_t *d3d10, unsigned first);
 static void d3d10_views_release(d3d10_video_t *d3d10);
 static void d3d10_views_publish(d3d10_video_t *d3d10);
+static bool d3d10_views_whole(const d3d10_video_t *d3d10, bool rolling);
 static void d3d10_record_free(d3d10_video_t *d3d10);
 static void d3d10_record_capture(d3d10_video_t *d3d10);
 
@@ -2993,6 +2994,7 @@ static void d3d10_free_shader_preset(d3d10_video_t* d3d10)
 {
    /* The views' chains read its preset */
    d3d10_views_free_chains(d3d10, 0);
+   d3d10->views.chains.preset_failed = false;
    d3d10_chain_free(&d3d10->chain, false);
    d3d10->flags &= ~(D3D10_ST_FLAG_INIT_HISTORY | D3D10_ST_FLAG_RESIZE_RTS);
 }
@@ -4131,6 +4133,10 @@ static void *d3d10_gfx_init(const video_info_t* video)
    /* RGBA8 is native even when this D3D10 device cannot sample BGRA8.
     * Image producers can write that order straight into upload loans. */
    video_driver_modify_disp_flags(VIDEO_FLAG_USE_RGBA, 0);
+   /* Read before the first frame */
+   retro_atomic_store_release_int(&d3d10->views.fallback,
+         d3d10_views_whole(d3d10, settings->uints.video_shader_subframes > 1
+            && settings->bools.video_scan_subframes) ? 1 : 0);
    d3d10_views_publish(d3d10);
    return d3d10;
 
@@ -4507,6 +4513,16 @@ static void d3d10_views_publish(d3d10_video_t *d3d10)
 {
    retro_atomic_store_release_int(&d3d10->views.allowed,
          d3d10_views_allowed(d3d10) ? 1 : 0);
+}
+
+/* Without a map, whether one would be drawn whole: views not allowed,
+ * a @rolling scanline, or a view's preset chain that could not be made
+ * while the views take the preset's */
+static bool d3d10_views_whole(const d3d10_video_t *d3d10, bool rolling)
+{
+   return !d3d10_views_allowed(d3d10) || rolling
+      || (   d3d10->chain.shader_preset && d3d10->chain.shader_preset->passes
+          && d3d10->views.chains.preset_failed);
 }
 
 static void d3d10_views_release(d3d10_video_t *d3d10)
@@ -4898,6 +4914,7 @@ static void d3d10_views_build_chains(d3d10_video_t *d3d10)
             && !(d3d10->views.chains.preset[i] =
                d3d10_chain_clone(d3d10, &d3d10->chain)))
          break;
+   d3d10->views.chains.preset_failed = i < d3d10->views.chains.count;
 }
 
 /* View @v of @frame written into @t, which is its size */
@@ -5344,13 +5361,12 @@ static bool d3d10_gfx_frame(
       d3d10->views.active = views;
       d3d10_update_viewport(d3d10, views);
    }
-   /* With no map: whether one would be drawn whole, by what
-    * d3d10_views_setup tests besides the map */
-   retro_atomic_store_release_int(&d3d10->views.fallback,
-         (video_info->views.num_views ? !views
-          : (   !d3d10_views_allowed(d3d10)
-             || (   video_info->shader_subframes > 1
-                 && video_info->scan_subframes))) ? 1 : 0);
+   /* With no map: whether one would be drawn whole */
+   if (!video_views_chains_behind(&d3d10->views.chains, &video_info->views))
+      retro_atomic_store_release_int(&d3d10->views.fallback,
+            (video_info->views.num_views ? !views
+             : d3d10_views_whole(d3d10, video_info->shader_subframes > 1
+                && video_info->scan_subframes)) ? 1 : 0);
    d3d10_views_publish(d3d10);
 
 #if 0

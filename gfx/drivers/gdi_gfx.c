@@ -3030,8 +3030,9 @@ static bool gdi_frame(void *data, const void *frame,
       gdi->views.active  = views;
       gdi->should_resize = true;
    }
-   retro_atomic_store_release_int(&gdi->views.fallback,
-         views_fallback ? 1 : 0);
+   if (!video_views_chains_behind(&gdi->views.chains, &video_info->views))
+      retro_atomic_store_release_int(&gdi->views.fallback,
+            views_fallback ? 1 : 0);
    views_per_eye = video_views_ui_per_eye(&video_info->views,
          &video_info->views_layout, true);
 

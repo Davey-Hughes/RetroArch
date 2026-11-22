@@ -3124,8 +3124,9 @@ static bool gl1_frame(void *data, const void *frame,
       gl1->views.active = views;
       gl1_set_viewport(gl1, video_info->dims, views, true);
    }
-   retro_atomic_store_release_int(&gl1->views.fallback,
-         views_fallback ? 1 : 0);
+   if (!video_views_chains_behind(&gl1->views.chains, &video_info->views))
+      retro_atomic_store_release_int(&gl1->views.fallback,
+            views_fallback ? 1 : 0);
    gl1_views_publish(gl1);
 #endif
 
