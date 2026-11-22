@@ -126,7 +126,8 @@ typedef struct gx_video
    /* The size the frontend lays views out at: the XFB's lines, as wide
     * as the display's aspect makes them in square pixels */
    unsigned out_dims;
-   /* For get_flags: the last frame with a map was drawn whole */
+   /* For get_flags: a map is drawn whole: the last frame's, or with
+    * none what one would get */
    retro_atomic_int_t views_fallback;
    uint16_t xOrigin;
    uint16_t yOrigin;
@@ -1574,6 +1575,7 @@ static float gx_views_sx(const gx_video_t *gx)
 static bool gx_views_setup(gx_video_t *gx, const video_frame_info_t *info,
       unsigned frame_dims)
 {
+   unsigned stereo = info->views_settings.stereo_mode;
    bool views = info->views.num_views && !info->views_layout.offscreen
       && video_views_fit_frame(&info->views, frame_dims);
    if (views != gx->views_active)
@@ -1581,8 +1583,11 @@ static bool gx_views_setup(gx_video_t *gx, const video_frame_info_t *info,
       gx->views_active  = views;
       gx->should_resize = true;
    }
+   /* Without a map: anaglyph and interlaced would draw one whole */
    retro_atomic_store_release_int(&gx->views_fallback,
-         (info->views.num_views && !views) ? 1 : 0);
+         (info->views.num_views ? !views
+          : (   stereo == VIDEO_STEREO_MODE_ANAGLYPH
+             || stereo == VIDEO_STEREO_MODE_INTERLACED)) ? 1 : 0);
    if (views && !gx->views_seen)
    {
       gx->views_seen = true;
@@ -1621,23 +1626,32 @@ static void gx_views_draw(gx_video_t *gx, const video_frame_info_t *info,
       float v0 = (float)rv->y / th;
       float u1 = (float)(rv->x + rv->width)  / tw;
       float v1 = (float)(rv->y + rv->height) / th;
-      if (p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
-         continue;
+      u8 a     = (u8)VIDEO_VIEWS_PLACEMENT_ALPHA(p->flags);
+      u8 c     = (p->flags & VIDEO_VIEWS_PLACEMENT_BLANK) ? 0 : 255;
+      if (!c)
+      {
+         if (!(p->flags & VIDEO_VIEWS_PLACEMENT_INSET))
+            continue;
+         /* A blank inset: black over its base, the colour alone */
+         GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
+      }
       gx_views_viewport(gx, &p->dst);
       GX_Begin(GX_TRIANGLESTRIP, GX_VTXFMT0, 4);
       GX_Position3f32(-1,  1, -0.5);
-      GX_Color4u8(255, 255, 255, 255);
+      GX_Color4u8(c, c, c, a);
       GX_TexCoord2f32(u0, v0);
       GX_Position3f32( 1,  1, -0.5);
-      GX_Color4u8(255, 255, 255, 255);
+      GX_Color4u8(c, c, c, a);
       GX_TexCoord2f32(u1, v0);
       GX_Position3f32(-1, -1, -0.5);
-      GX_Color4u8(255, 255, 255, 255);
+      GX_Color4u8(c, c, c, a);
       GX_TexCoord2f32(u0, v1);
       GX_Position3f32( 1, -1, -0.5);
-      GX_Color4u8(255, 255, 255, 255);
+      GX_Color4u8(c, c, c, a);
       GX_TexCoord2f32(u1, v1);
       GX_End();
+      if (!c)
+         GX_SetTevOp(GX_TEVSTAGE0, GX_MODULATE);
    }
    GX_SetVtxDesc(GX_VA_POS,  GX_INDEX8);
    GX_SetVtxDesc(GX_VA_TEX0, GX_INDEX8);

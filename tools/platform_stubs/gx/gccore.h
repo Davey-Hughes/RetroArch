@@ -251,6 +251,9 @@ void VIDEO_SetTrapFilter(bool enable);
 #ifndef GX_ORTHOGRAPHIC
 #define GX_ORTHOGRAPHIC 1
 #endif
+#ifndef GX_PASSCLR
+#define GX_PASSCLR 4
+#endif
 #ifndef GX_PF_RGB8_Z24
 #define GX_PF_RGB8_Z24 0
 #endif

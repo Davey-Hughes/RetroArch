@@ -103,7 +103,8 @@ typedef struct gekko_video
    /* The size the frontend lays views out at: the EFB's lines, as wide
     * as the display's aspect makes them in square pixels */
    unsigned              out_dims;
-   /* For get_flags: the last frame with a map was drawn whole */
+   /* For get_flags: a map is drawn whole: the last frame's, or with
+    * none what one would get */
    retro_atomic_int_t    views_fallback;
    bool                  views_active;
    bool                  views_seen;
@@ -469,6 +470,7 @@ static float views_sx(const gekko_video_t *gx)
 static bool views_setup(gekko_video_t *gx, const video_frame_info_t *info)
 {
    const video_views_layout_t *layout = &info->views_layout;
+   unsigned stereo = info->views_settings.stereo_mode;
    bool views = info->views.num_views && !layout->offscreen
       && gx->tex_w
       && video_views_fit_frame(&info->views,
@@ -478,8 +480,11 @@ static bool views_setup(gekko_video_t *gx, const video_frame_info_t *info)
       gx->views_active  = views;
       gx->should_resize = true;
    }
+   /* Without a map: anaglyph and interlaced would draw one whole */
    retro_atomic_store_release_int(&gx->views_fallback,
-         (info->views.num_views && !views) ? 1 : 0);
+         (info->views.num_views ? !views
+          : (   stereo == VIDEO_STEREO_MODE_ANAGLYPH
+             || stereo == VIDEO_STEREO_MODE_INTERLACED)) ? 1 : 0);
    if (views && !gx->views_seen)
    {
       gx->views_seen = true;
@@ -497,19 +502,30 @@ static void draw_views(gekko_video_t *gx, const video_frame_info_t *info)
    gk_gx_tex_load(&gx->frame_tex, 0, 0);
    for (i = 0; i < layout->num_placements; i++)
    {
-      float u[4], v[4];
+      float u[4] = { 0, 0, 0, 0 }, v[4] = { 0, 0, 0, 0 };
       const video_views_placement_t *p = &layout->placements[i];
       const struct retro_video_view *rv = &info->views.views[p->view];
-      if (p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
-         continue;
-      corners(gx,
-            (float)rv->x / gx->tex_w, (float)rv->y / gx->tex_h,
-            (float)(rv->x + rv->width)  / gx->tex_w,
-            (float)(rv->y + rv->height) / gx->tex_h, u, v);
+      uint32_t a = (uint32_t)VIDEO_VIEWS_PLACEMENT_ALPHA(p->flags);
+      bool blank = (p->flags & VIDEO_VIEWS_PLACEMENT_BLANK) != 0;
+      if (blank)
+      {
+         if (!(p->flags & VIDEO_VIEWS_PLACEMENT_INSET))
+            continue;
+         /* A blank inset: black over its base, the colour alone */
+         gk_gx_tev(0, GK_GX_PASSCLR);
+      }
+      else
+         corners(gx,
+               (float)rv->x / gx->tex_w, (float)rv->y / gx->tex_h,
+               (float)(rv->x + rv->width)  / gx->tex_w,
+               (float)(rv->y + rv->height) / gx->tex_h, u, v);
       quad((float)VIDEO_POS_X(p->dst.pos) * sx,
             (float)VIDEO_POS_Y(p->dst.pos),
             (float)VIDEO_SCALE_W(p->dst.dims) * sx,
-            (float)VIDEO_SCALE_H(p->dst.dims), u, v, 0xffffffffu);
+            (float)VIDEO_SCALE_H(p->dst.dims), u, v,
+            (blank ? 0u : 0xffffff00u) | a);
+      if (blank)
+         gk_gx_tev(0, GK_GX_MODULATE);
    }
 }
 

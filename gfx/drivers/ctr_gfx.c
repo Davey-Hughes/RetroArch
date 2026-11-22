@@ -197,10 +197,15 @@ typedef struct ctr_video
        * memory the GPU reads; made on the first frame with views */
       ctr_vertex_t *coords;
       unsigned count[CTR_VIEWS_TARGETS];
+      /* The quads drawn black, a bit each: blank insets */
+      unsigned blank[CTR_VIEWS_TARGETS];
       /* The part of the last frame the texture holds */
       unsigned frame_dims;
-      /* For get_flags: the last frame with a map was drawn whole */
+      /* For get_flags: a map is drawn whole: the last frame's, or with
+       * none what one would get */
       retro_atomic_int_t fallback;
+      /* The quads' memory could not be had */
+      bool failed;
       bool active;
       /* The bottom screen shows the core's screens past the first */
       bool bottom;
@@ -1787,9 +1792,16 @@ static void ctr_views_place(ctr_video_t *ctr, const video_views_map_t *map,
       {
          const video_views_placement_t *p = &layout.placements[i];
          int k = video_views_find(&sub, sub.views[p->view].screen, eyes[e]);
-         if (k >= 0 && !(p->flags & VIDEO_VIEWS_PLACEMENT_BLANK))
-            ctr_views_quad(&q[(*n)++], ctr->rotation, &p->dst,
-                  &map->views[index[k]]);
+         if (k < 0)
+            continue;
+         if (p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
+         {
+            if (!(p->flags & VIDEO_VIEWS_PLACEMENT_INSET))
+               continue;
+            ctr->views.blank[targets[e]] |= 1u << *n;
+         }
+         ctr_views_quad(&q[(*n)++], ctr->rotation, &p->dst,
+               &map->views[index[k]]);
       }
    }
 }
@@ -1810,6 +1822,7 @@ static bool ctr_views_setup(ctr_video_t *ctr,
       ctr->views.coords = (ctr_vertex_t*)linearAlloc(CTR_VIEWS_TARGETS
             * RETRO_VIDEO_VIEWS_MAX * sizeof(ctr_vertex_t));
       views             = ctr->views.coords != NULL;
+      ctr->views.failed = !views;
    }
 #ifndef CONSOLE_LOG
    bottom = views && lcd_bottom && map->num_screens > 1;
@@ -1835,7 +1848,7 @@ static bool ctr_views_setup(ctr_video_t *ctr,
       ctr->should_resize = true;
    }
    retro_atomic_store_release_int(&ctr->views.fallback,
-         (map->num_views && !views) ? 1 : 0);
+         (map->num_views ? !views : ctr->views.failed) ? 1 : 0);
    if (views && !ctr->views.direct_seen)
    {
       ctr->views.direct_seen = true;
@@ -1856,7 +1869,10 @@ static void ctr_views_draw(ctr_video_t *ctr, const video_views_map_t *map,
    bool stereo    = ctr->video_mode == CTR_VIDEO_MODE_3D;
 
    for (t = 0; t < CTR_VIEWS_TARGETS; t++)
+   {
       ctr->views.count[t] = 0;
+      ctr->views.blank[t] = 0;
+   }
    ctr_views_place(ctr, map, settings,
          ctr->views.bottom ? (roots & 1u) : roots,
          VIDEO_SCALE_PACK(CTR_TOP_FRAMEBUFFER_WIDTH,
@@ -1909,8 +1925,15 @@ static void ctr_views_draw(ctr_video_t *ctr, const video_views_map_t *map,
       }
       for (i = 0; i < ctr->views.count[t]; i++)
       {
+         bool blank = (ctr->views.blank[t] >> i) & 1;
+         /* Black whatever the stages before it made */
+         if (blank)
+            GPU_SetTexEnv(3, GPU_CONSTANT, GPU_CONSTANT, 0, 0,
+                  GPU_REPLACE, GPU_REPLACE, COLOR_ABGR(0, 0, 0, 255));
          ctrGuSetAttributeBuffersAddress(VIRT_TO_PHYS(&q[i]));
          GPU_DrawArray(GPU_GEOMETRY_PRIM, 0, 1);
+         if (blank)
+            GPU_SetTexEnv(3, GPU_PREVIOUS, GPU_PREVIOUS, 0, 0, 0, 0, 0);
       }
    }
 }
