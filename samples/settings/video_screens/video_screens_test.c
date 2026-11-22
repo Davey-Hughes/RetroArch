@@ -6237,16 +6237,19 @@ static void test_window_menu_display(void)
    CHECK(row->value.target.string != picked);
    window_test_begin();
 
-   /* Nothing published on the desktop: Auto, Main Window and Off */
+   /* Nothing published on the desktop: Auto, Main Window, Over Screen 1
+    * and Off */
    video_driver_publish_window_displays(displays, 0);
    menu_setting_video_screen_display_values();
-   CHECK(string_is_equal(row->aux.values, "|main|off"));
+   CHECK(string_is_equal(row->aux.values, "|main|over:1|off"));
    row->actions->repr(row, s, sizeof(s));
    CHECK(string_is_equal(s, "Auto"));
    CHECK(row->actions->right(row, 0, false) == 0);
    CHECK(string_is_equal(picked, VIDEO_WINDOW_DISPLAY_MAIN));
    row->actions->repr(row, s, sizeof(s));
    CHECK(string_is_equal(s, "Main Window"));
+   CHECK(row->actions->right(row, 0, false) == 0);
+   CHECK(string_is_equal(picked, "over:1"));
    CHECK(row->actions->right(row, 0, false) == 0);
    CHECK(string_is_equal(picked, VIDEO_WINDOW_DISPLAY_OFF));
    row->actions->repr(row, s, sizeof(s));
@@ -6263,7 +6266,7 @@ static void test_window_menu_display(void)
    video_driver_publish_window_displays(displays, 3);
    menu_setting_video_screen_display_values();
    CHECK(string_is_equal(row->aux.values,
-            "|Built-in Screen|Screen-2|DP Screen|off"));
+            "|Built-in Screen|Screen-2|DP Screen|over:1|off"));
    CHECK(row->actions->right(row, 0, false) == 0);
    CHECK(string_is_equal(picked, "Built-in Screen"));
    row->actions->repr(row, s, sizeof(s));
@@ -6281,11 +6284,15 @@ static void test_window_menu_display(void)
    row->actions->repr(row, s, sizeof(s));
    CHECK(string_is_equal(s, "Display: DP Screen (DELL U2720Q)"));
    CHECK(row->actions->right(row, 0, false) == 0);
+   CHECK(string_is_equal(picked, "over:1"));
+   CHECK(row->actions->right(row, 0, false) == 0);
    CHECK(string_is_equal(picked, VIDEO_WINDOW_DISPLAY_OFF));
    CHECK(row->actions->right(row, 0, false) == 0);
    CHECK(!picked[0]);
    CHECK(row->actions->left(row, 0, false) == 0);
    CHECK(string_is_equal(picked, VIDEO_WINDOW_DISPLAY_OFF));
+   CHECK(row->actions->left(row, 0, false) == 0);
+   CHECK(string_is_equal(picked, "over:1"));
    CHECK(row->actions->left(row, 0, false) == 0);
    CHECK(string_is_equal(picked, "DP Screen"));
 
@@ -6304,7 +6311,7 @@ static void test_window_menu_display(void)
    video_driver_publish_window_displays(displays, 3);
    menu_setting_video_screen_display_values();
    CHECK(string_is_equal(row->aux.values,
-            "|Built-in Screen|Screen-2|Screen-2 2|off"));
+            "|Built-in Screen|Screen-2|Screen-2 2|over:1|off"));
    strlcpy(picked, "Screen-2", 64);
    CHECK(row->actions->right(row, 0, false) == 0);
    CHECK(string_is_equal(picked, "Screen-2 2"));
@@ -6322,8 +6329,8 @@ static void test_window_menu_display(void)
    window_test_end();
 }
 
-/* Desktop monitors: Auto, Main Window, each monitor, then Off; the
- * menu's row gets the monitors only */
+/* Desktop monitors: Auto, Main Window, each monitor, Over Screen 1,
+ * then Off; the menu's row gets the monitors only */
 static void test_window_menu_monitors(void)
 {
    static video_window_display_t displays[2];
@@ -6347,7 +6354,8 @@ static void test_window_menu_monitors(void)
    displays[0].monitor = displays[1].monitor = true;
    video_driver_publish_window_displays(displays, 2);
    menu_setting_video_screen_display_values();
-   CHECK(string_is_equal(row->aux.values, "|main|DP-1|Monitor 2|off"));
+   CHECK(string_is_equal(row->aux.values,
+            "|main|DP-1|Monitor 2|over:1|off"));
    CHECK(string_is_equal(menu->aux.values, "|DP-1|Monitor 2"));
    picked[0] = '\0';
    menu_st->flags &= ~(MENU_ST_FLAG_PREVENT_POPULATE
@@ -6366,6 +6374,8 @@ static void test_window_menu_monitors(void)
    CHECK(row->actions->right(row, 0, false) == 0);
    CHECK(string_is_equal(picked, "Monitor 2"));
    CHECK(row->actions->right(row, 0, false) == 0);
+   CHECK(string_is_equal(picked, "over:1"));
+   CHECK(row->actions->right(row, 0, false) == 0);
    CHECK(string_is_equal(picked, VIDEO_WINDOW_DISPLAY_OFF));
    CHECK(row->actions->right(row, 0, false) == 0);
    CHECK(!picked[0]);
@@ -6380,17 +6390,17 @@ static void test_window_menu_monitors(void)
    CHECK(menu->actions->right(menu, 0, false) == 0);
    CHECK(string_is_equal(menu->value.target.string, "DP-1"));
    menu->value.target.string[0] = '\0';
-   /* None listed on the desktop: Auto, Main Window, Off */
+   /* None listed on the desktop: Auto, Main Window, Over Screen 1, Off */
    video_driver_publish_window_displays(displays, 0);
    menu_setting_video_screen_display_values();
-   CHECK(string_is_equal(row->aux.values, "|main|off"));
+   CHECK(string_is_equal(row->aux.values, "|main|over:1|off"));
    CHECK(string_is_equal(menu->aux.values, "|"));
    /* A monitor literally named "main" is not offered */
    strlcpy(displays[1].name, VIDEO_WINDOW_DISPLAY_MAIN,
          sizeof(displays[1].name));
    video_driver_publish_window_displays(displays, 2);
    menu_setting_video_screen_display_values();
-   CHECK(string_is_equal(row->aux.values, "|main|DP-1|off"));
+   CHECK(string_is_equal(row->aux.values, "|main|DP-1|over:1|off"));
    CHECK(string_is_equal(menu->aux.values, "|DP-1"));
    /* Every slot listed and the one chosen gone: left is Off, right is
     * Auto, not the last monitor */
@@ -6414,6 +6424,31 @@ static void test_window_menu_monitors(void)
    }
    video_driver_publish_window_displays(NULL, 0);
    picked[0] = '\0';
+   window_test_end();
+}
+
+/* A display named as an Over value is not offered */
+static void test_display_offered_over(void)
+{
+   static video_window_display_t displays[2];
+   rarch_setting_t *row;
+   rarch_setting_t *menu;
+   load_fixture("");
+   row  = menu_setting_find_enum(MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY);
+   menu = menu_setting_find_enum(MENU_ENUM_LABEL_VIDEO_MENU_DISPLAY);
+   CHECK(row != NULL);
+   CHECK(menu != NULL);
+   if (!row || !menu)
+      return;
+   window_test_begin();
+   window_test_named(&displays[0], 1, true, "DP-1", "", 0);
+   window_test_named(&displays[1], 2, false, "over:1", "", 0);
+   displays[0].monitor = displays[1].monitor = true;
+   video_driver_publish_window_displays(displays, 2);
+   menu_setting_video_screen_display_values();
+   CHECK(string_is_equal(row->aux.values, "|main|DP-1|over:2|off"));
+   CHECK(string_is_equal(menu->aux.values, "|DP-1"));
+   video_driver_publish_window_displays(NULL, 0);
    window_test_end();
 }
 
@@ -6463,8 +6498,8 @@ static void window_display_pick(file_list_t *list, size_t i)
             list->list[i].type, i, list->list[i].entry_idx);
 }
 
-/* OK on a display row: Auto, each display listed now, then Off; the
- * menu's row has no Off */
+/* OK on a display row: Auto, each display listed now, Over Screen 1,
+ * then Off; the menu's row has neither */
 static void test_window_menu_display_dropdown(void)
 {
    static video_window_display_t displays[2];
@@ -6493,15 +6528,19 @@ static void test_window_menu_display_dropdown(void)
       return;
    window_test_begin();
 
-   /* Nothing published on the desktop: Auto, Main Window and Off */
+   /* Nothing published on the desktop: Auto, Main Window, Over Screen 1
+    * and Off */
    video_driver_publish_window_displays(displays, 0);
    CHECK(window_display_ok(row) == 1);
-   CHECK(window_display_dropdown(&list, row) == 3);
-   if (list.size == 3)
+   CHECK(window_display_dropdown(&list, row) == 4);
+   if (list.size == 4)
    {
       CHECK(string_is_equal(list.list[0].path, "Auto"));
       CHECK(string_is_equal(list.list[1].path, "Main Window"));
-      CHECK(string_is_equal(list.list[2].path, "OFF"));
+      CHECK(string_is_equal(list.list[2].path, "Over Screen 1"));
+      CHECK(string_is_equal(list.list[3].path, "OFF"));
+      window_display_pick(&list, 2);
+      CHECK(string_is_equal(picked, "over:1"));
       window_display_pick(&list, 1);
       CHECK(string_is_equal(picked, VIDEO_WINDOW_DISPLAY_MAIN));
       picked[0] = '\0';
@@ -6520,21 +6559,22 @@ static void test_window_menu_display_dropdown(void)
    video_driver_publish_window_displays(displays, 2);
    strlcpy(picked, "Screen-2", 64);
    CHECK(window_display_ok(row) == 1);
-   CHECK(window_display_dropdown(&list, row) == 4);
-   if (list.size == 4)
+   CHECK(window_display_dropdown(&list, row) == 5);
+   if (list.size == 5)
    {
       CHECK(string_is_equal(list.list[0].path, "Auto"));
       CHECK(string_is_equal(list.list[1].path,
                "Display: Built-in Screen (1920x1080)"));
       CHECK(string_is_equal(list.list[2].path,
                "Display: Screen-2 (AYN 1240x1080)"));
-      CHECK(string_is_equal(list.list[3].path, "OFF"));
+      CHECK(string_is_equal(list.list[3].path, "Over Screen 1"));
+      CHECK(string_is_equal(list.list[4].path, "OFF"));
       cbs = (menu_file_list_cbs_t*)list.list[2].actiondata;
       CHECK(cbs && cbs->checked);
       CHECK(string_is_equal(picked, "Screen-2"));
       window_display_pick(&list, 1);
       CHECK(string_is_equal(picked, "Built-in Screen"));
-      window_display_pick(&list, 3);
+      window_display_pick(&list, 4);
       CHECK(string_is_equal(picked, VIDEO_WINDOW_DISPLAY_OFF));
       window_display_pick(&list, 0);
       CHECK(!picked[0]);
@@ -8082,8 +8122,8 @@ static void screen_menu_end(void)
 }
 
 /* With the screens' windows off Game Screens lists a Display row a
- * screen: Auto and Off, named as the core names the screen, and a
- * choice is this core's alone */
+ * screen: Auto, Over the other screen and Off, named as the core names
+ * the screen, and a choice is this core's alone */
 static void test_screen_menu_basic_rows(void)
 {
    static struct retro_video_view views[2];
@@ -8114,7 +8154,7 @@ static void test_screen_menu_basic_rows(void)
    row = menu_setting_find("video_screen2_display");
    CHECK(row != NULL);
    if (row)
-      CHECK(string_is_equal(row->aux.values, "|off"));
+      CHECK(string_is_equal(row->aux.values, "|over:1|off"));
    menu_cbs_sublabel_for_enum((enum msg_hash_enums)
          (MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY + 1), 0, 0, s, sizeof(s));
    CHECK(string_is_equal(s, "Off leaves this game screen out. Auto shows "
@@ -8122,6 +8162,8 @@ static void test_screen_menu_basic_rows(void)
             "runs, it is kept for that core."));
 
    settings->flags &= ~SETTINGS_FLG_MODIFIED;
+   menu_action("video_screen1_display", MENU_ACTION_RIGHT);
+   menu_value("video_screen1_display", "Over VMU A1");
    menu_action("video_screen1_display", MENU_ACTION_RIGHT);
    menu_value("video_screen1_display", "OFF");
    CHECK(prefs->set[0] == display);
@@ -8169,8 +8211,9 @@ static void test_screen_menu_core_default_start(void)
    screen_menu_end();
 }
 
-/* The list OK opens: Auto and Off, the core's default marked; a pick is
- * this core's, and picking the default it already has is no choice */
+/* The list OK opens: Auto, Over Top and Off, the core's default marked;
+ * a pick is this core's, and picking the default it already has is no
+ * choice */
 static void test_screen_menu_dropdown(void)
 {
    static struct retro_video_view views[2];
@@ -8196,26 +8239,27 @@ static void test_screen_menu_dropdown(void)
    if (row && menu_st->driver_ctx)
    {
       CHECK(window_display_ok(row) == 1);
-      CHECK(window_display_dropdown(&list, row) == 2);
-      if (list.size == 2)
+      CHECK(window_display_dropdown(&list, row) == 3);
+      if (list.size == 3)
       {
          CHECK(string_is_equal(list.list[0].path, "Auto"));
-         CHECK(string_is_equal(list.list[1].path, "OFF (core default)"));
-         cbs = (menu_file_list_cbs_t*)list.list[1].actiondata;
+         CHECK(string_is_equal(list.list[1].path, "Over Top"));
+         CHECK(string_is_equal(list.list[2].path, "OFF (core default)"));
+         cbs = (menu_file_list_cbs_t*)list.list[2].actiondata;
          CHECK(cbs && cbs->checked);
-         window_display_pick(&list, 1);
+         window_display_pick(&list, 2);
          CHECK(!prefs->set[1]);
          window_display_pick(&list, 0);
          CHECK(prefs->set[1] == display && !prefs->values[1].display[0]);
       }
       file_list_deinitialize(&list);
-      CHECK(window_display_dropdown(&list, row) == 2);
-      if (list.size == 2)
+      CHECK(window_display_dropdown(&list, row) == 3);
+      if (list.size == 3)
       {
-         CHECK(string_is_equal(list.list[1].path, "OFF"));
+         CHECK(string_is_equal(list.list[2].path, "OFF"));
          cbs = (menu_file_list_cbs_t*)list.list[0].actiondata;
          CHECK(cbs && cbs->checked);
-         window_display_pick(&list, 1);
+         window_display_pick(&list, 2);
          CHECK(prefs->set[1] == display);
          CHECK(string_is_equal(prefs->values[1].display,
                   VIDEO_WINDOW_DISPLAY_OFF));
@@ -8227,11 +8271,11 @@ static void test_screen_menu_dropdown(void)
       memset(&values, 0, sizeof(values));
       video_driver_screen_set(1, display, &values);
       CHECK(window_display_ok(row) == 1);
-      CHECK(window_display_dropdown(&list, row) == 2);
-      if (list.size == 2)
+      CHECK(window_display_dropdown(&list, row) == 3);
+      if (list.size == 3)
       {
          CHECK(string_is_equal(list.list[0].path, "Auto"));
-         CHECK(string_is_equal(list.list[1].path, "OFF"));
+         CHECK(string_is_equal(list.list[2].path, "OFF"));
          cbs = (menu_file_list_cbs_t*)list.list[0].actiondata;
          CHECK(cbs && cbs->checked);
       }
@@ -8308,9 +8352,9 @@ static void test_screen_menu_no_content_rows(void)
    row = menu_setting_find("video_screen2_display");
    CHECK(row != NULL);
    if (row)
-      CHECK(string_is_equal(row->aux.values, "|off"));
+      CHECK(string_is_equal(row->aux.values, "|over:1|off"));
    settings->flags &= ~SETTINGS_FLG_MODIFIED;
-   menu_action("video_screen2_display", MENU_ACTION_RIGHT);
+   menu_action("video_screen2_display", MENU_ACTION_LEFT);
    CHECK(string_is_equal(settings->arrays.video_screen_display[1],
             VIDEO_WINDOW_DISPLAY_OFF));
    CHECK(settings->flags & SETTINGS_FLG_MODIFIED);
@@ -8454,6 +8498,136 @@ static void test_screen_menu_page_label(void)
    screen_menu_display_label(1, s, sizeof(s));
    CHECK(string_is_equal(s, "Bottom"));
    window_test_end();
+}
+
+/* Screen 1's row offers Over Top between Auto and Off: a pick is this
+ * core's, and the next frame draws the inset */
+static void test_screen_menu_over_values(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   rarch_setting_t *row;
+   const video_screen_prefs_t *prefs = &video_state_get_ptr()->screen_prefs;
+   const unsigned display            =
+      VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY);
+   load_fixture("");
+   screens_test_core();
+   window_test_begin();
+   config_get_ptr()->bools.video_windows_enable = false;
+   screens_test_map(&map, views, screens, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+         RETRO_VIDEO_SCREEN_STATE_ACTIVE);
+   screens[1].size = 0.0f;
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   CHECK(prefs->in_use);
+   menu_setting_video_screen_display_values();
+   row = menu_setting_find("video_screen2_display");
+   CHECK(row != NULL);
+   if (row)
+      CHECK(string_is_equal(row->aux.values, "|over:1|off"));
+   menu_action("video_screen2_display", MENU_ACTION_RIGHT);
+   menu_value("video_screen2_display", "Over Top");
+   CHECK(prefs->set[1] == display);
+   CHECK(string_is_equal(prefs->values[1].display, "over:1"));
+   window_test_run();
+   CHECK(screens_test_inset());
+   CHECK(window_test_seen_views.over == 0x2u);
+   /* Now an inset, screen 1 is no base for screen 0 */
+   menu_setting_video_screen_display_values();
+   row = menu_setting_find("video_screen1_display");
+   CHECK(row != NULL);
+   if (row)
+      CHECK(string_is_equal(row->aux.values, "|off"));
+   menu_action("video_screen2_display", MENU_ACTION_RIGHT);
+   menu_value("video_screen2_display", "OFF");
+   menu_action("video_screen2_display", MENU_ACTION_LEFT);
+   menu_value("video_screen2_display", "Over Top");
+   menu_action("video_screen2_display", MENU_ACTION_LEFT);
+   menu_value("video_screen2_display", "Auto");
+   CHECK(prefs->set[1] == display && !prefs->values[1].display[0]);
+   screen_menu_end();
+}
+
+/* A core's Over reads as the Over value it resolves to, marked as the
+ * core's; a choice reads unmarked, and Start brings the mark back */
+static void test_screen_menu_over_core_default(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   load_fixture("");
+   screens_test_core();
+   window_test_begin();
+   config_get_ptr()->bools.video_windows_enable = false;
+   screens_test_map(&map, views, screens, RETRO_VIDEO_SCREEN_SHOW_OVER,
+         RETRO_VIDEO_SCREEN_STATE_ACTIVE);
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   menu_value("video_screen2_display", "Over Top (core default)");
+   menu_action("video_screen2_display", MENU_ACTION_RIGHT);
+   menu_value("video_screen2_display", "OFF");
+   menu_action("video_screen2_display", MENU_ACTION_LEFT);
+   menu_value("video_screen2_display", "Over Top");
+   menu_action("video_screen2_display", MENU_ACTION_START);
+   menu_value("video_screen2_display", "Over Top (core default)");
+   screen_menu_end();
+}
+
+/* A screen drawn over another is no base to offer */
+static void test_screen_menu_over_offer(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   rarch_setting_t *row;
+   load_fixture("");
+   screens_test_core();
+   window_test_begin();
+   config_get_ptr()->bools.video_windows_enable = false;
+   screens_test_map(&map, views, screens, RETRO_VIDEO_SCREEN_SHOW_OVER,
+         RETRO_VIDEO_SCREEN_STATE_ACTIVE);
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   CHECK(video_state_get_ptr()->views_core.over == 0x2u);
+   menu_setting_video_screen_display_values();
+   row = menu_setting_find("video_screen1_display");
+   CHECK(row != NULL);
+   if (row)
+      CHECK(string_is_equal(row->aux.values, "|off"));
+   row = menu_setting_find("video_screen2_display");
+   CHECK(row != NULL);
+   if (row)
+      CHECK(string_is_equal(row->aux.values, "|over:1|off"));
+   screen_menu_end();
+}
+
+/* With no content each row offers every other screen, and edits the
+ * global value */
+static void test_screen_menu_over_no_content(void)
+{
+   rarch_setting_t *row;
+   settings_t *settings              = config_get_ptr();
+   const video_screen_prefs_t *prefs = &video_state_get_ptr()->screen_prefs;
+   load_fixture("");
+   screens_test_core_done();
+   video_driver_clear_views();
+   menu_setting_video_screen_display_values();
+   row = menu_setting_find("video_screen1_display");
+   CHECK(row != NULL);
+   if (row)
+      CHECK(string_is_equal(row->aux.values, "|over:2|off"));
+   row = menu_setting_find("video_screen2_display");
+   CHECK(row != NULL);
+   if (row)
+      CHECK(string_is_equal(row->aux.values, "|over:1|off"));
+   menu_action("video_screen2_display", MENU_ACTION_RIGHT);
+   CHECK(string_is_equal(settings->arrays.video_screen_display[1],
+            "over:1"));
+   CHECK(!prefs->set[1] && !prefs->dirty);
+   menu_value("video_screen2_display", "Over Screen 1");
+   menu_action("video_screen2_display", MENU_ACTION_START);
+   CHECK(!settings->arrays.video_screen_display[1][0]);
 }
 
 #ifdef HAVE_OPENXR
@@ -10633,6 +10807,7 @@ int main(int argc, char **argv)
    test_window_menu_settings();
    test_window_menu_display();
    test_window_menu_monitors();
+   test_display_offered_over();
    test_window_menu_display_dropdown();
    test_window_menu_rows();
    test_window_menu_follows_screens();
@@ -10650,6 +10825,10 @@ int main(int argc, char **argv)
    test_screen_menu_no_views_core();
    test_screen_menu_window_rows_per_core();
    test_screen_menu_page_label();
+   test_screen_menu_over_values();
+   test_screen_menu_over_core_default();
+   test_screen_menu_over_offer();
+   test_screen_menu_over_no_content();
    test_window_menu_one_place();
    test_blank_unused_strings();
    test_blank_unused_hotkey();

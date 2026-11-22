@@ -1526,6 +1526,17 @@ static void test_place_inset(void)
    CHECK(placed(0, 0u, 3u, 0u, 0));
    CHECK(place_r.target[0] == 1 && place_r.target[1] == 1);
    CHECK(!place_host.make && !place_host.moving);
+   /* The same choice made mid-game moves RetroArch too */
+   place_reset(1, 2);
+   place_game(2, false);
+   place_at(0);
+   place_in.shown = 2;
+   place_at(VIDEO_WINDOWS_MOVE_USEC);
+   CHECK(!place_r.move);
+   place_in.over  = 0x1u;
+   place_in.base  = 1u;
+   place_at(VIDEO_WINDOWS_MOVE_USEC + 100000);
+   CHECK(placed(2, 0u, 3u, 0u, 2));
 }
 
 /* The Thor as Android 12 and later types it, with its display ids */

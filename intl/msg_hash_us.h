@@ -8042,6 +8042,10 @@ MSG_HASH(
    "%s (core default)"
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_OVER,
+   "Over %s"
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_WINDOW_FULLSCREEN,
    "Game Screen %u Fullscreen"
    )

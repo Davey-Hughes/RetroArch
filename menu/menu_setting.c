@@ -4050,20 +4050,24 @@ static size_t setting_get_string_representation_video_blank_unused_screens(
 #endif
 
 /* The display rows' values: "" for Auto, "|main" on the desktop,
- * "|key" a display, then "|off"; the menu's row has no Main Window
- * or Off. Auto and Off alone without the screens' windows. */
+ * "|key" a display, "|over:N" each base on offer, then "|off"; the
+ * menu's row has the displays alone. Auto, the Over values and Off
+ * without the screens' windows. */
+#define SETTING_VIDEO_SCREEN_OVERS_SIZE ((RETRO_VIDEO_VIEWS_MAX - 1) \
+      * (sizeof("|" VIDEO_WINDOW_DISPLAY_OVER) + 1))
 #ifdef HAVE_VIDEO_WINDOWS
-/* The rows' copy of the published list, about 1 KiB, kept off the
- * stack; app thread */
-static char setting_video_screen_display_list[
+/* A row's list, from the published displays, kept off the stack; app
+ * thread */
+static char setting_video_screen_display_list[RETRO_VIDEO_VIEWS_MAX][
       VIDEO_WINDOW_DISPLAYS_MAX * VIDEO_WINDOW_DISPLAY_NAME_SIZE
       + sizeof("|" VIDEO_WINDOW_DISPLAY_MAIN)
+      + SETTING_VIDEO_SCREEN_OVERS_SIZE
       + sizeof("|" VIDEO_WINDOW_DISPLAY_OFF)];
 static char setting_video_menu_display_list[
       VIDEO_WINDOW_DISPLAYS_MAX * VIDEO_WINDOW_DISPLAY_NAME_SIZE + 1];
 #else
-static char setting_video_screen_display_list[
-      sizeof("|" VIDEO_WINDOW_DISPLAY_OFF)];
+static char setting_video_screen_display_list[RETRO_VIDEO_VIEWS_MAX][
+      SETTING_VIDEO_SCREEN_OVERS_SIZE + sizeof("|" VIDEO_WINDOW_DISPLAY_OFF)];
 #endif
 /* The Display rows step a copy of what RetroArch uses for each screen;
  * _seen is what each last read: a value that differs is a candidate */
@@ -4122,13 +4126,46 @@ static void setting_video_screen_display_change(rarch_setting_t *setting)
 }
 
 #ifdef HAVE_VIDEO_WINDOWS
-/* A key the values can hold: named, no '|' in it, and not Off's or
- * Main Window's */
+/* A key the values can hold: named, no '|' in it, and not Off's,
+ * Main Window's or an Over value */
 static bool setting_video_screen_display_offered(const char *key)
 {
    return key[0] && !strchr(key, '|')
       && !string_is_equal(key, VIDEO_WINDOW_DISPLAY_OFF)
-      && !string_is_equal(key, VIDEO_WINDOW_DISPLAY_MAIN);
+      && !string_is_equal(key, VIDEO_WINDOW_DISPLAY_MAIN)
+      && video_screen_prefs_over_base(key) < 0;
+}
+
+/* Appends "|key" to @list for each display a row can hold */
+static size_t setting_video_screen_display_keys(
+      const video_window_display_t *displays, unsigned count,
+      char *list, size_t len, size_t size)
+{
+   char key[VIDEO_WINDOW_DISPLAY_NAME_SIZE];
+   unsigned i;
+   for (i = 0; i < count; i++)
+   {
+      video_windows_display_key(displays, i, key, sizeof(key));
+      if (!setting_video_screen_display_offered(key))
+         continue;
+      len += strlcpy(list + len, "|", size - len);
+      len += strlcpy(list + len, key, size - len);
+   }
+   return len;
+}
+
+/* The menu's row */
+static void setting_video_screen_display_menu_build(void)
+{
+   unsigned count;
+   const video_window_display_t *displays =
+      video_driver_borrow_window_displays(&count);
+   /* "" alone lists nothing in the dropdown, not even Auto */
+   if (!setting_video_screen_display_keys(displays, count,
+            setting_video_menu_display_list, 0,
+            sizeof(setting_video_menu_display_list)))
+      strlcpy(setting_video_menu_display_list, "|",
+            sizeof(setting_video_menu_display_list));
 }
 
 #ifndef ANDROID
@@ -4219,43 +4256,57 @@ void menu_setting_video_screen_windows_moved(void)
 #endif
 #endif
 
+/* Screen @s's row. A base on offer is another screen with a view that
+ * is not an inset; with no map to check, every other screen listed. */
+static void setting_video_screen_display_build(unsigned s)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   char *list                     = setting_video_screen_display_list[s];
+   size_t size                    =
+      sizeof(setting_video_screen_display_list[s]);
+   size_t len                     = 0;
+   unsigned screens               = menu_setting_video_screens();
+   unsigned bases                 = ~0u;
+   unsigned b;
+   list[0] = '\0';
+#ifdef HAVE_VIDEO_WINDOWS
+   if (setting_video_screen_display_full())
+   {
+      unsigned count;
+      const video_window_display_t *displays =
+         video_driver_borrow_window_displays(&count);
+      if (video_windows_offer_main(displays, count))
+         len = strlcpy(list, "|" VIDEO_WINDOW_DISPLAY_MAIN, size);
+      len = setting_video_screen_display_keys(displays, count, list, len,
+            size);
+   }
+#endif
+   if (video_st->views_presented)
+   {
+      screens = video_st->views_core.num_screens;
+      bases   = ~(video_st->views_core.viewless
+            | video_st->views_core.over);
+      if (screens > RETRO_VIDEO_VIEWS_MAX)
+         screens = RETRO_VIDEO_VIEWS_MAX;
+   }
+   for (b = 0; b < screens; b++)
+   {
+      if (b == s || !(bases & (1u << b)))
+         continue;
+      len += strlcpy(list + len, "|", size - len);
+      len += video_screen_prefs_over_value(b, list + len, size - len);
+   }
+   strlcpy(list + len, "|" VIDEO_WINDOW_DISPLAY_OFF, size - len);
+}
+
 void menu_setting_video_screen_display_values(void)
 {
+   unsigned s;
 #ifdef HAVE_VIDEO_WINDOWS
-   char key[VIDEO_WINDOW_DISPLAY_NAME_SIZE];
-   unsigned i, count;
-   size_t keys;
-   size_t len                             = 0;
-   const video_window_display_t *displays =
-      video_driver_borrow_window_displays(&count);
-   setting_video_screen_display_list[0] = '\0';
-   if (video_windows_offer_main(displays, count))
-      len = strlcpy(setting_video_screen_display_list,
-            "|" VIDEO_WINDOW_DISPLAY_MAIN,
-            sizeof(setting_video_screen_display_list));
-   keys = len;
-   for (i = 0; i < count; i++)
-   {
-      video_windows_display_key(displays, i, key, sizeof(key));
-      if (!setting_video_screen_display_offered(key))
-         continue;
-      len += strlcpy(setting_video_screen_display_list + len, "|",
-            sizeof(setting_video_screen_display_list) - len);
-      len += strlcpy(setting_video_screen_display_list + len, key,
-            sizeof(setting_video_screen_display_list) - len);
-   }
-   /* "" alone lists nothing in the dropdown, not even Auto */
-   strlcpy(setting_video_menu_display_list,
-         len > keys ? setting_video_screen_display_list + keys : "|",
-         sizeof(setting_video_menu_display_list));
-   strlcpy(setting_video_screen_display_list + len,
-         "|" VIDEO_WINDOW_DISPLAY_OFF,
-         sizeof(setting_video_screen_display_list) - len);
-   if (setting_video_screen_display_full())
-      return;
+   setting_video_screen_display_menu_build();
 #endif
-   strlcpy(setting_video_screen_display_list, "|" VIDEO_WINDOW_DISPLAY_OFF,
-         sizeof(setting_video_screen_display_list));
+   for (s = 0; s < RETRO_VIDEO_VIEWS_MAX; s++)
+      setting_video_screen_display_build(s);
 }
 
 static size_t setting_video_screen_display_text(rarch_setting_t *setting,
@@ -4267,6 +4318,7 @@ static size_t setting_video_screen_display_text(rarch_setting_t *setting,
    unsigned i, count;
 #endif
    size_t _len;
+   int base;
    const char *value;
    if (!setting)
       return 0;
@@ -4281,6 +4333,16 @@ static size_t setting_video_screen_display_text(rarch_setting_t *setting,
                MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_MAIN), len);
    if (!value[0])
       return strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_AUTO), len);
+   base = video_screen_prefs_over_base(value);
+   if (base >= 0 && setting->enum_idx != MENU_ENUM_LABEL_VIDEO_MENU_DISPLAY)
+   {
+      char label[64];
+      video_driver_screen_label((unsigned)base, msg_hash_to_str(
+               MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_SETTINGS),
+            label, sizeof(label));
+      return snprintf(s, len, msg_hash_to_str(
+               MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_OVER), label);
+   }
    _len = snprintf(s, len, msg_hash_to_str(
             MENU_ENUM_LABEL_VALUE_VIDEO_WINDOW_DISPLAY), value);
 #ifdef HAVE_VIDEO_WINDOWS
@@ -4334,67 +4396,60 @@ static size_t setting_get_string_representation_video_screen_display(
             MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_CORE_DEFAULT), text);
 }
 
-/* Left and right go through Auto, Main Window on a screen's row on the
- * desktop, the displays listed and, on a screen's row, Off; one no
- * longer listed goes to Auto on the right and the last on the left. A
- * screen's row has Auto and Off alone without the screens' windows. */
+/* Left and right step through the row's values, listed afresh; one no
+ * longer listed goes to Auto on the right and the last on the left */
 static int setting_video_screen_display_step(rarch_setting_t *setting,
       bool right)
 {
-#ifdef HAVE_VIDEO_WINDOWS
-   const video_window_display_t *displays = NULL;
-   char key[VIDEO_WINDOW_DISPLAY_NAME_SIZE];
-   unsigned listed[VIDEO_WINDOW_DISPLAYS_MAX];
-   unsigned i, count;
-#endif
-   unsigned pos, last;
-   unsigned m = 0;
-   unsigned n = 0;
+   char cur[VIDEO_WINDOW_DISPLAY_NAME_SIZE];
+   const char *tok;
+   const char *end;
+   size_t _len;
+   unsigned i;
+   unsigned count = 0;
+   unsigned pos   = 0;
+   bool found     = false;
    bool off;
    char *value;
    if (!setting)
       return -1;
    off   = setting->enum_idx != MENU_ENUM_LABEL_VIDEO_MENU_DISPLAY;
    if (off)
-      setting_video_screen_display_read(setting);
-   value = setting->value.target.string;
-   pos   = value[0] ? VIDEO_WINDOW_DISPLAYS_MAX + 3 : 0;
-#ifdef HAVE_VIDEO_WINDOWS
-   if (!off || setting_video_screen_display_full())
    {
-      displays = video_driver_borrow_window_displays(&count);
-      m        = (off && video_windows_offer_main(displays, count)) ? 1 : 0;
-      for (i = 0; i < count; i++)
-      {
-         video_windows_display_key(displays, i, key, sizeof(key));
-         if (!setting_video_screen_display_offered(key))
-            continue;
-         if (value[0] && string_is_equal(key, value))
-            pos = n + 1 + m;
-         listed[n++] = i;
-      }
+      setting_video_screen_display_read(setting);
+      setting_video_screen_display_build(setting->index_offset);
    }
-#endif
-   last = off ? n + m + 1 : n;
-   if (m && string_is_equal(value, VIDEO_WINDOW_DISPLAY_MAIN))
-      pos = 1;
-   if (off && string_is_equal(value, VIDEO_WINDOW_DISPLAY_OFF))
-      pos = last;
-   if (pos > last)
-      pos = right ? 0 : last;
-   else
-      pos = right ? (pos + 1) % (last + 1) : (pos + last) % (last + 1);
-   if (!pos)
-      value[0] = '\0';
-   else if (pos > n + m)
-      strlcpy(value, VIDEO_WINDOW_DISPLAY_OFF, setting->size);
 #ifdef HAVE_VIDEO_WINDOWS
-   else if (pos <= m)
-      strlcpy(value, VIDEO_WINDOW_DISPLAY_MAIN, setting->size);
    else
-      video_windows_display_key(displays, listed[pos - 1 - m], value,
-            setting->size);
+      setting_video_screen_display_menu_build();
 #endif
+   value = setting->value.target.string;
+   strlcpy(cur, value, sizeof(cur));
+   for (tok = setting->aux.values; ; tok = end + 1)
+   {
+      end  = strchr(tok, '|');
+      _len = end ? (size_t)(end - tok) : strlen(tok);
+      if (!found && !strncmp(tok, cur, _len) && !cur[_len])
+      {
+         found = true;
+         pos   = count;
+      }
+      count++;
+      if (!end)
+         break;
+   }
+   if (!found)
+      pos = right ? 0 : count - 1;
+   else
+      pos = right ? (pos + 1) % count : (pos + count - 1) % count;
+   for (tok = setting->aux.values, i = 0; i < pos; i++)
+      tok = strchr(tok, '|') + 1;
+   end  = strchr(tok, '|');
+   _len = end ? (size_t)(end - tok) : strlen(tok);
+   if (_len >= setting->size)
+      _len = setting->size - 1;
+   memcpy(value, tok, _len);
+   value[_len] = '\0';
    if (off)
       setting_video_screen_display_write(setting->index_offset);
    else
@@ -17481,7 +17536,7 @@ static void setting_append_list_video_screen_display(
       /* Values from the platform's list, as the theme row has its own */
       (*list)[list_info->index - 1].type         = ST_STRING_OPTIONS;
       (*list)[list_info->index - 1].ui_type      = ST_UI_TYPE_STRING_COMBOBOX;
-      (*list)[list_info->index - 1].aux.values   = setting_video_screen_display_list;
+      (*list)[list_info->index - 1].aux.values   = setting_video_screen_display_list[screen];
       (*list)[list_info->index - 1].index_offset = screen;
       SETTINGS_ACTION_SET(left, &(*list)[list_info->index - 1], &setting_string_action_left_video_screen_display)
       SETTINGS_ACTION_SET(right, &(*list)[list_info->index - 1], &setting_string_action_right_video_screen_display)

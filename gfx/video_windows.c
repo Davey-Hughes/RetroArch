@@ -470,8 +470,8 @@ static void video_windows_place_route(const video_windows_place_in_t *in,
       && !(in->menu_open && menu_main);
 }
 
-/* The screens' and the menu's display settings; Notifications moves
- * nothing */
+/* The screens' and the menu's display settings and the insets;
+ * Notifications moves nothing */
 static unsigned video_windows_settings_hash(
       const video_windows_place_in_t *in)
 {
@@ -489,6 +489,11 @@ static unsigned video_windows_settings_hash(
       h = (h ^ 0x100u) * 16777619u;
    }
    h = (h ^ in->menu_follows) * 16777619u;
+   /* An inset goes where its base does */
+   h = (h ^ in->over) * 16777619u;
+   for (s = 0; s < RETRO_VIDEO_VIEWS_MAX; s++)
+      if (in->over & (1u << s))
+         h = (h ^ VIDEO_VIEWS_NIBBLE(in->base, s)) * 16777619u;
    return h ? (unsigned)h : 1u;
 }
 

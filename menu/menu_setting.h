@@ -132,9 +132,10 @@ void menu_setting_free(rarch_setting_t *setting);
  * name of the keyboard listed there. */
 size_t menu_setting_keyboard_index_name(unsigned idx, char *s, size_t len);
 
-/* Rebuilds the display rows' values: Auto, then each listed display's
- * key; Auto and Off without the screens' windows. App thread; the list
- * is built from it. */
+/* Rebuilds each display row's values: Auto, each listed display's key,
+ * the Over value of each base on offer, then Off; Auto, the Over values
+ * and Off without the screens' windows. App thread; the list is built
+ * from it. */
 void menu_setting_video_screen_display_values(void);
 
 /* The screens the menu lists: Game Screens 1 and 2, and each further one
