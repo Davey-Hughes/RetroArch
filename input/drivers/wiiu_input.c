@@ -86,22 +86,6 @@ static void kb_key_callback(KBDKeyEvent *key)
          RETRO_DEVICE_KEYBOARD);
 }
 
-/* A touch, -0x7fff to 0x7fff, on a NO_INPUT screen's part of the packed
- * frame, which views fallback shows whole. */
-static bool wiiu_input_no_input(int16_t x, int16_t y)
-{
-   video_driver_state_t *video_st = video_state_get_ptr();
-   long w = (long)VIDEO_SCALE_W(video_st->views_frame_dims);
-   long h = (long)VIDEO_SCALE_H(video_st->views_frame_dims);
-   long px, py;
-   if (!video_st->views_fallback)
-      return false;
-   px = ((long)x + 0x7fff) * w / 0xfffe;
-   py = ((long)y + 0x7fff) * h / 0xfffe;
-   return video_views_point_no_input(&video_st->views_core,
-         (int)(px < w ? px : w - 1), (int)(py < h ? py : h - 1));
-}
-
 static int16_t wiiu_input_state(
       void *data,
       const input_device_driver_t *joypad,
@@ -146,7 +130,7 @@ static int16_t wiiu_input_state(
                    * GamePad shows its views */
                   if (     device == RETRO_DEVICE_POINTER
                         && !gx2_views_touch(x, y, &x, &y)
-                        && wiiu_input_no_input(x, y))
+                        && gx2_views_touch_no_input(x, y))
                      return -0x8000;
                   return (id == RETRO_DEVICE_ID_POINTER_X) ? x : y;
                }

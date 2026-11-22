@@ -2026,6 +2026,20 @@ bool gx2_views_touch(int16_t x, int16_t y, int16_t *res_x, int16_t *res_y)
    return video_views_touch_point(&gx2_views_touch_map, x, y, res_x, res_y);
 }
 
+bool gx2_views_touch_no_input(int16_t x, int16_t y)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   long w = (long)VIDEO_SCALE_W(video_st->views_frame_dims);
+   long h = (long)VIDEO_SCALE_H(video_st->views_frame_dims);
+   long px, py;
+   if (!video_st->views_fallback)
+      return false;
+   px = ((long)x + 0x7fff) * w / 0xfffe;
+   py = ((long)y + 0x7fff) * h / 0xfffe;
+   return video_views_point_no_input(&video_st->views_core,
+         (int)(px < w ? px : w - 1), (int)(py < h ? py : h - 1));
+}
+
 /* The GamePad's colour buffer, made on first use */
 static bool gx2_views_drc_make(wiiu_video_t *wiiu)
 {

@@ -2790,6 +2790,9 @@ bool ctr_views_touch(int16_t x, int16_t y, int16_t *res_x, int16_t *res_y);
  * -0x8000 off them. False, with @res_x and @res_y as they were, when
  * it shows none. */
 bool gx2_views_touch(int16_t x, int16_t y, int16_t *res_x, int16_t *res_y);
+/* A GamePad touch, as above, on a NO_INPUT screen's part of the packed
+ * frame, which views fallback shows whole. */
+bool gx2_views_touch_no_input(int16_t x, int16_t y);
 #endif
 #ifdef HAVE_OPENXR
 /* Main thread: the core's own view map and frame size the last frame
