@@ -4641,6 +4641,195 @@ static void test_screens_none_placed_pointer(void)
    window_test_end();
 }
 
+/* A frame repeated: the last one's dimensions, with NULL data */
+static void window_test_repeat(void)
+{
+   window_test_frames = 0;
+   window_test_handed = NULL;
+   video_driver_frame(NULL, 8, 2, 0);
+   CHECK(window_test_frames == 1);
+}
+
+/* screens_test_map()'s screens both shown, drawn from a frame with data
+ * in the main window */
+static void null_refresh_begin(struct retro_video_views *map,
+      struct retro_video_view *views, struct retro_video_screen *screens)
+{
+   screens_test_core();
+   window_test_begin();
+   config_get_ptr()->bools.video_windows_enable = false;
+   screens_test_map(map, views, screens, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+         RETRO_VIDEO_SCREEN_STATE_ACTIVE);
+   screens[1].flags = 0;
+   screens[1].size  = 0.0f;
+   CHECK(video_driver_set_views(map));
+   window_test_run();
+   CHECK(window_test_seen_placed == 2);
+}
+
+static void null_refresh_end(void)
+{
+   window_test_end();
+   screens_test_core_done();
+}
+
+/* A core's NO_INPUT sent with a NULL refresh applies to it */
+static void test_null_refresh_no_input(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   const uint32_t oob = VIDEO_POS_PACK(-0x8000, -0x8000);
+   struct retro_video_views map;
+   struct video_viewport vp;
+   video_views_rect_t bottom;
+   uint32_t pos, screen_pos;
+   int x, y;
+   null_refresh_begin(&map, views, screens);
+   CHECK(window_test_seen_layout.placements[1].view == 1);
+   bottom = window_test_seen_layout.placements[1].dst;
+   x      = VIDEO_POS_X(bottom.pos) + (int)VIDEO_SCALE_W(bottom.dims) / 2;
+   y      = VIDEO_POS_Y(bottom.pos) + (int)VIDEO_SCALE_H(bottom.dims) / 2;
+   CHECK(video_driver_get_viewport_info(&vp));
+   pos = oob;
+   CHECK(video_driver_translate_coord_viewport(&vp, x, y, &pos,
+            &screen_pos, true));
+   CHECK(pos != oob);
+   screens[1].flags = RETRO_VIDEO_SCREEN_FLAG_NO_INPUT;
+   CHECK(video_driver_set_views(&map));
+   window_test_repeat();
+   CHECK(window_test_seen_views.no_input == 0x2u);
+   pos = 0;
+   CHECK(video_driver_translate_coord_viewport(&vp, x, y, &pos,
+            &screen_pos, true));
+   CHECK(pos == oob);
+   null_refresh_end();
+}
+
+/* A core's HIDDEN sent with a NULL refresh leaves its screen out */
+static void test_null_refresh_hidden(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   null_refresh_begin(&map, views, screens);
+   screens[1].show = RETRO_VIDEO_SCREEN_SHOW_HIDDEN;
+   CHECK(video_driver_set_views(&map));
+   window_test_repeat();
+   CHECK(window_test_seen_placed == 1);
+   CHECK(window_test_seen_layout.placements[0].view == 0);
+   CHECK(window_test_seen_views.left_out == 0x2u);
+   null_refresh_end();
+}
+
+/* A core's BLANK sent with a NULL refresh draws its screen black */
+static void test_null_refresh_blank(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   null_refresh_begin(&map, views, screens);
+   screens[1].state = RETRO_VIDEO_SCREEN_STATE_BLANK;
+   CHECK(video_driver_set_views(&map));
+   window_test_repeat();
+   CHECK(window_test_seen_placed == 2);
+   CHECK(window_test_seen_layout.placements[1].view == 1);
+   CHECK(window_test_seen_layout.placements[1].flags
+         == VIDEO_VIEWS_PLACEMENT_BLANK);
+   CHECK(window_test_seen_views.blank == 0x2u);
+   null_refresh_end();
+}
+
+/* A screen shown on a NULL refresh had no pixels in the frame repeated:
+ * black until a frame with data */
+static void test_null_refresh_shown_blank(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   unsigned i;
+   null_refresh_begin(&map, views, screens);
+   screens[1].show = RETRO_VIDEO_SCREEN_SHOW_HIDDEN;
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   CHECK(window_test_seen_placed == 1);
+   screens[1].show = RETRO_VIDEO_SCREEN_SHOW_SHOWN;
+   CHECK(video_driver_set_views(&map));
+   for (i = 0; i < 2; i++)
+   {
+      window_test_repeat();
+      CHECK(window_test_seen_placed == 2);
+      CHECK(window_test_seen_layout.placements[1].view == 1);
+      CHECK(window_test_seen_layout.placements[1].flags
+            == VIDEO_VIEWS_PLACEMENT_BLANK);
+      CHECK(window_test_seen_views.blank == 0x2u);
+   }
+   window_test_run();
+   CHECK(window_test_seen_placed == 2);
+   CHECK(!window_test_seen_layout.placements[1].flags);
+   CHECK(!window_test_seen_views.blank);
+   null_refresh_end();
+}
+
+/* The user's Over set before a NULL refresh draws the inset on it, with
+ * the pixels the repeated frame drew it with */
+static void test_null_refresh_inset(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   settings_t *settings = config_get_ptr();
+   null_refresh_begin(&map, views, screens);
+   strlcpy(settings->arrays.video_screen_display[1], "over:1",
+         sizeof(settings->arrays.video_screen_display[1]));
+   window_test_repeat();
+   CHECK(screens_test_inset());
+   CHECK(window_test_seen_views.over == 0x2u);
+   CHECK(!window_test_seen_views.blank);
+   settings->arrays.video_screen_display[1][0] = '\0';
+   null_refresh_end();
+}
+
+/* A screen in its own window was drawn: a NULL refresh keeps it */
+static void test_null_refresh_own_window(void)
+{
+   window_test_begin();
+   window_test_run();
+   CHECK(window_test_seen.plan.separate_mask == 2u);
+   CHECK(window_test_seen_placed == 1);
+   window_test_repeat();
+   CHECK(window_test_seen.plan.separate_mask == 2u);
+   CHECK(!window_test_seen.core.blank);
+   CHECK(!video_state_get_ptr()->views_core.blank);
+   window_test_end();
+}
+
+/* A map whose rectangles changed waits for a frame with data */
+static void test_null_refresh_views_changed(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   static video_views_layout_t drawn;
+   struct retro_video_views map;
+   null_refresh_begin(&map, views, screens);
+   drawn = window_test_seen_layout;
+   views[0].width   = views[1].width = 4;
+   screens[1].show  = RETRO_VIDEO_SCREEN_SHOW_HIDDEN;
+   screens[1].flags = RETRO_VIDEO_SCREEN_FLAG_NO_INPUT;
+   CHECK(video_driver_set_views(&map));
+   window_test_repeat();
+   CHECK(window_test_seen_placed == 2);
+   CHECK(!memcmp(window_test_seen_layout.placements, drawn.placements,
+         2 * sizeof(drawn.placements[0])));
+   CHECK(!window_test_seen_views.left_out);
+   CHECK(!window_test_seen_views.no_input);
+   CHECK(window_test_seen_views.views[1].width == 8);
+   window_test_run();
+   CHECK(window_test_seen_placed == 1);
+   CHECK(window_test_seen_views.left_out == 0x2u);
+   CHECK(window_test_seen_views.no_input == 0x2u);
+   null_refresh_end();
+}
+
 /* Writes go to the global settings until a views core runs, then to
  * its store; clearing an entry brings the global value back */
 static void test_screens_writes_per_core(void)
@@ -11525,6 +11714,13 @@ int main(int argc, char **argv)
    test_screens_over_base_hidden();
    test_screens_user_off_windows_off();
    test_screens_none_placed_pointer();
+   test_null_refresh_no_input();
+   test_null_refresh_hidden();
+   test_null_refresh_blank();
+   test_null_refresh_shown_blank();
+   test_null_refresh_inset();
+   test_null_refresh_own_window();
+   test_null_refresh_views_changed();
    test_screens_writes_per_core();
    test_screen_set_default_clears();
    test_screens_core_default_bits();

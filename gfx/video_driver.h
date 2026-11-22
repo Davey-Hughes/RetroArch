@@ -2254,6 +2254,8 @@ typedef struct
    video_screen_shown_box_t screens_shown_box[RETRO_VIDEO_VIEWS_MAX];
    unsigned screens_insets;
    unsigned views_frame_dims;
+   /* The screens the last snapshot drew with pixels, a bit a screen */
+   unsigned views_drawn;
    /* The view count the driver instance was last told. */
    unsigned views_driver_count;
    /* The status video_driver_views_status_changed() last saw. */

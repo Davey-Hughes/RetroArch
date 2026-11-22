@@ -619,20 +619,24 @@ SCREEN_LOG_RE = re.compile(r'\[Video\] Screen \d+: .*')
 # GET_VIDEO_SCREEN_BUFFER, which the frontend knows
 SCREEN_BUFFER_UNSUPPORTED_RE = re.compile(
     r'\[Environ\] UNSUPPORTED \(#(?:108|65644)\)')
+SCREENS_SWITCHED_RE = re.compile(r'\[video_views\] screens switched')
 # The light gun aimed, with the menu closed, at the top screen's centre
 # and then the bottom one's, as ds-horizontal lays them out. Aimed at
 # the top first, so the second aim reads differently whatever the
 # pointer's start. A blank screen still takes the gun.
 # [(name, video_views_test_screens, whether the bottom screen takes the
-# gun, points)]
+# gun, points, what run_case() is given besides)]
 SCREENS_AIM_SETTINGS = {'video_stereo_mode': '0', 'video_screen_layout': '1'}
 SCREENS_AIM_POINTS = [(400, 480, GREEN), (1200, 480, YELLOW)]
 # The bottom screen blank: black, in its place.
 SCREENS_BOTTOM_BLANK = [(400, 480, GREEN), (1200, 480, BLACK)]
 SCREENS_AIM_CASES = [
-    ('screens-no-input', 'no_input', False, SCREENS_AIM_POINTS),
-    ('screens-no-input-off', 'no_input_off', True, SCREENS_AIM_POINTS),
-    ('screens-blank-aim', 'blank', True, SCREENS_BOTTOM_BLANK)]
+    ('screens-no-input', 'no_input', False, SCREENS_AIM_POINTS, {}),
+    ('screens-no-input-off', 'no_input_off', True, SCREENS_AIM_POINTS, {}),
+    ('screens-blank-aim', 'blank', True, SCREENS_BOTTOM_BLANK, {}),
+    # NO_INPUT sent with a NULL refresh, aimed after it
+    ('screens-no-input-null', 'no_input_null', False, SCREENS_AIM_POINTS,
+     {'until': SCREENS_SWITCHED_RE})]
 SCREENS_AIM = ((400, 480), (1200, 480))
 GUN_RE = re.compile(r'\[video_views\] lightgun x=(-?\d+) y=(-?\d+) '
                     r'offscreen=(\d) trigger=(\d) '
@@ -666,7 +670,6 @@ SCREENS_INSET_BLANK_HALF = SCREENS_INSET_AROUND + [
 # Drivers that draw an inset at its opacity; the rest draw it solid.
 OPACITY_DRIVERS = ('gl', 'glcore', 'gl1', 'vulkan', 'd3d8', 'd3d9_hlsl',
                    'd3d10', 'd3d11', 'sdl', 'sdl2', 'sdl3')
-SCREENS_SWITCHED_RE = re.compile(r'\[video_views\] screens switched')
 # The core's own screen choices, under the case directory. A file the
 # frontend wrote again would have lost the comment.
 CORE_FILE = os.path.join('video_views test', 'video_views test.screens.cfg')
@@ -679,6 +682,11 @@ CORE_FILE_OFF = {CORE_FILE: '# kept\nvideo_screen2_display = "off"\n'}
 SCREENS_DRAW_CASES = [
     ('screens-hidden', 'hidden', SCREENS_TOP_ALONE, {}),
     ('screens-blank-late', 'blank_late', SCREENS_BOTTOM_BLANK,
+     {'until': SCREENS_SWITCHED_RE}),
+    # Sent with a NULL refresh, every refresh after it NULL
+    ('screens-hide-null', 'hide_null', SCREENS_TOP_ALONE,
+     {'until': SCREENS_SWITCHED_RE}),
+    ('screens-blank-null', 'blank_null', SCREENS_BOTTOM_BLANK,
      {'until': SCREENS_SWITCHED_RE}),
     ('screens-none-shown', 'none_shown', SCREENS_NONE, {}),
     ('screens-over', 'over', SCREENS_INSET, {}),
@@ -2312,12 +2320,12 @@ def run_screens_rules_case(retroarch, root, driver):
 def run_screens_aim_case(retroarch, root, driver, case):
     """The light gun aimed at the bottom screen's centre with the menu
     closed: on that screen only when it takes input."""
-    name, mode, takes, points = case
+    name, mode, takes, points, extra = case
     aimed = []
     errors = run_case(retroarch, root, driver,
                       (name, 'ds', SCREENS_AIM_SETTINGS, points),
                       opts={'video_views_test_screens': mode},
-                      aim=SCREENS_AIM, aimed=aimed)
+                      aim=SCREENS_AIM, aimed=aimed, **extra)
     guns = GUN_RE.findall(log_text(case_dir(root, driver, name)))
     if len(aimed) < len(SCREENS_AIM):
         return errors + ['the pointer did not move']

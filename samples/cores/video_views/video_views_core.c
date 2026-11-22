@@ -82,8 +82,10 @@
  * opacity; over_blank, the same BLANK; over_blank_half, BLANK at half
  * opacity; blank, BLANK; absent, ABSENT with its view kept. blank_late
  * sends it ACTIVE and from frame 60 BLANK, absent_back ABSENT and from
- * frame 60 ACTIVE, each logging the switch once. none_shown sends both
- * screens HIDDEN.
+ * frame 60 ACTIVE, each logging the switch once. hide_null, no_input_null
+ * and blank_null send it SHOWN and from frame 60 HIDDEN, NO_INPUT or
+ * BLANK, that frame and every one after it as a NULL refresh, each
+ * logging the switch once. none_shown sends both screens HIDDEN.
  *
  * VIDEO_VIEWS_TEST_LIBRARY_NAME in the environment replaces the library
  * name, so one build can load as a second core. */
@@ -1132,7 +1134,8 @@ void retro_set_environment(retro_environment_t cb)
       { "video_views_test_screens",
         "Screens the ds map describes; off|rules|no_input|no_input_off"
         "|shown|hidden|over|over_half|over_blank|over_blank_half|blank"
-        "|blank_late|absent|absent_back|none_shown" },
+        "|blank_late|absent|absent_back|none_shown|hide_null"
+        "|no_input_null|blank_null" },
       { NULL, NULL }
    };
    struct retro_log_callback logging;
@@ -2317,7 +2320,9 @@ static const struct
 
 /* video_views_test_screens' modes besides rules: how the ds map's
  * screen 1 is sent, @late being its state from SCR_SWITCH_FRAME on.
- * @both gives screen 0 the same show. @opacity is screen 1's. */
+ * @both gives screen 0 the same show. @opacity is screen 1's. A @null
+ * mode switches there with a NULL refresh and sends every refresh after
+ * it NULL, screen 1 from then @null_show with @null_flags. */
 static const struct
 {
    const char *name;
@@ -2327,6 +2332,9 @@ static const struct
    unsigned late;
    bool both;
    float opacity;
+   bool null;
+   unsigned null_show;
+   unsigned null_flags;
 } scr_modes[] = {
    { "no_input",     RETRO_VIDEO_SCREEN_FLAG_NO_INPUT,
       RETRO_VIDEO_SCREEN_SHOW_SHOWN,
@@ -2367,8 +2375,25 @@ static const struct
       false, 0.0f },
    { "none_shown",   0, RETRO_VIDEO_SCREEN_SHOW_HIDDEN,
       RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
-      true, 0.0f }
+      true, 0.0f },
+   { "hide_null",    0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f, true, RETRO_VIDEO_SCREEN_SHOW_HIDDEN, 0 },
+   { "no_input_null", 0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f, true, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_FLAG_NO_INPUT },
+   { "blank_null",   0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_BLANK,
+      false, 0.0f, true, RETRO_VIDEO_SCREEN_SHOW_SHOWN, 0 }
 };
+
+/* A null mode from its switch on: each refresh repeats the last frame */
+static bool screens_repeat(void)
+{
+   return screens_kind == SCREENS_MODE && scr_modes[screens_mode].null
+      && frames_run > SCR_SWITCH_FRAME;
+}
 
 static bool screens_mode_named(const char *name)
 {
@@ -2391,23 +2416,31 @@ static const char *screens_add(struct retro_video_views *in)
    const char *name = "full";
    if (screens_kind != SCREENS_RULES)
    {
+      unsigned flags = scr_modes[screens_mode].flags;
       unsigned show  = scr_modes[screens_mode].show;
       unsigned state = scr_modes[screens_mode].state;
-      bool over      = (show == RETRO_VIDEO_SCREEN_SHOW_OVER);
+      bool over;
       /* retro_run() has counted this frame. */
-      if (     scr_modes[screens_mode].late != state
+      if (     (scr_modes[screens_mode].late != state
+               || scr_modes[screens_mode].null)
             && frames_run > SCR_SWITCH_FRAME)
       {
          state = scr_modes[screens_mode].late;
+         if (scr_modes[screens_mode].null)
+         {
+            show  = scr_modes[screens_mode].null_show;
+            flags = scr_modes[screens_mode].null_flags;
+         }
          if (!screens_switched)
             log_cb(RETRO_LOG_INFO, "[video_views] screens switched\n");
          screens_switched = true;
       }
+      over = (show == RETRO_VIDEO_SCREEN_SHOW_OVER);
       scr_screens[0]  = mkscreen("Top", 0, 0,
             scr_modes[screens_mode].both ? show : 0,
             0, 0.0f, 0, 0.0f, 0, 0, 0, 0);
-      scr_screens[1]  = mkscreen("Bottom", scr_modes[screens_mode].flags,
-            state, show, 0, over ? 0.25f : 0.0f,
+      scr_screens[1]  = mkscreen("Bottom", flags, state, show, 0,
+            over ? 0.25f : 0.0f,
             over ? RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT : 0,
             scr_modes[screens_mode].opacity, 0, 0, 0, 0);
       in->flags      |= RETRO_VIDEO_VIEWS_FLAG_SCREENS;
@@ -2622,7 +2655,13 @@ void retro_run(void)
    log_lightgun(fw, fh);
    update_rumble();
 
-   if (HW_IS_VULKAN(hw_kind))
+   if (screens_repeat())
+   {
+      if (gl_clears())
+         p_glDisable(GL_SCISSOR_TEST);
+      video_cb(NULL, fw, fh, 0);
+   }
+   else if (HW_IS_VULKAN(hw_kind))
    {
       if (vk_send(fw, fh))
          video_cb(RETRO_HW_FRAME_BUFFER_VALID, fw, fh, 0);

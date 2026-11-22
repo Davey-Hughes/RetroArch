@@ -5671,9 +5671,10 @@ static void video_driver_views_take_arrangement(video_views_map_t *to,
 }
 
 /* Fills the frame's views and layout. A repeated frame (no data), or one
- * that will not be presented (frameskip), reuses the last map, since the
- * driver's last presented (or repeated) textures still match it. @now
- * is the frame's clock sample. */
+ * that will not be presented (frameskip), keeps the last map's views,
+ * since the driver's last presented (or repeated) textures still match
+ * them; the rest of a map with those views applies at once. @now is the
+ * frame's clock sample. */
 static void video_driver_views_frame(video_driver_state_t *video_st,
       settings_t *settings, const void *data, bool render_frame,
       unsigned core_dims, unsigned dims, retro_time_t now,
@@ -5683,8 +5684,10 @@ static void video_driver_views_frame(video_driver_state_t *video_st,
    bool allowed;
    bool presented;
    bool arranged = false;
+   bool repeat = false;
    bool redraw = false;
    bool windows = false;
+   video_views_map_t *core = &video_st->views_core;
 #ifdef HAVE_THREADS
    /* A Win32 window drag has the video thread redraw the cached frame
     * beside the main thread, whose state this is: it lays out what was
@@ -5711,15 +5714,36 @@ static void video_driver_views_frame(video_driver_state_t *video_st,
             core_dims, dims, &video_st->views_frame);
       if (presented)
       {
-         video_views_map_t *core    = &video_st->views_core;
          *core                      = video_st->views;
          video_st->views_frame_dims = core_dims;
-         /* Not in views: set_views compares each map with it */
-         video_screen_prefs_arrange(video_st->screens_resolved,
-               video_st->screens_defaults, &video_st->views_screens, core);
-         video_driver_views_take_arrangement(&video_st->views_frame, core);
-         arranged = true;
+         arranged                   = true;
       }
+   }
+   else if (presented && !redraw
+         && core->num_views   == video_st->views.num_views
+         && core->num_screens == video_st->views.num_screens
+         && !memcmp(core->views, video_st->views.views,
+               core->num_views * sizeof(core->views[0])))
+   {
+      core->no_input = video_st->views.no_input;
+      core->viewless = video_st->views.viewless;
+      repeat         = true;
+      arranged       = true;
+   }
+   if (arranged)
+   {
+      unsigned drawn;
+      /* Not in views: set_views compares each map with it */
+      video_screen_prefs_arrange(video_st->screens_resolved,
+            video_st->screens_defaults, &video_st->views_screens, core);
+      drawn = ((1u << core->num_screens) - 1u)
+            & ~(core->viewless | core->left_out | core->blank);
+      /* The frame repeated has no pixels for a screen it did not draw */
+      if (repeat)
+         core->blank          |= drawn & ~video_st->views_drawn;
+      else
+         video_st->views_drawn = drawn;
+      video_driver_views_take_arrangement(&video_st->views_frame, core);
    }
 #ifdef HAVE_VIDEO_WINDOWS
    if (!redraw)
@@ -5761,8 +5785,8 @@ static void video_driver_views_frame(video_driver_state_t *video_st,
       return;
    video_st->views_presented = presented;
    /* The menu's rows: this frame's arrangement; a kept map's as last
-    * published, until a frame with data arranges again; with no map,
-    * the values' own */
+    * published, until a frame arranges again; with no map, the values'
+    * own */
    video_driver_screens_publish(video_st, arranged
          ? video_st->views_core.over : presented
          ? video_st->screens_insets : video_driver_screens_insets(video_st));
