@@ -6,7 +6,8 @@
  * slot's insets drawn into its image after it, each in its rect.
  * The second outputs' render passes run against a fake device, and the
  * headset's format pick against a fake runtime; a screen window's
- * output is checked for whether it encodes HDR. */
+ * output is checked for whether it encodes HDR, and its repeat runs
+ * with its publishes stubbed as video_driver.c keeps them. */
 #include <stdio.h>
 #include <string.h>
 #include <vulkan/vulkan.h>
@@ -109,6 +110,23 @@ struct vulkan_filter_chain_swapchain_info
 
 typedef struct
 {
+   VkRenderPass render_pass;
+   VkFormat format;
+   VkColorSpaceKHR color_space;
+   unsigned dims;
+} vulkan_output_t;
+
+struct vk_window
+{
+   struct { void *surface; unsigned generation; unsigned dims; } native;
+   vulkan_output_t output;
+   void *surface;
+   unsigned passes_freed;
+   video_views_layout_t *layout;
+};
+
+typedef struct
+{
    test_context_t *context;
    test_chain_t *chain;
    vulkan_filter_chain_t *filter_chain;
@@ -201,30 +219,35 @@ typedef struct
       VkRenderPass render_pass;
       bool proj_shown;
    } xr;
+   struct
+   {
+      struct vk_window win[RETRO_VIDEO_VIEWS_MAX];
+      struct { unsigned display[RETRO_VIDEO_VIEWS_MAX]; } held;
+   } windows;
 } vk_t;
 
 typedef struct vulkan_openxr vulkan_openxr_t;
 
+typedef struct video_window_layout
+{
+   video_views_layout_t layout;
+   video_views_map_t core_map;
+} video_window_layout_t;
+
 typedef struct
 {
-   VkRenderPass render_pass;
-   VkFormat format;
-   VkColorSpaceKHR color_space;
-} vulkan_output_t;
-
-struct vk_window
-{
-   struct { void *surface; } native;
-   vulkan_output_t output;
-   void *surface;
-   unsigned passes_freed;
-};
+   video_views_map_t core;
+   unsigned window_screens[RETRO_VIDEO_VIEWS_MAX];
+   unsigned core_dims;
+} video_windows_frame_t;
 
 typedef struct
 {
    video_views_map_t views;
    int headset_eye[2];
    bool shader_active;
+   video_views_layout_settings_t views_settings;
+   const video_windows_frame_t *windows;
 } video_frame_info_t;
 
 static unsigned allocations, destructions, warnings, failures;
@@ -710,6 +733,51 @@ static void vulkan_views_fill(vk_t *vk, const video_views_rect_t *cut,
       fills++;
       last_fill = *cut;
    }
+}
+
+/* Window 1's slots: one lent, one published */
+static video_window_layout_t win_slots[2];
+static unsigned win_next, win_last, win_publishes;
+/* What a repeat lays the window out as */
+static video_views_layout_t win_laid;
+
+static const video_window_layout_t *video_driver_published_window_layout(
+      unsigned window)
+{
+   (void)window;
+   return win_last ? &win_slots[win_last - 1] : NULL;
+}
+
+static void video_driver_window_layout_screens(
+      const video_windows_frame_t *frame,
+      const video_views_layout_settings_t *settings, unsigned screens,
+      unsigned dims, video_views_layout_t *out)
+{
+   (void)frame;
+   (void)settings;
+   (void)screens;
+   (void)dims;
+   *out = win_laid;
+}
+
+static void video_driver_publish_window_layout(unsigned window,
+      unsigned generation, unsigned display,
+      const video_views_layout_t *layout,
+      const video_views_map_t *core_map, unsigned core_dims,
+      unsigned window_dims)
+{
+   video_window_layout_t *slot = &win_slots[win_next];
+   (void)window;
+   (void)generation;
+   (void)display;
+   (void)core_dims;
+   (void)window_dims;
+   if (layout != &slot->layout)
+      slot->layout = *layout;
+   slot->core_map = *core_map;
+   win_last       = win_next + 1;
+   win_next      ^= 1;
+   win_publishes++;
 }
 
 #include "driver_code.inc"
@@ -1629,6 +1697,51 @@ static void test_xr_draw_repeat_changed(void)
    CHECK(frames_ended == 0 && slot_creates[0] == 1);
 }
 
+/* A repeat that changes only screen 1's NO_INPUT publishes the window's
+ * layout again with the new map, without drawing it */
+static void test_window_repeat_no_input(void)
+{
+   vk_t vk;
+   video_frame_info_t info;
+   video_windows_frame_t f;
+   struct vk_window *win = &vk.windows.win[1];
+   unsigned publishes;
+   memset(&vk, 0, sizeof(vk));
+   memset(&info, 0, sizeof(info));
+   memset(&f, 0, sizeof(f));
+   memset(win_slots, 0, sizeof(win_slots));
+   memset(&win_laid, 0, sizeof(win_laid));
+   win_next = win_last = win_publishes = 0;
+   win_laid.num_placements          = 1;
+   win_laid.placements[0].view      = 1;
+   win_laid.placements[0].dst.dims  = VIDEO_SCALE_PACK(64, 32);
+   win_laid.canvas_dims             = VIDEO_SCALE_PACK(64, 32);
+   f.window_screens[1]              = 0x2;
+   info.windows                     = &f;
+   /* The frame with data, as vulkan_windows_present publishes it */
+   win->layout  = &win_slots[win_next].layout;
+   *win->layout = win_laid;
+   video_driver_publish_window_layout(1, 1, 0, win->layout, &f.core, 0, 0);
+   f.core.no_input = 0x2;
+   win->layout     = &win_slots[win_next].layout;
+   CHECK(!vulkan_window_repeat(&vk, &info, 1));
+   CHECK(win_publishes == 2);
+   CHECK(video_driver_published_window_layout(1)->core_map.no_input == 0x2);
+   CHECK(video_views_layout_same(
+         &video_driver_published_window_layout(1)->layout, &win_laid));
+   /* Unchanged, and another window's screen: nothing published */
+   publishes       = win_publishes;
+   f.core.no_input = 0x6;
+   win->layout     = &win_slots[win_next].layout;
+   CHECK(!vulkan_window_repeat(&vk, &info, 1));
+   CHECK(win_publishes == publishes);
+   /* Laid out otherwise: drawn, and published by its present */
+   win_laid.placements[0].flags = VIDEO_VIEWS_PLACEMENT_BLANK;
+   win->layout                  = &win_slots[win_next].layout;
+   CHECK(vulkan_window_repeat(&vk, &info, 1));
+   CHECK(win_publishes == publishes);
+}
+
 int main(void)
 {
    test_desktop_failure(false);
@@ -1656,6 +1769,7 @@ int main(void)
    test_xr_draw_inset_stereo();
    test_xr_draw_inset_repeat();
    test_xr_draw_repeat_changed();
-   printf("%u failed (25 Vulkan target cases)\n", failures);
+   test_window_repeat_no_input();
+   printf("%u failed (26 Vulkan target cases)\n", failures);
    return failures ? 1 : 0;
 }

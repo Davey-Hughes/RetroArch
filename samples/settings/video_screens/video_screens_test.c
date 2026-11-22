@@ -1913,12 +1913,12 @@ static void test_window_layout_frame_settings(void)
    CHECK(published->layout.placements[0].dst.pos
          == layout.placements[0].dst.pos);
    /* As the publisher sees it, also once a focus change republishes */
-   CHECK(video_driver_published_window_layout(1) == &published->layout);
+   CHECK(video_driver_published_window_layout(1) == published);
    CHECK(video_views_layout_same(&published->layout, &layout));
    video_driver_publish_window_focus(1, 0, false);
-   CHECK(video_driver_published_window_layout(1) != &published->layout);
-   CHECK(video_views_layout_same(video_driver_published_window_layout(1),
-         &layout));
+   CHECK(video_driver_published_window_layout(1) != published);
+   CHECK(video_views_layout_same(
+         &video_driver_published_window_layout(1)->layout, &layout));
 
    /* Settings changed between frames reach only the next one */
    settings->uints.video_screen_layout = VIDEO_SCREEN_LAYOUT_HORIZONTAL;

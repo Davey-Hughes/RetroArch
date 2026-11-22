@@ -13323,6 +13323,27 @@ static unsigned vulkan_window_buffers(const vk_t *vk)
       + (space && ctx->swapchain_settings.bit_depth == 2);
 }
 
+/* A repeat: window @w's screens laid out into its lent slot; true when
+ * that is not the layout it last published, so it is drawn again. A
+ * change in their NO_INPUT alone is published at once, undrawn. */
+static bool vulkan_window_repeat(vk_t *vk,
+      const video_frame_info_t *video_info, unsigned w)
+{
+   struct vk_window *win          = &vk->windows.win[w];
+   const video_windows_frame_t *f = video_info->windows;
+   const video_window_layout_t *drawn =
+      video_driver_published_window_layout(w);
+   video_driver_window_layout_screens(f, &video_info->views_settings,
+         f->window_screens[w], win->output.dims, win->layout);
+   if (!drawn || !video_views_layout_same(win->layout, &drawn->layout))
+      return true;
+   if ((drawn->core_map.no_input ^ f->core.no_input) & f->window_screens[w])
+      video_driver_publish_window_layout(w, win->native.generation,
+            vk->windows.held.display[w], win->layout, &f->core,
+            f->core_dims, win->native.dims);
+   return false;
+}
+
 /* The windows' part of a frame, before its views are settled: each one
  * made or let go of, polled, and given an output and a free image.
  * Those that will draw their screens put their views' chains, sized for
@@ -13468,13 +13489,7 @@ static VIDEO_NOINLINE void vulkan_windows_prepare(vk_t *vk,
        * the screens are laid out otherwise than it was drawn */
       laid        = state > 0 && screens && !new_frame && !f->window_ui[w];
       if (laid)
-      {
-         const video_views_layout_t *drawn =
-            video_driver_published_window_layout(w);
-         video_driver_window_layout_screens(f, &video_info->views_settings,
-               f->window_screens[w], out->dims, win->layout);
-         screens = !drawn || !video_views_layout_same(win->layout, drawn);
-      }
+         screens = vulkan_window_repeat(vk, video_info, w);
       if (state > 0 && !screens && !f->window_ui[w])
          state = 0;
       /* Once a frame, not again from the BFI, sub-frame and swap

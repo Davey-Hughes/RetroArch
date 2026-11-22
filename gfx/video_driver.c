@@ -1226,7 +1226,7 @@ video_views_layout_t *video_driver_lend_window_layout(unsigned window)
    return &box->slot[box->next].layout;
 }
 
-const video_views_layout_t *video_driver_published_window_layout(
+const video_window_layout_t *video_driver_published_window_layout(
       unsigned window)
 {
    video_window_layouts_t *box;
@@ -1237,7 +1237,7 @@ const video_views_layout_t *video_driver_published_window_layout(
    if (!box->last)
       return NULL;
    slot = &box->slot[box->last - 1];
-   return slot->generation ? &slot->layout : NULL;
+   return slot->generation ? slot : NULL;
 }
 
 /* The publisher's bounds and focus with the last layout, so input keeps
