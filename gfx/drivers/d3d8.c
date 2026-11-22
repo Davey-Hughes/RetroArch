@@ -3588,7 +3588,15 @@ static bool d3d8_frame(void *data, const void *frame,
    bool views_ui                       = false;
 #endif
 
-   if (!frame)
+   if (!frame
+#ifdef D3D8_VIEWS
+         /* Drawn again from the views' textures when it moved them */
+         && !(   d3d->views.active && !d3d->needs_restore
+              && dims == d3d->views.frame_dims
+              && !video_views_layout_same(&video_info->views_layout,
+                    &d3d->views.layout))
+#endif
+      )
       return true;
 
    /* We cannot recover in fullscreen. */
@@ -3622,6 +3630,9 @@ static bool d3d8_frame(void *data, const void *frame,
    /* As the main thread laid the UI out: overlays are hidden. */
    views_per_eye = video_views_ui_per_eye(&video_info->views,
          &video_info->views_layout, true);
+   /* Nothing to draw the frame whole from */
+   if (!frame && !views)
+      return true;
 #endif
 
    if (d3d->should_resize)
@@ -3660,8 +3671,9 @@ static bool d3d8_frame(void *data, const void *frame,
       d3d->views.blend     = views_blend;
       for (v = 0; v < RETRO_VIDEO_VIEWS_MAX; v++)
          d3d->views.drawn[v] = view_chains[v];
-      d3d8_views_write(d3d, &video_info->views, view_chains, frame, pitch,
-            d3d->video_info.rgb32);
+      if (frame)
+         d3d8_views_write(d3d, &video_info->views, view_chains, frame,
+               pitch, d3d->video_info.rgb32);
       d3d8_views_render(d3d,
             settings->bools.video_smooth ? D3DTEXF_LINEAR : D3DTEXF_POINT);
    }

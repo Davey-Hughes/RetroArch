@@ -101,6 +101,8 @@ typedef struct d3d9_views
     * register */
    void                  *ps[D3D9_VIEWS_PS_COUNT];
    int                   ps_reg[D3D9_VIEWS_PS_COUNT];
+   /* The layout the views were last drawn with */
+   video_views_layout_t  layout;
    unsigned              frame_dims;
    /* For get_flags on the main thread: whether views may be drawn, and
     * whether a map is drawn whole: the last frame's, or with none what

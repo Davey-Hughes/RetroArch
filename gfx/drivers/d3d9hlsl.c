@@ -8808,6 +8808,7 @@ static bool d3d9_hlsl_frame_body(void *data, const void *frame,
    bool widgets_active                 = video_info->widgets_active;
 #endif
    bool views_per_eye                  = false;
+   bool redraw                         = false;
 #ifdef D3D9_HW_RENDER
    bool hw_frame                       = false;
 #endif
@@ -8823,13 +8824,19 @@ static bool d3d9_hlsl_frame_body(void *data, const void *frame,
    bool views_ui                       = false;
 #endif
 
+#ifdef D3D9_VIEWS
+   /* Without one, the views may be drawn again from their texture */
+   redraw = !frame && d3d9_hlsl_views_redraw(d3d, video_info, dims);
+#endif
 #ifdef D3D9_HW_RENDER
-   /* The last frame again (menu, pause) comes without one: a hardware
-    * core's is the texture it handed over, if a reset left it any */
-   if (!frame && video_info->frame_repeat && d3d->hw.enable)
+   /* The last frame again (menu, pause, moved views) comes without one:
+    * a hardware core's is the texture it handed over, if a reset left
+    * it any */
+   if (     !frame && (video_info->frame_repeat || redraw)
+         && d3d->hw.enable)
       frame = RETRO_HW_FRAME_BUFFER_VALID;
 #endif
-   if (!frame)
+   if (!frame && !redraw)
       return true;
 
 #ifdef D3D9_HW_RENDER
@@ -8839,7 +8846,7 @@ static bool d3d9_hlsl_frame_body(void *data, const void *frame,
    /* A frame the core wrote into the lent texture stays where it is */
    {
       hlsl_renderchain_t *_chain = (hlsl_renderchain_t*)d3d->renderchain_data;
-      if (_chain)
+      if (_chain && frame)
          d3d9_sw_fb_settle(&d3d->sw_fb, frame, frame_width, frame_height,
                pitch, _chain->chain.pixel_size,
                _chain->chain.prev.last_dims[_chain->chain.prev.ptr]);
@@ -8950,6 +8957,9 @@ static bool d3d9_hlsl_frame_body(void *data, const void *frame,
    retro_atomic_store_release_int(&d3d->views.fallback,
          views_fallback ? 1 : 0);
    d3d9_hlsl_views_publish(d3d);
+   /* Nothing to draw the frame whole from */
+   if (!frame && !views)
+      return true;
 #endif
 
    if (d3d->should_resize)
@@ -9015,7 +9025,7 @@ static bool d3d9_hlsl_frame_body(void *data, const void *frame,
          d.tex     = _chain->chain.hw_tex;
       else
 #endif
-      if (views_direct)
+      if (views_direct && frame)
       {
          unsigned src_pitch = pitch;
          const uint8_t *src = d3d9_sw_fb_src_begin(&d3d->sw_fb, frame,

@@ -122,6 +122,21 @@ static void D3D9V_FN(views_publish)(d3d9_video_t *d3d)
          D3D9V_FN(views_allowed)(d3d) ? 1 : 0);
 }
 
+/* Whether a refresh without a frame, of @dims, draws the stock chain's
+ * views again from the last frame's texture: when the layout moved
+ * them, or the last frame is asked for again (a screenshot reads the
+ * back buffer after it) */
+static bool D3D9V_FN(views_redraw)(const d3d9_video_t *d3d,
+      const video_frame_info_t *info, unsigned dims)
+{
+   return d3d->views.active && !d3d->needs_restore
+      && !D3D9V_FN(views_preset)(d3d)
+      && dims == d3d->views.frame_dims
+      && (   info->frame_repeat
+          || !video_views_layout_same(&info->views_layout,
+                &d3d->views.layout));
+}
+
 static bool D3D9V_FN(views_target_retire)(d3d9_video_t *d3d,
       d3d9_views_target_t *t)
 {
@@ -528,6 +543,8 @@ static void D3D9V_FN(views_render)(d3d9_video_t *d3d,
    D3D9V_FN(views_cut)(d3d, &whole);
    IDirect3DDevice9_SetTexture(d3d->dev, 0, NULL);
    IDirect3DDevice9_SetPixelShader(d3d->dev, NULL);
+   if (!video_views_layout_same(&d3d->views.layout, layout))
+      d3d->views.layout = *layout;
 }
 
 /* Moves UI drawing into the UI layer, laid out at one eye's size */

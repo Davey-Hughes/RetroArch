@@ -696,6 +696,11 @@ SCREENS_DRAW_CASES = [
     ('screens-over-blank-half', 'over_blank_half', SCREENS_INSET_BLANK_HALF,
      {'solid': SCREENS_INSET_BLANK}),
 ]
+# Not on the drivers that draw views straight from the frame and keep
+# nothing to draw them again from: a NULL refresh leaves their last
+# picture, or on XShm black.
+SCREENS_NULL_CASES = ('screens-hide-null', 'screens-blank-null')
+NO_REDRAW_DRIVERS = ('sdl', 'x11', 'xvideo', 'gdi')
 # xvideo's interlaced path places and clears by itself: the late blank
 # again there, in each eye's rows. An entry as above.
 SCREENS_XV_INTERLACED_CASE = (
@@ -2723,7 +2728,8 @@ def driver_jobs(retroarch, root, driver):
     if driver in SCREENS_DRIVERS and wanted('screens-no-input'):
         jobs.append(screens_aim)
     jobs += [lambda c=c: screens_show(c) for c in SCREENS_DRAW_CASES
-             if wanted(c[0])]
+             if wanted(c[0]) and not (driver in NO_REDRAW_DRIVERS
+                                      and c[0] in SCREENS_NULL_CASES)]
     if driver == 'xvideo' and wanted(SCREENS_XV_INTERLACED_CASE[0]):
         jobs.append(lambda: screens_show(SCREENS_XV_INTERLACED_CASE))
     jobs += [lambda c=c: screens_preset(c)

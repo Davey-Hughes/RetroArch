@@ -4728,13 +4728,19 @@ static bool d3d9_cg_frame(void *data, const void *frame,
    bool views_ui                       = false;
 #endif
 
-   if (!frame)
+   if (!frame
+#ifdef D3D9_VIEWS
+         /* Without one, the views may be drawn again from their
+          * texture */
+         && !d3d9_cg_views_redraw(d3d, video_info, dims)
+#endif
+      )
       return true;
 
    /* A frame the core wrote into the lent texture stays where it is */
    {
       cg_renderchain_t *_chain = (cg_renderchain_t*)d3d->renderchain_data;
-      if (_chain)
+      if (_chain && frame)
          d3d9_sw_fb_settle(&d3d->sw_fb, frame, frame_width, frame_height,
                pitch, _chain->chain.pixel_size,
                _chain->chain.prev.last_dims[_chain->chain.prev.ptr]);
@@ -4785,6 +4791,9 @@ static bool d3d9_cg_frame(void *data, const void *frame,
    retro_atomic_store_release_int(&d3d->views.fallback,
          views_fallback ? 1 : 0);
    d3d9_cg_views_publish(d3d);
+   /* Nothing to draw the frame whole from */
+   if (!frame && !views)
+      return true;
 #endif
 
    if (d3d->should_resize)
@@ -4847,6 +4856,7 @@ static bool d3d9_cg_frame(void *data, const void *frame,
       d.tex_dims   = first->info.tex_dims;
       d.filter     = (DWORD)d3d_translate_filter(first->info.pass->filter);
       d.rotation   = d3d->dev_rotation;
+      if (frame)
       {
          unsigned src_pitch = pitch;
          const uint8_t *src = d3d9_sw_fb_src_begin(&d3d->sw_fb, frame,
