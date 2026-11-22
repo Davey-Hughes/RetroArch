@@ -8965,10 +8965,73 @@ static void test_screen_menu_inset_steps(void)
    menu_action("video_screen2_opacity", MENU_ACTION_LEFT);
    CHECK(!(prefs->set[1]
             & VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_OPACITY)));
+   /* Left past Default, which would show the core's 7 % again */
    menu_value("video_screen2_opacity", "7% (core default)");
    menu_action("video_screen2_opacity", MENU_ACTION_LEFT);
-   CHECK(!(prefs->set[1]
+   CHECK(prefs->values[1].opacity == 100 && (prefs->set[1]
             & VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_OPACITY)));
+   menu_value("video_screen2_opacity", "100%");
+   screen_menu_end();
+}
+
+/* A step at a list's end over a value the row does not store, the
+ * core's or the global one while a core runs, goes past Default, which
+ * would show that value again; from a stored value Default clears it */
+static void test_screen_menu_inset_steps_inherited(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   settings_t *settings              = config_get_ptr();
+   const video_screen_prefs_t *prefs = &video_state_get_ptr()->screen_prefs;
+   const unsigned corner             =
+      VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_CORNER);
+   load_fixture("");
+   screens_test_core();
+   window_test_begin();
+   settings->bools.video_windows_enable = false;
+   screens_test_map(&map, views, screens, RETRO_VIDEO_SCREEN_SHOW_OVER,
+         RETRO_VIDEO_SCREEN_STATE_ACTIVE);
+   screens[1].anchor  = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT;
+   screens[1].size    = 1.0f;
+   screens[1].opacity = 1.0f;
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   menu_value("video_screen2_corner", "Bottom Right (core default)");
+   menu_action("video_screen2_corner", MENU_ACTION_RIGHT);
+   CHECK((prefs->set[1] & corner) && prefs->values[1].corner
+         == RETRO_VIDEO_SCREEN_ANCHOR_TOP_LEFT);
+   menu_value("video_screen2_corner", "Top Left");
+   menu_action("video_screen2_corner", MENU_ACTION_LEFT);
+   CHECK(!(prefs->set[1] & corner));
+   menu_value("video_screen2_corner", "Bottom Right (core default)");
+   menu_value("video_screen2_size", "100% (core default)");
+   menu_action("video_screen2_size", MENU_ACTION_RIGHT);
+   CHECK(prefs->values[1].size == 10);
+   menu_value("video_screen2_size", "10%");
+   menu_value("video_screen2_opacity", "100% (core default)");
+   menu_action("video_screen2_opacity", MENU_ACTION_RIGHT);
+   CHECK(prefs->values[1].opacity == 10);
+   menu_value("video_screen2_opacity", "10%");
+   /* The Display row moves off the core's Over too */
+   menu_value("video_screen2_display", "Over Top (core default)");
+   menu_action("video_screen2_display", MENU_ACTION_LEFT);
+   menu_value("video_screen2_display", "Auto");
+   menu_action("video_screen2_display", MENU_ACTION_START);
+
+   /* The global 10 % while the core, which sends no size, runs */
+   screens[1].size = 0.0f;
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   settings->uints.video_screen_size[1] = 10;
+   menu_action("video_screen2_size", MENU_ACTION_START);
+   menu_value("video_screen2_size", "10%");
+   menu_action("video_screen2_size", MENU_ACTION_LEFT);
+   CHECK(prefs->values[1].size == 100 && (prefs->set[1]
+            & VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_SIZE)));
+   CHECK(settings->uints.video_screen_size[1] == 10);
+   menu_value("video_screen2_size", "100%");
+   settings->uints.video_screen_size[1] = 0;
    screen_menu_end();
 }
 
@@ -11177,6 +11240,7 @@ int main(int argc, char **argv)
    test_screen_menu_inset_window_rows();
    test_screen_menu_inset_rows_no_content();
    test_screen_menu_inset_steps();
+   test_screen_menu_inset_steps_inherited();
    test_window_menu_one_place();
    test_blank_unused_strings();
    test_blank_unused_hotkey();

@@ -4586,18 +4586,25 @@ static void setting_video_screen_inset_change(rarch_setting_t *setting)
 
 /* Default, then the eight anchors or 10 % to 100 % in 5 % steps, round
  * again; a value between steps, as a core's can be, goes to the step
- * beside it */
+ * beside it. Default is passed over while it would show the value shown
+ * now, the core's or the global one, so a step always moves. */
 static int setting_video_screen_inset_step(rarch_setting_t *setting,
       bool right)
 {
+   const video_screen_prefs_t *prefs;
    unsigned *v;
+   unsigned was;
+   unsigned pref;
    unsigned first = 10;
    unsigned last  = 100;
    unsigned step  = 5;
    if (!setting)
       return -1;
-   v = setting->value.target.unsigned_integer;
-   if (setting_video_screen_inset_pref(setting) == VIDEO_SCREEN_PREF_CORNER)
+   prefs = &video_state_get_ptr()->screen_prefs;
+   pref  = setting_video_screen_inset_pref(setting);
+   v     = setting->value.target.unsigned_integer;
+   was   = *v;
+   if (pref == VIDEO_SCREEN_PREF_CORNER)
    {
       first = step = 1;
       last  = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT;
@@ -4608,6 +4615,9 @@ static int setting_video_screen_inset_step(rarch_setting_t *setting,
       *v = last;
    else
       *v = *v <= first ? 0 : (*v - 1) - (*v - 1) % step;
+   if (     !*v && was && prefs->in_use
+         && !(prefs->set[setting->index_offset] & VIDEO_SCREEN_PREF_BIT(pref)))
+      *v = right ? first : last;
    return 0;
 }
 
