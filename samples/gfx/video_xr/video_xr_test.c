@@ -8530,7 +8530,7 @@ static void test_xr_inset_no_input_base(void)
    map.no_input = 0x1u;
    video_xr_place(&p, &set);
    CHECK(set.num_quads == 1 && set.num_insets == 1);
-   CHECK(!set.quads[0].no_input && !set.insets[0].no_input);
+   CHECK(set.quads[0].no_input && !set.insets[0].no_input);
    CHECK(video_xr_quad_live(&set, &set.quads[0], VIDEO_OPENXR_LASER_ALWAYS,
             false));
    o.x = 0.0f; o.y = 0.0f;   o.z = 0.0f;
@@ -8673,6 +8673,59 @@ static void test_xr_inset_auto(void)
    CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.875f, 0.875f,
             VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
    CHECK(y < 0);
+}
+
+/* A quad is live for a screen on it that takes input and that the mode
+ * makes live: screen 0 over a NO_INPUT screen 1 has none in Auto, and
+ * the inset alone in Always. */
+static void test_xr_inset_auto_no_input_base(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   video_xr_vec3_t o, d;
+   int16_t x, y, tx, ty;
+   float u, v, t;
+   unsigned frame = VIDEO_SCALE_PACK(256, 384);
+
+   map_ds_screens(&map);
+   params_init(&p, &map);
+   video_xr_place(&p, &set);
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.5f, 0.5f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &tx, &ty));
+
+   map.over     = 0x1u;
+   map.base     = 0x1u;
+   map.anchor   = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT;
+   map.size[0]  = 0.25f;
+   map.no_input = 0x2u;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 1 && set.quads[0].screen == 1);
+   CHECK(set.num_insets == 1 && !set.insets[0].no_input);
+   /* The inset's centre, then the base's. */
+   o.x = 0.0f; o.y = 0.0f; o.z = 0.0f;
+   d.x = set.quads[0].pose.position.x + 0.375f * set.quads[0].width;
+   d.y = set.quads[0].pose.position.y - 0.375f * set.quads[0].height;
+   d.z = -1.8f;
+   CHECK(!video_xr_quad_live(&set, &set.quads[0], VIDEO_OPENXR_LASER_AUTO,
+            false));
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_AUTO, false, false,
+            &o, &d, &u, &v, &t) == -1);
+   CHECK(video_xr_quad_live(&set, &set.quads[0], VIDEO_OPENXR_LASER_ALWAYS,
+            false));
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_ALWAYS, false, false,
+            &o, &d, &u, &v, &t) == 0);
+   CHECK(NEAR(u, 0.875) && NEAR(v, 0.875));
+   x = y = 0;
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], u, v,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
+   CHECK(near_px(x, tx, 256) && near_px(y, ty, 384));
+   d.x = set.quads[0].pose.position.x;
+   d.y = set.quads[0].pose.position.y;
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_AUTO, false, false,
+            &o, &d, &u, &v, &t) == -1);
+   CHECK(!video_xr_quad_to_frame(&set, &set.quads[0], 0.5f, 0.5f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
 }
 
 /* Without an inset Auto is as it was: screen 0's quad is the mouse's,
@@ -8930,6 +8983,7 @@ int main(void)
    test_xr_inset_no_input_base();
    test_xr_inset_order();
    test_xr_inset_auto();
+   test_xr_inset_auto_no_input_base();
    test_xr_auto_no_inset();
    test_xr_inset_blank();
    test_xr_place_window_inset();

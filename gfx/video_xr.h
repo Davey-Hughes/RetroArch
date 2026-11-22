@@ -94,8 +94,7 @@ typedef struct video_xr_quad
    unsigned screen;        /* the core's screen, for a SCREEN quad */
    unsigned slot;
    unsigned layer;         /* the slot's array layer it shows */
-   /* A NO_INPUT screen's, with no inset in its slot that takes input */
-   bool no_input;
+   bool no_input;          /* a NO_INPUT screen's */
 } video_xr_quad_t;
 
 typedef struct video_xr_slot
@@ -839,10 +838,10 @@ void video_xr_cut_pixels(uint8_t *px, bool bottom_up);
 
 /* Whether a laser (enum video_openxr_laser, or VIDEO_XR_LIVE_EDIT) can
  * point at q, of set (NULL: no insets). Auto: the menu or a window while
- * the menu is open, and screens 1 and up, a screen 0 too while an inset
- * in its slot is one of those and takes input. Always: every screen and
- * a whole frame too. Off: nothing. Edit mode's: every item. A NO_INPUT
- * screen: edit mode's only. */
+ * the menu is open, and screens 1 and up. Always: every screen and a
+ * whole frame too. Off: nothing. Edit mode's: every item. A screen's
+ * quad goes by the screens on it, its own and the insets in its slot:
+ * live when the mode has one of them that is not NO_INPUT. */
 #define VIDEO_XR_LIVE_EDIT VIDEO_OPENXR_LASER_LAST
 bool video_xr_quad_live(const video_xr_quad_set_t *set,
       const video_xr_quad_t *q, unsigned laser, bool menu_open);

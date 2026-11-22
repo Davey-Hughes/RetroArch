@@ -469,7 +469,7 @@ static void video_xr_place_insets(const video_xr_params_t *p,
 static void video_xr_place_screens(const video_xr_params_t *p,
       const video_xr_layout_t *lay, video_xr_quad_set_t *out)
 {
-   unsigned s, i, takes;
+   unsigned s, i;
    unsigned placed              = 0;
    const video_views_map_t *map = p->map;
 
@@ -521,15 +521,10 @@ static void video_xr_place_screens(const video_xr_params_t *p,
                0, &pose, (float)w, (float)h);
       }
    }
-   video_xr_place_insets(p, placed, out);
-   /* A quad takes input for its screen or for an inset in its slot. */
-   takes = placed & ~map->no_input;
-   for (i = 0; i < out->num_insets; i++)
-      if (!out->insets[i].no_input)
-         takes |= 1u << out->insets[i].slot;
    for (i = 0; i < out->num_quads; i++)
-      if (!(takes & (1u << out->quads[i].slot)))
+      if (map->no_input & (1u << out->quads[i].screen))
          out->quads[i].no_input = true;
+   video_xr_place_insets(p, placed, out);
 }
 
 /* The UI's image: its own size, but no more than VIDEO_XR_MENU_DENSITY
@@ -994,7 +989,7 @@ bool video_xr_quad_live(const video_xr_quad_set_t *set,
    unsigned i;
    if (laser == VIDEO_XR_LIVE_EDIT)
       return true;
-   if (laser == VIDEO_OPENXR_LASER_OFF || q->no_input)
+   if (laser == VIDEO_OPENXR_LASER_OFF)
       return false;
    switch (q->kind)
    {
@@ -1005,15 +1000,16 @@ bool video_xr_quad_live(const video_xr_quad_set_t *set,
             return true;
          break;
       case VIDEO_XR_QUAD_SCREEN:
-         if (video_xr_screen_live(laser, q->screen))
+         /* For a screen on it that takes input: its own, or an inset's
+          * in its slot. */
+         if (!q->no_input && video_xr_screen_live(laser, q->screen))
             return true;
-         /* Or for an inset in its slot that takes input. */
          for (i = 0; set && i < set->num_insets; i++)
             if (     set->insets[i].slot == q->slot
                   && !set->insets[i].no_input
                   && video_xr_screen_live(laser, set->insets[i].screen))
                return true;
-         break;
+         return false;
       default:
          break;
    }

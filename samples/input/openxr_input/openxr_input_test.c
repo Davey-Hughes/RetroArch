@@ -11568,6 +11568,33 @@ static void test_laser_inset(void)
             RETRO_DEVICE_ID_LIGHTGUN_SCREEN_X, &x) && x == -0x8000,
          "on a NO_INPUT base beside its inset: the gun at %d", x);
 
+   /* The other way round, screen 0 over a NO_INPUT screen 1: nothing
+    * on the quad is the laser's in Auto, and in Always the inset is,
+    * packed pixel 400,120. */
+   t_two_screens.over     = 0x1;
+   t_two_screens.base     = 0x1;
+   t_two_screens.anchor   = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT;
+   t_two_screens.size[0]  = 0.25f;
+   t_two_screens.size[1]  = 0.0f;
+   t_two_screens.no_input = 0x2;
+   t_place_two_screens();
+   CHECK(t_quads.num_quads == 1 && t_quads.num_insets == 1
+         && t_quads.quads[0].screen == 1,
+         "screen 0 over screen 1: %u quads, %u insets", t_quads.num_quads,
+         t_quads.num_insets);
+   t_aim[1].position.x = t_aim[2].position.x =
+      t_quads.quads[0].pose.position.x + 0.375f * t_quads.quads[0].width;
+   t_aim[1].position.y = t_aim[2].position.y =
+      t_quads.quads[0].pose.position.y - 0.375f * t_quads.quads[0].height;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_AUTO);
+   CHECK(!input_openxr_pointer_owned(),
+         "Auto with screen 0 over a NO_INPUT screen 1: the pointer is owned");
+   x = y = 0;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(t_gun_at(&x, &y) && abs(x - 40) < 300 && abs(y + 16351) < 300,
+         "screen 0 over a NO_INPUT screen 1 in Always: the gun at %d,%d, "
+         "want 40,-16351", x, y);
+
    t_hooks.session_destroying(t_hooks.user);
    t_touch_reset();
    t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
