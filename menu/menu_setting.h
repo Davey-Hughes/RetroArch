@@ -142,10 +142,14 @@ void menu_setting_video_screen_display_values(void);
  * the core has */
 unsigned menu_setting_video_screens(void);
 
+/* A bit for each screen drawn over another, whose Corner, Size and
+ * Opacity rows follow its Display row. App thread. */
+unsigned menu_setting_video_screen_insets(void);
+
 #ifdef HAVE_VIDEO_WINDOWS
 #ifndef ANDROID
 /* Game Screen @screen has a window of its own by its Display setting
- * and the displays listed now. App thread. */
+ * and the displays listed now; an inset has none. App thread. */
 bool menu_setting_video_screen_window_own(unsigned screen);
 
 /* The screen whose Screen N row or page is @label, or

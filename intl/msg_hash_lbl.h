@@ -1212,6 +1212,18 @@ MSG_HASH(
    "video_screen%u_display"
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VIDEO_SCREEN_CORNER,
+   "video_screen%u_corner"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VIDEO_SCREEN_SIZE,
+   "video_screen%u_size"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VIDEO_SCREEN_OPACITY,
+   "video_screen%u_opacity"
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_FULLSCREEN,
    "video_screen%u_window_fullscreen"
    )

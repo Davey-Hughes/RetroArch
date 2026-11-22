@@ -2618,6 +2618,9 @@ int menu_cbs_init_bind_sublabel(menu_file_list_cbs_t *cbs,
       { MENU_ENUM_LABEL_VIDEO_SCREEN_XR_RESET_ALL, MENU_ENUM_SUBLABEL_VIDEO_SCREEN_XR_RESET_ALL },
       { MENU_ENUM_LABEL_VIDEO_SCREEN_XR_EDIT, MENU_ENUM_SUBLABEL_VIDEO_SCREEN_XR_EDIT },
       { MENU_ENUM_LABEL_VIDEO_SCREEN_SETTINGS, MENU_ENUM_SUBLABEL_VIDEO_SCREEN_SETTINGS },
+      { MENU_ENUM_LABEL_VIDEO_SCREEN_CORNER, MENU_ENUM_SUBLABEL_VIDEO_SCREEN_CORNER },
+      { MENU_ENUM_LABEL_VIDEO_SCREEN_SIZE, MENU_ENUM_SUBLABEL_VIDEO_SCREEN_SIZE },
+      { MENU_ENUM_LABEL_VIDEO_SCREEN_OPACITY, MENU_ENUM_SUBLABEL_VIDEO_SCREEN_OPACITY },
       { MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_FULLSCREEN, MENU_ENUM_SUBLABEL_VIDEO_SCREEN_WINDOW_FULLSCREEN },
       { MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_X, MENU_ENUM_SUBLABEL_VIDEO_SCREEN_WINDOW_X },
       { MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_Y, MENU_ENUM_SUBLABEL_VIDEO_SCREEN_WINDOW_Y },
@@ -3416,10 +3419,13 @@ int menu_cbs_init_bind_sublabel(menu_file_list_cbs_t *cbs,
          BIND_ACTION_SUBLABEL(cbs, action_bind_sublabel_from_enum);
          return 0;
       }
-      else if (cbs->enum_idx >= MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_FULLSCREEN
+      else if (cbs->enum_idx >= MENU_ENUM_LABEL_VIDEO_SCREEN_CORNER
             && cbs->enum_idx <= MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_HEIGHT_LAST)
       {
-         static const enum msg_hash_enums windows[] = {
+         static const enum msg_hash_enums rows[] = {
+            MENU_ENUM_LABEL_VIDEO_SCREEN_CORNER,
+            MENU_ENUM_LABEL_VIDEO_SCREEN_SIZE,
+            MENU_ENUM_LABEL_VIDEO_SCREEN_OPACITY,
             MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_FULLSCREEN,
             MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_X,
             MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_Y,
@@ -3427,10 +3433,10 @@ int menu_cbs_init_bind_sublabel(menu_file_list_cbs_t *cbs,
             MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_HEIGHT
          };
          unsigned i;
-         for (i = 0; i < ARRAY_SIZE(windows); i++)
-            if (     cbs->enum_idx >= windows[i]
-                  && cbs->enum_idx <= windows[i] + RETRO_VIDEO_VIEWS_MAX)
-               key = windows[i];
+         for (i = 0; i < ARRAY_SIZE(rows); i++)
+            if (     cbs->enum_idx >= rows[i]
+                  && cbs->enum_idx <= rows[i] + RETRO_VIDEO_VIEWS_MAX)
+               key = rows[i];
       }
       while (lo < hi)
       {

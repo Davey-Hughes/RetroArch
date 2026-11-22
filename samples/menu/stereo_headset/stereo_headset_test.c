@@ -289,6 +289,48 @@ static void check_display_over_values(const char *how)
    }
 }
 
+/* Game Screen 2's Corner, Size and Opacity follow its Display row only
+ * while it is drawn over another: with no content, while its Display is
+ * an Over value */
+static void check_inset_rows(const char *how)
+{
+   static const enum msg_hash_enums rows[] = {
+      MENU_ENUM_LABEL_VIDEO_SCREEN_CORNER,
+      MENU_ENUM_LABEL_VIDEO_SCREEN_SIZE,
+      MENU_ENUM_LABEL_VIDEO_SCREEN_OPACITY
+   };
+   char name[64];
+   settings_t *settings = config_get_ptr();
+   unsigned s, r;
+   int at;
+   for (s = 0; s < 2; s++)
+      for (r = 0; r < ARRAY_SIZE(rows); r++)
+      {
+         snprintf(name, sizeof(name), msg_hash_to_str(rows[r]), s + 1);
+         CHECK(row(name) < 0, "%s: %s is listed for a screen drawn alone",
+               how, name);
+      }
+   strlcpy(settings->arrays.video_screen_display[1], "over:1",
+         sizeof(settings->arrays.video_screen_display[1]));
+   rebuild_as_hotplug();
+   snprintf(name, sizeof(name), MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY_STR, 2);
+   at = row(name);
+   for (r = 0; r < ARRAY_SIZE(rows); r++)
+   {
+      snprintf(name, sizeof(name), msg_hash_to_str(rows[r]), 2);
+      CHECK(at >= 0 && row(name) == at + 1 + (int)r,
+            "%s: %s does not follow Game Screen 2's Display over screen 1",
+            how, name);
+      snprintf(name, sizeof(name), msg_hash_to_str(rows[r]), 1);
+      CHECK(row(name) < 0, "%s: %s is listed for the base", how, name);
+   }
+   settings->arrays.video_screen_display[1][0] = '\0';
+   rebuild_as_hotplug();
+   snprintf(name, sizeof(name), msg_hash_to_str(rows[0]), 2);
+   CHECK(row(name) < 0, "%s: %s stays once the screen is back on Auto",
+         how, name);
+}
+
 static void lane_off(void)
 {
    set_headset(false);
@@ -307,6 +349,7 @@ static void lane_off(void)
    CHECK(row(MENU_ENUM_LABEL_VIDEO_SCREEN_LAYOUT_STR) >= 0,
          "Screen Layout is not listed in Game Screens");
    check_display_over_values("Headset Output off");
+   check_inset_rows("Headset Output off");
 }
 
 static void lane_on(void)
@@ -325,6 +368,7 @@ static void lane_on(void)
    CHECK(row(MENU_ENUM_LABEL_VIDEO_SCREEN_LAYOUT_STR) >= 0,
          "Screen Layout is not listed with Headset Output on");
    check_display_over_values("Headset Output on");
+   check_inset_rows("Headset Output on");
 }
 
 /* Under a driver without a headset path the setting has no row to

@@ -8069,8 +8069,9 @@ static void test_window_menu_screen_names(void)
    settings->uints.video_menu_follows = 0;
 }
 
-/* A screen's Display row, labelled as a list draws it */
-static void screen_menu_display_label(unsigned screen, char *s, size_t len)
+/* The label screen @screen's row @first draws */
+static void screen_menu_row_label(enum msg_hash_enums first, unsigned screen,
+      char *s, size_t len)
 {
    menu_file_list_cbs_t cbs;
    struct item_file item;
@@ -8078,8 +8079,7 @@ static void screen_menu_display_label(unsigned screen, char *s, size_t len)
    memset(&cbs, 0, sizeof(cbs));
    memset(&item, 0, sizeof(item));
    memset(&list, 0, sizeof(list));
-   cbs.enum_idx    = (enum msg_hash_enums)
-      (MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY + screen);
+   cbs.enum_idx    = (enum msg_hash_enums)(first + screen);
    item.actiondata = &cbs;
    list.list       = &item;
    list.capacity   = 1;
@@ -8089,6 +8089,13 @@ static void screen_menu_display_label(unsigned screen, char *s, size_t len)
    CHECK(cbs.action_label != NULL);
    if (cbs.action_label)
       cbs.action_label(&list, 0, 0, "", "", s, len);
+}
+
+/* A screen's Display row, labelled as a list draws it */
+static void screen_menu_display_label(unsigned screen, char *s, size_t len)
+{
+   screen_menu_row_label(MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY, screen, s,
+         len);
 }
 
 /* Game Screens, as the menu lists it */
@@ -8628,6 +8635,341 @@ static void test_screen_menu_over_no_content(void)
    menu_value("video_screen2_display", "Over Screen 1");
    menu_action("video_screen2_display", MENU_ACTION_START);
    CHECK(!settings->arrays.video_screen_display[1][0]);
+}
+
+/* How many of Corner, Size and Opacity follow Game Screen @screen + 1's
+ * Display row in @list, in that order; -1 for one listed elsewhere */
+static int screen_menu_inset_rows(const file_list_t *list, unsigned screen)
+{
+   static const char *const rows[] = { "corner", "size", "opacity" };
+   char name[64];
+   size_t at;
+   unsigned r;
+   int count = 0;
+   snprintf(name, sizeof(name), "video_screen%u_display", screen + 1);
+   at = window_menu_index(list, name);
+   for (r = 0; r < ARRAY_SIZE(rows); r++)
+   {
+      size_t i;
+      snprintf(name, sizeof(name), "video_screen%u_%s", screen + 1, rows[r]);
+      i = window_menu_index(list, name);
+      if (i == list->size)
+         continue;
+      if (at == list->size || i != at + 1 + r)
+         return -1;
+      count++;
+   }
+   return count;
+}
+
+/* The inset the last frame drew is @size of its base's height, to the
+ * pixel */
+static bool screens_test_inset_size(float size)
+{
+   const video_views_layout_t *l = &window_test_seen_layout;
+   float want;
+   float got;
+   if (l->num_placements != 2)
+      return false;
+   want = size * (float)VIDEO_SCALE_H(l->placements[0].dst.dims);
+   got  = (float)VIDEO_SCALE_H(l->placements[1].dst.dims);
+   return l->placements[1].flags == VIDEO_VIEWS_PLACEMENT_INSET
+      && got > want - 1.0f && got < want + 1.0f;
+}
+
+/* Screen 1 drawn over screen 0: its Corner, Size and Opacity follow its
+ * Display row, the core's values marked; a step is this core's and sizes
+ * the next frame's inset, and Start brings the core's value back */
+static void test_screen_menu_inset_rows(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   file_list_t list;
+   settings_t *settings              = config_get_ptr();
+   const video_screen_prefs_t *prefs = &video_state_get_ptr()->screen_prefs;
+   load_fixture("");
+   screens_test_core();
+   window_test_begin();
+   settings->bools.video_windows_enable = false;
+   screens_test_map(&map, views, screens, RETRO_VIDEO_SCREEN_SHOW_OVER,
+         RETRO_VIDEO_SCREEN_STATE_ACTIVE);
+   screens[1].anchor = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT;
+   screens[1].size   = 0.25f;
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   CHECK(prefs->in_use);
+   CHECK(video_state_get_ptr()->views_core.over == 0x2u);
+   screen_menu_list(&list);
+   CHECK(screen_menu_inset_rows(&list, 1) == 3);
+   CHECK(screen_menu_inset_rows(&list, 0) == 0);
+   file_list_deinitialize(&list);
+   menu_value("video_screen2_corner", "Bottom Right (core default)");
+   menu_value("video_screen2_size", "25% (core default)");
+   menu_value("video_screen2_opacity", "Default (100%)");
+   menu_action("video_screen2_size", MENU_ACTION_RIGHT);
+   menu_value("video_screen2_size", "30%");
+   CHECK(prefs->set[1] == VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_SIZE));
+   CHECK(prefs->values[1].size == 30);
+   CHECK(settings->uints.video_screen_size[1] == 0);
+   window_test_run();
+   CHECK(window_test_seen_views.over == 0x2u);
+   CHECK(window_test_seen_views.size[1] == 0.30f);
+   CHECK(screens_test_inset_size(0.30f));
+   menu_action("video_screen2_size", MENU_ACTION_START);
+   menu_value("video_screen2_size", "25% (core default)");
+   CHECK(!prefs->set[1]);
+   screen_menu_end();
+}
+
+/* Screens drawn side by side have no Corner, Size or Opacity rows */
+static void test_screen_menu_inset_rows_shown(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   file_list_t list;
+   load_fixture("");
+   screens_test_core();
+   window_test_begin();
+   config_get_ptr()->bools.video_windows_enable = false;
+   screens_test_map(&map, views, screens, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+         RETRO_VIDEO_SCREEN_STATE_ACTIVE);
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   screen_menu_list(&list);
+   CHECK(window_menu_has(&list, "video_screen2_display"));
+   CHECK(screen_menu_inset_rows(&list, 0) == 0);
+   CHECK(screen_menu_inset_rows(&list, 1) == 0);
+   file_list_deinitialize(&list);
+   screen_menu_end();
+}
+
+/* The rows come with an Over value chosen on the Display row, before
+ * the next frame draws it, and go with Off */
+static void test_screen_menu_inset_rows_follow_display(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   file_list_t list;
+   struct menu_state *menu_st        = menu_state_get_ptr();
+   const video_screen_prefs_t *prefs = &video_state_get_ptr()->screen_prefs;
+   load_fixture("");
+   screens_test_core();
+   window_test_begin();
+   config_get_ptr()->bools.video_windows_enable = false;
+   screens_test_map(&map, views, screens, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+         RETRO_VIDEO_SCREEN_STATE_ACTIVE);
+   screens[1].size = 0.0f;
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   screen_menu_list(&list);
+   CHECK(screen_menu_inset_rows(&list, 1) == 0);
+   file_list_deinitialize(&list);
+   menu_st->flags &= ~MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+   menu_action("video_screen2_display", MENU_ACTION_RIGHT);
+   CHECK(string_is_equal(prefs->values[1].display, "over:1"));
+   CHECK(menu_st->flags & MENU_ST_FLAG_ENTRIES_NEED_REFRESH);
+   screen_menu_list(&list);
+   CHECK(screen_menu_inset_rows(&list, 1) == 3);
+   CHECK(screen_menu_inset_rows(&list, 0) == 0);
+   file_list_deinitialize(&list);
+   menu_value("video_screen2_corner", "Default (Bottom Right)");
+   menu_value("video_screen2_size", "Default (25%)");
+   menu_value("video_screen2_opacity", "Default (100%)");
+   menu_st->flags &= ~MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
+   menu_action("video_screen2_display", MENU_ACTION_RIGHT);
+   CHECK(string_is_equal(prefs->values[1].display, VIDEO_WINDOW_DISPLAY_OFF));
+   CHECK(menu_st->flags & MENU_ST_FLAG_ENTRIES_NEED_REFRESH);
+   menu_st->flags &= ~(MENU_ST_FLAG_ENTRIES_NEED_REFRESH
+                     | MENU_ST_FLAG_PREVENT_POPULATE);
+   screen_menu_list(&list);
+   CHECK(screen_menu_inset_rows(&list, 1) == 0);
+   file_list_deinitialize(&list);
+   screen_menu_end();
+}
+
+/* With the screens' windows on, an inset's page and the companion's
+ * list have its Display and the three rows and none of its window
+ * rows; its saved window size stays */
+static void test_screen_menu_inset_window_rows(void)
+{
+#ifndef ANDROID
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   video_screen_values_t values;
+   file_list_t list;
+   char s[64];
+   const video_screen_prefs_t *prefs = &video_state_get_ptr()->screen_prefs;
+   const unsigned size               =
+        VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_WIDTH)
+      | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_HEIGHT);
+   load_fixture("");
+   screens_test_core();
+   window_test_begin();
+   screens_test_map(&map, views, screens, RETRO_VIDEO_SCREEN_SHOW_OVER,
+         RETRO_VIDEO_SCREEN_STATE_ACTIVE);
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   CHECK(config_get_ptr()->bools.video_windows_enable);
+   CHECK(video_state_get_ptr()->views_core.over == 0x2u);
+   video_driver_screen_get(1, &values);
+   values.window_dims = VIDEO_SCALE_PACK(640, 480);
+   video_driver_screen_set(1, size, &values);
+   window_test_run();
+   memset(&list, 0, sizeof(list));
+   window_menu_page_build(&list, 1);
+   CHECK(window_menu_index(&list, "video_screen2_display") == 0);
+   CHECK(screen_menu_inset_rows(&list, 1) == 3);
+   CHECK(list.size == 4);
+   CHECK(!window_menu_has(&list, "video_screen2_window_fullscreen"));
+   CHECK(!window_menu_has(&list, "video_screen2_window_width"));
+   CHECK(!window_menu_has(&list, "video_screen2_window_x"));
+   file_list_deinitialize(&list);
+   memset(&list, 0, sizeof(list));
+   menu_displaylist_build_list(&list, config_get_ptr(),
+         DISPLAYLIST_VIDEO_GAME_SCREENS_SETTINGS_LIST, true);
+   CHECK(screen_menu_inset_rows(&list, 1) == 3);
+   CHECK(screen_menu_inset_rows(&list, 0) == 0);
+   CHECK(!window_menu_has(&list, "video_screen2_window_width"));
+   file_list_deinitialize(&list);
+   /* Short labels after the Display row */
+   screen_menu_row_label(MENU_ENUM_LABEL_VIDEO_SCREEN_CORNER, 1, s, sizeof(s));
+   CHECK(string_is_equal(s, "Corner"));
+   screen_menu_row_label(MENU_ENUM_LABEL_VIDEO_SCREEN_SIZE, 1, s, sizeof(s));
+   CHECK(string_is_equal(s, "Size"));
+   screen_menu_row_label(MENU_ENUM_LABEL_VIDEO_SCREEN_OPACITY, 1, s,
+         sizeof(s));
+   CHECK(string_is_equal(s, "Opacity"));
+   CHECK((prefs->set[1] & size) == size);
+   CHECK(prefs->values[1].window_dims == VIDEO_SCALE_PACK(640, 480));
+   window_test_end();
+   screens_test_core_done();
+#endif
+}
+
+/* With no content a screen whose Display is an Over value has the
+ * rows, and they edit and reset the global values */
+static void test_screen_menu_inset_rows_no_content(void)
+{
+   file_list_t list;
+   settings_t *settings              = config_get_ptr();
+   const video_screen_prefs_t *prefs = &video_state_get_ptr()->screen_prefs;
+   load_fixture("");
+   screens_test_core_done();
+   video_driver_clear_views();
+   screen_menu_list(&list);
+   CHECK(screen_menu_inset_rows(&list, 1) == 0);
+   file_list_deinitialize(&list);
+   strlcpy(settings->arrays.video_screen_display[1], "over:1",
+         sizeof(settings->arrays.video_screen_display[1]));
+   screen_menu_list(&list);
+   CHECK(screen_menu_inset_rows(&list, 1) == 3);
+   CHECK(screen_menu_inset_rows(&list, 0) == 0);
+   file_list_deinitialize(&list);
+   settings->flags &= ~SETTINGS_FLG_MODIFIED;
+   menu_value("video_screen2_corner", "Default (Bottom Right)");
+   menu_action("video_screen2_corner", MENU_ACTION_RIGHT);
+   CHECK(settings->uints.video_screen_corner[1]
+         == RETRO_VIDEO_SCREEN_ANCHOR_TOP_LEFT);
+   menu_value("video_screen2_corner", "Top Left");
+   menu_action("video_screen2_size", MENU_ACTION_RIGHT);
+   CHECK(settings->uints.video_screen_size[1] == 10);
+   menu_value("video_screen2_size", "10%");
+   menu_action("video_screen2_opacity", MENU_ACTION_LEFT);
+   CHECK(settings->uints.video_screen_opacity[1] == 100);
+   menu_value("video_screen2_opacity", "100%");
+   CHECK(settings->flags & SETTINGS_FLG_MODIFIED);
+   CHECK(!prefs->set[1] && !prefs->dirty);
+   menu_action("video_screen2_corner", MENU_ACTION_START);
+   menu_action("video_screen2_size", MENU_ACTION_START);
+   menu_action("video_screen2_opacity", MENU_ACTION_START);
+   CHECK(!settings->uints.video_screen_corner[1]);
+   CHECK(!settings->uints.video_screen_size[1]);
+   CHECK(!settings->uints.video_screen_opacity[1]);
+   menu_value("video_screen2_size", "Default (25%)");
+   CHECK(!prefs->set[1] && !prefs->dirty);
+   settings->arrays.video_screen_display[1][0] = '\0';
+}
+
+/* Left and Right pass only through values the files keep: Default,
+ * then 1-8 for Corner and 10 % to 100 % in 5 % steps, both ways round;
+ * a core's value between steps goes to the step beside it */
+static void test_screen_menu_inset_steps(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   unsigned i;
+   unsigned *corner;
+   unsigned *size;
+   unsigned seen = 0;
+   bool valid    = true;
+   settings_t *settings              = config_get_ptr();
+   const video_screen_prefs_t *prefs = &video_state_get_ptr()->screen_prefs;
+   load_fixture("");
+   screens_test_core_done();
+   video_driver_clear_views();
+   strlcpy(settings->arrays.video_screen_display[1], "over:1",
+         sizeof(settings->arrays.video_screen_display[1]));
+   corner = &settings->uints.video_screen_corner[1];
+   size   = &settings->uints.video_screen_size[1];
+   for (i = 0; i < 20; i++)
+   {
+      menu_action("video_screen2_size", MENU_ACTION_RIGHT);
+      if (*size && (*size < 10 || *size > 100 || *size % 5))
+         valid = false;
+      if (!*size)
+         break;
+      seen++;
+   }
+   CHECK(valid && seen == 19 && !*size);
+   menu_action("video_screen2_size", MENU_ACTION_LEFT);
+   CHECK(*size == 100);
+   menu_action("video_screen2_size", MENU_ACTION_RIGHT);
+   CHECK(*size == 0);
+   menu_action("video_screen2_size", MENU_ACTION_RIGHT);
+   menu_action("video_screen2_size", MENU_ACTION_LEFT);
+   CHECK(*size == 0);
+   menu_action("video_screen2_corner", MENU_ACTION_LEFT);
+   CHECK(*corner == RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT);
+   menu_value("video_screen2_corner", "Bottom Right");
+   menu_action("video_screen2_corner", MENU_ACTION_LEFT);
+   CHECK(*corner == RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM);
+   menu_action("video_screen2_corner", MENU_ACTION_RIGHT);
+   menu_action("video_screen2_corner", MENU_ACTION_RIGHT);
+   CHECK(*corner == 0);
+   settings->arrays.video_screen_display[1][0] = '\0';
+
+   /* A core's 33 % and 7 % */
+   screens_test_core();
+   window_test_begin();
+   settings->bools.video_windows_enable = false;
+   screens_test_map(&map, views, screens, RETRO_VIDEO_SCREEN_SHOW_OVER,
+         RETRO_VIDEO_SCREEN_STATE_ACTIVE);
+   screens[1].size    = 0.33f;
+   screens[1].opacity = 0.07f;
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   menu_value("video_screen2_size", "33% (core default)");
+   menu_action("video_screen2_size", MENU_ACTION_RIGHT);
+   CHECK(prefs->values[1].size == 35);
+   menu_action("video_screen2_size", MENU_ACTION_START);
+   menu_action("video_screen2_size", MENU_ACTION_LEFT);
+   CHECK(prefs->values[1].size == 30);
+   menu_value("video_screen2_opacity", "7% (core default)");
+   menu_action("video_screen2_opacity", MENU_ACTION_RIGHT);
+   CHECK(prefs->values[1].opacity == 10);
+   menu_action("video_screen2_opacity", MENU_ACTION_LEFT);
+   CHECK(!(prefs->set[1]
+            & VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_OPACITY)));
+   menu_value("video_screen2_opacity", "7% (core default)");
+   menu_action("video_screen2_opacity", MENU_ACTION_LEFT);
+   CHECK(!(prefs->set[1]
+            & VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_OPACITY)));
+   screen_menu_end();
 }
 
 #ifdef HAVE_OPENXR
@@ -10829,6 +11171,12 @@ int main(int argc, char **argv)
    test_screen_menu_over_core_default();
    test_screen_menu_over_offer();
    test_screen_menu_over_no_content();
+   test_screen_menu_inset_rows();
+   test_screen_menu_inset_rows_shown();
+   test_screen_menu_inset_rows_follow_display();
+   test_screen_menu_inset_window_rows();
+   test_screen_menu_inset_rows_no_content();
+   test_screen_menu_inset_steps();
    test_window_menu_one_place();
    test_blank_unused_strings();
    test_blank_unused_hotkey();

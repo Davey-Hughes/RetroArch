@@ -129,8 +129,7 @@ static int action_bind_label_video_screen_display(
    return 0;
 }
 
-#if defined(HAVE_VIDEO_WINDOWS) && !defined(ANDROID)
-/* A screen's window rows on its page, without "Game Screen N" */
+/* A screen's rows after its Display row, without "Game Screen N" */
 static int action_bind_label_video_screen_page(
       file_list_t *list,
       unsigned type, unsigned i,
@@ -138,6 +137,13 @@ static int action_bind_label_video_screen_page(
       char *s, size_t len)
 {
    static const enum msg_hash_enums rows[][2] = {
+      { MENU_ENUM_LABEL_VIDEO_SCREEN_CORNER,
+        MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_PAGE_CORNER },
+      { MENU_ENUM_LABEL_VIDEO_SCREEN_SIZE,
+        MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_PAGE_SIZE },
+      { MENU_ENUM_LABEL_VIDEO_SCREEN_OPACITY,
+        MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_PAGE_OPACITY },
+#if defined(HAVE_VIDEO_WINDOWS) && !defined(ANDROID)
       { MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_FULLSCREEN,
         MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_PAGE_FULLSCREEN },
       { MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_X,
@@ -148,6 +154,7 @@ static int action_bind_label_video_screen_page(
         MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_PAGE_WINDOW_WIDTH },
       { MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_HEIGHT,
         MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_PAGE_WINDOW_HEIGHT }
+#endif
    };
    menu_file_list_cbs_t *cbs = (menu_file_list_cbs_t*)
       list->list[i].actiondata;
@@ -162,6 +169,7 @@ static int action_bind_label_video_screen_page(
    return 0;
 }
 
+#if defined(HAVE_VIDEO_WINDOWS) && !defined(ANDROID)
 /* Game Screens' row for a screen, as the core names it */
 static int action_bind_label_video_screen_settings(
       file_list_t *list,
@@ -194,6 +202,12 @@ int menu_cbs_init_bind_label(menu_file_list_cbs_t *cbs,
          && cbs->enum_idx <= MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY_LAST)
    {
       BIND_ACTION_LABEL(cbs, action_bind_label_video_screen_display);
+      return 0;
+   }
+   if (     cbs->enum_idx >= MENU_ENUM_LABEL_VIDEO_SCREEN_CORNER
+         && cbs->enum_idx <= MENU_ENUM_LABEL_VIDEO_SCREEN_OPACITY_LAST)
+   {
+      BIND_ACTION_LABEL(cbs, action_bind_label_video_screen_page);
       return 0;
    }
 #if defined(HAVE_VIDEO_WINDOWS) && !defined(ANDROID)

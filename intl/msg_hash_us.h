@@ -8022,6 +8022,18 @@ MSG_HASH(
    "Window Y"
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_PAGE_CORNER,
+   "Corner"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_PAGE_SIZE,
+   "Size"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_PAGE_OPACITY,
+   "Opacity"
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_DISPLAY,
    "Game Screen %u Display"
    )
@@ -8044,6 +8056,66 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_OVER,
    "Over %s"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_CORNER,
+   "Game Screen %u Corner"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_VIDEO_SCREEN_CORNER,
+   "Where this game screen sits over the screen it is drawn over. Chosen while a core runs, it is kept for that core."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_SIZE,
+   "Game Screen %u Size"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_VIDEO_SCREEN_SIZE,
+   "This game screen's height, as a share of the screen it is drawn over. Chosen while a core runs, it is kept for that core."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_OPACITY,
+   "Game Screen %u Opacity"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_VIDEO_SCREEN_OPACITY,
+   "How solid this game screen is drawn over the other; some video drivers draw it solid. Chosen while a core runs, it is kept for that core."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_INSET_DEFAULT,
+   "Default (%s)"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_CORNER_TOP_LEFT,
+   "Top Left"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_CORNER_TOP,
+   "Top"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_CORNER_TOP_RIGHT,
+   "Top Right"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_CORNER_LEFT,
+   "Left"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_CORNER_RIGHT,
+   "Right"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_CORNER_BOTTOM_LEFT,
+   "Bottom Left"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_CORNER_BOTTOM,
+   "Bottom"
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_CORNER_BOTTOM_RIGHT,
+   "Bottom Right"
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_WINDOW_FULLSCREEN,
