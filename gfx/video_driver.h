@@ -2705,7 +2705,8 @@ unsigned video_driver_screen_get(unsigned screen, video_screen_values_t *out);
  * while screen_prefs.in_use, else to the global settings, marking them
  * modified. NULL @values clears the core's entries, or, with no views
  * core running, sets the global ones to their built-in defaults
- * ("" Auto, off, 0, video_views_xr_reset()). */
+ * ("" Auto, off, 0, video_views_xr_reset()). A Corner, Size or Opacity
+ * of 0, Default, clears the core's entry too. */
 void video_driver_screen_set(unsigned screen, unsigned bits,
       const video_screen_values_t *values);
 /* Any thread: the core's screen names, "" where it gave none; returns

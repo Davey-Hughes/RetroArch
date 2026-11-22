@@ -4593,6 +4593,41 @@ static void test_screens_writes_per_core(void)
    screens_test_core_done();
 }
 
+/* Default for a views core's Corner, Size or Opacity clears its entry,
+ * so the global value shows through; with none running it is the
+ * global 0 */
+static void test_screen_set_default_clears(void)
+{
+   video_screen_values_t values, got;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   settings_t *settings           = config_get_ptr();
+   const unsigned corner          =
+      VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_CORNER);
+   const unsigned size            =
+      VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_SIZE);
+   video_driver_clear_views();
+   screens_test_core();
+   video_st->screen_prefs.in_use        = true;
+   settings->uints.video_screen_size[1] = 30;
+   memset(&values, 0, sizeof(values));
+   values.corner = 2;
+   values.size   = 60;
+   video_driver_screen_set(1, corner | size, &values);
+   CHECK(video_st->screen_prefs.set[1] == (corner | size));
+   video_driver_screen_get(1, &got);
+   CHECK(got.size == 60);
+   values.size = 0;
+   video_driver_screen_set(1, size, &values);
+   CHECK(video_st->screen_prefs.set[1] == corner);
+   video_driver_screen_get(1, &got);
+   CHECK(got.size == 30 && got.corner == 2);
+   CHECK(settings->uints.video_screen_size[1] == 30);
+   video_st->screen_prefs.in_use = false;
+   video_driver_screen_set(1, size, &values);
+   CHECK(settings->uints.video_screen_size[1] == 0);
+   screens_test_core_done();
+}
+
 /* A core's Hidden is Display's default, and says so */
 static void test_screens_core_default_bits(void)
 {
@@ -4962,6 +4997,171 @@ static void test_screen_prefs_saved_for_loaded_core(void)
    settings->bools.config_save_on_exit  = kept_save_on_exit;
    screens_test_core_done();
    screens_file_end();
+}
+
+/* A core's Corner, Size and Opacity from its file, and back */
+static void test_screen_prefs_inset_keys(void)
+{
+   video_screen_prefs_t *prefs = &video_state_get_ptr()->screen_prefs;
+   const unsigned inset        =
+        VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_CORNER)
+      | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_SIZE)
+      | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_OPACITY);
+   video_screen_values_t values;
+   config_file_t *conf;
+   char path[PATH_MAX_LENGTH];
+   unsigned value = 0;
+   unsigned i;
+   screens_file_begin("video_views inset", path, sizeof(path));
+   screens_file_write(path,
+         "video_screen2_corner = \"3\"\n"
+         "video_screen2_size = \"40\"\n"
+         "video_screen2_opacity = \"50\"\n");
+   screens_test_core();
+   strlcpy(prefs->library_name, "video_views inset",
+         sizeof(prefs->library_name));
+   CHECK(config_load_video_screen_prefs(prefs->library_name, prefs));
+   CHECK(prefs->set[1] == inset);
+   CHECK(prefs->values[1].corner == 3);
+   CHECK(prefs->values[1].size == 40);
+   CHECK(prefs->values[1].opacity == 50);
+   for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+      if (i != 1)
+         CHECK(!prefs->set[i]);
+   /* A Size change, then the unload's save */
+   memset(&values, 0, sizeof(values));
+   values.size = 60;
+   video_driver_screen_set(1, VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_SIZE),
+         &values);
+   CHECK(prefs->dirty);
+   CHECK(config_save_video_screen_prefs(prefs->library_name, prefs));
+   conf = config_file_new_from_path_to_string(path);
+   CHECK(conf != NULL);
+   if (conf)
+   {
+      CHECK(screens_file_keys(conf) == 3);
+      CHECK(config_get_uint(conf, "video_screen2_corner", &value)
+            && value == 3);
+      CHECK(config_get_uint(conf, "video_screen2_size", &value)
+            && value == 60);
+      CHECK(config_get_uint(conf, "video_screen2_opacity", &value)
+            && value == 50);
+      config_file_free(conf);
+   }
+   screens_test_core_done();
+   filestream_delete(path);
+   screens_file_end();
+}
+
+/* Out of range, they are ignored; a stale Over value is kept as
+ * written, its screen laid out as on Auto */
+static void test_screen_prefs_inset_invalid(void)
+{
+   static const char *over[2] = { "over:9", "over:x" };
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   video_screen_prefs_t *prefs = &video_state_get_ptr()->screen_prefs;
+   video_screen_values_t values;
+   config_file_t *conf;
+   char path[PATH_MAX_LENGTH];
+   char text[256];
+   char display[64];
+   unsigned i;
+   screens_file_begin("video_views inset", path, sizeof(path));
+   for (i = 0; i < 2; i++)
+   {
+      snprintf(text, sizeof(text),
+            "video_screen2_display = \"%s\"\n"
+            "video_screen2_corner = \"9\"\n"
+            "video_screen2_size = \"5\"\n"
+            "video_screen2_opacity = \"x\"\n"
+            "video_screen3_size = \"150\"\n", over[i]);
+      screens_file_write(path, text);
+      screens_test_core();
+      CHECK(config_load_video_screen_prefs("video_views inset", prefs));
+      CHECK(prefs->set[1] == VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY));
+      CHECK(!prefs->set[2]);
+      window_test_begin();
+      config_get_ptr()->bools.video_windows_enable = false;
+      screens_test_map(&map, views, screens, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+            RETRO_VIDEO_SCREEN_STATE_ACTIVE);
+      screens[1].size = 0.0f;
+      CHECK(video_driver_set_views(&map));
+      window_test_run();
+      CHECK(window_test_seen_layout.num_placements == 2);
+      CHECK(   window_test_seen_layout.placements[1].view == 1
+            && !window_test_seen_layout.placements[1].flags);
+      CHECK(!window_test_seen_views.over);
+      /* Another change rewrites the file */
+      memset(&values, 0, sizeof(values));
+      values.size = 30;
+      video_driver_screen_set(0, VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_SIZE),
+            &values);
+      CHECK(config_save_video_screen_prefs("video_views inset", prefs));
+      conf = config_file_new_from_path_to_string(path);
+      CHECK(conf != NULL);
+      if (conf)
+      {
+         CHECK(screens_file_keys(conf) == 2);
+         CHECK(config_get_array(conf, "video_screen2_display", display,
+                  sizeof(display)));
+         CHECK(string_is_equal(display, over[i]));
+         config_file_free(conf);
+      }
+      window_test_end();
+      screens_test_core_done();
+   }
+   filestream_delete(path);
+   screens_file_end();
+}
+
+/* The global values: used where the core gives none, out of range
+ * read as Default, and Default not written */
+static void test_config_inset_globals(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   settings_t *settings = config_get_ptr();
+   config_file_t *conf;
+   unsigned value       = 0;
+   load_fixture(
+         "video_screen2_size = \"30\"\n"
+         "video_screen3_corner = \"9\"\n"
+         "video_screen3_opacity = \"5\"\n");
+   CHECK(settings->uints.video_screen_size[1] == 30);
+   CHECK(!settings->uints.video_screen_corner[1]);
+   CHECK(!settings->uints.video_screen_opacity[1]);
+   CHECK(!settings->uints.video_screen_corner[2]);
+   CHECK(!settings->uints.video_screen_opacity[2]);
+   screens_test_core();
+   window_test_begin();
+   settings->bools.video_windows_enable = false;
+   screens_test_map(&map, views, screens, RETRO_VIDEO_SCREEN_SHOW_OVER,
+         RETRO_VIDEO_SCREEN_STATE_ACTIVE);
+   screens[1].size = 0.0f;
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   CHECK(window_test_seen_views.over == 0x2u);
+   CHECK(window_test_seen_views.size[1] == 0.30f);
+   window_test_end();
+   screens_test_core_done();
+   settings->bools.config_save_minimal = false;
+   CHECK(config_save_file(saved_path));
+   conf = config_file_new_from_path_to_string(saved_path);
+   CHECK(conf != NULL);
+   if (conf)
+   {
+      CHECK(config_get_uint(conf, "video_screen2_size", &value)
+            && value == 30);
+      CHECK(config_get_entry(conf, "video_screen2_corner") == NULL);
+      CHECK(config_get_entry(conf, "video_screen2_opacity") == NULL);
+      CHECK(config_get_entry(conf, "video_screen1_size") == NULL);
+      CHECK(config_get_entry(conf, "video_screen3_corner") == NULL);
+      config_file_free(conf);
+   }
+   settings->uints.video_screen_size[1] = 0;
 }
 
 /* An absent screen's window goes, and comes back where it was; nothing
@@ -10375,6 +10575,9 @@ int main(int argc, char **argv)
       test_screen_prefs_window_keys_kept();
       test_screen_prefs_not_in_override();
       test_screen_prefs_saved_for_loaded_core();
+      test_screen_prefs_inset_keys();
+      test_screen_prefs_inset_invalid();
+      test_config_inset_globals();
    }
    test_window_layout();
    test_window_frame();
@@ -10405,6 +10608,7 @@ int main(int argc, char **argv)
    test_screens_user_off_windows_off();
    test_screens_none_placed_pointer();
    test_screens_writes_per_core();
+   test_screen_set_default_clears();
    test_screens_core_default_bits();
    test_window_absent_back();
    test_window_screen0_left_out();

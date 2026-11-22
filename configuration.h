@@ -307,6 +307,9 @@ typedef struct settings
       unsigned video_rotation;
       unsigned video_stereo_mode;
       unsigned video_screen_layout;
+      unsigned video_screen_corner[RETRO_VIDEO_VIEWS_MAX];
+      unsigned video_screen_size[RETRO_VIDEO_VIEWS_MAX];
+      unsigned video_screen_opacity[RETRO_VIDEO_VIEWS_MAX];
 #ifdef HAVE_VIDEO_WINDOWS
       unsigned video_screen_window_pos[RETRO_VIDEO_VIEWS_MAX];
       unsigned video_screen_window_dims[RETRO_VIDEO_VIEWS_MAX];

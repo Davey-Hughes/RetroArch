@@ -4549,6 +4549,9 @@ static void video_driver_screen_global(const settings_t *settings,
    out->xr.roll           = settings->floats.video_screen_xr_roll[screen];
    out->xr.scale          = settings->floats.video_screen_xr_scale[screen];
    out->xr.visible        = settings->bools.video_screen_xr_visible[screen];
+   out->corner            = settings->uints.video_screen_corner[screen];
+   out->size              = settings->uints.video_screen_size[screen];
+   out->opacity           = settings->uints.video_screen_opacity[screen];
    strlcpy(out->display, settings->arrays.video_screen_display[screen],
          sizeof(out->display));
 }
@@ -4602,7 +4605,25 @@ void video_driver_screen_set(unsigned screen, unsigned bits,
    if (screen >= RETRO_VIDEO_VIEWS_MAX || !settings)
       return;
    if (video_st->screen_prefs.in_use)
-      video_screen_prefs_set(&video_st->screen_prefs, screen, bits, values);
+   {
+      /* Default clears the entry: the core's value or the global one
+       * shows through */
+      unsigned cleared = 0;
+      if (values)
+      {
+         if (!values->corner)
+            cleared |= VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_CORNER);
+         if (!values->size)
+            cleared |= VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_SIZE);
+         if (!values->opacity)
+            cleared |= VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_OPACITY);
+         cleared &= bits;
+         video_screen_prefs_set(&video_st->screen_prefs, screen, cleared,
+               NULL);
+      }
+      video_screen_prefs_set(&video_st->screen_prefs, screen,
+            bits & ~cleared, values);
+   }
    else
    {
       if (!values)
@@ -4614,6 +4635,12 @@ void video_driver_screen_set(unsigned screen, unsigned bits,
          strlcpy(settings->arrays.video_screen_display[screen],
                values->display,
                sizeof(settings->arrays.video_screen_display[screen]));
+      if (bits & VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_CORNER))
+         settings->uints.video_screen_corner[screen]  = values->corner;
+      if (bits & VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_SIZE))
+         settings->uints.video_screen_size[screen]    = values->size;
+      if (bits & VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_OPACITY))
+         settings->uints.video_screen_opacity[screen] = values->opacity;
 #ifdef HAVE_VIDEO_WINDOWS
       {
          unsigned *pos  = &settings->uints.video_screen_window_pos[screen];

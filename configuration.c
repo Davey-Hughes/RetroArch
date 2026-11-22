@@ -6395,6 +6395,9 @@ void config_set_defaults(settings_t *target)
       settings->bools.video_screen_window_pos_set[i] = false;
 #endif
       settings->arrays.video_screen_display[i][0] = '\0';
+      settings->uints.video_screen_corner[i]      = 0;
+      settings->uints.video_screen_size[i]        = 0;
+      settings->uints.video_screen_opacity[i]     = 0;
    }
 #ifdef HAVE_VIDEO_WINDOWS
    settings->arrays.video_menu_display[0] = '\0';
@@ -7162,6 +7165,32 @@ CONFIG_NOINLINE static void config_load_video_windows(settings_t *settings, conf
 #undef CONFIG_NOINLINE
 #endif
 
+/* The Corner, Size or Opacity (@pref) at @key; 0, Default, when absent
+ * or out of range */
+static unsigned config_get_video_screen_inset(config_file_t *conf,
+      const char *key, unsigned pref)
+{
+   unsigned value = 0;
+   if (   !config_get_uint(conf, key, &value)
+       || (pref == VIDEO_SCREEN_PREF_CORNER
+             ? value > RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT
+             : value < 10 || value > 100))
+      return 0;
+   return value;
+}
+
+/* Default is not written */
+static void config_set_video_screen_inset(config_file_t *conf,
+      unsigned screen, unsigned pref, unsigned value)
+{
+   char key[64];
+   video_screen_prefs_key(screen, pref, key, sizeof(key));
+   if (value)
+      config_set_uint(conf, key, value);
+   else
+      config_unset(conf, key);
+}
+
 /**
  * config_load:
  * @path                : path to be read from.
@@ -7504,6 +7533,15 @@ static bool config_load_file(const char *path, settings_t *settings)
       settings->arrays.video_screen_display[i][0] = '\0';
       config_get_array(conf, cfg, settings->arrays.video_screen_display[i],
             sizeof(settings->arrays.video_screen_display[i]));
+      video_screen_prefs_key(i, VIDEO_SCREEN_PREF_CORNER, cfg, sizeof(cfg));
+      settings->uints.video_screen_corner[i]  =
+         config_get_video_screen_inset(conf, cfg, VIDEO_SCREEN_PREF_CORNER);
+      video_screen_prefs_key(i, VIDEO_SCREEN_PREF_SIZE, cfg, sizeof(cfg));
+      settings->uints.video_screen_size[i]    =
+         config_get_video_screen_inset(conf, cfg, VIDEO_SCREEN_PREF_SIZE);
+      video_screen_prefs_key(i, VIDEO_SCREEN_PREF_OPACITY, cfg, sizeof(cfg));
+      settings->uints.video_screen_opacity[i] =
+         config_get_video_screen_inset(conf, cfg, VIDEO_SCREEN_PREF_OPACITY);
    }
 #ifdef HAVE_VIDEO_WINDOWS
    /* After the displays: a retired window mode migrates into one */
@@ -8402,6 +8440,19 @@ bool config_load_video_screen_prefs(const char *library_name,
                break;
             case VIDEO_SCREEN_PREF_XR_VISIBLE:
                valid = config_get_bool(conf, key, &values.xr.visible);
+               break;
+            /* Default is no entry */
+            case VIDEO_SCREEN_PREF_CORNER:
+               values.corner  = config_get_video_screen_inset(conf, key, p);
+               valid          = values.corner != 0;
+               break;
+            case VIDEO_SCREEN_PREF_SIZE:
+               values.size    = config_get_video_screen_inset(conf, key, p);
+               valid          = values.size != 0;
+               break;
+            case VIDEO_SCREEN_PREF_OPACITY:
+               values.opacity = config_get_video_screen_inset(conf, key, p);
+               valid          = values.opacity != 0;
                break;
             default:
                xr    = config_video_screen_prefs_xr(&values.xr, p);
@@ -10166,6 +10217,12 @@ bool config_save_file(const char *path)
          config_set_string(conf, cfg, settings->arrays.video_screen_display[i]);
       else
          config_unset(conf, cfg);
+      config_set_video_screen_inset(conf, i, VIDEO_SCREEN_PREF_CORNER,
+            settings->uints.video_screen_corner[i]);
+      config_set_video_screen_inset(conf, i, VIDEO_SCREEN_PREF_SIZE,
+            settings->uints.video_screen_size[i]);
+      config_set_video_screen_inset(conf, i, VIDEO_SCREEN_PREF_OPACITY,
+            settings->uints.video_screen_opacity[i]);
    }
 #ifdef HAVE_VIDEO_WINDOWS
    if (   !minimal
@@ -10662,6 +10719,15 @@ bool config_save_video_screen_prefs(const char *library_name,
                config_set_string(conf, key,
                      values->xr.visible ? "true" : "false");
                break;
+            case VIDEO_SCREEN_PREF_CORNER:
+               config_set_uint(conf, key, values->corner);
+               break;
+            case VIDEO_SCREEN_PREF_SIZE:
+               config_set_uint(conf, key, values->size);
+               break;
+            case VIDEO_SCREEN_PREF_OPACITY:
+               config_set_uint(conf, key, values->opacity);
+               break;
             default:
                if ((xr = config_video_screen_prefs_xr(&values->xr, p)))
                   config_set_float(conf, key, *xr);
@@ -11031,6 +11097,17 @@ int8_t config_save_overrides(enum override_type type,
          if (!string_is_equal(settings->arrays.video_screen_display[i],
                   overrides->arrays.video_screen_display[i]))
             config_set_string(conf, cfg, overrides->arrays.video_screen_display[i]);
+
+         /* Default too, so it beats a global value */
+         video_screen_prefs_key(i, VIDEO_SCREEN_PREF_CORNER, cfg, sizeof(cfg));
+         if (settings->uints.video_screen_corner[i] != overrides->uints.video_screen_corner[i])
+            config_set_uint(conf, cfg, overrides->uints.video_screen_corner[i]);
+         video_screen_prefs_key(i, VIDEO_SCREEN_PREF_SIZE, cfg, sizeof(cfg));
+         if (settings->uints.video_screen_size[i] != overrides->uints.video_screen_size[i])
+            config_set_uint(conf, cfg, overrides->uints.video_screen_size[i]);
+         video_screen_prefs_key(i, VIDEO_SCREEN_PREF_OPACITY, cfg, sizeof(cfg));
+         if (settings->uints.video_screen_opacity[i] != overrides->uints.video_screen_opacity[i])
+            config_set_uint(conf, cfg, overrides->uints.video_screen_opacity[i]);
       }
 #ifdef HAVE_VIDEO_WINDOWS
       if (!string_is_equal(settings->arrays.video_menu_display,
