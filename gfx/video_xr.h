@@ -94,7 +94,8 @@ typedef struct video_xr_quad
    unsigned screen;        /* the core's screen, for a SCREEN quad */
    unsigned slot;
    unsigned layer;         /* the slot's array layer it shows */
-   bool no_input;          /* a NO_INPUT screen's */
+   /* A NO_INPUT screen's, with no inset in its slot that takes input */
+   bool no_input;
 } video_xr_quad_t;
 
 typedef struct video_xr_slot
@@ -698,11 +699,13 @@ void video_xr_turn_back(video_xr_pose_t *pose);
 /* A point on a quad as packed-frame pointer coordinates: any copy of a
  * screen lands in its EYE_NONE or left view at the same fraction, a
  * whole frame spreads over the frame. map and frame_dims are the
- * core's own. A point on one of the screen's insets lands in the
- * inset's view, unless that is NO_INPUT. False for the menu and a
- * NO_INPUT screen. Rotated views map unrotated, as the window's touch
+ * core's own. set is q's (NULL: no insets): a point inside an inset
+ * of q's slot, as its entry's rect draws it, lands in the inset's view
+ * at the same fraction, unless that is NO_INPUT. False for the menu and
+ * a NO_INPUT screen. Rotated views map unrotated, as the window's touch
  * does. */
-bool video_xr_quad_to_frame(const video_xr_quad_t *q, float u, float v,
+bool video_xr_quad_to_frame(const video_xr_quad_set_t *set,
+      const video_xr_quad_t *q, float u, float v,
       const video_views_map_t *map, unsigned frame_dims,
       int16_t *res_x, int16_t *res_y);
 

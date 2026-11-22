@@ -107,9 +107,11 @@ void video_xr_rotate(const video_xr_quat_t *q, const video_xr_vec3_t *v,
       video_xr_vec3_t *out) { (void)q; *out = *v; }
 bool video_xr_window_point(const video_viewport_t *vp, float *u, float *v)
 { (void)vp; (void)u; (void)v; return false; }
-bool video_xr_quad_to_frame(const video_xr_quad_t *q, float u, float v,
+bool video_xr_quad_to_frame(const video_xr_quad_set_t *set,
+      const video_xr_quad_t *q, float u, float v,
       const video_views_map_t *map, unsigned dims, int16_t *x, int16_t *y)
-{ (void)q; (void)u; (void)v; (void)map; (void)dims; (void)x; (void)y; return false; }
+{ (void)set; (void)q; (void)u; (void)v; (void)map; (void)dims; (void)x; (void)y;
+  return false; }
 bool video_views_map_point(const video_views_layout_t *layout,
       const video_views_map_t *map, unsigned frame_dims, int x, int y,
       bool report_oob, uint32_t *res_pos)

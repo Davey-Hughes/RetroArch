@@ -11480,9 +11480,22 @@ static void test_laser_no_input(void)
    t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
 }
 
+/* t_two_screens as video_xr_place puts it, 1.6 m wide and 1.8 m ahead. */
+static void t_place_two_screens(void)
+{
+   video_xr_params_t p;
+   memset(&p, 0, sizeof(p));
+   p.map      = &t_two_screens;
+   video_xr_pose_identity(&p.anchor);
+   p.distance = 1.8f;
+   p.width    = 1.6f;
+   video_xr_place(&p, &t_quads);
+}
+
 /* The laser on an inset is the inset's, at the same fraction of its
- * view; a NO_INPUT inset passes it to its base. Screen 1 over screen
- * 0's bottom right, a quarter of its height. */
+ * view; a NO_INPUT inset passes it to its base, and over a NO_INPUT
+ * base the inset still takes it. Screen 1 over screen 0's bottom right,
+ * a quarter of its height. */
 static void test_laser_inset(void)
 {
    int16_t x = 0;
@@ -11492,10 +11505,14 @@ static void test_laser_inset(void)
    t_forget_devices();
    t_fresh_session();
    t_aim_at_screen_1();
-   t_quads.quads[0].screen = 0;
-   t_two_screens.over      = 0x2;
-   t_two_screens.anchor    = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT << 4;
-   t_two_screens.size[1]   = 0.25f;
+   t_two_screens.over    = 0x2;
+   t_two_screens.anchor  = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT << 4;
+   t_two_screens.size[1] = 0.25f;
+   t_place_two_screens();
+   CHECK(t_quads.num_quads == 1 && t_quads.num_insets == 1
+         && t_quads.quads[0].screen == 0,
+         "the inset's quads: %u quads, %u insets", t_quads.num_quads,
+         t_quads.num_insets);
    /* The inset's middle, 7/8 across and down the quad: packed pixel
     * 400,360. */
    t_aim[1].position.x = t_aim[2].position.x = 0.6f;
@@ -11507,11 +11524,30 @@ static void test_laser_inset(void)
 
    /* NO_INPUT: screen 0 there, packed pixel 700,210. */
    t_two_screens.no_input = 0x2;
+   t_place_two_screens();
    x = y = 0;
    t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
    CHECK(t_gun_at(&x, &y) && abs(x - 24647) < 300 && abs(y + 4037) < 300,
          "through a NO_INPUT inset: the gun at %d,%d, want 24647,-4037",
          x, y);
+
+   /* The base NO_INPUT instead: the inset's all the same. */
+   t_two_screens.no_input = 0x1;
+   t_place_two_screens();
+   x = y = 0;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(t_gun_at(&x, &y) && abs(x - 40) < 300 && abs(y - 16485) < 300,
+         "on the inset over a NO_INPUT base: the gun at %d,%d, "
+         "want 40,16485", x, y);
+   /* Beside it, on the base: off every screen. */
+   t_aim[1].position.x = t_aim[2].position.x = 0.0f;
+   t_aim[1].position.y = t_aim[2].position.y = 0.0f;
+   x = 12345;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(!t_gun_at(&x, &y)
+         && input_openxr_pointer(t_on(0), RETRO_DEVICE_LIGHTGUN, 0,
+            RETRO_DEVICE_ID_LIGHTGUN_SCREEN_X, &x) && x == -0x8000,
+         "on a NO_INPUT base beside its inset: the gun at %d", x);
 
    t_hooks.session_destroying(t_hooks.user);
    t_touch_reset();

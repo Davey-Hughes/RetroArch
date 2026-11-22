@@ -1632,8 +1632,8 @@ static void input_openxr_frame_aims(input_openxr_t *st, int config,
  * A window has the frame where the video driver's viewport puts it, or
  * the core's views where their layout does, as the window's own pointer
  * does; off them, or on NO_INPUT ones alone, it is off the screens. */
-static bool input_openxr_frame_point(const video_xr_quad_t *q, float u,
-      float v, int16_t *x, int16_t *y)
+static bool input_openxr_frame_point(const video_xr_quad_set_t *set,
+      const video_xr_quad_t *q, float u, float v, int16_t *x, int16_t *y)
 {
    unsigned dims                = 0;
    const video_views_map_t *map = NULL;
@@ -1661,7 +1661,7 @@ static bool input_openxr_frame_point(const video_xr_quad_t *q, float u,
    }
    if (!video_driver_get_views_core(&map, &dims))
       return false;
-   return video_xr_quad_to_frame(q, u, v, map, dims, x, y);
+   return video_xr_quad_to_frame(set, q, u, v, map, dims, x, y);
 }
 
 /* The menu's own quad, or a window while the menu is open over it. */
@@ -1844,8 +1844,8 @@ static void input_openxr_laser_poll(input_openxr_t *st, unsigned laser,
       st->menu_v  = st->hit_v[p];
    }
    else if (q)
-      st->ptr_on = input_openxr_frame_point(q, st->hit_u[p], st->hit_v[p],
-            &st->ptr_x, &st->ptr_y);
+      st->ptr_on = input_openxr_frame_point(&st->quads, q, st->hit_u[p],
+            st->hit_v[p], &st->ptr_x, &st->ptr_y);
    /* Untracked mid-press, a touch holds its last point, as the menu's
     * press does. */
    else if (     !tracked[p] && touch_on && p == prev && !pressed[p]

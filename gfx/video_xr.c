@@ -469,7 +469,7 @@ static void video_xr_place_insets(const video_xr_params_t *p,
 static void video_xr_place_screens(const video_xr_params_t *p,
       const video_xr_layout_t *lay, video_xr_quad_set_t *out)
 {
-   unsigned s, i;
+   unsigned s, i, takes;
    unsigned placed              = 0;
    const video_views_map_t *map = p->map;
 
@@ -521,10 +521,15 @@ static void video_xr_place_screens(const video_xr_params_t *p,
                0, &pose, (float)w, (float)h);
       }
    }
-   for (i = 0; i < out->num_quads; i++)
-      if (map->no_input & (1u << out->quads[i].screen))
-         out->quads[i].no_input = true;
    video_xr_place_insets(p, placed, out);
+   /* A quad takes input for its screen or for an inset in its slot. */
+   takes = placed & ~map->no_input;
+   for (i = 0; i < out->num_insets; i++)
+      if (!out->insets[i].no_input)
+         takes |= 1u << out->insets[i].slot;
+   for (i = 0; i < out->num_quads; i++)
+      if (!(takes & (1u << out->quads[i].slot)))
+         out->quads[i].no_input = true;
 }
 
 /* The UI's image: its own size, but no more than VIDEO_XR_MENU_DENSITY
@@ -823,7 +828,8 @@ static unsigned video_xr_pixel(float f, unsigned w)
    return (p >= w) ? w - 1 : p;
 }
 
-bool video_xr_quad_to_frame(const video_xr_quad_t *q, float u, float v,
+bool video_xr_quad_to_frame(const video_xr_quad_set_t *set,
+      const video_xr_quad_t *q, float u, float v,
       const video_views_map_t *map, unsigned frame_dims,
       int16_t *res_x, int16_t *res_y)
 {
@@ -837,30 +843,28 @@ bool video_xr_quad_to_frame(const video_xr_quad_t *q, float u, float v,
    if (q->kind == VIDEO_XR_QUAD_SCREEN)
    {
       int r;
-      unsigned i, insets;
+      unsigned i;
       unsigned s = q->screen;
       if (!map || !map->num_views)
          return false;
-      /* Its insets, topmost first; a NO_INPUT one passes the point on. */
-      insets = video_views_with_insets(map, 1u << s)
-         & ~((1u << s) | map->no_input);
-      for (i = map->num_screens; i-- > 0; )
+      /* Its slot's insets as drawn, topmost first; a NO_INPUT one
+       * passes the point on. */
+      for (i = set ? set->num_insets : 0; i-- > 0; )
       {
          double fu, fv;
-         video_views_frect_t in;
-         if (!(insets & (1u << i)))
+         const video_xr_inset_t *in = &set->insets[i];
+         if (     in->slot != q->slot || in->no_input
+               || (map->no_input & (1u << in->screen))
+               || !(in->rect.w > 0.0) || !(in->rect.h > 0.0))
             continue;
-         video_xr_inset_rect(map, i, 0, &in);
-         if (!(in.w > 0.0) || !(in.h > 0.0))
-            continue;
-         fu = ((double)u - in.x) / in.w;
-         fv = ((double)v - in.y) / in.h;
+         fu = ((double)u - in->rect.x) / in->rect.w;
+         fv = ((double)v - in->rect.y) / in->rect.h;
          /* An inset at the quad's edge takes the edge. */
          if (fu < -1e-6 || fu > 1.0 + 1e-6 || fv < -1e-6 || fv > 1.0 + 1e-6)
             continue;
          u = (float)fu;
          v = (float)fv;
-         s = i;
+         s = in->screen;
          break;
       }
       if ((r = video_views_find(map, s, RETRO_VIDEO_VIEW_EYE_NONE)) < 0)
