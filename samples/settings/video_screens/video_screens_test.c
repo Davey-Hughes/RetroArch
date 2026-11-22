@@ -4166,7 +4166,7 @@ static void test_fallback_no_input(void)
    const uint32_t oob = VIDEO_POS_PACK(-0x8000, -0x8000);
    struct retro_video_views map;
    struct video_viewport vp;
-   uint32_t pos, screen_pos, top, top_screen;
+   uint32_t pos, screen_pos, top, top_screen, left, outside;
 
    window_test_begin();
    window_test_flags = (1u << GFX_CTX_FLAGS_VIDEO_VIEWS)
@@ -4182,6 +4182,13 @@ static void test_fallback_no_input(void)
    CHECK(video_driver_translate_coord_viewport(&vp, 600, 240, &pos,
             &screen_pos, true));
    CHECK(pos != oob);
+   CHECK(video_driver_translate_coord_viewport(&vp, 900, 240, &pos,
+            &screen_pos, false));
+   CHECK(pos != oob);
+   CHECK(video_driver_translate_coord_viewport(&vp, -5, 240, &left,
+            &screen_pos, false));
+   CHECK(video_driver_translate_coord_viewport(&vp, 900, 240, &outside,
+            &screen_pos, true));
 
    memset(views, 0, sizeof(views));
    views[0].width  = views[1].width  = 4;
@@ -4213,6 +4220,23 @@ static void test_fallback_no_input(void)
    CHECK(video_driver_translate_coord_viewport(&vp, 200, 240, &pos,
             &screen_pos, true));
    CHECK(pos == top && screen_pos == top_screen);
+   /* Confined, a point past the viewport is where it is clamped to */
+   pos = 0;
+   CHECK(video_driver_translate_coord_viewport(&vp, 900, 240, &pos,
+            &screen_pos, false));
+   CHECK(pos == oob);
+   pos = 0;
+   CHECK(video_driver_translate_coord_viewport(&vp, 600, 600, &pos,
+            &screen_pos, false));
+   CHECK(pos == oob);
+   pos = 0;
+   CHECK(video_driver_translate_coord_viewport(&vp, -5, 240, &pos,
+            &screen_pos, false));
+   CHECK(pos == left);
+   pos = 0;
+   CHECK(video_driver_translate_coord_viewport(&vp, 900, 240, &pos,
+            &screen_pos, true));
+   CHECK(pos == outside);
    window_test_end();
 }
 

@@ -2636,20 +2636,24 @@ bool video_driver_translate_coord_viewport(
          scaled_y =  0x7fff;
    }
 
-   /* Views fallback draws the packed frame whole in the viewport */
-   if (     video_driver_st.views_fallback
-         && mouse_x >= 0 && mouse_x < norm_vp_width
-         && mouse_y >= 0 && mouse_y < norm_vp_height
-         && video_views_point_no_input(&video_driver_st.views_core,
-            (int)((unsigned)mouse_x
-               * VIDEO_SCALE_W(video_driver_st.views_frame_dims)
-               / (unsigned)norm_vp_width),
-            (int)((unsigned)mouse_y
-               * VIDEO_SCALE_H(video_driver_st.views_frame_dims)
-               / (unsigned)norm_vp_height)))
+   /* Views fallback draws the packed frame whole in the viewport. A
+    * confined point is tested where it was clamped to. */
+   if (video_driver_st.views_fallback)
    {
-      scaled_x = -0x8000;
-      scaled_y = -0x8000;
+      int px = mouse_x < 0 ? 0 : MIN(mouse_x, norm_vp_width  - 1);
+      int py = mouse_y < 0 ? 0 : MIN(mouse_y, norm_vp_height - 1);
+      if (     (!report_oob || (px == mouse_x && py == mouse_y))
+            && video_views_point_no_input(&video_driver_st.views_core,
+               (int)((unsigned)px
+                  * VIDEO_SCALE_W(video_driver_st.views_frame_dims)
+                  / (unsigned)norm_vp_width),
+               (int)((unsigned)py
+                  * VIDEO_SCALE_H(video_driver_st.views_frame_dims)
+                  / (unsigned)norm_vp_height)))
+      {
+         scaled_x = -0x8000;
+         scaled_y = -0x8000;
+      }
    }
 
    *res_pos           = VIDEO_POS_PACK(scaled_x, scaled_y);
