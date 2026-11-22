@@ -11522,9 +11522,28 @@ static void test_laser_inset(void)
    CHECK(t_gun_at(&x, &y) && abs(x - 40) < 300 && abs(y - 16485) < 300,
          "on the inset: the gun at %d,%d, want 40,16485", x, y);
 
-   /* NO_INPUT: screen 0 there, packed pixel 700,210. */
+   /* Auto: the inset is a screen past the first, so the laser is on it,
+    * and screen 0 beside it stays the mouse's. */
+   x = y = 0;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_AUTO);
+   CHECK(t_gun_at(&x, &y) && abs(x - 40) < 300 && abs(y - 16485) < 300,
+         "on the inset in Auto: the gun at %d,%d, want 40,16485", x, y);
+   t_aim[1].position.x = t_aim[2].position.x = 0.0f;
+   t_aim[1].position.y = t_aim[2].position.y = 0.0f;
+   x = y = 0;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_AUTO);
+   CHECK(!t_gun_at(&x, &y),
+         "on screen 0 beside its inset in Auto: the gun at %d,%d", x, y);
+   t_aim[1].position.x = t_aim[2].position.x = 0.6f;
+   t_aim[1].position.y = t_aim[2].position.y = -0.18f;
+
+   /* NO_INPUT: nothing is the laser's in Auto; in Always screen 0
+    * there, packed pixel 700,210. */
    t_two_screens.no_input = 0x2;
    t_place_two_screens();
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_AUTO);
+   CHECK(!input_openxr_pointer_owned(),
+         "Auto with a NO_INPUT inset over screen 0: the pointer is owned");
    x = y = 0;
    t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
    CHECK(t_gun_at(&x, &y) && abs(x - 24647) < 300 && abs(y + 4037) < 300,

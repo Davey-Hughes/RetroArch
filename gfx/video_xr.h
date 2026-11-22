@@ -701,11 +701,12 @@ void video_xr_turn_back(video_xr_pose_t *pose);
  * whole frame spreads over the frame. map and frame_dims are the
  * core's own. set is q's (NULL: no insets): a point inside an inset
  * of q's slot, as its entry's rect draws it, lands in the inset's view
- * at the same fraction, unless that is NO_INPUT. False for the menu and
- * a NO_INPUT screen. Rotated views map unrotated, as the window's touch
+ * at the same fraction, unless that is NO_INPUT. False for the menu, a
+ * NO_INPUT screen and, with laser Auto, a point on screen 0, which is
+ * the mouse's. Rotated views map unrotated, as the window's touch
  * does. */
 bool video_xr_quad_to_frame(const video_xr_quad_set_t *set,
-      const video_xr_quad_t *q, float u, float v,
+      const video_xr_quad_t *q, float u, float v, unsigned laser,
       const video_views_map_t *map, unsigned frame_dims,
       int16_t *res_x, int16_t *res_y);
 
@@ -837,13 +838,14 @@ void video_xr_cut_pixels(uint8_t *px, bool bottom_up);
 #define VIDEO_XR_CURSOR_LIFT  0.002f
 
 /* Whether a laser (enum video_openxr_laser, or VIDEO_XR_LIVE_EDIT) can
- * point at q. Auto: the menu or a window while the menu is open, and
- * screens 1 and up. Always: every screen and a whole frame too. Off:
- * nothing. Edit mode's: every item. A NO_INPUT screen: edit mode's
- * only. */
+ * point at q, of set (NULL: no insets). Auto: the menu or a window while
+ * the menu is open, and screens 1 and up, a screen 0 too while an inset
+ * in its slot is one of those and takes input. Always: every screen and
+ * a whole frame too. Off: nothing. Edit mode's: every item. A NO_INPUT
+ * screen: edit mode's only. */
 #define VIDEO_XR_LIVE_EDIT VIDEO_OPENXR_LASER_LAST
-bool video_xr_quad_live(const video_xr_quad_t *q, unsigned laser,
-      bool menu_open);
+bool video_xr_quad_live(const video_xr_quad_set_t *set,
+      const video_xr_quad_t *q, unsigned laser, bool menu_open);
 
 /* Edit mode takes the menu by a handle bar centred under its bottom
  * edge, in its plane: this fraction of its width, this many metres

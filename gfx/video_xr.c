@@ -828,8 +828,15 @@ static unsigned video_xr_pixel(float f, unsigned w)
    return (p >= w) ? w - 1 : p;
 }
 
+/* Whether a laser in this mode takes a point on screen s: Auto leaves
+ * screen 0 to the mouse. */
+static bool video_xr_screen_live(unsigned laser, unsigned s)
+{
+   return laser != VIDEO_OPENXR_LASER_AUTO || s >= 1;
+}
+
 bool video_xr_quad_to_frame(const video_xr_quad_set_t *set,
-      const video_xr_quad_t *q, float u, float v,
+      const video_xr_quad_t *q, float u, float v, unsigned laser,
       const video_views_map_t *map, unsigned frame_dims,
       int16_t *res_x, int16_t *res_y)
 {
@@ -869,7 +876,7 @@ bool video_xr_quad_to_frame(const video_xr_quad_set_t *set,
       }
       if ((r = video_views_find(map, s, RETRO_VIDEO_VIEW_EYE_NONE)) < 0)
          return false;
-      if (map->no_input & (1u << s))
+      if ((map->no_input & (1u << s)) || !video_xr_screen_live(laser, s))
          return false;
       x0 = map->views[r].x;
       y0 = map->views[r].y;
@@ -981,9 +988,10 @@ void video_xr_place_window(const video_xr_params_t *p, bool menu,
    }
 }
 
-bool video_xr_quad_live(const video_xr_quad_t *q, unsigned laser,
-      bool menu_open)
+bool video_xr_quad_live(const video_xr_quad_set_t *set,
+      const video_xr_quad_t *q, unsigned laser, bool menu_open)
 {
+   unsigned i;
    if (laser == VIDEO_XR_LIVE_EDIT)
       return true;
    if (laser == VIDEO_OPENXR_LASER_OFF || q->no_input)
@@ -997,8 +1005,14 @@ bool video_xr_quad_live(const video_xr_quad_t *q, unsigned laser,
             return true;
          break;
       case VIDEO_XR_QUAD_SCREEN:
-         if (q->screen >= 1)
+         if (video_xr_screen_live(laser, q->screen))
             return true;
+         /* Or for an inset in its slot that takes input. */
+         for (i = 0; set && i < set->num_insets; i++)
+            if (     set->insets[i].slot == q->slot
+                  && !set->insets[i].no_input
+                  && video_xr_screen_live(laser, set->insets[i].screen))
+               return true;
          break;
       default:
          break;
@@ -1071,7 +1085,7 @@ static int video_xr_pick_with(const video_xr_quad_set_t *set,
    {
       float qu, qv, qt;
       const video_xr_quad_t *q = &set->quads[i];
-      if (     !video_xr_quad_live(q, laser, menu_open)
+      if (     !video_xr_quad_live(set, q, laser, menu_open)
             || (laser == VIDEO_XR_LIVE_EDIT && set->slots[q->slot].fixed)
             || (menu_only && !(menu_open
                   && (q->kind == VIDEO_XR_QUAD_MENU

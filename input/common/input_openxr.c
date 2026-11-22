@@ -1633,7 +1633,8 @@ static void input_openxr_frame_aims(input_openxr_t *st, int config,
  * the core's views where their layout does, as the window's own pointer
  * does; off them, or on NO_INPUT ones alone, it is off the screens. */
 static bool input_openxr_frame_point(const video_xr_quad_set_t *set,
-      const video_xr_quad_t *q, float u, float v, int16_t *x, int16_t *y)
+      const video_xr_quad_t *q, float u, float v, unsigned laser,
+      int16_t *x, int16_t *y)
 {
    unsigned dims                = 0;
    const video_views_map_t *map = NULL;
@@ -1661,7 +1662,7 @@ static bool input_openxr_frame_point(const video_xr_quad_set_t *set,
    }
    if (!video_driver_get_views_core(&map, &dims))
       return false;
-   return video_xr_quad_to_frame(set, q, u, v, map, dims, x, y);
+   return video_xr_quad_to_frame(set, q, u, v, laser, map, dims, x, y);
 }
 
 /* The menu's own quad, or a window while the menu is open over it. */
@@ -1740,7 +1741,7 @@ static void input_openxr_laser_poll(input_openxr_t *st, unsigned laser,
    for (i = 0; i < st->quads.num_quads; i++)
    {
       const video_xr_quad_t *lq = &st->quads.quads[i];
-      if (!video_xr_quad_live(lq, laser, menu_open))
+      if (!video_xr_quad_live(&st->quads, lq, laser, menu_open))
          continue;
       /* Without a live screen a hand can touch, the mouse and the
        * overlay keep the core's pointer and gun. */
@@ -1845,7 +1846,7 @@ static void input_openxr_laser_poll(input_openxr_t *st, unsigned laser,
    }
    else if (q)
       st->ptr_on = input_openxr_frame_point(&st->quads, q, st->hit_u[p],
-            st->hit_v[p], &st->ptr_x, &st->ptr_y);
+            st->hit_v[p], laser, &st->ptr_x, &st->ptr_y);
    /* Untracked mid-press, a touch holds its last point, as the menu's
     * press does. */
    else if (     !tracked[p] && touch_on && p == prev && !pressed[p]
@@ -2287,7 +2288,7 @@ static bool input_openxr_any_live(const video_xr_quad_set_t *set,
    for (i = 0; i < set->num_quads; i++)
    {
       const video_xr_quad_t *q = &set->quads[i];
-      if (     video_xr_quad_live(q, laser, menu_open)
+      if (     video_xr_quad_live(set, q, laser, menu_open)
             && !(laser == VIDEO_XR_LIVE_EDIT && set->slots[q->slot].fixed))
          return true;
    }
