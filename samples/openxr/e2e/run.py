@@ -4208,6 +4208,56 @@ def check_screens_mode(blank):
     return check
 
 
+# Screen 1 over screen 0's bottom right corner at a quarter of its
+# height: screen 0's image from 0.75 on, both ways. Points either side of
+# its edges, and its centre.
+DS_INSET_IN = ((0.766, 0.875), (0.875, 0.771), (0.875, 0.875))
+DS_INSET_OUT = ((0.5, 0.5), (0.734, 0.875), (0.875, 0.734))
+AIM_DS_INSET = 'aim right 0.2 -0.4 -0.3 0.6 -0.45 -1.8'  # screen 0, 0.875 0.875
+
+
+def check_screens_over(blank):
+    """The ds map's screen 1 sent OVER screen 0 has no quad: screen 0's
+    image shows it in its corner, black when it is BLANK too, with
+    screen 0 around it. Screen 0 is where it is with both shown."""
+    def check(res):
+        fr = last_snap(res)
+        if not fr:
+            return no_quads(res)
+        q = [x for x in quads(fr) if not x['flags'] & BLEND]
+        top = [x for x in q if at(x, DS_TOP)]
+        rest = [x for x in q if not at(x, DS_TOP)]
+        errors = []
+        if rest:
+            errors.append('the inset screen 1 has a quad: %s'
+                          % [(x['pose'][:3], x['size']) for x in rest])
+        if len(top) != 1 or not sized(top[0], DS_SIZE):
+            return errors + ['screen 0: %s, want one quad at %s size %s'
+                             % ([(x['pose'][:3], x['size']) for x in top],
+                                DS_TOP, DS_SIZE)]
+        path = image(res, fr, top[0])
+        for points, want in ((DS_INSET_OUT, GREEN),
+                             (DS_INSET_IN, BLACK if blank else YELLOW)):
+            for fx, fy in points:
+                c, _ = colour(path, fx, fy)
+                if not near(c, want):
+                    errors.append('screen 0\'s image at %g,%g shows %s, '
+                                  'want %s' % (fx, fy, c, want))
+        return errors
+    return check
+
+
+def check_screens_over_laser(res):
+    """Always: a hand pointing at the inset aims the gun at screen 1, at
+    the centre of its view in the packed frame."""
+    guns = kinds(core_events(res), 'gun')
+    if find(guns, 0, lambda g: not g['offscreen']
+            and packed_at(g, (128, 288))) < 0:
+        return ['the gun never aimed at screen 1 through its inset: %s'
+                % guns[-3:]]
+    return []
+
+
 def check_tracked_screen_off(res):
     """The tracked eyes' screen with Display Off is left out: its map is
     taken, no projection is sent, and the bottom screen keeps its quad
@@ -4241,6 +4291,17 @@ SCREENS_CASES = [
     {'name': 'screens-blank', 'map': 'ds',
      'options': {'video_views_test_screens': 'blank'}, 'steps': SETTLE,
      'check': check_screens_mode(True)},
+    {'name': 'screens-over', 'map': 'ds',
+     'options': {'video_views_test_screens': 'over'}, 'steps': SETTLE,
+     'check': check_screens_over(False)},
+    {'name': 'screens-over-blank', 'map': 'ds',
+     'options': {'video_views_test_screens': 'over_blank'}, 'steps': SETTLE,
+     'check': check_screens_over(True)},
+    {'name': 'screens-over-laser', 'map': 'ds',
+     'options': {'video_views_test_screens': 'over'},
+     'settings': {'video_openxr_laser': '1'},
+     'steps': [('wait', 6), ('script', AIM_DS_INSET), ('wait', 2)],
+     'check': check_screens_over_laser},
     {'name': 'tracked-screen-off', 'map': '3ds',
      'options': {'video_views_test_vr': 'local'},
      'settings': {'video_screen1_display': 'off'}, 'steps': SETTLE,

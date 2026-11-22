@@ -722,6 +722,12 @@ void video_xr_window_rect(const video_viewport_t *vp, unsigned frame_dims,
       unsigned rotation, const struct retro_video_view *v,
       video_views_rect_t *out);
 
+/* in's rect in its slot's image of dims, in pixels from the image's top
+ * left: edges rounded, cut to the image, a pixel at least each way.
+ * False for a zero rect, which is not drawn. */
+bool video_xr_inset_px(const video_xr_inset_t *in, unsigned dims,
+      video_views_rect_t *out);
+
 /* The quads of a window that holds the frame, the menu and all, as
  * the Quest's GL host shows it: p's map as video_xr_place puts its screens
  * while it is untracked and the menu is closed, each slot's layers cut

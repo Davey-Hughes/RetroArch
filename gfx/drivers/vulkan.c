@@ -14227,18 +14227,36 @@ static vulkan_filter_chain_t *vulkan_xr_chain(vk_t *vk,
    return *chain;
 }
 
+/* Inset i's chain for layer l of slot s, NULL to draw it black, and its
+ * pixels there; false when it is not drawn in s. */
+static bool vulkan_xr_inset(const vk_t *vk, unsigned s, unsigned l,
+      unsigned i, vulkan_filter_chain_t **xr_chains,
+      vulkan_filter_chain_t **chain, video_views_rect_t *cut)
+{
+   const video_xr_inset_t *in = &vk->xr.set.insets[i];
+   if (     in->slot != s
+         || !video_xr_inset_px(in, vk->xr.set.slots[s].dims, cut))
+      return false;
+   *chain = (in->blank || in->view[l] < 0) ? NULL : xr_chains[in->view[l]];
+   return true;
+}
+
 /* Slot s's layers, each through its view's headset chain or the whole
  * frame's, straight into the runtime's acquired images; a blank
- * screen's are only cleared. A repeat - a screen resized, made again or
- * not yet shown while no new frame came - replays the last frame's
- * final pass at the image's size, so feedback and history stay where
- * that frame left them. */
+ * screen's are only cleared. Then the slot's insets, each through its
+ * view's chain into its rect, or cleared there. A repeat - a screen
+ * resized, made again or not yet shown while no new frame came -
+ * replays the last frame's final pass at the image's size, so feedback
+ * and history stay where that frame left them. */
 static void vulkan_xr_draw_screen(vk_t *vk, unsigned s,
       vulkan_filter_chain_t **xr_chains, vulkan_filter_chain_t *xr_frame,
       bool new_frame)
 {
-   unsigned l;
+   unsigned l, i;
    VkViewport vp;
+   video_views_rect_t cut;
+   vulkan_filter_chain_t *ic;
+   const video_xr_quad_set_t *set = &vk->xr.set;
    VkClearValue clear;
    VkRenderPassBeginInfo rp;
    const video_xr_slot_t *plan = &vk->xr.set.slots[s];
@@ -14277,6 +14295,17 @@ static void vulkan_xr_draw_screen(vk_t *vk, unsigned s,
          replay = vulkan_filter_chain_replay_ready(chain);
       if (chain && !replay)
          vulkan_filter_chain_build_offscreen_passes(chain, vk->cmd, &vp);
+      /* A view in both layers runs its passes once. */
+      for (i = 0; i < set->num_insets; i++)
+      {
+         VkViewport ivp;
+         if (     !vulkan_xr_inset(vk, s, l, i, xr_chains, &ic, &cut) || !ic
+               || (l && set->insets[i].view[0] == set->insets[i].view[l])
+               || (!new_frame && vulkan_filter_chain_replay_ready(ic)))
+            continue;
+         vulkan_views_vp(&cut, &ivp);
+         vulkan_filter_chain_build_offscreen_passes(ic, vk->cmd, &ivp);
+      }
       rp.sType                    = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
       rp.pNext                    = NULL;
       rp.renderPass               = vk->xr.render_pass;
@@ -14296,9 +14325,37 @@ static void vulkan_xr_draw_screen(vk_t *vk, unsigned s,
       else if (chain)
          vulkan_filter_chain_build_viewport_pass(chain, vk->cmd,
                &vp, vk->xr.mvp.data);
+      for (i = 0; i < set->num_insets; i++)
+      {
+         VkViewport ivp;
+         if (!vulkan_xr_inset(vk, s, l, i, xr_chains, &ic, &cut))
+            continue;
+         if (!ic)
+         {
+            vulkan_views_fill(vk, &cut, 255);
+            continue;
+         }
+         /* The final pass is cut to its viewport. */
+         vulkan_views_vp(&cut, &ivp);
+         if (!new_frame && vulkan_filter_chain_replay_ready(ic))
+            vulkan_filter_chain_build_viewport_pass_replay(ic, vk->cmd,
+                  &ivp, vk->xr.mvp.data);
+         else if (l && set->insets[i].view[0] == set->insets[i].view[l])
+            vulkan_filter_chain_build_viewport_pass_again(ic, vk->cmd,
+                  &ivp, vk->xr.mvp.data);
+         else
+            vulkan_filter_chain_build_viewport_pass(ic, vk->cmd,
+                  &ivp, vk->xr.mvp.data);
+      }
       vkCmdEndRenderPass(vk->cmd);
       if (chain && new_frame)
          vulkan_filter_chain_end_frame(chain, vk->cmd);
+      /* After its last layer. */
+      for (i = 0; new_frame && i < set->num_insets; i++)
+         if (     vulkan_xr_inset(vk, s, l, i, xr_chains, &ic, &cut) && ic
+               && (   l + 1 >= plan->layers
+                   || set->insets[i].view[l + 1] != set->insets[i].view[l]))
+            vulkan_filter_chain_end_frame(ic, vk->cmd);
    }
 
    /* The chains bound descriptor sets of their own. */
@@ -15477,7 +15534,7 @@ static bool vulkan_frame(void *data, const void *frame,
    /* Each view the headset shows has a chain of its own there. */
    if (xr_draw && video_info->views.num_views)
    {
-      unsigned s, l;
+      unsigned s, l, i;
       memset(xr_chains, 0, sizeof(xr_chains));
       xr_map = true;
       vulkan_xr_plan(vk, video_info, true, xr_eyes, 0, 0, 0);
@@ -15496,6 +15553,28 @@ static bool vulkan_frame(void *data, const void *frame,
                            vk->rotation_raw))))
                xr_map = false;
          }
+      for (i = 0; i < vk->xr.set.num_insets; i++)
+      {
+         video_views_rect_t cut;
+         const video_xr_inset_t *in = &vk->xr.set.insets[i];
+         if (     in->blank
+               || !video_xr_inset_px(in, vk->xr.set.slots[in->slot].dims,
+                  &cut))
+            continue;
+         for (l = 0; l < vk->xr.set.slots[in->slot].layers; l++)
+         {
+            int v = in->view[l];
+            const struct retro_video_view *rv;
+            if (v < 0)
+               continue;
+            rv = &video_info->views.views[v];
+            if (!(xr_chains[v] = vulkan_xr_chain(vk, video_info, v,
+                        video_xr_shrinks(cut.dims,
+                           VIDEO_SCALE_PACK(rv->width, rv->height),
+                           vk->rotation_raw))))
+               xr_map = false;
+         }
+      }
    }
 #endif
 

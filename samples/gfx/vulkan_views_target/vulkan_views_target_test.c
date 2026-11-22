@@ -2,7 +2,8 @@
  * shared ensure policy. Only device allocation and logging are replaced.
  * The XR draw and its slots run with the runtime's swapchains and the
  * pass steps stubbed: what reaches the runtime's images, when a chain
- * ends a frame, and when a repeat replays the last frame's final pass.
+ * ends a frame, when a repeat replays the last frame's final pass, and a
+ * slot's insets drawn into its image after it, each in its rect.
  * The second outputs' render passes run against a fake device, and the
  * headset's format pick against a fake runtime; a screen window's
  * output is checked for whether it encodes HDR. */
@@ -362,15 +363,6 @@ static void vulkan_xr_plan(vk_t *vk, const video_frame_info_t *video_info,
    vk->xr.set = planned;
 }
 
-bool video_xr_shrinks(unsigned image_dims, unsigned source_dims,
-      unsigned rotation)
-{
-   (void)image_dims;
-   (void)source_dims;
-   (void)rotation;
-   return false;
-}
-
 static void vulkan_openxr_slot_forget(vulkan_openxr_t *xr, unsigned slot)
 {
    (void)xr;
@@ -381,8 +373,10 @@ static void vulkan_openxr_slot_forget(vulkan_openxr_t *xr, unsigned slot)
 /* What reached the runtime's images: offscreen runs, final passes,
  * replays of the last frame's, the size of the last, the render passes
  * into a swapchain framebuffer, and frames the chains ended. */
-static unsigned offscreen_passes, viewport_passes, replays;
-static unsigned last_pass_w, last_pass_h;
+static unsigned offscreen_passes, viewport_passes, replays, agains;
+static unsigned last_pass_w, last_pass_h, last_pass_x, last_pass_y;
+static unsigned fills;
+static video_views_rect_t last_fill;
 static unsigned render_passes, frames_ended;
 static bool chain_drawn = true;
 /* The pass the last one began, and how many began another before it */
@@ -415,6 +409,8 @@ static void vulkan_filter_chain_build_viewport_pass_replay(
    replays++;
    last_pass_w = (unsigned)vp->width;
    last_pass_h = (unsigned)vp->height;
+   last_pass_x = (unsigned)vp->x;
+   last_pass_y = (unsigned)vp->y;
 }
 
 static void vulkan_filter_chain_build_viewport_pass(
@@ -427,6 +423,22 @@ static void vulkan_filter_chain_build_viewport_pass(
    viewport_passes++;
    last_pass_w = (unsigned)vp->width;
    last_pass_h = (unsigned)vp->height;
+   last_pass_x = (unsigned)vp->x;
+   last_pass_y = (unsigned)vp->y;
+}
+
+static void vulkan_filter_chain_build_viewport_pass_again(
+      vulkan_filter_chain_t *chain, VkCommandBuffer cmd,
+      const VkViewport *vp, const float *mvp)
+{
+   (void)chain;
+   (void)cmd;
+   (void)mvp;
+   agains++;
+   last_pass_w = (unsigned)vp->width;
+   last_pass_h = (unsigned)vp->height;
+   last_pass_x = (unsigned)vp->x;
+   last_pass_y = (unsigned)vp->y;
 }
 
 static void vulkan_filter_chain_end_frame(vulkan_filter_chain_t *chain,
@@ -686,6 +698,17 @@ static void test_destroy_pipeline(VkDevice device, VkPipeline pipe,
 #define vkCreateGraphicsPipelines test_create_graphics_pipelines
 #define vkDestroyPipeline test_destroy_pipeline
 
+static void vulkan_views_fill(vk_t *vk, const video_views_rect_t *cut,
+      unsigned alpha)
+{
+   (void)vk;
+   if (alpha >= 255)
+   {
+      fills++;
+      last_fill = *cut;
+   }
+}
+
 #include "driver_code.inc"
 
 #define CHECK(cond) do { if (!(cond)) { \
@@ -703,9 +726,9 @@ static void init(vk_t *vk, test_context_t *context, test_chain_t *chain)
    vk->context = context;
    vk->chain = chain;
    allocations = destructions = warnings = fail_allocation = 0;
-   offscreen_passes = viewport_passes = replays = 0;
-   last_pass_w = last_pass_h = 0;
-   render_passes = frames_ended = 0;
+   offscreen_passes = viewport_passes = replays = agains = 0;
+   last_pass_w = last_pass_h = last_pass_x = last_pass_y = 0;
+   render_passes = frames_ended = fills = 0;
    began_pass = VK_NULL_HANDLE;
    mixed_passes = 0;
    view_format_made = VK_FORMAT_UNDEFINED;
@@ -715,6 +738,7 @@ static void init(vk_t *vk, test_context_t *context, test_chain_t *chain)
    memset(runtime_formats, 0, sizeof(runtime_formats));
    xr_frees = xr_retargets = 0;
    chain_drawn = true;
+   memset(&last_fill, 0, sizeof(last_fill));
    memset(slot_creates, 0, sizeof(slot_creates));
    slot_refuses = 0;
    logs = 0;
@@ -956,12 +980,33 @@ static void xr_plan(unsigned dims, unsigned screens)
 /* Any chain: the pass steps are stubbed. */
 #define XR_FRAME_CHAIN ((vulkan_filter_chain_t*)(uintptr_t)1)
 
-static void xr_draw_frame(vk_t *vk, unsigned src_dims, bool new_frame)
+/* @chains: each view's, for a plan that draws views. */
+static void xr_draw_views(vk_t *vk, unsigned src_dims, bool new_frame,
+      vulkan_filter_chain_t **chains)
 {
    video_frame_info_t info;
    memset(&info, 0, sizeof(info));
-   vulkan_xr_draw(vk, &info, new_frame, true, false, NULL, XR_FRAME_CHAIN,
+   vulkan_xr_draw(vk, &info, new_frame, true, false, chains, XR_FRAME_CHAIN,
          NULL, src_dims, src_dims, src_dims, true);
+}
+
+static void xr_draw_frame(vk_t *vk, unsigned src_dims, bool new_frame)
+{
+   xr_draw_views(vk, src_dims, new_frame, NULL);
+}
+
+/* View @view over slot 0's bottom right quarter each way. */
+static void xr_plan_inset(int view)
+{
+   video_xr_inset_t *in = &planned.insets[planned.num_insets++];
+   in->rect.x  = 0.75;
+   in->rect.y  = 0.75;
+   in->rect.w  = 0.25;
+   in->rect.h  = 0.25;
+   in->view[0] = view;
+   in->view[1] = (planned.slots[0].layers > 1) ? view : -1;
+   in->slot    = 0;
+   in->screen  = 1;
 }
 
 static void xr_draw(vk_t *vk, unsigned src_dims)
@@ -1454,6 +1499,98 @@ static void test_xr_pick_format(void)
    vulkan_views_targets_free(&vk);
 }
 
+/* An inset is drawn into its base's image, in the base's render pass
+ * after it, by its view's chain at its rect; its frame ends too. A blank
+ * one's rect is cleared with no pass, and one with a zero rect is not
+ * drawn. */
+static void test_xr_draw_inset(void)
+{
+   vk_t vk;
+   test_context_t context;
+   test_chain_t chain;
+   vulkan_filter_chain_t *chains[RETRO_VIDEO_VIEWS_MAX];
+   unsigned dims = VIDEO_SCALE_PACK(64, 32);
+   memset(chains, 0, sizeof(chains));
+   chains[1] = XR_FRAME_CHAIN;
+   init(&vk, &context, &chain);
+   acquire_fails = 0;
+   xr_plan(dims, 1);
+   xr_plan_inset(1);
+   xr_draw_views(&vk, dims, true, chains);
+   CHECK(offscreen_passes == 2 && viewport_passes == 2 && agains == 0);
+   CHECK(render_passes == 1 && frames_ended == 2 && replays == 0);
+   CHECK(last_pass_x == 48 && last_pass_y == 24);
+   CHECK(last_pass_w == 16 && last_pass_h == 8 && fills == 0);
+
+   offscreen_passes = viewport_passes = render_passes = frames_ended = 0;
+   planned.insets[0].blank = true;
+   xr_draw_views(&vk, dims, true, chains);
+   CHECK(offscreen_passes == 1 && viewport_passes == 1 && frames_ended == 1);
+   CHECK(render_passes == 1 && fills == 1);
+   CHECK(last_fill.pos == VIDEO_POS_PACK(48, 24));
+   CHECK(last_fill.dims == VIDEO_SCALE_PACK(16, 8));
+   CHECK(last_pass_w == 64 && last_pass_h == 32);
+
+   offscreen_passes = viewport_passes = frames_ended = fills = 0;
+   planned.insets[0].blank  = false;
+   planned.insets[0].rect.h = 0.0;
+   xr_draw_views(&vk, dims, true, chains);
+   CHECK(offscreen_passes == 1 && viewport_passes == 1 && frames_ended == 1);
+   CHECK(fills == 0 && last_pass_w == 64 && last_pass_h == 32);
+}
+
+/* A view over a stereo base is in both layers: its passes run and its
+ * frame ends once, and the second layer draws its final pass again. */
+static void test_xr_draw_inset_stereo(void)
+{
+   vk_t vk;
+   test_context_t context;
+   test_chain_t chain;
+   vulkan_filter_chain_t *chains[RETRO_VIDEO_VIEWS_MAX];
+   unsigned dims = VIDEO_SCALE_PACK(64, 32);
+   memset(chains, 0, sizeof(chains));
+   chains[0] = chains[1] = chains[2] = XR_FRAME_CHAIN;
+   init(&vk, &context, &chain);
+   acquire_fails = 0;
+   xr_plan(dims, 1);
+   planned.slots[0].layers  = 2;
+   planned.slots[0].view[0] = 0;
+   planned.slots[0].view[1] = 1;
+   xr_plan_inset(2);
+   xr_draw_views(&vk, dims, true, chains);
+   CHECK(offscreen_passes == 3 && viewport_passes == 3 && agains == 1);
+   CHECK(render_passes == 2 && frames_ended == 3 && replays == 0);
+   CHECK(last_pass_w == 16 && last_pass_h == 8);
+}
+
+/* A slot made again on a repeat replays its inset's last final pass as
+ * its own, at the inset's rect of the new image. */
+static void test_xr_draw_inset_repeat(void)
+{
+   vk_t vk;
+   test_context_t context;
+   test_chain_t chain;
+   vulkan_filter_chain_t *chains[RETRO_VIDEO_VIEWS_MAX];
+   unsigned dims    = VIDEO_SCALE_PACK(64, 32);
+   unsigned changed = VIDEO_SCALE_PACK(80, 40);
+   memset(chains, 0, sizeof(chains));
+   chains[1] = XR_FRAME_CHAIN;
+   init(&vk, &context, &chain);
+   acquire_fails = 0;
+   xr_plan(dims, 1);
+   xr_plan_inset(1);
+   xr_draw_views(&vk, dims, true, chains);
+   xr_release(&vk);
+   offscreen_passes = viewport_passes = render_passes = frames_ended = 0;
+   xr_plan(changed, 1);
+   xr_plan_inset(1);
+   xr_draw_views(&vk, dims, false, chains);
+   CHECK(replays == 2 && render_passes == 1);
+   CHECK(offscreen_passes == 0 && viewport_passes == 0 && frames_ended == 0);
+   CHECK(last_pass_x == 60 && last_pass_y == 30);
+   CHECK(last_pass_w == 20 && last_pass_h == 10);
+}
+
 int main(void)
 {
    test_desktop_failure(false);
@@ -1477,6 +1614,9 @@ int main(void)
    test_xr_hdr_preset_falls_back();
    test_views_preset_hdr();
    test_xr_pick_format();
-   printf("%u failed (21 Vulkan target cases)\n", failures);
+   test_xr_draw_inset();
+   test_xr_draw_inset_stereo();
+   test_xr_draw_inset_repeat();
+   printf("%u failed (24 Vulkan target cases)\n", failures);
    return failures ? 1 : 0;
 }

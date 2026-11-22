@@ -943,6 +943,28 @@ void video_xr_window_rect(const video_viewport_t *vp, unsigned frame_dims,
    out->dims = VIDEO_SCALE_PACK(x1 - x0, y1 - y0);
 }
 
+bool video_xr_inset_px(const video_xr_inset_t *in, unsigned dims,
+      video_views_rect_t *out)
+{
+   int x0, y0, x1, y1;
+   int w = (int)VIDEO_SCALE_W(dims);
+   int h = (int)VIDEO_SCALE_H(dims);
+
+   if (!(in->rect.w > 0.0) || !(in->rect.h > 0.0) || !w || !h)
+      return false;
+   x0        = (int)floor(in->rect.x * w + 0.5);
+   y0        = (int)floor(in->rect.y * h + 0.5);
+   x1        = (int)floor((in->rect.x + in->rect.w) * w + 0.5);
+   y1        = (int)floor((in->rect.y + in->rect.h) * h + 0.5);
+   x0        = MAX(0, MIN(x0, w - 1));
+   y0        = MAX(0, MIN(y0, h - 1));
+   x1        = MAX(x0 + 1, MIN(x1, w));
+   y1        = MAX(y0 + 1, MIN(y1, h));
+   out->pos  = VIDEO_POS_PACK(x0, y0);
+   out->dims = VIDEO_SCALE_PACK(x1 - x0, y1 - y0);
+   return true;
+}
+
 void video_xr_place_window(const video_xr_params_t *p, bool menu,
       bool tracked, const video_viewport_t *vp, unsigned frame_dims,
       video_xr_quad_set_t *out,

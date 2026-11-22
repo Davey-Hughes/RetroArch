@@ -25,6 +25,6 @@ def function(source, name):
 
 
 parts = [function(driver, name) for name in
-         ('gl3_xr_same', 'gl3_xr_keep', 'gl3_xr_draw_screen',
+         ('gl3_views_vp', 'gl3_xr_same', 'gl3_xr_keep', 'gl3_xr_draw_screen',
           'gl3_xr_eye_views', 'gl3_xr_draw_projection', 'gl3_xr_draw')]
 Path(sys.argv[1]).write_text('\n\n'.join(parts) + '\n')

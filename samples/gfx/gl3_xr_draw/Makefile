@@ -9,19 +9,26 @@ CFLAGS += -Wall -Wextra -pedantic -std=c89 -Werror=declaration-after-statement \
           -I$(REPO_ROOT) -I$(REPO_ROOT)/libretro-common/include \
           -I$(REPO_ROOT)/gfx/include -I$(BUILD_DIR)
 
+# The headset's layout, which the draw asks for an inset's pixels.
+OBJECTS := $(BUILD_DIR)/video_xr.o $(BUILD_DIR)/video_views.o
+
 all: $(TARGET)
 
 $(BUILD_DIR)/driver_code.inc: extract.py $(REPO_ROOT)/gfx/drivers/gl3.c
 	@mkdir -p $(BUILD_DIR)
 	$(PYTHON) extract.py $@
 
-$(TARGET): gl3_xr_draw_test.c $(BUILD_DIR)/driver_code.inc
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+$(BUILD_DIR)/%.o: $(REPO_ROOT)/gfx/%.c
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(filter-out -Wextra,$(CFLAGS)) -c $< -o $@
+
+$(TARGET): gl3_xr_draw_test.c $(BUILD_DIR)/driver_code.inc $(OBJECTS)
+	$(CC) $(CFLAGS) $< $(OBJECTS) -o $@ $(LDFLAGS) -lm
 
 check: $(TARGET)
 	$(RUNNER) $(TARGET)
 
 clean:
-	rm -f $(BUILD_DIR)/driver_code.inc $(TARGET)
+	rm -f $(BUILD_DIR)/driver_code.inc $(OBJECTS) $(TARGET)
 
 .PHONY: all check clean

@@ -7352,9 +7352,12 @@ static unsigned t_gl_shown(XrSwapchain *first)
    return n;
 }
 
+/* Where t_gl_draw's inset is in its slot's image; negative for none. */
+static double t_gl_inset_x = -1.0;
+
 /* The video thread's draw: slot's targets marked gen, published with a
  * quad for slot and one for another slot, which the slot's image must
- * not bring with it. */
+ * not bring with it; with t_gl_inset_x, an inset for each likewise. */
 static bool t_gl_draw(gl_openxr_t *xr, unsigned slot, unsigned dims,
       unsigned layers, unsigned gen, const openxr_projection_t *p)
 {
@@ -7382,6 +7385,15 @@ static bool t_gl_draw(gl_openxr_t *xr, unsigned slot, unsigned dims,
       set.slots[slot].dims            = dims;
       set.slots[slot].layers          = layers;
       set.num_quads                   = 2;
+      if (t_gl_inset_x >= 0.0)
+      {
+         set.insets[0].slot   = set.quads[1].slot;
+         set.insets[1].slot   = slot;
+         set.insets[1].rect.x = t_gl_inset_x;
+         set.insets[1].rect.w = 0.25;
+         set.insets[1].rect.h = 0.25;
+         set.num_insets       = 2;
+      }
    }
    gl_openxr_slot_publish(xr, slot, &set, p);
    return true;
@@ -7723,6 +7735,62 @@ static void test_gl_host_empty_record(void)
          && t_gl_image_content(xr, menu, 0) == 40, "reopened again");
    t_gl_host_free(xr);
    t_gl_books_closed("empty record");
+}
+
+/* A slot's insets are published with its quads: the ones drawn into
+ * the image the headset holds, and no other slot's. */
+static void test_gl_host_insets(void)
+{
+   video_xr_quad_set_t got;
+   gl_openxr_t *xr = t_gl_host_new();
+   CHECK(xr, "host");
+   if (!xr)
+      return;
+   CHECK(gl_openxr_start(xr), "start");
+   t_gl_inset_x = 0.75;
+   CHECK(t_gl_draw(xr, 1, VIDEO_SCALE_PACK(64, 64), 1, 1, NULL)
+         && t_gate_step(1), "inset");
+   openxr_frame_get_quads(&xr->frame, &got);
+   CHECK(     got.num_quads == 1 && got.num_insets == 1
+         && got.insets[0].slot == 1 && got.insets[0].rect.x == 0.75,
+         "inset: %u quads, %u insets, slot %u at %g", got.num_quads,
+         got.num_insets, got.insets[0].slot, got.insets[0].rect.x);
+
+   /* Moved while the runtime is busy: where the old image has it. */
+   t_sc_wait    = XR_TIMEOUT_EXPIRED;
+   t_gl_inset_x = 0.25;
+   CHECK(t_gl_draw(xr, 1, VIDEO_SCALE_PACK(64, 64), 1, 2, NULL)
+         && t_gate_step(1), "moved");
+   openxr_frame_get_quads(&xr->frame, &got);
+   CHECK(got.num_insets == 1 && got.insets[0].rect.x == 0.75,
+         "moved, busy: %u insets at %g", got.num_insets,
+         got.insets[0].rect.x);
+   t_sc_wait    = XR_SUCCESS;
+   CHECK(t_gate_step(1), "frame");
+   openxr_frame_get_quads(&xr->frame, &got);
+   CHECK(got.num_insets == 1 && got.insets[0].rect.x == 0.25,
+         "moved: %u insets at %g", got.num_insets, got.insets[0].rect.x);
+
+   /* Drawn without one. */
+   t_gl_inset_x = -1.0;
+   CHECK(t_gl_draw(xr, 1, VIDEO_SCALE_PACK(64, 64), 1, 3, NULL)
+         && t_gate_step(1), "none");
+   openxr_frame_get_quads(&xr->frame, &got);
+   CHECK(got.num_quads == 1 && !got.num_insets, "none: %u insets",
+         got.num_insets);
+
+   /* A slot that shows nothing brings none. */
+   t_gl_inset_x = 0.5;
+   CHECK(t_gl_draw(xr, 1, VIDEO_SCALE_PACK(64, 64), 1, 4, NULL)
+         && t_gate_step(1), "again");
+   gl_openxr_slot_forget(xr, 1);
+   CHECK(t_gate_step(1), "forgotten");
+   openxr_frame_get_quads(&xr->frame, &got);
+   CHECK(!got.num_quads && !got.num_insets, "forgotten: %u quads, %u insets",
+         got.num_quads, got.num_insets);
+   t_gl_inset_x = -1.0;
+   t_gl_host_free(xr);
+   t_gl_books_closed("insets");
 }
 
 /* The screen the tracked eyes are on yields to them: the headset shows
@@ -10168,6 +10236,7 @@ int main(void)
    test_gl_host_records();
    test_gl_host_resize();
    test_gl_host_empty_record();
+   test_gl_host_insets();
    test_gl_host_projection();
    test_gl_host_yield();
    test_gl_host_cursor_remake();

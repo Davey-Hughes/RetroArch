@@ -4,7 +4,8 @@
  * the chain's frame, and a repeat draws a screen again only when it
  * moved or changed size, by replaying the last frame's final pass. A
  * blank screen's texture is only cleared, and so are the tracked eyes'
- * of a blank screen, whose views are not read. */
+ * of a blank screen, whose views are not read. A slot's insets are
+ * drawn into its texture after it, each in its rect. */
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -104,7 +105,9 @@ typedef struct gl3
       {
          video_xr_slot_t info;
          video_xr_quad_t quads[4];
+         video_xr_inset_t insets[RETRO_VIDEO_VIEWS_MAX];
          unsigned num_quads;
+         unsigned num_insets;
          bool published;
       } shown[VIDEO_XR_MAX_SLOTS];
       float mvp[16];
@@ -126,8 +129,9 @@ static unsigned failures;
  * attached is an image of the driver's own. */
 #define RUNTIME_TEX(s, l) (0x100u + (s) * 2u + (l))
 
-static unsigned offscreen_passes, viewport_passes, replays;
-static unsigned frames_ended, last_pass_dims;
+static unsigned offscreen_passes, viewport_passes, replays, agains;
+static unsigned frames_ended, last_pass_dims, last_pass_pos;
+static unsigned scissors, last_scissor_pos, last_scissor_dims;
 static bool chain_drawn = true;
 static unsigned runtime_attaches, own_attaches, clears;
 static unsigned tex_binds, quads_drawn, eye_dims;
@@ -175,6 +179,12 @@ static void glViewport(GLint x, GLint y, GLsizei w, GLsizei h)
    (void)y;
    (void)w;
    (void)h;
+}
+static void glScissor(GLint x, GLint y, GLsizei w, GLsizei h)
+{
+   scissors++;
+   last_scissor_pos  = VIDEO_POS_PACK(x, y);
+   last_scissor_dims = VIDEO_SCALE_PACK(w, h);
 }
 static void glClearColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a)
 {
@@ -246,6 +256,7 @@ static void gl3_filter_chain_build_viewport_pass_replay(
    (void)mvp;
    replays++;
    last_pass_dims = vp->dims;
+   last_pass_pos  = vp->pos;
 }
 static void gl3_filter_chain_build_viewport_pass(gl3_filter_chain_t *chain,
       const struct gl3_viewport *vp, const float *mvp)
@@ -254,6 +265,17 @@ static void gl3_filter_chain_build_viewport_pass(gl3_filter_chain_t *chain,
    (void)mvp;
    viewport_passes++;
    last_pass_dims = vp->dims;
+   last_pass_pos  = vp->pos;
+}
+static void gl3_filter_chain_build_viewport_pass_again(
+      gl3_filter_chain_t *chain, const struct gl3_viewport *vp,
+      const float *mvp)
+{
+   (void)chain;
+   (void)mvp;
+   agains++;
+   last_pass_dims = vp->dims;
+   last_pass_pos  = vp->pos;
 }
 static void gl3_filter_chain_end_frame(gl3_filter_chain_t *chain)
 {
@@ -272,14 +294,6 @@ static void gl3_xr_plan(gl3_t *gl, const video_frame_info_t *video_info,
    (void)src_dims;
    (void)ui_dims;
    gl->xr.set = planned;
-}
-bool video_xr_shrinks(unsigned image_dims, unsigned source_dims,
-      unsigned rotation)
-{
-   (void)image_dims;
-   (void)source_dims;
-   (void)rotation;
-   return false;
 }
 static void gl3_xr_forget(gl3_t *gl, unsigned s, bool yield)
 {
@@ -366,7 +380,8 @@ static void plan(unsigned dims, unsigned screens, float x)
    planned.num_quads = screens;
 }
 
-static void draw(gl3_t *gl, bool new_frame)
+/* @chains: each view's, for a plan that draws views. */
+static void draw_views(gl3_t *gl, bool new_frame, gl3_filter_chain_t **chains)
 {
    video_frame_info_t info;
    struct gl3_filter_chain_texture frame;
@@ -375,15 +390,35 @@ static void draw(gl3_t *gl, bool new_frame)
    frame.image = 0x10;
    frame.dims  = VIDEO_SCALE_PACK(64, 32);
    info.frame_repeat = !new_frame;
-   gl3_xr_draw(gl, &info, new_frame, true, false, NULL, FRAME_CHAIN, NULL,
+   gl3_xr_draw(gl, &info, new_frame, true, false, chains, FRAME_CHAIN, NULL,
          &frame, frame.dims, 0);
+}
+
+static void draw(gl3_t *gl, bool new_frame)
+{
+   draw_views(gl, new_frame, NULL);
+}
+
+/* View @view over slot 0's bottom right quarter each way. */
+static void plan_inset(int view)
+{
+   video_xr_inset_t *in = &planned.insets[planned.num_insets++];
+   in->rect.x  = 0.75;
+   in->rect.y  = 0.75;
+   in->rect.w  = 0.25;
+   in->rect.h  = 0.25;
+   in->view[0] = view;
+   in->view[1] = (planned.slots[0].layers > 1) ? view : -1;
+   in->slot    = 0;
+   in->screen  = 1;
 }
 
 static void reset(gl3_t *gl)
 {
    memset(gl, 0, sizeof(*gl));
-   offscreen_passes = viewport_passes = replays = 0;
-   frames_ended = last_pass_dims = 0;
+   offscreen_passes = viewport_passes = replays = agains = 0;
+   frames_ended = last_pass_dims = last_pass_pos = 0;
+   scissors = last_scissor_pos = last_scissor_dims = 0;
    chain_drawn = true;
    runtime_attaches = own_attaches = clears = 0;
    tex_binds = quads_drawn = 0;
@@ -520,6 +555,106 @@ static void test_projection_blank(void)
    CHECK(runtime_attaches == 2 && published[s] == 1 && gl.xr.proj_shown);
 }
 
+/* An inset is drawn into its base's texture after it, by its view's
+ * chain at its rect, which is given from the top and drawn from the
+ * bottom; its frame ends too. One with a zero rect is not drawn. */
+static void test_inset(void)
+{
+   gl3_t gl;
+   gl3_filter_chain_t *chains[RETRO_VIDEO_VIEWS_MAX];
+   unsigned dims = VIDEO_SCALE_PACK(64, 32);
+   memset(chains, 0, sizeof(chains));
+   chains[1] = FRAME_CHAIN;
+   reset(&gl);
+   plan(dims, 1, 0.0f);
+   plan_inset(1);
+   draw_views(&gl, true, chains);
+   CHECK(offscreen_passes == 2 && viewport_passes == 2 && agains == 0);
+   CHECK(frames_ended == 2 && replays == 0);
+   CHECK(runtime_attaches == 1 && own_attaches == 0 && clears == 1);
+   CHECK(last_pass_pos == VIDEO_POS_PACK(48, 0));
+   CHECK(last_pass_dims == VIDEO_SCALE_PACK(16, 8));
+   CHECK(published[0] == 1);
+
+   reset(&gl);
+   plan(dims, 1, 0.0f);
+   plan_inset(1);
+   planned.insets[0].rect.w = 0.0;
+   draw_views(&gl, true, chains);
+   CHECK(offscreen_passes == 1 && viewport_passes == 1);
+   CHECK(frames_ended == 1 && last_pass_dims == dims && clears == 1);
+}
+
+/* A blank inset's rect is cleared, and no pass runs for it. */
+static void test_inset_blank(void)
+{
+   gl3_t gl;
+   gl3_filter_chain_t *chains[RETRO_VIDEO_VIEWS_MAX];
+   unsigned dims = VIDEO_SCALE_PACK(64, 32);
+   memset(chains, 0, sizeof(chains));
+   chains[1] = FRAME_CHAIN;
+   reset(&gl);
+   plan(dims, 1, 0.0f);
+   plan_inset(1);
+   planned.insets[0].blank = true;
+   draw_views(&gl, true, chains);
+   CHECK(offscreen_passes == 1 && viewport_passes == 1 && frames_ended == 1);
+   CHECK(clears == 2 && scissors == 1);
+   CHECK(last_scissor_pos == VIDEO_POS_PACK(48, 0));
+   CHECK(last_scissor_dims == VIDEO_SCALE_PACK(16, 8));
+   CHECK(last_pass_dims == dims);
+}
+
+/* A repeat draws a slot again when its insets changed, and only then:
+ * the base and the inset replay. */
+static void test_inset_repeat(void)
+{
+   gl3_t gl;
+   gl3_filter_chain_t *chains[RETRO_VIDEO_VIEWS_MAX];
+   unsigned dims = VIDEO_SCALE_PACK(64, 32);
+   memset(chains, 0, sizeof(chains));
+   chains[1] = FRAME_CHAIN;
+   reset(&gl);
+   plan(dims, 2, 0.0f);
+   plan_inset(1);
+   draw_views(&gl, true, chains);
+   offscreen_passes = viewport_passes = frames_ended = 0;
+   draw_views(&gl, false, chains);
+   CHECK(viewport_passes == 0 && replays == 0 && published[0] == 1);
+   planned.insets[0].rect.x = 0.0;
+   draw_views(&gl, false, chains);
+   CHECK(replays == 2 && offscreen_passes == 0 && viewport_passes == 0);
+   CHECK(frames_ended == 0 && last_pass_pos == VIDEO_POS_PACK(0, 0));
+   CHECK(published[0] == 2 && published[1] == 1);
+   /* Gone: the base alone again. */
+   replays = 0;
+   planned.num_insets = 0;
+   draw_views(&gl, false, chains);
+   CHECK(replays == 1 && published[0] == 3 && published[1] == 1);
+}
+
+/* A view over a stereo base is in both layers: its passes run and its
+ * frame ends once, and the second layer draws its final pass again. */
+static void test_inset_stereo(void)
+{
+   gl3_t gl;
+   gl3_filter_chain_t *chains[RETRO_VIDEO_VIEWS_MAX];
+   unsigned dims = VIDEO_SCALE_PACK(64, 32);
+   memset(chains, 0, sizeof(chains));
+   chains[0] = chains[1] = chains[2] = FRAME_CHAIN;
+   reset(&gl);
+   plan(dims, 1, 0.0f);
+   planned.slots[0].layers  = 2;
+   planned.slots[0].view[0] = 0;
+   planned.slots[0].view[1] = 1;
+   plan_inset(2);
+   draw_views(&gl, true, chains);
+   CHECK(offscreen_passes == 3 && viewport_passes == 3 && agains == 1);
+   CHECK(frames_ended == 3 && replays == 0);
+   CHECK(runtime_attaches == 2 && clears == 2);
+   CHECK(last_pass_dims == VIDEO_SCALE_PACK(16, 8));
+}
+
 int main(void)
 {
    test_direct();
@@ -528,6 +663,10 @@ int main(void)
    test_repeat_unready();
    test_blank();
    test_projection_blank();
-   printf("%u failed (6 GL3 headset draw cases)\n", failures);
+   test_inset();
+   test_inset_blank();
+   test_inset_repeat();
+   test_inset_stereo();
+   printf("%u failed (10 GL3 headset draw cases)\n", failures);
    return failures ? 1 : 0;
 }

@@ -5553,12 +5553,13 @@ static void gl2_desktop_xr_plan(gl2_t *gl,
 
 /* The plan's rectangles out of the window's back buffer, which is
  * bottom up, into each slot's textures, scaled to the slot's size; what
- * lies past the window, and a blank screen, stay black. A slot the plan
- * leaves out shows nothing more: at once, or with eyes once the
- * projection shows. */
+ * lies past the window, and a blank screen, stay black. Then the slot's
+ * insets, each into its rect, a blank one black. A slot the plan leaves
+ * out shows nothing more: at once, or with eyes once the projection
+ * shows. */
 static void gl2_desktop_xr_draw(gl2_t *gl, bool eyes)
 {
-   unsigned s, l;
+   unsigned s, l, i;
    gl2_desktop_xr_t *xr = gl->desktop_xr;
    GLint full_h         = (GLint)VIDEO_SCALE_H(gl->video_dims);
 
@@ -5593,13 +5594,39 @@ static void gl2_desktop_xr_draw(gl2_t *gl, bool eyes)
          glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                GL_TEXTURE_2D, (GLuint)tex[l], 0);
          glClear(GL_COLOR_BUFFER_BIT);
-         if (plan->blank)
-            continue;
-         glBlitFramebuffer(x, y, x + (GLint)VIDEO_SCALE_W(r->dims),
-               y + (GLint)VIDEO_SCALE_H(r->dims), 0, 0,
-               (GLint)VIDEO_SCALE_W(plan->dims),
-               (GLint)VIDEO_SCALE_H(plan->dims),
-               GL_COLOR_BUFFER_BIT, GL_LINEAR);
+         if (!plan->blank)
+            glBlitFramebuffer(x, y, x + (GLint)VIDEO_SCALE_W(r->dims),
+                  y + (GLint)VIDEO_SCALE_H(r->dims), 0, 0,
+                  (GLint)VIDEO_SCALE_W(plan->dims),
+                  (GLint)VIDEO_SCALE_H(plan->dims),
+                  GL_COLOR_BUFFER_BIT, GL_LINEAR);
+         for (i = 0; i < xr->set.num_insets; i++)
+         {
+            video_views_rect_t cut;
+            GLint dx, dy, dw, dh;
+            const video_xr_inset_t *in = &xr->set.insets[i];
+            if (     in->slot != s
+                  || !video_xr_inset_px(in, plan->dims, &cut))
+               continue;
+            dw = (GLint)VIDEO_SCALE_W(cut.dims);
+            dh = (GLint)VIDEO_SCALE_H(cut.dims);
+            dx = VIDEO_POS_X(cut.pos);
+            dy = (GLint)VIDEO_SCALE_H(plan->dims) - VIDEO_POS_Y(cut.pos) - dh;
+            if (in->blank || in->view[l] < 0)
+            {
+               glEnable(GL_SCISSOR_TEST);
+               glScissor(dx, dy, dw, dh);
+               glClear(GL_COLOR_BUFFER_BIT);
+               glDisable(GL_SCISSOR_TEST);
+               continue;
+            }
+            x = VIDEO_POS_X(in->src[l].pos);
+            y = full_h - VIDEO_POS_Y(in->src[l].pos)
+               - (GLint)VIDEO_SCALE_H(in->src[l].dims);
+            glBlitFramebuffer(x, y, x + (GLint)VIDEO_SCALE_W(in->src[l].dims),
+                  y + (GLint)VIDEO_SCALE_H(in->src[l].dims), dx, dy,
+                  dx + dw, dy + dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+         }
       }
       gl_openxr_slot_publish(xr->host, s, &xr->set, NULL);
       xr->published[s] = plan->dims;

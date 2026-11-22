@@ -251,12 +251,14 @@ typedef struct gl3
       gl3_filter_chain_t *frame_shrink;
       video_xr_quad_set_t set;
       /* Each slot as it was last published: a repeat draws a slot again
-       * only when its quads moved. */
+       * only when its quads moved or its insets changed. */
       struct
       {
          video_xr_slot_t info;
          video_xr_quad_t quads[4];
+         video_xr_inset_t insets[RETRO_VIDEO_VIEWS_MAX];
          unsigned num_quads;
+         unsigned num_insets;
          bool published;
       } shown[VIDEO_XR_MAX_SLOTS];
       /* The window's projection for the frame, which the headset's
@@ -6987,7 +6989,18 @@ static bool gl3_xr_same(const gl3_t *gl, unsigned s)
             return false;
          n++;
       }
-   return n == gl->xr.shown[s].num_quads;
+   if (n != gl->xr.shown[s].num_quads)
+      return false;
+   for (i = 0, n = 0; i < set->num_insets; i++)
+      if (set->insets[i].slot == s)
+      {
+         if (     n >= gl->xr.shown[s].num_insets
+               || memcmp(&set->insets[i], &gl->xr.shown[s].insets[n],
+                  sizeof(set->insets[i])))
+            return false;
+         n++;
+      }
+   return n == gl->xr.shown[s].num_insets;
 }
 
 static void gl3_xr_keep(gl3_t *gl, unsigned s)
@@ -7000,6 +7013,11 @@ static void gl3_xr_keep(gl3_t *gl, unsigned s)
       if (set->quads[i].slot == s && gl->xr.shown[s].num_quads < 4)
          gl->xr.shown[s].quads[gl->xr.shown[s].num_quads++] =
             set->quads[i];
+   gl->xr.shown[s].num_insets = 0;
+   for (i = 0; i < set->num_insets; i++)
+      if (set->insets[i].slot == s)
+         gl->xr.shown[s].insets[gl->xr.shown[s].num_insets++] =
+            set->insets[i];
    gl->xr.shown[s].published = true;
 }
 
@@ -7019,16 +7037,19 @@ static void gl3_xr_forget(gl3_t *gl, unsigned s, bool yield)
 
 /* Each layer of a screen slot drawn whole into tex by its view's
  * headset chain or the whole frame's: its passes at the image's size; a
- * blank screen's is only cleared. A repeat - a screen moved, resized or
- * not yet shown while no new frame came - replays the last frame's
- * final pass, so feedback and history stay where that frame left them. */
+ * blank screen's is only cleared. Then the slot's insets, each by its
+ * view's chain into its rect, or cleared there. A repeat - a screen
+ * moved, resized or not yet shown while no new frame came - replays the
+ * last frame's final pass, so feedback and history stay where that frame
+ * left them. */
 static void gl3_xr_draw_screen(gl3_t *gl, unsigned s, const uint32_t *tex,
       gl3_filter_chain_t **chains, gl3_filter_chain_t *frame_chain,
       const struct gl3_filter_chain_texture *frame_tex, bool new_frame)
 {
-   unsigned l;
+   unsigned l, i;
    struct gl3_viewport vp;
-   const video_xr_slot_t *plan = &gl->xr.set.slots[s];
+   const video_xr_quad_set_t *set = &gl->xr.set;
+   const video_xr_slot_t *plan    = &set->slots[s];
 
    vp.pos  = 0;
    vp.dims = plan->dims;
@@ -7070,6 +7091,56 @@ static void gl3_xr_draw_screen(gl3_t *gl, unsigned s, const uint32_t *tex,
          gl3_filter_chain_build_viewport_pass(chain, &vp, gl->xr.mvp);
          if (new_frame)
             gl3_filter_chain_end_frame(chain);
+      }
+      for (i = 0; i < set->num_insets; i++)
+      {
+         video_views_rect_t cut;
+         struct gl3_viewport ivp;
+         gl3_filter_chain_t *ic;
+         const video_xr_inset_t *e = &set->insets[i];
+         int iv                    = e->blank ? -1 : e->view[l];
+         /* A view in both layers runs its passes once. */
+         bool again                = l && e->view[0] == e->view[l];
+         bool ireplay              = false;
+
+         if (e->slot != s || !video_xr_inset_px(e, plan->dims, &cut))
+            continue;
+         gl3_views_vp(&cut, VIDEO_SCALE_H(plan->dims), &ivp);
+         if (!(ic = (iv >= 0) ? chains[iv] : NULL))
+         {
+            glBindFramebuffer(GL_FRAMEBUFFER, gl->xr.fbo);
+            glEnable(GL_SCISSOR_TEST);
+            glScissor(VIDEO_POS_X(ivp.pos), VIDEO_POS_Y(ivp.pos),
+                  VIDEO_SCALE_W(ivp.dims), VIDEO_SCALE_H(ivp.dims));
+            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glDisable(GL_SCISSOR_TEST);
+            continue;
+         }
+         if (!new_frame)
+            ireplay = gl3_filter_chain_replay_ready(ic);
+         if (!ireplay && !again)
+         {
+            in.image       = gl->views.tex[iv];
+            in.dims        = gl->views.tex_dims[iv];
+            in.padded_dims = in.dims;
+            in.origin      = 0;
+            in.format      = gl->views.tex_format[iv];
+            gl3_filter_chain_set_input_texture(ic, &in);
+            gl3_filter_chain_build_offscreen_passes(ic, &ivp);
+         }
+         /* Each final pass leaves framebuffer 0 bound. */
+         glBindFramebuffer(GL_FRAMEBUFFER, gl->xr.fbo);
+         if (ireplay)
+            gl3_filter_chain_build_viewport_pass_replay(ic, &ivp,
+                  gl->xr.mvp);
+         else if (again)
+            gl3_filter_chain_build_viewport_pass_again(ic, &ivp, gl->xr.mvp);
+         else
+            gl3_filter_chain_build_viewport_pass(ic, &ivp, gl->xr.mvp);
+         if (     new_frame
+               && (l + 1 >= plan->layers || e->view[l + 1] != e->view[l]))
+            gl3_filter_chain_end_frame(ic);
       }
    }
 }
@@ -7706,6 +7777,28 @@ static bool gl3_frame(void *data, const void *frame,
                            gl->rotation_raw))))
                xr_map = false;
          }
+      for (i = 0; i < gl->xr.set.num_insets; i++)
+      {
+         video_views_rect_t cut;
+         const video_xr_inset_t *in = &gl->xr.set.insets[i];
+         if (     in->blank
+               || !video_xr_inset_px(in, gl->xr.set.slots[in->slot].dims,
+                  &cut))
+            continue;
+         for (l = 0; l < gl->xr.set.slots[in->slot].layers; l++)
+         {
+            int v = in->view[l];
+            const struct retro_video_view *rv;
+            if (v < 0)
+               continue;
+            rv = &video_info->views.views[v];
+            if (!(xr_chains[v] = gl3_xr_chain(gl, video_info, v,
+                        video_xr_shrinks(cut.dims,
+                           VIDEO_SCALE_PACK(rv->width, rv->height),
+                           gl->rotation_raw))))
+               xr_map = false;
+         }
+      }
    }
    /* The headset's views and its tracked eyes come from the same
     * copies. */

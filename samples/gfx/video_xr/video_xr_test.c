@@ -8675,6 +8675,43 @@ static void test_xr_inset_auto(void)
    CHECK(y < 0);
 }
 
+/* An entry's rect in its slot's image: edges rounded, inside the image,
+ * a pixel at least; a zero rect is not drawn. */
+static void test_xr_inset_px(void)
+{
+   video_xr_inset_t in;
+   video_views_rect_t r;
+   unsigned dims = VIDEO_SCALE_PACK(1600, 1200);
+
+   memset(&in, 0, sizeof(in));
+   in.rect.x = 0.75; in.rect.y = 0.75; in.rect.w = 0.25; in.rect.h = 0.25;
+   CHECK(video_xr_inset_px(&in, dims, &r));
+   CHECK(VIDEO_POS_X(r.pos) == 1200 && VIDEO_POS_Y(r.pos) == 900);
+   CHECK(VIDEO_SCALE_W(r.dims) == 400 && VIDEO_SCALE_H(r.dims) == 300);
+   /* Edges, not sizes: 0.3333 and 0.6666 of 100 are 33 and 67. */
+   in.rect.x = 0.3333; in.rect.y = 0.0; in.rect.w = 0.3333; in.rect.h = 1.0;
+   CHECK(video_xr_inset_px(&in, VIDEO_SCALE_PACK(100, 10), &r));
+   CHECK(VIDEO_POS_X(r.pos) == 33 && VIDEO_POS_Y(r.pos) == 0);
+   CHECK(VIDEO_SCALE_W(r.dims) == 34 && VIDEO_SCALE_H(r.dims) == 10);
+   /* Under a pixel, at the far corner: one pixel, inside. */
+   in.rect.x = 0.9999; in.rect.y = 0.9999;
+   in.rect.w = 0.0001; in.rect.h = 0.0001;
+   CHECK(video_xr_inset_px(&in, dims, &r));
+   CHECK(VIDEO_POS_X(r.pos) == 1599 && VIDEO_POS_Y(r.pos) == 1199);
+   CHECK(VIDEO_SCALE_W(r.dims) == 1 && VIDEO_SCALE_H(r.dims) == 1);
+   /* Past the image: cut to it. */
+   in.rect.x = 0.5; in.rect.y = -0.25; in.rect.w = 0.75; in.rect.h = 0.5;
+   CHECK(video_xr_inset_px(&in, dims, &r));
+   CHECK(VIDEO_POS_X(r.pos) == 800 && VIDEO_POS_Y(r.pos) == 0);
+   CHECK(VIDEO_SCALE_W(r.dims) == 800 && VIDEO_SCALE_H(r.dims) == 300);
+   in.rect.w = 0.0;
+   CHECK(!video_xr_inset_px(&in, dims, &r));
+   in.rect.w = 0.25; in.rect.h = 0.0;
+   CHECK(!video_xr_inset_px(&in, dims, &r));
+   in.rect.h = 0.25;
+   CHECK(!video_xr_inset_px(&in, 0, &r));
+}
+
 /* A quad is live for a screen on it that takes input and that the mode
  * makes live: screen 0 over a NO_INPUT screen 1 has none in Auto, and
  * the inset alone in Always. */
@@ -8984,6 +9021,7 @@ int main(void)
    test_xr_inset_order();
    test_xr_inset_auto();
    test_xr_inset_auto_no_input_base();
+   test_xr_inset_px();
    test_xr_auto_no_inset();
    test_xr_inset_blank();
    test_xr_place_window_inset();

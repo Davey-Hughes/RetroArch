@@ -43,6 +43,8 @@ for name in ('VV_FN', 'VV_DRV', 'VV_TARGET', 'VV_TARGET_MAKE',
         raise RuntimeError('binding missing: ' + name)
     parts.append(match[0])
 parts.append(function(shared, 'VV_FN(target_ensure)'))
+parts.append(function(driver, 'vulkan_views_vp'))
+parts.append(function(driver, 'vulkan_xr_inset'))
 parts.append(function(driver, 'vulkan_xr_draw_screen'))
 parts.append(function(driver, 'vulkan_xr_slot_ensure'))
 parts.append(function(driver, 'vulkan_xr_copy_ui'))

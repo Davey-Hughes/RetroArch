@@ -91,7 +91,9 @@ typedef struct gl_openxr_record
    bool empty;             /* the slot shows nothing from here */
    bool yield;             /* empty once the projection shows */
    unsigned num_quads;
+   unsigned num_insets;
    video_xr_quad_t quads[VIDEO_XR_MAX_QUADS];
+   video_xr_inset_t insets[RETRO_VIDEO_VIEWS_MAX];   /* drawn into tex */
    video_xr_slot_t info;
    openxr_projection_t projection;
 } gl_openxr_record_t;
@@ -102,7 +104,7 @@ typedef struct gl_openxr_slot
    gl_openxr_record_t rec[OPENXR_RING_SIZE];
    /* The XR thread's: the front waits to be copied; the swapchains'
     * size; the size refused, not asked again; the images; the quads
-    * shown with the image the swapchains hold. */
+    * and insets shown with the image the swapchains hold. */
    bool pending;
    unsigned dims;
    unsigned layers;
@@ -111,7 +113,9 @@ typedef struct gl_openxr_slot
    uint32_t images[OPENXR_MAX_IMAGES][2];
    bool copy_failed;
    unsigned num_quads;
+   unsigned num_insets;
    video_xr_quad_t quads[VIDEO_XR_MAX_QUADS];
+   video_xr_inset_t insets[RETRO_VIDEO_VIEWS_MAX];
    video_xr_slot_t info;
    retro_atomic_int_t refused;   /* for the video thread */
 } gl_openxr_slot_t;
@@ -725,9 +729,11 @@ static bool gl_openxr_fill_slot(gl_openxr_t *xr, unsigned slot)
       s->num_quads   = 0;
       return true;
    }
-   s->num_quads = r->num_quads;
+   s->num_quads  = r->num_quads;
+   s->num_insets = r->num_insets;
    memcpy(s->quads, r->quads, r->num_quads * sizeof(r->quads[0]));
-   s->info      = r->info;
+   memcpy(s->insets, r->insets, r->num_insets * sizeof(r->insets[0]));
+   s->info       = r->info;
    return true;
 }
 
@@ -745,6 +751,9 @@ static void gl_openxr_publish_quads(gl_openxr_t *xr)
       for (i = 0; i < slot->num_quads && set.num_quads < VIDEO_XR_MAX_QUADS;
             i++)
          set.quads[set.num_quads++] = slot->quads[i];
+      for (i = 0; slot->num_quads && i < slot->num_insets
+            && set.num_insets < RETRO_VIDEO_VIEWS_MAX; i++)
+         set.insets[set.num_insets++] = slot->insets[i];
    }
    openxr_frame_publish(&xr->frame, &set);
 }
@@ -925,13 +934,17 @@ void gl_openxr_slot_publish(gl_openxr_t *xr, unsigned slot,
    r->drawn     = drawn;
    r->empty     = false;
    r->yield     = false;
-   r->num_quads = 0;
+   r->num_quads  = 0;
+   r->num_insets = 0;
    memset(&r->info, 0, sizeof(r->info));
    if (quads)
    {
       for (i = 0; i < quads->num_quads; i++)
          if (quads->quads[i].slot == slot)
             r->quads[r->num_quads++] = quads->quads[i];
+      for (i = 0; i < quads->num_insets; i++)
+         if (quads->insets[i].slot == slot)
+            r->insets[r->num_insets++] = quads->insets[i];
       if (slot < VIDEO_XR_MAX_SLOTS)
          r->info = quads->slots[slot];
    }

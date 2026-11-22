@@ -624,7 +624,7 @@ static void gl_xr_draw(gl_android_openxr_t *xr)
 {
    video_xr_params_t p;
    video_views_rect_t rects[VIDEO_XR_MAX_SLOTS][2];
-   unsigned s, l;
+   unsigned s, l, i;
    unsigned index[2];
    int eyes[2];
    bool menu   = false;
@@ -694,12 +694,39 @@ static void gl_xr_draw(gl_android_openxr_t *xr)
          glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                GL_TEXTURE_2D, (GLuint)xr->images[s][index[l]][l], 0);
          glClear(GL_COLOR_BUFFER_BIT);
-         if (xr->set.slots[s].blank)
-            continue;
-         glBlitFramebuffer(x, y, x + (GLint)VIDEO_SCALE_W(r->dims),
-               y + (GLint)VIDEO_SCALE_H(r->dims), 0, 0,
-               (GLint)VIDEO_SCALE_W(dims), (GLint)VIDEO_SCALE_H(dims),
-               GL_COLOR_BUFFER_BIT, GL_LINEAR);
+         if (!xr->set.slots[s].blank)
+            glBlitFramebuffer(x, y, x + (GLint)VIDEO_SCALE_W(r->dims),
+                  y + (GLint)VIDEO_SCALE_H(r->dims), 0, 0,
+                  (GLint)VIDEO_SCALE_W(dims), (GLint)VIDEO_SCALE_H(dims),
+                  GL_COLOR_BUFFER_BIT, GL_LINEAR);
+         /* The slot's insets, each into its rect; a blank one black. */
+         for (i = 0; i < xr->set.num_insets; i++)
+         {
+            video_views_rect_t cut;
+            GLint dx, dy, dw, dh;
+            const video_xr_inset_t *in = &xr->set.insets[i];
+            if (in->slot != s || !video_xr_inset_px(in, dims, &cut))
+               continue;
+            dw = (GLint)VIDEO_SCALE_W(cut.dims);
+            dh = (GLint)VIDEO_SCALE_H(cut.dims);
+            dx = VIDEO_POS_X(cut.pos);
+            dy = (GLint)VIDEO_SCALE_H(dims) - VIDEO_POS_Y(cut.pos) - dh;
+            if (in->blank || in->view[l] < 0)
+            {
+               glEnable(GL_SCISSOR_TEST);
+               glScissor(dx, dy, dw, dh);
+               glClear(GL_COLOR_BUFFER_BIT);
+               glDisable(GL_SCISSOR_TEST);
+               continue;
+            }
+            x = VIDEO_POS_X(in->src[l].pos);
+            y = (GLint)VIDEO_SCALE_H(xr->views_vp.full_dims)
+               - VIDEO_POS_Y(in->src[l].pos)
+               - (GLint)VIDEO_SCALE_H(in->src[l].dims);
+            glBlitFramebuffer(x, y, x + (GLint)VIDEO_SCALE_W(in->src[l].dims),
+                  y + (GLint)VIDEO_SCALE_H(in->src[l].dims), dx, dy,
+                  dx + dw, dy + dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+         }
       }
       glBindFramebuffer(GL_FRAMEBUFFER, 0);
       /* The compositor reads the images on its own context. */
