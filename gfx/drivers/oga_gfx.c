@@ -915,6 +915,7 @@ static bool oga_views_frame(oga_video_t *vid, const void *frame,
    oga_rect_t whole;
    video_views_rect_t cuts[VIDEO_VIEWS_MAX_PLACEMENTS];
    unsigned char which[VIDEO_VIEWS_MAX_PLACEMENTS];
+   unsigned int over[VIDEO_VIEWS_MAX_PLACEMENTS];
    const video_views_layout_t *layout;
    unsigned stereo = info ? info->views_settings.stereo_mode : 0;
    bool blended    = false;
@@ -948,6 +949,7 @@ static bool oga_views_frame(oga_video_t *vid, const void *frame,
          && i < VIDEO_VIEWS_MAX_PLACEMENTS; i++)
    {
       unsigned flags = layout->placements[i].flags;
+      unsigned alpha = VIDEO_VIEWS_PLACEMENT_ALPHA(flags);
       /* A blank root's place is black already; a blank inset's is over
        * its base */
       if (     (   (flags & VIDEO_VIEWS_PLACEMENT_BLANK)
@@ -955,7 +957,14 @@ static bool oga_views_frame(oga_video_t *vid, const void *frame,
             || !video_views_visible(layout, &layout->placements[i], screen,
                &cuts[n]))
          continue;
-      if (VIDEO_VIEWS_PLACEMENT_ALPHA(flags) < 255)
+      /* The RGA's source-over blend, the opacity its global alpha.
+       * From a 32-bit frame it would read the X byte as alpha too, so
+       * that inset is drawn solid; the black has no alpha. */
+      over[n] = (alpha < 255
+            && (   (flags & VIDEO_VIEWS_PLACEMENT_BLANK)
+                || vid->frame_surface->rk_format == RK_FORMAT_RGB_565))
+         ? ((alpha << 16) | 0x0105) : 0;
+      if (over[n])
          blended = true;
       which[n++] = (unsigned char)i;
    }
@@ -977,10 +986,6 @@ static bool oga_views_frame(oga_video_t *vid, const void *frame,
       video_views_rect_t from;
       const video_views_rect_t *cut    = &cuts[i];
       const video_views_placement_t *p = &layout->placements[which[i]];
-      unsigned alpha                   = VIDEO_VIEWS_PLACEMENT_ALPHA(p->flags);
-      /* The RGA's source-over blend, the opacity its global alpha */
-      unsigned int over                = (alpha < 255)
-         ? ((alpha << 16) | 0x0105) : 0;
 
       if (p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
       {
@@ -991,7 +996,7 @@ static bool oga_views_frame(oga_video_t *vid, const void *frame,
                vid->views_surface,
                VIDEO_POS_X(cut->pos), VIDEO_POS_Y(cut->pos),
                (int)VIDEO_SCALE_W(cut->dims), (int)VIDEO_SCALE_H(cut->dims),
-               0, vid->scale_mode, over);
+               0, vid->scale_mode, over[i]);
          continue;
       }
       video_views_cut_source(&info->views.views[p->view], &p->dst, cut,
@@ -1001,7 +1006,7 @@ static bool oga_views_frame(oga_video_t *vid, const void *frame,
             (int)VIDEO_SCALE_W(from.dims), (int)VIDEO_SCALE_H(from.dims),
             vid->views_surface, VIDEO_POS_X(cut->pos), VIDEO_POS_Y(cut->pos),
             (int)VIDEO_SCALE_W(cut->dims), (int)VIDEO_SCALE_H(cut->dims),
-            0, vid->scale_mode, over);
+            0, vid->scale_mode, over[i]);
    }
    whole.x = whole.y = 0;
    whole.w = vid->drm_width;
