@@ -9123,6 +9123,7 @@ static enum runloop_state_enum runloop_check_state(
           * frame is cleared when the menu's texture goes up */
          menu_setting_video_screen_windows_moved();
 #endif
+         menu_setting_video_screens_shown();
          if (!menu_driver_iterate(menu_st, p_disp, anim_get_ptr(),
                   settings, action, current_time))
          {

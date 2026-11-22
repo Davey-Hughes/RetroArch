@@ -142,9 +142,14 @@ void menu_setting_video_screen_display_values(void);
  * the core has */
 unsigned menu_setting_video_screens(void);
 
-/* A bit for each screen drawn over another, whose Corner, Size and
- * Opacity rows follow its Display row. App thread. */
-unsigned menu_setting_video_screen_insets(void);
+/* Main thread, before the menu iterates: the rows of each screen whose
+ * published values moved since they last took them take them; a Display
+ * row holding what it last read follows. */
+void menu_setting_video_screens_shown(void);
+
+/* Any thread: Game Screen @screen's Display row as it reads */
+size_t menu_setting_video_screen_display_repr(unsigned screen, char *s,
+      size_t len);
 
 #ifdef HAVE_VIDEO_WINDOWS
 #ifndef ANDROID

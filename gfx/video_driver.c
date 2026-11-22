@@ -4496,9 +4496,17 @@ static void video_driver_views_set_count(video_driver_state_t *video_st,
    video_st->views_driver_count = count;
 }
 
+static void video_driver_screens_resolve(video_driver_state_t *video_st,
+      const settings_t *settings);
+static unsigned video_driver_screens_insets(
+      const video_driver_state_t *video_st);
+static void video_driver_screens_publish(video_driver_state_t *video_st,
+      unsigned insets);
+
 void video_driver_clear_views(void)
 {
    video_driver_state_t *video_st = &video_driver_st;
+   settings_t *settings           = config_get_ptr();
    video_driver_views_set_count(video_st, 0);
    memset(&video_st->views,        0, sizeof(video_st->views));
    memset(&video_st->views_core,   0, sizeof(video_st->views_core));
@@ -4509,6 +4517,13 @@ void video_driver_clear_views(void)
    video_st->views_frame_dims = 0;
    video_st->views_presented  = false;
    video_st->views_fallback   = false;
+   /* Without the core's defaults or its arrangement */
+   if (settings)
+   {
+      video_driver_screens_resolve(video_st, settings);
+      video_driver_screens_publish(video_st,
+            video_driver_screens_insets(video_st));
+   }
    video_st->headset_view     = VIDEO_HEADSET_VIEW_IMMERSIVE;
 #ifdef HAVE_VIDEO_WINDOWS
    /* The next content starts with no closes */
@@ -4582,6 +4597,56 @@ static void video_driver_screens_resolve(video_driver_state_t *video_st,
    for (s = 0; s < RETRO_VIDEO_VIEWS_MAX; s++)
       video_st->screens_defaults[s] = video_driver_screen_resolve(video_st,
             settings, s, &video_st->screens_resolved[s]);
+}
+
+/* Main thread: the screens drawn over another as the next frame
+ * arranges them, so a Display choice made since the last frame counts;
+ * with no map, those whose Display is an Over value */
+static VIDEO_NOINLINE unsigned video_driver_screens_insets(
+      const video_driver_state_t *video_st)
+{
+   unsigned s;
+   unsigned insets = 0;
+   if (video_st->views_presented)
+   {
+      video_views_map_t map;
+      memset(&map, 0, sizeof(map));
+      map.num_screens = video_st->views_core.num_screens;
+      map.viewless    = video_st->views_core.viewless;
+      video_screen_prefs_arrange(video_st->screens_resolved,
+            video_st->screens_defaults, &video_st->views_screens, &map);
+      return map.over;
+   }
+   for (s = 0; s < RETRO_VIDEO_VIEWS_MAX; s++)
+      if (video_screen_prefs_over_base(
+               video_st->screens_resolved[s].display) >= 0)
+         insets |= 1u << s;
+   return insets;
+}
+
+/* Main thread: publishes each screen whose resolved values, defaults
+ * or bit in @insets differ from those last published */
+static void video_driver_screens_publish(video_driver_state_t *video_st,
+      unsigned insets)
+{
+   unsigned s;
+   for (s = 0; s < RETRO_VIDEO_VIEWS_MAX; s++)
+   {
+      video_screen_shown_t *shown   = &video_st->screens_shown[s];
+      video_screen_shown_box_t *box = &video_st->screens_shown_box[s];
+      bool inset                    = ((insets >> s) & 1u) != 0;
+      if (     shown->inset    == inset
+            && shown->defaults == video_st->screens_defaults[s]
+            && !memcmp(&shown->values, &video_st->screens_resolved[s],
+               sizeof(shown->values)))
+         continue;
+      memcpy(&shown->values, &video_st->screens_resolved[s],
+            sizeof(shown->values));
+      shown->defaults = video_st->screens_defaults[s];
+      shown->inset    = inset;
+      retro_seqlatch_publish(&box->seq, box->words, shown, sizeof(*shown));
+   }
+   video_st->screens_insets = insets;
 }
 
 unsigned video_driver_screen_get(unsigned screen, video_screen_values_t *out)
@@ -4686,6 +4751,10 @@ void video_driver_screen_set(unsigned screen, unsigned bits,
    /* A write within a frame, as a bounds take is, reaches its windows */
    video_st->screens_defaults[screen] = video_driver_screen_resolve(
          video_st, settings, screen, &video_st->screens_resolved[screen]);
+   /* Only a Display can make or end an inset */
+   video_driver_screens_publish(video_st,
+         (bits & VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY))
+         ? video_driver_screens_insets(video_st) : video_st->screens_insets);
 }
 
 int video_driver_get_screen_names(video_views_names_t *out)
@@ -4696,6 +4765,26 @@ int video_driver_get_screen_names(video_views_names_t *out)
 int video_driver_screen_names_stamp(void)
 {
    return retro_atomic_load_acquire_int(&video_driver_st.views_names.seq);
+}
+
+int video_driver_screen_shown_read(unsigned screen, video_screen_shown_t *out)
+{
+   video_screen_shown_box_t *box;
+   if (screen >= RETRO_VIDEO_VIEWS_MAX)
+   {
+      memset(out, 0, sizeof(*out));
+      return 0;
+   }
+   box = &video_driver_st.screens_shown_box[screen];
+   return retro_seqlatch_read(&box->seq, box->words, out, sizeof(*out));
+}
+
+int video_driver_screen_shown_stamp(unsigned screen)
+{
+   if (screen >= RETRO_VIDEO_VIEWS_MAX)
+      return 0;
+   return retro_atomic_load_acquire_int(
+         &video_driver_st.screens_shown_box[screen].seq);
 }
 
 unsigned video_driver_views_status(void)
@@ -5573,6 +5662,7 @@ static void video_driver_views_frame(video_driver_state_t *video_st,
    gfx_ctx_flags_t flags;
    bool allowed;
    bool presented;
+   bool arranged = false;
    bool redraw = false;
    bool windows = false;
 #ifdef HAVE_THREADS
@@ -5608,6 +5698,7 @@ static void video_driver_views_frame(video_driver_state_t *video_st,
          video_screen_prefs_arrange(video_st->screens_resolved,
                video_st->screens_defaults, &video_st->views_screens, core);
          video_driver_views_take_arrangement(&video_st->views_frame, core);
+         arranged = true;
       }
    }
 #ifdef HAVE_VIDEO_WINDOWS
@@ -5649,6 +5740,12 @@ static void video_driver_views_frame(video_driver_state_t *video_st,
    if (redraw)
       return;
    video_st->views_presented = presented;
+   /* The menu's rows: this frame's arrangement; a kept map's as last
+    * published, until a frame with data arranges again; with no map,
+    * the values' own */
+   video_driver_screens_publish(video_st, arranged
+         ? video_st->views_core.over : presented
+         ? video_st->screens_insets : video_driver_screens_insets(video_st));
    /* For the frames after this one. The driver still gets the map, and
     * clears the flag once it draws views again. */
    video_st->views_fallback = presented

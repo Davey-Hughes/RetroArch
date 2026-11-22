@@ -9396,7 +9396,7 @@ static unsigned menu_displaylist_video_screen_inset_rows(
    };
    unsigned i;
    unsigned count = 0;
-   if (!(menu_setting_video_screen_insets() & (1u << screen)))
+   if (!(video_state_get_ptr()->screens_insets & (1u << screen)))
       return 0;
    for (i = 0; i < ARRAY_SIZE(rows); i++)
       if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,

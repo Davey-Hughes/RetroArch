@@ -1897,6 +1897,24 @@ typedef struct video_windows_routes
    unsigned held;                 /* the redraw's: slot + 1 */
 } video_windows_routes_t;
 
+/* What the menu's rows show for one screen, published by the main
+ * thread when it changes (rthreads/retro_seqlatch.h, as the names) */
+typedef struct video_screen_shown
+{
+   video_screen_values_t values;
+   unsigned defaults;   /* resolve()'s return */
+   bool inset;
+} video_screen_shown_t;
+
+#define VIDEO_SCREEN_SHOWN_WORDS \
+   RETRO_SEQLATCH_WORDS(sizeof(video_screen_shown_t))
+
+typedef struct video_screen_shown_box
+{
+   retro_atomic_int_t seq;
+   retro_atomic_int_t words[2 * VIDEO_SCREEN_SHOWN_WORDS];
+} video_screen_shown_box_t;
+
 /* Slots of video_driver_state_t::vp_params_bits in use. The array has
  * headroom above this so a parameter can be added without moving
  * anything after it; the count is what the publish and the read walk.
@@ -2230,6 +2248,11 @@ typedef struct
    video_screen_prefs_t screen_prefs;
    video_screen_values_t screens_resolved[RETRO_VIDEO_VIEWS_MAX];
    unsigned screens_defaults[RETRO_VIDEO_VIEWS_MAX];
+   /* What the menu's rows show: the main thread's last published copy
+    * and its insets, a bit a screen, and the box any thread reads */
+   video_screen_shown_t screens_shown[RETRO_VIDEO_VIEWS_MAX];
+   video_screen_shown_box_t screens_shown_box[RETRO_VIDEO_VIEWS_MAX];
+   unsigned screens_insets;
    unsigned views_frame_dims;
    /* The view count the driver instance was last told. */
    unsigned views_driver_count;
@@ -2714,6 +2737,10 @@ void video_driver_screen_set(unsigned screen, unsigned bits,
 int video_driver_get_screen_names(video_views_names_t *out);
 /* Any thread: moves when a name does. */
 int video_driver_screen_names_stamp(void);
+/* Any thread. Returns the stamp it read at. */
+int video_driver_screen_shown_read(unsigned screen, video_screen_shown_t *out);
+/* Any thread: moves when screen @screen's published values do. */
+int video_driver_screen_shown_stamp(unsigned screen);
 /* RETRO_VIDEO_VIEWS_STATUS_ flags for the current driver and settings. */
 unsigned video_driver_views_status(void);
 /* Main thread: true once after the status changes. */

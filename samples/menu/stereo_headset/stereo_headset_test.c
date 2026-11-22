@@ -300,9 +300,10 @@ static void check_inset_rows(const char *how)
       MENU_ENUM_LABEL_VIDEO_SCREEN_OPACITY
    };
    char name[64];
-   settings_t *settings = config_get_ptr();
+   video_screen_values_t values;
    unsigned s, r;
    int at;
+   const unsigned display = VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY);
    for (s = 0; s < 2; s++)
       for (r = 0; r < ARRAY_SIZE(rows); r++)
       {
@@ -310,8 +311,9 @@ static void check_inset_rows(const char *how)
          CHECK(row(name) < 0, "%s: %s is listed for a screen drawn alone",
                how, name);
       }
-   strlcpy(settings->arrays.video_screen_display[1], "over:1",
-         sizeof(settings->arrays.video_screen_display[1]));
+   memset(&values, 0, sizeof(values));
+   strlcpy(values.display, "over:1", sizeof(values.display));
+   video_driver_screen_set(1, display, &values);
    rebuild_as_hotplug();
    snprintf(name, sizeof(name), MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY_STR, 2);
    at = row(name);
@@ -324,7 +326,8 @@ static void check_inset_rows(const char *how)
       snprintf(name, sizeof(name), msg_hash_to_str(rows[r]), 1);
       CHECK(row(name) < 0, "%s: %s is listed for the base", how, name);
    }
-   settings->arrays.video_screen_display[1][0] = '\0';
+   values.display[0] = '\0';
+   video_driver_screen_set(1, display, &values);
    rebuild_as_hotplug();
    snprintf(name, sizeof(name), msg_hash_to_str(rows[0]), 2);
    CHECK(row(name) < 0, "%s: %s stays once the screen is back on Auto",

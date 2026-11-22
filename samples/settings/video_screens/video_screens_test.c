@@ -8294,7 +8294,8 @@ static void test_screen_menu_dropdown(void)
 }
 
 /* A Display row left listed follows a core's default as it comes and
- * goes; a candidate value put in the row is labelled as itself */
+ * goes, as the menu iterates; a candidate value put in the row is
+ * labelled as itself */
 static void test_screen_menu_row_follows(void)
 {
    static struct retro_video_view views[2];
@@ -8313,11 +8314,13 @@ static void test_screen_menu_row_follows(void)
       screens[1].show = RETRO_VIDEO_SCREEN_SHOW_SHOWN;
       CHECK(video_driver_set_views(&map));
       window_test_run();
+      menu_setting_video_screens_shown();
       row->actions->repr(row, s, sizeof(s));
       CHECK(string_is_equal(s, "Auto"));
       screens[1].show = RETRO_VIDEO_SCREEN_SHOW_HIDDEN;
       CHECK(video_driver_set_views(&map));
       window_test_run();
+      menu_setting_video_screens_shown();
       row->actions->repr(row, s, sizeof(s));
       CHECK(string_is_equal(s, "OFF (core default)"));
       row->value.target.string[0] = '\0';
@@ -8336,6 +8339,7 @@ static void test_screen_menu_row_follows(void)
             sizeof(values.display));
       video_driver_screen_set(1,
             VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY), &values);
+      menu_setting_video_screens_shown();
       row->actions->repr(row, s, sizeof(s));
       CHECK(string_is_equal(s, "OFF"));
    }
@@ -8855,6 +8859,7 @@ static void test_screen_menu_inset_window_rows(void)
 static void test_screen_menu_inset_rows_no_content(void)
 {
    file_list_t list;
+   video_screen_values_t values;
    settings_t *settings              = config_get_ptr();
    const video_screen_prefs_t *prefs = &video_state_get_ptr()->screen_prefs;
    load_fixture("");
@@ -8863,8 +8868,10 @@ static void test_screen_menu_inset_rows_no_content(void)
    screen_menu_list(&list);
    CHECK(screen_menu_inset_rows(&list, 1) == 0);
    file_list_deinitialize(&list);
-   strlcpy(settings->arrays.video_screen_display[1], "over:1",
-         sizeof(settings->arrays.video_screen_display[1]));
+   memset(&values, 0, sizeof(values));
+   strlcpy(values.display, "over:1", sizeof(values.display));
+   video_driver_screen_set(1, VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY),
+         &values);
    screen_menu_list(&list);
    CHECK(screen_menu_inset_rows(&list, 1) == 3);
    CHECK(screen_menu_inset_rows(&list, 0) == 0);
@@ -9032,6 +9039,203 @@ static void test_screen_menu_inset_steps_inherited(void)
    CHECK(settings->uints.video_screen_size[1] == 10);
    menu_value("video_screen2_size", "100%");
    settings->uints.video_screen_size[1] = 0;
+   screen_menu_end();
+}
+
+/* A screen's values as the menu's rows read them: a write that changes
+ * them publishes them whole, and one that changes nothing, a write or a
+ * frame, moves no stamp */
+static void test_screen_shown_read(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   video_screen_shown_t shown;
+   video_screen_values_t values;
+   int first, second;
+   const unsigned bits = VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY)
+                       | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_SIZE);
+   load_fixture("");
+   screens_test_core_done();
+   video_driver_clear_views();
+   memset(&values, 0, sizeof(values));
+   strlcpy(values.display, "over:1", sizeof(values.display));
+   values.size = 30;
+   video_driver_screen_set(1, bits, &values);
+   first = video_driver_screen_shown_read(1, &shown);
+   CHECK(shown.values.size == 30 && shown.inset && !shown.defaults);
+   values.size = 45;
+   video_driver_screen_set(1, bits, &values);
+   second = video_driver_screen_shown_read(1, &shown);
+   CHECK(second != first);
+   CHECK(shown.values.size == 45 && shown.inset && !shown.defaults);
+   CHECK(string_is_equal(shown.values.display, "over:1"));
+   video_driver_screen_set(1, bits, &values);
+   CHECK(video_driver_screen_shown_read(1, &shown) == second);
+   CHECK(video_driver_screen_shown_stamp(1) == second);
+   video_driver_screen_set(1, bits, NULL);
+   CHECK(video_driver_screen_shown_read(1, &shown) != second);
+   CHECK(!shown.values.display[0] && !shown.values.size && !shown.inset);
+
+   /* The core's hidden screen, from a frame; the next frame has nothing
+    * new */
+   screen_menu_begin(&map, views, screens);
+   first = video_driver_screen_shown_read(1, &shown);
+   CHECK(string_is_equal(shown.values.display, VIDEO_WINDOW_DISPLAY_OFF));
+   CHECK(shown.defaults & VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY));
+   CHECK(!shown.inset);
+   window_test_run();
+   CHECK(video_driver_screen_shown_stamp(1) == first);
+   screen_menu_end();
+}
+
+/* A row's text is what the main thread published, and drawing it writes
+ * no row buffer: with screen 2's values written under its rows, each
+ * buffer keeps its sentinel, the Display row's the value it last read */
+static void test_screen_menu_repr_writes_nothing(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   video_screen_values_t values;
+   rarch_setting_t *display, *corner, *size, *opacity;
+#if defined(HAVE_VIDEO_WINDOWS) && !defined(ANDROID)
+   rarch_setting_t *fullscreen, *width, *height, *x, *y;
+#endif
+   char s[64];
+   video_screen_prefs_t *prefs = &video_state_get_ptr()->screen_prefs;
+   unsigned bits               =
+        VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY)
+      | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_CORNER)
+      | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_SIZE)
+      | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_OPACITY);
+   screen_menu_begin(&map, views, screens);
+   display = menu_setting_find("video_screen2_display");
+   corner  = menu_setting_find("video_screen2_corner");
+   size    = menu_setting_find("video_screen2_size");
+   opacity = menu_setting_find("video_screen2_opacity");
+   CHECK(display && corner && size && opacity);
+#if defined(HAVE_VIDEO_WINDOWS) && !defined(ANDROID)
+   fullscreen = menu_setting_find("video_screen2_window_fullscreen");
+   width      = menu_setting_find("video_screen2_window_width");
+   height     = menu_setting_find("video_screen2_window_height");
+   x          = menu_setting_find("video_screen2_window_x");
+   y          = menu_setting_find("video_screen2_window_y");
+   CHECK(fullscreen && width && height && x && y);
+   if (!fullscreen || !width || !height || !x || !y)
+      display = NULL;
+   bits |= VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_FULLSCREEN)
+         | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_X)
+         | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_Y)
+         | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_WIDTH)
+         | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_HEIGHT)
+         | VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_WINDOW_POS_SET);
+#endif
+   if (!display || !corner || !size || !opacity)
+   {
+      screen_menu_end();
+      return;
+   }
+   CHECK(string_is_equal(display->value.target.string,
+            VIDEO_WINDOW_DISPLAY_OFF));
+   video_driver_screen_get(1, &values);
+   strlcpy(values.display, "over:1", sizeof(values.display));
+   values.corner            = RETRO_VIDEO_SCREEN_ANCHOR_TOP_LEFT;
+   values.size              = 40;
+   values.opacity           = 60;
+   values.window_dims       = VIDEO_SCALE_PACK(640, 480);
+   values.window_pos        = VIDEO_POS_PACK(12, 34);
+   values.window_pos_set    = true;
+   values.window_fullscreen = true;
+   video_driver_screen_set(1, bits, &values);
+   *corner->value.target.unsigned_integer  = 77;
+   *size->value.target.unsigned_integer    = 77;
+   *opacity->value.target.unsigned_integer = 77;
+#if defined(HAVE_VIDEO_WINDOWS) && !defined(ANDROID)
+   *fullscreen->value.target.boolean       = false;
+   *width->value.target.unsigned_integer   = 7;
+   *height->value.target.unsigned_integer  = 7;
+   *x->value.target.integer                = -7;
+   *y->value.target.integer                = -7;
+#endif
+   display->actions->repr(display, s, sizeof(s));
+   CHECK(string_is_equal(s, "OFF"));
+   corner->actions->repr(corner, s, sizeof(s));
+   CHECK(string_is_equal(s, "Top Left"));
+   size->actions->repr(size, s, sizeof(s));
+   CHECK(string_is_equal(s, "40%"));
+   opacity->actions->repr(opacity, s, sizeof(s));
+   CHECK(string_is_equal(s, "60%"));
+#if defined(HAVE_VIDEO_WINDOWS) && !defined(ANDROID)
+   fullscreen->actions->repr(fullscreen, s, sizeof(s));
+   CHECK(string_is_equal(s, "ON"));
+   width->actions->repr(width, s, sizeof(s));
+   CHECK(string_is_equal(s, "640"));
+   height->actions->repr(height, s, sizeof(s));
+   CHECK(string_is_equal(s, "480"));
+   x->actions->repr(x, s, sizeof(s));
+   CHECK(string_is_equal(s, "12"));
+   y->actions->repr(y, s, sizeof(s));
+   CHECK(string_is_equal(s, "34"));
+   CHECK(!*fullscreen->value.target.boolean);
+   CHECK(*width->value.target.unsigned_integer == 7);
+   CHECK(*height->value.target.unsigned_integer == 7);
+   CHECK(*x->value.target.integer == -7 && *y->value.target.integer == -7);
+#endif
+   CHECK(string_is_equal(display->value.target.string,
+            VIDEO_WINDOW_DISPLAY_OFF));
+   CHECK(*corner->value.target.unsigned_integer == 77);
+   CHECK(*size->value.target.unsigned_integer == 77);
+   CHECK(*opacity->value.target.unsigned_integer == 77);
+   /* A value changed with no write through the driver shows from the
+    * next frame: the text calls no resolver */
+   prefs->values[1].size = 55;
+   size->actions->repr(size, s, sizeof(s));
+   CHECK(string_is_equal(s, "40%"));
+   window_test_run();
+   size->actions->repr(size, s, sizeof(s));
+   CHECK(string_is_equal(s, "55%"));
+   CHECK(*size->value.target.unsigned_integer == 77);
+   screen_menu_end();
+}
+
+/* A value written under the list reaches a Display row still holding
+ * what it last read at the menu's next iterate, not before, and the row
+ * names its base from the published names; a candidate in the row is
+ * left alone */
+static void test_screen_menu_follows_published(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   video_screen_values_t values;
+   rarch_setting_t *row;
+   char s[64];
+   const unsigned display = VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY);
+   screen_menu_begin(&map, views, screens);
+   row = menu_setting_find("video_screen2_display");
+   CHECK(row != NULL);
+   if (!row)
+   {
+      screen_menu_end();
+      return;
+   }
+   menu_setting_video_screens_shown();
+   CHECK(string_is_equal(row->value.target.string, VIDEO_WINDOW_DISPLAY_OFF));
+   memset(&values, 0, sizeof(values));
+   strlcpy(values.display, "over:1", sizeof(values.display));
+   video_driver_screen_set(1, display, &values);
+   CHECK(string_is_equal(row->value.target.string, VIDEO_WINDOW_DISPLAY_OFF));
+   menu_setting_video_screens_shown();
+   CHECK(string_is_equal(row->value.target.string, "over:1"));
+   row->actions->repr(row, s, sizeof(s));
+   CHECK(string_is_equal(s, "Over Top"));
+   /* A candidate, as a dropdown puts in the row */
+   strlcpy(row->value.target.string, VIDEO_WINDOW_DISPLAY_OFF, row->size);
+   values.display[0] = '\0';
+   video_driver_screen_set(1, display, &values);
+   menu_setting_video_screens_shown();
+   CHECK(string_is_equal(row->value.target.string, VIDEO_WINDOW_DISPLAY_OFF));
    screen_menu_end();
 }
 
@@ -11241,6 +11445,9 @@ int main(int argc, char **argv)
    test_screen_menu_inset_rows_no_content();
    test_screen_menu_inset_steps();
    test_screen_menu_inset_steps_inherited();
+   test_screen_shown_read();
+   test_screen_menu_repr_writes_nothing();
+   test_screen_menu_follows_published();
    test_window_menu_one_place();
    test_blank_unused_strings();
    test_blank_unused_hotkey();

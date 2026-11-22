@@ -2134,14 +2134,10 @@ static size_t menu_action_setting_disp_set_label_video_screen_settings(
    size_t _len               = 0;
    menu_file_list_cbs_t *cbs = (menu_file_list_cbs_t*)
       list->list[i].actiondata;
-   rarch_setting_t *display  = NULL;
    *w                        = 19;
    if (cbs->setting)
-      display = menu_setting_find_enum((enum msg_hash_enums)
-            (MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY
-             + cbs->setting->index_offset));
-   if (display && display->actions->repr)
-      _len = display->actions->repr(display, s, len);
+      _len = menu_setting_video_screen_display_repr(
+            cbs->setting->index_offset, s, len);
    else
       *s = '\0';
    if (path && *path)
