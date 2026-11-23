@@ -44,6 +44,7 @@
 #include "../cores/internal_cores.h"
 #include "video_driver.h"
 #include "video_hdr_metadata.h"
+#include "video_screen_images.h"
 #include "gfx_media_display.h"
 #if defined(HAVE_X11) && defined(HAVE_XRANDR)
 #include "common/x11_common.h"
@@ -4495,6 +4496,8 @@ bool video_driver_set_views(struct retro_video_views *views)
    if (     map.image
          && !(video_driver_views_status() & RETRO_VIDEO_VIEWS_STATUS_IMAGES))
       return false;
+   if (!video_screen_images_set(views, &map))
+      return false;
    if (map.num_views && video_st->screen_prefs.core_loaded)
       video_st->screen_prefs.in_use = true;
    described = video_driver_views_take_screens(video_st, &screens);
@@ -4550,6 +4553,7 @@ void video_driver_clear_views(void)
    memset(&video_st->views_frame,  0, sizeof(video_st->views_frame));
    memset(&video_st->views_layout, 0, sizeof(video_st->views_layout));
    memset(&video_st->views_screens, 0, sizeof(video_st->views_screens));
+   video_screen_images_clear();
    video_driver_views_publish_names(video_st);
    video_st->views_frame_dims = 0;
    video_st->views_presented  = false;

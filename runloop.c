@@ -163,6 +163,7 @@ bool android_get_vfs_authorized_locations(
 #include "gfx/gfx_display.h"
 #include "gfx/gfx_thumbnail.h"
 #include "gfx/video_filter.h"
+#include "gfx/video_screen_images.h"
 
 #include "input/input_osk.h"
 
@@ -4905,9 +4906,13 @@ bool runloop_environment_cb(unsigned cmd, void *data)
          *(unsigned*)data = video_driver_views_status();
          break;
 
-      /* No image screens: nothing to lend */
       case RETRO_ENVIRONMENT_GET_VIDEO_SCREEN_BUFFER:
-         return false;
+         if (!data)
+            return false;
+         return video_screen_images_lend(
+               (struct retro_video_screen_buffer*)data,
+               (video_driver_views_status()
+                & RETRO_VIDEO_VIEWS_STATUS_IMAGES) != 0);
 
       case RETRO_ENVIRONMENT_GET_JIT_CAPABLE:
          {

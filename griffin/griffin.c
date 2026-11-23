@@ -1418,6 +1418,7 @@ DRIVERS
 #include "../gfx/gfx_instrument.c"
 #include "../gfx/gfx_surface.c"
 #include "../gfx/gfx_surface_player.c"
+#include "../gfx/video_screen_images.c"
 #include "../gfx/gfx_thumbnail.c"
 #include "../gfx/gfx_thumbnail_match.c"
 #include "../gfx/gfx_thumbnail_results.c"
