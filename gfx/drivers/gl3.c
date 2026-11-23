@@ -562,6 +562,10 @@ static void gl3_views_sync_params(gl3_t *gl, gl3_filter_chain_t *fc);
 static void gl3_views_draw_direct(gl3_t *gl,
       const struct gl3_views_draw *d, unsigned view,
       const video_views_rect_t *dst, const video_views_rect_t *cut);
+static void gl3_views_draw_image(gl3_t *gl,
+      const struct gl3_views_draw *d, unsigned screen,
+      const video_views_rect_t *dst, const video_views_rect_t *cut,
+      bool nearest);
 static void gl3_views_draw_pass(gl3_t *gl, const struct gl3_views_draw *d,
       gl3_filter_chain_t *fc, const video_views_rect_t *dst,
       const video_views_rect_t *cut, bool again);
@@ -583,6 +587,8 @@ static bool gl3_views_target_retire(gl3_t *gl, struct gl3_views_fbo *t);
 #define VV_PASS(p, d, f, r, c, a)       gl3_views_draw_pass(p, d, f, r, c, a)
 #define VV_ALPHA(p, d, a)               gl3_views_alpha(p, a)
 #define VV_FILL(p, d, c, a)             gl3_views_fill(p, d, c, a)
+#define VV_IMAGE_MAP(p, d)              (&(d)->video_info->views)
+#define VV_IMAGE(p, d, s, r, c, n)      gl3_views_draw_image(p, d, s, r, c, n)
 #define VV_TARGET                       struct gl3_views_fbo
 #define VV_TARGET_MAKE(drv, t, dims)    gl3_views_target_make(drv, t, dims)
 #define VV_TARGET_RETIRE(drv, t)        gl3_views_target_retire(drv, t)
@@ -6589,7 +6595,7 @@ static void gl3_stock_rect_draw(gl3_t *gl,
       const struct gl3_filter_chain_texture *src,
       const struct retro_video_view *v, bool bottom_up,
       const struct gl3_viewport *vp, const struct gl3_viewport *cut,
-      const float *mvp)
+      const float *mvp, bool smooth)
 {
    static const float white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
    unsigned k;
@@ -6633,8 +6639,7 @@ static void gl3_stock_rect_draw(gl3_t *gl,
 #endif
    glActiveTexture(GL_TEXTURE0 + 1);
    glBindTexture(GL_TEXTURE_2D, src->image);
-   glBindSampler(1,
-         gl->pipelines.stock_rect_samplers[gl->video_info.smooth ? 1 : 0]);
+   glBindSampler(1, gl->pipelines.stock_rect_samplers[smooth ? 1 : 0]);
    glUseProgram(gl->pipelines.stock_rect);
    if (gl->pipelines.stock_rect_loc.flat_ubo_fragment >= 0)
       glUniform4fv(gl->pipelines.stock_rect_loc.flat_ubo_fragment, 5, ubo);
@@ -6655,7 +6660,46 @@ static void gl3_views_draw_direct(gl3_t *gl,
    gl3_views_vp(cut, d->target_height, &sc);
    glBindFramebuffer(GL_FRAMEBUFFER, d->target);
    gl3_stock_rect_draw(gl, d->src, &d->video_info->views.views[view],
-         d->bottom_up, &vp, &sc, d->mvp);
+         d->bottom_up, &vp, &sc, d->mvp, gl->video_info.smooth);
+}
+
+/* Screen @screen's picture whole over @dst, cut to @cut, its first row
+ * at the top and never turned. A preset's last pass turns the blend
+ * off, so it goes on again here. */
+static void gl3_views_draw_image(gl3_t *gl,
+      const struct gl3_views_draw *d, unsigned screen,
+      const video_views_rect_t *dst, const video_views_rect_t *cut,
+      bool nearest)
+{
+   struct gl3_viewport vp, sc;
+   struct retro_video_view whole;
+   struct gl3_filter_chain_texture tex;
+   const video_views_map_t *map = &d->video_info->views;
+
+   if (!gl->pipelines.stock_rect_tried)
+      gl3_stock_rect_init(gl);
+   if (!gl->pipelines.stock_rect)
+      return;
+   tex.image          = gl_media_pool_resolve(gl->media_pool,
+         (GLuint)map->image_tex[screen]);
+   tex.dims           = map->image_dims[screen];
+   tex.padded_dims    = tex.dims;
+   tex.origin         = 0;
+   tex.format         = GL_RGBA8;
+   whole.x            = 0;
+   whole.y            = 0;
+   whole.width        = VIDEO_SCALE_W(tex.dims);
+   whole.height       = VIDEO_SCALE_H(tex.dims);
+   whole.screen       = 0;
+   whole.eye          = 0;
+   whole.aspect_ratio = 0.0f;
+   gl3_views_vp(dst, d->target_height, &vp);
+   gl3_views_vp(cut, d->target_height, &sc);
+   glBindFramebuffer(GL_FRAMEBUFFER, d->target);
+   if (gl->views.alpha_blend)
+      glEnable(GL_BLEND);
+   gl3_stock_rect_draw(gl, &tex, &whole, false, &vp, &sc,
+         gl->mvp_no_rot_yflip.data, !nearest);
 }
 
 /* A placement through its view's chain */
@@ -8171,7 +8215,7 @@ static bool gl3_frame(void *data, const void *frame,
                &gl->filter_chain_vp, &gl->filter_chain_vp,
                (gl->flags & GL3_FLAG_HW_RENDER_BOTTOM_LEFT)
                ? gl->mvp.data
-               : gl->mvp_yflip.data);
+               : gl->mvp_yflip.data, gl->video_info.smooth);
          glBindFramebuffer(GL_FRAMEBUFFER, 0);
       }
       else
@@ -9989,7 +10033,8 @@ video_driver_t video_gl3 = {
 #endif
 #endif
    gl3_read_viewport_bgrx,
-   true /* max_geometry_in_place */
+   true, /* max_geometry_in_place */
+   true  /* views_images */
 };
 
 #ifdef HAVE_GL_MENU_BLOOM
