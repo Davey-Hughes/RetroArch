@@ -4622,6 +4622,7 @@ static void images_test_fill(const struct retro_video_screen_buffer *buf,
 }
 
 static struct retro_video_screen_image images_test_image;
+static unsigned images_test_screen_flags;   /* screen 2's */
 
 /* screens_test_dsi()'s picture at @data with @serial */
 static void images_test_picture(const void *data, unsigned serial)
@@ -4635,15 +4636,17 @@ static void images_test_picture(const void *data, unsigned serial)
    images_test_image.serial = serial;
 }
 
-/* The dsi map with images_test_image as screen 2's */
+/* The dsi map in window_test_run()'s frame with images_test_image as
+ * screen 2's */
 static bool images_test_set(void)
 {
    static struct retro_video_view views[2];
    static struct retro_video_screen screens[3];
    struct retro_video_screen_image dsi;
    struct retro_video_views map;
-   screens_test_dsi(&map, views, screens, &dsi);
+   screens_test_dsi_small(&map, views, screens, &dsi);
    screens[2].image = &images_test_image;
+   screens[2].flags = images_test_screen_flags;
    return video_driver_set_views(&map);
 }
 
@@ -4852,6 +4855,427 @@ static void test_images_unload(void)
    CHECK(images_test_get(&buf, 2, 48, 32, RETRO_PIXEL_FORMAT_XRGB8888));
    images_test_fill(&buf, 0x55);
    CHECK(images_test_hand(buf.data, 1));
+   window_test_end();
+}
+
+/* The stand-in's textures: handles from 101, and what the last load or
+ * update was given */
+static unsigned images_test_loads;
+static unsigned images_test_updates;
+static unsigned images_test_unloads;
+static uintptr_t images_test_next_tex;
+static uintptr_t images_test_updated;
+static uintptr_t images_test_unloaded;
+static const void *images_test_pixels;
+static unsigned images_test_width;
+static unsigned images_test_height;
+static uint32_t images_test_words[48 * 32];
+
+static void images_test_record(const struct texture_image *ti)
+{
+   size_t n = (size_t)ti->width * ti->height;
+   if (n > sizeof(images_test_words) / sizeof(images_test_words[0]))
+      n = sizeof(images_test_words) / sizeof(images_test_words[0]);
+   images_test_pixels = ti->pixels;
+   images_test_width  = ti->width;
+   images_test_height = ti->height;
+   memcpy(images_test_words, ti->pixels, n * sizeof(uint32_t));
+}
+
+static uintptr_t images_test_tex_load(void *video_data, void *data,
+      bool threaded, enum texture_filter_type filter_type)
+{
+   (void)video_data;
+   (void)threaded;
+   (void)filter_type;
+   images_test_loads++;
+   images_test_record((const struct texture_image*)data);
+   return images_test_next_tex++;
+}
+
+static enum video_texture_update images_test_tex_update(void *video_data,
+      uintptr_t id, const struct texture_image *ti, bool threaded)
+{
+   (void)video_data;
+   (void)threaded;
+   images_test_updates++;
+   images_test_updated = id;
+   images_test_record(ti);
+   return VIDEO_TEXTURE_UPDATE_DONE;
+}
+
+static void images_test_tex_unload(void *data, bool threaded, uintptr_t id)
+{
+   (void)data;
+   (void)threaded;
+   images_test_unloads++;
+   images_test_unloaded = id;
+}
+
+static void images_test_calls_reset(void)
+{
+   images_test_loads    = 0;
+   images_test_updates  = 0;
+   images_test_unloads  = 0;
+   images_test_updated  = 0;
+   images_test_unloaded = 0;
+   images_test_pixels   = NULL;
+   images_test_width    = 0;
+   images_test_height   = 0;
+   memset(images_test_words, 0, sizeof(images_test_words));
+}
+
+static unsigned images_test_tex_calls(void)
+{
+   return images_test_loads + images_test_updates + images_test_unloads;
+}
+
+/* images_test_begin() with the texture calls recorded, no windows */
+static void images_test_frames_begin(void)
+{
+   images_test_begin();
+   config_get_ptr()->bools.video_windows_enable = false;
+   window_test_poke.load_texture   = images_test_tex_load;
+   window_test_poke.update_texture = images_test_tex_update;
+   window_test_poke.unload_texture = images_test_tex_unload;
+   images_test_next_tex     = 101;
+   images_test_screen_flags = 0;
+   images_test_calls_reset();
+}
+
+/* A refresh with NULL data */
+static void images_test_repeat(void)
+{
+   window_test_frames = 0;
+   video_driver_frame(NULL, 8, 2, 8 * sizeof(uint32_t));
+   CHECK(window_test_frames == 1);
+}
+
+static void images_test_pattern(uint32_t first)
+{
+   unsigned i;
+   for (i = 0; i < 48 * 32; i++)
+      screens_test_dsi_pixels[i] = first + i;
+}
+
+/* A lent picture is uploaded from the lent slot once */
+static void test_images_upload_lend(void)
+{
+   struct retro_video_screen_buffer buf;
+   images_test_frames_begin();
+   CHECK(images_test_get(&buf, 2, 48, 32, RETRO_PIXEL_FORMAT_XRGB8888));
+   images_test_fill(&buf, 0x5a);
+   CHECK(images_test_hand(buf.data, 1));
+   window_test_run();
+   CHECK(images_test_loads == 1 && !images_test_updates);
+   CHECK(images_test_pixels == buf.data);
+   CHECK(images_test_width == 48 && images_test_height == 32);
+   CHECK(images_test_words[0] == 0x5a5a5a5au);
+   CHECK(window_test_seen_views.image_tex[2] == 101);
+   CHECK(window_test_seen_views.image_gen[2] != 0);
+   images_test_calls_reset();
+   window_test_run();
+   CHECK(!images_test_tex_calls());
+   CHECK(window_test_seen_views.image_tex[2] == 101);
+   window_test_end();
+}
+
+/* The core's pixels are uploaded as handed in, not from where they lie */
+static void test_images_upload_copy(void)
+{
+   unsigned i;
+   unsigned wrong = 0;
+   images_test_frames_begin();
+   images_test_pattern(0x00102030u);
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1));
+   memset(screens_test_dsi_pixels, 0, sizeof(screens_test_dsi_pixels));
+   window_test_run();
+   CHECK(images_test_loads == 1);
+   CHECK(images_test_pixels
+         && images_test_pixels != (const void*)screens_test_dsi_pixels);
+   for (i = 0; i < 48 * 32; i++)
+      if (images_test_words[i] != 0x00102030u + i)
+         wrong++;
+   CHECK(!wrong);
+   window_test_end();
+}
+
+/* RGB565 goes up as XRGB8888 */
+static void test_images_upload_565(void)
+{
+   static const uint16_t px[4] = { 0xF800, 0x07E0, 0x001F, 0xFFFF };
+   images_test_frames_begin();
+   images_test_picture(px, 1);
+   images_test_image.width  = 4;
+   images_test_image.height = 1;
+   images_test_image.pitch  = sizeof(px);
+   images_test_image.format = RETRO_PIXEL_FORMAT_RGB565;
+   CHECK(images_test_set());
+   window_test_run();
+   CHECK(images_test_loads == 1);
+   CHECK(images_test_width == 4 && images_test_height == 1);
+   CHECK(images_test_words[0] == 0x00FF0000u);
+   CHECK(images_test_words[1] == 0x0000FF00u);
+   CHECK(images_test_words[2] == 0x000000FFu);
+   CHECK(images_test_words[3] == 0x00FFFFFFu);
+   window_test_end();
+}
+
+/* Rows wider than the picture go up packed (Review Focus 4) */
+static void test_images_upload_padded(void)
+{
+   static uint32_t wide[50 * 32];
+   static uint16_t odd[48 * 4];
+   static const uint16_t c565[4] = { 0xF800, 0x07E0, 0x001F, 0x0000 };
+   static const uint32_t c8888[4] = {
+      0x00FF0000u, 0x0000FF00u, 0x000000FFu, 0x00000000u };
+   unsigned x, y;
+   unsigned wrong = 0;
+   images_test_frames_begin();
+   for (y = 0; y < 32; y++)
+      for (x = 0; x < 50; x++)
+         wide[y * 50 + x] = x < 48 ? 0x00a00000u | (y << 8) | x : 0xdeadbeefu;
+   images_test_picture(wide, 1);
+   images_test_image.pitch = 200;
+   CHECK(images_test_set());
+   window_test_run();
+   CHECK(images_test_width == 48 && images_test_height == 32);
+   for (y = 0; y < 32; y++)
+      for (x = 0; x < 48; x++)
+         if (images_test_words[y * 48 + x] != (0x00a00000u | (y << 8) | x))
+            wrong++;
+   CHECK(!wrong);
+
+   for (y = 0; y < 4; y++)
+      for (x = 0; x < 48; x++)
+         odd[y * 48 + x] = x < 47 ? c565[(x + y) % 4] : 0xFFFF;
+   images_test_picture(odd, 2);
+   images_test_image.width  = 47;
+   images_test_image.height = 4;
+   images_test_image.pitch  = 96;
+   images_test_image.format = RETRO_PIXEL_FORMAT_RGB565;
+   CHECK(images_test_set());
+   window_test_run();
+   CHECK(images_test_width == 47 && images_test_height == 4);
+   for (y = 0; y < 4; y++)
+      for (x = 0; x < 47; x++)
+         if (images_test_words[y * 47 + x] != c8888[(x + y) % 4])
+            wrong++;
+   CHECK(!wrong);
+   window_test_end();
+}
+
+/* A new picture of the same size updates the texture in place */
+static void test_images_update_in_place(void)
+{
+   uint8_t gen;
+   images_test_frames_begin();
+   images_test_pattern(1);
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1));
+   window_test_run();
+   CHECK(images_test_loads == 1);
+   gen = window_test_seen_views.image_gen[2];
+   images_test_calls_reset();
+   images_test_pattern(0x00abcdefu);
+   CHECK(images_test_hand(screens_test_dsi_pixels, 2));
+   window_test_run();
+   CHECK(!images_test_loads && images_test_updates == 1);
+   CHECK(images_test_updated == 101);
+   CHECK(images_test_words[0] == 0x00abcdefu);
+   CHECK(window_test_seen_views.image_tex[2] == 101);
+   CHECK(window_test_seen_views.image_gen[2] != gen);
+   memset(screens_test_dsi_pixels, 0, sizeof(screens_test_dsi_pixels));
+   window_test_end();
+}
+
+/* A picture changed on a NULL refresh goes up on it, and the refresh
+ * does not blank an image screen it did not draw before */
+static void test_images_null_refresh(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_screen_image image;
+   struct retro_video_views map;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   uint8_t gen;
+   images_test_frames_begin();
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1));
+   window_test_run();
+   gen = window_test_seen_views.image_gen[2];
+   images_test_calls_reset();
+   images_test_pattern(7);
+   CHECK(images_test_hand(screens_test_dsi_pixels, 2));
+   images_test_repeat();
+   CHECK(images_test_loads + images_test_updates == 1);
+   CHECK(images_test_words[0] == 7);
+   CHECK(window_test_seen_views.image_tex[2] == 101);
+   CHECK(window_test_seen_views.image_gen[2] != gen);
+   CHECK(!(video_st->views_core.blank & 0x4u));
+
+   /* Shown first on a NULL refresh */
+   screens_test_dsi_small(&map, views, screens, &image);
+   screens[2].image = NULL;
+   screens[2].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   images_test_calls_reset();
+   CHECK(images_test_hand(screens_test_dsi_pixels, 3));
+   images_test_repeat();
+   CHECK(images_test_loads + images_test_updates == 1);
+   CHECK(window_test_seen_views.image_tex[2] != 0);
+   CHECK(!(video_st->views_core.blank & 0x4u));
+   memset(screens_test_dsi_pixels, 0, sizeof(screens_test_dsi_pixels));
+   window_test_end();
+}
+
+/* A frame not shown uploads nothing */
+static void test_images_not_shown(void)
+{
+   static uint32_t pixels[8 * 2];
+   video_driver_state_t *video_st = video_state_get_ptr();
+   images_test_frames_begin();
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1));
+   video_st->main_flags &= ~VIDEO_FLAG_ACTIVE;
+   video_driver_frame(pixels, 8, 2, 8 * sizeof(pixels[0]));
+   CHECK(!images_test_tex_calls());
+   video_st->main_flags |= VIDEO_FLAG_ACTIVE;
+   window_test_run();
+   CHECK(images_test_loads == 1);
+   window_test_end();
+}
+
+/* A frame fast-forward skips uploads nothing; the next drawn one does
+ * (Review Focus 5) */
+static void test_images_frameskip(void)
+{
+   static uint32_t pixels[8 * 2];
+   video_driver_state_t *video_st = video_state_get_ptr();
+   input_driver_state_t *input    = input_state_get_ptr();
+   settings_t *settings           = config_get_ptr();
+   bool saved_skip                = settings->bools.fastforward_frameskip;
+   unsigned saved_nonblock        = input->flags & INP_FLAG_NONBLOCKING;
+   unsigned ff_mask               = VIDEO_FLAG_FF_DECIDED
+      | VIDEO_FLAG_FF_SKIP_FRAME | VIDEO_FLAG_FF_FRAME_OWED;
+   unsigned saved_ff              = video_st->main_flags & ff_mask;
+   images_test_frames_begin();
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1));
+   window_test_run();
+   images_test_calls_reset();
+   images_test_pattern(9);
+   CHECK(images_test_hand(screens_test_dsi_pixels, 2));
+   input->flags |= INP_FLAG_NONBLOCKING;
+   settings->bools.fastforward_frameskip = true;
+   video_st->main_flags |= VIDEO_FLAG_FF_DECIDED | VIDEO_FLAG_FF_SKIP_FRAME;
+   window_test_frames = 0;
+   video_driver_frame(pixels, 8, 2, 8 * sizeof(pixels[0]));
+   CHECK(!window_test_frames);
+   CHECK(!images_test_tex_calls());
+   settings->bools.fastforward_frameskip = saved_skip;
+   input->flags = (input->flags & ~INP_FLAG_NONBLOCKING) | saved_nonblock;
+   video_st->main_flags = (video_st->main_flags & ~ff_mask) | saved_ff;
+   window_test_run();
+   CHECK(images_test_loads + images_test_updates == 1);
+   CHECK(images_test_words[0] == 9);
+   memset(screens_test_dsi_pixels, 0, sizeof(screens_test_dsi_pixels));
+   window_test_end();
+}
+
+/* A new lent picture every frame: each frame draws its own
+ * (Review Focus 1) */
+static void test_images_every_frame(void)
+{
+   struct retro_video_screen_buffer buf;
+   unsigned n;
+   images_test_frames_begin();
+   for (n = 1; n <= 10; n++)
+   {
+      CHECK(images_test_get(&buf, 2, 48, 32, RETRO_PIXEL_FORMAT_XRGB8888));
+      images_test_fill(&buf, (int)n);
+      CHECK(images_test_hand(buf.data, n));
+      images_test_calls_reset();
+      window_test_run();
+      CHECK(images_test_loads + images_test_updates == 1);
+      CHECK(images_test_pixels == buf.data);
+      CHECK(images_test_words[0] == 0x01010101u * n);
+      CHECK(window_test_seen_views.image_tex[2] == 101);
+   }
+   window_test_end();
+}
+
+/* Sampled nearest when SHARP, or with Bilinear Filtering off */
+static void test_images_nearest(void)
+{
+   settings_t *settings = config_get_ptr();
+   bool saved_smooth    = settings->bools.video_smooth;
+   images_test_frames_begin();
+   settings->bools.video_smooth = true;
+   images_test_screen_flags     = RETRO_VIDEO_SCREEN_FLAG_SHARP;
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1));
+   window_test_run();
+   CHECK(window_test_seen_views.nearest == 0x4u);
+   images_test_screen_flags     = 0;
+   CHECK(images_test_hand(NULL, 1));
+   settings->bools.video_smooth = false;
+   window_test_run();
+   CHECK(window_test_seen_views.nearest == 0x4u);
+   settings->bools.video_smooth = true;
+   window_test_run();
+   CHECK(!window_test_seen_views.nearest);
+   settings->bools.video_smooth = saved_smooth;
+   window_test_end();
+}
+
+/* A BLANK image inset is not uploaded until it is shown */
+static void test_images_blank_no_upload(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_screen_image image;
+   struct retro_video_views map;
+   images_test_frames_begin();
+   screens_test_dsi_small(&map, views, screens, &image);
+   screens[2].state  = RETRO_VIDEO_SCREEN_STATE_BLANK;
+   screens[2].show   = RETRO_VIDEO_SCREEN_SHOW_OVER;
+   screens[2].anchor = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT;
+   screens[2].size   = 0.25f;
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   CHECK(video_state_get_ptr()->views_core.blank & 0x4u);
+   CHECK(!images_test_tex_calls());
+   CHECK(!window_test_seen_views.image_tex[2]);
+   screens[2].state = RETRO_VIDEO_SCREEN_STATE_ACTIVE;
+   image.data       = NULL;
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   CHECK(images_test_loads == 1);
+   CHECK(window_test_seen_views.image_tex[2] == 101);
+   window_test_end();
+}
+
+/* Unload, and a map without the image, free the texture */
+static void test_images_unload_surface(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_screen_image image;
+   struct retro_video_views map;
+   images_test_frames_begin();
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1));
+   window_test_run();
+   CHECK(window_test_seen_views.image_tex[2] == 101);
+   images_test_calls_reset();
+   video_driver_clear_views();
+   CHECK(images_test_unloads == 1 && images_test_unloaded == 101);
+
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1));
+   window_test_run();
+   CHECK(window_test_seen_views.image_tex[2] == 102);
+   images_test_calls_reset();
+   screens_test_dsi_small(&map, views, screens, &image);
+   screens[2].image = NULL;
+   screens[2].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
+   CHECK(video_driver_set_views(&map));
+   CHECK(images_test_unloads == 1 && images_test_unloaded == 102);
    window_test_end();
 }
 
@@ -12238,6 +12662,18 @@ int main(int argc, char **argv)
    test_images_dropped();
    test_images_get_unused();
    test_images_unload();
+   test_images_upload_lend();
+   test_images_upload_copy();
+   test_images_upload_565();
+   test_images_upload_padded();
+   test_images_update_in_place();
+   test_images_null_refresh();
+   test_images_not_shown();
+   test_images_frameskip();
+   test_images_every_frame();
+   test_images_nearest();
+   test_images_blank_no_upload();
+   test_images_unload_surface();
    test_screens_core_show();
    test_screens_core_over_inset();
    test_screens_user_over();

@@ -5715,7 +5715,7 @@ static VIDEO_NOINLINE const video_views_map_t *video_driver_views_redraw_core(
 }
 #endif
 
-/* @from's masks and arrangement, without its views */
+/* @from's masks, arrangement and images, without its views */
 static void video_driver_views_take_arrangement(video_views_map_t *to,
       const video_views_map_t *from)
 {
@@ -5726,8 +5726,14 @@ static void video_driver_views_take_arrangement(video_views_map_t *to,
    to->over     = from->over;
    to->base     = from->base;
    to->anchor   = from->anchor;
-   memcpy(to->opacity, from->opacity, sizeof(to->opacity));
-   memcpy(to->size,    from->size,    sizeof(to->size));
+   to->image    = from->image;
+   to->nearest  = from->nearest;
+   memcpy(to->opacity,      from->opacity,      sizeof(to->opacity));
+   memcpy(to->size,         from->size,         sizeof(to->size));
+   memcpy(to->image_dims,   from->image_dims,   sizeof(to->image_dims));
+   memcpy(to->image_aspect, from->image_aspect, sizeof(to->image_aspect));
+   memcpy(to->image_tex,    from->image_tex,    sizeof(to->image_tex));
+   memcpy(to->image_gen,    from->image_gen,    sizeof(to->image_gen));
 }
 
 /* Fills the frame's views and layout. A repeated frame (no data), or one
@@ -5790,6 +5796,11 @@ static void video_driver_views_frame(video_driver_state_t *video_st,
    {
       core->no_input = video_st->views.no_input;
       core->viewless = video_st->views.viewless;
+      core->image    = video_st->views.image;
+      memcpy(core->image_dims, video_st->views.image_dims,
+            sizeof(core->image_dims));
+      memcpy(core->image_aspect, video_st->views.image_aspect,
+            sizeof(core->image_aspect));
       repeat         = true;
       arranged       = true;
    }
@@ -5805,12 +5816,23 @@ static void video_driver_views_frame(video_driver_state_t *video_st,
             video_st->screens_defaults, &video_st->views_screens,
             video_st->views_images_arranged, core);
       drawn = ((1u << core->num_screens) - 1u)
-            & ~(core->viewless | core->left_out | core->blank);
+            & ~(core->viewless | core->left_out | core->blank | core->image);
       /* The frame repeated has no pixels for a screen it did not draw */
       if (repeat)
          core->blank          |= drawn & ~video_st->views_drawn;
       else
          video_st->views_drawn = drawn;
+      if (render_frame)
+      {
+         unsigned nearest = settings->bools.video_smooth ? 0 : core->image;
+         unsigned s;
+         for (s = 0; s < video_st->views_screens.count; s++)
+            if (video_st->views_screens.screens[s].flags
+                  & RETRO_VIDEO_SCREEN_FLAG_SHARP)
+               nearest |= 1u << s;
+         video_screen_images_frame(core,
+               core->image & ~(core->left_out | core->blank), nearest);
+      }
       video_driver_views_take_arrangement(&video_st->views_frame, core);
    }
 #ifdef HAVE_VIDEO_WINDOWS

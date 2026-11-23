@@ -20,6 +20,7 @@
 #include <gfx/scaler/pixconv.h>
 
 #include "video_screen_images.h"
+#include "gfx_surface.h"
 #include "video_defines.h"
 #include "../verbosity.h"
 
@@ -37,6 +38,11 @@ typedef struct video_screen_images_screen
    unsigned format;        /* the kept picture's, as the core sent it */
    unsigned kept_gen;
    unsigned uploaded_gen;
+   unsigned sent_gen;      /* the upload in flight's */
+   unsigned failed_gen;    /* not tried again */
+   gfx_surface_t *surface;
+   gfx_surface_t *old;     /* drawn until surface has a texture */
+   unsigned surface_dims;
 } video_screen_images_screen_t;
 
 static video_screen_images_screen_t video_screen_images_store
@@ -125,15 +131,35 @@ static void video_screen_images_copy(uint32_t *dst,
    }
 }
 
-/* @scr loses its picture. A lent slot stays the core's and a pinned one
- * the upload's. */
+/* @scr's surfaces go; a slot an upload still reads goes with its
+ * surface */
+static void video_screen_images_unsurface(video_screen_images_screen_t *scr)
+{
+   int pinned = video_screen_images_with(scr, VIDEO_SCREEN_IMAGES_PINNED);
+   if (pinned < 0)
+      gfx_surface_free(scr->surface);
+   else if (gfx_surface_free_adopt(scr->surface, scr->slot[pinned]))
+   {
+      scr->slot[pinned]       = NULL;
+      scr->slot_dims[pinned]  = 0;
+      scr->slot_flags[pinned] = 0;
+   }
+   else
+      scr->slot_flags[pinned] &= ~VIDEO_SCREEN_IMAGES_PINNED;
+   gfx_surface_free(scr->old);
+   scr->surface      = NULL;
+   scr->old          = NULL;
+   scr->surface_dims = 0;
+}
+
+/* @scr loses its picture and textures. A lent slot stays the core's. */
 static void video_screen_images_drop(video_screen_images_screen_t *scr)
 {
    int i;
+   video_screen_images_unsurface(scr);
    for (i = 0; i < VIDEO_SCREEN_IMAGES_SLOTS; i++)
    {
-      if (scr->slot_flags[i]
-            & (VIDEO_SCREEN_IMAGES_LENT | VIDEO_SCREEN_IMAGES_PINNED))
+      if (scr->slot_flags[i] & VIDEO_SCREEN_IMAGES_LENT)
          scr->slot_flags[i] &= ~VIDEO_SCREEN_IMAGES_KEPT;
       else if (scr->slot[i])
       {
@@ -304,15 +330,122 @@ refuse:
    return false;
 }
 
+/* @scr's upload of generation @gen ended, on its surface's texture or
+ * not */
+static void video_screen_images_settle(video_screen_images_screen_t *scr,
+      bool landed, unsigned gen)
+{
+   if (!landed)
+   {
+      scr->failed_gen = gen;
+      return;
+   }
+   scr->uploaded_gen = gen;
+   gfx_surface_free(scr->old);
+   scr->old = NULL;
+}
+
+/* Main thread, from video_thread_async_poll: a queued upload landed or
+ * its load failed */
+static void video_screen_images_released(void *user, gfx_surface_t *s,
+      unsigned slot)
+{
+   video_screen_images_screen_t *scr = (video_screen_images_screen_t*)user;
+   int pinned = video_screen_images_with(scr, VIDEO_SCREEN_IMAGES_PINNED);
+   (void)slot;
+   if (pinned >= 0)
+      scr->slot_flags[pinned] &= ~VIDEO_SCREEN_IMAGES_PINNED;
+   video_screen_images_settle(scr, !s->dropped, scr->sent_gen);
+}
+
+/* @scr's kept picture up, when it is newer than the one up and no upload
+ * is in flight */
+static void video_screen_images_upload(video_screen_images_screen_t *scr)
+{
+   gfx_surface_src_t src;
+   unsigned dims;
+   int kept = video_screen_images_with(scr, VIDEO_SCREEN_IMAGES_KEPT);
+   if (     kept < 0
+         || scr->kept_gen == scr->uploaded_gen
+         || scr->kept_gen == scr->failed_gen
+         || video_screen_images_with(scr, VIDEO_SCREEN_IMAGES_PINNED) >= 0)
+      return;
+   dims = scr->slot_dims[kept];
+   if (!scr->surface || scr->surface_dims != dims)
+   {
+      gfx_surface_t *made = gfx_surface_new_static(dims,
+            TEXTURE_FILTER_NEAREST);
+      if (!made)
+      {
+         scr->failed_gen = scr->kept_gen;
+         return;
+      }
+      if (GFX_SURFACE_HANDLE(scr->surface))
+      {
+         gfx_surface_free(scr->old);
+         scr->old = scr->surface;
+      }
+      else
+         gfx_surface_free(scr->surface);
+      scr->surface      = made;
+      scr->surface_dims = dims;
+   }
+   memset(&src, 0, sizeof(src));
+   src.pixels = scr->slot[kept];
+   src.pixfmt = IMAGE_PIXFMT_8888;
+   switch (gfx_surface_submit_external(scr->surface, &src,
+            video_screen_images_released, scr))
+   {
+      case GFX_SURFACE_SUBMIT_DONE:
+         video_screen_images_settle(scr, true, scr->kept_gen);
+         break;
+      case GFX_SURFACE_SUBMIT_QUEUED:
+         scr->slot_flags[kept] |= VIDEO_SCREEN_IMAGES_PINNED;
+         scr->sent_gen          = scr->kept_gen;
+         break;
+      case GFX_SURFACE_SUBMIT_FAILED:
+         scr->failed_gen = scr->kept_gen;
+         break;
+      default: /* BUSY or DROPPED: the next shown frame */
+         break;
+   }
+}
+
+void video_screen_images_frame(video_views_map_t *map, unsigned draw,
+      unsigned nearest)
+{
+   video_screen_images_screen_t *store =
+         video_screen_images_store[video_screen_images_shown];
+   unsigned s;
+   for (s = 0; s < RETRO_VIDEO_SCREENS_MAX; s++)
+   {
+      video_screen_images_screen_t *scr = &store[s];
+      uintptr_t tex                     = 0;
+      if (draw & (1u << s))
+      {
+         video_screen_images_upload(scr);
+         if (!(tex = GFX_SURFACE_HANDLE(scr->surface)))
+            tex = GFX_SURFACE_HANDLE(scr->old);
+      }
+      map->image_tex[s] = tex;
+      map->image_gen[s] = tex ? (uint8_t)scr->uploaded_gen : 0;
+   }
+   map->nearest = nearest & map->image;
+}
+
 void video_screen_images_clear(void)
 {
    unsigned o, s;
    int i;
    for (o = 0; o < VIDEO_SCREEN_IMAGES_OWNERS; o++)
       for (s = 0; s < RETRO_VIDEO_SCREENS_MAX; s++)
+      {
+         video_screen_images_screen_t *scr = &video_screen_images_store[o][s];
+         video_screen_images_unsurface(scr);
          for (i = 0; i < VIDEO_SCREEN_IMAGES_SLOTS; i++)
-            if (video_screen_images_store[o][s].slot[i])
-               free(video_screen_images_store[o][s].slot[i]);
+            if (scr->slot[i])
+               free(scr->slot[i]);
+      }
    memset(video_screen_images_store, 0, sizeof(video_screen_images_store));
    video_screen_images_shown = VIDEO_SCREEN_IMAGES_MAIN;
 }

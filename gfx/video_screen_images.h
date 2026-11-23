@@ -52,7 +52,15 @@ bool video_screen_images_lend(struct retro_video_screen_buffer *buf,
 bool video_screen_images_set(const struct retro_video_views *in,
       const video_views_map_t *map);
 
-/* Content unload: both stores emptied, every lend ended. */
+/* Main thread, a shown frame, after the arrange step, never in the
+ * redraw: uploads the shown store's newest picture of each screen of
+ * @draw, and writes @map's image_tex and image_gen and the image bits
+ * of @nearest into map->nearest. */
+void video_screen_images_frame(video_views_map_t *map, unsigned draw,
+      unsigned nearest);
+
+/* Content unload: both stores emptied, their textures freed, every lend
+ * ended. */
 void video_screen_images_clear(void);
 
 RETRO_END_DECLS

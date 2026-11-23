@@ -2967,8 +2967,8 @@ enum retro_vr_reference_space {
  *    keep the rectangles that frame was shown with. Everything else in a
  *    newer map applies from that call: names, \c show, \c state, flags
  *    and images. A core that changes rectangles sends a frame with data.
- *    A screen not drawn in the last frame is drawn black until the next
- *    frame with data.
+ *    A screen with views not drawn in the last frame is drawn black until
+ *    the next frame with data.
  *  - \c num_views is 1 to \c RETRO_VIDEO_VIEWS_MAX, or 0 to clear the map,
  *    in which case \c views may be NULL.
  *    Screens number from 0 with no gaps; screen 0 is the primary. Each
