@@ -875,9 +875,9 @@ SCREENS_IMAGE_INSET_OUT = (GREEN, GREEN, BLACK, None)
 IMAGE_SENT_RE = re.compile(r'\[video_views\] image serial=(\d+) '
                            r'accepted=(\d)')
 IMAGE_NOT_LENT_RE = re.compile(r'\[video_views\] image buffer refused')
-# video_driver_init_internal's line, once per init: the second is
+# video_driver_init_internal's line, once per init: after the switch,
 # image_restart's restart.
-SCREENS_RESTARTED_RE = re.compile(r'\[Video\] Set video size to:'
+SCREENS_RESTARTED_RE = re.compile(r'\[video_views\] screens switched'
                                   r'[\s\S]*\[Video\] Set video size to:')
 
 
@@ -952,6 +952,9 @@ SCREENS_IMAGE_CASES = [
      {'opts': {'video_views_test_image_sharp': 'off'},
       'settings': {'video_smooth': 'true'},
       'blends': image_blends(SCREENS_IMAGE_BESIDE, IMAGE_QUADRANTS)}),
+    ('screens-image-sharp-smooth', 'image',
+     screens_image_beside(IMAGE_QUADRANTS),
+     {'settings': {'video_smooth': 'true'}}),
     ('screens-image-copy', 'image', screens_image_beside(IMAGE_QUADRANTS),
      {'opts': {'video_views_test_image': 'copy'}}),
     ('screens-image-null', 'image_null',
@@ -2612,9 +2615,10 @@ def run_screens_show_case(retroarch, root, driver, case, screens=None):
 def run_screens_image_case(retroarch, root, driver, case):
     """An image case: the window's points, IMAGES in every status, each
     picture the core sent taken, through a lend unless it copies, and
-    its blends and number of pictures where it has them."""
+    its blends, number of pictures and until line where it has them."""
     name, mode, points, extra = case
     extra = dict(extra)
+    until = extra.get('until')
     blends = extra.pop('blends', ())
     handins = extra.pop('handins', None)
     extra.pop('drivers', None)
@@ -2625,6 +2629,8 @@ def run_screens_image_case(retroarch, root, driver, case):
                       **extra)
     d = case_dir(root, driver, name)
     text = log_text(d)
+    if until and not until.search(text):
+        errors.append('never logged /%s/' % until.pattern)
     images = [s[4] for s in statuses(d)]
     if any(i != 1 for i in images):
         errors.append('status images=%s, want images=1'
