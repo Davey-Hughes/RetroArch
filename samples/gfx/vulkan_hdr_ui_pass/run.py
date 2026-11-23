@@ -22,8 +22,15 @@ different way:
 With a preset and any UI, the UI layer's render pass was left open
 before the composite recorded its barriers and began its own render
 pass inside it; the validation layer reports both. Every case must
-select an HDR10 swapchain, take the HDR path it is meant to, and log
-no validation error.
+select the HDR swapchain its surface offers, take the HDR path it is
+meant to, and log no validation error.
+
+The scrgb-only cases run on a surface with scRGB and no HDR10
+(FAKE_HDR_SCRGB_ONLY=1: the layer stands an FP16 swapchain in front of
+the real one), asking HDR10 or scRGB; hdr10-only-scrgb-menu asks scRGB
+on the HDR10 surface. Each must come up in the encoding its surface
+offers, warn when that is not the one asked, and run every HDR pass in
+it. The -pq cases have the core send HDR10 PQ (HDR_UI_CORE_PQ=1).
 
 usage: run.py --retroarch ./retroarch --log-dir DIR [--only REGEX]
 Needs Xvfb, lavapipe (VK_DRIVER_FILES is set to it when it is found)
@@ -83,18 +90,42 @@ shader1 = pass.slang
 filter_linear1 = true
 '''
 
-# name, preset, settings, open the menu, UI drawn. OSD text is off
-# except in the message case, so the menu is the only UI the menu
-# cases draw and the plain case draws none.
+# name, preset, settings, open the menu, UI drawn, surface, environment.
+# OSD text is off except in the message case, so the menu is the only
+# UI the menu cases draw and the plain case draws none.
 CASES = [
-    ('shader-menu', True, {}, True, True),
-    ('shader-statistics', True, {'statistics_show': 'true'}, False, True),
+    ('shader-menu', True, {}, True, True, 'hdr10', {}),
+    ('shader-statistics', True, {'statistics_show': 'true'}, False, True,
+     'hdr10', {}),
     ('shader-message', True,
-     {'fps_show': 'true', 'video_font_enable': 'true'}, False, True),
-    ('shader-plain', True, {}, False, False),
-    ('shader-menu-threaded', True, {'video_threaded': 'true'}, True, True),
-    ('stock-menu', False, {}, True, True),
+     {'fps_show': 'true', 'video_font_enable': 'true'}, False, True,
+     'hdr10', {}),
+    ('shader-plain', True, {}, False, False, 'hdr10', {}),
+    ('shader-menu-threaded', True, {'video_threaded': 'true'}, True, True,
+     'hdr10', {}),
+    ('stock-menu', False, {}, True, True, 'hdr10', {}),
+    ('hdr10-only-scrgb-menu', True, {'video_hdr_mode': '2'}, True, True,
+     'hdr10', {}),
+    ('scrgb-only-hdr10-menu', True, {}, True, True, 'scrgb', {}),
+    ('scrgb-only-hdr10-menu-threaded', True, {'video_threaded': 'true'},
+     True, True, 'scrgb', {}),
+    ('scrgb-only-hdr10-stock-menu', False, {}, True, True, 'scrgb', {}),
+    ('scrgb-only-hdr10-pq', False, {}, False, False, 'scrgb',
+     {'HDR_UI_CORE_PQ': '1'}),
+    ('scrgb-only-scrgb-menu', True, {'video_hdr_mode': '2'}, True, True,
+     'scrgb', {}),
+    ('scrgb-only-scrgb-pq', False, {'video_hdr_mode': '2'}, False, False,
+     'scrgb', {'HDR_UI_CORE_PQ': '1'}),
 ]
+
+# Per surface: the swapchain the driver must report, the HDR pass
+# modes allowed on it, and the layer's line for each swapchain.
+SURFACES = {
+    'hdr10': ('HDR10', (0, 1), 'fake-hdr: HDR10 swapchain'),
+    'scrgb': ('scRGB', (0, 2, 3), 'fake-hdr: scRGB swapchain'),
+}
+MODE_NAMES = {'1': 'HDR10', '2': 'scRGB'}
+FALLBACK_WARN = '[Vulkan] %s not available on this surface, using %s.'
 
 # What the driver logs, once per change, as it takes each HDR pass.
 GAME_PASS = '[Vulkan] HDR game pass:'
@@ -219,13 +250,16 @@ def write_cfg(path, d, settings, preset):
 
 
 def run_case(exe, d, core, display, name, preset, settings, menu, ui,
-             logs):
+             surface, case_env, logs):
     cfg = d / ('%s.cfg' % name)
     write_cfg(cfg, d, settings, preset)
     env = dict(os.environ, DISPLAY=display,
                VK_ADD_LAYER_PATH=str(d),
                VK_INSTANCE_LAYERS='VK_LAYER_RA_fake_hdr',
                XDG_CONFIG_HOME=str(d), HOME=str(d))
+    if surface == 'scrgb':
+        env['FAKE_HDR_SCRGB_ONLY'] = '1'
+    env.update(case_env)
     if not env.get('VK_DRIVER_FILES') and os.path.exists(LVP):
         env['VK_DRIVER_FILES'] = LVP
     cmd = [exe, '-v', '--config', str(cfg), '-L', str(core)]
@@ -254,10 +288,27 @@ def run_case(exe, d, core, display, name, preset, settings, menu, ui,
     text = out.decode(errors='replace')
 
     errors = []
+    asked = settings.get('video_hdr_mode', '1')
+    want, modes, layer_line = SURFACES[surface]
     if p.returncode != 0:
         errors.append('exit status %d' % p.returncode)
-    if 'fake-hdr: HDR10 swapchain' not in text:
-        errors.append('no HDR10 swapchain was created (fell back to SDR?)')
+    if layer_line not in text:
+        errors.append('no %s swapchain was created (fell back to SDR?)'
+                      % want)
+    if surface == 'scrgb' and SURFACES['hdr10'][2] in text:
+        errors.append('an HDR10 swapchain on a surface without HDR10')
+    m = re.search(r'\[Vulkan\] Source is .*, swapchain (\w+)\.', text)
+    if not m or m.group(1) != want:
+        errors.append('the driver reports swapchain %s, not %s'
+                      % (m.group(1) if m else '(none)', want))
+    passes = re.findall(r'\[Vulkan\] HDR (\w+) pass: mode (\d+)', text)
+    for kind, mode in sorted(set(passes)):
+        if int(mode) not in modes:
+            errors.append('HDR %s pass in mode %s on %s' % (kind, mode, want))
+    if asked in MODE_NAMES and MODE_NAMES[asked] != want \
+            and FALLBACK_WARN % (MODE_NAMES[asked], want) not in text:
+        errors.append('no warning that %s fell back to %s'
+                      % (MODE_NAMES[asked], want))
     if 'Validation Error' in text:
         errors.append('%d validation error(s)' % text.count('Validation Error'))
         vuids = {}
@@ -302,11 +353,11 @@ def main():
         with tempfile.TemporaryDirectory(prefix='ra-hdr-ui-') as d:
             d = Path(d)
             core = build(d)
-            for name, preset, settings, menu, ui in CASES:
+            for name, preset, settings, menu, ui, surface, env in CASES:
                 if a.only and not re.search(a.only, name):
                     continue
                 errors = run_case(exe, d, core, display, name, preset,
-                                  settings, menu, ui, logs)
+                                  settings, menu, ui, surface, env, logs)
                 if errors:
                     failed += 1
                     print('FAIL: %s (%s)' % (name, logs / (name + '.log')))
