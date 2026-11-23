@@ -5431,25 +5431,22 @@ bool vulkan_create_swapchain(gfx_ctx_vulkan_data_t *vk,
                   VIDEO_FLAG_HDR_SUPPORT | VIDEO_FLAG_HDR10_SUPPORT | VIDEO_FLAG_SCRGB_SUPPORT);
          }
 
-         /* Clamp the selected mode if the surface doesn't support it */
          {
+            static const char *const mode_names[] = { "SDR", "HDR10", "scRGB" };
             uint32_t disp_flags = video_driver_get_disp_flags();
-            if (video_hdr_mode == 2 && !(disp_flags & VIDEO_FLAG_SCRGB_SUPPORT))
-            {
-               RARCH_WARN("[Vulkan] scRGB not available on this surface, falling back.\n");
-               video_hdr_mode = (disp_flags & VIDEO_FLAG_HDR10_SUPPORT) ? 1 : 0;
-            }
-            if (video_hdr_mode == 1 && !(disp_flags & VIDEO_FLAG_HDR10_SUPPORT))
-            {
-               RARCH_WARN("[Vulkan] HDR10 not available on this surface, falling back.\n");
-               video_hdr_mode = 0;
-            }
+            unsigned asked      = video_hdr_mode;
+            video_hdr_mode      = vulkan_hdr_surface_mode(asked,
+                  (disp_flags & VIDEO_FLAG_HDR10_SUPPORT) != 0,
+                  (disp_flags & VIDEO_FLAG_SCRGB_SUPPORT) != 0);
+            if ((asked == 1 || asked == 2) && video_hdr_mode != asked)
+               RARCH_WARN("[Vulkan] %s not available on this surface, using %s.\n",
+                     mode_names[asked], mode_names[video_hdr_mode]);
          }
 
          if (video_hdr_mode > 0)
             vk->context.flags |=  VK_CTX_FLAG_HDR_ENABLE;
          else
-            vk->context.flags &= ~VK_CTX_FLAG_HDR_ENABLE;
+            vk->context.flags &= ~(VK_CTX_FLAG_HDR_ENABLE | VK_CTX_FLAG_HDR_SCRGB);
 
          if (video_hdr_mode == 2)
          {
@@ -5500,7 +5497,7 @@ bool vulkan_create_swapchain(gfx_ctx_vulkan_data_t *vk,
       }
       else
       {
-         vk->context.flags &= ~VK_CTX_FLAG_HDR_ENABLE;
+         vk->context.flags &= ~(VK_CTX_FLAG_HDR_ENABLE | VK_CTX_FLAG_HDR_SCRGB);
       }
 
       if (!(vk->context.flags & VK_CTX_FLAG_HDR_ENABLE))

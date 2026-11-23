@@ -16,7 +16,8 @@
 #ifndef VULKAN_SURFACE_FORMAT_H__
 #define VULKAN_SURFACE_FORMAT_H__
 
-/* Which 8-bit SDR surface format the swapchain is created with.
+/* Which 8-bit SDR surface format, or which HDR mode, the swapchain is
+ * created with.
  *
  * B8G8R8A8_UNORM (DRM XRGB8888/ARGB8888) is the one format every display
  * plane scans out, so a compositor can put a fullscreen window straight
@@ -54,6 +55,19 @@ static INLINE int vulkan_sdr8_surface_format(
    }
 
    return first;
+}
+
+/* The HDR mode to make the swapchain in (1 HDR10, 2 scRGB, 0 SDR): the
+ * mode asked if the surface lists its format and colour space, else the
+ * other HDR mode if listed, else SDR. */
+static INLINE unsigned vulkan_hdr_surface_mode(unsigned asked,
+      int hdr10, int scrgb)
+{
+   if (asked == 1)
+      return hdr10 ? 1 : (scrgb ? 2 : 0);
+   if (asked == 2)
+      return scrgb ? 2 : (hdr10 ? 1 : 0);
+   return 0;
 }
 
 #endif
