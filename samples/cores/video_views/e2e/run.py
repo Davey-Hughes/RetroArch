@@ -1002,6 +1002,10 @@ SCREENS_IMAGE_CASES = [
     ('screens-image-stereo-preset', 'image',
      screens_image_sbs(IMAGE_QUADRANTS),
      {'preset': True, 'settings': {'video_stereo_mode': '1'}}),
+    # Side by side straight from the frame: the right eye's Top follows
+    # the left eye's picture, whose texture and filter it must not keep.
+    ('screens-image-sbs', 'image', screens_image_sbs(IMAGE_QUADRANTS),
+     {'settings': {'video_stereo_mode': '1'}}),
     # Over the core's own frame, bottom up or top down: the picture's
     # first row stays at the top.
     ('screens-image-hw', 'image', screens_image_beside(IMAGE_QUADRANTS),
