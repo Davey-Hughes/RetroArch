@@ -936,7 +936,8 @@ def screens_image_inset(colours):
 
 # The image modes, on IMAGES_DRIVERS. Entries as SCREENS_DRAW_CASES',
 # with 'opts' added to the core's options, 'blends' pixels that must be
-# neither side's colour, 'handins' how many pictures the core sends and
+# neither side's colour, 'handins' how many pictures the core sends,
+# 'preset' True to draw through the driver's SCREENS_PRESETS preset and
 # 'drivers' those of IMAGES_DRIVERS the case runs on.
 SCREENS_IMAGE_CASES = [
     ('screens-image', 'image', screens_image_beside(IMAGE_QUADRANTS), {}),
@@ -965,6 +966,14 @@ SCREENS_IMAGE_CASES = [
     ('screens-image-over-threaded', 'image_over',
      screens_image_inset(IMAGE_QUADRANTS),
      {'settings': {'video_threaded': 'true'}, 'drivers': ('gl', 'vulkan')}),
+    # The inset over Top's passes.
+    ('screens-image-over-preset', 'image_over',
+     screens_image_inset(IMAGE_QUADRANTS), {'preset': True}),
+    # Placed in each eye, whose rows interlace: a picture missing from
+    # either loses every other row.
+    ('screens-image-interlaced', 'image',
+     screens_image_beside(IMAGE_QUADRANTS),
+     {'settings': {'video_stereo_mode': '5'}}),
 ]
 
 
@@ -2615,15 +2624,21 @@ def run_screens_show_case(retroarch, root, driver, case, screens=None):
 def run_screens_image_case(retroarch, root, driver, case):
     """An image case: the window's points, IMAGES in every status, each
     picture the core sent taken, through a lend unless it copies, and
-    its blends, number of pictures and until line where it has them."""
+    its blends, number of pictures, preset and until line where it has
+    them."""
     name, mode, points, extra = case
     extra = dict(extra)
     until = extra.get('until')
+    preset = extra.pop('preset', False)
     blends = extra.pop('blends', ())
     handins = extra.pop('handins', None)
     extra.pop('drivers', None)
     opts = dict(extra.pop('opts', {}), video_views_test_screens=mode)
     settings = dict(SCREENS_AIM_SETTINGS, **extra.pop('settings', {}))
+    if preset:
+        settings['video_shader_enable'] = 'true'
+        extra['args'] = ('--set-shader='
+                         + os.path.join(HERE, SCREENS_PRESETS[driver]),)
     errors = run_case(retroarch, root, driver,
                       (name, 'ds', settings, points), opts=opts, screens=1,
                       **extra)
@@ -2631,6 +2646,11 @@ def run_screens_image_case(retroarch, root, driver, case):
     text = log_text(d)
     if until and not until.search(text):
         errors.append('never logged /%s/' % until.pattern)
+    if (preset and driver in DRIVER_PRESETS
+            and not direct_drawn(d, PRESET_RE)):
+        errors.append('views not drawn through the preset')
+    if preset and direct_drawn(d, DIRECT_RE):
+        errors.append('views drawn straight from the frame')
     images = [s[4] for s in statuses(d)]
     if any(i != 1 for i in images):
         errors.append('status images=%s, want images=1'
