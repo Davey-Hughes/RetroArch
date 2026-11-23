@@ -34,6 +34,9 @@ also probes native SDR/PQ/scRGB output; inspect the reported mode to distinguish
 an available HDR path from an SDR fallback. The live core is a thin wrapper over
 the recording fixture and produces no output recording.
 
+python3 vulkan_mode.py runs vulkan.c's resize and default-chain code against
+mocks: only the swapchain's format pick may turn HDR on or off.
+
 GLCore capability tests exercise the shipping publisher and getter while another
 thread changes FP16/PQ framebuffer state. A scRGB texture is accepted only when
 the selected UI target preserves FP16 highlights. No render-thread handles or
