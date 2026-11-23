@@ -44,6 +44,7 @@
 #include "../../../gfx/video_driver.h"
 #include "../../../gfx/gfx_instrument.h"
 #include "../../../gfx/video_thread_wrapper.h"
+#include "../../../gfx/video_screen_images.h"
 #ifdef HAVE_TEMPORAL_UPSCALER
 #include "../../../gfx/video_upscaler.h"
 #endif
@@ -11296,6 +11297,143 @@ static void lane_surface_update(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Lane: image screens across a driver restart                         */
+/*   An image screen's update still out when the driver restarts -     */
+/*   done but not delivered, or not yet taken by the video thread -    */
+/*   leaves no texture of the old driver loaded.                       */
+/* ------------------------------------------------------------------ */
+
+static retro_atomic_int_t imgrst_holding;
+static retro_atomic_int_t imgrst_cmd;
+
+/* Video thread: keeps the thread from the in-list until a command is
+ * sent, and says which. Bounded, so a command that never comes fails
+ * the lane rather than hanging it. */
+static uintptr_t imgrst_hold(void *driver_data,
+      const video_poke_interface_t *poke, void *user)
+{
+   thread_video_t *thr = (thread_video_t*)user;
+   unsigned spun;
+   (void)driver_data;
+   (void)poke;
+   retro_atomic_store_release_int(&imgrst_holding, 1);
+   for (spun = 0; spun < 10000
+         && retro_atomic_load_acquire_int(&thr->send_cmd) == CMD_VIDEO_NONE;
+         spun++)
+      retro_sleep(1);
+   retro_atomic_store_release_int(&imgrst_cmd,
+         retro_atomic_load_acquire_int(&thr->send_cmd));
+   retro_atomic_store_release_int(&imgrst_holding, 0);
+   return 0;
+}
+
+/* Screen 0's picture as SET_VIDEO_VIEWS hands it in, then a shown
+ * frame's upload */
+static bool imgrst_show(unsigned serial)
+{
+   static uint32_t                        pixels[16 * 16];
+   static struct retro_video_screen_image im;
+   static struct retro_video_screen       screen;
+   static struct retro_video_views        in;
+   static video_views_map_t               map;
+   memset(&in,  0, sizeof(in));
+   memset(&map, 0, sizeof(map));
+   memset(pixels, (int)serial, sizeof(pixels));
+   im.data        = pixels;
+   im.width       = 16;
+   im.height      = 16;
+   im.pitch       = 16 * sizeof(uint32_t);
+   im.format      = RETRO_PIXEL_FORMAT_XRGB8888;
+   im.serial      = serial;
+   screen.image   = &im;
+   in.screens     = &screen;
+   in.num_screens = 1;
+   map.image      = 1;
+   if (!video_screen_images_set(&in, &map))
+      return false;
+   video_screen_images_frame(&map, 1, 0);
+   return true;
+}
+
+static void lane_screen_image_restart(void)
+{
+   static video_thread_async_job_t  job;
+   static video_thread_async_load_t hold;
+   unsigned had = failures;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   unsigned step, i;
+
+   set_threaded_via_setting(true);
+   run_frames(3);
+   expect_wrapper(true, "image restart lane");
+
+   for (step = 0; step < 2; step++)
+   {
+      const char *how     = step ? "not taken" : "not delivered";
+      thread_video_t *thr = (thread_video_t*)video_st->data;
+      CHECK(surftex_install(), "image restart lane: no texture back end");
+      /* The first picture is a load, delivered at the next frame */
+      CHECK(imgrst_show(step * 2 + 1), "image restart lane: picture refused");
+      run_frames(2);
+      video_thread_wait_idle();
+      CHECK(surftex_loads == 1 && surftex_live_count() == 1,
+            "image restart lane, %s: %u loads, %u live after the first "
+            "picture", how, surftex_loads, surftex_live_count());
+      if (step)
+      {
+         memset(&hold, 0, sizeof(hold));
+         job.run          = imgrst_hold;
+         job.user         = thr;
+         hold.img         = &job;
+         hold.kind        = VIDEO_THREAD_ASYNC_JOB;
+         hold.lent_idx[0] = hold.lent_idx[1] = -1;
+         retro_atomic_store_release_int(&imgrst_cmd, CMD_VIDEO_NONE);
+         CHECK(video_thread_async_post(&hold),
+               "image restart lane: the hold was refused");
+         for (i = 0; i < 2000
+               && !retro_atomic_load_acquire_int(&imgrst_holding); i++)
+            retro_sleep(1);
+         CHECK(retro_atomic_load_acquire_int(&imgrst_holding),
+               "image restart lane: the video thread never took the hold");
+      }
+      /* The next picture updates that texture in place */
+      CHECK(imgrst_show(step * 2 + 2), "image restart lane: picture refused");
+      if (!step)
+      {
+         /* No frame runs before the restart to deliver it */
+         for (i = 0; i < 2000 && mpsc_stack_empty(&thr->async.out); i++)
+            retro_sleep(1);
+         CHECK(!mpsc_stack_empty(&thr->async.out),
+               "image restart lane: the update never completed");
+      }
+      command_event(CMD_EVENT_REINIT, NULL);
+      /* The back end went with the old driver */
+      surftex_mode  = 0;
+      surftex_inner = NULL;
+      if (step)
+         CHECK(retro_atomic_load_acquire_int(&imgrst_cmd) == CMD_FREE,
+               "image restart lane: command %d reached the held thread "
+               "before CMD_FREE", retro_atomic_load_acquire_int(&imgrst_cmd));
+      CHECK(surftex_updates == (step ? 0u : 1u),
+            "image restart lane, %s: the update ran %u times", how,
+            surftex_updates);
+      CHECK(surftex_live_count() == 0,
+            "image restart lane, %s: %u textures of the old driver left "
+            "loaded (%u loads, %u unloads)", how, surftex_live_count(),
+            surftex_loads, surftex_unloads);
+      expect_wrapper(true, "image restart lane, after the restart");
+   }
+
+   video_screen_images_clear();
+   set_threaded_via_setting(false);
+   run_frames(2);
+
+   if (failures == had)
+      fprintf(stderr, "[pass] image restart lane (an update undelivered, "
+            "and one not taken)\n");
+}
+
+/* ------------------------------------------------------------------ */
 /* Lane: an overlay page of the pack's textures through the driver     */
 /*   Textures made by video_driver_texture_load() are shown as an      */
 /*   overlay page through load_textures(), drawn for a few frames,     */
@@ -15475,6 +15613,7 @@ int main(int argc, char *argv[])
       lane_window_answers();
       lane_presentable_refresh();
       lane_size_pair_round_trip();
+      lane_screen_image_restart();
    }
    else
       fprintf(stderr, "[skip] null-driver instrumented lanes (real driver: %s)\n",

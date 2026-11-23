@@ -1398,29 +1398,36 @@ static bool video_thread_handle_packet(
             l = (video_thread_tex_retire_t*)mpsc_stack_drain(&thr->tex_retire);
             video_thread_tex_retire_run(thr, l);
          }
-         /* Uploads that completed but were not delivered yet hold a
-          * texture of this driver's that nobody will ever unload:
-          * their done() is answered with 0 after the join, so the
-          * texture goes back to the driver here. An update names the
-          * poster's own texture and is left alone. */
+         /* Uploads not delivered yet hold a texture of this driver's
+          * that nobody will ever unload: their done() is answered with
+          * 0 after the join, so the texture goes back to the driver
+          * here. A load's new texture, and an update's, run or not:
+          * its poster lets go of its texture only in that done(). */
          {
-            /* Taken off the list and put back in the same order, for
-             * the main thread's delivery; this thread is out's only
-             * producer. */
-            video_thread_async_load_t *n = video_thread_async_take(thr,
-                  &thr->async.out);
-            while (n)
+            unsigned i;
+            for (i = 0; i < 2; i++)
             {
-               video_thread_async_load_t *next = VIDEO_THREAD_ASYNC_NEXT(n);
-               if (     (n->kind == VIDEO_THREAD_ASYNC_LOAD || n->made)
-                     && n->handle
-                     && thr->poke && thr->poke->unload_texture
-                     && thr->driver_data)
-                  thr->poke->unload_texture(thr->driver_data, false,
-                        n->handle);
-               n->handle = 0;
-               video_thread_async_push(thr, &thr->async.out, n);
-               n = next;
+               /* Taken off the list and put back in the same order,
+                * for the teardown after the join */
+               mpsc_stack_t *list = i ? &thr->async.in : &thr->async.out;
+               video_thread_async_load_t *n = video_thread_async_take(thr,
+                     list);
+               while (n)
+               {
+                  video_thread_async_load_t *next =
+                     VIDEO_THREAD_ASYNC_NEXT(n);
+                  if (     (   n->kind == VIDEO_THREAD_ASYNC_UPDATE
+                            || (!i && (   n->kind == VIDEO_THREAD_ASYNC_LOAD
+                                       || n->made)))
+                        && n->handle
+                        && thr->poke && thr->poke->unload_texture
+                        && thr->driver_data)
+                     thr->poke->unload_texture(thr->driver_data, false,
+                           n->handle);
+                  n->handle = 0;
+                  video_thread_async_push(thr, list, n);
+                  n = next;
+               }
             }
          }
          /* The lent memory goes with the driver, as does its frame
