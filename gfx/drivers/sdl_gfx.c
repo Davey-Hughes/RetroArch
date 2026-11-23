@@ -80,7 +80,8 @@ typedef struct sdl_video
       /* VV_ALPHA's alpha below 255, which views are drawn at; 0 solid */
       unsigned alpha;
       unsigned frame_dims;
-      /* For get_flags: the last frame with a map was drawn whole */
+      /* For get_flags: a map is drawn whole: the last frame's, or with
+       * none what one would get */
       retro_atomic_int_t fallback;
       bool direct_seen;
    } views;
