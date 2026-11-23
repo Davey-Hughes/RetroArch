@@ -5527,6 +5527,50 @@ static void test_images_per_instance(void)
    window_test_end();
 }
 
+/* An image screen in its own window: the window's map is the frame's,
+ * with the picture landed, and the main window lays out the rest */
+static void test_window_image_frame(void)
+{
+   settings_t *settings = config_get_ptr();
+   video_views_layout_t layout;
+   uint8_t gen;
+   images_test_frames_begin();
+   settings->bools.video_windows_enable = true;
+   strlcpy(settings->arrays.video_screen_display[1],
+         VIDEO_WINDOW_DISPLAY_MAIN,
+         sizeof(settings->arrays.video_screen_display[1]));
+   settings->arrays.video_screen_display[2][0] = '\0';
+   /* The desktop's, without a list */
+   video_driver_publish_window_displays(NULL, 0);
+   images_test_pattern(1);
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1));
+   window_test_run();
+   CHECK(window_test_handed != NULL);
+   CHECK(window_test_seen.plan.separate_mask == 0x4u);
+   CHECK(window_test_seen.window_screens[2] == 0x4u);
+   CHECK(window_test_seen.core.image & 0x4u);
+   CHECK(window_test_seen.core.image_tex[2] == 101);
+   CHECK(window_test_seen_views.image_tex[2] == 101);
+   CHECK(window_test_seen_placed == 2);
+   CHECK(!screens_test_image_placed(2, 0));
+   video_driver_window_layout_screens(&window_test_seen,
+         &window_test_settings, window_test_seen.window_screens[2],
+         VIDEO_SCALE_PACK(480, 320), &layout);
+   CHECK(layout.num_placements == 1);
+   CHECK(layout.placements[0].view == 2);
+   CHECK(layout.placements[0].flags & VIDEO_VIEWS_PLACEMENT_IMAGE);
+   /* A new picture: the window's map has its landing */
+   gen = window_test_seen.core.image_gen[2];
+   images_test_pattern(2);
+   CHECK(images_test_hand(screens_test_dsi_pixels, 2));
+   window_test_run();
+   CHECK(window_test_seen.core.image_tex[2] == 101);
+   CHECK(window_test_seen.core.image_gen[2] != gen);
+   settings->arrays.video_screen_display[1][0] = '\0';
+   memset(screens_test_dsi_pixels, 0, sizeof(screens_test_dsi_pixels));
+   window_test_end();
+}
+
 /* As a core load leaves the store: empty, and the core's */
 static void screens_test_core(void)
 {
@@ -12996,6 +13040,7 @@ int main(int argc, char **argv)
    test_images_rgba();
    test_images_gone_kept();
    test_images_per_instance();
+   test_window_image_frame();
    test_screens_core_show();
    test_screens_core_over_inset();
    test_screens_user_over();

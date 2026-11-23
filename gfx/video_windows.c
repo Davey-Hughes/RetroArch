@@ -27,7 +27,7 @@ void video_windows_plan(const video_views_map_t *map,
 {
    unsigned s;
    memset(out, 0, sizeof(*out));
-   if (!map || !map->num_views)
+   if (!map || !(map->num_views || map->image))
       return;
    for (s = 0; s < map->num_screens && s < RETRO_VIDEO_VIEWS_MAX; s++)
    {

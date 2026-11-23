@@ -960,8 +960,10 @@ def screens_image_sbs(colours):
 # with 'opts' added to the core's options, 'blends' pixels that must be
 # neither side's colour, 'handins' how many pictures the core sends,
 # 'preset' True to draw through the driver's SCREENS_PRESETS preset,
-# 'hw' True to run once for each hardware kind EXACT_HW gives the driver
-# and 'drivers' those of IMAGES_DRIVERS the case runs on.
+# 'hw' True to run once for each hardware kind EXACT_HW gives the driver,
+# 'drivers' those of IMAGES_DRIVERS the case runs on and 'window' the
+# colours of the picture's quadrants in screen 2's own window, which
+# only the Xvfb runs can find.
 SCREENS_IMAGE_CASES = [
     ('screens-image', 'image', screens_image_beside(IMAGE_QUADRANTS), {}),
     ('screens-image-over', 'image_over',
@@ -1014,7 +1016,22 @@ SCREENS_IMAGE_CASES = [
     ('screens-image-rotated', 'image',
      screens_image_rotated(IMAGE_QUADRANTS),
      {'settings': {'video_rotation': '1'}}),
+    # In a Game Screens window of its own, Top alone in the main one.
+    ('screens-image-window', 'image', SCREENS_TOP_ALONE,
+     {'window': IMAGE_QUADRANTS, 'drivers': ('gl', 'vulkan'),
+      'settings': {'video_windows_enable': 'true'}}),
+    # The window drawn again for a picture changed on a NULL refresh.
+    ('screens-image-window-null', 'image_null', SCREENS_TOP_ALONE,
+     {'window': IMAGE_MIRRORED, 'drivers': ('gl', 'vulkan'),
+      'settings': {'video_windows_enable': 'true'},
+      'until': SCREENS_SWITCHED_RE}),
 ]
+# A screen's own window, as video_window_title() names it.
+SCREEN_WINDOW_RE = re.compile(r'^\s*(0x[0-9a-f]+) "RetroArch - [^"]*":',
+                              re.M)
+# The contexts the window cases need where the driver's default makes no
+# screen windows: GLX's.
+WINDOW_CONTEXTS = {'gl': 'egl_x'}
 
 
 # The last few files read_png() decoded on this thread, by path, with
@@ -1799,6 +1816,29 @@ def window_errors(display, points):
     return errors
 
 
+def screen_window_shots(d, env):
+    """Each screen's own window on the case's Xvfb, as import reads it,
+    in d/window-N.png, and the window tree in d/xwininfo.txt."""
+    try:
+        tree = subprocess.run(['xwininfo', '-root', '-tree'], env=env,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL,
+                              universal_newlines=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        tree = ''
+    with open(os.path.join(d, 'xwininfo.txt'), 'w') as f:
+        f.write(tree)
+    for i, wid in enumerate(SCREEN_WINDOW_RE.findall(tree)):
+        try:
+            subprocess.run(['import', '-display', env['DISPLAY'], '-window',
+                            wid, 'PNG24:' + os.path.join(
+                                d, 'window-%d.png' % i)],
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=20)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
 # Rounds of screenshots a pointer case takes before it gives up on the
 # cursor showing where its check wants it.
 POINTER_ROUNDS = 5
@@ -1920,7 +1960,7 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
              opts=None, args=(), gpu=None, pointer=(), env_extra=None,
              pointer_check=None, raw=False, passes=None, after=None,
              window=(), until=None, aim=(), aimed=None, files=None,
-             screens=None, screenshot=True):
+             screens=None, screenshot=True, window_shots=False):
     """gpu, a list, gets RetroArch's GPU memory in MiB sampled while it
     settles. pointer, window points, has the menu open with the pointer
     at each in turn, in d/pointer-N.png; pointer_check(d) gives the
@@ -1939,7 +1979,8 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
     the core had logged before it. files, {path under the case directory:
     text}, are there when it starts. screens, given, is the SCREENS bit
     every status must have. screenshot False takes none: the statuses
-    alone are checked."""
+    alone are checked. window_shots True takes the screens' own windows
+    on Xvfb as screen_window_shots() does, before the screenshot."""
     name, mapopt, settings, points = case
     hdr = HDR and driver == 'vulkan'
     d = case_dir(root, driver, name, hw)
@@ -2045,6 +2086,8 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
             mib = gpu_mib(pid) if pid else None
             if mib is not None:
                 gpu.append(mib)
+        if window_shots and XVFB:
+            screen_window_shots(d, env)
         if pointer:
             send('MENU_TOGGLE', port)
             time.sleep(3)
@@ -2664,18 +2707,23 @@ def run_screens_show_case(retroarch, root, driver, case, screens=None):
 def run_screens_image_case(retroarch, root, driver, case, hw='off'):
     """An image case: the window's points, IMAGES in every status, each
     picture the core sent taken, through a lend unless it copies, and
-    its blends, number of pictures, preset and until line where it has
-    them."""
+    its blends, number of pictures, preset, until line and screen window
+    where it has them."""
     name, mode, points, extra = case
     extra = dict(extra)
     until = extra.get('until')
     preset = extra.pop('preset', False)
     blends = extra.pop('blends', ())
     handins = extra.pop('handins', None)
+    window = extra.pop('window', None)
     extra.pop('drivers', None)
     extra.pop('hw', None)
     opts = dict(extra.pop('opts', {}), video_views_test_screens=mode)
     settings = dict(SCREENS_AIM_SETTINGS, **extra.pop('settings', {}))
+    if window:
+        extra['window_shots'] = True
+        if driver in WINDOW_CONTEXTS:
+            settings['video_context_driver'] = WINDOW_CONTEXTS[driver]
     if preset:
         settings['video_shader_enable'] = 'true'
         extra['args'] = ('--set-shader='
@@ -2721,6 +2769,33 @@ def run_screens_image_case(retroarch, root, driver, case, hw='off'):
                        for c in (ca, cb)):
                     errors.append('(%d,%d) got %s, want a blend of %s and '
                                   '%s' % (x, y, got, ca, cb))
+    if window:
+        errors += screen_window_errors(d, window)
+    return errors
+
+
+def screen_window_errors(d, colours):
+    """What is wrong with the one screen window's shot in d: the centres
+    of the quadrants of its picture, the box its lit pixels fill, must
+    be in colours."""
+    shots = sorted(x for x in os.listdir(d)
+                   if x.startswith('window-') and x.endswith('.png'))
+    if len(shots) != 1:
+        return ['%d screen windows shot, want 1 (see %s)'
+                % (len(shots), os.path.join(d, 'xwininfo.txt'))]
+    w, h, bpp, rows = read_png(os.path.join(d, shots[0]))
+    lit = [(x, y) for y in range(h) for x in range(w)
+           if any(v > TOLERANCE for v in rows[y][x * bpp:x * bpp + 3])]
+    if not lit:
+        return ['the screen window is black']
+    x0, y0, x1, y1 = box_of(lit)
+    errors = []
+    for x, y, want in image_centres((x0, y0, x1 - x0 + 1, y1 - y0 + 1),
+                                    colours):
+        got = tuple(rows[y][x * bpp:x * bpp + 3])
+        if any(abs(g - e) > TOLERANCE for g, e in zip(got, want)):
+            errors.append('window (%d,%d) got %s want %s'
+                          % (x, y, got, want))
     return errors
 
 
@@ -3113,6 +3188,7 @@ def driver_jobs(retroarch, root, driver):
              for c in SCREENS_IMAGE_CASES
              if driver in c[3].get('drivers', IMAGES_DRIVERS)
              and wanted(c[0])
+             and (XVFB and not WINE or 'window' not in c[3])
              for hw in ([h for h in EXACT_HW[driver] if h != 'off']
                         if c[3].get('hw') else ['off'])]
     jobs += [lambda c=c: screens_status(c)

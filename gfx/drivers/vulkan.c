@@ -13380,19 +13380,27 @@ static unsigned vulkan_window_buffers(const vk_t *vk)
 }
 
 /* A repeat: window @w's screens laid out into its lent slot; true when
- * that is not the layout it last published, so it is drawn again. A
- * change in their NO_INPUT alone is published at once, undrawn. */
+ * that is not the layout it last published, or a picture it draws has
+ * landed since, so it is drawn again. A change in their NO_INPUT alone
+ * is published at once, undrawn. */
 static bool vulkan_window_repeat(vk_t *vk,
       const video_frame_info_t *video_info, unsigned w)
 {
+   unsigned s;
    struct vk_window *win          = &vk->windows.win[w];
    const video_windows_frame_t *f = video_info->windows;
    const video_window_layout_t *drawn =
       video_driver_published_window_layout(w);
+   unsigned images                = f->core.image & f->window_screens[w];
    video_driver_window_layout_screens(f, &video_info->views_settings,
          f->window_screens[w], win->output.dims, win->layout);
    if (!drawn || !video_views_layout_same(win->layout, &drawn->layout))
       return true;
+   for (s = 0; s < RETRO_VIDEO_VIEWS_MAX; s++)
+      if (     (images & (1u << s))
+            && (   drawn->core_map.image_tex[s] != f->core.image_tex[s]
+                || drawn->core_map.image_gen[s] != f->core.image_gen[s]))
+         return true;
    if ((drawn->core_map.no_input ^ f->core.no_input) & f->window_screens[w])
       video_driver_publish_window_layout(w, win->native.generation,
             vk->windows.held.display[w], win->layout, &f->core,

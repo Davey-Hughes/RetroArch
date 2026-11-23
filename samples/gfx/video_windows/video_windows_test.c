@@ -3080,6 +3080,75 @@ static void test_windows_steps_inset(void)
    CHECK(retire == 0x2u);
 }
 
+/* An image screen gets a window like one with views, and goes with its
+ * base as an inset */
+static void test_plan_image_screen(void)
+{
+   static uint32_t pixels[48 * 32];
+   struct retro_video_view v[2];
+   struct retro_video_screen scr[3];
+   struct retro_video_screen_image image;
+   struct retro_video_views in;
+   video_views_map_t map;
+   video_window_settings_t screens[RETRO_VIDEO_VIEWS_MAX];
+   video_windows_plan_t plan;
+   memset(v, 0, sizeof(v));
+   memset(scr, 0, sizeof(scr));
+   memset(&image, 0, sizeof(image));
+   memset(&in, 0, sizeof(in));
+   memset(screens, 0, sizeof(screens));
+   /* "dsi": two stacked screens and a 48x32 picture as screen 2 */
+   v[0].width      = 256;
+   v[0].height     = 192;
+   v[1]            = v[0];
+   v[1].y          = 192;
+   v[1].screen     = 1;
+   image.data      = pixels;
+   image.width     = 48;
+   image.height    = 32;
+   image.pitch     = 48 * sizeof(uint32_t);
+   image.format    = RETRO_PIXEL_FORMAT_XRGB8888;
+   image.serial    = 1;
+   scr[2].image    = &image;
+   in.views        = v;
+   in.num_views    = 2;
+   in.flags        = RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   in.screens      = scr;
+   in.num_screens  = 3;
+   CHECK(video_views_validate_map(&in, &map, NULL));
+   CHECK(map.num_screens == 3 && map.image == 0x4u);
+   screens[2].mode = VIDEO_WINDOW_SEPARATE;
+   video_windows_plan(&map, screens, true, true, 0, NULL, &plan);
+   CHECK(plan.separate_mask == 0x4u && plan.main_mask == 0x3u);
+   CHECK(video_views_with_insets(&map, plan.separate_mask) == 0x4u);
+   map.left_out    = 0x4u;
+   video_windows_plan(&map, screens, true, true, 0, NULL, &plan);
+   CHECK(plan.hidden_mask & 0x4u);
+   CHECK(!((plan.main_mask | plan.separate_mask) & 0x4u));
+   map.left_out    = 0;
+   map.over        = 0x4u;
+   map.base        = 0;
+   video_windows_plan(&map, screens, true, true, 0, NULL, &plan);
+   CHECK(!((plan.main_mask | plan.separate_mask | plan.hidden_mask) & 0x4u));
+   CHECK(video_views_with_insets(&map, plan.main_mask) == 0x7u);
+}
+
+/* A map with only image screens is planned too */
+static void test_plan_image_alone(void)
+{
+   video_views_map_t map;
+   video_window_settings_t screens[RETRO_VIDEO_VIEWS_MAX];
+   video_windows_plan_t plan;
+   memset(&map, 0, sizeof(map));
+   memset(screens, 0, sizeof(screens));
+   map.num_screens = 2;
+   map.image       = 0x3u;
+   screens[1].mode = VIDEO_WINDOW_SEPARATE;
+   video_windows_plan(&map, screens, true, true, 0, NULL, &plan);
+   CHECK(plan.main_mask == 0x1u && plan.separate_mask == 0x2u);
+   CHECK(plan.hidden_mask == 0u);
+}
+
 int main(void)
 {
    test_windows_policy();
@@ -3121,6 +3190,8 @@ int main(void)
    test_plan_inset();
    test_plan_inset_forced_attached();
    test_windows_steps_inset();
+   test_plan_image_screen();
+   test_plan_image_alone();
    if (failures)
       return 1;
    puts("video_windows: ok");
