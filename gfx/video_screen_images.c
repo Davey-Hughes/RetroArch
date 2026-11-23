@@ -87,26 +87,30 @@ static uint32_t *video_screen_images_alloc(unsigned dims)
          * VIDEO_SCALE_H(dims) * sizeof(uint32_t));
 }
 
-/* Whether @data points into a slot of @store; its screen and slot */
-static bool video_screen_images_find(
-      const video_screen_images_screen_t *store, const void *data,
-      unsigned *screen, int *slot)
+/* Whether @data points into a slot of either store; its screen and slot */
+static bool video_screen_images_find(const void *data, unsigned *screen,
+      int *slot)
 {
-   unsigned s;
+   unsigned o, s;
    int i;
-   for (s = 0; s < RETRO_VIDEO_SCREENS_MAX; s++)
+   for (o = 0; o < VIDEO_SCREEN_IMAGES_OWNERS; o++)
    {
-      for (i = 0; i < VIDEO_SCREEN_IMAGES_SLOTS; i++)
+      const video_screen_images_screen_t *store =
+            video_screen_images_store[o];
+      for (s = 0; s < RETRO_VIDEO_SCREENS_MAX; s++)
       {
-         unsigned dims = store[s].slot_dims[i];
-         size_t len    = (size_t)VIDEO_SCALE_W(dims) * VIDEO_SCALE_H(dims)
-               * sizeof(uint32_t);
-         if (     store[s].slot[i]
-               && (uintptr_t)data - (uintptr_t)store[s].slot[i] < len)
+         for (i = 0; i < VIDEO_SCREEN_IMAGES_SLOTS; i++)
          {
-            *screen = s;
-            *slot   = i;
-            return true;
+            unsigned dims = store[s].slot_dims[i];
+            size_t len    = (size_t)VIDEO_SCALE_W(dims)
+                  * VIDEO_SCALE_H(dims) * sizeof(uint32_t);
+            if (     store[s].slot[i]
+                  && (uintptr_t)data - (uintptr_t)store[s].slot[i] < len)
+            {
+               *screen = s;
+               *slot   = i;
+               return true;
+            }
          }
       }
    }
@@ -268,9 +272,9 @@ bool video_screen_images_set(const struct retro_video_views *in,
       }
       if (!im->data)
          goto refuse;
-      if (video_screen_images_find(store, im->data, &found, &slot))
+      if (video_screen_images_find(im->data, &found, &slot))
       {
-         /* Only this screen's lend, as it was lent */
+         /* Only the caller's lend for this screen, as it was lent */
          if (     found != s
                || !(scr->slot_flags[slot] & VIDEO_SCREEN_IMAGES_LENT)
                || im->data   != scr->slot[slot]
@@ -480,19 +484,31 @@ void video_screen_images_driver_free(void)
       }
 }
 
+void video_screen_images_free_owner(unsigned owner)
+{
+   unsigned s;
+   int i;
+   if (owner >= VIDEO_SCREEN_IMAGES_OWNERS)
+      return;
+   for (s = 0; s < RETRO_VIDEO_SCREENS_MAX; s++)
+   {
+      video_screen_images_screen_t *scr =
+            &video_screen_images_store[owner][s];
+      video_screen_images_unsurface(scr);
+      for (i = 0; i < VIDEO_SCREEN_IMAGES_SLOTS; i++)
+         if (scr->slot[i])
+            free(scr->slot[i]);
+   }
+   memset(video_screen_images_store[owner], 0,
+         sizeof(video_screen_images_store[owner]));
+   /* Main's pictures drawn until a map is taken */
+   if (video_screen_images_shown == owner)
+      video_screen_images_shown = VIDEO_SCREEN_IMAGES_MAIN;
+}
+
 void video_screen_images_clear(void)
 {
-   unsigned o, s;
-   int i;
+   unsigned o;
    for (o = 0; o < VIDEO_SCREEN_IMAGES_OWNERS; o++)
-      for (s = 0; s < RETRO_VIDEO_SCREENS_MAX; s++)
-      {
-         video_screen_images_screen_t *scr = &video_screen_images_store[o][s];
-         video_screen_images_unsurface(scr);
-         for (i = 0; i < VIDEO_SCREEN_IMAGES_SLOTS; i++)
-            if (scr->slot[i])
-               free(scr->slot[i]);
-      }
-   memset(video_screen_images_store, 0, sizeof(video_screen_images_store));
-   video_screen_images_shown = VIDEO_SCREEN_IMAGES_MAIN;
+      video_screen_images_free_owner(o);
 }

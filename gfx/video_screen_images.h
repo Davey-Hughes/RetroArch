@@ -40,6 +40,10 @@ enum video_screen_images_owner
  * run-ahead hook says otherwise. */
 void video_screen_images_set_caller(unsigned owner);
 
+/* runahead_secondary_core_destroy: @owner's store emptied and its
+ * lends ended. */
+void video_screen_images_free_owner(unsigned owner);
+
 /* GET_VIDEO_SCREEN_BUFFER for the caller's store. @images: whether
  * STATUS_IMAGES is set now. False leaves @buf as it was. */
 bool video_screen_images_lend(struct retro_video_screen_buffer *buf,

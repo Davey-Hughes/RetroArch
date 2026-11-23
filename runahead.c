@@ -50,6 +50,7 @@
 #include "driver.h"
 #include "audio/audio_driver.h"
 #include "gfx/video_driver.h"
+#include "gfx/video_screen_images.h"
 #ifdef HAVE_THREADS
 #include "gfx/video_thread_wrapper.h"
 #endif
@@ -523,6 +524,7 @@ void runahead_secondary_core_destroy(void *data)
     * this runs regardless of whether a secondary instance was
     * ever actually created. */
    runahead_copy_reset(true);
+   video_screen_images_free_owner(VIDEO_SCREEN_IMAGES_SECOND);
 
    if (!runloop_st->secondary_lib_handle)
       return;
@@ -1306,7 +1308,9 @@ static bool runloop_environment_secondary_core_hook(
       return true;
    }
 
+   video_screen_images_set_caller(VIDEO_SCREEN_IMAGES_SECOND);
    result                         = runloop_environment_cb(cmd, data);
+   video_screen_images_set_caller(VIDEO_SCREEN_IMAGES_MAIN);
 
    if (runloop_st->flags & RUNLOOP_FLAG_HAS_VARIABLE_UPDATE)
    {

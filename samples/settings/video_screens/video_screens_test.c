@@ -28,6 +28,7 @@
 #include "../../../menu/menu_cbs.h"
 #include "../../../gfx/video_driver.h"
 #include "../../../gfx/video_thread_wrapper.h"
+#include "../../../gfx/video_screen_images.h"
 #ifdef HAVE_GFX_WIDGETS
 #include "../../../gfx/gfx_display.h"
 #include "../../../gfx/gfx_widgets.h"
@@ -5447,6 +5448,60 @@ static void test_images_gone_kept(void)
    CHECK(screens_test_image_placed(2, 0) == 1);
    CHECK(window_test_seen_views.image_tex[2] == 101);
    CHECK(!images_test_tex_calls());
+   window_test_end();
+}
+
+/* images_test_hand() as run-ahead's second instance, tagged as its hook
+ * does */
+static bool images_test_hand_second(const void *data, unsigned serial)
+{
+   bool taken;
+   video_screen_images_set_caller(VIDEO_SCREEN_IMAGES_SECOND);
+   taken = images_test_hand(data, serial);
+   video_screen_images_set_caller(VIDEO_SCREEN_IMAGES_MAIN);
+   return taken;
+}
+
+/* Run-ahead's second instance keeps its own serials and lends; the
+ * instance whose map was taken last is drawn */
+static void test_images_per_instance(void)
+{
+   static uint32_t blue[48 * 32];
+   struct retro_video_screen_buffer main_lend;
+   struct retro_video_screen_buffer second_lend;
+   unsigned i;
+   images_test_frames_begin();
+   for (i = 0; i < 48 * 32; i++)
+   {
+      screens_test_dsi_pixels[i] = 0x00FF0000u;
+      blue[i]                    = 0x000000FFu;
+   }
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1));
+   CHECK(images_test_hand_second(blue, 1));
+   CHECK(images_test_hand(NULL, 1));
+   CHECK(!images_test_hand_second(NULL, 2));
+   CHECK(images_test_get(&main_lend, 2, 48, 32, RETRO_PIXEL_FORMAT_XRGB8888));
+   images_test_fill(&main_lend, 0x33);
+   CHECK(!images_test_hand_second(main_lend.data, 2));
+   video_screen_images_set_caller(VIDEO_SCREEN_IMAGES_SECOND);
+   CHECK(images_test_get(&second_lend, 2, 48, 32,
+         RETRO_PIXEL_FORMAT_XRGB8888));
+   video_screen_images_set_caller(VIDEO_SCREEN_IMAGES_MAIN);
+   images_test_fill(&second_lend, 0x44);
+   CHECK(!images_test_hand(second_lend.data, 2));
+   CHECK(images_test_hand_second(NULL, 1));
+   window_test_run();
+   CHECK(images_test_loads + images_test_updates == 1);
+   CHECK(images_test_words[0] == 0x000000FFu);
+   /* The second instance closed: main's picture is drawn */
+   video_screen_images_free_owner(VIDEO_SCREEN_IMAGES_SECOND);
+   images_test_calls_reset();
+   window_test_run();
+   CHECK(images_test_loads + images_test_updates == 1);
+   CHECK(images_test_words[0] == 0x00FF0000u);
+   CHECK(!images_test_hand_second(NULL, 1));
+   CHECK(images_test_hand(NULL, 1));
+   memset(screens_test_dsi_pixels, 0, sizeof(screens_test_dsi_pixels));
    window_test_end();
 }
 
@@ -12850,6 +12905,7 @@ int main(int argc, char **argv)
    test_images_failed();
    test_images_rgba();
    test_images_gone_kept();
+   test_images_per_instance();
    test_screens_core_show();
    test_screens_core_over_inset();
    test_screens_user_over();
