@@ -4689,7 +4689,6 @@ static void test_images_get_again(void)
    CHECK(images_test_get(&first, 2, 48, 32, RETRO_PIXEL_FORMAT_XRGB8888));
    CHECK(images_test_get(&second, 2, 32, 16, RETRO_PIXEL_FORMAT_XRGB8888));
    CHECK(first.data != second.data);
-   images_test_fill(&first, 0x22);
    images_test_fill(&second, 0x11);
    CHECK(!images_test_hand(first.data, 1));
    images_test_picture(second.data, 1);
