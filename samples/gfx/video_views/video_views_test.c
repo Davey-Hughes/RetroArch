@@ -191,6 +191,35 @@ static void map_dsi(video_views_map_t *map)
    video_views_validate_map(&in, map, NULL);
 }
 
+/* dsi with Bottom left out and the VMU an inset a quarter of Top's
+ * height in its bottom right. */
+static void map_dsi_inset(video_views_map_t *map)
+{
+   map_dsi(map);
+   map->left_out   = 0x2;
+   map->over       = 0x4;
+   map->base       = 0;
+   map->anchor     = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT << 8;
+   map->size[2]    = 0.25f;
+   map->opacity[2] = 255;
+}
+
+/* dsi with Top a stereo pair and Bottom left out, so the image's
+ * screen 2 is also a view's index: Bottom's. */
+static bool map_dsi_index(video_views_map_t *map)
+{
+   struct retro_video_views in;
+   t_dsi(&in);
+   t_dsi_views[0] = mkview(  0,   0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_LEFT);
+   t_dsi_views[1] = mkview(256,   0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_RIGHT);
+   t_dsi_views[2] = mkview(  0, 192, 256, 192, 1, RETRO_VIDEO_VIEW_EYE_NONE);
+   in.num_views   = 3;
+   if (!video_views_validate_map(&in, map, NULL))
+      return false;
+   map->left_out = 0x2;
+   return true;
+}
+
 static void map_ds_inset(video_views_map_t *map);
 static void map_three(video_views_map_t *map);
 
@@ -1960,11 +1989,12 @@ static int bad_ctx;
 #define MAX_DRAWS 16
 static struct
 {
-   char kind;             /* D direct, P pass, A alpha, F fill */
-   int view;              /* -1: a pass */
+   char kind;             /* D direct, P pass, A alpha, F fill, I image */
+   int view;              /* -1: a pass; an image's screen */
    fake_chain_t *chain;
    video_views_rect_t dst, cut;
    int again;
+   int nearest;
    unsigned alpha;
 } draws[MAX_DRAWS];
 static int num_draws;
@@ -2044,6 +2074,35 @@ static void fake_fill(fake_drv_t *d, const fake_ctx_t *x,
    num_draws++;
 }
 
+static const video_views_map_t *fake_map;
+
+static const video_views_map_t *fake_image_map(fake_drv_t *d,
+      const fake_ctx_t *x)
+{
+   (void)d;
+   if (x != &fake_ctx)
+      bad_ctx++;
+   return fake_map;
+}
+
+static void fake_image(fake_drv_t *d, const fake_ctx_t *x, unsigned screen,
+      const video_views_rect_t *dst, const video_views_rect_t *cut,
+      bool nearest)
+{
+   (void)d;
+   if (x != &fake_ctx)
+      bad_ctx++;
+   if (num_draws >= MAX_DRAWS)
+      return;
+   draws[num_draws].kind    = 'I';
+   draws[num_draws].view    = (int)screen;
+   draws[num_draws].chain   = NULL;
+   draws[num_draws].dst     = *dst;
+   draws[num_draws].cut     = *cut;
+   draws[num_draws].nearest = nearest ? 1 : 0;
+   num_draws++;
+}
+
 /* The calls logged, one letter each, are @want */
 static int t_calls_are(const char *want)
 {
@@ -2083,13 +2142,15 @@ static bool fake_retire(fake_drv_t *d, fake_target_t *t)
 #define VV_PASS(drv, x, c, dst, cut, a) fake_pass(drv, x, c, dst, cut, a)
 #define VV_ALPHA(drv, x, a)             fake_alpha(drv, x, a)
 #define VV_FILL(drv, x, cut, a)         fake_fill(drv, x, cut, a)
+#define VV_IMAGE_MAP(drv, x)            fake_image_map(drv, x)
+#define VV_IMAGE(drv, x, s, dst, cut, n) fake_image(drv, x, s, dst, cut, n)
 #define VV_TARGET                       fake_target_t
 #define VV_TARGET_MAKE(drv, t, dims)    fake_make(drv, t, dims)
 #define VV_TARGET_RETIRE(drv, t)        fake_retire(drv, t)
 #define VV_ROWS_UP
 #include "gfx/video_views_draw.h"
 
-/* The same driver without the alpha and fill hooks */
+/* The same driver without the alpha, fill and image hooks */
 #define VV_FN(name)                     plain_vv_##name
 #define VV_DRV                          fake_drv_t
 #define VV_CHAIN                        fake_chain_t
@@ -4211,15 +4272,8 @@ static void test_layout_image_view_index(void)
    video_views_map_t map;
    video_views_layout_t l;
    video_views_rect_t r;
-   struct retro_video_views in;
 
-   t_dsi(&in);
-   t_dsi_views[0] = mkview(  0,   0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_LEFT);
-   t_dsi_views[1] = mkview(256,   0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_RIGHT);
-   t_dsi_views[2] = mkview(  0, 192, 256, 192, 1, RETRO_VIDEO_VIEW_EYE_NONE);
-   in.num_views   = 3;
-   CHECK(video_views_validate_map(&in, &map, NULL));
-   map.left_out = 0x2;
+   CHECK(map_dsi_index(&map));
    t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
    CHECK(l.num_placements == 2);
    CHECK(l.placements[0].view == 0 && l.placements[0].flags == 0);
@@ -4257,6 +4311,249 @@ static void test_layout_view_over_image(void)
    CHECK(t_bottom_right(&l.placements[2].dst, &l.placements[1].dst));
    CHECK(rect_is(&l.placements[1].dst, 1320, 400, 240, 160));
    CHECK(rect_is(&l.placements[2].dst, 1453, 480, 107, 80));
+}
+
+/* An image screen comes with its fields, renumbered; selected alone it
+ * has a place without a view. */
+static void test_select_screens_image(void)
+{
+   video_views_map_t map, out;
+   video_views_layout_params_t p;
+   video_views_layout_t l;
+   unsigned index[RETRO_VIDEO_VIEWS_MAX];
+
+   map_dsi(&map);
+   map.image_tex[2] = 77;
+   map.image_gen[2] = 3;
+   map.nearest      = 0x4;
+   CHECK(video_views_select_screens(&map, 0x5, &out, index));
+   CHECK(out.num_screens == 2 && out.num_views == 1 && index[0] == 0);
+   CHECK(out.image == 0x2 && out.no_input == 0x2 && out.nearest == 0x2);
+   CHECK(out.image_dims[1] == VIDEO_SCALE_PACK(48, 32));
+   CHECK(out.image_aspect[1] == 1.5f);
+   CHECK(out.image_tex[1] == 77 && out.image_gen[1] == 3);
+   CHECK(out.image_dims[0] == 0 && out.image_tex[0] == 0);
+
+   CHECK(video_views_select_screens(&map, 0x4, &out, index));
+   CHECK(out.num_screens == 1 && out.num_views == 0);
+   CHECK(out.image == 0x1 && out.nearest == 0x1);
+   CHECK(   out.image_dims[0] == VIDEO_SCALE_PACK(48, 32)
+         && out.image_aspect[0] == 1.5f && out.image_tex[0] == 77);
+   params_init(&p, &out, 1600, 960);
+   video_views_layout(&p, &l);
+   CHECK(   l.num_placements == 1 && l.placements[0].view == 0
+         && l.placements[0].flags == VIDEO_VIEWS_PLACEMENT_IMAGE);
+
+   /* No view and no image: nothing selected. */
+   map.image = 0;
+   CHECK(!video_views_select_screens(&map, 0x4, &out, index));
+   CHECK(out.num_screens == 0 && out.image == 0);
+}
+
+/* A touch never lands on an image, which takes none of the entries. */
+static void test_touch_publish_image(void)
+{
+   video_views_map_t map, sub;
+   video_views_layout_params_t p;
+   video_views_layout_t l;
+   video_views_touch_t t;
+   unsigned i, index[RETRO_VIDEO_VIEWS_MAX];
+   unsigned frame = VIDEO_SCALE_PACK(256, 384);
+
+   memset(&t, 0, sizeof(t));
+   memset(index, 0, sizeof(index));
+   map_dsi(&map);
+   CHECK(video_views_select_screens(&map, 0x5, &sub, index));
+   params_init(&p, &sub, 1600, 960);
+   p.screen_layout = VIDEO_SCREEN_LAYOUT_HORIZONTAL;
+   video_views_layout(&p, &l);
+   CHECK(l.num_placements == 2);
+   video_views_touch_publish(&t, &map, &l, index, p.dims, frame);
+   CHECK(t.count == 1 && t.no_input == 0 && t.src[0].screen == 0);
+   CHECK(t.dst[0].pos == l.placements[0].dst.pos);
+
+   /* Placement view 2 is the image's screen, not Bottom's view. */
+   for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+      index[i] = i;
+   CHECK(map_dsi_index(&map));
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(l.num_placements == 2);
+   video_views_touch_publish(&t, &map, &l, index, p.dims,
+         VIDEO_SCALE_PACK(512, 384));
+   CHECK(t.count == 1);
+   for (i = 0; i < t.count; i++)
+      CHECK(t.src[i].y != 192);
+}
+
+/* A point on an image inset reaches its base; with the base NO_INPUT
+ * too, it is off every view. */
+static void test_map_point_image_inset(void)
+{
+   video_views_map_t map;
+   video_views_layout_t l;
+   uint32_t pos, want;
+   unsigned frame = VIDEO_SCALE_PACK(256, 384);
+
+   map_dsi_inset(&map);
+   map.left_out = 0x6;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(video_views_map_point(&l, &map, frame, 1260, 840, true, &want));
+   CHECK(VIDEO_POS_Y(want) < 0 && VIDEO_POS_Y(want) != -0x8000);
+   map.left_out = 0x2;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(   l.num_placements == 2
+         && rect_is(&l.placements[1].dst, 1080, 720, 360, 240));
+   pos = 0;
+   CHECK(video_views_map_point(&l, &map, frame, 1260, 840, true, &pos));
+   CHECK(pos == want);
+
+   map.no_input |= 0x1;
+   pos = 0;
+   CHECK(video_views_map_point(&l, &map, frame, 1260, 840, true, &pos));
+   CHECK(pos == VIDEO_POS_PACK(-0x8000, -0x8000));
+}
+
+/* An image root alone: every point is off every view. */
+static void test_map_point_image_root(void)
+{
+   video_views_map_t map;
+   video_views_layout_t l;
+   uint32_t pos;
+   int cx, cy;
+   unsigned frame = VIDEO_SCALE_PACK(256, 384);
+
+   map_dsi(&map);
+   map.left_out = 0x3;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(   l.num_placements == 1
+         && l.placements[0].flags == VIDEO_VIEWS_PLACEMENT_IMAGE);
+   cx = VIDEO_POS_X(l.placements[0].dst.pos)
+      + (int)VIDEO_SCALE_W(l.placements[0].dst.dims) / 2;
+   cy = VIDEO_POS_Y(l.placements[0].dst.pos)
+      + (int)VIDEO_SCALE_H(l.placements[0].dst.dims) / 2;
+   pos = 0;
+   CHECK(video_views_map_point(&l, &map, frame, cx, cy, true, &pos));
+   CHECK(pos == VIDEO_POS_PACK(-0x8000, -0x8000));
+   pos = 0;
+   CHECK(video_views_map_point(&l, &map, frame, cx, cy, false, &pos));
+   CHECK(pos == VIDEO_POS_PACK(-0x8000, -0x8000));
+}
+
+/* An image placement drawn through VV_IMAGE at its opacity, never
+ * through its view number's chain or view. */
+static void test_draw_placements_image(void)
+{
+   video_views_map_t map;
+   video_views_layout_t l;
+   video_views_chains_t set;
+   video_views_rect_t rects[RETRO_VIDEO_VIEWS_MAX];
+   fake_drv_t d;
+   fake_chain_t *chains[RETRO_VIDEO_VIEWS_MAX];
+   unsigned full = VIDEO_SCALE_PACK(1600, 960);
+
+   memset(&d, 0, sizeof(d));
+   memset(chains, 0, sizeof(chains));
+   chains[0] = &chain_objs[0];
+   chains[1] = &chain_objs[1];
+   chains[2] = &chain_objs[2];
+
+   map_dsi_inset(&map);
+   map.opacity[2]   = 128;
+   map.image_tex[2] = 77;
+   map.nearest      = 0x4;
+   fake_map         = &map;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   num_draws = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, true, false);
+   CHECK(t_calls_are("DAIA"));
+   CHECK(   draws[0].view == 0 && draws[1].alpha == 128
+         && draws[2].view == 2 && draws[2].nearest == 1
+         && draws[3].alpha == 255);
+   CHECK(   rect_is(&draws[2].dst, 1080, 720, 360, 240)
+         && rect_is(&draws[2].cut, 1080, 720, 360, 240));
+   num_draws = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, false, false);
+   CHECK(t_calls_are("PAIA"));
+   CHECK(draws[0].chain == chains[0] && draws[2].view == 2);
+   map.nearest = 0x1;
+   num_draws   = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, true, false);
+   CHECK(t_calls_are("DAIA") && draws[2].nearest == 0);
+
+   /* No picture yet: not drawn. */
+   map.image_tex[2] = 0;
+   num_draws        = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, true, false);
+   CHECK(t_calls_are("D") && draws[0].view == 0);
+
+   /* Blank: an inset filled, with or without a picture; a root left
+    * alone. */
+   map.image_tex[2] = 77;
+   map.blank        = 0x4;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   num_draws = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, true, false);
+   CHECK(t_calls_are("DAFA"));
+   CHECK(   draws[2].alpha == 128
+         && rect_is(&draws[2].cut, 1080, 720, 360, 240));
+   map.image_tex[2] = 0;
+   num_draws        = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, true, false);
+   CHECK(t_calls_are("DAFA"));
+   map_dsi(&map);
+   map.left_out     = 0x3;
+   map.blank        = 0x4;
+   map.image_tex[2] = 77;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(l.num_placements == 1);
+   num_draws = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, true, false);
+   CHECK(num_draws == 0);
+
+   /* Placement view 2 is the image's screen: view 2, Bottom's, gets no
+    * chain, and the image is drawn without one. */
+   CHECK(map_dsi_index(&map));
+   map.image_tex[2] = 77;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   memset(&set, 0, sizeof(set));
+   set.count = 3;
+   CHECK(fake_vv_pick_chains(&d, &set, &map, &l, true, true, full, chains,
+            rects));
+   CHECK(chains[0] && !chains[1] && !chains[2] && d.stock_made == 1);
+   num_draws = 0;
+   fake_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, false, false);
+   CHECK(t_calls_are("PI") && draws[0].chain == chains[0]
+         && draws[1].view == 2);
+   fake_map = NULL;
+   CHECK(!bad_ctx);
+}
+
+/* Without VV_IMAGE an image placement is not drawn. */
+static void test_draw_placements_image_no_hook(void)
+{
+   video_views_map_t map;
+   video_views_layout_t l;
+   fake_drv_t d;
+   fake_chain_t *chains[RETRO_VIDEO_VIEWS_MAX];
+   unsigned full = VIDEO_SCALE_PACK(1600, 960);
+
+   memset(&d, 0, sizeof(d));
+   memset(chains, 0, sizeof(chains));
+   chains[0] = &chain_objs[0];
+   chains[1] = &chain_objs[1];
+   chains[2] = &chain_objs[2];
+
+   map_dsi_inset(&map);
+   map.image_tex[2] = 77;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(l.num_placements == 2);
+   num_draws = 0;
+   plain_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, true, false);
+   CHECK(t_calls_are("D") && draws[0].view == 0);
+   num_draws = 0;
+   plain_vv_draw_placements(&d, &fake_ctx, &l, chains, true, full, false, false);
+   CHECK(t_calls_are("P") && draws[0].chain == chains[0]);
+   CHECK(!bad_ctx);
 }
 
 static void test_roots_with_insets(void)
@@ -4509,6 +4806,12 @@ int main(void)
    test_layout_image_stereo();
    test_layout_image_view_index();
    test_layout_view_over_image();
+   test_select_screens_image();
+   test_touch_publish_image();
+   test_map_point_image_inset();
+   test_map_point_image_root();
+   test_draw_placements_image();
+   test_draw_placements_image_no_hook();
    test_roots_with_insets();
    test_select_screens_screen0_inset();
    test_map_point_inset();

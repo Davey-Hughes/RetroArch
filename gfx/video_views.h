@@ -325,7 +325,7 @@ bool video_views_eye_pair(const video_views_map_t *map, int eyes[2]);
  * their screens counted from 0 in @map's order, bases renumbered with
  * them; @index[i] is @out's view i's index in @map. For a driver that
  * shows some screens on one display and the rest on another. False,
- * with @out emptied, when none of those screens has a view. */
+ * with @out emptied, when none of those screens has a place. */
 bool video_views_select_screens(const video_views_map_t *map,
       unsigned roots, video_views_map_t *out, unsigned *index);
 
@@ -465,8 +465,8 @@ bool video_views_first_drawn(const video_views_layout_t *layout,
 /* Window point to packed-frame pointer coordinates, through @layout,
  * VIDEO_POS_PACK'd into @res_pos. @map and @frame_dims are the core's
  * own. A point on any copy of a screen lands in that screen's EYE_NONE
- * or left-eye rectangle. NO_INPUT screens are not there: with only
- * those placed, every point is off every view. */
+ * or left-eye rectangle. NO_INPUT screens and images are not there:
+ * with only those placed, every point is off every view. */
 bool video_views_map_point(const video_views_layout_t *layout,
       const video_views_map_t *map, unsigned frame_dims,
       int x, int y, bool report_oob, uint32_t *res_pos);
@@ -499,7 +499,7 @@ typedef struct video_views_touch
 
 /* @layout's placements, of @map's views through @index (the selection's
  * to the map's), on a display of size @dims; @frame_dims the packed
- * frame's. A NULL @layout holds none. */
+ * frame's. Images take no entry. A NULL @layout holds none. */
 void video_views_touch_publish(video_views_touch_t *t,
       const video_views_map_t *map, const video_views_layout_t *layout,
       const unsigned *index, unsigned dims, unsigned frame_dims);

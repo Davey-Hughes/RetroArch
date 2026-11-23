@@ -540,7 +540,7 @@ bool video_views_select_screens(const video_views_map_t *map,
       out->views[out->num_views]          = *v;
       out->views[out->num_views++].screen = num[v->screen];
    }
-   if (!out->num_views)
+   if (!out->num_views && !(sel & map->image))
       return false;
    /* Selected screens with no view count too; viewless marks them. */
    out->num_screens = n;
@@ -556,12 +556,18 @@ bool video_views_select_screens(const video_views_map_t *map,
       out->left_out |= ((map->left_out >> s) & 1u) << j;
       out->blank    |= ((map->blank    >> s) & 1u) << j;
       out->over     |= ((map->over     >> s) & 1u) << j;
+      out->image    |= ((map->image    >> s) & 1u) << j;
+      out->nearest  |= ((map->nearest  >> s) & 1u) << j;
       /* A sized root's base on another display: it sizes itself. */
       out->base     |= (uint32_t)((sel & (1u << b)) ? num[b] : j) << (j * 4);
       out->anchor   |= (uint32_t)VIDEO_VIEWS_NIBBLE(map->anchor, s)
             << (j * 4);
-      out->opacity[j] = map->opacity[s];
-      out->size[j]    = map->size[s];
+      out->opacity[j]      = map->opacity[s];
+      out->size[j]         = map->size[s];
+      out->image_dims[j]   = map->image_dims[s];
+      out->image_aspect[j] = map->image_aspect[s];
+      out->image_tex[j]    = map->image_tex[s];
+      out->image_gen[j]    = map->image_gen[s];
    }
    return true;
 }
@@ -882,12 +888,16 @@ void video_views_touch_publish(video_views_touch_t *t,
    t->count    = 0;
    t->no_input = 0;
    for (i = 0; layout && i < layout->num_placements
-         && i < RETRO_VIDEO_VIEWS_MAX; i++)
+         && t->count < RETRO_VIDEO_VIEWS_MAX; i++)
    {
-      t->dst[i] = layout->placements[i].dst;
-      t->src[i] = map->views[index[layout->placements[i].view]];
-      if (map->no_input & (1u << t->src[i].screen))
-         t->no_input |= 1u << i;
+      const video_views_placement_t *p = &layout->placements[i];
+      unsigned n                       = t->count;
+      if (p->flags & VIDEO_VIEWS_PLACEMENT_IMAGE)
+         continue;
+      t->dst[n] = p->dst;
+      t->src[n] = map->views[index[p->view]];
+      if (map->no_input & (1u << t->src[n].screen))
+         t->no_input |= 1u << n;
       t->count++;
    }
    t->dims       = dims;
@@ -1160,8 +1170,9 @@ bool video_views_map_point(const video_views_layout_t *layout,
          continue;
       if (!VIDEO_SCALE_W(d->dims) || !VIDEO_SCALE_H(d->dims))
          continue;
-      if (map->no_input
-            & (1u << map->views[layout->placements[i].view].screen))
+      if (     (layout->placements[i].flags & VIDEO_VIEWS_PLACEMENT_IMAGE)
+            || (map->no_input
+               & (1u << map->views[layout->placements[i].view].screen)))
       {
          no_input = true;
          continue;

@@ -39,6 +39,13 @@
  *                                   1-255, 255 solid. Undefined: solid.
  *   VV_FILL(drv, ctx, cut, alpha)   @cut filled black at @alpha, for a
  *                                   blank inset. Undefined: not drawn.
+ *   VV_IMAGE_MAP(drv, ctx)          the frame's map (a const
+ *                                   video_views_map_t *) the draws read
+ *   VV_IMAGE(drv, ctx, screen, dst, cut, nearest)
+ *                                   @screen's picture drawn whole into
+ *                                   @dst, clipped to @cut, sampled
+ *                                   nearest when @nearest. Undefined:
+ *                                   image placements are skipped.
  *   VV_TARGET                       the driver's target type
  *   VV_TARGET_MAKE(drv, t, dims)    @t made at @dims; false if it can't be
  *   VV_TARGET_RETIRE(drv, t)        @t let go; false if not yet
@@ -122,6 +129,11 @@ static void VV_FN(draw_placements)(VV_DRV *drv, const VV_DRAW *ctx,
    {
       video_views_rect_t dst, cut;
       const video_views_placement_t *p = &layout->placements[i];
+      bool image = (p->flags & VIDEO_VIEWS_PLACEMENT_IMAGE) != 0;
+#ifdef VV_IMAGE
+      const video_views_map_t *image_map = image
+            ? VV_IMAGE_MAP(drv, ctx) : NULL;
+#endif
 #ifdef VV_FILL
       bool fill = (p->flags & (VIDEO_VIEWS_PLACEMENT_BLANK
                | VIDEO_VIEWS_PLACEMENT_INSET))
@@ -129,9 +141,16 @@ static void VV_FN(draw_placements)(VV_DRV *drv, const VV_DRAW *ctx,
 #else
       bool fill = false;
 #endif
+#ifndef VV_IMAGE
+      if (image)
+         continue;
+#endif
       if (     (!all_areas && p->area != 0)
             || (!fill && (   (p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
-                          || !chains[p->view]))
+#ifdef VV_IMAGE
+                          || (image && !image_map->image_tex[p->view])
+#endif
+                          || (!image && !chains[p->view])))
             || !video_views_visible(layout, p, dims, &cut))
          continue;
       dst = p->dst;
@@ -154,6 +173,14 @@ static void VV_FN(draw_placements)(VV_DRV *drv, const VV_DRAW *ctx,
       if (fill)
       {
          VV_FILL(drv, ctx, &cut, VIDEO_VIEWS_PLACEMENT_ALPHA(p->flags));
+         continue;
+      }
+#endif
+#ifdef VV_IMAGE
+      if (image)
+      {
+         VV_IMAGE(drv, ctx, p->view, &dst, &cut,
+               (image_map->nearest & (1u << p->view)) != 0);
          continue;
       }
 #endif
@@ -206,6 +233,8 @@ static void VV_FN(target_drop)(VV_DRV *drv, video_views_target_t *t,
 #undef VV_PASS
 #undef VV_ALPHA
 #undef VV_FILL
+#undef VV_IMAGE_MAP
+#undef VV_IMAGE
 #undef VV_TARGET
 #undef VV_TARGET_MAKE
 #undef VV_TARGET_RETIRE
