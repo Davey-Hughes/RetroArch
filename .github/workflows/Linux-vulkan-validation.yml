@@ -236,8 +236,8 @@ jobs:
 
       - name: Configure
         # Non-Qt, as the harness requires (with Qt, main() lives in
-        # ui_qt.o). Select SDL2 for the views cases below; other defaults
-        # keep every Vulkan path a release build has.
+        # ui_qt.o). Other defaults keep every Vulkan path a release build
+        # has.
         run: |
           ./configure --disable-qt --enable-sdl2 --disable-sdl3
           grep -q '^HAVE_VULKAN = 1' config.mk
@@ -336,25 +336,6 @@ jobs:
           # it was created with, HDR support included.
           HARNESS_CORE_HW_VULKAN=3 SAN=none VK_DEBUG=1 GFX_INSTRUMENT=1 CYCLES=1 make -C samples/gfx/threaded_video check-vulkan
           make -C samples/gfx/threaded_video clean
-
-      - name: Views on gl, glcore, Vulkan and SDL2, end to end (Xvfb, llvmpipe, lavapipe)
-        shell: bash
-        run: |
-          set -eu
-          # The views compositor (gfx/video_views_draw.h) as gl, glcore,
-          # Vulkan and SDL2 instantiate it: the video_views test core's map in
-          # each stereo mode, a view per eye, the blend canvas, views
-          # read exactly out of the frame in every way the drivers copy
-          # or draw them, the UI layer per eye with the menu open, a
-          # pointer mapped back through it, and the screens a core
-          # describes. Each case runs on an Xvfb of its own; Vulkan here
-          # under the validation layer.
-          make -C samples/cores/video_views
-          export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
-          export LIBGL_ALWAYS_SOFTWARE=1
-          RA_E2E_XVFB=1 RA_E2E_ONLY='^(3ds-sbs-full|3ds-sbs-half|3ds-top-bottom|3ds-anaglyph|3ds-interlaced|ds-horizontal|exact-3ds|crop-threaded-menu|pointer-sbs-full|screens-rules|screens-no-input|screens-no-input-off|screens-no-input-null|screens-blank-aim|screens-over-aim|screens-over-no-input-aim|screens-hidden|screens-blank-late|screens-hide-null|screens-blank-null|screens-none-shown|screens-shown|screens-shown-sized|screens-over(-blank)?(-half)?(-sbs|-interlaced)?(-preset)?|screens-user-over(-corner|-preset|-stereo-preset|-blank-stereo-preset)?|screens-absent|screens-blank|screens-absent-back|screens-user-off|screens-core-beaten|screens-per-core-own|screens-per-core-other|screens-none-shown-menu|screens-status-no-map(-anaglyph|-rolling|-mipmap)?)$' \
-            python3 samples/cores/video_views/e2e/run.py ./retroarch \
-            "$RUNNER_TEMP/views-e2e" gl glcore vulkan sdl2
 
       - name: HDR10 frame paths under the validation layer (lavapipe, fake HDR10 surface)
         shell: bash
@@ -989,6 +970,112 @@ jobs:
           set -eu
           ffmpeg -v error -y -f lavfi -i color=orange:size=320x240:rate=30 -t 3 -c:v libx264 -preset ultrafast -pix_fmt yuv420p samples/menu/rgui_media/settings-preview.mp4
           MEDIA_TEST_SETTINGS_ORANGE=1 python3 samples/menu/texture_media/external_settings_paths.py samples/menu/rgui_media/settings-preview.mp4 --video-driver ${{ matrix.driver }} --threaded
+
+  views-gl-vulkan-sdl2:
+    name: Views on gl, glcore, Vulkan and SDL2, end to end (Xvfb, llvmpipe, lavapipe)
+    runs-on: ubuntu-latest
+    env:
+      APT_PKGS: build-essential libxkbcommon-dev libx11-xcb-dev libxcb1-dev libxinerama-dev libxrandr-dev libxxf86vm-dev libxv-dev xvfb x11-utils zlib1g-dev libfreetype-dev libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers vulkan-tools libasound2-dev libgl1-mesa-dri libgl-dev imagemagick libsdl2-dev ccache
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Apt cache key
+        id: apt
+        run: sh .github/workflows/scripts/apt-cache-key.sh "$APT_PKGS"
+
+      - name: Restore apt cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+          restore-keys: ${{ steps.apt.outputs.prefix }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: sh .github/workflows/scripts/apt-install.sh $APT_PKGS
+
+      - name: Save apt cache
+        if: env.APT_CACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.apt-cache
+          key: ${{ steps.apt.outputs.key }}
+
+      - name: Link with lld
+        run: sh .github/workflows/scripts/use-lld.sh
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.workflow }}-${{ github.job }}-
+
+      - name: Enable ccache
+        run: |
+          set -eu
+          export CCACHE_DIR="$HOME/.ccache"
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          ccache -M 250M
+          ccache -z
+
+      - name: Configure
+        run: |
+          ./configure --disable-qt --enable-sdl2 --disable-sdl3
+          grep -q '^HAVE_VULKAN = 1' config.mk
+          grep -q '^HAVE_SDL2 = 1' config.mk
+
+      - name: Build with VULKAN_DEBUG=1
+        # The validation layer and its messenger for the Vulkan cases.
+        run: |
+          make -j$(getconf _NPROCESSORS_ONLN) VULKAN_DEBUG=1
+          test -x retroarch
+
+      - name: Views on gl, glcore, Vulkan and SDL2, end to end (Xvfb, llvmpipe, lavapipe)
+        shell: bash
+        run: |
+          set -eu
+          # The views compositor (gfx/video_views_draw.h) as gl, glcore,
+          # Vulkan and SDL2 instantiate it: the video_views test core's map in
+          # each stereo mode, a view per eye, the blend canvas, views
+          # read exactly out of the frame in every way the drivers copy
+          # or draw them, the UI layer per eye with the menu open, a
+          # pointer mapped back through it, and the screens a core
+          # describes. Each case runs on an Xvfb of its own; Vulkan here
+          # under the validation layer.
+          make -C samples/cores/video_views
+          export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
+          export LIBGL_ALWAYS_SOFTWARE=1
+          RA_E2E_XVFB=1 RA_E2E_ONLY='^(3ds-sbs-full|3ds-sbs-half|3ds-top-bottom|3ds-anaglyph|3ds-interlaced|ds-horizontal|exact-3ds|crop-threaded-menu|pointer-sbs-full|screens-rules|screens-no-input|screens-no-input-off|screens-no-input-null|screens-blank-aim|screens-over-aim|screens-over-no-input-aim|screens-hidden|screens-blank-late|screens-hide-null|screens-blank-null|screens-none-shown|screens-shown|screens-shown-sized|screens-over(-blank)?(-half)?(-sbs|-interlaced)?(-preset)?|screens-user-over(-corner|-preset|-stereo-preset|-blank-stereo-preset)?|screens-absent|screens-blank|screens-absent-back|screens-user-off|screens-core-beaten|screens-per-core-own|screens-per-core-other|screens-none-shown-menu|screens-status-no-map(-anaglyph|-rolling|-mipmap)?)$' \
+            python3 samples/cores/video_views/e2e/run.py ./retroarch \
+            "$RUNNER_TEMP/views-e2e" gl glcore vulkan sdl2
+
+      - name: Preserve views logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: views-gl-vulkan-sdl2-logs
+          path: ${{ runner.temp }}/views-e2e/**/*.log
+          if-no-files-found: ignore
+
+      - name: ccache statistics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: ccache -sv
+
+      - name: Save ccache
+        # Only master's pushes keep a cache: pull requests restore
+        # master's, so one push does not evict the next one's.
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
 
   views-sdl3:
     name: Views on SDL3, end to end (Xvfb, llvmpipe)
