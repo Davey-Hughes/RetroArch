@@ -188,6 +188,14 @@ typedef struct video_views_map
    uint32_t anchor;     /* 4 bits a screen: an inset's anchor, 1-8 */
    uint8_t opacity[RETRO_VIDEO_VIEWS_MAX];  /* an inset's; 255 solid */
    float size[RETRO_VIDEO_VIEWS_MAX];       /* of its base's height; 0 none */
+   /* Set by validation. */
+   unsigned image;                              /* screens drawn from an image */
+   unsigned image_dims[RETRO_VIDEO_VIEWS_MAX];  /* VIDEO_SCALE_PACK */
+   float image_aspect[RETRO_VIDEO_VIEWS_MAX];   /* display w / h */
+   /* The frontend's, set per frame; validation leaves them 0. */
+   uintptr_t image_tex[RETRO_VIDEO_VIEWS_MAX];  /* 0 until a picture landed */
+   uint8_t image_gen[RETRO_VIDEO_VIEWS_MAX];    /* moves when one lands */
+   unsigned nearest;                            /* image screens sampled nearest */
 } video_views_map_t;
 
 #define VIDEO_VIEWS_NIBBLE(bits, s) (((bits) >> ((s) * 4)) & 0xfu)
@@ -201,6 +209,7 @@ typedef struct video_views_frect
 } video_views_frect_t;
 
 #define VIDEO_VIEWS_NAME_SIZE 32   /* bytes kept of a screen's name, with its NUL */
+#define VIDEO_VIEWS_IMAGE_MAX 512  /* largest picture side taken */
 
 /* One validated retro_video_screen. */
 typedef struct video_views_screen

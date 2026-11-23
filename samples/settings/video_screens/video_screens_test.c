@@ -4332,6 +4332,39 @@ static void screens_test_full(struct retro_video_views *map,
    map->num_screens = 3;
 }
 
+static uint32_t screens_test_dsi_pixels[48 * 32];
+
+/* "dsi": two stacked screens and a VMU, screen 2, drawn from a 48x32
+ * XRGB8888 image */
+static void screens_test_dsi(struct retro_video_views *map,
+      struct retro_video_view *views, struct retro_video_screen *screens,
+      struct retro_video_screen_image *image)
+{
+   memset(views, 0, 2 * sizeof(*views));
+   views[0].width  = views[1].width  = 256;
+   views[0].height = views[1].height = 192;
+   views[1].y      = 192;
+   views[1].screen = 1;
+   memset(screens, 0, 3 * sizeof(*screens));
+   screens[0].name  = "Top";
+   screens[1].name  = "Bottom";
+   screens[2].name  = "VMU";
+   screens[2].image = image;
+   memset(image, 0, sizeof(*image));
+   image->data   = screens_test_dsi_pixels;
+   image->width  = 48;
+   image->height = 32;
+   image->pitch  = 48 * sizeof(uint32_t);
+   image->format = RETRO_PIXEL_FORMAT_XRGB8888;
+   image->serial = 1;
+   memset(map, 0, sizeof(*map));
+   map->views       = views;
+   map->num_views   = 2;
+   map->flags       = RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   map->screens     = screens;
+   map->num_screens = 3;
+}
+
 static bool screens_test_label(unsigned screen, const char *want)
 {
    char label[64];
@@ -4358,6 +4391,7 @@ static void test_views_screens_frontend(void)
    video_driver_state_t *video_st = video_state_get_ptr();
    struct retro_video_views map;
    struct retro_video_screen_buffer buf;
+   struct retro_video_screen_image image;
    video_views_names_t names;
    video_views_map_t kept;
    unsigned status;
@@ -4395,6 +4429,14 @@ static void test_views_screens_frontend(void)
    CHECK(!memcmp(&kept, &video_st->views, sizeof(kept)));
    CHECK(screens_test_label(2, "VMU A1"));
    CHECK(video_driver_screen_names_stamp() == stamp);
+
+   /* An image map while IMAGES is unset: refused, nothing moves */
+   screens_test_dsi(&map, views, screens, &image);
+   CHECK(!video_driver_set_views(&map));
+   CHECK(!memcmp(&kept, &video_st->views, sizeof(kept)));
+   CHECK(screens_test_label(2, "VMU A1"));
+   CHECK(video_driver_screen_names_stamp() == stamp);
+   screens_test_full(&map, views, screens);
 
    /* Without the flag the screens are RetroArch's to name */
    map.flags = 0;

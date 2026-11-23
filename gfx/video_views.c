@@ -103,6 +103,7 @@ static bool video_views_screen_validate(
    unsigned max_screen  = num_scr ? num_scr : RETRO_VIDEO_VIEWS_MAX;
    unsigned no_input    = 0;
    unsigned viewless    = 0;
+   unsigned image       = 0;
    unsigned count_none[RETRO_VIDEO_VIEWS_MAX];
    unsigned count_left[RETRO_VIDEO_VIEWS_MAX];
    unsigned count_right[RETRO_VIDEO_VIEWS_MAX];
@@ -168,7 +169,25 @@ static bool video_views_screen_validate(
    {
       const struct retro_video_screen *s = &scr[i];
       if (s->image)
-         return false;
+      {
+         const struct retro_video_screen_image *im = s->image;
+         size_t px = 0;
+         if (im->format == RETRO_PIXEL_FORMAT_XRGB8888)
+            px = 4;
+         else if (im->format == RETRO_PIXEL_FORMAT_RGB565)
+            px = 2;
+         if (     !px || !im->width || !im->height
+               || im->width  > VIDEO_VIEWS_IMAGE_MAX
+               || im->height > VIDEO_VIEWS_IMAGE_MAX
+               || im->pitch  < im->width * px)
+            return false;
+         /* As a view's: NaN falls through to width / height. */
+         if (     im->aspect_ratio > 0.0f
+               && (im->aspect_ratio < 0.01f || im->aspect_ratio > 100.0f))
+            return false;
+         image    |= 1u << i;
+         no_input |= 1u << i;
+      }
       if (     s->show   > RETRO_VIDEO_SCREEN_SHOW_OVER
             || s->state  > RETRO_VIDEO_SCREEN_STATE_ABSENT
             || s->base  >= num_scr
@@ -206,6 +225,12 @@ static bool video_views_screen_validate(
 
    for (i = 0; i < num_screens; i++)
    {
+      if (image & (1u << i))
+      {
+         if (count_none[i] || count_left[i] || count_right[i])
+            return false;
+         continue;
+      }
       if (count_none[i] == 1 && !count_left[i] && !count_right[i])
          continue;
       if (     !count_none[i] && count_left[i] == 1 && count_right[i] == 1
@@ -229,6 +254,17 @@ static bool video_views_screen_validate(
       out->num_screens = num_screens;
       out->no_input    = no_input;
       out->viewless    = viewless;
+      out->image       = image;
+      for (i = 0; i < num_scr; i++)
+      {
+         const struct retro_video_screen_image *im = scr[i].image;
+         if (!im)
+            continue;
+         out->image_dims[i]   = VIDEO_SCALE_PACK(im->width, im->height);
+         out->image_aspect[i] = im->aspect_ratio > 0.0f
+               ? im->aspect_ratio
+               : (float)im->width / im->height;
+      }
    }
    if (screens)
    {

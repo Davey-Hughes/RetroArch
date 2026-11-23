@@ -4492,6 +4492,9 @@ bool video_driver_set_views(struct retro_video_views *views)
          && !video_views_eye_pair(&map, eyes))
       return false;
 #endif
+   if (     map.image
+         && !(video_driver_views_status() & RETRO_VIDEO_VIEWS_STATUS_IMAGES))
+      return false;
    if (map.num_views && video_st->screen_prefs.core_loaded)
       video_st->screen_prefs.in_use = true;
    described = video_driver_views_take_screens(video_st, &screens);

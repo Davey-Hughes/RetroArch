@@ -153,6 +153,44 @@ static void map_vb(video_views_map_t *map)
    video_views_validate(v, 2, map);
 }
 
+/* "dsi": DS packing with screens, and a VMU, screen 2, drawn from a
+ * 48x32 XRGB8888 image. Frame 256x384. */
+static struct retro_video_view         t_dsi_views[3];
+static struct retro_video_screen       t_dsi_screens[3];
+static struct retro_video_screen_image t_dsi_image;
+static uint32_t t_dsi_pixels[48 * 32];
+
+static void t_dsi(struct retro_video_views *in)
+{
+   t_dsi_views[0] = mkview(0,   0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_NONE);
+   t_dsi_views[1] = mkview(0, 192, 256, 192, 1, RETRO_VIDEO_VIEW_EYE_NONE);
+   memset(t_dsi_screens, 0, sizeof(t_dsi_screens));
+   t_dsi_screens[0].name    = "Top";
+   t_dsi_screens[1].name    = "Bottom";
+   t_dsi_screens[2].name    = "VMU";
+   t_dsi_screens[2].image   = &t_dsi_image;
+   t_dsi_image.data         = t_dsi_pixels;
+   t_dsi_image.width        = 48;
+   t_dsi_image.height       = 32;
+   t_dsi_image.pitch        = 48 * sizeof(uint32_t);
+   t_dsi_image.format       = RETRO_PIXEL_FORMAT_XRGB8888;
+   t_dsi_image.aspect_ratio = 0.0f;
+   t_dsi_image.serial       = 1;
+   memset(in, 0, sizeof(*in));
+   in->views       = t_dsi_views;
+   in->num_views   = 2;
+   in->flags       = RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   in->screens     = t_dsi_screens;
+   in->num_screens = 3;
+}
+
+static void map_dsi(video_views_map_t *map)
+{
+   struct retro_video_views in;
+   t_dsi(&in);
+   video_views_validate_map(&in, map, NULL);
+}
+
 static void map_ds_inset(video_views_map_t *map);
 static void map_three(video_views_map_t *map);
 
@@ -265,6 +303,20 @@ static void test_frame_helpers(void)
    map.num_views = 0;
    CHECK(!video_views_snapshot(&map, VIDEO_SCALE_PACK(800, 480),
             VIDEO_SCALE_PACK(800, 480), &out));
+}
+
+/* Scaling the views leaves an image's size and aspect alone. */
+static void test_snapshot_image(void)
+{
+   video_views_map_t map, out;
+
+   map_dsi(&map);
+   CHECK(video_views_snapshot(&map, VIDEO_SCALE_PACK(256, 384),
+            VIDEO_SCALE_PACK(512, 768), &out));
+   CHECK(out.views[1].y == 384 && out.views[1].width == 512);
+   CHECK(out.image == 0x4);
+   CHECK(out.image_dims[2] == VIDEO_SCALE_PACK(48, 32));
+   CHECK(out.image_aspect[2] == 1.5f);
 }
 
 static void params_init(video_views_layout_params_t *p,
@@ -933,8 +985,6 @@ static void test_select_screens_roots(void)
  * view. */
 static struct retro_video_view   t_full_views[2];
 static struct retro_video_screen t_full_screens[3];
-static struct retro_video_screen_image t_vmu_image;
-static uint32_t t_vmu_pixels[48 * 32];
 
 static struct retro_video_screen t_screen(const char *name,
       unsigned flags, unsigned state, unsigned show, unsigned base,
@@ -1097,18 +1147,6 @@ static void t_view_past_count(struct retro_video_views *in)
    t_full_screens[0].swap_with = 0;
 }
 
-static void t_image(struct retro_video_views *in)
-{
-   t_vmu_image.data         = t_vmu_pixels;
-   t_vmu_image.width        = 48;
-   t_vmu_image.height       = 32;
-   t_vmu_image.pitch        = 48 * sizeof(uint32_t);
-   t_vmu_image.format       = RETRO_PIXEL_FORMAT_XRGB8888;
-   t_vmu_image.aspect_ratio = 0.0f;
-   t_vmu_image.serial       = 1;
-   t_full_screens[2].image  = &t_vmu_image;
-}
-
 static void t_active_viewless(struct retro_video_views *in)
 {
    t_full_screens[2].state = RETRO_VIDEO_SCREEN_STATE_ACTIVE;
@@ -1239,7 +1277,6 @@ static void test_screens_refused(void)
       { "too-many",             t_too_many             },
       { "null-screens",         t_null_screens         },
       { "view-past-count",      t_view_past_count      },
-      { "image",                t_image                },
       { "active-viewless",      t_active_viewless      },
       { "blank-viewless",       t_blank_viewless       },
       { "eye-unpaired",         t_eye_unpaired         },
@@ -1280,6 +1317,137 @@ static void test_screens_refused(void)
             || !t_all_a5(&scr, sizeof(scr)))
       {
          printf("  FAIL refused case %s\n", cases[i].name);
+         failures++;
+      }
+   }
+}
+
+/* An image screen needs no view; validation keeps its size and aspect,
+ * and makes it NO_INPUT. */
+static void test_screens_image(void)
+{
+   struct retro_video_views in;
+   video_views_map_t map;
+   video_views_screens_t scr;
+   unsigned i;
+
+   t_dsi(&in);
+   memset(&map, 0xA5, sizeof(map));
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(map.num_views == 2 && map.num_screens == 3 && scr.count == 3);
+   CHECK(map.image == 0x4);
+   CHECK(map.image_dims[2] == VIDEO_SCALE_PACK(48, 32));
+   CHECK(map.image_aspect[2] == 1.5f);
+   CHECK(map.no_input == 0x4 && map.viewless == 0);
+   CHECK(!map.nearest);
+   for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+      CHECK(!map.image_tex[i] && !map.image_gen[i]);
+
+   t_dsi_image.aspect_ratio = 2.0f;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(map.image_aspect[2] == 2.0f);
+
+   /* NaN gives width over height, as for a view. */
+   t_dsi_image.aspect_ratio = (float)sqrt(-1.0);
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(map.image_aspect[2] == 1.5f);
+
+   t_dsi(&in);
+   t_dsi_image.format = RETRO_PIXEL_FORMAT_RGB565;
+   t_dsi_image.pitch  = 96;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(map.image == 0x4 && map.image_dims[2] == VIDEO_SCALE_PACK(48, 32));
+}
+
+static void t_img_viewed(struct retro_video_views *in)
+{
+   t_dsi_views[2] = mkview(0, 384, 48, 32, 2, RETRO_VIDEO_VIEW_EYE_NONE);
+   in->num_views  = 3;
+}
+
+static void t_img_width_zero(struct retro_video_views *in)
+{
+   t_dsi_image.width = 0;
+}
+
+static void t_img_height_zero(struct retro_video_views *in)
+{
+   t_dsi_image.height = 0;
+}
+
+static void t_img_format(struct retro_video_views *in)
+{
+   t_dsi_image.format = RETRO_PIXEL_FORMAT_0RGB1555;
+}
+
+static void t_img_pitch(struct retro_video_views *in)
+{
+   t_dsi_image.pitch = 191;
+}
+
+static void t_img_pitch_565(struct retro_video_views *in)
+{
+   t_dsi_image.format = RETRO_PIXEL_FORMAT_RGB565;
+   t_dsi_image.pitch  = 95;
+}
+
+static void t_img_width_max(struct retro_video_views *in)
+{
+   t_dsi_image.width = VIDEO_VIEWS_IMAGE_MAX + 1;
+   t_dsi_image.pitch = (VIDEO_VIEWS_IMAGE_MAX + 1) * sizeof(uint32_t);
+}
+
+static void t_img_height_max(struct retro_video_views *in)
+{
+   t_dsi_image.height = VIDEO_VIEWS_IMAGE_MAX + 1;
+}
+
+static void t_img_aspect_low(struct retro_video_views *in)
+{
+   t_dsi_image.aspect_ratio = 0.005f;
+}
+
+static void t_img_aspect_high(struct retro_video_views *in)
+{
+   t_dsi_image.aspect_ratio = 101.0f;
+}
+
+/* dsi with one image rule broken: refused, with out and screens
+ * untouched. */
+static void test_screens_image_refused(void)
+{
+   static const struct
+   {
+      const char *name;
+      void (*change)(struct retro_video_views *in);
+   } cases[] = {
+      { "viewed",      t_img_viewed      },
+      { "width-zero",  t_img_width_zero  },
+      { "height-zero", t_img_height_zero },
+      { "format",      t_img_format      },
+      { "pitch",       t_img_pitch       },
+      { "pitch-565",   t_img_pitch_565   },
+      { "width-max",   t_img_width_max   },
+      { "height-max",  t_img_height_max  },
+      { "aspect-low",  t_img_aspect_low  },
+      { "aspect-high", t_img_aspect_high }
+   };
+   unsigned i;
+
+   for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+   {
+      struct retro_video_views in;
+      video_views_map_t map;
+      video_views_screens_t scr;
+      t_dsi(&in);
+      cases[i].change(&in);
+      memset(&map, 0xA5, sizeof(map));
+      memset(&scr, 0xA5, sizeof(scr));
+      if (     video_views_validate_map(&in, &map, &scr)
+            || !t_all_a5(&map, sizeof(map))
+            || !t_all_a5(&scr, sizeof(scr)))
+      {
+         printf("  FAIL refused image case %s\n", cases[i].name);
          failures++;
       }
    }
@@ -4026,12 +4194,15 @@ int main(void)
    test_screen_normalize();
    test_validate();
    test_frame_helpers();
+   test_snapshot_image();
    test_eye_pair();
    test_select_screens_roots();
    test_screens_full();
    test_screens_absent_flag();
    test_screens_old_struct();
    test_screens_refused();
+   test_screens_image();
+   test_screens_image_refused();
    test_screens_accepted();
    test_screens_names();
    test_screens_select_masks();
