@@ -3,7 +3,8 @@
  * The XR draw and its slots run with the runtime's swapchains and the
  * pass steps stubbed: what reaches the runtime's images, when a chain
  * ends a frame, when a repeat replays the last frame's final pass, and a
- * slot's insets drawn into its image after it, each in its rect.
+ * slot's insets drawn into its image after it, each in its rect; an
+ * image screen's slot or inset drawn from its picture, with no chain.
  * The second outputs' render passes run against a fake device, and the
  * headset's format pick against a fake runtime; a screen window's
  * output is checked for whether it encodes HDR, and its repeat runs
@@ -724,6 +725,25 @@ static void test_destroy_pipeline(VkDevice device, VkPipeline pipe,
 #define vkCreateGraphicsPipelines test_create_graphics_pipelines
 #define vkDestroyPipeline test_destroy_pipeline
 
+static unsigned pictures;
+static uintptr_t last_picture;
+static video_views_rect_t last_picture_rect;
+static bool picture_whole = true;
+
+static void vulkan_views_draw_image(vk_t *vk, uintptr_t image_tex,
+      const video_views_rect_t *dst, const video_views_rect_t *cut,
+      bool nearest)
+{
+   /* It binds the stock pipeline. */
+   vk->tracker.pipeline = (VkPipeline)(uintptr_t)1;
+   pictures++;
+   last_picture      = image_tex;
+   last_picture_rect = *dst;
+   /* Whole in its rect, nearest */
+   if (!nearest || cut->pos != dst->pos || cut->dims != dst->dims)
+      picture_whole = false;
+}
+
 static void vulkan_views_fill(vk_t *vk, const video_views_rect_t *cut,
       unsigned alpha)
 {
@@ -810,6 +830,10 @@ static void init(vk_t *vk, test_context_t *context, test_chain_t *chain)
    xr_frees = xr_retargets = 0;
    chain_drawn = true;
    memset(&last_fill, 0, sizeof(last_fill));
+   pictures      = 0;
+   last_picture  = 0;
+   picture_whole = true;
+   memset(&last_picture_rect, 0, sizeof(last_picture_rect));
    memset(slot_creates, 0, sizeof(slot_creates));
    slot_refuses = 0;
    logs = 0;
@@ -1742,6 +1766,71 @@ static void test_window_repeat_no_input(void)
    CHECK(win_publishes == publishes);
 }
 
+/* An image screen's slot is cleared and its picture drawn whole, with
+ * no chain: not the whole frame. One not landed is only cleared. */
+static void test_xr_draw_image(void)
+{
+   vk_t vk;
+   test_context_t context;
+   test_chain_t chain;
+   unsigned dims = VIDEO_SCALE_PACK(64, 32);
+   init(&vk, &context, &chain);
+   acquire_fails = 0;
+   xr_plan(dims, 1);
+   planned.slots[0].image     = true;
+   planned.slots[0].image_tex = 77;
+   xr_draw(&vk, dims);
+   CHECK(vk.xr.slots[0].drawn && render_passes == 1);
+   CHECK(offscreen_passes == 0 && viewport_passes == 0 && frames_ended == 0);
+   CHECK(pictures == 1 && picture_whole && last_picture == 77);
+   CHECK(last_picture_rect.pos == 0 && last_picture_rect.dims == dims);
+   CHECK(vk.tracker.pipeline == VK_NULL_HANDLE);
+
+   init(&vk, &context, &chain);
+   xr_plan(dims, 1);
+   planned.slots[0].image = true;
+   xr_draw(&vk, dims);
+   CHECK(vk.xr.slots[0].drawn && render_passes == 1);
+   CHECK(offscreen_passes == 0 && viewport_passes == 0 && pictures == 0);
+}
+
+/* An image inset's picture is drawn into its rect, with no chain; one
+ * not landed leaves the base there, and a blank one is filled. */
+static void test_xr_draw_image_inset(void)
+{
+   vk_t vk;
+   test_context_t context;
+   test_chain_t chain;
+   unsigned i;
+   unsigned dims = VIDEO_SCALE_PACK(64, 32);
+   for (i = 0; i < 3; i++)
+   {
+      init(&vk, &context, &chain);
+      acquire_fails = 0;
+      xr_plan(dims, 1);
+      xr_plan_inset(-1);
+      planned.insets[0].screen    = 2;
+      planned.insets[0].image     = true;
+      planned.insets[0].image_tex = (i == 1) ? 0 : 77;
+      planned.insets[0].blank     = (i == 2);
+      xr_draw(&vk, dims);
+      CHECK(offscreen_passes == 1 && viewport_passes == 1);
+      CHECK(frames_ended == 1 && render_passes == 1);
+      CHECK(last_pass_w == 64 && last_pass_h == 32);
+      CHECK(pictures == (i ? 0u : 1u) && picture_whole);
+      CHECK(fills == ((i == 2) ? 1u : 0u));
+   }
+   init(&vk, &context, &chain);
+   xr_plan(dims, 1);
+   xr_plan_inset(-1);
+   planned.insets[0].image     = true;
+   planned.insets[0].image_tex = 77;
+   xr_draw(&vk, dims);
+   CHECK(last_picture == 77);
+   CHECK(last_picture_rect.pos == VIDEO_POS_PACK(48, 24));
+   CHECK(last_picture_rect.dims == VIDEO_SCALE_PACK(16, 8));
+}
+
 int main(void)
 {
    test_desktop_failure(false);
@@ -1770,6 +1859,8 @@ int main(void)
    test_xr_draw_inset_repeat();
    test_xr_draw_repeat_changed();
    test_window_repeat_no_input();
-   printf("%u failed (26 Vulkan target cases)\n", failures);
+   test_xr_draw_image();
+   test_xr_draw_image_inset();
+   printf("%u failed (28 Vulkan target cases)\n", failures);
    return failures ? 1 : 0;
 }

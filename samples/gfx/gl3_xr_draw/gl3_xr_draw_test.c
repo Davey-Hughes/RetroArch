@@ -5,7 +5,8 @@
  * moved or changed size, by replaying the last frame's final pass. A
  * blank screen's texture is only cleared, and so are the tracked eyes'
  * of a blank screen, whose views are not read. A slot's insets are
- * drawn into its texture after it, each in its rect. */
+ * drawn into its texture after it, each in its rect. An image screen's
+ * slot or inset is drawn from its picture, with no chain. */
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -137,6 +138,12 @@ static unsigned runtime_attaches, own_attaches, clears;
 static unsigned tex_binds, quads_drawn, eye_dims;
 static unsigned published[OPENXR_PROJECTION_SLOT + 1];
 static video_xr_quad_set_t planned;
+/* The frame's map, for its pictures' sizes */
+static video_views_map_t frame_map;
+static unsigned pictures, last_picture_dims, last_picture_pos;
+static unsigned last_picture_size;
+static uintptr_t last_picture;
+static bool picture_solid = true;
 
 static void glGetIntegerv(GLenum pname, GLint *v)
 {
@@ -334,6 +341,20 @@ void gl_openxr_slot_forget(gl_openxr_t *xr, unsigned slot)
    (void)xr;
    (void)slot;
 }
+static void gl3_picture_draw(gl3_t *gl, GLuint target, uintptr_t image_tex,
+      unsigned image_dims, const struct gl3_viewport *vp,
+      const struct gl3_viewport *sc, bool blend, bool nearest)
+{
+   pictures++;
+   last_picture      = image_tex;
+   last_picture_dims = image_dims;
+   last_picture_pos  = vp->pos;
+   last_picture_size = vp->dims;
+   /* Into the runtime's texture, whole in its rect, nearest, opaque */
+   if (     target != gl->xr.fbo || blend || !nearest
+         || sc->pos != vp->pos || sc->dims != vp->dims)
+      picture_solid = false;
+}
 static void gl3_xr_copy_ui(gl3_t *gl, unsigned s, GLuint tex,
       unsigned ui_dims)
 {
@@ -387,6 +408,7 @@ static void draw_views(gl3_t *gl, bool new_frame, gl3_filter_chain_t **chains)
    struct gl3_filter_chain_texture frame;
    memset(&info, 0, sizeof(info));
    memset(&frame, 0, sizeof(frame));
+   info.views  = frame_map;
    frame.image = 0x10;
    frame.dims  = VIDEO_SCALE_PACK(64, 32);
    info.frame_repeat = !new_frame;
@@ -424,6 +446,10 @@ static void reset(gl3_t *gl)
    tex_binds = quads_drawn = 0;
    eye_dims = VIDEO_SCALE_PACK(64, 32);
    memset(published, 0, sizeof(published));
+   memset(&frame_map, 0, sizeof(frame_map));
+   pictures = last_picture_dims = last_picture_pos = last_picture_size = 0;
+   last_picture  = 0;
+   picture_solid = true;
 }
 
 /* A new frame: each screen straight into the runtime's texture, one
@@ -655,6 +681,68 @@ static void test_inset_stereo(void)
    CHECK(last_pass_dims == VIDEO_SCALE_PACK(16, 8));
 }
 
+/* An image screen's slot is cleared and its picture drawn whole, with
+ * no chain: not the whole frame. One not landed is only cleared. */
+static void test_image(void)
+{
+   gl3_t gl;
+   unsigned dims = VIDEO_SCALE_PACK(64, 32);
+   reset(&gl);
+   plan(dims, 1, 0.0f);
+   planned.slots[0].image     = true;
+   planned.slots[0].image_tex = 77;
+   frame_map.image_dims[0]    = VIDEO_SCALE_PACK(48, 32);
+   draw(&gl, true);
+   CHECK(offscreen_passes == 0 && viewport_passes == 0 && frames_ended == 0);
+   CHECK(clears == 1 && pictures == 1 && picture_solid);
+   CHECK(last_picture == 77 && last_picture_dims == VIDEO_SCALE_PACK(48, 32));
+   CHECK(last_picture_pos == 0 && last_picture_size == dims);
+   CHECK(published[0] == 1);
+
+   reset(&gl);
+   plan(dims, 1, 0.0f);
+   planned.slots[0].image = true;
+   draw(&gl, true);
+   CHECK(offscreen_passes == 0 && viewport_passes == 0);
+   CHECK(clears == 1 && pictures == 0 && published[0] == 1);
+}
+
+/* An image inset's picture is drawn into its rect, with no chain; one
+ * not landed leaves the base there, and a blank one is cleared. */
+static void test_image_inset(void)
+{
+   gl3_t gl;
+   unsigned i;
+   unsigned dims = VIDEO_SCALE_PACK(64, 32);
+   for (i = 0; i < 3; i++)
+   {
+      reset(&gl);
+      plan(dims, 1, 0.0f);
+      plan_inset(-1);
+      planned.insets[0].screen    = 2;
+      planned.insets[0].image     = true;
+      planned.insets[0].image_tex = (i == 1) ? 0 : 77;
+      planned.insets[0].blank     = (i == 2);
+      frame_map.image_dims[2]     = VIDEO_SCALE_PACK(48, 32);
+      draw(&gl, true);
+      CHECK(offscreen_passes == 1 && viewport_passes == 1);
+      CHECK(frames_ended == 1 && last_pass_dims == dims);
+      CHECK(pictures == (i ? 0u : 1u) && picture_solid);
+      CHECK(clears == ((i == 2) ? 2u : 1u));
+   }
+   reset(&gl);
+   plan(dims, 1, 0.0f);
+   plan_inset(-1);
+   planned.insets[0].screen    = 2;
+   planned.insets[0].image     = true;
+   planned.insets[0].image_tex = 77;
+   frame_map.image_dims[2]     = VIDEO_SCALE_PACK(48, 32);
+   draw(&gl, true);
+   CHECK(last_picture == 77 && last_picture_dims == VIDEO_SCALE_PACK(48, 32));
+   CHECK(last_picture_pos == VIDEO_POS_PACK(48, 0));
+   CHECK(last_picture_size == VIDEO_SCALE_PACK(16, 8));
+}
+
 int main(void)
 {
    test_direct();
@@ -667,6 +755,8 @@ int main(void)
    test_inset_blank();
    test_inset_repeat();
    test_inset_stereo();
-   printf("%u failed (10 GL3 headset draw cases)\n", failures);
+   test_image();
+   test_image_inset();
+   printf("%u failed (12 GL3 headset draw cases)\n", failures);
    return failures ? 1 : 0;
 }

@@ -7719,8 +7719,7 @@ struct vulkan_views_draw_ctx
 static void vulkan_views_draw_direct(vk_t *vk,
       const struct vulkan_views_draw_ctx *d, unsigned view,
       const video_views_rect_t *dst, const video_views_rect_t *cut);
-static void vulkan_views_draw_image(vk_t *vk,
-      const struct vulkan_views_draw_ctx *d, unsigned screen,
+static void vulkan_views_draw_image(vk_t *vk, uintptr_t image_tex,
       const video_views_rect_t *dst, const video_views_rect_t *cut,
       bool nearest);
 static void vulkan_views_draw_pass(vk_t *vk, vulkan_filter_chain_t *fc,
@@ -7751,7 +7750,8 @@ static void vulkan_draw_menu(vk_t *vk, video_frame_info_t *video_info,
 #define VV_ALPHA(p, d, a)               ((p)->views.alpha = ((a) < 255) ? (a) : 0)
 #define VV_FILL(p, d, c, a)             vulkan_views_fill(p, c, a)
 #define VV_IMAGE_MAP(p, d)              (&(d)->video_info->views)
-#define VV_IMAGE(p, d, s, r, c, n)      vulkan_views_draw_image(p, d, s, r, c, n)
+#define VV_IMAGE(p, d, s, r, c, n)      vulkan_views_draw_image(p, \
+      VV_IMAGE_MAP(p, d)->image_tex[s], r, c, n)
 #define VV_TARGET                       struct vk_image
 #define VV_TARGET_MAKE(drv, t, dims)    vulkan_views_make(drv, t, dims)
 #define VV_TARGET_RETIRE(drv, t)        vulkan_views_retire(drv, t)
@@ -11900,19 +11900,17 @@ static void vulkan_views_draw_direct(vk_t *vk,
          ? vk->samplers.linear : vk->samplers.nearest);
 }
 
-/* Screen @screen's picture whole over @dst, cut to @cut, its first row
- * at the top and never turned. A chain's last pass may have bound its
- * own pipeline. */
-static void vulkan_views_draw_image(vk_t *vk,
-      const struct vulkan_views_draw_ctx *d, unsigned screen,
+/* A map's image_tex whole over @dst, cut to @cut, its first row at the
+ * top and never turned. A chain's last pass may have bound its own
+ * pipeline. */
+static void vulkan_views_draw_image(vk_t *vk, uintptr_t image_tex,
       const video_views_rect_t *dst, const video_views_rect_t *cut,
       bool nearest)
 {
    VkViewport vp;
    VkRect2D sci;
    struct retro_video_view whole;
-   struct vk_texture *tex = (struct vk_texture*)
-      d->video_info->views.image_tex[screen];
+   struct vk_texture *tex = (struct vk_texture*)image_tex;
 
    if (!vk->pipelines.stock_rect)
       return;
@@ -14321,8 +14319,9 @@ static vulkan_filter_chain_t *vulkan_xr_chain(vk_t *vk,
    return *chain;
 }
 
-/* Inset i's chain for layer l of slot s, NULL to draw it black, and its
- * pixels there; false when it is not drawn in s. */
+/* Inset i's chain for layer l of slot s, NULL to draw it black or, for
+ * an image screen, from its picture, and its pixels there; false when it
+ * is not drawn in s. */
 static bool vulkan_xr_inset(const vk_t *vk, unsigned s, unsigned l,
       unsigned i, vulkan_filter_chain_t **xr_chains,
       vulkan_filter_chain_t **chain, video_views_rect_t *cut)
@@ -14331,14 +14330,16 @@ static bool vulkan_xr_inset(const vk_t *vk, unsigned s, unsigned l,
    if (     in->slot != s
          || !video_xr_inset_px(in, vk->xr.set.slots[s].dims, cut))
       return false;
-   *chain = (in->blank || in->view[l] < 0) ? NULL : xr_chains[in->view[l]];
+   *chain = (in->blank || in->image || in->view[l] < 0)
+      ? NULL : xr_chains[in->view[l]];
    return true;
 }
 
 /* Slot s's layers, each through its view's headset chain or the whole
  * frame's, straight into the runtime's acquired images; a blank
- * screen's are only cleared. Then the slot's insets, each through its
- * view's chain into its rect, or cleared there. A repeat - a screen
+ * screen's are only cleared, an image screen's drawn from its picture.
+ * Then the slot's insets, each through its view's chain into its rect,
+ * from its picture, or cleared there. A repeat - a screen
  * resized, made again, not yet shown or planned otherwise while no new
  * frame came - replays the last frame's final pass at the image's size,
  * so feedback and history stay where that frame left them. */
@@ -14348,7 +14349,7 @@ static void vulkan_xr_draw_screen(vk_t *vk, unsigned s,
 {
    unsigned l, i;
    VkViewport vp;
-   video_views_rect_t cut;
+   video_views_rect_t cut, whole;
    vulkan_filter_chain_t *ic;
    const video_xr_quad_set_t *set = &vk->xr.set;
    VkClearValue clear;
@@ -14373,6 +14374,8 @@ static void vulkan_xr_draw_screen(vk_t *vk, unsigned s,
    vp.height   = (float)VIDEO_SCALE_H(plan->dims);
    vp.minDepth = 0.0f;
    vp.maxDepth = 1.0f;
+   whole.pos   = 0;
+   whole.dims  = plan->dims;
    clear.color.float32[0] = 0.0f;
    clear.color.float32[1] = 0.0f;
    clear.color.float32[2] = 0.0f;
@@ -14380,7 +14383,7 @@ static void vulkan_xr_draw_screen(vk_t *vk, unsigned s,
 
    for (l = 0; l < plan->layers; l++)
    {
-      vulkan_filter_chain_t *chain = plan->blank ? NULL
+      vulkan_filter_chain_t *chain = (plan->blank || plan->image) ? NULL
          : ((plan->view[l] >= 0) ? xr_chains[plan->view[l]] : xr_frame);
 
       bool replay                  = false;
@@ -14419,14 +14422,22 @@ static void vulkan_xr_draw_screen(vk_t *vk, unsigned s,
       else if (chain)
          vulkan_filter_chain_build_viewport_pass(chain, vk->cmd,
                &vp, vk->xr.mvp.data);
+      else if (plan->image && !plan->blank && plan->image_tex)
+         vulkan_views_draw_image(vk, plan->image_tex, &whole, &whole, true);
       for (i = 0; i < set->num_insets; i++)
       {
          VkViewport ivp;
+         const video_xr_inset_t *in = &set->insets[i];
          if (!vulkan_xr_inset(vk, s, l, i, xr_chains, &ic, &cut))
             continue;
          if (!ic)
          {
-            vulkan_views_fill(vk, &cut, 255);
+            /* A picture not landed yet leaves the base, as in the
+             * window. */
+            if (!in->image || in->blank)
+               vulkan_views_fill(vk, &cut, 255);
+            else if (in->image_tex)
+               vulkan_views_draw_image(vk, in->image_tex, &cut, &cut, true);
             continue;
          }
          /* The final pass is cut to its viewport. */
@@ -14452,9 +14463,10 @@ static void vulkan_xr_draw_screen(vk_t *vk, unsigned s,
             vulkan_filter_chain_end_frame(ic, vk->cmd);
    }
 
-   /* The chains bound descriptor sets of their own. */
-   vk->tracker.view    = VK_NULL_HANDLE;
-   vk->tracker.sampler = VK_NULL_HANDLE;
+   /* The chains bound descriptor sets and pipelines of their own. */
+   vk->tracker.view     = VK_NULL_HANDLE;
+   vk->tracker.sampler  = VK_NULL_HANDLE;
+   vk->tracker.pipeline = VK_NULL_HANDLE;
    memset(vk->tracker.mvp.data, 0, sizeof(vk->tracker.mvp.data));
 }
 

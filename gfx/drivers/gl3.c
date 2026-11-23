@@ -6663,26 +6663,22 @@ static void gl3_views_draw_direct(gl3_t *gl,
          d->bottom_up, &vp, &sc, d->mvp, gl->video_info.smooth);
 }
 
-/* Screen @screen's picture whole over @dst, cut to @cut, its first row
- * at the top and never turned. A preset's last pass turns the blend
- * off, so it goes on again here. */
-static void gl3_views_draw_image(gl3_t *gl,
-      const struct gl3_views_draw *d, unsigned screen,
-      const video_views_rect_t *dst, const video_views_rect_t *cut,
-      bool nearest)
+/* A map's image_tex, of image_dims, whole over vp in target, cut to sc,
+ * its first row at the top and never turned. */
+static void gl3_picture_draw(gl3_t *gl, GLuint target, uintptr_t image_tex,
+      unsigned image_dims, const struct gl3_viewport *vp,
+      const struct gl3_viewport *sc, bool blend, bool nearest)
 {
-   struct gl3_viewport vp, sc;
    struct retro_video_view whole;
    struct gl3_filter_chain_texture tex;
-   const video_views_map_t *map = &d->video_info->views;
 
    if (!gl->pipelines.stock_rect_tried)
       gl3_stock_rect_init(gl);
    if (!gl->pipelines.stock_rect)
       return;
    tex.image          = gl_media_pool_resolve(gl->media_pool,
-         (GLuint)map->image_tex[screen]);
-   tex.dims           = map->image_dims[screen];
+         (GLuint)image_tex);
+   tex.dims           = image_dims;
    tex.padded_dims    = tex.dims;
    tex.origin         = 0;
    tex.format         = GL_RGBA8;
@@ -6693,13 +6689,29 @@ static void gl3_views_draw_image(gl3_t *gl,
    whole.screen       = 0;
    whole.eye          = 0;
    whole.aspect_ratio = 0.0f;
+   glBindFramebuffer(GL_FRAMEBUFFER, target);
+   if (blend)
+      glEnable(GL_BLEND);
+   else
+      glDisable(GL_BLEND);
+   gl3_stock_rect_draw(gl, &tex, &whole, false, vp, sc,
+         gl->mvp_no_rot_yflip.data, !nearest);
+}
+
+/* Screen @screen's picture over @dst, cut to @cut. A preset's last pass
+ * turns the blend off, so it goes on again here. */
+static void gl3_views_draw_image(gl3_t *gl,
+      const struct gl3_views_draw *d, unsigned screen,
+      const video_views_rect_t *dst, const video_views_rect_t *cut,
+      bool nearest)
+{
+   struct gl3_viewport vp, sc;
+   const video_views_map_t *map = &d->video_info->views;
+
    gl3_views_vp(dst, d->target_height, &vp);
    gl3_views_vp(cut, d->target_height, &sc);
-   glBindFramebuffer(GL_FRAMEBUFFER, d->target);
-   if (gl->views.alpha_blend)
-      glEnable(GL_BLEND);
-   gl3_stock_rect_draw(gl, &tex, &whole, false, &vp, &sc,
-         gl->mvp_no_rot_yflip.data, !nearest);
+   gl3_picture_draw(gl, d->target, map->image_tex[screen],
+         map->image_dims[screen], &vp, &sc, gl->views.alpha_blend, nearest);
 }
 
 /* A placement through its view's chain */
@@ -7103,14 +7115,16 @@ static void gl3_xr_forget(gl3_t *gl, unsigned s, bool yield)
 
 /* Each layer of a screen slot drawn whole into tex by its view's
  * headset chain or the whole frame's: its passes at the image's size; a
- * blank screen's is only cleared. Then the slot's insets, each by its
- * view's chain into its rect, or cleared there. A repeat - a screen
+ * blank screen's is only cleared, an image screen's drawn from its
+ * picture in map. Then the slot's insets, each by its view's chain into
+ * its rect, from its picture, or cleared there. A repeat - a screen
  * moved, resized or not yet shown while no new frame came - replays the
  * last frame's final pass, so feedback and history stay where that frame
  * left them. */
 static void gl3_xr_draw_screen(gl3_t *gl, unsigned s, const uint32_t *tex,
       gl3_filter_chain_t **chains, gl3_filter_chain_t *frame_chain,
-      const struct gl3_filter_chain_texture *frame_tex, bool new_frame)
+      const struct gl3_filter_chain_texture *frame_tex,
+      const video_views_map_t *map, bool new_frame)
 {
    unsigned l, i;
    struct gl3_viewport vp;
@@ -7123,7 +7137,7 @@ static void gl3_xr_draw_screen(gl3_t *gl, unsigned s, const uint32_t *tex,
    {
       struct gl3_filter_chain_texture in;
       int v                    = plan->view[l];
-      gl3_filter_chain_t *chain = plan->blank ? NULL
+      gl3_filter_chain_t *chain = (plan->blank || plan->image) ? NULL
          : ((v >= 0) ? chains[v] : frame_chain);
       bool replay              = chain && !new_frame
          && gl3_filter_chain_replay_ready(chain);
@@ -7158,6 +7172,9 @@ static void gl3_xr_draw_screen(gl3_t *gl, unsigned s, const uint32_t *tex,
          if (new_frame)
             gl3_filter_chain_end_frame(chain);
       }
+      else if (plan->image && !plan->blank && plan->image_tex)
+         gl3_picture_draw(gl, gl->xr.fbo, plan->image_tex,
+               map->image_dims[s], &vp, &vp, false, true);
       for (i = 0; i < set->num_insets; i++)
       {
          video_views_rect_t cut;
@@ -7172,6 +7189,15 @@ static void gl3_xr_draw_screen(gl3_t *gl, unsigned s, const uint32_t *tex,
          if (e->slot != s || !video_xr_inset_px(e, plan->dims, &cut))
             continue;
          gl3_views_vp(&cut, VIDEO_SCALE_H(plan->dims), &ivp);
+         if (e->image && !e->blank)
+         {
+            /* A picture not landed yet leaves the base, as in the
+             * window. */
+            if (e->image_tex)
+               gl3_picture_draw(gl, gl->xr.fbo, e->image_tex,
+                     map->image_dims[e->screen], &ivp, &ivp, false, true);
+            continue;
+         }
          if (!(ic = (iv >= 0) ? chains[iv] : NULL))
          {
             glBindFramebuffer(GL_FRAMEBUFFER, gl->xr.fbo);
@@ -7371,7 +7397,7 @@ static void gl3_xr_draw(gl3_t *gl, const video_frame_info_t *video_info,
          gl3_xr_copy_ui(gl, s, tex[0], ui_dims);
       else
          gl3_xr_draw_screen(gl, s, tex, chains, frame_chain, frame_tex,
-               new_frame);
+               &video_info->views, new_frame);
       gl_openxr_slot_publish(xr, s, &gl->xr.set, NULL);
       gl3_xr_keep(gl, s);
    }

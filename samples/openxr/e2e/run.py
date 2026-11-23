@@ -57,8 +57,8 @@ import zlib
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, '..', '..', '..'))
 sys.path.insert(0, os.path.join(ROOT, 'samples', 'cores', 'video_views', 'e2e'))
-from run import (CORE, free_port, isolated_env, read_png, send,  # noqa: E402
-                 write_cfg)
+from run import (CORE, IMAGE_MIRRORED, IMAGE_QUADRANTS,  # noqa: E402
+                 free_port, isolated_env, read_png, send, write_cfg)
 
 PRESET = os.path.join(HERE, 'output_size.slangp')
 LAYER_DIR = os.path.join(ROOT, 'samples', 'openxr', 'test_layer')
@@ -4271,6 +4271,90 @@ def check_screens_over_laser(res):
     return []
 
 
+# The image modes' screen 2, a 48x32 picture: its quadrants' centres, and
+# its rect in Top's image over Top's bottom right corner at a quarter of
+# its height, (x, y, width, height). Top around it: points past its left
+# and top edges, and Top's centre.
+IMAGE_CENTRES = ((0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75))
+DS_IMAGE_INSET = (0.71875, 0.75, 0.28125, 0.25)
+DS_IMAGE_OUT = ((0.5, 0.5), (0.703, 0.875), (0.86, 0.734))
+
+
+def image_status(res, want):
+    status = STATUS_RE.findall(res.log)
+    if not status or status[-1][5] != want:
+        return ['status %s, want images=%s' % (status[-1:], want)]
+    return []
+
+
+def picture_errors(path, rect, colours, what):
+    """The picture's quadrants, each at its centre in rect."""
+    x, y, w, h = rect
+    errors = []
+    for (fx, fy), want in zip(IMAGE_CENTRES, colours):
+        c, _ = colour(path, x + fx * w, y + fy * h)
+        if not near(c, want):
+            errors.append('%s at %g,%g shows %s, want %s'
+                          % (what, fx, fy, c, want))
+    return errors
+
+
+def check_screens_image(colours):
+    """The image modes' screen 2 SHOWN: its own quad beside Top's, whose
+    image is the picture."""
+    def check(res):
+        errors = image_status(res, '1')
+        fr = last_snap(res)
+        if not fr:
+            return errors + no_quads(res)
+        q = [x for x in quads(fr) if not x['flags'] & BLEND]
+        rest = [x for x in q if not sized(x, DS_SIZE)]
+        if len(q) != 2 or len(rest) != 1:
+            return errors + ['want Top\'s quad and screen 2\'s, got %s'
+                             % [(x['pose'][:3], x['size']) for x in q]]
+        return errors + picture_errors(image(res, fr, rest[0]),
+                                       (0.0, 0.0, 1.0, 1.0), colours,
+                                       'screen 2\'s image')
+    return check
+
+
+def check_screens_image_over(res):
+    """image_over: screen 2 has no quad; Top's image shows the picture in
+    the inset's rect, GREEN around it."""
+    errors = image_status(res, '1')
+    fr = last_snap(res)
+    if not fr:
+        return errors + no_quads(res)
+    q = [x for x in quads(fr) if not x['flags'] & BLEND]
+    if len(q) != 1 or not sized(q[0], DS_SIZE):
+        return errors + ['want Top\'s quad alone, got %s'
+                         % [(x['pose'][:3], x['size']) for x in q]]
+    path = image(res, fr, q[0])
+    errors += picture_errors(path, DS_IMAGE_INSET, IMAGE_QUADRANTS,
+                             'the inset')
+    for fx, fy in DS_IMAGE_OUT:
+        c, _ = colour(path, fx, fy)
+        if not near(c, GREEN):
+            errors.append('Top\'s image at %g,%g shows %s, want %s'
+                          % (fx, fy, c, GREEN))
+    return errors
+
+
+def check_screens_image_gl(res):
+    """gl reports FALLBACK while a headset runs: IMAGES reads 0 and no
+    quad shows the picture."""
+    errors = image_status(res, '0')
+    fr = last_snap(res)
+    if not fr:
+        return errors + no_quads(res)
+    for x in quads(fr):
+        if not picture_errors(image(res, fr, x), (0.0, 0.0, 1.0, 1.0),
+                              IMAGE_QUADRANTS, ''):
+            errors.append('the quad at %s shows the picture'
+                          % (x['pose'][:3],))
+    return errors
+
+
 def check_tracked_screen_off(res):
     """The tracked eyes' screen with Display Off is left out: its map is
     taken, no projection is sent, and the bottom screen keeps its quad
@@ -4320,6 +4404,16 @@ SCREENS_CASES = [
      'settings': {'video_openxr_laser': '1'},
      'steps': [('wait', 6), ('script', AIM_DS_INSET), ('wait', 2)],
      'check': check_screens_over_laser},
+    {'name': 'screens-image', 'map': 'ds',
+     'options': {'video_views_test_screens': 'image'}, 'steps': SETTLE,
+     'check': check_screens_image(IMAGE_QUADRANTS)},
+    {'name': 'screens-image-over', 'map': 'ds',
+     'options': {'video_views_test_screens': 'image_over'}, 'steps': SETTLE,
+     'check': check_screens_image_over},
+    # The mirrored picture under a new serial, on a refresh with NULL data.
+    {'name': 'screens-image-null', 'map': 'ds',
+     'options': {'video_views_test_screens': 'image_null'}, 'steps': SETTLE,
+     'check': check_screens_null(check_screens_image(IMAGE_MIRRORED))},
     {'name': 'tracked-screen-off', 'map': '3ds',
      'options': {'video_views_test_vr': 'local'},
      'settings': {'video_screen1_display': 'off'}, 'steps': SETTLE,
@@ -8948,6 +9042,9 @@ GL_EXTRA = [
                ('send', 'HEADSET_RECENTER'), ('wait', 1.5),
                ('mark', 'free'), ('script', 'busy off'), ('wait', 3)],
      'check': check_tracked_busy},
+    {'name': 'screens-image-gl', 'map': 'ds',
+     'options': {'video_views_test_screens': 'image'}, 'steps': SETTLE,
+     'check': check_screens_image_gl},
 ]
 CASES += CUSTOM_CASES
 CASES += SCREENS_CASES
@@ -9011,7 +9108,8 @@ GL_BASE = {
            'tracked-recenter-busy', 'tracked-reinit',
            'tracked-reinit-resized', 'tracked-reinit-paused',
            'tracked-reinit-local', 'tracked-reinit-local-hw',
-           'tracked-reinit-poses', 'tracked-reinit-paused-hw'],
+           'tracked-reinit-poses', 'tracked-reinit-paused-hw',
+           'screens-image-gl'],
 }
 # The edit cases whose work is a host's or a driver's own: the plan and
 # its edit count, the hold and hand-over, the outlines, the handle and
@@ -9085,13 +9183,16 @@ GL_CHECKS = {
 # the binding.
 GL_SKIP = {'glcore-egl': ('focus',),
            'glcore-glx': tuple(n for n in GL_EDIT + GL_EDIT_MENU
-                               if n not in ('edit-grab', 'edit-command'))}
+                               if n not in ('edit-grab', 'edit-command')),
+           # gl reports FALLBACK while a headset runs: screens-image-gl.
+           'gl-egl': tuple(c['name'] for c in SCREENS_CASES
+                           if c['name'].startswith('screens-image'))}
 # A lane that runs only these of its driver's cases: gl's other binding.
 GL_ONLY = {'gl-glx': ('3ds-stereo', 'no-map', 'menu', 'menu-closes',
                       'tracked', 'tracked-menu', 'tracked-recenter',
                       'tracked-reinit', 'pace-2', 'session-lost',
                       'hw-teardown') + tuple(c['name'] for c in CUSTOM_CASES)
-            + ('edit-grab',)}
+            + ('edit-grab', 'screens-image-gl')}
 
 
 def gl_cases():

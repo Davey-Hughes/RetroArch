@@ -119,7 +119,7 @@ class GlLanes(unittest.TestCase):
     def test_extra_cases_gl_only(self):
         names = {c['name'] for c in run.CASES}
         self.assertTrue(all(c['name'] not in names for c in run.GL_EXTRA))
-        self.assertEqual(len(run.CASES), 221)
+        self.assertEqual(len(run.CASES), 224)
 
     def test_screens_lanes(self):
         # A hidden, a blank and a left-out tracked screen on each driver,
@@ -130,6 +130,19 @@ class GlLanes(unittest.TestCase):
             for lane in ('glcore-egl', 'glcore-glx', 'gl-egl'):
                 self.assertIn(lane + '-' + n, names)
             self.assertNotIn('gl-glx-' + n, names)
+
+    def test_screens_image_lanes(self):
+        # Image screens on vulkan and glcore; gl reads IMAGES 0.
+        names = [c['name'] for c in self.gl_cases]
+        for n in ('screens-image', 'screens-image-over', 'screens-image-null'):
+            self.assertIn(n, [c['name'] for c in run.CASES])
+            for lane in ('glcore-egl', 'glcore-glx'):
+                self.assertIn(lane + '-' + n, names)
+            for lane in ('gl-egl', 'gl-glx'):
+                self.assertNotIn(lane + '-' + n, names)
+        for lane, driver, context in run.GL_LANES:
+            self.assertEqual(lane + '-screens-image-gl' in names,
+                             driver == 'gl')
 
     def test_edit_lanes(self):
         names = [c['name'] for c in self.gl_cases]
