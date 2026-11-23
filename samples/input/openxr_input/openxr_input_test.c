@@ -11706,6 +11706,77 @@ static void test_window_quad_no_input(void)
    t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
 }
 
+/* An image screen takes no input: the laser on its quad is off every
+ * screen, and in Auto it leaves the pointer to the mouse. A 48x32
+ * picture as screen 2, below t_two_screens. */
+static void test_laser_image(void)
+{
+   struct retro_video_view v[2];
+   struct retro_video_screen scr[3];
+   struct retro_video_screen_image image;
+   struct retro_video_views in;
+   static uint32_t pixels[48 * 32];
+   int16_t x = 12345;
+   int16_t y = 0;
+   unsigned i;
+
+   t_let_go();
+   t_forget_devices();
+   t_fresh_session();
+   t_aim_at_screen_1();
+   v[0]            = t_two_screens.views[0];
+   v[1]            = t_two_screens.views[1];
+   memset(scr, 0, sizeof(scr));
+   memset(&image, 0, sizeof(image));
+   image.data      = pixels;
+   image.width     = 48;
+   image.height    = 32;
+   image.pitch     = 48 * sizeof(uint32_t);
+   image.format    = RETRO_PIXEL_FORMAT_XRGB8888;
+   image.serial    = 1;
+   scr[2].image    = &image;
+   memset(&in, 0, sizeof(in));
+   in.views        = v;
+   in.num_views    = 2;
+   in.flags        = RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   in.screens      = scr;
+   in.num_screens  = 3;
+   CHECK(video_views_validate_map(&in, &t_two_screens, NULL)
+         && t_two_screens.image == 0x4,
+         "the image's map: image %#x", t_two_screens.image);
+   t_two_screens.image_tex[2] = 77;
+   t_place_two_screens();
+   for (i = 0; i < t_quads.num_quads; i++)
+      if (t_quads.quads[i].screen == 2)
+         break;
+   CHECK(i < t_quads.num_quads, "the image's quad: %u quads",
+         t_quads.num_quads);
+   if (i < t_quads.num_quads)
+   {
+      t_aim[1].position.x = t_aim[2].position.x =
+         t_quads.quads[i].pose.position.x;
+      t_aim[1].position.y = t_aim[2].position.y =
+         t_quads.quads[i].pose.position.y;
+   }
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(!t_gun_at(&x, &y)
+         && input_openxr_pointer(t_on(0), RETRO_DEVICE_LIGHTGUN, 0,
+            RETRO_DEVICE_ID_LIGHTGUN_SCREEN_X, &x) && x == -0x8000,
+         "the laser on the image: the gun at %d", x);
+   /* Bottom left out, Auto has no screen for the laser: the image is
+    * not one. */
+   t_two_screens.left_out = 0x2;
+   t_place_two_screens();
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_AUTO);
+   CHECK(!input_openxr_pointer_owned(),
+         "Auto with Top and the image: the pointer is owned");
+
+   t_hooks.session_destroying(t_hooks.user);
+   t_touch_reset();
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+}
+
 int main(void)
 {
    t_forget_devices();
@@ -11858,6 +11929,7 @@ int main(void)
    test_laser_inset();
    test_window_views_no_input();
    test_window_quad_no_input();
+   test_laser_image();
    if (failures)
    {
       printf("%d failure(s)\n", failures);

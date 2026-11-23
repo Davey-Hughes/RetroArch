@@ -109,6 +109,9 @@ typedef struct video_xr_slot
    bool fixed;
    /* A BLANK screen's: it keeps its place and is drawn black. */
    bool blank;
+   bool image;             /* an image screen's, drawn from image_tex */
+   uint8_t image_gen;      /* moves with each new picture */
+   uintptr_t image_tex;    /* 0: not landed, nothing drawn */
 } video_xr_slot_t;
 
 /* An inset drawn into its base's slot, after the base */
@@ -123,6 +126,9 @@ typedef struct video_xr_inset
    unsigned screen;
    bool blank;
    bool no_input;
+   bool image;                 /* as video_xr_slot_t's */
+   uint8_t image_gen;
+   uintptr_t image_tex;
 } video_xr_inset_t;
 
 typedef struct video_xr_quad_set

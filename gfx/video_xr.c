@@ -403,8 +403,9 @@ void video_xr_layout(const video_xr_params_t *p, video_xr_layout_t *out)
       out->pos[s].y  = (float)y;
       out->width[s]  = (float)w;
       out->height[s] = (float)h;
-      out->native[s] = VIDEO_SCALE_PACK((unsigned)(disp_w[s] + 0.5),
-            (unsigned)(disp_h[s] + 0.5));
+      out->native[s] = (map->image & (1u << s)) ? map->image_dims[s]
+         : VIDEO_SCALE_PACK((unsigned)(disp_w[s] + 0.5),
+               (unsigned)(disp_h[s] + 0.5));
    }
    out->count = map->num_screens;
 }
@@ -460,6 +461,12 @@ static void video_xr_place_insets(const video_xr_params_t *p,
          in->screen   = i;
          in->blank    = (map->blank & (1u << i)) != 0;
          in->no_input = (map->no_input & (1u << i)) != 0;
+         if (map->image & (1u << i))
+         {
+            in->image     = true;
+            in->image_tex = map->image_tex[i];
+            in->image_gen = map->image_gen[i];
+         }
       }
    }
 }
@@ -501,8 +508,18 @@ static void video_xr_place_screens(const video_xr_params_t *p,
       video_xr_adjust(p, &lay->pos[s], p->screens ? &screen : NULL,
             &pose, &w, &h, &distance);
 
-      slot->dims    = video_xr_screen_dims(p, (float)w, (float)h, distance,
-            lay->native[s]);
+      if (map->image & (1u << s))
+      {
+         /* At least its picture's pixels, under the stock chain too. */
+         slot->dims      = video_xr_image_dims((float)w, (float)h, distance,
+               p->px_per_rad, lay->native[s], p->max_dim);
+         slot->image     = true;
+         slot->image_tex = map->image_tex[s];
+         slot->image_gen = map->image_gen[s];
+      }
+      else
+         slot->dims = video_xr_screen_dims(p, (float)w, (float)h, distance,
+               lay->native[s]);
       slot->blank   = (map->blank & (1u << s)) != 0;
       slot->view[0] = left;
       if (left != right)

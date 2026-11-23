@@ -8853,6 +8853,237 @@ static void test_xr_place_window_inset(void)
    CHECK(set.num_quads == 1 && set.num_insets == 0);
 }
 
+/* "dsi": DS packing with screens, and a VMU, screen 2, drawn from a
+ * 48x32 XRGB8888 picture landed as texture 77, generation 3. Frame
+ * 256x384. */
+static uint32_t xr_dsi_pixels[48 * 32];
+
+static void map_dsi(video_views_map_t *map)
+{
+   struct retro_video_view v[2];
+   struct retro_video_screen scr[3];
+   struct retro_video_screen_image image;
+   struct retro_video_views in;
+   v[0] = mkview(0,   0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_NONE);
+   v[1] = mkview(0, 192, 256, 192, 1, RETRO_VIDEO_VIEW_EYE_NONE);
+   memset(scr, 0, sizeof(scr));
+   memset(&image, 0, sizeof(image));
+   image.data     = xr_dsi_pixels;
+   image.width    = 48;
+   image.height   = 32;
+   image.pitch    = 48 * sizeof(uint32_t);
+   image.format   = RETRO_PIXEL_FORMAT_XRGB8888;
+   image.serial   = 1;
+   scr[2].image   = &image;
+   memset(&in, 0, sizeof(in));
+   in.views       = v;
+   in.num_views   = 2;
+   in.flags       = RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   in.screens     = scr;
+   in.num_screens = 3;
+   CHECK(video_views_validate_map(&in, map, NULL));
+   CHECK(map->image == 0x4u);
+   map->image_tex[2] = 77;
+   map->image_gen[2] = 3;
+}
+
+/* dsi with Bottom left out and the VMU over Top's bottom right, a
+ * quarter of its height. */
+static void map_dsi_inset(video_views_map_t *map)
+{
+   map_dsi(map);
+   map->left_out   = 0x2u;
+   map->over       = 0x4u;
+   map->base       = 0;
+   map->anchor     = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT << 8;
+   map->size[2]    = 0.25f;
+   map->opacity[2] = 255;
+}
+
+/* Screen s's quad in set, or -1. */
+static int xr_quad_of(const video_xr_quad_set_t *set, unsigned s)
+{
+   unsigned i;
+   for (i = 0; i < set->num_quads; i++)
+      if (     set->quads[i].kind == VIDEO_XR_QUAD_SCREEN
+            && set->quads[i].screen == s)
+         return (int)i;
+   return -1;
+}
+
+/* An image screen's spot is its extent: its picture's height at its
+ * aspect, and the picture's size as its source. */
+static void test_xr_image_spot(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_layout_t lay;
+
+   map_dsi(&map);
+   map.left_out = 0x2u;
+   params_init(&p, &map);
+   video_xr_layout(&p, &lay);
+   CHECK(lay.count == 3 && lay.height[0] > 0.0f && lay.height[2] > 0.0f);
+   CHECK(fabs((double)lay.height[2] / lay.height[0] - 32.0 / 192.0) < 1e-5);
+   CHECK(fabs((double)lay.width[2] / lay.height[2] - 1.5) < 1e-5);
+   CHECK(dims_is(lay.native[2], 48, 32));
+}
+
+/* An image screen has one quad for both eyes, NO_INPUT, and a slot
+ * drawn from its picture: no view. */
+static void test_xr_image_slot(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   const video_xr_slot_t *slot;
+   int i;
+
+   map_dsi(&map);
+   params_init(&p, &map);
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 3);
+   i = xr_quad_of(&set, 2);
+   CHECK(i >= 0);
+   if (i < 0)
+      return;
+   CHECK(set.quads[i].eye == VIDEO_XR_EYE_BOTH && set.quads[i].no_input);
+   slot = &set.slots[set.quads[i].slot];
+   CHECK(slot->image && slot->image_tex == 77 && slot->image_gen == 3);
+   CHECK(slot->view[0] == -1 && slot->view[1] == -1 && slot->layers == 1);
+   CHECK(slot->dims != 0);
+   CHECK(!set.slots[0].image && !set.slots[0].image_tex);
+   CHECK(!set.slots[1].image && !set.slots[1].image_tex);
+}
+
+/* An image's slot holds at least its picture, under the stock chain
+ * and a low density too, sized by another screen or not; a large VMU
+ * gets the headset's pixels. */
+static void test_xr_image_slot_dims(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   video_screen_xr_t screens[RETRO_VIDEO_VIEWS_MAX];
+   unsigned want;
+   int i;
+
+   map_dsi(&map);
+   params_init(&p, &map);
+   p.stock      = true;
+   p.px_per_rad = 100.0f;
+   video_xr_place(&p, &set);
+   CHECK(xr_quad_of(&set, 2) >= 0);
+   CHECK(dims_is(set.slots[2].dims, 48, 32));
+   /* A screen with views goes below its source there. */
+   CHECK(VIDEO_SCALE_W(set.slots[0].dims) < 256);
+
+   /* A quarter of Top's height, 72x48: the floor is still 48x32. */
+   map.size[2] = 0.25f;
+   video_xr_place(&p, &set);
+   i = xr_quad_of(&set, 2);
+   CHECK(i >= 0 && NEAR(set.quads[i].height, 0.3));
+   CHECK(dims_is(set.slots[2].dims, 48, 32));
+   map.size[2] = 0.0f;
+
+   /* 3 m wide and 1.8 m away. */
+   p.stock      = false;
+   p.px_per_rad = 1000.0f;
+   video_views_xr_reset(screens, RETRO_VIDEO_VIEWS_MAX);
+   screens[2].scale = 10.0f;
+   p.screens        = screens;
+   video_xr_place(&p, &set);
+   i = xr_quad_of(&set, 2);
+   CHECK(i >= 0);
+   if (i < 0)
+      return;
+   CHECK(NEAR(set.quads[i].width, 3.0) && NEAR(set.quads[i].height, 2.0));
+   want = video_xr_image_dims(set.quads[i].width, set.quads[i].height,
+         p.distance, p.px_per_rad, VIDEO_SCALE_PACK(48, 32), p.max_dim);
+   CHECK(set.slots[2].dims == want);
+   CHECK(VIDEO_SCALE_W(want) > 48 && VIDEO_SCALE_H(want) > 32);
+}
+
+/* An image inset is an entry in its base's slot, drawn from its
+ * picture: no view. */
+static void test_xr_image_inset(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   const video_xr_inset_t *in;
+
+   map_dsi_inset(&map);
+   params_init(&p, &map);
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 1 && set.quads[0].screen == 0);
+   CHECK(set.num_insets == 1);
+   if (set.num_insets != 1)
+      return;
+   in = &set.insets[0];
+   CHECK(in->slot == set.quads[0].slot && in->screen == 2);
+   CHECK(in->image && in->image_tex == 77 && in->image_gen == 3);
+   CHECK(in->view[0] == -1 && in->view[1] == -1 && in->no_input);
+   CHECK(   NEAR(in->rect.x, 0.71875) && NEAR(in->rect.y, 0.75)
+         && NEAR(in->rect.w, 0.28125) && NEAR(in->rect.h, 0.25));
+   CHECK(!set.slots[0].image && !set.slots[0].image_tex);
+}
+
+/* Nothing maps into an image: a point on its quad is off every view,
+ * and one on its inset is its base's. */
+static void test_xr_image_quad_to_frame(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   int16_t x, y, tx, ty;
+   int i;
+   unsigned frame = VIDEO_SCALE_PACK(256, 384);
+
+   map_dsi(&map);
+   params_init(&p, &map);
+   video_xr_place(&p, &set);
+   i = xr_quad_of(&set, 2);
+   CHECK(i >= 0);
+   if (i < 0)
+      return;
+   x = y = 12345;
+   CHECK(!video_xr_quad_to_frame(&set, &set.quads[i], 0.5f, 0.5f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
+   CHECK(x == 12345 && y == 12345);
+   /* Top where the inset goes. */
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.875f, 0.875f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &tx, &ty));
+   CHECK(ty < 0);
+
+   map_dsi_inset(&map);
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 1 && set.num_insets == 1);
+   x = y = 0;
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.875f, 0.875f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
+   CHECK(x == tx && y == ty);
+}
+
+/* A following menu goes with an image screen's quad when it is the
+ * first shown. */
+static void test_xr_image_menu(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+
+   map_dsi(&map);
+   map.left_out  = 0x3u;
+   params_init(&p, &map);
+   p.ui_dims     = VIDEO_SCALE_PACK(1600, 960);
+   p.menu_follow = true;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 2 && xr_quad_of(&set, 2) == 0);
+   CHECK(menu_over(&set, 0));
+   CHECK(set.quads[1].pose.position.z > set.quads[0].pose.position.z);
+}
+
 int main(void)
 {
    test_screen_defaults();
@@ -9025,6 +9256,12 @@ int main(void)
    test_xr_auto_no_inset();
    test_xr_inset_blank();
    test_xr_place_window_inset();
+   test_xr_image_spot();
+   test_xr_image_slot();
+   test_xr_image_slot_dims();
+   test_xr_image_inset();
+   test_xr_image_quad_to_frame();
+   test_xr_image_menu();
 
    if (failures)
    {
