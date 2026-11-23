@@ -7406,6 +7406,10 @@ struct d3d11_views_draw
 static void d3d11_views_draw_direct(d3d11_video_t *d3d11,
       const struct d3d11_views_draw *d, unsigned view,
       const video_views_rect_t *dst, const video_views_rect_t *cut);
+static void d3d11_views_draw_image(d3d11_video_t *d3d11,
+      const struct d3d11_views_draw *d, unsigned screen,
+      const video_views_rect_t *dst, const video_views_rect_t *cut,
+      bool nearest);
 static void d3d11_views_draw_pass(d3d11_video_t *d3d11,
       const struct d3d11_views_draw *d, d3d11_chain_t *c,
       const video_views_rect_t *dst, const video_views_rect_t *cut);
@@ -7431,6 +7435,8 @@ static bool d3d11_views_retire(d3d11_video_t *d3d11, d3d11_texture_t *t);
 #define VV_PASS(p, d, f, r, c, a)       d3d11_views_draw_pass(p, d, f, r, c)
 #define VV_ALPHA(p, d, a)               d3d11_views_alpha(p, a)
 #define VV_FILL(p, d, c, a)             d3d11_views_fill(p, d, c, a)
+#define VV_IMAGE_MAP(p, d)              (&(d)->video_info->views)
+#define VV_IMAGE(p, d, s, r, c, n)      d3d11_views_draw_image(p, d, s, r, c, n)
 #define VV_TARGET                       d3d11_texture_t
 #define VV_TARGET_MAKE(drv, t, dims)    d3d11_views_make(drv, t, dims)
 #define VV_TARGET_RETIRE(drv, t)        d3d11_views_retire(drv, t)
@@ -7742,6 +7748,35 @@ static void d3d11_views_fill(d3d11_video_t *d3d11,
    d3d11_views_quad(d3d11, &d3d11->views.rect, d->src,
          d3d11->samplers[RARCH_FILTER_UNSPEC][RARCH_WRAP_EDGE], &vp);
    d3d11_views_alpha(d3d11, alpha);
+}
+
+/* Screen @screen's picture whole over @dst, cut to @cut, its first row
+ * at the top and never turned. A chain's last pass may have bound its
+ * own stages; the direct draws read the frame's texture and filter. */
+static void d3d11_views_draw_image(d3d11_video_t *d3d11,
+      const struct d3d11_views_draw *d, unsigned screen,
+      const video_views_rect_t *dst, const video_views_rect_t *cut,
+      bool nearest)
+{
+   D3D11_VIEWPORT vp;
+   D3D11_RECT sc;
+   D3D11DeviceContext ctx = d3d11->context;
+   d3d11_texture_t *tex   = (d3d11_texture_t*)
+      d->video_info->views.image_tex[screen];
+
+   d3d11_views_bind(d3d11);
+   d3d11_views_vp(dst, &vp);
+   sc.left   = VIDEO_POS_X(cut->pos);
+   sc.top    = VIDEO_POS_Y(cut->pos);
+   sc.right  = sc.left + (LONG)VIDEO_SCALE_W(cut->dims);
+   sc.bottom = sc.top  + (LONG)VIDEO_SCALE_H(cut->dims);
+   ctx->lpVtbl->RSSetScissorRects(ctx, 1, &sc);
+   d3d11_views_quad(d3d11, &d3d11->views.rect, tex->view,
+         d3d11->samplers[nearest ? RARCH_FILTER_NEAREST
+         : RARCH_FILTER_LINEAR][RARCH_WRAP_EDGE], &vp);
+   ctx->lpVtbl->PSSetShaderResources(ctx, 0, 1, &d->src);
+   ctx->lpVtbl->PSSetSamplers(ctx, 0, 1,
+         &d3d11->samplers[RARCH_FILTER_UNSPEC][RARCH_WRAP_EDGE]);
 }
 
 /* A COM reference more, where there is the object */
@@ -11747,7 +11782,8 @@ video_driver_t video_d3d11 = {
    NULL, /* set_vr_content_info */
 #endif
    NULL, /* read_viewport_bgrx */
-   true /* max_geometry_in_place */
+   true, /* max_geometry_in_place */
+   true  /* views_images */
 };
 
 #ifdef HAVE_SLANG
