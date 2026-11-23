@@ -7719,6 +7719,10 @@ struct vulkan_views_draw_ctx
 static void vulkan_views_draw_direct(vk_t *vk,
       const struct vulkan_views_draw_ctx *d, unsigned view,
       const video_views_rect_t *dst, const video_views_rect_t *cut);
+static void vulkan_views_draw_image(vk_t *vk,
+      const struct vulkan_views_draw_ctx *d, unsigned screen,
+      const video_views_rect_t *dst, const video_views_rect_t *cut,
+      bool nearest);
 static void vulkan_views_draw_pass(vk_t *vk, vulkan_filter_chain_t *fc,
       const video_views_rect_t *dst, const video_views_rect_t *cut,
       bool again);
@@ -7746,6 +7750,8 @@ static void vulkan_draw_menu(vk_t *vk, video_frame_info_t *video_info,
 #define VV_PASS(p, d, f, r, c, a)       vulkan_views_draw_pass(p, f, r, c, a)
 #define VV_ALPHA(p, d, a)               ((p)->views.alpha = ((a) < 255) ? (a) : 0)
 #define VV_FILL(p, d, c, a)             vulkan_views_fill(p, c, a)
+#define VV_IMAGE_MAP(p, d)              (&(d)->video_info->views)
+#define VV_IMAGE(p, d, s, r, c, n)      vulkan_views_draw_image(p, d, s, r, c, n)
 #define VV_TARGET                       struct vk_image
 #define VV_TARGET_MAKE(drv, t, dims)    vulkan_views_make(drv, t, dims)
 #define VV_TARGET_RETIRE(drv, t)        vulkan_views_retire(drv, t)
@@ -11763,12 +11769,12 @@ static bool vulkan_views_stock_encodes(const vk_t *vk, bool direct,
 }
 #endif
 
-/* Draws view v straight from the frame's texture src over vp, cut to
- * sci, as the stock chain draws its copy: the same texels, the same
- * filter, stopping at the view's edge as at an image's. */
+/* Draws rectangle v of texture src over vp, cut to sci, as the stock
+ * chain draws its copy: the same texels, stopping at v's edge as at an
+ * image's. */
 static void vulkan_views_draw_stock(vk_t *vk, struct vk_texture *src,
       const struct retro_video_view *v, const VkViewport *vp,
-      const VkRect2D *sci)
+      const VkRect2D *sci, const math_matrix_4x4 *mvp, VkSampler sampler)
 {
    /* The mvp, then the first and last texel centres. */
    struct
@@ -11792,7 +11798,7 @@ static void vulkan_views_draw_stock(vk_t *vk, struct vk_texture *src,
    float uw            = (float)v->width  / tw;
    float vh            = (float)v->height / th;
 
-   ubo.mvp      = vk->mvp;
+   ubo.mvp      = *mvp;
    ubo.clamp[0] = u0 + 0.5f / tw;
    ubo.clamp[1] = v0 + 0.5f / th;
    ubo.clamp[2] = u0 + uw - 0.5f / tw;
@@ -11802,7 +11808,7 @@ static void vulkan_views_draw_stock(vk_t *vk, struct vk_texture *src,
    {
       /* The HDR pass's values, its source size slot the clamp */
       hdr_ubo                    = vk->hdr.ubo_values;
-      hdr_ubo.mvp                = vk->mvp;
+      hdr_ubo.mvp                = *mvp;
       hdr_ubo.not_used1.width    = ubo.clamp[0];
       hdr_ubo.not_used1.height   = ubo.clamp[1];
       hdr_ubo.not_used1.pad0     = ubo.clamp[2];
@@ -11835,8 +11841,7 @@ static void vulkan_views_draw_stock(vk_t *vk, struct vk_texture *src,
    if (blend)
       call.pipeline  = vk->pipelines.stock_rect_blend;
    call.texture      = src;
-   call.sampler      = vk->video.smooth
-      ? vk->samplers.linear : vk->samplers.nearest;
+   call.sampler      = sampler;
    call.vbo          = &range;
    call.vertices     = 4;
    if (     vulkan_draw_bind(vk, &call)
@@ -11891,7 +11896,38 @@ static void vulkan_views_draw_direct(vk_t *vk,
    vulkan_views_vp(dst, &vp);
    vulkan_views_sci(cut, &sci);
    vulkan_views_draw_stock(vk, d->direct, &d->video_info->views.views[view],
-         &vp, &sci);
+         &vp, &sci, &vk->mvp, vk->video.smooth
+         ? vk->samplers.linear : vk->samplers.nearest);
+}
+
+/* Screen @screen's picture whole over @dst, cut to @cut, its first row
+ * at the top and never turned. A chain's last pass may have bound its
+ * own pipeline. */
+static void vulkan_views_draw_image(vk_t *vk,
+      const struct vulkan_views_draw_ctx *d, unsigned screen,
+      const video_views_rect_t *dst, const video_views_rect_t *cut,
+      bool nearest)
+{
+   VkViewport vp;
+   VkRect2D sci;
+   struct retro_video_view whole;
+   struct vk_texture *tex = (struct vk_texture*)
+      d->video_info->views.image_tex[screen];
+
+   if (!vk->pipelines.stock_rect)
+      return;
+   whole.x              = 0;
+   whole.y              = 0;
+   whole.width          = VIDEO_SCALE_W(tex->dims);
+   whole.height         = VIDEO_SCALE_H(tex->dims);
+   whole.screen         = 0;
+   whole.eye            = 0;
+   whole.aspect_ratio   = 0.0f;
+   vulkan_views_vp(dst, &vp);
+   vulkan_views_sci(cut, &sci);
+   vk->tracker.pipeline = VK_NULL_HANDLE;
+   vulkan_views_draw_stock(vk, tex, &whole, &vp, &sci, &vk->mvp_no_rot,
+         nearest ? vk->samplers.nearest : vk->samplers.linear);
 }
 
 /* A placement through its view's chain */
@@ -21293,7 +21329,8 @@ video_driver_t video_vulkan = {
    vulkan_set_vr_content_info,
 #endif
    vulkan_read_viewport_bgrx,
-   true /* max_geometry_in_place */
+   true, /* max_geometry_in_place */
+   true  /* views_images */
 };
 
 #include "../common/hdr_viewer_colour.h"
