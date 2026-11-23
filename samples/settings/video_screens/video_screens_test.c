@@ -10515,6 +10515,16 @@ static void test_screens_redraw_inset(void)
       CHECK(screens_test_inset());
       CHECK(!memcmp(window_test_seen_layout.placements, drawn.placements,
             2 * sizeof(drawn.placements[0])));
+      /* Again, the main thread part way through arranging the map */
+      video_st->views_core.over = 0;
+      video_st->views_core.base = 0;
+      memset(video_st->views_core.size, 0,
+            sizeof(video_st->views_core.size));
+      memset(&window_test_seen_layout, 0, sizeof(window_test_seen_layout));
+      window_test_redraw(threaded, data);
+      CHECK(screens_test_inset());
+      CHECK(!memcmp(window_test_seen_layout.placements, drawn.placements,
+            2 * sizeof(drawn.placements[0])));
       threaded->free(data);
    }
    else

@@ -5433,7 +5433,8 @@ static VIDEO_NOINLINE void video_driver_blank_unused(
  * sample. Not inlined: the frame's stack has no room to spare. */
 static VIDEO_NOINLINE const video_windows_frame_t *video_driver_windows_frame(
       video_driver_state_t *video_st, settings_t *settings,
-      uint32_t flags, bool redraw, retro_time_t now)
+      uint32_t flags, bool redraw, const video_views_map_t *core,
+      retro_time_t now)
 {
    static const video_windows_route_t route_none;
    const video_windows_route_t *route;
@@ -5503,7 +5504,7 @@ static VIDEO_NOINLINE const video_windows_frame_t *video_driver_windows_frame(
       w->pos_set    = v->window_pos_set;
       w->edit       = redraw ? 0 : video_st->windows_edit[i];
    }
-   out->core          = video_st->views_core;
+   out->core          = *core;
    out->core_dims     = video_st->views_frame_dims;
    /* Only the app thread takes display lists and lays out the UI; a
     * redraw keeps the last route */
@@ -5673,6 +5674,33 @@ static VIDEO_NOINLINE void video_driver_screens_route(
 }
 #endif
 
+#ifdef HAVE_THREADS
+/* Main thread: views_core for the redraw, when it changes */
+static VIDEO_NOINLINE void video_driver_views_core_publish(
+      video_driver_state_t *video_st)
+{
+   if (!memcmp(&video_st->views_core_published, &video_st->views_core,
+            sizeof(video_st->views_core)))
+      return;
+   memcpy(&video_st->views_core_published, &video_st->views_core,
+         sizeof(video_st->views_core));
+   retro_seqlatch_publish(&video_st->views_core_box.seq,
+         video_st->views_core_box.words, &video_st->views_core,
+         sizeof(video_st->views_core));
+}
+
+/* Video thread: the redraw's copy of views_core, which the main thread
+ * may be arranging */
+static VIDEO_NOINLINE const video_views_map_t *video_driver_views_redraw_core(
+      video_driver_state_t *video_st)
+{
+   retro_seqlatch_read(&video_st->views_core_box.seq,
+         video_st->views_core_box.words, &video_st->views_redraw,
+         sizeof(video_st->views_redraw));
+   return &video_st->views_redraw;
+}
+#endif
+
 /* @from's masks and arrangement, without its views */
 static void video_driver_views_take_arrangement(video_views_map_t *to,
       const video_views_map_t *from)
@@ -5706,11 +5734,14 @@ static void video_driver_views_frame(video_driver_state_t *video_st,
    bool redraw = false;
    bool windows = false;
    video_views_map_t *core = &video_st->views_core;
+   const video_views_map_t *laid = core;
 #ifdef HAVE_THREADS
    /* A Win32 window drag has the video thread redraw the cached frame
     * beside the main thread, whose state this is: it lays out what was
-    * last presented and writes nothing. */
+    * last presented and writes none of it. */
    redraw      = video_thread_is_video_thread();
+   if (redraw)
+      laid     = video_driver_views_redraw_core(video_st);
 #endif
 #ifdef HAVE_VIDEO_WINDOWS
    windows     = settings->bools.video_windows_enable;
@@ -5769,7 +5800,7 @@ static void video_driver_views_frame(video_driver_state_t *video_st,
    /* With or without views: it also places the menu and decides the
     * idle logo */
    video_info->windows = video_driver_windows_frame(video_st, settings,
-         flags.flags, redraw, now);
+         flags.flags, redraw, laid, now);
 #else
    (void)now;
 #endif
@@ -5786,7 +5817,7 @@ static void video_driver_views_frame(video_driver_state_t *video_st,
 #endif
       /* Without the screens that have windows of their own */
       video_driver_views_layout(&video_info->views_settings,
-            &video_st->views_core, video_info->dims,
+            laid, video_info->dims,
             BIT32_GET(flags.flags, GFX_CTX_FLAGS_VIDEO_VIEWS_OWN_EYES)
             ? VIDEO_STEREO_MODE_2D : video_info->views_settings.stereo_mode,
             true, video_info->windows
@@ -5801,6 +5832,9 @@ static void video_driver_views_frame(video_driver_state_t *video_st,
    }
    if (redraw)
       return;
+#ifdef HAVE_THREADS
+   video_driver_views_core_publish(video_st);
+#endif
    video_st->views_presented = presented;
    /* The menu's rows: this frame's arrangement; a kept map's as last
     * published, until a frame arranges again; with no map, the values'

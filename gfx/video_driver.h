@@ -1915,6 +1915,15 @@ typedef struct video_screen_shown_box
    retro_atomic_int_t words[2 * VIDEO_SCREEN_SHOWN_WORDS];
 } video_screen_shown_box_t;
 
+#define VIDEO_VIEWS_MAP_WORDS RETRO_SEQLATCH_WORDS(sizeof(video_views_map_t))
+
+/* A map one thread publishes for another (rthreads/retro_seqlatch.h) */
+typedef struct video_views_map_box
+{
+   retro_atomic_int_t seq;
+   retro_atomic_int_t words[2 * VIDEO_VIEWS_MAP_WORDS];
+} video_views_map_box_t;
+
 /* Slots of video_driver_state_t::vp_params_bits in use. The array has
  * headroom above this so a parameter can be added without moving
  * anything after it; the count is what the publish and the read walk.
@@ -2233,11 +2242,19 @@ typedef struct
     * used: the core's map and frame size (touch maps back into those),
     * the map scaled to the frame the driver got, and the layout.
     * video_driver_frame() writes them on the main thread; the video
-    * thread's redraw of the cached frame only reads them. */
+    * thread's redraw of the cached frame only reads them, views_core
+    * through views_core_box. */
    video_views_map_t views;
    video_views_map_t views_core;
    video_views_map_t views_frame;
    video_views_layout_t views_layout;
+#ifdef HAVE_THREADS
+   /* views_core as the main thread last published it, and the redraw's
+    * copy */
+   video_views_map_t views_core_published;
+   video_views_map_box_t views_core_box;
+   video_views_map_t views_redraw;
+#endif
    /* The core's screens, main thread, and their names for any thread */
    video_views_screens_t views_screens;
    video_views_names_box_t views_names;
