@@ -975,7 +975,7 @@ jobs:
     name: Views on gl, glcore, Vulkan and SDL2, end to end (Xvfb, llvmpipe, lavapipe)
     runs-on: ubuntu-latest
     env:
-      APT_PKGS: build-essential libxkbcommon-dev libx11-xcb-dev libxcb1-dev libxinerama-dev libxrandr-dev libxxf86vm-dev libxv-dev xvfb x11-utils zlib1g-dev libfreetype-dev libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers vulkan-tools libasound2-dev libgl1-mesa-dri libgl-dev imagemagick libsdl2-dev ccache
+      APT_PKGS: build-essential libxkbcommon-dev libx11-xcb-dev libxcb1-dev libxinerama-dev libxrandr-dev libxxf86vm-dev libxv-dev xvfb x11-utils zlib1g-dev libfreetype-dev libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers vulkan-tools libasound2-dev libgl1-mesa-dri libgl-dev libegl-dev imagemagick libsdl2-dev ccache
     timeout-minutes: 45
 
     steps:
@@ -1051,7 +1051,7 @@ jobs:
           make -C samples/cores/video_views
           export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
           export LIBGL_ALWAYS_SOFTWARE=1
-          RA_E2E_XVFB=1 RA_E2E_ONLY='^(3ds-sbs-full|3ds-sbs-half|3ds-top-bottom|3ds-anaglyph|3ds-interlaced|ds-horizontal|exact-3ds|crop-threaded-menu|pointer-sbs-full|screens-rules|screens-no-input|screens-no-input-off|screens-no-input-null|screens-blank-aim|screens-over-aim|screens-over-no-input-aim|screens-hidden|screens-blank-late|screens-hide-null|screens-blank-null|screens-none-shown|screens-shown|screens-shown-sized|screens-over(-blank)?(-half)?(-sbs|-interlaced)?(-preset)?|screens-user-over(-corner|-preset|-stereo-preset|-blank-stereo-preset)?|screens-absent|screens-blank|screens-absent-back|screens-user-off|screens-core-beaten|screens-per-core-own|screens-per-core-other|screens-none-shown-menu|screens-status-no-map(-anaglyph|-rolling|-mipmap)?)$' \
+          RA_E2E_XVFB=1 RA_E2E_ONLY='^(3ds-sbs-full|3ds-sbs-half|3ds-top-bottom|3ds-anaglyph|3ds-interlaced|ds-horizontal|exact-3ds|crop-threaded-menu|pointer-sbs-full|screens-rules|screens-no-input|screens-no-input-off|screens-no-input-null|screens-blank-aim|screens-over-aim|screens-over-no-input-aim|screens-hidden|screens-blank-late|screens-hide-null|screens-blank-null|screens-none-shown|screens-shown|screens-shown-sized|screens-over(-blank)?(-half)?(-sbs|-interlaced)?(-preset)?|screens-user-over(-corner|-preset|-stereo-preset|-blank-stereo-preset)?|screens-absent|screens-blank|screens-absent-back|screens-user-off|screens-core-beaten|screens-per-core-own|screens-per-core-other|screens-none-shown-menu|screens-status-no-map(-anaglyph|-rolling|-mipmap)?|screens-image.*)$' \
             python3 samples/cores/video_views/e2e/run.py ./retroarch \
             "$RUNNER_TEMP/views-e2e" gl glcore vulkan sdl2
 

@@ -884,6 +884,9 @@ IMAGE_NOT_LENT_RE = re.compile(r'\[video_views\] image buffer refused')
 # image_restart's restart.
 SCREENS_RESTARTED_RE = re.compile(r'\[video_views\] screens switched'
                                   r'[\s\S]*\[Video\] Set video size to:')
+# image_null's switch in each of run-ahead's two instances.
+SCREENS_SWITCHED_TWICE_RE = re.compile(r'(\[video_views\] screens switched'
+                                       r'[\s\S]*){2}')
 
 
 def image_quadrants(rect):
@@ -990,7 +993,7 @@ SCREENS_IMAGE_CASES = [
      {'until': SCREENS_RESTARTED_RE, 'handins': 1}),
     ('screens-image-over-threaded', 'image_over',
      screens_image_inset(IMAGE_QUADRANTS),
-     {'settings': {'video_threaded': 'true'}, 'drivers': ('gl', 'vulkan')}),
+     {'settings': {'video_threaded': 'true'}}),
     # The inset over Top's passes.
     ('screens-image-over-preset', 'image_over',
      screens_image_inset(IMAGE_QUADRANTS), {'preset': True}),
@@ -1025,6 +1028,15 @@ SCREENS_IMAGE_CASES = [
      {'window': IMAGE_MIRRORED, 'drivers': ('gl', 'vulkan'),
       'settings': {'video_windows_enable': 'true'},
       'until': SCREENS_SWITCHED_RE}),
+    # Run-ahead's second instance runs two frames ahead and is shown:
+    # the main one sends its first picture's serial after the second
+    # has switched, which only a store for each instance accepts.
+    ('screens-image-runahead', 'image_null',
+     screens_image_beside(IMAGE_MIRRORED),
+     {'drivers': ('gl', 'glcore', 'vulkan'),
+      'settings': {'run_ahead_enabled': 'true', 'run_ahead_frames': '2',
+                   'run_ahead_secondary_instance': 'true'},
+      'until': SCREENS_SWITCHED_TWICE_RE}),
 ]
 # A screen's own window, as video_window_title() names it.
 SCREEN_WINDOW_RE = re.compile(r'^\s*(0x[0-9a-f]+) "RetroArch - [^"]*":',
@@ -2720,6 +2732,9 @@ def run_screens_image_case(retroarch, root, driver, case, hw='off'):
     extra.pop('hw', None)
     opts = dict(extra.pop('opts', {}), video_views_test_screens=mode)
     settings = dict(SCREENS_AIM_SETTINGS, **extra.pop('settings', {}))
+    if 'run_ahead_enabled' in settings:
+        # The second instance's copy of the core goes in TMPDIR.
+        extra['env_extra'] = {'TMPDIR': case_dir(root, driver, name, hw)}
     if window:
         extra['window_shots'] = True
         if driver in WINDOW_CONTEXTS:
@@ -2744,6 +2759,8 @@ def run_screens_image_case(retroarch, root, driver, case, hw='off'):
     if any(i != 1 for i in images):
         errors.append('status images=%s, want images=1'
                       % ','.join(str(i) for i in images))
+    if any(s[2] != 1 for s in statuses(d)):
+        errors.append('a status with accepted=0')
     sent = IMAGE_SENT_RE.findall(text)
     if not sent:
         errors.append('no picture sent')

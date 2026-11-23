@@ -2872,9 +2872,26 @@ void retro_run(void)
       video_cb(frame_buf, fw, fh, fw * sizeof(uint32_t));
 }
 
-size_t retro_serialize_size(void) { return 0; }
-bool retro_serialize(void *data, size_t size) { (void)data; (void)size; return false; }
-bool retro_unserialize(const void *data, size_t size) { (void)data; (void)size; return false; }
+/* For run-ahead: the frame count alone. Each instance keeps its own
+ * picture serial, as the frontend keeps a store for each. */
+size_t retro_serialize_size(void) { return sizeof(frames_run); }
+
+bool retro_serialize(void *data, size_t size)
+{
+   if (size < sizeof(frames_run))
+      return false;
+   memcpy(data, &frames_run, sizeof(frames_run));
+   return true;
+}
+
+bool retro_unserialize(const void *data, size_t size)
+{
+   if (size < sizeof(frames_run))
+      return false;
+   memcpy(&frames_run, data, sizeof(frames_run));
+   return true;
+}
+
 void retro_cheat_reset(void) { }
 void retro_cheat_set(unsigned index, bool enabled, const char *code)
 {
