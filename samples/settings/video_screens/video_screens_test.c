@@ -1307,6 +1307,7 @@ static uint32_t window_test_saved_flags;
 static unsigned window_test_saved_dims;
 static uint32_t window_test_saved_runloop;
 static enum rarch_core_type window_test_saved_core;
+static bool window_test_saved_images;
 
 static bool window_test_frame(void *data, const void *frame, unsigned dims,
       uint64_t count, unsigned pitch, const char *msg,
@@ -1382,6 +1383,9 @@ static void window_test_begin(void)
    video_st->poke           = &window_test_poke;
    video_st->data           = &window_test_driver;
    video_st->main_flags    |= VIDEO_FLAG_ACTIVE;
+   /* As init caches it; a test sets it beside window_test_flags */
+   window_test_saved_images = video_st->views_images;
+   video_st->views_images   = window_test_driver.views_images;
    video_driver_set_output_dims(VIDEO_SCALE_PACK(800, 480));
    /* A core runs, and placement decides afresh */
    window_test_saved_runloop = runloop_state_get_ptr()->flags;
@@ -1413,6 +1417,7 @@ static void window_test_end(void)
    video_st->poke          = window_test_saved_poke;
    video_st->data          = window_test_saved_data;
    video_st->main_flags    = window_test_saved_flags;
+   video_st->views_images  = window_test_saved_images;
    video_driver_set_output_dims(window_test_saved_dims);
    config_get_ptr()->bools.video_windows_enable = false;
    runloop_state_get_ptr()->flags             = window_test_saved_runloop;
@@ -4289,6 +4294,31 @@ static void test_status_screens(void)
    window_test_end();
 }
 
+/* IMAGES comes with SCREENS where the driver draws image screens */
+static void test_status_images(void)
+{
+   const unsigned both            = RETRO_VIDEO_VIEWS_STATUS_SCREENS
+                                  | RETRO_VIDEO_VIEWS_STATUS_IMAGES;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   runloop_state_t *runloop_st    = runloop_state_get_ptr();
+   unsigned core_rotation         = runloop_st->system.rotation;
+
+   window_test_begin();
+   window_test_flags      = 1u << GFX_CTX_FLAGS_VIDEO_VIEWS;
+   video_st->views_images = true;
+   CHECK((video_driver_views_status() & both) == both);
+   window_test_flags     |= 1u << GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK;
+   CHECK(!(video_driver_views_status() & both));
+   window_test_flags      = 1u << GFX_CTX_FLAGS_VIDEO_VIEWS;
+   runloop_st->system.rotation = 1;
+   CHECK(!(video_driver_views_status() & both));
+   runloop_st->system.rotation = core_rotation;
+   video_st->views_images = false;
+   CHECK((video_driver_views_status() & both)
+         == RETRO_VIDEO_VIEWS_STATUS_SCREENS);
+   window_test_end();
+}
+
 /* Two stacked screens and a VMU, screen 2, with no view */
 static void screens_test_full(struct retro_video_views *map,
       struct retro_video_view *views, struct retro_video_screen *screens)
@@ -4363,6 +4393,31 @@ static void screens_test_dsi(struct retro_video_views *map,
    map->flags       = RETRO_VIDEO_VIEWS_FLAG_SCREENS;
    map->screens     = screens;
    map->num_screens = 3;
+}
+
+/* screens_test_dsi() in window_test_run()'s 8x2 frame */
+static void screens_test_dsi_small(struct retro_video_views *map,
+      struct retro_video_view *views, struct retro_video_screen *screens,
+      struct retro_video_screen_image *image)
+{
+   screens_test_dsi(map, views, screens, image);
+   views[0].width  = views[1].width  = 8;
+   views[0].height = views[1].height = 1;
+   views[1].y      = 1;
+}
+
+/* The driver's last layout's IMAGE placements for @screen with @flags */
+static unsigned screens_test_image_placed(unsigned screen, unsigned flags)
+{
+   const video_views_layout_t *l = &window_test_seen_layout;
+   unsigned want                 = VIDEO_VIEWS_PLACEMENT_IMAGE | flags;
+   unsigned i;
+   unsigned n = 0;
+   for (i = 0; i < l->num_placements; i++)
+      if (     l->placements[i].view == screen
+            && (l->placements[i].flags & want) == want)
+         n++;
+   return n;
 }
 
 static bool screens_test_label(unsigned screen, const char *want)
@@ -4482,6 +4537,58 @@ static void test_views_screens_frontend(void)
    CHECK(!runloop_environment_cb(RETRO_ENVIRONMENT_GET_VIDEO_SCREEN_BUFFER,
             &buf));
    CHECK(!buf.data && !buf.pitch);
+}
+
+/* IMAGES gone under an accepted image map leaves its image screen, root
+ * or inset, out and refuses new image maps; back, the screen is placed
+ * again with no new map */
+static void test_screens_images_gone(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   static struct retro_video_screen_image image;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   struct retro_video_views map;
+
+   window_test_begin();
+   config_get_ptr()->bools.video_windows_enable = false;
+   video_st->views_images = true;
+   screens_test_dsi_small(&map, views, screens, &image);
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   CHECK(window_test_seen_placed == 3);
+   CHECK(screens_test_image_placed(2, 0) == 1);
+   CHECK(!video_st->views_core.left_out);
+
+   window_test_flags |= 1u << GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK;
+   window_test_run();
+   CHECK(window_test_seen_placed == 2);
+   CHECK(!screens_test_image_placed(2, 0));
+   CHECK(video_st->views_core.left_out & 0x4u);
+   image.serial = 2;
+   CHECK(!video_driver_set_views(&map));
+   window_test_flags &= ~(1u << GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK);
+   window_test_run();
+   CHECK(window_test_seen_placed == 3);
+   CHECK(screens_test_image_placed(2, 0) == 1);
+   CHECK(!video_st->views_core.left_out);
+
+   /* An inset, on a driver that draws no image screens */
+   screens[2].show   = RETRO_VIDEO_SCREEN_SHOW_OVER;
+   screens[2].anchor = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT;
+   screens[2].size   = 0.25f;
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   CHECK(screens_test_image_placed(2, VIDEO_VIEWS_PLACEMENT_INSET) == 1);
+   video_st->views_images = false;
+   window_test_run();
+   CHECK(window_test_seen_placed == 2);
+   CHECK(!screens_test_image_placed(2, 0));
+   CHECK(video_st->views_core.left_out & 0x4u);
+   video_st->views_images = true;
+   window_test_run();
+   CHECK(screens_test_image_placed(2, VIDEO_VIEWS_PLACEMENT_INSET) == 1);
+   window_test_end();
 }
 
 /* As a core load leaves the store: empty, and the core's */
@@ -9094,6 +9201,53 @@ static void test_screen_menu_inset_rows(void)
    screen_menu_end();
 }
 
+/* An image screen's Display row has its name and it is offered as a
+ * base; drawn over Top it has Corner, Size and Opacity rows, which stay
+ * while IMAGES is unset */
+static void test_screen_menu_image_rows(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   static struct retro_video_screen_image image;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   struct retro_video_views map;
+   file_list_t list;
+   rarch_setting_t *row;
+   char s[256];
+   load_fixture("");
+   screens_test_core();
+   window_test_begin();
+   config_get_ptr()->bools.video_windows_enable = false;
+   video_st->views_images = true;
+   screens_test_dsi_small(&map, views, screens, &image);
+   CHECK(video_driver_set_views(&map));
+   window_test_run();
+   screen_menu_display_label(2, s, sizeof(s));
+   CHECK(string_is_equal(s, "VMU"));
+   menu_setting_video_screen_display_values();
+   row = menu_setting_find("video_screen1_display");
+   CHECK(row != NULL);
+   if (row)
+      CHECK(string_is_equal(row->aux.values, "|over:2|over:3|off"));
+   menu_action("video_screen3_display", MENU_ACTION_RIGHT);
+   menu_value("video_screen3_display", "Over Top");
+   screen_menu_list(&list);
+   CHECK(window_menu_has(&list, "video_screen3_display"));
+   CHECK(screen_menu_inset_rows(&list, 2) == 3);
+   file_list_deinitialize(&list);
+   window_test_run();
+   CHECK(screens_test_image_placed(2, VIDEO_VIEWS_PLACEMENT_INSET) == 1);
+
+   video_st->views_images = false;
+   window_test_run();
+   CHECK(!screens_test_image_placed(2, 0));
+   screen_menu_list(&list);
+   CHECK(window_menu_has(&list, "video_screen3_display"));
+   CHECK(screen_menu_inset_rows(&list, 2) == 3);
+   file_list_deinitialize(&list);
+   screen_menu_end();
+}
+
 /* Screens drawn side by side have no Corner, Size or Opacity rows */
 static void test_screen_menu_inset_rows_shown(void)
 {
@@ -11808,7 +11962,9 @@ int main(int argc, char **argv)
    test_window_pointer_no_input();
    test_fallback_no_input();
    test_status_screens();
+   test_status_images();
    test_views_screens_frontend();
+   test_screens_images_gone();
    test_screens_core_show();
    test_screens_core_over_inset();
    test_screens_user_over();
@@ -11871,6 +12027,7 @@ int main(int argc, char **argv)
    test_screen_menu_over_offer();
    test_screen_menu_over_no_content();
    test_screen_menu_inset_rows();
+   test_screen_menu_image_rows();
    test_screen_menu_inset_rows_shown();
    test_screen_menu_inset_rows_follow_display();
    test_screen_menu_inset_window_rows();

@@ -1735,6 +1735,9 @@ typedef struct video_driver
 
    /* Software maxima may change within the initial input-scale capacity. */
    bool max_geometry_in_place;
+   /* Draws image screens on every output it has, or reports
+    * GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK there. */
+   bool views_images;
 } video_driver_t;
 
 #ifdef HAVE_OPENXR
@@ -2059,6 +2062,10 @@ typedef struct
    /* Initial software-frame capacity, in pixels on each axis; zero opts out. */
    unsigned max_geometry_capacity;
    enum retro_pixel_format max_geometry_format;
+   /* The (inner) driver's views_images, cached at init, and whether the
+    * last arranged frame had RETRO_VIDEO_VIEWS_STATUS_IMAGES */
+   bool views_images;
+   bool views_images_arranged;
 
 #ifdef HAVE_VIDEO_FILTER
    unsigned state_scale;

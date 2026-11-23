@@ -109,10 +109,12 @@ size_t video_screen_prefs_over_value(unsigned base, char *s, size_t len);
 /* Pure. @map's left_out, blank, over, base, anchor, opacity and size for
  * its num_screens screens, from each screen's @resolved values,
  * @defaults (resolve()'s return per screen) and the core's @screens
- * (NULL: none). Reads @map's num_screens and viewless. */
+ * (NULL: none). Reads @map's num_screens, viewless and image.
+ * @images: STATUS_IMAGES this frame. Without it every image screen is
+ * left out, as ABSENT. */
 void video_screen_prefs_arrange(const video_screen_values_t *resolved,
       const unsigned *defaults, const video_views_screens_t *screens,
-      video_views_map_t *map);
+      bool images, video_views_map_t *map);
 
 /* Takes @bits of @values for @screen, marking them set; NULL @values
  * clears those entries. dirty only when something changed. */

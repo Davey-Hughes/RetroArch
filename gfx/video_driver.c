@@ -4554,6 +4554,7 @@ void video_driver_clear_views(void)
    video_st->views_frame_dims = 0;
    video_st->views_presented  = false;
    video_st->views_fallback   = false;
+   video_st->views_images_arranged = false;
    /* Without the core's defaults or its arrangement */
    if (settings)
    {
@@ -4650,8 +4651,10 @@ static VIDEO_NOINLINE unsigned video_driver_screens_insets(
       memset(&map, 0, sizeof(map));
       map.num_screens = video_st->views_core.num_screens;
       map.viewless    = video_st->views_core.viewless;
+      map.image       = video_st->views_core.image;
       video_screen_prefs_arrange(video_st->screens_resolved,
-            video_st->screens_defaults, &video_st->views_screens, &map);
+            video_st->screens_defaults, &video_st->views_screens,
+            video_st->views_images_arranged, &map);
       return map.over;
    }
    for (s = 0; s < RETRO_VIDEO_VIEWS_MAX; s++)
@@ -4847,7 +4850,11 @@ unsigned video_driver_views_status(void)
       /* Not while the core is turned: UPRIGHT is not drawn */
       if (     !BIT32_GET(flags.flags, GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK)
             && !runloop_state_get_ptr()->system.rotation)
+      {
          status |= RETRO_VIDEO_VIEWS_STATUS_SCREENS;
+         if (video_driver_st.views_images)
+            status |= RETRO_VIDEO_VIEWS_STATUS_IMAGES;
+      }
       /* A display of the driver's own per eye shows both while the
        * driver says so (the 3DS's 3D slider); a headset whatever the
        * window's mode. */
@@ -5785,9 +5792,14 @@ static void video_driver_views_frame(video_driver_state_t *video_st,
    if (arranged)
    {
       unsigned drawn;
+      /* STATUS_IMAGES, as video_driver_views_status() has it */
+      video_st->views_images_arranged = video_st->views_images
+         && !BIT32_GET(flags.flags, GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK)
+         && !runloop_state_get_ptr()->system.rotation;
       /* Not in views: set_views compares each map with it */
       video_screen_prefs_arrange(video_st->screens_resolved,
-            video_st->screens_defaults, &video_st->views_screens, core);
+            video_st->screens_defaults, &video_st->views_screens,
+            video_st->views_images_arranged, core);
       drawn = ((1u << core->num_screens) - 1u)
             & ~(core->viewless | core->left_out | core->blank);
       /* The frame repeated has no pixels for a screen it did not draw */
@@ -10133,6 +10145,7 @@ bool video_driver_init_internal(bool *video_is_threaded, bool verbosity_enabled)
 #endif
       video_st->max_geometry_capacity = 0;
       video_st->max_geometry_format = video_st->pix_fmt;
+      video_st->views_images        = driver->views_images;
       if (     driver->max_geometry_in_place
             && !video_driver_is_hw_context()
 #ifdef HAVE_VIDEO_FILTER

@@ -296,7 +296,7 @@ static void video_screen_prefs_inset(const video_screen_values_t *resolved,
 
 void video_screen_prefs_arrange(const video_screen_values_t *resolved,
       const unsigned *defaults, const video_views_screens_t *screens,
-      video_views_map_t *map)
+      bool images, video_views_map_t *map)
 {
    unsigned s, i, fall, insets;
    unsigned base[RETRO_VIDEO_VIEWS_MAX];
@@ -324,6 +324,8 @@ void video_screen_prefs_arrange(const video_screen_values_t *resolved,
       int b = video_screen_prefs_over_base(resolved[s].display);
       base[s] = s;
       if (core && core->state == RETRO_VIDEO_SCREEN_STATE_ABSENT)
+         out |= 1u << s;
+      if (!images && (map->image & (1u << s)))
          out |= 1u << s;
       if (!strcmp(resolved[s].display, VIDEO_WINDOW_DISPLAY_OFF))
          out |= 1u << s;
