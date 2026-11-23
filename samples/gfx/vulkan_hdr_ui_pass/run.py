@@ -309,14 +309,24 @@ def run_case(exe, d, core, display, name, preset, settings, menu, ui,
             and FALLBACK_WARN % (MODE_NAMES[asked], want) not in text:
         errors.append('no warning that %s fell back to %s'
                       % (MODE_NAMES[asked], want))
-    if 'Validation Error' in text:
-        errors.append('%d validation error(s)' % text.count('Validation Error'))
+    # Newer layers leave out the "Validation Error: [ ID ]" head when the
+    # message names its VUID, which it does in the spec URL a line on.
+    lines = text.splitlines()
+    starts = [i for i, line in enumerate(lines)
+              if 'Validation Error' in line
+              or '[Vulkan] ERROR Validation' in line]
+    if starts:
+        errors.append('%d validation error(s)' % len(starts))
         vuids = {}
-        for line in text.splitlines():
-            if 'Validation Error' in line:
-                m = re.search(r'\[ (\S+) \]', line)
-                vuid = m.group(1) if m else line.strip()[:200]
-                vuids[vuid] = vuids.get(vuid, 0) + 1
+        for i in starts:
+            j = i + 1
+            while j < len(lines) and not lines[j].startswith('['):
+                j += 1
+            msg = '\n'.join(lines[i:j])
+            m = (re.search(r'\[ (\S+) \]', msg)
+                 or re.search(r'#(VUID-[\w-]+)', msg))
+            vuid = m.group(1) if m else lines[i].strip()[:200]
+            vuids[vuid] = vuids.get(vuid, 0) + 1
         for vuid in sorted(vuids):
             errors.append('  %s x%d' % (vuid, vuids[vuid]))
     # The preset is what puts the game through the offscreen buffer
