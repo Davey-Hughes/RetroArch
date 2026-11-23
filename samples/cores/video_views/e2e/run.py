@@ -872,6 +872,11 @@ SCREENS_IMAGE_BESIDE_TOP = [(680, 480, GREEN), (100, 480, GREEN),
 SCREENS_IMAGE_BESIDE_OUT = (GREEN, BLACK, BLACK, BLACK)
 SCREENS_IMAGE_INSET_TOP = [(800, 480, GREEN)]
 SCREENS_IMAGE_INSET_OUT = (GREEN, GREEN, BLACK, None)
+# Under video_rotation 1 Top turns to 192x256 and the picture stays
+# 48x32, side by side at 3.75 pixels to a core pixel, Top at x 350.
+SCREENS_IMAGE_ROTATED = (1070, 420, 180, 120)
+SCREENS_IMAGE_ROTATED_TOP = [(710, 480, GREEN), (360, 480, GREEN),
+                             (340, 480, BLACK)]
 IMAGE_SENT_RE = re.compile(r'\[video_views\] image serial=(\d+) '
                            r'accepted=(\d)')
 IMAGE_NOT_LENT_RE = re.compile(r'\[video_views\] image buffer refused')
@@ -929,6 +934,11 @@ def screens_image_beside(colours):
         SCREENS_IMAGE_BESIDE, colours, SCREENS_IMAGE_BESIDE_OUT)
 
 
+def screens_image_rotated(colours):
+    return SCREENS_IMAGE_ROTATED_TOP + image_points(
+        SCREENS_IMAGE_ROTATED, colours, SCREENS_IMAGE_BESIDE_OUT)
+
+
 def screens_image_inset(colours):
     return SCREENS_IMAGE_INSET_TOP + image_points(
         SCREENS_IMAGE_INSET, colours, SCREENS_IMAGE_INSET_OUT)
@@ -937,8 +947,9 @@ def screens_image_inset(colours):
 # The image modes, on IMAGES_DRIVERS. Entries as SCREENS_DRAW_CASES',
 # with 'opts' added to the core's options, 'blends' pixels that must be
 # neither side's colour, 'handins' how many pictures the core sends,
-# 'preset' True to draw through the driver's SCREENS_PRESETS preset and
-# 'drivers' those of IMAGES_DRIVERS the case runs on.
+# 'preset' True to draw through the driver's SCREENS_PRESETS preset,
+# 'hw' True to run once for each hardware kind EXACT_HW gives the driver
+# and 'drivers' those of IMAGES_DRIVERS the case runs on.
 SCREENS_IMAGE_CASES = [
     ('screens-image', 'image', screens_image_beside(IMAGE_QUADRANTS), {}),
     ('screens-image-over', 'image_over',
@@ -974,6 +985,14 @@ SCREENS_IMAGE_CASES = [
     ('screens-image-interlaced', 'image',
      screens_image_beside(IMAGE_QUADRANTS),
      {'settings': {'video_stereo_mode': '5'}}),
+    # Over the core's own frame, bottom up or top down: the picture's
+    # first row stays at the top.
+    ('screens-image-hw', 'image', screens_image_beside(IMAGE_QUADRANTS),
+     {'hw': True}),
+    # The user's rotation turns Top, never the picture.
+    ('screens-image-rotated', 'image',
+     screens_image_rotated(IMAGE_QUADRANTS),
+     {'settings': {'video_rotation': '1'}}),
 ]
 
 
@@ -2621,7 +2640,7 @@ def run_screens_show_case(retroarch, root, driver, case, screens=None):
     return errors
 
 
-def run_screens_image_case(retroarch, root, driver, case):
+def run_screens_image_case(retroarch, root, driver, case, hw='off'):
     """An image case: the window's points, IMAGES in every status, each
     picture the core sent taken, through a lend unless it copies, and
     its blends, number of pictures, preset and until line where it has
@@ -2633,6 +2652,7 @@ def run_screens_image_case(retroarch, root, driver, case):
     blends = extra.pop('blends', ())
     handins = extra.pop('handins', None)
     extra.pop('drivers', None)
+    extra.pop('hw', None)
     opts = dict(extra.pop('opts', {}), video_views_test_screens=mode)
     settings = dict(SCREENS_AIM_SETTINGS, **extra.pop('settings', {}))
     if preset:
@@ -2640,9 +2660,9 @@ def run_screens_image_case(retroarch, root, driver, case):
         extra['args'] = ('--set-shader='
                          + os.path.join(HERE, SCREENS_PRESETS[driver]),)
     errors = run_case(retroarch, root, driver,
-                      (name, 'ds', settings, points), opts=opts, screens=1,
-                      **extra)
-    d = case_dir(root, driver, name)
+                      (name, 'ds', settings, points), hw=hw, opts=opts,
+                      screens=1, **extra)
+    d = case_dir(root, driver, name, hw)
     text = log_text(d)
     if until and not until.search(text):
         errors.append('never logged /%s/' % until.pattern)
@@ -2995,9 +3015,10 @@ def driver_jobs(retroarch, root, driver):
             errors.append('views drawn straight from the frame')
         return report('%s/%s' % (driver, name), errors), bool(errors)
 
-    def screens_image(case):
-        errors = run_screens_image_case(retroarch, root, driver, case)
-        return report('%s/%s' % (driver, case[0]), errors), bool(errors)
+    def screens_image(case, hw):
+        errors = run_screens_image_case(retroarch, root, driver, case, hw)
+        name = case[0] if hw == 'off' else '%s (hw %s)' % (case[0], hw)
+        return report('%s/%s' % (driver, name), errors), bool(errors)
 
     def screens_menu():
         errors = run_screens_menu_case(retroarch, root, driver)
@@ -3067,9 +3088,12 @@ def driver_jobs(retroarch, root, driver):
                        else []) if wanted(c[0])]
     if driver in SCREENS_DRIVERS and wanted(SCREENS_MENU_CASE[0]):
         jobs.append(screens_menu)
-    jobs += [lambda c=c: screens_image(c) for c in SCREENS_IMAGE_CASES
+    jobs += [lambda c=c, hw=hw: screens_image(c, hw)
+             for c in SCREENS_IMAGE_CASES
              if driver in c[3].get('drivers', IMAGES_DRIVERS)
-             and wanted(c[0])]
+             and wanted(c[0])
+             for hw in ([h for h in EXACT_HW[driver] if h != 'off']
+                        if c[3].get('hw') else ['off'])]
     jobs += [lambda c=c: screens_status(c)
              for c in (SCREENS_STATUS_CASES
                        if driver in SCREENS_STATUS_DRIVERS else [])
