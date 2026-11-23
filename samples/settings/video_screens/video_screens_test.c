@@ -4862,12 +4862,20 @@ static void test_images_unload(void)
 static unsigned images_test_loads;
 static unsigned images_test_updates;
 static unsigned images_test_unloads;
+static bool images_test_load_fails;
+/* The order of the loads, unloads and the driver's free: the count of
+ * these calls at the last of each */
+static unsigned images_test_seq;
+static unsigned images_test_load_at;
+static unsigned images_test_unload_at;
+static unsigned images_test_free_at;
 static uintptr_t images_test_next_tex;
 static uintptr_t images_test_updated;
 static uintptr_t images_test_unloaded;
 static const void *images_test_pixels;
 static unsigned images_test_width;
 static unsigned images_test_height;
+static bool images_test_rgba;
 static uint32_t images_test_words[48 * 32];
 
 static void images_test_record(const struct texture_image *ti)
@@ -4878,6 +4886,7 @@ static void images_test_record(const struct texture_image *ti)
    images_test_pixels = ti->pixels;
    images_test_width  = ti->width;
    images_test_height = ti->height;
+   images_test_rgba   = ti->supports_rgba;
    memcpy(images_test_words, ti->pixels, n * sizeof(uint32_t));
 }
 
@@ -4888,7 +4897,10 @@ static uintptr_t images_test_tex_load(void *video_data, void *data,
    (void)threaded;
    (void)filter_type;
    images_test_loads++;
+   images_test_load_at = ++images_test_seq;
    images_test_record((const struct texture_image*)data);
+   if (images_test_load_fails)
+      return 0;
    return images_test_next_tex++;
 }
 
@@ -4908,7 +4920,14 @@ static void images_test_tex_unload(void *data, bool threaded, uintptr_t id)
    (void)data;
    (void)threaded;
    images_test_unloads++;
-   images_test_unloaded = id;
+   images_test_unload_at = ++images_test_seq;
+   images_test_unloaded  = id;
+}
+
+static void images_test_free(void *data)
+{
+   (void)data;
+   images_test_free_at = ++images_test_seq;
 }
 
 static void images_test_calls_reset(void)
@@ -4918,9 +4937,14 @@ static void images_test_calls_reset(void)
    images_test_unloads  = 0;
    images_test_updated  = 0;
    images_test_unloaded = 0;
+   images_test_seq      = 0;
+   images_test_load_at  = 0;
+   images_test_unload_at = 0;
+   images_test_free_at  = 0;
    images_test_pixels   = NULL;
    images_test_width    = 0;
    images_test_height   = 0;
+   images_test_rgba     = false;
    memset(images_test_words, 0, sizeof(images_test_words));
 }
 
@@ -4939,7 +4963,19 @@ static void images_test_frames_begin(void)
    window_test_poke.unload_texture = images_test_tex_unload;
    images_test_next_tex     = 101;
    images_test_screen_flags = 0;
+   images_test_load_fails   = false;
    images_test_calls_reset();
+}
+
+/* A video driver restart, the stand-in back as the next driver and no
+ * new map */
+static void images_test_restart(void)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   window_test_driver.free = images_test_free;
+   driver_uninit(DRIVER_VIDEO_MASK, 0);
+   video_st->data = &window_test_driver;
+   video_st->poke = &window_test_poke;
 }
 
 /* A refresh with NULL data */
@@ -5275,6 +5311,142 @@ static void test_images_unload_surface(void)
    screens[2].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
    CHECK(video_driver_set_views(&map));
    CHECK(images_test_unloads == 1 && images_test_unloaded == 102);
+   window_test_end();
+}
+
+/* A driver restart frees the texture before the driver, and the next
+ * frame loads the kept picture with no new map */
+static void test_images_restart(void)
+{
+   images_test_frames_begin();
+   images_test_pattern(0x00405060u);
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1));
+   memset(screens_test_dsi_pixels, 0, sizeof(screens_test_dsi_pixels));
+   window_test_run();
+   CHECK(window_test_seen_views.image_tex[2] == 101);
+   images_test_calls_reset();
+   images_test_restart();
+   CHECK(images_test_unloads == 1 && images_test_unloaded == 101);
+   CHECK(images_test_unload_at && images_test_unload_at < images_test_free_at);
+   window_test_run();
+   CHECK(images_test_loads == 1 && !images_test_updates);
+   CHECK(images_test_words[0] == 0x00405060u);
+   CHECK(window_test_seen_views.image_tex[2] == 102);
+   window_test_end();
+}
+
+/* A new size gets a new texture; the old one goes after the new one
+ * has loaded */
+static void test_images_resize(void)
+{
+   images_test_frames_begin();
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1));
+   window_test_run();
+   CHECK(window_test_seen_views.image_tex[2] == 101);
+   images_test_calls_reset();
+   images_test_picture(screens_test_dsi_pixels, 2);
+   images_test_image.width  = 32;
+   images_test_image.height = 16;
+   images_test_image.pitch  = 32 * sizeof(uint32_t);
+   CHECK(images_test_set());
+   window_test_run();
+   CHECK(images_test_loads == 1 && !images_test_updates);
+   CHECK(images_test_width == 32 && images_test_height == 16);
+   CHECK(window_test_seen_views.image_tex[2] == 102);
+   CHECK(images_test_unloads == 1 && images_test_unloaded == 101);
+   CHECK(images_test_load_at < images_test_unload_at);
+   window_test_end();
+}
+
+/* A load that fails is not tried again until a new picture or a
+ * driver restart */
+static void test_images_failed(void)
+{
+   images_test_frames_begin();
+   images_test_load_fails = true;
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1));
+   window_test_run();
+   CHECK(images_test_loads == 1);
+   CHECK(!window_test_seen_views.image_tex[2]);
+   images_test_calls_reset();
+   window_test_run();
+   window_test_run();
+   CHECK(!images_test_tex_calls());
+   CHECK(!window_test_seen_views.image_tex[2]);
+   CHECK(images_test_hand(screens_test_dsi_pixels, 2));
+   window_test_run();
+   window_test_run();
+   CHECK(images_test_loads == 1);
+   CHECK(!window_test_seen_views.image_tex[2]);
+   images_test_calls_reset();
+   images_test_load_fails = false;
+   images_test_restart();
+   window_test_run();
+   CHECK(images_test_loads == 1);
+   CHECK(window_test_seen_views.image_tex[2] == 101);
+   window_test_end();
+}
+
+static bool images_test_red_rgba(void)
+{
+   const uint8_t *b = (const uint8_t*)images_test_words;
+   return images_test_rgba && b[0] == 0xFF && !b[1] && !b[2] && !b[3];
+}
+
+/* A driver that wants RGBA gets the picture in that order, copied or
+ * lent, and the next driver, which does not, gets it in its own */
+static void test_images_rgba(void)
+{
+   struct retro_video_screen_buffer buf;
+   unsigned i;
+   images_test_frames_begin();
+   video_driver_modify_disp_flags(VIDEO_FLAG_USE_RGBA, 0);
+   for (i = 0; i < 48 * 32; i++)
+      screens_test_dsi_pixels[i] = 0x00FF0000u;
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1));
+   window_test_run();
+   CHECK(images_test_loads == 1);
+   CHECK(images_test_red_rgba());
+   CHECK(screens_test_dsi_pixels[0] == 0x00FF0000u);
+
+   CHECK(images_test_get(&buf, 2, 48, 32, RETRO_PIXEL_FORMAT_XRGB8888));
+   for (i = 0; i < 48 * 32; i++)
+      ((uint32_t*)buf.data)[i] = 0x00FF0000u;
+   CHECK(images_test_hand(buf.data, 2));
+   images_test_calls_reset();
+   window_test_run();
+   CHECK(images_test_loads + images_test_updates == 1);
+   CHECK(images_test_pixels == buf.data);
+   CHECK(images_test_red_rgba());
+
+   images_test_calls_reset();
+   video_driver_modify_disp_flags(0, VIDEO_FLAG_USE_RGBA);
+   images_test_restart();
+   window_test_run();
+   CHECK(images_test_loads == 1 && !images_test_rgba);
+   CHECK(images_test_words[0] == 0x00FF0000u);
+   memset(screens_test_dsi_pixels, 0, sizeof(screens_test_dsi_pixels));
+   window_test_end();
+}
+
+/* IMAGES gone leaves the texture, and its return draws it again with
+ * no upload */
+static void test_images_gone_kept(void)
+{
+   images_test_frames_begin();
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1));
+   window_test_run();
+   CHECK(window_test_seen_views.image_tex[2] == 101);
+   images_test_calls_reset();
+   window_test_flags |= 1u << GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK;
+   window_test_run();
+   CHECK(!screens_test_image_placed(2, 0));
+   CHECK(!images_test_tex_calls());
+   window_test_flags &= ~(1u << GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK);
+   window_test_run();
+   CHECK(screens_test_image_placed(2, 0) == 1);
+   CHECK(window_test_seen_views.image_tex[2] == 101);
+   CHECK(!images_test_tex_calls());
    window_test_end();
 }
 
@@ -12673,6 +12845,11 @@ int main(int argc, char **argv)
    test_images_nearest();
    test_images_blank_no_upload();
    test_images_unload_surface();
+   test_images_restart();
+   test_images_resize();
+   test_images_failed();
+   test_images_rgba();
+   test_images_gone_kept();
    test_screens_core_show();
    test_screens_core_over_inset();
    test_screens_user_over();

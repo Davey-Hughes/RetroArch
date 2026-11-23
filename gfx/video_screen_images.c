@@ -27,6 +27,7 @@
 #define VIDEO_SCREEN_IMAGES_KEPT   (1u << 0)  /* the last picture taken */
 #define VIDEO_SCREEN_IMAGES_LENT   (1u << 1)
 #define VIDEO_SCREEN_IMAGES_PINNED (1u << 2)  /* read by an upload in flight */
+#define VIDEO_SCREEN_IMAGES_RGBA   (1u << 3)  /* kept in memory order R,G,B,X */
 
 /* One screen of one core instance */
 typedef struct video_screen_images_screen
@@ -112,9 +113,9 @@ static bool video_screen_images_find(
    return false;
 }
 
-/* @im's pixels into @dst as packed XRGB8888 */
+/* @im's pixels into @dst packed, as XRGB8888 or with @rgba as XBGR8888 */
 static void video_screen_images_copy(uint32_t *dst,
-      const struct retro_video_screen_image *im)
+      const struct retro_video_screen_image *im, bool rgba)
 {
    unsigned x, y;
    const uint8_t *src = (const uint8_t*)im->data;
@@ -123,12 +124,25 @@ static void video_screen_images_copy(uint32_t *dst,
       if (im->format == RETRO_PIXEL_FORMAT_RGB565)
       {
          const uint16_t *in = (const uint16_t*)src;
-         for (x = 0; x < im->width; x++)
-            dst[x] = pixconv_rgb565_to_xrgb8888(in[x]);
+         if (rgba)
+            for (x = 0; x < im->width; x++)
+               dst[x] = pixconv_rgb565_to_xbgr8888(in[x]);
+         else
+            for (x = 0; x < im->width; x++)
+               dst[x] = pixconv_rgb565_to_xrgb8888(in[x]);
       }
+      else if (rgba)
+         conv_argb8888_abgr8888(dst, src, (int)im->width, 1, 0, 0);
       else
          memcpy(dst, src, im->width * sizeof(uint32_t));
    }
+}
+
+/* A packed picture of @dims into the other channel order, in place */
+static void video_screen_images_swap(uint32_t *pixels, unsigned dims)
+{
+   conv_argb8888_abgr8888(pixels, pixels,
+         (int)(VIDEO_SCALE_W(dims) * VIDEO_SCALE_H(dims)), 1, 0, 0);
 }
 
 /* @scr's surfaces go; a slot an upload still reads goes with its
@@ -290,6 +304,7 @@ bool video_screen_images_set(const struct retro_video_views *in,
       video_screen_images_screen_t *scr = &store[s];
       unsigned dims;
       unsigned held;
+      bool rgba;
       int kept;
       int slot = take[s];
       if (!(map->image & (1u << s)))
@@ -309,14 +324,18 @@ bool video_screen_images_set(const struct retro_video_views *in,
          scr->slot[slot]      = made[s];
          scr->slot_dims[slot] = dims;
       }
+      rgba = gfx_surface_wants_rgba();
       if (!(scr->slot_flags[slot] & VIDEO_SCREEN_IMAGES_LENT))
-         video_screen_images_copy(scr->slot[slot], im);
+         video_screen_images_copy(scr->slot[slot], im, rgba);
+      else if (rgba)
+         video_screen_images_swap(scr->slot[slot], dims);
       if (held != dims)
          RARCH_LOG("[Video] Screen %u image: %ux%u.\n",
                s, im->width, im->height);
       if (kept >= 0)
          scr->slot_flags[kept] &= ~VIDEO_SCREEN_IMAGES_KEPT;
-      scr->slot_flags[slot] = VIDEO_SCREEN_IMAGES_KEPT;
+      scr->slot_flags[slot] = VIDEO_SCREEN_IMAGES_KEPT
+            | (rgba ? VIDEO_SCREEN_IMAGES_RGBA : 0);
       scr->serial           = im->serial;
       scr->format           = im->format;
       scr->kept_gen++;
@@ -364,6 +383,7 @@ static void video_screen_images_upload(video_screen_images_screen_t *scr)
 {
    gfx_surface_src_t src;
    unsigned dims;
+   bool rgba;
    int kept = video_screen_images_with(scr, VIDEO_SCREEN_IMAGES_KEPT);
    if (     kept < 0
          || scr->kept_gen == scr->uploaded_gen
@@ -390,9 +410,17 @@ static void video_screen_images_upload(video_screen_images_screen_t *scr)
       scr->surface      = made;
       scr->surface_dims = dims;
    }
+   /* Taken under a driver that wanted the other order */
+   rgba = gfx_surface_wants_rgba();
+   if (rgba != !!(scr->slot_flags[kept] & VIDEO_SCREEN_IMAGES_RGBA))
+   {
+      video_screen_images_swap(scr->slot[kept], dims);
+      scr->slot_flags[kept] ^= VIDEO_SCREEN_IMAGES_RGBA;
+   }
    memset(&src, 0, sizeof(src));
    src.pixels = scr->slot[kept];
    src.pixfmt = IMAGE_PIXFMT_8888;
+   src.rgba   = rgba;
    switch (gfx_surface_submit_external(scr->surface, &src,
             video_screen_images_released, scr))
    {
@@ -431,6 +459,25 @@ void video_screen_images_frame(video_views_map_t *map, unsigned draw,
       map->image_gen[s] = tex ? (uint8_t)scr->uploaded_gen : 0;
    }
    map->nearest = nearest & map->image;
+}
+
+void video_screen_images_driver_free(void)
+{
+   unsigned o, s;
+   int i;
+   for (o = 0; o < VIDEO_SCREEN_IMAGES_OWNERS; o++)
+      for (s = 0; s < RETRO_VIDEO_SCREENS_MAX; s++)
+      {
+         video_screen_images_screen_t *scr = &video_screen_images_store[o][s];
+         /* Nothing writes a slot before the driver and its thread are
+          * gone */
+         for (i = 0; i < VIDEO_SCREEN_IMAGES_SLOTS; i++)
+            scr->slot_flags[i] &= ~VIDEO_SCREEN_IMAGES_PINNED;
+         video_screen_images_unsurface(scr);
+         /* Neither up nor refused on the next driver */
+         scr->uploaded_gen = scr->kept_gen - 1;
+         scr->failed_gen   = scr->uploaded_gen;
+      }
 }
 
 void video_screen_images_clear(void)

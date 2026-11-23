@@ -59,6 +59,11 @@ bool video_screen_images_set(const struct retro_video_views *in,
 void video_screen_images_frame(video_views_map_t *map, unsigned draw,
       unsigned nearest);
 
+/* driver_uninit, after video_thread_wait_idle, before the driver
+ * goes: every surface freed and every pin cleared. Slots and pictures
+ * stay for the next driver. */
+void video_screen_images_driver_free(void);
+
 /* Content unload: both stores emptied, their textures freed, every lend
  * ended. */
 void video_screen_images_clear(void);
