@@ -354,34 +354,37 @@ int video_views_find(const video_views_map_t *map,
    return (eye == RETRO_VIDEO_VIEW_EYE_NONE) ? left : -1;
 }
 
-/* The screen whose view sets @screen's height: the end of its chain of
- * sized bases, or the lowest-numbered screen of a cycle in it. */
-static unsigned video_views_extent_root(const video_views_map_t *map,
-      unsigned screen)
+/* @screen's chain of sized bases, from @screen, up to the screen whose
+ * view sets its height: the chain's end, or the lowest-numbered screen
+ * of a cycle in it. Returns that screen's place in @chain. Each base is
+ * read once: a redraw may walk a map the main thread is arranging. */
+static unsigned video_views_extent_chain(const video_views_map_t *map,
+      unsigned screen, unsigned *chain)
 {
+   unsigned n    = 0;
    unsigned seen = 0;
    unsigned s    = screen;
    for (;;)
    {
-      unsigned b, c, low;
-      seen |= 1u << s;
+      unsigned b, i, low;
+      seen     |= 1u << s;
+      chain[n]  = s;
       if ((map->over & (1u << s)) || !(map->size[s] > 0.0f))
-         return s;
+         return n;
       b = VIDEO_VIEWS_NIBBLE(map->base, s);
-      if (video_views_find(map, b, RETRO_VIDEO_VIEW_EYE_NONE) < 0)
-         return s;
+      if (     b >= RETRO_VIDEO_VIEWS_MAX
+            || video_views_find(map, b, RETRO_VIDEO_VIEW_EYE_NONE) < 0)
+         return n;
       if (!(seen & (1u << b)))
       {
          s = b;
+         n++;
          continue;
       }
-      low = b;
-      for (c = b; c != s; )
-      {
-         c = VIDEO_VIEWS_NIBBLE(map->base, c);
-         if (c < low)
-            low = c;
-      }
+      for (i = 0; chain[i] != b; i++) { }
+      for (low = i; i <= n; i++)
+         if (chain[i] < chain[low])
+            low = i;
       return low;
    }
 }
@@ -389,18 +392,19 @@ static unsigned video_views_extent_root(const video_views_map_t *map,
 bool video_views_extent(const video_views_map_t *map, unsigned screen,
       unsigned rotation, double *w, double *h)
 {
-   unsigned s, root;
+   unsigned k, root;
+   unsigned chain[RETRO_VIDEO_VIEWS_MAX];
    double aspect;
    const struct retro_video_view *v;
    int i = video_views_find(map, screen, RETRO_VIDEO_VIEW_EYE_NONE);
    if (i < 0)
       return false;
-   root = video_views_extent_root(map, screen);
-   v    = &map->views[video_views_find(map, root,
+   root = video_views_extent_chain(map, screen, chain);
+   v    = &map->views[video_views_find(map, chain[root],
          RETRO_VIDEO_VIEW_EYE_NONE)];
    *h   = (rotation & 1) ? v->width : v->height;
-   for (s = screen; s != root; s = VIDEO_VIEWS_NIBBLE(map->base, s))
-      *h *= map->size[s];
+   for (k = 0; k < root; k++)
+      *h *= map->size[chain[k]];
    aspect = video_views_aspect(&map->views[i]);
    if (rotation & 1)
       aspect = 1.0 / aspect;
@@ -617,15 +621,15 @@ static void video_views_fit(const video_views_layout_params_t *p,
    }
 }
 
-/* Inset @s's rectangle over its base's, both in fit's units. */
+/* Inset @s's rectangle over @base's, both in fit's units. */
 static void video_views_fit_inset(const video_views_layout_params_t *p,
-      unsigned s, video_views_rect_t *fit)
+      unsigned s, unsigned base, video_views_rect_t *fit)
 {
    int x0, y0, x1, y1;
    video_views_frect_t b, r;
    double w = 1.0, h = 1.0;
    const video_views_map_t *map = p->map;
-   const video_views_rect_t *br = &fit[VIDEO_VIEWS_NIBBLE(map->base, s)];
+   const video_views_rect_t *br = &fit[base];
    b.x = VIDEO_POS_X(br->pos);
    b.y = VIDEO_POS_Y(br->pos);
    b.w = VIDEO_SCALE_W(br->dims);
@@ -760,7 +764,7 @@ void video_views_layout(const video_views_layout_params_t *p,
          if (     (insets & (1u << i))
                && VIDEO_VIEWS_NIBBLE(map->base, i) == s)
          {
-            video_views_fit_inset(p, i, fit);
+            video_views_fit_inset(p, i, s, fit);
             order[n++] = i;
          }
    }

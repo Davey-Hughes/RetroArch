@@ -15,13 +15,15 @@ SOURCES := \
 	$(LIBRETRO_COMM_DIR)/gfx/scaler/scaler.c \
 	$(LIBRETRO_COMM_DIR)/gfx/scaler/scaler_filter.c \
 	$(LIBRETRO_COMM_DIR)/gfx/scaler/scaler_int.c \
-	$(LIBRETRO_COMM_DIR)/gfx/scaler/pixconv.c
+	$(LIBRETRO_COMM_DIR)/gfx/scaler/pixconv.c \
+	$(LIBRETRO_COMM_DIR)/rthreads/rthreads.c
 
 OBJS := $(call sample_objs,$(SOURCES:.c=.o))
 
 CFLAGS  += -Wall -std=c89 -pedantic -Werror=declaration-after-statement -g1 -O1 \
-           -D_GNU_SOURCE -I$(LIBRETRO_COMM_DIR)/include -I$(RARCH_DIR)
-LDFLAGS += -lm
+           -D_GNU_SOURCE -DHAVE_THREADS -I$(LIBRETRO_COMM_DIR)/include \
+           -I$(RARCH_DIR)
+LDFLAGS += -lm -lpthread
 
 ifneq ($(SANITIZER),)
    CFLAGS  := -fsanitize=$(SANITIZER) -fno-omit-frame-pointer $(CFLAGS)

@@ -24,6 +24,12 @@
 #include <limits.h>
 #include <math.h>
 
+#ifdef HAVE_THREADS
+#include <time.h>
+#include <retro_atomic.h>
+#include <rthreads/rthreads.h>
+#endif
+
 #include "gfx/video_views.h"
 #include "gfx/video_defines.h"
 #include "gfx/video_views_cpu.h"
@@ -3471,6 +3477,64 @@ static void test_extent_chain_cycle(void)
    CHECK(extent_is(&map, 2, 0, 64.0, 48.0));
 }
 
+#ifdef HAVE_THREADS
+static video_views_map_t extent_torn_map;
+static retro_atomic_int_t extent_torn_done;
+static int extent_torn_bad;
+
+/* A redraw's walk while the main thread arranges the map */
+static void extent_torn_reader(void *data)
+{
+   unsigned i;
+   (void)data;
+   for (i = 0; i < 200000; i++)
+   {
+      double w = 0.0, h = 0.0;
+      if (     !video_views_extent(&extent_torn_map, 2, 0, &w, &h)
+            || h != 96.0)
+         extent_torn_bad++;
+   }
+   retro_atomic_store_release_int(&extent_torn_done, 1);
+}
+#endif
+
+/* Screen 2 at half of 1 or of 0, its base cleared and set again as
+ * the arrange step does: every walk ends, at half of 192. */
+static void test_extent_torn_base(void)
+{
+#ifdef HAVE_THREADS
+   sthread_t *t;
+   time_t end;
+   unsigned flips = 0;
+   volatile uint32_t *base = &extent_torn_map.base;
+   map_three(&extent_torn_map);
+   extent_torn_map.base    = 0x100;
+   extent_torn_map.size[2] = 0.5f;
+   retro_atomic_store_release_int(&extent_torn_done, 0);
+   t = sthread_create(extent_torn_reader, NULL);
+   CHECK(t != NULL);
+   if (!t)
+      return;
+   end = time(NULL) + 10;
+   while (!retro_atomic_load_acquire_int(&extent_torn_done))
+   {
+      *base = 0;
+      *base = 0x100;
+      if (!(++flips & 0xffffu) && time(NULL) > end)
+      {
+         /* The walk never ends; its thread cannot be joined */
+         printf("  FAIL %s:%d: screen 2's extent walk did not end\n",
+               __FILE__, __LINE__);
+         printf("video_views: FAILED\n");
+         fflush(stdout);
+         exit(1);
+      }
+   }
+   sthread_join(t);
+   CHECK(!extent_torn_bad);
+#endif
+}
+
 static int frect_is(const video_views_frect_t *r, double x, double y,
       double w, double h)
 {
@@ -4003,6 +4067,7 @@ int main(void)
    test_extent_view_rule();
    test_extent_base_size();
    test_extent_chain_cycle();
+   test_extent_torn_base();
    test_inset_anchors();
    test_inset_shrink();
    test_layout_inset();
