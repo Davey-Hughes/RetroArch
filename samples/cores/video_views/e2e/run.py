@@ -15,9 +15,10 @@ copies them, or a software frame's written straight in; and, on glcore,
 a frame drawn whole out of a core's larger framebuffer.
 The screens cases check what the frontend makes of the screens the
 core describes: which maps it accepts and the log of the screens it
-keeps, a light gun kept off a screen that takes no input, and which
+keeps, a light gun kept off a screen that takes no input, which
 screens it lays out, leaves out or draws black by the core's show and
-state, the user's setting and the core's own file of choices.
+state, the user's setting and the core's own file of choices, and the
+pictures of image screens on the drivers that draw them.
 In full it needs a GPU, gamescope and a RetroArch build.
 
 With RA_E2E_XVFB=1 each case runs on an Xvfb server of its own instead
@@ -441,7 +442,7 @@ COPY_RE = re.compile(r'\[GLCore\] Views copied by ([\w ]+)\.')
 
 STATUS_RE = re.compile(
     r'\[video_views\] presents=(\d) stereo=(\d) accepted=(\d) views=\d+ '
-    r'screens=(\d)')
+    r'screens=(\d) images=(\d)')
 
 # RA_E2E_HDR=1: the vulkan cases with HDR10 output, and HDR_CASES too.
 HDR = os.environ.get('RA_E2E_HDR') == '1'
@@ -588,13 +589,13 @@ HDR_LAYER_ENV = {}
 HDR_LAYER_DIRS = []
 HDR_LAYER_LOCK = threading.Lock()
 # The core's rules cases (video_views_test_screens rules), each sent on
-# the ds map for a frame, with whether the frontend must accept it; then
-# the full map.
+# the ds map for a frame, with whether the frontend must accept it (None:
+# on IMAGES_DRIVERS); then the full map.
 SCREENS_RULES = [
     ('no-flag', 1), ('zero-screens', 1), ('absent-viewless', 1),
     ('swap-one-side', 1), ('swap-both', 1), ('unknown-flags', 1),
     ('too-many', 0), ('null-screens', 0), ('view-past-count', 0),
-    ('image', 0), ('active-viewless', 0), ('blank-viewless', 0),
+    ('image', None), ('active-viewless', 0), ('blank-viewless', 0),
     ('eye-unpaired', 0), ('base-past-count', 0), ('over-self', 0),
     ('over-over', 0), ('size-negative', 0), ('anchor', 0),
     ('over-size', 0), ('opacity', 0), ('private-owners', 0),
@@ -651,6 +652,8 @@ SCREENS_DRIVERS = ('gl', 'glcore', 'vulkan', 'sdl2')
 # check on every status line: the bit comes from each driver's FALLBACK.
 SCREENS_STATUS_DRIVERS = SCREENS_DRIVERS + (
     'sdl3', 'gdi', 'd3d8', 'd3d9_hlsl', 'd3d10', 'd3d11', 'd3d12', 'xvideo')
+# Those of them that draw image screens: IMAGES set, lends given.
+IMAGES_DRIVERS = ('gl', 'glcore', 'vulkan', 'd3d11')
 # What the window shows of the ds map's two screens, laid out as
 # SCREENS_AIM_SETTINGS has them. Screen 0 alone is 4:3, 1280 wide from
 # x 160.
@@ -847,6 +850,118 @@ SCREENS_STATUS_CASES = [
 SCREENS_GL_STATUS_CASES = [
     ('screens-status-no-map-mipmap', {'video_shader_enable': 'true'},
      ('gl',), ('--set-shader=' + os.path.join(HERE, 'mipmap.glslp'),)),
+]
+
+# The image modes' screen 2, a 48x32 picture in quadrants: top left, top
+# right, bottom left, bottom right. Mirrored by image_null's switch; at
+# half opacity over GREEN.
+MAGENTA = (255, 0, 255)
+IMAGE_QUADRANTS = (RED, BLUE, WHITE, MAGENTA)
+IMAGE_MIRRORED = (BLUE, RED, MAGENTA, WHITE)
+IMAGE_HALF = ((128, 128, 0), (0, 128, 128), (128, 255, 128),
+              (128, 128, 128))
+# Where it lands, (x, y, width, height): beside Top, five pixels to a
+# core pixel as Top, which moves to x 40 for it; and over Top's bottom
+# right corner at a quarter of its height, 3:2.
+SCREENS_IMAGE_BESIDE = (1320, 400, 240, 160)
+SCREENS_IMAGE_INSET = (1080, 720, 360, 240)
+# Top around each, and what lies past each edge of the picture: left,
+# top, right, bottom (None: off the window).
+SCREENS_IMAGE_BESIDE_TOP = [(680, 480, GREEN), (100, 480, GREEN),
+                            (20, 480, BLACK)]
+SCREENS_IMAGE_BESIDE_OUT = (GREEN, BLACK, BLACK, BLACK)
+SCREENS_IMAGE_INSET_TOP = [(800, 480, GREEN)]
+SCREENS_IMAGE_INSET_OUT = (GREEN, GREEN, BLACK, None)
+IMAGE_SENT_RE = re.compile(r'\[video_views\] image serial=(\d+) '
+                           r'accepted=(\d)')
+IMAGE_NOT_LENT_RE = re.compile(r'\[video_views\] image buffer refused')
+# video_driver_init_internal's line, once per init: the second is
+# image_restart's restart.
+SCREENS_RESTARTED_RE = re.compile(r'\[Video\] Set video size to:'
+                                  r'[\s\S]*\[Video\] Set video size to:')
+
+
+def image_quadrants(rect):
+    """The quadrants of the picture at rect, in IMAGE_QUADRANTS' order."""
+    x, y, w, h = rect
+    return [(x + w // 2 * i, y + h // 2 * j, w // 2, h // 2)
+            for j in (0, 1) for i in (0, 1)]
+
+
+def image_centres(rect, colours):
+    """Each quadrant's centre in its colour."""
+    return [(x + w // 2, y + h // 2, c)
+            for (x, y, w, h), c in zip(image_quadrants(rect), colours)]
+
+
+def image_points(rect, colours, out):
+    """Each quadrant's centre and the second pixel in from each of its
+    edges in its colour, and the second pixel past each edge of the
+    picture in out's colour for that edge."""
+    x, y, w, h = rect
+    points = image_centres(rect, colours)
+    for (qx, qy, qw, qh), c in zip(image_quadrants(rect), colours):
+        cx, cy = qx + qw // 2, qy + qh // 2
+        points += [(qx + 1, cy, c), (qx + qw - 2, cy, c),
+                   (cx, qy + 1, c), (cx, qy + qh - 2, c)]
+    cx, cy = x + w // 2, y + h // 2
+    past = ((x - 2, cy), (cx, y - 2), (x + w + 1, cy), (cx, y + h + 1))
+    return points + [(px, py, c) for (px, py), c in zip(past, out)
+                     if c is not None]
+
+
+def image_blends(rect, colours):
+    """Across each edge between two quadrants, level with their centres:
+    the second pixel each side, and the two quadrants' colours."""
+    tl, tr, bl, br = colours
+    x, y, w, h = rect
+    mx, my = x + w // 2, y + h // 2
+    top, bottom = y + h // 4, y + 3 * h // 4
+    left, right = x + w // 4, x + 3 * w // 4
+    return [((mx - 2, top), (mx + 1, top), tl, tr),
+            ((mx - 2, bottom), (mx + 1, bottom), bl, br),
+            ((left, my - 2), (left, my + 1), tl, bl),
+            ((right, my - 2), (right, my + 1), tr, br)]
+
+
+def screens_image_beside(colours):
+    return SCREENS_IMAGE_BESIDE_TOP + image_points(
+        SCREENS_IMAGE_BESIDE, colours, SCREENS_IMAGE_BESIDE_OUT)
+
+
+def screens_image_inset(colours):
+    return SCREENS_IMAGE_INSET_TOP + image_points(
+        SCREENS_IMAGE_INSET, colours, SCREENS_IMAGE_INSET_OUT)
+
+
+# The image modes, on IMAGES_DRIVERS. Entries as SCREENS_DRAW_CASES',
+# with 'opts' added to the core's options, 'blends' pixels that must be
+# neither side's colour, 'handins' how many pictures the core sends and
+# 'drivers' those of IMAGES_DRIVERS the case runs on.
+SCREENS_IMAGE_CASES = [
+    ('screens-image', 'image', screens_image_beside(IMAGE_QUADRANTS), {}),
+    ('screens-image-over', 'image_over',
+     screens_image_inset(IMAGE_QUADRANTS), {}),
+    ('screens-image-over-half', 'image_over_half',
+     screens_image_inset(IMAGE_HALF), {}),
+    ('screens-image-over-blank', 'image_over_blank',
+     screens_image_inset((BLACK,) * 4), {}),
+    ('screens-image-smooth', 'image',
+     SCREENS_IMAGE_BESIDE_TOP
+     + image_centres(SCREENS_IMAGE_BESIDE, IMAGE_QUADRANTS),
+     {'opts': {'video_views_test_image_sharp': 'off'},
+      'settings': {'video_smooth': 'true'},
+      'blends': image_blends(SCREENS_IMAGE_BESIDE, IMAGE_QUADRANTS)}),
+    ('screens-image-copy', 'image', screens_image_beside(IMAGE_QUADRANTS),
+     {'opts': {'video_views_test_image': 'copy'}}),
+    ('screens-image-null', 'image_null',
+     screens_image_beside(IMAGE_MIRRORED), {'until': SCREENS_SWITCHED_RE}),
+    ('screens-image-restart', 'image_restart',
+     screens_image_beside(IMAGE_QUADRANTS),
+     {'until': SCREENS_RESTARTED_RE, 'handins': 1}),
+    ('screens-image-over-threaded', 'image_over',
+     screens_image_inset(IMAGE_QUADRANTS),
+     {'settings': {'video_threaded': 'true'}, 'drivers': ('gl', 'vulkan')}),
 ]
 
 
@@ -2397,7 +2512,9 @@ def run_memory_case(retroarch, root, driver, case):
 
 def run_screens_rules_case(retroarch, root, driver):
     """The rules cases: which maps the frontend accepts, the screens it
-    logs for the full map, and GET_VIDEO_SCREEN_BUFFER known."""
+    logs for the full map, and GET_VIDEO_SCREEN_BUFFER known, lending on
+    IMAGES_DRIVERS only."""
+    images = 1 if driver in IMAGES_DRIVERS else 0
     case = ('screens-rules', 'ds', {'video_stereo_mode': '0'}, [])
     errors = run_case(retroarch, root, driver, case,
                       opts={'video_views_test_screens': 'rules'},
@@ -2407,6 +2524,8 @@ def run_screens_rules_case(retroarch, root, driver):
     for name, accepted in SCREENS_CASE_RE.findall(text):
         logged.setdefault(name, []).append(int(accepted))
     for name, want in SCREENS_RULES:
+        if want is None:
+            want = images
         if name not in logged:
             errors.append('case %s not logged' % name)
         elif any(a != want for a in logged[name]):
@@ -2416,8 +2535,8 @@ def run_screens_rules_case(retroarch, root, driver):
     for name in sorted(set(logged) - known):
         errors.append('case %s not in SCREENS_RULES' % name)
     answers = set(SCREEN_BUFFER_RE.findall(text))
-    if answers != {'0'}:
-        errors.append('screen_buffer=%s, want 0' % sorted(answers))
+    if answers != {str(images)}:
+        errors.append('screen_buffer=%s, want %d' % (sorted(answers), images))
     lines = SCREEN_LOG_RE.findall(text)[-3:]
     if lines != SCREENS_FULL_LOG:
         errors.append('the last screen lines are %s, want %s'
@@ -2487,6 +2606,54 @@ def run_screens_show_case(retroarch, root, driver, case, screens=None):
         if found != extra['files'][path]:
             errors.append('%s is %r after the run, want %r'
                           % (path, found, extra['files'][path]))
+    return errors
+
+
+def run_screens_image_case(retroarch, root, driver, case):
+    """An image case: the window's points, IMAGES in every status, each
+    picture the core sent taken, through a lend unless it copies, and
+    its blends and number of pictures where it has them."""
+    name, mode, points, extra = case
+    extra = dict(extra)
+    blends = extra.pop('blends', ())
+    handins = extra.pop('handins', None)
+    extra.pop('drivers', None)
+    opts = dict(extra.pop('opts', {}), video_views_test_screens=mode)
+    settings = dict(SCREENS_AIM_SETTINGS, **extra.pop('settings', {}))
+    errors = run_case(retroarch, root, driver,
+                      (name, 'ds', settings, points), opts=opts, screens=1,
+                      **extra)
+    d = case_dir(root, driver, name)
+    text = log_text(d)
+    images = [s[4] for s in statuses(d)]
+    if any(i != 1 for i in images):
+        errors.append('status images=%s, want images=1'
+                      % ','.join(str(i) for i in images))
+    sent = IMAGE_SENT_RE.findall(text)
+    if not sent:
+        errors.append('no picture sent')
+    refused = [int(s) for s, a in sent if a != '1']
+    if refused:
+        errors.append('%d maps with the picture refused, serials %s'
+                      % (len(refused), sorted(set(refused))))
+    if handins is not None and len(sent) != handins:
+        errors.append('%d pictures sent, want %d' % (len(sent), handins))
+    if opts.get('video_views_test_image') != 'copy' \
+            and IMAGE_NOT_LENT_RE.search(text):
+        errors.append('the picture was not lent')
+    shots = sorted(x for x in os.listdir(os.path.join(d, 'shots'))
+                   if x.endswith('.png'))
+    if blends and shots:
+        w, h, bpp, rows = read_png(os.path.join(d, 'shots', shots[0]))
+        if (w, h) != (W, H):
+            blends = ()
+        for a, b, ca, cb in blends:
+            for x, y in (a, b):
+                got = tuple(rows[y][x * bpp:x * bpp + 3])
+                if any(all(abs(g - e) <= TOLERANCE for g, e in zip(got, c))
+                       for c in (ca, cb)):
+                    errors.append('(%d,%d) got %s, want a blend of %s and '
+                                  '%s' % (x, y, got, ca, cb))
     return errors
 
 
@@ -2802,6 +2969,10 @@ def driver_jobs(retroarch, root, driver):
             errors.append('views drawn straight from the frame')
         return report('%s/%s' % (driver, name), errors), bool(errors)
 
+    def screens_image(case):
+        errors = run_screens_image_case(retroarch, root, driver, case)
+        return report('%s/%s' % (driver, case[0]), errors), bool(errors)
+
     def screens_menu():
         errors = run_screens_menu_case(retroarch, root, driver)
         return report('%s/%s' % (driver, SCREENS_MENU_CASE[0]), errors), \
@@ -2848,7 +3019,7 @@ def driver_jobs(retroarch, root, driver):
     jobs += [lambda m=m, c=c: pointer(m, c) for m in sorted(POINTER_MENUS)
              for c in POINTER_CASES
              if wanted(c[0]) and driver not in NO_POINTER_DRIVERS]
-    if driver in SCREENS_DRIVERS and wanted('screens-rules'):
+    if driver in SCREENS_STATUS_DRIVERS and wanted('screens-rules'):
         jobs.append(screens_rules)
     jobs += [lambda c=c: screens_aim(c)
              for c in (SCREENS_AIM_CASES if driver in SCREENS_DRIVERS
@@ -2870,6 +3041,9 @@ def driver_jobs(retroarch, root, driver):
                        else []) if wanted(c[0])]
     if driver in SCREENS_DRIVERS and wanted(SCREENS_MENU_CASE[0]):
         jobs.append(screens_menu)
+    jobs += [lambda c=c: screens_image(c) for c in SCREENS_IMAGE_CASES
+             if driver in c[3].get('drivers', IMAGES_DRIVERS)
+             and wanted(c[0])]
     jobs += [lambda c=c: screens_status(c)
              for c in (SCREENS_STATUS_CASES
                        if driver in SCREENS_STATUS_DRIVERS else [])

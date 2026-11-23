@@ -556,7 +556,8 @@ def last_projection_snap(res):
 
 HMD_RE = re.compile(r'\[video_views\] hmd=(\d) recommended=(\d+)x(\d+)')
 STATUS_RE = re.compile(r'\[video_views\] presents=(\d) stereo=(\d) '
-                       r'accepted=(\d) views=(\d+)')
+                       r'accepted=(\d) views=(\d+) screens=(\d) '
+                       r'images=(\d)')
 EYES_RE = re.compile(r'\[video_views\] vr eyes frame=(\d+) '
                      r'left=([-\d.]+),([-\d.]+),'
                      r'([-\d.]+) right=([-\d.]+),([-\d.]+),([-\d.]+) '

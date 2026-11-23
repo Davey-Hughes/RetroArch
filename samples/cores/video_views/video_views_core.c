@@ -87,7 +87,18 @@
  * BLANK, that frame and every one after it as a NULL refresh, each
  * logging the switch once. none_shown sends both screens HIDDEN.
  * over_no_input sends the bottom one as over does, NO_INPUT;
- * shown_sized, SHOWN at a quarter of the top one's height.
+ * shown_sized, SHOWN at a quarter of the top one's height. The image
+ * modes send the bottom one HIDDEN and screen 2, VMU, as a 48x32
+ * picture of four colours, through a lent buffer or, with
+ * video_views_test_image copy, from padded rows of the core's own;
+ * SHARP unless video_views_test_image_sharp is off: image, SHOWN;
+ * image_over, OVER as over does, at opacity 1; image_over_half, the
+ * same at half opacity; image_over_blank, the same BLANK. image_null
+ * sends it SHOWN and from frame 60 mirrored under a new serial, on a
+ * NULL refresh, and every refresh after it NULL. image_restart raises
+ * the maximum size at frame 60, which restarts the driver. Each
+ * picture is sent until the frontend takes it; each one sent, and each
+ * refused map without one, logs its serial and the answer.
  *
  * VIDEO_VIEWS_TEST_LIBRARY_NAME in the environment replaces the library
  * name, so one build can load as a second core. */
@@ -115,6 +126,8 @@
 /* Azahar's maximum, at 10x. */
 #define LARGE_MAX_W 8000
 #define LARGE_MAX_H 4800
+/* image_restart's maximum: past what a driver keeps in place. */
+#define RAISED_MAX 4096
 
 /* Two eyes of the largest grid size. */
 #define GRID_MAX 1024
@@ -129,6 +142,7 @@
 #define COL_YELLOW 0xFFFF00
 #define COL_WHITE  0xFFFFFF
 #define COL_BLACK  0x000000
+#define COL_MAGENTA 0xFF00FF
 
 enum map_kind
 {
@@ -347,6 +361,12 @@ static int screens_logged_accepted = -1;
 /* With SCREENS_MODE, the scr_modes entry, and whether it has switched. */
 static unsigned screens_mode;
 static bool screens_switched;
+/* The image modes' options, the serial the frontend took last, and
+ * whether image_restart has raised the maximum size. */
+static bool vmu_copy;
+static bool vmu_sharp = true;
+static unsigned vmu_held;
+static bool max_raised;
 
 static void fallback_log(enum retro_log_level level, const char *fmt, ...)
 {
@@ -849,10 +869,11 @@ static void log_status(unsigned status, int accepted, unsigned n)
       return;
    log_cb(RETRO_LOG_INFO,
          "[video_views] presents=%d stereo=%d accepted=%d views=%u "
-         "screens=%d\n",
+         "screens=%d images=%d\n",
          (status & RETRO_VIDEO_VIEWS_STATUS_PRESENTS) ? 1 : 0,
          (status & RETRO_VIDEO_VIEWS_STATUS_STEREO) ? 1 : 0, accepted, n,
-         (status & RETRO_VIDEO_VIEWS_STATUS_SCREENS) ? 1 : 0);
+         (status & RETRO_VIDEO_VIEWS_STATUS_SCREENS) ? 1 : 0,
+         (status & RETRO_VIDEO_VIEWS_STATUS_IMAGES) ? 1 : 0);
    last_status   = (int)status;
    last_accepted = accepted;
 }
@@ -1067,6 +1088,8 @@ static void read_options(void)
    screens_kind = SCREENS_OFF;
    screens_next = 0;
    screens_switched = false;
+   vmu_held     = 0;
+   max_raised   = false;
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
       if (!strcmp(var.value, "rules"))
@@ -1074,6 +1097,16 @@ static void read_options(void)
       else if (screens_mode_named(var.value))
          screens_kind = SCREENS_MODE;
    }
+
+   var.key   = "video_views_test_image";
+   var.value = NULL;
+   vmu_copy  = environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var)
+      && var.value && !strcmp(var.value, "copy");
+
+   var.key   = "video_views_test_image_sharp";
+   var.value = NULL;
+   vmu_sharp = !(environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var)
+      && var.value && !strcmp(var.value, "off"));
 
    var.key   = "video_views_test_map";
    var.value = NULL;
@@ -1139,7 +1172,13 @@ void retro_set_environment(retro_environment_t cb)
         "Screens the ds map describes; off|rules|no_input|no_input_off"
         "|shown|hidden|over|over_half|over_blank|over_blank_half|blank"
         "|blank_late|absent|absent_back|none_shown|hide_null"
-        "|no_input_null|blank_null|over_no_input|shown_sized" },
+        "|no_input_null|blank_null|over_no_input|shown_sized|image"
+        "|image_over|image_over_half|image_over_blank|image_null"
+        "|image_restart" },
+      { "video_views_test_image",
+        "Image screen pixels; lend|copy" },
+      { "video_views_test_image_sharp",
+        "Image screen SHARP; on|off" },
       { NULL, NULL }
    };
    struct retro_log_callback logging;
@@ -1187,6 +1226,11 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
    info->geometry.base_height  = fh;
    info->geometry.max_width    = large_max ? LARGE_MAX_W : MAX_W;
    info->geometry.max_height   = large_max ? LARGE_MAX_H : MAX_H;
+   if (max_raised)
+   {
+      info->geometry.max_width  = RAISED_MAX;
+      info->geometry.max_height = RAISED_MAX;
+   }
    if (grid_sized())
    {
       if (info->geometry.max_width < 2 * grid_cap)
@@ -2327,7 +2371,9 @@ static const struct
  * @both gives screen 0 the same show. @opacity is screen 1's. A @null
  * mode switches there with a NULL refresh and sends every refresh after
  * it NULL, screen 1 from then @null_show with @null_flags. @size is
- * screen 1's when it is not OVER. */
+ * screen 1's when it is not OVER. @image sends screen 1 HIDDEN and the
+ * fields above for screen 2, the VMU picture, which a @null mode
+ * mirrors at the switch. @restart raises the maximum size there. */
 static const struct
 {
    const char *name;
@@ -2341,6 +2387,8 @@ static const struct
    unsigned null_show;
    unsigned null_flags;
    float size;
+   bool image;
+   bool restart;
 } scr_modes[] = {
    { "no_input",     RETRO_VIDEO_SCREEN_FLAG_NO_INPUT,
       RETRO_VIDEO_SCREEN_SHOW_SHOWN,
@@ -2398,7 +2446,25 @@ static const struct
       false, 0.0f },
    { "shown_sized",  0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
       RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
-      false, 0.0f, false, 0, 0, 0.25f }
+      false, 0.0f, false, 0, 0, 0.25f },
+   { "image",        0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f, false, 0, 0, 0.0f, true },
+   { "image_over",   0, RETRO_VIDEO_SCREEN_SHOW_OVER,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 1.0f, false, 0, 0, 0.0f, true },
+   { "image_over_half", 0, RETRO_VIDEO_SCREEN_SHOW_OVER,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.5f, false, 0, 0, 0.0f, true },
+   { "image_over_blank", 0, RETRO_VIDEO_SCREEN_SHOW_OVER,
+      RETRO_VIDEO_SCREEN_STATE_BLANK,  RETRO_VIDEO_SCREEN_STATE_BLANK,
+      false, 1.0f, false, 0, 0, 0.0f, true },
+   { "image_null",   0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f, true, RETRO_VIDEO_SCREEN_SHOW_SHOWN, 0, 0.0f, true },
+   { "image_restart", 0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f, false, 0, 0, 0.0f, true, true }
 };
 
 /* A null mode from its switch on: each refresh repeats the last frame */
@@ -2422,6 +2488,87 @@ static bool screens_mode_named(const char *name)
    return false;
 }
 
+/* The image modes' picture, and the core's own rows of it, padded as a
+ * core's may be. */
+#define VMU_W     48
+#define VMU_H     32
+#define VMU_PITCH 200
+static struct retro_video_screen_image vmu_image;
+static uint32_t vmu_own[VMU_PITCH / sizeof(uint32_t) * VMU_H];
+
+/* Red, blue over white, magenta; mirrored, blue, red over magenta,
+ * white. The X byte is 0. */
+static void vmu_fill(void *px, size_t pitch, bool mirrored)
+{
+   static const uint32_t cols[4] = { COL_RED, COL_BLUE, COL_WHITE,
+      COL_MAGENTA };
+   unsigned x, y;
+   for (y = 0; y < VMU_H; y++)
+   {
+      uint32_t *row = (uint32_t*)((uint8_t*)px + y * pitch);
+      for (x = 0; x < VMU_W; x++)
+         row[x] = cols[(y >= VMU_H / 2 ? 2 : 0)
+            + ((x >= VMU_W / 2) != mirrored ? 1 : 0)];
+   }
+}
+
+/* Screen 2's picture this frame: sent until the frontend takes it,
+ * then by its serial alone. A lend refused leaves the core's own. */
+static const struct retro_video_screen_image *vmu_picture(void)
+{
+   struct retro_video_screen_buffer buf;
+   bool mirrored   = screens_switched && scr_modes[screens_mode].null;
+   unsigned serial = mirrored ? 2 : 1;
+   if (vmu_held == serial)
+   {
+      vmu_image.data = NULL;
+      return &vmu_image;
+   }
+   memset(&buf, 0, sizeof(buf));
+   buf.screen = 2;
+   buf.width  = VMU_W;
+   buf.height = VMU_H;
+   buf.format = RETRO_PIXEL_FORMAT_XRGB8888;
+   if (     vmu_copy
+         || !environ_cb(RETRO_ENVIRONMENT_GET_VIDEO_SCREEN_BUFFER, &buf))
+   {
+      if (!vmu_copy)
+         log_cb(RETRO_LOG_INFO, "[video_views] image buffer refused\n");
+      buf.data  = vmu_own;
+      buf.pitch = VMU_PITCH;
+   }
+   vmu_fill(buf.data, buf.pitch, mirrored);
+   vmu_image.data         = buf.data;
+   vmu_image.width        = VMU_W;
+   vmu_image.height       = VMU_H;
+   vmu_image.pitch        = buf.pitch;
+   vmu_image.format       = RETRO_PIXEL_FORMAT_XRGB8888;
+   vmu_image.aspect_ratio = 0.0f;
+   vmu_image.serial       = serial;
+   return &vmu_image;
+}
+
+/* After the map: a picture sent and taken is held. Each one sent, and
+ * each refused map without one, is logged. */
+static void vmu_answer(int accepted)
+{
+   if (!vmu_image.data && accepted)
+      return;
+   log_cb(RETRO_LOG_INFO, "[video_views] image serial=%u accepted=%d\n",
+         vmu_image.serial, accepted);
+   if (accepted)
+      vmu_held = vmu_image.serial;
+}
+
+/* image_restart's switch: a maximum the driver cannot take in place. */
+static void raise_max(void)
+{
+   struct retro_system_av_info av;
+   max_raised = true;
+   retro_get_system_av_info(&av);
+   environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av);
+}
+
 /* The screens video_views_test_screens adds to @in, the ds map. In the
  * rules mode this frame's case, whose name it returns. */
 static const char *screens_add(struct retro_video_views *in)
@@ -2432,10 +2579,12 @@ static const char *screens_add(struct retro_video_views *in)
       unsigned flags = scr_modes[screens_mode].flags;
       unsigned show  = scr_modes[screens_mode].show;
       unsigned state = scr_modes[screens_mode].state;
+      bool image     = scr_modes[screens_mode].image;
       bool over;
       /* retro_run() has counted this frame. */
       if (     (scr_modes[screens_mode].late != state
-               || scr_modes[screens_mode].null)
+               || scr_modes[screens_mode].null
+               || scr_modes[screens_mode].restart)
             && frames_run > SCR_SWITCH_FRAME)
       {
          state = scr_modes[screens_mode].late;
@@ -2445,20 +2594,36 @@ static const char *screens_add(struct retro_video_views *in)
             flags = scr_modes[screens_mode].null_flags;
          }
          if (!screens_switched)
+         {
             log_cb(RETRO_LOG_INFO, "[video_views] screens switched\n");
+            if (scr_modes[screens_mode].restart)
+               raise_max();
+         }
          screens_switched = true;
       }
       over = (show == RETRO_VIDEO_SCREEN_SHOW_OVER);
       scr_screens[0]  = mkscreen("Top", 0, 0,
             scr_modes[screens_mode].both ? show : 0,
             0, 0.0f, 0, 0.0f, 0, 0, 0, 0);
-      scr_screens[1]  = mkscreen("Bottom", flags, state, show, 0,
+      scr_screens[image ? 2 : 1] = mkscreen(image ? "VMU" : "Bottom",
+            flags, state, show, 0,
             over ? 0.25f : scr_modes[screens_mode].size,
             over ? RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT : 0,
             scr_modes[screens_mode].opacity, 0, 0, 0, 0);
       in->flags      |= RETRO_VIDEO_VIEWS_FLAG_SCREENS;
       in->screens     = scr_screens;
       in->num_screens = 2;
+      if (image)
+      {
+         scr_screens[1] = mkscreen("Bottom", 0,
+               RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+               RETRO_VIDEO_SCREEN_SHOW_HIDDEN, 0, 0.0f, 0, 0.0f, 0, 0, 0,
+               0);
+         if (vmu_sharp)
+            scr_screens[2].flags |= RETRO_VIDEO_SCREEN_FLAG_SHARP;
+         scr_screens[2].image = vmu_picture();
+         in->num_screens      = 3;
+      }
       return NULL;
    }
    if (!screens_next)
@@ -2643,6 +2808,8 @@ void retro_run(void)
             &views) ? 1 : 0;
       if (screens_case)
          screens_log(screens_case, accepted);
+      else if (views.num_screens > 2)
+         vmu_answer(accepted);
       if (     (int)hmd != last_hmd
             || views.recommended_view_width != last_rec_w
             || views.recommended_view_height != last_rec_h)
