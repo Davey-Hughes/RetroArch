@@ -944,6 +944,18 @@ def screens_image_inset(colours):
         SCREENS_IMAGE_INSET, colours, SCREENS_IMAGE_INSET_OUT)
 
 
+def screens_image_sbs(colours):
+    """SCREENS_IMAGE_BESIDE's layout halved into each eye's half."""
+    x, y, w, h = SCREENS_IMAGE_BESIDE
+    points = []
+    for eye in (0, W // 2):
+        points += [(px // 2 + eye, py, c)
+                   for px, py, c in SCREENS_IMAGE_BESIDE_TOP]
+        points += image_points((x // 2 + eye, y, w // 2, h), colours,
+                               SCREENS_IMAGE_BESIDE_OUT)
+    return points
+
+
 # The image modes, on IMAGES_DRIVERS. Entries as SCREENS_DRAW_CASES',
 # with 'opts' added to the core's options, 'blends' pixels that must be
 # neither side's colour, 'handins' how many pictures the core sends,
@@ -985,6 +997,11 @@ SCREENS_IMAGE_CASES = [
     ('screens-image-interlaced', 'image',
      screens_image_beside(IMAGE_QUADRANTS),
      {'settings': {'video_stereo_mode': '5'}}),
+    # Side by side under the preset: each eye's picture follows a pass
+    # of Top's, which may leave the driver's own state behind.
+    ('screens-image-stereo-preset', 'image',
+     screens_image_sbs(IMAGE_QUADRANTS),
+     {'preset': True, 'settings': {'video_stereo_mode': '1'}}),
     # Over the core's own frame, bottom up or top down: the picture's
     # first row stays at the top.
     ('screens-image-hw', 'image', screens_image_beside(IMAGE_QUADRANTS),
