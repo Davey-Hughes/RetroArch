@@ -22,6 +22,9 @@
 #include "video_screen_images.h"
 #include "gfx_surface.h"
 #include "video_defines.h"
+#ifdef HAVE_THREADS
+#include "video_thread_wrapper.h"
+#endif
 #include "../verbosity.h"
 
 #define VIDEO_SCREEN_IMAGES_KEPT   (1u << 0)  /* the last picture taken */
@@ -44,6 +47,7 @@ typedef struct video_screen_images_screen
    gfx_surface_t *surface;
    gfx_surface_t *old;     /* drawn until surface has a texture */
    unsigned surface_dims;
+   uint8_t landed;         /* image_gen: moves with each upload landed */
 } video_screen_images_screen_t;
 
 static video_screen_images_screen_t video_screen_images_store
@@ -364,8 +368,7 @@ static void video_screen_images_settle(video_screen_images_screen_t *scr,
       return;
    }
    scr->uploaded_gen = gen;
-   gfx_surface_free(scr->old);
-   scr->old = NULL;
+   scr->landed++;
 }
 
 /* Main thread, from video_thread_async_poll: a queued upload landed or
@@ -449,6 +452,11 @@ void video_screen_images_frame(video_views_map_t *map, unsigned draw,
    video_screen_images_screen_t *store =
          video_screen_images_store[video_screen_images_shown];
    unsigned s;
+#ifdef HAVE_THREADS
+   /* Uploads landed since the last frame are named by this one */
+   if (draw)
+      video_thread_async_poll();
+#endif
    for (s = 0; s < RETRO_VIDEO_SCREENS_MAX; s++)
    {
       video_screen_images_screen_t *scr = &store[s];
@@ -456,11 +464,18 @@ void video_screen_images_frame(video_views_map_t *map, unsigned draw,
       if (draw & (1u << s))
       {
          video_screen_images_upload(scr);
-         if (!(tex = GFX_SURFACE_HANDLE(scr->surface)))
+         if ((tex = GFX_SURFACE_HANDLE(scr->surface)))
+         {
+            /* Not before a frame names its replacement: the frames and
+             * the redraw's box that name it are retired before it */
+            gfx_surface_free(scr->old);
+            scr->old = NULL;
+         }
+         else
             tex = GFX_SURFACE_HANDLE(scr->old);
       }
       map->image_tex[s] = tex;
-      map->image_gen[s] = tex ? (uint8_t)scr->uploaded_gen : 0;
+      map->image_gen[s] = tex ? scr->landed : 0;
    }
    map->nearest = nearest & map->image;
 }

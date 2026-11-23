@@ -5124,6 +5124,28 @@ static void test_images_update_in_place(void)
    window_test_end();
 }
 
+/* A landing moves image_gen however many pictures were taken since the
+ * last one */
+static void test_images_gen_landings(void)
+{
+   uint8_t gen;
+   unsigned n;
+   images_test_frames_begin();
+   images_test_pattern(1);
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1));
+   window_test_run();
+   gen = window_test_seen_views.image_gen[2];
+   for (n = 2; n <= 257; n++)
+      CHECK(images_test_hand(screens_test_dsi_pixels, n));
+   images_test_calls_reset();
+   window_test_run();
+   CHECK(images_test_updates == 1);
+   CHECK(window_test_seen_views.image_tex[2] == 101);
+   CHECK(window_test_seen_views.image_gen[2] != gen);
+   memset(screens_test_dsi_pixels, 0, sizeof(screens_test_dsi_pixels));
+   window_test_end();
+}
+
 /* A picture changed on a NULL refresh goes up on it, and the refresh
  * does not blank an image screen it did not draw before */
 static void test_images_null_refresh(void)
@@ -11644,6 +11666,73 @@ static void test_screens_redraw_inset(void)
 #endif
 }
 
+/* A redraw draws an image screen with the handles last published, not
+ * the main thread's, which may be part way through the next frame */
+static void test_screens_redraw_image(void)
+{
+#ifdef HAVE_THREADS
+   static video_driver_t driver;
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_screen_image dsi;
+   struct retro_video_views map;
+   const video_driver_t *threaded = NULL;
+   void *data                     = NULL;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   settings_t *settings           = config_get_ptr();
+   video_info_t info;
+   memset(&driver, 0, sizeof(driver));
+   memset(&info, 0, sizeof(info));
+   driver.init          = snapshot_init;
+   driver.frame         = window_test_frame;
+   driver.free          = snapshot_free;
+   driver.viewport_info = redraw_viewport;
+   driver.read_viewport = redraw_read_viewport;
+   driver.ident         = "redraw";
+   info.input_scale     = 1;
+   info.rgb32           = true;
+   images_test_frames_begin();
+   settings->bools.video_windows_enable = true;
+   strlcpy(settings->arrays.video_screen_display[2],
+         VIDEO_WINDOW_DISPLAY_MAIN,
+         sizeof(settings->arrays.video_screen_display[2]));
+   images_test_pattern(1);
+   images_test_picture(screens_test_dsi_pixels, 1);
+   screens_test_dsi_small(&map, views, screens, &dsi);
+   screens[2].image  = &images_test_image;
+   screens[2].show   = RETRO_VIDEO_SCREEN_SHOW_OVER;
+   screens[2].anchor = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT;
+   screens[2].size   = 0.25f;
+   CHECK(video_driver_set_views(&map));
+   if (video_init_thread(&threaded, &data, &driver, info))
+   {
+      video_st->thread_wrapper_active = false;
+      window_test_run();
+      CHECK(screens_test_image_placed(2, VIDEO_VIEWS_PLACEMENT_INSET) == 1);
+      CHECK(window_test_seen_views.image_tex[2] == 101);
+      memset(&window_test_seen_layout, 0, sizeof(window_test_seen_layout));
+      memset(&window_test_seen_views, 0, sizeof(window_test_seen_views));
+      window_test_redraw(threaded, data);
+      CHECK(screens_test_image_placed(2, VIDEO_VIEWS_PLACEMENT_INSET) == 1);
+      CHECK(window_test_seen_views.image_tex[2] == 101);
+      /* Again, the main thread part way through the next frame */
+      video_st->views_core.image_tex[2]  = 0;
+      video_st->views_frame.image_tex[2] = 0;
+      memset(&window_test_seen_layout, 0, sizeof(window_test_seen_layout));
+      memset(&window_test_seen_views, 0, sizeof(window_test_seen_views));
+      window_test_redraw(threaded, data);
+      CHECK(screens_test_image_placed(2, VIDEO_VIEWS_PLACEMENT_INSET) == 1);
+      CHECK(window_test_seen_views.image_tex[2] == 101);
+      threaded->free(data);
+   }
+   else
+      CHECK(false);
+   settings->arrays.video_screen_display[2][0] = '\0';
+   memset(screens_test_dsi_pixels, 0, sizeof(screens_test_dsi_pixels));
+   window_test_end();
+#endif
+}
+
 /* A UI layer in another window lays out at its target's size, waiting
  * or not; one in the main window at the main window's UI size */
 static void test_window_ui_layer_dims(void)
@@ -12893,6 +12982,7 @@ int main(int argc, char **argv)
    test_images_upload_565();
    test_images_upload_padded();
    test_images_update_in_place();
+   test_images_gen_landings();
    test_images_null_refresh();
    test_images_not_shown();
    test_images_frameskip();
@@ -12986,6 +13076,7 @@ int main(int argc, char **argv)
    test_window_redraw_edit();
    test_screens_redraw_masks();
    test_screens_redraw_inset();
+   test_screens_redraw_image();
    test_screen_frame_snapshot();
    test_xr_screen_menu();
    test_xr_menu_map_change();

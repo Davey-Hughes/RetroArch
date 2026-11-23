@@ -5850,6 +5850,15 @@ static void video_driver_views_frame(video_driver_state_t *video_st,
       /* Laid out from the core's own map: a CPU filter's scaling must
        * not change a view's shape. The indices match the scaled map. */
       video_info->views = video_st->views_frame;
+      /* Images the box names: alive while it names them */
+      if (redraw)
+      {
+         memcpy(video_info->views.image_tex, laid->image_tex,
+               sizeof(laid->image_tex));
+         memcpy(video_info->views.image_gen, laid->image_gen,
+               sizeof(laid->image_gen));
+         video_info->views.nearest = laid->nearest;
+      }
 #ifdef HAVE_OPENXR
       /* An accepted tracked map's eyes, while the headset tracks. */
       if (     !redraw && vr_saved_valid
