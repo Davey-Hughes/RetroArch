@@ -6588,9 +6588,9 @@ static void gl3_views_ui_end(gl3_t *gl, video_frame_info_t *video_info,
    gl3_set_viewport(gl, video_info->dims, false, true);
 }
 
-/* Draws rectangle v of the frame's texture src over vp, cut to cut, as
- * the stock chain draws a copy of it: the same texels, the same filter,
- * stopping at the rectangle's edge as at a texture's. */
+/* Draws rectangle v of texture src over vp, cut to cut, as the stock
+ * chain draws a copy of it: the same texels, sampled linear when
+ * smooth, stopping at the rectangle's edge as at a texture's. */
 static void gl3_stock_rect_draw(gl3_t *gl,
       const struct gl3_filter_chain_texture *src,
       const struct retro_video_view *v, bool bottom_up,
