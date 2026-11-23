@@ -3703,6 +3703,32 @@ static void test_extent_torn_base(void)
 #endif
 }
 
+static void test_extent_image(void)
+{
+   video_views_map_t map;
+   struct retro_video_views in;
+
+   map_dsi(&map);
+   CHECK(extent_is(&map, 2, 0, 48.0, 32.0));
+   /* Never turned */
+   CHECK(extent_is(&map, 2, 1, 48.0, 32.0));
+   CHECK(extent_is(&map, 2, 3, 48.0, 32.0));
+
+   /* Screen 1 at half the picture's height, at its own aspect */
+   map.base    = 0x20;
+   map.size[1] = 0.5f;
+   CHECK(extent_is(&map, 1, 0, 64.0 / 3.0, 16.0));
+   /* The picture at half of Top's: screen 1's chain passes through it. */
+   map.size[2] = 0.5f;
+   CHECK(extent_is(&map, 2, 0, 144.0, 96.0));
+   CHECK(extent_is(&map, 1, 0, 64.0, 48.0));
+
+   t_dsi(&in);
+   t_dsi_image.aspect_ratio = 2.0f;
+   CHECK(video_views_validate_map(&in, &map, NULL));
+   CHECK(extent_is(&map, 2, 0, 64.0, 32.0));
+}
+
 static int frect_is(const video_views_frect_t *r, double x, double y,
       double w, double h)
 {
@@ -4007,6 +4033,232 @@ static void test_layout_inset_integer(void)
             (unsigned)in.w, (unsigned)in.h));
 }
 
+/* @r is @aspect times as wide as tall, within a pixel. */
+static int t_aspect_near(const video_views_rect_t *r, double aspect)
+{
+   double w = VIDEO_SCALE_W(r->dims);
+   double h = VIDEO_SCALE_H(r->dims);
+   if (fabs(w - h * aspect) <= 1.0)
+      return 1;
+   printf("    got %gx%g, want w:h %g\n", w, h, aspect);
+   return 0;
+}
+
+/* @r is @frac of @base's height tall, within a pixel. */
+static int t_height_near(const video_views_rect_t *r,
+      const video_views_rect_t *base, double frac)
+{
+   double h    = VIDEO_SCALE_H(r->dims);
+   double want = VIDEO_SCALE_H(base->dims) * frac;
+   if (fabs(h - want) <= 1.0)
+      return 1;
+   printf("    got height %g, want %g\n", h, want);
+   return 0;
+}
+
+/* The picture beside Top, at the one scale. */
+static void test_layout_image_root(void)
+{
+   video_views_map_t map;
+   video_views_layout_t l;
+
+   map_dsi(&map);
+   map.left_out = 0x2;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(l.num_placements == 2);
+   CHECK(l.placements[0].view == 0 && l.placements[0].flags == 0);
+   CHECK(   l.placements[1].view == 2
+         && l.placements[1].flags == VIDEO_VIEWS_PLACEMENT_IMAGE);
+   CHECK(t_aspect_near(&l.placements[1].dst, 1.5));
+   CHECK(t_height_near(&l.placements[1].dst, &l.placements[0].dst,
+            32.0 / 192.0));
+   CHECK(rect_is(&l.placements[1].dst, 1320, 400, 240, 160));
+}
+
+static void test_layout_image_sized(void)
+{
+   video_views_map_t map;
+   video_views_layout_t l;
+
+   map_dsi(&map);
+   map.base    = 0;
+   map.size[2] = 0.25f;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(l.num_placements == 3);
+   CHECK(   l.placements[2].view == 2
+         && l.placements[2].flags == VIDEO_VIEWS_PLACEMENT_IMAGE);
+   CHECK(t_height_near(&l.placements[2].dst, &l.placements[0].dst, 0.25));
+   CHECK(t_aspect_near(&l.placements[2].dst, 1.5));
+}
+
+static void test_layout_image_inset(void)
+{
+   video_views_map_t map;
+   video_views_layout_t l;
+   const video_views_placement_t *img = &l.placements[1];
+
+   map_dsi(&map);
+   map.over       = 0x4;
+   map.base       = 0;
+   map.anchor     = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT << 8;
+   map.size[2]    = 0.25f;
+   map.opacity[2] = 128;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(l.num_placements == 3);
+   CHECK(   l.placements[0].view == 0 && img->view == 2
+         && l.placements[2].view == 1);
+   CHECK(img->flags == (VIDEO_VIEWS_PLACEMENT_IMAGE
+         | VIDEO_VIEWS_PLACEMENT_INSET
+         | VIDEO_VIEWS_PLACEMENT_ALPHA_BITS(128)));
+   CHECK(t_bottom_right(&img->dst, &l.placements[0].dst));
+   CHECK(t_height_near(&img->dst, &l.placements[0].dst, 0.25));
+   CHECK(t_aspect_near(&img->dst, 1.5));
+   CHECK(rect_is(&img->dst, 575, 630, 225, 150));
+
+   map.blank = 0x4;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(l.num_placements == 3 && img->view == 2);
+   CHECK(img->flags == (VIDEO_VIEWS_PLACEMENT_IMAGE
+         | VIDEO_VIEWS_PLACEMENT_INSET | VIDEO_VIEWS_PLACEMENT_BLANK
+         | VIDEO_VIEWS_PLACEMENT_ALPHA_BITS(128)));
+}
+
+/* Stretch, the aspect setting and a custom viewport leave the picture
+ * its aspect. */
+static void test_layout_image_alone(void)
+{
+   video_views_map_t map;
+   video_views_layout_params_t p;
+   video_views_layout_t l;
+   video_views_rect_t vp;
+
+   map_dsi(&map);
+   map.left_out = 0x3;
+   params_init(&p, &map, 1600, 960);
+   p.screen_layout = VIDEO_SCREEN_LAYOUT_HORIZONTAL;
+   p.stretch       = true;
+   video_views_layout(&p, &l);
+   CHECK(   l.num_placements == 1 && l.placements[0].view == 2
+         && l.placements[0].flags == VIDEO_VIEWS_PLACEMENT_IMAGE);
+   CHECK(rect_is(&l.placements[0].dst, 80, 0, 1440, 960));
+
+   p.stretch       = false;
+   p.single_aspect = 16.0f / 9.0f;
+   video_views_layout(&p, &l);
+   CHECK(l.num_placements == 1);
+   CHECK(rect_is(&l.placements[0].dst, 80, 0, 1440, 960));
+
+   p.single_aspect = 0.0f;
+   vp.pos          = VIDEO_POS_PACK(100, 100);
+   vp.dims         = VIDEO_SCALE_PACK(800, 600);
+   p.custom_vp     = &vp;
+   video_views_layout(&p, &l);
+   CHECK(l.num_placements == 1);
+   CHECK(rect_is(&l.placements[0].dst, 80, 0, 1440, 960));
+
+   /* A map of the picture alone, with no view, as a selection of it
+    * gives */
+   memset(&map, 0, sizeof(map));
+   map.num_screens     = 1;
+   map.image           = 0x1;
+   map.image_dims[0]   = VIDEO_SCALE_PACK(48, 32);
+   map.image_aspect[0] = 1.5f;
+   p.custom_vp         = NULL;
+   video_views_layout(&p, &l);
+   CHECK(   l.num_placements == 1 && l.placements[0].view == 0
+         && l.placements[0].flags == VIDEO_VIEWS_PLACEMENT_IMAGE);
+   CHECK(rect_is(&l.placements[0].dst, 80, 0, 1440, 960));
+}
+
+/* An image beside a stereo screen: one placement in each eye's area. */
+static void test_layout_image_stereo(void)
+{
+   video_views_map_t map;
+   video_views_layout_t l;
+   struct retro_video_views in;
+   const video_views_rect_t *a, *b;
+
+   t_dsi(&in);
+   t_dsi_views[0]   = mkview(  0, 0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_LEFT);
+   t_dsi_views[1]   = mkview(256, 0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_RIGHT);
+   t_dsi_screens[1] = t_dsi_screens[2];
+   in.num_screens   = 2;
+   CHECK(video_views_validate_map(&in, &map, NULL));
+   CHECK(map.image == 0x2);
+   t_side_layout(&map, VIDEO_STEREO_MODE_SBS_FULL, &l);
+   CHECK(l.num_placements == 4);
+   CHECK(   l.placements[0].view == 0 && l.placements[0].area == 0
+         && l.placements[0].flags == 0
+         && l.placements[2].view == 1 && l.placements[2].area == 1
+         && l.placements[2].flags == 0);
+   CHECK(   l.placements[1].view == 1 && l.placements[1].area == 0
+         && l.placements[1].flags == VIDEO_VIEWS_PLACEMENT_IMAGE);
+   CHECK(   l.placements[3].view == 1 && l.placements[3].area == 1
+         && l.placements[3].flags == VIDEO_VIEWS_PLACEMENT_IMAGE);
+   CHECK(video_views_placement_screen(&map, &l.placements[2]) == 0);
+   CHECK(video_views_placement_screen(&map, &l.placements[3]) == 1);
+   /* The same spot in each eye */
+   a = &l.placements[1].dst;
+   b = &l.placements[3].dst;
+   CHECK(   b->dims == a->dims
+         && b->pos  == VIDEO_POS_PACK(VIDEO_POS_X(a->pos) + 800,
+               VIDEO_POS_Y(a->pos)));
+}
+
+/* An IMAGE placement's view is its screen, here also a view's index. */
+static void test_layout_image_view_index(void)
+{
+   video_views_map_t map;
+   video_views_layout_t l;
+   video_views_rect_t r;
+   struct retro_video_views in;
+
+   t_dsi(&in);
+   t_dsi_views[0] = mkview(  0,   0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_LEFT);
+   t_dsi_views[1] = mkview(256,   0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_RIGHT);
+   t_dsi_views[2] = mkview(  0, 192, 256, 192, 1, RETRO_VIDEO_VIEW_EYE_NONE);
+   in.num_views   = 3;
+   CHECK(video_views_validate_map(&in, &map, NULL));
+   map.left_out = 0x2;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(l.num_placements == 2);
+   CHECK(l.placements[0].view == 0 && l.placements[0].flags == 0);
+   CHECK(   l.placements[1].view == 2
+         && l.placements[1].flags == VIDEO_VIEWS_PLACEMENT_IMAGE);
+   CHECK(video_views_placement_screen(&map, &l.placements[0]) == 0);
+   CHECK(video_views_placement_screen(&map, &l.placements[1]) == 2);
+   CHECK(!video_views_first_drawn(&l, 2, true,
+            VIDEO_SCALE_PACK(1600, 960), &r));
+   CHECK(   video_views_first_drawn(&l, 0, true,
+            VIDEO_SCALE_PACK(1600, 960), &r)
+         && r.pos == l.placements[0].dst.pos
+         && r.dims == l.placements[0].dst.dims);
+}
+
+/* Top an inset over the picture: after it, in its bottom-right corner. */
+static void test_layout_view_over_image(void)
+{
+   video_views_map_t map;
+   video_views_layout_t l;
+
+   map_dsi(&map);
+   map.over       = 0x1;
+   map.base       = 2;
+   map.anchor     = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT;
+   map.size[0]    = 0.5f;
+   map.opacity[0] = 255;
+   t_side_layout(&map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(l.num_placements == 3);
+   CHECK(l.placements[0].view == 1 && l.placements[0].flags == 0);
+   CHECK(   l.placements[1].view == 2
+         && l.placements[1].flags == VIDEO_VIEWS_PLACEMENT_IMAGE);
+   CHECK(   l.placements[2].view == 0
+         && l.placements[2].flags == VIDEO_VIEWS_PLACEMENT_INSET);
+   CHECK(t_bottom_right(&l.placements[2].dst, &l.placements[1].dst));
+   CHECK(rect_is(&l.placements[1].dst, 1320, 400, 240, 160));
+   CHECK(rect_is(&l.placements[2].dst, 1453, 480, 107, 80));
+}
+
 static void test_roots_with_insets(void)
 {
    struct retro_video_view v[4];
@@ -4239,6 +4491,7 @@ int main(void)
    test_extent_base_size();
    test_extent_chain_cycle();
    test_extent_torn_base();
+   test_extent_image();
    test_inset_anchors();
    test_inset_shrink();
    test_layout_inset();
@@ -4249,6 +4502,13 @@ int main(void)
    test_layout_inset_stereo();
    test_layout_inset_rotated();
    test_layout_inset_integer();
+   test_layout_image_root();
+   test_layout_image_sized();
+   test_layout_image_inset();
+   test_layout_image_alone();
+   test_layout_image_stereo();
+   test_layout_image_view_index();
+   test_layout_view_over_image();
    test_roots_with_insets();
    test_select_screens_screen0_inset();
    test_map_point_inset();

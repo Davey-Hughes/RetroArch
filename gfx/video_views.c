@@ -390,8 +390,14 @@ int video_views_find(const video_views_map_t *map,
    return (eye == RETRO_VIDEO_VIEW_EYE_NONE) ? left : -1;
 }
 
-/* @screen's chain of sized bases, from @screen, up to the screen whose
- * view sets its height: the chain's end, or the lowest-numbered screen
+bool video_views_has_place(const video_views_map_t *map, unsigned screen)
+{
+   return (map->image & (1u << screen))
+      || video_views_find(map, screen, RETRO_VIDEO_VIEW_EYE_NONE) >= 0;
+}
+
+/* @screen's chain of sized bases, from @screen, up to the screen that
+ * sets its height: the chain's end, or the lowest-numbered screen
  * of a cycle in it. Returns that screen's place in @chain. Each base is
  * read once: a redraw may walk a map the main thread is arranging. */
 static unsigned video_views_extent_chain(const video_views_map_t *map,
@@ -408,8 +414,7 @@ static unsigned video_views_extent_chain(const video_views_map_t *map,
       if ((map->over & (1u << s)) || !(map->size[s] > 0.0f))
          return n;
       b = VIDEO_VIEWS_NIBBLE(map->base, s);
-      if (     b >= RETRO_VIDEO_VIEWS_MAX
-            || video_views_find(map, b, RETRO_VIDEO_VIEW_EYE_NONE) < 0)
+      if (b >= RETRO_VIDEO_VIEWS_MAX || !video_views_has_place(map, b))
          return n;
       if (!(seen & (1u << b)))
       {
@@ -428,22 +433,32 @@ static unsigned video_views_extent_chain(const video_views_map_t *map,
 bool video_views_extent(const video_views_map_t *map, unsigned screen,
       unsigned rotation, double *w, double *h)
 {
-   unsigned k, root;
+   unsigned k, root, r;
    unsigned chain[RETRO_VIDEO_VIEWS_MAX];
    double aspect;
-   const struct retro_video_view *v;
-   int i = video_views_find(map, screen, RETRO_VIDEO_VIEW_EYE_NONE);
-   if (i < 0)
+   if (!video_views_has_place(map, screen))
       return false;
    root = video_views_extent_chain(map, screen, chain);
-   v    = &map->views[video_views_find(map, chain[root],
-         RETRO_VIDEO_VIEW_EYE_NONE)];
-   *h   = (rotation & 1) ? v->width : v->height;
+   r    = chain[root];
+   if (map->image & (1u << r))
+      *h = VIDEO_SCALE_H(map->image_dims[r]);
+   else
+   {
+      const struct retro_video_view *v = &map->views[video_views_find(map,
+            r, RETRO_VIDEO_VIEW_EYE_NONE)];
+      *h = (rotation & 1) ? v->width : v->height;
+   }
    for (k = 0; k < root; k++)
       *h *= map->size[chain[k]];
-   aspect = video_views_aspect(&map->views[i]);
-   if (rotation & 1)
-      aspect = 1.0 / aspect;
+   if (map->image & (1u << screen))
+      aspect = map->image_aspect[screen];
+   else
+   {
+      aspect = video_views_aspect(&map->views[video_views_find(map, screen,
+            RETRO_VIDEO_VIEW_EYE_NONE)]);
+      if (rotation & 1)
+         aspect = 1.0 / aspect;
+   }
    *w = *h * aspect;
    return true;
 }
@@ -584,15 +599,17 @@ static void video_views_fit(const video_views_layout_params_t *p,
    unsigned cw   = VIDEO_SCALE_W(cdims);
    unsigned ch   = VIDEO_SCALE_H(cdims);
    bool vertical = (p->screen_layout != VIDEO_SCREEN_LAYOUT_HORIZONTAL);
+   /* The one-screen settings; an image keeps its aspect */
+   bool single   = count == 1 && !(map->image & (1u << first));
 
-   if (count == 1 && p->stretch && !p->scale_integer)
+   if (single && p->stretch && !p->scale_integer)
    {
       fit[first].pos  = VIDEO_POS_PACK(0, 0);
       fit[first].dims = cdims;
       return;
    }
 
-   if (count == 1 && p->custom_vp && cdims == p->dims)
+   if (single && p->custom_vp && cdims == p->dims)
    {
       fit[first] = *p->custom_vp;
       return;
@@ -603,7 +620,7 @@ static void video_views_fit(const video_views_layout_params_t *p,
       if (skip & (1u << s))
          continue;
       video_views_extent(map, s, p->rotation, &disp_w[s], &disp_h[s]);
-      if (count == 1 && p->single_aspect > 0.0f)
+      if (single && p->single_aspect > 0.0f)
          disp_w[s] = disp_h[s] * ((p->rotation & 1)
                ? 1.0 / p->single_aspect : p->single_aspect);
       if (vertical)
@@ -734,7 +751,7 @@ void video_views_layout(const video_views_layout_params_t *p,
    memset(out, 0, sizeof(*out));
    w = VIDEO_SCALE_W(p->dims);
    h = VIDEO_SCALE_H(p->dims);
-   if (!map || !map->num_views || !w || !h)
+   if (!map || !(map->num_views || map->image) || !w || !h)
       return;
 
    roots = video_views_roots(map) & ~p->exclude_screens;
@@ -815,16 +832,30 @@ void video_views_layout(const video_views_layout_params_t *p,
          video_views_placement_t *pl =
                &out->placements[out->num_placements++];
          s        = order[i];
-         pl->view = (unsigned)video_views_find(map, s, eye);
          pl->area = a;
+         if (map->image & (1u << s))
+         {
+            pl->view  = s;
+            pl->flags = VIDEO_VIEWS_PLACEMENT_IMAGE;
+         }
+         else
+            pl->view  = (unsigned)video_views_find(map, s, eye);
          if (map->blank & (1u << s))
-            pl->flags = VIDEO_VIEWS_PLACEMENT_BLANK;
+            pl->flags |= VIDEO_VIEWS_PLACEMENT_BLANK;
          if (insets & (1u << s))
             pl->flags |= VIDEO_VIEWS_PLACEMENT_INSET
                   | VIDEO_VIEWS_PLACEMENT_ALPHA_BITS(map->opacity[s]);
          video_views_place(&fit[s], cdims, &out->areas[a], &pl->dst);
       }
    }
+}
+
+unsigned video_views_placement_screen(const video_views_map_t *map,
+      const video_views_placement_t *p)
+{
+   if (p->flags & VIDEO_VIEWS_PLACEMENT_IMAGE)
+      return p->view;
+   return map->views[p->view].screen;
 }
 
 bool video_views_layout_same(const video_views_layout_t *a,
@@ -1063,7 +1094,8 @@ bool video_views_first_drawn(const video_views_layout_t *layout,
       video_views_rect_t r;
       const video_views_placement_t *p = &layout->placements[i];
       if (     p->view == view
-            && !(p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
+            && !(p->flags & (VIDEO_VIEWS_PLACEMENT_BLANK
+                  | VIDEO_VIEWS_PLACEMENT_IMAGE))
             && (all_areas || p->area == 0)
             && video_views_visible(layout, p, dims, &r))
       {

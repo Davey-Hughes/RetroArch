@@ -297,9 +297,13 @@ double video_views_aspect(const struct retro_video_view *v);
  * left) view's height times its aspect; on an odd @rotation, the view's
  * width tall at the inverse aspect. A screen that is not an inset and
  * has a size is size times its base's extent tall, at its own (turned)
- * aspect. False without a view. */
+ * aspect. An image screen is its picture's height tall at its aspect,
+ * never turned. False without a place. */
 bool video_views_extent(const video_views_map_t *map, unsigned screen,
       unsigned rotation, double *w, double *h);
+
+/* A view or an image: @screen has a place to be drawn. */
+bool video_views_has_place(const video_views_map_t *map, unsigned screen);
 
 /* An inset's rectangle in @base's units: at @anchor inside @base,
  * @size of its height tall at @aspect (w / h), shrunk to fit inside
@@ -336,6 +340,7 @@ bool video_views_snapshot(const video_views_map_t *map,
 
 #define VIDEO_VIEWS_PLACEMENT_BLANK (1u << 0)   /* drawn black */
 #define VIDEO_VIEWS_PLACEMENT_INSET (1u << 1)   /* drawn over its base's */
+#define VIDEO_VIEWS_PLACEMENT_IMAGE (1u << 2)   /* view holds the screen */
 /* Bits 8-15 hold 255 minus the opacity, so flags 0 is solid. */
 #define VIDEO_VIEWS_PLACEMENT_ALPHA_BITS(a) ((255u - (a)) << 8)
 #define VIDEO_VIEWS_PLACEMENT_ALPHA(flags)  (255u - (((flags) >> 8) & 0xffu))
@@ -344,7 +349,7 @@ bool video_views_snapshot(const video_views_map_t *map,
 typedef struct video_views_placement
 {
    video_views_rect_t dst;   /* canvas pixels, top-left origin */
-   unsigned view;            /* index into the map's views */
+   unsigned view;            /* the map's view, or an IMAGE's screen */
    unsigned area;            /* 0: left eye or the only area, 1: right eye */
    unsigned flags;           /* VIDEO_VIEWS_PLACEMENT_* */
 } video_views_placement_t;
@@ -403,6 +408,10 @@ typedef struct video_views_layout_params
 
 void video_views_layout(const video_views_layout_params_t *params,
       video_views_layout_t *out);
+
+/* The screen @p draws, an image's or a view's. */
+unsigned video_views_placement_screen(const video_views_map_t *map,
+      const video_views_placement_t *p);
 
 /* Whether @a and @b draw the same views in the same places with the
  * same flags. */
