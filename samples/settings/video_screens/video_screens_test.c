@@ -4684,11 +4684,16 @@ static void test_images_get_again(void)
    struct retro_video_screen_buffer second;
    images_test_begin();
    CHECK(images_test_get(&first, 2, 48, 32, RETRO_PIXEL_FORMAT_XRGB8888));
-   CHECK(images_test_get(&second, 2, 48, 32, RETRO_PIXEL_FORMAT_XRGB8888));
+   CHECK(images_test_get(&second, 2, 32, 16, RETRO_PIXEL_FORMAT_XRGB8888));
+   CHECK(first.data != second.data);
+   images_test_fill(&first, 0x22);
    images_test_fill(&second, 0x11);
-   if (first.data != second.data)
-      CHECK(!images_test_hand(first.data, 1));
-   CHECK(images_test_hand(second.data, 1));
+   CHECK(!images_test_hand(first.data, 1));
+   images_test_picture(second.data, 1);
+   images_test_image.width  = 32;
+   images_test_image.height = 16;
+   images_test_image.pitch  = 32 * sizeof(uint32_t);
+   CHECK(images_test_set());
    window_test_end();
 }
 
