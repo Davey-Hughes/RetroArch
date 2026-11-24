@@ -201,6 +201,11 @@ void video_screen_images_set_caller(unsigned owner)
       video_screen_images_caller = owner;
 }
 
+void video_screen_images_show_main(void)
+{
+   video_screen_images_shown = VIDEO_SCREEN_IMAGES_MAIN;
+}
+
 bool video_screen_images_lend(struct retro_video_screen_buffer *buf,
       bool images)
 {

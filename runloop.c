@@ -10640,6 +10640,8 @@ int runloop_iterate(void)
           (runloop_st->core_options && runloop_st->core_options->updated))
          serialization_clear_history();
 
+      if (!want_runahead)
+         video_screen_images_show_main();
       if (want_runahead)
          frame_advanced = runahead_run(
                runloop_st,

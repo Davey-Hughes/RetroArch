@@ -5568,6 +5568,31 @@ static void test_images_per_instance(void)
    window_test_end();
 }
 
+/* Main's frames shown again (run-ahead's single instance or off,
+ * preemptive frames, netplay): main's picture is drawn with no new map */
+static void test_images_main_again(void)
+{
+   static uint32_t blue[48 * 32];
+   unsigned i;
+   images_test_frames_begin();
+   for (i = 0; i < 48 * 32; i++)
+   {
+      screens_test_dsi_pixels[i] = 0x00FF0000u;
+      blue[i]                    = 0x000000FFu;
+   }
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1));
+   CHECK(images_test_hand_second(blue, 1));
+   window_test_run();
+   CHECK(images_test_words[0] == 0x000000FFu);
+   images_test_calls_reset();
+   video_screen_images_show_main();
+   window_test_run();
+   CHECK(images_test_loads + images_test_updates == 1);
+   CHECK(images_test_words[0] == 0x00FF0000u);
+   memset(screens_test_dsi_pixels, 0, sizeof(screens_test_dsi_pixels));
+   window_test_end();
+}
+
 /* An image screen in its own window: the window's map is the frame's,
  * with the picture landed, and the main window lays out the rest */
 static void test_window_image_frame(void)
@@ -13082,6 +13107,7 @@ int main(int argc, char **argv)
    test_images_rgba();
    test_images_gone_kept();
    test_images_per_instance();
+   test_images_main_again();
    test_window_image_frame();
    test_screens_core_show();
    test_screens_core_over_inset();

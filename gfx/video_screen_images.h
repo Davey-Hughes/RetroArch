@@ -41,8 +41,12 @@ enum video_screen_images_owner
 void video_screen_images_set_caller(unsigned owner);
 
 /* runahead_secondary_core_destroy: @owner's store emptied and its
- * lends ended. */
+ * lends ended; main's pictures drawn if @owner's were. */
 void video_screen_images_free_owner(unsigned owner);
+
+/* Main's frame is shown, not run-ahead's second instance's: main's
+ * pictures are drawn. */
+void video_screen_images_show_main(void);
 
 /* GET_VIDEO_SCREEN_BUFFER for the caller's store. @images: whether
  * STATUS_IMAGES is set now. False leaves @buf as it was. */

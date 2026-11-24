@@ -2007,6 +2007,7 @@ static bool runahead_run_impl(void *data,
    {
       /* TODO: multiple savestates for higher performance
        * when not using secondary core */
+      video_screen_images_show_main();
       for (frame_number = 0; frame_number <= runahead_count; frame_number++)
       {
          last_frame      = frame_number == runahead_count;
@@ -2138,6 +2139,7 @@ static bool runahead_run_impl(void *data,
 
 force_input_dirty:
    serialization_phase_value = RETRO_EXECUTION_PHASE_RETAINED;
+   video_screen_images_show_main();
    advanced = core_run();
    runloop_st->flags |=  RUNLOOP_FLAG_RUNAHEAD_FORCE_INPUT_DIRTY;
    return advanced;
