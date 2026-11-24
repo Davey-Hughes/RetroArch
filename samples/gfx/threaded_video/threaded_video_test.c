@@ -11464,7 +11464,6 @@ static int                            imglane_mode;
 static uintptr_t                      imglane_main;
 /* The video thread's; the main thread reads them once the ring is
  * drained, or once imglane_unloads or imglane_landings has moved */
-static unsigned char imglane_live[IMGLANE_MAX + 1];
 static uint32_t      imglane_content[IMGLANE_MAX + 1];
 static int           imglane_unload_drawn[IMGLANE_MAX + 1];
 static unsigned      imglane_loads;
@@ -11475,6 +11474,8 @@ static uint32_t      imglane_drawn_content[IMGLANE_FRAMES];
 static retro_atomic_int_t imglane_landings;
 static retro_atomic_int_t imglane_drawn;
 static retro_atomic_int_t imglane_unloads;
+/* By tag, loaded and not unloaded: the main thread waits on it */
+static retro_atomic_int_t imglane_live[IMGLANE_MAX + 1];
 /* Texture calls that made the main thread wait: on it, or marshalled */
 static retro_atomic_int_t imglane_waits;
 static retro_atomic_int_t imglane_unload_main;
@@ -11518,7 +11519,7 @@ static uintptr_t imglane_load(void *data, void *img, bool threaded,
    if (imglane_loads >= IMGLANE_MAX)
       return 0;
    id = IMGLANE_TAG + ++imglane_loads;
-   imglane_live[id - IMGLANE_TAG] = 1;
+   retro_atomic_store_release_int(&imglane_live[id - IMGLANE_TAG], 1);
    imglane_land(id, (const struct texture_image*)img);
    return id;
 }
@@ -11528,7 +11529,8 @@ static enum video_texture_update imglane_update(void *data, uintptr_t id,
 {
    (void)data;
    imglane_call(threaded);
-   if (!imglane_ours(id) || !imglane_live[id - IMGLANE_TAG])
+   if (!imglane_ours(id) || !retro_atomic_load_acquire_int(
+         &imglane_live[id - IMGLANE_TAG]))
       return VIDEO_TEXTURE_UPDATE_REFUSED;
    imglane_land(id, ti);
    return VIDEO_TEXTURE_UPDATE_DONE;
@@ -11551,7 +11553,7 @@ static void imglane_unload(void *data, bool threaded, uintptr_t id)
          video_st->views_core_box.words, &boxed, sizeof(boxed));
    if (boxed.image_tex[2] == id)
       retro_atomic_fetch_add_int(&imglane_boxed, 1);
-   imglane_live[id - IMGLANE_TAG]         = 0;
+   retro_atomic_store_release_int(&imglane_live[id - IMGLANE_TAG], 0);
    imglane_unload_drawn[id - IMGLANE_TAG] =
          retro_atomic_load_acquire_int(&imglane_drawn);
    retro_atomic_fetch_add_int(&imglane_unloads, 1);
@@ -11599,7 +11601,8 @@ static bool imglane_frame(void *data, const void *frame, unsigned dims,
       imglane_drawn_content[n] = imglane_ours(tex)
             ? imglane_content[tex - IMGLANE_TAG] : 0;
    }
-   if (tex && (!imglane_ours(tex) || !imglane_live[tex - IMGLANE_TAG]))
+   if (tex && (!imglane_ours(tex) || !retro_atomic_load_acquire_int(
+         &imglane_live[tex - IMGLANE_TAG])))
       retro_atomic_fetch_add_int(&imglane_dead, 1);
    retro_atomic_store_release_int(&imglane_drawn, n + 1);
    return imglane_inner->frame(data, frame, dims, frame_count, pitch, msg,
@@ -11612,9 +11615,11 @@ static bool imglane_frame(void *data, const void *frame, unsigned dims,
 static bool imglane_install(void)
 {
    video_driver_state_t *video_st = video_state_get_ptr();
+   unsigned i;
    if (imglane_mode || !video_st->data)
       return false;
-   memset(imglane_live, 0, sizeof(imglane_live));
+   for (i = 0; i <= IMGLANE_MAX; i++)
+      retro_atomic_store_release_int(&imglane_live[i], 0);
    memset(imglane_content, 0, sizeof(imglane_content));
    memset(imglane_unload_drawn, 0, sizeof(imglane_unload_drawn));
    memset(imglane_landed, 0, sizeof(imglane_landed));
@@ -11991,7 +11996,7 @@ static void lane_screen_images(void)
    }
    CHECK(at >= 0, "image lane: no frame drew the resized picture");
    CHECK(retro_atomic_load_acquire_int(&imglane_unloads) == 1
-         && !imglane_live[1],
+         && !retro_atomic_load_acquire_int(&imglane_live[1]),
          "image lane: the replaced texture was not unloaded (%d unloads)",
          retro_atomic_load_acquire_int(&imglane_unloads));
    CHECK(!retro_atomic_load_acquire_int(&imglane_unload_main),
@@ -12046,9 +12051,11 @@ static void lane_screen_images(void)
    CHECK(at > 0 && at <= IMGLANE_FRAMES && imglane_drawn_tex[at - 1] != got,
          "image lane: the dupe after the drop drew %lx", (unsigned long)got);
    for (i = 0; i < 2000 && imglane_ours(got)
-         && imglane_live[got - IMGLANE_TAG]; i++)
+         && retro_atomic_load_acquire_int(&imglane_live[got - IMGLANE_TAG]);
+         i++)
       retro_sleep(1);
-   CHECK(imglane_ours(got) && !imglane_live[got - IMGLANE_TAG],
+   CHECK(imglane_ours(got)
+         && !retro_atomic_load_acquire_int(&imglane_live[got - IMGLANE_TAG]),
          "image lane: the dropped texture was not unloaded");
    imglane_frame_drawn();
 
