@@ -302,7 +302,7 @@ void video_screen_prefs_arrange(const video_screen_values_t *resolved,
    unsigned base[RETRO_VIDEO_VIEWS_MAX];
    unsigned user        = 0;   /* the user's insets */
    unsigned over        = 0;   /* the core's insets */
-   unsigned out         = 0;   /* ABSENT, Off or HIDDEN */
+   unsigned out         = map->rules_out;   /* and ABSENT, Off or HIDDEN */
    unsigned count       = screens ? screens->count : 0;
    unsigned num_screens = map->num_screens;
 

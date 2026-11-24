@@ -3645,6 +3645,50 @@ static void test_arrange_images_off(void)
    CHECK(a.map.over == 0x2 && a.map.left_out == 0x6);
 }
 
+/* A screen in the map's rules_out is left out as ABSENT, an image or
+ * not, and an inset over it with it; the others keep their values. */
+static void test_arrange_rules_out(void)
+{
+   static t_arrange_t a;
+   video_views_map_t on;
+   video_views_layout_t l;
+   unsigned s;
+
+   t_arrange_begin(&a, 3);
+   map_dsi(&a.map);
+   t_arrange_run(&a);
+   on = a.map;
+   CHECK(on.left_out == 0);
+   a.map.rules_out = 0x4;
+   t_arrange_run(&a);
+   CHECK(a.map.left_out == 0x4 && a.map.rules_out == 0x4);
+   CHECK(!((a.map.over ^ on.over) & 0x3));
+   CHECK(!((a.map.blank ^ on.blank) & 0x3));
+   for (s = 0; s < 2; s++)
+      CHECK(   T_NIB(a.map.base, s) == T_NIB(on.base, s)
+            && T_NIB(a.map.anchor, s) == T_NIB(on.anchor, s)
+            && a.map.size[s] == on.size[s]
+            && a.map.opacity[s] == on.opacity[s]);
+   CHECK(t_arrange_clear_past(&a.map, 3));
+   t_side_layout(&a.map, VIDEO_STEREO_MODE_2D, &l);
+   CHECK(l.num_placements == 2 && !t_images_placed(&l));
+
+   /* Bottom over the VMU */
+   t_arrange_begin(&a, 3);
+   map_dsi(&a.map);
+   a.map.rules_out = 0x4;
+   t_arrange_user(&a, 1, "over:3");
+   t_arrange_run(&a);
+   CHECK(a.map.over == 0x2 && a.map.left_out == 0x6);
+
+   /* A screen with a view, BLANK: no place, so not drawn black */
+   t_arrange_begin(&a, 2);
+   a.scr.screens[0].state = RETRO_VIDEO_SCREEN_STATE_BLANK;
+   a.map.rules_out        = 0x1;
+   t_arrange_run(&a);
+   CHECK(a.map.left_out == 0x1 && !a.map.blank && !a.map.over);
+}
+
 #undef T_NIB
 
 #undef T_PREF
@@ -4908,6 +4952,7 @@ int main(void)
    test_arrange_blank_inset();
    test_arrange_shown_sized();
    test_arrange_images_off();
+   test_arrange_rules_out();
 
    if (failures)
    {

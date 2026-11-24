@@ -192,6 +192,8 @@ typedef struct video_views_map
    unsigned image;                              /* screens drawn from an image */
    unsigned image_dims[RETRO_VIDEO_VIEWS_MAX];  /* VIDEO_SCALE_PACK */
    float image_aspect[RETRO_VIDEO_VIEWS_MAX];   /* display w / h */
+   /* The frontend's, set with the map; validation leaves it 0. */
+   unsigned rules_out;   /* left out by the map's rules at the call */
    /* The frontend's, set per frame; validation leaves them 0. */
    uintptr_t image_tex[RETRO_VIDEO_VIEWS_MAX];  /* 0 until a picture landed */
    uint8_t image_gen[RETRO_VIDEO_VIEWS_MAX];    /* moves when one lands */
