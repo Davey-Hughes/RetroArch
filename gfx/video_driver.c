@@ -5754,8 +5754,10 @@ static void video_driver_views_take_arrangement(video_views_map_t *to,
  * that will not be presented (frameskip), keeps the last map's views,
  * since the driver's last presented (or repeated) textures still match
  * them; the rest of a map with those views applies at once. @now is the
- * frame's clock sample. */
-static void video_driver_views_frame(video_driver_state_t *video_st,
+ * frame's clock sample. Not inlined: video_driver_frame's size is
+ * budgeted. */
+static VIDEO_NOINLINE void video_driver_views_frame(
+      video_driver_state_t *video_st,
       settings_t *settings, const void *data, bool render_frame,
       unsigned core_dims, unsigned dims, retro_time_t now,
       video_frame_info_t *video_info)
