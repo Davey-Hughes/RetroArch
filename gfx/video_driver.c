@@ -4840,6 +4840,18 @@ int video_driver_screen_shown_stamp(unsigned screen)
          &video_driver_st.screens_shown_box[screen].seq);
 }
 
+/* STATUS_SCREENS and STATUS_IMAGES for a context with VIDEO_VIEWS and
+ * @flags. Not while the core is turned: UPRIGHT is not drawn. */
+static unsigned video_driver_views_screens_status(
+      const video_driver_state_t *video_st, uint32_t flags)
+{
+   if (     BIT32_GET(flags, GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK)
+         || runloop_state_get_ptr()->system.rotation)
+      return 0;
+   return RETRO_VIDEO_VIEWS_STATUS_SCREENS
+      | (video_st->views_images ? RETRO_VIDEO_VIEWS_STATUS_IMAGES : 0);
+}
+
 unsigned video_driver_views_status(void)
 {
    gfx_ctx_flags_t flags;
@@ -4859,15 +4871,8 @@ unsigned video_driver_views_status(void)
    video_context_driver_get_flags(&flags);
    if (BIT32_GET(flags.flags, GFX_CTX_FLAGS_VIDEO_VIEWS))
    {
-      status |= RETRO_VIDEO_VIEWS_STATUS_PRESENTS;
-      /* Not while the core is turned: UPRIGHT is not drawn */
-      if (     !BIT32_GET(flags.flags, GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK)
-            && !runloop_state_get_ptr()->system.rotation)
-      {
-         status |= RETRO_VIDEO_VIEWS_STATUS_SCREENS;
-         if (video_driver_st.views_images)
-            status |= RETRO_VIDEO_VIEWS_STATUS_IMAGES;
-      }
+      status |= RETRO_VIDEO_VIEWS_STATUS_PRESENTS
+         | video_driver_views_screens_status(&video_driver_st, flags.flags);
       /* A display of the driver's own per eye shows both while the
        * driver says so (the 3DS's 3D slider); a headset whatever the
        * window's mode. */
@@ -5817,9 +5822,8 @@ static void video_driver_views_frame(video_driver_state_t *video_st,
    {
       unsigned drawn;
       /* STATUS_IMAGES, as video_driver_views_status() has it */
-      video_st->views_images_arranged = video_st->views_images
-         && !BIT32_GET(flags.flags, GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK)
-         && !runloop_state_get_ptr()->system.rotation;
+      video_st->views_images_arranged = (video_driver_views_screens_status(
+               video_st, flags.flags) & RETRO_VIDEO_VIEWS_STATUS_IMAGES) != 0;
       /* Not in views: set_views compares each map with it */
       video_screen_prefs_arrange(video_st->screens_resolved,
             video_st->screens_defaults, &video_st->views_screens,
