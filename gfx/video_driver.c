@@ -4079,6 +4079,7 @@ static uintptr_t video_driver_windows_logo_texture(bool want)
 
 #ifdef HAVE_THREADS
 static void video_driver_movie_blocks_free(void);
+static void video_driver_views_core_publish(video_driver_state_t *video_st);
 #endif
 
 void video_driver_free_internal(void)
@@ -4176,6 +4177,14 @@ void video_driver_free_internal(void)
     * implementation dereferences that argument on entry. */
    video_st->data               = NULL;
    video_st->views_driver_count = 0;
+   /* Image screens' textures went with it */
+   memset(video_st->views_core.image_tex, 0,
+         sizeof(video_st->views_core.image_tex));
+   memset(video_st->views_frame.image_tex, 0,
+         sizeof(video_st->views_frame.image_tex));
+#ifdef HAVE_THREADS
+   video_driver_views_core_publish(video_st);
+#endif
 #ifdef HAVE_VIDEO_WINDOWS
    video_driver_window_layouts_clear(video_st);
 #endif
@@ -5822,19 +5831,22 @@ static void video_driver_views_frame(video_driver_state_t *video_st,
          core->blank          |= drawn & ~video_st->views_drawn;
       else
          video_st->views_drawn = drawn;
-      if (render_frame)
-      {
-         unsigned nearest = settings->bools.video_smooth ? 0 : core->image;
-         unsigned s;
-         for (s = 0; s < video_st->views_screens.count; s++)
-            if (video_st->views_screens.screens[s].flags
-                  & RETRO_VIDEO_SCREEN_FLAG_SHARP)
-               nearest |= 1u << s;
-         video_screen_images_frame(core,
-               core->image & ~(core->left_out | core->blank), nearest);
-      }
-      video_driver_views_take_arrangement(&video_st->views_frame, core);
    }
+   /* Arranged or not: a texture the store let go is named by no frame
+    * drawn after it, nor by the redraw's box */
+   if (render_frame && !redraw)
+   {
+      unsigned nearest = settings->bools.video_smooth ? 0 : core->image;
+      unsigned s;
+      for (s = 0; s < video_st->views_screens.count; s++)
+         if (video_st->views_screens.screens[s].flags
+               & RETRO_VIDEO_SCREEN_FLAG_SHARP)
+            nearest |= 1u << s;
+      video_screen_images_frame(core, presented
+            ? core->image & ~(core->left_out | core->blank) : 0, nearest);
+   }
+   if (arranged || (render_frame && !redraw))
+      video_driver_views_take_arrangement(&video_st->views_frame, core);
 #ifdef HAVE_VIDEO_WINDOWS
    if (!redraw)
       video_driver_screens_route(video_st, presented);

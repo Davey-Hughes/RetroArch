@@ -11754,6 +11754,41 @@ static void imglane_align(void)
       run_frames(1);
 }
 
+/* The next core run sends a dupe */
+static void imglane_align_dupe(void)
+{
+   dylib_t lib           = runloop_state_get_ptr()->lib_handle;
+   unsigned (*runs)(void) = lib
+      ? (unsigned (*)(void))dylib_proc(lib, "harness_core_runs") : NULL;
+   unsigned i;
+   for (i = 0; runs && i < 3 && (runs() + 1) % 3 != 0; i++)
+      run_frames(1);
+}
+
+/* imglane_set()'s map without screen 2's picture and with the views
+ * moved */
+static bool imglane_drop(void)
+{
+   static struct retro_video_view   views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   memset(views, 0, sizeof(views));
+   views[0].width  = views[1].width = 320;
+   views[0].height = 100;
+   views[1].y      = 100;
+   views[1].height = 140;
+   views[1].screen = 1;
+   memset(screens, 0, sizeof(screens));
+   screens[2].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
+   memset(&map, 0, sizeof(map));
+   map.views       = views;
+   map.num_views   = 2;
+   map.flags       = RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   map.screens     = screens;
+   map.num_screens = 3;
+   return runloop_environment_cb(RETRO_ENVIRONMENT_SET_VIDEO_VIEWS, &map);
+}
+
 /* Video thread: keeps the thread from the in-list until let go */
 static uintptr_t imglane_hold(void *driver_data,
       const video_poke_interface_t *poke, void *user)
@@ -11997,6 +12032,25 @@ static void lane_screen_images(void)
    CHECK(retro_atomic_load_acquire_int(&imglane_landings) == landings + 1,
          "image lane: %d uploads after the held one, for one picture",
          retro_atomic_load_acquire_int(&imglane_landings) - landings);
+
+   /* 4. A map that drops the image screen and moves the views: the
+    * dupe before it is arranged names no texture the store let go, and
+    * the redraw's box names none when it goes */
+   got = imglane_frame_drawn();
+   CHECK(imglane_ours(got), "image lane: no picture drawn before the drop");
+   imglane_align_dupe();
+   CHECK(imglane_drop(), "image lane: the map without the picture was "
+         "refused");
+   imglane_frame_drawn();
+   at = retro_atomic_load_acquire_int(&imglane_drawn);
+   CHECK(at > 0 && at <= IMGLANE_FRAMES && imglane_drawn_tex[at - 1] != got,
+         "image lane: the dupe after the drop drew %lx", (unsigned long)got);
+   for (i = 0; i < 2000 && imglane_ours(got)
+         && imglane_live[got - IMGLANE_TAG]; i++)
+      retro_sleep(1);
+   CHECK(imglane_ours(got) && !imglane_live[got - IMGLANE_TAG],
+         "image lane: the dropped texture was not unloaded");
+   imglane_frame_drawn();
 
    CHECK(!retro_atomic_load_acquire_int(&imglane_waits),
          "image lane: %d texture calls waited",

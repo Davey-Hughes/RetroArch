@@ -5186,6 +5186,47 @@ static void test_images_null_refresh(void)
    window_test_end();
 }
 
+/* A map that drops the image screen and moves the views: the NULL
+ * refreshes before it is arranged name no texture the store let go,
+ * nor one of the driver before a restart */
+static void test_images_dropped_repeat(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_screen_image image;
+   struct retro_video_views map;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   images_test_frames_begin();
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1));
+   window_test_run();
+   CHECK(window_test_seen_views.image_tex[2] == 101);
+   images_test_calls_reset();
+   screens_test_dsi(&map, views, screens, &image);
+   screens[2].image = NULL;
+   screens[2].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
+   CHECK(video_driver_set_views(&map));
+   CHECK(images_test_unloads == 1 && images_test_unloaded == 101);
+   images_test_repeat();
+   CHECK(screens_test_image_placed(2, 0) == 1);
+   CHECK(!window_test_seen_views.image_tex[2]);
+   CHECK(!video_st->views_core.image_tex[2]);
+   window_test_end();
+
+   images_test_frames_begin();
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1));
+   window_test_run();
+   CHECK(window_test_seen_views.image_tex[2] == 101);
+   screens_test_dsi(&map, views, screens, &image);
+   CHECK(video_driver_set_views(&map));
+   images_test_calls_reset();
+   images_test_restart();
+   CHECK(images_test_unloads == 1 && images_test_unloaded == 101);
+   images_test_repeat();
+   CHECK(screens_test_image_placed(2, 0) == 1);
+   CHECK(window_test_seen_views.image_tex[2] == 102);
+   window_test_end();
+}
+
 /* A frame not shown uploads nothing */
 static void test_images_not_shown(void)
 {
@@ -13028,6 +13069,7 @@ int main(int argc, char **argv)
    test_images_update_in_place();
    test_images_gen_landings();
    test_images_null_refresh();
+   test_images_dropped_repeat();
    test_images_not_shown();
    test_images_frameskip();
    test_images_every_frame();
