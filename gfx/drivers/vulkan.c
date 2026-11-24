@@ -13547,8 +13547,9 @@ static VIDEO_NOINLINE void vulkan_windows_prepare(vk_t *vk,
       screens     = views && f->window_screens[w];
       state       = vulkan_window_output(vk, win, video_info);
       win->layout = video_driver_lend_window_layout(w);
-      /* A repeat keeps the last image unless the UI is drawn there or
-       * the screens are laid out otherwise than it was drawn */
+      /* A repeat keeps the last image unless the UI is drawn there, the
+       * screens are laid out otherwise than it was drawn or a picture
+       * landed */
       laid        = state > 0 && screens && !new_frame && !f->window_ui[w];
       if (laid)
          screens = vulkan_window_repeat(vk, video_info, w);

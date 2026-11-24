@@ -297,12 +297,12 @@ double video_views_aspect(const struct retro_video_view *v);
  * left) view's height times its aspect; on an odd @rotation, the view's
  * width tall at the inverse aspect. A screen that is not an inset and
  * has a size is size times its base's extent tall, at its own (turned)
- * aspect. An image screen is its picture's height tall at its aspect,
- * never turned. False without a place. */
+ * aspect. An image screen's own height is its picture's; its aspect is
+ * never turned. False with nothing to draw. */
 bool video_views_extent(const video_views_map_t *map, unsigned screen,
       unsigned rotation, double *w, double *h);
 
-/* A view or an image: @screen has a place to be drawn. */
+/* A view or an image: @screen has something to draw, left out or not. */
 bool video_views_has_place(const video_views_map_t *map, unsigned screen);
 
 /* An inset's rectangle in @base's units: at @anchor inside @base,
