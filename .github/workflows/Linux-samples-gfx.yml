@@ -1510,10 +1510,13 @@ jobs:
         working-directory: samples/gfx/hdr_metadata
         run: |
           set -eu
+          . "$GITHUB_WORKSPACE/.github/workflows/scripts/wine-server.sh"
           make clean
           make check SANITIZER=address,undefined
           CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' python3 run.py
           CFLAGS='-fsanitize=thread -fno-omit-frame-pointer' python3 run.py
+          CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' python3 vulkan_mode.py
+          CC=x86_64-w64-mingw32-gcc RUNNER=wine WINEDEBUG=-all python3 vulkan_mode.py
           CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' python3 ownership.py
 
       - name: Menu framebuffer loans (ASan/UBSan, TSan)

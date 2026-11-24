@@ -75,14 +75,17 @@ name: CI Vulkan/GL/D3D11 [idle waits + driver harness]
 #    built from a pinned release with its renderer, the tree configured
 #    with SDL3 in place of SDL2.
 #
-# 9. HDR10 frame: the shipping frontend from the validation build, on
+# 9. HDR frame: the shipping frontend from the validation build, on
 #    lavapipe under an Xvfb of depth 30, through a layer that pairs the
 #    surface's 10-bit format with the HDR10 colour space
 #    (samples/gfx/vulkan_hdr_ui_pass), so the driver takes its HDR path
 #    with no HDR display: a shader preset with the menu, the statistics
-#    and an OSD message over it, and the controls without. The UI
-#    layer's render pass was left open under the composite whenever a
-#    preset and any UI met; no lane here ran HDR, so nothing saw it.
+#    and an OSD message over it, and the controls without. The layer
+#    can offer scRGB and no HDR10 instead; lavapipe cannot present FP16,
+#    so the driver draws into the layer's FP16 stand-in images and each
+#    present copies them into the real 10-bit swapchain. The UI layer's
+#    render pass was left open under the composite whenever a preset
+#    and any UI met; no lane here ran HDR, so nothing saw it.
 
 on:
   push:
@@ -355,13 +358,14 @@ jobs:
             python3 samples/cores/video_views/e2e/run.py ./retroarch \
             "$RUNNER_TEMP/views-e2e" gl glcore vulkan sdl2
 
-      - name: HDR10 frame paths under the validation layer (lavapipe, fake HDR10 surface)
+      - name: HDR frame paths under the validation layer (lavapipe, fake HDR10 and scRGB surfaces)
         shell: bash
         run: |
           set -eu
-          # Each case selects an HDR10 swapchain or fails, and must take
-          # the HDR game pass and composite it names; any validation
-          # error fails it. Logs stay in the temp dir named below.
+          # Each case takes the swapchain its fake surface offers,
+          # whatever mode it asks, and must run the HDR game pass and
+          # composite it names in that encoding; any validation error
+          # fails it. Logs stay in the temp dir named below.
           export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
           python3 samples/gfx/vulkan_hdr_ui_pass/run.py --retroarch ./retroarch \
             --log-dir "$RUNNER_TEMP/vulkan-hdr-ui-pass"

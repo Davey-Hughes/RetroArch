@@ -48,6 +48,19 @@ static void expect(const char *name,
       printf("[ok]   %s\n", name);
 }
 
+static void expect_hdr(const char *name,
+      unsigned asked, int hdr10, int scrgb, unsigned want)
+{
+   unsigned got = vulkan_hdr_surface_mode(asked, hdr10, scrgb);
+   if (got != want)
+   {
+      printf("[FAIL] %s: mode %u, expected %u\n", name, got, want);
+      failures++;
+   }
+   else
+      printf("[ok]   %s\n", name);
+}
+
 int main(void)
 {
    /* RGBA listed first, as the NVIDIA Wayland WSI does. */
@@ -93,6 +106,17 @@ int main(void)
    expect("bgra extended only",    bgra_ext_only, 2, 1);
    expect("no 8-bit unorm",        none,          2, -1);
    expect("empty list",            none,          0, -1);
+
+   expect_hdr("off stays off",           0, 1, 1, 0);
+   expect_hdr("hdr10 asked, both",       1, 1, 1, 1);
+   expect_hdr("hdr10 asked, scrgb only", 1, 0, 1, 2);
+   expect_hdr("hdr10 asked, hdr10 only", 1, 1, 0, 1);
+   expect_hdr("hdr10 asked, neither",    1, 0, 0, 0);
+   expect_hdr("scrgb asked, both",       2, 1, 1, 2);
+   expect_hdr("scrgb asked, hdr10 only", 2, 1, 0, 1);
+   expect_hdr("scrgb asked, scrgb only", 2, 0, 1, 2);
+   expect_hdr("scrgb asked, neither",    2, 0, 0, 0);
+   expect_hdr("out of range",            3, 1, 1, 0);
 
    if (failures)
    {

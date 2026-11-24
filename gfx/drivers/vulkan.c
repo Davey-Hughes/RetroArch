@@ -621,6 +621,9 @@ typedef struct vk
     * under a live driver, and the swapchain-recreate chain rebuild
     * on the video thread reads this instead of live settings. */
    unsigned hdr_mode_latched;
+   /* The HDR mode the swapchain was last made, or asked to be made
+    * again, for. */
+   unsigned hdr_mode_asked;
    /* The scanlines/subpixel pokes only pushed into the live chains;
     * a chain rebuilt on swapchain recreate re-read live settings for
     * them (and forgot nothing only by that accident). Latched here
@@ -7136,7 +7139,7 @@ static bool vulkan_init_default_filter_chain(vk_t *vk)
    {
       bool emits_hdr10 = vulkan_chain_emits_hdr10(vk, vk->filter_chain_default);
       bool emits_hdr16 = vulkan_chain_emits_hdr16(vk, vk->filter_chain_default);
-      unsigned hdr_mode = vk->hdr_mode_latched;
+      unsigned hdr_mode = (vk->context->flags & VK_CTX_FLAG_HDR_SCRGB) ? 2 : 1;
 
       vulkan_filter_chain_set_paper_white_nits(vk->filter_chain_default, vk->hdr.ubo_values.paper_white_nits);
       vulkan_filter_chain_set_expand_gamut(vk->filter_chain_default, vk->hdr.ubo_values.expand_gamut);
@@ -7146,8 +7149,6 @@ static bool vulkan_init_default_filter_chain(vk_t *vk)
       if (hdr_mode == 2)
       {
          /* scRGB mode: swapchain is always RGBA16F + extended linear sRGB */
-         vk->context->flags |= VK_CTX_FLAG_HDR_SCRGB;
-
          if (emits_hdr16)
          {
             /* Shader outputs RGBA16F (scRGB): passthrough to swapchain */
@@ -7170,8 +7171,6 @@ static bool vulkan_init_default_filter_chain(vk_t *vk)
       }
       else /* hdr_mode == 1, HDR10 */
       {
-         vk->context->flags &= ~VK_CTX_FLAG_HDR_SCRGB;
-
          if (emits_hdr10 || emits_hdr16)
          {
             /* Shader outputs HDR10 PQ (10-bit or RGBA16F): passthrough.
@@ -7498,7 +7497,7 @@ static bool vulkan_init_filter_chain_preset(vk_t *vk, const char *shader_path)
    {
       bool emits_hdr10 = vulkan_chain_emits_hdr10(vk, vk->filter_chain);
       bool emits_hdr16 = vulkan_chain_emits_hdr16(vk, vk->filter_chain);
-      unsigned hdr_mode = vk->hdr_mode_latched;
+      unsigned hdr_mode = (vk->context->flags & VK_CTX_FLAG_HDR_SCRGB) ? 2 : 1;
 
       vulkan_filter_chain_set_paper_white_nits(vk->filter_chain, vk->hdr.ubo_values.paper_white_nits);
       vulkan_filter_chain_set_expand_gamut(vk->filter_chain, vk->hdr.ubo_values.expand_gamut);
@@ -7508,8 +7507,6 @@ static bool vulkan_init_filter_chain_preset(vk_t *vk, const char *shader_path)
       if (hdr_mode == 2)
       {
          /* scRGB mode: swapchain is always RGBA16F + extended linear sRGB */
-         vk->context->flags |= VK_CTX_FLAG_HDR_SCRGB;
-
          if (emits_hdr16)
          {
             /* Shader outputs RGBA16F (scRGB): passthrough to swapchain */
@@ -7553,8 +7550,6 @@ static bool vulkan_init_filter_chain_preset(vk_t *vk, const char *shader_path)
       }
       else /* hdr_mode == 1, HDR10 */
       {
-         vk->context->flags &= ~VK_CTX_FLAG_HDR_SCRGB;
-
          if (emits_hdr10 || emits_hdr16)
          {
             /* Shader outputs HDR10 PQ (10-bit or RGBA16F): passthrough.
@@ -7608,8 +7603,6 @@ static bool vulkan_init_filter_chain(vk_t *vk)
             vulkan_set_hdr_inverse_tonemap(vk, vk->filter_chain_default, true);
             vulkan_set_hdr10(vk, vk->filter_chain_default, true);
          }
-         /* Stock shader does not need 16-bit float swapchain. */
-         vk->context->flags &= ~VK_CTX_FLAG_HDR_SCRGB;
       }
 #endif /* VULKAN_HDR_SWAPCHAIN */
 
@@ -8694,6 +8687,7 @@ static void *vulkan_init(const video_info_t *video)
     * set_rotation keeps it current from here on. */
    vk->rotation_raw    = retroarch_get_rotation();
    vk->hdr_mode_latched = config_get_ptr()->uints.video_hdr_mode;
+   vk->hdr_mode_asked   = vk->hdr_mode_latched;
    ctx_driver                         = vulkan_get_context(vk, settings);
    if (!ctx_driver)
    {
@@ -9532,7 +9526,7 @@ static bool vulkan_shader_load_step(void *data,
          settings_t *settings = config_get_ptr();
          bool emits_hdr10 = vulkan_chain_emits_hdr10(vk, vk->filter_chain);
          bool emits_hdr16 = vulkan_chain_emits_hdr16(vk, vk->filter_chain);
-         unsigned hdr_mode = settings->uints.video_hdr_mode;
+         unsigned hdr_mode = (vk->context->flags & VK_CTX_FLAG_HDR_SCRGB) ? 2 : 1;
 
          vulkan_filter_chain_set_paper_white_nits(
                vk->filter_chain,
@@ -9549,7 +9543,6 @@ static bool vulkan_shader_load_step(void *data,
 
          if (hdr_mode == 2)
          {
-            vk->context->flags |= VK_CTX_FLAG_HDR_SCRGB;
             vulkan_set_hdr_inverse_tonemap(vk, vk->filter_chain, false);
             vulkan_set_hdr10(vk, vk->filter_chain, false);
 
@@ -9577,8 +9570,6 @@ static bool vulkan_shader_load_step(void *data,
          }
          else /* hdr_mode == 1, HDR10 */
          {
-            vk->context->flags &= ~VK_CTX_FLAG_HDR_SCRGB;
-
             if (emits_hdr10 || emits_hdr16)
             {
                vulkan_set_hdr_inverse_tonemap(vk, vk->filter_chain, false);
@@ -10962,46 +10953,21 @@ static void vulkan_apply_pending_resize(vk_t *vk,
       const video_frame_info_t *video_info)
 {
 #ifdef VULKAN_HDR_SWAPCHAIN
-   bool video_hdr_enable;
-#endif
-#ifdef VULKAN_HDR_SWAPCHAIN
-   video_hdr_enable = (video_driver_get_disp_flags() & VIDEO_FLAG_HDR_SUPPORT) && (video_info->hdr_mode > 0);
-   if (       (vk->flags & VK_FLAG_SHOULD_RESIZE)
-         || (((vk->context->flags & VK_CTX_FLAG_HDR_ENABLE) > 0)
-         != video_hdr_enable))
-#else
-   if (vk->flags & VK_FLAG_SHOULD_RESIZE)
-#endif /* VULKAN_HDR_SWAPCHAIN */
+   /* HDR is the format pick's to turn on or off: a change of the mode
+    * asked has the swapchain made again, once. */
+   if (video_info->hdr_mode != vk->hdr_mode_asked)
    {
-#ifdef VULKAN_HDR_SWAPCHAIN
-      /* The off-screen buffers are not thrown away here any more:
-       * vulkan_hdr_buffers_init() below remakes them if the swapchain
-       * that comes out of this has another size, and only then. */
-      if (video_hdr_enable)
-         vk->context->flags |= VK_CTX_FLAG_HDR_ENABLE;
-      else
-         vk->context->flags &= ~VK_CTX_FLAG_HDR_ENABLE;
-
+      vk->hdr_mode_asked  = video_info->hdr_mode;
+      vk->context->flags |= VK_CTX_FLAG_INVALID_SWAPCHAIN;
+      vk->flags          |= VK_FLAG_SHOULD_RESIZE;
+   }
 #endif /* VULKAN_HDR_SWAPCHAIN */
-
-#ifdef VULKAN_HDR_SWAPCHAIN
-      /* Force swapchain recreation if the HDR format mode changed.
-       * Without this, vulkan_create_swapchain's early-return check
-       * (same width/height/interval) would skip the recreation. */
-      {
-         bool need_16bit = (vk->context->flags & VK_CTX_FLAG_HDR_SCRGB) != 0;
-         bool have_16bit = vk->context->swapchain_format
-            == VK_FORMAT_R16G16B16A16_SFLOAT;
-         if (need_16bit != have_16bit)
-            vk->context->flags |= VK_CTX_FLAG_INVALID_SWAPCHAIN;
-      }
-#endif
-
-      /* Same hazard as the HDR case above, for the SDR path: changing
-       * the requested bit depth does not change width/height/interval,
-       * so vulkan_create_swapchain would early-return and keep the old
-       * format.  Force recreation when the depth we want and the depth
-       * we have disagree. */
+   if (vk->flags & VK_FLAG_SHOULD_RESIZE)
+   {
+      /* On the SDR path, changing the requested bit depth does not
+       * change width/height/interval, so vulkan_create_swapchain would
+       * early-return and keep the old format.  Force recreation when the
+       * depth we want and the depth we have disagree. */
       {
          bool want_10bit        = (video_info->swapchain_bit_depth == 2);
          bool have_10bit        =

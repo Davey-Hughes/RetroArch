@@ -21,9 +21,11 @@
  */
 
 /* A software core with no content: a moving XRGB8888 gradient, so the
- * frontend has a game frame to run the shader preset on every frame. */
+ * frontend has a game frame to run the shader preset on every frame.
+ * With HDR_UI_CORE_PQ=1 it sends a constant HDR10_2101010 grey instead. */
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <libretro.h>
@@ -35,6 +37,7 @@ static retro_environment_t  environ_cb;
 static retro_video_refresh_t video_cb;
 static uint32_t             frame[W * H];
 static unsigned             tick;
+static int                  pq;
 
 RETRO_API void retro_set_environment(retro_environment_t cb)
 {
@@ -85,9 +88,11 @@ RETRO_API void retro_run(void)
    unsigned x, y;
    for (y = 0; y < H; y++)
       for (x = 0; x < W; x++)
-         frame[y * W + x] = ((uint32_t)((x + tick) & 0xff) << 16)
-                          | ((uint32_t)(y & 0xff) << 8)
-                          | (uint32_t)((x ^ y) & 0xff);
+         frame[y * W + x] = pq
+            ? (3u << 30) | (512u << 20) | (512u << 10) | 512u
+            : ((uint32_t)((x + tick) & 0xff) << 16)
+              | ((uint32_t)(y & 0xff) << 8)
+              | (uint32_t)((x ^ y) & 0xff);
    tick++;
    video_cb(frame, W, H, W * sizeof(uint32_t));
 }
@@ -116,7 +121,11 @@ RETRO_API void retro_cheat_set(unsigned index, bool enabled, const char *code)
 RETRO_API bool retro_load_game(const struct retro_game_info *game)
 {
    enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
+   const char *env = getenv("HDR_UI_CORE_PQ");
    (void)game;
+   pq = env && !strcmp(env, "1");
+   if (pq)
+      fmt = RETRO_PIXEL_FORMAT_HDR10_2101010;
    return environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt);
 }
 
