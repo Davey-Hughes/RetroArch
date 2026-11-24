@@ -2947,11 +2947,23 @@ enum retro_vr_reference_space {
  * views lays them out, shades and composes them itself. Any other frontend
  * shows the packed frame as it is, so the core needs no second code path.
  *
- * Rules:
+ * Rules. The frontend refuses a map that breaks one, except those marked
+ * "Left out": a screen that breaks one of them is left out and the rest of
+ * the map is accepted.
  *  - Call from \c retro_load_game() or \c retro_run(). The map applies from
  *    the next \c retro_video_refresh_t call and the frontend copies it.
  *    Cores should send it every \c retro_run(): an unchanged map costs a
- *    comparison, and resending covers state loads and run-ahead.
+ *    comparison, and resending covers state loads and run-ahead. A map
+ *    sent from \c retro_load_game() is checked against the status at that
+ *    time, which may read 0 there, so the core sends it again from
+ *    \c retro_run().
+ *  - \c RETRO_ENVIRONMENT_SET_ROTATION applies at once. A core that
+ *    changes rotation while a map is in effect calls it and sends the
+ *    matching map in the same \c retro_run(), before the frame it
+ *    describes. Where the frontend draws on a thread of its own, one frame
+ *    already queued may be drawn at the new rotation with the old
+ *    rectangles; only a core that changes rotation while it uses UPRIGHT
+ *    screens or rectangles that depend on rotation meets this.
  *  - Everything the map points at (views, screens, names, image structs,
  *    and pixels that are not a lent buffer) is read during the call and
  *    may be freed or changed once it returns. A name may change between
@@ -2975,9 +2987,14 @@ enum retro_vr_reference_space {
  *    screen has one \c RETRO_VIDEO_VIEW_EYE_NONE view, or one
  *    \c RETRO_VIDEO_VIEW_EYE_LEFT and one \c RETRO_VIDEO_VIEW_EYE_RIGHT view
  *    of equal width and height.
- *  - \c aspect_ratio is the view's display aspect ratio. At or below zero
- *    means \c width / \c height. Above zero it must be from 0.01 to 100,
- *    or the map is invalid.
+ *  - \c aspect_ratio is the view's display aspect ratio in the frame's
+ *    orientation, before \c RETRO_ENVIRONMENT_SET_ROTATION: for a view the
+ *    rotation turns, the aspect of its pixels as drawn, which the frontend
+ *    inverts for an odd rotation. At or below zero means \c width /
+ *    \c height. Above zero it must be from 0.01 to 100, or the map is
+ *    invalid. An image's \c aspect_ratio reads the same way; an image
+ *    screen that is not a LAYER is never turned, so its aspect is as
+ *    displayed.
  *  - \c retro_game_geometry keeps describing the whole packed frame.
  *    \c RETRO_ENVIRONMENT_SET_ROTATION rotates each view on its own,
  *    except on a \c RETRO_VIDEO_SCREEN_FLAG_UPRIGHT screen.
@@ -3003,10 +3020,11 @@ enum retro_vr_reference_space {
  *    \c swap_with and \c RETRO_VIDEO_SCREEN_STATE_ABSENT. \c num_screens
  *    may change between maps; a display that can return stays in the
  *    count as ABSENT.
- *  - A screen with an \c image has no views, is
+ *  - A screen with an \c image has no views and is
  *    \c RETRO_VIDEO_VIEW_EYE_NONE and \c RETRO_VIDEO_SCREEN_FLAG_NO_INPUT
- *    in effect (its pixels are not in the frame input is measured in),
- *    and is refused unless \c RETRO_VIDEO_VIEWS_STATUS_IMAGES is set.
+ *    in effect (its pixels are not in the frame input is measured in).
+ *    Left out: an image screen while \c RETRO_VIDEO_VIEWS_STATUS_IMAGES
+ *    is not set.
  *  - A screen without an image that is ACTIVE or BLANK has views, by the
  *    rule above. A BLANK screen's rectangle gives its size; its pixels are
  *    not read. An ABSENT screen may have no views and no image.
@@ -3028,37 +3046,120 @@ enum retro_vr_reference_space {
  *  - \c swap_with is 0, or from 1 to \c num_screens and not the screen
  *    itself. A screen belongs to at most one pair; one side declaring the
  *    pair is enough, and two sides that disagree make the map invalid.
- *  - \c order is 0 on every screen or non-zero on every screen. Equal
- *    values are placed in screen-number order.
+ *  - \c order is 0 on every screen or non-zero on every screen, counting
+ *    only screens whose \c show is not LAYER. Equal values are placed in
+ *    screen-number order.
  *  - \c RETRO_ENVIRONMENT_SET_ROTATION does not turn a screen with
- *    \c RETRO_VIDEO_SCREEN_FLAG_UPRIGHT, nor an image screen. \c anchor
- *    and \c size are measured on the display, after rotation.
- *  - An image's \c width and \c height are non-zero, its \c format is
- *    \c RETRO_PIXEL_FORMAT_XRGB8888 or \c RETRO_PIXEL_FORMAT_RGB565, and
- *    \c pitch is at least \c width times the pixel size. When \c data is
- *    a lent buffer, \c width, \c height and \c format equal those passed
- *    to \c RETRO_ENVIRONMENT_GET_VIDEO_SCREEN_BUFFER and \c pitch is the
- *    one it returned. A frontend may refuse an image larger than it
- *    supports.
+ *    \c RETRO_VIDEO_SCREEN_FLAG_UPRIGHT, nor an image screen that is not
+ *    a LAYER. \c anchor and \c size are measured on the display, after
+ *    rotation.
+ *  - Left out: a screen with \c RETRO_VIDEO_SCREEN_FLAG_UPRIGHT that the
+ *    frontend cannot draw upright, while the core's rotation (set with
+ *    \c RETRO_ENVIRONMENT_SET_ROTATION, not the user's setting) is not 0.
+ *    The rotation is the one set when the map arrives, so a core calls
+ *    \c RETRO_ENVIRONMENT_SET_ROTATION first. An image screen that is not
+ *    a LAYER is never turned and is not affected.
+ *  - An image's \c width and \c height are non-zero and \c pitch is at
+ *    least \c width times the pixel size. When \c data is a lent buffer,
+ *    it is the one lent for that screen, \c width, \c height and
+ *    \c format equal those passed to
+ *    \c RETRO_ENVIRONMENT_GET_VIDEO_SCREEN_BUFFER and \c pitch is the one
+ *    it returned; \c data points nowhere else into a buffer of the
+ *    frontend's. Left out: a \c format the frontend does not take (it
+ *    takes \c RETRO_PIXEL_FORMAT_XRGB8888 and
+ *    \c RETRO_PIXEL_FORMAT_RGB565; formats are an open list, as blends
+ *    are), an image larger than it supports, and pixels it cannot take
+ *    for want of memory.
  *  - The frontend keeps a screen's last image until an accepted map has
  *    no image for that screen (a map with \c num_views 0 has none), or
  *    content unloads. Nothing else drops it: not BLANK, not ABSENT with
- *    the image still set, not a refused map, not a restart of the video
- *    driver.
- *  - \c data is not NULL for a screen whose image the frontend does not
- *    hold, and whenever \c serial differs from the last one it took. With
- *    an unchanged \c serial, \c data is not read. A change of size or
- *    format comes with a new \c serial.
+ *    the image still set, not a refused map, not a map that leaves the
+ *    screen out, not a restart of the video driver.
+ *  - NULL \c data needs the image the frontend holds. Left out: NULL
+ *    \c data for a screen whose image it does not hold, or with a
+ *    \c serial other than the last one it took. With an unchanged
+ *    \c serial, \c data is not read. A change of size or format comes
+ *    with a new \c serial.
  *  - \c serial is the core's own counter, not emulated state: it is not
  *    saved in a savestate. After a state load the core changes it if the
  *    pixels differ from the ones it last sent. Changing it on every load
  *    is correct too, at an upload per frame under run-ahead and rewind.
+ *  - \c show may be \c RETRO_VIDEO_SCREEN_SHOW_LAYER. A LAYER's \c base
+ *    is not the screen itself and names a screen whose own show is SHOWN
+ *    or HIDDEN: the stack's root. The root and every LAYER whose \c base
+ *    it is form one stack. There are no stacks within stacks.
+ *  - Left out: a LAYER whose \c blend the frontend does not draw,
+ *    including a value it does not know. \c blend and an image's
+ *    \c format are the screen fields where an unknown value does not
+ *    refuse the map, which keeps their lists open.
+ *  - On a LAYER, \c x, \c y, \c width and \c height are finite and from
+ *    -64 to 64. \c width and \c height are both 0 (the rectangle is
+ *    \c base's extent, and \c x and \c y are ignored) or both above 0,
+ *    except on a LAYER with an image, where one may be 0 and the other
+ *    above 0.
+ *  - That zero side is derived from the image's aspect (its
+ *    \c aspect_ratio above 0, else \c width / \c height) and the root's
+ *    aspect, both in the rectangle's frame, so the image keeps its shape
+ *    whatever the root's aspect. The coordinate on that axis, \c x for a
+ *    derived width and \c y for a derived height, is then the
+ *    rectangle's centre, not its edge. A derived side is held at 64.
+ *  - On a LAYER, \c swap_with and \c group are 0, and \c opacity 0 is
+ *    full. \c size, \c anchor, \c order, EMPHASIS, GROUP_VERTICAL and
+ *    INTEGER are ignored; UPRIGHT is honoured. LAYER_OFF is ignored on a
+ *    screen that is not a LAYER.
+ *  - A core sends LAYER screens only while some
+ *    \c RETRO_VIDEO_VIEWS_STATUS_BLEND_ flag is set. A frontend that knows
+ *    LAYER accepts them at any time and leaves out those it does not draw.
+ *  - A layer the core cannot draw (no art file for this game, a lamp it
+ *    does not emulate) keeps its screen number as an ABSENT LAYER with no
+ *    image and a zero rectangle. An ABSENT layer keeps its place in the
+ *    stack's bounds, and a zero rectangle is the root's own extent, so
+ *    the placeholder adds nothing to them.
+ *  - \c RETRO_VIDEO_SCREEN_FORMAT_ARGB8888 is taken only on a LAYER's
+ *    image, and only while the status flag of that layer's own \c blend
+ *    is set; under ADD and MULTIPLY the alpha weights the colour.
+ *    Elsewhere the screen is left out, as an image screen is while
+ *    \c RETRO_VIDEO_VIEWS_STATUS_IMAGES is not set.
+ *  - A stack turns as one, except its UPRIGHT layers.
+ *    \c RETRO_ENVIRONMENT_SET_ROTATION turns the root and every layer
+ *    without UPRIGHT together, about the stack, image layers included;
+ *    their rectangles are in the root's frame before rotation. It does
+ *    not turn a layer with UPRIGHT, whose rectangle is in the root's
+ *    displayed frame, after rotation. Each layer has its own flags.
+ *  - Under an UPRIGHT root nothing in the stack turns. The root's frame is
+ *    then also its displayed frame, so UPRIGHT on its layers changes
+ *    nothing.
+ *  - The user's rotation setting turns the whole stack, UPRIGHT layers
+ *    included.
+ *  - Art at another orientation (a quarter turn off both frames, or
+ *    mirrored) has no flag; the core turns it into one of the two frames
+ *    itself.
+ *  - \c x, \c y, \c width, \c height, \c blend, \c z and UPRIGHT may
+ *    change between maps. A rectangle change moves the stack's bounds and
+ *    re-flows its place; it is not for animation. A core that changes
+ *    rotation sends its UPRIGHT layers' rectangles again, for the new
+ *    displayed frame, in the same \c retro_run(), by the rule above. A
+ *    stack without UPRIGHT layers does not depend on rotation.
+ *  - A screen that is left out is not drawn and, if it is a LAYER, is not
+ *    in its stack's bounds; its number and the user's settings for it
+ *    stay. Nothing is taken from it: not its pixels, not its \c serial,
+ *    not a lent buffer handed in on it, whose lend stays open. An image
+ *    the frontend holds for it is kept, so NULL \c data with the held
+ *    \c serial draws it again once the screen is no longer left out.
+ *    When \c screens_left_out is not NULL, the frontend sets that
+ *    unsigned, on accepting the map, to the screens it left out, bit n
+ *    for screen n; a refused map leaves it as it was. It names only
+ *    screens this map's rules left out at the call: not the user's
+ *    choices, not \c state, not an output that cannot draw a screen, not
+ *    a status or rotation change after the call.
  *  - The frontend clears the map when content unloads.
  *
  * @param[in] data <tt>const struct retro_video_views *</tt>.
- * @return \c true if the map was accepted. \c false for an invalid map,
- * which leaves the previous map in effect, or from a frontend that does
- * not know this call. Either way the core keeps sending the packed frame.
+ * @return \c true if the map was accepted. A screen the frontend cannot
+ * take is left out, not refused, and \c screens_left_out names it.
+ * \c false for an invalid map, which leaves the previous map in effect,
+ * or from a frontend that does not know this call. Either way the core
+ * keeps sending the packed frame.
  * @see retro_video_views
  * @see RETRO_ENVIRONMENT_GET_VIDEO_VIEWS_STATUS
  */
@@ -3069,6 +3170,11 @@ enum retro_vr_reference_space {
  *
  * The answer can change at any time (the user's stereo mode, HDR output,
  * the video driver), so a core asks every \c retro_run(), before it draws.
+ * It is reliable from the first \c retro_run(): during
+ * \c retro_load_game() it may read 0 where views are presented later, and
+ * \c RETRO_ENVIRONMENT_GET_VIDEO_SCREEN_BUFFER may return false there, so
+ * a core asks for its lends from \c retro_run() and sends its map there
+ * again.
  *  - With \c RETRO_VIDEO_VIEWS_STATUS_PRESENTS, the core may pack its frame
  *    for views and send the map with \c RETRO_ENVIRONMENT_SET_VIDEO_VIEWS
  *    before the \c retro_video_refresh_t call of the frame it describes.
@@ -3083,14 +3189,19 @@ enum retro_vr_reference_space {
  *    the packed frame elsewhere.
  *  - With \c RETRO_VIDEO_VIEWS_STATUS_SCREENS, the frontend honours each
  *    screen's name, show, state, \c RETRO_VIDEO_SCREEN_FLAG_NO_INPUT and
- *    \c RETRO_VIDEO_SCREEN_FLAG_UPRIGHT; the other fields of
+ *    \c RETRO_VIDEO_SCREEN_FLAG_UPRIGHT (a screen it cannot draw upright
+ *    is left out while the core's rotation is not 0); the other fields of
  *    \c retro_video_screen are hints. A core that relies on HIDDEN or
  *    OVER sends its side screens only while this flag is set, and keeps
  *    its own overlay otherwise. A core that only adds names may send them
  *    always.
  *  - With \c RETRO_VIDEO_VIEWS_STATUS_IMAGES, the frontend draws image
- *    screens and lends buffers for them. Without it, a map with an image
- *    screen is refused.
+ *    screens and lends buffers for them. Without it, image screens are
+ *    left out of a map, not refused.
+ *  - Neither SCREENS nor IMAGES depends on the core's rotation.
+ *  - With a \c RETRO_VIDEO_VIEWS_STATUS_BLEND_ flag, the frontend draws
+ *    LAYER screens with that blend. A core sends LAYER screens only while
+ *    one is set.
  *
  * @param[out] data <tt>unsigned *</tt>. Set to a combination of the
  * \c RETRO_VIDEO_VIEWS_STATUS_ flags.
@@ -3113,12 +3224,20 @@ enum retro_vr_reference_space {
  * map was accepted, headset or not. */
 #define RETRO_VIDEO_VIEWS_STATUS_HMD      (1 << 2)
 /* The frontend honours retro_video_views::screens: names, show, state,
- * RETRO_VIDEO_SCREEN_FLAG_NO_INPUT and RETRO_VIDEO_SCREEN_FLAG_UPRIGHT.
- * Only set together with PRESENTS. */
+ * RETRO_VIDEO_SCREEN_FLAG_NO_INPUT and RETRO_VIDEO_SCREEN_FLAG_UPRIGHT
+ * (a screen it cannot draw upright is left out while the core's
+ * rotation is not 0). Only set together with PRESENTS. */
 #define RETRO_VIDEO_VIEWS_STATUS_SCREENS  (1 << 3)
 /* The frontend draws image screens and lends buffers for them. Only set
  * together with SCREENS. */
 #define RETRO_VIDEO_VIEWS_STATUS_IMAGES   (1 << 4)
+/* The frontend draws LAYER screens with this blend in its main window.
+ * Only set together with SCREENS. A layer whose blend has no flag set
+ * is left out. A core sends LAYER screens only while one is set. */
+#define RETRO_VIDEO_VIEWS_STATUS_BLEND_ALPHA    (1 << 5)
+#define RETRO_VIDEO_VIEWS_STATUS_BLEND_ADD      (1 << 6)
+#define RETRO_VIDEO_VIEWS_STATUS_BLEND_MULTIPLY (1 << 7)
+#define RETRO_VIDEO_VIEWS_STATUS_BLEND_NONE     (1 << 8)
 
 /* The eye a view shows; see RETRO_ENVIRONMENT_SET_VIDEO_VIEWS. */
 #define RETRO_VIDEO_VIEW_EYE_NONE  0
@@ -3163,10 +3282,12 @@ struct retro_video_view
 /* retro_video_screen::show, a default the user's choice overrides. HIDDEN:
  * drawn nowhere. OVER: drawn over screen base, at anchor, only where and
  * while base is drawn; an output that cannot draw one screen over another
- * treats it as HIDDEN. */
+ * treats it as HIDDEN. LAYER: drawn in screen base's stack, at x, y, width
+ * and height in base's extent, with blend, in z order. */
 #define RETRO_VIDEO_SCREEN_SHOW_SHOWN  0
 #define RETRO_VIDEO_SCREEN_SHOW_HIDDEN 1
 #define RETRO_VIDEO_SCREEN_SHOW_OVER   2
+#define RETRO_VIDEO_SCREEN_SHOW_LAYER  3
 
 /* retro_video_screen::state, live. BLANK keeps the screen's place and draws
  * it black; ABSENT takes it out of the layout. */
@@ -3192,7 +3313,9 @@ struct retro_video_view
  * owner plays locally. SHARP, INTEGER: nearest filtering and integer scale
  * by default. GROUP_VERTICAL: on a group's lowest-numbered screen, the
  * group stacks top to bottom. UPRIGHT: RETRO_ENVIRONMENT_SET_ROTATION does
- * not turn the screen. */
+ * not turn the screen; a frontend that cannot draw it upright leaves it
+ * out while the core's rotation is not 0. LAYER_OFF: on a LAYER, off until
+ * the user turns it on; ignored on other screens. */
 #define RETRO_VIDEO_SCREEN_FLAG_NO_INPUT       (1 << 0)
 #define RETRO_VIDEO_SCREEN_FLAG_EMPHASIS       (1 << 1)
 #define RETRO_VIDEO_SCREEN_FLAG_PRIVATE        (1 << 2)
@@ -3200,6 +3323,22 @@ struct retro_video_view
 #define RETRO_VIDEO_SCREEN_FLAG_INTEGER        (1 << 4)
 #define RETRO_VIDEO_SCREEN_FLAG_GROUP_VERTICAL (1 << 5)
 #define RETRO_VIDEO_SCREEN_FLAG_UPRIGHT        (1 << 6)
+#define RETRO_VIDEO_SCREEN_FLAG_LAYER_OFF      (1 << 7)
+
+/* retro_video_screen::blend, read on a LAYER screen. An open list: a
+ * frontend leaves out a layer whose blend it does not draw and says
+ * which it draws with the RETRO_VIDEO_VIEWS_STATUS_BLEND_ flags.
+ * Arithmetic is on stored 8-bit values, not linear light. */
+#define RETRO_VIDEO_SCREEN_BLEND_ALPHA    0
+#define RETRO_VIDEO_SCREEN_BLEND_ADD      1
+#define RETRO_VIDEO_SCREEN_BLEND_MULTIPLY 2
+#define RETRO_VIDEO_SCREEN_BLEND_NONE     3
+
+/* For image screens only: 32 bits per pixel in native byte order,
+ * alpha in the top 8 bits and red, green, blue below, as in
+ * RETRO_PIXEL_FORMAT_XRGB8888. Straight alpha, not premultiplied.
+ * Outside enum retro_pixel_format's values. */
+#define RETRO_VIDEO_SCREEN_FORMAT_ARGB8888 0x100
 
 /**
  * The pixels of a screen that is not in the frame, as the player sees
@@ -3213,7 +3352,8 @@ struct retro_video_screen_image
    unsigned width;
    unsigned height;
    size_t pitch;          /* bytes per row */
-   unsigned format;       /* RETRO_PIXEL_FORMAT_XRGB8888 or _RGB565 */
+   unsigned format;       /* RETRO_PIXEL_FORMAT_XRGB8888 or _RGB565;
+                             RETRO_VIDEO_SCREEN_FORMAT_ARGB8888 on a LAYER */
    float aspect_ratio;    /* as retro_video_view::aspect_ratio */
    unsigned serial;       /* changes exactly when the pixels change */
 };
@@ -3229,10 +3369,12 @@ struct retro_video_screen
    unsigned flags;        /* RETRO_VIDEO_SCREEN_FLAG_ */
    unsigned state;        /* RETRO_VIDEO_SCREEN_STATE_, live */
    unsigned show;         /* RETRO_VIDEO_SCREEN_SHOW_, a default */
-   unsigned base;         /* screen it is sized against; OVER: drawn over */
+   unsigned base;         /* screen it is sized against; OVER: drawn over;
+                             LAYER: the stack's root */
    float size;            /* share of base's shown height; 0 = default */
    unsigned anchor;       /* SHOW_OVER: RETRO_VIDEO_SCREEN_ANCHOR_ */
-   float opacity;         /* SHOW_OVER: 0 = the frontend's default */
+   float opacity;         /* SHOW_OVER: 0 = the frontend's default;
+                             LAYER: 0 = full */
    unsigned order;        /* layout position, 1 and up; 0 on every screen =
                              screen number */
    unsigned owners;       /* bit n: on input port n (a VMU: its
@@ -3240,6 +3382,12 @@ struct retro_video_screen
    unsigned swap_with;    /* screen + 1; 0 = none */
    unsigned group;        /* panorama group, 1 and up; 0 = none */
    const struct retro_video_screen_image *image; /* NULL: from views */
+   unsigned blend;        /* LAYER: RETRO_VIDEO_SCREEN_BLEND_ */
+   unsigned z;            /* LAYER: order in base's stack, lowest first */
+   float x;               /* LAYER: rectangle in base's extent, where */
+   float y;               /*   base spans 0 to 1 both ways; width and */
+   float width;           /*   height 0: base's extent; one of them 0 */
+   float height;          /*   on an image: from the image's aspect */
 };
 
 /**
@@ -3272,6 +3420,8 @@ struct retro_video_views
    /** Read only with RETRO_VIDEO_VIEWS_FLAG_SCREENS. */
    const struct retro_video_screen *screens;
    unsigned num_screens;
+   unsigned *screens_left_out; /* NULL, or set when the map is accepted:
+                                  bit n: screen n was left out */
 };
 
 /**
@@ -3279,24 +3429,36 @@ struct retro_video_views
  * to the frontend without a copy.
  *
  *  - The buffer has the asked size and format and undefined contents, so
- *    the core writes every pixel.
+ *    the core writes every pixel. \c RETRO_VIDEO_SCREEN_FORMAT_ARGB8888
+ *    is lent while any \c RETRO_VIDEO_VIEWS_STATUS_BLEND_ flag is set,
+ *    since this call does not know the screen's blend.
  *  - \c screen is below \c RETRO_VIDEO_SCREENS_MAX and need not be in a
  *    map yet. The buffer is handed in on that screen only.
- *  - The buffer is the core's until the \c retro_run() or
- *    \c retro_load_game() call it was lent in returns, until a second
- *    call for the same screen takes it back, or until a
- *    \c RETRO_ENVIRONMENT_SET_VIDEO_VIEWS call whose image \c data points
- *    at it with a new \c serial returns true, whichever is first. After
- *    that the core must not touch it. A buffer not handed in is the
- *    frontend's again; the core asks for another.
- *  - A refused hand-in does not end the lend.
+ *  - The lend stays open until a \c RETRO_ENVIRONMENT_SET_VIDEO_VIEWS
+ *    call takes the buffer on that screen (it returns true, the image's
+ *    \c data points at the buffer with a new \c serial, and the screen is
+ *    not left out), until a second call for the same screen takes it
+ *    back, or until content unloads. After that the core must not touch
+ *    it.
+ *  - Nothing else ends the lend: not the return of the \c retro_run() or
+ *    \c retro_load_game() call it was lent in, not a refused map or a map
+ *    that leaves the screen out, not a restart or switch of the video
+ *    driver, not the status losing \c RETRO_VIDEO_VIEWS_STATUS_IMAGES.
+ *  - The core may write the buffer from a thread of its own. It still
+ *    makes this call and \c RETRO_ENVIRONMENT_SET_VIDEO_VIEWS from
+ *    \c retro_load_game() or \c retro_run(), and finishes writing before
+ *    it hands the buffer in, asks again for that screen, or returns from
+ *    \c retro_unload_game().
+ *  - At most one lend is open per screen, for each instance of the core.
+ *    A frontend lends only memory it keeps valid that long.
  *  - The frontend never waits for a buffer: when none is free it returns
  *    false. All buffers are freed when content unloads.
  *
  * @param[in,out] data <tt>struct retro_video_screen_buffer *</tt>.
  * @return \c true with \c data and \c pitch set. \c false when the
- * frontend cannot lend one now, or does not know this call; the core then
- * passes its own pixels, which the frontend copies.
+ * frontend cannot lend one now (during \c retro_load_game() it may not),
+ * or does not know this call; the core then passes its own pixels, which
+ * the frontend copies.
  * @see retro_video_screen_image
  */
 #define RETRO_ENVIRONMENT_GET_VIDEO_SCREEN_BUFFER (108 | RETRO_ENVIRONMENT_EXPERIMENTAL)
@@ -3309,7 +3471,7 @@ struct retro_video_screen_buffer
    unsigned screen;                /* in */
    unsigned width;                 /* in */
    unsigned height;                /* in */
-   unsigned format;                /* in, RETRO_PIXEL_FORMAT_ */
+   unsigned format;                /* in, as retro_video_screen_image's */
    void *data;                     /* out */
    size_t pitch;                   /* out */
 };
