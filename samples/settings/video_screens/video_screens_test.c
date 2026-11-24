@@ -5593,6 +5593,37 @@ static void test_images_main_again(void)
    window_test_end();
 }
 
+/* The second instance's store freed while drawn: the NULL refresh before
+ * a map is arranged names main's picture, not a freed texture */
+static void test_images_second_freed_repeat(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   static uint32_t blue[48 * 32];
+   struct retro_video_screen_image image;
+   struct retro_video_views map;
+   unsigned i;
+   images_test_frames_begin();
+   for (i = 0; i < 48 * 32; i++)
+      blue[i] = 0x000000FFu;
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1));
+   CHECK(images_test_hand_second(blue, 1));
+   window_test_run();
+   CHECK(window_test_seen_views.image_tex[2] == 101);
+   screens_test_dsi(&map, views, screens, &image);
+   image.data = blue;
+   video_screen_images_set_caller(VIDEO_SCREEN_IMAGES_SECOND);
+   CHECK(video_driver_set_views(&map));
+   video_screen_images_set_caller(VIDEO_SCREEN_IMAGES_MAIN);
+   images_test_calls_reset();
+   video_screen_images_free_owner(VIDEO_SCREEN_IMAGES_SECOND);
+   CHECK(images_test_unloads == 1 && images_test_unloaded == 101);
+   images_test_repeat();
+   CHECK(screens_test_image_placed(2, 0) == 1);
+   CHECK(window_test_seen_views.image_tex[2] == 102);
+   window_test_end();
+}
+
 /* An image screen in its own window: the window's map is the frame's,
  * with the picture landed, and the main window lays out the rest */
 static void test_window_image_frame(void)
@@ -13108,6 +13139,7 @@ int main(int argc, char **argv)
    test_images_gone_kept();
    test_images_per_instance();
    test_images_main_again();
+   test_images_second_freed_repeat();
    test_window_image_frame();
    test_screens_core_show();
    test_screens_core_over_inset();
