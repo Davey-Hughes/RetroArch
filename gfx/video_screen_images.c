@@ -252,6 +252,7 @@ bool video_screen_images_set(const struct retro_video_views *in,
          video_screen_images_store[video_screen_images_caller];
    int take[RETRO_VIDEO_SCREENS_MAX];         /* slot to keep; -1 none */
    uint32_t *made[RETRO_VIDEO_SCREENS_MAX];   /* that slot remade */
+   int rgba = -1;                             /* asked once, if needed */
    unsigned s;
 
    for (s = 0; s < RETRO_VIDEO_SCREENS_MAX; s++)
@@ -317,7 +318,6 @@ bool video_screen_images_set(const struct retro_video_views *in,
       video_screen_images_screen_t *scr = &store[s];
       unsigned dims;
       unsigned held;
-      bool rgba;
       int kept;
       int slot = take[s];
       if (!(map->image & (1u << s)))
@@ -337,7 +337,8 @@ bool video_screen_images_set(const struct retro_video_views *in,
          scr->slot[slot]      = made[s];
          scr->slot_dims[slot] = dims;
       }
-      rgba = gfx_surface_wants_rgba();
+      if (rgba < 0)
+         rgba = gfx_surface_wants_rgba();
       if (!(scr->slot_flags[slot] & VIDEO_SCREEN_IMAGES_LENT))
          video_screen_images_copy(scr->slot[slot], im, rgba);
       else if (rgba)
@@ -390,12 +391,12 @@ static void video_screen_images_released(void *user, gfx_surface_t *s,
 }
 
 /* @scr's kept picture up, when it is newer than the one up and no upload
- * is in flight */
-static void video_screen_images_upload(video_screen_images_screen_t *scr)
+ * is in flight. @rgba: the driver's channel order, asked if -1 */
+static void video_screen_images_upload(video_screen_images_screen_t *scr,
+      int *rgba)
 {
    gfx_surface_src_t src;
    unsigned dims;
-   bool rgba;
    int kept = video_screen_images_with(scr, VIDEO_SCREEN_IMAGES_KEPT);
    if (     kept < 0
          || scr->kept_gen == scr->uploaded_gen
@@ -423,8 +424,9 @@ static void video_screen_images_upload(video_screen_images_screen_t *scr)
       scr->surface_dims = dims;
    }
    /* Taken under a driver that wanted the other order */
-   rgba = gfx_surface_wants_rgba();
-   if (rgba != !!(scr->slot_flags[kept] & VIDEO_SCREEN_IMAGES_RGBA))
+   if (*rgba < 0)
+      *rgba = gfx_surface_wants_rgba();
+   if (*rgba != !!(scr->slot_flags[kept] & VIDEO_SCREEN_IMAGES_RGBA))
    {
       video_screen_images_swap(scr->slot[kept], dims);
       scr->slot_flags[kept] ^= VIDEO_SCREEN_IMAGES_RGBA;
@@ -432,7 +434,7 @@ static void video_screen_images_upload(video_screen_images_screen_t *scr)
    memset(&src, 0, sizeof(src));
    src.pixels = scr->slot[kept];
    src.pixfmt = IMAGE_PIXFMT_8888;
-   src.rgba   = rgba;
+   src.rgba   = *rgba != 0;
    switch (gfx_surface_submit_external(scr->surface, &src,
             video_screen_images_released, scr))
    {
@@ -456,6 +458,7 @@ void video_screen_images_frame(video_views_map_t *map, unsigned draw,
 {
    video_screen_images_screen_t *store =
          video_screen_images_store[video_screen_images_shown];
+   int rgba = -1;
    unsigned s;
 #ifdef HAVE_THREADS
    /* Uploads landed since the last frame are named by this one */
@@ -468,7 +471,7 @@ void video_screen_images_frame(video_views_map_t *map, unsigned draw,
       uintptr_t tex                     = 0;
       if (draw & (1u << s))
       {
-         video_screen_images_upload(scr);
+         video_screen_images_upload(scr, &rgba);
          if ((tex = GFX_SURFACE_HANDLE(scr->surface)))
          {
             /* Not before a frame names its replacement: the frames and
