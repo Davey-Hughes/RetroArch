@@ -3256,8 +3256,8 @@ enum retro_vr_reference_space {
  * flag and any views must hold exactly one LEFT and one RIGHT view, or it
  * is refused; an empty map clears the views whatever its flags. */
 #define RETRO_VIDEO_VIEWS_FLAG_TRACKED (1 << 0)
-/* screens and num_screens are filled in. Without this flag the frontend
- * reads nothing past recommended_view_height. */
+/* screens, num_screens and screens_left_out are filled in. Without this
+ * flag the frontend reads nothing past recommended_view_height. */
 #define RETRO_VIDEO_VIEWS_FLAG_SCREENS (1 << 1)
 
 /**
