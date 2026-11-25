@@ -92,6 +92,12 @@ static void video_views_screen_name(char *s, const char *name)
 typedef char video_views_screens_fit[
    (RETRO_VIDEO_SCREENS_MAX <= RETRO_VIDEO_VIEWS_MAX) ? 1 : -1];
 
+/* Written so NaN fails. */
+static bool video_views_layer_in_extent(float f)
+{
+   return f >= -VIDEO_VIEWS_LAYER_EXTENT && f <= VIDEO_VIEWS_LAYER_EXTENT;
+}
+
 /* The map's rules, with screen information when @num_scr is not 0. */
 static bool video_views_screen_validate(
       const struct retro_video_view *views, unsigned num_views,
@@ -104,6 +110,11 @@ static bool video_views_screen_validate(
    unsigned no_input    = 0;
    unsigned viewless    = 0;
    unsigned image       = 0;
+   unsigned image_out   = 0;   /* images not taken: no size kept */
+   unsigned rules_out   = 0;
+   unsigned layer       = 0;
+   unsigned upright     = 0;
+   unsigned first       = 0;   /* the first screen that is not a LAYER */
    unsigned count_none[RETRO_VIDEO_VIEWS_MAX];
    unsigned count_left[RETRO_VIDEO_VIEWS_MAX];
    unsigned count_right[RETRO_VIDEO_VIEWS_MAX];
@@ -165,53 +176,99 @@ static bool video_views_screen_validate(
          num_screens = v->screen + 1;
    }
 
+   while (     first < num_scr
+            && scr[first].show == RETRO_VIDEO_SCREEN_SHOW_LAYER)
+      first++;
+
    for (i = 0; i < num_scr; i++)
    {
       const struct retro_video_screen *s = &scr[i];
+      bool is_layer = s->show == RETRO_VIDEO_SCREEN_SHOW_LAYER;
       if (s->image)
       {
          const struct retro_video_screen_image *im = s->image;
          size_t px = 0;
-         if (im->format == RETRO_PIXEL_FORMAT_XRGB8888)
-            px = 4;
-         else if (im->format == RETRO_PIXEL_FORMAT_RGB565)
-            px = 2;
-         if (     !px || !im->width || !im->height
-               || im->width  > VIDEO_VIEWS_IMAGE_MAX
-               || im->height > VIDEO_VIEWS_IMAGE_MAX
-               || im->pitch  < im->width * px)
+         switch (im->format)
+         {
+            case RETRO_PIXEL_FORMAT_XRGB8888:
+            case RETRO_VIDEO_SCREEN_FORMAT_ARGB8888:
+               px = 4;
+               break;
+            case RETRO_PIXEL_FORMAT_RGB565:
+            case RETRO_PIXEL_FORMAT_0RGB1555:
+               px = 2;
+               break;
+            default:
+               break;
+         }
+         if (     !im->width || !im->height
+               || (px && im->pitch / px < im->width))
             return false;
          /* As a view's: NaN falls through to width / height. */
          if (     im->aspect_ratio > 0.0f
                && (im->aspect_ratio < 0.01f || im->aspect_ratio > 100.0f))
             return false;
+         /* ARGB8888 on a LAYER is the frontend's to judge. */
+         if (     (   im->format != RETRO_PIXEL_FORMAT_XRGB8888
+                   && im->format != RETRO_PIXEL_FORMAT_RGB565
+                   && !(   is_layer
+                        && im->format == RETRO_VIDEO_SCREEN_FORMAT_ARGB8888))
+               || im->width  > VIDEO_VIEWS_IMAGE_MAX
+               || im->height > VIDEO_VIEWS_IMAGE_MAX)
+            image_out |= 1u << i;
          image    |= 1u << i;
          no_input |= 1u << i;
       }
-      if (     s->show   > RETRO_VIDEO_SCREEN_SHOW_OVER
+      if (     s->show   > RETRO_VIDEO_SCREEN_SHOW_LAYER
             || s->state  > RETRO_VIDEO_SCREEN_STATE_ABSENT
-            || s->base  >= num_scr
-            || s->anchor > RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT)
-         return false;
-      /* Written so NaN fails. */
-      if (!(s->size >= 0.0f) || s->size > FLT_MAX)
+            || s->base  >= num_scr)
          return false;
       if (!(s->opacity >= 0.0f && s->opacity <= 1.0f))
          return false;
-      /* A base that is not OVER is not the screen itself. */
-      if (     s->show == RETRO_VIDEO_SCREEN_SHOW_OVER
-            && (   scr[s->base].show == RETRO_VIDEO_SCREEN_SHOW_OVER
-                || s->size > 1.0f))
-         return false;
       if ((s->flags & RETRO_VIDEO_SCREEN_FLAG_PRIVATE) && !s->owners)
          return false;
-      /* order is 0 on every screen or on none. */
-      if (!s->order != !scr[0].order)
-         return false;
+      if (is_layer)
+      {
+         /* The root is SHOWN or HIDDEN, so not the layer itself. */
+         if (     scr[s->base].show > RETRO_VIDEO_SCREEN_SHOW_HIDDEN
+               || s->swap_with || s->group)
+            return false;
+         /* Both sides 0 or both above 0; an image gives a side left 0. */
+         if (     !video_views_layer_in_extent(s->x)
+               || !video_views_layer_in_extent(s->y)
+               || !video_views_layer_in_extent(s->width)
+               || !video_views_layer_in_extent(s->height)
+               || s->width < 0.0f || s->height < 0.0f
+               || (   !s->image
+                   && (s->width > 0.0f) != (s->height > 0.0f)))
+            return false;
+         layer |= 1u << i;
+         if (s->blend > RETRO_VIDEO_SCREEN_BLEND_NONE)
+            rules_out |= 1u << i;
+      }
+      else
+      {
+         if (s->anchor > RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT)
+            return false;
+         /* Written so NaN fails. */
+         if (!(s->size >= 0.0f) || s->size > FLT_MAX)
+            return false;
+         /* A base that is not OVER is not the screen itself. */
+         if (     s->show == RETRO_VIDEO_SCREEN_SHOW_OVER
+               && (   scr[s->base].show == RETRO_VIDEO_SCREEN_SHOW_OVER
+                   || s->size > 1.0f))
+            return false;
+         /* order is 0 on every screen that is not a LAYER, or on none. */
+         if (!s->order != !scr[first].order)
+            return false;
+      }
       if (s->swap_with)
       {
          unsigned t = s->swap_with - 1;
          if (s->swap_with > num_scr || t == i)
+            return false;
+         /* One side makes a pair, and a LAYER is in none. */
+         if (scr[t].show == RETRO_VIDEO_SCREEN_SHOW_LAYER)
             return false;
          if (     (partner[i] >= 0 && partner[i] != (int)t)
                || (partner[t] >= 0 && partner[t] != (int)i))
@@ -221,6 +278,9 @@ static bool video_views_screen_validate(
       }
       if (s->flags & RETRO_VIDEO_SCREEN_FLAG_NO_INPUT)
          no_input |= 1u << i;
+      if (     (s->flags & RETRO_VIDEO_SCREEN_FLAG_UPRIGHT)
+            && (is_layer || !s->image))
+         upright |= 1u << i;
    }
 
    for (i = 0; i < num_screens; i++)
@@ -255,10 +315,13 @@ static bool video_views_screen_validate(
       out->no_input    = no_input;
       out->viewless    = viewless;
       out->image       = image;
+      out->rules_out   = rules_out | image_out;
+      out->layer       = layer;
+      out->upright     = upright;
       for (i = 0; i < num_scr; i++)
       {
          const struct retro_video_screen_image *im = scr[i].image;
-         if (!im)
+         if (!im || (image_out & (1u << i)))
             continue;
          out->image_dims[i]   = VIDEO_SCALE_PACK(im->width, im->height);
          out->image_aspect[i] = im->aspect_ratio > 0.0f
@@ -277,13 +340,23 @@ static bool video_views_screen_validate(
          d->state     = s->state;
          d->show      = s->show;
          d->base      = s->base;
-         d->anchor    = s->anchor;
-         d->order     = s->order;
          d->owners    = s->owners;
          d->swap_with = s->swap_with;
          d->group     = s->group;
-         d->size      = s->size;
          d->opacity   = s->opacity;
+         d->blend     = s->blend;
+         d->z         = s->z;
+         d->x         = s->x;
+         d->y         = s->y;
+         d->width     = s->width;
+         d->height    = s->height;
+         /* A LAYER's are not read: kept 0. */
+         if (s->show != RETRO_VIDEO_SCREEN_SHOW_LAYER)
+         {
+            d->anchor = s->anchor;
+            d->order  = s->order;
+            d->size   = s->size;
+         }
          video_views_screen_name(d->name, s->name);
       }
       screens->count = num_scr;

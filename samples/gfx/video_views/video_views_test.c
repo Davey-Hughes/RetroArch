@@ -191,6 +191,27 @@ static void map_dsi(video_views_map_t *map)
    video_views_validate_map(&in, map, NULL);
 }
 
+/* "dsl": dsi plus "Gel", screen 3, a MULTIPLY LAYER over Top drawn from
+ * a 48x32 XRGB8888 image. A fifth screen is spare. */
+static struct retro_video_screen       t_dsl_screens[5];
+static struct retro_video_screen_image t_dsl_image;
+
+static void t_dsl(struct retro_video_views *in)
+{
+   t_dsi(in);
+   memset(t_dsl_screens, 0, sizeof(t_dsl_screens));
+   memcpy(t_dsl_screens, t_dsi_screens, sizeof(t_dsi_screens));
+   t_dsl_image            = t_dsi_image;
+   t_dsl_screens[3].name  = "Gel";
+   t_dsl_screens[3].show  = RETRO_VIDEO_SCREEN_SHOW_LAYER;
+   t_dsl_screens[3].base  = 0;
+   t_dsl_screens[3].blend = RETRO_VIDEO_SCREEN_BLEND_MULTIPLY;
+   t_dsl_screens[3].z     = 1;
+   t_dsl_screens[3].image = &t_dsl_image;
+   in->screens     = t_dsl_screens;
+   in->num_screens = 4;
+}
+
 /* dsi with Bottom left out and the VMU an inset a quarter of Top's
  * height in its bottom right. */
 static void map_dsi_inset(video_views_map_t *map)
@@ -1270,7 +1291,7 @@ static void t_swap_disagree(struct retro_video_views *in)
 
 static void t_show_unknown(struct retro_video_views *in)
 {
-   t_full_screens[2].show = 3;
+   t_full_screens[2].show = 4;
 }
 
 static void t_state_unknown(struct retro_video_views *in)
@@ -1407,6 +1428,29 @@ static void t_img_height_zero(struct retro_video_views *in)
 static void t_img_format(struct retro_video_views *in)
 {
    t_dsi_image.format = RETRO_PIXEL_FORMAT_0RGB1555;
+   t_dsi_image.pitch  = 96;
+}
+
+static void t_img_format_unknown(struct retro_video_views *in)
+{
+   t_dsi_image.format = 0x200;
+}
+
+static void t_img_argb(struct retro_video_views *in)
+{
+   t_dsi_image.format = RETRO_VIDEO_SCREEN_FORMAT_ARGB8888;
+}
+
+static void t_img_pitch_argb(struct retro_video_views *in)
+{
+   t_dsi_image.format = RETRO_VIDEO_SCREEN_FORMAT_ARGB8888;
+   t_dsi_image.pitch  = 191;
+}
+
+static void t_img_pitch_1555(struct retro_video_views *in)
+{
+   t_dsi_image.format = RETRO_PIXEL_FORMAT_0RGB1555;
+   t_dsi_image.pitch  = 95;
 }
 
 static void t_img_pitch(struct retro_video_views *in)
@@ -1453,11 +1497,10 @@ static void test_screens_image_refused(void)
       { "viewed",      t_img_viewed      },
       { "width-zero",  t_img_width_zero  },
       { "height-zero", t_img_height_zero },
-      { "format",      t_img_format      },
       { "pitch",       t_img_pitch       },
       { "pitch-565",   t_img_pitch_565   },
-      { "width-max",   t_img_width_max   },
-      { "height-max",  t_img_height_max  },
+      { "pitch-argb",  t_img_pitch_argb  },
+      { "pitch-1555",  t_img_pitch_1555  },
       { "aspect-low",  t_img_aspect_low  },
       { "aspect-high", t_img_aspect_high }
    };
@@ -1477,6 +1520,277 @@ static void test_screens_image_refused(void)
             || !t_all_a5(&scr, sizeof(scr)))
       {
          printf("  FAIL refused image case %s\n", cases[i].name);
+         failures++;
+      }
+   }
+}
+
+/* dsi with an image the frontend does not take: accepted, the screen in
+ * rules_out with no size kept. */
+static void test_screens_image_left_out(void)
+{
+   static const struct
+   {
+      const char *name;
+      void (*change)(struct retro_video_views *in);
+   } cases[] = {
+      { "format",         t_img_format         },
+      { "format-unknown", t_img_format_unknown },
+      { "argb",           t_img_argb           },
+      { "width-max",      t_img_width_max      },
+      { "height-max",     t_img_height_max     }
+   };
+   struct retro_video_views in;
+   video_views_map_t map;
+   video_views_screens_t scr;
+   unsigned i;
+
+   for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+   {
+      t_dsi(&in);
+      cases[i].change(&in);
+      memset(&map, 0xA5, sizeof(map));
+      memset(&scr, 0xA5, sizeof(scr));
+      if (     !video_views_validate_map(&in, &map, &scr)
+            || map.rules_out != 0x4 || map.image != 0x4
+            || !(map.no_input & 0x4)
+            || map.image_dims[2] || map.image_aspect[2] != 0.0f)
+      {
+         printf("  FAIL left-out image case %s\n", cases[i].name);
+         failures++;
+      }
+   }
+
+   /* On a LAYER, ARGB8888 is the frontend's to judge. */
+   t_dsl(&in);
+   t_dsl_image.format = RETRO_VIDEO_SCREEN_FORMAT_ARGB8888;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(map.rules_out == 0 && map.image == 0xc);
+   CHECK(map.image_dims[3] == VIDEO_SCALE_PACK(48, 32));
+   t_dsl_image.format = RETRO_PIXEL_FORMAT_0RGB1555;
+   t_dsl_image.pitch  = 96;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(map.rules_out == 0x8 && !map.image_dims[3]);
+}
+
+/* A LAYER: its rectangle, blend and z kept, size, anchor and order not
+ * read. */
+static void test_screens_layer(void)
+{
+   struct retro_video_views in;
+   video_views_map_t map;
+   video_views_screens_t scr;
+   struct retro_video_screen *gel = &t_dsl_screens[3];
+
+   t_dsl(&in);
+   memset(&map, 0xA5, sizeof(map));
+   memset(&scr, 0xA5, sizeof(scr));
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(map.num_views == 2 && map.num_screens == 4 && scr.count == 4);
+   CHECK(map.layer == 0x8 && map.rules_out == 0 && map.upright == 0);
+   CHECK(map.image == 0xc && (map.no_input & 0x8) && !map.viewless);
+   CHECK(map.image_dims[3] == VIDEO_SCALE_PACK(48, 32));
+   CHECK(scr.screens[3].show == RETRO_VIDEO_SCREEN_SHOW_LAYER);
+   CHECK(scr.screens[3].blend == 2 && scr.screens[3].z == 1);
+   CHECK(   scr.screens[3].x == 0.0f && scr.screens[3].y == 0.0f
+         && scr.screens[3].width == 0.0f && scr.screens[3].height == 0.0f);
+
+   /* A blend the frontend does not know */
+   gel->blend = 7;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(map.rules_out == 0x8 && map.layer == 0x8 && map.image == 0xc);
+   CHECK(scr.screens[3].blend == 7);
+   gel->blend = RETRO_VIDEO_SCREEN_BLEND_NONE;
+   CHECK(video_views_validate_map(&in, &map, &scr) && !map.rules_out);
+
+   /* The placeholder */
+   t_dsl(&in);
+   gel->image = NULL;
+   gel->state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK((map.viewless & 0x8) && map.layer == 0x8 && map.image == 0x4);
+
+   /* One side from the image's aspect */
+   t_dsl(&in);
+   gel->height = 1.0f;
+   gel->x      = 0.5f;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(scr.screens[3].x == 0.5f && scr.screens[3].height == 1.0f);
+   gel->width  = 0.5f;
+   gel->height = 0.0f;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   /* The bounds are in */
+   gel->x      = VIDEO_VIEWS_LAYER_EXTENT;
+   gel->y      = -VIDEO_VIEWS_LAYER_EXTENT;
+   gel->width  = VIDEO_VIEWS_LAYER_EXTENT;
+   gel->height = VIDEO_VIEWS_LAYER_EXTENT;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(   scr.screens[3].y == -64.0f && scr.screens[3].width == 64.0f
+         && scr.screens[3].height == 64.0f);
+
+   /* Flags are copied; UPRIGHT counts on a LAYER and on a screen with
+    * no image */
+   t_dsl(&in);
+   gel->flags = RETRO_VIDEO_SCREEN_FLAG_LAYER_OFF
+         | RETRO_VIDEO_SCREEN_FLAG_UPRIGHT;
+   t_dsl_screens[1].flags = RETRO_VIDEO_SCREEN_FLAG_LAYER_OFF;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(scr.screens[3].flags == gel->flags && map.upright == 0x8);
+   CHECK(scr.screens[1].flags == RETRO_VIDEO_SCREEN_FLAG_LAYER_OFF);
+   t_dsl(&in);
+   t_dsl_screens[2].flags = RETRO_VIDEO_SCREEN_FLAG_UPRIGHT;
+   CHECK(video_views_validate_map(&in, &map, &scr) && map.upright == 0);
+   t_dsl_screens[1].flags = RETRO_VIDEO_SCREEN_FLAG_UPRIGHT;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(map.upright == 0x2);
+
+   /* order: a LAYER's is not counted */
+   t_dsl(&in);
+   t_dsl_screens[0].order = 2;
+   t_dsl_screens[1].order = 1;
+   t_dsl_screens[2].order = 3;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   t_dsl(&in);
+   gel->order = 5;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   /* nor is screen 0's when it is the LAYER */
+   t_dsl(&in);
+   t_dsl_screens[0]       = *gel;
+   t_dsl_screens[0].base  = 3;
+   t_dsl_screens[3]       = t_dsi_screens[0];
+   t_dsl_screens[3].order = 2;
+   t_dsl_screens[1].order = 1;
+   t_dsl_screens[2].order = 3;
+   t_dsi_views[0].screen  = 3;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(map.layer == 0x1 && map.image == 0x5);
+
+   /* anchor and size are not read, and kept as 0 */
+   t_dsl(&in);
+   gel->anchor = 99;
+   gel->size   = -1.0f;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(scr.screens[3].anchor == 0 && scr.screens[3].size == 0.0f);
+   gel->size   = (float)HUGE_VAL;
+   gel->order  = 5;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(scr.screens[3].size == 0.0f && scr.screens[3].order == 0);
+   /* opacity is */
+   gel->opacity = 1.5f;
+   CHECK(!video_views_validate_map(&in, &map, &scr));
+}
+
+static void t_layer_self(struct retro_video_views *in)
+{
+   t_dsl_screens[3].base = 3;
+}
+
+static void t_layer_on_layer(struct retro_video_views *in)
+{
+   t_dsl_screens[4].show  = RETRO_VIDEO_SCREEN_SHOW_LAYER;
+   t_dsl_screens[4].base  = 3;
+   t_dsl_screens[4].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
+   in->num_screens        = 5;
+}
+
+static void t_layer_on_over(struct retro_video_views *in)
+{
+   t_dsl_screens[2].show = RETRO_VIDEO_SCREEN_SHOW_OVER;
+   t_dsl_screens[3].base = 2;
+}
+
+static void t_layer_x(struct retro_video_views *in)
+{
+   t_dsl_screens[3].x = 64.5f;
+}
+
+static void t_layer_y(struct retro_video_views *in)
+{
+   t_dsl_screens[3].y = -65.0f;
+}
+
+static void t_layer_width_nan(struct retro_video_views *in)
+{
+   t_dsl_screens[3].width = (float)sqrt(-1.0);
+}
+
+static void t_layer_height_inf(struct retro_video_views *in)
+{
+   t_dsl_screens[3].height = (float)HUGE_VAL;
+}
+
+static void t_layer_one_side(struct retro_video_views *in)
+{
+   t_dsl_screens[3].image = NULL;
+   t_dsl_screens[3].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
+   t_dsl_screens[3].width = 0.5f;
+}
+
+static void t_layer_width_negative(struct retro_video_views *in)
+{
+   t_dsl_screens[3].width  = -0.5f;
+   t_dsl_screens[3].height = 0.5f;
+}
+
+static void t_layer_swap(struct retro_video_views *in)
+{
+   t_dsl_screens[3].swap_with = 1;
+}
+
+static void t_layer_group(struct retro_video_views *in)
+{
+   t_dsl_screens[3].group = 1;
+}
+
+static void t_layer_swap_named(struct retro_video_views *in)
+{
+   t_dsl_screens[0].swap_with = 4;
+}
+
+static void t_layer_show_unknown(struct retro_video_views *in)
+{
+   t_dsl_screens[3].show = 4;
+}
+
+/* dsl with one LAYER rule broken: refused, with out and screens
+ * untouched. */
+static void test_screens_layer_refused(void)
+{
+   static const struct
+   {
+      const char *name;
+      void (*change)(struct retro_video_views *in);
+   } cases[] = {
+      { "self",           t_layer_self           },
+      { "on-layer",       t_layer_on_layer       },
+      { "on-over",        t_layer_on_over        },
+      { "x",              t_layer_x              },
+      { "y",              t_layer_y              },
+      { "width-nan",      t_layer_width_nan      },
+      { "height-inf",     t_layer_height_inf     },
+      { "one-side",       t_layer_one_side       },
+      { "width-negative", t_layer_width_negative },
+      { "swap",           t_layer_swap           },
+      { "group",          t_layer_group          },
+      { "swap-named",     t_layer_swap_named     },
+      { "show-unknown",   t_layer_show_unknown   }
+   };
+   unsigned i;
+
+   for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+   {
+      struct retro_video_views in;
+      video_views_map_t map;
+      video_views_screens_t scr;
+      t_dsl(&in);
+      cases[i].change(&in);
+      memset(&map, 0xA5, sizeof(map));
+      memset(&scr, 0xA5, sizeof(scr));
+      if (     video_views_validate_map(&in, &map, &scr)
+            || !t_all_a5(&map, sizeof(map))
+            || !t_all_a5(&scr, sizeof(scr)))
+      {
+         printf("  FAIL refused layer case %s\n", cases[i].name);
          failures++;
       }
    }
@@ -3687,6 +4001,43 @@ static void test_arrange_rules_out(void)
    a.map.rules_out        = 0x1;
    t_arrange_run(&a);
    CHECK(a.map.left_out == 0x1 && !a.map.blank && !a.map.over);
+
+   /* An inset that is itself in rules_out */
+   t_arrange_begin(&a, 2);
+   t_arrange_core_over(&a, 1, 0);
+   a.map.rules_out = 0x2;
+   t_arrange_run(&a);
+   CHECK(a.map.over == 0x2 && a.map.left_out == 0x2);
+
+   /* A bit at or past num_screens is not a screen */
+   t_arrange_begin(&a, 2);
+   a.map.rules_out = 0x4;
+   t_arrange_run(&a);
+   CHECK(!a.map.left_out && t_arrange_clear_past(&a.map, 2));
+}
+
+/* A LAYER is left out whatever the map's rules_out and with or without
+ * images, and an inset over it with it. */
+static void test_arrange_layer(void)
+{
+   static t_arrange_t a;
+   struct retro_video_views in;
+
+   t_arrange_begin(&a, 4);
+   t_dsl(&in);
+   CHECK(video_views_validate_map(&in, &a.map, &a.scr));
+   CHECK(a.map.layer == 0x8 && !a.map.rules_out);
+   t_arrange_run(&a);
+   CHECK(a.map.left_out == 0x8 && !a.map.over && a.map.layer == 0x8);
+   CHECK(t_arrange_clear_past(&a.map, 4));
+   a.images = false;
+   t_arrange_run(&a);
+   CHECK(a.map.left_out == 0xc);
+
+   a.images = true;
+   t_arrange_user(&a, 1, "over:4");
+   t_arrange_run(&a);
+   CHECK(a.map.over == 0x2 && a.map.left_out == 0xa);
 }
 
 #undef T_NIB
@@ -4862,6 +5213,9 @@ int main(void)
    test_screens_refused();
    test_screens_image();
    test_screens_image_refused();
+   test_screens_image_left_out();
+   test_screens_layer();
+   test_screens_layer_refused();
    test_screens_accepted();
    test_screens_names();
    test_screens_select_masks();
@@ -4953,6 +5307,7 @@ int main(void)
    test_arrange_shown_sized();
    test_arrange_images_off();
    test_arrange_rules_out();
+   test_arrange_layer();
 
    if (failures)
    {

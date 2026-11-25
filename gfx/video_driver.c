@@ -4479,8 +4479,18 @@ static void video_driver_views_log_screens(
             i, s->name, s->flags, s->state, s->show, s->base, s->size,
             s->anchor, s->opacity, s->order, s->owners, s->swap_with,
             s->group);
+      if (s->show == RETRO_VIDEO_SCREEN_SHOW_LAYER)
+         RARCH_LOG("[Video] Screen %u layer: blend %u, z %u, "
+               "rect %.3f %.3f %.3f %.3f.\n",
+               i, s->blend, s->z, s->x, s->y, s->width, s->height);
    }
 }
+
+/* A blend's status flag is BLEND_ALPHA shifted by the blend. */
+typedef char video_driver_views_blend_flags_fit[
+   (RETRO_VIDEO_VIEWS_STATUS_BLEND_NONE
+      == (RETRO_VIDEO_VIEWS_STATUS_BLEND_ALPHA
+         << RETRO_VIDEO_SCREEN_BLEND_NONE)) ? 1 : -1];
 
 bool video_driver_set_views(struct retro_video_views *views)
 {
@@ -4502,9 +4512,20 @@ bool video_driver_set_views(struct retro_video_views *views)
          && !video_views_eye_pair(&map, eyes))
       return false;
 #endif
-   if (     map.image
-         && !(video_driver_views_status() & RETRO_VIDEO_VIEWS_STATUS_IMAGES))
-      map.rules_out = map.image;
+   if (map.image | map.layer)
+   {
+      unsigned s;
+      unsigned status = video_driver_views_status();
+      if (!(status & RETRO_VIDEO_VIEWS_STATUS_IMAGES))
+         map.rules_out |= map.image;
+      /* A LAYER whose blend is not drawn; an unknown blend is out
+       * already */
+      for (s = 0; s < screens.count; s++)
+         if (     (map.layer & ~map.rules_out & (1u << s))
+               && !(status & (RETRO_VIDEO_VIEWS_STATUS_BLEND_ALPHA
+                     << screens.screens[s].blend)))
+            map.rules_out |= 1u << s;
+   }
    if (!video_screen_images_set(views, &map, &map.rules_out))
       return false;
    if (     (views->flags & RETRO_VIDEO_VIEWS_FLAG_SCREENS)
@@ -4669,6 +4690,8 @@ static VIDEO_NOINLINE unsigned video_driver_screens_insets(
       map.viewless    = video_st->views_core.viewless;
       map.image       = video_st->views_core.image;
       map.rules_out   = video_st->views_core.rules_out;
+      map.layer       = video_st->views_core.layer;
+      map.upright     = video_st->views_core.upright;
       video_screen_prefs_arrange(video_st->screens_resolved,
             video_st->screens_defaults, &video_st->views_screens,
             video_st->views_images_arranged, &map);
@@ -5747,6 +5770,8 @@ static void video_driver_views_take_arrangement(video_views_map_t *to,
    to->image    = from->image;
    to->nearest  = from->nearest;
    to->rules_out = from->rules_out;
+   to->layer    = from->layer;
+   to->upright  = from->upright;
    memcpy(to->opacity,      from->opacity,      sizeof(to->opacity));
    memcpy(to->size,         from->size,         sizeof(to->size));
    memcpy(to->image_dims,   from->image_dims,   sizeof(to->image_dims));
@@ -5819,6 +5844,8 @@ static VIDEO_NOINLINE void video_driver_views_frame(
       core->viewless = video_st->views.viewless;
       core->image    = video_st->views.image;
       core->rules_out = video_st->views.rules_out;
+      core->layer    = video_st->views.layer;
+      core->upright  = video_st->views.upright;
       memcpy(core->image_dims, video_st->views.image_dims,
             sizeof(core->image_dims));
       memcpy(core->image_aspect, video_st->views.image_aspect,

@@ -192,8 +192,12 @@ typedef struct video_views_map
    unsigned image;                              /* screens drawn from an image */
    unsigned image_dims[RETRO_VIDEO_VIEWS_MAX];  /* VIDEO_SCALE_PACK */
    float image_aspect[RETRO_VIDEO_VIEWS_MAX];   /* display w / h */
-   /* The frontend's, set with the map; validation leaves it 0. */
-   unsigned rules_out;   /* left out by the map's rules at the call */
+   /* Left out by the map's rules at the call: validation's, then the
+    * frontend's. */
+   unsigned rules_out;
+   /* Set by validation. */
+   unsigned layer;       /* show LAYER */
+   unsigned upright;     /* UPRIGHT where SET_ROTATION would turn it */
    /* The frontend's, set per frame; validation leaves them 0. */
    uintptr_t image_tex[RETRO_VIDEO_VIEWS_MAX];  /* 0 until a picture landed */
    uint8_t image_gen[RETRO_VIDEO_VIEWS_MAX];    /* moves when one lands */
@@ -212,6 +216,7 @@ typedef struct video_views_frect
 
 #define VIDEO_VIEWS_NAME_SIZE 32   /* bytes kept of a screen's name, with its NUL */
 #define VIDEO_VIEWS_IMAGE_MAX 512  /* largest picture side taken */
+#define VIDEO_VIEWS_LAYER_EXTENT 64.0f   /* a LAYER's rectangle bound */
 
 /* One validated retro_video_screen. */
 typedef struct video_views_screen
@@ -227,6 +232,12 @@ typedef struct video_views_screen
    unsigned group;
    float size;
    float opacity;
+   unsigned blend;
+   unsigned z;
+   float x;
+   float y;
+   float width;
+   float height;
    char name[VIDEO_VIEWS_NAME_SIZE];   /* "" when the core gave none */
 } video_views_screen_t;
 

@@ -5809,6 +5809,174 @@ static void test_screens_left_out_repeat_frame(void)
    window_test_end();
 }
 
+static char layer_test_log_path[2048];
+
+/* images_test_set()'s map plus "Gel", screen 3: a MULTIPLY LAYER on Top,
+ * or SHOWN without @layer, drawn from @gel or with NULL from a view of
+ * its own */
+static bool layer_test_set(const struct retro_video_screen_image *gel,
+      bool layer)
+{
+   static struct retro_video_view views[3];
+   static struct retro_video_screen screens[4];
+   struct retro_video_screen_image dsi;
+   struct retro_video_views map;
+   screens_test_dsi_small(&map, views, screens, &dsi);
+   screens[2].image = &images_test_image;
+   memset(&screens[3], 0, sizeof(screens[3]));
+   screens[3].name  = "Gel";
+   screens[3].image = gel;
+   if (layer)
+   {
+      screens[3].show  = RETRO_VIDEO_SCREEN_SHOW_LAYER;
+      screens[3].blend = RETRO_VIDEO_SCREEN_BLEND_MULTIPLY;
+      screens[3].z     = 1;
+   }
+   if (!gel)
+   {
+      views[2]        = views[0];
+      views[2].screen = 3;
+      map.num_views   = 3;
+   }
+   map.num_screens      = 4;
+   images_test_left_out = 0xA5A5A5A5;
+   map.screens_left_out = &images_test_left_out;
+   return video_driver_set_views(&map);
+}
+
+/* The driver's last layout's placement of the frame's view @view */
+static const video_views_placement_t *layer_test_view_placed(unsigned view)
+{
+   const video_views_layout_t *l = &window_test_seen_layout;
+   unsigned i;
+   for (i = 0; i < l->num_placements; i++)
+      if (     l->placements[i].view == view
+            && !(l->placements[i].flags & VIDEO_VIEWS_PLACEMENT_IMAGE))
+         return &l->placements[i];
+   return NULL;
+}
+
+/* The frame just drawn left Gel out, with Top where @top has it */
+static void layer_test_out(const video_views_rect_t *top)
+{
+   video_driver_state_t *video_st     = video_state_get_ptr();
+   const video_views_placement_t *now = layer_test_view_placed(0);
+   CHECK(video_st->views_core.left_out & 0x8);
+   CHECK(window_test_seen_views.left_out & 0x8);
+   CHECK(window_test_seen_views.layer == 0x8);
+   CHECK(string_is_equal(video_st->screens_routed[3],
+            VIDEO_WINDOW_DISPLAY_OFF));
+   CHECK(!screens_test_image_placed(3, 0) && !layer_test_view_placed(2));
+   CHECK(now && now->dst.pos == top->pos && now->dst.dims == top->dims);
+}
+
+/* How many times the log file holds @text */
+static unsigned layer_test_logged(const char *text)
+{
+   void *buf     = NULL;
+   int64_t len   = 0;
+   int64_t n     = (int64_t)strlen(text);
+   unsigned hits = 0;
+   int64_t i;
+   if (filestream_read_file(layer_test_log_path, &buf, &len))
+      for (i = 0; i + n <= len; i++)
+         if (!memcmp((const char*)buf + i, text, (size_t)n))
+            hits++;
+   free(buf);
+   return hits;
+}
+
+/* A LAYER is left out on every frame and NULL refresh, whatever it is
+ * drawn from, and an image format not taken leaves only its screen out
+ * (Review Focus 1) */
+static void test_screens_layer_left_out(void)
+{
+   static uint32_t pixels[48 * 32];
+   struct retro_video_screen_image gel;
+   video_views_rect_t top;
+   const video_views_placement_t *placed;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   bool verbose                   = verbosity_is_enabled();
+   unsigned n;
+   images_test_frames_begin();
+   retro_main_log_file_init(layer_test_log_path, false);
+   verbosity_enable();
+
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1)
+         && !images_test_left_out);
+   window_test_run();
+   placed = layer_test_view_placed(0);
+   CHECK(placed && window_test_seen_placed == 3);
+   memset(&top, 0, sizeof(top));
+   if (placed)
+      top = placed->dst;
+
+   memset(&gel, 0, sizeof(gel));
+   gel.data   = pixels;
+   gel.width  = 48;
+   gel.height = 32;
+   gel.pitch  = 48 * sizeof(uint32_t);
+   gel.format = RETRO_PIXEL_FORMAT_XRGB8888;
+   gel.serial = 1;
+
+   /* SHOWN, then a LAYER between refreshes: out from the next one */
+   CHECK(layer_test_set(&gel, false) && !images_test_left_out);
+   window_test_run();
+   CHECK(screens_test_image_placed(3, 0) == 1);
+   CHECK(layer_test_set(&gel, true) && images_test_left_out == 0x8);
+   CHECK(video_st->views.rules_out == 0x8 && video_st->views.layer == 0x8);
+   for (n = 0; n < 3; n++)
+   {
+      images_test_repeat();
+      layer_test_out(&top);
+   }
+   window_test_run();
+   layer_test_out(&top);
+   CHECK(window_test_seen_placed == 3);
+
+   /* An ARGB8888 image: out with its layer, nothing taken */
+   gel.format = RETRO_VIDEO_SCREEN_FORMAT_ARGB8888;
+   gel.serial = 2;
+   CHECK(layer_test_set(&gel, true) && images_test_left_out == 0x8);
+   window_test_run();
+   layer_test_out(&top);
+
+   /* From the frame */
+   CHECK(layer_test_set(NULL, true) && images_test_left_out == 0x8);
+   window_test_run();
+   layer_test_out(&top);
+   CHECK(window_test_seen_placed == 3);
+   for (n = 0; n < 3; n++)
+   {
+      images_test_repeat();
+      layer_test_out(&top);
+   }
+
+   /* A format not taken leaves the VMU out and its picture kept */
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1)
+         && !images_test_left_out);
+   images_test_picture(screens_test_dsi_pixels, 2);
+   images_test_image.format = RETRO_PIXEL_FORMAT_0RGB1555;
+   images_test_image.pitch  = 48 * sizeof(uint16_t);
+   CHECK(images_test_set() && images_test_left_out == 0x4);
+   window_test_run();
+   CHECK(!screens_test_image_placed(2, 0));
+   CHECK(images_test_hand(NULL, 1) && !images_test_left_out);
+   window_test_run();
+   CHECK(screens_test_image_placed(2, 0) == 1);
+   CHECK(window_test_seen_views.image_tex[2] == 101);
+   /* The VMU's and SHOWN Gel's, once each */
+   CHECK(images_test_loads == 2 && !images_test_updates);
+
+   if (!verbose)
+      verbosity_disable();
+   retro_main_log_file_deinit();
+   CHECK(layer_test_logged("Screen 3 layer: blend 2, z 1, "
+            "rect 0.000 0.000 0.000 0.000.") == 1);
+   CHECK(layer_test_logged("Screen 3 layer:") == 1);
+   window_test_end();
+}
+
 /* An image screen in its own window: the window's map is the frame's,
  * with the picture landed, and the main window lays out the rest */
 static void test_window_image_frame(void)
@@ -13238,6 +13406,7 @@ int main(int argc, char **argv)
    fill_pathname_join(saved_path, argv[1], "saved.cfg", sizeof(saved_path));
    fill_pathname_join(override_path, argv[1], "override.cfg", sizeof(override_path));
    fill_pathname_join(screens_config_dir, argv[1], "screens", sizeof(screens_config_dir));
+   fill_pathname_join(layer_test_log_path, argv[1], "layer.log", sizeof(layer_test_log_path));
    config_file_set_io_default(config_file_io_filestream());
    rtime_init();
    retroarch_config_init();
@@ -13330,6 +13499,7 @@ int main(int argc, char **argv)
    test_images_lend_open();
    test_images_left_out_every_frame();
    test_screens_left_out_repeat_frame();
+   test_screens_layer_left_out();
    test_window_image_frame();
    test_screens_core_show();
    test_screens_core_over_inset();
