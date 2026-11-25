@@ -1165,11 +1165,12 @@ jobs:
           # interlaced canvas, views read exactly out of the frame, the
           # UI layer per eye with the menu open, a pointer mapped back
           # through it, screens left out, drawn blank or drawn over
-          # another, and SCREENS with no map. Anaglyph draws the frame
-          # whole there.
+          # another, SCREENS with no map, and a LAYER or an UPRIGHT screen
+          # of a turned core left out. Anaglyph draws the frame whole
+          # there.
           export LIBGL_ALWAYS_SOFTWARE=1
           export LD_LIBRARY_PATH=/opt/sdl3/lib
-          RA_E2E_XVFB=1 RA_E2E_ONLY='^(3ds-sbs-full|3ds-sbs-half|3ds-top-bottom|3ds-interlaced|ds-horizontal|exact-3ds|exact-3ds-rgb565|crop-threaded-menu|pointer-sbs-full|screens-rules|screens-hidden|screens-blank-late|screens-hide-null|screens-blank-null|screens-none-shown|screens-over(-blank)?(-half)?(-sbs|-interlaced)?|screens-status-no-map(-anaglyph|-rolling)?)$' \
+          RA_E2E_XVFB=1 RA_E2E_ONLY='^(3ds-sbs-full|3ds-sbs-half|3ds-top-bottom|3ds-interlaced|ds-horizontal|exact-3ds|exact-3ds-rgb565|crop-threaded-menu|pointer-sbs-full|screens-rules|screens-hidden|screens-blank-late|screens-hide-null|screens-blank-null|screens-none-shown|screens-over(-blank)?(-half)?(-sbs|-interlaced)?|screens-status-no-map(-anaglyph|-rolling)?|screens-layer-(fallback|sent)|screens-upright-turned)$' \
             python3 samples/cores/video_views/e2e/run.py ./retroarch \
             "$RUNNER_TEMP/views-e2e" sdl3
 

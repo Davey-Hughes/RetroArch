@@ -851,9 +851,9 @@ SCREENS_STATE_CASES = [
     ('screens-shown-sized', 'shown_sized',
      [(1440, 480, YELLOW), (640, 480, GREEN), (1440, 200, BLACK)], {}),
 ]
-# A LAYER while RetroArch draws no blend, on SCREENS_DRIVERS: the core
-# that reads the status sends none and multiplies Top by Gel itself;
-# one sent anyway is left out, Top as it was. Entries as
+# A LAYER while RetroArch draws no blend, on SCREENS_DRIVERS and sdl3:
+# the core that reads the status sends none and multiplies Top by Gel
+# itself; one sent anyway is left out, Top as it was. Entries as
 # SCREENS_DRAW_CASES', with 'left_out' each screens_left_out the core
 # must log, in order, and no other.
 SCREENS_TOP_GEL = [(x, y, (0, 128, 0) if c == GREEN else c)
@@ -864,7 +864,7 @@ SCREENS_LAYER_CASES = [
     ('screens-layer-sent', 'layer_sent', SCREENS_TOP_ALONE,
      {'left_out': [0x4]}),
 ]
-# A core that turns itself with Bottom UPRIGHT, on SCREENS_DRIVERS:
+# A core that turns itself with Bottom UPRIGHT, on the same drivers:
 # Bottom is left out while the core is turned and drawn once it is not.
 # Entries as SCREENS_LAYER_CASES'.
 SCREENS_TURNED_CASES = [
@@ -3316,7 +3316,7 @@ def driver_jobs(retroarch, root, driver):
                        else []) if wanted(c[0])]
     jobs += [lambda c=c: screens_layer(c)
              for c in (SCREENS_LAYER_CASES + SCREENS_TURNED_CASES
-                       if driver in SCREENS_DRIVERS else [])
+                       if driver in SCREENS_DRIVERS + ('sdl3',) else [])
              if wanted(c[0])]
     if driver in SCREENS_DRIVERS and wanted(SCREENS_MENU_CASE[0]):
         jobs.append(screens_menu)
