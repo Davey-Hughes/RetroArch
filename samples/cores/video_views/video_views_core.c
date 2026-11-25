@@ -112,7 +112,7 @@
  * screen 2, a LAYER, while the status has BLEND_MULTIPLY, and
  * otherwise multiplies the top screen's colour itself; layer_sent
  * sends it whatever the status. The turned modes send SET_ROTATION 1
- * before each map: image_turned and image_upright_turned are image,
+ * before their first map: image_turned and image_upright_turned are image,
  * the second with UPRIGHT on VMU; upright_turned sends the bottom one
  * SHOWN with UPRIGHT and from frame 60 SET_ROTATION 0, logging the
  * switch once; upright_over sends the bottom one so too and VMU's
@@ -385,6 +385,8 @@ static unsigned scr_left_out;
 /* With SCREENS_MODE, the scr_modes entry, and whether it has switched. */
 static unsigned screens_mode;
 static bool screens_switched;
+/* The rotation the turned modes sent last; 4 before the first. */
+static unsigned scr_rotation;
 /* The image modes' options, the serial the frontend took last, and
  * whether image_restart has raised the maximum size. */
 static bool vmu_copy;
@@ -1114,6 +1116,7 @@ static void read_options(void)
    screens_kind = SCREENS_OFF;
    screens_next = 0;
    screens_switched = false;
+   scr_rotation = 4;
    vmu_held     = 0;
    max_raised   = false;
    vmu_lent     = NULL;
@@ -2590,8 +2593,8 @@ static const struct
 #define GEL_IF_DRAWN 1
 #define GEL_ALWAYS   2
 #define GEL_COL      0xFF80FF
-/* A mode's SET_ROTATION before each map: 1, or 1 until the switch and
- * 0 from it. */
+/* A mode's SET_ROTATION, sent when it changes: 1, or 1 until the
+ * switch and 0 from it. */
 #define TURN_ALWAYS 1
 #define TURN_EARLY  2
 
@@ -2861,15 +2864,16 @@ static const struct retro_video_screen_image *vmu_lend_open(void)
    return &vmu_image;
 }
 
-/* After the map: a picture sent and taken is held. Each one sent, and
- * each refused map without one, is logged. */
+/* After the map: a picture sent and taken is held, one the map left
+ * out is not. Each one sent, and each refused map without one, is
+ * logged. */
 static void vmu_answer(int accepted)
 {
    if (!vmu_image.data && accepted)
       return;
    log_cb(RETRO_LOG_INFO, "[video_views] image serial=%u accepted=%d\n",
          vmu_image.serial, accepted);
-   if (accepted)
+   if (accepted && !(scr_left_out & (1u << 2)))
       vmu_held = vmu_image.serial;
 }
 
@@ -2921,7 +2925,9 @@ static const char *screens_add(struct retro_video_views *in,
       {
          unsigned rotation = (turn == TURN_EARLY && screens_switched)
             ? 0 : 1;
-         environ_cb(RETRO_ENVIRONMENT_SET_ROTATION, &rotation);
+         if (rotation != scr_rotation)
+            environ_cb(RETRO_ENVIRONMENT_SET_ROTATION, &rotation);
+         scr_rotation = rotation;
       }
       over = (show == RETRO_VIDEO_SCREEN_SHOW_OVER);
       scr_screens[0]  = mkscreen("Top", 0, 0,

@@ -4367,7 +4367,7 @@ DS_TURNED_POINTS = ((0.5, 0.5), (0.15, 0.15), (0.85, 0.15), (0.15, 0.85),
 
 def check_screens_upright_over(left_out):
     """upright_over, a turned core: screen 1, UPRIGHT, has no quad in
-    any snapshot, nor has the picture OVER it. Screen 0's quad is where
+    any frame, nor has the picture OVER it. Screen 0's quad is where
     it is with both shown, turned, in its colour to its corners. The
     core's screens_left_out is left_out, logged once."""
     def check(res):
@@ -4378,7 +4378,7 @@ def check_screens_upright_over(left_out):
                           % (found, left_out))
         for fr in res.frames:
             q = [x for x in quads(fr) if not x['flags'] & BLEND]
-            if fr['snap'] and len(q) > 1:
+            if len(q) > 1:
                 errors.append('frame %d has %d quads: %s'
                               % (fr['n'], len(q),
                                  [(x['pose'][:3], x['size']) for x in q]))
