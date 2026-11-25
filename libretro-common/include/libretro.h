@@ -2948,7 +2948,7 @@ enum retro_vr_reference_space {
  * shows the packed frame as it is, so the core needs no second code path.
  *
  * Rules. The frontend refuses a map that breaks one, except those marked
- * "Left out": a screen that breaks one of them is left out and the rest of
+ * "Left out": a screen that breaks only those is left out and the rest of
  * the map is accepted.
  *  - Call from \c retro_load_game() or \c retro_run(). The map applies from
  *    the next \c retro_video_refresh_t call and the frontend copies it.
@@ -3056,7 +3056,8 @@ enum retro_vr_reference_space {
  *  - Left out: a screen with \c RETRO_VIDEO_SCREEN_FLAG_UPRIGHT that the
  *    frontend cannot draw upright, while the core's rotation (set with
  *    \c RETRO_ENVIRONMENT_SET_ROTATION, not the user's setting) is not 0.
- *    The rotation is the one set when the map arrives, so a core calls
+ *    The screen is left out on every frame the core is turned; its bit
+ *    follows the rotation set when the map arrives, so a core calls
  *    \c RETRO_ENVIRONMENT_SET_ROTATION first. An image screen that is not
  *    a LAYER is never turned and is not affected.
  *  - An image's \c width and \c height are non-zero and \c pitch is at
@@ -3070,11 +3071,12 @@ enum retro_vr_reference_space {
  *    \c RETRO_PIXEL_FORMAT_RGB565; formats are an open list, as blends
  *    are), an image larger than it supports, and pixels it cannot take
  *    for want of memory.
- *  - The frontend keeps a screen's last image until an accepted map has
- *    no image for that screen (a map with \c num_views 0 has none), or
- *    content unloads. Nothing else drops it: not BLANK, not ABSENT with
- *    the image still set, not a refused map, not a map that leaves the
- *    screen out, not a restart of the video driver.
+ *  - The frontend keeps a screen's last image until an accepted map that
+ *    does not leave the screen out has no image for it (a map with
+ *    \c num_views 0 has none), or content unloads. Nothing else drops
+ *    it: not BLANK, not ABSENT with the image still set, not a refused
+ *    map, not a map that leaves the screen out, not a restart of the
+ *    video driver.
  *  - NULL \c data needs the image the frontend holds. Left out: NULL
  *    \c data for a screen whose image it does not hold, or with a
  *    \c serial other than the last one it took. With an unchanged
@@ -3088,6 +3090,9 @@ enum retro_vr_reference_space {
  *    is not the screen itself and names a screen whose own show is SHOWN
  *    or HIDDEN: the stack's root. The root and every LAYER whose \c base
  *    it is form one stack. There are no stacks within stacks.
+ *  - A stack starts as opaque black. The root is drawn first, as
+ *    \c RETRO_VIDEO_SCREEN_BLEND_NONE, then each drawn layer in \c z
+ *    order, equal values in screen-number order.
  *  - Left out: a LAYER whose \c blend the frontend does not draw,
  *    including a value it does not know. \c blend and an image's
  *    \c format are the screen fields where an unknown value does not
@@ -3098,11 +3103,12 @@ enum retro_vr_reference_space {
  *    except on a LAYER with an image, where one may be 0 and the other
  *    above 0.
  *  - That zero side is derived from the image's aspect (its
- *    \c aspect_ratio above 0, else \c width / \c height) and the root's
- *    aspect, both in the rectangle's frame, so the image keeps its shape
- *    whatever the root's aspect. The coordinate on that axis, \c x for a
- *    derived width and \c y for a derived height, is then the
- *    rectangle's centre, not its edge. A derived side is held at 64.
+ *    \c aspect_ratio above 0, else the image's \c width / \c height)
+ *    and the root's aspect, both in the rectangle's frame, so the image
+ *    keeps its shape whatever the root's aspect. The coordinate on that
+ *    axis, \c x for a derived width and \c y for a derived height, is
+ *    then the rectangle's centre, not its edge. A derived side is held
+ *    at 64.
  *  - On a LAYER, \c swap_with and \c group are 0, and \c opacity 0 is
  *    full. \c size, \c anchor, \c order, EMPHASIS, GROUP_VERTICAL and
  *    INTEGER are ignored; UPRIGHT is honoured. LAYER_OFF is ignored on a
@@ -3117,8 +3123,8 @@ enum retro_vr_reference_space {
  *    the placeholder adds nothing to them.
  *  - \c RETRO_VIDEO_SCREEN_FORMAT_ARGB8888 is taken only on a LAYER's
  *    image, and only while the status flag of that layer's own \c blend
- *    is set; under ADD and MULTIPLY the alpha weights the colour.
- *    Elsewhere the screen is left out, as an image screen is while
+ *    is set; under ADD and MULTIPLY the alpha weights the colour. Left
+ *    out: a screen with it elsewhere, as an image screen is while
  *    \c RETRO_VIDEO_VIEWS_STATUS_IMAGES is not set.
  *  - A stack turns as one, except its UPRIGHT layers.
  *    \c RETRO_ENVIRONMENT_SET_ROTATION turns the root and every layer
@@ -3138,8 +3144,9 @@ enum retro_vr_reference_space {
  *    change between maps. A rectangle change moves the stack's bounds and
  *    re-flows its place; it is not for animation. A core that changes
  *    rotation sends its UPRIGHT layers' rectangles again, for the new
- *    displayed frame, in the same \c retro_run(), by the rule above. A
- *    stack without UPRIGHT layers does not depend on rotation.
+ *    displayed frame, in the same \c retro_run(), by the
+ *    \c RETRO_ENVIRONMENT_SET_ROTATION rule above. A stack without
+ *    UPRIGHT layers does not depend on rotation.
  *  - A screen that is left out is not drawn and, if it is a LAYER, is not
  *    in its stack's bounds; its number and the user's settings for it
  *    stay. Nothing is taken from it: not its pixels, not its \c serial,
@@ -3151,7 +3158,9 @@ enum retro_vr_reference_space {
  *    for screen n; a refused map leaves it as it was. It names only
  *    screens this map's rules left out at the call: not the user's
  *    choices, not \c state, not an output that cannot draw a screen, not
- *    a status or rotation change after the call.
+ *    a status or rotation change after the call. A screen drawn OVER a
+ *    left-out screen, and the layers of a left-out root, are not drawn
+ *    either and have no bit of their own.
  *  - The frontend clears the map when content unloads.
  *
  * @param[in] data <tt>const struct retro_video_views *</tt>.
@@ -3328,7 +3337,15 @@ struct retro_video_view
 /* retro_video_screen::blend, read on a LAYER screen. An open list: a
  * frontend leaves out a layer whose blend it does not draw and says
  * which it draws with the RETRO_VIDEO_VIEWS_STATUS_BLEND_ flags.
- * Arithmetic is on stored 8-bit values, not linear light. */
+ * Each channel is a stored 8-bit value read as 0 to 1 (v / 255), not
+ * linear light. s is the layer's colour after the frontend's shading, d
+ * the stack's colour under it. a is the pixel's alpha times the layer's
+ * opacity (1 when opacity is 0); the pixel's alpha is 1 for a layer from
+ * the frame and for XRGB8888 and RGB565 images.
+ *   ALPHA:    d' = s * a + d * (1 - a)
+ *   ADD:      d' = min(1, d + s * a)
+ *   MULTIPLY: d' = d * (1 - a + s * a)
+ *   NONE:     d' = s; alpha and opacity are not read. */
 #define RETRO_VIDEO_SCREEN_BLEND_ALPHA    0
 #define RETRO_VIDEO_SCREEN_BLEND_ADD      1
 #define RETRO_VIDEO_SCREEN_BLEND_MULTIPLY 2
