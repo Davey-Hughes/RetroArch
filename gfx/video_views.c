@@ -344,14 +344,17 @@ static bool video_views_screen_validate(
          d->swap_with = s->swap_with;
          d->group     = s->group;
          d->opacity   = s->opacity;
-         d->blend     = s->blend;
-         d->z         = s->z;
-         d->x         = s->x;
-         d->y         = s->y;
-         d->width     = s->width;
-         d->height    = s->height;
-         /* A LAYER's are not read: kept 0. */
-         if (s->show != RETRO_VIDEO_SCREEN_SHOW_LAYER)
+         /* What a screen's show does not read is kept 0. */
+         if (s->show == RETRO_VIDEO_SCREEN_SHOW_LAYER)
+         {
+            d->blend  = s->blend;
+            d->z      = s->z;
+            d->x      = s->x;
+            d->y      = s->y;
+            d->width  = s->width;
+            d->height = s->height;
+         }
+         else
          {
             d->anchor = s->anchor;
             d->order  = s->order;

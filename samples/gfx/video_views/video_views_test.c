@@ -1665,6 +1665,27 @@ static void test_screens_layer(void)
    CHECK(video_views_validate_map(&in, &map, &scr));
    CHECK(map.layer == 0x1 && map.image == 0x5);
 
+   /* blend, z and the rectangle are a LAYER's alone: 0 on any other
+    * screen */
+   t_dsl(&in);
+   gel->x      = 0.25f;
+   gel->y      = -0.5f;
+   gel->width  = 0.5f;
+   gel->height = 0.75f;
+   t_dsl_screens[1].blend  = 7;
+   t_dsl_screens[1].z      = 3;
+   t_dsl_screens[1].x      = 0.25f;
+   t_dsl_screens[1].y      = -0.5f;
+   t_dsl_screens[1].width  = (float)HUGE_VAL;
+   t_dsl_screens[1].height = -1.0f;
+   CHECK(video_views_validate_map(&in, &map, &scr) && !map.rules_out);
+   CHECK(   scr.screens[1].blend == 0 && scr.screens[1].z == 0
+         && scr.screens[1].x == 0.0f && scr.screens[1].y == 0.0f
+         && scr.screens[1].width == 0.0f && scr.screens[1].height == 0.0f);
+   CHECK(   scr.screens[3].blend == 2 && scr.screens[3].z == 1
+         && scr.screens[3].x == 0.25f && scr.screens[3].y == -0.5f
+         && scr.screens[3].width == 0.5f && scr.screens[3].height == 0.75f);
+
    /* anchor and size are not read, and kept as 0 */
    t_dsl(&in);
    gel->anchor = 99;
