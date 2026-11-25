@@ -5076,7 +5076,7 @@ static void test_images_upload_565(void)
    window_test_end();
 }
 
-/* Rows wider than the picture go up packed (Review Focus 4) */
+/* Rows wider than the picture go up packed */
 static void test_images_upload_padded(void)
 {
    static uint32_t wide[50 * 32];
@@ -5262,8 +5262,7 @@ static void test_images_not_shown(void)
    window_test_end();
 }
 
-/* A frame fast-forward skips uploads nothing; the next drawn one does
- * (Review Focus 5) */
+/* A frame fast-forward skips uploads nothing; the next drawn one does */
 static void test_images_frameskip(void)
 {
    static uint32_t pixels[8 * 2];
@@ -5298,8 +5297,7 @@ static void test_images_frameskip(void)
    window_test_end();
 }
 
-/* A new lent picture every frame: each frame draws its own
- * (Review Focus 1) */
+/* A new lent picture every frame: each frame draws its own */
 static void test_images_every_frame(void)
 {
    struct retro_video_screen_buffer buf;
@@ -5782,7 +5780,7 @@ static void test_images_left_out(void)
 }
 
 /* A lend handed in while IMAGES is unset stays open across a driver
- * restart, and is taken once IMAGES is back (Review Focus 3) */
+ * restart, and is taken once IMAGES is back */
 static void test_images_left_out_lend(void)
 {
    struct retro_video_screen_buffer buf;
@@ -5840,8 +5838,7 @@ static unsigned layer_test_logged(const char *text)
 }
 
 /* The same image map every frame while IMAGES is unset: accepted and
- * left out each time, stored and logged once, nothing taken (Review
- * Focus 2) */
+ * left out each time, stored and logged once, nothing taken */
 static void test_images_left_out_every_frame(void)
 {
    video_views_map_t kept;
@@ -5873,7 +5870,7 @@ static void test_images_left_out_every_frame(void)
 }
 
 /* A screen the map left out stays out on the NULL refreshes after it;
- * a map between refreshes counts from the next one (Review Focus 1) */
+ * a map between refreshes counts from the next one */
 static void test_screens_left_out_repeat_frame(void)
 {
    video_driver_state_t *video_st = video_state_get_ptr();
@@ -5966,8 +5963,7 @@ static void layer_test_out(const video_views_rect_t *top)
 }
 
 /* A LAYER is left out on every frame and NULL refresh, whatever it is
- * drawn from, and an image format not taken leaves only its screen out
- * (Review Focus 1) */
+ * drawn from, and an image format not taken leaves only its screen out */
 static void test_screens_layer_left_out(void)
 {
    static uint32_t pixels[48 * 32];
@@ -6106,7 +6102,7 @@ static void upright_test_out(bool windows)
 
 /* An UPRIGHT screen is left out while the core is turned, with its bit
  * when the map arrives turned; a rotation changed with no new map counts
- * from the next frame and leaves the bit (Review Focus 5) */
+ * from the next frame and leaves the bit */
 static void test_screens_upright_turned(void)
 {
    runloop_state_t *runloop_st    = runloop_state_get_ptr();
@@ -11016,8 +11012,7 @@ static bool screen_menu_layer_offers(const char *values)
 
 /* A LAYER's Display row offers Auto and Off with the screens' windows
  * off or on, and it has no inset or window rows; an Over value stored
- * for its screen shows as Auto and is kept until the row is stepped
- * (Review Focus 4) */
+ * for its screen shows as Auto and is kept until the row is stepped */
 static void test_screen_menu_layer_rows(void)
 {
    static const char stored[]     = "video_screen4_display = \"over:1\"\n";
@@ -12546,7 +12541,7 @@ static void test_screens_redraw_masks(void)
 #endif
 }
 
-/* Review Focus 5: a redraw draws the inset where the frame did */
+/* A redraw draws the inset where the frame did */
 static void test_screens_redraw_inset(void)
 {
 #ifdef HAVE_THREADS

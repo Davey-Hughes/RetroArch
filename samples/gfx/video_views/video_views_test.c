@@ -3756,8 +3756,7 @@ static void test_arrange_user_over(void)
    CHECK(a.map.over == 0x2 && T_NIB(a.map.base, 1) == 0);
 }
 
-/* Review Focus 3: a hand-edited or stale Over value is laid out as on
- * Auto */
+/* A hand-edited or stale Over value is laid out as on Auto */
 static void test_arrange_user_over_invalid(void)
 {
    static t_arrange_t a;
@@ -4063,7 +4062,7 @@ static void test_arrange_layer(void)
 }
 
 /* A LAYER's Display is Auto or Off whoever placed its screen, and the
- * stored value is kept for a map where it is no LAYER (Review Focus 4). */
+ * stored value is kept for a map where it is no LAYER. */
 static void test_resolve_layer(void)
 {
    static const char *const placed[] = {
