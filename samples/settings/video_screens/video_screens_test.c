@@ -4684,6 +4684,9 @@ static void test_images_get(void)
    images_test_fill(&buf, 0x11);
    CHECK(!images_test_get(&buf, 2, 48, 32, RETRO_PIXEL_FORMAT_RGB565));
    CHECK(images_test_untouched_buf(&buf));
+   CHECK(!images_test_get(&buf, 2, 48, 32,
+            RETRO_VIDEO_SCREEN_FORMAT_ARGB8888));
+   CHECK(images_test_untouched_buf(&buf));
    CHECK(!images_test_get(&buf, 2, 513, 32, RETRO_PIXEL_FORMAT_XRGB8888));
    CHECK(images_test_untouched_buf(&buf));
    CHECK(!images_test_get(&buf, 2, 48, 0, RETRO_PIXEL_FORMAT_XRGB8888));
@@ -6134,6 +6137,45 @@ static void test_screens_upright_turned(void)
    CHECK(video_st->views_core.blank == 0x2);
 
    CHECK(upright_test_set(false) && !images_test_left_out);
+   runloop_st->system.rotation = core_rotation;
+   window_test_end();
+}
+
+/* The user's Off under a turned core: Top hidden with no bit of its own,
+ * beside UPRIGHT Bottom's */
+static void test_screens_user_off_turned(void)
+{
+   runloop_state_t *runloop_st    = runloop_state_get_ptr();
+   video_driver_state_t *video_st = video_state_get_ptr();
+   settings_t *settings           = config_get_ptr();
+   unsigned core_rotation         = runloop_st->system.rotation;
+   images_test_frames_begin();
+   images_test_picture(screens_test_dsi_pixels, 1);
+   strlcpy(settings->arrays.video_screen_display[0],
+         VIDEO_WINDOW_DISPLAY_OFF,
+         sizeof(settings->arrays.video_screen_display[0]));
+
+   runloop_st->system.rotation = 1;
+   CHECK(upright_test_set(false) && images_test_left_out == 0x2);
+   CHECK(!video_st->views.rules_out);
+   window_test_run();
+   CHECK(video_st->views_core.left_out == 0x7);
+   CHECK(!window_test_seen_views.rules_out && !window_test_seen_placed);
+
+   /* Bottom and the VMU over it */
+   runloop_st->system.rotation = 0;
+   window_test_run();
+   CHECK(images_test_left_out == 0x2);
+   CHECK(video_st->views_core.left_out == 0x1);
+   CHECK(window_test_seen_placed == 2 && !layer_test_view_placed(0));
+   CHECK(layer_test_view_placed(1) && screens_test_image_placed(2, 0) == 1);
+
+   CHECK(upright_test_set(false) && !images_test_left_out);
+   window_test_run();
+   CHECK(video_st->views_core.left_out == 0x1);
+   CHECK(window_test_seen_placed == 2 && !layer_test_view_placed(0));
+
+   settings->arrays.video_screen_display[0][0] = '\0';
    runloop_st->system.rotation = core_rotation;
    window_test_end();
 }
@@ -13885,6 +13927,7 @@ int main(int argc, char **argv)
    test_screens_left_out_repeat_frame();
    test_screens_layer_left_out();
    test_screens_upright_turned();
+   test_screens_user_off_turned();
    test_screens_image_turned();
    test_screens_rotation_with_map();
    test_window_image_frame();
