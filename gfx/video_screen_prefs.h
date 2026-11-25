@@ -93,8 +93,9 @@ typedef struct video_screen_prefs
  * default from @screens, else @global. The core's defaults: Display
  * Off for show HIDDEN and the Over value of its base for OVER; Corner,
  * Size and Opacity its non-zero anchor, size and opacity, the last two
- * as rounded percents. Returns the VIDEO_SCREEN_PREF_BIT()s whose value
- * is the core's default. @prefs and @screens may be NULL. */
+ * as rounded percents. A LAYER's Display is "" unless it is Off, and
+ * its show gives no default. Returns the VIDEO_SCREEN_PREF_BIT()s whose
+ * value is the core's default. @prefs and @screens may be NULL. */
 unsigned video_screen_prefs_resolve(const video_screen_prefs_t *prefs,
       const video_views_screens_t *screens,
       const video_screen_values_t *global, unsigned screen,

@@ -10917,6 +10917,148 @@ static void test_screen_menu_image_rows(void)
    screen_menu_end();
 }
 
+/* test_screen_menu_image_rows()'s map plus "Gel", screen 3, drawn from a
+ * view of its own: a LAYER on Top, or SHOWN without @layer */
+static bool screen_menu_layer_set(bool layer)
+{
+   static struct retro_video_view views[3];
+   static struct retro_video_screen screens[4];
+   static struct retro_video_screen_image image;
+   struct retro_video_views map;
+   screens_test_dsi_small(&map, views, screens, &image);
+   memset(&screens[3], 0, sizeof(screens[3]));
+   screens[3].name = "Gel";
+   if (layer)
+   {
+      screens[3].show  = RETRO_VIDEO_SCREEN_SHOW_LAYER;
+      screens[3].blend = RETRO_VIDEO_SCREEN_BLEND_MULTIPLY;
+      screens[3].z     = 1;
+   }
+   views[2]        = views[0];
+   views[2].screen = 3;
+   map.num_views   = 3;
+   map.num_screens = 4;
+   return video_driver_set_views(&map);
+}
+
+/* Gel's Display row offers @values, listed afresh */
+static bool screen_menu_layer_offers(const char *values)
+{
+   rarch_setting_t *row;
+   menu_setting_video_screen_display_values();
+   row = menu_setting_find("video_screen4_display");
+   return row && string_is_equal(row->aux.values, values);
+}
+
+/* A LAYER's Display row offers Auto and Off with the screens' windows
+ * off or on, and it has no inset or window rows; an Over value stored
+ * for its screen shows as Auto and is kept until the row is stepped
+ * (Review Focus 4) */
+static void test_screen_menu_layer_rows(void)
+{
+   static const char stored[]     = "video_screen4_display = \"over:1\"\n";
+   video_driver_state_t *video_st = video_state_get_ptr();
+   settings_t *settings           = config_get_ptr();
+   video_screen_prefs_t *prefs    = &video_st->screen_prefs;
+   const unsigned display         =
+      VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY);
+   config_file_t *conf;
+   file_list_t list;
+   char path[PATH_MAX_LENGTH];
+   char text[64];
+   unsigned windows;
+   load_fixture("");
+   screens_file_begin("video_views layer", path, sizeof(path));
+   screens_file_write(path, stored);
+   screens_test_core();
+   strlcpy(prefs->library_name, "video_views layer",
+         sizeof(prefs->library_name));
+   CHECK(config_load_video_screen_prefs(prefs->library_name, prefs));
+   CHECK(prefs->set[3] == display);
+   window_test_begin();
+   settings->bools.video_windows_enable = false;
+   video_st->views_images               = true;
+
+   /* SHOWN, the stored choice applies */
+   CHECK(screen_menu_layer_set(false));
+   window_test_run();
+   menu_value("video_screen4_display", "Over Top");
+   CHECK(screen_menu_layer_offers("|over:1|over:2|over:3|off"));
+
+   CHECK(screen_menu_layer_set(true));
+   for (windows = 0; windows < 2; windows++)
+   {
+      settings->bools.video_windows_enable = windows != 0;
+      window_test_run();
+      CHECK(screen_menu_layer_offers("|off"));
+      menu_value("video_screen4_display", "Auto");
+      memset(&list, 0, sizeof(list));
+      menu_displaylist_build_list(&list, settings,
+            DISPLAYLIST_VIDEO_GAME_SCREENS_SETTINGS_LIST, true);
+      CHECK(window_menu_has(&list, "video_screen4_display"));
+      CHECK(screen_menu_inset_rows(&list, 3) == 0);
+      CHECK(!window_menu_has(&list, "video_screen4_window_fullscreen"));
+      CHECK(!window_menu_has(&list, "video_screen4_window_width"));
+      file_list_deinitialize(&list);
+   }
+   CHECK(prefs->set[3] == display && !prefs->dirty);
+   CHECK(string_is_equal(prefs->values[3].display, "over:1"));
+   /* The unload's save */
+   config_save_video_screen_prefs(prefs->library_name, prefs);
+   CHECK(screens_file_holds(path, stored));
+
+   menu_action("video_screen4_display", MENU_ACTION_RIGHT);
+   menu_value("video_screen4_display", "OFF");
+   CHECK(prefs->set[3] == display);
+   CHECK(string_is_equal(prefs->values[3].display,
+            VIDEO_WINDOW_DISPLAY_OFF));
+   CHECK(config_save_video_screen_prefs(prefs->library_name, prefs));
+   conf = config_file_new_from_path_to_string(path);
+   CHECK(conf != NULL);
+   if (conf)
+   {
+      CHECK(screens_file_keys(conf) == 1);
+      CHECK(config_get_array(conf, "video_screen4_display", text,
+               sizeof(text)));
+      CHECK(string_is_equal(text, VIDEO_WINDOW_DISPLAY_OFF));
+      config_file_free(conf);
+   }
+   menu_action("video_screen4_display", MENU_ACTION_LEFT);
+   menu_value("video_screen4_display", "Auto");
+   CHECK(prefs->set[3] == display && !prefs->values[3].display[0]);
+   /* On Auto with the windows on: no window of its own to set up */
+   window_test_run();
+   memset(&list, 0, sizeof(list));
+   menu_displaylist_build_list(&list, settings,
+         DISPLAYLIST_VIDEO_GAME_SCREENS_SETTINGS_LIST, true);
+   CHECK(window_menu_has(&list, "video_screen4_display"));
+   CHECK(screen_menu_inset_rows(&list, 3) == 0);
+#ifndef ANDROID
+   CHECK(window_menu_has(&list, "video_screen2_window_width"));
+#endif
+   CHECK(!window_menu_has(&list, "video_screen4_window_fullscreen"));
+   CHECK(!window_menu_has(&list, "video_screen4_window_width"));
+   file_list_deinitialize(&list);
+
+   /* SHOWN again: the usual values and rows */
+   CHECK(screen_menu_layer_set(false));
+   window_test_run();
+#ifndef ANDROID
+   memset(&list, 0, sizeof(list));
+   menu_displaylist_build_list(&list, settings,
+         DISPLAYLIST_VIDEO_GAME_SCREENS_SETTINGS_LIST, true);
+   CHECK(window_menu_has(&list, "video_screen4_window_width"));
+   file_list_deinitialize(&list);
+#endif
+   settings->bools.video_windows_enable = false;
+   window_test_run();
+   CHECK(screen_menu_layer_offers("|over:1|over:2|over:3|off"));
+   window_test_end();
+   screens_test_core_done();
+   filestream_delete(path);
+   screens_file_end();
+}
+
 /* Screens drawn side by side have no Corner, Size or Opacity rows */
 static void test_screen_menu_inset_rows_shown(void)
 {
@@ -13809,6 +13951,7 @@ int main(int argc, char **argv)
    test_screen_menu_over_no_content();
    test_screen_menu_inset_rows();
    test_screen_menu_image_rows();
+   test_screen_menu_layer_rows();
    test_screen_menu_inset_rows_shown();
    test_screen_menu_inset_rows_follow_display();
    test_screen_menu_inset_window_rows();

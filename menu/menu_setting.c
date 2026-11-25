@@ -4076,6 +4076,15 @@ static char setting_video_screen_display_value[RETRO_VIDEO_VIEWS_MAX]
 static char setting_video_screen_display_seen[RETRO_VIDEO_VIEWS_MAX]
       [VIDEO_WINDOW_DISPLAY_NAME_SIZE];
 
+/* The running core sends screen @s as a LAYER */
+static bool setting_video_screen_is_layer(unsigned s)
+{
+   const video_views_screens_t *screens =
+      &video_state_get_ptr()->views_screens;
+   return s < screens->count
+      && screens->screens[s].show == RETRO_VIDEO_SCREEN_SHOW_LAYER;
+}
+
 #ifdef HAVE_VIDEO_WINDOWS
 /* The screens have windows or displays of their own to go to */
 static bool setting_video_screen_display_full(void)
@@ -4175,7 +4184,8 @@ bool menu_setting_video_screen_window_own(unsigned screen)
    unsigned count;
    const video_window_display_t *displays =
       video_driver_borrow_window_displays(&count);
-   if (video_state_get_ptr()->screens_insets & (1u << screen))
+   if (     (video_state_get_ptr()->screens_insets & (1u << screen))
+         || setting_video_screen_is_layer(screen))
       return false;
    video_driver_screen_get(screen, &values);
    return video_windows_display_own(displays, count, values.display,
@@ -4259,7 +4269,8 @@ void menu_setting_video_screen_windows_moved(void)
 #endif
 
 /* Screen @s's row. A base on offer is another screen with a view that
- * is not an inset; with no map to check, every other screen listed. */
+ * is not an inset; with no map to check, every other screen listed.
+ * A LAYER's row has Auto and Off alone. */
 static void setting_video_screen_display_build(unsigned s)
 {
    video_driver_state_t *video_st = video_state_get_ptr();
@@ -4271,6 +4282,11 @@ static void setting_video_screen_display_build(unsigned s)
    unsigned bases                 = ~0u;
    unsigned b;
    list[0] = '\0';
+   if (setting_video_screen_is_layer(s))
+   {
+      strlcpy(list, "|" VIDEO_WINDOW_DISPLAY_OFF, size);
+      return;
+   }
 #ifdef HAVE_VIDEO_WINDOWS
    if (setting_video_screen_display_full())
    {

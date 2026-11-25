@@ -154,7 +154,8 @@ size_t menu_setting_video_screen_display_repr(unsigned screen, char *s,
 #ifdef HAVE_VIDEO_WINDOWS
 #ifndef ANDROID
 /* Game Screen @screen has a window of its own by its Display setting
- * and the displays listed now; an inset has none. App thread. */
+ * and the displays listed now; an inset or a LAYER has none. App
+ * thread. */
 bool menu_setting_video_screen_window_own(unsigned screen);
 
 /* The screen whose Screen N row or page is @label, or

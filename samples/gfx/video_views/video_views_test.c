@@ -4062,6 +4062,75 @@ static void test_arrange_layer(void)
    CHECK(a.map.over == 0x2 && a.map.left_out == 0xa);
 }
 
+/* A LAYER's Display is Auto or Off whoever placed its screen, and the
+ * stored value is kept for a map where it is no LAYER (Review Focus 4). */
+static void test_resolve_layer(void)
+{
+   static const char *const placed[] = {
+      "over:1", VIDEO_WINDOW_DISPLAY_MAIN, "DP-2"
+   };
+   static video_screen_prefs_t prefs, kept;
+   static video_views_map_t map;
+   static video_views_screens_t scr;
+   struct retro_video_views in;
+   video_screen_values_t global, mine, out;
+   unsigned i;
+
+   t_dsl(&in);
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(scr.screens[3].show == RETRO_VIDEO_SCREEN_SHOW_LAYER);
+   t_prefs_values(&global);
+   t_prefs_values(&mine);
+   /* Its show gives no default, with LAYER_OFF or without */
+   strcpy(out.display, "unset");
+   CHECK(video_screen_prefs_resolve(NULL, &scr, &global, 3, &out) == 0);
+   CHECK(!out.display[0]);
+   t_dsl_screens[3].flags = RETRO_VIDEO_SCREEN_FLAG_LAYER_OFF;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   CHECK(video_screen_prefs_resolve(NULL, &scr, &global, 3, &out) == 0);
+   CHECK(!out.display[0]);
+   for (i = 0; i < sizeof(placed) / sizeof(placed[0]); i++)
+   {
+      memset(&prefs, 0, sizeof(prefs));
+      strcpy(mine.display, placed[i]);
+      video_screen_prefs_set(&prefs, 3, T_PREF(DISPLAY), &mine);
+      memcpy(&kept, &prefs, sizeof(kept));
+      CHECK(video_screen_prefs_resolve(&prefs, &scr, &global, 3, &out) == 0);
+      CHECK(!out.display[0]);
+      CHECK(!memcmp(&prefs, &kept, sizeof(prefs)));
+      CHECK(!strcmp(prefs.values[3].display, placed[i]));
+      /* The global setting's */
+      strcpy(global.display, placed[i]);
+      CHECK(video_screen_prefs_resolve(NULL, &scr, &global, 3, &out) == 0);
+      CHECK(!out.display[0]);
+      global.display[0] = '\0';
+   }
+   /* Off stays, the user's and the global setting's */
+   memset(&prefs, 0, sizeof(prefs));
+   strcpy(mine.display, VIDEO_WINDOW_DISPLAY_OFF);
+   video_screen_prefs_set(&prefs, 3, T_PREF(DISPLAY), &mine);
+   CHECK(video_screen_prefs_resolve(&prefs, &scr, &global, 3, &out) == 0);
+   CHECK(!strcmp(out.display, VIDEO_WINDOW_DISPLAY_OFF));
+   strcpy(global.display, VIDEO_WINDOW_DISPLAY_OFF);
+   CHECK(video_screen_prefs_resolve(NULL, &scr, &global, 3, &out) == 0);
+   CHECK(!strcmp(out.display, VIDEO_WINDOW_DISPLAY_OFF));
+   /* Auto chosen over a global Off */
+   mine.display[0] = '\0';
+   video_screen_prefs_set(&prefs, 3, T_PREF(DISPLAY), &mine);
+   CHECK(video_screen_prefs_resolve(&prefs, &scr, &global, 3, &out) == 0);
+   CHECK(!out.display[0]);
+   global.display[0] = '\0';
+
+   /* The same screen SHOWN */
+   t_dsl(&in);
+   t_dsl_screens[3].show = RETRO_VIDEO_SCREEN_SHOW_SHOWN;
+   CHECK(video_views_validate_map(&in, &map, &scr));
+   strcpy(mine.display, "over:1");
+   video_screen_prefs_set(&prefs, 3, T_PREF(DISPLAY), &mine);
+   CHECK(video_screen_prefs_resolve(&prefs, &scr, &global, 3, &out) == 0);
+   CHECK(!strcmp(out.display, "over:1"));
+}
+
 /* UPRIGHT is left out only while the core is turned, and the core's
  * inset over it with it. */
 static void test_arrange_upright(void)
@@ -5397,6 +5466,7 @@ int main(void)
    test_arrange_images_off();
    test_arrange_rules_out();
    test_arrange_layer();
+   test_resolve_layer();
    test_arrange_upright();
 
    if (failures)

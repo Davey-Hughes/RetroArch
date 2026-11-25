@@ -172,7 +172,13 @@ unsigned video_screen_prefs_resolve(const video_screen_prefs_t *prefs,
    if (!screens || screen >= screens->count)
       return 0;
    core = &screens->screens[screen];
-   if (!(set & VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY)))
+   if (core->show == RETRO_VIDEO_SCREEN_SHOW_LAYER)
+   {
+      /* Drawn with its base or not at all, wherever it was placed */
+      if (strcmp(out->display, VIDEO_WINDOW_DISPLAY_OFF))
+         out->display[0] = '\0';
+   }
+   else if (!(set & VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY)))
    {
       if (core->show == RETRO_VIDEO_SCREEN_SHOW_HIDDEN)
          memcpy(out->display, VIDEO_WINDOW_DISPLAY_OFF,
