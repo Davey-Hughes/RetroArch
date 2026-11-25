@@ -4504,9 +4504,12 @@ bool video_driver_set_views(struct retro_video_views *views)
 #endif
    if (     map.image
          && !(video_driver_views_status() & RETRO_VIDEO_VIEWS_STATUS_IMAGES))
+      map.rules_out = map.image;
+   if (!video_screen_images_set(views, &map, &map.rules_out))
       return false;
-   if (!video_screen_images_set(views, &map))
-      return false;
+   if (     (views->flags & RETRO_VIDEO_VIEWS_FLAG_SCREENS)
+         && views->screens_left_out)
+      *views->screens_left_out = map.rules_out;
    if (map.num_views && video_st->screen_prefs.core_loaded)
       video_st->screen_prefs.in_use = true;
    described = video_driver_views_take_screens(video_st, &screens);
@@ -4665,6 +4668,7 @@ static VIDEO_NOINLINE unsigned video_driver_screens_insets(
       map.num_screens = video_st->views_core.num_screens;
       map.viewless    = video_st->views_core.viewless;
       map.image       = video_st->views_core.image;
+      map.rules_out   = video_st->views_core.rules_out;
       video_screen_prefs_arrange(video_st->screens_resolved,
             video_st->screens_defaults, &video_st->views_screens,
             video_st->views_images_arranged, &map);
@@ -5742,6 +5746,7 @@ static void video_driver_views_take_arrangement(video_views_map_t *to,
    to->anchor   = from->anchor;
    to->image    = from->image;
    to->nearest  = from->nearest;
+   to->rules_out = from->rules_out;
    memcpy(to->opacity,      from->opacity,      sizeof(to->opacity));
    memcpy(to->size,         from->size,         sizeof(to->size));
    memcpy(to->image_dims,   from->image_dims,   sizeof(to->image_dims));
@@ -5813,6 +5818,7 @@ static VIDEO_NOINLINE void video_driver_views_frame(
       core->no_input = video_st->views.no_input;
       core->viewless = video_st->views.viewless;
       core->image    = video_st->views.image;
+      core->rules_out = video_st->views.rules_out;
       memcpy(core->image_dims, video_st->views.image_dims,
             sizeof(core->image_dims));
       memcpy(core->image_aspect, video_st->views.image_aspect,

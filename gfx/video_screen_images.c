@@ -246,13 +246,15 @@ bool video_screen_images_lend(struct retro_video_screen_buffer *buf,
 }
 
 bool video_screen_images_set(const struct retro_video_views *in,
-      const video_views_map_t *map)
+      const video_views_map_t *map, unsigned *left_out)
 {
    video_screen_images_screen_t *store =
          video_screen_images_store[video_screen_images_caller];
    int take[RETRO_VIDEO_SCREENS_MAX];         /* slot to keep; -1 none */
    uint32_t *made[RETRO_VIDEO_SCREENS_MAX];   /* that slot remade */
-   int rgba = -1;                             /* asked once, if needed */
+   int rgba      = -1;                        /* asked once, if needed */
+   unsigned out  = *left_out;
+   unsigned copy = 0;                         /* the core's own pixels */
    unsigned s;
 
    for (s = 0; s < RETRO_VIDEO_SCREENS_MAX; s++)
@@ -261,10 +263,11 @@ bool video_screen_images_set(const struct retro_video_views *in,
       made[s] = NULL;
    }
 
+   /* The refusals, on every image screen */
    for (s = 0; s < RETRO_VIDEO_SCREENS_MAX; s++)
    {
       const struct retro_video_screen_image *im;
-      video_screen_images_screen_t *scr = &store[s];
+      const video_screen_images_screen_t *scr = &store[s];
       unsigned dims;
       unsigned found;
       int kept;
@@ -277,38 +280,56 @@ bool video_screen_images_set(const struct retro_video_views *in,
       if (kept >= 0 && im->serial == scr->serial)
       {
          if (dims != scr->slot_dims[kept] || im->format != scr->format)
-            goto refuse;
+            return false;
          continue;
       }
+      /* No pixels for a picture not held */
       if (!im->data)
-         goto refuse;
-      if (video_screen_images_find(im->data, &found, &slot))
       {
-         /* Only the caller's lend for this screen, as it was lent */
-         if (     found != s
-               || !(scr->slot_flags[slot] & VIDEO_SCREEN_IMAGES_LENT)
-               || im->data   != scr->slot[slot]
-               || dims       != scr->slot_dims[slot]
-               || im->format != RETRO_PIXEL_FORMAT_XRGB8888
-               || im->pitch  != im->width * sizeof(uint32_t))
-            goto refuse;
-         take[s] = slot;
+         out |= 1u << s;
          continue;
       }
-      /* The core's own pixels: a copy into a free slot, else the kept
-       * one */
+      if (!video_screen_images_find(im->data, &found, &slot))
+      {
+         copy |= 1u << s;
+         continue;
+      }
+      /* Only the caller's lend for this screen, as it was lent */
+      if (     found != s
+            || !(scr->slot_flags[slot] & VIDEO_SCREEN_IMAGES_LENT)
+            || im->data   != scr->slot[slot]
+            || dims       != scr->slot_dims[slot]
+            || im->format != RETRO_PIXEL_FORMAT_XRGB8888
+            || im->pitch  != im->width * sizeof(uint32_t))
+         return false;
+      take[s] = slot;
+   }
+
+   /* A copy into a free slot, else the kept one; with no slot or no
+    * memory the screen is left out */
+   for (s = 0; s < RETRO_VIDEO_SCREENS_MAX; s++)
+   {
+      const struct retro_video_screen_image *im;
+      const video_screen_images_screen_t *scr = &store[s];
+      unsigned dims;
+      int kept;
+      int slot;
+      if (!(copy & ~out & (1u << s)))
+         continue;
+      im   = in->screens[s].image;
+      dims = VIDEO_SCALE_PACK(im->width, im->height);
+      kept = video_screen_images_with(scr, VIDEO_SCREEN_IMAGES_KEPT);
       slot = video_screen_images_pick(scr, dims, VIDEO_SCREEN_IMAGES_KEPT
             | VIDEO_SCREEN_IMAGES_LENT | VIDEO_SCREEN_IMAGES_PINNED);
       if (     slot < 0 && kept >= 0
             && !(scr->slot_flags[kept] & VIDEO_SCREEN_IMAGES_PINNED))
          slot = kept;
+      if (     slot >= 0
+            && (!scr->slot[slot] || scr->slot_dims[slot] != dims)
+            && !(made[s] = video_screen_images_alloc(dims)))
+         slot = -1;
       if (slot < 0)
-         goto refuse;
-      if (!scr->slot[slot] || scr->slot_dims[slot] != dims)
-      {
-         if (!(made[s] = video_screen_images_alloc(dims)))
-            goto refuse;
-      }
+         out |= 1u << s;
       take[s] = slot;
    }
 
@@ -320,6 +341,9 @@ bool video_screen_images_set(const struct retro_video_views *in,
       unsigned held;
       int kept;
       int slot = take[s];
+      /* Left out: nothing taken, dropped or ended */
+      if (out & (1u << s))
+         continue;
       if (!(map->image & (1u << s)))
       {
          video_screen_images_drop(scr);
@@ -355,12 +379,8 @@ bool video_screen_images_set(const struct retro_video_views *in,
       scr->kept_gen++;
    }
    video_screen_images_shown = video_screen_images_caller;
+   *left_out                 = out;
    return true;
-
-refuse:
-   for (s = 0; s < RETRO_VIDEO_SCREENS_MAX; s++)
-      free(made[s]);
-   return false;
 }
 
 /* @scr's upload of generation @gen ended, on its surface's texture or

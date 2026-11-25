@@ -11336,6 +11336,7 @@ static bool imgrst_show(unsigned serial)
    static struct retro_video_screen       screen;
    static struct retro_video_views        in;
    static video_views_map_t               map;
+   unsigned left_out = 0;
    memset(&in,  0, sizeof(in));
    memset(&map, 0, sizeof(map));
    memset(pixels, (int)serial, sizeof(pixels));
@@ -11349,7 +11350,7 @@ static bool imgrst_show(unsigned serial)
    in.screens     = &screen;
    in.num_screens = 1;
    map.image      = 1;
-   if (!video_screen_images_set(&in, &map))
+   if (!video_screen_images_set(&in, &map, &left_out) || left_out)
       return false;
    video_screen_images_frame(&map, 1, 0);
    return true;

@@ -4450,6 +4450,7 @@ static void test_views_screens_frontend(void)
    video_views_names_t names;
    video_views_map_t kept;
    unsigned status;
+   unsigned left_out;
    int stamp;
 
    video_driver_clear_views();
@@ -4485,12 +4486,15 @@ static void test_views_screens_frontend(void)
    CHECK(screens_test_label(2, "VMU A1"));
    CHECK(video_driver_screen_names_stamp() == stamp);
 
-   /* An image map while IMAGES is unset: refused, nothing moves */
+   /* An image map while IMAGES is unset: accepted, the image left out */
    screens_test_dsi(&map, views, screens, &image);
-   CHECK(!video_driver_set_views(&map));
-   CHECK(!memcmp(&kept, &video_st->views, sizeof(kept)));
-   CHECK(screens_test_label(2, "VMU A1"));
-   CHECK(video_driver_screen_names_stamp() == stamp);
+   left_out             = 0xA5A5A5A5;
+   map.screens_left_out = &left_out;
+   CHECK(video_driver_set_views(&map));
+   CHECK(video_st->views.rules_out == 0x4 && left_out == 0x4);
+   CHECK(screens_test_label(0, "Top"));
+   CHECK(screens_test_label(1, "Bottom"));
+   CHECK(screens_test_label(2, "VMU"));
    screens_test_full(&map, views, screens);
 
    /* Without the flag the screens are RetroArch's to name */
@@ -4532,8 +4536,8 @@ static void test_views_screens_frontend(void)
 }
 
 /* IMAGES gone under an accepted image map leaves its image screen, root
- * or inset, out and refuses new image maps; back, the screen is placed
- * again with no new map */
+ * or inset, out, and a new image map takes nothing; back, the screen is
+ * placed again with no new map */
 static void test_screens_images_gone(void)
 {
    static struct retro_video_view views[2];
@@ -4541,6 +4545,7 @@ static void test_screens_images_gone(void)
    static struct retro_video_screen_image image;
    video_driver_state_t *video_st = video_state_get_ptr();
    struct retro_video_views map;
+   unsigned left_out = 0xA5A5A5A5;
 
    window_test_begin();
    config_get_ptr()->bools.video_windows_enable = false;
@@ -4557,9 +4562,15 @@ static void test_screens_images_gone(void)
    CHECK(window_test_seen_placed == 2);
    CHECK(!screens_test_image_placed(2, 0));
    CHECK(video_st->views_core.left_out & 0x4u);
-   image.serial = 2;
-   CHECK(!video_driver_set_views(&map));
+   image.serial         = 2;
+   map.screens_left_out = &left_out;
+   CHECK(video_driver_set_views(&map) && left_out == 0x4);
    window_test_flags &= ~(1u << GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK);
+   image.data           = NULL;
+   CHECK(video_driver_set_views(&map) && left_out == 0x4);
+   image.serial         = 1;
+   CHECK(video_driver_set_views(&map) && left_out == 0);
+   image.data           = screens_test_dsi_pixels;
    window_test_run();
    CHECK(window_test_seen_placed == 3);
    CHECK(screens_test_image_placed(2, 0) == 1);
@@ -4624,6 +4635,8 @@ static void images_test_fill(const struct retro_video_screen_buffer *buf,
 
 static struct retro_video_screen_image images_test_image;
 static unsigned images_test_screen_flags;   /* screen 2's */
+/* The core's screens_left_out, a marker before each map */
+static unsigned images_test_left_out;
 
 /* screens_test_dsi()'s picture at @data with @serial */
 static void images_test_picture(const void *data, unsigned serial)
@@ -4646,8 +4659,10 @@ static bool images_test_set(void)
    struct retro_video_screen_image dsi;
    struct retro_video_views map;
    screens_test_dsi_small(&map, views, screens, &dsi);
-   screens[2].image = &images_test_image;
-   screens[2].flags = images_test_screen_flags;
+   screens[2].image     = &images_test_image;
+   screens[2].flags     = images_test_screen_flags;
+   images_test_left_out = 0xA5A5A5A5;
+   map.screens_left_out = &images_test_left_out;
    return video_driver_set_views(&map);
 }
 
@@ -4709,7 +4724,7 @@ static void test_images_lend_hand_in(void)
    images_test_fill(&buf, 0x5a);
    CHECK(images_test_hand(buf.data, 1));
    CHECK(!images_test_hand(buf.data, 2));
-   CHECK(images_test_hand(NULL, 1));
+   CHECK(images_test_hand(NULL, 1) && !images_test_left_out);
    window_test_end();
 }
 
@@ -4718,8 +4733,8 @@ static void test_images_copy(void)
 {
    images_test_begin();
    CHECK(images_test_hand(screens_test_dsi_pixels, 1));
-   CHECK(images_test_hand(NULL, 1));
-   CHECK(!images_test_hand(NULL, 2));
+   CHECK(images_test_hand(NULL, 1) && !images_test_left_out);
+   CHECK(images_test_hand(NULL, 2) && images_test_left_out == 0x4);
    window_test_end();
 }
 
@@ -4730,7 +4745,7 @@ static void test_images_refusals(void)
    struct retro_video_screen_buffer buf;
    struct retro_video_screen_buffer other;
    images_test_begin();
-   CHECK(!images_test_hand(NULL, 1));
+   CHECK(images_test_hand(NULL, 1) && images_test_left_out == 0x4);
    CHECK(images_test_get(&kept, 2, 48, 32, RETRO_PIXEL_FORMAT_XRGB8888));
    images_test_fill(&kept, 0x22);
    CHECK(images_test_hand(kept.data, 1));
@@ -4739,7 +4754,7 @@ static void test_images_refusals(void)
    images_test_fill(&buf, 0x33);
    images_test_fill(&other, 0x44);
 
-   CHECK(!images_test_hand(NULL, 7));
+   CHECK(images_test_hand(NULL, 7) && images_test_left_out == 0x4);
    images_test_picture(screens_test_dsi_pixels, 1);
    images_test_image.width = 32;
    images_test_image.pitch = 32 * sizeof(uint32_t);
@@ -4758,7 +4773,7 @@ static void test_images_refusals(void)
    images_test_image.height = 31;
    CHECK(!images_test_set());
 
-   CHECK(images_test_hand(NULL, 1));
+   CHECK(images_test_hand(NULL, 1) && !images_test_left_out);
    CHECK(images_test_hand(buf.data, 2));
    window_test_end();
 }
@@ -4776,16 +4791,16 @@ static void test_images_keep_last(void)
    image.data       = NULL;
    screens[2].state = RETRO_VIDEO_SCREEN_STATE_BLANK;
    CHECK(video_driver_set_views(&map));
-   CHECK(images_test_hand(NULL, 1));
+   CHECK(images_test_hand(NULL, 1) && !images_test_left_out);
    screens[2].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
    CHECK(video_driver_set_views(&map));
-   CHECK(images_test_hand(NULL, 1));
+   CHECK(images_test_hand(NULL, 1) && !images_test_left_out);
    /* A view on the image screen */
    screens[1].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
    screens[2].state = RETRO_VIDEO_SCREEN_STATE_ACTIVE;
    views[1].screen  = 2;
    CHECK(!video_driver_set_views(&map));
-   CHECK(images_test_hand(NULL, 1));
+   CHECK(images_test_hand(NULL, 1) && !images_test_left_out);
    window_test_end();
 }
 
@@ -4803,11 +4818,11 @@ static void test_images_dropped(void)
    screens[2].image = NULL;
    screens[2].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
    CHECK(video_driver_set_views(&map));
-   CHECK(!images_test_hand(NULL, 1));
+   CHECK(images_test_hand(NULL, 1) && images_test_left_out == 0x4);
    CHECK(images_test_hand(screens_test_dsi_pixels, 1));
    map.num_views = 0;
    CHECK(video_driver_set_views(&map));
-   CHECK(!images_test_hand(NULL, 1));
+   CHECK(images_test_hand(NULL, 1) && images_test_left_out == 0x4);
 
    /* Lent before the drop, written and handed in after it */
    CHECK(images_test_hand(screens_test_dsi_pixels, 1));
@@ -4851,7 +4866,7 @@ static void test_images_unload(void)
    CHECK(images_test_hand(kept.data, 1));
    CHECK(images_test_get(&buf, 2, 48, 32, RETRO_PIXEL_FORMAT_XRGB8888));
    video_driver_clear_views();
-   CHECK(!images_test_hand(NULL, 1));
+   CHECK(images_test_hand(NULL, 1) && images_test_left_out == 0x4);
    CHECK(images_test_get(&buf, 2, 48, 32, RETRO_PIXEL_FORMAT_XRGB8888));
    images_test_fill(&buf, 0x55);
    CHECK(images_test_hand(buf.data, 1));
@@ -5313,7 +5328,7 @@ static void test_images_nearest(void)
    window_test_run();
    CHECK(window_test_seen_views.nearest == 0x4u);
    images_test_screen_flags     = 0;
-   CHECK(images_test_hand(NULL, 1));
+   CHECK(images_test_hand(NULL, 1) && !images_test_left_out);
    settings->bools.video_smooth = false;
    window_test_run();
    CHECK(window_test_seen_views.nearest == 0x4u);
@@ -5541,8 +5556,8 @@ static void test_images_per_instance(void)
    }
    CHECK(images_test_hand(screens_test_dsi_pixels, 1));
    CHECK(images_test_hand_second(blue, 1));
-   CHECK(images_test_hand(NULL, 1));
-   CHECK(!images_test_hand_second(NULL, 2));
+   CHECK(images_test_hand(NULL, 1) && !images_test_left_out);
+   CHECK(images_test_hand_second(NULL, 2) && images_test_left_out == 0x4);
    CHECK(images_test_get(&main_lend, 2, 48, 32, RETRO_PIXEL_FORMAT_XRGB8888));
    images_test_fill(&main_lend, 0x33);
    CHECK(!images_test_hand_second(main_lend.data, 2));
@@ -5552,7 +5567,7 @@ static void test_images_per_instance(void)
    video_screen_images_set_caller(VIDEO_SCREEN_IMAGES_MAIN);
    images_test_fill(&second_lend, 0x44);
    CHECK(!images_test_hand(second_lend.data, 2));
-   CHECK(images_test_hand_second(NULL, 1));
+   CHECK(images_test_hand_second(NULL, 1) && !images_test_left_out);
    window_test_run();
    CHECK(images_test_loads + images_test_updates == 1);
    CHECK(images_test_words[0] == 0x000000FFu);
@@ -5562,8 +5577,8 @@ static void test_images_per_instance(void)
    window_test_run();
    CHECK(images_test_loads + images_test_updates == 1);
    CHECK(images_test_words[0] == 0x00FF0000u);
-   CHECK(!images_test_hand_second(NULL, 1));
-   CHECK(images_test_hand(NULL, 1));
+   CHECK(images_test_hand_second(NULL, 1) && images_test_left_out == 0x4);
+   CHECK(images_test_hand(NULL, 1) && !images_test_left_out);
    memset(screens_test_dsi_pixels, 0, sizeof(screens_test_dsi_pixels));
    window_test_end();
 }
@@ -5621,6 +5636,176 @@ static void test_images_second_freed_repeat(void)
    images_test_repeat();
    CHECK(screens_test_image_placed(2, 0) == 1);
    CHECK(window_test_seen_views.image_tex[2] == 102);
+   window_test_end();
+}
+
+/* A screen whose pixels the frontend does not hold or cannot take is
+ * left out and takes nothing; a refused map writes nothing */
+static void test_images_left_out(void)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[4];
+   struct retro_video_screen_image image;
+   struct retro_video_screen_buffer buf;
+   struct retro_video_views map;
+   video_views_map_t kept;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   unsigned left_out;
+   images_test_frames_begin();
+   CHECK(images_test_hand(NULL, 1) && images_test_left_out == 0x4);
+   CHECK(video_st->views.rules_out == 0x4);
+   window_test_run();
+   CHECK(window_test_seen_placed == 2 && !screens_test_image_placed(2, 0));
+   CHECK(images_test_hand(NULL, 1) && images_test_left_out == 0x4);
+
+   /* A serial other than the held one: the held picture stays */
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1)
+         && !images_test_left_out);
+   CHECK(images_test_hand(NULL, 2) && images_test_left_out == 0x4);
+   CHECK(images_test_hand(NULL, 1) && !images_test_left_out);
+
+   /* Without IMAGES nothing is taken */
+   video_st->views_images = false;
+   CHECK(images_test_hand(screens_test_dsi_pixels, 2)
+         && images_test_left_out == 0x4);
+   video_st->views_images = true;
+   CHECK(images_test_hand(NULL, 2) && images_test_left_out == 0x4);
+   CHECK(images_test_hand(NULL, 1) && !images_test_left_out);
+
+   /* Refused for a lend misuse: nothing moves */
+   CHECK(images_test_get(&buf, 3, 48, 32, RETRO_PIXEL_FORMAT_XRGB8888));
+   kept = video_st->views;
+   CHECK(!images_test_hand(buf.data, 2));
+   CHECK(images_test_left_out == 0xA5A5A5A5);
+   CHECK(!memcmp(&kept, &video_st->views, sizeof(kept)));
+
+   /* Screen 2 would be left out; screen 3 hands in screen 2's lend */
+   CHECK(images_test_get(&buf, 2, 48, 32, RETRO_PIXEL_FORMAT_XRGB8888));
+   images_test_fill(&buf, 0x33);
+   screens_test_dsi_small(&map, views, screens, &image);
+   memset(&screens[3], 0, sizeof(screens[3]));
+   images_test_picture(NULL, 9);
+   screens[2].image     = &images_test_image;
+   screens[3].name      = "VMU 2";
+   screens[3].image     = &image;
+   image.data           = buf.data;
+   map.num_screens      = 4;
+   left_out             = 0xA5A5A5A5;
+   map.screens_left_out = &left_out;
+   CHECK(!video_driver_set_views(&map) && left_out == 0xA5A5A5A5);
+   CHECK(!memcmp(&kept, &video_st->views, sizeof(kept)));
+   CHECK(images_test_hand(NULL, 1) && !images_test_left_out);
+   CHECK(images_test_hand(buf.data, 3) && !images_test_left_out);
+
+   /* Without the flag the core's unsigned is not written */
+   screens_test_dsi_small(&map, views, screens, &image);
+   image.data           = NULL;
+   image.serial         = 9;
+   map.screens_left_out = &left_out;
+   map.flags            = 0;
+   CHECK(video_driver_set_views(&map) && left_out == 0xA5A5A5A5);
+   /* Nor asked for */
+   map.flags            = RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   map.screens_left_out = NULL;
+   CHECK(video_driver_set_views(&map));
+   CHECK(video_st->views.rules_out == 0x4);
+   window_test_end();
+}
+
+/* A lend handed in while IMAGES is unset stays open across a driver
+ * restart, and is taken once IMAGES is back (Review Focus 3) */
+static void test_images_left_out_lend(void)
+{
+   struct retro_video_screen_buffer buf;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   images_test_frames_begin();
+   CHECK(images_test_get(&buf, 2, 48, 32, RETRO_PIXEL_FORMAT_XRGB8888));
+   images_test_fill(&buf, 0x5a);
+   video_st->views_images = false;
+   CHECK(images_test_hand(buf.data, 1) && images_test_left_out == 0x4);
+   images_test_restart();
+   video_st->views_images = true;
+   CHECK(images_test_hand(NULL, 1) && images_test_left_out == 0x4);
+   CHECK(images_test_hand(buf.data, 1) && !images_test_left_out);
+   window_test_run();
+   CHECK(images_test_loads == 1 && images_test_pixels == buf.data);
+   CHECK(images_test_words[0] == 0x5a5a5a5au);
+   CHECK(window_test_seen_views.image_tex[2] == 101);
+   window_test_end();
+}
+
+/* A lend outlives the frames after it and a driver restart */
+static void test_images_lend_open(void)
+{
+   struct retro_video_screen_buffer buf;
+   images_test_frames_begin();
+   CHECK(images_test_get(&buf, 2, 48, 32, RETRO_PIXEL_FORMAT_XRGB8888));
+   window_test_run();
+   window_test_run();
+   window_test_run();
+   images_test_restart();
+   images_test_fill(&buf, 0x6b);
+   CHECK(images_test_hand(buf.data, 1) && !images_test_left_out);
+   window_test_run();
+   CHECK(images_test_loads == 1 && images_test_pixels == buf.data);
+   CHECK(images_test_words[0] == 0x6b6b6b6bu);
+   window_test_end();
+}
+
+/* The same image map every frame while IMAGES is unset: accepted and
+ * left out each time, stored once, nothing taken (Review Focus 2) */
+static void test_images_left_out_every_frame(void)
+{
+   video_views_map_t kept;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   unsigned n;
+   images_test_frames_begin();
+   video_st->views_images = false;
+   for (n = 0; n < 60; n++)
+   {
+      CHECK(images_test_hand(screens_test_dsi_pixels, 1)
+            && images_test_left_out == 0x4);
+      if (!n)
+         kept = video_st->views;
+      CHECK(!memcmp(&kept, &video_st->views, sizeof(kept)));
+      window_test_run();
+      CHECK(!screens_test_image_placed(2, 0));
+   }
+   CHECK(!images_test_tex_calls());
+   video_st->views_images = true;
+   CHECK(images_test_hand(NULL, 1) && images_test_left_out == 0x4);
+   window_test_end();
+}
+
+/* A screen the map left out stays out on the NULL refreshes after it;
+ * a map between refreshes counts from the next one (Review Focus 1) */
+static void test_screens_left_out_repeat_frame(void)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   unsigned n;
+   images_test_frames_begin();
+   CHECK(images_test_hand(NULL, 1) && images_test_left_out == 0x4);
+   window_test_run();
+   CHECK(video_st->views_core.left_out == 0x4);
+   CHECK(!screens_test_image_placed(2, 0));
+   for (n = 0; n < 3; n++)
+   {
+      images_test_repeat();
+      CHECK(video_st->views_core.left_out == 0x4);
+      CHECK(window_test_seen_views.left_out == 0x4);
+      CHECK(!screens_test_image_placed(2, 0));
+   }
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1)
+         && !images_test_left_out);
+   images_test_repeat();
+   CHECK(!video_st->views_core.left_out);
+   CHECK(!window_test_seen_views.rules_out);
+   CHECK(screens_test_image_placed(2, 0) == 1);
+   CHECK(images_test_hand(NULL, 2) && images_test_left_out == 0x4);
+   images_test_repeat();
+   CHECK(video_st->views_core.left_out == 0x4);
+   CHECK(window_test_seen_views.rules_out == 0x4);
+   CHECK(!screens_test_image_placed(2, 0));
    window_test_end();
 }
 
@@ -13140,6 +13325,11 @@ int main(int argc, char **argv)
    test_images_per_instance();
    test_images_main_again();
    test_images_second_freed_repeat();
+   test_images_left_out();
+   test_images_left_out_lend();
+   test_images_lend_open();
+   test_images_left_out_every_frame();
+   test_screens_left_out_repeat_frame();
    test_window_image_frame();
    test_screens_core_show();
    test_screens_core_over_inset();

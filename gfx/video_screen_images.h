@@ -54,11 +54,14 @@ bool video_screen_images_lend(struct retro_video_screen_buffer *buf,
       bool images);
 
 /* SET_VIDEO_VIEWS's state rules and pixels for @map, already validated,
- * against the caller's store, all or nothing: false changes nothing and
- * ends no lend. True also makes the caller's store the one whose
+ * against the caller's store. @left_out in: screens the frontend's rules
+ * left out, which take nothing; out: also those whose pixels the store
+ * does not hold or could not take. The refusal rules are checked on
+ * every image screen first: false changes nothing, @left_out included,
+ * and ends no lend. True also makes the caller's store the one whose
  * pictures are drawn. */
 bool video_screen_images_set(const struct retro_video_views *in,
-      const video_views_map_t *map);
+      const video_views_map_t *map, unsigned *left_out);
 
 /* Main thread, a shown frame, after the arrange step, never in the
  * redraw: uploads the shown store's newest picture of each screen of
