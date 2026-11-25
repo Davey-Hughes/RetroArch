@@ -112,10 +112,12 @@ size_t video_screen_prefs_over_value(unsigned base, char *s, size_t len);
  * (NULL: none). Reads @map's num_screens, viewless, image, and
  * rules_out and layer, whose screens are left out, as ABSENT.
  * @images: STATUS_IMAGES this frame. Without it every image screen is
- * left out, as ABSENT. */
+ * left out, as ABSENT.
+ * @turned: the core's rotation is not 0 this frame: upright is left out
+ * then, as ABSENT, besides rules_out and layer. */
 void video_screen_prefs_arrange(const video_screen_values_t *resolved,
       const unsigned *defaults, const video_views_screens_t *screens,
-      bool images, video_views_map_t *map);
+      bool images, bool turned, video_views_map_t *map);
 
 /* Takes @bits of @values for @screen, marking them set; NULL @values
  * clears those entries. dirty only when something changed. */

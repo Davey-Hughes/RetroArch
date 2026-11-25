@@ -3479,6 +3479,7 @@ typedef struct
    unsigned defaults[RETRO_VIDEO_VIEWS_MAX];
    video_views_map_t map;
    bool images;
+   bool turned;
 } t_arrange_t;
 
 /* @n screens, each SHOWN and ACTIVE, nothing set */
@@ -3526,7 +3527,7 @@ static void t_arrange_run(t_arrange_t *a)
             &a->global[s], s, &a->resolved[s]);
    t_arrange_junk(&a->map);
    video_screen_prefs_arrange(a->resolved, a->defaults, &a->scr, a->images,
-         &a->map);
+         a->turned, &a->map);
 }
 
 /* Nothing at or past @n */
@@ -3564,12 +3565,12 @@ static void test_arrange_masks(void)
    strcpy(resolved[3].display, VIDEO_WINDOW_DISPLAY_OFF);
    map.num_screens = 4;
    t_arrange_junk(&map);
-   video_screen_prefs_arrange(resolved, defaults, &scr, true, &map);
+   video_screen_prefs_arrange(resolved, defaults, &scr, true, false, &map);
    CHECK(map.left_out == 0xC && map.blank == 0x2 && !map.over);
    CHECK(t_arrange_clear_past(&map, 4));
    map.num_screens = 2;
    t_arrange_junk(&map);
-   video_screen_prefs_arrange(resolved, defaults, &scr, true, &map);
+   video_screen_prefs_arrange(resolved, defaults, &scr, true, false, &map);
    CHECK(map.left_out == 0 && map.blank == 0x2);
    CHECK(t_arrange_clear_past(&map, 2));
    /* Entries past count are stale. */
@@ -3578,16 +3579,16 @@ static void test_arrange_masks(void)
    scr.screens[3].state   = RETRO_VIDEO_SCREEN_STATE_ABSENT;
    resolved[3].display[0] = '\0';
    t_arrange_junk(&map);
-   video_screen_prefs_arrange(resolved, defaults, &scr, true, &map);
+   video_screen_prefs_arrange(resolved, defaults, &scr, true, false, &map);
    CHECK(map.left_out == 0 && map.blank == 0x2);
    /* No screen information. */
    strcpy(resolved[1].display, VIDEO_WINDOW_DISPLAY_OFF);
    t_arrange_junk(&map);
-   video_screen_prefs_arrange(resolved, defaults, NULL, true, &map);
+   video_screen_prefs_arrange(resolved, defaults, NULL, true, false, &map);
    CHECK(map.left_out == 0x2 && map.blank == 0);
    scr.count = 0;
    t_arrange_junk(&map);
-   video_screen_prefs_arrange(resolved, defaults, &scr, true, &map);
+   video_screen_prefs_arrange(resolved, defaults, &scr, true, false, &map);
    CHECK(map.left_out == 0x2 && map.blank == 0);
    CHECK(t_arrange_clear_past(&map, 4));
 }
@@ -4059,6 +4060,28 @@ static void test_arrange_layer(void)
    t_arrange_user(&a, 1, "over:4");
    t_arrange_run(&a);
    CHECK(a.map.over == 0x2 && a.map.left_out == 0xa);
+}
+
+/* UPRIGHT is left out only while the core is turned, and the core's
+ * inset over it with it. */
+static void test_arrange_upright(void)
+{
+   static t_arrange_t a;
+
+   t_arrange_begin(&a, 3);
+   map_dsi(&a.map);
+   t_arrange_core_over(&a, 2, 1);
+   a.map.upright = 0x2;
+   t_arrange_run(&a);
+   CHECK(a.map.over == 0x4 && !a.map.left_out);
+   a.turned = true;
+   t_arrange_run(&a);
+   CHECK(a.map.over == 0x4 && a.map.left_out == 0x6);
+   CHECK(a.map.upright == 0x2 && !a.map.rules_out);
+   CHECK(t_arrange_clear_past(&a.map, 3));
+   a.turned = false;
+   t_arrange_run(&a);
+   CHECK(!a.map.left_out);
 }
 
 #undef T_NIB
@@ -5219,6 +5242,50 @@ static void test_touch_point_inset(void)
    CHECK(x == top_x && y == top_y);
 }
 
+/* The same on a quarter turn: a point on a NO_INPUT inset is its
+ * base's. */
+static void test_touch_point_inset_rotated(void)
+{
+   video_views_map_t map, sub;
+   video_views_layout_params_t p;
+   video_views_layout_t l;
+   video_views_touch_t t;
+   unsigned index[RETRO_VIDEO_VIEWS_MAX];
+   int16_t x, y, top_x, top_y;
+   unsigned frame = VIDEO_SCALE_PACK(256, 384);
+
+   memset(&t, 0, sizeof(t));
+   map_ds_inset(&map);
+   map.left_out = 0x2;
+   CHECK(video_views_select_screens(&map, video_views_roots(&map),
+            &sub, index));
+   params_init(&p, &sub, 1600, 960);
+   p.screen_layout = VIDEO_SCREEN_LAYOUT_HORIZONTAL;
+   p.rotation      = 1;
+   video_views_layout(&p, &l);
+   video_views_touch_publish(&t, &map, &l, index, p.dims, frame);
+   /* (1070, 840) of 1600x960, the inset's centre */
+   CHECK(video_views_touch_point(&t, 11059, 24575, &top_x, &top_y));
+   CHECK(top_x != -0x8000 && top_y < 0);
+
+   map.left_out = 0;
+   CHECK(video_views_select_screens(&map, video_views_roots(&map),
+            &sub, index));
+   video_views_layout(&p, &l);
+   CHECK(l.num_placements == 2
+         && rect_is(&l.placements[1].dst, 980, 720, 180, 240));
+   video_views_touch_publish(&t, &map, &l, index, p.dims, frame);
+   /* Bottom's packed pixel (128, 287) */
+   CHECK(video_views_touch_point(&t, 11059, 24575, &x, &y));
+   CHECK(x == 0 && y == 16212);
+
+   map.no_input = 0x2;
+   video_views_touch_publish(&t, &map, &l, index, p.dims, frame);
+   x = y = 0;
+   CHECK(video_views_touch_point(&t, 11059, 24575, &x, &y));
+   CHECK(x == top_x && y == top_y);
+}
+
 int main(void)
 {
    test_screen_defaults();
@@ -5304,6 +5371,7 @@ int main(void)
    test_map_point_inset_tie();
    test_map_point_inset_rotated();
    test_touch_point_inset();
+   test_touch_point_inset_rotated();
    test_map_point_no_input();
    test_map_point_blank();
    test_touch_no_input();
@@ -5329,6 +5397,7 @@ int main(void)
    test_arrange_images_off();
    test_arrange_rules_out();
    test_arrange_layer();
+   test_arrange_upright();
 
    if (failures)
    {

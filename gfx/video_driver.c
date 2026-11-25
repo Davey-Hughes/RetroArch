@@ -4495,6 +4495,8 @@ typedef char video_driver_views_blend_flags_fit[
 bool video_driver_set_views(struct retro_video_views *views)
 {
    bool described;
+   unsigned out;
+   unsigned turned = 0;
    video_views_map_t map;
    video_views_screens_t screens;
    video_driver_state_t *video_st = &video_driver_st;
@@ -4526,11 +4528,17 @@ bool video_driver_set_views(struct retro_video_views *views)
                      << screens.screens[s].blend)))
             map.rules_out |= 1u << s;
    }
-   if (!video_screen_images_set(views, &map, &map.rules_out))
+   /* UPRIGHT is not drawn turned. The map keeps its own rules: the
+    * rotation can change under it. */
+   if (runloop_state_get_ptr()->system.rotation)
+      turned = map.upright & ~map.rules_out;
+   out = map.rules_out | turned;
+   if (!video_screen_images_set(views, &map, &out))
       return false;
+   map.rules_out = out & ~turned;
    if (     (views->flags & RETRO_VIDEO_VIEWS_FLAG_SCREENS)
          && views->screens_left_out)
-      *views->screens_left_out = map.rules_out;
+      *views->screens_left_out = out;
    if (map.num_views && video_st->screen_prefs.core_loaded)
       video_st->screen_prefs.in_use = true;
    described = video_driver_views_take_screens(video_st, &screens);
@@ -4694,7 +4702,8 @@ static VIDEO_NOINLINE unsigned video_driver_screens_insets(
       map.upright     = video_st->views_core.upright;
       video_screen_prefs_arrange(video_st->screens_resolved,
             video_st->screens_defaults, &video_st->views_screens,
-            video_st->views_images_arranged, &map);
+            video_st->views_images_arranged,
+            runloop_state_get_ptr()->system.rotation != 0, &map);
       return map.over;
    }
    for (s = 0; s < RETRO_VIDEO_VIEWS_MAX; s++)
@@ -4868,12 +4877,11 @@ int video_driver_screen_shown_stamp(unsigned screen)
 }
 
 /* STATUS_SCREENS and STATUS_IMAGES for a context with VIDEO_VIEWS and
- * @flags. Not while the core is turned: UPRIGHT is not drawn. */
+ * @flags. */
 static unsigned video_driver_views_screens_status(
       const video_driver_state_t *video_st, uint32_t flags)
 {
-   if (     BIT32_GET(flags, GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK)
-         || runloop_state_get_ptr()->system.rotation)
+   if (BIT32_GET(flags, GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK))
       return 0;
    return RETRO_VIDEO_VIEWS_STATUS_SCREENS
       | (video_st->views_images ? RETRO_VIDEO_VIEWS_STATUS_IMAGES : 0);
@@ -5862,7 +5870,8 @@ static VIDEO_NOINLINE void video_driver_views_frame(
       /* Not in views: set_views compares each map with it */
       video_screen_prefs_arrange(video_st->screens_resolved,
             video_st->screens_defaults, &video_st->views_screens,
-            video_st->views_images_arranged, core);
+            video_st->views_images_arranged,
+            runloop_state_get_ptr()->system.rotation != 0, core);
       drawn = ((1u << core->num_screens) - 1u)
             & ~(core->viewless | core->left_out | core->blank | core->image);
       /* The frame repeated has no pixels for a screen it did not draw */

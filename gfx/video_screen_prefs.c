@@ -296,14 +296,15 @@ static void video_screen_prefs_inset(const video_screen_values_t *resolved,
 
 void video_screen_prefs_arrange(const video_screen_values_t *resolved,
       const unsigned *defaults, const video_views_screens_t *screens,
-      bool images, video_views_map_t *map)
+      bool images, bool turned, video_views_map_t *map)
 {
    unsigned s, i, fall, insets;
    unsigned base[RETRO_VIDEO_VIEWS_MAX];
    unsigned user        = 0;   /* the user's insets */
    unsigned over        = 0;   /* the core's insets */
    /* with ABSENT, Off and HIDDEN */
-   unsigned out         = map->rules_out | map->layer;
+   unsigned out         = map->rules_out | map->layer
+      | (turned ? map->upright : 0);
    unsigned count       = screens ? screens->count : 0;
    unsigned num_screens = map->num_screens;
 

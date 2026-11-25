@@ -4255,8 +4255,8 @@ static void test_fallback_no_input(void)
    window_test_end();
 }
 
-/* SCREENS while the driver would draw a map's views, set or not, and the
- * core's own rotation is 0; the user's rotation does not count */
+/* SCREENS while the driver would draw a map's views, set or not; neither
+ * the core's rotation nor the user's counts */
 static void test_status_screens(void)
 {
    const unsigned both         = RETRO_VIDEO_VIEWS_STATUS_PRESENTS
@@ -4285,12 +4285,10 @@ static void test_status_screens(void)
    window_test_flags = 1u << GFX_CTX_FLAGS_VIDEO_VIEWS;
    video_driver_views_status_changed();
    runloop_st->system.rotation = 1;
-   CHECK((video_driver_views_status() & both)
-         == RETRO_VIDEO_VIEWS_STATUS_PRESENTS);
-   CHECK(video_driver_views_status_changed());
+   CHECK((video_driver_views_status() & both) == both);
    CHECK(!video_driver_views_status_changed());
    runloop_st->system.rotation = core_rotation;
-   CHECK(video_driver_views_status_changed());
+   CHECK(!video_driver_views_status_changed());
    CHECK((video_driver_views_status() & both) == both);
    window_test_end();
 }
@@ -4311,9 +4309,12 @@ static void test_status_images(void)
    window_test_flags     |= 1u << GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK;
    CHECK(!(video_driver_views_status() & both));
    window_test_flags      = 1u << GFX_CTX_FLAGS_VIDEO_VIEWS;
+   video_driver_views_status_changed();
    runloop_st->system.rotation = 1;
-   CHECK(!(video_driver_views_status() & both));
+   CHECK((video_driver_views_status() & both) == both);
+   CHECK(!video_driver_views_status_changed());
    runloop_st->system.rotation = core_rotation;
+   CHECK(!video_driver_views_status_changed());
    video_st->views_images = false;
    CHECK((video_driver_views_status() & both)
          == RETRO_VIDEO_VIEWS_STATUS_SCREENS);
@@ -5974,6 +5975,184 @@ static void test_screens_layer_left_out(void)
    CHECK(layer_test_logged("Screen 3 layer: blend 2, z 1, "
             "rect 0.000 0.000 0.000 0.000.") == 1);
    CHECK(layer_test_logged("Screen 3 layer:") == 1);
+   window_test_end();
+}
+
+/* images_test_set()'s map with Bottom UPRIGHT and the VMU the core's
+ * inset over it; @swap has Bottom's view above Top's */
+static bool upright_test_set(bool swap)
+{
+   static struct retro_video_view views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_screen_image dsi;
+   struct retro_video_views map;
+   screens_test_dsi_small(&map, views, screens, &dsi);
+   views[0].y           = swap ? 1 : 0;
+   views[1].y           = swap ? 0 : 1;
+   screens[1].flags     = RETRO_VIDEO_SCREEN_FLAG_UPRIGHT;
+   screens[2].image     = &images_test_image;
+   screens[2].show      = RETRO_VIDEO_SCREEN_SHOW_OVER;
+   screens[2].base      = 1;
+   images_test_left_out = 0xA5A5A5A5;
+   map.screens_left_out = &images_test_left_out;
+   return video_driver_set_views(&map);
+}
+
+/* The frame just drawn placed Top alone: Bottom and the VMU over it are
+ * out everywhere, by no rule of the map's; with @windows, Bottom's
+ * window too */
+static void upright_test_out(bool windows)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   if (windows)
+   {
+      CHECK(!window_test_seen.window_screens[1]);
+      CHECK(!(video_st->windows_wanted & 2u));
+   }
+   CHECK(video_st->views_core.left_out == 0x6);
+   CHECK(window_test_seen_views.left_out == 0x6);
+   CHECK(!window_test_seen_views.rules_out);
+   CHECK(window_test_seen_placed == 1 && layer_test_view_placed(0));
+   CHECK(string_is_equal(video_st->screens_routed[1],
+            VIDEO_WINDOW_DISPLAY_OFF));
+   CHECK(string_is_equal(video_st->screens_routed[2],
+            VIDEO_WINDOW_DISPLAY_OFF));
+}
+
+/* An UPRIGHT screen is left out while the core is turned, with its bit
+ * when the map arrives turned; a rotation changed with no new map counts
+ * from the next frame and leaves the bit (Review Focus 5) */
+static void test_screens_upright_turned(void)
+{
+   runloop_state_t *runloop_st    = runloop_state_get_ptr();
+   video_driver_state_t *video_st = video_state_get_ptr();
+   unsigned core_rotation         = runloop_st->system.rotation;
+   video_views_layout_t layout;
+   unsigned n;
+   images_test_frames_begin();
+   config_get_ptr()->bools.video_windows_enable = true;
+   /* The desktop's, without a list */
+   video_driver_publish_window_displays(NULL, 0);
+   images_test_picture(screens_test_dsi_pixels, 1);
+
+   runloop_st->system.rotation = 1;
+   CHECK(upright_test_set(false) && images_test_left_out == 0x2);
+   CHECK(!video_st->views.rules_out && video_st->views.upright == 0x2);
+   window_test_run();
+   upright_test_out(true);
+
+   /* Bottom's window, the VMU in it */
+   runloop_st->system.rotation = 0;
+   window_test_run();
+   CHECK(!video_st->views_core.left_out);
+   CHECK(window_test_seen_placed == 1 && layer_test_view_placed(0));
+   CHECK(window_test_seen.plan.separate_mask == 2u);
+   CHECK(window_test_seen.window_screens[1] == 0x6u);
+   video_driver_window_layout_screens(&window_test_seen,
+         &window_test_settings, window_test_seen.window_screens[1],
+         VIDEO_SCALE_PACK(480, 320), &layout);
+   CHECK(layout.num_placements == 2);
+   CHECK(   layout.placements[0].view == 1
+         && layout.placements[1].view == 2
+         && (layout.placements[1].flags & VIDEO_VIEWS_PLACEMENT_IMAGE));
+   CHECK(!*video_st->screens_routed[1] && !*video_st->screens_routed[2]);
+   CHECK(images_test_left_out == 0x2);
+
+   runloop_st->system.rotation = 1;
+   window_test_run();
+   upright_test_out(true);
+   for (n = 0; n < 3; n++)
+   {
+      images_test_repeat();
+      upright_test_out(true);
+   }
+   CHECK(images_test_left_out == 0x2);
+   /* Back on a refresh: a place, with no pixels drawn for it */
+   runloop_st->system.rotation = 0;
+   images_test_repeat();
+   CHECK(!video_st->views_core.left_out);
+   CHECK(video_st->views_core.blank == 0x2);
+
+   CHECK(upright_test_set(false) && !images_test_left_out);
+   runloop_st->system.rotation = core_rotation;
+   window_test_end();
+}
+
+/* An image screen is never turned: lent, taken and placed while the core
+ * is, UPRIGHT or not */
+static void test_screens_image_turned(void)
+{
+   struct retro_video_screen_buffer buf;
+   runloop_state_t *runloop_st    = runloop_state_get_ptr();
+   video_driver_state_t *video_st = video_state_get_ptr();
+   unsigned core_rotation         = runloop_st->system.rotation;
+   images_test_frames_begin();
+   runloop_st->system.rotation = 1;
+   CHECK(images_test_get(&buf, 2, 48, 32, RETRO_PIXEL_FORMAT_XRGB8888));
+   images_test_fill(&buf, 0x5a);
+   CHECK(images_test_hand(buf.data, 1) && !images_test_left_out);
+   window_test_run();
+   CHECK(images_test_loads == 1 && images_test_pixels == buf.data);
+   CHECK(screens_test_image_placed(2, 0) == 1);
+   CHECK(!video_st->views_core.left_out);
+
+   images_test_screen_flags = RETRO_VIDEO_SCREEN_FLAG_UPRIGHT;
+   CHECK(images_test_hand(NULL, 1) && !images_test_left_out);
+   CHECK(!video_st->views.upright);
+   window_test_run();
+   CHECK(screens_test_image_placed(2, 0) == 1);
+   CHECK(!video_st->views_core.left_out);
+   images_test_screen_flags    = 0;
+   runloop_st->system.rotation = core_rotation;
+   window_test_end();
+}
+
+static unsigned upright_test_rotation;
+
+static void upright_test_set_rotation(void *data, unsigned rotation)
+{
+   (void)data;
+   upright_test_rotation = rotation;
+}
+
+/* SET_ROTATION and the map for it in one retro_run(): the next frame is
+ * turned, with that map's views and its UPRIGHT screen left out; back the
+ * same way */
+static void test_screens_rotation_with_map(void)
+{
+   runloop_state_t *runloop_st    = runloop_state_get_ptr();
+   settings_t *settings           = config_get_ptr();
+   unsigned core_rotation         = runloop_st->system.rotation;
+   unsigned asked_rotation        = runloop_st->system.core_requested_rotation;
+   bool allow_rotate              = settings->bools.video_allow_rotate;
+   unsigned rotation              = 1;
+   images_test_frames_begin();
+   window_test_driver.set_rotation     = upright_test_set_rotation;
+   settings->bools.video_allow_rotate  = true;
+   images_test_picture(screens_test_dsi_pixels, 1);
+   CHECK(upright_test_set(false) && !images_test_left_out);
+   window_test_run();
+   CHECK(window_test_seen_placed == 3 && !window_test_settings.rotation);
+
+   CHECK(runloop_environment_cb(RETRO_ENVIRONMENT_SET_ROTATION, &rotation));
+   CHECK(upright_test_set(true) && images_test_left_out == 0x2);
+   window_test_run();
+   CHECK(retroarch_get_rotation() == 1 && upright_test_rotation == 1);
+   CHECK(window_test_settings.rotation == 1);
+   CHECK(   window_test_seen_views.views[0].y == 1
+         && window_test_seen_views.views[1].y == 0);
+   upright_test_out(false);
+
+   rotation = 0;
+   CHECK(runloop_environment_cb(RETRO_ENVIRONMENT_SET_ROTATION, &rotation));
+   CHECK(upright_test_set(false) && !images_test_left_out);
+   window_test_run();
+   CHECK(!window_test_settings.rotation && !window_test_seen_views.views[0].y);
+   CHECK(window_test_seen_placed == 3);
+
+   settings->bools.video_allow_rotate          = allow_rotate;
+   runloop_st->system.rotation                 = core_rotation;
+   runloop_st->system.core_requested_rotation  = asked_rotation;
    window_test_end();
 }
 
@@ -13500,6 +13679,9 @@ int main(int argc, char **argv)
    test_images_left_out_every_frame();
    test_screens_left_out_repeat_frame();
    test_screens_layer_left_out();
+   test_screens_upright_turned();
+   test_screens_image_turned();
+   test_screens_rotation_with_map();
    test_window_image_frame();
    test_screens_core_show();
    test_screens_core_over_inset();
