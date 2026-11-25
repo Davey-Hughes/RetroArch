@@ -524,14 +524,18 @@ void runahead_secondary_core_destroy(void *data)
     * this runs regardless of whether a secondary instance was
     * ever actually created. */
    runahead_copy_reset(true);
-   video_screen_images_free_owner(VIDEO_SCREEN_IMAGES_SECOND);
 
    if (!runloop_st->secondary_lib_handle)
+   {
+      video_screen_images_free_owner(VIDEO_SCREEN_IMAGES_SECOND);
       return;
+   }
 
    /* unload game from core */
    if (runloop_st->secondary_core.retro_unload_game)
       runloop_st->secondary_core.retro_unload_game();
+   /* After the unload: the core may hold a lend until then */
+   video_screen_images_free_owner(VIDEO_SCREEN_IMAGES_SECOND);
    runloop_st->core_poll_type_override = POLL_TYPE_OVERRIDE_DONTCARE;
 
    /* deinit */

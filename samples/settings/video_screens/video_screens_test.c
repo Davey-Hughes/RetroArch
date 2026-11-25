@@ -5584,6 +5584,66 @@ static void test_images_per_instance(void)
    window_test_end();
 }
 
+#if defined(HAVE_DYNAMIC) && defined(HAVE_RUNAHEAD) && !defined(_WIN32)
+static struct retro_video_screen_buffer images_test_second_lend;
+static unsigned images_test_second_unloads;
+static bool images_test_second_held;
+
+/* The second instance's retro_unload_game(): writes its open lend and
+ * asks whether its picture is still held */
+static void images_test_second_unload_game(void)
+{
+   video_screen_images_set_caller(VIDEO_SCREEN_IMAGES_SECOND);
+   images_test_fill(&images_test_second_lend, 0x7c);
+   images_test_second_held = images_test_hand(NULL, 1)
+         && !images_test_left_out;
+   video_screen_images_set_caller(VIDEO_SCREEN_IMAGES_MAIN);
+   images_test_second_unloads++;
+}
+
+/* Run-ahead's second instance closed: its store lasts through its
+ * retro_unload_game(), and is emptied with or without a library */
+static void test_images_second_unload_order(void)
+{
+   struct retro_video_screen_buffer buf;
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   enum poll_type_override_t poll_override =
+         runloop_st->core_poll_type_override;
+   images_test_begin();
+   CHECK(images_test_hand(screens_test_dsi_pixels, 1));
+   video_screen_images_set_caller(VIDEO_SCREEN_IMAGES_SECOND);
+   CHECK(images_test_get(&buf, 2, 48, 32, RETRO_PIXEL_FORMAT_XRGB8888));
+   images_test_fill(&buf, 0x5a);
+   CHECK(images_test_hand(buf.data, 1) && !images_test_left_out);
+   CHECK(images_test_get(&images_test_second_lend, 2, 48, 32,
+         RETRO_PIXEL_FORMAT_XRGB8888));
+   video_screen_images_set_caller(VIDEO_SCREEN_IMAGES_MAIN);
+   images_test_second_unloads = 0;
+   images_test_second_held    = false;
+   runloop_st->secondary_core.retro_unload_game =
+         images_test_second_unload_game;
+   runloop_st->secondary_core.retro_deinit = NULL;
+   runloop_st->secondary_library_path      = NULL;
+   /* The program's own handle */
+   runloop_st->secondary_lib_handle        = dylib_load(NULL);
+   CHECK(runloop_st->secondary_lib_handle != NULL);
+   runahead_secondary_core_destroy(runloop_st);
+   CHECK(images_test_second_unloads == 1);
+   CHECK(images_test_second_held);
+   CHECK(images_test_hand_second(NULL, 1) && images_test_left_out == 0x4);
+   CHECK(images_test_hand(NULL, 1) && !images_test_left_out);
+   /* No library open: emptied all the same */
+   CHECK(!runloop_st->secondary_lib_handle);
+   CHECK(images_test_hand_second(screens_test_dsi_pixels, 1)
+         && !images_test_left_out);
+   runahead_secondary_core_destroy(runloop_st);
+   CHECK(images_test_second_unloads == 1);
+   CHECK(images_test_hand_second(NULL, 1) && images_test_left_out == 0x4);
+   runloop_st->core_poll_type_override = poll_override;
+   window_test_end();
+}
+#endif
+
 /* Main's frames shown again (run-ahead's single instance or off,
  * preemptive frames, netplay): main's picture is drawn with no new map */
 static void test_images_main_again(void)
@@ -13671,6 +13731,9 @@ int main(int argc, char **argv)
    test_images_rgba();
    test_images_gone_kept();
    test_images_per_instance();
+#if defined(HAVE_DYNAMIC) && defined(HAVE_RUNAHEAD) && !defined(_WIN32)
+   test_images_second_unload_order();
+#endif
    test_images_main_again();
    test_images_second_freed_repeat();
    test_images_left_out();
