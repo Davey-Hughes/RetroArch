@@ -111,8 +111,13 @@
  * of (255, 128, 255) that multiplies the top screen: layer sends it as
  * screen 2, a LAYER, while the status has BLEND_MULTIPLY, and
  * otherwise multiplies the top screen's colour itself; layer_sent
- * sends it whatever the status. The modes besides rules log their
- * map's screens_left_out each time it changes.
+ * sends it whatever the status. The turned modes send SET_ROTATION 1
+ * before each map: image_turned and image_upright_turned are image,
+ * the second with UPRIGHT on VMU; upright_turned sends the bottom one
+ * SHOWN with UPRIGHT and from frame 60 SET_ROTATION 0, logging the
+ * switch once; upright_over sends the bottom one so too and VMU's
+ * picture OVER it. The modes besides rules log their map's
+ * screens_left_out each time it changes.
  *
  * VIDEO_VIEWS_TEST_LIBRARY_NAME in the environment replaces the library
  * name, so one build can load as a second core. */
@@ -1197,7 +1202,8 @@ void retro_set_environment(retro_environment_t cb)
         "|blank_late|absent|absent_back|none_shown|hide_null"
         "|no_input_null|blank_null|over_no_input|shown_sized|image"
         "|image_over|image_over_half|image_over_blank|image_null"
-        "|image_restart|image_lend_open|layer|layer_sent" },
+        "|image_restart|image_lend_open|layer|layer_sent|image_turned"
+        "|image_upright_turned|upright_turned|upright_over" },
       { "video_views_test_image",
         "Image screen pixels; lend|copy" },
       { "video_views_test_image_sharp",
@@ -2584,6 +2590,10 @@ static const struct
 #define GEL_IF_DRAWN 1
 #define GEL_ALWAYS   2
 #define GEL_COL      0xFF80FF
+/* A mode's SET_ROTATION before each map: 1, or 1 until the switch and
+ * 0 from it. */
+#define TURN_ALWAYS 1
+#define TURN_EARLY  2
 
 /* video_views_test_screens' modes besides rules: how the ds map's
  * screen 1 is sent, @late being its state from SCR_SWITCH_FRAME on.
@@ -2596,7 +2606,9 @@ static const struct
  * @lend_open keeps the picture's buffer from the first frame and sends
  * no picture until SCR_LEND_FRAMES after the switch. @gel, a GEL_
  * value, has Gel multiply screen 0: as screen 2, a LAYER, when it is
- * sent, in the core's own drawing when it is not. */
+ * sent, in the core's own drawing when it is not. @turn, a TURN_ value,
+ * turns the core. @upright_base sends an image mode's screen 1 SHOWN
+ * with UPRIGHT, as the picture's base. */
 static const struct
 {
    const char *name;
@@ -2614,6 +2626,8 @@ static const struct
    bool restart;
    bool lend_open;
    unsigned gel;
+   unsigned turn;
+   bool upright_base;
 } scr_modes[] = {
    { "no_input",     RETRO_VIDEO_SCREEN_FLAG_NO_INPUT,
       RETRO_VIDEO_SCREEN_SHOW_SHOWN,
@@ -2698,7 +2712,22 @@ static const struct
       false, 0.0f, false, 0, 0, 0.0f, false, false, false, GEL_IF_DRAWN },
    { "layer_sent",   0, RETRO_VIDEO_SCREEN_SHOW_HIDDEN,
       RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
-      false, 0.0f, false, 0, 0, 0.0f, false, false, false, GEL_ALWAYS }
+      false, 0.0f, false, 0, 0, 0.0f, false, false, false, GEL_ALWAYS },
+   { "image_turned", 0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f, false, 0, 0, 0.0f, true, false, false, 0, TURN_ALWAYS },
+   { "image_upright_turned", RETRO_VIDEO_SCREEN_FLAG_UPRIGHT,
+      RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f, false, 0, 0, 0.0f, true, false, false, 0, TURN_ALWAYS },
+   { "upright_turned", RETRO_VIDEO_SCREEN_FLAG_UPRIGHT,
+      RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f, false, 0, 0, 0.0f, false, false, false, 0, TURN_EARLY },
+   { "upright_over", 0, RETRO_VIDEO_SCREEN_SHOW_OVER,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 1.0f, false, 0, 0, 0.0f, true, false, false, 0, TURN_ALWAYS,
+      true }
 };
 
 /* A null mode from its switch on: each refresh repeats the last frame */
@@ -2864,12 +2893,14 @@ static const char *screens_add(struct retro_video_views *in,
       unsigned flags = scr_modes[screens_mode].flags;
       unsigned show  = scr_modes[screens_mode].show;
       unsigned state = scr_modes[screens_mode].state;
+      unsigned turn  = scr_modes[screens_mode].turn;
       bool image     = scr_modes[screens_mode].image;
       bool over;
       /* retro_run() has counted this frame. */
       if (     (scr_modes[screens_mode].late != state
                || scr_modes[screens_mode].null
-               || scr_modes[screens_mode].restart)
+               || scr_modes[screens_mode].restart
+               || turn == TURN_EARLY)
             && frames_run > SCR_SWITCH_FRAME)
       {
          state = scr_modes[screens_mode].late;
@@ -2885,6 +2916,12 @@ static const char *screens_add(struct retro_video_views *in,
                raise_max();
          }
          screens_switched = true;
+      }
+      if (turn)
+      {
+         unsigned rotation = (turn == TURN_EARLY && screens_switched)
+            ? 0 : 1;
+         environ_cb(RETRO_ENVIRONMENT_SET_ROTATION, &rotation);
       }
       over = (show == RETRO_VIDEO_SCREEN_SHOW_OVER);
       scr_screens[0]  = mkscreen("Top", 0, 0,
@@ -2902,10 +2939,15 @@ static const char *screens_add(struct retro_video_views *in,
       in->screens_left_out = &scr_left_out;
       if (image)
       {
-         scr_screens[1] = mkscreen("Bottom", 0,
+         bool base = scr_modes[screens_mode].upright_base;
+         scr_screens[1] = mkscreen("Bottom",
+               base ? RETRO_VIDEO_SCREEN_FLAG_UPRIGHT : 0,
                RETRO_VIDEO_SCREEN_STATE_ACTIVE,
-               RETRO_VIDEO_SCREEN_SHOW_HIDDEN, 0, 0.0f, 0, 0.0f, 0, 0, 0,
-               0);
+               base ? RETRO_VIDEO_SCREEN_SHOW_SHOWN
+                    : RETRO_VIDEO_SCREEN_SHOW_HIDDEN,
+               0, 0.0f, 0, 0.0f, 0, 0, 0, 0);
+         if (base)
+            scr_screens[2].base = 1;
          if (vmu_sharp)
             scr_screens[2].flags |= RETRO_VIDEO_SCREEN_FLAG_SHARP;
          if (scr_modes[screens_mode].lend_open)

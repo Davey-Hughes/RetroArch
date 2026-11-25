@@ -864,6 +864,13 @@ SCREENS_LAYER_CASES = [
     ('screens-layer-sent', 'layer_sent', SCREENS_TOP_ALONE,
      {'left_out': [0x4]}),
 ]
+# A core that turns itself with Bottom UPRIGHT, on SCREENS_DRIVERS:
+# Bottom is left out while the core is turned and drawn once it is not.
+# Entries as SCREENS_LAYER_CASES'.
+SCREENS_TURNED_CASES = [
+    ('screens-upright-turned', 'upright_turned', SCREENS_BOTH,
+     {'left_out': [0x2, 0x0], 'until': SCREENS_SWITCHED_RE}),
+]
 LEFT_OUT_RE = re.compile(r'\[video_views\] left_out=0x([0-9a-f]+)')
 # With no screen placed the menu still lays out over the whole window,
 # as it does over a frame without views: the second case, which the
@@ -917,6 +924,15 @@ SCREENS_IMAGE_INSET_OUT = (GREEN, GREEN, BLACK, None)
 SCREENS_IMAGE_ROTATED = (1070, 420, 180, 120)
 SCREENS_IMAGE_ROTATED_TOP = [(710, 480, GREEN), (360, 480, GREEN),
                              (340, 480, BLACK)]
+# Top alone, turned: 720 wide from x 440. Past its sides, in from each
+# corner past the marker, and where the picture is beside it or over a
+# corner of it.
+SCREENS_TOP_TURNED = [(800, 480, GREEN), (460, 480, GREEN),
+                      (1140, 480, GREEN), (420, 480, BLACK),
+                      (1180, 480, BLACK), (500, 60, GREEN),
+                      (1100, 60, GREEN), (500, 900, GREEN),
+                      (1100, 900, GREEN), (1205, 450, BLACK),
+                      (1205, 510, BLACK), (300, 480, BLACK)]
 IMAGE_SENT_RE = re.compile(r'\[video_views\] image serial=(\d+) '
                            r'accepted=(\d)')
 IMAGE_NOT_LENT_RE = re.compile(r'\[video_views\] image buffer refused')
@@ -1067,6 +1083,16 @@ SCREENS_IMAGE_CASES = [
     ('screens-image-rotated', 'image',
      screens_image_rotated(IMAGE_QUADRANTS),
      {'settings': {'video_rotation': '1'}}),
+    # A core that turns itself turns Top, never the picture, UPRIGHT or
+    # not.
+    ('screens-image-turned', 'image_turned',
+     screens_image_rotated(IMAGE_QUADRANTS), {'left_out': [0x0]}),
+    ('screens-image-upright-turned', 'image_upright_turned',
+     screens_image_rotated(IMAGE_QUADRANTS), {'left_out': [0x0]}),
+    # Bottom UPRIGHT in a turned core is left out, and the picture OVER
+    # it is not drawn.
+    ('screens-upright-over', 'upright_over', SCREENS_TOP_TURNED,
+     {'left_out': [0x2]}),
     # In a Game Screens window of its own, Top alone in the main one.
     ('screens-image-window', 'image', SCREENS_TOP_ALONE,
      {'window': IMAGE_QUADRANTS, 'drivers': ('gl', 'vulkan'),
@@ -3289,8 +3315,9 @@ def driver_jobs(retroarch, root, driver):
              for c in (SCREENS_STATE_CASES if driver in SCREENS_DRIVERS
                        else []) if wanted(c[0])]
     jobs += [lambda c=c: screens_layer(c)
-             for c in (SCREENS_LAYER_CASES if driver in SCREENS_DRIVERS
-                       else []) if wanted(c[0])]
+             for c in (SCREENS_LAYER_CASES + SCREENS_TURNED_CASES
+                       if driver in SCREENS_DRIVERS else [])
+             if wanted(c[0])]
     if driver in SCREENS_DRIVERS and wanted(SCREENS_MENU_CASE[0]):
         jobs.append(screens_menu)
     jobs += [lambda c=c, hw=hw: screens_image(c, hw)

@@ -4355,6 +4355,52 @@ def check_screens_image_gl(res):
     return errors
 
 
+LEFT_OUT_RE = re.compile(r'\[video_views\] left_out=0x([0-9a-f]+)')
+
+
+# A ds screen its core turns: as wide, 3:4. Its centre and a point in
+# each corner, past the marker.
+DS_TURNED_SIZE = (1.6, 2.13333)
+DS_TURNED_POINTS = ((0.5, 0.5), (0.15, 0.15), (0.85, 0.15), (0.15, 0.85),
+                    (0.85, 0.85))
+
+
+def check_screens_upright_over(left_out):
+    """upright_over, a turned core: screen 1, UPRIGHT, has no quad in
+    any snapshot, nor has the picture OVER it. Screen 0's quad is where
+    it is with both shown, turned, in its colour to its corners. The
+    core's screens_left_out is left_out, logged once."""
+    def check(res):
+        errors = []
+        found = LEFT_OUT_RE.findall(res.log)
+        if found != ['%x' % left_out]:
+            errors.append('left_out logged %s, want [\'%x\']'
+                          % (found, left_out))
+        for fr in res.frames:
+            q = [x for x in quads(fr) if not x['flags'] & BLEND]
+            if fr['snap'] and len(q) > 1:
+                errors.append('frame %d has %d quads: %s'
+                              % (fr['n'], len(q),
+                                 [(x['pose'][:3], x['size']) for x in q]))
+        fr = last_snap(res)
+        if not fr:
+            return errors + no_quads(res)
+        q = [x for x in quads(fr) if not x['flags'] & BLEND]
+        if (len(q) != 1 or not at(q[0], DS_TOP)
+                or not sized(q[0], DS_TURNED_SIZE)):
+            return errors + ['want screen 0\'s quad alone at %s size %s, '
+                             'got %s'
+                             % (DS_TOP, DS_TURNED_SIZE,
+                                [(x['pose'][:3], x['size']) for x in q])]
+        for fx, fy in DS_TURNED_POINTS:
+            c, _ = colour(image(res, fr, q[0]), fx, fy)
+            if not near(c, GREEN):
+                errors.append('screen 0\'s image at %g,%g shows %s, want %s'
+                              % (fx, fy, c, GREEN))
+        return errors
+    return check
+
+
 def check_tracked_screen_off(res):
     """The tracked eyes' screen with Display Off is left out: its map is
     taken, no projection is sent, and the bottom screen keeps its quad
@@ -4414,6 +4460,11 @@ SCREENS_CASES = [
     {'name': 'screens-image-null', 'map': 'ds',
      'options': {'video_views_test_screens': 'image_null'}, 'steps': SETTLE,
      'check': check_screens_null(check_screens_image(IMAGE_MIRRORED))},
+    # A turned core's UPRIGHT screen 1 is left out, with the picture
+    # OVER it.
+    {'name': 'screens-upright-over', 'map': 'ds',
+     'options': {'video_views_test_screens': 'upright_over'},
+     'steps': SETTLE, 'check': check_screens_upright_over(0x2)},
     {'name': 'tracked-screen-off', 'map': '3ds',
      'options': {'video_views_test_vr': 'local'},
      'settings': {'video_screen1_display': 'off'}, 'steps': SETTLE,
@@ -9143,6 +9194,8 @@ GL_CHECKS = {
            'hw-teardown': check_hw_teardown_gl,
            'hw-teardown-threaded': threaded(check_hw_teardown_gl),
            '3ds-stereo': check_screens(native=True),
+           # No IMAGES while a headset runs: the picture is left out too.
+           'screens-upright-over': check_screens_upright_over(0x6),
            '3ds-swap': check_screens(swap=True, native=True),
            '3ds-stereo-index0': check_screens(native=True),
            '3ds-horizontal': check_screens(horizontal=True, native=True),
