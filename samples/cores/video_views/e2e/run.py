@@ -589,21 +589,47 @@ HDR_LAYER_ENV = {}
 HDR_LAYER_DIRS = []
 HDR_LAYER_LOCK = threading.Lock()
 # The core's rules cases (video_views_test_screens rules), each sent on
-# the ds map for a frame, with whether the frontend must accept it (None:
-# on IMAGES_DRIVERS); then the full map.
+# the ds map for a frame, with whether the frontend must accept it and
+# the screens_left_out it must leave: a number, 'sentinel' (not written:
+# a refused map, or one without FLAG_SCREENS) or None (0 on
+# IMAGES_DRIVERS, 0x4 elsewhere); then the full map.
+SCREENS_SENTINEL = 0xa5a5a5a5
 SCREENS_RULES = [
-    ('no-flag', 1), ('zero-screens', 1), ('absent-viewless', 1),
-    ('swap-one-side', 1), ('swap-both', 1), ('unknown-flags', 1),
-    ('too-many', 0), ('null-screens', 0), ('view-past-count', 0),
-    ('image', None), ('active-viewless', 0), ('blank-viewless', 0),
-    ('eye-unpaired', 0), ('base-past-count', 0), ('over-self', 0),
-    ('over-over', 0), ('size-negative', 0), ('anchor', 0),
-    ('over-size', 0), ('opacity', 0), ('private-owners', 0),
-    ('swap-self', 0), ('swap-past-count', 0), ('swap-disagree', 0),
-    ('show-unknown', 0), ('state-unknown', 0), ('state-unknown-viewed', 0),
-    ('order-mixed', 0), ('order-mixed-first', 0), ('full', 1)]
+    ('no-flag', 1, 'sentinel'), ('zero-screens', 1, 0),
+    ('absent-viewless', 1, 0), ('swap-one-side', 1, 0),
+    ('swap-both', 1, 0), ('unknown-flags', 1, 0),
+    ('too-many', 0, 'sentinel'), ('null-screens', 0, 'sentinel'),
+    ('view-past-count', 0, 'sentinel'),
+    # Screen 2's picture: left out wherever the frontend cannot take it
+    ('image-null-unheld', 1, 0x4), ('image', 1, None),
+    ('image-null-held', 1, None), ('image-null-serial', 1, 0x4),
+    ('image-format', 1, 0x4), ('image-large', 1, 0x4),
+    ('image-argb', 1, 0x4),
+    # Screen 2 a LAYER: left out, no blend being drawn
+    ('layer-placeholder', 1, 0x4), ('layer-styles', 1, 0x7c),
+    ('layer-argb', 1, 0x4), ('layer-one-side-image', 1, 0x4),
+    ('layer-order', 1, 0x4), ('layer-off', 1, 0x4),
+    ('layer-upright', 1, 0x4), ('layer-upright-clear', 1, 0x4),
+    ('layer-self', 0, 'sentinel'), ('layer-on-layer', 0, 'sentinel'),
+    ('layer-on-over', 0, 'sentinel'), ('layer-range', 0, 'sentinel'),
+    ('layer-nan', 0, 'sentinel'), ('layer-one-side', 0, 'sentinel'),
+    ('layer-swap', 0, 'sentinel'), ('layer-group', 0, 'sentinel'),
+    ('active-viewless', 0, 'sentinel'), ('blank-viewless', 0, 'sentinel'),
+    ('eye-unpaired', 0, 'sentinel'), ('base-past-count', 0, 'sentinel'),
+    ('over-self', 0, 'sentinel'), ('over-over', 0, 'sentinel'),
+    ('size-negative', 0, 'sentinel'), ('anchor', 0, 'sentinel'),
+    ('over-size', 0, 'sentinel'), ('opacity', 0, 'sentinel'),
+    ('private-owners', 0, 'sentinel'), ('swap-self', 0, 'sentinel'),
+    ('swap-past-count', 0, 'sentinel'), ('swap-disagree', 0, 'sentinel'),
+    ('show-unknown', 0, 'sentinel'), ('state-unknown', 0, 'sentinel'),
+    ('state-unknown-viewed', 0, 'sentinel'), ('order-mixed', 0, 'sentinel'),
+    ('order-mixed-first', 0, 'sentinel'), ('full', 1, 0)]
 SCREENS_CASE_RE = re.compile(
-    r'\[video_views\] screens case=([\w-]+) accepted=(\d)')
+    r'\[video_views\] screens case=([\w-]+) accepted=(\d) '
+    r'left_out=0x([0-9a-f]+)')
+# layer-styles' five layers, screen and blend, as the frontend logs them.
+SCREENS_LAYER_STYLES = [(2, 0), (3, 1), (4, 2), (5, 3), (6, 7)]
+SCREENS_LAYER_RE = re.compile(r'\[Video\] Screen (\d+) layer: blend (\d+),')
 SCREENS_FULL_RE = re.compile(r'\[video_views\] screens case=full ')
 SCREEN_BUFFER_RE = re.compile(r'\[video_views\] screen_buffer=(\d)')
 # The full map's screens as the frontend logs them.
@@ -2618,9 +2644,9 @@ def run_memory_case(retroarch, root, driver, case):
 
 
 def run_screens_rules_case(retroarch, root, driver):
-    """The rules cases: which maps the frontend accepts, the screens it
-    logs for the full map, and GET_VIDEO_SCREEN_BUFFER known, lending on
-    IMAGES_DRIVERS only."""
+    """The rules cases: which maps the frontend accepts and the screens
+    it leaves out of each, the screens it logs for the full map, and
+    GET_VIDEO_SCREEN_BUFFER known, lending on IMAGES_DRIVERS only."""
     images = 1 if driver in IMAGES_DRIVERS else 0
     case = ('screens-rules', 'ds', {'video_stereo_mode': '0'}, [])
     errors = run_case(retroarch, root, driver, case,
@@ -2628,19 +2654,29 @@ def run_screens_rules_case(retroarch, root, driver):
                       until=SCREENS_FULL_RE)
     text = log_text(case_dir(root, driver, case[0]))
     logged = {}
-    for name, accepted in SCREENS_CASE_RE.findall(text):
-        logged.setdefault(name, []).append(int(accepted))
-    for name, want in SCREENS_RULES:
-        if want is None:
-            want = images
+    for name, accepted, left_out in SCREENS_CASE_RE.findall(text):
+        logged.setdefault(name, []).append(
+            (int(accepted), int(left_out, 16)))
+    for name, accepted, left_out in SCREENS_RULES:
+        if left_out is None:
+            left_out = 0 if images else 0x4
+        elif left_out == 'sentinel':
+            left_out = SCREENS_SENTINEL
         if name not in logged:
             errors.append('case %s not logged' % name)
-        elif any(a != want for a in logged[name]):
-            errors.append('case %s accepted=%s, want %d'
-                          % (name, logged[name], want))
-    known = set(name for name, _ in SCREENS_RULES)
+        elif any(a != (accepted, left_out) for a in logged[name]):
+            errors.append(
+                'case %s accepted, left_out=%s, want %d, 0x%x'
+                % (name, ['%d, 0x%x' % a for a in logged[name]],
+                   accepted, left_out))
+    known = set(rule[0] for rule in SCREENS_RULES)
     for name in sorted(set(logged) - known):
         errors.append('case %s not in SCREENS_RULES' % name)
+    layers = [(int(n), int(b)) for n, b in SCREENS_LAYER_RE.findall(text)]
+    if not any(layers[i:i + 5] == SCREENS_LAYER_STYLES
+               for i in range(len(layers))):
+        errors.append('layer lines %s, want %s among them'
+                      % (layers, SCREENS_LAYER_STYLES))
     answers = set(SCREEN_BUFFER_RE.findall(text))
     if answers != {str(images)}:
         errors.append('screen_buffer=%s, want %d' % (sorted(answers), images))

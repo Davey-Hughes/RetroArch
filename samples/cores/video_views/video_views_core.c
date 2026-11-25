@@ -73,8 +73,13 @@
  * does the 3ds map in the modes besides rules. rules
  * asks for a screen buffer on its first frame, then sends one map a
  * frame, each keeping or breaking one of the header's screen rules, and
- * logs whether it was accepted; after the last, the full map every
- * frame. no_input names the two screens and marks the bottom one
+ * logs whether it was accepted and its screens_left_out, 0xa5a5a5a5
+ * where the frontend wrote none; after the last, the full map every
+ * frame. Its image cases send screen 2 a picture the frontend cannot
+ * take (no pixels, a format or a size it does not know), which it
+ * leaves out; its layer cases make screen 2 Gel, a LAYER on the top
+ * screen, left out while no blend is drawn, or break one LAYER rule.
+ * no_input names the two screens and marks the bottom one
  * NO_INPUT, for e2e/run.py's light gun check; no_input_off only names
  * them. The other modes name them too and send the bottom one as:
  * shown, SHOWN; hidden, HIDDEN; over, OVER the top one's bottom right
@@ -358,6 +363,7 @@ static enum screens_kind screens_kind = SCREENS_OFF;
 static unsigned screens_next;
 static const char *screens_logged;
 static int screens_logged_accepted = -1;
+static unsigned screens_logged_left_out;
 /* With SCREENS_MODE, the scr_modes entry, and whether it has switched. */
 static unsigned screens_mode;
 static bool screens_switched;
@@ -2105,9 +2111,13 @@ static void change_map(void)
  * changes in one way. As samples/gfx/video_views/video_views_test.c's
  * full map. */
 static struct retro_video_view   scr_views[2];
-static struct retro_video_screen scr_screens[3];
+static struct retro_video_screen scr_screens[RETRO_VIDEO_SCREENS_MAX];
 static struct retro_video_screen_image scr_image;
 static uint32_t scr_pixels[48 * 32];
+static uint32_t scr_large[513 * 32];
+/* screens_left_out before each call, so a call that writes none shows. */
+#define SCR_LEFT_OUT_NONE 0xA5A5A5A5u
+static unsigned scr_left_out;
 
 static struct retro_video_screen mkscreen(const char *name, unsigned flags,
       unsigned state, unsigned show, unsigned base, float size,
@@ -2128,6 +2138,12 @@ static struct retro_video_screen mkscreen(const char *name, unsigned flags,
    s.swap_with = swap_with;
    s.group     = group;
    s.image     = NULL;
+   s.blend     = 0;
+   s.z         = 0;
+   s.x         = 0.0f;
+   s.y         = 0.0f;
+   s.width     = 0.0f;
+   s.height    = 0.0f;
    return s;
 }
 
@@ -2155,6 +2171,8 @@ static void scr_full(struct retro_video_views *in)
    in->flags      |= RETRO_VIDEO_VIEWS_FLAG_SCREENS;
    in->screens     = scr_screens;
    in->num_screens = 3;
+   scr_left_out         = SCR_LEFT_OUT_NONE;
+   in->screens_left_out = &scr_left_out;
 }
 
 /* Accepted */
@@ -2216,6 +2234,7 @@ static void scr_view_past_count(struct retro_video_views *in)
    scr_screens[0].swap_with = 0;
 }
 
+/* Accepted; the screen is left out where the frontend cannot take it */
 static void scr_image_screen(struct retro_video_views *in)
 {
    scr_image.data         = scr_pixels;
@@ -2226,6 +2245,163 @@ static void scr_image_screen(struct retro_video_views *in)
    scr_image.aspect_ratio = 0.0f;
    scr_image.serial       = 1;
    scr_screens[2].image   = &scr_image;
+}
+
+static void scr_image_null(struct retro_video_views *in)
+{
+   scr_image_screen(in);
+   scr_image.data = NULL;
+}
+
+/* Serial 2 is never taken. Under serial 1, which "image" leaves held, a
+ * new format or size is refused, not left out. */
+static void scr_image_null_serial(struct retro_video_views *in)
+{
+   scr_image_null(in);
+   scr_image.serial = 2;
+}
+
+static void scr_image_format(struct retro_video_views *in)
+{
+   scr_image_screen(in);
+   scr_image.format = RETRO_PIXEL_FORMAT_0RGB1555;
+   scr_image.pitch  = 48 * sizeof(uint16_t);
+   scr_image.serial = 2;
+}
+
+static void scr_image_large(struct retro_video_views *in)
+{
+   scr_image_screen(in);
+   scr_image.data   = scr_large;
+   scr_image.width  = 513;
+   scr_image.pitch  = 513 * sizeof(uint32_t);
+   scr_image.serial = 2;
+}
+
+static void scr_image_argb(struct retro_video_views *in)
+{
+   scr_image_screen(in);
+   scr_image.format = RETRO_VIDEO_SCREEN_FORMAT_ARGB8888;
+   scr_image.serial = 2;
+}
+
+/* Screen @i as Gel: the VMU made a LAYER on @base. */
+static void scr_gel(unsigned i, unsigned base)
+{
+   scr_screens[i]      = scr_screens[2];
+   scr_screens[i].name = "Gel";
+   scr_screens[i].show = RETRO_VIDEO_SCREEN_SHOW_LAYER;
+   scr_screens[i].base = base;
+}
+
+/* Accepted; a LAYER is left out while its blend is not drawn */
+static void scr_layer_placeholder(struct retro_video_views *in)
+{
+   scr_gel(2, 0);
+}
+
+static void scr_layer_styles(struct retro_video_views *in)
+{
+   static const unsigned blend[5] = {
+      RETRO_VIDEO_SCREEN_BLEND_ALPHA, RETRO_VIDEO_SCREEN_BLEND_ADD,
+      RETRO_VIDEO_SCREEN_BLEND_MULTIPLY, RETRO_VIDEO_SCREEN_BLEND_NONE, 7
+   };
+   unsigned i;
+   for (i = 0; i < 5; i++)
+   {
+      scr_gel(2 + i, 0);
+      scr_screens[2 + i].blend = blend[i];
+   }
+   in->num_screens = 7;
+}
+
+static void scr_layer_argb(struct retro_video_views *in)
+{
+   scr_image_argb(in);
+   scr_gel(2, 0);
+   scr_screens[2].blend = RETRO_VIDEO_SCREEN_BLEND_ALPHA;
+}
+
+static void scr_layer_one_side_image(struct retro_video_views *in)
+{
+   scr_image_screen(in);
+   scr_gel(2, 0);
+   scr_screens[2].x      = 0.5f;
+   scr_screens[2].height = 1.0f;
+}
+
+static void scr_layer_order(struct retro_video_views *in)
+{
+   scr_gel(2, 0);
+   scr_screens[2].order = 0;
+}
+
+static void scr_layer_off(struct retro_video_views *in)
+{
+   scr_gel(2, 0);
+   scr_screens[1].flags |= RETRO_VIDEO_SCREEN_FLAG_LAYER_OFF;
+   scr_screens[2].flags |= RETRO_VIDEO_SCREEN_FLAG_LAYER_OFF;
+}
+
+static void scr_layer_upright(struct retro_video_views *in)
+{
+   scr_gel(2, 0);
+   scr_screens[2].flags |= RETRO_VIDEO_SCREEN_FLAG_UPRIGHT;
+}
+
+/* Refused */
+static void scr_layer_self(struct retro_video_views *in)
+{
+   scr_gel(2, 2);
+}
+
+static void scr_layer_on_layer(struct retro_video_views *in)
+{
+   scr_gel(2, 0);
+   scr_gel(3, 2);
+   in->num_screens = 4;
+}
+
+static void scr_layer_on_over(struct retro_video_views *in)
+{
+   scr_gel(3, 2);
+   in->num_screens = 4;
+}
+
+static void scr_layer_range(struct retro_video_views *in)
+{
+   scr_gel(2, 0);
+   scr_screens[2].x      = 65.0f;
+   scr_screens[2].width  = 1.0f;
+   scr_screens[2].height = 1.0f;
+}
+
+static void scr_layer_nan(struct retro_video_views *in)
+{
+   volatile float zero = 0.0f;
+   scr_gel(2, 0);
+   scr_screens[2].width = zero / zero;
+}
+
+static void scr_layer_one_side(struct retro_video_views *in)
+{
+   scr_gel(2, 0);
+   scr_screens[2].width = 0.5f;
+}
+
+/* The top screen's own pair is dropped, so the LAYER is all that is
+ * wrong. */
+static void scr_layer_swap(struct retro_video_views *in)
+{
+   scr_gel(2, 0);
+   scr_screens[0].swap_with = 0;
+   scr_screens[2].swap_with = 1;
+}
+
+static void scr_layer_group(struct retro_video_views *in)
+{
+   scr_gel(2, 0);
+   scr_screens[2].group = 1;
 }
 
 static void scr_active_viewless(struct retro_video_views *in)
@@ -2302,7 +2478,7 @@ static void scr_swap_disagree(struct retro_video_views *in)
 
 static void scr_show_unknown(struct retro_video_views *in)
 {
-   scr_screens[2].show = 3;
+   scr_screens[2].show = 4;
 }
 
 static void scr_state_unknown(struct retro_video_views *in)
@@ -2341,7 +2517,29 @@ static const struct
    { "too-many",             scr_too_many             },
    { "null-screens",         scr_null_screens         },
    { "view-past-count",      scr_view_past_count      },
+   { "image-null-unheld",    scr_image_null           },
    { "image",                scr_image_screen         },
+   { "image-null-held",      scr_image_null           },
+   { "image-null-serial",    scr_image_null_serial    },
+   { "image-format",         scr_image_format         },
+   { "image-large",          scr_image_large          },
+   { "image-argb",           scr_image_argb           },
+   { "layer-placeholder",    scr_layer_placeholder    },
+   { "layer-styles",         scr_layer_styles         },
+   { "layer-argb",           scr_layer_argb           },
+   { "layer-one-side-image", scr_layer_one_side_image },
+   { "layer-order",          scr_layer_order          },
+   { "layer-off",            scr_layer_off            },
+   { "layer-upright",        scr_layer_upright        },
+   { "layer-upright-clear",  scr_layer_placeholder    },
+   { "layer-self",           scr_layer_self           },
+   { "layer-on-layer",       scr_layer_on_layer       },
+   { "layer-on-over",        scr_layer_on_over        },
+   { "layer-range",          scr_layer_range          },
+   { "layer-nan",            scr_layer_nan            },
+   { "layer-one-side",       scr_layer_one_side       },
+   { "layer-swap",           scr_layer_swap           },
+   { "layer-group",          scr_layer_group          },
    { "active-viewless",      scr_active_viewless      },
    { "blank-viewless",       scr_blank_viewless       },
    { "eye-unpaired",         scr_eye_unpaired         },
@@ -2650,12 +2848,15 @@ static const char *screens_add(struct retro_video_views *in)
 /* Each case once; the full map again only when its answer changes. */
 static void screens_log(const char *name, int accepted)
 {
-   if (name == screens_logged && accepted == screens_logged_accepted)
+   if (     name == screens_logged && accepted == screens_logged_accepted
+         && scr_left_out == screens_logged_left_out)
       return;
-   log_cb(RETRO_LOG_INFO, "[video_views] screens case=%s accepted=%d\n",
-         name, accepted);
+   log_cb(RETRO_LOG_INFO,
+         "[video_views] screens case=%s accepted=%d left_out=0x%x\n",
+         name, accepted, scr_left_out);
    screens_logged          = name;
    screens_logged_accepted = accepted;
+   screens_logged_left_out = scr_left_out;
 }
 
 void retro_run(void)
