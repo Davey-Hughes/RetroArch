@@ -5732,6 +5732,11 @@ static void test_images_left_out(void)
    video_st->views_images = false;
    CHECK(images_test_hand(screens_test_dsi_pixels, 2)
          && images_test_left_out == 0x4);
+   /* A new size under the held serial is refused all the same */
+   images_test_picture(screens_test_dsi_pixels, 1);
+   images_test_image.width = 24;
+   images_test_image.pitch = 24 * sizeof(uint32_t);
+   CHECK(!images_test_set() && images_test_left_out == 0xA5A5A5A5);
    video_st->views_images = true;
    CHECK(images_test_hand(NULL, 2) && images_test_left_out == 0x4);
    CHECK(images_test_hand(NULL, 1) && !images_test_left_out);
@@ -5816,15 +5821,37 @@ static void test_images_lend_open(void)
    window_test_end();
 }
 
+static char layer_test_log_path[2048];
+
+/* How many times the log file holds @text */
+static unsigned layer_test_logged(const char *text)
+{
+   void *buf     = NULL;
+   int64_t len   = 0;
+   int64_t n     = (int64_t)strlen(text);
+   unsigned hits = 0;
+   int64_t i;
+   if (filestream_read_file(layer_test_log_path, &buf, &len))
+      for (i = 0; i + n <= len; i++)
+         if (!memcmp((const char*)buf + i, text, (size_t)n))
+            hits++;
+   free(buf);
+   return hits;
+}
+
 /* The same image map every frame while IMAGES is unset: accepted and
- * left out each time, stored once, nothing taken (Review Focus 2) */
+ * left out each time, stored and logged once, nothing taken (Review
+ * Focus 2) */
 static void test_images_left_out_every_frame(void)
 {
    video_views_map_t kept;
    video_driver_state_t *video_st = video_state_get_ptr();
+   bool verbose                   = verbosity_is_enabled();
    unsigned n;
    images_test_frames_begin();
    video_st->views_images = false;
+   retro_main_log_file_init(layer_test_log_path, false);
+   verbosity_enable();
    for (n = 0; n < 60; n++)
    {
       CHECK(images_test_hand(screens_test_dsi_pixels, 1)
@@ -5835,6 +5862,10 @@ static void test_images_left_out_every_frame(void)
       window_test_run();
       CHECK(!screens_test_image_placed(2, 0));
    }
+   if (!verbose)
+      verbosity_disable();
+   retro_main_log_file_deinit();
+   CHECK(layer_test_logged("View map:") == 1);
    CHECK(!images_test_tex_calls());
    video_st->views_images = true;
    CHECK(images_test_hand(NULL, 1) && images_test_left_out == 0x4);
@@ -5873,11 +5904,11 @@ static void test_screens_left_out_repeat_frame(void)
    window_test_end();
 }
 
-static char layer_test_log_path[2048];
+static unsigned layer_test_blend = RETRO_VIDEO_SCREEN_BLEND_MULTIPLY;
 
-/* images_test_set()'s map plus "Gel", screen 3: a MULTIPLY LAYER on Top,
- * or SHOWN without @layer, drawn from @gel or with NULL from a view of
- * its own */
+/* images_test_set()'s map plus "Gel", screen 3: a layer_test_blend LAYER
+ * on Top, or SHOWN without @layer, drawn from @gel or with NULL from a
+ * view of its own */
 static bool layer_test_set(const struct retro_video_screen_image *gel,
       bool layer)
 {
@@ -5893,7 +5924,7 @@ static bool layer_test_set(const struct retro_video_screen_image *gel,
    if (layer)
    {
       screens[3].show  = RETRO_VIDEO_SCREEN_SHOW_LAYER;
-      screens[3].blend = RETRO_VIDEO_SCREEN_BLEND_MULTIPLY;
+      screens[3].blend = layer_test_blend;
       screens[3].z     = 1;
    }
    if (!gel)
@@ -5932,22 +5963,6 @@ static void layer_test_out(const video_views_rect_t *top)
             VIDEO_WINDOW_DISPLAY_OFF));
    CHECK(!screens_test_image_placed(3, 0) && !layer_test_view_placed(2));
    CHECK(now && now->dst.pos == top->pos && now->dst.dims == top->dims);
-}
-
-/* How many times the log file holds @text */
-static unsigned layer_test_logged(const char *text)
-{
-   void *buf     = NULL;
-   int64_t len   = 0;
-   int64_t n     = (int64_t)strlen(text);
-   unsigned hits = 0;
-   int64_t i;
-   if (filestream_read_file(layer_test_log_path, &buf, &len))
-      for (i = 0; i + n <= len; i++)
-         if (!memcmp((const char*)buf + i, text, (size_t)n))
-            hits++;
-   free(buf);
-   return hits;
 }
 
 /* A LAYER is left out on every frame and NULL refresh, whatever it is
@@ -6038,6 +6053,13 @@ static void test_screens_layer_left_out(void)
    CHECK(layer_test_logged("Screen 3 layer: blend 2, z 1, "
             "rect 0.000 0.000 0.000 0.000.") == 1);
    CHECK(layer_test_logged("Screen 3 layer:") == 1);
+
+   /* A blend past the status flags */
+   gel.format       = RETRO_PIXEL_FORMAT_XRGB8888;
+   gel.serial       = 3;
+   layer_test_blend = 40;
+   CHECK(layer_test_set(&gel, true) && images_test_left_out == 0x8);
+   layer_test_blend = RETRO_VIDEO_SCREEN_BLEND_MULTIPLY;
    window_test_end();
 }
 
