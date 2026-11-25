@@ -851,6 +851,20 @@ SCREENS_STATE_CASES = [
     ('screens-shown-sized', 'shown_sized',
      [(1440, 480, YELLOW), (640, 480, GREEN), (1440, 200, BLACK)], {}),
 ]
+# A LAYER while RetroArch draws no blend, on SCREENS_DRIVERS: the core
+# that reads the status sends none and multiplies Top by Gel itself;
+# one sent anyway is left out, Top as it was. Entries as
+# SCREENS_DRAW_CASES', with 'left_out' each screens_left_out the core
+# must log, in order, and no other.
+SCREENS_TOP_GEL = [(x, y, (0, 128, 0) if c == GREEN else c)
+                   for x, y, c in SCREENS_TOP_ALONE]
+SCREENS_LAYER_CASES = [
+    ('screens-layer-fallback', 'layer', SCREENS_TOP_GEL,
+     {'left_out': [0x0]}),
+    ('screens-layer-sent', 'layer_sent', SCREENS_TOP_ALONE,
+     {'left_out': [0x4]}),
+]
+LEFT_OUT_RE = re.compile(r'\[video_views\] left_out=0x([0-9a-f]+)')
 # With no screen placed the menu still lays out over the whole window,
 # as it does over a frame without views: the second case, which the
 # first one's menu must match. Opaque, so the frame behind is not seen.
@@ -910,6 +924,10 @@ IMAGE_NOT_LENT_RE = re.compile(r'\[video_views\] image buffer refused')
 # image_restart's restart.
 SCREENS_RESTARTED_RE = re.compile(r'\[video_views\] screens switched'
                                   r'[\s\S]*\[Video\] Set video size to:')
+# image_lend_open's restart, then its hand-in.
+SCREENS_LEND_OPEN_RE = re.compile(
+    SCREENS_RESTARTED_RE.pattern
+    + r'[\s\S]*\[video_views\] image serial=1 accepted=1')
 # image_null's switch in each of run-ahead's two instances.
 SCREENS_SWITCHED_TWICE_RE = re.compile(r'(\[video_views\] screens switched'
                                        r'[\s\S]*){2}')
@@ -990,9 +1008,9 @@ def screens_image_sbs(colours):
 # neither side's colour, 'handins' how many pictures the core sends,
 # 'preset' True to draw through the driver's SCREENS_PRESETS preset,
 # 'hw' True to run once for each hardware kind EXACT_HW gives the driver,
-# 'drivers' those of IMAGES_DRIVERS the case runs on and 'window' the
+# 'drivers' those of IMAGES_DRIVERS the case runs on, 'window' the
 # colours of the picture's quadrants in screen 2's own window, which
-# only the Xvfb runs can find.
+# only the Xvfb runs can find, and 'left_out' as SCREENS_LAYER_CASES'.
 SCREENS_IMAGE_CASES = [
     ('screens-image', 'image', screens_image_beside(IMAGE_QUADRANTS), {}),
     ('screens-image-over', 'image_over',
@@ -1017,6 +1035,10 @@ SCREENS_IMAGE_CASES = [
     ('screens-image-restart', 'image_restart',
      screens_image_beside(IMAGE_QUADRANTS),
      {'until': SCREENS_RESTARTED_RE, 'handins': 1}),
+    # A buffer lent before a restart of the driver, handed in after it.
+    ('screens-image-lend-open', 'image_lend_open',
+     screens_image_beside(IMAGE_QUADRANTS),
+     {'until': SCREENS_LEND_OPEN_RE, 'handins': 1, 'left_out': [0x0]}),
     ('screens-image-over-threaded', 'image_over',
      screens_image_inset(IMAGE_QUADRANTS),
      {'settings': {'video_threaded': 'true'}}),
@@ -2752,11 +2774,35 @@ def run_screens_show_case(retroarch, root, driver, case, screens=None):
     return errors
 
 
+def left_out_errors(d, want):
+    """The screens_left_out values the core logged against want."""
+    found = [int(v, 16) for v in LEFT_OUT_RE.findall(log_text(d))]
+    if found == want:
+        return []
+    return ['left_out logged %s, want %s'
+            % tuple('[%s]' % ', '.join('0x%x' % v for v in values)
+                    for values in (found, want))]
+
+
+def run_screens_layer_case(retroarch, root, driver, case):
+    """A show case with SCREENS in every status, every map accepted and
+    the core's screens_left_out as 'left_out' has it."""
+    name, mode, points, extra = case
+    extra = dict(extra)
+    left_out = extra.pop('left_out')
+    errors = run_screens_show_case(retroarch, root, driver,
+                                   (name, mode, points, extra), 1)
+    d = case_dir(root, driver, name)
+    if any(s[2] != 1 for s in statuses(d)):
+        errors.append('a status with accepted=0')
+    return errors + left_out_errors(d, left_out)
+
+
 def run_screens_image_case(retroarch, root, driver, case, hw='off'):
     """An image case: the window's points, IMAGES in every status, each
     picture the core sent taken, through a lend unless it copies, and
-    its blends, number of pictures, preset, until line and screen window
-    where it has them."""
+    its blends, number of pictures, preset, until line, screen window
+    and left_out where it has them."""
     name, mode, points, extra = case
     extra = dict(extra)
     until = extra.get('until')
@@ -2764,6 +2810,7 @@ def run_screens_image_case(retroarch, root, driver, case, hw='off'):
     blends = extra.pop('blends', ())
     handins = extra.pop('handins', None)
     window = extra.pop('window', None)
+    left_out = extra.pop('left_out', None)
     extra.pop('drivers', None)
     extra.pop('hw', None)
     opts = dict(extra.pop('opts', {}), video_views_test_screens=mode)
@@ -2824,6 +2871,8 @@ def run_screens_image_case(retroarch, root, driver, case, hw='off'):
                                   '%s' % (x, y, got, ca, cb))
     if window:
         errors += screen_window_errors(d, window)
+    if left_out is not None:
+        errors += left_out_errors(d, left_out)
     return errors
 
 
@@ -3143,6 +3192,10 @@ def driver_jobs(retroarch, root, driver):
                                        screens)
         return report('%s/%s' % (driver, case[0]), errors), bool(errors)
 
+    def screens_layer(case):
+        errors = run_screens_layer_case(retroarch, root, driver, case)
+        return report('%s/%s' % (driver, case[0]), errors), bool(errors)
+
     def screens_status(case):
         name, settings, whole, args = case
         errors = run_case(retroarch, root, driver,
@@ -3234,6 +3287,9 @@ def driver_jobs(retroarch, root, driver):
              and c[0] not in SCREENS_PRESET_SOLID.get(driver, ())]
     jobs += [lambda c=c: screens_show(c)
              for c in (SCREENS_STATE_CASES if driver in SCREENS_DRIVERS
+                       else []) if wanted(c[0])]
+    jobs += [lambda c=c: screens_layer(c)
+             for c in (SCREENS_LAYER_CASES if driver in SCREENS_DRIVERS
                        else []) if wanted(c[0])]
     if driver in SCREENS_DRIVERS and wanted(SCREENS_MENU_CASE[0]):
         jobs.append(screens_menu)

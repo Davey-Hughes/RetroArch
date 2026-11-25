@@ -104,6 +104,15 @@
  * the maximum size at frame 60, which restarts the driver. Each
  * picture is sent until the frontend takes it; each one sent, and each
  * refused map without one, logs its serial and the answer.
+ * image_lend_open is lent its buffer and fills it in the first
+ * retro_run(), sends VMU ABSENT without a picture, restarts the driver
+ * as image_restart does and hands that buffer in 30 frames later. The
+ * layer modes send the bottom one HIDDEN and have Gel, a 48x32 picture
+ * of (255, 128, 255) that multiplies the top screen: layer sends it as
+ * screen 2, a LAYER, while the status has BLEND_MULTIPLY, and
+ * otherwise multiplies the top screen's colour itself; layer_sent
+ * sends it whatever the status. The modes besides rules log their
+ * map's screens_left_out each time it changes.
  *
  * VIDEO_VIEWS_TEST_LIBRARY_NAME in the environment replaces the library
  * name, so one build can load as a second core. */
@@ -364,6 +373,10 @@ static unsigned screens_next;
 static const char *screens_logged;
 static int screens_logged_accepted = -1;
 static unsigned screens_logged_left_out;
+/* A map's screens_left_out, set to this before each call so that a
+ * call that writes none shows. */
+#define SCR_LEFT_OUT_NONE 0xA5A5A5A5u
+static unsigned scr_left_out;
 /* With SCREENS_MODE, the scr_modes entry, and whether it has switched. */
 static unsigned screens_mode;
 static bool screens_switched;
@@ -373,6 +386,8 @@ static bool vmu_copy;
 static bool vmu_sharp = true;
 static unsigned vmu_held;
 static bool max_raised;
+/* image_lend_open's buffer, lent in the first retro_run(). */
+static const void *vmu_lent;
 
 static void fallback_log(enum retro_log_level level, const char *fmt, ...)
 {
@@ -1096,6 +1111,8 @@ static void read_options(void)
    screens_switched = false;
    vmu_held     = 0;
    max_raised   = false;
+   vmu_lent     = NULL;
+   screens_logged_left_out = SCR_LEFT_OUT_NONE;
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
       if (!strcmp(var.value, "rules"))
@@ -1180,7 +1197,7 @@ void retro_set_environment(retro_environment_t cb)
         "|blank_late|absent|absent_back|none_shown|hide_null"
         "|no_input_null|blank_null|over_no_input|shown_sized|image"
         "|image_over|image_over_half|image_over_blank|image_null"
-        "|image_restart" },
+        "|image_restart|image_lend_open|layer|layer_sent" },
       { "video_views_test_image",
         "Image screen pixels; lend|copy" },
       { "video_views_test_image_sharp",
@@ -2115,9 +2132,6 @@ static struct retro_video_screen scr_screens[RETRO_VIDEO_SCREENS_MAX];
 static struct retro_video_screen_image scr_image;
 static uint32_t scr_pixels[48 * 32];
 static uint32_t scr_large[513 * 32];
-/* screens_left_out before each call, so a call that writes none shows. */
-#define SCR_LEFT_OUT_NONE 0xA5A5A5A5u
-static unsigned scr_left_out;
 
 static struct retro_video_screen mkscreen(const char *name, unsigned flags,
       unsigned state, unsigned show, unsigned base, float size,
@@ -2563,6 +2577,13 @@ static const struct
 
 /* A mode whose @late differs from its @state switches at this frame. */
 #define SCR_SWITCH_FRAME 60
+/* image_lend_open hands its buffer in this long after the switch. */
+#define SCR_LEND_FRAMES 30
+/* A mode's Gel: sent while the status says its blend is drawn, or
+ * whatever it says. */
+#define GEL_IF_DRAWN 1
+#define GEL_ALWAYS   2
+#define GEL_COL      0xFF80FF
 
 /* video_views_test_screens' modes besides rules: how the ds map's
  * screen 1 is sent, @late being its state from SCR_SWITCH_FRAME on.
@@ -2571,7 +2592,11 @@ static const struct
  * it NULL, screen 1 from then @null_show with @null_flags. @size is
  * screen 1's when it is not OVER. @image sends screen 1 HIDDEN and the
  * fields above for screen 2, the VMU picture, which a @null mode
- * mirrors at the switch. @restart raises the maximum size there. */
+ * mirrors at the switch. @restart raises the maximum size there.
+ * @lend_open keeps the picture's buffer from the first frame and sends
+ * no picture until SCR_LEND_FRAMES after the switch. @gel, a GEL_
+ * value, has Gel multiply screen 0: as screen 2, a LAYER, when it is
+ * sent, in the core's own drawing when it is not. */
 static const struct
 {
    const char *name;
@@ -2587,6 +2612,8 @@ static const struct
    float size;
    bool image;
    bool restart;
+   bool lend_open;
+   unsigned gel;
 } scr_modes[] = {
    { "no_input",     RETRO_VIDEO_SCREEN_FLAG_NO_INPUT,
       RETRO_VIDEO_SCREEN_SHOW_SHOWN,
@@ -2662,7 +2689,16 @@ static const struct
       false, 0.0f, true, RETRO_VIDEO_SCREEN_SHOW_SHOWN, 0, 0.0f, true },
    { "image_restart", 0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
       RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
-      false, 0.0f, false, 0, 0, 0.0f, true, true }
+      false, 0.0f, false, 0, 0, 0.0f, true, true },
+   { "image_lend_open", 0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f, false, 0, 0, 0.0f, true, true, true },
+   { "layer",        0, RETRO_VIDEO_SCREEN_SHOW_HIDDEN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f, false, 0, 0, 0.0f, false, false, false, GEL_IF_DRAWN },
+   { "layer_sent",   0, RETRO_VIDEO_SCREEN_SHOW_HIDDEN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f, false, 0, 0, 0.0f, false, false, false, GEL_ALWAYS }
 };
 
 /* A null mode from its switch on: each refresh repeats the last frame */
@@ -2684,6 +2720,38 @@ static bool screens_mode_named(const char *name)
       }
    }
    return false;
+}
+
+/* Whether the mode sends Gel under @status. */
+static bool gel_sent(unsigned status)
+{
+   unsigned gel = scr_modes[screens_mode].gel;
+   return gel == GEL_ALWAYS || (gel == GEL_IF_DRAWN
+         && (status & RETRO_VIDEO_VIEWS_STATUS_BLEND_MULTIPLY));
+}
+
+/* @col as BLEND_MULTIPLY draws it under Gel. */
+static uint32_t gel_multiply(uint32_t col)
+{
+   uint32_t out = 0;
+   unsigned shift;
+   for (shift = 0; shift < 24; shift += 8)
+      out |= ((((col >> shift) & 0xFF) * ((GEL_COL >> shift) & 0xFF)
+               + 127) / 255) << shift;
+   return out;
+}
+
+/* Screen 2 as Gel: a LAYER over all of screen 0. */
+static void gel_screen(struct retro_video_views *in)
+{
+   unsigned i;
+   for (i = 0; i < sizeof(scr_pixels) / sizeof(scr_pixels[0]); i++)
+      scr_pixels[i] = GEL_COL;
+   scr_screens[2] = mkscreen("Gel", 0, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+         RETRO_VIDEO_SCREEN_SHOW_LAYER, 0, 0.0f, 0, 0.0f, 0, 0, 0, 0);
+   scr_screens[2].blend = RETRO_VIDEO_SCREEN_BLEND_MULTIPLY;
+   scr_image_screen(in);
+   in->num_screens = 3;
 }
 
 /* The image modes' picture, and the core's own rows of it, padded as a
@@ -2746,6 +2814,24 @@ static const struct retro_video_screen_image *vmu_picture(void)
    return &vmu_image;
 }
 
+/* image_lend_open's picture: lent and filled in the first retro_run(),
+ * NULL until SCR_LEND_FRAMES after the switch, then that buffer. */
+static const struct retro_video_screen_image *vmu_lend_open(void)
+{
+   if (!vmu_lent)
+   {
+      vmu_picture();
+      vmu_lent = vmu_image.data;
+   }
+   if (frames_run <= SCR_SWITCH_FRAME + SCR_LEND_FRAMES)
+   {
+      vmu_image.data = NULL;
+      return NULL;
+   }
+   vmu_image.data = (vmu_held == vmu_image.serial) ? NULL : vmu_lent;
+   return &vmu_image;
+}
+
 /* After the map: a picture sent and taken is held. Each one sent, and
  * each refused map without one, is logged. */
 static void vmu_answer(int accepted)
@@ -2767,9 +2853,10 @@ static void raise_max(void)
    environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av);
 }
 
-/* The screens video_views_test_screens adds to @in, the ds map. In the
- * rules mode this frame's case, whose name it returns. */
-static const char *screens_add(struct retro_video_views *in)
+/* The screens video_views_test_screens adds to @in, the ds map, under
+ * @status. In the rules mode this frame's case, whose name it returns. */
+static const char *screens_add(struct retro_video_views *in,
+      unsigned status)
 {
    const char *name = "full";
    if (screens_kind != SCREENS_RULES)
@@ -2811,6 +2898,8 @@ static const char *screens_add(struct retro_video_views *in)
       in->flags      |= RETRO_VIDEO_VIEWS_FLAG_SCREENS;
       in->screens     = scr_screens;
       in->num_screens = 2;
+      scr_left_out         = SCR_LEFT_OUT_NONE;
+      in->screens_left_out = &scr_left_out;
       if (image)
       {
          scr_screens[1] = mkscreen("Bottom", 0,
@@ -2819,9 +2908,18 @@ static const char *screens_add(struct retro_video_views *in)
                0);
          if (vmu_sharp)
             scr_screens[2].flags |= RETRO_VIDEO_SCREEN_FLAG_SHARP;
-         scr_screens[2].image = vmu_picture();
+         if (scr_modes[screens_mode].lend_open)
+         {
+            scr_screens[2].image = vmu_lend_open();
+            if (!scr_screens[2].image)
+               scr_screens[2].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
+         }
+         else
+            scr_screens[2].image = vmu_picture();
          in->num_screens      = 3;
       }
+      else if (gel_sent(status))
+         gel_screen(in);
       return NULL;
    }
    if (!screens_next)
@@ -2856,6 +2954,15 @@ static void screens_log(const char *name, int accepted)
          name, accepted, scr_left_out);
    screens_logged          = name;
    screens_logged_accepted = accepted;
+   screens_logged_left_out = scr_left_out;
+}
+
+/* A mode's screens_left_out, each time it changes. */
+static void left_out_log(void)
+{
+   if (scr_left_out == screens_logged_left_out)
+      return;
+   log_cb(RETRO_LOG_INFO, "[video_views] left_out=0x%x\n", scr_left_out);
    screens_logged_left_out = scr_left_out;
 }
 
@@ -2922,6 +3029,9 @@ void retro_run(void)
       geo_h = fh;
    }
    n = build_map(v, c, stereo);
+   if (     screens_kind == SCREENS_MODE && scr_modes[screens_mode].gel
+         && !gel_sent(status))
+      c[0] = gel_multiply(c[0]);
    if (HW_IS_VULKAN(hw_kind))
    {
       if (!vk_ready)
@@ -3004,13 +3114,17 @@ void retro_run(void)
       }
       if (     (screens_kind != SCREENS_OFF && map_kind == MAP_DS)
             || (screens_kind == SCREENS_MODE && map_kind == MAP_3DS))
-         screens_case = screens_add(&views);
+         screens_case = screens_add(&views, status);
       accepted        = environ_cb(RETRO_ENVIRONMENT_SET_VIDEO_VIEWS,
             &views) ? 1 : 0;
       if (screens_case)
          screens_log(screens_case, accepted);
-      else if (views.num_screens > 2)
-         vmu_answer(accepted);
+      else if (views.num_screens)
+      {
+         left_out_log();
+         if (scr_modes[screens_mode].image)
+            vmu_answer(accepted);
+      }
       if (     (int)hmd != last_hmd
             || views.recommended_view_width != last_rec_w
             || views.recommended_view_height != last_rec_h)
