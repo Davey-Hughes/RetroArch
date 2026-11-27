@@ -14,7 +14,7 @@ shared = (root / 'gfx/video_views_draw.h').read_text()
 def function(source, name):
     masked = re.sub(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"',
                     lambda m: ' ' * len(m[0]), source, flags=re.S)
-    match = re.search(r'static (?:bool|void|VkRenderPass|VkPipeline) '
+    match = re.search(r'static (?:bool|void|unsigned|VkRenderPass|VkPipeline) '
                       + re.escape(name)
                       + r'\([^;]*?\)\s*\{', masked)
     if not match:
@@ -48,6 +48,7 @@ parts.append(function(driver, 'vulkan_xr_inset'))
 parts.append(function(driver, 'vulkan_xr_draw_screen'))
 parts.append(function(driver, 'vulkan_xr_slot_ensure'))
 parts.append(function(driver, 'vulkan_xr_copy_ui'))
+parts.append(function(driver, 'vulkan_xr_eye_views'))
 parts.append(function(driver, 'vulkan_xr_draw_projection'))
 parts.append(function(driver, 'vulkan_xr_same'))
 parts.append(function(driver, 'vulkan_xr_keep'))
