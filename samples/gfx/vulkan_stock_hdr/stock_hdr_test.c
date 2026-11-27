@@ -2,9 +2,11 @@
  * the vulkan_views_draw_stock it calls), the blank inset fill, the
  * pick of a second output's pipelines (vulkan_views_target_use) and a
  * screen window's draw with them (vulkan_window_draw_screens), the
- * HDR pass encode the draw borrows (vulkan_hdr_ubo_mode) and the
+ * HDR pass encode the draw borrows (vulkan_hdr_ubo_mode), the
  * decisions that send stock views straight into an HDR swapchain, with
- * no FP16 image and HDR game pass between, against a recording fake. */
+ * no FP16 image and HDR game pass between, unless a placement is
+ * translucent (vulkan_views_translucent), and a window's FP16 image
+ * kept for that (vulkan_window_fp16_ensure), against a recording fake. */
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -116,7 +118,7 @@ typedef struct vk
       VkImageView view; } tracker;
    struct { VkPipeline stock_rect, stock_rect_blend, stock_rect_sdr,
       stock_rect_sdr_blend, stock_rect_hdr, alpha_blend,
-      alpha_blend_sdr; } pipelines;
+      alpha_blend_sdr, alpha_premult; } pipelines;
    struct { VkSampler linear, nearest; } samplers;
    struct { unsigned hdr_stock; VkPipeline stock_pipeline, blend_pipeline,
       fill_pipeline; bool target; unsigned alpha; bool fp16;
@@ -144,6 +146,13 @@ struct vulkan_views_draw_ctx
 
 /* gfx/video_views.h's */
 #define VIDEO_VIEWS_MAX_PLACEMENTS (RETRO_VIDEO_VIEWS_MAX * 2)
+
+#define VIDEO_VIEWS_PLACEMENT_BLANK (1u << 0)   /* drawn black */
+#define VIDEO_VIEWS_PLACEMENT_INSET (1u << 1)   /* drawn over its base's */
+#define VIDEO_VIEWS_PLACEMENT_IMAGE (1u << 2)   /* view holds the screen */
+/* Bits 8-15 hold 255 minus the opacity, so flags 0 is solid. */
+#define VIDEO_VIEWS_PLACEMENT_ALPHA_BITS(a) ((255u - (a)) << 8)
+#define VIDEO_VIEWS_PLACEMENT_ALPHA(flags)  (255u - (((flags) >> 8) & 0xffu))
 
 /* One view drawn into one eye's area. */
 typedef struct video_views_placement
@@ -174,6 +183,14 @@ typedef struct video_views_layout
    bool ui_per_eye;
 } video_views_layout_t;
 
+/* A render target the views draw into: the size it was made at, kept
+ * when making it failed so it isn't retried every frame. */
+typedef struct video_views_target
+{
+   unsigned dims;
+   bool made;
+} video_views_target_t;
+
 typedef struct vulkan_filter_chain vulkan_filter_chain_t;
 struct vk_image { VkImageView view; };
 struct vk_window
@@ -182,6 +199,7 @@ struct vk_window
    video_views_layout_t *layout;
    vulkan_filter_chain_t *chains[RETRO_VIDEO_VIEWS_MAX];
    struct vk_image hdr;
+   video_views_target_t hdr_target;
 };
 
 /* The draw the fake took, the blend constants set after how many
@@ -249,6 +267,26 @@ static void vulkan_window_quad(vk_t *vk, const struct vk_image *img,
    drew.quad_img      = img;
    drew.quad_format   = format;
    drew.quad_pipeline = pipeline;
+}
+
+/* A window FP16 image's makes and drops; a make gives fp16.made */
+static struct { unsigned ensures, drops; bool made; } fp16;
+static bool vulkan_vv_target_ensure(vk_t *vk, video_views_target_t *t,
+      struct vk_image *target, unsigned dims)
+{
+   (void)vk; (void)target;
+   fp16.ensures++;
+   t->dims = dims;
+   t->made = fp16.made;
+   return t->made;
+}
+static void vulkan_vv_target_drop(vk_t *vk, video_views_target_t *t,
+      struct vk_image *target)
+{
+   (void)vk; (void)target;
+   fp16.drops++;
+   t->dims = 0;
+   t->made = false;
 }
 
 static bool vulkan_draw_bind(vk_t *vk, const struct vk_draw_triangles *c)
@@ -345,6 +383,7 @@ static void setup(void)
    vk.pipelines.stock_rect_sdr_blend  = 15;
    vk.pipelines.alpha_blend           = 16;
    vk.pipelines.alpha_blend_sdr       = 17;
+   vk.pipelines.alpha_premult         = 18;
    vk.samplers.linear                 = 21;
    vk.samplers.nearest                = 22;
    vk.video.smooth                    = true;
@@ -699,6 +738,32 @@ static void test_sdr_window_decision(void)
       printf("[pass] %s\n", t);
 }
 
+/* Translucent: any placement, stock, image or blank, below full
+ * opacity */
+static void test_translucent_layout(void)
+{
+   static const char t[] = "test_translucent_layout";
+   unsigned before = failures;
+   video_views_layout_t layout;
+   memset(&layout, 0, sizeof(layout));
+   expect(t, !vulkan_views_translucent(&layout), "no placements", 0);
+   layout.num_placements = 2;
+   expect(t, !vulkan_views_translucent(&layout), "flags 0", 1);
+   layout.placements[1].flags = VIDEO_VIEWS_PLACEMENT_BLANK
+      | VIDEO_VIEWS_PLACEMENT_INSET;
+   expect(t, !vulkan_views_translucent(&layout), "a solid blank inset", 2);
+   layout.placements[1].flags = VIDEO_VIEWS_PLACEMENT_ALPHA_BITS(128);
+   expect(t, vulkan_views_translucent(&layout), "a stock placement", 3);
+   layout.placements[1].flags = VIDEO_VIEWS_PLACEMENT_BLANK
+      | VIDEO_VIEWS_PLACEMENT_INSET | VIDEO_VIEWS_PLACEMENT_ALPHA_BITS(128);
+   expect(t, vulkan_views_translucent(&layout), "a blank inset", 4);
+   layout.placements[1].flags = VIDEO_VIEWS_PLACEMENT_IMAGE
+      | VIDEO_VIEWS_PLACEMENT_ALPHA_BITS(128);
+   expect(t, vulkan_views_translucent(&layout), "an image", 5);
+   if (failures == before)
+      printf("[pass] %s\n", t);
+}
+
 /* Stock views straight from the frame encode as they draw, unless the
  * blends read the canvas, the views are not in FP16 (no HDR, or a
  * preset's chains write the encoding), or the pipeline is missing */
@@ -707,17 +772,21 @@ static void test_main_window_decision(void)
    static const char t[] = "test_main_window_decision";
    unsigned before = failures;
    setup();
-   expect(t, vulkan_views_stock_encodes(&vk, true, false), "encodes", 0);
-   expect(t, !vulkan_views_stock_encodes(&vk, false, false),
+   expect(t, vulkan_views_stock_encodes(&vk, true, false, false),
+         "encodes", 0);
+   expect(t, !vulkan_views_stock_encodes(&vk, false, false, false),
          "not through chains", 1);
-   expect(t, !vulkan_views_stock_encodes(&vk, true, true),
+   expect(t, !vulkan_views_stock_encodes(&vk, true, true, false),
          "not into the canvas", 2);
+   expect(t, vulkan_views_stock_encodes(&vk, true, false, false)
+         && !vulkan_views_stock_encodes(&vk, true, false, true),
+         "not when translucent", 5);
    vk.views.fp16 = false;
-   expect(t, !vulkan_views_stock_encodes(&vk, true, false),
+   expect(t, !vulkan_views_stock_encodes(&vk, true, false, false),
          "not without FP16 views", 3);
    setup();
    vk.pipelines.stock_rect_hdr = VK_NULL_HANDLE;
-   expect(t, !vulkan_views_stock_encodes(&vk, true, false),
+   expect(t, !vulkan_views_stock_encodes(&vk, true, false, false),
          "not without the pipeline", 4);
    if (failures == before)
       printf("[pass] %s\n", t);
@@ -733,19 +802,76 @@ static void test_window_decision(void)
    setup();
    out.format      = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
    out.color_space = VK_COLOR_SPACE_HDR10_ST2084_EXT;
-   expect(t, vulkan_window_stock_encodes(&vk, &out, true), "HDR10", 0);
-   expect(t, !vulkan_window_stock_encodes(&vk, &out, false),
+   expect(t, vulkan_window_stock_encodes(&vk, &out, true, false), "HDR10", 0);
+   expect(t, !vulkan_window_stock_encodes(&vk, &out, false, false),
          "not through chains", 1);
+   expect(t, vulkan_window_stock_encodes(&vk, &out, true, false)
+         && !vulkan_window_stock_encodes(&vk, &out, true, true),
+         "not when translucent", 5);
    out.format      = VK_FORMAT_B8G8R8A8_UNORM;
    out.color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-   expect(t, !vulkan_window_stock_encodes(&vk, &out, true), "not SDR", 2);
+   expect(t, !vulkan_window_stock_encodes(&vk, &out, true, false),
+         "not SDR", 2);
    vk.context->swapchain_format = VK_FORMAT_R16G16B16A16_SFLOAT;
    out.format      = VK_FORMAT_R16G16B16A16_SFLOAT;
    out.color_space = VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT;
-   expect(t, vulkan_window_stock_encodes(&vk, &out, true), "scRGB", 3);
+   expect(t, vulkan_window_stock_encodes(&vk, &out, true, false), "scRGB", 3);
    vk.context->flags = 0;
-   expect(t, !vulkan_window_stock_encodes(&vk, &out, true),
+   expect(t, !vulkan_window_stock_encodes(&vk, &out, true, false),
          "not without HDR output", 4);
+   if (failures == before)
+      printf("[pass] %s\n", t);
+}
+
+/* A window in the main window's encoding keeps its FP16 image while its
+ * stock views encode straight in, so a frame with a translucent
+ * placement goes through it with nothing made then; an SDR window's
+ * straight stock views let it go */
+static void test_window_fp16(void)
+{
+   static const char t[] = "test_window_fp16";
+   unsigned before = failures;
+   struct vk_window win;
+   video_views_layout_t layout;
+   setup();
+   memset(&fp16, 0, sizeof(fp16));
+   memset(&win, 0, sizeof(win));
+   memset(&layout, 0, sizeof(layout));
+   win.layout             = &layout;
+   win.output.format      = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+   win.output.color_space = VK_COLOR_SPACE_HDR10_ST2084_EXT;
+   win.output.dims        = VIDEO_SCALE_PACK(640, 480);
+   layout.num_placements  = 1;
+   fp16.made              = true;
+   expect(t, vulkan_window_fp16_ensure(&vk, &win, true)
+         && fp16.ensures == 1 && !fp16.drops && win.hdr_target.made
+         && win.hdr_target.dims == win.output.dims,
+         "kept while encoding straight", fp16.drops);
+   fp16.made = false;
+   expect(t, vulkan_window_fp16_ensure(&vk, &win, true),
+         "encodes straight without it", 1);
+   layout.placements[0].flags = VIDEO_VIEWS_PLACEMENT_ALPHA_BITS(128);
+   expect(t, !vulkan_window_fp16_ensure(&vk, &win, true),
+         "not translucent without it", 2);
+   fp16.made = true;
+   expect(t, vulkan_window_fp16_ensure(&vk, &win, true),
+         "translucent through it", 3);
+   layout.placements[0].flags = 0;
+   fp16.made = false;
+   expect(t, !vulkan_window_fp16_ensure(&vk, &win, false),
+         "not through chains without it", 4);
+   /* An SDR window, its pass in targets[1] */
+   memset(&fp16, 0, sizeof(fp16));
+   vk.views.targets[1].pass       = 41;
+   vk.views.targets[1].format     = VK_FORMAT_B8G8R8A8_UNORM;
+   vk.views.targets[1].stock_rect = 42;
+   vk.views.targets[1].premult    = 43;
+   win.output.format      = VK_FORMAT_B8G8R8A8_UNORM;
+   win.output.color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+   win.hdr_target.made    = true;
+   expect(t, vulkan_window_fp16_ensure(&vk, &win, true)
+         && fp16.drops == 1 && !fp16.ensures && !win.hdr_target.made,
+         "let go by an SDR window's straight stock views", fp16.ensures);
    if (failures == before)
       printf("[pass] %s\n", t);
 }
@@ -848,8 +974,10 @@ int main(void)
    test_encoded_draw();
    test_plain_draw();
    test_translucent_draw();
+   test_translucent_layout();
    test_main_window_decision();
    test_window_decision();
+   test_window_fp16();
    test_target_pipeline_draw();
    test_sdr_window_decision();
    test_fill_pipeline();
