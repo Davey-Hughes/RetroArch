@@ -56,7 +56,8 @@ cut = '\n\n'.join(function(source, name) for name in (
         'vulkan_views_target_stock',
         'vulkan_views_target_use',
         'vulkan_window_stock_sdr',
-        'vulkan_window_stock_encodes'))
+        'vulkan_window_stock_encodes',
+        'vulkan_window_draw_screens'))
 
 if shutil.which('glslc'):
     with tempfile.TemporaryDirectory(prefix='stock-rect-hdr-') as tmp:

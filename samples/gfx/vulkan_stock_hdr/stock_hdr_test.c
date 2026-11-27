@@ -1,6 +1,7 @@
 /* Runs the production stock view draw (vulkan_views_draw_direct and
  * the vulkan_views_draw_stock it calls), the blank inset fill, the
- * pick of a second output's pipelines (vulkan_views_target_use), the
+ * pick of a second output's pipelines (vulkan_views_target_use) and a
+ * screen window's draw with them (vulkan_window_draw_screens), the
  * HDR pass encode the draw borrows (vulkan_hdr_ubo_mode) and the
  * decisions that send stock views straight into an HDR swapchain, with
  * no FP16 image and HDR game pass between, against a recording fake. */
@@ -18,6 +19,7 @@ typedef uintptr_t VkSampler;
 typedef uintptr_t VkBuffer;
 typedef uintptr_t VkCommandBuffer;
 typedef uintptr_t VkImageView;
+typedef uintptr_t VkRenderPass;
 typedef uint64_t VkDeviceSize;
 typedef int VkFormat;
 typedef int VkColorSpaceKHR;
@@ -79,8 +81,8 @@ struct vk_draw_quad
    VkSampler sampler;
    uint64_t color;
 };
-typedef struct { VkFormat format; VkColorSpaceKHR color_space; }
-   vulkan_output_t;
+typedef struct { VkRenderPass render_pass; VkFormat format;
+   VkColorSpaceKHR color_space; unsigned dims; } vulkan_output_t;
 
 #define VULKAN_WRITE_QUAD_VBO(pv, _x, _y, _w, _h, _tx, _ty, _tw, _th, c) \
 { \
@@ -96,7 +98,6 @@ struct vk_chain { int vbo; };
 
 #include "production_types.h"
 
-typedef uintptr_t VkRenderPass;
 struct vk_target_pass
 {
    VkRenderPass pass;
@@ -138,6 +139,51 @@ struct vulkan_views_draw_ctx
    struct vk_texture *direct;
 };
 
+/* libretro.h's */
+#define RETRO_VIDEO_VIEWS_MAX 8
+
+/* gfx/video_views.h's */
+#define VIDEO_VIEWS_MAX_PLACEMENTS (RETRO_VIDEO_VIEWS_MAX * 2)
+
+/* One view drawn into one eye's area. */
+typedef struct video_views_placement
+{
+   video_views_rect_t dst;   /* canvas pixels, top-left origin */
+   unsigned view;            /* the map's view, or an IMAGE's screen */
+   unsigned area;            /* 0: left eye or the only area, 1: right eye */
+   unsigned flags;           /* VIDEO_VIEWS_PLACEMENT_* */
+} video_views_placement_t;
+
+typedef struct video_views_layout
+{
+   video_views_placement_t placements[VIDEO_VIEWS_MAX_PLACEMENTS];
+   video_views_rect_t areas[2];
+   unsigned num_placements;
+   unsigned num_areas;
+   /* What the placements are drawn into: the window, or for anaglyph and
+    * interlaced an offscreen image holding both eyes side by side, which
+    * a final pass blends into the window. */
+   unsigned canvas_dims;
+   /* The size the menu and widgets lay out at. */
+   unsigned ui_dims;
+   /* The params' stereo mode, so drivers pick the blend without reading
+    * settings. */
+   unsigned stereo_mode;
+   bool offscreen;
+   /* The UI is drawn once and placed in each eye's area. */
+   bool ui_per_eye;
+} video_views_layout_t;
+
+typedef struct vulkan_filter_chain vulkan_filter_chain_t;
+struct vk_image { VkImageView view; };
+struct vk_window
+{
+   vulkan_output_t output;
+   video_views_layout_t *layout;
+   vulkan_filter_chain_t *chains[RETRO_VIDEO_VIEWS_MAX];
+   struct vk_image hdr;
+};
+
 /* The draw the fake took, the blend constants set after how many
  * binds, and the quads and clears a fill took */
 static struct
@@ -158,6 +204,52 @@ static struct
 } last;
 static struct vk_vertex vbo_mem[4];
 static unsigned failures;
+
+/* What a window's screens drew: its placements, with the pass's
+ * pipelines, direct and the chains' final target at the call, and its
+ * FP16 image's quad */
+static struct
+{
+   unsigned placements;
+   bool target, direct;
+   VkPipeline stock, blend, fill;
+   VkRenderPass chains_pass, chains_target;
+   unsigned quads;
+   const struct vk_image *quad_img;
+   VkFormat quad_format;
+   VkPipeline quad_pipeline;
+} drew;
+
+static void vulkan_vv_draw_placements(vk_t *vk,
+      const struct vulkan_views_draw_ctx *d,
+      const video_views_layout_t *layout,
+      vulkan_filter_chain_t *const *chains, bool all_areas, unsigned dims,
+      bool direct)
+{
+   (void)d; (void)layout; (void)chains; (void)all_areas; (void)dims;
+   drew.placements++;
+   drew.target      = vk->views.target;
+   drew.stock       = vk->views.stock_pipeline;
+   drew.blend       = vk->views.blend_pipeline;
+   drew.fill        = vk->views.fill_pipeline;
+   drew.direct      = direct;
+   drew.chains_pass = drew.chains_target;
+}
+static void vulkan_window_chains_target(vulkan_filter_chain_t **chains,
+      VkRenderPass render_pass)
+{
+   (void)chains;
+   drew.chains_target = render_pass;
+}
+static void vulkan_window_quad(vk_t *vk, const struct vk_image *img,
+      unsigned img_dims, VkFormat format, unsigned dims, VkPipeline pipeline)
+{
+   (void)vk; (void)img_dims; (void)dims;
+   drew.quads++;
+   drew.quad_img      = img;
+   drew.quad_format   = format;
+   drew.quad_pipeline = pipeline;
+}
 
 static bool vulkan_draw_bind(vk_t *vk, const struct vk_draw_triangles *c)
 {
@@ -658,6 +750,98 @@ static void test_window_decision(void)
       printf("[pass] %s\n", t);
 }
 
+/* An SDR window in B8G8R8A8 beside the A2B10G10R10 swapchain, its
+ * pass's pipelines in targets[1] */
+static void window_setup(struct vk_window *win, video_views_layout_t *layout)
+{
+   setup();
+   memset(&drew, 0, sizeof(drew));
+   memset(win, 0, sizeof(*win));
+   memset(layout, 0, sizeof(*layout));
+   vk.views.targets[1].pass             = 41;
+   vk.views.targets[1].stock_rect       = 42;
+   vk.views.targets[1].premult          = 43;
+   vk.views.targets[1].stock_rect_blend = 44;
+   vk.views.targets[1].format           = VK_FORMAT_B8G8R8A8_UNORM;
+   win->output.render_pass              = 41;
+   win->output.format                   = VK_FORMAT_B8G8R8A8_UNORM;
+   win->output.dims                     = VIDEO_SCALE_PACK(320, 240);
+   win->layout                          = layout;
+   win->chains[0]                       = (vulkan_filter_chain_t*)layout;
+}
+
+/* A screen window draws its views with its own pass's pipelines, through
+ * its chains or straight in, and leaves the window's own for the output
+ * after; its FP16 image goes through premult. The plain draw takes them
+ * in another format without HDR, and none in the swapchain's. */
+static void test_window_screens_target(void)
+{
+   static const char t[] = "test_window_screens_target";
+   unsigned before = failures;
+   unsigned i;
+   video_frame_info_t info;
+   struct vulkan_views_draw_ctx d;
+   video_views_layout_t layout;
+   struct vk_window win;
+   d.video_info = &info;
+   for (i = 0; i < 2; i++)
+   {
+      /* chains_sdr, then stock_sdr */
+      window_setup(&win, &layout);
+      d.direct = i ? &frame : NULL;
+      vulkan_window_draw_screens(&vk, &d, &win, i ? 42 : VK_NULL_HANDLE,
+            !i, true, true, 43);
+      expect(t, drew.placements == 1 && drew.target,
+            "drawn with the target set", i);
+      expect(t, drew.stock == 42 && drew.blend == 44 && drew.fill == 43,
+            "with the window pass's pipelines", (double)drew.stock);
+      expect(t, drew.direct == (i == 1), "direct only straight in", i);
+      expect(t, !vk.views.target && !vk.views.stock_pipeline
+            && !vk.views.blend_pipeline && !vk.views.fill_pipeline,
+            "the window's own after", i);
+      expect(t, !drew.quads, "no FP16 quad", drew.quads);
+   }
+   window_setup(&win, &layout);
+   d.direct = NULL;
+   vulkan_window_draw_screens(&vk, &d, &win, VK_NULL_HANDLE, true, true,
+         true, 43);
+   expect(t, drew.chains_pass == 41 && drew.chains_target == VK_NULL_HANDLE,
+         "the chains into the window's pass, then their own",
+         (double)drew.chains_pass);
+   window_setup(&win, &layout);
+   vulkan_window_draw_screens(&vk, &d, &win, VK_NULL_HANDLE, false, true,
+         true, 43);
+   expect(t, drew.quads == 1 && drew.quad_pipeline == 43
+         && drew.quad_img == &win.hdr
+         && drew.quad_format == VK_FORMAT_R16G16B16A16_SFLOAT,
+         "the FP16 image through premult", (double)drew.quad_pipeline);
+   expect(t, !drew.placements, "no placements in FP16", drew.placements);
+   /* Without HDR, in another format */
+   window_setup(&win, &layout);
+   vk.context->flags = 0;
+   d.direct          = &frame;
+   vulkan_window_draw_screens(&vk, &d, &win, VK_NULL_HANDLE, false, true,
+         false, 43);
+   expect(t, drew.placements == 1 && drew.target && drew.stock == 42
+         && drew.blend == 44 && drew.fill == 43 && drew.direct,
+         "plain: the window pass's pipelines", (double)drew.stock);
+   expect(t, !vk.views.target && !vk.views.stock_pipeline
+         && !vk.views.blend_pipeline && !vk.views.fill_pipeline,
+         "plain: the window's own after", 0);
+   /* and in the swapchain's */
+   window_setup(&win, &layout);
+   vk.context->flags  = 0;
+   win.output.format  = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+   vulkan_window_draw_screens(&vk, &d, &win, VK_NULL_HANDLE, false, true,
+         false, VK_NULL_HANDLE);
+   expect(t, drew.placements == 1 && !drew.target && !drew.stock
+         && !drew.blend && !drew.fill && drew.direct,
+         "plain in the swapchain's format: the window's own",
+         (double)drew.stock);
+   if (failures == before)
+      printf("[pass] %s\n", t);
+}
+
 int main(void)
 {
    test_uniform_layout();
@@ -670,5 +854,6 @@ int main(void)
    test_sdr_window_decision();
    test_fill_pipeline();
    test_target_use();
+   test_window_screens_target();
    return failures ? 1 : 0;
 }

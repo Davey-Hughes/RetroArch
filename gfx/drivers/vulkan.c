@@ -11995,8 +11995,8 @@ static void vulkan_views_draw_pass(vk_t *vk, vulkan_filter_chain_t *fc,
 }
 
 /* @cut black at @alpha, for a blank inset: a black quad at that vertex
- * alpha through the pass's alpha_blend, else cleared (solid, or the pass
- * has none) */
+ * alpha through the pass's alpha_blend, or a second output's premult,
+ * else cleared (solid, or the pass has none) */
 static void vulkan_views_fill(vk_t *vk, const video_views_rect_t *cut,
       unsigned alpha)
 {
@@ -13827,6 +13827,41 @@ static void vulkan_window_stock_hdr(vk_t *vk,
 }
 #endif
 
+/* @win's screens in the pass begun on its output, with that pass's
+ * pipelines: stock views straight in with @stock_sdr, through its chains
+ * with @chains_sdr, else under HDR its FP16 image through @premult, or
+ * as the main window draws */
+static void vulkan_window_draw_screens(vk_t *vk,
+      const struct vulkan_views_draw_ctx *d, struct vk_window *win,
+      VkPipeline stock_sdr, bool chains_sdr, bool screens, bool hdr,
+      VkPipeline premult)
+{
+   const vulkan_output_t *out = &win->output;
+   if (screens && hdr && !stock_sdr && !chains_sdr)
+   {
+      vulkan_window_quad(vk, &win->hdr, out->dims,
+            VK_FORMAT_R16G16B16A16_SFLOAT, out->dims, premult);
+      return;
+   }
+   if (!screens)
+      return;
+   vulkan_views_target_use(vk, out->format);
+   if (stock_sdr)
+      vulkan_vv_draw_placements(vk, d, win->layout, win->chains,
+            !win->layout->offscreen, out->dims, true);
+   else if (chains_sdr)
+   {
+      vulkan_window_chains_target(win->chains, out->render_pass);
+      vulkan_vv_draw_placements(vk, d, win->layout, win->chains,
+            !win->layout->offscreen, out->dims, false);
+      vulkan_window_chains_target(win->chains, VK_NULL_HANDLE);
+   }
+   else
+      vulkan_vv_draw_placements(vk, d, win->layout, win->chains,
+            !win->layout->offscreen, out->dims, d->direct != NULL);
+   vulkan_views_target_use(vk, VK_FORMAT_UNDEFINED);
+}
+
 static bool vulkan_windows_draw(vk_t *vk, video_frame_info_t *video_info)
 {
    unsigned w;
@@ -13953,26 +13988,8 @@ static bool vulkan_windows_draw(vk_t *vk, video_frame_info_t *video_info)
          vkCmdBeginRenderPass(vk->cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
          vk->tracker.dirty   |= VULKAN_DIRTY_DYNAMIC_BIT;
          vk->tracker.pipeline = VK_NULL_HANDLE;
-         if (stock_sdr)
-         {
-            vulkan_views_target_use(vk, out->format);
-            vulkan_vv_draw_placements(vk, &d, win->layout, win->chains,
-                  !win->layout->offscreen, out->dims, true);
-            vulkan_views_target_use(vk, VK_FORMAT_UNDEFINED);
-         }
-         else if (chains_sdr)
-         {
-            vulkan_window_chains_target(win->chains, out->render_pass);
-            vulkan_vv_draw_placements(vk, &d, win->layout, win->chains,
-                  !win->layout->offscreen, out->dims, false);
-            vulkan_window_chains_target(win->chains, VK_NULL_HANDLE);
-         }
-         else if (screens && hdr)
-            vulkan_window_quad(vk, &win->hdr, out->dims,
-                  VK_FORMAT_R16G16B16A16_SFLOAT, out->dims, premult);
-         else if (screens)
-            vulkan_vv_draw_placements(vk, &d, win->layout, win->chains,
-                  !win->layout->offscreen, out->dims, d.direct != NULL);
+         vulkan_window_draw_screens(vk, &d, win, stock_sdr, chains_sdr,
+               screens, hdr, premult);
          if (vk->windows.ui_window == w)
          {
             if (vk->windows.ui_direct)
@@ -14522,6 +14539,7 @@ static void vulkan_xr_draw_screen(vk_t *vk, unsigned s,
       vkCmdBeginRenderPass(vk->cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
       vk->tracker.dirty   |= VULKAN_DIRTY_DYNAMIC_BIT;
       vk->tracker.pipeline = VK_NULL_HANDLE;
+      vulkan_views_target_use(vk, vk->xr.view_format);
       if (replay)
          vulkan_filter_chain_build_viewport_pass_replay(chain, vk->cmd,
                &vp, vk->xr.mvp.data);
@@ -14558,6 +14576,7 @@ static void vulkan_xr_draw_screen(vk_t *vk, unsigned s,
             vulkan_filter_chain_build_viewport_pass(ic, vk->cmd,
                   &ivp, vk->xr.mvp.data);
       }
+      vulkan_views_target_use(vk, VK_FORMAT_UNDEFINED);
       vkCmdEndRenderPass(vk->cmd);
       if (chain && new_frame)
          vulkan_filter_chain_end_frame(chain, vk->cmd);

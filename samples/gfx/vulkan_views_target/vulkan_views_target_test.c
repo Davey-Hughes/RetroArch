@@ -4,7 +4,8 @@
  * pass steps stubbed: what reaches the runtime's images, when a chain
  * ends a frame, when a repeat replays the last frame's final pass, and a
  * slot's insets drawn into its image after it, each in its rect; an
- * image screen's slot or inset drawn from its picture, with no chain.
+ * image screen's slot or inset drawn from its picture, with no chain,
+ * through the headset pass's pipelines.
  * The second outputs' render passes run against a fake device, and the
  * headset's format pick against a fake runtime; a screen window's
  * output is checked for whether it encodes HDR, and its repeat runs
@@ -181,6 +182,10 @@ typedef struct
       bool preset_hdr_logged;
       struct vk_target_pass targets[VK_VIEWS_TARGETS];
       unsigned passes_freed;
+      VkPipeline stock_pipeline;
+      VkPipeline blend_pipeline;
+      VkPipeline fill_pipeline;
+      bool target;
    } views;
    struct { struct vk_effect_template effect_tpl[2]; } display;
    struct
@@ -743,6 +748,10 @@ static unsigned pictures;
 static uintptr_t last_picture;
 static video_views_rect_t last_picture_rect;
 static bool picture_whole = true;
+/* Pictures drawn with views.target set, and views.stock_pipeline at
+ * each */
+static unsigned pictures_targeted;
+static VkPipeline picture_stock[2];
 
 static void vulkan_views_draw_image(vk_t *vk, uintptr_t image_tex,
       const video_views_rect_t *dst, const video_views_rect_t *cut,
@@ -750,6 +759,10 @@ static void vulkan_views_draw_image(vk_t *vk, uintptr_t image_tex,
 {
    /* It binds the stock pipeline. */
    vk->tracker.pipeline = (VkPipeline)(uintptr_t)1;
+   if (vk->views.target)
+      pictures_targeted++;
+   if (pictures < 2)
+      picture_stock[pictures] = vk->views.stock_pipeline;
    pictures++;
    last_picture      = image_tex;
    last_picture_rect = *dst;
@@ -847,6 +860,8 @@ static void init(vk_t *vk, test_context_t *context, test_chain_t *chain)
    pictures      = 0;
    last_picture  = 0;
    picture_whole = true;
+   pictures_targeted = 0;
+   memset(picture_stock, 0, sizeof(picture_stock));
    memset(&last_picture_rect, 0, sizeof(last_picture_rect));
    memset(slot_creates, 0, sizeof(slot_creates));
    slot_refuses = 0;
@@ -1855,6 +1870,56 @@ static void test_xr_draw_image_inset(void)
    CHECK(last_picture_rect.dims == VIDEO_SCALE_PACK(16, 8));
 }
 
+/* Under HDR output the headset's image screens and insets draw with
+ * its own pass's pipelines, and what draws after with the window's; in
+ * the window's format with the window's own. */
+static void test_xr_draw_image_target(void)
+{
+   vk_t vk;
+   test_context_t context;
+   test_chain_t chain;
+   VkPipeline stock;
+   unsigned i;
+   unsigned dims = VIDEO_SCALE_PACK(64, 32);
+   for (i = 0; i < 2; i++)
+   {
+      init(&vk, &context, &chain);
+      context.flags                  = VK_CTX_FLAG_HDR_ENABLE;
+      context.swapchain_format       = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+      vk.views.render_pass           = TEST_RENDER_PASS;
+      vk.pipelines.alpha_premult     = (VkPipeline)(uintptr_t)0x78;
+      vk.pipelines.stock_rect        = (VkPipeline)(uintptr_t)0x79;
+      vk.display.effect_tpl[0].valid = true;
+      vk.xr.view_format              = i ? context.swapchain_format
+         : VK_FORMAT_B8G8R8A8_UNORM;
+      vk.xr.render_pass              = vulkan_views_target_pass(&vk,
+            vk.xr.view_format, true);
+      stock = vulkan_views_target_stock(&vk, VK_FORMAT_B8G8R8A8_UNORM);
+      acquire_fails = 0;
+      xr_plan(dims, 1);
+      xr_plan_inset(-1);
+      planned.slots[0].image      = true;
+      planned.slots[0].image_tex  = 77;
+      planned.insets[0].screen    = 2;
+      planned.insets[0].image     = true;
+      planned.insets[0].image_tex = 78;
+      xr_draw(&vk, dims);
+      CHECK(pictures == 2 && last_picture == 78);
+      if (i)
+         CHECK(pictures_targeted == 0 && picture_stock[0] == VK_NULL_HANDLE
+               && picture_stock[1] == VK_NULL_HANDLE);
+      else
+      {
+         CHECK(pictures_targeted == 2);
+         CHECK(stock != VK_NULL_HANDLE && stock != vk.pipelines.stock_rect
+               && picture_stock[0] == stock && picture_stock[1] == stock);
+      }
+      CHECK(!vk.views.target && vk.views.stock_pipeline == VK_NULL_HANDLE
+            && vk.views.blend_pipeline == VK_NULL_HANDLE
+            && vk.views.fill_pipeline == VK_NULL_HANDLE);
+   }
+}
+
 int main(void)
 {
    test_desktop_failure(false);
@@ -1885,6 +1950,7 @@ int main(void)
    test_window_repeat_no_input();
    test_xr_draw_image();
    test_xr_draw_image_inset();
-   printf("%u failed (28 Vulkan target cases)\n", failures);
+   test_xr_draw_image_target();
+   printf("%u failed (29 Vulkan target cases)\n", failures);
    return failures ? 1 : 0;
 }
