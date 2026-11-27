@@ -1075,7 +1075,8 @@ static void xr_plan(unsigned dims, unsigned screens)
 /* Any chain: the pass steps are stubbed. */
 #define XR_FRAME_CHAIN ((vulkan_filter_chain_t*)(uintptr_t)1)
 
-/* @chains: each view's, for a plan that draws views. */
+/* @chains: each view's, for a plan that draws views. The UI is drawn
+ * into its slot too, each time, in a render pass of its own. */
 static void xr_draw_views(vk_t *vk, unsigned src_dims, bool new_frame,
       vulkan_filter_chain_t **chains)
 {
@@ -1255,7 +1256,7 @@ static void test_xr_draw_blank(void)
    CHECK(vk.xr.slots[0].drawn && vk.xr.slots[1].drawn);
    CHECK(offscreen_passes == 1 && viewport_passes == 1);
    CHECK(frames_ended == 1 && replays == 0);
-   CHECK(render_passes == 2 && slot_creates[1] == 1);
+   CHECK(render_passes == 3 && slot_creates[1] == 1);
 }
 
 /* Model completed frame slots freeing the retire ring. */
@@ -1613,7 +1614,7 @@ static void test_xr_draw_inset(void)
    xr_plan_inset(1);
    xr_draw_views(&vk, dims, true, chains);
    CHECK(offscreen_passes == 2 && viewport_passes == 2 && agains == 0);
-   CHECK(render_passes == 1 && frames_ended == 2 && replays == 0);
+   CHECK(render_passes == 2 && frames_ended == 2 && replays == 0);
    CHECK(last_pass_x == 48 && last_pass_y == 24);
    CHECK(last_pass_w == 16 && last_pass_h == 8 && fills == 0);
 
@@ -1621,7 +1622,7 @@ static void test_xr_draw_inset(void)
    planned.insets[0].blank = true;
    xr_draw_views(&vk, dims, true, chains);
    CHECK(offscreen_passes == 1 && viewport_passes == 1 && frames_ended == 1);
-   CHECK(render_passes == 1 && fills == 1);
+   CHECK(render_passes == 2 && fills == 1);
    CHECK(last_fill.pos == VIDEO_POS_PACK(48, 24));
    CHECK(last_fill.dims == VIDEO_SCALE_PACK(16, 8));
    CHECK(last_pass_w == 64 && last_pass_h == 32);
@@ -1654,7 +1655,7 @@ static void test_xr_draw_inset_stereo(void)
    xr_plan_inset(2);
    xr_draw_views(&vk, dims, true, chains);
    CHECK(offscreen_passes == 3 && viewport_passes == 3 && agains == 1);
-   CHECK(render_passes == 2 && frames_ended == 3 && replays == 0);
+   CHECK(render_passes == 3 && frames_ended == 3 && replays == 0);
    CHECK(last_pass_w == 16 && last_pass_h == 8);
 }
 
@@ -1680,7 +1681,7 @@ static void test_xr_draw_inset_repeat(void)
    xr_plan(changed, 1);
    xr_plan_inset(1);
    xr_draw_views(&vk, dims, false, chains);
-   CHECK(replays == 2 && render_passes == 1);
+   CHECK(replays == 2 && render_passes == 2);
    CHECK(offscreen_passes == 0 && viewport_passes == 0 && frames_ended == 0);
    CHECK(last_pass_x == 60 && last_pass_y == 30);
    CHECK(last_pass_w == 20 && last_pass_h == 10);
@@ -1707,17 +1708,18 @@ static void test_xr_draw_repeat_changed(void)
    planned.slots[1].blank = true;
    xr_draw_views(&vk, dims, false, chains);
    CHECK(!vk.xr.slots[0].drawn && vk.xr.slots[1].drawn);
-   CHECK(render_passes == 1 && replays == 0 && viewport_passes == 0);
+   CHECK(render_passes == 2 && replays == 0 && viewport_passes == 0);
    CHECK(offscreen_passes == 0 && frames_ended == 0);
    xr_release(&vk);
    render_passes = 0;
    xr_draw_views(&vk, dims, false, chains);
    CHECK(!vk.xr.slots[0].drawn && !vk.xr.slots[1].drawn);
-   CHECK(render_passes == 0);
+   CHECK(render_passes == 1);
+   render_passes = 0;
    planned.insets[0].blank = true;
    xr_draw_views(&vk, dims, false, chains);
    CHECK(vk.xr.slots[0].drawn && !vk.xr.slots[1].drawn);
-   CHECK(render_passes == 1 && replays == 1 && fills == 1);
+   CHECK(render_passes == 2 && replays == 1 && fills == 1);
    CHECK(frames_ended == 0 && slot_creates[0] == 1);
 }
 
@@ -1780,7 +1782,7 @@ static void test_xr_draw_image(void)
    planned.slots[0].image     = true;
    planned.slots[0].image_tex = 77;
    xr_draw(&vk, dims);
-   CHECK(vk.xr.slots[0].drawn && render_passes == 1);
+   CHECK(vk.xr.slots[0].drawn && render_passes == 2);
    CHECK(offscreen_passes == 0 && viewport_passes == 0 && frames_ended == 0);
    CHECK(pictures == 1 && picture_whole && last_picture == 77);
    CHECK(last_picture_rect.pos == 0 && last_picture_rect.dims == dims);
@@ -1790,7 +1792,7 @@ static void test_xr_draw_image(void)
    xr_plan(dims, 1);
    planned.slots[0].image = true;
    xr_draw(&vk, dims);
-   CHECK(vk.xr.slots[0].drawn && render_passes == 1);
+   CHECK(vk.xr.slots[0].drawn && render_passes == 2);
    CHECK(offscreen_passes == 0 && viewport_passes == 0 && pictures == 0);
 }
 
@@ -1815,7 +1817,7 @@ static void test_xr_draw_image_inset(void)
       planned.insets[0].blank     = (i == 2);
       xr_draw(&vk, dims);
       CHECK(offscreen_passes == 1 && viewport_passes == 1);
-      CHECK(frames_ended == 1 && render_passes == 1);
+      CHECK(frames_ended == 1 && render_passes == 2);
       CHECK(last_pass_w == 64 && last_pass_h == 32);
       CHECK(pictures == (i ? 0u : 1u) && picture_whole);
       CHECK(fills == ((i == 2) ? 1u : 0u));
