@@ -478,11 +478,12 @@ SDR_WINDOWS = {'FAKE_HDR_FIRST_SURFACE_ONLY': '1'}
 # raw (points are the PQ codes' top bytes, not decoded),
 # game and composite (whether the HDR game pass and composite are taken:
 # True and menu by default), log (lines the log holds, in order), absent
-# (lines it does not hold), after (a line the screenshot waits for) and
+# (lines it does not hold), after (a line the screenshot waits for),
 # window (points on screen 2's window, read on Xvfb only: see
-# window_errors()). The fake layer's own lines, and the log and after of
-# a case whose env sets one of its FAKE_HDR_ knobs, are checked on Xvfb
-# only, where the layer is.
+# window_errors()) and window_title (that window's title, when it is
+# not SCREEN2_WINDOW). The fake layer's own lines, and the log and after
+# of a case whose env sets one of its FAKE_HDR_ knobs, are checked on
+# Xvfb only, where the layer is.
 HDR_CASES = [
     ('hdr-preset-menu-sbs', '3ds',
      {'video_stereo_mode': '2', 'video_shader_enable': 'true',
@@ -1325,6 +1326,88 @@ HDR_CASES += [
      {'opts': {'video_views_test_screens': 'upright_over'},
       'left_out': [0x2], 'game': None}),
 ]
+# The screens modes with screen windows under HDR10 output, entries as
+# HDR_CASES'. Top alone in the main window; the picture in a window of
+# its own, or OVER the bottom screen's corner in the bottom screen's, as
+# SCREENS_IMAGE_INSET over Top's. A point tagged 'sdr' is an sRGB code.
+SCREENS_WINDOWS = {'video_windows_enable': 'true', 'video_stereo_mode': '0'}
+BOTTOM_WINDOW = b'RetroArch - Bottom'
+VMU_WINDOW = b'RetroArch - VMU'
+# The picture alone in its window, 30 pixels to a core pixel.
+WINDOW_IMAGE = (80, 0, 1440, 960)
+# At half opacity over YELLOW.
+IMAGE_HALF_YELLOW = ((255, 128, 0), (128, 128, 128), (255, 255, 128),
+                     (255, 128, 128))
+BLANK_HALF_YELLOW = ((128, 128, 0),) * 4
+
+
+def window_image(tag):
+    return [p + tag for p in image_points(WINDOW_IMAGE, IMAGE_QUADRANTS,
+                                          (BLACK, None, BLACK, None))]
+
+
+def window_inset(colours, tag):
+    return [p + tag for p in [(800, 480, YELLOW)] + image_points(
+        SCREENS_IMAGE_INSET, colours, (YELLOW, YELLOW, BLACK, None))]
+
+
+HDR_CASES += [
+    # In an SDR window, straight and through an SDR preset's chain.
+    ('hdr-window-image', 'ds', SCREENS_WINDOWS, [(800, 480, GREEN)],
+     {'opts': {'video_views_test_screens': 'image'}, 'env': SDR_WINDOWS,
+      'log': [STOCK_DIRECT, SECOND_OUTPUT_SDR], 'absent': [WINDOW_NOT_DRAWN],
+      'game': False, 'window': window_image(('sdr',)),
+      'window_title': VMU_WINDOW}),
+    ('hdr-preset-window-image', 'ds',
+     dict(SCREENS_WINDOWS, video_shader_enable='true'), [(800, 480, GREEN)],
+     {'preset': os.path.join(HERE, 'pass.slangp'),
+      'opts': {'video_views_test_screens': 'image'}, 'env': SDR_WINDOWS,
+      'log': [SECOND_OUTPUT_SDR], 'absent': [WINDOW_NOT_DRAWN],
+      'window': window_image(('sdr',)), 'window_title': VMU_WINDOW}),
+    ('hdr-window-over-bottom-half', 'ds', SCREENS_WINDOWS,
+     [(800, 480, GREEN)],
+     {'opts': {'video_views_test_screens': 'image_over_bottom_half'},
+      'env': SDR_WINDOWS, 'log': [STOCK_DIRECT, SECOND_OUTPUT_SDR],
+      'absent': [WINDOW_NOT_DRAWN], 'game': False,
+      'window': window_inset(IMAGE_HALF_YELLOW, ('sdr',)),
+      'window_title': BOTTOM_WINDOW}),
+    ('hdr-window-over-bottom-blank-half', 'ds', SCREENS_WINDOWS,
+     [(800, 480, GREEN)],
+     {'opts': {'video_views_test_screens': 'image_over_bottom_blank_half'},
+      'env': SDR_WINDOWS, 'log': [STOCK_DIRECT, SECOND_OUTPUT_SDR],
+      'absent': [WINDOW_NOT_DRAWN], 'game': False,
+      'window': window_inset(BLANK_HALF_YELLOW, ('sdr',)),
+      'window_title': BOTTOM_WINDOW}),
+    # In the main window's HDR pair a translucent inset blends in the
+    # window's FP16 image before the encode.
+    ('hdr-window-hdr-over-bottom-half', 'ds', SCREENS_WINDOWS,
+     [(800, 480, GREEN)],
+     {'opts': {'video_views_test_screens': 'image_over_bottom_half'},
+      'log': [STOCK_DIRECT, SECOND_OUTPUT_HDR10],
+      'absent': [WINDOW_NOT_DRAWN], 'game': False,
+      'window': window_inset(IMAGE_HALF_YELLOW, ()),
+      'window_title': BOTTOM_WINDOW}),
+    ('hdr-window-hdr-over-bottom-blank-half', 'ds', SCREENS_WINDOWS,
+     [(800, 480, GREEN)],
+     {'opts': {'video_views_test_screens': 'image_over_bottom_blank_half'},
+      'log': [STOCK_DIRECT, SECOND_OUTPUT_HDR10],
+      'absent': [WINDOW_NOT_DRAWN], 'game': False,
+      'window': window_inset(BLANK_HALF_YELLOW, ()),
+      'window_title': BOTTOM_WINDOW}),
+    ('hdr-window-hdr-over-bottom-blank-half-preset', 'ds',
+     dict(SCREENS_WINDOWS, video_shader_enable='true'), [(800, 480, GREEN)],
+     {'preset': os.path.join(HERE, 'pass.slangp'),
+      'opts': {'video_views_test_screens': 'image_over_bottom_blank_half'},
+      'log': [SECOND_OUTPUT_HDR10], 'absent': [WINDOW_NOT_DRAWN],
+      'window': window_inset(BLANK_HALF_YELLOW, ()),
+      'window_title': BOTTOM_WINDOW}),
+    # Bottom UPRIGHT in a turned core is left out: no window is made for
+    # it and the picture OVER it, as without HDR.
+    ('hdr-window-upright-over', 'ds', SCREENS_WINDOWS, SCREENS_TOP_TURNED,
+     {'opts': {'video_views_test_screens': 'upright_over'},
+      'env': SDR_WINDOWS, 'left_out': [0x2],
+      'absent': [SECOND_OUTPUT_SDR, SECOND_OUTPUT_HDR10], 'game': None}),
+]
 
 
 def send(cmd, port):
@@ -1601,14 +1684,18 @@ def hdr_passes(name):
 # A validation message's ID, as its log line carries it.
 VALIDATION_ID_RE = re.compile(
     r'\[ (VUID-[A-Za-z0-9_-]+|UNASSIGNED-[A-Za-z0-9_.-]+) \]')
+# An INFO message: the layer's name for it, or the severity the driver
+# logs.
+VALIDATION_INFO_RE = re.compile(
+    r'Validation Information|\[Vulkan\] (INFO|VERBOSE) ')
 
 
 def hdr_errors(d, game, composite):
     """A run with HDR10 output must have it (on Xvfb the fake layer logs
-    its HDR10 swapchain), log no validation message (a line with its ID)
-    and log each pass's mode once, not per frame (no case changes it
-    mid-run). game and composite say whether it takes the HDR game pass
-    and composite; None checks neither way."""
+    its HDR10 swapchain), log no validation error or warning (a line with
+    its ID, not an INFO one) and log each pass's mode once, not per frame
+    (no case changes it mid-run). game and composite say whether it takes
+    the HDR game pass and composite; None checks neither way."""
     text = log_text(d)
     errors = []
     if XVFB and 'fake-hdr: HDR10 swapchain' not in text:
@@ -1616,10 +1703,11 @@ def hdr_errors(d, game, composite):
     vuids = {}
     for line in text.splitlines():
         m = VALIDATION_ID_RE.search(line)
-        if m:
+        if m and not VALIDATION_INFO_RE.search(line):
             vuids[m.group(1)] = vuids.get(m.group(1), 0) + 1
     if vuids:
-        errors.append('%d validation error(s)' % sum(vuids.values()))
+        errors.append('%d validation error(s) or warning(s)'
+                      % sum(vuids.values()))
         errors += ['  %s x%d' % (v, vuids[v]) for v in sorted(vuids)]
     for line, want, what in ((GAME_PASS, game, 'game pass'),
                              (COMPOSITE_PASS, composite, 'composite')):
@@ -1893,9 +1981,9 @@ class XImage(ctypes.Structure):
                 ('blue_mask', ctypes.c_ulong)]
 
 
-def window_errors(display, points):
-    """Points (x, y, colour) on screen 2's window on the depth-30 Xvfb
-    display, read as the 10-bit codes its swapchain wrote there: each
+def window_errors(display, points, title=SCREEN2_WINDOW):
+    """Points (x, y, colour) on the window named title on the depth-30
+    Xvfb display, read as the 10-bit codes its swapchain wrote there: each
     colour is wanted PQ-encoded, as the main window's HDR10 has it, or
     as sRGB codes for a point (x, y, colour, 'sdr')."""
     x11 = ctypes.CDLL('libX11.so.6')
@@ -1922,9 +2010,10 @@ def window_errors(display, points):
     x11.XFree.argtypes = [ctypes.c_void_p]
     x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
     x11.XSetErrorHandler(ctypes.cast(X_IGNORE_ERRORS, ctypes.c_void_p))
+    what = '"%s"' % title.decode()
     dpy = x11.XOpenDisplay(display.encode())
     if not dpy:
-        return ["can't open %s for screen 2's window" % display]
+        return ["can't open %s for %s" % (display, what)]
     errors = []
     try:
         unused, kids = ctypes.c_ulong(), ctypes.POINTER(ctypes.c_ulong)()
@@ -1935,36 +2024,35 @@ def window_errors(display, points):
             for i in range(count.value):
                 name = ctypes.c_char_p()
                 if x11.XFetchName(dpy, kids[i], ctypes.byref(name)):
-                    if name.value == SCREEN2_WINDOW:
+                    if name.value == title:
                         win = kids[i]
                     x11.XFree(name)
             if kids:
                 x11.XFree(kids)
         if win is None:
-            return ['no window named "%s"' % SCREEN2_WINDOW.decode()]
+            return ['no window named %s' % what]
         for point in points:
             x, y, colour = point[:3]
             # AllPlanes, ZPixmap
             img = x11.XGetImage(dpy, win, x, y, 1, 1,
                                 ctypes.c_ulong(-1).value, 2)
             if not img:
-                errors.append("screen 2's window has no pixel at (%d,%d)"
-                              % (x, y))
+                errors.append('%s has no pixel at (%d,%d)' % (what, x, y))
                 continue
             px = x11.XGetPixel(img, 0, 0)
             masks = (img.contents.red_mask, img.contents.green_mask,
                      img.contents.blue_mask)
             x11.XDestroyImage(img)
             if not all(masks) or any(m // (m & -m) != 1023 for m in masks):
-                return errors + ["screen 2's window is not 10-bit"]
+                return errors + ['%s is not 10-bit' % what]
             got = tuple((px & m) // (m & -m) for m in masks)
             if point[3:] == ('sdr',):
                 want = tuple(int(c * 1023 / 255.0 + 0.5) for c in colour)
             else:
                 want = srgb8_to_pq10(colour)
             if any(abs(g - e) > WINDOW_TOLERANCE for g, e in zip(got, want)):
-                errors.append("screen 2's window (%d,%d) got codes %s want %s"
-                              % (x, y, got, want))
+                errors.append('%s (%d,%d) got codes %s want %s'
+                              % (what, x, y, got, want))
     finally:
         x11.XCloseDisplay(dpy)
     return errors
@@ -2114,7 +2202,8 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
              opts=None, args=(), gpu=None, pointer=(), env_extra=None,
              pointer_check=None, raw=False, passes=None, after=None,
              window=(), until=None, aim=(), aimed=None, files=None,
-             screens=None, screenshot=True, window_shots=False):
+             screens=None, screenshot=True, window_shots=False,
+             window_title=SCREEN2_WINDOW):
     """gpu, a list, gets RetroArch's GPU memory in MiB sampled while it
     settles. pointer, window points, has the menu open with the pointer
     at each in turn, in d/pointer-N.png; pointer_check(d) gives the
@@ -2125,7 +2214,7 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
     points as read_png() does, and passes, (game, composite), are what
     hdr_errors() checks; hdr_passes() gives them by default. The
     screenshot waits for the log line after, when given. window, points
-    on screen 2's window, are checked by window_errors() on Xvfb, with
+    on the window_title window, are checked by window_errors() on Xvfb, with
     RetroArch still up. until, a regex, keeps the case running until the
     logs have it. aim, window points, has the pointer at each in turn
     with the menu closed, until the core logs a light gun line after the
@@ -2272,7 +2361,7 @@ def run_case(retroarch, root, driver, case, hw='off', menu=False,
             if pngs and png_done(os.path.join(d, 'shots', pngs[0])):
                 shot = os.path.join(d, 'shots', pngs[0])
         if window and XVFB:
-            window_got = window_errors(env['DISPLAY'], window)
+            window_got = window_errors(env['DISPLAY'], window, window_title)
         elif window:
             print('[e2e] %s: window points not checked' % name, flush=True)
         send('QUIT', port)
@@ -2602,7 +2691,8 @@ def run_hdr_case(retroarch, root, driver, case):
                               extra.get('composite', menu)),
                       after=extra.get('after') if XVFB or not knobs
                       else None,
-                      window=extra.get('window', ()))
+                      window=extra.get('window', ()),
+                      window_title=extra.get('window_title', SCREEN2_WINDOW))
     text, at = log_text(case_dir(root, driver, name)), 0
     for line in lines:
         at = text.find(line, at)

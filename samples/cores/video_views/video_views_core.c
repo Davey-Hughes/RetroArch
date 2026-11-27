@@ -98,7 +98,10 @@
  * video_views_test_image copy, from padded rows of the core's own;
  * SHARP unless video_views_test_image_sharp is off: image, SHOWN;
  * image_over, OVER as over does, at opacity 1; image_over_half, the
- * same at half opacity; image_over_blank, the same BLANK. image_null
+ * same at half opacity; image_over_blank, the same BLANK.
+ * image_over_bottom_half sends the bottom one SHOWN and the picture
+ * OVER its bottom right corner at a quarter of its height, at half
+ * opacity; image_over_bottom_blank_half, the same BLANK. image_null
  * sends it SHOWN and from frame 60 mirrored under a new serial, on a
  * NULL refresh, and every refresh after it NULL. image_restart raises
  * the maximum size at frame 60, which restarts the driver. Each
@@ -1204,7 +1207,8 @@ void retro_set_environment(retro_environment_t cb)
         "|shown|hidden|over|over_half|over_blank|over_blank_half|blank"
         "|blank_late|absent|absent_back|none_shown|hide_null"
         "|no_input_null|blank_null|over_no_input|shown_sized|image"
-        "|image_over|image_over_half|image_over_blank|image_null"
+        "|image_over|image_over_half|image_over_blank"
+        "|image_over_bottom_half|image_over_bottom_blank_half|image_null"
         "|image_restart|image_lend_open|layer|layer_sent|image_turned"
         "|image_upright_turned|upright_turned|upright_over" },
       { "video_views_test_image",
@@ -2611,7 +2615,7 @@ static const struct
  * value, has Gel multiply screen 0: as screen 2, a LAYER, when it is
  * sent, in the core's own drawing when it is not. @turn, a TURN_ value,
  * turns the core. @upright_base sends an image mode's screen 1 SHOWN
- * with UPRIGHT, as the picture's base. */
+ * with UPRIGHT, as the picture's base; @shown_base, SHOWN without it. */
 static const struct
 {
    const char *name;
@@ -2631,6 +2635,7 @@ static const struct
    unsigned gel;
    unsigned turn;
    bool upright_base;
+   bool shown_base;
 } scr_modes[] = {
    { "no_input",     RETRO_VIDEO_SCREEN_FLAG_NO_INPUT,
       RETRO_VIDEO_SCREEN_SHOW_SHOWN,
@@ -2701,6 +2706,14 @@ static const struct
    { "image_over_blank", 0, RETRO_VIDEO_SCREEN_SHOW_OVER,
       RETRO_VIDEO_SCREEN_STATE_BLANK,  RETRO_VIDEO_SCREEN_STATE_BLANK,
       false, 1.0f, false, 0, 0, 0.0f, true },
+   { "image_over_bottom_half", 0, RETRO_VIDEO_SCREEN_SHOW_OVER,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.5f, false, 0, 0, 0.0f, true, false, false, 0, 0, false,
+      true },
+   { "image_over_bottom_blank_half", 0, RETRO_VIDEO_SCREEN_SHOW_OVER,
+      RETRO_VIDEO_SCREEN_STATE_BLANK,  RETRO_VIDEO_SCREEN_STATE_BLANK,
+      false, 0.5f, false, 0, 0, 0.0f, true, false, false, 0, 0, false,
+      true },
    { "image_null",   0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
       RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
       false, 0.0f, true, RETRO_VIDEO_SCREEN_SHOW_SHOWN, 0, 0.0f, true },
@@ -2945,9 +2958,10 @@ static const char *screens_add(struct retro_video_views *in,
       in->screens_left_out = &scr_left_out;
       if (image)
       {
-         bool base = scr_modes[screens_mode].upright_base;
+         bool upright = scr_modes[screens_mode].upright_base;
+         bool base    = upright || scr_modes[screens_mode].shown_base;
          scr_screens[1] = mkscreen("Bottom",
-               base ? RETRO_VIDEO_SCREEN_FLAG_UPRIGHT : 0,
+               upright ? RETRO_VIDEO_SCREEN_FLAG_UPRIGHT : 0,
                RETRO_VIDEO_SCREEN_STATE_ACTIVE,
                base ? RETRO_VIDEO_SCREEN_SHOW_SHOWN
                     : RETRO_VIDEO_SCREEN_SHOW_HIDDEN,
