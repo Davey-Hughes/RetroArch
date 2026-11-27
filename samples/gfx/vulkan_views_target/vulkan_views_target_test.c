@@ -76,6 +76,7 @@ struct vk_texture
 {
    VkImage image;
    VkImageView view;
+   unsigned dims;
 };
 
 struct vk_draw_quad
@@ -153,6 +154,7 @@ typedef struct
    VkViewport vk_vp;
    math_matrix_4x4 mvp_no_rot;
    struct { VkSampler linear, nearest; } samplers;
+   struct { bool smooth; } video;
    struct vk_per_frame
    {
       struct vk_texture view_images[RETRO_VIDEO_VIEWS_MAX];
@@ -186,6 +188,7 @@ typedef struct
       VkPipeline blend_pipeline;
       VkPipeline fill_pipeline;
       bool target;
+      unsigned alpha;
    } views;
    struct { struct vk_effect_template effect_tpl[2]; } display;
    struct
@@ -217,7 +220,7 @@ typedef struct
       video_xr_quad_set_t set;
       unsigned ui_dims;
       unsigned proj_dims;
-      struct { float data[16]; } mvp;
+      math_matrix_4x4 mvp;
       VkFormat window_format;
       bool window_hdr;
       VkFormat format;
@@ -225,6 +228,7 @@ typedef struct
       VkFormat view_format;
       VkRenderPass render_pass;
       bool proj_shown;
+      bool stock_insets;
    } xr;
    struct
    {
@@ -752,6 +756,7 @@ static bool picture_whole = true;
  * each */
 static unsigned pictures_targeted;
 static VkPipeline picture_stock[2];
+static unsigned picture_alpha;
 
 static void vulkan_views_draw_image(vk_t *vk, uintptr_t image_tex,
       const video_views_rect_t *dst, const video_views_rect_t *cut,
@@ -763,6 +768,7 @@ static void vulkan_views_draw_image(vk_t *vk, uintptr_t image_tex,
       pictures_targeted++;
    if (pictures < 2)
       picture_stock[pictures] = vk->views.stock_pipeline;
+   picture_alpha = vk->views.alpha;
    pictures++;
    last_picture      = image_tex;
    last_picture_rect = *dst;
@@ -771,15 +777,51 @@ static void vulkan_views_draw_image(vk_t *vk, uintptr_t image_tex,
       picture_whole = false;
 }
 
+/* Fills, the last one's alpha and those with views.target set; fills
+ * counts the solid ones */
+static unsigned fill_calls, fill_alpha, fills_targeted;
+
 static void vulkan_views_fill(vk_t *vk, const video_views_rect_t *cut,
       unsigned alpha)
 {
-   (void)vk;
+   fill_calls++;
+   fill_alpha = alpha;
+   if (vk->views.target)
+      fills_targeted++;
    if (alpha >= 255)
    {
       fills++;
       last_fill = *cut;
    }
+}
+
+/* Stock draws, those with views.target set, and the last one's source,
+ * views.alpha, sampler and viewport; whole: it took the source whole
+ * with the headset's mvp */
+static unsigned stock_draws, stock_targeted, stock_alpha;
+static struct vk_texture *stock_src;
+static VkSampler stock_sampler;
+static VkViewport stock_vp;
+static bool stock_whole;
+
+static void vulkan_views_draw_stock(vk_t *vk, struct vk_texture *src,
+      const struct retro_video_view *v, const VkViewport *vp,
+      const VkRect2D *sci, const math_matrix_4x4 *mvp, VkSampler sampler)
+{
+   stock_draws++;
+   if (vk->views.target)
+      stock_targeted++;
+   stock_src     = src;
+   stock_alpha   = vk->views.alpha;
+   stock_sampler = sampler;
+   stock_vp      = *vp;
+   stock_whole   = v->x == 0 && v->y == 0
+      && v->width  == VIDEO_SCALE_W(src->dims)
+      && v->height == VIDEO_SCALE_H(src->dims)
+      && mvp == &vk->xr.mvp
+      && sci->offset.x == (int32_t)vp->x && sci->offset.y == (int32_t)vp->y
+      && sci->extent.width  == (uint32_t)vp->width
+      && sci->extent.height == (uint32_t)vp->height;
 }
 
 /* Window 1's slots: one lent, one published */
@@ -862,6 +904,13 @@ static void init(vk_t *vk, test_context_t *context, test_chain_t *chain)
    picture_whole = true;
    pictures_targeted = 0;
    memset(picture_stock, 0, sizeof(picture_stock));
+   picture_alpha = 0;
+   fill_calls = fill_alpha = fills_targeted = 0;
+   stock_draws = stock_targeted = stock_alpha = 0;
+   stock_src     = NULL;
+   stock_sampler = VK_NULL_HANDLE;
+   memset(&stock_vp, 0, sizeof(stock_vp));
+   stock_whole   = false;
    memset(&last_picture_rect, 0, sizeof(last_picture_rect));
    memset(slot_creates, 0, sizeof(slot_creates));
    slot_refuses = 0;
@@ -1140,6 +1189,7 @@ static void xr_plan_inset(int view)
    in->view[1] = (planned.slots[0].layers > 1) ? view : -1;
    in->slot    = 0;
    in->screen  = 1;
+   in->alpha   = 255;
 }
 
 static void xr_draw(vk_t *vk, unsigned src_dims)
@@ -1920,6 +1970,88 @@ static void test_xr_draw_image_target(void)
    }
 }
 
+/* Insets below 255 at their opacity: a blank one filled, an image one
+ * and, with the stock chains, a view one from its copy whole, each
+ * through a blend; a preset's view inset stays solid through its chain.
+ * Under HDR output each draws with the headset pass's pipelines. */
+static void test_xr_draw_inset_alpha(void)
+{
+   vk_t vk;
+   test_context_t context;
+   test_chain_t chain;
+   video_frame_info_t info;
+   vulkan_filter_chain_t *chains[RETRO_VIDEO_VIEWS_MAX];
+   unsigned i;
+   unsigned dims = VIDEO_SCALE_PACK(64, 32);
+   memset(chains, 0, sizeof(chains));
+   chains[1] = XR_FRAME_CHAIN;
+   for (i = 0; i < 3; i++)
+   {
+      init(&vk, &context, &chain);
+      memset(&info, 0, sizeof(info));
+      if (i == 1)
+      {
+         info.shader_active = true;
+         vk.filter_chain    = XR_FRAME_CHAIN;
+      }
+      else if (i == 2)
+      {
+         context.flags                  = VK_CTX_FLAG_HDR_ENABLE;
+         context.swapchain_format       = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+         vk.views.render_pass           = TEST_RENDER_PASS;
+         vk.pipelines.alpha_premult     = (VkPipeline)(uintptr_t)0x78;
+         vk.pipelines.stock_rect        = (VkPipeline)(uintptr_t)0x79;
+         vk.display.effect_tpl[0].valid = true;
+         vk.xr.view_format              = VK_FORMAT_B8G8R8A8_UNORM;
+         vk.xr.render_pass              = vulkan_views_target_pass(&vk,
+               vk.xr.view_format, true);
+      }
+      vk.views.last_index                 = 1;
+      vk.swapchain[1].view_images[1].dims = VIDEO_SCALE_PACK(20, 10);
+      vk.samplers.linear                  = (VkSampler)(uintptr_t)0x51;
+      vk.samplers.nearest                 = (VkSampler)(uintptr_t)0x52;
+      vk.video.smooth                     = true;
+      acquire_fails = 0;
+      xr_plan(dims, 1);
+      planned.slots[0].blank      = true;
+      xr_plan_inset(-1);
+      planned.insets[0].blank     = true;
+      xr_plan_inset(-1);
+      planned.insets[1].screen    = 2;
+      planned.insets[1].image     = true;
+      planned.insets[1].image_tex = 78;
+      xr_plan_inset(1);
+      planned.insets[2].screen    = 3;
+      planned.insets[0].alpha     = 128;
+      planned.insets[1].alpha     = 128;
+      planned.insets[2].alpha     = 128;
+      vulkan_xr_draw(&vk, &info, true, true, false, chains, XR_FRAME_CHAIN,
+            NULL, dims, dims, dims, true);
+      CHECK(fill_calls == 1 && fill_alpha == 128 && fills == 0);
+      CHECK(pictures == 1 && last_picture == 78 && picture_alpha == 128);
+      CHECK(offscreen_passes == 1 && frames_ended == 1);
+      if (i == 1)
+      {
+         CHECK(!vk.xr.stock_insets);
+         CHECK(viewport_passes == 1 && stock_draws == 0);
+      }
+      else
+      {
+         CHECK(vk.xr.stock_insets);
+         CHECK(viewport_passes == 0 && stock_draws == 1);
+         CHECK(stock_src == &vk.swapchain[1].view_images[1]
+               && stock_alpha == 128);
+         CHECK(stock_whole && stock_sampler == vk.samplers.linear);
+         CHECK(stock_vp.x == 48.0f && stock_vp.y == 24.0f
+               && stock_vp.width == 16.0f && stock_vp.height == 8.0f);
+      }
+      if (i == 2)
+         CHECK(fills_targeted == 1 && pictures_targeted == 1
+               && stock_targeted == 1);
+      CHECK(vk.views.alpha == 0);
+   }
+}
+
 int main(void)
 {
    test_desktop_failure(false);
@@ -1951,6 +2083,7 @@ int main(void)
    test_xr_draw_image();
    test_xr_draw_image_inset();
    test_xr_draw_image_target();
-   printf("%u failed (29 Vulkan target cases)\n", failures);
+   test_xr_draw_inset_alpha();
+   printf("%u failed (30 Vulkan target cases)\n", failures);
    return failures ? 1 : 0;
 }

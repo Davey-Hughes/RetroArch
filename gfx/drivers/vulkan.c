@@ -623,6 +623,9 @@ typedef struct vk
          unsigned num_insets;
       } slots[OPENXR_MAX_SLOTS];
       video_xr_quad_set_t set;
+      /* The stock chains draw the screens: a view inset below 255 is
+       * drawn from its view's copy, as the window draws a stock view */
+      bool stock_insets;
       math_matrix_4x4 mvp;
       /* What the pick was made for: the window's format and HDR output */
       VkFormat window_format;
@@ -14554,19 +14557,43 @@ static void vulkan_xr_draw_screen(vk_t *vk, unsigned s,
          const video_xr_inset_t *in = &set->insets[i];
          if (!vulkan_xr_inset(vk, s, l, i, xr_chains, &ic, &cut))
             continue;
+         /* At its opacity, as VV_ALPHA sets it */
+         vk->views.alpha = (in->alpha < 255) ? in->alpha : 0;
          if (!ic)
          {
             /* A picture not landed yet leaves the base, as in the
              * window. */
             if (!in->image || in->blank)
-               vulkan_views_fill(vk, &cut, 255);
+               vulkan_views_fill(vk, &cut, in->alpha);
             else if (in->image_tex)
                vulkan_views_draw_image(vk, in->image_tex, &cut, &cut, true);
+            vk->views.alpha = 0;
             continue;
          }
          /* The final pass is cut to its viewport. */
          vulkan_views_vp(&cut, &ivp);
-         if (!new_frame && vulkan_filter_chain_replay_ready(ic))
+         if (vk->views.alpha && vk->xr.stock_insets)
+         {
+            /* Its view's copy whole; a preset's stays solid, as the
+             * window's do */
+            VkRect2D sci;
+            struct retro_video_view v;
+            struct vk_texture *src = &vk->swapchain[vk->views.last_index]
+               .view_images[in->view[l]];
+            v.x            = 0;
+            v.y            = 0;
+            v.width        = VIDEO_SCALE_W(src->dims);
+            v.height       = VIDEO_SCALE_H(src->dims);
+            v.screen       = 0;
+            v.eye          = 0;
+            v.aspect_ratio = 0.0f;
+            vulkan_views_sci(&cut, &sci);
+            vk->tracker.pipeline = VK_NULL_HANDLE;
+            vulkan_views_draw_stock(vk, src, &v, &ivp, &sci, &vk->xr.mvp,
+                  vk->video.smooth
+                  ? vk->samplers.linear : vk->samplers.nearest);
+         }
+         else if (!new_frame && vulkan_filter_chain_replay_ready(ic))
             vulkan_filter_chain_build_viewport_pass_replay(ic, vk->cmd,
                   &ivp, vk->xr.mvp.data);
          else if (l && set->insets[i].view[0] == set->insets[i].view[l])
@@ -14575,6 +14602,7 @@ static void vulkan_xr_draw_screen(vk_t *vk, unsigned s,
          else
             vulkan_filter_chain_build_viewport_pass(ic, vk->cmd,
                   &ivp, vk->xr.mvp.data);
+         vk->views.alpha = 0;
       }
       vulkan_views_target_use(vk, VK_FORMAT_UNDEFINED);
       vkCmdEndRenderPass(vk->cmd);
@@ -14807,6 +14835,7 @@ static void vulkan_xr_draw(vk_t *vk, const video_frame_info_t *video_info,
 
    if (window_drawn)
       vk->xr.ui_dims = ui_dims;
+   vk->xr.stock_insets = vulkan_xr_stock(vk, video_info);
    vulkan_xr_plan(vk, video_info, map, eyes, frame_dims, src_dims,
          vk->xr.ui_dims);
    if (     xr_shrink
