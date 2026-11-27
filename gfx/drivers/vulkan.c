@@ -512,11 +512,17 @@ typedef struct vk
       video_views_ui_dims_t saved;
       unsigned last_index;
       unsigned copied;
-      /* While stock views draw straight into an HDR swapchain, encoded:
-       * the HDR pass mode plus one; 0 otherwise. hdr_stock_logged: the
-       * last such value logged. */
+      /* While stock views draw straight into an HDR swapchain, or an
+       * image screen into a target holding encoded values, encoded: the
+       * HDR pass mode plus one; 0 otherwise. hdr_stock_logged: the last
+       * value the stock views logged. */
       unsigned hdr_stock;
       unsigned hdr_stock_logged;
+      /* While the main window's views and canvas draw into a target that
+       * holds encoded values (a views preset that writes HDR): the HDR
+       * pass mode an SDR picture is encoded with there, plus one; 0
+       * otherwise */
+      unsigned encoded;
       /* While views draw into a second output's or the headset's pass in
        * another format than the window's: that pass's stock_rect, its
        * blend twin and premult, each VK_NULL_HANDLE where it could not be
@@ -815,6 +821,7 @@ typedef struct vk
       VkPipeline stereo_interlaced_sdr;
       VkPipeline stock_rect_sdr;
       VkPipeline stock_rect_sdr_blend;
+      VkPipeline stock_rect_hdr_sdr;
       VkPipeline alpha_premult_sdr;
 #endif /* VULKAN_HDR_SWAPCHAIN */
       VkDescriptorSetLayout set_layout;
@@ -6525,6 +6532,17 @@ static void vulkan_init_pipelines(vk_t *vk)
          vkDestroyShaderModule(vk->context->device,
                shader_stages[1].module, NULL);
 
+         module_info.codeSize    = sizeof(stock_rect_hdr_frag);
+         module_info.pCode       = stock_rect_hdr_frag;
+         shader_stages[1].module = VK_NULL_HANDLE;
+         if (vkCreateShaderModule(vk->context->device,
+                  &module_info, NULL, &shader_stages[1].module) == VK_SUCCESS)
+            vkCreateGraphicsPipelines(vk->context->device,
+                  vk->pipelines.cache, 1, &pipe, NULL,
+                  &vk->pipelines.stock_rect_hdr_sdr);
+         vkDestroyShaderModule(vk->context->device,
+               shader_stages[1].module, NULL);
+
          shader_stages[1].module              = alpha_frag;
          blend_attachment.blendEnable         = VK_TRUE;
          blend_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
@@ -7033,11 +7051,14 @@ if (vk->context->flags & VK_CTX_FLAG_HDR_SUPPORT)
    vkDestroyPipeline(vk->context->device,
          vk->pipelines.stock_rect_sdr_blend, NULL);
    vkDestroyPipeline(vk->context->device,
+         vk->pipelines.stock_rect_hdr_sdr, NULL);
+   vkDestroyPipeline(vk->context->device,
          vk->pipelines.alpha_premult_sdr, NULL);
    vk->pipelines.stereo_anaglyph_sdr   = VK_NULL_HANDLE;
    vk->pipelines.stereo_interlaced_sdr = VK_NULL_HANDLE;
    vk->pipelines.stock_rect_sdr        = VK_NULL_HANDLE;
    vk->pipelines.stock_rect_sdr_blend  = VK_NULL_HANDLE;
+   vk->pipelines.stock_rect_hdr_sdr    = VK_NULL_HANDLE;
    vk->pipelines.alpha_premult_sdr     = VK_NULL_HANDLE;
 
    for (i = 0; i < (int)ARRAY_SIZE(vk->display.pipelines_sdr); i++)
@@ -11816,6 +11837,19 @@ static bool vulkan_views_stock_encodes(const vk_t *vk, bool direct,
    return direct && !blend && !translucent && vk->views.fp16
       && vk->pipelines.stock_rect_hdr != VK_NULL_HANDLE;
 }
+
+/* views.encoded for the main window: under HDR output, a views preset
+ * writing the swapchain's encoding draws straight into it; one writing
+ * HDR10 under scRGB leaves PQ in FP16, which the HDR game pass's mode 3
+ * decodes */
+static unsigned vulkan_views_encoded(vk_t *vk, void *filter_chain)
+{
+   if (!(vk->context->flags & VK_CTX_FLAG_HDR_ENABLE))
+      return 0;
+   if (!vk->views.fp16)
+      return (vk->context->flags & VK_CTX_FLAG_HDR_SCRGB) ? 3 : 2;
+   return (vulkan_hdr_source_mode(vk, NULL, filter_chain) == 3) ? 2 : 0;
+}
 #endif
 
 /* Draws rectangle v of texture src over vp, cut to sci, as the stock
@@ -11877,7 +11911,8 @@ static void vulkan_views_draw_stock(vk_t *vk, struct vk_texture *src,
 #ifdef VULKAN_HDR_SWAPCHAIN
    if (vk->views.hdr_stock)
    {
-      call.pipeline     = vk->pipelines.stock_rect_hdr;
+      call.pipeline     = (vk->flags & VK_FLAG_SDR_PIPELINE)
+         ? vk->pipelines.stock_rect_hdr_sdr : vk->pipelines.stock_rect_hdr;
       call.uniform      = &hdr_ubo;
       call.uniform_size = sizeof(hdr_ubo);
       blend             = VK_NULL_HANDLE;
@@ -11963,7 +11998,8 @@ static void vulkan_views_draw_direct(vk_t *vk,
 }
 
 /* A map's image_tex whole over @dst, cut to @cut, its first row at the
- * top and never turned. A chain's last pass may have bound its own
+ * top and never turned, encoded and solid where the target holds
+ * encoded values. A chain's last pass may have bound its own
  * pipeline. */
 static void vulkan_views_draw_image(vk_t *vk, uintptr_t image_tex,
       const video_views_rect_t *dst, const video_views_rect_t *cut,
@@ -11973,6 +12009,9 @@ static void vulkan_views_draw_image(vk_t *vk, uintptr_t image_tex,
    VkRect2D sci;
    struct retro_video_view whole;
    struct vk_texture *tex = (struct vk_texture*)image_tex;
+#ifdef VULKAN_HDR_SWAPCHAIN
+   unsigned hdr_stock     = vk->views.hdr_stock;
+#endif
 
    if (!vk->pipelines.stock_rect)
       return;
@@ -11986,8 +12025,15 @@ static void vulkan_views_draw_image(vk_t *vk, uintptr_t image_tex,
    vulkan_views_vp(dst, &vp);
    vulkan_views_sci(cut, &sci);
    vk->tracker.pipeline = VK_NULL_HANDLE;
+#ifdef VULKAN_HDR_SWAPCHAIN
+   if (!hdr_stock)
+      vk->views.hdr_stock = vk->views.encoded;
+#endif
    vulkan_views_draw_stock(vk, tex, &whole, &vp, &sci, &vk->mvp_no_rot,
          nearest ? vk->samplers.nearest : vk->samplers.linear);
+#ifdef VULKAN_HDR_SWAPCHAIN
+   vk->views.hdr_stock = hdr_stock;
+#endif
 }
 
 /* A placement through its view's chain */
@@ -12011,7 +12057,8 @@ static void vulkan_views_draw_pass(vk_t *vk, vulkan_filter_chain_t *fc,
 
 /* @cut black at @alpha, for a blank inset: a black quad at that vertex
  * alpha through the pass's alpha_blend, or a second output's premult,
- * else cleared (solid, or the pass has none) */
+ * else cleared (solid, the pass has none, or the target holds encoded
+ * values) */
 static void vulkan_views_fill(vk_t *vk, const video_views_rect_t *cut,
       unsigned alpha)
 {
@@ -12021,6 +12068,8 @@ static void vulkan_views_fill(vk_t *vk, const video_views_rect_t *cut,
 #ifdef VULKAN_HDR_SWAPCHAIN
    else if (vk->flags & VK_FLAG_SDR_PIPELINE)
       pipeline = vk->pipelines.alpha_blend_sdr;
+   if (vk->views.encoded)
+      pipeline = VK_NULL_HANDLE;
 #endif
    if (alpha >= 255 || !pipeline)
    {
@@ -16491,6 +16540,9 @@ static bool vulkan_frame(void *data, const void *frame,
       return vulkan_recreate_context_swapchain(vk);
    }
 
+#ifdef VULKAN_HDR_SWAPCHAIN
+   vk->views.encoded = views ? vulkan_views_encoded(vk, filter_chain) : 0;
+#endif
    if (views_blend)
       vulkan_views_canvas(vk, video_info, view_chains, views_direct_tex);
 
@@ -16603,6 +16655,7 @@ static bool vulkan_frame(void *data, const void *frame,
                &vk->video_vp, vk->mvp.data);
 #ifdef VULKAN_HDR_SWAPCHAIN
       vk->views.hdr_stock = 0;
+      vk->views.encoded   = 0;
 #endif
 #ifdef VULKAN_HDR_SWAPCHAIN
       vk->flags &= ~VK_FLAG_SDR_PIPELINE;
@@ -16907,6 +16960,10 @@ static bool vulkan_frame(void *data, const void *frame,
       vk->windows.ui_window = 0;
       vk->windows.ui_direct = 0;
    }
+#endif
+#ifdef VULKAN_HDR_SWAPCHAIN
+   /* Also when the window's pass was not begun */
+   vk->views.encoded = 0;
 #endif
 
 #ifdef HAVE_OPENXR

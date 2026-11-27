@@ -6,7 +6,9 @@
  * decisions that send stock views straight into an HDR swapchain, with
  * no FP16 image and HDR game pass between, unless a placement is
  * translucent (vulkan_views_translucent), and a window's FP16 image
- * kept for that (vulkan_window_fp16_ensure), against a recording fake. */
+ * kept for that (vulkan_window_fp16_ensure), and an image screen's draw
+ * (vulkan_views_draw_image) encoded where the target holds encoded
+ * values, against a recording fake. */
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -37,6 +39,7 @@ typedef int VkColorSpaceKHR;
 #define VK_COLOR_SPACE_HDR10_ST2084_EXT 1000104008
 #define VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT 1000104002
 #define VK_CTX_FLAG_HDR_ENABLE (1u << 3)
+#define VK_CTX_FLAG_HDR_SCRGB (1u << 4)
 #define VK_FLAG_SDR_PIPELINE (1u << 5)
 #define VK_FLAG_TRACKER_USE_SCISSOR (1u << 6)
 #define VULKAN_DIRTY_DYNAMIC_BIT 1u
@@ -58,7 +61,8 @@ typedef struct { unsigned aspectMask, colorAttachment;
 typedef struct { VkRect2D rect; unsigned baseArrayLayer, layerCount; }
    VkClearRect;
 struct vk_texture { unsigned dims; };
-struct retro_video_view { unsigned x, y, width, height; };
+struct retro_video_view { unsigned x, y, width, height, screen, eye;
+   float aspect_ratio; };
 typedef struct { unsigned pos, dims; } video_views_rect_t;
 typedef struct { struct { struct retro_video_view views[1]; } views; }
    video_frame_info_t;
@@ -112,16 +116,16 @@ struct vk_target_pass
 
 typedef struct vk
 {
-   math_matrix_4x4 mvp;
+   math_matrix_4x4 mvp, mvp_no_rot;
    VkViewport vk_vp;
    struct { VkRect2D scissor; unsigned dirty; VkPipeline pipeline;
       VkImageView view; } tracker;
    struct { VkPipeline stock_rect, stock_rect_blend, stock_rect_sdr,
-      stock_rect_sdr_blend, stock_rect_hdr, alpha_blend,
+      stock_rect_sdr_blend, stock_rect_hdr, stock_rect_hdr_sdr, alpha_blend,
       alpha_blend_sdr, alpha_premult; } pipelines;
    struct { VkSampler linear, nearest; } samplers;
-   struct { unsigned hdr_stock; VkPipeline stock_pipeline, blend_pipeline,
-      fill_pipeline; bool target; unsigned alpha; bool fp16;
+   struct { unsigned hdr_stock, encoded; VkPipeline stock_pipeline,
+      blend_pipeline, fill_pipeline; bool target; unsigned alpha; bool fp16;
       struct vk_target_pass targets[VK_VIEWS_TARGETS]; } views;
    struct { struct vk_texture blank_texture; } display;
    struct { vulkan_hdr_uniform_t ubo_values; } hdr;
@@ -343,6 +347,20 @@ static void vkCmdClearAttachments(VkCommandBuffer c, unsigned n,
    last.clear_rect = r->rect;
    last.clears++;
 }
+/* What the view chains' preset writes */
+static struct { bool hdr10, hdr16; } emits;
+struct video_shader;
+static bool vulkan_chain_emits_hdr10(vk_t *vk, vulkan_filter_chain_t *chain)
+{
+   (void)vk; (void)chain;
+   return emits.hdr10;
+}
+static bool vulkan_chain_emits_hdr16(vk_t *vk, vulkan_filter_chain_t *chain)
+{
+   (void)vk; (void)chain;
+   return emits.hdr16;
+}
+
 /* rgba16_pack.h's scalar path, little-endian */
 static uint64_t rgba16_pack(const float *rgba)
 {
@@ -372,6 +390,7 @@ static void setup(void)
    unsigned i;
    memset(&vk, 0, sizeof(vk));
    memset(&last, 0, sizeof(last));
+   memset(&emits, 0, sizeof(emits));
    vk.context                         = &vk.context_s;
    vk.chain                           = &vk.chain_s;
    vk.context->flags                  = VK_CTX_FLAG_HDR_ENABLE;
@@ -384,6 +403,7 @@ static void setup(void)
    vk.pipelines.alpha_blend           = 16;
    vk.pipelines.alpha_blend_sdr       = 17;
    vk.pipelines.alpha_premult         = 18;
+   vk.pipelines.stock_rect_hdr_sdr    = 19;
    vk.samplers.linear                 = 21;
    vk.samplers.nearest                = 22;
    vk.video.smooth                    = true;
@@ -391,7 +411,10 @@ static void setup(void)
    vk.quad_ibo.num_quads              = 1;
    vk.views.fp16                      = true;
    for (i = 0; i < 16; i++)
+   {
       vk.mvp.data[i]                  = (float)(i + 1);
+      vk.mvp_no_rot.data[i]           = (float)(i + 101);
+   }
    vk.hdr.ubo_values.paper_white_nits = 203.0f;
    vk.hdr.ubo_values.expand_gamut     = 2;
    vk.hdr.ubo_values.subpixel_layout  = 1;
@@ -424,6 +447,17 @@ static void fill(unsigned alpha)
    cut.pos  = (48u << 16) | 24u;
    cut.dims = VIDEO_SCALE_PACK(16, 8);
    vulkan_views_fill(&vk, &cut, alpha);
+}
+
+/* A 48x32 picture over x 8, y 4, 48x32, nearest */
+static void image(void)
+{
+   static struct vk_texture picture;
+   video_views_rect_t dst;
+   picture.dims = VIDEO_SCALE_PACK(48, 32);
+   dst.pos      = (8u << 16) | 4u;
+   dst.dims     = VIDEO_SCALE_PACK(48, 32);
+   vulkan_views_draw_image(&vk, (uintptr_t)&picture, &dst, &dst, true);
 }
 
 /* The uniform shapes stock_rect_hdr.frag reads: SourceSize, where the
@@ -693,6 +727,134 @@ static void test_fill_pipeline(void)
          && last.clear_rect.extent.width == 16
          && last.clear_rect.extent.height == 8, "over the cut",
          last.clear_rect.offset.x);
+   if (failures == before)
+      printf("[pass] %s\n", t);
+}
+
+/* What the main window's target holds: nothing encoded without HDR
+ * output, or in FP16 that the HDR game pass encodes; the swapchain's
+ * encoding where a views preset writes it straight in; PQ in FP16
+ * under scRGB with a preset writing HDR10 */
+static void test_encoded_mode(void)
+{
+   static const char t[] = "test_encoded_mode";
+   unsigned before = failures;
+   setup();
+   vk.context->flags = 0;
+   vk.views.fp16     = false;
+   expect(t, vulkan_views_encoded(&vk, NULL) == 0, "no HDR",
+         vulkan_views_encoded(&vk, NULL));
+   setup();
+   vk.views.fp16 = false;
+   expect(t, vulkan_views_encoded(&vk, NULL) == 2, "HDR10 straight in",
+         vulkan_views_encoded(&vk, NULL));
+   vk.context->flags |= VK_CTX_FLAG_HDR_SCRGB;
+   expect(t, vulkan_views_encoded(&vk, NULL) == 3, "scRGB straight in",
+         vulkan_views_encoded(&vk, NULL));
+   vk.views.fp16 = true;
+   emits.hdr10   = true;
+   expect(t, vulkan_views_encoded(&vk, NULL) == 2,
+         "scRGB, PQ in FP16", vulkan_views_encoded(&vk, NULL));
+   setup();
+   expect(t, vulkan_views_encoded(&vk, NULL) == 0, "HDR10, an SDR preset",
+         vulkan_views_encoded(&vk, NULL));
+   vk.context->flags |= VK_CTX_FLAG_HDR_SCRGB;
+   expect(t, vulkan_views_encoded(&vk, NULL) == 0, "scRGB, an SDR preset",
+         vulkan_views_encoded(&vk, NULL));
+   if (failures == before)
+      printf("[pass] %s\n", t);
+}
+
+/* Where the target holds encoded values a picture is encoded as it
+ * holds them, whole and never turned, with sdr_render_pass's pipeline
+ * in FP16 and none without it; the stock views' direct encode wins */
+static void test_image_encoded(void)
+{
+   static const char t[] = "test_image_encoded";
+   unsigned before = failures;
+   vulkan_hdr_uniform_t u;
+   setup();
+   vk.views.encoded = 2;
+   image();
+   memcpy(&u, last.uniform, sizeof(u));
+   expect(t, last.draws == 1 && last.pipeline == vk.pipelines.stock_rect_hdr,
+         "stock_rect_hdr", (double)last.pipeline);
+   expect(t, last.uniform_size == sizeof(vulkan_hdr_uniform_t),
+         "the HDR uniform", (double)last.uniform_size);
+   expect(t, u.hdr_mode == 1 && u.inverse_tonemap == 1.0f && u.hdr10 == 1.0f,
+         "mode 1, the HDR10 encode", u.hdr_mode);
+   expect(t, !memcmp(&u.mvp, &vk.mvp_no_rot, sizeof(u.mvp)), "never turned",
+         u.mvp.data[0]);
+   expect(t, u.not_used1.width == 0.5f / 48.0f
+         && u.not_used1.height == 0.5f / 32.0f
+         && u.not_used1.pad0 == (48.0f - 0.5f) / 48.0f
+         && u.not_used1.pad1 == (32.0f - 0.5f) / 32.0f, "the whole picture",
+         u.not_used1.width);
+   expect(t, last.sampler == vk.samplers.nearest, "nearest",
+         (double)last.sampler);
+   expect(t, !vk.views.hdr_stock, "hdr_stock restored", vk.views.hdr_stock);
+   setup();
+   vk.flags        |= VK_FLAG_SDR_PIPELINE;
+   vk.views.encoded = 2;
+   image();
+   memcpy(&u, last.uniform, sizeof(u));
+   expect(t, last.draws == 1
+         && last.pipeline == vk.pipelines.stock_rect_hdr_sdr
+         && u.hdr_mode == 1, "in FP16: stock_rect_hdr_sdr, mode 1",
+         (double)last.pipeline);
+   setup();
+   vk.flags                       |= VK_FLAG_SDR_PIPELINE;
+   vk.views.encoded                = 2;
+   vk.pipelines.stock_rect_hdr_sdr = VK_NULL_HANDLE;
+   image();
+   expect(t, !last.binds && !last.draws, "in FP16 none without it",
+         last.binds);
+   setup();
+   vk.views.encoded = 3;
+   image();
+   memcpy(&u, last.uniform, sizeof(u));
+   expect(t, last.pipeline == vk.pipelines.stock_rect_hdr && u.hdr_mode == 2
+         && u.inverse_tonemap == 0.0f && u.hdr10 == 0.0f, "scRGB: mode 2",
+         u.hdr_mode);
+   setup();
+   image();
+   expect(t, last.pipeline == vk.pipelines.stock_rect
+         && last.uniform_size == sizeof(math_matrix_4x4) + 4 * sizeof(float),
+         "not encoded: stock_rect, mvp and clamp", (double)last.pipeline);
+   setup();
+   vk.views.hdr_stock = 3;
+   vk.views.encoded   = 2;
+   image();
+   memcpy(&u, last.uniform, sizeof(u));
+   expect(t, last.pipeline == vk.pipelines.stock_rect_hdr && u.hdr_mode == 2
+         && vk.views.hdr_stock == 3, "the stock direct encode wins",
+         u.hdr_mode);
+   if (failures == before)
+      printf("[pass] %s\n", t);
+}
+
+/* Where the target holds encoded values a translucent picture or blank
+ * inset draws solid: nothing blends encoded values */
+static void test_encoded_solid(void)
+{
+   static const char t[] = "test_encoded_solid";
+   unsigned before = failures;
+   setup();
+   vk.views.encoded = 2;
+   vk.views.alpha   = 64;
+   image();
+   expect(t, last.pipeline == vk.pipelines.stock_rect_hdr && !last.blend_sets,
+         "the picture solid", (double)last.pipeline);
+   setup();
+   vk.views.encoded = 2;
+   fill(128);
+   expect(t, !last.quads && last.clears == 1, "the inset cleared",
+         last.quads);
+   setup();
+   vk.flags        |= VK_FLAG_SDR_PIPELINE;
+   vk.views.encoded = 2;
+   fill(128);
+   expect(t, !last.quads && last.clears == 1, "in FP16 too", last.quads);
    if (failures == before)
       printf("[pass] %s\n", t);
 }
@@ -983,5 +1145,8 @@ int main(void)
    test_fill_pipeline();
    test_target_use();
    test_window_screens_target();
+   test_encoded_mode();
+   test_image_encoded();
+   test_encoded_solid();
    return failures ? 1 : 0;
 }
