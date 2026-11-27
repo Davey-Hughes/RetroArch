@@ -473,7 +473,9 @@ SDR_WINDOWS = {'FAKE_HDR_FIRST_SURFACE_ONLY': '1'}
 # Run only with RA_E2E_HDR=1.
 # [(name, map option, settings, points, extra)]. extra may hold preset
 # (a preset's path), menu (opened, as in MENU_CASES), env (added to
-# RetroArch's), raw (points are the PQ codes' top bytes, not decoded),
+# RetroArch's), opts (added to the core's options), left_out (the
+# screens_left_out values the core logs, as left_out_errors() checks),
+# raw (points are the PQ codes' top bytes, not decoded),
 # game and composite (whether the HDR game pass and composite are taken:
 # True and menu by default), log (lines the log holds, in order), absent
 # (lines it does not hold), after (a line the screenshot waits for) and
@@ -1265,6 +1267,66 @@ def pq_row(line, bt2020, raw, memo):
     return out
 
 
+# The picture alone, read raw: the top bytes of its HDR10 codes.
+HDR_IMAGE_PQ = [(x, y, tuple(c >> 2 for c in srgb8_to_pq10(colour)))
+                for x, y, colour in image_points(
+                    SCREENS_IMAGE_BESIDE, IMAGE_QUADRANTS, (None,) * 4)]
+# The screens modes in the main window under HDR10 output, entries as
+# HDR_CASES'. A translucent inset or picture blends on SDR values in
+# FP16, before the HDR game pass.
+HDR_CASES += [
+    ('hdr-screens-over-half', 'ds', dict(SCREENS_AIM_SETTINGS),
+     SCREENS_INSET_HALF,
+     {'opts': {'video_views_test_screens': 'over_half'}}),
+    ('hdr-screens-over-blank-half', 'ds', dict(SCREENS_AIM_SETTINGS),
+     SCREENS_INSET_BLANK_HALF,
+     {'opts': {'video_views_test_screens': 'over_blank_half'}}),
+    ('hdr-screens-over-blank-half-preset', 'ds',
+     dict(SCREENS_AIM_SETTINGS, video_shader_enable='true'),
+     SCREENS_INSET_BLANK_HALF,
+     {'preset': os.path.join(HERE, 'pass.slangp'),
+      'opts': {'video_views_test_screens': 'over_blank_half'}}),
+    ('hdr-screens-over-blank-half-interlaced', 'ds',
+     dict(SCREENS_AIM_SETTINGS, video_stereo_mode='5'),
+     screens_over_points('5', (0, 128, 0)),
+     {'opts': {'video_views_test_screens': 'over_blank_half'}}),
+    # Opaque, the picture goes straight into the swapchain with Top.
+    ('hdr-screens-image', 'ds', dict(SCREENS_AIM_SETTINGS),
+     screens_image_beside(IMAGE_QUADRANTS),
+     {'opts': {'video_views_test_screens': 'image'}, 'game': False,
+      'log': [STOCK_DIRECT]}),
+    ('hdr-screens-image-over-half', 'ds', dict(SCREENS_AIM_SETTINGS),
+     screens_image_inset(IMAGE_HALF),
+     {'opts': {'video_views_test_screens': 'image_over_half'}}),
+    # Under a preset that writes HDR10 the picture is encoded, in one
+    # picture and through the interlaced canvas, and a translucent inset
+    # is drawn solid.
+    ('hdr-emit-preset-image', 'ds',
+     dict(SCREENS_AIM_SETTINGS, video_shader_enable='true'),
+     HDR_IMAGE_PQ,
+     {'preset': os.path.join(HERE, 'hdr10_pass.slangp'), 'raw': True,
+      'opts': {'video_views_test_screens': 'image'}, 'game': False}),
+    ('hdr-emit-preset-image-interlaced', 'ds',
+     dict(SCREENS_AIM_SETTINGS, video_shader_enable='true',
+          video_stereo_mode='5'),
+     HDR_IMAGE_PQ,
+     {'preset': os.path.join(HERE, 'hdr10_pass.slangp'), 'raw': True,
+      'opts': {'video_views_test_screens': 'image'}, 'game': False}),
+    ('hdr-emit-preset-over-blank-half', 'ds',
+     dict(SCREENS_AIM_SETTINGS, video_shader_enable='true'),
+     SCREENS_INSET_BLANK,
+     {'preset': os.path.join(HERE, 'hdr10_pass.slangp'), 'raw': True,
+      'opts': {'video_views_test_screens': 'over_blank_half'},
+      'game': False}),
+    # Bottom UPRIGHT in a turned core is left out, and the picture OVER
+    # it is not drawn.
+    ('hdr-screens-upright-over', 'ds', dict(SCREENS_AIM_SETTINGS),
+     SCREENS_TOP_TURNED,
+     {'opts': {'video_views_test_screens': 'upright_over'},
+      'left_out': [0x2], 'game': None}),
+]
+
+
 def send(cmd, port):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.sendto(cmd.encode(), ('127.0.0.1', port))
@@ -1536,22 +1598,26 @@ def hdr_passes(name):
     return HDR_PASSES[max(found, key=len)] if found else (None, None)
 
 
+# A validation message's ID, as its log line carries it.
+VALIDATION_ID_RE = re.compile(
+    r'\[ (VUID-[A-Za-z0-9_-]+|UNASSIGNED-[A-Za-z0-9_.-]+) \]')
+
+
 def hdr_errors(d, game, composite):
     """A run with HDR10 output must have it (on Xvfb the fake layer logs
-    its HDR10 swapchain), log no validation error and log each pass's
-    mode once, not per frame (no case changes it mid-run). game and
-    composite say whether it takes the HDR game pass and composite;
-    None checks neither way."""
+    its HDR10 swapchain), log no validation message (a line with its ID)
+    and log each pass's mode once, not per frame (no case changes it
+    mid-run). game and composite say whether it takes the HDR game pass
+    and composite; None checks neither way."""
     text = log_text(d)
     errors = []
     if XVFB and 'fake-hdr: HDR10 swapchain' not in text:
         errors.append('no HDR10 swapchain was created (fell back to SDR?)')
     vuids = {}
     for line in text.splitlines():
-        if 'Validation Error' in line:
-            m = re.search(r'\[ (\S+) \]', line)
-            vuid = m.group(1) if m else line.strip()[:200]
-            vuids[vuid] = vuids.get(vuid, 0) + 1
+        m = VALIDATION_ID_RE.search(line)
+        if m:
+            vuids[m.group(1)] = vuids.get(m.group(1), 0) + 1
     if vuids:
         errors.append('%d validation error(s)' % sum(vuids.values()))
         errors += ['  %s x%d' % (v, vuids[v]) for v in sorted(vuids)]
@@ -2529,7 +2595,8 @@ def run_hdr_case(retroarch, root, driver, case):
               % name, flush=True)
     errors = run_case(retroarch, root, driver,
                       (name, mapopt, settings, points), menu=menu,
-                      args=args, env_extra=extra.get('env'),
+                      opts=extra.get('opts'), args=args,
+                      env_extra=extra.get('env'),
                       raw=extra.get('raw', False),
                       passes=(extra.get('game', True),
                               extra.get('composite', menu)),
@@ -2546,6 +2613,9 @@ def run_hdr_case(retroarch, root, driver, case):
         at += len(line)
     errors += ['"%s" in the log' % line for line in extra.get('absent', ())
                if line in text]
+    if 'left_out' in extra:
+        errors += left_out_errors(case_dir(root, driver, name),
+                                  extra['left_out'])
     return errors
 
 
