@@ -1,7 +1,8 @@
-/* Runs the production stock view draw (vulkan_views_draw_stock), the
- * HDR pass encode it borrows (vulkan_hdr_ubo_mode) and the decisions
- * that send stock views straight into an HDR swapchain, with no FP16
- * image and HDR game pass between, against a recording fake. */
+/* Runs the production stock view draw (vulkan_views_draw_direct and
+ * the vulkan_views_draw_stock it calls), the HDR pass encode it
+ * borrows (vulkan_hdr_ubo_mode) and the decisions that send stock views
+ * straight into an HDR swapchain, with no FP16 image and HDR game pass
+ * between, against a recording fake. */
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -34,6 +35,8 @@ typedef int VkColorSpaceKHR;
 #define VIDEO_SCALE_W(d) ((d) & 0xffffu)
 #define VIDEO_SCALE_H(d) ((d) >> 16)
 #define VIDEO_SCALE_PACK(w, h) ((unsigned)(w) | ((unsigned)(h) << 16))
+#define VIDEO_POS_X(p) ((int)((p) & 0xffffu))
+#define VIDEO_POS_Y(p) ((int)((p) >> 16))
 
 typedef struct { float data[16]; } math_matrix_4x4;
 typedef struct { float x, y, width, height, minDepth, maxDepth; } VkViewport;
@@ -41,6 +44,9 @@ typedef struct { struct { int x, y; } offset;
    struct { unsigned width, height; } extent; } VkRect2D;
 struct vk_texture { unsigned dims; };
 struct retro_video_view { unsigned x, y, width, height; };
+typedef struct { unsigned pos, dims; } video_views_rect_t;
+typedef struct { struct { struct retro_video_view views[1]; } views; }
+   video_frame_info_t;
 struct vk_vertex { float x, y; float tex_x, tex_y; uint64_t color; };
 struct vk_buffer_range { uint8_t *data; VkBuffer buffer;
    VkDeviceSize offset; };
@@ -87,11 +93,11 @@ typedef struct vk
    VkViewport vk_vp;
    struct { VkRect2D scissor; unsigned dirty; VkPipeline pipeline; }
       tracker;
-   struct { VkPipeline stock_rect, stock_rect_sdr, stock_rect_hdr; }
-      pipelines;
+   struct { VkPipeline stock_rect, stock_rect_blend, stock_rect_sdr,
+      stock_rect_hdr; } pipelines;
    struct { VkSampler linear, nearest; } samplers;
-   struct { unsigned hdr_stock; VkPipeline stock_pipeline; bool fp16;
-      struct vk_target_pass targets[VK_VIEWS_TARGETS]; } views;
+   struct { unsigned hdr_stock; VkPipeline stock_pipeline; unsigned alpha;
+      bool fp16; struct vk_target_pass targets[VK_VIEWS_TARGETS]; } views;
    struct { vulkan_hdr_uniform_t ubo_values; } hdr;
    struct { bool smooth; } video;
    struct { VkBuffer buffer; unsigned num_quads; } quad_ibo;
@@ -103,7 +109,14 @@ typedef struct vk
    unsigned flags;
 } vk_t;
 
-/* The draw the fake took */
+struct vulkan_views_draw_ctx
+{
+   const video_frame_info_t *video_info;
+   struct vk_texture *direct;
+};
+
+/* The draw the fake took, and the blend constants set after how many
+ * binds */
 static struct
 {
    VkPipeline pipeline;
@@ -111,6 +124,9 @@ static struct
    size_t uniform_size;
    unsigned char uniform[512];
    unsigned draws;
+   unsigned binds;
+   float blend[4];
+   unsigned blend_sets, blend_binds;
 } last;
 static struct vk_vertex vbo_mem[4];
 static unsigned failures;
@@ -118,6 +134,7 @@ static unsigned failures;
 static bool vulkan_draw_bind(vk_t *vk, const struct vk_draw_triangles *c)
 {
    (void)vk;
+   last.binds++;
    last.pipeline     = c->pipeline;
    last.sampler      = c->sampler;
    last.uniform_size = c->uniform_size;
@@ -147,6 +164,13 @@ static void vkCmdDrawIndexed(VkCommandBuffer c, unsigned n, unsigned i,
 static void vkCmdDraw(VkCommandBuffer c, unsigned n, unsigned i,
       unsigned f, unsigned fi)
 { (void)c; (void)n; (void)i; (void)f; (void)fi; last.draws++; }
+static void vkCmdSetBlendConstants(VkCommandBuffer c, const float k[4])
+{
+   (void)c;
+   memcpy(last.blend, k, sizeof(last.blend));
+   last.blend_sets++;
+   last.blend_binds = last.binds;
+}
 
 #include "production_stock_hdr.h"
 
@@ -172,6 +196,7 @@ static void setup(void)
    vk.context->flags                  = VK_CTX_FLAG_HDR_ENABLE;
    vk.context->swapchain_format       = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
    vk.pipelines.stock_rect            = 11;
+   vk.pipelines.stock_rect_blend      = 14;
    vk.pipelines.stock_rect_sdr        = 12;
    vk.pipelines.stock_rect_hdr        = 13;
    vk.samplers.linear                 = 21;
@@ -197,11 +222,14 @@ static void setup(void)
 
 static void draw(void)
 {
-   VkViewport vp;
-   VkRect2D sci;
-   memset(&vp, 0, sizeof(vp));
-   memset(&sci, 0, sizeof(sci));
-   vulkan_views_draw_stock(&vk, &frame, &view, &vp, &sci);
+   video_frame_info_t info;
+   struct vulkan_views_draw_ctx d;
+   video_views_rect_t rect;
+   memset(&rect, 0, sizeof(rect));
+   info.views.views[0] = view;
+   d.video_info        = &info;
+   d.direct            = &frame;
+   vulkan_views_draw_direct(&vk, &d, 0, &rect, &rect);
 }
 
 /* The uniform shapes stock_rect_hdr.frag reads: SourceSize, where the
@@ -282,6 +310,32 @@ static void test_plain_draw(void)
    draw();
    expect(t, last.pipeline == vk.pipelines.stock_rect_sdr, "stock_rect_sdr",
          (double)last.pipeline);
+   if (failures == before)
+      printf("[pass] %s\n", t);
+}
+
+/* A translucent inset blends at its alpha, the constants set after the
+ * bind; with no blend pipeline it draws solid */
+static void test_translucent_draw(void)
+{
+   static const char t[] = "test_translucent_draw";
+   unsigned before = failures;
+   setup();
+   vk.views.alpha = 64;
+   draw();
+   expect(t, last.pipeline == vk.pipelines.stock_rect_blend,
+         "stock_rect_blend", (double)last.pipeline);
+   expect(t, last.blend_sets == 1 && last.blend_binds == 1,
+         "the constants after the bind", last.blend_binds);
+   expect(t, last.blend[0] == 0.0f && last.blend[1] == 0.0f
+         && last.blend[2] == 0.0f && last.blend[3] == 64.0f / 255.0f,
+         "the alpha", last.blend[3]);
+   setup();
+   vk.views.alpha                = 64;
+   vk.pipelines.stock_rect_blend = VK_NULL_HANDLE;
+   draw();
+   expect(t, last.pipeline == vk.pipelines.stock_rect && !last.blend_sets,
+         "solid without it", (double)last.pipeline);
    if (failures == before)
       printf("[pass] %s\n", t);
 }
@@ -399,6 +453,7 @@ int main(void)
    test_uniform_layout();
    test_encoded_draw();
    test_plain_draw();
+   test_translucent_draw();
    test_main_window_decision();
    test_window_decision();
    test_target_pipeline_draw();
