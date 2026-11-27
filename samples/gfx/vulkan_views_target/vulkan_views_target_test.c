@@ -26,6 +26,7 @@
 #define VULKAN_HDR_SWAPCHAIN
 #define VK_CTX_FLAG_HDR_ENABLE 0x1
 #define VK_CTX_FLAG_HDR_SCRGB 0x2
+#define VK_FLAG_SOURCE_HDR10 (1 << 17)
 #define VULKAN_IMAGE_LAYOUT_TRANSITION(cmd, img, a, b, c, d, e, f) \
    do { (void)(cmd); (void)(img); } while (0)
 
@@ -133,6 +134,8 @@ typedef struct
 {
    test_context_t *context;
    test_chain_t *chain;
+   uint32_t flags;
+   struct vk_image offscreen_buffer;
    vulkan_filter_chain_t *filter_chain;
    vulkan_filter_chain_t *filter_chain_default;
    VkRenderPass render_pass;
@@ -1625,6 +1628,37 @@ static void test_views_preset_hdr(void)
    CHECK(!vulkan_views_preset_hdr(&vk));
 }
 
+/* With no map, a map is reported drawn whole where HDR output would
+ * refuse it, as vulkan_views_prepare() does. */
+static void test_views_whole_hdr(void)
+{
+   vk_t vk;
+   test_context_t context;
+   test_chain_t chain;
+   video_frame_info_t info;
+   init(&vk, &context, &chain);
+   memset(&info, 0, sizeof(info));
+   /* HDR, fp16, no offscreen image, stock chains made */
+   context.flags = VK_CTX_FLAG_HDR_ENABLE;
+   vk.views.fp16 = true;
+   CHECK(vulkan_views_whole(&vk, &info));
+   vk.offscreen_buffer.image = (VkImage)(uintptr_t)1;
+   CHECK(!vulkan_views_whole(&vk, &info));
+   /* fp16 false (a preset writing HDR), stock */
+   vk.views.fp16 = false;
+   CHECK(vulkan_views_whole(&vk, &info));
+   info.shader_active = true;
+   vk.filter_chain    = XR_FRAME_CHAIN;
+   CHECK(!vulkan_views_whole(&vk, &info));
+   /* No HDR */
+   info.shader_active = false;
+   context.flags      = 0;
+   CHECK(!vulkan_views_whole(&vk, &info));
+   /* An HDR10 source */
+   vk.flags = VK_FLAG_SOURCE_HDR10;
+   CHECK(vulkan_views_whole(&vk, &info));
+}
+
 /* The headset's format: the window's without HDR output, its sRGB twin
  * first; with it 8-bit SDR of its own, sRGB first, in a pass of its own
  * format. A new pass retargets the chains, a new format makes the
@@ -2074,6 +2108,7 @@ int main(void)
    test_xr_draw_in_xr_pass();
    test_xr_hdr_preset_falls_back();
    test_views_preset_hdr();
+   test_views_whole_hdr();
    test_xr_pick_format();
    test_xr_draw_inset();
    test_xr_draw_inset_stereo();
@@ -2084,6 +2119,6 @@ int main(void)
    test_xr_draw_image_inset();
    test_xr_draw_image_target();
    test_xr_draw_inset_alpha();
-   printf("%u failed (30 Vulkan target cases)\n", failures);
+   printf("%u failed (31 Vulkan target cases)\n", failures);
    return failures ? 1 : 0;
 }

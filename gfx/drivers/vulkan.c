@@ -11557,14 +11557,28 @@ static bool vulkan_views_stock(const vk_t *vk,
       || vk->filter_chain == vk->filter_chain_default;
 }
 
-/* Without a map, whether one would be drawn whole: views not allowed,
- * or the chains its views would take could not be made */
+/* With HDR output, views drawn straight into the swapchain need their
+ * preset chains, and FP16 needs the HDR game pass's buffer. */
+static bool vulkan_views_hdr_drawable(const vk_t *vk, bool stock)
+{
+#ifdef VULKAN_HDR_SWAPCHAIN
+   if (vk->context->flags & VK_CTX_FLAG_HDR_ENABLE)
+      return vk->views.fp16
+            ? vk->offscreen_buffer.image != VK_NULL_HANDLE : !stock;
+#endif
+   return true;
+}
+
+/* Without a map, whether one would be drawn whole: views not allowed or
+ * not drawable, or the chains its views would take could not be made */
 static bool vulkan_views_whole(const vk_t *vk,
       const video_frame_info_t *video_info)
 {
+   bool stock = vulkan_views_stock(vk, video_info);
    return !vulkan_views_allowed(vk)
-      || (vulkan_views_stock(vk, video_info)
-         ? vk->views.chains.stock_failed : vk->views.chains.preset_failed);
+      || !vulkan_views_hdr_drawable(vk, stock)
+      || (stock ? vk->views.chains.stock_failed
+                : vk->views.chains.preset_failed);
 }
 
 /* Each drawn view's chain, as pick_chains (video_views_draw.h), and in
@@ -11575,15 +11589,10 @@ static bool vulkan_views_prepare(vk_t *vk,
       vulkan_filter_chain_t **chains, video_views_rect_t *rects, bool *stock)
 {
    unsigned i;
-   bool drawable = vulkan_views_allowed(vk);
-   *stock = vulkan_views_stock(vk, video_info);
-#ifdef VULKAN_HDR_SWAPCHAIN
-   /* With HDR output, views drawn straight into the swapchain need
-    * their preset chains, and FP16 needs the HDR game pass's buffer. */
-   if (vk->context->flags & VK_CTX_FLAG_HDR_ENABLE)
-      drawable = drawable && (vk->views.fp16
-            ? vk->offscreen_buffer.image != VK_NULL_HANDLE : !*stock);
-#endif
+   bool drawable;
+   *stock   = vulkan_views_stock(vk, video_info);
+   drawable = vulkan_views_allowed(vk)
+      && vulkan_views_hdr_drawable(vk, *stock);
    if (     drawable
          && vulkan_vv_pick_chains(vk, &vk->views.chains, &video_info->views,
             &video_info->views_layout, *stock, all_areas, dims, chains,
