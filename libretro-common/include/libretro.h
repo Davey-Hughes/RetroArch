@@ -3132,9 +3132,9 @@ enum retro_vr_reference_space {
  *    their rectangles are in the root's frame before rotation. It does
  *    not turn a layer with UPRIGHT, whose rectangle is in the root's
  *    displayed frame, after rotation. Each layer has its own flags.
- *  - Under an UPRIGHT root nothing in the stack turns. The root's frame is
- *    then also its displayed frame, so UPRIGHT on its layers changes
- *    nothing.
+ *  - Under an UPRIGHT root, or an image root, nothing in the stack turns.
+ *    The root's frame is then also its displayed frame, so UPRIGHT on its
+ *    layers changes nothing.
  *  - The user's rotation setting turns the whole stack, UPRIGHT layers
  *    included.
  *  - Art at another orientation (a quarter turn off both frames, or
