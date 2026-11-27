@@ -455,8 +455,10 @@ struct vk_target_pass
 {
    VkRenderPass pass;
    VkPipeline premult;
-   /* stock_rect against it; VK_NULL_HANDLE when it could not be made */
+   /* stock_rect against it, and its twin at the blend constants' alpha;
+    * VK_NULL_HANDLE when it could not be made */
    VkPipeline stock_rect;
+   VkPipeline stock_rect_blend;
    VkFormat format;
 };
 
@@ -515,9 +517,14 @@ typedef struct vk
        * last such value logged. */
       unsigned hdr_stock;
       unsigned hdr_stock_logged;
-      /* While stock views draw straight into a second output in another
-       * format: stock_rect made against its pass; else VK_NULL_HANDLE */
+      /* While views draw into a second output's or the headset's pass in
+       * another format than the window's: that pass's stock_rect, its
+       * blend twin and premult, each VK_NULL_HANDLE where it could not be
+       * made; target is set then */
       VkPipeline stock_pipeline;
+      VkPipeline blend_pipeline;
+      VkPipeline fill_pipeline;
+      bool target;
       /* VV_ALPHA's alpha below 255, which stock views are drawn at;
        * 0 draws them solid */
       unsigned alpha;
@@ -804,6 +811,7 @@ typedef struct vk
       VkPipeline stereo_anaglyph_sdr;
       VkPipeline stereo_interlaced_sdr;
       VkPipeline stock_rect_sdr;
+      VkPipeline stock_rect_sdr_blend;
       VkPipeline alpha_premult_sdr;
 #endif /* VULKAN_HDR_SWAPCHAIN */
       VkDescriptorSetLayout set_layout;
@@ -6490,6 +6498,27 @@ static void vulkan_init_pipelines(vk_t *vk)
                &module_info, NULL, &shader_stages[1].module);
          vkCreateGraphicsPipelines(vk->context->device, vk->pipelines.cache,
                1, &pipe, NULL, &vk->pipelines.stock_rect_sdr);
+         {
+            VkPipelineColorBlendAttachmentState opaque = blend_attachment;
+            blend_attachment.blendEnable         = VK_TRUE;
+            blend_attachment.srcColorBlendFactor =
+               VK_BLEND_FACTOR_CONSTANT_ALPHA;
+            blend_attachment.dstColorBlendFactor =
+               VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+            blend_attachment.srcAlphaBlendFactor =
+               VK_BLEND_FACTOR_CONSTANT_ALPHA;
+            blend_attachment.dstAlphaBlendFactor =
+               VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+            blend_attachment.alphaBlendOp        = VK_BLEND_OP_ADD;
+            dynamic.pDynamicStates               = dynamics_blend;
+            dynamic.dynamicStateCount            = ARRAY_SIZE(dynamics_blend);
+            vkCreateGraphicsPipelines(vk->context->device,
+                  vk->pipelines.cache, 1, &pipe, NULL,
+                  &vk->pipelines.stock_rect_sdr_blend);
+            dynamic.pDynamicStates               = dynamics;
+            dynamic.dynamicStateCount            = ARRAY_SIZE(dynamics);
+            blend_attachment                     = opaque;
+         }
          vkDestroyShaderModule(vk->context->device,
                shader_stages[1].module, NULL);
 
@@ -6999,10 +7028,13 @@ if (vk->context->flags & VK_CTX_FLAG_HDR_SUPPORT)
    vkDestroyPipeline(vk->context->device,
          vk->pipelines.stock_rect_sdr, NULL);
    vkDestroyPipeline(vk->context->device,
+         vk->pipelines.stock_rect_sdr_blend, NULL);
+   vkDestroyPipeline(vk->context->device,
          vk->pipelines.alpha_premult_sdr, NULL);
    vk->pipelines.stereo_anaglyph_sdr   = VK_NULL_HANDLE;
    vk->pipelines.stereo_interlaced_sdr = VK_NULL_HANDLE;
    vk->pipelines.stock_rect_sdr        = VK_NULL_HANDLE;
+   vk->pipelines.stock_rect_sdr_blend  = VK_NULL_HANDLE;
    vk->pipelines.alpha_premult_sdr     = VK_NULL_HANDLE;
 
    for (i = 0; i < (int)ARRAY_SIZE(vk->display.pipelines_sdr); i++)
@@ -7159,6 +7191,8 @@ static void vulkan_views_targets_free(vk_t *vk)
             NULL);
       vkDestroyPipeline(vk->context->device,
             vk->views.targets[i].stock_rect, NULL);
+      vkDestroyPipeline(vk->context->device,
+            vk->views.targets[i].stock_rect_blend, NULL);
       vkDestroyRenderPass(vk->context->device, vk->views.targets[i].pass,
             NULL);
    }
@@ -11790,7 +11824,7 @@ static void vulkan_views_draw_stock(vk_t *vk, struct vk_texture *src,
    VkViewport saved_vp = vk->vk_vp;
    VkRect2D saved_sci  = vk->tracker.scissor;
    uint32_t saved_flag = vk->flags & VK_FLAG_TRACKER_USE_SCISSOR;
-   bool blend          = vk->views.alpha && vk->pipelines.stock_rect_blend;
+   VkPipeline blend    = vk->pipelines.stock_rect_blend;
    float tw            = (float)VIDEO_SCALE_W(src->dims);
    float th            = (float)VIDEO_SCALE_H(src->dims);
    float u0            = (float)v->x / tw;
@@ -11822,8 +11856,7 @@ static void vulkan_views_draw_stock(vk_t *vk, struct vk_texture *src,
    vk->flags           |= VK_FLAG_TRACKER_USE_SCISSOR;
    vk->tracker.dirty   |= VULKAN_DIRTY_DYNAMIC_BIT;
 
-   call.pipeline     = vk->views.stock_pipeline
-      ? vk->views.stock_pipeline : vk->pipelines.stock_rect;
+   call.pipeline     = vk->pipelines.stock_rect;
    call.uniform      = &ubo;
    call.uniform_size = sizeof(ubo);
 #ifdef VULKAN_HDR_SWAPCHAIN
@@ -11832,19 +11865,33 @@ static void vulkan_views_draw_stock(vk_t *vk, struct vk_texture *src,
       call.pipeline     = vk->pipelines.stock_rect_hdr;
       call.uniform      = &hdr_ubo;
       call.uniform_size = sizeof(hdr_ubo);
+      blend             = VK_NULL_HANDLE;
    }
-   else if (vk->flags & VK_FLAG_SDR_PIPELINE)
-      call.pipeline     = vk->pipelines.stock_rect_sdr;
+   else
 #endif
-   /* Translucent only where stock_rect would draw */
-   blend             = blend && call.pipeline == vk->pipelines.stock_rect;
+   if (vk->views.target)
+   {
+      call.pipeline     = vk->views.stock_pipeline;
+      blend             = vk->views.blend_pipeline;
+   }
+#ifdef VULKAN_HDR_SWAPCHAIN
+   else if (vk->flags & VK_FLAG_SDR_PIPELINE)
+   {
+      call.pipeline     = vk->pipelines.stock_rect_sdr;
+      blend             = vk->pipelines.stock_rect_sdr_blend;
+   }
+#endif
+   /* At VV_ALPHA's alpha through the pass's blend twin, else solid */
+   if (!vk->views.alpha)
+      blend          = VK_NULL_HANDLE;
    if (blend)
-      call.pipeline  = vk->pipelines.stock_rect_blend;
+      call.pipeline  = blend;
    call.texture      = src;
    call.sampler      = sampler;
    call.vbo          = &range;
    call.vertices     = 4;
-   if (     vulkan_draw_bind(vk, &call)
+   if (     call.pipeline
+         && vulkan_draw_bind(vk, &call)
          && vulkan_buffer_chain_alloc(vk->context, &vk->chain->vbo,
             4 * sizeof(struct vk_vertex), &range))
    {
@@ -11947,12 +11994,20 @@ static void vulkan_views_draw_pass(vk_t *vk, vulkan_filter_chain_t *fc,
    vulkan_filter_chain_set_scissor(fc, NULL);
 }
 
-/* @cut black at @alpha, for a blank inset: cleared when solid, else a
- * black quad at that vertex alpha through alpha_blend */
+/* @cut black at @alpha, for a blank inset: a black quad at that vertex
+ * alpha through the pass's alpha_blend, else cleared (solid, or the pass
+ * has none) */
 static void vulkan_views_fill(vk_t *vk, const video_views_rect_t *cut,
       unsigned alpha)
 {
-   if (alpha >= 255)
+   VkPipeline pipeline = vk->pipelines.alpha_blend;
+   if (vk->views.target)
+      pipeline = vk->views.fill_pipeline;
+#ifdef VULKAN_HDR_SWAPCHAIN
+   else if (vk->flags & VK_FLAG_SDR_PIPELINE)
+      pipeline = vk->pipelines.alpha_blend_sdr;
+#endif
+   if (alpha >= 255 || !pipeline)
    {
       VkClearAttachment clear;
       VkClearRect rect;
@@ -11984,7 +12039,7 @@ static void vulkan_views_fill(vk_t *vk, const video_views_rect_t *cut,
       vk->tracker.pipeline = VK_NULL_HANDLE;
       vk->tracker.view     = VK_NULL_HANDLE;
 
-      quad.pipeline = vk->pipelines.alpha_blend;
+      quad.pipeline = pipeline;
       quad.texture  = &vk->display.blank_texture;
       quad.sampler  = vk->samplers.nearest;
       quad.mvp      = &vk->mvp;
@@ -13033,6 +13088,11 @@ static bool vulkan_views_target_make(vk_t *vk, struct vk_target_pass *t,
    VkShaderModuleCreateInfo module_info;
    VkDevice device = vk->context->device;
    VkResult res    = VK_ERROR_INITIALIZATION_FAILED;
+   static const VkDynamicState dynamics_blend[] = {
+      VK_DYNAMIC_STATE_VIEWPORT,
+      VK_DYNAMIC_STATE_SCISSOR,
+      VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+   };
 
    if (!vk->display.effect_tpl[0].valid)
       return false;
@@ -13117,8 +13177,10 @@ static bool vulkan_views_target_make(vk_t *vk, struct vk_target_pass *t,
                &tpl.pipe, NULL, &t->premult);
          vkDestroyShaderModule(device, stages[1].module, NULL);
       }
-      /* Stock views straight from the frame, opaque */
+      /* Stock views straight from the frame, opaque, then at the blend
+       * constants' alpha */
       t->stock_rect        = VK_NULL_HANDLE;
+      t->stock_rect_blend  = VK_NULL_HANDLE;
       module_info.codeSize = spirv_stock_rect_frag_size;
       module_info.pCode    = spirv_stock_rect_frag;
       if (     res == VK_SUCCESS
@@ -13129,6 +13191,25 @@ static bool vulkan_views_target_make(vk_t *vk, struct vk_target_pass *t,
          if (vkCreateGraphicsPipelines(device, vk->pipelines.cache, 1,
                   &tpl.pipe, NULL, &t->stock_rect) != VK_SUCCESS)
             t->stock_rect = VK_NULL_HANDLE;
+         else
+         {
+            tpl.blend_attachment.blendEnable         = VK_TRUE;
+            tpl.blend_attachment.srcColorBlendFactor =
+               VK_BLEND_FACTOR_CONSTANT_ALPHA;
+            tpl.blend_attachment.dstColorBlendFactor =
+               VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+            tpl.blend_attachment.srcAlphaBlendFactor =
+               VK_BLEND_FACTOR_CONSTANT_ALPHA;
+            tpl.blend_attachment.dstAlphaBlendFactor =
+               VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+            tpl.blend_attachment.alphaBlendOp        = VK_BLEND_OP_ADD;
+            tpl.dynamic.pDynamicStates               = dynamics_blend;
+            tpl.dynamic.dynamicStateCount            =
+               ARRAY_SIZE(dynamics_blend);
+            if (vkCreateGraphicsPipelines(device, vk->pipelines.cache, 1,
+                     &tpl.pipe, NULL, &t->stock_rect_blend) != VK_SUCCESS)
+               t->stock_rect_blend = VK_NULL_HANDLE;
+         }
          vkDestroyShaderModule(device, stages[1].module, NULL);
       }
       vkDestroyShaderModule(device, stages[0].module, NULL);
@@ -13196,6 +13277,30 @@ static VkPipeline vulkan_views_target_stock(vk_t *vk, VkFormat format)
             && vk->views.targets[i].format == format)
          return vk->views.targets[i].stock_rect;
    return VK_NULL_HANDLE;
+}
+
+/* Views draw with that pass's pipelines from here on; the window's own
+ * for its format or VK_FORMAT_UNDEFINED */
+static void vulkan_views_target_use(vk_t *vk, VkFormat format)
+{
+   unsigned i;
+   vk->views.target         = false;
+   vk->views.stock_pipeline = VK_NULL_HANDLE;
+   vk->views.blend_pipeline = VK_NULL_HANDLE;
+   vk->views.fill_pipeline  = VK_NULL_HANDLE;
+   if (     format == VK_FORMAT_UNDEFINED
+         || format == vk->context->swapchain_format)
+      return;
+   vk->views.target = true;
+   for (i = 0; i < VK_VIEWS_TARGETS; i++)
+      if (     vk->views.targets[i].pass != VK_NULL_HANDLE
+            && vk->views.targets[i].format == format)
+      {
+         vk->views.stock_pipeline = vk->views.targets[i].stock_rect;
+         vk->views.blend_pipeline = vk->views.targets[i].stock_rect_blend;
+         vk->views.fill_pipeline  = vk->views.targets[i].premult;
+         return;
+      }
 }
 #endif
 
@@ -13850,10 +13955,10 @@ static bool vulkan_windows_draw(vk_t *vk, video_frame_info_t *video_info)
          vk->tracker.pipeline = VK_NULL_HANDLE;
          if (stock_sdr)
          {
-            vk->views.stock_pipeline = stock_sdr;
+            vulkan_views_target_use(vk, out->format);
             vulkan_vv_draw_placements(vk, &d, win->layout, win->chains,
                   !win->layout->offscreen, out->dims, true);
-            vk->views.stock_pipeline = VK_NULL_HANDLE;
+            vulkan_views_target_use(vk, VK_FORMAT_UNDEFINED);
          }
          else if (chains_sdr)
          {

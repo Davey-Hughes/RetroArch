@@ -1,8 +1,9 @@
 /* Runs the production stock view draw (vulkan_views_draw_direct and
- * the vulkan_views_draw_stock it calls), the HDR pass encode it
- * borrows (vulkan_hdr_ubo_mode) and the decisions that send stock views
- * straight into an HDR swapchain, with no FP16 image and HDR game pass
- * between, against a recording fake. */
+ * the vulkan_views_draw_stock it calls), the blank inset fill, the
+ * pick of a second output's pipelines (vulkan_views_target_use), the
+ * HDR pass encode the draw borrows (vulkan_hdr_ubo_mode) and the
+ * decisions that send stock views straight into an HDR swapchain, with
+ * no FP16 image and HDR game pass between, against a recording fake. */
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -16,11 +17,15 @@ typedef uintptr_t VkPipeline;
 typedef uintptr_t VkSampler;
 typedef uintptr_t VkBuffer;
 typedef uintptr_t VkCommandBuffer;
+typedef uintptr_t VkImageView;
 typedef uint64_t VkDeviceSize;
 typedef int VkFormat;
 typedef int VkColorSpaceKHR;
 #define VK_NULL_HANDLE 0
 #define VK_INDEX_TYPE_UINT16 0
+#define VK_IMAGE_ASPECT_COLOR_BIT 1
+#define VK_FORMAT_UNDEFINED 0
+#define VK_FORMAT_R8G8B8A8_UNORM 37
 #define VK_FORMAT_A2B10G10R10_UNORM_PACK32 64
 #define VK_FORMAT_R16G16B16A16_SFLOAT 97
 #define VK_FORMAT_B8G8R8A8_UNORM 44
@@ -35,13 +40,19 @@ typedef int VkColorSpaceKHR;
 #define VIDEO_SCALE_W(d) ((d) & 0xffffu)
 #define VIDEO_SCALE_H(d) ((d) >> 16)
 #define VIDEO_SCALE_PACK(w, h) ((unsigned)(w) | ((unsigned)(h) << 16))
-#define VIDEO_POS_X(p) ((int)((p) & 0xffffu))
-#define VIDEO_POS_Y(p) ((int)((p) >> 16))
+#define VIDEO_POS_X(p) ((int)(int16_t)(((unsigned)(p) >> 16) & 0xffffu))
+#define VIDEO_POS_Y(p) ((int)(int16_t)( (unsigned)(p)        & 0xffffu))
 
 typedef struct { float data[16]; } math_matrix_4x4;
 typedef struct { float x, y, width, height, minDepth, maxDepth; } VkViewport;
 typedef struct { struct { int x, y; } offset;
    struct { unsigned width, height; } extent; } VkRect2D;
+typedef union { float float32[4]; } VkClearColorValue;
+typedef union { VkClearColorValue color; } VkClearValue;
+typedef struct { unsigned aspectMask, colorAttachment;
+   VkClearValue clearValue; } VkClearAttachment;
+typedef struct { VkRect2D rect; unsigned baseArrayLayer, layerCount; }
+   VkClearRect;
 struct vk_texture { unsigned dims; };
 struct retro_video_view { unsigned x, y, width, height; };
 typedef struct { unsigned pos, dims; } video_views_rect_t;
@@ -59,6 +70,14 @@ struct vk_draw_triangles
    VkSampler sampler;
    size_t uniform_size;
    unsigned vertices;
+};
+struct vk_draw_quad
+{
+   struct vk_texture *texture;
+   const math_matrix_4x4 *mvp;
+   VkPipeline pipeline;
+   VkSampler sampler;
+   uint64_t color;
 };
 typedef struct { VkFormat format; VkColorSpaceKHR color_space; }
    vulkan_output_t;
@@ -83,6 +102,7 @@ struct vk_target_pass
    VkRenderPass pass;
    VkPipeline premult;
    VkPipeline stock_rect;
+   VkPipeline stock_rect_blend;
    VkFormat format;
 };
 #define VK_VIEWS_TARGETS 4
@@ -91,13 +111,16 @@ typedef struct vk
 {
    math_matrix_4x4 mvp;
    VkViewport vk_vp;
-   struct { VkRect2D scissor; unsigned dirty; VkPipeline pipeline; }
-      tracker;
+   struct { VkRect2D scissor; unsigned dirty; VkPipeline pipeline;
+      VkImageView view; } tracker;
    struct { VkPipeline stock_rect, stock_rect_blend, stock_rect_sdr,
-      stock_rect_hdr; } pipelines;
+      stock_rect_sdr_blend, stock_rect_hdr, alpha_blend,
+      alpha_blend_sdr; } pipelines;
    struct { VkSampler linear, nearest; } samplers;
-   struct { unsigned hdr_stock; VkPipeline stock_pipeline; unsigned alpha;
-      bool fp16; struct vk_target_pass targets[VK_VIEWS_TARGETS]; } views;
+   struct { unsigned hdr_stock; VkPipeline stock_pipeline, blend_pipeline,
+      fill_pipeline; bool target; unsigned alpha; bool fp16;
+      struct vk_target_pass targets[VK_VIEWS_TARGETS]; } views;
+   struct { struct vk_texture blank_texture; } display;
    struct { vulkan_hdr_uniform_t ubo_values; } hdr;
    struct { bool smooth; } video;
    struct { VkBuffer buffer; unsigned num_quads; } quad_ibo;
@@ -115,8 +138,8 @@ struct vulkan_views_draw_ctx
    struct vk_texture *direct;
 };
 
-/* The draw the fake took, and the blend constants set after how many
- * binds */
+/* The draw the fake took, the blend constants set after how many
+ * binds, and the quads and clears a fill took */
 static struct
 {
    VkPipeline pipeline;
@@ -127,6 +150,11 @@ static struct
    unsigned binds;
    float blend[4];
    unsigned blend_sets, blend_binds;
+   VkPipeline quad_pipeline;
+   uint64_t quad_color;
+   unsigned quads;
+   VkRect2D clear_rect;
+   unsigned clears;
 } last;
 static struct vk_vertex vbo_mem[4];
 static unsigned failures;
@@ -171,6 +199,29 @@ static void vkCmdSetBlendConstants(VkCommandBuffer c, const float k[4])
    last.blend_sets++;
    last.blend_binds = last.binds;
 }
+static void vulkan_draw_quad(vk_t *vk, const struct vk_draw_quad *quad)
+{
+   (void)vk;
+   last.quad_pipeline = quad->pipeline;
+   last.quad_color    = quad->color;
+   last.quads++;
+}
+static void vkCmdClearAttachments(VkCommandBuffer c, unsigned n,
+      const VkClearAttachment *a, unsigned rects, const VkClearRect *r)
+{
+   (void)c; (void)n; (void)a; (void)rects;
+   last.clear_rect = r->rect;
+   last.clears++;
+}
+/* rgba16_pack.h's scalar path, little-endian */
+static uint64_t rgba16_pack(const float *rgba)
+{
+   uint64_t r = 0;
+   unsigned i;
+   for (i = 4; i-- > 0; )
+      r = (r << 16) | (uint64_t)(rgba[i] * 65535.0f + 0.5f);
+   return r;
+}
 
 #include "production_stock_hdr.h"
 
@@ -199,6 +250,9 @@ static void setup(void)
    vk.pipelines.stock_rect_blend      = 14;
    vk.pipelines.stock_rect_sdr        = 12;
    vk.pipelines.stock_rect_hdr        = 13;
+   vk.pipelines.stock_rect_sdr_blend  = 15;
+   vk.pipelines.alpha_blend           = 16;
+   vk.pipelines.alpha_blend_sdr       = 17;
    vk.samplers.linear                 = 21;
    vk.samplers.nearest                = 22;
    vk.video.smooth                    = true;
@@ -230,6 +284,15 @@ static void draw(void)
    d.video_info        = &info;
    d.direct            = &frame;
    vulkan_views_draw_direct(&vk, &d, 0, &rect, &rect);
+}
+
+/* A blank inset at x 48, y 24, 16x8 */
+static void fill(unsigned alpha)
+{
+   video_views_rect_t cut;
+   cut.pos  = (48u << 16) | 24u;
+   cut.dims = VIDEO_SCALE_PACK(16, 8);
+   vulkan_views_fill(&vk, &cut, alpha);
 }
 
 /* The uniform shapes stock_rect_hdr.frag reads: SourceSize, where the
@@ -305,11 +368,13 @@ static void test_plain_draw(void)
          (double)last.pipeline);
    expect(t, last.uniform_size == sizeof(math_matrix_4x4) + 4 * sizeof(float),
          "mvp and clamp", (double)last.uniform_size);
+   expect(t, !last.blend_sets, "no constants", last.blend_sets);
    setup();
    vk.flags |= VK_FLAG_SDR_PIPELINE;
    draw();
    expect(t, last.pipeline == vk.pipelines.stock_rect_sdr, "stock_rect_sdr",
          (double)last.pipeline);
+   expect(t, !last.blend_sets, "no constants in FP16", last.blend_sets);
    if (failures == before)
       printf("[pass] %s\n", t);
 }
@@ -336,6 +401,61 @@ static void test_translucent_draw(void)
    draw();
    expect(t, last.pipeline == vk.pipelines.stock_rect && !last.blend_sets,
          "solid without it", (double)last.pipeline);
+   /* In FP16, with sdr_render_pass's twin */
+   setup();
+   vk.flags      |= VK_FLAG_SDR_PIPELINE;
+   vk.views.alpha = 64;
+   draw();
+   expect(t, last.pipeline == vk.pipelines.stock_rect_sdr_blend,
+         "stock_rect_sdr_blend", (double)last.pipeline);
+   expect(t, last.binds == 1 && last.blend_sets == 1
+         && last.blend_binds == 1, "the constants once after the one bind",
+         last.blend_sets);
+   setup();
+   vk.flags                         |= VK_FLAG_SDR_PIPELINE;
+   vk.views.alpha                    = 64;
+   vk.pipelines.stock_rect_sdr_blend = VK_NULL_HANDLE;
+   draw();
+   expect(t, last.pipeline == vk.pipelines.stock_rect_sdr && !last.blend_sets,
+         "solid in FP16 without it", (double)last.pipeline);
+   /* In a second output's pass, with its own */
+   setup();
+   vk.views.target         = true;
+   vk.views.stock_pipeline = 61;
+   vk.views.blend_pipeline = 62;
+   vk.views.alpha          = 64;
+   draw();
+   expect(t, last.pipeline == 62 && last.blend_sets == 1
+         && last.blend_binds == 1 && last.blend[3] == 64.0f / 255.0f,
+         "the output's twin, the constants after the bind",
+         (double)last.pipeline);
+   setup();
+   vk.views.target         = true;
+   vk.views.stock_pipeline = 61;
+   vk.views.blend_pipeline = 62;
+   draw();
+   expect(t, last.pipeline == 61 && !last.blend_sets,
+         "the output's stock_rect when solid", (double)last.pipeline);
+   setup();
+   vk.views.target         = true;
+   vk.views.stock_pipeline = 61;
+   vk.views.alpha          = 64;
+   draw();
+   expect(t, last.pipeline == 61 && !last.blend_sets,
+         "the output's stock_rect without its twin", (double)last.pipeline);
+   setup();
+   vk.views.target = true;
+   vk.views.alpha  = 64;
+   draw();
+   expect(t, !last.draws && !last.binds,
+         "nothing without the output's pipelines", last.draws);
+   /* Encoded, solid */
+   setup();
+   vk.views.hdr_stock = 2;
+   vk.views.alpha     = 64;
+   draw();
+   expect(t, last.pipeline == vk.pipelines.stock_rect_hdr && !last.blend_sets,
+         "stock_rect_hdr, solid", (double)last.pipeline);
    if (failures == before)
       printf("[pass] %s\n", t);
 }
@@ -346,12 +466,102 @@ static void test_target_pipeline_draw(void)
    static const char t[] = "test_target_pipeline_draw";
    unsigned before = failures;
    setup();
+   vk.views.target         = true;
    vk.views.stock_pipeline = 31;
    draw();
    expect(t, last.pipeline == 31, "the output's stock_rect",
          (double)last.pipeline);
    expect(t, last.uniform_size == sizeof(math_matrix_4x4) + 4 * sizeof(float),
          "mvp and clamp", (double)last.uniform_size);
+   if (failures == before)
+      printf("[pass] %s\n", t);
+}
+
+/* Views in a second output's or the headset's pass in another format
+ * draw with its pipelines, or none where it has no pass; in the
+ * window's format, or with none given, with the window's own */
+static void test_target_use(void)
+{
+   static const char t[] = "test_target_use";
+   unsigned before = failures;
+   static const VkFormat window[2] = {
+      VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_UNDEFINED };
+   unsigned i;
+   setup();
+   vk.views.targets[1].pass             = 41;
+   vk.views.targets[1].stock_rect       = 42;
+   vk.views.targets[1].premult          = 43;
+   vk.views.targets[1].stock_rect_blend = 44;
+   vk.views.targets[1].format           = VK_FORMAT_B8G8R8A8_UNORM;
+   for (i = 0; i < 2; i++)
+   {
+      vk.views.target         = true;
+      vk.views.stock_pipeline = 1;
+      vk.views.blend_pipeline = 2;
+      vk.views.fill_pipeline  = 3;
+      vulkan_views_target_use(&vk, window[i]);
+      expect(t, !vk.views.target && !vk.views.stock_pipeline
+            && !vk.views.blend_pipeline && !vk.views.fill_pipeline,
+            "the window's own", i);
+   }
+   vulkan_views_target_use(&vk, VK_FORMAT_B8G8R8A8_UNORM);
+   expect(t, vk.views.target && vk.views.stock_pipeline == 42
+         && vk.views.blend_pipeline == 44 && vk.views.fill_pipeline == 43,
+         "the output's pass's", (double)vk.views.stock_pipeline);
+   vulkan_views_target_use(&vk, VK_FORMAT_R8G8B8A8_UNORM);
+   expect(t, vk.views.target && !vk.views.stock_pipeline
+         && !vk.views.blend_pipeline && !vk.views.fill_pipeline,
+         "none without a pass", (double)vk.views.stock_pipeline);
+   /* As vulkan_views_targets_free leaves them */
+   vulkan_views_target_use(&vk, VK_FORMAT_B8G8R8A8_UNORM);
+   memset(vk.views.targets, 0, sizeof(vk.views.targets));
+   vulkan_views_target_use(&vk, VK_FORMAT_B8G8R8A8_UNORM);
+   expect(t, vk.views.target && !vk.views.stock_pipeline
+         && !vk.views.blend_pipeline && !vk.views.fill_pipeline,
+         "none once freed", (double)vk.views.stock_pipeline);
+   if (failures == before)
+      printf("[pass] %s\n", t);
+}
+
+/* A blank inset below 255 is black at its alpha through the pass's
+ * alpha_blend, or the clear where the pass has none; at 255 the clear,
+ * over the cut */
+static void test_fill_pipeline(void)
+{
+   static const char t[] = "test_fill_pipeline";
+   unsigned before = failures;
+   setup();
+   fill(128);
+   expect(t, last.quads == 1 && last.quad_pipeline == vk.pipelines.alpha_blend,
+         "alpha_blend", (double)last.quad_pipeline);
+   expect(t, last.quad_color == ((uint64_t)(128 * 257) << 48),
+         "black at its alpha", (double)(last.quad_color >> 48));
+   expect(t, !last.clears, "no clear", last.clears);
+   setup();
+   vk.flags |= VK_FLAG_SDR_PIPELINE;
+   fill(128);
+   expect(t, last.quads == 1
+         && last.quad_pipeline == vk.pipelines.alpha_blend_sdr,
+         "alpha_blend_sdr in FP16", (double)last.quad_pipeline);
+   setup();
+   vk.views.target        = true;
+   vk.views.fill_pipeline = 51;
+   fill(128);
+   expect(t, last.quads == 1 && last.quad_pipeline == 51,
+         "the output's premult", (double)last.quad_pipeline);
+   setup();
+   vk.views.target = true;
+   fill(128);
+   expect(t, !last.quads && last.clears == 1,
+         "the clear without the output's", last.quads);
+   setup();
+   fill(255);
+   expect(t, !last.quads && last.clears == 1, "solid: the clear",
+         last.quads);
+   expect(t, last.clear_rect.offset.x == 48 && last.clear_rect.offset.y == 24
+         && last.clear_rect.extent.width == 16
+         && last.clear_rect.extent.height == 8, "over the cut",
+         last.clear_rect.offset.x);
    if (failures == before)
       printf("[pass] %s\n", t);
 }
@@ -458,5 +668,7 @@ int main(void)
    test_window_decision();
    test_target_pipeline_draw();
    test_sdr_window_decision();
+   test_fill_pipeline();
+   test_target_use();
    return failures ? 1 : 0;
 }

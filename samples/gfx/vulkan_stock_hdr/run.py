@@ -50,9 +50,11 @@ cut = '\n\n'.join(function(source, name) for name in (
         'vulkan_views_draw_stock',
         'vulkan_views_vp',
         'vulkan_views_sci',
+        'vulkan_views_fill',
         'vulkan_views_draw_direct',
         'vulkan_window_encodes',
         'vulkan_views_target_stock',
+        'vulkan_views_target_use',
         'vulkan_window_stock_sdr',
         'vulkan_window_stock_encodes'))
 
