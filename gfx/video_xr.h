@@ -128,6 +128,7 @@ typedef struct video_xr_inset
    bool no_input;
    bool image;                 /* as video_xr_slot_t's */
    uint8_t image_gen;
+   uint8_t alpha;              /* its opacity; 255 solid */
    uintptr_t image_tex;
 } video_xr_inset_t;
 

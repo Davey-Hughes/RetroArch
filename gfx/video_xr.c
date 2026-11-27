@@ -461,6 +461,7 @@ static void video_xr_place_insets(const video_xr_params_t *p,
          in->screen   = i;
          in->blank    = (map->blank & (1u << i)) != 0;
          in->no_input = (map->no_input & (1u << i)) != 0;
+         in->alpha    = map->opacity[i];
          if (map->image & (1u << i))
          {
             in->image     = true;

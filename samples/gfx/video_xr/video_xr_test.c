@@ -8823,6 +8823,24 @@ static void test_xr_inset_blank(void)
    CHECK(set.num_quads == 1 && !set.quads[0].no_input);
 }
 
+/* An inset carries its screen's opacity. */
+static void test_place_insets_alpha(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+
+   map_ds_inset(&map);
+   params_init(&p, &map);
+   map.opacity[1] = 128;
+   video_xr_place(&p, &set);
+   CHECK(set.num_insets == 1 && set.insets[0].alpha == 128);
+
+   map.opacity[1] = 255;
+   video_xr_place(&p, &set);
+   CHECK(set.num_insets == 1 && set.insets[0].alpha == 255);
+}
+
 /* A window's inset: where its view lies in the window. */
 static void test_xr_place_window_inset(void)
 {
@@ -9255,6 +9273,7 @@ int main(void)
    test_xr_inset_px();
    test_xr_auto_no_inset();
    test_xr_inset_blank();
+   test_place_insets_alpha();
    test_xr_place_window_inset();
    test_xr_image_spot();
    test_xr_image_slot();
