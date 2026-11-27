@@ -57,8 +57,9 @@ import zlib
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, '..', '..', '..'))
 sys.path.insert(0, os.path.join(ROOT, 'samples', 'cores', 'video_views', 'e2e'))
-from run import (CORE, IMAGE_MIRRORED, IMAGE_QUADRANTS,  # noqa: E402
-                 free_port, isolated_env, read_png, send, write_cfg)
+from run import (CORE, IMAGE_HALF, IMAGE_MIRRORED,  # noqa: E402
+                 IMAGE_QUADRANTS, free_port, isolated_env, read_png, send,
+                 write_cfg)
 
 PRESET = os.path.join(HERE, 'output_size.slangp')
 LAYER_DIR = os.path.join(ROOT, 'samples', 'openxr', 'test_layer')
@@ -4229,10 +4230,16 @@ DS_INSET_OUT = ((0.5, 0.5), (0.734, 0.875), (0.875, 0.734))
 AIM_DS_INSET = 'aim right 0.2 -0.4 -0.3 0.6 -0.45 -1.8'  # screen 0, 0.875 0.875
 
 
-def check_screens_over(blank):
+def check_screens_over(blank, half=False):
     """The ds map's screen 1 sent OVER screen 0 has no quad: screen 0's
     image shows it in its corner, black when it is BLANK too, with
-    screen 0 around it. Screen 0 is where it is with both shown."""
+    screen 0 around it, at half opacity over GREEN when half. Screen 0
+    is where it is with both shown."""
+    if half:
+        inset = (0, 128, 0) if blank else (128, 255, 0)
+    else:
+        inset = BLACK if blank else YELLOW
+
     def check(res):
         fr = last_snap(res)
         if not fr:
@@ -4249,8 +4256,7 @@ def check_screens_over(blank):
                              % ([(x['pose'][:3], x['size']) for x in top],
                                 DS_TOP, DS_SIZE)]
         path = image(res, fr, top[0])
-        for points, want in ((DS_INSET_OUT, GREEN),
-                             (DS_INSET_IN, BLACK if blank else YELLOW)):
+        for points, want in ((DS_INSET_OUT, GREEN), (DS_INSET_IN, inset)):
             for fx, fy in points:
                 c, _ = colour(path, fx, fy)
                 if not near(c, want):
@@ -4318,26 +4324,27 @@ def check_screens_image(colours):
     return check
 
 
-def check_screens_image_over(res):
+def check_screens_image_over(colours=IMAGE_QUADRANTS):
     """image_over: screen 2 has no quad; Top's image shows the picture in
-    the inset's rect, GREEN around it."""
-    errors = image_status(res, '1')
-    fr = last_snap(res)
-    if not fr:
-        return errors + no_quads(res)
-    q = [x for x in quads(fr) if not x['flags'] & BLEND]
-    if len(q) != 1 or not sized(q[0], DS_SIZE):
-        return errors + ['want Top\'s quad alone, got %s'
-                         % [(x['pose'][:3], x['size']) for x in q]]
-    path = image(res, fr, q[0])
-    errors += picture_errors(path, DS_IMAGE_INSET, IMAGE_QUADRANTS,
-                             'the inset')
-    for fx, fy in DS_IMAGE_OUT:
-        c, _ = colour(path, fx, fy)
-        if not near(c, GREEN):
-            errors.append('Top\'s image at %g,%g shows %s, want %s'
-                          % (fx, fy, c, GREEN))
-    return errors
+    the inset's rect, its quadrants in colours, GREEN around it."""
+    def check(res):
+        errors = image_status(res, '1')
+        fr = last_snap(res)
+        if not fr:
+            return errors + no_quads(res)
+        q = [x for x in quads(fr) if not x['flags'] & BLEND]
+        if len(q) != 1 or not sized(q[0], DS_SIZE):
+            return errors + ['want Top\'s quad alone, got %s'
+                             % [(x['pose'][:3], x['size']) for x in q]]
+        path = image(res, fr, q[0])
+        errors += picture_errors(path, DS_IMAGE_INSET, colours, 'the inset')
+        for fx, fy in DS_IMAGE_OUT:
+            c, _ = colour(path, fx, fy)
+            if not near(c, GREEN):
+                errors.append('Top\'s image at %g,%g shows %s, want %s'
+                              % (fx, fy, c, GREEN))
+        return errors
+    return check
 
 
 def check_screens_image_gl(res):
@@ -4445,6 +4452,12 @@ SCREENS_CASES = [
     {'name': 'screens-over-blank', 'map': 'ds',
      'options': {'video_views_test_screens': 'over_blank'}, 'steps': SETTLE,
      'check': check_screens_over(True)},
+    {'name': 'screens-over-half', 'map': 'ds',
+     'options': {'video_views_test_screens': 'over_half'}, 'steps': SETTLE,
+     'check': check_screens_over(False, half=True)},
+    {'name': 'screens-over-blank-half', 'map': 'ds',
+     'options': {'video_views_test_screens': 'over_blank_half'},
+     'steps': SETTLE, 'check': check_screens_over(True, half=True)},
     {'name': 'screens-over-laser', 'map': 'ds',
      'options': {'video_views_test_screens': 'over'},
      'settings': {'video_openxr_laser': '1'},
@@ -4455,7 +4468,10 @@ SCREENS_CASES = [
      'check': check_screens_image(IMAGE_QUADRANTS)},
     {'name': 'screens-image-over', 'map': 'ds',
      'options': {'video_views_test_screens': 'image_over'}, 'steps': SETTLE,
-     'check': check_screens_image_over},
+     'check': check_screens_image_over()},
+    {'name': 'screens-image-over-half', 'map': 'ds',
+     'options': {'video_views_test_screens': 'image_over_half'},
+     'steps': SETTLE, 'check': check_screens_image_over(IMAGE_HALF)},
     # The mirrored picture under a new serial, on a refresh with NULL data.
     {'name': 'screens-image-null', 'map': 'ds',
      'options': {'video_views_test_screens': 'image_null'}, 'steps': SETTLE,
@@ -9233,13 +9249,17 @@ GL_CHECKS = {
 # What a lane cannot run: the unfocus helper sends an X event, and the
 # Wayland lane's window is not an X one. glcore's GLX lane runs only a
 # smoke test of edit mode, whose work differs from EGL's in nothing but
-# the binding.
-GL_SKIP = {'glcore-egl': ('focus',),
+# the binding. glcore's and gl's headset insets draw solid.
+SCREENS_HALF = tuple(c['name'] for c in SCREENS_CASES
+                     if c['name'].endswith('-half'))
+GL_SKIP = {'glcore-egl': ('focus',) + SCREENS_HALF,
            'glcore-glx': tuple(n for n in GL_EDIT + GL_EDIT_MENU
-                               if n not in ('edit-grab', 'edit-command')),
+                               if n not in ('edit-grab', 'edit-command'))
+           + SCREENS_HALF,
            # gl reports FALLBACK while a headset runs: screens-image-gl.
            'gl-egl': tuple(c['name'] for c in SCREENS_CASES
-                           if c['name'].startswith('screens-image'))}
+                           if c['name'].startswith('screens-image'))
+           + SCREENS_HALF}
 # A lane that runs only these of its driver's cases: gl's other binding.
 GL_ONLY = {'gl-glx': ('3ds-stereo', 'no-map', 'menu', 'menu-closes',
                       'tracked', 'tracked-menu', 'tracked-recenter',
