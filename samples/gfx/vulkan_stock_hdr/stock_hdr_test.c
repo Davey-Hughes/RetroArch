@@ -850,6 +850,14 @@ static void test_encoded_solid(void)
    expect(t, last.pipeline == vk.pipelines.stock_rect_hdr && !last.blend_sets,
          "the picture solid", (double)last.pipeline);
    setup();
+   vk.flags        |= VK_FLAG_SDR_PIPELINE;
+   vk.views.encoded = 2;
+   vk.views.alpha   = 64;
+   image();
+   expect(t, last.pipeline == vk.pipelines.stock_rect_hdr_sdr
+         && !last.blend_sets, "the picture solid in FP16",
+         (double)last.pipeline);
+   setup();
    vk.views.encoded = 2;
    fill(128);
    expect(t, !last.quads && last.clears == 1, "the inset cleared",
