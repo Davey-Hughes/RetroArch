@@ -14661,10 +14661,12 @@ static void vulkan_xr_draw_screen(vk_t *vk, unsigned s,
          }
          /* The final pass is cut to its viewport. */
          vulkan_views_vp(&cut, &ivp);
-         if (vk->views.alpha && vk->xr.stock_insets)
+         if (     vk->views.alpha && vk->xr.stock_insets
+               && (!vk->views.target || vk->views.stock_pipeline))
          {
-            /* Its view's copy whole; a preset's stays solid, as the
-             * window's do */
+            /* Its view's copy whole; a preset's stays solid through its
+             * chain, as the window's do, and so does one where this
+             * pass has no stock_rect */
             VkRect2D sci;
             struct retro_video_view v;
             struct vk_texture *src = &vk->swapchain[vk->views.last_index]

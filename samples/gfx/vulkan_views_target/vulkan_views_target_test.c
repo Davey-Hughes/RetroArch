@@ -2011,7 +2011,8 @@ static void test_xr_draw_image_target(void)
  * and, with the stock chains, a view one from its copy whole, each
  * through a blend; a preset's view inset stays solid through its chain.
  * The blank one takes the headset's projection, not the menu's. Under
- * HDR output each draws with the headset pass's pipelines. */
+ * HDR output each draws with the headset pass's pipelines, and the view
+ * one solid through its chain where that pass has no stock_rect. */
 static void test_xr_draw_inset_alpha(void)
 {
    vk_t vk;
@@ -2023,7 +2024,7 @@ static void test_xr_draw_inset_alpha(void)
    unsigned dims = VIDEO_SCALE_PACK(64, 32);
    memset(chains, 0, sizeof(chains));
    chains[1] = XR_FRAME_CHAIN;
-   for (i = 0; i < 3; i++)
+   for (i = 0; i < 4; i++)
    {
       init(&vk, &context, &chain);
       memset(&info, 0, sizeof(info));
@@ -2032,7 +2033,7 @@ static void test_xr_draw_inset_alpha(void)
          info.shader_active = true;
          vk.filter_chain    = XR_FRAME_CHAIN;
       }
-      else if (i == 2)
+      else if (i >= 2)
       {
          context.flags                  = VK_CTX_FLAG_HDR_ENABLE;
          context.swapchain_format       = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
@@ -2043,6 +2044,11 @@ static void test_xr_draw_inset_alpha(void)
          vk.xr.view_format              = VK_FORMAT_B8G8R8A8_UNORM;
          vk.xr.render_pass              = vulkan_views_target_pass(&vk,
                vk.xr.view_format, true);
+         if (i == 3)
+         {
+            vk.views.targets[0].stock_rect       = VK_NULL_HANDLE;
+            vk.views.targets[0].stock_rect_blend = VK_NULL_HANDLE;
+         }
       }
       vk.views.last_index                 = 1;
       vk.swapchain[1].view_images[1].dims = VIDEO_SCALE_PACK(20, 10);
@@ -2074,6 +2080,11 @@ static void test_xr_draw_inset_alpha(void)
          CHECK(!vk.xr.stock_insets);
          CHECK(viewport_passes == 1 && stock_draws == 0);
       }
+      else if (i == 3)
+      {
+         CHECK(vk.xr.stock_insets && vk.views.targets[0].pass);
+         CHECK(viewport_passes == 1 && stock_draws == 0);
+      }
       else
       {
          CHECK(vk.xr.stock_insets);
@@ -2084,9 +2095,9 @@ static void test_xr_draw_inset_alpha(void)
          CHECK(stock_vp.x == 48.0f && stock_vp.y == 24.0f
                && stock_vp.width == 16.0f && stock_vp.height == 8.0f);
       }
-      if (i == 2)
+      if (i >= 2)
          CHECK(fills_targeted == 1 && pictures_targeted == 1
-               && stock_targeted == 1);
+               && stock_targeted == (i == 2 ? 1u : 0u));
       CHECK(vk.views.alpha == 0);
    }
 }
