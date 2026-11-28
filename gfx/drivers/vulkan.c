@@ -513,7 +513,7 @@ typedef struct vk
       unsigned last_index;
       unsigned copied;
       /* While stock views draw straight into an HDR swapchain, or an
-       * image screen into a target holding encoded values, encoded: the
+       * image screen into a target holding encoded values, hdr_stock: the
        * HDR pass mode plus one; 0 otherwise. hdr_stock_logged: the last
        * value the stock views logged. */
       unsigned hdr_stock;
