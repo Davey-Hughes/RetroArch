@@ -110,9 +110,12 @@ void video_driver_update_viewport(struct video_viewport *vp, bool force_full,
       bool keep_aspect, bool y_down)
 { (void)vp; (void)force_full; (void)keep_aspect; (void)y_down; }
 unsigned video_driver_window_generation(void) { return 0; }
+int video_driver_get_screen_names(video_views_names_t *out)
+{ memset(out, 0, sizeof(*out)); return 0; }
 void video_driver_window_layout_screens(const video_windows_frame_t *frame,
-      unsigned screens, unsigned dims, video_views_layout_t *out)
-{ (void)frame; (void)screens; (void)dims; (void)out; }
+      const video_views_layout_settings_t *settings, unsigned screens,
+      unsigned dims, video_views_layout_t *out)
+{ (void)frame; (void)settings; (void)screens; (void)dims; (void)out; }
 const char *video_shader_get_current_shader_preset(void) { return NULL; }
 enum rarch_shader_type video_shader_get_type_from_ext(const char *ext, bool *is_preset)
 { (void)ext; (void)is_preset; return RARCH_SHADER_NONE; }
@@ -122,6 +125,14 @@ bool video_thread_hw_allowed(void) { return false; }
 uint64_t video_thread_swap_count(void) { return 0; }
 uintptr_t video_thread_texture_handle(void *data, custom_command_method_t func)
 { (void)data; (void)func; return 0; }
+unsigned video_window_title_screen(const video_window_request_t *request)
+{
+   unsigned s;
+   for (s = 0; s < RETRO_VIDEO_VIEWS_MAX; s++)
+      if (request->screens & (1u << s))
+         return s;
+   return request->screen;
+}
 void video_windows_held_saved(video_windows_held_t *held, unsigned w,
       unsigned pos, unsigned dims, bool moved)
 { (void)held; (void)w; (void)pos; (void)dims; (void)moved; }

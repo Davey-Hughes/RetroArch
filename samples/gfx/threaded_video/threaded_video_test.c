@@ -44,6 +44,7 @@
 #include "../../../gfx/video_driver.h"
 #include "../../../gfx/gfx_instrument.h"
 #include "../../../gfx/video_thread_wrapper.h"
+#include "../../../gfx/video_screen_images.h"
 #ifdef HAVE_TEMPORAL_UPSCALER
 #include "../../../gfx/video_upscaler.h"
 #endif
@@ -11296,6 +11297,899 @@ static void lane_surface_update(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Lane: image screens across a driver restart                         */
+/*   An image screen's update still out when the driver restarts -     */
+/*   done but not delivered, or not yet taken by the video thread -    */
+/*   leaves no texture of the old driver loaded.                       */
+/* ------------------------------------------------------------------ */
+
+static retro_atomic_int_t imgrst_holding;
+static retro_atomic_int_t imgrst_cmd;
+
+/* Video thread: keeps the thread from the in-list until a command is
+ * sent, and says which. Bounded, so a command that never comes fails
+ * the lane rather than hanging it. */
+static uintptr_t imgrst_hold(void *driver_data,
+      const video_poke_interface_t *poke, void *user)
+{
+   thread_video_t *thr = (thread_video_t*)user;
+   unsigned spun;
+   (void)driver_data;
+   (void)poke;
+   retro_atomic_store_release_int(&imgrst_holding, 1);
+   for (spun = 0; spun < 10000
+         && retro_atomic_load_acquire_int(&thr->send_cmd) == CMD_VIDEO_NONE;
+         spun++)
+      retro_sleep(1);
+   retro_atomic_store_release_int(&imgrst_cmd,
+         retro_atomic_load_acquire_int(&thr->send_cmd));
+   retro_atomic_store_release_int(&imgrst_holding, 0);
+   return 0;
+}
+
+/* Screen 0's picture as SET_VIDEO_VIEWS hands it in, then a shown
+ * frame's upload */
+static bool imgrst_show(unsigned serial)
+{
+   static uint32_t                        pixels[16 * 16];
+   static struct retro_video_screen_image im;
+   static struct retro_video_screen       screen;
+   static struct retro_video_views        in;
+   static video_views_map_t               map;
+   unsigned left_out = 0;
+   memset(&in,  0, sizeof(in));
+   memset(&map, 0, sizeof(map));
+   memset(pixels, (int)serial, sizeof(pixels));
+   im.data        = pixels;
+   im.width       = 16;
+   im.height      = 16;
+   im.pitch       = 16 * sizeof(uint32_t);
+   im.format      = RETRO_PIXEL_FORMAT_XRGB8888;
+   im.serial      = serial;
+   screen.image   = &im;
+   in.screens     = &screen;
+   in.num_screens = 1;
+   map.image      = 1;
+   if (!video_screen_images_set(&in, &map, &left_out) || left_out)
+      return false;
+   video_screen_images_frame(&map, 1, 0);
+   return true;
+}
+
+static void lane_screen_image_restart(void)
+{
+   static video_thread_async_job_t  job;
+   static video_thread_async_load_t hold;
+   unsigned had = failures;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   unsigned step, i;
+
+   set_threaded_via_setting(true);
+   run_frames(3);
+   expect_wrapper(true, "image restart lane");
+
+   for (step = 0; step < 3; step++)
+   {
+      static const char *const hows[3] =
+            { "not delivered", "not taken", "a load not taken" };
+      const char *how     = hows[step];
+      thread_video_t *thr = (thread_video_t*)video_st->data;
+      CHECK(surftex_install(), "image restart lane: no texture back end");
+      if (step < 2)
+      {
+         /* The first picture is a load, delivered at the next frame */
+         CHECK(imgrst_show(step * 2 + 1),
+               "image restart lane: picture refused");
+         run_frames(2);
+         video_thread_wait_idle();
+         CHECK(surftex_loads == 1 && surftex_live_count() == 1,
+               "image restart lane, %s: %u loads, %u live after the first "
+               "picture", how, surftex_loads, surftex_live_count());
+      }
+      if (step)
+      {
+         memset(&hold, 0, sizeof(hold));
+         job.run          = imgrst_hold;
+         job.user         = thr;
+         hold.img         = &job;
+         hold.kind        = VIDEO_THREAD_ASYNC_JOB;
+         hold.lent_idx[0] = hold.lent_idx[1] = -1;
+         retro_atomic_store_release_int(&imgrst_cmd, CMD_VIDEO_NONE);
+         CHECK(video_thread_async_post(&hold),
+               "image restart lane: the hold was refused");
+         for (i = 0; i < 2000
+               && !retro_atomic_load_acquire_int(&imgrst_holding); i++)
+            retro_sleep(1);
+         CHECK(retro_atomic_load_acquire_int(&imgrst_holding),
+               "image restart lane: the video thread never took the hold");
+      }
+      /* The next picture updates that texture in place, or is the
+       * first on this driver */
+      CHECK(imgrst_show(step * 2 + 2), "image restart lane: picture refused");
+      if (!step)
+      {
+         /* No frame runs before the restart to deliver it */
+         for (i = 0; i < 2000 && mpsc_stack_empty(&thr->async.out); i++)
+            retro_sleep(1);
+         CHECK(!mpsc_stack_empty(&thr->async.out),
+               "image restart lane: the update never completed");
+      }
+      command_event(CMD_EVENT_REINIT, NULL);
+      /* The back end went with the old driver */
+      surftex_mode  = 0;
+      surftex_inner = NULL;
+      if (step)
+         CHECK(retro_atomic_load_acquire_int(&imgrst_cmd) == CMD_FREE,
+               "image restart lane: command %d reached the held thread "
+               "before CMD_FREE", retro_atomic_load_acquire_int(&imgrst_cmd));
+      CHECK(surftex_updates == (step ? 0u : 1u),
+            "image restart lane, %s: the update ran %u times", how,
+            surftex_updates);
+      CHECK(surftex_live_count() == 0 && surftex_unloads == surftex_loads,
+            "image restart lane, %s: %u textures of the old driver left "
+            "loaded (%u loads, %u unloads)", how, surftex_live_count(),
+            surftex_loads, surftex_unloads);
+      expect_wrapper(true, "image restart lane, after the restart");
+   }
+
+   video_screen_images_clear();
+   set_threaded_via_setting(false);
+   run_frames(2);
+
+   if (failures == had)
+      fprintf(stderr, "[pass] image restart lane (an update undelivered, "
+            "one not taken, and a load not taken)\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* Lanes: image screens under the wrapper                              */
+/*   A core's picture goes up through gfx_surface's post alone: no     */
+/*   texture call on the main thread, nothing waits. A slot an upload  */
+/*   still reads is neither lent nor written; a texture replaced goes  */
+/*   only after the frames that name it, and never while the redraw's  */
+/*   box names it.                                                     */
+/* ------------------------------------------------------------------ */
+
+#define IMGLANE_TAG    0x6000
+#define IMGLANE_MAX    128
+#define IMGLANE_FRAMES 256
+
+static const video_driver_t          *imglane_inner;
+static video_driver_t                 imglane_driver;
+static const video_poke_interface_t  *imglane_base;
+static video_poke_interface_t         imglane_poke;
+static const video_poke_interface_t  *imglane_saved_poke;
+static bool                           imglane_saved_images;
+/* 0 down, 1 under the wrapper, 2 on the driver's own poke */
+static int                            imglane_mode;
+static uintptr_t                      imglane_main;
+/* The video thread's; the main thread reads them once the ring is
+ * drained, or once imglane_unloads or imglane_landings has moved */
+static uint32_t      imglane_content[IMGLANE_MAX + 1];
+static int           imglane_unload_drawn[IMGLANE_MAX + 1];
+static unsigned      imglane_loads;
+static uint32_t      imglane_landed[IMGLANE_FRAMES];
+static uintptr_t     imglane_drawn_tex[IMGLANE_FRAMES];
+static uint8_t       imglane_drawn_gen[IMGLANE_FRAMES];
+static uint32_t      imglane_drawn_content[IMGLANE_FRAMES];
+static retro_atomic_int_t imglane_landings;
+static retro_atomic_int_t imglane_drawn;
+static retro_atomic_int_t imglane_unloads;
+/* By tag, loaded and not unloaded: the main thread waits on it */
+static retro_atomic_int_t imglane_live[IMGLANE_MAX + 1];
+/* Texture calls that made the main thread wait: on it, or marshalled */
+static retro_atomic_int_t imglane_waits;
+static retro_atomic_int_t imglane_unload_main;
+/* Frames drawn naming a texture not loaded */
+static retro_atomic_int_t imglane_dead;
+/* Unloads of a texture the redraw's box named */
+static retro_atomic_int_t imglane_boxed;
+static retro_atomic_int_t imglane_holding;
+static retro_atomic_int_t imglane_hold_go;
+static uint32_t           imglane_px[48 * 32];
+
+static bool imglane_ours(uintptr_t id)
+{
+   return id > IMGLANE_TAG && id <= IMGLANE_TAG + IMGLANE_MAX;
+}
+
+static void imglane_call(bool threaded)
+{
+   if (threaded || sthread_get_current_thread_id() == imglane_main)
+      retro_atomic_fetch_add_int(&imglane_waits, 1);
+}
+
+/* A picture's serial is in every channel of every pixel, so either
+ * channel order reads it back */
+static void imglane_land(uintptr_t id, const struct texture_image *ti)
+{
+   int n = retro_atomic_load_acquire_int(&imglane_landings);
+   imglane_content[id - IMGLANE_TAG] = ti->pixels[0] & 0xff;
+   if (n < IMGLANE_FRAMES)
+      imglane_landed[n] = ti->pixels[0] & 0xff;
+   retro_atomic_store_release_int(&imglane_landings, n + 1);
+}
+
+static uintptr_t imglane_load(void *data, void *img, bool threaded,
+      enum texture_filter_type filter)
+{
+   uintptr_t id;
+   (void)data;
+   (void)filter;
+   imglane_call(threaded);
+   if (imglane_loads >= IMGLANE_MAX)
+      return 0;
+   id = IMGLANE_TAG + ++imglane_loads;
+   retro_atomic_store_release_int(&imglane_live[id - IMGLANE_TAG], 1);
+   imglane_land(id, (const struct texture_image*)img);
+   return id;
+}
+
+static enum video_texture_update imglane_update(void *data, uintptr_t id,
+      const struct texture_image *ti, bool threaded)
+{
+   (void)data;
+   imglane_call(threaded);
+   if (!imglane_ours(id) || !retro_atomic_load_acquire_int(
+         &imglane_live[id - IMGLANE_TAG]))
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
+   imglane_land(id, ti);
+   return VIDEO_TEXTURE_UPDATE_DONE;
+}
+
+static void imglane_unload(void *data, bool threaded, uintptr_t id)
+{
+   static video_views_map_t boxed;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   if (!imglane_ours(id))
+   {
+      if (imglane_base && imglane_base->unload_texture)
+         imglane_base->unload_texture(data, threaded, id);
+      return;
+   }
+   imglane_call(threaded);
+   if (sthread_get_current_thread_id() == imglane_main)
+      retro_atomic_fetch_add_int(&imglane_unload_main, 1);
+   retro_seqlatch_read(&video_st->views_core_box.seq,
+         video_st->views_core_box.words, &boxed, sizeof(boxed));
+   if (boxed.image_tex[2] == id)
+      retro_atomic_fetch_add_int(&imglane_boxed, 1);
+   retro_atomic_store_release_int(&imglane_live[id - IMGLANE_TAG], 0);
+   imglane_unload_drawn[id - IMGLANE_TAG] =
+         retro_atomic_load_acquire_int(&imglane_drawn);
+   retro_atomic_fetch_add_int(&imglane_unloads, 1);
+}
+
+static uint32_t imglane_flags(void *data)
+{
+   uint32_t flags = (imglane_base && imglane_base->get_flags)
+         ? imglane_base->get_flags(data) : 0;
+   return flags | (1u << GFX_CTX_FLAGS_VIDEO_VIEWS);
+}
+
+static void imglane_build(const video_poke_interface_t *base)
+{
+   imglane_base = base;
+   if (base)
+      imglane_poke = *base;
+   else
+      memset(&imglane_poke, 0, sizeof(imglane_poke));
+   imglane_poke.load_texture   = imglane_load;
+   imglane_poke.update_texture = imglane_update;
+   imglane_poke.unload_texture = imglane_unload;
+   imglane_poke.get_flags      = imglane_flags;
+}
+
+static void imglane_get_poke(void *data, const video_poke_interface_t **iface)
+{
+   const video_poke_interface_t *base = NULL;
+   imglane_inner->poke_interface(data, &base);
+   imglane_build(base);
+   *iface = &imglane_poke;
+}
+
+/* Video thread: what each frame drawn names for screen 2 */
+static bool imglane_frame(void *data, const void *frame, unsigned dims,
+      uint64_t frame_count, unsigned pitch, const char *msg,
+      video_frame_info_t *video_info)
+{
+   int n         = retro_atomic_load_acquire_int(&imglane_drawn);
+   uintptr_t tex = video_info ? video_info->views.image_tex[2] : 0;
+   if (n < IMGLANE_FRAMES)
+   {
+      imglane_drawn_tex[n]     = tex;
+      imglane_drawn_gen[n]     = video_info ? video_info->views.image_gen[2] : 0;
+      imglane_drawn_content[n] = imglane_ours(tex)
+            ? imglane_content[tex - IMGLANE_TAG] : 0;
+   }
+   if (tex && (!imglane_ours(tex) || !retro_atomic_load_acquire_int(
+         &imglane_live[tex - IMGLANE_TAG])))
+      retro_atomic_fetch_add_int(&imglane_dead, 1);
+   retro_atomic_store_release_int(&imglane_drawn, n + 1);
+   return imglane_inner->frame(data, frame, dims, frame_count, pitch, msg,
+         video_info);
+}
+
+/* The lane driver in place: the wrapped driver's copy under the
+ * wrapper, else the driver's own poke. views_images is cached at init,
+ * before the swap, so it is set here. */
+static bool imglane_install(void)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   unsigned i;
+   if (imglane_mode || !video_st->data)
+      return false;
+   for (i = 0; i <= IMGLANE_MAX; i++)
+      retro_atomic_store_release_int(&imglane_live[i], 0);
+   memset(imglane_content, 0, sizeof(imglane_content));
+   memset(imglane_unload_drawn, 0, sizeof(imglane_unload_drawn));
+   memset(imglane_landed, 0, sizeof(imglane_landed));
+   memset(imglane_drawn_tex, 0, sizeof(imglane_drawn_tex));
+   imglane_loads = 0;
+   retro_atomic_store_release_int(&imglane_landings, 0);
+   retro_atomic_store_release_int(&imglane_drawn, 0);
+   retro_atomic_store_release_int(&imglane_unloads, 0);
+   retro_atomic_store_release_int(&imglane_waits, 0);
+   retro_atomic_store_release_int(&imglane_unload_main, 0);
+   retro_atomic_store_release_int(&imglane_dead, 0);
+   retro_atomic_store_release_int(&imglane_boxed, 0);
+   imglane_main = sthread_get_current_thread_id();
+   if (video_st->thread_wrapper_active)
+   {
+      thread_video_t *thr = (thread_video_t*)video_st->data;
+      if (!thr->driver)
+         return false;
+      video_thread_wait_idle();
+      imglane_inner                 = thr->driver;
+      imglane_driver                = *thr->driver;
+      imglane_driver.frame          = imglane_frame;
+      imglane_driver.poke_interface = imglane_get_poke;
+      imglane_driver.views_images   = true;
+      set_driver(thr, &imglane_driver);
+      set_poke_from(thr, &imglane_driver);
+      imglane_mode = 1;
+   }
+   else
+   {
+      imglane_saved_poke = video_st->poke;
+      imglane_build(video_st->poke);
+      video_st->poke     = &imglane_poke;
+      imglane_mode       = 2;
+   }
+   imglane_saved_images   = video_st->views_images;
+   video_st->views_images = true;
+   return true;
+}
+
+/* The map and the store gone, their textures unloaded, the driver back */
+static void imglane_remove(void)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   unsigned i;
+   video_driver_clear_views();
+   run_frames(2);
+   video_thread_wait_idle();
+   for (i = 0; i < 2000 && retro_atomic_load_acquire_int(&imglane_unloads)
+         < (int)imglane_loads; i++)
+      retro_sleep(1);
+   CHECK(retro_atomic_load_acquire_int(&imglane_unloads) == (int)imglane_loads,
+         "image lane: %d of %u textures unloaded at the end",
+         retro_atomic_load_acquire_int(&imglane_unloads), imglane_loads);
+   if (imglane_mode == 1 && video_st->thread_wrapper_active)
+   {
+      thread_video_t *thr = (thread_video_t*)video_st->data;
+      video_thread_wait_idle();
+      set_driver(thr, imglane_inner);
+      set_poke_from(thr, imglane_inner);
+   }
+   else if (imglane_mode == 2)
+      video_st->poke = imglane_saved_poke;
+   video_st->views_images = imglane_saved_images;
+   imglane_mode           = 0;
+}
+
+static bool imglane_get(struct retro_video_screen_buffer *buf,
+      unsigned width, unsigned height)
+{
+   memset(buf, 0, sizeof(*buf));
+   buf->screen = 2;
+   buf->width  = width;
+   buf->height = height;
+   buf->format = RETRO_PIXEL_FORMAT_XRGB8888;
+   return runloop_environment_cb(RETRO_ENVIRONMENT_GET_VIDEO_SCREEN_BUFFER,
+         buf);
+}
+
+static void imglane_fill(uint32_t *px, size_t n, unsigned serial)
+{
+   size_t i;
+   for (i = 0; i < n; i++)
+      px[i] = (serial & 0xff) * 0x00010101u;
+}
+
+/* "dsi" in the core's 320x240 frame: two stacked screens and screen 2's
+ * picture, sent from the core's environment */
+static bool imglane_set(const void *data, unsigned width, unsigned height,
+      unsigned serial)
+{
+   static struct retro_video_view         views[2];
+   static struct retro_video_screen       screens[3];
+   static struct retro_video_screen_image im;
+   struct retro_video_views map;
+   memset(views, 0, sizeof(views));
+   views[0].width  = views[1].width  = 320;
+   views[0].height = views[1].height = 120;
+   views[1].y      = 120;
+   views[1].screen = 1;
+   memset(screens, 0, sizeof(screens));
+   screens[2].image = &im;
+   memset(&im, 0, sizeof(im));
+   im.data          = data;
+   im.width         = width;
+   im.height        = height;
+   im.pitch         = width * sizeof(uint32_t);
+   im.format        = RETRO_PIXEL_FORMAT_XRGB8888;
+   im.serial        = serial;
+   memset(&map, 0, sizeof(map));
+   map.views        = views;
+   map.num_views    = 2;
+   map.flags        = RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   map.screens      = screens;
+   map.num_screens  = 3;
+   return runloop_environment_cb(RETRO_ENVIRONMENT_SET_VIDEO_VIEWS, &map);
+}
+
+/* One frame, drawn before this returns; the texture it named */
+static uintptr_t imglane_frame_drawn(void)
+{
+   int n;
+   run_frames(1);
+   video_thread_wait_idle();
+   n = retro_atomic_load_acquire_int(&imglane_drawn);
+   return (n > 0 && n <= IMGLANE_FRAMES) ? imglane_drawn_tex[n - 1] : 0;
+}
+
+/* The next core run sends a frame, not a dupe: the first one that
+ * arranges a map */
+static void imglane_align(void)
+{
+   dylib_t lib           = runloop_state_get_ptr()->lib_handle;
+   unsigned (*runs)(void) = lib
+      ? (unsigned (*)(void))dylib_proc(lib, "harness_core_runs") : NULL;
+   if (runs && (runs() + 1) % 3 == 0)
+      run_frames(1);
+}
+
+/* The next core run sends a dupe */
+static void imglane_align_dupe(void)
+{
+   dylib_t lib           = runloop_state_get_ptr()->lib_handle;
+   unsigned (*runs)(void) = lib
+      ? (unsigned (*)(void))dylib_proc(lib, "harness_core_runs") : NULL;
+   unsigned i;
+   for (i = 0; runs && i < 3 && (runs() + 1) % 3 != 0; i++)
+      run_frames(1);
+}
+
+/* imglane_set()'s map without screen 2's picture and with the views
+ * moved */
+static bool imglane_drop(void)
+{
+   static struct retro_video_view   views[2];
+   static struct retro_video_screen screens[3];
+   struct retro_video_views map;
+   memset(views, 0, sizeof(views));
+   views[0].width  = views[1].width = 320;
+   views[0].height = 100;
+   views[1].y      = 100;
+   views[1].height = 140;
+   views[1].screen = 1;
+   memset(screens, 0, sizeof(screens));
+   screens[2].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
+   memset(&map, 0, sizeof(map));
+   map.views       = views;
+   map.num_views   = 2;
+   map.flags       = RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   map.screens     = screens;
+   map.num_screens = 3;
+   return runloop_environment_cb(RETRO_ENVIRONMENT_SET_VIDEO_VIEWS, &map);
+}
+
+/* Video thread: keeps the thread from the in-list until let go */
+static uintptr_t imglane_hold(void *driver_data,
+      const video_poke_interface_t *poke, void *user)
+{
+   unsigned spun;
+   (void)driver_data;
+   (void)poke;
+   (void)user;
+   retro_atomic_store_release_int(&imglane_holding, 1);
+   for (spun = 0; spun < 10000
+         && !retro_atomic_load_acquire_int(&imglane_hold_go); spun++)
+      retro_sleep(1);
+   retro_atomic_store_release_int(&imglane_holding, 0);
+   return 0;
+}
+
+static bool imglane_hold_begin(void)
+{
+   static video_thread_async_job_t  job;
+   static video_thread_async_load_t hold;
+   unsigned i;
+   video_thread_wait_idle();
+   memset(&hold, 0, sizeof(hold));
+   job.run          = imglane_hold;
+   job.user         = NULL;
+   hold.img         = &job;
+   hold.kind        = VIDEO_THREAD_ASYNC_JOB;
+   hold.lent_idx[0] = hold.lent_idx[1] = -1;
+   retro_atomic_store_release_int(&imglane_hold_go, 0);
+   if (!video_thread_async_post(&hold))
+      return false;
+   for (i = 0; i < 2000 && !retro_atomic_load_acquire_int(&imglane_holding);
+         i++)
+      retro_sleep(1);
+   return retro_atomic_load_acquire_int(&imglane_holding) != 0;
+}
+
+/* Sentinels: one run means every upload posted before it has run and
+ * its completion is out for the main thread. A node is the wrapper's
+ * until its completion is delivered. */
+#define IMGLANE_SYNCS 4
+static video_thread_async_job_t  imglane_sync_job;
+static video_thread_async_load_t imglane_sync_node[IMGLANE_SYNCS];
+static bool                      imglane_sync_out[IMGLANE_SYNCS];
+static retro_atomic_int_t        imglane_synced;
+
+static uintptr_t imglane_sentinel(void *driver_data,
+      const video_poke_interface_t *poke, void *user)
+{
+   (void)driver_data;
+   (void)poke;
+   (void)user;
+   retro_atomic_store_release_int(&imglane_synced, 1);
+   return 0;
+}
+
+static void imglane_sync_done(void *user, uintptr_t handle)
+{
+   (void)handle;
+   *(bool*)user = false;
+}
+
+/* Lets a hold go first, if one is up */
+static bool imglane_sync(void)
+{
+   unsigned i;
+   for (i = 0; i < IMGLANE_SYNCS && imglane_sync_out[i]; i++) { }
+   if (i == IMGLANE_SYNCS)
+      return false;
+   memset(&imglane_sync_node[i], 0, sizeof(imglane_sync_node[i]));
+   imglane_sync_job.run              = imglane_sentinel;
+   imglane_sync_job.user             = NULL;
+   imglane_sync_node[i].img          = &imglane_sync_job;
+   imglane_sync_node[i].kind         = VIDEO_THREAD_ASYNC_JOB;
+   imglane_sync_node[i].lent_idx[0]  = -1;
+   imglane_sync_node[i].lent_idx[1]  = -1;
+   imglane_sync_node[i].done         = imglane_sync_done;
+   imglane_sync_node[i].user         = &imglane_sync_out[i];
+   retro_atomic_store_release_int(&imglane_synced, 0);
+   if (!video_thread_async_post(&imglane_sync_node[i]))
+      return false;
+   imglane_sync_out[i] = true;
+   retro_atomic_store_release_int(&imglane_hold_go, 1);
+   for (i = 0; i < 2000 && !retro_atomic_load_acquire_int(&imglane_synced);
+         i++)
+      retro_sleep(1);
+   return retro_atomic_load_acquire_int(&imglane_synced) != 0;
+}
+
+/* Each frame drawn with image_gen g draws the g-th picture landed or a
+ * later one */
+static void imglane_check_gens(const char *lane)
+{
+   int drawn    = retro_atomic_load_acquire_int(&imglane_drawn);
+   int landings = retro_atomic_load_acquire_int(&imglane_landings);
+   int i;
+   for (i = 0; i < drawn && i < IMGLANE_FRAMES; i++)
+   {
+      unsigned g = imglane_drawn_gen[i];
+      if (!imglane_drawn_tex[i])
+         continue;
+      CHECK(g >= 1 && (int)g <= landings && g <= IMGLANE_FRAMES
+            && imglane_drawn_content[i] >= imglane_landed[g - 1],
+            "%s: frame %d drew picture %u with image_gen %u (%d landed)",
+            lane, i, imglane_drawn_content[i], g, landings);
+   }
+}
+
+static void lane_screen_images(void)
+{
+   struct retro_video_screen_buffer a, b, c;
+   unsigned had = failures;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   bool menu = menu_is_up();
+   uintptr_t first  = IMGLANE_TAG + 1;
+   uintptr_t second = IMGLANE_TAG + 2;
+   uintptr_t got;
+   int from, at, before, landings, i;
+
+   set_threaded_via_setting(true);
+   run_frames(3);
+   expect_wrapper(true, "image lane");
+   if (menu)
+      command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+   run_frames(2);
+   CHECK(imglane_install(), "image lane: no lane driver");
+
+   /* 1. A picture lent and handed in goes up on the video thread; while
+    * its upload is in flight the slot it is read from is lent to no one
+    * and written by no copy */
+   CHECK(imglane_get(&a, 48, 32), "image lane: the first GET was refused");
+   imglane_fill((uint32_t*)a.data, 48 * 32, 1);
+   CHECK(imglane_set(a.data, 48, 32, 1), "image lane: picture 1 refused");
+   imglane_align();
+   run_frames(1);
+   CHECK(video_st->views_presented && (video_st->views_core.image & 4u),
+         "image lane: the map was not arranged");
+   CHECK(imglane_sync() && retro_atomic_load_acquire_int(&imglane_landings)
+         == 1, "image lane: picture 1 never went up");
+   got = imglane_frame_drawn();
+   CHECK(got == first, "image lane: the frame after the load drew %lx, "
+         "not %lx", (unsigned long)got, (unsigned long)first);
+   CHECK(imglane_loads == 1 && imglane_landed[0] == 1,
+         "image lane: %u loads for one picture", imglane_loads);
+   CHECK(imglane_get(&a, 48, 32), "image lane: the second GET was refused");
+   imglane_fill((uint32_t*)a.data, 48 * 32, 2);
+   CHECK(imglane_set(a.data, 48, 32, 2), "image lane: picture 2 refused");
+   CHECK(imglane_hold_begin(), "image lane: the video thread never held");
+   run_frames(1);
+   CHECK(imglane_get(&b, 48, 32), "image lane: a GET in flight was refused");
+   imglane_fill((uint32_t*)b.data, 48 * 32, 3);
+   CHECK(imglane_set(b.data, 48, 32, 3), "image lane: picture 3 refused");
+   CHECK(imglane_get(&c, 48, 32), "image lane: a third GET was refused");
+   CHECK(c.data != a.data && c.data != b.data,
+         "image lane: a GET lent the slot an upload still reads");
+   CHECK(imglane_sync(), "image lane: the held upload never ran");
+   CHECK(retro_atomic_load_acquire_int(&imglane_landings) == 2
+         && imglane_landed[1] == 2,
+         "image lane: the upload in flight read picture %u, not 2",
+         imglane_landed[1]);
+   for (i = 0; i < 10 && imglane_content[1] != 3; i++)
+   {
+      imglane_frame_drawn();
+      imglane_sync();
+   }
+   CHECK(imglane_content[1] == 3, "image lane: picture 3 never went up");
+
+   /* 2. A new size: the frame after its texture landed names it; those
+    * before draw the old one, which goes on the video thread only after
+    * a frame naming the new one is drawn, and never while the redraw's
+    * box names it */
+   imglane_frame_drawn();
+   from = retro_atomic_load_acquire_int(&imglane_drawn);
+   CHECK(imglane_hold_begin(), "image lane: the video thread never held");
+   imglane_fill(imglane_px, 32 * 16, 4);
+   CHECK(imglane_set(imglane_px, 32, 16, 4), "image lane: picture 4 refused");
+   run_frames(1);
+   CHECK(imglane_sync(), "image lane: the held load never ran");
+   got = imglane_frame_drawn();
+   CHECK(got == second, "image lane: the frame after the release drew "
+         "%lx, not %lx", (unsigned long)got, (unsigned long)second);
+   for (i = 0; i < 10 && !retro_atomic_load_acquire_int(&imglane_unloads);
+         i++)
+      imglane_frame_drawn();
+   for (i = 0; i < 2000 && !retro_atomic_load_acquire_int(&imglane_unloads);
+         i++)
+      retro_sleep(1);
+   at = -1;
+   for (i = from; i < retro_atomic_load_acquire_int(&imglane_drawn)
+         && i < IMGLANE_FRAMES; i++)
+   {
+      if (imglane_drawn_tex[i] == second)
+      {
+         at = i;
+         break;
+      }
+      CHECK(imglane_drawn_tex[i] == first,
+            "image lane: frame %d, before the new texture, drew %lx", i,
+            (unsigned long)imglane_drawn_tex[i]);
+   }
+   CHECK(at >= 0, "image lane: no frame drew the resized picture");
+   CHECK(retro_atomic_load_acquire_int(&imglane_unloads) == 1
+         && !retro_atomic_load_acquire_int(&imglane_live[1]),
+         "image lane: the replaced texture was not unloaded (%d unloads)",
+         retro_atomic_load_acquire_int(&imglane_unloads));
+   CHECK(!retro_atomic_load_acquire_int(&imglane_unload_main),
+         "image lane: the replaced texture was unloaded on the main thread");
+   CHECK(at >= 0 && imglane_unload_drawn[1] > at,
+         "image lane: the replaced texture went with %d frames drawn, "
+         "before frame %d named its replacement", imglane_unload_drawn[1],
+         at);
+   CHECK(!retro_atomic_load_acquire_int(&imglane_boxed),
+         "image lane: a texture went while the redraw's box named it");
+
+   /* 3. Two pictures within one upload in flight: the first is passed
+    * over and the second goes up with a later frame */
+   CHECK(imglane_hold_begin(), "image lane: the video thread never held");
+   imglane_fill(imglane_px, 48 * 32, 6);
+   CHECK(imglane_set(imglane_px, 48, 32, 6), "image lane: picture 6 refused");
+   run_frames(1);
+   CHECK(imglane_get(&a, 48, 32), "image lane: a GET in flight was refused");
+   imglane_fill((uint32_t*)a.data, 48 * 32, 7);
+   CHECK(imglane_set(a.data, 48, 32, 7), "image lane: picture 7 refused");
+   imglane_fill(imglane_px, 48 * 32, 8);
+   CHECK(imglane_set(imglane_px, 48, 32, 8), "image lane: picture 8 refused");
+   before = retro_atomic_load_acquire_int(&imglane_landings);
+   CHECK(imglane_sync(), "image lane: the held upload never ran");
+   landings = retro_atomic_load_acquire_int(&imglane_landings);
+   CHECK(landings == before + 1 && imglane_landed[before] == 6,
+         "image lane: the upload in flight read picture %u, not 6",
+         imglane_landed[before]);
+   for (i = 0; i < 10 && imglane_drawn_content[
+            retro_atomic_load_acquire_int(&imglane_drawn) - 1] != 8; i++)
+   {
+      imglane_frame_drawn();
+      imglane_sync();
+   }
+   CHECK(imglane_drawn_content[
+            retro_atomic_load_acquire_int(&imglane_drawn) - 1] == 8,
+         "image lane: the newest picture was never drawn");
+   CHECK(retro_atomic_load_acquire_int(&imglane_landings) == landings + 1,
+         "image lane: %d uploads after the held one, for one picture",
+         retro_atomic_load_acquire_int(&imglane_landings) - landings);
+
+   /* 4. A map that drops the image screen and moves the views: the
+    * dupe before it is arranged names no texture the store let go, and
+    * the redraw's box names none when it goes */
+   got = imglane_frame_drawn();
+   CHECK(imglane_ours(got), "image lane: no picture drawn before the drop");
+   imglane_align_dupe();
+   CHECK(imglane_drop(), "image lane: the map without the picture was "
+         "refused");
+   imglane_frame_drawn();
+   at = retro_atomic_load_acquire_int(&imglane_drawn);
+   CHECK(at > 0 && at <= IMGLANE_FRAMES && imglane_drawn_tex[at - 1] != got,
+         "image lane: the dupe after the drop drew %lx", (unsigned long)got);
+   for (i = 0; i < 2000 && imglane_ours(got)
+         && retro_atomic_load_acquire_int(&imglane_live[got - IMGLANE_TAG]);
+         i++)
+      retro_sleep(1);
+   CHECK(imglane_ours(got)
+         && !retro_atomic_load_acquire_int(&imglane_live[got - IMGLANE_TAG]),
+         "image lane: the dropped texture was not unloaded");
+   imglane_frame_drawn();
+
+   CHECK(!retro_atomic_load_acquire_int(&imglane_waits),
+         "image lane: %d texture calls waited",
+         retro_atomic_load_acquire_int(&imglane_waits));
+   CHECK(!retro_atomic_load_acquire_int(&imglane_dead),
+         "image lane: %d frames drew a texture not loaded",
+         retro_atomic_load_acquire_int(&imglane_dead));
+   CHECK(!retro_atomic_load_acquire_int(&imglane_boxed),
+         "image lane: a texture went while the redraw's box named it");
+   imglane_check_gens("image lane");
+
+   imglane_remove();
+   if (menu)
+      command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+   run_frames(2);
+   if (failures == had)
+      fprintf(stderr, "[pass] image lane (uploads posted, never waited on; "
+            "textures retired behind their frames)\n");
+}
+
+/* Review Focus 1: a new picture every frame through the lend */
+static void lane_screen_images_every_frame(void)
+{
+   struct retro_video_screen_buffer buf;
+   unsigned had = failures;
+   bool menu = menu_is_up();
+   int drawn[61];
+   unsigned k;
+
+   set_threaded_via_setting(true);
+   run_frames(3);
+   expect_wrapper(true, "image every-frame lane");
+   if (menu)
+      command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+   run_frames(2);
+   CHECK(imglane_install(), "image every-frame lane: no lane driver");
+
+   for (k = 1; k <= 60; k++)
+   {
+      CHECK(imglane_get(&buf, 48, 32),
+            "image every-frame lane: GET %u refused", k);
+      if (!buf.data)
+         break;
+      imglane_fill((uint32_t*)buf.data, 48 * 32, 10 + k);
+      CHECK(imglane_set(buf.data, 48, 32, 10 + k),
+            "image every-frame lane: picture %u refused", k);
+      if (k == 1)
+         imglane_align();
+      imglane_frame_drawn();
+      drawn[k] = retro_atomic_load_acquire_int(&imglane_drawn);
+      CHECK(imglane_sync(), "image every-frame lane: no sentinel back");
+   }
+   imglane_frame_drawn();
+   /* The frame after each picture's draws it, or a newer one */
+   for (k = 1; k < 60; k++)
+      CHECK(drawn[k + 1] <= IMGLANE_FRAMES
+            && imglane_drawn_content[drawn[k + 1] - 1] >= 10 + k,
+            "image every-frame lane: picture %u was not drawn by the "
+            "frame after its own (%u)", 10 + k,
+            imglane_drawn_content[drawn[k + 1] - 1]);
+   CHECK(!retro_atomic_load_acquire_int(&imglane_waits),
+         "image every-frame lane: %d texture calls waited",
+         retro_atomic_load_acquire_int(&imglane_waits));
+   CHECK(!retro_atomic_load_acquire_int(&imglane_dead),
+         "image every-frame lane: %d frames drew a texture not loaded",
+         retro_atomic_load_acquire_int(&imglane_dead));
+   imglane_check_gens("image every-frame lane");
+
+   imglane_remove();
+   if (menu)
+      command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+   run_frames(2);
+   if (failures == had)
+      fprintf(stderr, "[pass] image every-frame lane (60 pictures, each "
+            "drawn by the next frame, nothing waited)\n");
+}
+
+#ifdef HARNESS_COUNT_HEAP
+/* With a picture landed and none new, a frame makes no heap call,
+ * threaded or not */
+static void lane_screen_images_heap(void)
+{
+   unsigned had = failures;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   bool menu = menu_is_up();
+   unsigned long calls[2];
+   unsigned i, n;
+
+   if (menu)
+      command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+   for (i = 0; i < 2; i++)
+   {
+      set_threaded_via_setting(i == 1);
+      run_frames(10);
+      expect_wrapper(i == 1, "image heap lane");
+      CHECK(imglane_install(), "image heap lane: no lane driver");
+      imglane_fill(imglane_px, 48 * 32, 7);
+      CHECK(imglane_set(imglane_px, 48, 32, 7),
+            "image heap lane: the picture was refused");
+      for (n = 0; n < 4 && !video_st->views_presented; n++)
+         run_frames(1);
+      run_frames(4);
+      video_thread_wait_idle();
+      CHECK(imglane_loads == 1 && (video_st->views_core.image_tex[2]),
+            "image heap lane: the picture never landed (%u loads)",
+            imglane_loads);
+      calls[i] = heap_calls_over(300);
+      imglane_remove();
+   }
+   CHECK(calls[0] == 0,
+         "image heap lane: %lu heap calls over 300 frames, unthreaded",
+         calls[0]);
+   CHECK(calls[1] == 0,
+         "image heap lane: %lu heap calls over 300 frames, threaded",
+         calls[1]);
+   if (menu)
+      command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+   run_frames(2);
+   if (failures == had)
+      fprintf(stderr, "[pass] image heap lane (0 heap calls in 300 frames "
+            "with a picture up, threaded and not)\n");
+}
+#else
+static void lane_screen_images_heap(void)
+{
+   fprintf(stderr, "[skip] image heap lane (needs glibc, no allocator "
+         "sanitizer)\n");
+}
+#endif
+
+/* ------------------------------------------------------------------ */
 /* Lane: an overlay page of the pack's textures through the driver     */
 /*   Textures made by video_driver_texture_load() are shown as an      */
 /*   overlay page through load_textures(), drawn for a few frames,     */
@@ -15475,6 +16369,10 @@ int main(int argc, char *argv[])
       lane_window_answers();
       lane_presentable_refresh();
       lane_size_pair_round_trip();
+      lane_screen_image_restart();
+      lane_screen_images();
+      lane_screen_images_every_frame();
+      lane_screen_images_heap();
    }
    else
       fprintf(stderr, "[skip] null-driver instrumented lanes (real driver: %s)\n",

@@ -50,6 +50,7 @@
 #include "driver.h"
 #include "audio/audio_driver.h"
 #include "gfx/video_driver.h"
+#include "gfx/video_screen_images.h"
 #ifdef HAVE_THREADS
 #include "gfx/video_thread_wrapper.h"
 #endif
@@ -525,11 +526,16 @@ void runahead_secondary_core_destroy(void *data)
    runahead_copy_reset(true);
 
    if (!runloop_st->secondary_lib_handle)
+   {
+      video_screen_images_free_owner(VIDEO_SCREEN_IMAGES_SECOND);
       return;
+   }
 
    /* unload game from core */
    if (runloop_st->secondary_core.retro_unload_game)
       runloop_st->secondary_core.retro_unload_game();
+   /* After the unload: the core may hold a lend until then */
+   video_screen_images_free_owner(VIDEO_SCREEN_IMAGES_SECOND);
    runloop_st->core_poll_type_override = POLL_TYPE_OVERRIDE_DONTCARE;
 
    /* deinit */
@@ -1306,7 +1312,9 @@ static bool runloop_environment_secondary_core_hook(
       return true;
    }
 
+   video_screen_images_set_caller(VIDEO_SCREEN_IMAGES_SECOND);
    result                         = runloop_environment_cb(cmd, data);
+   video_screen_images_set_caller(VIDEO_SCREEN_IMAGES_MAIN);
 
    if (runloop_st->flags & RUNLOOP_FLAG_HAS_VARIABLE_UPDATE)
    {
@@ -2003,6 +2011,7 @@ static bool runahead_run_impl(void *data,
    {
       /* TODO: multiple savestates for higher performance
        * when not using secondary core */
+      video_screen_images_show_main();
       for (frame_number = 0; frame_number <= runahead_count; frame_number++)
       {
          last_frame      = frame_number == runahead_count;
@@ -2134,6 +2143,7 @@ static bool runahead_run_impl(void *data,
 
 force_input_dirty:
    serialization_phase_value = RETRO_EXECUTION_PHASE_RETAINED;
+   video_screen_images_show_main();
    advanced = core_run();
    runloop_st->flags |=  RUNLOOP_FLAG_RUNAHEAD_FORCE_INPUT_DIRTY;
    return advanced;

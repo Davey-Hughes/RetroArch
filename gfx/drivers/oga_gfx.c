@@ -113,6 +113,8 @@ typedef struct oga_video
    /* A core's views laid out on the screen, upright, for the blit that
     * turns them onto the panel */
    oga_surface_t *views_surface;
+   /* Black, which a blank inset is blended from */
+   oga_surface_t *views_black;
    /* Where the last views frame put its views on views_surface; the
     * surface is cleared only when that changes. */
    video_views_rect_t views_cuts[VIDEO_VIEWS_MAX_PLACEMENTS];
@@ -139,7 +141,8 @@ typedef struct oga_video
    unsigned last_mode;
    unsigned rect_gen;
    float display_ar;
-   /* For get_flags: the last frame with a map was drawn whole */
+   /* For get_flags: a map is drawn whole: the last frame's, or with
+    * none what one would get */
    retro_atomic_int_t views_fallback;
    bool threaded;
    bool views_seen;
@@ -495,6 +498,7 @@ static void oga_free(void *data)
    oga_destroy_surface(vid->msg_surface);
    oga_destroy_surface(vid->menu_surface);
    oga_destroy_surface(vid->views_surface);
+   oga_destroy_surface(vid->views_black);
 
    close(vid->fd);
 
@@ -502,11 +506,14 @@ static void oga_free(void *data)
    vid = NULL;
 }
 
+static bool oga_views_packed(const oga_video_t *vid, bool turned);
+
 static void *oga_init(const video_info_t *video)
 {
    int i;
    oga_video_t *vid                     = NULL;
    settings_t *settings                 = config_get_ptr();
+   unsigned stereo                      = settings->uints.video_stereo_mode;
    video_driver_state_t *video_st       = video_state_get_ptr();
    struct retro_system_av_info *av_info = &video_st->av_info;
    struct retro_game_geometry  *geom    = &av_info->geometry;
@@ -617,11 +624,25 @@ static void *oga_init(const video_info_t *video)
     * views frame allocates nothing. Without it views are drawn whole. */
    vid->views_surface = oga_create_surface(vid->fd, vid->drm_width,
          vid->drm_height, RK_FORMAT_BGRA_8888, false);
+   /* Not cleared yet: the first views frame does it */
+   vid->views_cut_count = (unsigned)-1;
+   /* An eighth of the screen each way, which the RGA can enlarge to
+    * any inset; 16 bits, so the blend has no alpha of its own to read */
+   vid->views_black = oga_create_surface(vid->fd,
+         (vid->drm_width + 7) / 8, (vid->drm_height + 7) / 8,
+         RK_FORMAT_RGB_565, true);
+   if (vid->views_black)
+      memset(vid->views_black->map, 0, vid->views_black->size);
 
    /* What views are laid out on: the screen as it is seen */
    video_driver_set_output_dims(VIDEO_SCALE_PACK(vid->drm_width,
             vid->drm_height));
 
+   /* Read before the first frame, at the turn set_rotation gives next */
+   retro_atomic_store_release_int(&vid->views_fallback,
+         (   oga_views_packed(vid, retroarch_get_rotation() % 4 != 0)
+          || stereo == VIDEO_STEREO_MODE_ANAGLYPH
+          || stereo == VIDEO_STEREO_MODE_INTERLACED) ? 1 : 0);
    return vid;
 }
 
@@ -886,6 +907,13 @@ static void oga_prepare_page(oga_video_t *vid, oga_framebuf_t *page,
    page->dirty     = false;
 }
 
+/* What draws any map whole, whatever its frame: the surfaces made at
+ * init missing, or a core @turned from the panel's own turn */
+static bool oga_views_packed(const oga_video_t *vid, bool turned)
+{
+   return !vid->views_surface || !vid->views_black || turned;
+}
+
 /* A core's views: each placement scaled by the RGA straight from the
  * frame's surface into an upright surface the size of the screen, cut
  * to its own eye's area and the screen, which one more blit turns onto
@@ -902,19 +930,25 @@ static bool oga_views_frame(oga_video_t *vid, const void *frame,
    oga_rect_t whole;
    video_views_rect_t cuts[VIDEO_VIEWS_MAX_PLACEMENTS];
    unsigned char which[VIDEO_VIEWS_MAX_PLACEMENTS];
+   unsigned int over[VIDEO_VIEWS_MAX_PLACEMENTS];
    const video_views_layout_t *layout;
-   bool views = info && frame && info->views.num_views
+   unsigned stereo = info ? info->views_settings.stereo_mode : 0;
+   bool blended    = false;
+   /* What draws any map whole: the surfaces made at init missing, a
+    * turned core, or not all of the frame in its surface */
+   bool packed     = oga_views_packed(vid,
+            vid->rotation != HAL_TRANSFORM_ROT_270)
+      || width != VIDEO_SCALE_W(dims) || height != VIDEO_SCALE_H(dims);
+   bool views      = info && frame && info->views.num_views && !packed
       && !info->views_layout.offscreen
-      && vid->rotation == HAL_TRANSFORM_ROT_270
-      /* All of the frame in its surface */
-      && width == VIDEO_SCALE_W(dims) && height == VIDEO_SCALE_H(dims)
       && video_views_fit_frame(&info->views, dims);
 
-   /* Made at init; without it the frame is drawn whole */
-   if (!vid->views_surface)
-      views = false;
+   /* Without a map: anaglyph and interlaced would draw one whole too */
    retro_atomic_store_release_int(&vid->views_fallback,
-         (info && info->views.num_views && !views) ? 1 : 0);
+         (info && (info->views.num_views ? !views
+            : (   packed
+               || stereo == VIDEO_STEREO_MODE_ANAGLYPH
+               || stereo == VIDEO_STEREO_MODE_INTERLACED))) ? 1 : 0);
    if (!views)
       return false;
    if (!vid->views_seen)
@@ -929,15 +963,32 @@ static bool oga_views_frame(oga_video_t *vid, const void *frame,
    for (i = 0, n = 0; i < layout->num_placements
          && i < VIDEO_VIEWS_MAX_PLACEMENTS; i++)
    {
-      if (!video_views_visible(layout, &layout->placements[i], screen,
+      unsigned flags = layout->placements[i].flags;
+      unsigned alpha = VIDEO_VIEWS_PLACEMENT_ALPHA(flags);
+      /* A blank root's place is black already; a blank inset's is over
+       * its base */
+      if (     (   (flags & VIDEO_VIEWS_PLACEMENT_BLANK)
+                && !(flags & VIDEO_VIEWS_PLACEMENT_INSET))
+            || !video_views_visible(layout, &layout->placements[i], screen,
                &cuts[n]))
          continue;
+      /* The RGA's source-over blend, the opacity its global alpha.
+       * From a 32-bit frame it would read the X byte as alpha too, so
+       * that inset is drawn solid; the black has no alpha. */
+      over[n] = (alpha < 255
+            && (   (flags & VIDEO_VIEWS_PLACEMENT_BLANK)
+                || vid->frame_surface->rk_format == RK_FORMAT_RGB_565))
+         ? ((alpha << 16) | 0x0105) : 0;
+      if (over[n])
+         blended = true;
       which[n++] = (unsigned char)i;
    }
 
    /* The views overwrite the same rectangles every frame, so what lies
-    * outside them only needs black again when they move. */
-   if (     n != vid->views_cut_count
+    * outside them only needs black again when they move. A blend has
+    * to land on this frame's pixels, not on its own last result. */
+   if (     blended
+         || n != vid->views_cut_count
          || memcmp(cuts, vid->views_cuts, n * sizeof(cuts[0])))
    {
       rga_clear_surface(vid->views_surface, 0);
@@ -951,6 +1002,18 @@ static bool oga_views_frame(oga_video_t *vid, const void *frame,
       const video_views_rect_t *cut    = &cuts[i];
       const video_views_placement_t *p = &layout->placements[which[i]];
 
+      if (p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
+      {
+         /* Never shrunk: no more of the black than the cut is large */
+         oga_blit(vid->views_black, 0, 0,
+               MIN(vid->views_black->width, (int)VIDEO_SCALE_W(cut->dims)),
+               MIN(vid->views_black->height, (int)VIDEO_SCALE_H(cut->dims)),
+               vid->views_surface,
+               VIDEO_POS_X(cut->pos), VIDEO_POS_Y(cut->pos),
+               (int)VIDEO_SCALE_W(cut->dims), (int)VIDEO_SCALE_H(cut->dims),
+               0, vid->scale_mode, over[i]);
+         continue;
+      }
       video_views_cut_source(&info->views.views[p->view], &p->dst, cut,
             &from);
       oga_blit(vid->frame_surface,
@@ -958,7 +1021,7 @@ static bool oga_views_frame(oga_video_t *vid, const void *frame,
             (int)VIDEO_SCALE_W(from.dims), (int)VIDEO_SCALE_H(from.dims),
             vid->views_surface, VIDEO_POS_X(cut->pos), VIDEO_POS_Y(cut->pos),
             (int)VIDEO_SCALE_W(cut->dims), (int)VIDEO_SCALE_H(cut->dims),
-            0, vid->scale_mode, 0);
+            0, vid->scale_mode, over[i]);
    }
    whole.x = whole.y = 0;
    whole.w = vid->drm_width;

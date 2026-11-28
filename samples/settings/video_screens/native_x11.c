@@ -195,9 +195,10 @@ static void native_x11_wait_fullscreen(const gfx_ctx_driver_t *ctx,
    }
 }
 
-/* Windows named for 'screen', the root's children and theirs (a window
- * manager's frames) included */
-static unsigned native_x11_titled(Display *dpy, unsigned screen)
+/* Windows titled for 'request', the root's children and theirs (a
+ * window manager's frames) included */
+static unsigned native_x11_titled(Display *dpy,
+      const video_window_request_t *request)
 {
    char want[64];
    Window root, parent;
@@ -207,7 +208,7 @@ static unsigned native_x11_titled(Display *dpy, unsigned screen)
    Window *top    = NULL;
    int (*old)(Display*, XErrorEvent*) = XSetErrorHandler(
          native_x11_ignore_error);
-   snprintf(want, sizeof(want), "RetroArch - Screen %u", screen + 1);
+   video_window_title(request, want, sizeof(want));
    XSync(dpy, False);
    if (XQueryTree(dpy, DefaultRootWindow(dpy), &root, &parent, &top, &n))
    {
@@ -264,7 +265,7 @@ static void native_x11_text(Display *dpy, Window win, const char *property,
 /* The title as each kind of window manager reads it: WM_NAME, and
  * EWMH's _NET_WM_NAME in UTF-8 */
 static void native_x11_titles(Display *dpy, Window primary, Window win,
-      unsigned screen)
+      const video_window_request_t *request)
 {
    char name[128], net_name[128], main_name[128], main_net_name[128];
    Atom utf8 = XInternAtom(dpy, "UTF8_STRING", False);
@@ -275,8 +276,8 @@ static void native_x11_titles(Display *dpy, Window primary, Window win,
          sizeof(main_name));
    native_x11_text(dpy, primary, "_NET_WM_NAME", utf8, main_net_name,
          sizeof(main_net_name));
-   native_window_titles(name, main_name, screen);
-   native_window_titles(net_name, main_net_name, screen);
+   native_window_titles(name, main_name, request);
+   native_window_titles(net_name, main_net_name, request);
 }
 
 /* Whether 'win''s _NET_WM_ICON is x11_retroarch_icon; 'count' longs */
@@ -2520,9 +2521,8 @@ static void native_x11_lifecycle(const gfx_ctx_driver_t *ctx, void *data,
 #endif
    CHECK(display == g_x11_dpy);
    CHECK(secondary != None && secondary != primary);
-   CHECK(native_x11_titled(display, video_window_title_screen(request)) == 1);
-   native_x11_titles(display, primary, secondary,
-         video_window_title_screen(request));
+   CHECK(native_x11_titled(display, request) == 1);
+   native_x11_titles(display, primary, secondary, request);
    native_x11_identity(display, primary, secondary);
    /* After a restart, what was queued for the last lifetime's window
     * (a close and a resize) has to reach nothing */
@@ -2818,16 +2818,19 @@ static void native_x11_lifecycle(const gfx_ctx_driver_t *ctx, void *data,
 
    /* Game Screen 1's window on a spare id: titled for its screen */
    {
-      video_window_request_t spare;
+      video_window_request_t spare, id;
       video_window_native_t one;
       native_window_spare(request, &spare);
+      id         = spare;
+      id.screens = 0;
       memset(&one, 0, sizeof(one));
       CHECK(ctx->windows->create(data, &spare, &one));
-      CHECK(native_x11_titled(display, 0) == 1);
-      CHECK(native_x11_titled(display, spare.screen) == 0);
+      CHECK(native_x11_titled(display, &spare) == 1);
+      CHECK(native_x11_titled(display, &id) == 0);
       if (one.state)
       {
-         native_x11_titles(display, primary, native_x11_window(&one), 0);
+         native_x11_titles(display, primary, native_x11_window(&one),
+               &spare);
          native_x11_identity(display, primary, native_x11_window(&one));
       }
       ctx->windows->destroy(data, &one);
@@ -2855,12 +2858,12 @@ static void native_x11_lifecycle(const gfx_ctx_driver_t *ctx, void *data,
    CHECK(!ctx->windows->create(data, &other, &invalid));
    CHECK(!invalid.state && !invalid.surface && !invalid.display);
    CHECK(!native_window_settle(ctx, data, request, 200000));
-   CHECK(native_x11_titled(display, video_window_title_screen(request)) == 0);
+   CHECK(native_x11_titled(display, request) == 0);
    CHECK(ctx->windows->create(data, request, window));
    CHECK(!ctx->windows->create(data, request, &invalid));
    CHECK(!invalid.state && !invalid.surface);
    native_window_wait(ctx, data, request, window, NATIVE_EVENT(RESUME), 0);
-   CHECK(native_x11_titled(display, video_window_title_screen(request)) == 1);
+   CHECK(native_x11_titled(display, request) == 1);
 
    /* An error the handler takes for a window replaced before the next
     * pump does not close the replacement; one for the window does */

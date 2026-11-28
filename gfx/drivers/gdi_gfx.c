@@ -2581,6 +2581,8 @@ struct gdi_views_draw
 static void gdi_views_draw_direct(gdi_t *gdi,
       const struct gdi_views_draw *d, unsigned view,
       const video_views_rect_t *dst, const video_views_rect_t *cut);
+static void gdi_views_fill(const struct gdi_views_draw *d,
+      const video_views_rect_t *cut);
 static bool gdi_views_target_make(gdi_t *gdi, struct gdi_views_dib *t,
       unsigned dims);
 static bool gdi_views_target_retire(gdi_t *gdi, struct gdi_views_dib *t);
@@ -2596,6 +2598,7 @@ static bool gdi_views_target_retire(gdi_t *gdi, struct gdi_views_dib *t);
 #define VV_DRAW                         struct gdi_views_draw
 #define VV_DIRECT(p, d, v, r, c)        gdi_views_draw_direct(p, d, v, r, c)
 #define VV_PASS(p, d, f, r, c, a)       ((void)0)
+#define VV_FILL(p, d, c, a)             gdi_views_fill(d, c)
 #define VV_TARGET                       struct gdi_views_dib
 #define VV_TARGET_MAKE(drv, t, dims)    gdi_views_target_make(drv, t, dims)
 #define VV_TARGET_RETIRE(drv, t)        gdi_views_target_retire(drv, t)
@@ -2694,14 +2697,24 @@ static void gdi_views_draw_direct(gdi_t *gdi,
    RestoreDC(d->dc, saved);
 }
 
+/* @cut black, for a blank inset */
+static void gdi_views_fill(const struct gdi_views_draw *d,
+      const video_views_rect_t *cut)
+{
+   RECT rect;
+   rect.left   = VIDEO_POS_X(cut->pos);
+   rect.top    = VIDEO_POS_Y(cut->pos);
+   rect.right  = rect.left + (LONG)VIDEO_SCALE_W(cut->dims);
+   rect.bottom = rect.top  + (LONG)VIDEO_SCALE_H(cut->dims);
+   FillRect(d->dc, &rect, (HBRUSH)GetStockObject(BLACK_BRUSH));
+}
+
 /* Whether the UI is drawn this frame once, into the layer placed in
- * each eye */
+ * each eye: @per_eye, the layout puts it there */
 static bool gdi_views_ui_wanted(gdi_t *gdi, video_frame_info_t *video_info,
-      const char *msg)
+      const char *msg, bool per_eye)
 {
    bool ui;
-   bool per_eye = video_views_ui_per_eye(&video_info->views,
-         &video_info->views_layout, true);
    ui = VIDEO_VIEWS_UI_WANTED(per_eye, gdi->menu_enable, msg,
          video_info->statistics_show,
          video_info->widgets_visible);
@@ -2713,15 +2726,21 @@ static bool gdi_views_ui_wanted(gdi_t *gdi, video_frame_info_t *video_info,
 }
 
 /* Whether this frame draws its views, with each drawn view's chain
- * picked and the rectangle its first placement takes, and in *blend
- * whether through the canvas. The UI layer takes AlphaBlend; without
- * it a frame whose UI is drawn per eye is drawn whole. */
+ * picked and the rectangle its first placement takes, in *blend
+ * whether through the canvas, and in *fallback whether a map, sent or
+ * not, is drawn whole. The UI layer takes AlphaBlend; without it a
+ * frame whose UI is drawn per eye is drawn whole. */
 static bool gdi_views_setup(gdi_t *gdi, video_frame_info_t *video_info,
-      const char *msg, bool *blend, void **chains, video_views_rect_t *rects)
+      const char *msg, bool *blend, bool *fallback, void **chains,
+      video_views_rect_t *rects)
 {
    bool views;
+   bool whole                         = false;
    const video_views_layout_t *layout = &video_info->views_layout;
    bool offscreen = video_info->views.num_views && layout->offscreen;
+#if !GDI_HAS_ALPHABLEND
+   unsigned stereo = video_info->views_settings.stereo_mode;
+#endif
 
    *blend = offscreen
       && gdi_vv_target_ensure(gdi, &gdi->views.canvas_target,
@@ -2733,13 +2752,22 @@ static bool gdi_views_setup(gdi_t *gdi, video_frame_info_t *video_info,
    views = video_info->views.num_views
       && (!offscreen || *blend)
 #if !GDI_HAS_ALPHABLEND
-      && !gdi_views_ui_wanted(gdi, video_info, msg)
+      && !gdi_views_ui_wanted(gdi, video_info, msg, layout->ui_per_eye)
 #endif
       && video_views_fit_frame(&video_info->views, gdi->views.frame_dims)
       && gdi_vv_pick_chains(gdi, &gdi->views.chains, &video_info->views,
             layout, true, *blend || !layout->offscreen,
             *blend ? layout->canvas_dims : video_info->dims, chains, rects);
    *blend = views && *blend;
+#if !GDI_HAS_ALPHABLEND
+   /* Without a map, what one would get: drawn whole with UI in a
+    * stereo mode that puts it in each eye */
+   whole  = gdi_views_ui_wanted(gdi, video_info, msg,
+            stereo == VIDEO_STEREO_MODE_SBS_HALF
+         || stereo == VIDEO_STEREO_MODE_SBS_FULL
+         || stereo == VIDEO_STEREO_MODE_TOP_BOTTOM);
+#endif
+   *fallback = video_info->views.num_views ? !views : whole;
    if (views && !gdi->views.direct_seen)
    {
       gdi->views.direct_seen = true;
@@ -2941,6 +2969,7 @@ static bool gdi_frame(void *data, const void *frame,
    video_views_rect_t view_rects[RETRO_VIDEO_VIEWS_MAX];
    bool views                       = false;
    bool views_blend                 = false;
+   bool views_fallback              = false;
    bool views_per_eye               = false;
    bool views_ui                    = false;
 
@@ -2995,14 +3024,15 @@ static bool gdi_frame(void *data, const void *frame,
    /* The viewport is the whole window while views draw. */
    gdi->views.frame_dims = dims;
    views = gdi_views_setup(gdi, video_info, msg, &views_blend,
-         view_chains, view_rects);
+         &views_fallback, view_chains, view_rects);
    if (views != gdi->views.active)
    {
       gdi->views.active  = views;
       gdi->should_resize = true;
    }
-   retro_atomic_store_release_int(&gdi->views.fallback,
-         (video_info->views.num_views && !views) ? 1 : 0);
+   if (!video_views_chains_behind(&gdi->views.chains, &video_info->views))
+      retro_atomic_store_release_int(&gdi->views.fallback,
+            views_fallback ? 1 : 0);
    views_per_eye = video_views_ui_per_eye(&video_info->views,
          &video_info->views_layout, true);
 
@@ -3151,7 +3181,7 @@ static bool gdi_frame(void *data, const void *frame,
       gdi_vv_target_drop(gdi, &gdi->views.ui_target, &gdi->views.ui);
 #if GDI_HAS_ALPHABLEND
    views_ui = gdi->menu_textured_active && gdi->bmp_menu
-      && gdi_views_ui_wanted(gdi, video_info, msg)
+      && gdi_views_ui_wanted(gdi, video_info, msg, views_per_eye)
       && gdi_vv_target_ensure(gdi, &gdi->views.ui_target, &gdi->views.ui,
             video_info->views_layout.ui_dims);
    if (views_ui)

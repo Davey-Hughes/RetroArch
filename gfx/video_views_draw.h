@@ -35,6 +35,17 @@
  *                                   @chain's final pass over @dst, cut to
  *                                   @cut; @again for a view placed a
  *                                   second time, which swaps no feedback
+ *   VV_ALPHA(drv, ctx, alpha)       the draws that follow at @alpha,
+ *                                   1-255, 255 solid. Undefined: solid.
+ *   VV_FILL(drv, ctx, cut, alpha)   @cut filled black at @alpha, for a
+ *                                   blank inset. Undefined: not drawn.
+ *   VV_IMAGE_MAP(drv, ctx)          the frame's map (a const
+ *                                   video_views_map_t *) the draws read
+ *   VV_IMAGE(drv, ctx, screen, dst, cut, nearest)
+ *                                   @screen's picture drawn whole into
+ *                                   @dst, clipped to @cut, sampled
+ *                                   nearest when @nearest. Undefined:
+ *                                   image placements are skipped.
  *   VV_TARGET                       the driver's target type
  *   VV_TARGET_MAKE(drv, t, dims)    @t made at @dims; false if it can't be
  *   VV_TARGET_RETIRE(drv, t)        @t let go; false if not yet
@@ -101,6 +112,9 @@ static void VV_FN(draw_placements)(VV_DRV *drv, const VV_DRAW *ctx,
 {
    unsigned i;
    bool drawn[RETRO_VIDEO_VIEWS_MAX];
+#ifdef VV_ALPHA
+   unsigned alpha = 255;
+#endif
 #ifdef VV_ROWS_UP
    /* With an even height the bottom row is an odd one from the top, so
     * the eyes change halves. */
@@ -115,8 +129,28 @@ static void VV_FN(draw_placements)(VV_DRV *drv, const VV_DRAW *ctx,
    {
       video_views_rect_t dst, cut;
       const video_views_placement_t *p = &layout->placements[i];
+      bool image = (p->flags & VIDEO_VIEWS_PLACEMENT_IMAGE) != 0;
+#ifdef VV_IMAGE
+      const video_views_map_t *image_map = image
+            ? VV_IMAGE_MAP(drv, ctx) : NULL;
+#endif
+#ifdef VV_FILL
+      bool fill = (p->flags & (VIDEO_VIEWS_PLACEMENT_BLANK
+               | VIDEO_VIEWS_PLACEMENT_INSET))
+            == (VIDEO_VIEWS_PLACEMENT_BLANK | VIDEO_VIEWS_PLACEMENT_INSET);
+#else
+      bool fill = false;
+#endif
+#ifndef VV_IMAGE
+      if (image)
+         continue;
+#endif
       if (     (!all_areas && p->area != 0)
-            || !chains[p->view]
+            || (!fill && (   (p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
+#ifdef VV_IMAGE
+                          || (image && !image_map->image_tex[p->view])
+#endif
+                          || (!image && !chains[p->view])))
             || !video_views_visible(layout, p, dims, &cut))
          continue;
       dst = p->dst;
@@ -128,6 +162,28 @@ static void VV_FN(draw_placements)(VV_DRV *drv, const VV_DRAW *ctx,
          VIDEO_POS_PUT_X(cut.pos, VIDEO_POS_X(cut.pos) + move);
       }
 #endif
+#ifdef VV_ALPHA
+      if (VIDEO_VIEWS_PLACEMENT_ALPHA(p->flags) != alpha)
+      {
+         alpha = VIDEO_VIEWS_PLACEMENT_ALPHA(p->flags);
+         VV_ALPHA(drv, ctx, alpha);
+      }
+#endif
+#ifdef VV_FILL
+      if (fill)
+      {
+         VV_FILL(drv, ctx, &cut, VIDEO_VIEWS_PLACEMENT_ALPHA(p->flags));
+         continue;
+      }
+#endif
+#ifdef VV_IMAGE
+      if (image)
+      {
+         VV_IMAGE(drv, ctx, p->view, &dst, &cut,
+               (image_map->nearest & (1u << p->view)) != 0);
+         continue;
+      }
+#endif
       if (direct)
       {
          VV_DIRECT(drv, ctx, p->view, &dst, &cut);
@@ -136,6 +192,10 @@ static void VV_FN(draw_placements)(VV_DRV *drv, const VV_DRAW *ctx,
       VV_PASS(drv, ctx, chains[p->view], &dst, &cut, drawn[p->view]);
       drawn[p->view] = true;
    }
+#ifdef VV_ALPHA
+   if (alpha != 255)
+      VV_ALPHA(drv, ctx, 255);
+#endif
 }
 
 /* @target at @dims, made or remade as the size changes. */
@@ -171,6 +231,10 @@ static void VV_FN(target_drop)(VV_DRV *drv, video_views_target_t *t,
 #undef VV_DRAW
 #undef VV_DIRECT
 #undef VV_PASS
+#undef VV_ALPHA
+#undef VV_FILL
+#undef VV_IMAGE_MAP
+#undef VV_IMAGE
 #undef VV_TARGET
 #undef VV_TARGET_MAKE
 #undef VV_TARGET_RETIRE

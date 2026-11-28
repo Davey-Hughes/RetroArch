@@ -91,7 +91,9 @@ typedef struct gl_openxr_record
    bool empty;             /* the slot shows nothing from here */
    bool yield;             /* empty once the projection shows */
    unsigned num_quads;
+   unsigned num_insets;
    video_xr_quad_t quads[VIDEO_XR_MAX_QUADS];
+   video_xr_inset_t insets[RETRO_VIDEO_VIEWS_MAX];   /* drawn into tex */
    video_xr_slot_t info;
    openxr_projection_t projection;
 } gl_openxr_record_t;
@@ -102,7 +104,7 @@ typedef struct gl_openxr_slot
    gl_openxr_record_t rec[OPENXR_RING_SIZE];
    /* The XR thread's: the front waits to be copied; the swapchains'
     * size; the size refused, not asked again; the images; the quads
-    * shown with the image the swapchains hold. */
+    * and insets shown with the image the swapchains hold. */
    bool pending;
    unsigned dims;
    unsigned layers;
@@ -111,7 +113,9 @@ typedef struct gl_openxr_slot
    uint32_t images[OPENXR_MAX_IMAGES][2];
    bool copy_failed;
    unsigned num_quads;
+   unsigned num_insets;
    video_xr_quad_t quads[VIDEO_XR_MAX_QUADS];
+   video_xr_inset_t insets[RETRO_VIDEO_VIEWS_MAX];
    video_xr_slot_t info;
    retro_atomic_int_t refused;   /* for the video thread */
 } gl_openxr_slot_t;
@@ -397,6 +401,7 @@ struct gl_openxr_dot
 {
    gl_openxr_t *xr;
    uint32_t images[OPENXR_MAX_IMAGES][2];
+   video_views_names_t names;
 };
 
 static bool gl_openxr_cursor_fill(void *user, uint32_t index,
@@ -414,7 +419,7 @@ static bool gl_openxr_cursor_fill(void *user, uint32_t index,
       *code = 0;
       return false;
    }
-   openxr_frame_cursor_pixels(px, w, true);
+   openxr_frame_cursor_pixels(px, w, true, &dot->names);
    while (xr->gl.GetError() != GL_NO_ERROR) { }
    xr->gl.BindTexture(GL_TEXTURE_2D, dot->images[index][0]);
    xr->gl.PixelStorei(GL_UNPACK_ALIGNMENT, 4);
@@ -429,34 +434,50 @@ static bool gl_openxr_cursor_fill(void *user, uint32_t index,
    return false;
 }
 
-static void gl_openxr_cursor_create(gl_openxr_t *xr)
+/* The laser's dot with the screen names now, on the XR thread: at the
+ * session's start, and again as the frame loop's remake, which logs
+ * nothing. A new dot replaces the old; a failed remake keeps it. */
+static void gl_openxr_cursor_create(gl_openxr_t *xr, bool remake)
 {
    static const int64_t formats[2] = {
       OPENXR_GL_SRGB8_ALPHA8, OPENXR_GL_RGBA8 };
    struct gl_openxr_dot dot;
    openxr_gl_images_t li;
+   XrSwapchain made;
    const char *step = NULL;
    int code         = 0;
    dot.xr           = xr;
    li.sc            = &xr->sc;
    li.tex           = dot.images;
-   xr->frame.cursor = openxr_swapchains_create_filled(&xr->sc, formats, 2,
+   xr->frame.names_baked = video_driver_get_screen_names(&dot.names);
+   made = openxr_swapchains_create_filled(&xr->sc, formats, 2,
          VIDEO_SCALE_PACK(openxr_frame_cursor_w(&xr->frame),
             VIDEO_XR_CURSOR_H),
          openxr_binding_gl_images, &li, gl_openxr_cursor_fill, &dot,
          &step, &code);
-   if (xr->frame.cursor && xr->frame.rt->max_width)
+   if (made && xr->frame.cursor)
+      xr->sc.DestroySwapchain(xr->frame.cursor);
+   if (made)
+      xr->frame.cursor = made;
+   if (remake)
+      return;
+   if (made && xr->frame.rt->max_width)
       RARCH_LOG("[OpenXR] Laser cursor ready: %u wide, with %s (the "
             "headset's widest %u).\n", openxr_frame_cursor_w(&xr->frame),
             openxr_frame_cursor_parts(&xr->frame),
             xr->frame.rt->max_width);
-   else if (xr->frame.cursor)
+   else if (made)
       RARCH_LOG("[OpenXR] Laser cursor ready: %u wide, with %s (the "
             "headset does not say its widest).\n",
             openxr_frame_cursor_w(&xr->frame),
             openxr_frame_cursor_parts(&xr->frame));
    else
       RARCH_WARN("[OpenXR] No laser cursor (%s, %d).\n", step, code);
+}
+
+static void gl_openxr_cursor_remake(void *user)
+{
+   gl_openxr_cursor_create((gl_openxr_t*)user, true);
 }
 
 /* The XR thread's start: its context for good, then the session. */
@@ -481,7 +502,9 @@ static bool gl_openxr_thread_start(void *user)
    openxr_host_session_created(&xr->host);
    RARCH_LOG("[OpenXR] Session created.\n");
    openxr_frame_input_attach(&xr->frame);
-   gl_openxr_cursor_create(xr);
+   xr->frame.cursor_remake = gl_openxr_cursor_remake;
+   xr->frame.cursor_user   = xr;
+   gl_openxr_cursor_create(xr, false);
    /* The copy keeps the stored values; the compositor decodes them. */
    xr->gl.Disable(GL_FRAMEBUFFER_SRGB);
    if (!xr->copy_image)
@@ -706,9 +729,11 @@ static bool gl_openxr_fill_slot(gl_openxr_t *xr, unsigned slot)
       s->num_quads   = 0;
       return true;
    }
-   s->num_quads = r->num_quads;
+   s->num_quads  = r->num_quads;
+   s->num_insets = r->num_insets;
    memcpy(s->quads, r->quads, r->num_quads * sizeof(r->quads[0]));
-   s->info      = r->info;
+   memcpy(s->insets, r->insets, r->num_insets * sizeof(r->insets[0]));
+   s->info       = r->info;
    return true;
 }
 
@@ -726,6 +751,9 @@ static void gl_openxr_publish_quads(gl_openxr_t *xr)
       for (i = 0; i < slot->num_quads && set.num_quads < VIDEO_XR_MAX_QUADS;
             i++)
          set.quads[set.num_quads++] = slot->quads[i];
+      for (i = 0; slot->num_quads && i < slot->num_insets
+            && set.num_insets < RETRO_VIDEO_VIEWS_MAX; i++)
+         set.insets[set.num_insets++] = slot->insets[i];
    }
    openxr_frame_publish(&xr->frame, &set);
 }
@@ -906,13 +934,17 @@ void gl_openxr_slot_publish(gl_openxr_t *xr, unsigned slot,
    r->drawn     = drawn;
    r->empty     = false;
    r->yield     = false;
-   r->num_quads = 0;
+   r->num_quads  = 0;
+   r->num_insets = 0;
    memset(&r->info, 0, sizeof(r->info));
    if (quads)
    {
       for (i = 0; i < quads->num_quads; i++)
          if (quads->quads[i].slot == slot)
             r->quads[r->num_quads++] = quads->quads[i];
+      for (i = 0; i < quads->num_insets; i++)
+         if (quads->insets[i].slot == slot)
+            r->insets[r->num_insets++] = quads->insets[i];
       if (slot < VIDEO_XR_MAX_SLOTS)
          r->info = quads->slots[slot];
    }

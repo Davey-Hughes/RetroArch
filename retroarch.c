@@ -229,6 +229,7 @@
 #include "verbosity.h"
 
 #include "gfx/video_driver.h"
+#include "gfx/video_screen_images.h"
 #ifdef HAVE_TEMPORAL_UPSCALER
 #include "gfx/video_upscaler.h"
 #endif
@@ -2210,6 +2211,9 @@ void driver_uninit(int flags, enum driver_lifetime_flags lifetime_flags)
       p_dispwidget->active = false;
    }
 #endif
+
+   if (flags & DRIVER_VIDEO_MASK)
+      video_screen_images_driver_free();
 
 #ifdef HAVE_MENU
    if (flags & DRIVER_MENU_MASK)
@@ -7132,6 +7136,13 @@ void retroarch_save_for_suspend(void)
     * background, e.g. swiped away from Recents. No-op when no core
     * with options is loaded. */
    runloop_core_options_save();
+#ifdef HAVE_CONFIGFILE
+   /* The running core's screen choices, likewise */
+   {
+      video_screen_prefs_t *prefs = &video_state_get_ptr()->screen_prefs;
+      config_save_video_screen_prefs(prefs->library_name, prefs);
+   }
+#endif
 
    if (settings->bools.config_save_on_exit)
    {

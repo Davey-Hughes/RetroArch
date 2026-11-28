@@ -75,8 +75,13 @@ typedef struct sdl_video
       SDL_Surface *canvas;
       /* The menu at one eye's size, for side by side and top-bottom */
       SDL_Surface *ui;
+      /* What a translucent inset is blitted from, grown as they ask */
+      SDL_Surface *inset;
+      /* VV_ALPHA's alpha below 255, which views are drawn at; 0 solid */
+      unsigned alpha;
       unsigned frame_dims;
-      /* For get_flags: the last frame with a map was drawn whole */
+      /* For get_flags: a map is drawn whole: the last frame's, or with
+       * none what one would get */
       retro_atomic_int_t fallback;
       bool direct_seen;
    } views;
@@ -118,6 +123,8 @@ static void sdl_gfx_free(void *data)
       SDL_FreeSurface(vid->views.canvas);
    if (vid->views.ui)
       SDL_FreeSurface(vid->views.ui);
+   if (vid->views.inset)
+      SDL_FreeSurface(vid->views.inset);
 
    if (vid->font)
       vid->font_driver->free(vid->font);
@@ -418,15 +425,16 @@ struct sdl_views_draw
 {
    const video_views_map_t *map;
    const uint8_t *frame;
-   uint8_t *pixels;
+   SDL_Surface *target;
    unsigned pitch;
-   unsigned stride;
    enum scaler_pix_fmt fmt;
 };
 
 static void sdl_views_draw_direct(sdl_video_t *vid,
       const struct sdl_views_draw *d, unsigned view,
       const video_views_rect_t *dst, const video_views_rect_t *cut);
+static void sdl_views_fill(sdl_video_t *vid, const struct sdl_views_draw *d,
+      const video_views_rect_t *cut, unsigned alpha);
 static bool sdl_views_target_make(sdl_video_t *vid, SDL_Surface **t,
       unsigned dims);
 static bool sdl_views_target_retire(sdl_video_t *vid, SDL_Surface **t);
@@ -442,6 +450,8 @@ static bool sdl_views_target_retire(sdl_video_t *vid, SDL_Surface **t);
 #define VV_DRAW                         struct sdl_views_draw
 #define VV_DIRECT(p, d, v, r, c)        sdl_views_draw_direct(p, d, v, r, c)
 #define VV_PASS(p, d, f, r, c, a)       ((void)0)
+#define VV_ALPHA(p, d, a)               ((p)->views.alpha = ((a) < 255) ? (a) : 0)
+#define VV_FILL(p, d, c, a)             sdl_views_fill(p, d, c, a)
 #define VV_TARGET                       SDL_Surface*
 #define VV_TARGET_MAKE(drv, t, dims)    sdl_views_target_make(drv, t, dims)
 #define VV_TARGET_RETIRE(drv, t)        sdl_views_target_retire(drv, t)
@@ -466,13 +476,97 @@ static bool sdl_views_target_make(sdl_video_t *vid, SDL_Surface **t,
    return *t != NULL;
 }
 
+/* The inset surface, at least @dims, or NULL */
+static SDL_Surface *sdl_views_inset(sdl_video_t *vid, unsigned dims)
+{
+   unsigned w     = VIDEO_SCALE_W(dims);
+   unsigned h     = VIDEO_SCALE_H(dims);
+   SDL_Surface *s = vid->views.inset;
+   if (s && (unsigned)s->w >= w && (unsigned)s->h >= h)
+      return s;
+   if (s && (unsigned)s->w > w)
+      w = (unsigned)s->w;
+   if (s && (unsigned)s->h > h)
+      h = (unsigned)s->h;
+   sdl_views_target_retire(vid, &vid->views.inset);
+   sdl_views_target_make(vid, &vid->views.inset, VIDEO_SCALE_PACK(w, h));
+   return vid->views.inset;
+}
+
+/* The part of the inset surface, holding @dst, that @cut shows,
+ * blended into the target at @alpha. SDL blits and fills take the
+ * window surface unlocked. */
+static void sdl_views_inset_blit(sdl_video_t *vid,
+      const struct sdl_views_draw *d, const video_views_rect_t *dst,
+      const video_views_rect_t *cut, unsigned alpha)
+{
+   SDL_Rect src, to;
+   bool locked = d->target == vid->screen && SDL_MUSTLOCK(vid->screen);
+   src.x = (Sint16)(VIDEO_POS_X(cut->pos) - VIDEO_POS_X(dst->pos));
+   src.y = (Sint16)(VIDEO_POS_Y(cut->pos) - VIDEO_POS_Y(dst->pos));
+   src.w = (Uint16)VIDEO_SCALE_W(cut->dims);
+   src.h = (Uint16)VIDEO_SCALE_H(cut->dims);
+   to.x  = (Sint16)VIDEO_POS_X(cut->pos);
+   to.y  = (Sint16)VIDEO_POS_Y(cut->pos);
+   to.w  = src.w;
+   to.h  = src.h;
+   SDL_SetAlpha(vid->views.inset, SDL_SRCALPHA, (Uint8)alpha);
+   if (locked)
+      SDL_UnlockSurface(vid->screen);
+   SDL_BlitSurface(vid->views.inset, &src, d->target, &to);
+   if (locked)
+      SDL_LockSurface(vid->screen);
+}
+
 static void sdl_views_draw_direct(sdl_video_t *vid,
       const struct sdl_views_draw *d, unsigned view,
       const video_views_rect_t *dst, const video_views_rect_t *cut)
 {
+   SDL_Surface *inset = vid->views.alpha
+      ? sdl_views_inset(vid, dst->dims) : NULL;
+   if (inset)
+   {
+      /* Scaled whole aside, the part shown blended in */
+      video_views_rect_t whole;
+      whole.pos  = VIDEO_POS_PACK(0, 0);
+      whole.dims = dst->dims;
+      video_views_cpu_draw_view(&vid->views.cpu, d->fmt,
+            vid->scaler.scaler_type, &d->map->views[view], d->frame,
+            d->pitch, (uint8_t*)inset->pixels, inset->pitch, &whole,
+            &whole);
+      sdl_views_inset_blit(vid, d, dst, cut, vid->views.alpha);
+      return;
+   }
    video_views_cpu_draw_view(&vid->views.cpu, d->fmt,
          vid->scaler.scaler_type, &d->map->views[view], d->frame, d->pitch,
-         d->pixels, d->stride, dst, cut);
+         (uint8_t*)d->target->pixels, d->target->pitch, dst, cut);
+}
+
+/* @cut black at @alpha, for a blank inset */
+static void sdl_views_fill(sdl_video_t *vid, const struct sdl_views_draw *d,
+      const video_views_rect_t *cut, unsigned alpha)
+{
+   SDL_Rect r;
+   bool locked        = d->target == vid->screen && SDL_MUSTLOCK(vid->screen);
+   SDL_Surface *inset = (alpha < 255)
+      ? sdl_views_inset(vid, cut->dims) : NULL;
+   r.x = 0;
+   r.y = 0;
+   r.w = (Uint16)VIDEO_SCALE_W(cut->dims);
+   r.h = (Uint16)VIDEO_SCALE_H(cut->dims);
+   if (inset)
+   {
+      SDL_FillRect(inset, &r, 0);
+      sdl_views_inset_blit(vid, d, cut, cut, alpha);
+      return;
+   }
+   r.x = (Sint16)VIDEO_POS_X(cut->pos);
+   r.y = (Sint16)VIDEO_POS_Y(cut->pos);
+   if (locked)
+      SDL_UnlockSurface(vid->screen);
+   SDL_FillRect(d->target, &r, 0);
+   if (locked)
+      SDL_LockSurface(vid->screen);
 }
 
 /* Whether this frame draws its views, with each drawn view's chain in
@@ -499,6 +593,8 @@ static bool sdl_views_setup(sdl_video_t *vid,
    if (!offscreen)
       sdl_vv_target_drop(vid, &vid->views.canvas_target,
             &vid->views.canvas);
+   if (!views)
+      sdl_views_target_retire(vid, &vid->views.inset);
    retro_atomic_store_release_int(&vid->views.fallback,
          (video_info->views.num_views && !views) ? 1 : 0);
    if (views && !vid->views.direct_seen)
@@ -525,10 +621,9 @@ static void sdl_views_render(sdl_video_t *vid,
    d.frame  = (const uint8_t*)frame;
    d.pitch  = pitch;
    d.fmt    = vid->scaler.in_fmt;
-   d.pixels = (uint8_t*)target->pixels;
-   d.stride = target->pitch;
+   d.target = target;
    for (i = 0; i < (unsigned)target->h; i++)
-      memset(d.pixels + (size_t)i * d.stride, 0,
+      memset((uint8_t*)target->pixels + (size_t)i * target->pitch, 0,
             (size_t)target->w * sizeof(uint32_t));
    sdl_vv_draw_placements(vid, &d, layout, chains, true,
          VIDEO_SCALE_PACK(target->w, target->h), true);

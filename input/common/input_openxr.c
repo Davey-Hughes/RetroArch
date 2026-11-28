@@ -1629,23 +1629,51 @@ static void input_openxr_frame_aims(input_openxr_t *st, int config,
 
 /* A point on a screen's quad as the core's pointer coordinates: into
  * the core's view map when it has one, over the whole frame when not.
- * A window has the frame where the video driver's viewport puts it, as
- * the window's own pointer does. */
-static bool input_openxr_frame_point(const video_xr_quad_t *q, float u,
-      float v, int16_t *x, int16_t *y)
+ * A window has the frame where the video driver's viewport puts it, or
+ * the core's views where their layout does, as the window's own pointer
+ * does; off them, or on NO_INPUT ones alone, it is off the screens. */
+static bool input_openxr_frame_point(const video_xr_quad_set_t *set,
+      const video_xr_quad_t *q, float u, float v, unsigned laser,
+      int16_t *x, int16_t *y)
 {
    unsigned dims                = 0;
    const video_views_map_t *map = NULL;
    if (q->kind == VIDEO_XR_QUAD_WINDOW)
    {
       video_viewport_t vp;
-      if (     !video_driver_get_viewport_info(&vp)
-            || !video_xr_window_point(&vp, &u, &v))
+      const video_views_layout_t *layout = video_driver_get_views_layout();
+      if (!video_driver_get_viewport_info(&vp))
+         return false;
+      if (layout)
+      {
+         uint32_t pos;
+         if (     !video_driver_get_views_core(&map, &dims) || !map
+               || !video_views_map_point(layout, map, dims,
+                  (int)(u * VIDEO_SCALE_W(vp.full_dims)),
+                  (int)(v * VIDEO_SCALE_H(vp.full_dims)), true, &pos)
+               || pos == VIDEO_POS_PACK(-0x8000, -0x8000))
+            return false;
+         *x = (int16_t)VIDEO_POS_X(pos);
+         *y = (int16_t)VIDEO_POS_Y(pos);
+         return true;
+      }
+      if (!video_xr_window_point(&vp, &u, &v))
          return false;
    }
    if (!video_driver_get_views_core(&map, &dims))
       return false;
-   return video_xr_quad_to_frame(q, u, v, map, dims, x, y);
+   /* Views and no layout: the window draws the packed frame whole */
+   if (q->kind == VIDEO_XR_QUAD_WINDOW && map)
+   {
+      int fw = (int)VIDEO_SCALE_W(dims);
+      int fh = (int)VIDEO_SCALE_H(dims);
+      int fx = (int)(u * fw);
+      int fy = (int)(v * fh);
+      if (video_views_point_no_input(map,
+               fx < fw ? fx : fw - 1, fy < fh ? fy : fh - 1))
+         return false;
+   }
+   return video_xr_quad_to_frame(set, q, u, v, laser, map, dims, x, y);
 }
 
 /* The menu's own quad, or a window while the menu is open over it. */
@@ -1724,7 +1752,7 @@ static void input_openxr_laser_poll(input_openxr_t *st, unsigned laser,
    for (i = 0; i < st->quads.num_quads; i++)
    {
       const video_xr_quad_t *lq = &st->quads.quads[i];
-      if (!video_xr_quad_live(lq, laser, menu_open))
+      if (!video_xr_quad_live(&st->quads, lq, laser, menu_open))
          continue;
       /* Without a live screen a hand can touch, the mouse and the
        * overlay keep the core's pointer and gun. */
@@ -1828,8 +1856,8 @@ static void input_openxr_laser_poll(input_openxr_t *st, unsigned laser,
       st->menu_v  = st->hit_v[p];
    }
    else if (q)
-      st->ptr_on = input_openxr_frame_point(q, st->hit_u[p], st->hit_v[p],
-            &st->ptr_x, &st->ptr_y);
+      st->ptr_on = input_openxr_frame_point(&st->quads, q, st->hit_u[p],
+            st->hit_v[p], laser, &st->ptr_x, &st->ptr_y);
    /* Untracked mid-press, a touch holds its last point, as the menu's
     * press does. */
    else if (     !tracked[p] && touch_on && p == prev && !pressed[p]
@@ -2271,7 +2299,7 @@ static bool input_openxr_any_live(const video_xr_quad_set_t *set,
    for (i = 0; i < set->num_quads; i++)
    {
       const video_xr_quad_t *q = &set->quads[i];
-      if (     video_xr_quad_live(q, laser, menu_open)
+      if (     video_xr_quad_live(set, q, laser, menu_open)
             && !(laser == VIDEO_XR_LIVE_EDIT && set->slots[q->slot].fixed))
          return true;
    }

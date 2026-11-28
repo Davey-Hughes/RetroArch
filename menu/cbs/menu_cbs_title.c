@@ -1126,8 +1126,8 @@ static int action_get_title_video_screen_settings_list(
 {
    unsigned screen = menu_setting_video_screen_page(path);
    if (screen < RETRO_VIDEO_VIEWS_MAX)
-      snprintf(s, len, msg_hash_to_str(
-               MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_SETTINGS), screen + 1);
+      video_driver_screen_label(screen, msg_hash_to_str(
+               MENU_ENUM_LABEL_VALUE_VIDEO_SCREEN_SETTINGS), s, len);
    return 0;
 }
 #endif

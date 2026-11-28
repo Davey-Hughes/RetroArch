@@ -148,9 +148,12 @@ typedef struct _sdl3_video
       /* The game viewport while the UI layer is drawn */
       struct video_viewport vp;
       /* For get_flags on the main thread: whether views may be drawn,
-       * and whether the last frame with a map drew it whole */
+       * and whether a map is drawn whole: the last frame's, or with
+       * none what one would get */
       retro_atomic_int_t    allowed;
       retro_atomic_int_t    fallback;
+      /* VV_ALPHA's alpha below 255, which views are drawn at; 0 solid */
+      unsigned              alpha;
       bool                  tried;
       /* A view could not be written at frame_dims: draw whole */
       bool                  write_failed;

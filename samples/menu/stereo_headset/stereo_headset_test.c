@@ -266,6 +266,74 @@ static bool cursor_on_headset_output(void)
       == row(MENU_ENUM_LABEL_VIDEO_OPENXR_ENABLE_STR);
 }
 
+/* Game Screens' Display rows, with no content: each offers Over the
+ * other screen */
+static void check_display_over_values(const char *how)
+{
+   static const char *const want[2] = { "|over:2|off", "|over:1|off" };
+   char name[64];
+   unsigned s;
+   for (s = 0; s < 2; s++)
+   {
+      rarch_setting_t *setting;
+      snprintf(name, sizeof(name),
+            MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY_STR, s + 1);
+      setting = menu_setting_find(name);
+      CHECK(row(name) >= 0, "%s: %s is not listed in Game Screens",
+            how, name);
+      CHECK(setting && setting->aux.values
+            && string_is_equal(setting->aux.values, want[s]),
+            "%s: %s offers \"%s\", want \"%s\"", how, name,
+            setting && setting->aux.values ? setting->aux.values : "",
+            want[s]);
+   }
+}
+
+/* Game Screen 2's Corner, Size and Opacity follow its Display row only
+ * while it is drawn over another: with no content, while its Display is
+ * an Over value */
+static void check_inset_rows(const char *how)
+{
+   static const enum msg_hash_enums rows[] = {
+      MENU_ENUM_LABEL_VIDEO_SCREEN_CORNER,
+      MENU_ENUM_LABEL_VIDEO_SCREEN_SIZE,
+      MENU_ENUM_LABEL_VIDEO_SCREEN_OPACITY
+   };
+   char name[64];
+   video_screen_values_t values;
+   unsigned s, r;
+   int at;
+   const unsigned display = VIDEO_SCREEN_PREF_BIT(VIDEO_SCREEN_PREF_DISPLAY);
+   for (s = 0; s < 2; s++)
+      for (r = 0; r < ARRAY_SIZE(rows); r++)
+      {
+         snprintf(name, sizeof(name), msg_hash_to_str(rows[r]), s + 1);
+         CHECK(row(name) < 0, "%s: %s is listed for a screen drawn alone",
+               how, name);
+      }
+   memset(&values, 0, sizeof(values));
+   strlcpy(values.display, "over:1", sizeof(values.display));
+   video_driver_screen_set(1, display, &values);
+   rebuild_as_hotplug();
+   snprintf(name, sizeof(name), MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY_STR, 2);
+   at = row(name);
+   for (r = 0; r < ARRAY_SIZE(rows); r++)
+   {
+      snprintf(name, sizeof(name), msg_hash_to_str(rows[r]), 2);
+      CHECK(at >= 0 && row(name) == at + 1 + (int)r,
+            "%s: %s does not follow Game Screen 2's Display over screen 1",
+            how, name);
+      snprintf(name, sizeof(name), msg_hash_to_str(rows[r]), 1);
+      CHECK(row(name) < 0, "%s: %s is listed for the base", how, name);
+   }
+   values.display[0] = '\0';
+   video_driver_screen_set(1, display, &values);
+   rebuild_as_hotplug();
+   snprintf(name, sizeof(name), msg_hash_to_str(rows[0]), 2);
+   CHECK(row(name) < 0, "%s: %s stays once the screen is back on Auto",
+         how, name);
+}
+
 static void lane_off(void)
 {
    set_headset(false);
@@ -283,6 +351,8 @@ static void lane_off(void)
    open_game_screens_list();
    CHECK(row(MENU_ENUM_LABEL_VIDEO_SCREEN_LAYOUT_STR) >= 0,
          "Screen Layout is not listed in Game Screens");
+   check_display_over_values("Headset Output off");
+   check_inset_rows("Headset Output off");
 }
 
 static void lane_on(void)
@@ -300,6 +370,8 @@ static void lane_on(void)
    open_game_screens_list();
    CHECK(row(MENU_ENUM_LABEL_VIDEO_SCREEN_LAYOUT_STR) >= 0,
          "Screen Layout is not listed with Headset Output on");
+   check_display_over_values("Headset Output on");
+   check_inset_rows("Headset Output on");
 }
 
 /* Under a driver without a headset path the setting has no row to

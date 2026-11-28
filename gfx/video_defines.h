@@ -417,7 +417,8 @@ enum display_flags
    /* Set by a video driver that presents a core's view map
     * (RETRO_ENVIRONMENT_SET_VIDEO_VIEWS) itself. */
    GFX_CTX_FLAGS_VIDEO_VIEWS,
-   /* Set while such a driver draws a frame that has a map whole. */
+   /* Set while such a driver would draw a map whole now, whether or not
+    * one is set. */
    GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK,
    /* Set by a video driver whose GPU recording reads the core's image
     * before the menu, overlays and messages are drawn over it, when

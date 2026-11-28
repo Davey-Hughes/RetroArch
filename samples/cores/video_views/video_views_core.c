@@ -67,7 +67,63 @@
  * is in its working directory it sends the map flat. With
  * video_views_test_vr_scene grid, software eyes draw one world-locked
  * floor grid, axes and a wall ahead from their own poses, instead of
- * a solid colour, for checking by eye that the world holds still. */
+ * a solid colour, for checking by eye that the world holds still.
+ *
+ * With video_views_test_screens the ds map describes its screens, as
+ * does the 3ds map in the modes besides rules. rules
+ * asks for a screen buffer on its first frame, then sends one map a
+ * frame, each keeping or breaking one of the header's screen rules, and
+ * logs whether it was accepted and its screens_left_out, 0xa5a5a5a5
+ * where the frontend wrote none; after the last, the full map every
+ * frame. Its image cases send screen 2 a picture the frontend cannot
+ * take (no pixels, a format or a size it does not know), which it
+ * leaves out; its layer cases make screen 2 Gel, a LAYER on the top
+ * screen, left out while no blend is drawn, or break one LAYER rule.
+ * no_input names the two screens and marks the bottom one
+ * NO_INPUT, for e2e/run.py's light gun check; no_input_off only names
+ * them. The other modes name them too and send the bottom one as:
+ * shown, SHOWN; hidden, HIDDEN; over, OVER the top one's bottom right
+ * corner at a quarter of its height; over_half, the same at half
+ * opacity; over_blank, the same BLANK; over_blank_half, BLANK at half
+ * opacity; blank, BLANK; absent, ABSENT with its view kept. blank_late
+ * sends it ACTIVE and from frame 60 BLANK, absent_back ABSENT and from
+ * frame 60 ACTIVE, each logging the switch once. hide_null, no_input_null
+ * and blank_null send it SHOWN and from frame 60 HIDDEN, NO_INPUT or
+ * BLANK, that frame and every one after it as a NULL refresh, each
+ * logging the switch once. none_shown sends both screens HIDDEN.
+ * over_no_input sends the bottom one as over does, NO_INPUT;
+ * shown_sized, SHOWN at a quarter of the top one's height. The image
+ * modes send the bottom one HIDDEN and screen 2, VMU, as a 48x32
+ * picture of four colours, through a lent buffer or, with
+ * video_views_test_image copy, from padded rows of the core's own;
+ * SHARP unless video_views_test_image_sharp is off: image, SHOWN;
+ * image_over, OVER as over does, at opacity 1; image_over_half, the
+ * same at half opacity; image_over_blank, the same BLANK.
+ * image_over_bottom_half sends the bottom one SHOWN and the picture
+ * OVER its bottom right corner at a quarter of its height, at half
+ * opacity; image_over_bottom_blank_half, the same BLANK. image_null
+ * sends it SHOWN and from frame 60 mirrored under a new serial, on a
+ * NULL refresh, and every refresh after it NULL. image_restart raises
+ * the maximum size at frame 60, which restarts the driver. Each
+ * picture is sent until the frontend takes it; each one sent, and each
+ * refused map without one, logs its serial and the answer.
+ * image_lend_open is lent its buffer and fills it in the first
+ * retro_run(), sends VMU ABSENT without a picture, restarts the driver
+ * as image_restart does and hands that buffer in 30 frames later. The
+ * layer modes send the bottom one HIDDEN and have Gel, a 48x32 picture
+ * of (255, 128, 255) that multiplies the top screen: layer sends it as
+ * screen 2, a LAYER, while the status has BLEND_MULTIPLY, and
+ * otherwise multiplies the top screen's colour itself; layer_sent
+ * sends it whatever the status. The turned modes send SET_ROTATION 1
+ * before their first map: image_turned and image_upright_turned are image,
+ * the second with UPRIGHT on VMU; upright_turned sends the bottom one
+ * SHOWN with UPRIGHT and from frame 60 SET_ROTATION 0, logging the
+ * switch once; upright_over sends the bottom one so too and VMU's
+ * picture OVER it. The modes besides rules log their map's
+ * screens_left_out each time it changes.
+ *
+ * VIDEO_VIEWS_TEST_LIBRARY_NAME in the environment replaces the library
+ * name, so one build can load as a second core. */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -92,6 +148,8 @@
 /* Azahar's maximum, at 10x. */
 #define LARGE_MAX_W 8000
 #define LARGE_MAX_H 4800
+/* image_restart's maximum: past what a driver keeps in place. */
+#define RAISED_MAX 4096
 
 /* Two eyes of the largest grid size. */
 #define GRID_MAX 1024
@@ -106,6 +164,7 @@
 #define COL_YELLOW 0xFFFF00
 #define COL_WHITE  0xFFFFFF
 #define COL_BLACK  0x000000
+#define COL_MAGENTA 0xFF00FF
 
 enum map_kind
 {
@@ -147,6 +206,13 @@ enum vr_kind
    VR_STAGE,
    VR_NOPAIR,
    VR_POSES
+};
+
+enum screens_kind
+{
+   SCREENS_OFF = 0,
+   SCREENS_RULES,
+   SCREENS_MODE
 };
 
 /* The GL the hardware mode uses, loaded through the frontend's
@@ -309,6 +375,29 @@ static unsigned geo_w, geo_h;
 static struct retro_vr_frame_state vr_fs;
 static bool vr_fs_ok;
 static uint32_t last_head_flags = 0xffffffffu;
+static enum screens_kind screens_kind = SCREENS_OFF;
+/* The rules case sent next, and the case and answer logged last. */
+static unsigned screens_next;
+static const char *screens_logged;
+static int screens_logged_accepted = -1;
+static unsigned screens_logged_left_out;
+/* A map's screens_left_out, set to this before each call so that a
+ * call that writes none shows. */
+#define SCR_LEFT_OUT_NONE 0xA5A5A5A5u
+static unsigned scr_left_out;
+/* With SCREENS_MODE, the scr_modes entry, and whether it has switched. */
+static unsigned screens_mode;
+static bool screens_switched;
+/* The rotation the turned modes sent last; 4 before the first. */
+static unsigned scr_rotation;
+/* The image modes' options, the serial the frontend took last, and
+ * whether image_restart has raised the maximum size. */
+static bool vmu_copy;
+static bool vmu_sharp = true;
+static unsigned vmu_held;
+static bool max_raised;
+/* image_lend_open's buffer, lent in the first retro_run(). */
+static const void *vmu_lent;
 
 static void fallback_log(enum retro_log_level level, const char *fmt, ...)
 {
@@ -486,6 +575,7 @@ static void context_reset(void)
 }
 
 static long long now_us(void);
+static bool screens_mode_named(const char *name);
 
 /* When, for a test that orders it against the headset's session. */
 static void context_destroy(void)
@@ -809,9 +899,12 @@ static void log_status(unsigned status, int accepted, unsigned n)
    if ((int)status == last_status && accepted == last_accepted)
       return;
    log_cb(RETRO_LOG_INFO,
-         "[video_views] presents=%d stereo=%d accepted=%d views=%u\n",
+         "[video_views] presents=%d stereo=%d accepted=%d views=%u "
+         "screens=%d images=%d\n",
          (status & RETRO_VIDEO_VIEWS_STATUS_PRESENTS) ? 1 : 0,
-         (status & RETRO_VIDEO_VIEWS_STATUS_STEREO) ? 1 : 0, accepted, n);
+         (status & RETRO_VIDEO_VIEWS_STATUS_STEREO) ? 1 : 0, accepted, n,
+         (status & RETRO_VIDEO_VIEWS_STATUS_SCREENS) ? 1 : 0,
+         (status & RETRO_VIDEO_VIEWS_STATUS_IMAGES) ? 1 : 0);
    last_status   = (int)status;
    last_accepted = accepted;
 }
@@ -1021,6 +1114,34 @@ static void read_options(void)
          grid_cap = n;
    }
 
+   var.key      = "video_views_test_screens";
+   var.value    = NULL;
+   screens_kind = SCREENS_OFF;
+   screens_next = 0;
+   screens_switched = false;
+   scr_rotation = 4;
+   vmu_held     = 0;
+   max_raised   = false;
+   vmu_lent     = NULL;
+   screens_logged_left_out = SCR_LEFT_OUT_NONE;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (!strcmp(var.value, "rules"))
+         screens_kind = SCREENS_RULES;
+      else if (screens_mode_named(var.value))
+         screens_kind = SCREENS_MODE;
+   }
+
+   var.key   = "video_views_test_image";
+   var.value = NULL;
+   vmu_copy  = environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var)
+      && var.value && !strcmp(var.value, "copy");
+
+   var.key   = "video_views_test_image_sharp";
+   var.value = NULL;
+   vmu_sharp = !(environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var)
+      && var.value && !strcmp(var.value, "off"));
+
    var.key   = "video_views_test_map";
    var.value = NULL;
    map_kind  = MAP_3DS;
@@ -1081,6 +1202,19 @@ void retro_set_environment(retro_environment_t cb)
         "Head tracking scene; solid|grid" },
       { "video_views_test_vr_scene_size",
         "Grid eye size, at most; 512|384|768|1024" },
+      { "video_views_test_screens",
+        "Screens the ds map describes; off|rules|no_input|no_input_off"
+        "|shown|hidden|over|over_half|over_blank|over_blank_half|blank"
+        "|blank_late|absent|absent_back|none_shown|hide_null"
+        "|no_input_null|blank_null|over_no_input|shown_sized|image"
+        "|image_over|image_over_half|image_over_blank"
+        "|image_over_bottom_half|image_over_bottom_blank_half|image_null"
+        "|image_restart|image_lend_open|layer|layer_sent|image_turned"
+        "|image_upright_turned|upright_turned|upright_over" },
+      { "video_views_test_image",
+        "Image screen pixels; lend|copy" },
+      { "video_views_test_image_sharp",
+        "Image screen SHARP; on|off" },
       { NULL, NULL }
    };
    struct retro_log_callback logging;
@@ -1110,8 +1244,9 @@ unsigned retro_api_version(void) { return RETRO_API_VERSION; }
 
 void retro_get_system_info(struct retro_system_info *info)
 {
+   const char *name = getenv("VIDEO_VIEWS_TEST_LIBRARY_NAME");
    memset(info, 0, sizeof(*info));
-   info->library_name     = "video_views test";
+   info->library_name     = (name && *name) ? name : "video_views test";
    info->library_version  = "1";
    info->valid_extensions = "";
    info->need_fullpath    = false;
@@ -1127,6 +1262,11 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
    info->geometry.base_height  = fh;
    info->geometry.max_width    = large_max ? LARGE_MAX_W : MAX_W;
    info->geometry.max_height   = large_max ? LARGE_MAX_H : MAX_H;
+   if (max_raised)
+   {
+      info->geometry.max_width  = RAISED_MAX;
+      info->geometry.max_height = RAISED_MAX;
+   }
    if (grid_sized())
    {
       if (info->geometry.max_width < 2 * grid_cap)
@@ -1997,6 +2137,897 @@ static void change_map(void)
          frames_run);
 }
 
+/* The rules mode's maps: the ds map with three screens, which each case
+ * changes in one way. As samples/gfx/video_views/video_views_test.c's
+ * full map. */
+static struct retro_video_view   scr_views[2];
+static struct retro_video_screen scr_screens[RETRO_VIDEO_SCREENS_MAX];
+static struct retro_video_screen_image scr_image;
+static uint32_t scr_pixels[48 * 32];
+static uint32_t scr_large[513 * 32];
+
+static struct retro_video_screen mkscreen(const char *name, unsigned flags,
+      unsigned state, unsigned show, unsigned base, float size,
+      unsigned anchor, float opacity, unsigned order, unsigned owners,
+      unsigned swap_with, unsigned group)
+{
+   struct retro_video_screen s;
+   s.name      = name;
+   s.flags     = flags;
+   s.state     = state;
+   s.show      = show;
+   s.base      = base;
+   s.size      = size;
+   s.anchor    = anchor;
+   s.opacity   = opacity;
+   s.order     = order;
+   s.owners    = owners;
+   s.swap_with = swap_with;
+   s.group     = group;
+   s.image     = NULL;
+   s.blend     = 0;
+   s.z         = 0;
+   s.x         = 0.0f;
+   s.y         = 0.0f;
+   s.width     = 0.0f;
+   s.height    = 0.0f;
+   return s;
+}
+
+static void scr_full(struct retro_video_views *in)
+{
+   scr_views[0]   = mkview(0,   0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_NONE);
+   scr_views[1]   = mkview(0, 192, 256, 192, 1, RETRO_VIDEO_VIEW_EYE_NONE);
+   scr_screens[0] = mkscreen("Top",
+         RETRO_VIDEO_SCREEN_FLAG_GROUP_VERTICAL
+         | RETRO_VIDEO_SCREEN_FLAG_EMPHASIS,
+         RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+         0, 0.0f, 0, 0.0f, 2, 0, 2, 1);
+   scr_screens[1] = mkscreen("Bottom",
+         RETRO_VIDEO_SCREEN_FLAG_NO_INPUT | RETRO_VIDEO_SCREEN_FLAG_SHARP
+         | RETRO_VIDEO_SCREEN_FLAG_INTEGER,
+         RETRO_VIDEO_SCREEN_STATE_BLANK, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+         0, 0.5f, 0, 0.0f, 1, 0, 0, 1);
+   scr_screens[2] = mkscreen("VMU A1",
+         RETRO_VIDEO_SCREEN_FLAG_PRIVATE | RETRO_VIDEO_SCREEN_FLAG_NO_INPUT
+         | RETRO_VIDEO_SCREEN_FLAG_SHARP,
+         RETRO_VIDEO_SCREEN_STATE_ABSENT, RETRO_VIDEO_SCREEN_SHOW_OVER,
+         0, 0.25f, 8, 0.75f, 3, 0x1, 0, 0);
+   in->views       = scr_views;
+   in->num_views   = 2;
+   in->flags      |= RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   in->screens     = scr_screens;
+   in->num_screens = 3;
+   scr_left_out         = SCR_LEFT_OUT_NONE;
+   in->screens_left_out = &scr_left_out;
+}
+
+/* Accepted */
+static void scr_no_flag(struct retro_video_views *in)
+{
+   unsigned i;
+   in->flags      &= ~RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   in->num_screens = 99;
+   for (i = 0; i < 3; i++)
+      scr_screens[i].anchor = 99;
+}
+
+static void scr_zero_screens(struct retro_video_views *in)
+{
+   in->screens     = NULL;
+   in->num_screens = 0;
+}
+
+static void scr_absent_viewless(struct retro_video_views *in)
+{
+   scr_screens[0].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
+   in->views            = &scr_views[1];
+   in->num_views        = 1;
+}
+
+static void scr_swap_one_side(struct retro_video_views *in)
+{
+   scr_screens[0].swap_with = 0;
+   scr_screens[1].swap_with = 1;
+}
+
+static void scr_swap_both(struct retro_video_views *in)
+{
+   scr_screens[1].swap_with = 1;
+}
+
+/* Bits the frontend does not know are ignored. */
+static void scr_unknown_flags(struct retro_video_views *in)
+{
+   in->flags            |= 1u << 31;
+   scr_screens[1].flags |= RETRO_VIDEO_SCREEN_FLAG_UPRIGHT | (1u << 31);
+}
+
+/* Refused */
+static void scr_too_many(struct retro_video_views *in)
+{
+   in->num_screens = RETRO_VIDEO_SCREENS_MAX + 1;
+}
+
+static void scr_null_screens(struct retro_video_views *in)
+{
+   in->screens     = NULL;
+   in->num_screens = 2;
+}
+
+static void scr_view_past_count(struct retro_video_views *in)
+{
+   in->num_screens          = 1;
+   scr_screens[0].swap_with = 0;
+}
+
+/* Accepted; the screen is left out where the frontend cannot take it */
+static void scr_image_screen(struct retro_video_views *in)
+{
+   scr_image.data         = scr_pixels;
+   scr_image.width        = 48;
+   scr_image.height       = 32;
+   scr_image.pitch        = 48 * sizeof(uint32_t);
+   scr_image.format       = RETRO_PIXEL_FORMAT_XRGB8888;
+   scr_image.aspect_ratio = 0.0f;
+   scr_image.serial       = 1;
+   scr_screens[2].image   = &scr_image;
+}
+
+static void scr_image_null(struct retro_video_views *in)
+{
+   scr_image_screen(in);
+   scr_image.data = NULL;
+}
+
+/* Serial 2 is never taken. Under serial 1, which "image" leaves held, a
+ * new format or size is refused, not left out. */
+static void scr_image_null_serial(struct retro_video_views *in)
+{
+   scr_image_null(in);
+   scr_image.serial = 2;
+}
+
+static void scr_image_format(struct retro_video_views *in)
+{
+   scr_image_screen(in);
+   scr_image.format = RETRO_PIXEL_FORMAT_0RGB1555;
+   scr_image.pitch  = 48 * sizeof(uint16_t);
+   scr_image.serial = 2;
+}
+
+static void scr_image_large(struct retro_video_views *in)
+{
+   scr_image_screen(in);
+   scr_image.data   = scr_large;
+   scr_image.width  = 513;
+   scr_image.pitch  = 513 * sizeof(uint32_t);
+   scr_image.serial = 2;
+}
+
+static void scr_image_argb(struct retro_video_views *in)
+{
+   scr_image_screen(in);
+   scr_image.format = RETRO_VIDEO_SCREEN_FORMAT_ARGB8888;
+   scr_image.serial = 2;
+}
+
+/* Screen @i as Gel: the VMU made a LAYER on @base. */
+static void scr_gel(unsigned i, unsigned base)
+{
+   scr_screens[i]      = scr_screens[2];
+   scr_screens[i].name = "Gel";
+   scr_screens[i].show = RETRO_VIDEO_SCREEN_SHOW_LAYER;
+   scr_screens[i].base = base;
+}
+
+/* Accepted; a LAYER is left out while its blend is not drawn */
+static void scr_layer_placeholder(struct retro_video_views *in)
+{
+   scr_gel(2, 0);
+}
+
+static void scr_layer_styles(struct retro_video_views *in)
+{
+   static const unsigned blend[5] = {
+      RETRO_VIDEO_SCREEN_BLEND_ALPHA, RETRO_VIDEO_SCREEN_BLEND_ADD,
+      RETRO_VIDEO_SCREEN_BLEND_MULTIPLY, RETRO_VIDEO_SCREEN_BLEND_NONE, 7
+   };
+   unsigned i;
+   for (i = 0; i < 5; i++)
+   {
+      scr_gel(2 + i, 0);
+      scr_screens[2 + i].blend = blend[i];
+   }
+   in->num_screens = 7;
+}
+
+static void scr_layer_argb(struct retro_video_views *in)
+{
+   scr_image_argb(in);
+   scr_gel(2, 0);
+   scr_screens[2].blend = RETRO_VIDEO_SCREEN_BLEND_ALPHA;
+}
+
+static void scr_layer_one_side_image(struct retro_video_views *in)
+{
+   scr_image_screen(in);
+   scr_gel(2, 0);
+   scr_screens[2].x      = 0.5f;
+   scr_screens[2].height = 1.0f;
+}
+
+static void scr_layer_order(struct retro_video_views *in)
+{
+   scr_gel(2, 0);
+   scr_screens[2].order = 0;
+}
+
+static void scr_layer_off(struct retro_video_views *in)
+{
+   scr_gel(2, 0);
+   scr_screens[1].flags |= RETRO_VIDEO_SCREEN_FLAG_LAYER_OFF;
+   scr_screens[2].flags |= RETRO_VIDEO_SCREEN_FLAG_LAYER_OFF;
+}
+
+static void scr_layer_upright(struct retro_video_views *in)
+{
+   scr_gel(2, 0);
+   scr_screens[2].flags |= RETRO_VIDEO_SCREEN_FLAG_UPRIGHT;
+}
+
+/* Refused */
+static void scr_layer_self(struct retro_video_views *in)
+{
+   scr_gel(2, 2);
+}
+
+static void scr_layer_on_layer(struct retro_video_views *in)
+{
+   scr_gel(2, 0);
+   scr_gel(3, 2);
+   in->num_screens = 4;
+}
+
+static void scr_layer_on_over(struct retro_video_views *in)
+{
+   scr_gel(3, 2);
+   in->num_screens = 4;
+}
+
+static void scr_layer_range(struct retro_video_views *in)
+{
+   scr_gel(2, 0);
+   scr_screens[2].x      = 65.0f;
+   scr_screens[2].width  = 1.0f;
+   scr_screens[2].height = 1.0f;
+}
+
+static void scr_layer_nan(struct retro_video_views *in)
+{
+   volatile float zero = 0.0f;
+   scr_gel(2, 0);
+   scr_screens[2].width = zero / zero;
+}
+
+static void scr_layer_one_side(struct retro_video_views *in)
+{
+   scr_gel(2, 0);
+   scr_screens[2].width = 0.5f;
+}
+
+/* The top screen's own pair is dropped, so the LAYER is all that is
+ * wrong. */
+static void scr_layer_swap(struct retro_video_views *in)
+{
+   scr_gel(2, 0);
+   scr_screens[0].swap_with = 0;
+   scr_screens[2].swap_with = 1;
+}
+
+static void scr_layer_group(struct retro_video_views *in)
+{
+   scr_gel(2, 0);
+   scr_screens[2].group = 1;
+}
+
+static void scr_active_viewless(struct retro_video_views *in)
+{
+   scr_screens[2].state = RETRO_VIDEO_SCREEN_STATE_ACTIVE;
+}
+
+static void scr_blank_viewless(struct retro_video_views *in)
+{
+   scr_screens[2].state = RETRO_VIDEO_SCREEN_STATE_BLANK;
+}
+
+static void scr_eye_unpaired(struct retro_video_views *in)
+{
+   scr_views[1].eye = RETRO_VIDEO_VIEW_EYE_LEFT;
+}
+
+static void scr_base_past_count(struct retro_video_views *in)
+{
+   scr_screens[1].base = 3;
+}
+
+static void scr_over_self(struct retro_video_views *in)
+{
+   scr_screens[2].base = 2;
+}
+
+static void scr_over_over(struct retro_video_views *in)
+{
+   scr_screens[0].show = RETRO_VIDEO_SCREEN_SHOW_OVER;
+   scr_screens[0].base = 1;
+}
+
+static void scr_size_negative(struct retro_video_views *in)
+{
+   scr_screens[1].size = -0.5f;
+}
+
+static void scr_anchor(struct retro_video_views *in)
+{
+   scr_screens[2].anchor = 9;
+}
+
+static void scr_over_size(struct retro_video_views *in)
+{
+   scr_screens[2].size = 1.5f;
+}
+
+static void scr_opacity(struct retro_video_views *in)
+{
+   scr_screens[2].opacity = 1.5f;
+}
+
+static void scr_private_owners(struct retro_video_views *in)
+{
+   scr_screens[2].owners = 0;
+}
+
+static void scr_swap_self(struct retro_video_views *in)
+{
+   scr_screens[0].swap_with = 1;
+}
+
+static void scr_swap_past_count(struct retro_video_views *in)
+{
+   scr_screens[0].swap_with = 4;
+}
+
+static void scr_swap_disagree(struct retro_video_views *in)
+{
+   scr_screens[0].swap_with = 2;
+   scr_screens[1].swap_with = 3;
+}
+
+static void scr_show_unknown(struct retro_video_views *in)
+{
+   scr_screens[2].show = 4;
+}
+
+static void scr_state_unknown(struct retro_video_views *in)
+{
+   scr_screens[2].state = 3;
+}
+
+/* Screen 2 has no view, so state-unknown breaks the viewless rule too. */
+static void scr_state_unknown_viewed(struct retro_video_views *in)
+{
+   scr_screens[0].state = 3;
+}
+
+static void scr_order_mixed(struct retro_video_views *in)
+{
+   scr_screens[2].order = 0;
+}
+
+static void scr_order_mixed_first(struct retro_video_views *in)
+{
+   scr_screens[0].order = 0;
+}
+
+/* In the order sent; e2e/run.py knows which the frontend must accept. */
+static const struct
+{
+   const char *name;
+   void (*change)(struct retro_video_views *in);
+} scr_cases[] = {
+   { "no-flag",              scr_no_flag              },
+   { "zero-screens",         scr_zero_screens         },
+   { "absent-viewless",      scr_absent_viewless      },
+   { "swap-one-side",        scr_swap_one_side        },
+   { "swap-both",            scr_swap_both            },
+   { "unknown-flags",        scr_unknown_flags        },
+   { "too-many",             scr_too_many             },
+   { "null-screens",         scr_null_screens         },
+   { "view-past-count",      scr_view_past_count      },
+   { "image-null-unheld",    scr_image_null           },
+   { "image",                scr_image_screen         },
+   { "image-null-held",      scr_image_null           },
+   { "image-null-serial",    scr_image_null_serial    },
+   { "image-format",         scr_image_format         },
+   { "image-large",          scr_image_large          },
+   { "image-argb",           scr_image_argb           },
+   { "layer-placeholder",    scr_layer_placeholder    },
+   { "layer-styles",         scr_layer_styles         },
+   { "layer-argb",           scr_layer_argb           },
+   { "layer-one-side-image", scr_layer_one_side_image },
+   { "layer-order",          scr_layer_order          },
+   { "layer-off",            scr_layer_off            },
+   { "layer-upright",        scr_layer_upright        },
+   { "layer-upright-clear",  scr_layer_placeholder    },
+   { "layer-self",           scr_layer_self           },
+   { "layer-on-layer",       scr_layer_on_layer       },
+   { "layer-on-over",        scr_layer_on_over        },
+   { "layer-range",          scr_layer_range          },
+   { "layer-nan",            scr_layer_nan            },
+   { "layer-one-side",       scr_layer_one_side       },
+   { "layer-swap",           scr_layer_swap           },
+   { "layer-group",          scr_layer_group          },
+   { "active-viewless",      scr_active_viewless      },
+   { "blank-viewless",       scr_blank_viewless       },
+   { "eye-unpaired",         scr_eye_unpaired         },
+   { "base-past-count",      scr_base_past_count      },
+   { "over-self",            scr_over_self            },
+   { "over-over",            scr_over_over            },
+   { "size-negative",        scr_size_negative        },
+   { "anchor",               scr_anchor               },
+   { "over-size",            scr_over_size            },
+   { "opacity",              scr_opacity              },
+   { "private-owners",       scr_private_owners       },
+   { "swap-self",            scr_swap_self            },
+   { "swap-past-count",      scr_swap_past_count      },
+   { "swap-disagree",        scr_swap_disagree        },
+   { "show-unknown",         scr_show_unknown         },
+   { "state-unknown",        scr_state_unknown        },
+   { "state-unknown-viewed", scr_state_unknown_viewed },
+   { "order-mixed",          scr_order_mixed          },
+   { "order-mixed-first",    scr_order_mixed_first    }
+};
+
+/* A mode whose @late differs from its @state switches at this frame. */
+#define SCR_SWITCH_FRAME 60
+/* image_lend_open hands its buffer in this long after the switch. */
+#define SCR_LEND_FRAMES 30
+/* A mode's Gel: sent while the status says its blend is drawn, or
+ * whatever it says. */
+#define GEL_IF_DRAWN 1
+#define GEL_ALWAYS   2
+#define GEL_COL      0xFF80FF
+/* A mode's SET_ROTATION, sent when it changes: 1, or 1 until the
+ * switch and 0 from it. */
+#define TURN_ALWAYS 1
+#define TURN_EARLY  2
+
+/* video_views_test_screens' modes besides rules: how the ds map's
+ * screen 1 is sent, @late being its state from SCR_SWITCH_FRAME on.
+ * @both gives screen 0 the same show. @opacity is screen 1's. A @null
+ * mode switches there with a NULL refresh and sends every refresh after
+ * it NULL, screen 1 from then @null_show with @null_flags. @size is
+ * screen 1's when it is not OVER. @image sends screen 1 HIDDEN and the
+ * fields above for screen 2, the VMU picture, which a @null mode
+ * mirrors at the switch. @restart raises the maximum size there.
+ * @lend_open keeps the picture's buffer from the first frame and sends
+ * no picture until SCR_LEND_FRAMES after the switch. @gel, a GEL_
+ * value, has Gel multiply screen 0: as screen 2, a LAYER, when it is
+ * sent, in the core's own drawing when it is not. @turn, a TURN_ value,
+ * turns the core. @upright_base sends an image mode's screen 1 SHOWN
+ * with UPRIGHT, as the picture's base; @shown_base, SHOWN without it. */
+static const struct
+{
+   const char *name;
+   unsigned flags;
+   unsigned show;
+   unsigned state;
+   unsigned late;
+   bool both;
+   float opacity;
+   bool null;
+   unsigned null_show;
+   unsigned null_flags;
+   float size;
+   bool image;
+   bool restart;
+   bool lend_open;
+   unsigned gel;
+   unsigned turn;
+   bool upright_base;
+   bool shown_base;
+} scr_modes[] = {
+   { "no_input",     RETRO_VIDEO_SCREEN_FLAG_NO_INPUT,
+      RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f },
+   { "no_input_off", 0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f },
+   { "shown",        0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f },
+   { "hidden",       0, RETRO_VIDEO_SCREEN_SHOW_HIDDEN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f },
+   { "over",         0, RETRO_VIDEO_SCREEN_SHOW_OVER,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f },
+   { "over_half",    0, RETRO_VIDEO_SCREEN_SHOW_OVER,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.5f },
+   { "over_blank",   0, RETRO_VIDEO_SCREEN_SHOW_OVER,
+      RETRO_VIDEO_SCREEN_STATE_BLANK,  RETRO_VIDEO_SCREEN_STATE_BLANK,
+      false, 0.0f },
+   { "over_blank_half", 0, RETRO_VIDEO_SCREEN_SHOW_OVER,
+      RETRO_VIDEO_SCREEN_STATE_BLANK,  RETRO_VIDEO_SCREEN_STATE_BLANK,
+      false, 0.5f },
+   { "blank",        0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_BLANK,  RETRO_VIDEO_SCREEN_STATE_BLANK,
+      false, 0.0f },
+   { "blank_late",   0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_BLANK,
+      false, 0.0f },
+   { "absent",       0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ABSENT, RETRO_VIDEO_SCREEN_STATE_ABSENT,
+      false, 0.0f },
+   { "absent_back",  0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ABSENT, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f },
+   { "none_shown",   0, RETRO_VIDEO_SCREEN_SHOW_HIDDEN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      true, 0.0f },
+   { "hide_null",    0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f, true, RETRO_VIDEO_SCREEN_SHOW_HIDDEN, 0 },
+   { "no_input_null", 0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f, true, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_FLAG_NO_INPUT },
+   { "blank_null",   0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_BLANK,
+      false, 0.0f, true, RETRO_VIDEO_SCREEN_SHOW_SHOWN, 0 },
+   { "over_no_input", RETRO_VIDEO_SCREEN_FLAG_NO_INPUT,
+      RETRO_VIDEO_SCREEN_SHOW_OVER,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f },
+   { "shown_sized",  0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f, false, 0, 0, 0.25f },
+   { "image",        0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f, false, 0, 0, 0.0f, true },
+   { "image_over",   0, RETRO_VIDEO_SCREEN_SHOW_OVER,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 1.0f, false, 0, 0, 0.0f, true },
+   { "image_over_half", 0, RETRO_VIDEO_SCREEN_SHOW_OVER,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.5f, false, 0, 0, 0.0f, true },
+   { "image_over_blank", 0, RETRO_VIDEO_SCREEN_SHOW_OVER,
+      RETRO_VIDEO_SCREEN_STATE_BLANK,  RETRO_VIDEO_SCREEN_STATE_BLANK,
+      false, 1.0f, false, 0, 0, 0.0f, true },
+   { "image_over_bottom_half", 0, RETRO_VIDEO_SCREEN_SHOW_OVER,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.5f, false, 0, 0, 0.0f, true, false, false, 0, 0, false,
+      true },
+   { "image_over_bottom_blank_half", 0, RETRO_VIDEO_SCREEN_SHOW_OVER,
+      RETRO_VIDEO_SCREEN_STATE_BLANK,  RETRO_VIDEO_SCREEN_STATE_BLANK,
+      false, 0.5f, false, 0, 0, 0.0f, true, false, false, 0, 0, false,
+      true },
+   { "image_null",   0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f, true, RETRO_VIDEO_SCREEN_SHOW_SHOWN, 0, 0.0f, true },
+   { "image_restart", 0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f, false, 0, 0, 0.0f, true, true },
+   { "image_lend_open", 0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f, false, 0, 0, 0.0f, true, true, true },
+   { "layer",        0, RETRO_VIDEO_SCREEN_SHOW_HIDDEN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f, false, 0, 0, 0.0f, false, false, false, GEL_IF_DRAWN },
+   { "layer_sent",   0, RETRO_VIDEO_SCREEN_SHOW_HIDDEN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f, false, 0, 0, 0.0f, false, false, false, GEL_ALWAYS },
+   { "image_turned", 0, RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f, false, 0, 0, 0.0f, true, false, false, 0, TURN_ALWAYS },
+   { "image_upright_turned", RETRO_VIDEO_SCREEN_FLAG_UPRIGHT,
+      RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f, false, 0, 0, 0.0f, true, false, false, 0, TURN_ALWAYS },
+   { "upright_turned", RETRO_VIDEO_SCREEN_FLAG_UPRIGHT,
+      RETRO_VIDEO_SCREEN_SHOW_SHOWN,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 0.0f, false, 0, 0, 0.0f, false, false, false, 0, TURN_EARLY },
+   { "upright_over", 0, RETRO_VIDEO_SCREEN_SHOW_OVER,
+      RETRO_VIDEO_SCREEN_STATE_ACTIVE, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+      false, 1.0f, false, 0, 0, 0.0f, true, false, false, 0, TURN_ALWAYS,
+      true }
+};
+
+/* A null mode from its switch on: each refresh repeats the last frame */
+static bool screens_repeat(void)
+{
+   return screens_kind == SCREENS_MODE && scr_modes[screens_mode].null
+      && frames_run > SCR_SWITCH_FRAME;
+}
+
+static bool screens_mode_named(const char *name)
+{
+   unsigned i;
+   for (i = 0; i < sizeof(scr_modes) / sizeof(scr_modes[0]); i++)
+   {
+      if (!strcmp(name, scr_modes[i].name))
+      {
+         screens_mode = i;
+         return true;
+      }
+   }
+   return false;
+}
+
+/* Whether the mode sends Gel under @status. */
+static bool gel_sent(unsigned status)
+{
+   unsigned gel = scr_modes[screens_mode].gel;
+   return gel == GEL_ALWAYS || (gel == GEL_IF_DRAWN
+         && (status & RETRO_VIDEO_VIEWS_STATUS_BLEND_MULTIPLY));
+}
+
+/* @col as BLEND_MULTIPLY draws it under Gel. */
+static uint32_t gel_multiply(uint32_t col)
+{
+   uint32_t out = 0;
+   unsigned shift;
+   for (shift = 0; shift < 24; shift += 8)
+      out |= ((((col >> shift) & 0xFF) * ((GEL_COL >> shift) & 0xFF)
+               + 127) / 255) << shift;
+   return out;
+}
+
+/* Screen 2 as Gel: a LAYER over all of screen 0. */
+static void gel_screen(struct retro_video_views *in)
+{
+   unsigned i;
+   for (i = 0; i < sizeof(scr_pixels) / sizeof(scr_pixels[0]); i++)
+      scr_pixels[i] = GEL_COL;
+   scr_screens[2] = mkscreen("Gel", 0, RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+         RETRO_VIDEO_SCREEN_SHOW_LAYER, 0, 0.0f, 0, 0.0f, 0, 0, 0, 0);
+   scr_screens[2].blend = RETRO_VIDEO_SCREEN_BLEND_MULTIPLY;
+   scr_image_screen(in);
+   in->num_screens = 3;
+}
+
+/* The image modes' picture, and the core's own rows of it, padded as a
+ * core's may be. */
+#define VMU_W     48
+#define VMU_H     32
+#define VMU_PITCH 200
+static struct retro_video_screen_image vmu_image;
+static uint32_t vmu_own[VMU_PITCH / sizeof(uint32_t) * VMU_H];
+
+/* Red, blue over white, magenta; mirrored, blue, red over magenta,
+ * white. The X byte is 0. */
+static void vmu_fill(void *px, size_t pitch, bool mirrored)
+{
+   static const uint32_t cols[4] = { COL_RED, COL_BLUE, COL_WHITE,
+      COL_MAGENTA };
+   unsigned x, y;
+   for (y = 0; y < VMU_H; y++)
+   {
+      uint32_t *row = (uint32_t*)((uint8_t*)px + y * pitch);
+      for (x = 0; x < VMU_W; x++)
+         row[x] = cols[(y >= VMU_H / 2 ? 2 : 0)
+            + ((x >= VMU_W / 2) != mirrored ? 1 : 0)];
+   }
+}
+
+/* Screen 2's picture this frame: sent until the frontend takes it,
+ * then by its serial alone. A lend refused leaves the core's own. */
+static const struct retro_video_screen_image *vmu_picture(void)
+{
+   struct retro_video_screen_buffer buf;
+   bool mirrored   = screens_switched && scr_modes[screens_mode].null;
+   unsigned serial = mirrored ? 2 : 1;
+   if (vmu_held == serial)
+   {
+      vmu_image.data = NULL;
+      return &vmu_image;
+   }
+   memset(&buf, 0, sizeof(buf));
+   buf.screen = 2;
+   buf.width  = VMU_W;
+   buf.height = VMU_H;
+   buf.format = RETRO_PIXEL_FORMAT_XRGB8888;
+   if (     vmu_copy
+         || !environ_cb(RETRO_ENVIRONMENT_GET_VIDEO_SCREEN_BUFFER, &buf))
+   {
+      if (!vmu_copy)
+         log_cb(RETRO_LOG_INFO, "[video_views] image buffer refused\n");
+      buf.data  = vmu_own;
+      buf.pitch = VMU_PITCH;
+   }
+   vmu_fill(buf.data, buf.pitch, mirrored);
+   vmu_image.data         = buf.data;
+   vmu_image.width        = VMU_W;
+   vmu_image.height       = VMU_H;
+   vmu_image.pitch        = buf.pitch;
+   vmu_image.format       = RETRO_PIXEL_FORMAT_XRGB8888;
+   vmu_image.aspect_ratio = 0.0f;
+   vmu_image.serial       = serial;
+   return &vmu_image;
+}
+
+/* image_lend_open's picture: lent and filled in the first retro_run(),
+ * NULL until SCR_LEND_FRAMES after the switch, then that buffer. */
+static const struct retro_video_screen_image *vmu_lend_open(void)
+{
+   if (!vmu_lent)
+   {
+      vmu_picture();
+      vmu_lent = vmu_image.data;
+   }
+   if (frames_run <= SCR_SWITCH_FRAME + SCR_LEND_FRAMES)
+   {
+      vmu_image.data = NULL;
+      return NULL;
+   }
+   vmu_image.data = (vmu_held == vmu_image.serial) ? NULL : vmu_lent;
+   return &vmu_image;
+}
+
+/* After the map: a picture sent and taken is held, one the map left
+ * out is not. Each one sent, and each refused map without one, is
+ * logged. */
+static void vmu_answer(int accepted)
+{
+   if (!vmu_image.data && accepted)
+      return;
+   log_cb(RETRO_LOG_INFO, "[video_views] image serial=%u accepted=%d\n",
+         vmu_image.serial, accepted);
+   if (accepted && !(scr_left_out & (1u << 2)))
+      vmu_held = vmu_image.serial;
+}
+
+/* image_restart's switch: a maximum the driver cannot take in place. */
+static void raise_max(void)
+{
+   struct retro_system_av_info av;
+   max_raised = true;
+   retro_get_system_av_info(&av);
+   environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av);
+}
+
+/* The screens video_views_test_screens adds to @in, the ds map, under
+ * @status. In the rules mode this frame's case, whose name it returns. */
+static const char *screens_add(struct retro_video_views *in,
+      unsigned status)
+{
+   const char *name = "full";
+   if (screens_kind != SCREENS_RULES)
+   {
+      unsigned flags = scr_modes[screens_mode].flags;
+      unsigned show  = scr_modes[screens_mode].show;
+      unsigned state = scr_modes[screens_mode].state;
+      unsigned turn  = scr_modes[screens_mode].turn;
+      bool image     = scr_modes[screens_mode].image;
+      bool over;
+      /* retro_run() has counted this frame. */
+      if (     (scr_modes[screens_mode].late != state
+               || scr_modes[screens_mode].null
+               || scr_modes[screens_mode].restart
+               || turn == TURN_EARLY)
+            && frames_run > SCR_SWITCH_FRAME)
+      {
+         state = scr_modes[screens_mode].late;
+         if (scr_modes[screens_mode].null)
+         {
+            show  = scr_modes[screens_mode].null_show;
+            flags = scr_modes[screens_mode].null_flags;
+         }
+         if (!screens_switched)
+         {
+            log_cb(RETRO_LOG_INFO, "[video_views] screens switched\n");
+            if (scr_modes[screens_mode].restart)
+               raise_max();
+         }
+         screens_switched = true;
+      }
+      if (turn)
+      {
+         unsigned rotation = (turn == TURN_EARLY && screens_switched)
+            ? 0 : 1;
+         if (rotation != scr_rotation)
+            environ_cb(RETRO_ENVIRONMENT_SET_ROTATION, &rotation);
+         scr_rotation = rotation;
+      }
+      over = (show == RETRO_VIDEO_SCREEN_SHOW_OVER);
+      scr_screens[0]  = mkscreen("Top", 0, 0,
+            scr_modes[screens_mode].both ? show : 0,
+            0, 0.0f, 0, 0.0f, 0, 0, 0, 0);
+      scr_screens[image ? 2 : 1] = mkscreen(image ? "VMU" : "Bottom",
+            flags, state, show, 0,
+            over ? 0.25f : scr_modes[screens_mode].size,
+            over ? RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT : 0,
+            scr_modes[screens_mode].opacity, 0, 0, 0, 0);
+      in->flags      |= RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+      in->screens     = scr_screens;
+      in->num_screens = 2;
+      scr_left_out         = SCR_LEFT_OUT_NONE;
+      in->screens_left_out = &scr_left_out;
+      if (image)
+      {
+         bool upright = scr_modes[screens_mode].upright_base;
+         bool base    = upright || scr_modes[screens_mode].shown_base;
+         scr_screens[1] = mkscreen("Bottom",
+               upright ? RETRO_VIDEO_SCREEN_FLAG_UPRIGHT : 0,
+               RETRO_VIDEO_SCREEN_STATE_ACTIVE,
+               base ? RETRO_VIDEO_SCREEN_SHOW_SHOWN
+                    : RETRO_VIDEO_SCREEN_SHOW_HIDDEN,
+               0, 0.0f, 0, 0.0f, 0, 0, 0, 0);
+         if (base)
+            scr_screens[2].base = 1;
+         if (vmu_sharp)
+            scr_screens[2].flags |= RETRO_VIDEO_SCREEN_FLAG_SHARP;
+         if (scr_modes[screens_mode].lend_open)
+         {
+            scr_screens[2].image = vmu_lend_open();
+            if (!scr_screens[2].image)
+               scr_screens[2].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
+         }
+         else
+            scr_screens[2].image = vmu_picture();
+         in->num_screens      = 3;
+      }
+      else if (gel_sent(status))
+         gel_screen(in);
+      return NULL;
+   }
+   if (!screens_next)
+   {
+      struct retro_video_screen_buffer buf;
+      memset(&buf, 0, sizeof(buf));
+      buf.screen = 1;
+      buf.width  = 48;
+      buf.height = 32;
+      buf.format = RETRO_PIXEL_FORMAT_XRGB8888;
+      log_cb(RETRO_LOG_INFO, "[video_views] screen_buffer=%d\n",
+            environ_cb(RETRO_ENVIRONMENT_GET_VIDEO_SCREEN_BUFFER, &buf)
+            ? 1 : 0);
+   }
+   scr_full(in);
+   if (screens_next < sizeof(scr_cases) / sizeof(scr_cases[0]))
+   {
+      name = scr_cases[screens_next].name;
+      scr_cases[screens_next++].change(in);
+   }
+   return name;
+}
+
+/* Each case once; the full map again only when its answer changes. */
+static void screens_log(const char *name, int accepted)
+{
+   if (     name == screens_logged && accepted == screens_logged_accepted
+         && scr_left_out == screens_logged_left_out)
+      return;
+   log_cb(RETRO_LOG_INFO,
+         "[video_views] screens case=%s accepted=%d left_out=0x%x\n",
+         name, accepted, scr_left_out);
+   screens_logged          = name;
+   screens_logged_accepted = accepted;
+   screens_logged_left_out = scr_left_out;
+}
+
+/* A mode's screens_left_out, each time it changes. */
+static void left_out_log(void)
+{
+   if (scr_left_out == screens_logged_left_out)
+      return;
+   log_cb(RETRO_LOG_INFO, "[video_views] left_out=0x%x\n", scr_left_out);
+   screens_logged_left_out = scr_left_out;
+}
+
 void retro_run(void)
 {
    struct retro_video_view v[RETRO_VIDEO_VIEWS_MAX];
@@ -2005,6 +3036,7 @@ void retro_run(void)
    unsigned i, n, fw, fh, cx, cy;
    int accepted    = 0;
    unsigned status = 0;
+   const char *screens_case = NULL;
    bool stereo;
    bool hmd;
    bool vr;
@@ -2059,6 +3091,9 @@ void retro_run(void)
       geo_h = fh;
    }
    n = build_map(v, c, stereo);
+   if (     screens_kind == SCREENS_MODE && scr_modes[screens_mode].gel
+         && !gel_sent(status))
+      c[0] = gel_multiply(c[0]);
    if (HW_IS_VULKAN(hw_kind))
    {
       if (!vk_ready)
@@ -2139,8 +3174,19 @@ void retro_run(void)
             ? RETRO_VR_REFERENCE_SPACE_STAGE
             : RETRO_VR_REFERENCE_SPACE_LOCAL;
       }
+      if (     (screens_kind != SCREENS_OFF && map_kind == MAP_DS)
+            || (screens_kind == SCREENS_MODE && map_kind == MAP_3DS))
+         screens_case = screens_add(&views, status);
       accepted        = environ_cb(RETRO_ENVIRONMENT_SET_VIDEO_VIEWS,
             &views) ? 1 : 0;
+      if (screens_case)
+         screens_log(screens_case, accepted);
+      else if (views.num_screens)
+      {
+         left_out_log();
+         if (scr_modes[screens_mode].image)
+            vmu_answer(accepted);
+      }
       if (     (int)hmd != last_hmd
             || views.recommended_view_width != last_rec_w
             || views.recommended_view_height != last_rec_h)
@@ -2166,7 +3212,13 @@ void retro_run(void)
    log_lightgun(fw, fh);
    update_rumble();
 
-   if (HW_IS_VULKAN(hw_kind))
+   if (screens_repeat())
+   {
+      if (gl_clears())
+         p_glDisable(GL_SCISSOR_TEST);
+      video_cb(NULL, fw, fh, 0);
+   }
+   else if (HW_IS_VULKAN(hw_kind))
    {
       if (vk_send(fw, fh))
          video_cb(RETRO_HW_FRAME_BUFFER_VALID, fw, fh, 0);
@@ -2197,9 +3249,26 @@ void retro_run(void)
       video_cb(frame_buf, fw, fh, fw * sizeof(uint32_t));
 }
 
-size_t retro_serialize_size(void) { return 0; }
-bool retro_serialize(void *data, size_t size) { (void)data; (void)size; return false; }
-bool retro_unserialize(const void *data, size_t size) { (void)data; (void)size; return false; }
+/* For run-ahead: the frame count alone. Each instance keeps its own
+ * picture serial, as the frontend keeps a store for each. */
+size_t retro_serialize_size(void) { return sizeof(frames_run); }
+
+bool retro_serialize(void *data, size_t size)
+{
+   if (size < sizeof(frames_run))
+      return false;
+   memcpy(data, &frames_run, sizeof(frames_run));
+   return true;
+}
+
+bool retro_unserialize(const void *data, size_t size)
+{
+   if (size < sizeof(frames_run))
+      return false;
+   memcpy(&frames_run, data, sizeof(frames_run));
+   return true;
+}
+
 void retro_cheat_reset(void) { }
 void retro_cheat_set(unsigned index, bool enabled, const char *code)
 {

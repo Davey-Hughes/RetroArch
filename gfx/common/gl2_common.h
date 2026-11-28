@@ -399,7 +399,7 @@ struct gl2
       GLuint                copy_fbo;
       GLuint                vbo;
       /* For get_flags on the main thread: whether views may be drawn,
-       * and whether the last frame with a map was drawn whole. */
+       * and whether a map, sent or not, is drawn whole. */
       retro_atomic_int_t    allowed;
       retro_atomic_int_t    fallback;
       /* A shader preset is loaded */

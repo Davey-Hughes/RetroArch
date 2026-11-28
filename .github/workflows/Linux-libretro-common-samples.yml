@@ -528,6 +528,10 @@ jobs:
             # A writer updates a record two million times while three
             # threads copy it: no copy torn, none going back.
             retro_seqlock_test
+            # The same over two copies behind one stamp: each copy is the
+            # update its stamp names, and a writer stopped part way holds
+            # no reader up.
+            retro_seqlatch_test
             # Twenty threads change one record two million times in all
             # while three copy it: no change lost, no copy torn.
             retro_cas_record_test

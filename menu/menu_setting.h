@@ -132,18 +132,30 @@ void menu_setting_free(rarch_setting_t *setting);
  * name of the keyboard listed there. */
 size_t menu_setting_keyboard_index_name(unsigned idx, char *s, size_t len);
 
-#ifdef HAVE_VIDEO_WINDOWS
-/* Rebuilds the display rows' values: Auto, then each listed display's
- * key. App thread; the list is built from it. */
+/* Rebuilds each display row's values: Auto, each listed display's key,
+ * the Over value of each base on offer, then Off; Auto, the Over values
+ * and Off without the screens' windows. App thread; the list is built
+ * from it. */
 void menu_setting_video_screen_display_values(void);
 
 /* The screens the menu lists: Game Screens 1 and 2, and each further one
  * the core has */
 unsigned menu_setting_video_screens(void);
 
+/* Main thread, before the menu iterates: the rows of each screen whose
+ * published values moved since they last took them take them; a Display
+ * row holding what it last read follows. */
+void menu_setting_video_screens_shown(void);
+
+/* Any thread: Game Screen @screen's Display row as it reads */
+size_t menu_setting_video_screen_display_repr(unsigned screen, char *s,
+      size_t len);
+
+#ifdef HAVE_VIDEO_WINDOWS
 #ifndef ANDROID
 /* Game Screen @screen has a window of its own by its Display setting
- * and the displays listed now. App thread. */
+ * and the displays listed now; an inset or a LAYER has none. App
+ * thread. */
 bool menu_setting_video_screen_window_own(unsigned screen);
 
 /* The screen whose Screen N row or page is @label, or

@@ -653,6 +653,13 @@ bool video_driver_get_viewport_info(struct video_viewport *vp)
    *vp = t_vp;
    return true;
 }
+/* The layout the window draws the core's views with: none, the frame
+ * drawn whole, unless a case gives one. */
+static const video_views_layout_t *t_layout;
+const video_views_layout_t *video_driver_get_views_layout(void)
+{
+   return t_layout;
+}
 static bool t_menu_open;
 bool menu_driver_alive(void) { return t_menu_open; }
 
@@ -11402,6 +11409,374 @@ static void test_touch_offered(void)
    t_forget_devices();
 }
 
+/* The gun's point on pad 0's port; false off the screens. */
+static bool t_gun_at(int16_t *x, int16_t *y)
+{
+   int16_t off = 1;
+   return input_openxr_pointer(t_on(0), RETRO_DEVICE_LIGHTGUN, 0,
+            RETRO_DEVICE_ID_LIGHTGUN_IS_OFFSCREEN, &off) && !off
+      && input_openxr_pointer(t_on(0), RETRO_DEVICE_LIGHTGUN, 0,
+            RETRO_DEVICE_ID_LIGHTGUN_SCREEN_X, x)
+      && input_openxr_pointer(t_on(0), RETRO_DEVICE_LIGHTGUN, 0,
+            RETRO_DEVICE_ID_LIGHTGUN_SCREEN_Y, y);
+}
+
+/* A NO_INPUT screen is not there for the laser: in front of screen 0
+ * it passes the ray on, alone on the ray it is off every screen, and
+ * with no other live screen the mouse keeps the core's pointer. */
+static void test_laser_no_input(void)
+{
+   int16_t x  = 0;
+   int16_t y  = 0;
+   int16_t bx = 0;
+   int16_t by = 0;
+
+   t_let_go();
+   t_forget_devices();
+   t_fresh_session();
+   /* Screen 0's quad 1.9 m ahead, alone: where the ray meets it. */
+   t_aim_at_screen_1();
+   t_quads.quads[0].screen          = 0;
+   t_quads.quads[0].pose.position.z = -1.9f;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(t_gun_at(&bx, &by) && abs(bx) < 100 && by < 0,
+         "screen 0 alone: the gun at %d,%d", bx, by);
+
+   /* Screen 1's in front takes the point. */
+   t_quads.num_quads                = 2;
+   t_quads.quads[1]                 = t_quads.quads[0];
+   t_quads.quads[1].screen          = 1;
+   t_quads.quads[1].pose.position.z = -1.8f;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(t_gun_at(&x, &y) && abs(x) < 100 && y > 0,
+         "screen 1 in front: the gun at %d,%d", x, y);
+
+   /* NO_INPUT, it passes the ray to screen 0. */
+   t_two_screens.no_input    = 0x2;
+   t_quads.quads[1].no_input = true;
+   x = y = 0;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(t_gun_at(&x, &y) && x == bx && y == by,
+         "through a NO_INPUT screen: the gun at %d,%d, want %d,%d",
+         x, y, bx, by);
+
+   /* Screen 0 off the ray: off every screen. */
+   t_quads.quads[0].pose.position.x = 3.0f;
+   x = 12345;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(!t_gun_at(&x, &y)
+         && input_openxr_pointer(t_on(0), RETRO_DEVICE_LIGHTGUN, 0,
+            RETRO_DEVICE_ID_LIGHTGUN_SCREEN_X, &x) && x == -0x8000,
+         "only a NO_INPUT screen on the ray: the gun at %d", x);
+
+   /* Auto leaves screen 0 to the mouse: nothing is the laser's. */
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_AUTO);
+   CHECK(!input_openxr_pointer_owned(),
+         "Auto with only a NO_INPUT screen live: the pointer is owned");
+
+   t_hooks.session_destroying(t_hooks.user);
+   t_touch_reset();
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+}
+
+/* t_two_screens as video_xr_place puts it, 1.6 m wide and 1.8 m ahead. */
+static void t_place_two_screens(void)
+{
+   video_xr_params_t p;
+   memset(&p, 0, sizeof(p));
+   p.map      = &t_two_screens;
+   video_xr_pose_identity(&p.anchor);
+   p.distance = 1.8f;
+   p.width    = 1.6f;
+   video_xr_place(&p, &t_quads);
+}
+
+/* The laser on an inset is the inset's, at the same fraction of its
+ * view; a NO_INPUT inset passes it to its base, and over a NO_INPUT
+ * base the inset still takes it. Screen 1 over screen 0's bottom right,
+ * a quarter of its height. */
+static void test_laser_inset(void)
+{
+   int16_t x = 0;
+   int16_t y = 0;
+
+   t_let_go();
+   t_forget_devices();
+   t_fresh_session();
+   t_aim_at_screen_1();
+   t_two_screens.over    = 0x2;
+   t_two_screens.anchor  = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT << 4;
+   t_two_screens.size[1] = 0.25f;
+   t_place_two_screens();
+   CHECK(t_quads.num_quads == 1 && t_quads.num_insets == 1
+         && t_quads.quads[0].screen == 0,
+         "the inset's quads: %u quads, %u insets", t_quads.num_quads,
+         t_quads.num_insets);
+   /* The inset's middle, 7/8 across and down the quad: packed pixel
+    * 400,360. */
+   t_aim[1].position.x = t_aim[2].position.x = 0.6f;
+   t_aim[1].position.y = t_aim[2].position.y = -0.18f;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(t_gun_at(&x, &y) && abs(x - 40) < 300 && abs(y - 16485) < 300,
+         "on the inset: the gun at %d,%d, want 40,16485", x, y);
+
+   /* Auto: the inset is a screen past the first, so the laser is on it,
+    * and screen 0 beside it stays the mouse's. */
+   x = y = 0;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_AUTO);
+   CHECK(t_gun_at(&x, &y) && abs(x - 40) < 300 && abs(y - 16485) < 300,
+         "on the inset in Auto: the gun at %d,%d, want 40,16485", x, y);
+   t_aim[1].position.x = t_aim[2].position.x = 0.0f;
+   t_aim[1].position.y = t_aim[2].position.y = 0.0f;
+   x = y = 0;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_AUTO);
+   CHECK(!t_gun_at(&x, &y),
+         "on screen 0 beside its inset in Auto: the gun at %d,%d", x, y);
+   t_aim[1].position.x = t_aim[2].position.x = 0.6f;
+   t_aim[1].position.y = t_aim[2].position.y = -0.18f;
+
+   /* NO_INPUT: nothing is the laser's in Auto; in Always screen 0
+    * there, packed pixel 700,210. */
+   t_two_screens.no_input = 0x2;
+   t_place_two_screens();
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_AUTO);
+   CHECK(!input_openxr_pointer_owned(),
+         "Auto with a NO_INPUT inset over screen 0: the pointer is owned");
+   x = y = 0;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(t_gun_at(&x, &y) && abs(x - 24647) < 300 && abs(y + 4037) < 300,
+         "through a NO_INPUT inset: the gun at %d,%d, want 24647,-4037",
+         x, y);
+
+   /* The base NO_INPUT instead: the inset's all the same. */
+   t_two_screens.no_input = 0x1;
+   t_place_two_screens();
+   x = y = 0;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(t_gun_at(&x, &y) && abs(x - 40) < 300 && abs(y - 16485) < 300,
+         "on the inset over a NO_INPUT base: the gun at %d,%d, "
+         "want 40,16485", x, y);
+   /* Beside it, on the base: off every screen. */
+   t_aim[1].position.x = t_aim[2].position.x = 0.0f;
+   t_aim[1].position.y = t_aim[2].position.y = 0.0f;
+   x = 12345;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(!t_gun_at(&x, &y)
+         && input_openxr_pointer(t_on(0), RETRO_DEVICE_LIGHTGUN, 0,
+            RETRO_DEVICE_ID_LIGHTGUN_SCREEN_X, &x) && x == -0x8000,
+         "on a NO_INPUT base beside its inset: the gun at %d", x);
+
+   /* The other way round, screen 0 over a NO_INPUT screen 1: nothing
+    * on the quad is the laser's in Auto, and in Always the inset is,
+    * packed pixel 400,120. */
+   t_two_screens.over     = 0x1;
+   t_two_screens.base     = 0x1;
+   t_two_screens.anchor   = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT;
+   t_two_screens.size[0]  = 0.25f;
+   t_two_screens.size[1]  = 0.0f;
+   t_two_screens.no_input = 0x2;
+   t_place_two_screens();
+   CHECK(t_quads.num_quads == 1 && t_quads.num_insets == 1
+         && t_quads.quads[0].screen == 1,
+         "screen 0 over screen 1: %u quads, %u insets", t_quads.num_quads,
+         t_quads.num_insets);
+   t_aim[1].position.x = t_aim[2].position.x =
+      t_quads.quads[0].pose.position.x + 0.375f * t_quads.quads[0].width;
+   t_aim[1].position.y = t_aim[2].position.y =
+      t_quads.quads[0].pose.position.y - 0.375f * t_quads.quads[0].height;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_AUTO);
+   CHECK(!input_openxr_pointer_owned(),
+         "Auto with screen 0 over a NO_INPUT screen 1: the pointer is owned");
+   x = y = 0;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(t_gun_at(&x, &y) && abs(x - 40) < 300 && abs(y + 16351) < 300,
+         "screen 0 over a NO_INPUT screen 1 in Always: the gun at %d,%d, "
+         "want 40,-16351", x, y);
+
+   t_hooks.session_destroying(t_hooks.user);
+   t_touch_reset();
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+}
+
+/* A window that draws the core's views: the laser's point goes through
+ * the window's layout, as the window's own pointer does, and a NO_INPUT
+ * screen there is off every view. The screens side by side in the
+ * 800x480 window, each 400x120: screen 0 at (0,180), screen 1 at
+ * (400,180). */
+static void test_window_views_no_input(void)
+{
+   video_views_layout_params_t lp;
+   video_views_layout_t layout;
+   int16_t x = 0;
+   int16_t y = 0;
+
+   t_let_go();
+   t_forget_devices();
+   t_fresh_session();
+   t_aim_at_screen_1();
+   t_quads.quads[0].kind   = VIDEO_XR_QUAD_WINDOW;
+   t_quads.quads[0].screen = 0;
+   t_quads.quads[0].height = 0.96f;
+   memset(&lp, 0, sizeof(lp));
+   lp.map           = &t_two_screens;
+   lp.dims          = VIDEO_SCALE_PACK(800, 480);
+   lp.screen_layout = VIDEO_SCREEN_LAYOUT_HORIZONTAL;
+   video_views_layout(&lp, &layout);
+   t_layout         = &layout;
+
+   /* Screen 1's middle, window pixel 600,240: packed pixel 400,360. */
+   t_aim[1].position.x = t_aim[2].position.x = 0.4f;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(t_gun_at(&x, &y) && abs(x - 40) < 300 && abs(y - 16485) < 300,
+         "screen 1 in the window: the gun at %d,%d, want 40,16485", x, y);
+
+   /* NO_INPUT: off every view there. */
+   t_two_screens.no_input = 0x2;
+   x = 12345;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(!t_gun_at(&x, &y)
+         && input_openxr_pointer(t_on(0), RETRO_DEVICE_LIGHTGUN, 0,
+            RETRO_DEVICE_ID_LIGHTGUN_SCREEN_X, &x) && x == -0x8000,
+         "a NO_INPUT screen in the window: the gun at %d", x);
+   /* Screen 0's middle, window pixel 200,240: packed pixel 400,120. */
+   t_aim[1].position.x = t_aim[2].position.x = -0.4f;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(t_gun_at(&x, &y) && abs(x - 40) < 300 && abs(y + 16351) < 300,
+         "screen 0 in the window: the gun at %d,%d, want 40,-16351", x, y);
+
+   /* A window that shows only the NO_INPUT screen. */
+   lp.exclude_screens = 0x1;
+   video_views_layout(&lp, &layout);
+   t_aim[1].position.x = t_aim[2].position.x = 0.0f;
+   x = 12345;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(!t_gun_at(&x, &y)
+         && input_openxr_pointer(t_on(0), RETRO_DEVICE_LIGHTGUN, 0,
+            RETRO_DEVICE_ID_LIGHTGUN_SCREEN_X, &x) && x == -0x8000,
+         "a window of only a NO_INPUT screen: the gun at %d", x);
+
+   t_layout = NULL;
+   t_hooks.session_destroying(t_hooks.user);
+   t_touch_reset();
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+}
+
+/* A window with the core's views and no layout draws the frame whole
+ * (views fallback): a NO_INPUT screen's part of it is off every view. */
+static void test_window_quad_no_input(void)
+{
+   int16_t x = 0;
+   int16_t y = 0;
+
+   t_let_go();
+   t_forget_devices();
+   t_fresh_session();
+   t_aim_at_screen_1();
+   t_quads.quads[0].kind   = VIDEO_XR_QUAD_WINDOW;
+   t_quads.quads[0].screen = 0;
+   t_quads.quads[0].height = 0.96f;
+
+   /* Screen 1's part, frame pixel 400,360. */
+   t_aim[1].position.y = t_aim[2].position.y = -0.24f;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(t_gun_at(&x, &y) && abs(x - 40) < 300 && abs(y - 16485) < 300,
+         "screen 1 in the whole frame: the gun at %d,%d, want 40,16485",
+         x, y);
+
+   t_two_screens.no_input = 0x2;
+   x = 12345;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(!t_gun_at(&x, &y)
+         && input_openxr_pointer(t_on(0), RETRO_DEVICE_LIGHTGUN, 0,
+            RETRO_DEVICE_ID_LIGHTGUN_SCREEN_X, &x) && x == -0x8000,
+         "a NO_INPUT screen in the whole frame: the gun at %d", x);
+   /* Screen 0's part, frame pixel 400,120. */
+   t_aim[1].position.y = t_aim[2].position.y = 0.24f;
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(t_gun_at(&x, &y) && abs(x - 40) < 300 && abs(y + 16351) < 300,
+         "screen 0 in the whole frame: the gun at %d,%d, want 40,-16351",
+         x, y);
+
+   t_hooks.session_destroying(t_hooks.user);
+   t_touch_reset();
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+}
+
+/* An image screen takes no input: the laser on its quad is off every
+ * screen, and in Auto it leaves the pointer to the mouse. A 48x32
+ * picture as screen 2, below t_two_screens. */
+static void test_laser_image(void)
+{
+   struct retro_video_view v[2];
+   struct retro_video_screen scr[3];
+   struct retro_video_screen_image image;
+   struct retro_video_views in;
+   static uint32_t pixels[48 * 32];
+   int16_t x = 12345;
+   int16_t y = 0;
+   unsigned i;
+
+   t_let_go();
+   t_forget_devices();
+   t_fresh_session();
+   t_aim_at_screen_1();
+   v[0]            = t_two_screens.views[0];
+   v[1]            = t_two_screens.views[1];
+   memset(scr, 0, sizeof(scr));
+   memset(&image, 0, sizeof(image));
+   image.data      = pixels;
+   image.width     = 48;
+   image.height    = 32;
+   image.pitch     = 48 * sizeof(uint32_t);
+   image.format    = RETRO_PIXEL_FORMAT_XRGB8888;
+   image.serial    = 1;
+   scr[2].image    = &image;
+   memset(&in, 0, sizeof(in));
+   in.views        = v;
+   in.num_views    = 2;
+   in.flags        = RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   in.screens      = scr;
+   in.num_screens  = 3;
+   CHECK(video_views_validate_map(&in, &t_two_screens, NULL)
+         && t_two_screens.image == 0x4,
+         "the image's map: image %#x", t_two_screens.image);
+   t_two_screens.image_tex[2] = 77;
+   t_place_two_screens();
+   for (i = 0; i < t_quads.num_quads; i++)
+      if (t_quads.quads[i].screen == 2)
+         break;
+   CHECK(i < t_quads.num_quads, "the image's quad: %u quads",
+         t_quads.num_quads);
+   if (i < t_quads.num_quads)
+   {
+      t_aim[1].position.x = t_aim[2].position.x =
+         t_quads.quads[i].pose.position.x;
+      t_aim[1].position.y = t_aim[2].position.y =
+         t_quads.quads[i].pose.position.y;
+   }
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_ALWAYS);
+   CHECK(!t_gun_at(&x, &y)
+         && input_openxr_pointer(t_on(0), RETRO_DEVICE_LIGHTGUN, 0,
+            RETRO_DEVICE_ID_LIGHTGUN_SCREEN_X, &x) && x == -0x8000,
+         "the laser on the image: the gun at %d", x);
+   /* Bottom left out, Auto has no screen for the laser: the image is
+    * not one. */
+   t_two_screens.left_out = 0x2;
+   t_place_two_screens();
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_AUTO);
+   CHECK(!input_openxr_pointer_owned(),
+         "Auto with Top and the image: the pointer is owned");
+
+   t_hooks.session_destroying(t_hooks.user);
+   t_touch_reset();
+   t_poll(VIDEO_OPENXR_CONTROLLERS_COMBINED, VIDEO_OPENXR_LASER_OFF);
+}
+
 int main(void)
 {
    t_forget_devices();
@@ -11550,6 +11925,11 @@ int main(void)
    test_touch_edit();
    test_touch_hold_back();
    test_touch_offered();
+   test_laser_no_input();
+   test_laser_inset();
+   test_window_views_no_input();
+   test_window_quad_no_input();
+   test_laser_image();
    if (failures)
    {
       printf("%d failure(s)\n", failures);

@@ -262,6 +262,21 @@ static void test_title_screen(void)
    CHECK(video_window_title_screen(&r) == 1);
 }
 
+static void test_title(void)
+{
+   char s[64];
+   video_window_request_t r;
+   memset(&r, 0, sizeof(r));
+   r.screen  = 3;
+   r.screens = 0x2;
+   strcpy(r.name, "VMU A1");
+   CHECK(video_window_title(&r, s, sizeof(s)) == strlen(s));
+   CHECK(!strcmp(s, "RetroArch - VMU A1"));
+   r.name[0] = '\0';
+   CHECK(video_window_title(&r, s, sizeof(s)) == strlen(s));
+   CHECK(!strcmp(s, "RetroArch - Screen 2"));
+}
+
 static void test_display_own(void)
 {
    char keys[RETRO_VIDEO_VIEWS_MAX][VIDEO_WINDOW_DISPLAY_NAME_SIZE];
@@ -1471,6 +1486,57 @@ static void test_place_no_ordinal(void)
    place_in.menu_follows = 1;
    place_at(0);
    CHECK(place_r.menu == 2);
+}
+
+/* An inset is placed as its base: no display or Presentation of its
+ * own, its Auto its base's */
+static void test_place_inset(void)
+{
+   /* The core's Game Screen 2 over Game Screen 1 on the panels: both in
+    * the main window, the bottom panel left to blank */
+   place_reset(1, 2);
+   place_d[0].type = VIDEO_WINDOW_TYPE_INTERNAL;
+   place_d[1].type = VIDEO_WINDOW_TYPE_INTERNAL;
+   place_game(2, false);
+   place_in.over   = 0x2u;
+   place_in.base   = 0u;
+   place_at(0);
+   CHECK(placed(0, 0u, 3u, 0u, 0));
+   CHECK(place_r.target[0] == 1 && place_r.target[1] == 1);
+   CHECK(video_windows_blank_ids(place_d, 2, place_r.display, NULL) == 1);
+   /* The user's Game Screen 1 over Game Screen 2: RetroArch goes where
+    * Game Screen 2 is */
+   place_reset(1, 2);
+   place_game(2, false);
+   place_in.over   = 0x1u;
+   place_in.base   = 1u;
+   place_at(0);
+   CHECK(placed(0, 0u, 3u, 0u, 2));
+   CHECK(place_r.target[0] == 2 && place_r.target[1] == 2);
+   place_own(2);
+   place_at(100000);
+   CHECK(placed(0, 0u, 3u, 0u, 0) && !place_host.moving);
+   /* ... and stays off a monitor Game Screen 1 alone would have had */
+   place_reset(1, 3);
+   place_d[2].type = VIDEO_WINDOW_TYPE_EXTERNAL;
+   place_game(2, false);
+   place_in.over   = 0x1u;
+   place_in.base   = 1u;
+   place_at(0);
+   CHECK(placed(0, 0u, 3u, 0u, 0));
+   CHECK(place_r.target[0] == 1 && place_r.target[1] == 1);
+   CHECK(!place_host.make && !place_host.moving);
+   /* The same choice made mid-game moves RetroArch too */
+   place_reset(1, 2);
+   place_game(2, false);
+   place_at(0);
+   place_in.shown = 2;
+   place_at(VIDEO_WINDOWS_MOVE_USEC);
+   CHECK(!place_r.move);
+   place_in.over  = 0x1u;
+   place_in.base  = 1u;
+   place_at(VIDEO_WINDOWS_MOVE_USEC + 100000);
+   CHECK(placed(2, 0u, 3u, 0u, 2));
 }
 
 /* The Thor as Android 12 and later types it, with its display ids */
@@ -2856,6 +2922,233 @@ static void test_window_ui_drawn(void)
    CHECK(widgets_asked == 1);
 }
 
+/* A screen without views goes in no window, whatever its mode. */
+static void test_plan_viewless(void)
+{
+   struct retro_video_view v[2];
+   struct retro_video_screen scr[3];
+   struct retro_video_views in;
+   video_views_map_t map;
+   video_window_settings_t screens[RETRO_VIDEO_VIEWS_MAX];
+   video_windows_plan_t plan;
+   unsigned mode;
+   memset(v, 0, sizeof(v));
+   memset(scr, 0, sizeof(scr));
+   memset(&in, 0, sizeof(in));
+   memset(screens, 0, sizeof(screens));
+   /* Views on screens 0 and 2; screen 1 ABSENT with none */
+   v[0].width     = v[0].height = 100;
+   v[1]           = v[0];
+   v[1].y         = 100;
+   v[1].screen    = 2;
+   scr[1].state   = RETRO_VIDEO_SCREEN_STATE_ABSENT;
+   in.views       = v;
+   in.num_views   = 2;
+   in.flags       = RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   in.screens     = scr;
+   in.num_screens = 3;
+   CHECK(video_views_validate_map(&in, &map, NULL));
+   CHECK(map.num_screens == 3 && map.viewless == 0x2u);
+   for (mode = VIDEO_WINDOW_ATTACHED; mode <= VIDEO_WINDOW_HIDDEN; mode++)
+   {
+      screens[1].mode = mode;
+      video_windows_plan(&map, screens, true, true, 0, NULL, &plan);
+      CHECK(!((plan.main_mask | plan.separate_mask | plan.hidden_mask) & 0x2u));
+      CHECK(plan.main_mask == 5u);
+   }
+}
+
+/* A left-out screen is hidden, screen 0 too. */
+static void test_plan_left_out(void)
+{
+   struct retro_video_view v[2];
+   struct retro_video_views in;
+   video_views_map_t map;
+   video_window_settings_t screens[RETRO_VIDEO_VIEWS_MAX];
+   video_windows_plan_t plan;
+   memset(v, 0, sizeof(v));
+   memset(&in, 0, sizeof(in));
+   memset(screens, 0, sizeof(screens));
+   v[0].width      = v[0].height = 100;
+   v[1]            = v[0];
+   v[1].y          = 100;
+   v[1].screen     = 1;
+   in.views        = v;
+   in.num_views    = 2;
+   CHECK(video_views_validate_map(&in, &map, NULL));
+   CHECK(map.num_screens == 2);
+   screens[1].mode = VIDEO_WINDOW_SEPARATE;
+   map.left_out    = 0x3u;
+   video_windows_plan(&map, screens, true, true, 0, NULL, &plan);
+   CHECK(plan.hidden_mask == 0x3u);
+   CHECK(plan.main_mask == 0u && plan.separate_mask == 0u);
+   map.left_out    = 0x2u;
+   video_windows_plan(&map, screens, true, true, 0, NULL, &plan);
+   CHECK(plan.main_mask == 0x1u && plan.hidden_mask == 0x2u);
+   CHECK(plan.separate_mask == 0u);
+}
+
+/* @num_screens screens of a view each, screen 1 Separate */
+static void plan_inset_map(video_views_map_t *map,
+      video_window_settings_t *screens, unsigned num_screens)
+{
+   struct retro_video_view v[3];
+   struct retro_video_views in;
+   unsigned i;
+   memset(v, 0, sizeof(v));
+   memset(&in, 0, sizeof(in));
+   memset(screens, 0, RETRO_VIDEO_VIEWS_MAX * sizeof(*screens));
+   for (i = 0; i < num_screens; i++)
+   {
+      v[i].y      = i * 100;
+      v[i].width  = v[i].height = 100;
+      v[i].screen = i;
+   }
+   in.views     = v;
+   in.num_views = num_screens;
+   CHECK(video_views_validate_map(&in, map, NULL));
+   CHECK(map->num_screens == num_screens);
+   screens[1].mode = VIDEO_WINDOW_SEPARATE;
+}
+
+/* An inset goes in no mask, and screen 0 stays in the main window only
+ * while it is a root */
+static void test_plan_inset(void)
+{
+   video_views_map_t map;
+   video_window_settings_t screens[RETRO_VIDEO_VIEWS_MAX];
+   video_windows_plan_t plan;
+   plan_inset_map(&map, screens, 2);
+   map.over = 0x2u;
+   map.base = 0u;
+   video_windows_plan(&map, screens, true, true, 0, NULL, &plan);
+   CHECK(plan.separate_mask == 0u && plan.main_mask == 0x1u);
+   CHECK(plan.hidden_mask == 0u);
+   map.over = 0x1u;
+   map.base = 1u;
+   video_windows_plan(&map, screens, true, true, 0, NULL, &plan);
+   CHECK(plan.separate_mask == 0x2u && plan.main_mask == 0u);
+   CHECK(plan.hidden_mask == 0u);
+}
+
+/* A window forced back to the main window takes its base's inset in
+ * with it, and out again */
+static void test_plan_inset_forced_attached(void)
+{
+   video_views_map_t map;
+   video_window_settings_t screens[RETRO_VIDEO_VIEWS_MAX];
+   video_windows_plan_t plan;
+   plan_inset_map(&map, screens, 3);
+   /* As routed: with its base's value */
+   screens[2].mode = VIDEO_WINDOW_SEPARATE;
+   map.over        = 0x4u;
+   map.base        = 1u << 8;
+   video_windows_plan(&map, screens, true, true, 0x2u, NULL, &plan);
+   CHECK(plan.main_mask == 0x3u && plan.separate_mask == 0u);
+   CHECK(video_views_with_insets(&map, plan.main_mask) == 0x7u);
+   video_windows_plan(&map, screens, true, true, 0, NULL, &plan);
+   CHECK(plan.main_mask == 0x1u && plan.separate_mask == 0x2u);
+   CHECK(video_views_with_insets(&map, plan.main_mask) == 0x1u);
+   CHECK(video_views_with_insets(&map, plan.separate_mask) == 0x6u);
+}
+
+/* An inset joining a window keeps it: it was made for its roots */
+static void test_windows_steps_inset(void)
+{
+   video_windows_frame_t frame;
+   video_windows_held_t held;
+   unsigned retire, create;
+   memset(&frame, 0, sizeof(frame));
+   memset(&held, 0, sizeof(held));
+   frame.monitors          = true;
+   frame.core.num_screens  = 3;
+   frame.core.over         = 0x4u;
+   frame.core.base         = 1u << 8;
+   frame.window_screens[1] = 0x6u;
+   video_windows_steps(&held, &frame, &retire, &create);
+   CHECK(retire == 0 && create == 0x2u);
+   CHECK(held.made_screens[1] == 0x2u);
+   held.live               = 0x2u;
+   /* ... and leaving it */
+   frame.core.over         = 0;
+   frame.window_screens[1] = 0x2u;
+   video_windows_steps(&held, &frame, &retire, &create);
+   CHECK(retire == 0 && create == 0);
+   /* Another root is another window */
+   frame.window_screens[1] = 0x6u;
+   video_windows_steps(&held, &frame, &retire, &create);
+   CHECK(retire == 0x2u);
+}
+
+/* An image screen gets a window like one with views, and goes with its
+ * base as an inset */
+static void test_plan_image_screen(void)
+{
+   static uint32_t pixels[48 * 32];
+   struct retro_video_view v[2];
+   struct retro_video_screen scr[3];
+   struct retro_video_screen_image image;
+   struct retro_video_views in;
+   video_views_map_t map;
+   video_window_settings_t screens[RETRO_VIDEO_VIEWS_MAX];
+   video_windows_plan_t plan;
+   memset(v, 0, sizeof(v));
+   memset(scr, 0, sizeof(scr));
+   memset(&image, 0, sizeof(image));
+   memset(&in, 0, sizeof(in));
+   memset(screens, 0, sizeof(screens));
+   /* "dsi": two stacked screens and a 48x32 picture as screen 2 */
+   v[0].width      = 256;
+   v[0].height     = 192;
+   v[1]            = v[0];
+   v[1].y          = 192;
+   v[1].screen     = 1;
+   image.data      = pixels;
+   image.width     = 48;
+   image.height    = 32;
+   image.pitch     = 48 * sizeof(uint32_t);
+   image.format    = RETRO_PIXEL_FORMAT_XRGB8888;
+   image.serial    = 1;
+   scr[2].image    = &image;
+   in.views        = v;
+   in.num_views    = 2;
+   in.flags        = RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   in.screens      = scr;
+   in.num_screens  = 3;
+   CHECK(video_views_validate_map(&in, &map, NULL));
+   CHECK(map.num_screens == 3 && map.image == 0x4u);
+   screens[2].mode = VIDEO_WINDOW_SEPARATE;
+   video_windows_plan(&map, screens, true, true, 0, NULL, &plan);
+   CHECK(plan.separate_mask == 0x4u && plan.main_mask == 0x3u);
+   CHECK(video_views_with_insets(&map, plan.separate_mask) == 0x4u);
+   map.left_out    = 0x4u;
+   video_windows_plan(&map, screens, true, true, 0, NULL, &plan);
+   CHECK(plan.hidden_mask & 0x4u);
+   CHECK(!((plan.main_mask | plan.separate_mask) & 0x4u));
+   map.left_out    = 0;
+   map.over        = 0x4u;
+   map.base        = 0;
+   video_windows_plan(&map, screens, true, true, 0, NULL, &plan);
+   CHECK(!((plan.main_mask | plan.separate_mask | plan.hidden_mask) & 0x4u));
+   CHECK(video_views_with_insets(&map, plan.main_mask) == 0x7u);
+}
+
+/* A map with only image screens is planned too */
+static void test_plan_image_alone(void)
+{
+   video_views_map_t map;
+   video_window_settings_t screens[RETRO_VIDEO_VIEWS_MAX];
+   video_windows_plan_t plan;
+   memset(&map, 0, sizeof(map));
+   memset(screens, 0, sizeof(screens));
+   map.num_screens = 2;
+   map.image       = 0x3u;
+   screens[1].mode = VIDEO_WINDOW_SEPARATE;
+   video_windows_plan(&map, screens, true, true, 0, NULL, &plan);
+   CHECK(plan.main_mask == 0x1u && plan.separate_mask == 0x2u);
+   CHECK(plan.hidden_mask == 0u);
+}
+
 int main(void)
 {
    test_windows_policy();
@@ -2863,6 +3156,7 @@ int main(void)
    test_resolve();
    test_spare_window();
    test_title_screen();
+   test_title();
    test_display_own();
    test_display_key();
    test_display_key_unnamed();
@@ -2872,6 +3166,7 @@ int main(void)
    test_place_external();
    test_place_moves();
    test_place_no_ordinal();
+   test_place_inset();
    test_blank_wanted();
    test_blank_ids();
    test_blank_state();
@@ -2890,6 +3185,13 @@ int main(void)
    test_windows_held_saved();
    test_windows_steps_ui();
    test_window_ui_drawn();
+   test_plan_viewless();
+   test_plan_left_out();
+   test_plan_inset();
+   test_plan_inset_forced_attached();
+   test_windows_steps_inset();
+   test_plan_image_screen();
+   test_plan_image_alone();
    if (failures)
       return 1;
    puts("video_windows: ok");

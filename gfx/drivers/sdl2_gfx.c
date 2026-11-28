@@ -433,6 +433,12 @@ static void *sdl2_get_menu_framebuffer(void *data, bool rgb32,
    return vid->menu_lend.pixels;
 }
 
+#ifdef SDL2_VIEWS
+static void sdl2_views_init(sdl2_video_t *vid);
+static bool sdl2_views_whole(const sdl2_video_t *vid, unsigned stereo,
+      bool ui);
+#endif
+
 static void *sdl2_gfx_init(const video_info_t *video)
 {
    int i;
@@ -622,6 +628,12 @@ static void *sdl2_gfx_init(const video_info_t *video)
 #endif
 
 #ifdef SDL2_VIEWS
+   /* Read before the first frame */
+   if (settings->uints.video_stereo_mode != VIDEO_STEREO_MODE_2D)
+      sdl2_views_init(vid);
+   retro_atomic_store_release_int(&vid->views.fallback,
+         sdl2_views_whole(vid, settings->uints.video_stereo_mode, false)
+         ? 1 : 0);
    retro_atomic_store_release_int(&vid->views.allowed, 1);
 #endif
 
@@ -714,6 +726,8 @@ struct sdl2_views_draw
 static void sdl2_views_draw_direct(sdl2_video_t *vid,
       const struct sdl2_views_draw *d, unsigned view,
       const video_views_rect_t *dst, const video_views_rect_t *cut);
+static void sdl2_views_fill(sdl2_video_t *vid,
+      const video_views_rect_t *cut, unsigned alpha);
 static bool sdl2_views_target_make(sdl2_video_t *vid, SDL_Texture **t,
       unsigned dims);
 static bool sdl2_views_target_retire(sdl2_video_t *vid, SDL_Texture **t);
@@ -729,13 +743,15 @@ static bool sdl2_views_target_retire(sdl2_video_t *vid, SDL_Texture **t);
 #define VV_DRAW                         struct sdl2_views_draw
 #define VV_DIRECT(p, d, v, r, c)        sdl2_views_draw_direct(p, d, v, r, c)
 #define VV_PASS(p, d, f, r, c, a)       ((void)0)
+#define VV_ALPHA(p, d, a)               ((p)->views.alpha = ((a) < 255) ? (a) : 0)
+#define VV_FILL(p, d, c, a)             sdl2_views_fill(p, c, a)
 #define VV_TARGET                       SDL_Texture *
 #define VV_TARGET_MAKE(drv, t, dims)    sdl2_views_target_make(drv, t, dims)
 #define VV_TARGET_RETIRE(drv, t)        sdl2_views_target_retire(drv, t)
 #include "../video_views_draw.h"
 
-/* Render targets and the premultiplied blend, found on first use: most
- * sessions never draw views */
+/* Render targets and the premultiplied blend, found on first use or in
+ * a stereo mode: most sessions never draw views */
 static void sdl2_views_init(sdl2_video_t *vid)
 {
    SDL_Texture *probe;
@@ -763,6 +779,19 @@ static void sdl2_views_init(sdl2_video_t *vid)
    if (!vid->views.layer)
       RARCH_LOG("[SDL2] Views drawn without the UI layer: the renderer "
             "blends no premultiplied colour.\n");
+}
+
+/* Without a map, whether one would be drawn whole: in anaglyph, and
+ * once the renderer is known to lack them, interlaced without targets
+ * and @ui in each eye without the layer */
+static bool sdl2_views_whole(const sdl2_video_t *vid, unsigned stereo,
+      bool ui)
+{
+   return stereo == VIDEO_STEREO_MODE_ANAGLYPH
+      || (   vid->views.tried
+          && (   (   !vid->views.targets
+                  && stereo == VIDEO_STEREO_MODE_INTERLACED)
+              || (!vid->views.layer && ui)));
 }
 
 static bool sdl2_views_target_retire(sdl2_video_t *vid, SDL_Texture **t)
@@ -833,26 +862,47 @@ static void sdl2_views_draw_direct(sdl2_video_t *vid,
       r.w   = r.h;
       r.h   = w;
    }
+   SDL_SetTextureBlendMode(vid->views.tex[view], vid->views.alpha
+         ? SDL_BLENDMODE_BLEND : SDL_BLENDMODE_NONE);
+   SDL_SetTextureAlphaMod(vid->views.tex[view], vid->views.alpha
+         ? (Uint8)vid->views.alpha : 255);
    SDL_RenderSetClipRect(vid->renderer, &c);
    SDL_RenderCopyEx(vid->renderer, vid->views.tex[view], NULL, &r,
          vid->rotation, NULL, SDL_FLIP_NONE);
    SDL_RenderSetClipRect(vid->renderer, NULL);
 }
 
+/* @cut black at @alpha, for a blank inset */
+static void sdl2_views_fill(sdl2_video_t *vid,
+      const video_views_rect_t *cut, unsigned alpha)
+{
+   SDL_Rect c;
+   sdl2_views_rect(cut, &c);
+   SDL_SetRenderDrawBlendMode(vid->renderer, (alpha < 255)
+         ? SDL_BLENDMODE_BLEND : SDL_BLENDMODE_NONE);
+   SDL_SetRenderDrawColor(vid->renderer, 0, 0, 0, (Uint8)alpha);
+   SDL_RenderFillRect(vid->renderer, &c);
+   SDL_SetRenderDrawBlendMode(vid->renderer, SDL_BLENDMODE_NONE);
+   SDL_SetRenderDrawColor(vid->renderer, 0, 0, 0, 255);
+}
+
 /* Whether this frame draws its views, with each drawn view's chain
- * picked and the rectangle its first placement takes, and in *blend
- * whether into the canvas. Drawn whole for anaglyph, whose colours no
+ * picked and the rectangle its first placement takes, in *blend
+ * whether into the canvas, and in *fallback whether a map, sent or
+ * not, is drawn whole. Drawn whole for anaglyph, whose colours no
  * blend makes, and when the stereo mode or the UI would need a canvas
  * or layer the renderer can't make. */
 static bool sdl2_views_setup(sdl2_video_t *vid,
       video_frame_info_t *video_info, const char *msg, bool *blend,
-      void **chains, video_views_rect_t *rects)
+      bool *fallback, void **chains, video_views_rect_t *rects)
 {
-   bool views, per_eye, ui;
+   bool views, per_eye, ui, whole;
    const video_views_layout_t *layout = &video_info->views_layout;
-   bool offscreen = video_info->views.num_views && layout->offscreen;
+   bool offscreen  = video_info->views.num_views && layout->offscreen;
+   unsigned stereo = video_info->views_settings.stereo_mode;
 
-   if (video_info->views.num_views && !vid->views.tried)
+   if (     (video_info->views.num_views || stereo != VIDEO_STEREO_MODE_2D)
+         && !vid->views.tried)
       sdl2_views_init(vid);
    *blend = offscreen
       && layout->stereo_mode == VIDEO_STEREO_MODE_INTERLACED
@@ -878,6 +928,19 @@ static bool sdl2_views_setup(sdl2_video_t *vid,
             layout, true, *blend || !layout->offscreen,
             *blend ? layout->canvas_dims : video_info->dims, chains, rects);
    *blend = views && *blend;
+   /* Without a map, what one would get */
+   per_eye = stereo == VIDEO_STEREO_MODE_SBS_HALF
+      || stereo == VIDEO_STEREO_MODE_SBS_FULL
+      || stereo == VIDEO_STEREO_MODE_TOP_BOTTOM;
+   ui = VIDEO_VIEWS_UI_WANTED(per_eye, vid->menu.active, msg,
+         video_info->statistics_show,
+         video_info->widgets_visible);
+#ifdef HAVE_MENU
+   ui = ui || (per_eye
+         && (video_info->menu_st_flags & MENU_ST_FLAG_ALIVE));
+#endif
+   whole = sdl2_views_whole(vid, stereo, ui);
+   *fallback = video_info->views.num_views ? !views : whole;
    if (views && !vid->views.direct_seen)
    {
       vid->views.direct_seen = true;
@@ -908,8 +971,9 @@ static void sdl2_views_write(sdl2_video_t *vid, const video_views_map_t *map,
          if (vid->views.tex[i])
             SDL_DestroyTexture(vid->views.tex[i]);
          vid->views.tex_dims[i]  = 0;
+         /* No alpha: the frame's X byte must not blend an inset */
          if (!(vid->views.tex[i] = SDL_CreateTexture(vid->renderer,
-                     SDL_PIXELFORMAT_ARGB8888,
+                     SDL_PIXELFORMAT_RGB888,
                      SDL_TEXTUREACCESS_STREAMING, (int)v->width,
                      (int)v->height)))
             continue;
@@ -1191,20 +1255,22 @@ static bool sdl2_gfx_frame(void *data, const void *frame,
    video_views_rect_t view_rects[RETRO_VIDEO_VIEWS_MAX];
    bool views         = false;
    bool views_blend   = false;
+   bool views_whole   = false;
    bool views_ui      = false;
 
    if (frame)
       vid->views.frame_dims = dims;
    views = sdl2_views_setup(vid, video_info, msg, &views_blend,
-         view_chains, view_rects);
+         &views_whole, view_chains, view_rects);
    /* vid->vp is the whole window while views draw. */
    if (views != vid->views.active)
    {
       vid->views.active = views;
       vid->flags       |= SDL2_FLAG_SHOULD_RESIZE;
    }
-   retro_atomic_store_release_int(&vid->views.fallback,
-         (video_info->views.num_views && !views) ? 1 : 0);
+   if (!video_views_chains_behind(&vid->views.chains, &video_info->views))
+      retro_atomic_store_release_int(&vid->views.fallback,
+            views_whole ? 1 : 0);
 #endif
 
    if (vid->flags & SDL2_FLAG_SHOULD_RESIZE)

@@ -5314,7 +5314,8 @@ static retro_time_t gl2_get_last_present_time(void *data)
  * origin, at the left eye's size within dims, shrunk if larger, as
  * Vulkan draws them. Sampled, so any format gl2 draws will do; each
  * image is cleared whole, as the compositor may read past the
- * rectangle. The framebuffer to draw through is bound. */
+ * rectangle, and a blank screen's is left so. The framebuffer to draw
+ * through is bound. */
 static void gl2_xr_draw_eye_images(gl2_t *gl,
       const video_frame_info_t *video_info, const uint32_t *dst,
       unsigned dims, unsigned *width, unsigned *height)
@@ -5376,6 +5377,8 @@ static void gl2_xr_draw_eye_images(gl2_t *gl,
       glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
             GL_TEXTURE_2D, (GLuint)dst[e], 0);
       glClear(GL_COLOR_BUFFER_BIT);
+      if (map->blank & (1u << v->screen))
+         continue;
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
       gl->shader->set_coords(gl->shader_data, &gl->coords);
@@ -5534,7 +5537,7 @@ static void gl2_desktop_xr_plan(gl2_t *gl,
       p.width         = video_info->headset_width;
       p.px_per_rad    = gl_openxr_pixels_per_radian(xr->host);
       p.max_dim       = gl_openxr_max_dim(xr->host);
-      p.screen_layout = video_info->screen_layout;
+      p.screen_layout = video_info->views_settings.screen_layout;
       p.rotation      = gl->rotation / 90;
       p.swap_eyes     = video_info->stereo_swap_eyes;
       p.window        = true;
@@ -5550,11 +5553,13 @@ static void gl2_desktop_xr_plan(gl2_t *gl,
 
 /* The plan's rectangles out of the window's back buffer, which is
  * bottom up, into each slot's textures, scaled to the slot's size; what
- * lies past the window stays black. A slot the plan leaves out shows
- * nothing more: at once, or with eyes once the projection shows. */
+ * lies past the window, and a blank screen, stay black. Then the slot's
+ * insets, each into its rect, a blank one black. A slot the plan leaves
+ * out shows nothing more: at once, or with eyes once the projection
+ * shows. */
 static void gl2_desktop_xr_draw(gl2_t *gl, bool eyes)
 {
-   unsigned s, l;
+   unsigned s, l, i;
    gl2_desktop_xr_t *xr = gl->desktop_xr;
    GLint full_h         = (GLint)VIDEO_SCALE_H(gl->video_dims);
 
@@ -5589,11 +5594,39 @@ static void gl2_desktop_xr_draw(gl2_t *gl, bool eyes)
          glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                GL_TEXTURE_2D, (GLuint)tex[l], 0);
          glClear(GL_COLOR_BUFFER_BIT);
-         glBlitFramebuffer(x, y, x + (GLint)VIDEO_SCALE_W(r->dims),
-               y + (GLint)VIDEO_SCALE_H(r->dims), 0, 0,
-               (GLint)VIDEO_SCALE_W(plan->dims),
-               (GLint)VIDEO_SCALE_H(plan->dims),
-               GL_COLOR_BUFFER_BIT, GL_LINEAR);
+         if (!plan->blank)
+            glBlitFramebuffer(x, y, x + (GLint)VIDEO_SCALE_W(r->dims),
+                  y + (GLint)VIDEO_SCALE_H(r->dims), 0, 0,
+                  (GLint)VIDEO_SCALE_W(plan->dims),
+                  (GLint)VIDEO_SCALE_H(plan->dims),
+                  GL_COLOR_BUFFER_BIT, GL_LINEAR);
+         for (i = 0; i < xr->set.num_insets; i++)
+         {
+            video_views_rect_t cut;
+            GLint dx, dy, dw, dh;
+            const video_xr_inset_t *in = &xr->set.insets[i];
+            if (     in->slot != s
+                  || !video_xr_inset_px(in, plan->dims, &cut))
+               continue;
+            dw = (GLint)VIDEO_SCALE_W(cut.dims);
+            dh = (GLint)VIDEO_SCALE_H(cut.dims);
+            dx = VIDEO_POS_X(cut.pos);
+            dy = (GLint)VIDEO_SCALE_H(plan->dims) - VIDEO_POS_Y(cut.pos) - dh;
+            if (in->blank || in->view[l] < 0)
+            {
+               glEnable(GL_SCISSOR_TEST);
+               glScissor(dx, dy, dw, dh);
+               glClear(GL_COLOR_BUFFER_BIT);
+               glDisable(GL_SCISSOR_TEST);
+               continue;
+            }
+            x = VIDEO_POS_X(in->src[l].pos);
+            y = full_h - VIDEO_POS_Y(in->src[l].pos)
+               - (GLint)VIDEO_SCALE_H(in->src[l].dims);
+            glBlitFramebuffer(x, y, x + (GLint)VIDEO_SCALE_W(in->src[l].dims),
+                  y + (GLint)VIDEO_SCALE_H(in->src[l].dims), dx, dy,
+                  dx + dw, dy + dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+         }
       }
       gl_openxr_slot_publish(xr->host, s, &xr->set, NULL);
       xr->published[s] = plan->dims;
@@ -5852,16 +5885,40 @@ struct gl2_views_draw
    GLuint target;
    unsigned target_height;
    unsigned frame_count;
+   unsigned images; /* screens whose image placements are drawn */
+   bool fill; /* blank insets filled */
 };
 
 static void gl2_views_draw_direct(gl2_t *gl,
       const struct gl2_views_draw *d, unsigned view,
       const video_views_rect_t *dst, const video_views_rect_t *cut);
+static void gl2_views_draw_image(gl2_t *gl,
+      const struct gl2_views_draw *d, unsigned screen,
+      const video_views_rect_t *dst, const video_views_rect_t *cut,
+      bool nearest);
 static void gl2_views_draw_pass(gl2_t *gl, const struct gl2_views_draw *d,
       const video_views_rect_t *dst, const video_views_rect_t *cut);
+static void gl2_views_fill(gl2_t *gl, const struct gl2_views_draw *d,
+      const video_views_rect_t *cut, unsigned alpha);
 static bool gl2_views_target_make(gl2_t *gl, struct gl2_views_fbo *t,
       unsigned dims);
 static bool gl2_views_target_retire(gl2_t *gl, struct gl2_views_fbo *t);
+
+/* The draws that follow at @alpha, by a constant blend the shaders' own
+ * alpha takes no part in; at 255 not blended, with the func the
+ * overlay's blending assumes */
+static void gl2_views_alpha(unsigned alpha)
+{
+   if (alpha < 255)
+   {
+      glBlendColor(0.0f, 0.0f, 0.0f, (GLfloat)alpha / 255.0f);
+      glBlendFunc(GL_CONSTANT_ALPHA, GL_ONE_MINUS_CONSTANT_ALPHA);
+      glEnable(GL_BLEND);
+      return;
+   }
+   glDisable(GL_BLEND);
+   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+}
 
 /* The views compositor, with these calls bound in. A view's chain is
  * the driver: with a preset its passes are drawn for one view at a
@@ -5874,6 +5931,10 @@ static bool gl2_views_target_retire(gl2_t *gl, struct gl2_views_fbo *t);
 #define VV_DRAW                         struct gl2_views_draw
 #define VV_DIRECT(p, d, v, r, c)        gl2_views_draw_direct(p, d, v, r, c)
 #define VV_PASS(p, d, f, r, c, a)       gl2_views_draw_pass(p, d, r, c)
+#define VV_ALPHA(p, d, a)               gl2_views_alpha(a)
+#define VV_FILL(p, d, c, a)             gl2_views_fill(p, d, c, a)
+#define VV_IMAGE_MAP(p, d)              (&(d)->video_info->views)
+#define VV_IMAGE(p, d, s, r, c, n)      gl2_views_draw_image(p, d, s, r, c, n)
 #define VV_TARGET                       struct gl2_views_fbo
 #define VV_TARGET_MAKE(drv, t, dims)    gl2_views_target_make(drv, t, dims)
 #define VV_TARGET_RETIRE(drv, t)        gl2_views_target_retire(drv, t)
@@ -6249,6 +6310,73 @@ static void gl2_views_draw_direct(gl2_t *gl,
    glDisable(GL_SCISSOR_TEST);
 }
 
+/* Screen @screen's picture whole over @dst, cut to @cut, its first row
+ * at the top, from the texture gl2_load_texture made for it */
+static void gl2_views_draw_image(gl2_t *gl,
+      const struct gl2_views_draw *d, unsigned screen,
+      const video_views_rect_t *dst, const video_views_rect_t *cut,
+      bool nearest)
+{
+   GLint vp[4], sc[4];
+   const video_views_map_t *map = &d->video_info->views;
+   GLint filter                 = nearest ? GL_NEAREST : GL_LINEAR;
+   float w = (float)VIDEO_SCALE_W(map->image_dims[screen]);
+   float h = (float)VIDEO_SCALE_H(map->image_dims[screen]);
+
+   if (!(d->images & (1u << screen)))
+      return;
+   if (d->target)
+      gl2_bind_fb(d->target);
+   else
+      gl2_renderchain_bind_backbuffer();
+   gl2_views_gl_rect(dst, d->target_height, vp);
+   gl2_views_gl_rect(cut, d->target_height, sc);
+   glViewport(vp[0], vp[1], vp[2], vp[3]);
+   glEnable(GL_SCISSOR_TEST);
+   glScissor(sc[0], sc[1], sc[2], sc[3]);
+   glBindTexture(GL_TEXTURE_2D, (GLuint)map->image_tex[screen]);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+   glUseProgram(gl->views.rect.prog);
+   if (gl->views.rect.loc_clamp >= 0)
+      glUniform4f(gl->views.rect.loc_clamp, 0.5f / w, 0.5f / h,
+            1.0f - 0.5f / w, 1.0f - 0.5f / h);
+   gl2_views_quad(gl, &gl->views.rect, &gl->mvp_no_rot, gl2_tex_coords);
+   glDisable(GL_SCISSOR_TEST);
+   glBindTexture(GL_TEXTURE_2D, gl->tex_info.tex);
+}
+
+/* @cut black at @alpha, for a blank inset: cleared when solid, else
+ * darkened under a quad whose colour the blend takes none of, at the
+ * constant gl2_views_alpha set */
+static void gl2_views_fill(gl2_t *gl, const struct gl2_views_draw *d,
+      const video_views_rect_t *cut, unsigned alpha)
+{
+   GLint sc[4];
+   if (!d->fill)
+      return;
+   if (d->target)
+      gl2_bind_fb(d->target);
+   else
+      gl2_renderchain_bind_backbuffer();
+   gl2_views_gl_rect(cut, d->target_height, sc);
+   glEnable(GL_SCISSOR_TEST);
+   glScissor(sc[0], sc[1], sc[2], sc[3]);
+   if (alpha >= 255)
+   {
+      glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+      glClear(GL_COLOR_BUFFER_BIT);
+   }
+   else
+   {
+      glViewport(sc[0], sc[1], sc[2], sc[3]);
+      glBlendFunc(GL_ZERO, GL_ONE_MINUS_CONSTANT_ALPHA);
+      gl2_views_quad(gl, &gl->views.rect, &gl->mvp_no_rot, tex_coords);
+      glBlendFunc(GL_CONSTANT_ALPHA, GL_ONE_MINUS_CONSTANT_ALPHA);
+   }
+   glDisable(GL_SCISSOR_TEST);
+}
+
 /* The frame's rows of view v as texture coordinates: those at its top
  * and at its bottom */
 static void gl2_views_rows(const gl2_t *gl, const struct retro_video_view *v,
@@ -6422,6 +6550,15 @@ static bool gl2_views_preset_ok(const gl2_t *gl)
       && !(gl->flags & GL2_FLAG_TEXTURE_MIPMAP)
       && gl->shader->get_prev_textures(gl->shader_data)
          < GL2_VIEWS_HISTORY;
+}
+
+/* Whether a map, sent or not, is drawn whole: also under a preset that
+ * keeps frames from one draw to the next */
+static bool gl2_views_whole(const gl2_t *gl, bool stock)
+{
+   return !gl2_views_allowed(gl)
+      || (stock ? (gl->flags & GL2_FLAG_FBO_INITED) != 0
+                : !gl2_views_preset_ok(gl));
 }
 
 /* View i's copy just drawn, as the preset reads earlier frames: as the
@@ -6694,13 +6831,14 @@ static void gl2_views_preset_view(gl2_t *gl,
 /* Whether this frame draws its views, with each drawn view's chain
  * picked and the rectangle its first placement takes; in *blend
  * whether they draw into the canvas, in *direct whether straight from
- * the frame, else through the preset. */
+ * the frame, else through the preset; in *fallback whether a map, sent
+ * or not, is drawn whole. */
 static bool gl2_views_setup(gl2_t *gl, const video_frame_info_t *video_info,
-      const void *frame, bool *blend, bool *direct, void **chains,
-      video_views_rect_t *rects)
+      const void *frame, bool *blend, bool *direct, bool *fallback,
+      void **chains, video_views_rect_t *rects)
 {
    unsigned i;
-   bool views;
+   bool views, whole;
    const video_views_layout_t *layout = &video_info->views_layout;
    bool offscreen = video_info->views.num_views && layout->offscreen;
    bool stock     = !video_info->shader_active || !gl->views.preset;
@@ -6715,12 +6853,8 @@ static bool gl2_views_setup(gl2_t *gl, const video_frame_info_t *video_info,
    /* A real frame without the blend modes frees the canvas. */
    if (frame && !offscreen)
       gl2_vv_target_drop(gl, &gl->views.canvas_target, &gl->views.canvas);
-   /* A preset that keeps frames from one draw to the next draws the
-    * frame whole. */
-   views = video_info->views.num_views
-      && gl2_views_allowed(gl)
-      && (stock ? !(gl->flags & GL2_FLAG_FBO_INITED)
-                : gl2_views_preset_ok(gl))
+   whole = gl2_views_whole(gl, stock);
+   views = video_info->views.num_views && !whole
       && video_views_fit_frame(&video_info->views, VIDEO_SCALE_PACK(
                (unsigned)gl->tex_info.input_size[0],
                (unsigned)gl->tex_info.input_size[1]));
@@ -6730,8 +6864,9 @@ static bool gl2_views_setup(gl2_t *gl, const video_frame_info_t *video_info,
       && gl2_vv_pick_chains(gl, &gl->views.chains, &video_info->views,
             layout, stock, *blend || !layout->offscreen,
             *blend ? layout->canvas_dims : video_info->dims, chains, rects);
-   *blend  = views && *blend;
-   *direct = views && stock;
+   *blend    = views && *blend;
+   *direct   = views && stock;
+   *fallback = video_info->views.num_views ? !views : whole;
    if (*direct && !gl->views.direct_seen)
    {
       gl->views.direct_seen = true;
@@ -6799,6 +6934,8 @@ static void gl2_views_render(gl2_t *gl,
    d.target        = blend ? canvas->fbo : 0;
    d.target_height = VIDEO_SCALE_H(target_dims);
    d.frame_count   = frame_count;
+   d.images        = direct ? ~0u : 0;
+   d.fill          = direct;
 
    if (blend)
       gl2_bind_fb(canvas->fbo);
@@ -6818,8 +6955,12 @@ static void gl2_views_render(gl2_t *gl,
    }
    else
    {
-      unsigned i, j;
+      unsigned i, j, k;
       void *one[RETRO_VIDEO_VIEWS_MAX];
+      unsigned n                  = layout->num_placements;
+      unsigned started            = 0;
+      unsigned pictured           = 0;
+      bool filled                 = false;
       struct video_tex_info frame = gl->tex_info;
       /* The copies a preset reading earlier frames keeps: the newest
        * and as many as it reads before it */
@@ -6828,10 +6969,51 @@ static void gl2_views_render(gl2_t *gl,
          && (gl->flags & GL2_FLAG_FBO_FEEDBACK_ENABLE);
       bool in_place  = gl2_views_in_place(gl, depth, sw);
       (void)in_place;
-      for (i = 0; i < video_info->views.num_views; i++)
+      /* The bases, then the insets in placement order, as one eye's
+       * inset is placed before the other eye's base: at a view's first
+       * placement its passes and its placements, at the first blank
+       * inset's every fill */
+      for (k = 0; k < 2 * n; k++)
       {
-         if (!chains[i])
+         const video_views_placement_t *p =
+               &layout->placements[k < n ? k : k - n];
+         i = p->view;
+         if ((k < n) == ((p->flags & VIDEO_VIEWS_PLACEMENT_INSET) != 0))
             continue;
+         if (     (p->flags & (VIDEO_VIEWS_PLACEMENT_BLANK
+                     | VIDEO_VIEWS_PLACEMENT_INSET))
+               == (VIDEO_VIEWS_PLACEMENT_BLANK | VIDEO_VIEWS_PLACEMENT_INSET))
+         {
+            if (filled)
+               continue;
+            filled = true;
+            for (j = 0; j < RETRO_VIDEO_VIEWS_MAX; j++)
+               one[j] = NULL;
+            d.fill = true;
+            gl2_vv_draw_placements(gl, &d, layout, one,
+                  blend || !layout->offscreen, target_dims, false, blend);
+            d.fill = false;
+            continue;
+         }
+         /* An image's placements at its first, as a view's; i is its
+          * screen */
+         if (p->flags & VIDEO_VIEWS_PLACEMENT_IMAGE)
+         {
+            if (pictured & (1u << i))
+               continue;
+            pictured |= 1u << i;
+            for (j = 0; j < RETRO_VIDEO_VIEWS_MAX; j++)
+               one[j] = NULL;
+            d.images = 1u << i;
+            gl2_vv_draw_placements(gl, &d, layout, one,
+                  blend || !layout->offscreen, target_dims, false, blend);
+            d.images = 0;
+            continue;
+         }
+         if (     i >= video_info->views.num_views || !chains[i]
+               || (started & (1u << i)))
+            continue;
+         started |= 1u << i;
          if (sw)
             gl2_views_write(gl, i, &video_info->views.views[i], depth,
                   sw, pitch, use_rgba);
@@ -6883,14 +7065,18 @@ static void gl2_views_render(gl2_t *gl,
 #ifdef HAVE_VIDEO_WINDOWS
       /* The screens' own windows' views too, as the frame was not */
       if (sw && video_info->windows)
+      {
+         unsigned windowed = video_views_with_insets(&video_info->views,
+               video_info->windows->plan.separate_mask)
+            & ~video_info->views.blank;
          for (i = 0; i < video_info->views.num_views; i++)
          {
             const struct retro_video_view *v = &video_info->views.views[i];
             if (     !chains[i] && v->screen < RETRO_VIDEO_VIEWS_MAX
-                  && (video_info->windows->plan.separate_mask
-                     & (1u << v->screen)))
+                  && (windowed & (1u << v->screen)))
                gl2_views_write(gl, i, v, depth, sw, pitch, use_rgba);
          }
+      }
 #endif
       gl->coords.vertex    = gl->vertex_ptr;
       gl->coords.tex_coord = gl->tex_info.coord;
@@ -7304,7 +7490,7 @@ static void gl2_window_request(gl2_t *gl, const video_windows_frame_t *f,
 {
    memset(out, 0, sizeof(*out));
    out->screen     = w;
-   out->screens    = f->window_screens[w];
+   out->screens    = f->window_screens[w] & ~f->core.over;
    out->generation = gl->windows.win[w].native.generation;
    out->settings   = f->settings[w];
    out->display    = f->display;
@@ -7314,11 +7500,16 @@ static void gl2_window_request(gl2_t *gl, const video_windows_frame_t *f,
 static bool gl2_window_make(gl2_t *gl, const video_windows_frame_t *f,
       unsigned w)
 {
+   video_views_names_t names;
    video_window_request_t request;
    struct gl2_window *win = &gl->windows.win[w];
 
    memset(win, 0, sizeof(*win));
    gl2_window_request(gl, f, w, &request);
+   /* Read once: a rename shows when the window is made again */
+   video_driver_get_screen_names(&names);
+   strlcpy(request.name, names.name[video_window_title_screen(&request)],
+         sizeof(request.name));
    request.generation = video_driver_window_generation();
    if (     !request.generation
          || !gl->ctx_driver->windows->create(gl->ctx_data, &request,
@@ -7379,8 +7570,8 @@ static bool gl2_window_draw(gl2_t *gl,
       return false;
    if (screens)
    {
-      video_driver_window_layout_screens(f, f->window_screens[w], dims,
-            layout);
+      video_driver_window_layout_screens(f, &video_info->views_settings,
+            f->window_screens[w], dims, layout);
       blend = layout->offscreen
          && gl2_vv_target_ensure(gl, &win->canvas_target, &win->canvas,
                layout->canvas_dims);
@@ -7670,6 +7861,7 @@ static bool gl2_frame(void *data, const void *frame,
    bool views                          = false;
    bool views_blend                    = false;
    bool views_direct                   = false;
+   bool views_fallback                 = false;
    /* A software frame put off until the views are known */
    const void *views_sw                = NULL;
    bool views_ui                       = false;
@@ -7906,7 +8098,7 @@ static bool gl2_frame(void *data, const void *frame,
 #ifdef GL2_VIEWS
    gl->views.written = 0;
    views = gl2_views_setup(gl, video_info, frame, &views_blend,
-         &views_direct, view_chains, view_rects);
+         &views_direct, &views_fallback, view_chains, view_rects);
    /* Views through the preset have theirs written straight in; drawn
     * any other way the frame is written now. */
    if (views_sw && (!views || views_direct))
@@ -7928,8 +8120,9 @@ static bool gl2_frame(void *data, const void *frame,
       gl->views.active = views;
       gl2_set_viewport(gl, VIDEO_SCALE_PACK(width, height), false, true);
    }
-   retro_atomic_store_release_int(&gl->views.fallback,
-         (video_info->views.num_views && !views) ? 1 : 0);
+   if (!video_views_chains_behind(&gl->views.chains, &video_info->views))
+      retro_atomic_store_release_int(&gl->views.fallback,
+            views_fallback ? 1 : 0);
    gl2_views_publish(gl);
    if (views)
       gl2_views_render(gl, video_info, &video_info->views_layout,
@@ -8244,9 +8437,9 @@ static bool gl2_frame(void *data, const void *frame,
    gl_android_openxr_set_pacing(video_info->input_driver_nonblock_state
          ? 0 : video_info->headset_interval, video_info->headset_request_hz);
    gl_android_openxr_set_views(&video_info->views, dims, &xr_vp,
-         gl->rotation / 90, video_info->screen_layout,
-         video_info->stereo_swap_eyes, video_info->headset_screens,
-         video_info->headset_edit_seq, video_info->headset_editing);
+         gl->rotation / 90, &video_info->views_settings,
+         video_info->headset_screens, video_info->headset_edit_seq,
+         video_info->headset_editing);
    if (gl_android_openxr_active())
    {
       bool new_frame = (frame || movie_frame) && !video_info->frame_repeat;
@@ -9573,8 +9766,10 @@ static void *gl2_init(const video_info_t *video)
       gl->desktop_xr->window_interval = interval;
 #endif
 #ifdef GL2_VIEWS
-   /* get_flags reads it before the first frame too */
+   /* get_flags reads them before the first frame too */
    gl2_views_publish(gl);
+   retro_atomic_store_release_int(&gl->views.fallback,
+         gl2_views_whole(gl, !gl->views.preset) ? 1 : 0);
 #ifdef HAVE_VIDEO_WINDOWS
    gl2_windows_take(gl);
 #endif
@@ -9829,6 +10024,12 @@ static bool gl2_set_shader(void *data,
    gl2_fbo_settings_latch(gl);
    gl2_renderchain_init(gl,
          (gl2_renderchain_data_t*)gl->renderchain_data);
+#ifdef GL2_VIEWS
+   /* With a map set, its next frame answers */
+   if (!gl->views.chains.count)
+      retro_atomic_store_release_int(&gl->views.fallback,
+            gl2_views_whole(gl, !gl->views.preset) ? 1 : 0);
+#endif
 
    /* Apparently need to set viewport for passes when we aren't using FBOs. */
    gl2_set_shader_viewports(gl, video_scale_integer);
@@ -11267,7 +11468,8 @@ video_driver_t video_gl2 = {
    gl2_set_vr_content_info,
 #endif
    gl2_read_viewport_bgrx,
-   true /* max_geometry_in_place */
+   true, /* max_geometry_in_place */
+   true  /* views_images */
 };
 
 #ifdef HAVE_GL_MENU_BLOOM

@@ -30,6 +30,11 @@ enum video_window_mode
 /* video_screen%u_display's value for a screen that is not shown */
 #define VIDEO_WINDOW_DISPLAY_OFF "off"
 
+/* video_screen%u_display's value for a screen drawn over another:
+ * "over:N", N the base's number from 1, as the video_screenN_ keys
+ * count */
+#define VIDEO_WINDOW_DISPLAY_OVER "over:"
+
 /* video_screen%u_display's value for a screen shown in the main window,
  * on the desktop */
 #define VIDEO_WINDOW_DISPLAY_MAIN "main"
@@ -87,13 +92,16 @@ enum video_window_event_kind
 typedef struct video_window_request
 {
    unsigned screen;
-   /* The screens it shows, a bit each; 0 for screen @screen alone */
+   /* The screens it shows, insets aside, a bit each; 0 for screen
+    * @screen alone */
    unsigned screens;
    unsigned generation;
    video_window_settings_t settings;
    /* The display it goes on: an ordinal of the published list, 0 where
     * the native layer places it */
    unsigned display;
+   /* The title screen's name, "" for none */
+   char name[VIDEO_VIEWS_NAME_SIZE];
 } video_window_request_t;
 
 typedef struct video_window_native
@@ -170,6 +178,11 @@ typedef struct gfx_ctx_window_driver
 
 /* The screen a window's title names: its first, else its id's */
 unsigned video_window_title_screen(const video_window_request_t *request);
+
+/* "RetroArch - " and @request's name, else "Screen N" for its title
+ * screen */
+size_t video_window_title(const video_window_request_t *request, char *s,
+      size_t len);
 
 /* What a context's native layer keeps of each window it makes, first
  * in its own window->state, on the thread that runs the context */
@@ -389,6 +402,10 @@ typedef struct video_windows_place_in
    /* The running content's screens, 0 with none; a core with no views
     * map has 1, and mapless */
    unsigned num_screens;
+   /* The screens routed as their base, and the bases, as in
+    * video_views_map_t: an inset is placed as its base */
+   unsigned over;
+   uint32_t base;
    /* The display the Presentation's window has drawn on since it was
     * made, 0 for none (video_driver_window_shown()) */
    unsigned shown;
@@ -513,8 +530,8 @@ typedef struct video_windows_frame
    /* Where the platform puts the windows: a display's ordinal, 0 where
     * the native layer places each one itself */
    unsigned display;
-   /* The screens each window shows, by window id; [0] is the main
-    * window's and stays 0 */
+   /* The screens each window shows, insets with their base, by window
+    * id; [0] is the main window's and stays 0 */
    unsigned window_screens[RETRO_VIDEO_VIEWS_MAX];
    /* Each UI layer's window and size */
    video_window_ui_target_t ui[VIDEO_WINDOW_UI_LAYERS];
@@ -535,14 +552,6 @@ typedef struct video_windows_frame
     * place, or made again for another monitor, mode or screens), and
     * is made again when its monitor goes or its named one comes back */
    bool monitors;
-   /* The main window's layout parameters, for a window's own */
-   float single_aspect;
-   unsigned stereo_mode;
-   unsigned screen_layout;
-   unsigned rotation;
-   bool stretch;
-   bool scale_integer;
-   bool swap_eyes;
 } video_windows_frame_t;
 
 /* Any thread; zero means the lifetime counter is exhausted. */
@@ -550,7 +559,8 @@ unsigned video_driver_window_generation(void);
 
 /* Without @route, screen 0 stays in the main window whatever its mode
  * and the others go by theirs; with one, a screen goes where @route
- * puts it. */
+ * puts it. A left-out screen is hidden, screen 0 too. An inset is in
+ * no mask: it goes with its base. */
 void video_windows_plan(const video_views_map_t *map,
       const video_window_settings_t *settings, bool enabled,
       bool supported, unsigned forced_attached,
@@ -641,11 +651,6 @@ bool video_windows_blank_update(video_windows_blank_t *blank,
 /* A host that decides afresh on its next call */
 void video_windows_host_reset(video_windows_host_t *host);
 
-/* Screen @screen's own window at @dims, from a frame's snapshot: its
- * map with every other screen left out. */
-void video_driver_window_layout(const video_windows_frame_t *frame,
-      unsigned screen, unsigned dims, video_views_layout_t *out);
-
 /* App thread: closed and failed screens get their windows again, each
  * at its saved settings (a restore-windows action, a content change) */
 void video_driver_restore_windows(void);
@@ -693,10 +698,12 @@ const video_window_display_t *video_driver_borrow_window_displays(
 void video_driver_blank_unused_resend(void);
 #endif
 
-/* A window showing @screens, from @frame's snapshot at @dims: the map
- * with every screen outside @screens left out. Any thread. */
+/* A window showing @screens, from @frame's snapshot at @dims by
+ * @settings (its frame's, without the custom viewport): the map with
+ * every screen outside @screens left out. Any thread. */
 void video_driver_window_layout_screens(const video_windows_frame_t *frame,
-      unsigned screens, unsigned dims, video_views_layout_t *out);
+      const video_views_layout_settings_t *settings, unsigned screens,
+      unsigned dims, video_views_layout_t *out);
 
 /* Any thread: the screens in @screens go back to the main window until
  * the next retry. For a window the renderer could not make or keep, in
@@ -725,6 +732,11 @@ void video_driver_publish_window_layout(unsigned window,
  * out in place and pass to the publish above. Valid until any publish
  * for that window, bounds and focus included; NULL for no window. */
 video_views_layout_t *video_driver_lend_window_layout(unsigned window);
+
+/* As the publisher: window @window's slot as last published. Valid
+ * until any publish for that window; NULL for none or a cleared one. */
+const struct video_window_layout *video_driver_published_window_layout(
+      unsigned window);
 
 /* The context's thread: window @window, showing @screens, was left at
  * @dims, and at @pos where @moved, while made for edit count @edit;
@@ -786,7 +798,7 @@ typedef struct video_windows_held
    /* Each live id's video_window_request_t::display */
    unsigned display[RETRO_VIDEO_VIEWS_MAX];
    /* With video_windows_frame_t::monitors: what each id was made for,
-    * and the ids that have it */
+    * its screens insets aside, and the ids that have it */
    video_window_settings_t made[RETRO_VIDEO_VIEWS_MAX];
    unsigned made_screens[RETRO_VIDEO_VIEWS_MAX];
    unsigned made_known;

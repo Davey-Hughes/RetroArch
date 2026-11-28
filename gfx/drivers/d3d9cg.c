@@ -4268,6 +4268,7 @@ static void *d3d9_cg_init(const video_info_t *info)
 
    d3d->keep_aspect       = info->force_aspect;
 #ifdef D3D9_VIEWS
+   d3d9_cg_views_seed(d3d);
    d3d9_cg_views_publish(d3d);
 #endif
 
@@ -4724,16 +4725,23 @@ static bool d3d9_cg_frame(void *data, const void *frame,
    bool views                          = false;
    bool views_blend                    = false;
    bool views_direct                   = false;
+   bool views_fallback                 = false;
    bool views_ui                       = false;
 #endif
 
-   if (!frame)
+   if (!frame
+#ifdef D3D9_VIEWS
+         /* Without one, the views may be drawn again from their
+          * texture */
+         && !d3d9_cg_views_redraw(d3d, video_info, dims)
+#endif
+      )
       return true;
 
    /* A frame the core wrote into the lent texture stays where it is */
    {
       cg_renderchain_t *_chain = (cg_renderchain_t*)d3d->renderchain_data;
-      if (_chain)
+      if (_chain && frame)
          d3d9_sw_fb_settle(&d3d->sw_fb, frame, frame_width, frame_height,
                pitch, _chain->chain.pixel_size,
                _chain->chain.prev.last_dims[_chain->chain.prev.ptr]);
@@ -4774,16 +4782,20 @@ static bool d3d9_cg_frame(void *data, const void *frame,
    d3d->views.frame_dims = VIDEO_SCALE_PACK(frame_width, frame_height);
    views = d3d9_cg_views_setup(d3d, video_info, msg,
          d3d->menu && d3d->menu->enabled, &views_blend, &views_direct,
-         view_chains, view_rects);
+         &views_fallback, view_chains, view_rects);
    /* The viewport is the whole window while views draw. */
    if (views != d3d->views.active)
    {
       d3d->views.active  = views;
       d3d->should_resize = true;
    }
-   retro_atomic_store_release_int(&d3d->views.fallback,
-         (video_info->views.num_views && !views) ? 1 : 0);
+   if (!video_views_chains_behind(&d3d->views.chains, &video_info->views))
+      retro_atomic_store_release_int(&d3d->views.fallback,
+            views_fallback ? 1 : 0);
    d3d9_cg_views_publish(d3d);
+   /* Nothing to draw the frame whole from */
+   if (!frame && !views)
+      return true;
 #endif
 
    if (d3d->should_resize)
@@ -4846,6 +4858,7 @@ static bool d3d9_cg_frame(void *data, const void *frame,
       d.tex_dims   = first->info.tex_dims;
       d.filter     = (DWORD)d3d_translate_filter(first->info.pass->filter);
       d.rotation   = d3d->dev_rotation;
+      if (frame)
       {
          unsigned src_pitch = pitch;
          const uint8_t *src = d3d9_sw_fb_src_begin(&d3d->sw_fb, frame,

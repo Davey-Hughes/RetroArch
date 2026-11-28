@@ -31,16 +31,16 @@ RETRO_BEGIN_DECLS
  * quad's swapchain image holds, and how a point on a quad maps back to
  * the core's frame. A quad faces +Z of its pose. */
 
-/* Slot s < num_screens holds screen s; the UI has its own slot; a
- * whole frame uses slot 0. */
+/* Slot s < num_screens holds screen s and the insets over it; the UI
+ * has its own slot; a whole frame uses slot 0. */
 #define VIDEO_XR_MENU_SLOT RETRO_VIDEO_VIEWS_MAX
 #define VIDEO_XR_MAX_SLOTS (RETRO_VIDEO_VIEWS_MAX + 1)
 #define VIDEO_XR_MAX_QUADS (RETRO_VIDEO_VIEWS_MAX * 2 + 1)
 /* Gap between screens, as a fraction of screen 0's width. */
 #define VIDEO_XR_GAP       0.02f
-/* How far the UI floats in front of screen 0, in metres. */
+/* How far the UI floats in front of the first screen drawn, in metres. */
 #define VIDEO_XR_MENU_LIFT 0.10f
-/* Following screen 0, the UI comes no nearer the anchor than this. */
+/* Following a screen, the UI comes no nearer the anchor than this. */
 #define VIDEO_XR_MENU_NEAREST 0.40f
 /* The UI's quad fits in screen 0's width by this much of it. */
 #define VIDEO_XR_MENU_MAX_H 0.75f
@@ -94,6 +94,7 @@ typedef struct video_xr_quad
    unsigned screen;        /* the core's screen, for a SCREEN quad */
    unsigned slot;
    unsigned layer;         /* the slot's array layer it shows */
+   bool no_input;          /* a NO_INPUT screen's */
 } video_xr_quad_t;
 
 typedef struct video_xr_slot
@@ -106,13 +107,38 @@ typedef struct video_xr_slot
    /* A frame shown whole without the screens' settings (a views core's
     * fallback): their edits would not move it, so it is no item. */
    bool fixed;
+   /* A BLANK screen's: it keeps its place and is drawn black. */
+   bool blank;
+   bool image;             /* an image screen's, drawn from image_tex */
+   uint8_t image_gen;      /* moves with each new picture */
+   uintptr_t image_tex;    /* 0: not landed, nothing drawn */
 } video_xr_slot_t;
+
+/* An inset drawn into its base's slot, after the base */
+typedef struct video_xr_inset
+{
+   /* Fractions of the slot's image, from its top left */
+   video_views_frect_t rect;
+   /* video_xr_place_window only: its view in the window, per layer */
+   video_views_rect_t src[2];
+   int view[2];                /* per layer of the base's slot; -1 none */
+   unsigned slot;              /* its base's */
+   unsigned screen;
+   bool blank;
+   bool no_input;
+   bool image;                 /* as video_xr_slot_t's */
+   uint8_t image_gen;
+   uint8_t alpha;              /* its opacity; 255 solid */
+   uintptr_t image_tex;
+} video_xr_inset_t;
 
 typedef struct video_xr_quad_set
 {
    video_xr_quad_t quads[VIDEO_XR_MAX_QUADS];
    video_xr_slot_t slots[VIDEO_XR_MAX_SLOTS];
+   video_xr_inset_t insets[RETRO_VIDEO_VIEWS_MAX];   /* in draw order */
    unsigned num_quads;
+   unsigned num_insets;
 } video_xr_quad_set_t;
 
 typedef struct video_xr_params
@@ -123,7 +149,7 @@ typedef struct video_xr_params
    /* Floating-screen adjustments by screen ID; NULL uses defaults. */
    const video_screen_xr_t *screens;
    /* The menu's own place from its spot; NULL: at its spot, or with
-    * menu_follow in front of screen 0. */
+    * menu_follow in front of the first screen shown. */
    const video_screen_xr_t *menu;
    float frame_aspect;
    unsigned frame_dims;
@@ -145,7 +171,8 @@ typedef struct video_xr_params
     * the others keep their places. */
    unsigned skip_screens;
    bool swap_eyes;
-   /* An unplaced menu opens in front of screen 0 and moves with it. */
+   /* An unplaced menu opens in front of the first screen shown and
+    * moves with it; at its spot when the projection shows that one. */
    bool menu_follow;
    /* The whole frame is the window, with the menu drawn in it. */
    bool window;
@@ -678,9 +705,14 @@ void video_xr_turn_back(video_xr_pose_t *pose);
 /* A point on a quad as packed-frame pointer coordinates: any copy of a
  * screen lands in its EYE_NONE or left view at the same fraction, a
  * whole frame spreads over the frame. map and frame_dims are the
- * core's own. False for the menu. Rotated views map unrotated, as the
- * window's touch does. */
-bool video_xr_quad_to_frame(const video_xr_quad_t *q, float u, float v,
+ * core's own. set is q's (NULL: no insets): a point inside an inset
+ * of q's slot, as its entry's rect draws it, lands in the inset's view
+ * at the same fraction, unless that is NO_INPUT. False for the menu, a
+ * NO_INPUT screen and, with laser Auto, a point on screen 0, which is
+ * the mouse's. Rotated views map unrotated, as the window's touch
+ * does. */
+bool video_xr_quad_to_frame(const video_xr_quad_set_t *set,
+      const video_xr_quad_t *q, float u, float v, unsigned laser,
       const video_views_map_t *map, unsigned frame_dims,
       int16_t *res_x, int16_t *res_y);
 
@@ -697,11 +729,18 @@ void video_xr_window_rect(const video_viewport_t *vp, unsigned frame_dims,
       unsigned rotation, const struct retro_video_view *v,
       video_views_rect_t *out);
 
+/* in's rect in its slot's image of dims, in pixels from the image's top
+ * left: edges rounded, cut to the image, a pixel at least each way.
+ * False for a zero rect, which is not drawn. */
+bool video_xr_inset_px(const video_xr_inset_t *in, unsigned dims,
+      video_views_rect_t *out);
+
 /* The quads of a window that holds the frame, the menu and all, as
  * the Quest's GL host shows it: p's map as video_xr_place puts its screens
  * while it is untracked and the menu is closed, each slot's layers cut
- * from the window at rects; else the window whole, its rect the window.
- * vp and frame_dims as video_xr_window_rect's, turned p->rotation. */
+ * from the window at rects and each inset's at its src; else the window
+ * whole, its rect the window. vp and frame_dims as
+ * video_xr_window_rect's, turned p->rotation. */
 void video_xr_place_window(const video_xr_params_t *p, bool menu,
       bool tracked, const video_viewport_t *vp, unsigned frame_dims,
       video_xr_quad_set_t *out,
@@ -811,12 +850,14 @@ void video_xr_cut_pixels(uint8_t *px, bool bottom_up);
 #define VIDEO_XR_CURSOR_LIFT  0.002f
 
 /* Whether a laser (enum video_openxr_laser, or VIDEO_XR_LIVE_EDIT) can
- * point at q. Auto: the menu or a window while the menu is open, and
- * screens 1 and up. Always: every screen and a whole frame too. Off:
- * nothing. Edit mode's: every item. */
+ * point at q, of set (NULL: no insets). Auto: the menu or a window while
+ * the menu is open, and screens 1 and up. Always: every screen and a
+ * whole frame too. Off: nothing. Edit mode's: every item. A screen's
+ * quad goes by the screens on it, its own and the insets in its slot:
+ * live when the mode has one of them that is not NO_INPUT. */
 #define VIDEO_XR_LIVE_EDIT VIDEO_OPENXR_LASER_LAST
-bool video_xr_quad_live(const video_xr_quad_t *q, unsigned laser,
-      bool menu_open);
+bool video_xr_quad_live(const video_xr_quad_set_t *set,
+      const video_xr_quad_t *q, unsigned laser, bool menu_open);
 
 /* Edit mode takes the menu by a handle bar centred under its bottom
  * edge, in its plane: this fraction of its width, this many metres

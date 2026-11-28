@@ -22,6 +22,7 @@
 #include <boolean.h>
 #include <retro_inline.h>
 #include <retro_atomic.h>
+#include <rthreads/retro_seqlatch.h>
 #include <retro_common_api.h>
 #include <libretro.h>
 
@@ -174,7 +175,100 @@ typedef struct video_views_map
    struct retro_video_view views[RETRO_VIDEO_VIEWS_MAX];
    unsigned num_views;
    unsigned num_screens;
+   /* Bit s is screen s. */
+   unsigned no_input;   /* RETRO_VIDEO_SCREEN_FLAG_NO_INPUT */
+   unsigned viewless;   /* below num_screens with no view */
+   /* The frontend's, set per frame; validation leaves them 0. */
+   unsigned left_out;   /* ABSENT, or its Display resolved to Off: no place */
+   unsigned blank;      /* BLANK and not left out: a place, drawn black */
+   /* The frontend's arrangement, set with the masks; validation leaves
+    * it 0. */
+   unsigned over;       /* screens drawn as insets this frame */
+   uint32_t base;       /* 4 bits a screen: an inset's base, a sized screen's */
+   uint32_t anchor;     /* 4 bits a screen: an inset's anchor, 1-8 */
+   uint8_t opacity[RETRO_VIDEO_VIEWS_MAX];  /* an inset's; 255 solid */
+   float size[RETRO_VIDEO_VIEWS_MAX];       /* of its base's height; 0 none */
+   /* Set by validation. */
+   unsigned image;                              /* screens drawn from an image */
+   unsigned image_dims[RETRO_VIDEO_VIEWS_MAX];  /* VIDEO_SCALE_PACK */
+   float image_aspect[RETRO_VIDEO_VIEWS_MAX];   /* display w / h */
+   /* Left out by the map's rules at the call: validation's, then the
+    * frontend's. */
+   unsigned rules_out;
+   /* Set by validation. */
+   unsigned layer;       /* show LAYER */
+   unsigned upright;     /* UPRIGHT where SET_ROTATION would turn it */
+   /* The frontend's, set per frame; validation leaves them 0. */
+   uintptr_t image_tex[RETRO_VIDEO_VIEWS_MAX];  /* 0 until a picture landed */
+   uint8_t image_gen[RETRO_VIDEO_VIEWS_MAX];    /* moves when one lands */
+   unsigned nearest;                            /* image screens sampled nearest */
 } video_views_map_t;
+
+#define VIDEO_VIEWS_NIBBLE(bits, s) (((bits) >> ((s) * 4)) & 0xfu)
+
+typedef struct video_views_frect
+{
+   double x;
+   double y;
+   double w;
+   double h;
+} video_views_frect_t;
+
+#define VIDEO_VIEWS_NAME_SIZE 32   /* bytes kept of a screen's name, with its NUL */
+#define VIDEO_VIEWS_IMAGE_MAX 512  /* largest picture side taken */
+#define VIDEO_VIEWS_LAYER_EXTENT 64.0f   /* a LAYER's rectangle bound */
+
+/* One validated retro_video_screen. */
+typedef struct video_views_screen
+{
+   unsigned flags;
+   unsigned state;
+   unsigned show;
+   unsigned base;
+   unsigned anchor;
+   unsigned order;
+   unsigned owners;
+   unsigned swap_with;
+   unsigned group;
+   float size;
+   float opacity;
+   unsigned blend;
+   unsigned z;
+   float x;
+   float y;
+   float width;
+   float height;
+   char name[VIDEO_VIEWS_NAME_SIZE];   /* "" when the core gave none */
+} video_views_screen_t;
+
+typedef struct video_views_screens
+{
+   video_views_screen_t screens[RETRO_VIDEO_SCREENS_MAX];
+   unsigned count;                     /* 0: the map describes no screens */
+} video_views_screens_t;
+
+/* Screen names crossing from the main thread, their one writer, to any
+ * thread (rthreads/retro_seqlatch.h). Zeroed: every name "", stamp 0. */
+typedef struct video_views_names
+{
+   char name[RETRO_VIDEO_SCREENS_MAX][VIDEO_VIEWS_NAME_SIZE];
+} video_views_names_t;
+
+#define VIDEO_VIEWS_NAMES_WORDS \
+   RETRO_SEQLATCH_WORDS(sizeof(video_views_names_t))
+
+typedef struct video_views_names_box
+{
+   retro_atomic_int_t seq;
+   retro_atomic_int_t words[2 * VIDEO_VIEWS_NAMES_WORDS];
+} video_views_names_box_t;
+
+void video_views_names_publish(video_views_names_box_t *box,
+      const video_views_names_t *names);
+
+/* Returns the stamp it read at. */
+int video_views_names_read(video_views_names_box_t *box,
+      video_views_names_t *out);
 
 typedef struct video_screen_xr
 {
@@ -194,6 +288,12 @@ void video_views_xr_normalize(video_screen_xr_t *screen);
 bool video_views_validate(const struct retro_video_view *views,
       unsigned num_views, video_views_map_t *out);
 
+/* A whole SET_VIDEO_VIEWS argument: its views, and its screens when it
+ * sets RETRO_VIDEO_VIEWS_FLAG_SCREENS. Writes @out and @screens only
+ * when it returns true. */
+bool video_views_validate_map(const struct retro_video_views *in,
+      video_views_map_t *out, video_views_screens_t *screens);
+
 bool video_views_fit_frame(const video_views_map_t *map,
       unsigned frame_dims);
 
@@ -206,23 +306,41 @@ void video_views_scale(video_views_map_t *map,
 /* A view's display aspect ratio: its own, or width / height. */
 double video_views_aspect(const struct retro_video_view *v);
 
+/* Screen @screen's display size in source units: its EYE_NONE (or
+ * left) view's height times its aspect; on an odd @rotation, the view's
+ * width tall at the inverse aspect. A screen that is not an inset and
+ * has a size is size times its base's extent tall, at its own (turned)
+ * aspect. An image screen's own height is its picture's; its aspect is
+ * never turned. False with nothing to draw. */
+bool video_views_extent(const video_views_map_t *map, unsigned screen,
+      unsigned rotation, double *w, double *h);
+
+/* A view or an image: @screen has something to draw, left out or not. */
+bool video_views_has_place(const video_views_map_t *map, unsigned screen);
+
+/* An inset's rectangle in @base's units: at @anchor inside @base,
+ * @size of its height tall at @aspect (w / h), shrunk to fit inside
+ * @base with the aspect kept. */
+void video_views_inset(const video_views_frect_t *base, unsigned anchor,
+      double size, double aspect, video_views_frect_t *out);
+
 /* Index of the view showing @screen to @eye: its EYE_NONE view if it has
  * one, else the matching eye, and for EYE_NONE the left. -1 if none. */
 int video_views_find(const video_views_map_t *map,
       unsigned screen, unsigned eye);
 
 /* A tracked map's eyes: true when the map holds exactly one LEFT and
- * one RIGHT view, their indices in eyes[0] and eyes[1]; else -1. */
+ * one RIGHT view, neither on a screen left out, their indices in
+ * eyes[0] and eyes[1]; else -1. */
 bool video_views_eye_pair(const video_views_map_t *map, int eyes[2]);
 
-/* The views of screens [@first, @first + @count) of @map as a map of
- * their own in @out, their screens counted from 0 and in @map's order;
- * @index[i] is @out's view i's index in @map. For a driver that shows
- * some screens on one display and the rest on another. False, with
- * @out emptied, when none of those screens has a view. */
+/* The views of @roots and their insets as a map of their own in @out,
+ * their screens counted from 0 in @map's order, bases renumbered with
+ * them; @index[i] is @out's view i's index in @map. For a driver that
+ * shows some screens on one display and the rest on another. False,
+ * with @out emptied, when none of those screens has a place. */
 bool video_views_select_screens(const video_views_map_t *map,
-      unsigned first, unsigned count, video_views_map_t *out,
-      unsigned *index);
+      unsigned roots, video_views_map_t *out, unsigned *index);
 
 /* The map for one frame: a copy scaled from the core's frame size to the
  * size the driver receives. False, with out emptied, when there is no map
@@ -233,12 +351,20 @@ bool video_views_snapshot(const video_views_map_t *map,
 
 #define VIDEO_VIEWS_MAX_PLACEMENTS (RETRO_VIDEO_VIEWS_MAX * 2)
 
+#define VIDEO_VIEWS_PLACEMENT_BLANK (1u << 0)   /* drawn black */
+#define VIDEO_VIEWS_PLACEMENT_INSET (1u << 1)   /* drawn over its base's */
+#define VIDEO_VIEWS_PLACEMENT_IMAGE (1u << 2)   /* view holds the screen */
+/* Bits 8-15 hold 255 minus the opacity, so flags 0 is solid. */
+#define VIDEO_VIEWS_PLACEMENT_ALPHA_BITS(a) ((255u - (a)) << 8)
+#define VIDEO_VIEWS_PLACEMENT_ALPHA(flags)  (255u - (((flags) >> 8) & 0xffu))
+
 /* One view drawn into one eye's area. */
 typedef struct video_views_placement
 {
    video_views_rect_t dst;   /* canvas pixels, top-left origin */
-   unsigned view;            /* index into the map's views */
+   unsigned view;            /* the map's view, or an IMAGE's screen */
    unsigned area;            /* 0: left eye or the only area, 1: right eye */
+   unsigned flags;           /* VIDEO_VIEWS_PLACEMENT_* */
 } video_views_placement_t;
 
 typedef struct video_views_layout
@@ -261,12 +387,26 @@ typedef struct video_views_layout
    bool ui_per_eye;
 } video_views_layout_t;
 
+/* What the settings give every layout, filled once a frame on the main
+ * thread */
+typedef struct video_views_layout_settings
+{
+   video_views_rect_t custom_vp;   /* window pixels; dims 0: none */
+   float single_aspect;
+   unsigned stereo_mode;
+   unsigned screen_layout;
+   unsigned rotation;
+   bool stretch;
+   bool swap_eyes;
+   bool scale_integer;
+} video_views_layout_settings_t;
+
 typedef struct video_views_layout_params
 {
    const video_views_map_t *map;
-   /* One included screen only. custom_vp is the custom viewport in window
-    * pixels, or NULL; single_aspect is the aspect ratio setting's value,
-    * or 0 for the view's own; stretch fills the area instead. */
+   /* One root only, insets aside. custom_vp is the custom viewport in
+    * window pixels, or NULL; single_aspect is the aspect ratio setting's
+    * value, or 0 for the view's own; stretch fills the area instead. */
    const video_views_rect_t *custom_vp;
    float single_aspect;
    bool stretch;
@@ -281,6 +421,23 @@ typedef struct video_views_layout_params
 
 void video_views_layout(const video_views_layout_params_t *params,
       video_views_layout_t *out);
+
+/* The screen @p draws, an image's or a view's. */
+unsigned video_views_placement_screen(const video_views_map_t *map,
+      const video_views_placement_t *p);
+
+/* Whether @a and @b draw the same views in the same places with the
+ * same flags. */
+bool video_views_layout_same(const video_views_layout_t *a,
+      const video_views_layout_t *b);
+
+/* Screens below num_screens with a place of their own: not viewless,
+ * left out or an inset. */
+unsigned video_views_roots(const video_views_map_t *map);
+
+/* @roots and the insets over them. */
+unsigned video_views_with_insets(const video_views_map_t *map,
+      unsigned roots);
 
 /* The size the menu and widgets lay out at: one eye's UI size when
  * @layout draws the UI per eye, else @dims. NULL is a frame drawn
@@ -313,7 +470,7 @@ void video_views_cut_source(const struct retro_video_view *v,
 /* The rectangle of @view's first placement drawn into a target of
  * size @dims, which its shader passes are sized for; all_areas false
  * draws the first area only. False when no placement of the view
- * shows. */
+ * shows, a blank one showing nothing of it. */
 bool video_views_first_drawn(const video_views_layout_t *layout,
       unsigned view, bool all_areas, unsigned dims,
       video_views_rect_t *out);
@@ -321,10 +478,15 @@ bool video_views_first_drawn(const video_views_layout_t *layout,
 /* Window point to packed-frame pointer coordinates, through @layout,
  * VIDEO_POS_PACK'd into @res_pos. @map and @frame_dims are the core's
  * own. A point on any copy of a screen lands in that screen's EYE_NONE
- * or left-eye rectangle. */
+ * or left-eye rectangle. NO_INPUT screens and images are not there:
+ * with only those placed, every point is off every view. */
 bool video_views_map_point(const video_views_layout_t *layout,
       const video_views_map_t *map, unsigned frame_dims,
       int x, int y, bool report_oob, uint32_t *res_pos);
+
+/* A packed-frame point, in frame pixels, that lies in a view of a
+ * NO_INPUT screen and in no view of a screen that takes input. */
+bool video_views_point_no_input(const video_views_map_t *map, int x, int y);
 
 /* Window point to the coordinates the menu and widgets lay out in,
  * through @layout. A per-eye UI: through the area the point is in, or
@@ -342,6 +504,7 @@ typedef struct video_views_touch
    video_views_rect_t dst[RETRO_VIDEO_VIEWS_MAX];
    struct retro_video_view src[RETRO_VIDEO_VIEWS_MAX];
    unsigned count;
+   unsigned no_input;   /* bit i: entry i takes no input */
    unsigned dims;
    unsigned frame_dims;
    retro_atomic_int_t seq;
@@ -349,14 +512,14 @@ typedef struct video_views_touch
 
 /* @layout's placements, of @map's views through @index (the selection's
  * to the map's), on a display of size @dims; @frame_dims the packed
- * frame's. A NULL @layout holds none. */
+ * frame's. Images take no entry. A NULL @layout holds none. */
 void video_views_touch_publish(video_views_touch_t *t,
       const video_views_map_t *map, const video_views_layout_t *layout,
       const unsigned *index, unsigned dims, unsigned frame_dims);
 
 /* A touch, -0x7fff to 0x7fff across the display, to the core's pointer
- * in its packed frame, -0x8000 off the views. False, with @res_x and
- * @res_y as they were, when the display shows no views. */
+ * in its packed frame, -0x8000 off the views that take input. False,
+ * with @res_x and @res_y as they were, when the display shows no views. */
 bool video_views_touch_point(video_views_touch_t *t, int x, int y,
       int16_t *res_x, int16_t *res_y);
 
@@ -376,14 +539,26 @@ void video_views_blend_xrgb8888(const uint32_t *canvas,
 
 /* Per-view shader chains, the driver's, as video_views_draw.h's
  * pick_chains takes them: one set for the preset, one for the stock
- * shader. count is the views the driver last made room for. */
+ * shader. count is the views the driver last made room for. A chain
+ * that could not be made is remembered, with or without a map, until
+ * the preset changes or the chains are made again. */
 typedef struct video_views_chains
 {
    void *preset[RETRO_VIDEO_VIEWS_MAX];
    void *stock[RETRO_VIDEO_VIEWS_MAX];
    unsigned count;
    bool stock_failed;
+   bool preset_failed;
 } video_views_chains_t;
+
+/* Whether @map has views past @set's count, which pick_chains can't
+ * draw: a frame queued before the count shrank, or a dupe laid out
+ * from the map before it. Such a frame keeps the last FALLBACK. */
+static INLINE bool video_views_chains_behind(
+      const video_views_chains_t *set, const video_views_map_t *map)
+{
+   return map->num_views > set->count;
+}
 
 /* A render target the views draw into: the size it was made at, kept
  * when making it failed so it isn't retried every frame. */

@@ -46,6 +46,7 @@
 #include "video_defines.h"
 #include "video_views.h"
 #include "video_windows.h"
+#include "video_screen_prefs.h"
 
 #ifdef HAVE_MODELINE
 #include "video_crt_switch.h"
@@ -819,6 +820,7 @@ typedef struct video_frame_info
     * when the frame is drawn whole. */
    video_views_map_t views;
    video_views_layout_t views_layout;
+   video_views_layout_settings_t views_settings;
    /* The screens' own windows: NULL while they are off or the driver
     * has none. Owned by video_driver_state_t, or under the threaded
     * wrapper by the frame's slot. */
@@ -842,7 +844,6 @@ typedef struct video_frame_info
    unsigned headset_interval;
    /* The rate to ask the headset for, 0 for none. */
    float headset_request_hz;
-   unsigned screen_layout;
    bool stereo_swap_eyes;
    bool headset_menu_placed;
    /* An unplaced menu opens in front of screen 1, not at its spot. */
@@ -1734,6 +1735,9 @@ typedef struct video_driver
 
    /* Software maxima may change within the initial input-scale capacity. */
    bool max_geometry_in_place;
+   /* Draws image screens on every output it has, or reports
+    * GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK there. */
+   bool views_images;
 } video_driver_t;
 
 #ifdef HAVE_OPENXR
@@ -1896,6 +1900,33 @@ typedef struct video_windows_routes
    unsigned held;                 /* the redraw's: slot + 1 */
 } video_windows_routes_t;
 
+/* What the menu's rows show for one screen, published by the main
+ * thread when it changes (rthreads/retro_seqlatch.h, as the names) */
+typedef struct video_screen_shown
+{
+   video_screen_values_t values;
+   unsigned defaults;   /* resolve()'s return */
+   bool inset;
+} video_screen_shown_t;
+
+#define VIDEO_SCREEN_SHOWN_WORDS \
+   RETRO_SEQLATCH_WORDS(sizeof(video_screen_shown_t))
+
+typedef struct video_screen_shown_box
+{
+   retro_atomic_int_t seq;
+   retro_atomic_int_t words[2 * VIDEO_SCREEN_SHOWN_WORDS];
+} video_screen_shown_box_t;
+
+#define VIDEO_VIEWS_MAP_WORDS RETRO_SEQLATCH_WORDS(sizeof(video_views_map_t))
+
+/* A map one thread publishes for another (rthreads/retro_seqlatch.h) */
+typedef struct video_views_map_box
+{
+   retro_atomic_int_t seq;
+   retro_atomic_int_t words[2 * VIDEO_VIEWS_MAP_WORDS];
+} video_views_map_box_t;
+
 /* Slots of video_driver_state_t::vp_params_bits in use. The array has
  * headroom above this so a parameter can be added without moving
  * anything after it; the count is what the publish and the read walk.
@@ -2031,6 +2062,10 @@ typedef struct
    /* Initial software-frame capacity, in pixels on each axis; zero opts out. */
    unsigned max_geometry_capacity;
    enum retro_pixel_format max_geometry_format;
+   /* The (inner) driver's views_images, cached at init, and whether the
+    * last arranged frame had RETRO_VIDEO_VIEWS_STATUS_IMAGES */
+   bool views_images;
+   bool views_images_arranged;
 
 #ifdef HAVE_VIDEO_FILTER
    unsigned state_scale;
@@ -2214,12 +2249,37 @@ typedef struct
     * used: the core's map and frame size (touch maps back into those),
     * the map scaled to the frame the driver got, and the layout.
     * video_driver_frame() writes them on the main thread; the video
-    * thread's redraw of the cached frame only reads them. */
+    * thread's redraw of the cached frame only reads them, views_core
+    * through views_core_box. */
    video_views_map_t views;
    video_views_map_t views_core;
    video_views_map_t views_frame;
    video_views_layout_t views_layout;
+#ifdef HAVE_THREADS
+   /* views_core as the main thread last published it, and the redraw's
+    * copy */
+   video_views_map_t views_core_published;
+   video_views_map_box_t views_core_box;
+   video_views_map_t views_redraw;
+#endif
+   /* The core's screens, main thread, and their names for any thread */
+   video_views_screens_t views_screens;
+   video_views_names_box_t views_names;
+   /* The running core's per-screen choices, and each screen's values
+    * as RetroArch uses them, with the VIDEO_SCREEN_PREF_BIT()s of those
+    * that are the core's defaults. Main thread; a redraw reads the
+    * values the last main-thread frame left, as it reads views_core. */
+   video_screen_prefs_t screen_prefs;
+   video_screen_values_t screens_resolved[RETRO_VIDEO_VIEWS_MAX];
+   unsigned screens_defaults[RETRO_VIDEO_VIEWS_MAX];
+   /* What the menu's rows show: the main thread's last published copy
+    * and its insets, a bit a screen, and the box any thread reads */
+   video_screen_shown_t screens_shown[RETRO_VIDEO_VIEWS_MAX];
+   video_screen_shown_box_t screens_shown_box[RETRO_VIDEO_VIEWS_MAX];
+   unsigned screens_insets;
    unsigned views_frame_dims;
+   /* The screens the last snapshot drew with pixels, a bit a screen */
+   unsigned views_drawn;
    /* The view count the driver instance was last told. */
    unsigned views_driver_count;
    /* The status video_driver_views_status_changed() last saw. */
@@ -2298,6 +2358,11 @@ typedef struct
    unsigned windows_retry;
    /* Each screen's video_window_settings_t::edit */
    unsigned windows_edit[RETRO_VIDEO_VIEWS_MAX];
+   /* What display routing reads: the resolved Display, "off" when left
+    * out */
+   char screens_routed[RETRO_VIDEO_VIEWS_MAX][VIDEO_WINDOW_DISPLAY_NAME_SIZE];
+   /* The screens routed as their base (views_core's base) */
+   unsigned screens_routed_over;
 #ifdef HAVE_MENU
    /* A bit a screen: rows a take changed, and of them those that had
     * no size before, until the menu reads them; main thread */
@@ -2678,6 +2743,30 @@ bool video_driver_set_views(struct retro_video_views *views);
 /* A headset is showing the core's own stereo views. */
 bool video_driver_vr_content_active(void);
 void video_driver_clear_views(void);
+/* Main thread: screen @screen's name from the core, else @fmt with
+ * @screen + 1. */
+size_t video_driver_screen_label(unsigned screen, const char *fmt,
+      char *s, size_t len);
+/* Main thread. @screen's values as RetroArch uses them; returns the
+ * VIDEO_SCREEN_PREF_BIT()s that are the core's default. */
+unsigned video_driver_screen_get(unsigned screen, video_screen_values_t *out);
+/* Main thread. Writes the @bits of @values: to the running core's store
+ * while screen_prefs.in_use, else to the global settings, marking them
+ * modified. NULL @values clears the core's entries, or, with no views
+ * core running, sets the global ones to their built-in defaults
+ * ("" Auto, off, 0, video_views_xr_reset()). A Corner, Size or Opacity
+ * of 0, Default, clears the core's entry too. */
+void video_driver_screen_set(unsigned screen, unsigned bits,
+      const video_screen_values_t *values);
+/* Any thread: the core's screen names, "" where it gave none; returns
+ * the stamp they were read at. */
+int video_driver_get_screen_names(video_views_names_t *out);
+/* Any thread: moves when a name does. */
+int video_driver_screen_names_stamp(void);
+/* Any thread. Returns the stamp it read at. */
+int video_driver_screen_shown_read(unsigned screen, video_screen_shown_t *out);
+/* Any thread: moves when screen @screen's published values do. */
+int video_driver_screen_shown_stamp(unsigned screen);
 /* RETRO_VIDEO_VIEWS_STATUS_ flags for the current driver and settings. */
 unsigned video_driver_views_status(void);
 /* Main thread: true once after the status changes. */
@@ -2705,12 +2794,13 @@ float video_driver_ui_display_aspect(void);
 /* Main thread: the layout the last frame presented a core's views
  * with, or NULL when it was drawn whole. */
 const video_views_layout_t *video_driver_get_views_layout(void);
-/* @map laid out flat into a display of size @dims by the user's
- * aspect, scaling and rotation settings, for a driver that places views
- * on displays of its own (GFX_CTX_FLAGS_VIDEO_VIEWS_OWN_EYES); @window:
- * the display the custom viewport is in. */
+/* @map laid out flat into a display of size @dims by @settings (the
+ * frame's), for a driver that places views on displays of its own
+ * (GFX_CTX_FLAGS_VIDEO_VIEWS_OWN_EYES); @window: the display the custom
+ * viewport is in. */
 void video_driver_views_layout_flat(const video_views_map_t *map,
-      unsigned dims, bool window, video_views_layout_t *out);
+      const video_views_layout_settings_t *settings, unsigned dims,
+      bool window, video_views_layout_t *out);
 #ifdef _3DS
 /* A bottom screen touch, -0x7fff to 0x7fff across it, to the core's
  * pointer in its packed frame, while it shows the core's screens;
@@ -2724,6 +2814,9 @@ bool ctr_views_touch(int16_t x, int16_t y, int16_t *res_x, int16_t *res_y);
  * -0x8000 off them. False, with @res_x and @res_y as they were, when
  * it shows none. */
 bool gx2_views_touch(int16_t x, int16_t y, int16_t *res_x, int16_t *res_y);
+/* A GamePad touch, as above, on a NO_INPUT screen's part of the packed
+ * frame, which views fallback shows whole. */
+bool gx2_views_touch_no_input(int16_t x, int16_t y);
 #endif
 #ifdef HAVE_OPENXR
 /* Main thread: the core's own view map and frame size the last frame

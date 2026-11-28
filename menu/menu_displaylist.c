@@ -9384,6 +9384,28 @@ static unsigned menu_displaylist_parse_settings_rows(
    return count;
 }
 
+/* Game Screen @screen's Corner, Size and Opacity, while it is drawn over
+ * another */
+static unsigned menu_displaylist_video_screen_inset_rows(
+      file_list_t *list, settings_t *settings, unsigned screen)
+{
+   static const enum msg_hash_enums rows[] = {
+      MENU_ENUM_LABEL_VIDEO_SCREEN_CORNER,
+      MENU_ENUM_LABEL_VIDEO_SCREEN_SIZE,
+      MENU_ENUM_LABEL_VIDEO_SCREEN_OPACITY
+   };
+   unsigned i;
+   unsigned count = 0;
+   if (!(video_state_get_ptr()->screens_insets & (1u << screen)))
+      return 0;
+   for (i = 0; i < ARRAY_SIZE(rows); i++)
+      if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+               (enum msg_hash_enums)(rows[i] + screen),
+               PARSE_ONLY_UINT, false) == 0)
+         count++;
+   return count;
+}
+
 #if defined(HAVE_VIDEO_WINDOWS) && !defined(ANDROID)
 /* Game Screen @screen's own window: fullscreen and size, and where it
  * goes once it has a size */
@@ -9402,13 +9424,15 @@ static unsigned menu_displaylist_video_screen_window_rows(
       { MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_X,          PARSE_ONLY_INT,  true  },
       { MENU_ENUM_LABEL_VIDEO_SCREEN_WINDOW_Y,          PARSE_ONLY_INT,  true  },
    };
+   video_screen_values_t values;
    unsigned i;
    unsigned count = 0;
    if (!menu_setting_video_screen_window_own(screen))
       return 0;
+   video_driver_screen_get(screen, &values);
    for (i = 0; i < ARRAY_SIZE(rows); i++)
    {
-      if (rows[i].sized && !settings->uints.video_screen_window_dims[screen])
+      if (rows[i].sized && !values.window_dims)
          continue;
       if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
                (enum msg_hash_enums)(rows[i].first + screen),
@@ -13376,6 +13400,8 @@ unsigned menu_displaylist_build_list(
                            (MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY + screen),
                            PARSE_ONLY_STRING_OPTIONS, false) == 0)
                      count++;
+                  count += menu_displaylist_video_screen_inset_rows(
+                        list, settings, screen);
 #else
                   /* The companion has no submenus: each screen's rows
                    * inline, as its page lists them */
@@ -13388,6 +13414,8 @@ unsigned menu_displaylist_build_list(
                               (MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY + screen),
                               PARSE_ONLY_STRING_OPTIONS, false) == 0)
                         count++;
+                     count += menu_displaylist_video_screen_inset_rows(
+                           list, settings, screen);
                      count += menu_displaylist_video_screen_window_rows(
                            list, settings, screen);
                   }
@@ -13422,12 +13450,36 @@ unsigned menu_displaylist_build_list(
 #endif
             }
          }
-#ifdef ANDROID
+         if (     !video_driver_test_all_flags(GFX_CTX_FLAGS_VIDEO_WINDOWS)
+               || !settings->bools.video_windows_enable)
+#endif
+         {
+            /* The screens in one window: a Display row each, the
+             * running views core's, or with no content everyone's */
+            const video_screen_prefs_t *prefs =
+               &video_state_get_ptr()->screen_prefs;
+            if (!prefs->core_loaded || prefs->in_use)
+            {
+               unsigned screens = menu_setting_video_screens();
+               unsigned screen;
+               menu_setting_video_screen_display_values();
+               for (screen = 0; screen < screens; screen++)
+               {
+                  if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
+                           (enum msg_hash_enums)
+                           (MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY + screen),
+                           PARSE_ONLY_STRING_OPTIONS, false) == 0)
+                     count++;
+                  count += menu_displaylist_video_screen_inset_rows(
+                        list, settings, screen);
+               }
+            }
+         }
+#if defined(HAVE_VIDEO_WINDOWS) && defined(ANDROID)
          if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
                   MENU_ENUM_LABEL_VIDEO_BLANK_UNUSED_SCREENS,
                   PARSE_ONLY_UINT, false) == 0)
             count++;
-#endif
 #endif
          break;
       case DISPLAYLIST_VIDEO_HEADSET_SETTINGS_LIST:
@@ -19164,6 +19216,8 @@ static bool menu_displaylist_ctl_internal(
                            (MENU_ENUM_LABEL_VIDEO_SCREEN_DISPLAY + screen),
                            PARSE_ONLY_STRING_OPTIONS, false) == 0)
                      count++;
+                  count += menu_displaylist_video_screen_inset_rows(
+                        info->list, settings, screen);
                   count += menu_displaylist_video_screen_window_rows(
                         info->list, settings, screen);
                }

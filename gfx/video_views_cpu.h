@@ -189,10 +189,10 @@ static INLINE void video_views_cpu_draw_view(video_views_cpu_t *cpu,
 }
 
 /* The scale a driver whose display hardware scales a surface to the
- * screen composes the views at: the most any placement shrinks its view
- * by, so that no view is drawn larger than it is and the hardware does
- * the enlarging; at most 1, and 1 for interlaced, whose rows are the
- * screen's. */
+ * screen composes the views at: the most any drawn placement shrinks its
+ * view by, so that no view is drawn larger than it is and the hardware
+ * does the enlarging; at most 1, and 1 for interlaced, whose rows are the
+ * screen's, or with nothing drawn. */
 static INLINE float video_views_cpu_scale(const video_views_map_t *map,
       const video_views_layout_t *layout)
 {
@@ -204,9 +204,12 @@ static INLINE float video_views_cpu_scale(const video_views_map_t *map,
    {
       const video_views_placement_t *p  = &layout->placements[i];
       const struct retro_video_view *v = &map->views[p->view];
-      float sw = VIDEO_SCALE_W(p->dst.dims)
+      float sw, sh;
+      if (p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
+         continue;
+      sw = VIDEO_SCALE_W(p->dst.dims)
          ? (float)v->width  / VIDEO_SCALE_W(p->dst.dims) : 1.0f;
-      float sh = VIDEO_SCALE_H(p->dst.dims)
+      sh = VIDEO_SCALE_H(p->dst.dims)
          ? (float)v->height / VIDEO_SCALE_H(p->dst.dims) : 1.0f;
       if (sw > scale)
          scale = sw;
@@ -307,11 +310,24 @@ static INLINE void video_views_cpu_draw_placements(video_views_cpu_t *cpu,
    {
       video_views_rect_t dst, cut;
       const video_views_placement_t *p = &layout->placements[i];
-      if (video_views_cpu_cut(layout, p, scale, dims, offscreen,
+      /* A blank root's place is black already; a blank inset's is over
+       * its base */
+      if (     ((p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
+               && !(p->flags & VIDEO_VIEWS_PLACEMENT_INSET))
+            || !video_views_cpu_cut(layout, p, scale, dims, offscreen,
                &dst, &cut))
+         continue;
+      if (!(p->flags & VIDEO_VIEWS_PLACEMENT_BLANK))
+      {
          video_views_cpu_draw_view(cpu, fmt, type, &map->views[p->view],
                frame, pitch, (uint8_t*)target, tstride * sizeof(uint32_t),
                &dst, &cut);
+         continue;
+      }
+      for (y = 0; y < VIDEO_SCALE_H(cut.dims); y++)
+         memset(target + (size_t)(VIDEO_POS_Y(cut.pos) + y) * tstride
+               + VIDEO_POS_X(cut.pos), 0,
+               VIDEO_SCALE_W(cut.dims) * sizeof(uint32_t));
    }
 }
 

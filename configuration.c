@@ -18,6 +18,7 @@
  */
 
 #include <ctype.h>
+#include <float.h>
 
 #include <libretro.h>
 #include <file/config_file.h>
@@ -5963,18 +5964,9 @@ void config_reset_video_menu_xr(settings_t *settings)
 
 void config_get_video_screen_xr(unsigned screen, video_screen_xr_t *out)
 {
-   settings_t *settings = config_get_ptr();
-   video_views_xr_reset(out, 1);
-   if (!settings || screen >= RETRO_VIDEO_VIEWS_MAX)
-      return;
-   out->x       = settings->floats.video_screen_xr_x[screen];
-   out->y       = settings->floats.video_screen_xr_y[screen];
-   out->z       = settings->floats.video_screen_xr_z[screen];
-   out->yaw     = settings->floats.video_screen_xr_yaw[screen];
-   out->pitch   = settings->floats.video_screen_xr_pitch[screen];
-   out->roll    = settings->floats.video_screen_xr_roll[screen];
-   out->scale   = settings->floats.video_screen_xr_scale[screen];
-   out->visible = settings->bools.video_screen_xr_visible[screen];
+   video_screen_values_t values;
+   video_driver_screen_get(screen, &values);
+   *out = values.xr;
 }
 
 bool config_get_video_menu_xr(video_screen_xr_t *out)
@@ -5996,25 +5988,21 @@ bool config_get_video_menu_xr(video_screen_xr_t *out)
 void config_set_video_screen_xr(unsigned screen,
       const video_screen_xr_t *values)
 {
-   video_screen_xr_t s;
-   settings_t *settings = config_get_ptr();
-   if (!settings || screen >= RETRO_VIDEO_VIEWS_MAX)
-      return;
-   if (!values)
-      config_reset_video_screen_xr(settings, screen, 1);
+   video_screen_values_t s;
+   unsigned bits = VIDEO_SCREEN_PREF_XR_PLACE;
+   memset(&s, 0, sizeof(s));
+   if (values)
+   {
+      s.xr = *values;
+      video_views_xr_normalize(&s.xr);
+   }
    else
    {
-      s = *values;
-      video_views_xr_normalize(&s);
-      settings->floats.video_screen_xr_x[screen]     = s.x;
-      settings->floats.video_screen_xr_y[screen]     = s.y;
-      settings->floats.video_screen_xr_z[screen]     = s.z;
-      settings->floats.video_screen_xr_yaw[screen]   = s.yaw;
-      settings->floats.video_screen_xr_pitch[screen] = s.pitch;
-      settings->floats.video_screen_xr_roll[screen]  = s.roll;
-      settings->floats.video_screen_xr_scale[screen] = s.scale;
+      /* Written, not cleared: a views core's entry beats the global one */
+      video_views_xr_reset(&s.xr, 1);
+      bits = VIDEO_SCREEN_PREF_XR_ALL;
    }
-   settings->flags |= SETTINGS_FLG_MODIFIED;
+   video_driver_screen_set(screen, bits, &s);
 }
 
 void config_set_video_menu_xr(const video_screen_xr_t *values)
@@ -6398,15 +6386,20 @@ void config_set_defaults(settings_t *target)
    config_reset_video_screen_xr(settings, 0, RETRO_VIDEO_VIEWS_MAX);
    config_reset_video_menu_xr(settings);
 
-#ifdef HAVE_VIDEO_WINDOWS
    for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
    {
+#ifdef HAVE_VIDEO_WINDOWS
       settings->uints.video_screen_window_pos[i] = 0;
       settings->uints.video_screen_window_dims[i] = 0;
       settings->bools.video_screen_window_fullscreen[i] = false;
       settings->bools.video_screen_window_pos_set[i] = false;
+#endif
       settings->arrays.video_screen_display[i][0] = '\0';
+      settings->uints.video_screen_corner[i]      = 0;
+      settings->uints.video_screen_size[i]        = 0;
+      settings->uints.video_screen_opacity[i]     = 0;
    }
+#ifdef HAVE_VIDEO_WINDOWS
    settings->arrays.video_menu_display[0] = '\0';
 #endif
 
@@ -7116,7 +7109,6 @@ CONFIG_NOINLINE static void config_load_video_windows(settings_t *settings, conf
 
       settings->bools.video_screen_window_fullscreen[i] = false;
       settings->bools.video_screen_window_pos_set[i] = false;
-      settings->arrays.video_screen_display[i][0] = '\0';
       strlcpy_lit(cfg + len, "mode", sizeof(cfg) - len);
       had_mode = config_get_uint(conf, cfg, &old_mode);
       strlcpy_lit(cfg + len, "x", sizeof(cfg) - len);
@@ -7137,9 +7129,6 @@ CONFIG_NOINLINE static void config_load_video_windows(settings_t *settings, conf
       settings->uints.video_screen_window_dims[i] =
          width && height && VIDEO_SCALE_FITS(width, height)
          ? VIDEO_SCALE_PACK(width, height) : 0;
-      snprintf(cfg, sizeof(cfg), "video_screen%u_display", i + 1);
-      config_get_array(conf, cfg, settings->arrays.video_screen_display[i],
-            sizeof(settings->arrays.video_screen_display[i]));
       /* Saved before the display rows. Auto does not stop it: a full
        * save writes every display, "" included */
       if (had_mode && !settings->arrays.video_screen_display[i][0])
@@ -7175,6 +7164,32 @@ CONFIG_NOINLINE static void config_load_video_windows(settings_t *settings, conf
 
 #undef CONFIG_NOINLINE
 #endif
+
+/* The Corner, Size or Opacity (@pref) at @key; 0, Default, when absent
+ * or out of range */
+static unsigned config_get_video_screen_inset(config_file_t *conf,
+      const char *key, unsigned pref)
+{
+   unsigned value = 0;
+   if (   !config_get_uint(conf, key, &value)
+       || (pref == VIDEO_SCREEN_PREF_CORNER
+             ? value > RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT
+             : value < 10 || value > 100))
+      return 0;
+   return value;
+}
+
+/* Default is not written */
+static void config_set_video_screen_inset(config_file_t *conf,
+      unsigned screen, unsigned pref, unsigned value)
+{
+   char key[64];
+   video_screen_prefs_key(screen, pref, key, sizeof(key));
+   if (value)
+      config_set_uint(conf, key, value);
+   else
+      config_unset(conf, key);
+}
 
 /**
  * config_load:
@@ -7511,7 +7526,25 @@ static bool config_load_file(const char *path, settings_t *settings)
             *size_settings[i].ptr  = *size_settings[i].ptr * 1024 * 1024;
    }
 
+   for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+   {
+      char cfg[64];
+      snprintf(cfg, sizeof(cfg), "video_screen%u_display", i + 1);
+      settings->arrays.video_screen_display[i][0] = '\0';
+      config_get_array(conf, cfg, settings->arrays.video_screen_display[i],
+            sizeof(settings->arrays.video_screen_display[i]));
+      video_screen_prefs_key(i, VIDEO_SCREEN_PREF_CORNER, cfg, sizeof(cfg));
+      settings->uints.video_screen_corner[i]  =
+         config_get_video_screen_inset(conf, cfg, VIDEO_SCREEN_PREF_CORNER);
+      video_screen_prefs_key(i, VIDEO_SCREEN_PREF_SIZE, cfg, sizeof(cfg));
+      settings->uints.video_screen_size[i]    =
+         config_get_video_screen_inset(conf, cfg, VIDEO_SCREEN_PREF_SIZE);
+      video_screen_prefs_key(i, VIDEO_SCREEN_PREF_OPACITY, cfg, sizeof(cfg));
+      settings->uints.video_screen_opacity[i] =
+         config_get_video_screen_inset(conf, cfg, VIDEO_SCREEN_PREF_OPACITY);
+   }
 #ifdef HAVE_VIDEO_WINDOWS
+   /* After the displays: a retired window mode migrates into one */
    config_load_video_windows(settings, conf);
 #endif
 
@@ -8301,6 +8334,142 @@ static bool config_load_file(const char *path, settings_t *settings)
    first_load = false;
    /* each port's deadzones, from the settings now loaded */
    input_driver_deadzones_refresh();
+   return true;
+}
+
+/* A core's screens file, named as validate_per_core_options names its
+ * options file; @make_dir makes the core's directory */
+static bool config_video_screen_prefs_path(char *s, size_t len,
+      const char *library_name, bool make_dir)
+{
+   char config_directory[DIR_MAX_LENGTH];
+   if (!library_name || !*library_name)
+      return false;
+   fill_pathname_application_special(config_directory,
+         sizeof(config_directory), APPLICATION_SPECIAL_DIRECTORY_CONFIG);
+   if (make_dir)
+   {
+      fill_pathname_join_special(s, config_directory, library_name, len);
+      if (!path_is_directory(s))
+         path_mkdir(s);
+   }
+   fill_pathname_join_special_ext(s, config_directory, library_name,
+         library_name, ".screens.cfg", len);
+   return true;
+}
+
+/* @xr's placement float for @pref, NULL for any other pref */
+static float *config_video_screen_prefs_xr(video_screen_xr_t *xr,
+      unsigned pref)
+{
+   switch (pref)
+   {
+      case VIDEO_SCREEN_PREF_XR_X:
+         return &xr->x;
+      case VIDEO_SCREEN_PREF_XR_Y:
+         return &xr->y;
+      case VIDEO_SCREEN_PREF_XR_Z:
+         return &xr->z;
+      case VIDEO_SCREEN_PREF_XR_YAW:
+         return &xr->yaw;
+      case VIDEO_SCREEN_PREF_XR_PITCH:
+         return &xr->pitch;
+      case VIDEO_SCREEN_PREF_XR_ROLL:
+         return &xr->roll;
+      case VIDEO_SCREEN_PREF_XR_SCALE:
+         return &xr->scale;
+      default:
+         break;
+   }
+   return NULL;
+}
+
+bool config_load_video_screen_prefs(const char *library_name,
+      video_screen_prefs_t *prefs)
+{
+   unsigned i, p;
+   config_file_t *conf;
+   char path[PATH_MAX_LENGTH];
+   if (   !config_video_screen_prefs_path(path, sizeof(path),
+            library_name, false)
+       || !(conf = config_file_new_from_path_to_string(path)))
+      return false;
+   /* Each entry checked as the global load checks it */
+   for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+   {
+      for (p = 0; p < VIDEO_SCREEN_PREF_COUNT; p++)
+      {
+         video_screen_values_t values;
+         char key[64];
+         float *xr;
+         int x           = 0;
+         int y           = 0;
+         unsigned width  = 0;
+         unsigned height = 0;
+         bool valid      = false;
+         memset(&values, 0, sizeof(values));
+         video_views_xr_reset(&values.xr, 1);
+         video_screen_prefs_key(i, p, key, sizeof(key));
+         switch (p)
+         {
+            case VIDEO_SCREEN_PREF_DISPLAY:
+               valid = config_get_array(conf, key, values.display,
+                     sizeof(values.display));
+               break;
+            case VIDEO_SCREEN_PREF_WINDOW_FULLSCREEN:
+               valid = config_get_bool(conf, key, &values.window_fullscreen);
+               break;
+            case VIDEO_SCREEN_PREF_WINDOW_X:
+            case VIDEO_SCREEN_PREF_WINDOW_Y:
+               valid =  config_get_int(conf, key,
+                        p == VIDEO_SCREEN_PREF_WINDOW_X ? &x : &y)
+                     && x >= VIDEO_POS_MIN && x <= VIDEO_POS_MAX
+                     && y >= VIDEO_POS_MIN && y <= VIDEO_POS_MAX;
+               values.window_pos = VIDEO_POS_PACK(x, y);
+               break;
+            case VIDEO_SCREEN_PREF_WINDOW_WIDTH:
+            case VIDEO_SCREEN_PREF_WINDOW_HEIGHT:
+               valid =  config_get_uint(conf, key,
+                        p == VIDEO_SCREEN_PREF_WINDOW_WIDTH ? &width : &height)
+                     && (width || height)
+                     && VIDEO_SCALE_FITS(width, height);
+               values.window_dims = VIDEO_SCALE_PACK(width, height);
+               break;
+            case VIDEO_SCREEN_PREF_WINDOW_POS_SET:
+               valid = config_get_bool(conf, key, &values.window_pos_set);
+               break;
+            case VIDEO_SCREEN_PREF_XR_VISIBLE:
+               valid = config_get_bool(conf, key, &values.xr.visible);
+               break;
+            /* Default is no entry */
+            case VIDEO_SCREEN_PREF_CORNER:
+               values.corner  = config_get_video_screen_inset(conf, key, p);
+               valid          = values.corner != 0;
+               break;
+            case VIDEO_SCREEN_PREF_SIZE:
+               values.size    = config_get_video_screen_inset(conf, key, p);
+               valid          = values.size != 0;
+               break;
+            case VIDEO_SCREEN_PREF_OPACITY:
+               values.opacity = config_get_video_screen_inset(conf, key, p);
+               valid          = values.opacity != 0;
+               break;
+            default:
+               xr    = config_video_screen_prefs_xr(&values.xr, p);
+               valid =  xr
+                     && config_get_float(conf, key, xr)
+                     && *xr >= -FLT_MAX && *xr <= FLT_MAX;
+               video_views_xr_normalize(&values.xr);
+               break;
+         }
+         if (valid)
+            video_screen_prefs_set(prefs, i, VIDEO_SCREEN_PREF_BIT(p),
+                  &values);
+      }
+   }
+   config_file_free(conf);
+   prefs->in_use = true;
+   prefs->dirty  = false;
    return true;
 }
 
@@ -9985,10 +10154,10 @@ bool config_save_file(const char *path)
       }
    }
 
-#ifdef HAVE_VIDEO_WINDOWS
    for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
    {
       char cfg[64];
+#ifdef HAVE_VIDEO_WINDOWS
       size_t len = snprintf(cfg, sizeof(cfg), "video_screen%u_window_", i + 1);
 
       /* Migrated or retired on load; a mode left in the file would
@@ -10039,6 +10208,7 @@ bool config_save_file(const char *path)
          config_set_string(conf, cfg, settings->bools.video_screen_window_fullscreen[i] ? "true" : "false");
       else
          config_unset(conf, cfg);
+#endif
 
       snprintf(cfg, sizeof(cfg), "video_screen%u_display", i + 1);
       if (   !minimal
@@ -10047,7 +10217,14 @@ bool config_save_file(const char *path)
          config_set_string(conf, cfg, settings->arrays.video_screen_display[i]);
       else
          config_unset(conf, cfg);
+      config_set_video_screen_inset(conf, i, VIDEO_SCREEN_PREF_CORNER,
+            settings->uints.video_screen_corner[i]);
+      config_set_video_screen_inset(conf, i, VIDEO_SCREEN_PREF_SIZE,
+            settings->uints.video_screen_size[i]);
+      config_set_video_screen_inset(conf, i, VIDEO_SCREEN_PREF_OPACITY,
+            settings->uints.video_screen_opacity[i]);
    }
+#ifdef HAVE_VIDEO_WINDOWS
    if (   !minimal
        || !string_is_equal(settings->arrays.video_menu_display,
              defaults->arrays.video_menu_display))
@@ -10479,6 +10656,91 @@ bool config_save_file(const char *path)
    return ret;
 }
 
+bool config_save_video_screen_prefs(const char *library_name,
+      video_screen_prefs_t *prefs)
+{
+   unsigned i, p;
+   config_file_t *conf;
+   char path[PATH_MAX_LENGTH];
+   bool any = false;
+   bool ret = false;
+   if (!prefs->dirty)
+      return false;
+   for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+      if (prefs->set[i])
+         any = true;
+   if (!config_video_screen_prefs_path(path, sizeof(path),
+            library_name, any))
+      return false;
+   if (!any)
+   {
+      if (!path_is_valid(path) || filestream_delete(path) == 0)
+         prefs->dirty = false;
+      return !prefs->dirty;
+   }
+   if (!(conf = config_file_new_alloc()))
+      return false;
+   for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
+   {
+      video_screen_values_t *values = &prefs->values[i];
+      for (p = 0; p < VIDEO_SCREEN_PREF_COUNT; p++)
+      {
+         char key[64];
+         float *xr;
+         if (!(prefs->set[i] & VIDEO_SCREEN_PREF_BIT(p)))
+            continue;
+         video_screen_prefs_key(i, p, key, sizeof(key));
+         switch (p)
+         {
+            case VIDEO_SCREEN_PREF_DISPLAY:
+               config_set_string(conf, key, values->display);
+               break;
+            case VIDEO_SCREEN_PREF_WINDOW_FULLSCREEN:
+               config_set_string(conf, key,
+                     values->window_fullscreen ? "true" : "false");
+               break;
+            case VIDEO_SCREEN_PREF_WINDOW_X:
+               config_set_int(conf, key, VIDEO_POS_X(values->window_pos));
+               break;
+            case VIDEO_SCREEN_PREF_WINDOW_Y:
+               config_set_int(conf, key, VIDEO_POS_Y(values->window_pos));
+               break;
+            case VIDEO_SCREEN_PREF_WINDOW_WIDTH:
+               config_set_uint(conf, key, VIDEO_SCALE_W(values->window_dims));
+               break;
+            case VIDEO_SCREEN_PREF_WINDOW_HEIGHT:
+               config_set_uint(conf, key, VIDEO_SCALE_H(values->window_dims));
+               break;
+            case VIDEO_SCREEN_PREF_WINDOW_POS_SET:
+               config_set_string(conf, key,
+                     values->window_pos_set ? "true" : "false");
+               break;
+            case VIDEO_SCREEN_PREF_XR_VISIBLE:
+               config_set_string(conf, key,
+                     values->xr.visible ? "true" : "false");
+               break;
+            case VIDEO_SCREEN_PREF_CORNER:
+               config_set_uint(conf, key, values->corner);
+               break;
+            case VIDEO_SCREEN_PREF_SIZE:
+               config_set_uint(conf, key, values->size);
+               break;
+            case VIDEO_SCREEN_PREF_OPACITY:
+               config_set_uint(conf, key, values->opacity);
+               break;
+            default:
+               if ((xr = config_video_screen_prefs_xr(&values->xr, p)))
+                  config_set_float(conf, key, *xr);
+               break;
+         }
+      }
+   }
+   if ((ret = config_file_write(conf, path, true)))
+      prefs->dirty = false;
+   config_file_free(conf);
+   return ret;
+}
+
 /**
  * config_save_overrides:
  * @path            : Path that shall be written to.
@@ -10800,10 +11062,10 @@ int8_t config_save_overrides(enum override_type type,
          }
       }
 
-#ifdef HAVE_VIDEO_WINDOWS
       for (i = 0; i < RETRO_VIDEO_VIEWS_MAX; i++)
       {
          char cfg[64];
+#ifdef HAVE_VIDEO_WINDOWS
          size_t len = snprintf(cfg, sizeof(cfg), "video_screen%u_window_", i + 1);
 
          strlcpy_lit(cfg + len, "x", sizeof(cfg) - len);
@@ -10829,12 +11091,25 @@ int8_t config_save_overrides(enum override_type type,
          strlcpy_lit(cfg + len, "fullscreen", sizeof(cfg) - len);
          if (settings->bools.video_screen_window_fullscreen[i] != overrides->bools.video_screen_window_fullscreen[i])
             config_set_string(conf, cfg, overrides->bools.video_screen_window_fullscreen[i] ? "true" : "false");
+#endif
 
          snprintf(cfg, sizeof(cfg), "video_screen%u_display", i + 1);
          if (!string_is_equal(settings->arrays.video_screen_display[i],
                   overrides->arrays.video_screen_display[i]))
             config_set_string(conf, cfg, overrides->arrays.video_screen_display[i]);
+
+         /* Default too, so it beats a global value */
+         video_screen_prefs_key(i, VIDEO_SCREEN_PREF_CORNER, cfg, sizeof(cfg));
+         if (settings->uints.video_screen_corner[i] != overrides->uints.video_screen_corner[i])
+            config_set_uint(conf, cfg, overrides->uints.video_screen_corner[i]);
+         video_screen_prefs_key(i, VIDEO_SCREEN_PREF_SIZE, cfg, sizeof(cfg));
+         if (settings->uints.video_screen_size[i] != overrides->uints.video_screen_size[i])
+            config_set_uint(conf, cfg, overrides->uints.video_screen_size[i]);
+         video_screen_prefs_key(i, VIDEO_SCREEN_PREF_OPACITY, cfg, sizeof(cfg));
+         if (settings->uints.video_screen_opacity[i] != overrides->uints.video_screen_opacity[i])
+            config_set_uint(conf, cfg, overrides->uints.video_screen_opacity[i]);
       }
+#ifdef HAVE_VIDEO_WINDOWS
       if (!string_is_equal(settings->arrays.video_menu_display,
                overrides->arrays.video_menu_display))
          config_set_string(conf, "video_menu_display",

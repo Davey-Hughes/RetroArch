@@ -19,6 +19,7 @@
  * failure. */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
@@ -183,7 +184,8 @@ static void test_screen_transform(void)
    CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_AUTO, false, false,
             &origin, &dir, &u, &v, &t) == 2);
    CHECK(NEAR(u, 0.251) && NEAR(v, 0.251) && NEAR(t, 1.0));
-   CHECK(video_xr_quad_to_frame(&set.quads[2], u, v, &map,
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[2], u, v,
+            VIDEO_OPENXR_LASER_ALWAYS, &map,
             VIDEO_SCALE_PACK(800, 480), &fx, &fy));
    CHECK(fx == -6522 && fy == 8276);
    screens[1].yaw = 0.0f;
@@ -1581,7 +1583,7 @@ static void test_live_edit(void)
    video_xr_place(&p, &set);
    /* Every item, screen 0 and the closed menu too. */
    for (i = 0; i < set.num_quads; i++)
-      CHECK(video_xr_quad_live(&set.quads[i], VIDEO_XR_LIVE_EDIT, false));
+      CHECK(video_xr_quad_live(&set, &set.quads[i], VIDEO_XR_LIVE_EDIT, false));
    o.x = o.y = o.z = 0.0f;
    /* Straight ahead the menu covers screen 0: through it, screen 0. */
    d.x = 0.0f; d.y = 0.0f; d.z = -1.0f;
@@ -1631,10 +1633,10 @@ static void test_live_edit(void)
    params_init(&p, NULL);
    p.frame_dims = VIDEO_SCALE_PACK(800, 480);
    video_xr_place(&p, &set);
-   CHECK(video_xr_quad_live(&set.quads[0], VIDEO_XR_LIVE_EDIT, false));
+   CHECK(video_xr_quad_live(&set, &set.quads[0], VIDEO_XR_LIVE_EDIT, false));
    p.window = true;
    video_xr_place(&p, &set);
-   CHECK(video_xr_quad_live(&set.quads[0], VIDEO_XR_LIVE_EDIT, false));
+   CHECK(video_xr_quad_live(&set, &set.quads[0], VIDEO_XR_LIVE_EDIT, false));
 }
 
 /* A frame shown whole without the screens' settings, a views core's
@@ -1850,12 +1852,16 @@ static void test_menu_spot(void)
    CHECK(NEAR(set.quads[set.num_quads - 1].width, 16.0));
    p.menu = NULL;
 
-   /* Screen 1 hidden or the projection's: the menu at its spot. */
+   /* Screen 1 hidden: the menu goes with screen 2; the projection's: at
+    * its spot. */
    screens[0].visible = false;
    screens[0].x       = 3.0f;
    video_xr_place(&p, &set);
    m = &set.quads[set.num_quads - 1];
-   CHECK(m->kind == VIDEO_XR_QUAD_MENU && pos_is(m, 0.0, 0.0, -1.7));
+   CHECK(set.num_quads == 2 && set.quads[0].screen == 1);
+   CHECK(m->kind == VIDEO_XR_QUAD_MENU && pos_is(m,
+            set.quads[0].pose.position.x, set.quads[0].pose.position.y,
+            -1.7));
    screens[0].visible = true;
    p.skip_screens     = 1u;
    video_xr_place(&p, &set);
@@ -2340,23 +2346,29 @@ static void test_quad_to_frame(void)
    video_xr_place(&p, &set);
 
    /* The right eye's copy lands in the left view, at the same point. */
-   CHECK(video_xr_quad_to_frame(&set.quads[1], 0.5f, 0.5f, &map, frame, &x, &y));
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[1], 0.5f, 0.5f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
    CHECK(x == -16364 && y == -16351);
-   CHECK(video_xr_quad_to_frame(&set.quads[0], 0.5f, 0.5f, &map, frame, &x, &y));
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.5f, 0.5f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
    CHECK(x == -16364 && y == -16351);
    /* The bottom screen's corners. */
-   CHECK(video_xr_quad_to_frame(&set.quads[2], 0.0f, 0.0f, &map, frame, &x, &y));
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[2], 0.0f, 0.0f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
    CHECK(x == -13083 && y == 67);
-   CHECK(video_xr_quad_to_frame(&set.quads[2], 1.0f, 1.0f, &map, frame, &x, &y));
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[2], 1.0f, 1.0f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
    CHECK(x == 13081 && y == 32767);
    /* The menu is not the core's. */
-   CHECK(!video_xr_quad_to_frame(&set.quads[3], 0.5f, 0.5f, &map, frame, &x, &y));
+   CHECK(!video_xr_quad_to_frame(&set, &set.quads[3], 0.5f, 0.5f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
 
    /* A whole frame spreads over the frame. */
    params_init(&p, NULL);
    p.frame_dims = frame;
    video_xr_place(&p, &set);
-   CHECK(video_xr_quad_to_frame(&set.quads[0], 0.25f, 0.75f, NULL, frame, &x, &y));
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.25f, 0.75f,
+            VIDEO_OPENXR_LASER_ALWAYS, NULL, frame, &x, &y));
    CHECK(x == -16364 && y == 16485);
 }
 
@@ -2371,24 +2383,37 @@ static void test_live(void)
    p.ui_dims = VIDEO_SCALE_PACK(1600, 960);
    video_xr_place(&p, &set);
    /* 0 and 1 are screen 0's eyes, 2 is screen 1, 3 the menu. */
-   CHECK(!video_xr_quad_live(&set.quads[0], VIDEO_OPENXR_LASER_AUTO, true));
-   CHECK( video_xr_quad_live(&set.quads[0], VIDEO_OPENXR_LASER_ALWAYS, false));
-   CHECK(!video_xr_quad_live(&set.quads[0], VIDEO_OPENXR_LASER_OFF, false));
-   CHECK( video_xr_quad_live(&set.quads[2], VIDEO_OPENXR_LASER_AUTO, false));
-   CHECK( video_xr_quad_live(&set.quads[2], VIDEO_OPENXR_LASER_ALWAYS, false));
-   CHECK(!video_xr_quad_live(&set.quads[2], VIDEO_OPENXR_LASER_OFF, false));
-   CHECK( video_xr_quad_live(&set.quads[3], VIDEO_OPENXR_LASER_AUTO, true));
-   CHECK(!video_xr_quad_live(&set.quads[3], VIDEO_OPENXR_LASER_AUTO, false));
-   CHECK( video_xr_quad_live(&set.quads[3], VIDEO_OPENXR_LASER_ALWAYS, true));
-   CHECK(!video_xr_quad_live(&set.quads[3], VIDEO_OPENXR_LASER_ALWAYS, false));
-   CHECK(!video_xr_quad_live(&set.quads[3], VIDEO_OPENXR_LASER_OFF, true));
+   CHECK(!video_xr_quad_live(&set, &set.quads[0], VIDEO_OPENXR_LASER_AUTO,
+            true));
+   CHECK( video_xr_quad_live(&set, &set.quads[0], VIDEO_OPENXR_LASER_ALWAYS,
+            false));
+   CHECK(!video_xr_quad_live(&set, &set.quads[0], VIDEO_OPENXR_LASER_OFF,
+            false));
+   CHECK( video_xr_quad_live(&set, &set.quads[2], VIDEO_OPENXR_LASER_AUTO,
+            false));
+   CHECK( video_xr_quad_live(&set, &set.quads[2], VIDEO_OPENXR_LASER_ALWAYS,
+            false));
+   CHECK(!video_xr_quad_live(&set, &set.quads[2], VIDEO_OPENXR_LASER_OFF,
+            false));
+   CHECK( video_xr_quad_live(&set, &set.quads[3], VIDEO_OPENXR_LASER_AUTO,
+            true));
+   CHECK(!video_xr_quad_live(&set, &set.quads[3], VIDEO_OPENXR_LASER_AUTO,
+            false));
+   CHECK( video_xr_quad_live(&set, &set.quads[3], VIDEO_OPENXR_LASER_ALWAYS,
+            true));
+   CHECK(!video_xr_quad_live(&set, &set.quads[3], VIDEO_OPENXR_LASER_ALWAYS,
+            false));
+   CHECK(!video_xr_quad_live(&set, &set.quads[3], VIDEO_OPENXR_LASER_OFF,
+            true));
 
    /* A whole frame is screen 0. */
    params_init(&p, NULL);
    p.frame_dims = VIDEO_SCALE_PACK(800, 480);
    video_xr_place(&p, &set);
-   CHECK(!video_xr_quad_live(&set.quads[0], VIDEO_OPENXR_LASER_AUTO, false));
-   CHECK( video_xr_quad_live(&set.quads[0], VIDEO_OPENXR_LASER_ALWAYS, false));
+   CHECK(!video_xr_quad_live(&set, &set.quads[0], VIDEO_OPENXR_LASER_AUTO,
+            false));
+   CHECK( video_xr_quad_live(&set, &set.quads[0], VIDEO_OPENXR_LASER_ALWAYS,
+            false));
 }
 
 static void test_pick(void)
@@ -2473,10 +2498,14 @@ static void test_window(void)
    CHECK(set.num_quads == 1 && set.quads[0].kind == VIDEO_XR_QUAD_WINDOW);
 
    /* The menu's while it is open; otherwise a whole frame. */
-   CHECK( video_xr_quad_live(&set.quads[0], VIDEO_OPENXR_LASER_AUTO, true));
-   CHECK(!video_xr_quad_live(&set.quads[0], VIDEO_OPENXR_LASER_AUTO, false));
-   CHECK( video_xr_quad_live(&set.quads[0], VIDEO_OPENXR_LASER_ALWAYS, false));
-   CHECK(!video_xr_quad_live(&set.quads[0], VIDEO_OPENXR_LASER_OFF, true));
+   CHECK( video_xr_quad_live(&set, &set.quads[0], VIDEO_OPENXR_LASER_AUTO,
+            true));
+   CHECK(!video_xr_quad_live(&set, &set.quads[0], VIDEO_OPENXR_LASER_AUTO,
+            false));
+   CHECK( video_xr_quad_live(&set, &set.quads[0], VIDEO_OPENXR_LASER_ALWAYS,
+            false));
+   CHECK(!video_xr_quad_live(&set, &set.quads[0], VIDEO_OPENXR_LASER_OFF,
+            true));
    o.x = 0.0f; o.y = 0.0f; o.z = 0.0f;
    d.x = 0.0f; d.y = 0.0f; d.z = -1.0f;
    CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_AUTO, true,
@@ -2487,8 +2516,8 @@ static void test_window(void)
             true, &o, &d, &u, &v, &t) == 0);
    CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_ALWAYS, false,
             true, &o, &d, &u, &v, &t) == -1);
-   CHECK(video_xr_quad_to_frame(&set.quads[0], 0.25f, 0.75f, NULL, frame,
-            &x, &y));
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.25f, 0.75f,
+            VIDEO_OPENXR_LASER_ALWAYS, NULL, frame, &x, &y));
    CHECK(x == -16364 && y == 16485);
 }
 
@@ -2531,7 +2560,8 @@ static void test_window_point(void)
    /* The middle of window pixel 449,361 is frame pixel 64,112. */
    u = 449.5f / 1280.0f; v = 361.5f / 720.0f;
    CHECK(video_xr_window_point(&vp, &u, &v));
-   CHECK(video_xr_quad_to_frame(&set.quads[0], u, v, NULL,
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], u, v,
+            VIDEO_OPENXR_LASER_ALWAYS, NULL,
             VIDEO_SCALE_PACK(256, 224), &x, &y));
    CHECK(x == -16320 && y == 146);
 
@@ -2676,14 +2706,16 @@ static void test_window_views_3ds(void)
     * shows there: frame pixel 336,360. */
    u = 96.5f / 320.0f;
    v = 120.5f / 240.0f;
-   CHECK(video_xr_quad_to_frame(&set.quads[2], u, v, &map,
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[2], u, v,
+            VIDEO_OPENXR_LASER_ALWAYS, &map,
             VIDEO_SCALE_PACK(800, 480), &sx, &sy));
    u = (424.0f + u * 432.0f) / 1280.0f;
    v = (348.0f + v * 324.0f) / 720.0f;
    CHECK(video_xr_window_point(&vp, &u, &v));
    memset(&win, 0, sizeof(win));
    win.kind = VIDEO_XR_QUAD_WINDOW;
-   CHECK(video_xr_quad_to_frame(&win, u, v, &map,
+   CHECK(video_xr_quad_to_frame(NULL, &win, u, v, VIDEO_OPENXR_LASER_ALWAYS,
+            &map,
             VIDEO_SCALE_PACK(800, 480), &wx, &wy));
    CHECK(sx == wx && sy == wy);
 
@@ -7833,6 +7865,1243 @@ static void test_request_rate(void)
    CHECK(NEAR(video_xr_request_rate(10, e2e, 2, 10.0f, 16), 10.0));
 }
 
+/* @num_scr screens around @views, those in @absent ABSENT, as
+ * video_views_validate_map makes them. */
+static void absent_map(const struct retro_video_view *views,
+      unsigned num_views, unsigned num_scr, unsigned absent,
+      video_views_map_t *map)
+{
+   struct retro_video_views in;
+   struct retro_video_screen scr[RETRO_VIDEO_VIEWS_MAX];
+   unsigned i;
+   memset(scr, 0, sizeof(scr));
+   for (i = 0; i < num_scr; i++)
+      if (absent & (1u << i))
+         scr[i].state = RETRO_VIDEO_SCREEN_STATE_ABSENT;
+   memset(&in, 0, sizeof(in));
+   in.views       = views;
+   in.num_views   = num_views;
+   in.flags       = RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   in.screens     = scr;
+   in.num_screens = num_scr;
+   CHECK(video_views_validate_map(&in, map, NULL));
+}
+
+/* Neither NaN nor infinite. */
+static int xr_finite(double x)
+{
+   return fabs(x) < 1e30;
+}
+
+static int lay_finite(const video_xr_layout_t *lay)
+{
+   unsigned s;
+   for (s = 0; s < lay->count; s++)
+      if (     !xr_finite(lay->width[s]) || !xr_finite(lay->height[s])
+            || !xr_finite(lay->pos[s].x) || !xr_finite(lay->pos[s].y)
+            || !xr_finite(lay->pos[s].z))
+         return 0;
+   return 1;
+}
+
+static int quads_finite(const video_xr_quad_set_t *set)
+{
+   unsigned i;
+   for (i = 0; i < set->num_quads; i++)
+   {
+      const video_xr_quad_t *q = &set->quads[i];
+      if (     !xr_finite(q->width) || !xr_finite(q->height)
+            || !xr_finite(q->pose.position.x)
+            || !xr_finite(q->pose.position.y)
+            || !xr_finite(q->pose.position.z))
+         return 0;
+   }
+   return 1;
+}
+
+/* A screen without views takes no place and has no quad. */
+static void test_xr_viewless(void)
+{
+   struct retro_video_view v[2];
+   video_views_map_t map, one, plain;
+   video_xr_params_t p;
+   video_xr_layout_t lay, want;
+   video_xr_quad_set_t set;
+   unsigned layout, i;
+
+   v[0] = mkview(0,   0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_NONE);
+   v[1] = mkview(0, 192, 256, 192, 2, RETRO_VIDEO_VIEW_EYE_NONE);
+   absent_map(v, 2, 3, 0x2, &map);
+   CHECK(map.num_screens == 3 && map.viewless == 0x2);
+   v[0] = mkview(0, 192, 256, 192, 1, RETRO_VIDEO_VIEW_EYE_NONE);
+   absent_map(v, 1, 2, 0x1, &one);
+   CHECK(one.num_screens == 2 && one.viewless == 0x1);
+   map_ds(&plain);
+   for (layout = 0; layout < VIDEO_SCREEN_LAYOUT_LAST; layout++)
+   {
+      params_init(&p, &plain);
+      p.screen_layout = layout;
+      video_xr_layout(&p, &want);
+      p.map = &map;
+      video_xr_layout(&p, &lay);
+      CHECK(lay.count == 3 && lay_finite(&lay));
+      CHECK(   lay.width[1] == 0.0f && lay.height[1] == 0.0f
+            && lay.native[1] == 0);
+      /* Screen 2 where a plain map's screen 1 is. */
+      CHECK(vec_is(&lay.pos[0], want.pos[0].x, want.pos[0].y,
+               want.pos[0].z));
+      CHECK(vec_is(&lay.pos[2], want.pos[1].x, want.pos[1].y,
+               want.pos[1].z));
+      CHECK(   NEAR(lay.width[2], want.width[1])
+            && NEAR(lay.height[2], want.height[1]));
+      video_xr_place(&p, &set);
+      CHECK(set.num_quads == 2 && quads_finite(&set));
+      for (i = 0; i < set.num_quads; i++)
+         CHECK(set.quads[i].screen != 1);
+      CHECK(set.slots[1].dims == 0 && set.slots[1].layers == 0);
+
+      /* Screen 0 without views: screen 1 sits where it would. */
+      p.map = &one;
+      video_xr_layout(&p, &lay);
+      CHECK(lay.count == 2 && lay_finite(&lay));
+      CHECK(   lay.width[0] == 0.0f && lay.height[0] == 0.0f
+            && lay.native[0] == 0);
+      CHECK(lay.pos[1].x == 0.0f && lay.pos[1].y == 0.0f);
+      CHECK(NEAR(lay.width[1], p.width));
+      video_xr_place(&p, &set);
+      CHECK(set.num_quads == 1 && quads_finite(&set));
+      CHECK(set.quads[0].screen == 1 && pos_is(&set.quads[0], 0.0, 0.0, -1.8));
+      CHECK(NEAR(set.quads[0].width, p.width));
+      CHECK(set.slots[0].dims == 0 && set.slots[0].layers == 0);
+   }
+}
+
+static void test_quad_to_frame_no_input(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   int16_t x, y, want_x, want_y;
+   unsigned frame = VIDEO_SCALE_PACK(800, 480);
+
+   map_3ds(&map);
+   params_init(&p, &map);
+   p.ui_dims = VIDEO_SCALE_PACK(1600, 960);
+   video_xr_place(&p, &set);
+   CHECK(set.quads[0].kind == VIDEO_XR_QUAD_SCREEN && set.quads[0].screen == 0);
+   CHECK(set.quads[2].kind == VIDEO_XR_QUAD_SCREEN && set.quads[2].screen == 1);
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[2], 0.5f, 0.5f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.5f, 0.5f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &want_x, &want_y));
+
+   map.no_input = 0x2;
+   CHECK(!video_xr_quad_to_frame(&set, &set.quads[2], 0.5f, 0.5f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
+   x = y = 0;
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.5f, 0.5f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
+   CHECK(x == want_x && y == want_y);
+}
+
+/* A NO_INPUT screen's quads are not there for the laser, edit mode's
+ * aside. */
+static void test_place_no_input(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   video_xr_vec3_t o, d;
+   float u, v, t;
+
+   map_ds(&map);
+   params_init(&p, &map);
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 2 && set.quads[1].screen == 1);
+   o   = set.quads[1].pose.position;
+   o.z = 0.0f;
+   d.x = d.y = 0.0f;
+   d.z = -1.0f;
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_ALWAYS, false, false,
+            &o, &d, &u, &v, &t) == 1);
+
+   map.no_input = 0x2;
+   video_xr_place(&p, &set);
+   CHECK(!set.quads[0].no_input && set.quads[1].no_input);
+   CHECK(!video_xr_quad_live(&set, &set.quads[1], VIDEO_OPENXR_LASER_AUTO,
+            false));
+   CHECK(!video_xr_quad_live(&set, &set.quads[1], VIDEO_OPENXR_LASER_ALWAYS,
+            false));
+   CHECK( video_xr_quad_live(&set, &set.quads[1], VIDEO_XR_LIVE_EDIT, false));
+   CHECK( video_xr_quad_live(&set, &set.quads[0], VIDEO_OPENXR_LASER_ALWAYS,
+            false));
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_ALWAYS, false, false,
+            &o, &d, &u, &v, &t) == -1);
+   CHECK(video_xr_pick_edit(&set, false, &o, &d, &u, &v, &t, NULL) == 1);
+}
+
+/* map_ds through video_views_validate_map. */
+static void map_ds_screens(video_views_map_t *map)
+{
+   struct retro_video_view v[2];
+   v[0] = mkview(0,   0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_NONE);
+   v[1] = mkview(0, 192, 256, 192, 1, RETRO_VIDEO_VIEW_EYE_NONE);
+   absent_map(v, 2, 2, 0, map);
+}
+
+/* A left-out screen has no quad, and the others keep their places. */
+static void test_xr_left_out(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t want, set;
+   unsigned layout, i;
+
+   map_ds_screens(&map);
+   for (layout = 0; layout < VIDEO_SCREEN_LAYOUT_LAST; layout++)
+   {
+      params_init(&p, &map);
+      p.screen_layout = layout;
+      map.left_out    = 0;
+      video_xr_place(&p, &want);
+      CHECK(want.num_quads == 2 && want.quads[1].screen == 1);
+      map.left_out    = 0x1u;
+      video_xr_place(&p, &set);
+      CHECK(set.num_quads == 1 && quads_finite(&set));
+      for (i = 0; i < set.num_quads; i++)
+         CHECK(set.quads[i].kind != VIDEO_XR_QUAD_SCREEN
+               || set.quads[i].screen != 0);
+      CHECK(   set.quads[0].kind == VIDEO_XR_QUAD_SCREEN
+            && set.quads[0].screen == 1);
+      CHECK(pose_same(&set.quads[0].pose, &want.quads[1].pose));
+      CHECK(   set.quads[0].width  == want.quads[1].width
+            && set.quads[0].height == want.quads[1].height);
+      CHECK(set.slots[0].dims == 0 && set.slots[0].layers == 0);
+   }
+}
+
+/* A blank screen keeps its quad and its slot, which says it is blank. */
+static void test_xr_blank_slot(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+
+   map_ds_screens(&map);
+   params_init(&p, &map);
+   map.blank = 0x2u;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 2);
+   CHECK(   set.quads[1].kind == VIDEO_XR_QUAD_SCREEN
+         && set.quads[1].screen == 1);
+   CHECK(set.slots[1].blank && !set.slots[0].blank);
+   CHECK(set.slots[1].dims && set.slots[1].layers == 1);
+}
+
+/* The menu, set's last quad, at quad i's x and y. */
+static int menu_over(const video_xr_quad_set_t *set, unsigned i)
+{
+   const video_xr_quad_t *m = &set->quads[set->num_quads - 1];
+   return m->kind == VIDEO_XR_QUAD_MENU
+      && NEAR(m->pose.position.x, set->quads[i].pose.position.x)
+      && NEAR(m->pose.position.y, set->quads[i].pose.position.y);
+}
+
+/* A following menu goes with the first screen placed, and stays at its
+ * own spot with none. */
+static void test_xr_menu_follows_first_placed(void)
+{
+   struct retro_video_view v[3];
+   video_views_map_t map, three;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   video_screen_xr_t screens[RETRO_VIDEO_VIEWS_MAX];
+   video_xr_pose_t spot;
+
+   map_ds_screens(&map);
+   params_init(&p, &map);
+   p.ui_dims = VIDEO_SCALE_PACK(1600, 960);
+   video_views_xr_reset(screens, RETRO_VIDEO_VIEWS_MAX);
+   /* Moved: a menu following it is off its own spot. */
+   screens[0].x = 0.5f;
+   p.screens    = screens;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 3 && set.quads[2].kind == VIDEO_XR_QUAD_MENU);
+   spot = set.quads[2].pose;
+
+   p.menu_follow = true;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 3 && set.quads[0].screen == 0);
+   CHECK(menu_over(&set, 0));
+   CHECK(!pose_same(&set.quads[2].pose, &spot));
+
+   map.left_out = 0x1u;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 2 && set.quads[0].screen == 1);
+   CHECK(menu_over(&set, 0));
+   map.left_out = 0;
+
+   screens[0].visible = false;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 2 && set.quads[0].screen == 1);
+   CHECK(menu_over(&set, 0));
+   screens[0].visible = true;
+
+   map.left_out = 0x3u;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 1 && set.quads[0].kind == VIDEO_XR_QUAD_MENU);
+   CHECK(pose_same(&set.quads[0].pose, &spot));
+
+   /* The first screen shown is the projection's: at its spot, though
+    * screen 2 has a quad. */
+   v[0] = mkview(0,   0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_NONE);
+   v[1] = mkview(0, 192, 256, 192, 1, RETRO_VIDEO_VIEW_EYE_NONE);
+   v[2] = mkview(0, 384, 256, 192, 2, RETRO_VIDEO_VIEW_EYE_NONE);
+   absent_map(v, 3, 3, 0, &three);
+   three.left_out = 0x1u;
+   p.map          = &three;
+   p.skip_screens = 0x2u;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 2 && set.quads[0].screen == 2);
+   CHECK(pose_same(&set.quads[1].pose, &spot));
+
+   /* The projection's screen hidden in the headset: still at its spot,
+    * not on to screen 2. */
+   three.left_out     = 0;
+   p.skip_screens     = 0x1u;
+   screens[0].visible = false;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 3 && set.quads[0].screen == 1);
+   CHECK(pose_same(&set.quads[2].pose, &spot));
+}
+
+/* No screen placed: nothing read past the screens, no screen quad, and
+ * a following menu at its own spot. */
+static void test_xr_all_skipped(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_layout_t lay;
+   video_xr_quad_set_t set;
+   unsigned i;
+
+   map_ds_screens(&map);
+   map.viewless  = 0x3u;
+   params_init(&p, &map);
+   p.ui_dims     = VIDEO_SCALE_PACK(1600, 960);
+   p.menu_follow = true;
+   video_xr_layout(&p, &lay);
+   CHECK(lay.count == 0);
+   video_xr_place(&p, &set);
+   for (i = 0; i < set.num_quads; i++)
+      CHECK(set.quads[i].kind != VIDEO_XR_QUAD_SCREEN);
+   CHECK(set.num_quads == 1 && set.quads[0].kind == VIDEO_XR_QUAD_MENU);
+   CHECK(quads_finite(&set) && pos_is(&set.quads[0], 0.0, 0.0, -1.7));
+}
+
+/* map_ds_screens with screen 1 over screen 0: bottom right, a quarter
+ * of its height. */
+static void map_ds_inset(video_views_map_t *map)
+{
+   map_ds_screens(map);
+   map->over       = 0x2u;
+   map->base       = 0;
+   map->anchor     = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT << 4;
+   map->size[1]    = 0.25f;
+   map->opacity[1] = 255;
+}
+
+static int vec_same(const video_xr_vec3_t *a, const video_xr_vec3_t *b)
+{
+   return a->x == b->x && a->y == b->y && a->z == b->z;
+}
+
+/* Saved headset spots never move: a screen made an inset leaves every
+ * spot where it was. */
+static void test_xr_inset_keeps_spots(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_layout_t want, lay;
+   unsigned layout, rotation;
+
+   for (layout = 0; layout < VIDEO_SCREEN_LAYOUT_LAST; layout++)
+      for (rotation = 0; rotation < 4; rotation++)
+      {
+         map_ds_inset(&map);
+         params_init(&p, &map);
+         p.screen_layout = layout;
+         p.rotation      = rotation;
+         video_xr_layout(&p, &lay);
+         /* As it was before: no over, and so no size. */
+         map.over        = 0;
+         map.size[1]     = 0.0f;
+         video_xr_layout(&p, &want);
+         CHECK(lay.count == 2 && want.count == 2);
+         CHECK(vec_same(&lay.pos[0], &want.pos[0]));
+         CHECK(vec_same(&lay.pos[1], &want.pos[1]));
+         CHECK(vec_same(&lay.menu, &want.menu));
+         CHECK(   lay.width[0]  == want.width[0]
+               && lay.height[0] == want.height[0]);
+      }
+}
+
+/* A shown screen with a base and a size takes a spot of that size. */
+static void test_xr_shown_sized(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_layout_t lay;
+
+   map_ds_screens(&map);
+   map.size[1] = 0.25f;
+   params_init(&p, &map);
+   video_xr_layout(&p, &lay);
+   CHECK(lay.count == 2 && lay.height[0] > 0.0f);
+   CHECK(fabs((double)lay.height[1] - (double)lay.height[0] / 4.0) < 1e-5);
+   CHECK(fabs((double)lay.width[1] - (double)lay.width[0] / 4.0) < 1e-5);
+}
+
+/* An inset has no quad and no slot: it is an entry in its base's slot,
+ * and a ray at it meets its base's quad. */
+static void test_xr_inset_entry(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   video_xr_vec3_t o, d;
+   float u, v, t;
+   unsigned i;
+
+   map_ds_inset(&map);
+   params_init(&p, &map);
+   video_xr_place(&p, &set);
+   for (i = 0; i < set.num_quads; i++)
+      CHECK(set.quads[i].kind != VIDEO_XR_QUAD_SCREEN
+            || set.quads[i].screen != 1);
+   CHECK(set.num_quads == 1 && set.quads[0].screen == 0);
+   CHECK(set.slots[0].dims && !set.slots[1].dims && !set.slots[1].layers);
+   CHECK(set.num_insets == 1);
+   CHECK(   set.insets[0].slot == set.quads[0].slot
+         && set.insets[0].screen == 1);
+   CHECK(   NEAR(set.insets[0].rect.x, 0.75)
+         && NEAR(set.insets[0].rect.y, 0.75)
+         && NEAR(set.insets[0].rect.w, 0.25)
+         && NEAR(set.insets[0].rect.h, 0.25));
+   CHECK(   set.insets[0].view[0]
+            == video_views_find(&map, 1, RETRO_VIDEO_VIEW_EYE_NONE)
+         && set.insets[0].view[1] == -1);
+   CHECK(!set.insets[0].blank && !set.insets[0].no_input);
+
+   /* The inset's centre: 7/8 across and down the 1.6 by 1.2 quad. */
+   o.x = 0.0f; o.y = 0.0f;   o.z = 0.0f;
+   d.x = 0.6f; d.y = -0.45f; d.z = -1.8f;
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_ALWAYS, false, false,
+            &o, &d, &u, &v, &t) == 0);
+   CHECK(NEAR(u, 0.875) && NEAR(v, 0.875));
+   CHECK(video_xr_pick_edit(&set, false, &o, &d, &u, &v, &t, NULL) == 0);
+
+   /* Its base hidden, left out or the projection's: it goes too. */
+   map.left_out = 0x1u;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 0 && set.num_insets == 0);
+   map.left_out   = 0;
+   p.skip_screens = 0x1u;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 0 && set.num_insets == 0);
+   /* Left out itself: its base alone. */
+   p.skip_screens = 0;
+   map.left_out   = 0x2u;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 1 && set.num_insets == 0);
+}
+
+/* A mono inset shows in both layers of a stereo base's slot; a stereo
+ * one shows its eyes there, and its left over a mono base. */
+static void test_xr_inset_stereo_base(void)
+{
+   struct retro_video_view v[4];
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+
+   v[0] = mkview(  0,   0, 400, 240, 0, RETRO_VIDEO_VIEW_EYE_LEFT);
+   v[1] = mkview(400,   0, 400, 240, 0, RETRO_VIDEO_VIEW_EYE_RIGHT);
+   v[2] = mkview(240, 240, 320, 240, 1, RETRO_VIDEO_VIEW_EYE_NONE);
+   absent_map(v, 3, 2, 0, &map);
+   map.over    = 0x2u;
+   map.anchor  = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT << 4;
+   map.size[1] = 0.25f;
+   params_init(&p, &map);
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 2 && set.slots[0].layers == 2);
+   CHECK(set.num_insets == 1 && set.insets[0].slot == 0);
+   CHECK(set.insets[0].view[0] == 2 && set.insets[0].view[1] == 2);
+
+   /* The other way round: the stereo screen over the mono one. */
+   map.over    = 0x1u;
+   map.base    = 0x1u;
+   map.anchor  = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT;
+   map.size[0] = 0.25f;
+   map.size[1] = 0.0f;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 1 && set.slots[1].layers == 1);
+   CHECK(set.num_insets == 1 && set.insets[0].slot == 1);
+   CHECK(set.insets[0].view[0] == 0 && set.insets[0].view[1] == -1);
+
+   /* Stereo over stereo: an eye a layer. */
+   v[2] = mkview(  0, 240, 400, 240, 1, RETRO_VIDEO_VIEW_EYE_LEFT);
+   v[3] = mkview(400, 240, 400, 240, 1, RETRO_VIDEO_VIEW_EYE_RIGHT);
+   absent_map(v, 4, 2, 0, &map);
+   map.over    = 0x2u;
+   map.anchor  = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT << 4;
+   map.size[1] = 0.25f;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 2 && set.slots[0].layers == 2);
+   CHECK(set.num_insets == 1);
+   CHECK(set.insets[0].view[0] == 2 && set.insets[0].view[1] == 3);
+}
+
+/* The menu never follows an inset: it goes with the first screen that
+ * has a quad. */
+static void test_xr_inset_menu(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+
+   map_ds_screens(&map);
+   map.over      = 0x1u;
+   map.base      = 0x1u;
+   map.anchor    = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT;
+   map.size[0]   = 0.25f;
+   params_init(&p, &map);
+   p.ui_dims     = VIDEO_SCALE_PACK(1600, 960);
+   p.menu_follow = true;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 2);
+   CHECK(   set.quads[0].kind == VIDEO_XR_QUAD_SCREEN
+         && set.quads[0].screen == 1);
+   CHECK(set.quads[0].pose.position.y < -0.5f);
+   CHECK(menu_over(&set, 0));
+}
+
+static int near_px(int a, int b, unsigned size)
+{
+   return abs(a - b) <= (int)(0x10000 / size);
+}
+
+/* A point on an inset is the inset's, at the same fraction of its view;
+ * through a NO_INPUT one it is the base's. */
+static void test_xr_inset_quad_to_frame(void)
+{
+   video_views_map_t map, plain;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   int16_t x, y, bx, by, tx, ty, cx, cy;
+   unsigned frame = VIDEO_SCALE_PACK(256, 384);
+
+   /* Bottom's middle, and Top's middle and inset corner. */
+   map_ds_screens(&plain);
+   params_init(&p, &plain);
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 2 && set.quads[1].screen == 1);
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[1], 0.5f, 0.5f,
+            VIDEO_OPENXR_LASER_ALWAYS, &plain, frame, &bx, &by));
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.5f, 0.5f,
+            VIDEO_OPENXR_LASER_ALWAYS, &plain, frame, &tx, &ty));
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.875f, 0.875f,
+            VIDEO_OPENXR_LASER_ALWAYS, &plain, frame, &cx, &cy));
+   CHECK(by > 0 && ty < 0 && cy < 0);
+
+   map_ds_inset(&map);
+   p.map = &map;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 1 && set.quads[0].screen == 0);
+   x = y = 0;
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.875f, 0.875f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map,
+            frame,
+            &x, &y));
+   CHECK(near_px(x, bx, 256) && near_px(y, by, 384));
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.5f, 0.5f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
+   CHECK(x == tx && y == ty);
+   /* Just off the inset. */
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.74f, 0.875f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
+   CHECK(y < 0);
+
+   map.no_input = 0x2u;
+   x = y = 0;
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.875f, 0.875f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map,
+            frame,
+            &x, &y));
+   CHECK(x == cx && y == cy);
+
+   /* No entry (the inset is the projection's), or no set: the base's. */
+   map.no_input   = 0;
+   p.skip_screens = 0x2u;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 1 && set.num_insets == 0);
+   x = y = 0;
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.875f, 0.875f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
+   CHECK(x == cx && y == cy);
+   p.skip_screens = 0;
+   video_xr_place(&p, &set);
+   CHECK(set.num_insets == 1);
+   x = y = 0;
+   CHECK(video_xr_quad_to_frame(NULL, &set.quads[0], 0.875f, 0.875f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
+   CHECK(x == cx && y == cy);
+}
+
+/* Turned a quarter turn, screens of unequal shape: a point is tested
+ * against the inset as drawn, and lands at its fraction of it. Top
+ * 400x240 and Bottom 320x240 make a quad 240 by 400 with the inset over
+ * u 0.6875 to 1, v 0.75 to 1. */
+static void test_xr_inset_quad_to_frame_turned(void)
+{
+   struct retro_video_view v[2];
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   int16_t x, y, bx, by, tx, ty;
+   float fu       = 64.5f / 320.0f;
+   float fv       = 144.5f / 240.0f;
+   unsigned frame = VIDEO_SCALE_PACK(400, 480);
+
+   v[0] = mkview( 0,   0, 400, 240, 0, RETRO_VIDEO_VIEW_EYE_NONE);
+   v[1] = mkview(40, 240, 320, 240, 1, RETRO_VIDEO_VIEW_EYE_NONE);
+   absent_map(v, 2, 2, 0, &map);
+   params_init(&p, &map);
+   p.rotation = 1;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 2 && set.quads[1].screen == 1);
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[1], fu, fv,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &bx, &by));
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.6f, 0.9f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &tx, &ty));
+
+   map.over    = 0x2u;
+   map.anchor  = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT << 4;
+   map.size[1] = 0.25f;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 1 && set.num_insets == 1);
+   CHECK(   NEAR(set.quads[0].width / set.quads[0].height, 0.6)
+         && NEAR(set.insets[0].rect.x, 0.6875)
+         && NEAR(set.insets[0].rect.y, 0.75)
+         && NEAR(set.insets[0].rect.w, 0.3125)
+         && NEAR(set.insets[0].rect.h, 0.25));
+   /* Inside the inset as drawn, left of where it would lie unturned. */
+   x = y = 0;
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0],
+            0.6875f + 0.3125f * fu, 0.75f + 0.25f * fv,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
+   CHECK(x == bx && y == by);
+   /* Left of it: the base's. */
+   x = y = 0;
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.6f, 0.9f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
+   CHECK(x == tx && y == ty);
+}
+
+/* A NO_INPUT base under an inset that takes input: the quad is live for
+ * the inset, and beside it a point is off every screen. */
+static void test_xr_inset_no_input_base(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   video_xr_vec3_t o, d;
+   int16_t x, y, bx, by;
+   float u, v, t;
+   unsigned frame = VIDEO_SCALE_PACK(256, 384);
+
+   map_ds_screens(&map);
+   params_init(&p, &map);
+   video_xr_place(&p, &set);
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[1], 0.5f, 0.5f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &bx, &by));
+
+   map_ds_inset(&map);
+   map.no_input = 0x1u;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 1 && set.num_insets == 1);
+   CHECK(set.quads[0].no_input && !set.insets[0].no_input);
+   CHECK(video_xr_quad_live(&set, &set.quads[0], VIDEO_OPENXR_LASER_ALWAYS,
+            false));
+   o.x = 0.0f; o.y = 0.0f;   o.z = 0.0f;
+   d.x = 0.6f; d.y = -0.45f; d.z = -1.8f;
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_ALWAYS, false, false,
+            &o, &d, &u, &v, &t) == 0);
+   x = y = 0;
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], u, v,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
+   CHECK(near_px(x, bx, 256) && near_px(y, by, 384));
+   /* Beside the inset. */
+   d.x = 0.0f; d.y = 0.0f;
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_ALWAYS, false, false,
+            &o, &d, &u, &v, &t) == 0);
+   CHECK(!video_xr_quad_to_frame(&set, &set.quads[0], u, v,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
+
+   /* Neither takes input: not there for the laser. */
+   map.no_input = 0x3u;
+   video_xr_place(&p, &set);
+   CHECK(set.quads[0].no_input && set.insets[0].no_input);
+   d.x = 0.6f; d.y = -0.45f;
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_ALWAYS, false, false,
+            &o, &d, &u, &v, &t) == -1);
+   /* A live base keeps its quad live under a NO_INPUT inset. */
+   map.no_input = 0x2u;
+   video_xr_place(&p, &set);
+   CHECK(!set.quads[0].no_input && set.insets[0].no_input);
+}
+
+/* Two insets on one base: entries in screen order, and a point under
+ * both is the later one's unless that is NO_INPUT. */
+static void test_xr_inset_order(void)
+{
+   struct retro_video_view v[3];
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   int16_t x, y;
+   unsigned frame = VIDEO_SCALE_PACK(256, 576);
+
+   v[0] = mkview(0,   0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_NONE);
+   v[1] = mkview(0, 192, 256, 192, 1, RETRO_VIDEO_VIEW_EYE_NONE);
+   v[2] = mkview(0, 384, 256, 192, 2, RETRO_VIDEO_VIEW_EYE_NONE);
+   absent_map(v, 3, 3, 0, &map);
+   map.over    = 0x6u;
+   map.anchor  = (RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT << 4)
+      | (RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT << 8);
+   map.size[1] = 0.5f;
+   map.size[2] = 0.25f;
+   params_init(&p, &map);
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 1 && set.num_insets == 2);
+   CHECK(set.insets[0].screen == 1 && set.insets[1].screen == 2);
+   /* Under both: screen 2's rows, the frame's last third. */
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.9f, 0.9f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
+   CHECK(y > 10923);
+   /* Under screen 1's alone: the middle third. */
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.6f, 0.6f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
+   CHECK(y > -10923 && y < 10923);
+   map.no_input = 0x4u;
+   video_xr_place(&p, &set);
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.9f, 0.9f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
+   CHECK(y > -10923 && y < 10923);
+}
+
+/* Auto's rule goes by the screen under the point: an inset past screen
+ * 0 that takes input makes screen 0's quad live, and screen 0 beside it
+ * stays the mouse's. */
+static void test_xr_inset_auto(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   video_xr_vec3_t o, d;
+   int16_t x, y, bx, by, tx, ty;
+   float u, v, t;
+   unsigned frame = VIDEO_SCALE_PACK(256, 384);
+
+   map_ds_screens(&map);
+   params_init(&p, &map);
+   video_xr_place(&p, &set);
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[1], 0.5f, 0.5f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &bx, &by));
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.5f, 0.5f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &tx, &ty));
+
+   map_ds_inset(&map);
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 1 && set.num_insets == 1);
+   CHECK( video_xr_quad_live(&set, &set.quads[0], VIDEO_OPENXR_LASER_AUTO,
+            false));
+   CHECK(!video_xr_quad_live(NULL, &set.quads[0], VIDEO_OPENXR_LASER_AUTO,
+            false));
+   o.x = 0.0f; o.y = 0.0f;   o.z = 0.0f;
+   d.x = 0.6f; d.y = -0.45f; d.z = -1.8f;
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_AUTO, false, false,
+            &o, &d, &u, &v, &t) == 0);
+   CHECK(NEAR(u, 0.875) && NEAR(v, 0.875));
+   x = y = 0;
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.875f, 0.875f,
+            VIDEO_OPENXR_LASER_AUTO, &map, frame, &x, &y));
+   CHECK(near_px(x, bx, 256) && near_px(y, by, 384));
+   /* Screen 0's part of the quad: Always's only. */
+   CHECK(!video_xr_quad_to_frame(&set, &set.quads[0], 0.5f, 0.5f,
+            VIDEO_OPENXR_LASER_AUTO, &map, frame, &x, &y));
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.5f, 0.5f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
+   CHECK(x == tx && y == ty);
+
+   /* A NO_INPUT inset leaves the quad to Auto's rule for screen 0. */
+   map.no_input = 0x2u;
+   video_xr_place(&p, &set);
+   CHECK(!video_xr_quad_live(&set, &set.quads[0], VIDEO_OPENXR_LASER_AUTO,
+            false));
+   CHECK( video_xr_quad_live(&set, &set.quads[0],
+            VIDEO_OPENXR_LASER_ALWAYS, false));
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_AUTO, false, false,
+            &o, &d, &u, &v, &t) == -1);
+
+   /* Screen 0 over screen 1: the quad is live for screen 1, and the
+    * inset's part of it is the mouse's. */
+   map_ds_screens(&map);
+   map.over    = 0x1u;
+   map.base    = 0x1u;
+   map.anchor  = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT;
+   map.size[0] = 0.25f;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 1 && set.quads[0].screen == 1);
+   CHECK(video_xr_quad_live(&set, &set.quads[0], VIDEO_OPENXR_LASER_AUTO,
+            false));
+   CHECK(!video_xr_quad_to_frame(&set, &set.quads[0], 0.875f, 0.875f,
+            VIDEO_OPENXR_LASER_AUTO, &map, frame, &x, &y));
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.5f, 0.5f,
+            VIDEO_OPENXR_LASER_AUTO, &map, frame, &x, &y));
+   CHECK(x == bx && y == by);
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.875f, 0.875f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
+   CHECK(y < 0);
+}
+
+/* An entry's rect in its slot's image: edges rounded, inside the image,
+ * a pixel at least; a zero rect is not drawn. */
+static void test_xr_inset_px(void)
+{
+   video_xr_inset_t in;
+   video_views_rect_t r;
+   unsigned dims = VIDEO_SCALE_PACK(1600, 1200);
+
+   memset(&in, 0, sizeof(in));
+   in.rect.x = 0.75; in.rect.y = 0.75; in.rect.w = 0.25; in.rect.h = 0.25;
+   CHECK(video_xr_inset_px(&in, dims, &r));
+   CHECK(VIDEO_POS_X(r.pos) == 1200 && VIDEO_POS_Y(r.pos) == 900);
+   CHECK(VIDEO_SCALE_W(r.dims) == 400 && VIDEO_SCALE_H(r.dims) == 300);
+   /* Edges, not sizes: 0.3333 and 0.6666 of 100 are 33 and 67. */
+   in.rect.x = 0.3333; in.rect.y = 0.0; in.rect.w = 0.3333; in.rect.h = 1.0;
+   CHECK(video_xr_inset_px(&in, VIDEO_SCALE_PACK(100, 10), &r));
+   CHECK(VIDEO_POS_X(r.pos) == 33 && VIDEO_POS_Y(r.pos) == 0);
+   CHECK(VIDEO_SCALE_W(r.dims) == 34 && VIDEO_SCALE_H(r.dims) == 10);
+   /* Under a pixel, at the far corner: one pixel, inside. */
+   in.rect.x = 0.9999; in.rect.y = 0.9999;
+   in.rect.w = 0.0001; in.rect.h = 0.0001;
+   CHECK(video_xr_inset_px(&in, dims, &r));
+   CHECK(VIDEO_POS_X(r.pos) == 1599 && VIDEO_POS_Y(r.pos) == 1199);
+   CHECK(VIDEO_SCALE_W(r.dims) == 1 && VIDEO_SCALE_H(r.dims) == 1);
+   /* Past the image: cut to it. */
+   in.rect.x = 0.5; in.rect.y = -0.25; in.rect.w = 0.75; in.rect.h = 0.5;
+   CHECK(video_xr_inset_px(&in, dims, &r));
+   CHECK(VIDEO_POS_X(r.pos) == 800 && VIDEO_POS_Y(r.pos) == 0);
+   CHECK(VIDEO_SCALE_W(r.dims) == 800 && VIDEO_SCALE_H(r.dims) == 300);
+   in.rect.w = 0.0;
+   CHECK(!video_xr_inset_px(&in, dims, &r));
+   in.rect.w = 0.25; in.rect.h = 0.0;
+   CHECK(!video_xr_inset_px(&in, dims, &r));
+   in.rect.h = 0.25;
+   CHECK(!video_xr_inset_px(&in, 0, &r));
+}
+
+/* A quad is live for a screen on it that takes input and that the mode
+ * makes live: screen 0 over a NO_INPUT screen 1 has none in Auto, and
+ * the inset alone in Always. */
+static void test_xr_inset_auto_no_input_base(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   video_xr_vec3_t o, d;
+   int16_t x, y, tx, ty;
+   float u, v, t;
+   unsigned frame = VIDEO_SCALE_PACK(256, 384);
+
+   map_ds_screens(&map);
+   params_init(&p, &map);
+   video_xr_place(&p, &set);
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.5f, 0.5f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &tx, &ty));
+
+   map.over     = 0x1u;
+   map.base     = 0x1u;
+   map.anchor   = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT;
+   map.size[0]  = 0.25f;
+   map.no_input = 0x2u;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 1 && set.quads[0].screen == 1);
+   CHECK(set.num_insets == 1 && !set.insets[0].no_input);
+   /* The inset's centre, then the base's. */
+   o.x = 0.0f; o.y = 0.0f; o.z = 0.0f;
+   d.x = set.quads[0].pose.position.x + 0.375f * set.quads[0].width;
+   d.y = set.quads[0].pose.position.y - 0.375f * set.quads[0].height;
+   d.z = -1.8f;
+   CHECK(!video_xr_quad_live(&set, &set.quads[0], VIDEO_OPENXR_LASER_AUTO,
+            false));
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_AUTO, false, false,
+            &o, &d, &u, &v, &t) == -1);
+   CHECK(video_xr_quad_live(&set, &set.quads[0], VIDEO_OPENXR_LASER_ALWAYS,
+            false));
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_ALWAYS, false, false,
+            &o, &d, &u, &v, &t) == 0);
+   CHECK(NEAR(u, 0.875) && NEAR(v, 0.875));
+   x = y = 0;
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], u, v,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
+   CHECK(near_px(x, tx, 256) && near_px(y, ty, 384));
+   d.x = set.quads[0].pose.position.x;
+   d.y = set.quads[0].pose.position.y;
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_AUTO, false, false,
+            &o, &d, &u, &v, &t) == -1);
+   CHECK(!video_xr_quad_to_frame(&set, &set.quads[0], 0.5f, 0.5f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
+}
+
+/* Without an inset Auto is as it was: screen 0's quad is the mouse's,
+ * screen 1's the laser's, and its points map as in Always. */
+static void test_xr_auto_no_inset(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   video_xr_vec3_t o, d;
+   int16_t x, y, bx, by;
+   float u, v, t;
+   unsigned frame = VIDEO_SCALE_PACK(256, 384);
+
+   map_ds_screens(&map);
+   params_init(&p, &map);
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 2 && set.num_insets == 0);
+   CHECK(!video_xr_quad_live(&set, &set.quads[0], VIDEO_OPENXR_LASER_AUTO,
+            false));
+   CHECK( video_xr_quad_live(&set, &set.quads[1], VIDEO_OPENXR_LASER_AUTO,
+            false));
+   o.x = 0.0f; o.y = 0.0f; o.z = 0.0f;
+   d.x = 0.0f; d.y = 0.0f; d.z = -1.8f;
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_AUTO, false, false,
+            &o, &d, &u, &v, &t) == -1);
+   d.x = set.quads[1].pose.position.x;
+   d.y = set.quads[1].pose.position.y;
+   CHECK(video_xr_pick(&set, VIDEO_OPENXR_LASER_AUTO, false, false,
+            &o, &d, &u, &v, &t) == 1);
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[1], 0.5f, 0.5f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &bx, &by));
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[1], 0.5f, 0.5f,
+            VIDEO_OPENXR_LASER_AUTO, &map, frame, &x, &y));
+   CHECK(x == bx && y == by);
+}
+
+/* A blank or NO_INPUT inset's entry says so. */
+static void test_xr_inset_blank(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+
+   map_ds_inset(&map);
+   params_init(&p, &map);
+   map.blank = 0x2u;
+   video_xr_place(&p, &set);
+   CHECK(set.num_insets == 1 && set.insets[0].screen == 1);
+   CHECK(set.insets[0].blank && !set.insets[0].no_input);
+   CHECK(!set.slots[0].blank);
+
+   map.blank    = 0;
+   map.no_input = 0x2u;
+   video_xr_place(&p, &set);
+   CHECK(set.num_insets == 1);
+   CHECK(!set.insets[0].blank && set.insets[0].no_input);
+   CHECK(set.num_quads == 1 && !set.quads[0].no_input);
+}
+
+/* An inset carries its screen's opacity. */
+static void test_place_insets_alpha(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+
+   map_ds_inset(&map);
+   params_init(&p, &map);
+   map.opacity[1] = 128;
+   video_xr_place(&p, &set);
+   CHECK(set.num_insets == 1 && set.insets[0].alpha == 128);
+
+   map.opacity[1] = 255;
+   video_xr_place(&p, &set);
+   CHECK(set.num_insets == 1 && set.insets[0].alpha == 255);
+}
+
+/* A window's inset: where its view lies in the window. */
+static void test_xr_place_window_inset(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   video_viewport_t vp;
+   video_views_rect_t want;
+   video_views_rect_t rects[VIDEO_XR_MAX_SLOTS][2];
+
+   map_ds_inset(&map);
+   window_params(&p, &map);
+   vp_set(&vp, 400, 0, 480, 720);
+   video_xr_place_window(&p, false, false, &vp, VIDEO_SCALE_PACK(256, 384),
+         &set, rects);
+   video_xr_window_rect(&vp, VIDEO_SCALE_PACK(256, 384), 0, &map.views[1],
+         &want);
+   CHECK(rect_is(&want, 400, 360, 480, 360));
+   CHECK(set.num_quads == 1 && set.num_insets == 1);
+   CHECK(set.insets[0].slot == 0 && set.insets[0].view[0] == 1);
+   CHECK(   set.insets[0].src[0].pos  == want.pos
+         && set.insets[0].src[0].dims == want.dims);
+   CHECK(rect_is(&rects[0][0], 400, 0, 480, 360));
+
+   /* The menu is drawn over the window whole: no entry. */
+   video_xr_place_window(&p, true, false, &vp, VIDEO_SCALE_PACK(256, 384),
+         &set, rects);
+   CHECK(set.num_quads == 1 && set.num_insets == 0);
+}
+
+/* "dsi": DS packing with screens, and a VMU, screen 2, drawn from a
+ * 48x32 XRGB8888 picture landed as texture 77, generation 3. Frame
+ * 256x384. */
+static uint32_t xr_dsi_pixels[48 * 32];
+
+static void map_dsi(video_views_map_t *map)
+{
+   struct retro_video_view v[2];
+   struct retro_video_screen scr[3];
+   struct retro_video_screen_image image;
+   struct retro_video_views in;
+   v[0] = mkview(0,   0, 256, 192, 0, RETRO_VIDEO_VIEW_EYE_NONE);
+   v[1] = mkview(0, 192, 256, 192, 1, RETRO_VIDEO_VIEW_EYE_NONE);
+   memset(scr, 0, sizeof(scr));
+   memset(&image, 0, sizeof(image));
+   image.data     = xr_dsi_pixels;
+   image.width    = 48;
+   image.height   = 32;
+   image.pitch    = 48 * sizeof(uint32_t);
+   image.format   = RETRO_PIXEL_FORMAT_XRGB8888;
+   image.serial   = 1;
+   scr[2].image   = &image;
+   memset(&in, 0, sizeof(in));
+   in.views       = v;
+   in.num_views   = 2;
+   in.flags       = RETRO_VIDEO_VIEWS_FLAG_SCREENS;
+   in.screens     = scr;
+   in.num_screens = 3;
+   CHECK(video_views_validate_map(&in, map, NULL));
+   CHECK(map->image == 0x4u);
+   map->image_tex[2] = 77;
+   map->image_gen[2] = 3;
+}
+
+/* dsi with Bottom left out and the VMU over Top's bottom right, a
+ * quarter of its height. */
+static void map_dsi_inset(video_views_map_t *map)
+{
+   map_dsi(map);
+   map->left_out   = 0x2u;
+   map->over       = 0x4u;
+   map->base       = 0;
+   map->anchor     = RETRO_VIDEO_SCREEN_ANCHOR_BOTTOM_RIGHT << 8;
+   map->size[2]    = 0.25f;
+   map->opacity[2] = 255;
+}
+
+/* Screen s's quad in set, or -1. */
+static int xr_quad_of(const video_xr_quad_set_t *set, unsigned s)
+{
+   unsigned i;
+   for (i = 0; i < set->num_quads; i++)
+      if (     set->quads[i].kind == VIDEO_XR_QUAD_SCREEN
+            && set->quads[i].screen == s)
+         return (int)i;
+   return -1;
+}
+
+/* An image screen's spot is its extent: its picture's height at its
+ * aspect, and the picture's size as its source. */
+static void test_xr_image_spot(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_layout_t lay;
+
+   map_dsi(&map);
+   map.left_out = 0x2u;
+   params_init(&p, &map);
+   video_xr_layout(&p, &lay);
+   CHECK(lay.count == 3 && lay.height[0] > 0.0f && lay.height[2] > 0.0f);
+   CHECK(fabs((double)lay.height[2] / lay.height[0] - 32.0 / 192.0) < 1e-5);
+   CHECK(fabs((double)lay.width[2] / lay.height[2] - 1.5) < 1e-5);
+   CHECK(dims_is(lay.native[2], 48, 32));
+}
+
+/* An image screen has one quad for both eyes, NO_INPUT, and a slot
+ * drawn from its picture: no view. */
+static void test_xr_image_slot(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   const video_xr_slot_t *slot;
+   int i;
+
+   map_dsi(&map);
+   params_init(&p, &map);
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 3);
+   i = xr_quad_of(&set, 2);
+   CHECK(i >= 0);
+   if (i < 0)
+      return;
+   CHECK(set.quads[i].eye == VIDEO_XR_EYE_BOTH && set.quads[i].no_input);
+   slot = &set.slots[set.quads[i].slot];
+   CHECK(slot->image && slot->image_tex == 77 && slot->image_gen == 3);
+   CHECK(slot->view[0] == -1 && slot->view[1] == -1 && slot->layers == 1);
+   CHECK(slot->dims != 0);
+   CHECK(!set.slots[0].image && !set.slots[0].image_tex);
+   CHECK(!set.slots[1].image && !set.slots[1].image_tex);
+}
+
+/* An image's slot holds at least its picture, under the stock chain
+ * and a low density too, sized by another screen or not; a large VMU
+ * gets the headset's pixels. */
+static void test_xr_image_slot_dims(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   video_screen_xr_t screens[RETRO_VIDEO_VIEWS_MAX];
+   unsigned want;
+   int i;
+
+   map_dsi(&map);
+   params_init(&p, &map);
+   p.stock      = true;
+   p.px_per_rad = 100.0f;
+   video_xr_place(&p, &set);
+   CHECK(xr_quad_of(&set, 2) >= 0);
+   CHECK(dims_is(set.slots[2].dims, 48, 32));
+   /* A screen with views goes below its source there. */
+   CHECK(VIDEO_SCALE_W(set.slots[0].dims) < 256);
+
+   /* A quarter of Top's height, 72x48: the floor is still 48x32. */
+   map.size[2] = 0.25f;
+   video_xr_place(&p, &set);
+   i = xr_quad_of(&set, 2);
+   CHECK(i >= 0 && NEAR(set.quads[i].height, 0.3));
+   CHECK(dims_is(set.slots[2].dims, 48, 32));
+   map.size[2] = 0.0f;
+
+   /* 3 m wide and 1.8 m away. */
+   p.stock      = false;
+   p.px_per_rad = 1000.0f;
+   video_views_xr_reset(screens, RETRO_VIDEO_VIEWS_MAX);
+   screens[2].scale = 10.0f;
+   p.screens        = screens;
+   video_xr_place(&p, &set);
+   i = xr_quad_of(&set, 2);
+   CHECK(i >= 0);
+   if (i < 0)
+      return;
+   CHECK(NEAR(set.quads[i].width, 3.0) && NEAR(set.quads[i].height, 2.0));
+   want = video_xr_image_dims(set.quads[i].width, set.quads[i].height,
+         p.distance, p.px_per_rad, VIDEO_SCALE_PACK(48, 32), p.max_dim);
+   CHECK(set.slots[2].dims == want);
+   CHECK(VIDEO_SCALE_W(want) > 48 && VIDEO_SCALE_H(want) > 32);
+}
+
+/* An image inset is an entry in its base's slot, drawn from its
+ * picture: no view. */
+static void test_xr_image_inset(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   const video_xr_inset_t *in;
+
+   map_dsi_inset(&map);
+   params_init(&p, &map);
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 1 && set.quads[0].screen == 0);
+   CHECK(set.num_insets == 1);
+   if (set.num_insets != 1)
+      return;
+   in = &set.insets[0];
+   CHECK(in->slot == set.quads[0].slot && in->screen == 2);
+   CHECK(in->image && in->image_tex == 77 && in->image_gen == 3);
+   CHECK(in->view[0] == -1 && in->view[1] == -1 && in->no_input);
+   CHECK(   NEAR(in->rect.x, 0.71875) && NEAR(in->rect.y, 0.75)
+         && NEAR(in->rect.w, 0.28125) && NEAR(in->rect.h, 0.25));
+   CHECK(!set.slots[0].image && !set.slots[0].image_tex);
+}
+
+/* Nothing maps into an image: a point on its quad is off every view,
+ * and one on its inset is its base's. */
+static void test_xr_image_quad_to_frame(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+   int16_t x, y, tx, ty;
+   int i;
+   unsigned frame = VIDEO_SCALE_PACK(256, 384);
+
+   map_dsi(&map);
+   params_init(&p, &map);
+   video_xr_place(&p, &set);
+   i = xr_quad_of(&set, 2);
+   CHECK(i >= 0);
+   if (i < 0)
+      return;
+   x = y = 12345;
+   CHECK(!video_xr_quad_to_frame(&set, &set.quads[i], 0.5f, 0.5f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
+   CHECK(x == 12345 && y == 12345);
+   /* Top where the inset goes. */
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.875f, 0.875f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &tx, &ty));
+   CHECK(ty < 0);
+
+   map_dsi_inset(&map);
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 1 && set.num_insets == 1);
+   x = y = 0;
+   CHECK(video_xr_quad_to_frame(&set, &set.quads[0], 0.875f, 0.875f,
+            VIDEO_OPENXR_LASER_ALWAYS, &map, frame, &x, &y));
+   CHECK(x == tx && y == ty);
+}
+
+/* A following menu goes with an image screen's quad when it is the
+ * first shown. */
+static void test_xr_image_menu(void)
+{
+   video_views_map_t map;
+   video_xr_params_t p;
+   video_xr_quad_set_t set;
+
+   map_dsi(&map);
+   map.left_out  = 0x3u;
+   params_init(&p, &map);
+   p.ui_dims     = VIDEO_SCALE_PACK(1600, 960);
+   p.menu_follow = true;
+   video_xr_place(&p, &set);
+   CHECK(set.num_quads == 2 && xr_quad_of(&set, 2) == 0);
+   CHECK(menu_over(&set, 0));
+   CHECK(set.quads[1].pose.position.z > set.quads[0].pose.position.z);
+}
+
 int main(void)
 {
    test_screen_defaults();
@@ -7983,6 +9252,35 @@ int main(void)
    test_pace_interval();
    test_pick_rate();
    test_request_rate();
+   test_xr_viewless();
+   test_quad_to_frame_no_input();
+   test_place_no_input();
+   test_xr_left_out();
+   test_xr_blank_slot();
+   test_xr_menu_follows_first_placed();
+   test_xr_all_skipped();
+   test_xr_inset_keeps_spots();
+   test_xr_shown_sized();
+   test_xr_inset_entry();
+   test_xr_inset_stereo_base();
+   test_xr_inset_menu();
+   test_xr_inset_quad_to_frame();
+   test_xr_inset_quad_to_frame_turned();
+   test_xr_inset_no_input_base();
+   test_xr_inset_order();
+   test_xr_inset_auto();
+   test_xr_inset_auto_no_input_base();
+   test_xr_inset_px();
+   test_xr_auto_no_inset();
+   test_xr_inset_blank();
+   test_place_insets_alpha();
+   test_xr_place_window_inset();
+   test_xr_image_spot();
+   test_xr_image_slot();
+   test_xr_image_slot_dims();
+   test_xr_image_inset();
+   test_xr_image_quad_to_frame();
+   test_xr_image_menu();
 
    if (failures)
    {

@@ -44,6 +44,9 @@ static enum rarch_display_type display_type;
 void video_driver_display_type_set(enum rarch_display_type t) { display_type = t; }
 static settings_t settings;
 settings_t *config_get_ptr(void) { return &settings; }
+/* No core here asks for a turn of its own */
+unsigned int retroarch_get_rotation(void)
+{ return settings.uints.video_rotation; }
 
 static unsigned memcpys;
 static void *count_memcpy(void *dst, const void *src, size_t n)
@@ -841,6 +844,47 @@ int main(void)
    connected = 1;
    if (failures == before)
       printf("   ok   the free and a failed init leave nothing\n");
+
+   /* ---- FALLBACK from init: what a map would get, steady ---- */
+   before = failures;
+   {
+      static const struct { unsigned stereo, rot, whole; } t[] = {
+         { VIDEO_STEREO_MODE_2D,         0, 0 },
+         { VIDEO_STEREO_MODE_ANAGLYPH,   0, 1 },
+         { VIDEO_STEREO_MODE_INTERLACED, 0, 1 },
+         { VIDEO_STEREO_MODE_2D,         1, 1 }
+      };
+      unsigned k;
+      for (k = 0; k < 4; k++)
+      {
+         settings.uints.video_stereo_mode = t[k].stereo;
+         settings.uints.video_rotation    = t[k].rot;
+         vi.views_settings.stereo_mode    = t[k].stereo;
+         v = (struct exynos_video*)exynos_init(&info);
+         CHECK(v && BIT32_GET(exynos_get_flags(v),
+                  GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK) == t[k].whole,
+               "stereo %u, %u quarter turn(s): FALLBACK %u at init",
+               t[k].stereo, t[k].rot, t[k].whole);
+         if (!v)
+            break;
+         /* As the frontend follows init */
+         exynos_set_rotation(v, t[k].rot);
+         frame(v, frame_px, 256, 224, 256 * 4, NULL, &vi);
+         CHECK(BIT32_GET(exynos_get_flags(v),
+                  GFX_CTX_FLAGS_VIDEO_VIEWS_FALLBACK) == t[k].whole,
+               "stereo %u, %u quarter turn(s): FALLBACK %u after a frame"
+               " with no map", t[k].stereo, t[k].rot, t[k].whole);
+         exynos_free(v);
+      }
+      settings.uints.video_stereo_mode = VIDEO_STEREO_MODE_2D;
+      settings.uints.video_rotation    = 0;
+      vi.views_settings.stereo_mode    = VIDEO_STEREO_MODE_2D;
+   }
+   CHECK(!fbs_alive && !bos_alive && !fds_open,
+         "those inits leave nothing (%u fbs, %u bos, %u open)", fbs_alive,
+         bos_alive, fds_open);
+   if (failures == before)
+      printf("   ok   FALLBACK from init is what a frame with no map gives\n");
 
    /* ---- a G2D behind an IOMMU: frames read where the core wrote them ---- */
    {

@@ -1256,7 +1256,8 @@ static int exynos_blit_frame(
 
 /* A core's views, laid out on the screen: the page cleared, then each
  * placement scaled by the G2D straight from the frame, cut to its own
- * eye's area and the screen. */
+ * eye's area and the screen. An inset is drawn solid: the G2D has no
+ * global alpha. */
 static int exynos_blit_views(
       struct exynos_data *pdata,
       const void *frame,
@@ -1276,8 +1277,25 @@ static int exynos_blit_views(
       video_views_rect_t cut, from;
       const video_views_placement_t *p = &layout->placements[i];
 
-      if (!video_views_visible(layout, p, pdata->dims, &cut))
+      /* A blank root's place is black already; a blank inset's is over
+       * its base */
+      if (     (   (p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
+                && !(p->flags & VIDEO_VIEWS_PLACEMENT_INSET))
+            || !video_views_visible(layout, p, pdata->dims, &cut))
          continue;
+      if (p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
+      {
+         if (     g2d_solid_fill(pdata->g2d, pdata->dst,
+                     (unsigned)VIDEO_POS_X(cut.pos),
+                     (unsigned)VIDEO_POS_Y(cut.pos),
+                     VIDEO_SCALE_W(cut.dims), VIDEO_SCALE_H(cut.dims))
+               || g2d_exec(pdata->g2d))
+         {
+            RARCH_ERR("[Exynos] Failed to fill view.\n");
+            return -1;
+         }
+         continue;
+      }
       video_views_cut_source(&map->views[p->view], &p->dst, &cut, &from);
 
       if (exynos_scale_frame(pdata, frame, src_pitch,
@@ -1415,7 +1433,8 @@ struct exynos_video
 
    bool aspect_changed;
    bool views_seen;
-   /* For get_flags: the last frame with a map was drawn whole */
+   /* For get_flags: a map is drawn whole: the last frame's, or with
+    * none what one would get */
    retro_atomic_int_t views_fallback;
 };
 
@@ -1992,6 +2011,8 @@ static void exynos_get_overlay_interface(void *data,
 }
 #endif
 
+static bool exynos_views_whole(bool turned, unsigned stereo);
+
 static void *exynos_init(const video_info_t *video)
 {
    struct exynos_video *vid;
@@ -2062,6 +2083,10 @@ static void *exynos_init(const video_info_t *video)
    video_driver_set_output_dims(vid->data->dims);
    video_driver_display_type_set(RARCH_DISPLAY_KMS);
 
+   /* Read before the first frame, at the turn set_rotation gives next */
+   retro_atomic_store_release_int(&vid->views_fallback,
+         exynos_views_whole(retroarch_get_rotation() % 4 != 0,
+            config_get_ptr()->uints.video_stereo_mode) ? 1 : 0);
    return vid;
 
 fail_font:
@@ -2119,21 +2144,33 @@ static void exynos_free(void *data)
    free(vid);
 }
 
+/* Without a map, whether one would be drawn whole: a @turned frame, and
+ * anaglyph and interlaced, which blend the eyes */
+static bool exynos_views_whole(bool turned, unsigned stereo)
+{
+   return turned
+      || stereo == VIDEO_STEREO_MODE_ANAGLYPH
+      || stereo == VIDEO_STEREO_MODE_INTERLACED;
+}
+
 /* Whether a core's views draw this frame: each placement blitted by the
  * G2D. Anaglyph and interlaced, which blend the eyes, draw the frame
- * whole. */
+ * whole, and so does a turned frame, which comes with @frame NULL. */
 static bool exynos_views_frame(struct exynos_video *vid,
       const void *frame, unsigned dims, unsigned pitch,
       const video_frame_info_t *info, struct exynos_page *page)
 {
    unsigned i;
    struct exynos_data *pdata = vid->data;
+   unsigned stereo = info ? info->views_settings.stereo_mode : 0;
    bool views = info && frame && info->views.num_views
       && !info->views_layout.offscreen
       && video_views_fit_frame(&info->views, dims);
 
+   /* Without a map, what one would get */
    retro_atomic_store_release_int(&vid->views_fallback,
-         (info && info->views.num_views && !views) ? 1 : 0);
+         (info && (info->views.num_views ? !views
+            : exynos_views_whole(!frame, stereo))) ? 1 : 0);
    if (views != pdata->views_on)
    {
       /* What the last one drew outside the other's rectangle goes */

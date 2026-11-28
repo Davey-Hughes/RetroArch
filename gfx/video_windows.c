@@ -13,6 +13,7 @@
  *  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <stdio.h>
 #include <string.h>
 
 #include <retro_miscellaneous.h>
@@ -26,7 +27,7 @@ void video_windows_plan(const video_views_map_t *map,
 {
    unsigned s;
    memset(out, 0, sizeof(*out));
-   if (!map || !map->num_views)
+   if (!map || !(map->num_views || map->image))
       return;
    for (s = 0; s < map->num_screens && s < RETRO_VIDEO_VIEWS_MAX; s++)
    {
@@ -34,7 +35,14 @@ void video_windows_plan(const video_views_map_t *map,
       unsigned mode = settings ? settings[s].mode : VIDEO_WINDOW_ATTACHED;
       bool separate = route ? (route->screens & bit) != 0
          : mode == VIDEO_WINDOW_SEPARATE;
-      if (!enabled || (!route && !s))
+      if (map->viewless & bit)
+         continue;
+      if (map->left_out & bit)
+         out->hidden_mask |= bit;
+      /* An inset goes with its base */
+      else if (map->over & bit)
+         continue;
+      else if (!enabled || (!route && !s))
          out->main_mask |= bit;
       else if (mode == VIDEO_WINDOW_HIDDEN)
          out->hidden_mask |= bit;
@@ -363,6 +371,13 @@ static bool video_windows_place_targets(const video_windows_place_in_t *in,
       return false;
    for (s = 0; s < RETRO_VIDEO_VIEWS_MAX; s++)
       want[s] = video_windows_place_screen(in, r->own, s ? want[0] : 0, s);
+   /* An inset goes on its base's display, not on Auto's by its number */
+   for (s = 0; s < RETRO_VIDEO_VIEWS_MAX; s++)
+   {
+      unsigned b = VIDEO_VIEWS_NIBBLE(in->base, s);
+      if (want[s] && (in->over & (1u << s)) && b < RETRO_VIDEO_VIEWS_MAX)
+         want[s] = want[b];
+   }
    for (s = 0; s < screens; s++)
       r->target[s] = want[s];
    /* A game without a map is shown even when its screen is Off */
@@ -455,8 +470,8 @@ static void video_windows_place_route(const video_windows_place_in_t *in,
       && !(in->menu_open && menu_main);
 }
 
-/* The screens' and the menu's display settings; Notifications moves
- * nothing */
+/* The screens' and the menu's display settings and the insets;
+ * Notifications moves nothing */
 static unsigned video_windows_settings_hash(
       const video_windows_place_in_t *in)
 {
@@ -474,6 +489,11 @@ static unsigned video_windows_settings_hash(
       h = (h ^ 0x100u) * 16777619u;
    }
    h = (h ^ in->menu_follows) * 16777619u;
+   /* An inset goes where its base does */
+   h = (h ^ in->over) * 16777619u;
+   for (s = 0; s < RETRO_VIDEO_VIEWS_MAX; s++)
+      if (in->over & (1u << s))
+         h = (h ^ VIDEO_VIEWS_NIBBLE(in->base, s)) * 16777619u;
    return h ? (unsigned)h : 1u;
 }
 
@@ -662,6 +682,15 @@ unsigned video_window_title_screen(const video_window_request_t *request)
       if (request->screens & (1u << s))
          return s;
    return request->screen;
+}
+
+size_t video_window_title(const video_window_request_t *request, char *s,
+      size_t len)
+{
+   if (*request->name)
+      return (size_t)snprintf(s, len, "RetroArch - %s", request->name);
+   return (size_t)snprintf(s, len, "RetroArch - Screen %u",
+         video_window_title_screen(request) + 1);
 }
 
 bool video_windows_blank_wanted(unsigned mode, bool game, bool flipped)
@@ -975,7 +1004,7 @@ static void video_windows_held_made(video_windows_held_t *held,
 {
    unsigned bit           = 1u << w;
    held->made[w]          = frame->settings[w];
-   held->made_screens[w]  = frame->window_screens[w];
+   held->made_screens[w]  = frame->window_screens[w] & ~frame->core.over;
    held->made_known      |= bit;
    held->made_named       = (held->made_named & ~bit)
       | (frame->window_named & bit);
@@ -995,7 +1024,8 @@ static enum video_windows_change video_windows_made_change(
    const video_window_settings_t *a = &held->made[w];
    const video_window_settings_t *b = &frame->settings[w];
    if (     a->mode != b->mode
-         || held->made_screens[w] != frame->window_screens[w])
+         ||    held->made_screens[w]
+            != (frame->window_screens[w] & ~frame->core.over))
       return VIDEO_WINDOWS_REMAKE;
    if (a->edit != b->edit)
    {

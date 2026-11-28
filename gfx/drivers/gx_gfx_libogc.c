@@ -126,7 +126,8 @@ typedef struct gx_video
    /* The size the frontend lays views out at: the XFB's lines, as wide
     * as the display's aspect makes them in square pixels */
    unsigned out_dims;
-   /* For get_flags: the last frame with a map was drawn whole */
+   /* For get_flags: a map is drawn whole: the last frame's, or with
+    * none what one would get */
    retro_atomic_int_t views_fallback;
    uint16_t xOrigin;
    uint16_t yOrigin;
@@ -673,6 +674,8 @@ static void build_disp_list(void)
    display_list_size = GX_EndDispList();
 }
 
+static bool gx_views_whole(unsigned stereo);
+
 static void *gx_init(const video_info_t *video)
 {
    settings_t *settings            = config_get_ptr();
@@ -713,6 +716,9 @@ static void *gx_init(const video_info_t *video)
       __SYS_UnlockSram(0);
    }
 #endif
+   /* Read before the first frame */
+   retro_atomic_store_release_int(&gx->views_fallback,
+         gx_views_whole(settings->uints.video_stereo_mode) ? 1 : 0);
    return gx;
 }
 
@@ -1569,11 +1575,20 @@ static float gx_views_sx(const gx_video_t *gx)
       / (float)VIDEO_SCALE_W(gx->out_dims);
 }
 
+/* Without a map, whether one would be drawn whole: anaglyph and
+ * interlaced need a canvas */
+static bool gx_views_whole(unsigned stereo)
+{
+   return stereo == VIDEO_STEREO_MODE_ANAGLYPH
+      || stereo == VIDEO_STEREO_MODE_INTERLACED;
+}
+
 /* Whether this frame draws its views: a map that fits @frame_dims, the
  * part of the frame the texture holds */
 static bool gx_views_setup(gx_video_t *gx, const video_frame_info_t *info,
       unsigned frame_dims)
 {
+   unsigned stereo = info->views_settings.stereo_mode;
    bool views = info->views.num_views && !info->views_layout.offscreen
       && video_views_fit_frame(&info->views, frame_dims);
    if (views != gx->views_active)
@@ -1581,8 +1596,9 @@ static bool gx_views_setup(gx_video_t *gx, const video_frame_info_t *info,
       gx->views_active  = views;
       gx->should_resize = true;
    }
+   /* Without a map, what one would get */
    retro_atomic_store_release_int(&gx->views_fallback,
-         (info->views.num_views && !views) ? 1 : 0);
+         (info->views.num_views ? !views : gx_views_whole(stereo)) ? 1 : 0);
    if (views && !gx->views_seen)
    {
       gx->views_seen = true;
@@ -1621,21 +1637,32 @@ static void gx_views_draw(gx_video_t *gx, const video_frame_info_t *info,
       float v0 = (float)rv->y / th;
       float u1 = (float)(rv->x + rv->width)  / tw;
       float v1 = (float)(rv->y + rv->height) / th;
+      u8 a     = (u8)VIDEO_VIEWS_PLACEMENT_ALPHA(p->flags);
+      u8 c     = (p->flags & VIDEO_VIEWS_PLACEMENT_BLANK) ? 0 : 255;
+      if (!c)
+      {
+         if (!(p->flags & VIDEO_VIEWS_PLACEMENT_INSET))
+            continue;
+         /* A blank inset: black over its base, the colour alone */
+         GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
+      }
       gx_views_viewport(gx, &p->dst);
       GX_Begin(GX_TRIANGLESTRIP, GX_VTXFMT0, 4);
       GX_Position3f32(-1,  1, -0.5);
-      GX_Color4u8(255, 255, 255, 255);
+      GX_Color4u8(c, c, c, a);
       GX_TexCoord2f32(u0, v0);
       GX_Position3f32( 1,  1, -0.5);
-      GX_Color4u8(255, 255, 255, 255);
+      GX_Color4u8(c, c, c, a);
       GX_TexCoord2f32(u1, v0);
       GX_Position3f32(-1, -1, -0.5);
-      GX_Color4u8(255, 255, 255, 255);
+      GX_Color4u8(c, c, c, a);
       GX_TexCoord2f32(u0, v1);
       GX_Position3f32( 1, -1, -0.5);
-      GX_Color4u8(255, 255, 255, 255);
+      GX_Color4u8(c, c, c, a);
       GX_TexCoord2f32(u1, v1);
       GX_End();
+      if (!c)
+         GX_SetTevOp(GX_TEVSTAGE0, GX_MODULATE);
    }
    GX_SetVtxDesc(GX_VA_POS,  GX_INDEX8);
    GX_SetVtxDesc(GX_VA_TEX0, GX_INDEX8);
@@ -1763,7 +1790,11 @@ static bool gx_frame(void *data, const void *frame,
    GX_SetCurrentMtx(GX_PNMTX0);
    GX_LoadTexObj(&g_tex.obj, GX_TEXMAP0);
    if (views)
+   {
       gx_views_draw(gx, video_info, frame_dims);
+      /* The placements need not cover what the last frame drew */
+      clear_efb = GX_TRUE;
+   }
    else
       GX_CallDispList(display_list, display_list_size);
 

@@ -119,7 +119,31 @@ class GlLanes(unittest.TestCase):
     def test_extra_cases_gl_only(self):
         names = {c['name'] for c in run.CASES}
         self.assertTrue(all(c['name'] not in names for c in run.GL_EXTRA))
-        self.assertEqual(len(run.CASES), 214)
+        self.assertEqual(len(run.CASES), 228)
+
+    def test_screens_lanes(self):
+        # A hidden, a blank, a left-out tracked and a turned core's
+        # UPRIGHT screen on each driver, once per GL driver.
+        names = [c['name'] for c in self.gl_cases]
+        for n in ('screens-hidden', 'screens-blank', 'tracked-screen-off',
+                  'screens-upright-over'):
+            self.assertIn(n, [c['name'] for c in run.CASES])
+            for lane in ('glcore-egl', 'glcore-glx', 'gl-egl'):
+                self.assertIn(lane + '-' + n, names)
+            self.assertNotIn('gl-glx-' + n, names)
+
+    def test_screens_image_lanes(self):
+        # Image screens on vulkan and glcore; gl reads IMAGES 0.
+        names = [c['name'] for c in self.gl_cases]
+        for n in ('screens-image', 'screens-image-over', 'screens-image-null'):
+            self.assertIn(n, [c['name'] for c in run.CASES])
+            for lane in ('glcore-egl', 'glcore-glx'):
+                self.assertIn(lane + '-' + n, names)
+            for lane in ('gl-egl', 'gl-glx'):
+                self.assertNotIn(lane + '-' + n, names)
+        for lane, driver, context in run.GL_LANES:
+            self.assertEqual(lane + '-screens-image-gl' in names,
+                             driver == 'gl')
 
     def test_edit_lanes(self):
         names = [c['name'] for c in self.gl_cases]
@@ -127,6 +151,7 @@ class GlLanes(unittest.TestCase):
                   'edit-follow', 'edit-no-map', 'edit-fallback'):
             self.assertIn('glcore-egl-' + n, names)
         for n in ('edit-grab', 'edit-reset', 'edit-outlines'):
+            self.assertIn('glcore-egl-' + n, names)
             self.assertIn('gl-egl-' + n, names)
         self.assertIn('glcore-egl-edit-beam', names)
         self.assertIn('gl-egl-edit-beam', names)

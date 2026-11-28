@@ -206,7 +206,8 @@ typedef struct gdi
       video_viewport_t      vp;
       unsigned              frame_dims;
       /* For get_flags on the main thread: whether views may be drawn,
-       * and whether the last frame with a map drew it whole */
+       * and whether a map is drawn whole: the last frame's, or with
+       * none what one would get */
       retro_atomic_int_t    allowed;
       retro_atomic_int_t    fallback;
       bool                  active;

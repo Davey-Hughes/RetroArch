@@ -45,13 +45,25 @@ def typedef(source, name):
 source = (root / 'gfx/drivers/vulkan.c').read_text(encoding='latin-1')
 types = typedef(source, 'vulkan_hdr_uniform_t')
 cut = '\n\n'.join(function(source, name) for name in (
+        'vulkan_hdr_source_mode',
+        'vulkan_views_encoded',
         'vulkan_hdr_ubo_mode',
+        'vulkan_views_translucent',
         'vulkan_views_stock_encodes',
         'vulkan_views_draw_stock',
+        'vulkan_views_vp',
+        'vulkan_views_sci',
+        'vulkan_views_fill',
+        'vulkan_views_draw_direct',
+        'vulkan_views_draw_image',
         'vulkan_window_encodes',
+        'vulkan_views_target_premult',
         'vulkan_views_target_stock',
+        'vulkan_views_target_use',
         'vulkan_window_stock_sdr',
-        'vulkan_window_stock_encodes'))
+        'vulkan_window_stock_encodes',
+        'vulkan_window_fp16_ensure',
+        'vulkan_window_draw_screens'))
 
 if shutil.which('glslc'):
     with tempfile.TemporaryDirectory(prefix='stock-rect-hdr-') as tmp:
@@ -69,7 +81,7 @@ with tempfile.TemporaryDirectory(prefix='vulkan-stock-hdr-') as tmp:
     exe = tmp / 'stock_hdr_test.exe'
     subprocess.run(shlex.split(os.environ.get('CC', 'cc')) + [
         '-std=c89', '-pedantic', '-Wall', '-Wextra', '-Werror',
-        '-Wno-long-long', '-Wno-unused-function',
+        '-Wno-long-long', '-Wno-unused-function', '-Wno-unused-parameter',
         '-I' + str(tmp), '-I' + str(root / 'libretro-common/include'),
         str(here / 'stock_hdr_test.c'), '-o', str(exe)], check=True)
     raise SystemExit(subprocess.run(

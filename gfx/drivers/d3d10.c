@@ -462,9 +462,13 @@ typedef struct
        * over the frame premultiplied. */
       D3D10BlendState       blend_ui;
       D3D10BlendState       blend_layer;
+      /* By the blend factor: an inset at its opacity, a blank one black */
+      D3D10BlendState       blend_alpha;
+      D3D10BlendState       blend_fill;
       unsigned              frame_dims;
       /* For get_flags on the main thread: whether views may be drawn,
-       * and whether the last frame with a map was drawn whole. */
+       * and whether a map is drawn whole: the last frame's, or with
+       * none whether one would be. */
       retro_atomic_int_t    allowed;
       retro_atomic_int_t    fallback;
       bool                  tried;
@@ -2982,6 +2986,7 @@ static void d3d10_chain_free(d3d10_chain_t *c, bool shared)
 static void d3d10_views_free_chains(d3d10_video_t *d3d10, unsigned first);
 static void d3d10_views_release(d3d10_video_t *d3d10);
 static void d3d10_views_publish(d3d10_video_t *d3d10);
+static bool d3d10_views_whole(const d3d10_video_t *d3d10, bool rolling);
 static void d3d10_record_free(d3d10_video_t *d3d10);
 static void d3d10_record_capture(d3d10_video_t *d3d10);
 
@@ -2989,6 +2994,7 @@ static void d3d10_free_shader_preset(d3d10_video_t* d3d10)
 {
    /* The views' chains read its preset */
    d3d10_views_free_chains(d3d10, 0);
+   d3d10->views.chains.preset_failed = false;
    d3d10_chain_free(&d3d10->chain, false);
    d3d10->flags &= ~(D3D10_ST_FLAG_INIT_HISTORY | D3D10_ST_FLAG_RESIZE_RTS);
 }
@@ -4127,6 +4133,10 @@ static void *d3d10_gfx_init(const video_info_t* video)
    /* RGBA8 is native even when this D3D10 device cannot sample BGRA8.
     * Image producers can write that order straight into upload loans. */
    video_driver_modify_disp_flags(VIDEO_FLAG_USE_RGBA, 0);
+   /* Read before the first frame */
+   retro_atomic_store_release_int(&d3d10->views.fallback,
+         d3d10_views_whole(d3d10, settings->uints.video_shader_subframes > 1
+            && settings->bools.video_scan_subframes) ? 1 : 0);
    d3d10_views_publish(d3d10);
    return d3d10;
 
@@ -4457,6 +4467,7 @@ struct d3d10_views_draw
 {
    const video_frame_info_t *video_info;
    D3D10RenderTargetView target;
+   D3D10ShaderResourceView src;
    unsigned src_dims;
 };
 
@@ -4466,6 +4477,10 @@ static void d3d10_views_draw_direct(d3d10_video_t *d3d10,
 static void d3d10_views_draw_pass(d3d10_video_t *d3d10,
       const struct d3d10_views_draw *d, d3d10_chain_t *c,
       const video_views_rect_t *dst, const video_views_rect_t *cut);
+static void d3d10_views_alpha(d3d10_video_t *d3d10, unsigned alpha);
+static void d3d10_views_fill(d3d10_video_t *d3d10,
+      const struct d3d10_views_draw *d, const video_views_rect_t *cut,
+      unsigned alpha);
 static bool d3d10_views_make(d3d10_video_t *d3d10, d3d10_texture_t *t,
       unsigned dims);
 static bool d3d10_views_retire(d3d10_video_t *d3d10, d3d10_texture_t *t);
@@ -4482,6 +4497,8 @@ static bool d3d10_views_retire(d3d10_video_t *d3d10, d3d10_texture_t *t);
 #define VV_DRAW                         struct d3d10_views_draw
 #define VV_DIRECT(p, d, v, r, c)        d3d10_views_draw_direct(p, d, v, r, c)
 #define VV_PASS(p, d, f, r, c, a)       d3d10_views_draw_pass(p, d, f, r, c)
+#define VV_ALPHA(p, d, a)               d3d10_views_alpha(p, a)
+#define VV_FILL(p, d, c, a)             d3d10_views_fill(p, d, c, a)
 #define VV_TARGET                       d3d10_texture_t
 #define VV_TARGET_MAKE(drv, t, dims)    d3d10_views_make(drv, t, dims)
 #define VV_TARGET_RETIRE(drv, t)        d3d10_views_retire(drv, t)
@@ -4498,6 +4515,16 @@ static void d3d10_views_publish(d3d10_video_t *d3d10)
          d3d10_views_allowed(d3d10) ? 1 : 0);
 }
 
+/* Without a map, whether one would be drawn whole: views not allowed,
+ * a @rolling scanline, or a view's preset chain that could not be made
+ * while the views take the preset's */
+static bool d3d10_views_whole(const d3d10_video_t *d3d10, bool rolling)
+{
+   return !d3d10_views_allowed(d3d10) || rolling
+      || (   d3d10->chain.shader_preset && d3d10->chain.shader_preset->passes
+          && d3d10->views.chains.preset_failed);
+}
+
 static void d3d10_views_release(d3d10_video_t *d3d10)
 {
    d3d10_release_shader(&d3d10->views.rect);
@@ -4507,6 +4534,8 @@ static void d3d10_views_release(d3d10_video_t *d3d10)
    Release(d3d10->views.ubo);
    Release(d3d10->views.blend_ui);
    Release(d3d10->views.blend_layer);
+   Release(d3d10->views.blend_alpha);
+   Release(d3d10->views.blend_fill);
    d3d10_release_texture(&d3d10->views.canvas);
    d3d10_release_texture(&d3d10->views.ui);
 }
@@ -4568,13 +4597,22 @@ static void d3d10_views_init(d3d10_video_t *d3d10)
    dev->lpVtbl->CreateBlendState(dev, &blend_desc, &d3d10->views.blend_ui);
    blend_desc.SrcBlend                 = D3D10_BLEND_ONE;
    dev->lpVtbl->CreateBlendState(dev, &blend_desc, &d3d10->views.blend_layer);
+   blend_desc.SrcBlend                 = D3D10_BLEND_BLEND_FACTOR;
+   blend_desc.DestBlend                = D3D10_BLEND_INV_BLEND_FACTOR;
+   blend_desc.SrcBlendAlpha            = D3D10_BLEND_BLEND_FACTOR;
+   blend_desc.DestBlendAlpha           = D3D10_BLEND_INV_BLEND_FACTOR;
+   dev->lpVtbl->CreateBlendState(dev, &blend_desc, &d3d10->views.blend_alpha);
+   blend_desc.SrcBlend                 = D3D10_BLEND_ZERO;
+   blend_desc.SrcBlendAlpha            = D3D10_BLEND_ZERO;
+   dev->lpVtbl->CreateBlendState(dev, &blend_desc, &d3d10->views.blend_fill);
 
    if (     ok
          && d3d10->views.rect.vs && d3d10->views.rect.ps
          && d3d10->views.rect.layout
          && d3d10->views.layer.ps && d3d10->views.anaglyph.ps
          && d3d10->views.interlaced.ps && d3d10->views.ubo
-         && d3d10->views.blend_ui && d3d10->views.blend_layer)
+         && d3d10->views.blend_ui && d3d10->views.blend_layer
+         && d3d10->views.blend_alpha && d3d10->views.blend_fill)
       return;
    RARCH_WARN("[D3D10] Views can't be drawn: their shaders failed.\n");
    d3d10_views_release(d3d10);
@@ -4585,6 +4623,8 @@ static void d3d10_views_init(d3d10_video_t *d3d10)
    d3d10->views.ubo         = NULL;
    d3d10->views.blend_ui    = NULL;
    d3d10->views.blend_layer = NULL;
+   d3d10->views.blend_alpha = NULL;
+   d3d10->views.blend_fill  = NULL;
    d3d10->views.failed      = true;
 }
 
@@ -4714,6 +4754,45 @@ static void d3d10_views_bind(d3d10_video_t *d3d10)
    dev->lpVtbl->PSSetConstantBuffers(dev, 0, 1, &d3d10->views.ubo);
 }
 
+/* The draws that follow at @alpha, by a constant blend the shaders' own
+ * alpha takes no part in; at 255 not blended */
+static void d3d10_views_alpha(d3d10_video_t *d3d10, unsigned alpha)
+{
+   float factor[4];
+   D3D10Device dev = d3d10->device;
+   if (alpha >= 255)
+   {
+      dev->lpVtbl->OMSetBlendState(dev, d3d10->blend_disable, NULL,
+            D3D10_DEFAULT_SAMPLE_MASK);
+      return;
+   }
+   factor[0] = factor[1] = factor[2] = factor[3] = (float)alpha / 255.0f;
+   dev->lpVtbl->OMSetBlendState(dev, d3d10->views.blend_alpha, factor,
+         D3D10_DEFAULT_SAMPLE_MASK);
+}
+
+/* @cut black at @alpha, for a blank inset: darkened under a quad whose
+ * colour the blend takes none of, then d3d10_views_alpha's blend again.
+ * The quad samples the frame, not a pass's float target, whose NaN a
+ * zero factor would not hide. */
+static void d3d10_views_fill(d3d10_video_t *d3d10,
+      const struct d3d10_views_draw *d, const video_views_rect_t *cut,
+      unsigned alpha)
+{
+   D3D10_VIEWPORT vp;
+   float factor[4];
+   D3D10Device dev = d3d10->device;
+   factor[0] = factor[1] = factor[2] = factor[3] = (float)alpha / 255.0f;
+   d3d10_views_bind(d3d10);
+   dev->lpVtbl->OMSetBlendState(dev, d3d10->views.blend_fill, factor,
+         D3D10_DEFAULT_SAMPLE_MASK);
+   d3d10_views_vp(cut, &vp);
+   d3d10_views_cut(dev, cut);
+   d3d10_views_quad(d3d10, &d3d10->views.rect, d->src,
+         d3d10->samplers[RARCH_FILTER_UNSPEC][RARCH_WRAP_EDGE], &vp);
+   d3d10_views_alpha(d3d10, alpha);
+}
+
 /* A COM reference more, where there is the object */
 static void d3d10_add_ref(void *object)
 {
@@ -4835,6 +4914,7 @@ static void d3d10_views_build_chains(d3d10_video_t *d3d10)
             && !(d3d10->views.chains.preset[i] =
                d3d10_chain_clone(d3d10, &d3d10->chain)))
          break;
+   d3d10->views.chains.preset_failed = i < d3d10->views.chains.count;
 }
 
 /* View @v of @frame written into @t, which is its size */
@@ -5062,6 +5142,7 @@ static void d3d10_views_render(d3d10_video_t *d3d10,
 
    d.video_info = video_info;
    d.target     = target;
+   d.src        = src;
    d.src_dims   = d3d10->views.frame_dims;
    d3d10_vv_draw_placements(d3d10, &d, layout, chains,
          blend || !layout->offscreen,
@@ -5280,8 +5361,12 @@ static bool d3d10_gfx_frame(
       d3d10->views.active = views;
       d3d10_update_viewport(d3d10, views);
    }
-   retro_atomic_store_release_int(&d3d10->views.fallback,
-         (video_info->views.num_views && !views) ? 1 : 0);
+   /* With no map: whether one would be drawn whole */
+   if (!video_views_chains_behind(&d3d10->views.chains, &video_info->views))
+      retro_atomic_store_release_int(&d3d10->views.fallback,
+            (video_info->views.num_views ? !views
+             : d3d10_views_whole(d3d10, video_info->shader_subframes > 1
+                && video_info->scan_subframes)) ? 1 : 0);
    d3d10_views_publish(d3d10);
 
 #if 0

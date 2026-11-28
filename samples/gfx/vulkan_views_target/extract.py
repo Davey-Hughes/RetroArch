@@ -14,7 +14,7 @@ shared = (root / 'gfx/video_views_draw.h').read_text()
 def function(source, name):
     masked = re.sub(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"',
                     lambda m: ' ' * len(m[0]), source, flags=re.S)
-    match = re.search(r'static (?:bool|void|VkRenderPass|VkPipeline) '
+    match = re.search(r'static (?:bool|void|unsigned|VkRenderPass|VkPipeline) '
                       + re.escape(name)
                       + r'\([^;]*?\)\s*\{', masked)
     if not match:
@@ -43,11 +43,23 @@ for name in ('VV_FN', 'VV_DRV', 'VV_TARGET', 'VV_TARGET_MAKE',
         raise RuntimeError('binding missing: ' + name)
     parts.append(match[0])
 parts.append(function(shared, 'VV_FN(target_ensure)'))
+parts.append(function(driver, 'vulkan_views_vp'))
+parts.append(function(driver, 'vulkan_views_sci'))
+parts.append(function(driver, 'vulkan_xr_inset'))
+parts.append(function(driver, 'vulkan_views_target_use'))
 parts.append(function(driver, 'vulkan_xr_draw_screen'))
 parts.append(function(driver, 'vulkan_xr_slot_ensure'))
 parts.append(function(driver, 'vulkan_xr_copy_ui'))
+parts.append(function(driver, 'vulkan_xr_eye_views'))
 parts.append(function(driver, 'vulkan_xr_draw_projection'))
-parts.append(function(driver, 'vulkan_xr_draw'))
+parts.append(function(driver, 'vulkan_xr_same'))
+parts.append(function(driver, 'vulkan_xr_keep'))
 parts.append(function(driver, 'vulkan_xr_stock'))
+parts.append(function(driver, 'vulkan_xr_draw'))
 parts.append(function(driver, 'vulkan_xr_pick_format'))
+parts.append(function(driver, 'vulkan_window_repeat'))
+parts.append(function(driver, 'vulkan_views_allowed'))
+parts.append(function(driver, 'vulkan_views_stock'))
+parts.append(function(driver, 'vulkan_views_hdr_drawable'))
+parts.append(function(driver, 'vulkan_views_whole'))
 Path(sys.argv[1]).write_text('\n\n'.join(parts) + '\n')

@@ -101,16 +101,23 @@ typedef struct d3d9_views
     * register */
    void                  *ps[D3D9_VIEWS_PS_COUNT];
    int                   ps_reg[D3D9_VIEWS_PS_COUNT];
+   /* The layout the views were last drawn with */
+   video_views_layout_t  layout;
    unsigned              frame_dims;
    /* For get_flags on the main thread: whether views may be drawn, and
-    * whether the last frame with a map drew it whole */
+    * whether a map is drawn whole: the last frame's, or with none what
+    * one would get */
    retro_atomic_int_t    allowed;
    retro_atomic_int_t    fallback;
+   /* The opacity views are drawn at, views_alpha's */
+   unsigned              alpha;
    bool                  tried;
    bool                  failed;
    /* The canvas, and the UI layer with its alpha kept apart */
    bool                  blend;
    bool                  layer;
+   /* The device blends by a factor, which opacity takes */
+   bool                  factor;
    bool                  active;
    bool                  direct_seen;
    bool                  preset_seen;

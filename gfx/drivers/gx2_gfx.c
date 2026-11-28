@@ -206,12 +206,16 @@ typedef struct
       unsigned count[2];
       /* Each quad's place on its display */
       video_views_rect_t dst[2][RETRO_VIDEO_VIEWS_MAX];
+      /* The quads drawn black, a bit each: blank insets */
+      unsigned blank[2];
       /* The part of the last frame the texture holds */
       unsigned frame_dims;
       bool drc_mem1;
       bool split;
       bool active;
       bool direct_seen;
+      /* The quads' memory could not be had */
+      bool failed;
    } views;
 
    wiiu_render_mode_t render_mode;
@@ -1463,6 +1467,7 @@ static void gx2_set_aspect_ratio(void *data, unsigned aspect_ratio_idx)
 }
 
 static uint32_t gx2_get_flags(void *data);
+static void gx2_views_seed(const wiiu_video_t *wiiu);
 static uintptr_t gx2_load_texture(void *video_data, void *data,
       bool threaded, enum texture_filter_type filter_type);
 
@@ -1767,6 +1772,7 @@ static void *gx2_init(const video_info_t *video)
       type                        = video_shader_parse_type(shader_preset);
       gx2_set_shader(wiiu, type, shader_preset);
    }
+   gx2_views_seed(wiiu);
 
    return wiiu;
 }
@@ -2008,8 +2014,8 @@ enum
    GX2_VIEWS_DRC
 };
 
-/* For get_flags, which has no driver: the last frame with a map was
- * drawn whole */
+/* For get_flags, which has no driver: a map is drawn whole: the last
+ * frame's, or with none what one would get */
 static retro_atomic_int_t gx2_views_fallback;
 
 /* Where the GamePad's touches land, for the input driver */
@@ -2018,6 +2024,20 @@ static video_views_touch_t gx2_views_touch_map;
 bool gx2_views_touch(int16_t x, int16_t y, int16_t *res_x, int16_t *res_y)
 {
    return video_views_touch_point(&gx2_views_touch_map, x, y, res_x, res_y);
+}
+
+bool gx2_views_touch_no_input(int16_t x, int16_t y)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   long w = (long)VIDEO_SCALE_W(video_st->views_frame_dims);
+   long h = (long)VIDEO_SCALE_H(video_st->views_frame_dims);
+   long px, py;
+   if (!video_st->views_fallback)
+      return false;
+   px = ((long)x + 0x7fff) * w / 0xfffe;
+   py = ((long)y + 0x7fff) * h / 0xfffe;
+   return video_views_point_no_input(&video_st->views_core,
+         (int)(px < w ? px : w - 1), (int)(py < h ? py : h - 1));
 }
 
 /* The GamePad's colour buffer, made on first use */
@@ -2064,12 +2084,12 @@ static void gx2_views_drc_free(wiiu_video_t *wiiu)
    wiiu->views.drc.surface.image = NULL;
 }
 
-/* Screens [@first, @first + @screens) of @map laid out on display @d
- * of size @dims, a quad each; published for touches when the GamePad
- * shows it (@touch) */
+/* The screens of @roots of @map and their insets laid out on display
+ * @d of size @dims by @settings, a quad each; published for touches
+ * when the GamePad shows it (@touch) */
 static void gx2_views_place(wiiu_video_t *wiiu, const video_views_map_t *map,
-      unsigned first, unsigned screens, unsigned dims, unsigned d,
-      bool touch)
+      const video_views_layout_settings_t *settings, unsigned roots,
+      unsigned dims, unsigned d, bool touch)
 {
    unsigned i;
    video_views_map_t sub;
@@ -2079,20 +2099,36 @@ static void gx2_views_place(wiiu_video_t *wiiu, const video_views_map_t *map,
    GX2Surface *tex   = &wiiu->texture.surface;
 
    wiiu->views.count[d] = 0;
-   if (!video_views_select_screens(map, first, screens, &sub, index))
+   wiiu->views.blank[d] = 0;
+   if (!video_views_select_screens(map, roots, &sub, index))
+   {
+      if (touch)
+         video_views_touch_publish(&gx2_views_touch_map, NULL, NULL, NULL,
+               0, 0);
       return;
+   }
    /* The custom viewport is the TV's */
-   video_driver_views_layout_flat(&sub, dims, d == GX2_VIEWS_TV, &layout);
+   video_driver_views_layout_flat(&sub, settings, dims, d == GX2_VIEWS_TV,
+         &layout);
    for (i = 0; i < layout.num_placements
          && wiiu->views.count[d] < RETRO_VIDEO_VIEWS_MAX; i++)
    {
-      frame_vertex_t *q                = v + wiiu->views.count[d]++ * 4;
-      const struct retro_video_view *rv = &map->views[
-         index[layout.placements[i].view]];
+      frame_vertex_t *q;
+      const video_views_placement_t *p  = &layout.placements[i];
+      const struct retro_video_view *rv = &map->views[index[p->view]];
       float u0 = (float)rv->x / tex->width;
       float v0 = (float)rv->y / tex->height;
       float u1 = (float)(rv->x + rv->width)  / tex->width;
       float v1 = (float)(rv->y + rv->height) / tex->height;
+      if (p->flags & VIDEO_VIEWS_PLACEMENT_BLANK)
+      {
+         if (!(p->flags & VIDEO_VIEWS_PLACEMENT_INSET))
+            continue;
+         wiiu->views.blank[d] |= 1u << wiiu->views.count[d];
+      }
+      /* The placement's rectangle goes with its quad */
+      wiiu->views.dst[d][wiiu->views.count[d]] = p->dst;
+      q            = v + wiiu->views.count[d]++ * 4;
       q[0].pos.x   = 0.0f; q[0].pos.y   = 0.0f;
       q[1].pos.x   = 1.0f; q[1].pos.y   = 0.0f;
       q[2].pos.x   = 1.0f; q[2].pos.y   = 1.0f;
@@ -2102,14 +2138,25 @@ static void gx2_views_place(wiiu_video_t *wiiu, const video_views_map_t *map,
       q[2].coord.u = u1;   q[2].coord.v = v1;
       q[3].coord.u = u0;   q[3].coord.v = v1;
    }
-   /* The placements' rectangles go with their quads */
-   for (i = 0; i < wiiu->views.count[d]; i++)
-      wiiu->views.dst[d][i] = layout.placements[i].dst;
    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, v,
          wiiu->views.count[d] * 4 * sizeof(*v));
    if (touch)
       video_views_touch_publish(&gx2_views_touch_map, map, &layout, index,
             dims, wiiu->views.frame_dims);
+}
+
+/* Without a map, whether one would be drawn whole: under a preset, or
+ * once the views' vertices could not be had */
+static bool gx2_views_whole(const wiiu_video_t *wiiu)
+{
+   return wiiu->shader_preset || wiiu->views.failed;
+}
+
+/* Read before the first frame */
+static void gx2_views_seed(const wiiu_video_t *wiiu)
+{
+   retro_atomic_store_release_int(&gx2_views_fallback,
+         gx2_views_whole(wiiu) ? 1 : 0);
 }
 
 /* Whether this frame draws its views: no preset, and the map fits the
@@ -2128,6 +2175,7 @@ static bool gx2_views_setup(wiiu_video_t *wiiu,
       wiiu->views.v = (frame_vertex_t*)MEM2_alloc(2 * RETRO_VIDEO_VIEWS_MAX
             * 4 * sizeof(frame_vertex_t), GX2_VERTEX_BUFFER_ALIGNMENT);
       views         = wiiu->views.v != NULL;
+      wiiu->views.failed = !views;
    }
    split = views && !prefer_drc && map->num_screens > 1
       && gx2_views_drc_make(wiiu);
@@ -2143,8 +2191,9 @@ static bool gx2_views_setup(wiiu_video_t *wiiu,
          video_views_touch_publish(&gx2_views_touch_map, map, NULL, NULL,
                0, 0);
    }
+   /* Without a map, what one would get */
    retro_atomic_store_release_int(&gx2_views_fallback,
-         (map->num_views && !views) ? 1 : 0);
+         (map->num_views ? !views : gx2_views_whole(wiiu)) ? 1 : 0);
    if (views && !wiiu->views.direct_seen)
    {
       wiiu->views.direct_seen = true;
@@ -2161,10 +2210,22 @@ static void gx2_views_draw(wiiu_video_t *wiiu, unsigned d)
    for (i = 0; i < wiiu->views.count[d]; i++)
    {
       const video_views_rect_t *r = &wiiu->views.dst[d][i];
+      bool blank                  = (wiiu->views.blank[d] >> i) & 1;
       GX2SetAttribBuffer(0, 4 * sizeof(*v), sizeof(*v), v + i * 4);
       GX2SetViewport(VIDEO_POS_X(r->pos), VIDEO_POS_Y(r->pos),
             VIDEO_SCALE_W(r->dims), VIDEO_SCALE_H(r->dims), 0.0f, 1.0f);
+      /* Black whatever the texture holds: the blend drops both sides */
+      if (blank)
+         GX2SetBlendControl(GX2_RENDER_TARGET_0, GX2_BLEND_MODE_ZERO,
+               GX2_BLEND_MODE_ZERO, GX2_BLEND_COMBINE_MODE_ADD,
+               GX2_ENABLE, GX2_BLEND_MODE_ONE, GX2_BLEND_MODE_ZERO,
+               GX2_BLEND_COMBINE_MODE_ADD);
       GX2DrawEx(GX2_PRIMITIVE_MODE_QUADS, 4, 0, 1);
+      if (blank)
+         GX2SetBlendControl(GX2_RENDER_TARGET_0, GX2_BLEND_MODE_SRC_ALPHA,
+               GX2_BLEND_MODE_INV_SRC_ALPHA, GX2_BLEND_COMBINE_MODE_ADD,
+               GX2_ENABLE, GX2_BLEND_MODE_SRC_ALPHA,
+               GX2_BLEND_MODE_INV_SRC_ALPHA, GX2_BLEND_COMBINE_MODE_ADD);
    }
 }
 
@@ -2766,15 +2827,17 @@ static bool gx2_frame(void *data, const void *frame,
    if (views)
    {
       const video_views_map_t *map = &video_info->views;
+      unsigned roots               = video_views_roots(map);
       unsigned tv_dims             = VIDEO_SCALE_PACK(
             wiiu->color_buffer.surface.width,
             wiiu->color_buffer.surface.height);
       /* The GamePad's touches land on what it shows */
-      gx2_views_place(wiiu, map, 0,
-            wiiu->views.split ? 1 : map->num_screens, tv_dims,
+      gx2_views_place(wiiu, map, &video_info->views_settings,
+            wiiu->views.split ? (roots & 1u) : roots, tv_dims,
             GX2_VIEWS_TV, !wiiu->views.split);
       if (wiiu->views.split)
-         gx2_views_place(wiiu, map, 1, map->num_screens - 1,
+         gx2_views_place(wiiu, map, &video_info->views_settings,
+               roots & ~1u,
                VIDEO_SCALE_PACK(GX2_VIEWS_DRC_WIDTH, GX2_VIEWS_DRC_HEIGHT),
                GX2_VIEWS_DRC, true);
    }

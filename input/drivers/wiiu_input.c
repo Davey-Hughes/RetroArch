@@ -128,8 +128,10 @@ static int16_t wiiu_input_state(
                   int16_t y = joypad->axis(0, 0xFFFF0005UL);
                   /* The core's pointer is in its packed frame when the
                    * GamePad shows its views */
-                  if (device == RETRO_DEVICE_POINTER)
-                     gx2_views_touch(x, y, &x, &y);
+                  if (     device == RETRO_DEVICE_POINTER
+                        && !gx2_views_touch(x, y, &x, &y)
+                        && gx2_views_touch_no_input(x, y))
+                     return -0x8000;
                   return (id == RETRO_DEVICE_ID_POINTER_X) ? x : y;
                }
          }
