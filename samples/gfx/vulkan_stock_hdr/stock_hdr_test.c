@@ -220,6 +220,7 @@ static struct
    unsigned blend_sets, blend_binds;
    VkPipeline quad_pipeline;
    uint64_t quad_color;
+   const math_matrix_4x4 *quad_mvp;
    unsigned quads;
    VkRect2D clear_rect;
    unsigned clears;
@@ -338,6 +339,7 @@ static void vulkan_draw_quad(vk_t *vk, const struct vk_draw_quad *quad)
    (void)vk;
    last.quad_pipeline = quad->pipeline;
    last.quad_color    = quad->color;
+   last.quad_mvp      = quad->mvp;
    last.quads++;
 }
 static void vkCmdClearAttachments(VkCommandBuffer c, unsigned n,
@@ -440,13 +442,14 @@ static void draw(void)
    vulkan_views_draw_direct(&vk, &d, 0, &rect, &rect);
 }
 
-/* A blank inset at x 48, y 24, 16x8 */
+/* A blank inset at x 48, y 24, 16x8, with its output's projection */
+static math_matrix_4x4 fill_mvp;
 static void fill(unsigned alpha)
 {
    video_views_rect_t cut;
    cut.pos  = (48u << 16) | 24u;
    cut.dims = VIDEO_SCALE_PACK(16, 8);
-   vulkan_views_fill(&vk, &cut, alpha);
+   vulkan_views_fill(&vk, &cut, &fill_mvp, alpha);
 }
 
 /* A 48x32 picture over x 8, y 4, 48x32, nearest */
@@ -701,6 +704,7 @@ static void test_fill_pipeline(void)
          "alpha_blend", (double)last.quad_pipeline);
    expect(t, last.quad_color == ((uint64_t)(128 * 257) << 48),
          "black at its alpha", (double)(last.quad_color >> 48));
+   expect(t, last.quad_mvp == &fill_mvp, "with the mvp it is given", 0);
    expect(t, !last.clears, "no clear", last.clears);
    setup();
    vk.flags |= VK_FLAG_SDR_PIPELINE;

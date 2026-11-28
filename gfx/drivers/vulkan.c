@@ -7784,7 +7784,7 @@ static void vulkan_views_draw_pass(vk_t *vk, vulkan_filter_chain_t *fc,
       const video_views_rect_t *dst, const video_views_rect_t *cut,
       bool again);
 static void vulkan_views_fill(vk_t *vk, const video_views_rect_t *cut,
-      unsigned alpha);
+      const math_matrix_4x4 *mvp, unsigned alpha);
 static bool vulkan_views_make(vk_t *vk, struct vk_image *img, unsigned dims);
 static bool vulkan_views_retire(vk_t *vk, struct vk_image *img);
 #ifdef HAVE_VIDEO_WINDOWS
@@ -7806,7 +7806,7 @@ static void vulkan_draw_menu(vk_t *vk, video_frame_info_t *video_info,
 #define VV_DIRECT(p, d, v, r, c)        vulkan_views_draw_direct(p, d, v, r, c)
 #define VV_PASS(p, d, f, r, c, a)       vulkan_views_draw_pass(p, f, r, c, a)
 #define VV_ALPHA(p, d, a)               ((p)->views.alpha = ((a) < 255) ? (a) : 0)
-#define VV_FILL(p, d, c, a)             vulkan_views_fill(p, c, a)
+#define VV_FILL(p, d, c, a)             vulkan_views_fill(p, c, &(p)->mvp, a)
 #define VV_IMAGE_MAP(p, d)              (&(d)->video_info->views)
 #define VV_IMAGE(p, d, s, r, c, n)      vulkan_views_draw_image(p, \
       VV_IMAGE_MAP(p, d)->image_tex[s], r, c, n)
@@ -12065,11 +12065,11 @@ static void vulkan_views_draw_pass(vk_t *vk, vulkan_filter_chain_t *fc,
 }
 
 /* @cut black at @alpha, for a blank inset: a black quad at that vertex
- * alpha through the pass's alpha_blend, or a second output's premult,
- * else cleared (solid, the pass has none, or the target holds encoded
- * values) */
+ * alpha with @mvp through the pass's alpha_blend, or a second output's
+ * premult, else cleared (solid, the pass has none, or the target holds
+ * encoded values) */
 static void vulkan_views_fill(vk_t *vk, const video_views_rect_t *cut,
-      unsigned alpha)
+      const math_matrix_4x4 *mvp, unsigned alpha)
 {
    VkPipeline pipeline = vk->pipelines.alpha_blend;
    if (vk->views.target)
@@ -12115,7 +12115,7 @@ static void vulkan_views_fill(vk_t *vk, const video_views_rect_t *cut,
       quad.pipeline = pipeline;
       quad.texture  = &vk->display.blank_texture;
       quad.sampler  = vk->samplers.nearest;
-      quad.mvp      = &vk->mvp;
+      quad.mvp      = mvp;
       quad.color    = rgba16_pack(black);
       vulkan_draw_quad(vk, &quad);
 
@@ -14653,7 +14653,7 @@ static void vulkan_xr_draw_screen(vk_t *vk, unsigned s,
             /* A picture not landed yet leaves the base, as in the
              * window. */
             if (!in->image || in->blank)
-               vulkan_views_fill(vk, &cut, in->alpha);
+               vulkan_views_fill(vk, &cut, &vk->xr.mvp, in->alpha);
             else if (in->image_tex)
                vulkan_views_draw_image(vk, in->image_tex, &cut, &cut, true);
             vk->views.alpha = 0;

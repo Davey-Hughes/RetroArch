@@ -155,7 +155,7 @@ typedef struct
    VkCommandBuffer cmd;
    struct video_viewport vp;
    VkViewport vk_vp;
-   math_matrix_4x4 mvp_no_rot;
+   math_matrix_4x4 mvp, mvp_no_rot;
    struct { VkSampler linear, nearest; } samplers;
    struct { bool smooth; } video;
    struct vk_per_frame
@@ -780,15 +780,17 @@ static void vulkan_views_draw_image(vk_t *vk, uintptr_t image_tex,
       picture_whole = false;
 }
 
-/* Fills, the last one's alpha and those with views.target set; fills
- * counts the solid ones */
+/* Fills, the last one's alpha and mvp and those with views.target set;
+ * fills counts the solid ones */
 static unsigned fill_calls, fill_alpha, fills_targeted;
+static const math_matrix_4x4 *fill_mvp;
 
 static void vulkan_views_fill(vk_t *vk, const video_views_rect_t *cut,
-      unsigned alpha)
+      const math_matrix_4x4 *mvp, unsigned alpha)
 {
    fill_calls++;
    fill_alpha = alpha;
+   fill_mvp   = mvp;
    if (vk->views.target)
       fills_targeted++;
    if (alpha >= 255)
@@ -909,6 +911,7 @@ static void init(vk_t *vk, test_context_t *context, test_chain_t *chain)
    memset(picture_stock, 0, sizeof(picture_stock));
    picture_alpha = 0;
    fill_calls = fill_alpha = fills_targeted = 0;
+   fill_mvp   = NULL;
    stock_draws = stock_targeted = stock_alpha = 0;
    stock_src     = NULL;
    stock_sampler = VK_NULL_HANDLE;
@@ -2007,7 +2010,8 @@ static void test_xr_draw_image_target(void)
 /* Insets below 255 at their opacity: a blank one filled, an image one
  * and, with the stock chains, a view one from its copy whole, each
  * through a blend; a preset's view inset stays solid through its chain.
- * Under HDR output each draws with the headset pass's pipelines. */
+ * The blank one takes the headset's projection, not the menu's. Under
+ * HDR output each draws with the headset pass's pipelines. */
 static void test_xr_draw_inset_alpha(void)
 {
    vk_t vk;
@@ -2062,6 +2066,7 @@ static void test_xr_draw_inset_alpha(void)
       vulkan_xr_draw(&vk, &info, true, true, false, chains, XR_FRAME_CHAIN,
             NULL, dims, dims, dims, true);
       CHECK(fill_calls == 1 && fill_alpha == 128 && fills == 0);
+      CHECK(fill_mvp == &vk.xr.mvp);
       CHECK(pictures == 1 && last_picture == 78 && picture_alpha == 128);
       CHECK(offscreen_passes == 1 && frames_ended == 1);
       if (i == 1)
