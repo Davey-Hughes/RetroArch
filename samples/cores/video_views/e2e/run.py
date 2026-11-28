@@ -1681,9 +1681,8 @@ def hdr_passes(name):
     return HDR_PASSES[max(found, key=len)] if found else (None, None)
 
 
-# A validation message's ID, as its log line carries it.
-VALIDATION_ID_RE = re.compile(
-    r'\[ (VUID-[A-Za-z0-9_-]+|UNASSIGNED-[A-Za-z0-9_.-]+) \]')
+# A validation message's ID, of any kind, as its log line carries it.
+VALIDATION_ID_RE = re.compile(r'\[ ([A-Za-z][A-Za-z0-9_.-]*) \]')
 # An INFO message: the layer's name for it, or the severity the driver
 # logs.
 VALIDATION_INFO_RE = re.compile(
