@@ -9258,7 +9258,8 @@ GL_SKIP = {'glcore-egl': ('focus',) + SCREENS_HALF,
            + SCREENS_HALF,
            # gl reports FALLBACK while a headset runs: screens-image-gl.
            'gl-egl': tuple(c['name'] for c in SCREENS_CASES
-                           if c['name'].startswith('screens-image'))
+                           if c['name'].startswith('screens-image')
+                           and c['name'] not in SCREENS_HALF)
            + SCREENS_HALF}
 # A lane that runs only these of its driver's cases: gl's other binding.
 GL_ONLY = {'gl-glx': ('3ds-stereo', 'no-map', 'menu', 'menu-closes',
